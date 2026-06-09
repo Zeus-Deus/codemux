@@ -1666,6 +1666,81 @@ pub fn find_remote_ref(repo_path: &Path, branch: &str) -> Option<String> {
     }
 }
 
+/// Wall-clock cap for the best-effort base fetch in
+/// [`fetch_origin_branch`]. Matches the 10s per-fetch timeout used by the
+/// background sidebar-divergence fetcher: long enough for a healthy remote,
+/// short enough that an unreachable one doesn't stall worktree creation.
+const BASE_FETCH_TIMEOUT_SECS: u64 = 10;
+
+/// Best-effort, scoped `git fetch origin <branch>` so
+/// `refs/remotes/origin/<branch>` reflects the true remote tip before a
+/// caller resolves it (e.g. as the base of a new workspace branch).
+/// Without this, `find_remote_ref` resolves to whatever the last fetch
+/// left behind — a potentially stale snapshot of the remote.
+///
+/// Returns `true` iff the fetch ran and succeeded. Designed to never
+/// block or fail worktree creation:
+/// - Scoped to a single branch (not every ref) to keep latency low.
+/// - Skipped entirely when there is no `origin` remote (local-only repos)
+///   or when `branch` is an absolute `refs/...` path.
+/// - `origin/<b>` inputs are normalised to `<b>` so callers can pass a
+///   base in either form.
+/// - `GIT_TERMINAL_PROMPT=0` so git can never hang on a credential prompt.
+/// - Killed after [`BASE_FETCH_TIMEOUT_SECS`] if the remote is slow or
+///   unreachable (a plain `.output()` would block indefinitely on a
+///   half-open connection).
+/// - All failures (offline, auth, missing branch) are swallowed — callers
+///   fall back to the existing local `origin/<b>` / `<b>` refs.
+pub fn fetch_origin_branch(repo_path: &Path, branch: &str) -> bool {
+    let branch = match branch.strip_prefix("origin/") {
+        Some(rest) => rest,
+        None if branch.starts_with("refs/") => return false,
+        None => branch,
+    };
+    if branch.is_empty() {
+        return false;
+    }
+    // Cheap local check first: `git fetch origin` on a repo with no
+    // `origin` remote errors immediately, but skipping it avoids spawning
+    // a doomed subprocess for the common local-only-repo case.
+    let remotes = run_git_permissive(repo_path, &["remote"]);
+    if !remotes.lines().any(|r| r.trim() == "origin") {
+        return false;
+    }
+    let Ok(mut child) = Command::new("git")
+        .args(["fetch", "--quiet", "--no-tags", "origin", branch])
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(BASE_FETCH_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                // Can't observe the child any more; don't leak it.
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// Returns true iff `git worktree list --porcelain` for `repo_path` contains
 /// an entry whose `worktree` line matches `target_path` AND whose `branch`
 /// line matches `refs/heads/<branch>` (the form git uses for porcelain
@@ -2162,7 +2237,16 @@ pub fn git_create_worktree(
 
     if new_branch {
         // Resolve base: prefer origin/<base> so new branches start from the
-        // latest remote commit, not a potentially stale local ref.
+        // latest remote commit, not a potentially stale local ref. Freshen
+        // `refs/remotes/origin/<base>` first — without the fetch it only
+        // reflects the remote as of the LAST fetch, so "latest remote
+        // commit" was previously aspirational. Best-effort: offline or
+        // no-remote repos fall through to the stale/local refs below.
+        // Callers run this whole function on a blocking pool
+        // (`spawn_blocking`), so the fetch never stalls the UI thread.
+        if let Some(b) = base {
+            fetch_origin_branch(repo_path, b);
+        }
         let resolved_base = base.map(|b| find_remote_ref(repo_path, b).unwrap_or_else(|| b.to_string()));
         let mut args = vec!["worktree", "add", "-b", branch, &path_str];
         if let Some(ref b) = resolved_base {
@@ -2796,6 +2880,101 @@ C  source.txt -> copy.txt";
         assert!(PathBuf::from(&wt_path).join("dev.txt").exists(), "should have develop's file");
 
         git_remove_worktree(Path::new(&wt_path), Some("feature-from-dev"), true).expect("cleanup");
+    }
+
+    /// Build the stale-clone scenario behind issue #76: a bare "origin",
+    /// a `local-<tag>` clone (the repo Codemux operates on), and a
+    /// publisher clone that pushes one extra commit which `local` never
+    /// fetches. Returns `(tempdir, local_clone_path, true_remote_tip)`,
+    /// with `local`'s `refs/remotes/origin/main` guaranteed stale.
+    fn setup_stale_clone_with_remote(tag: &str) -> (TempDir, PathBuf, String) {
+        let dir = TempDir::new().expect("create temp dir");
+        let root = dir.path().to_path_buf();
+
+        // Seed repo with one commit on main.
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).expect("mkdir seed");
+        run_git(&seed, &["init", "--initial-branch=main"]).expect("init seed");
+        run_git(&seed, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "initial"]).expect("seed commit");
+
+        // Bare "origin" plus two clones: `local` (under test) and
+        // `publisher` (a teammate pushing while `local` doesn't fetch).
+        let bare = root.join("origin.git");
+        run_git(&root, &["clone", "--bare", seed.to_str().unwrap(), bare.to_str().unwrap()]).expect("clone bare");
+        let local = root.join(format!("local-{tag}"));
+        run_git(&root, &["clone", bare.to_str().unwrap(), local.to_str().unwrap()]).expect("clone local");
+        let publisher = root.join("publisher");
+        run_git(&root, &["clone", bare.to_str().unwrap(), publisher.to_str().unwrap()]).expect("clone publisher");
+        run_git(&publisher, &["-c", "user.name=Test", "-c", "user.email=test@test.com", "commit", "--allow-empty", "-m", "remote-only"]).expect("publisher commit");
+        run_git(&publisher, &["push", "origin", "main"]).expect("publisher push");
+
+        let remote_tip = run_git(&bare, &["rev-parse", "main"]).expect("bare tip");
+        let stale = run_git(&local, &["rev-parse", "refs/remotes/origin/main"]).expect("local origin/main");
+        assert_ne!(stale, remote_tip, "precondition: local origin/main must be stale");
+        (dir, local, remote_tip)
+    }
+
+    // Issue #76: a new workspace branch must start from the LATEST remote
+    // commit of its base, not the stale `origin/<base>` snapshot left by
+    // the last fetch. `git_create_worktree` now runs a scoped
+    // `git fetch origin <base>` before resolving the base ref.
+    #[test]
+    fn test_new_branch_worktree_starts_from_freshly_fetched_origin_base() {
+        let (_dir, local, remote_tip) = setup_stale_clone_with_remote("fresh");
+
+        let wt_path = git_create_worktree(&local, "fresh-base-test", true, Some("main"), None)
+            .expect("create worktree");
+        let head = run_git(Path::new(&wt_path), &["rev-parse", "HEAD"]).expect("worktree HEAD");
+        assert_eq!(
+            head, remote_tip,
+            "new branch should start at the freshly-fetched remote tip, not the stale origin/main"
+        );
+
+        git_remove_worktree(Path::new(&wt_path), Some("fresh-base-test"), true).expect("cleanup");
+    }
+
+    // Issue #76 fallback: when the remote is unreachable (offline), the
+    // best-effort fetch must NOT hard-fail worktree creation — the new
+    // branch falls back to the existing (stale) `origin/<base>` ref.
+    #[test]
+    fn test_new_branch_worktree_offline_falls_back_to_stale_origin_ref() {
+        let (_dir, local, remote_tip) = setup_stale_clone_with_remote("offline");
+        let stale = run_git(&local, &["rev-parse", "refs/remotes/origin/main"]).expect("stale ref");
+
+        // Sever the remote: origin now points at a path that doesn't exist.
+        run_git(&local, &["remote", "set-url", "origin", "/nonexistent/codemux-test-origin.git"])
+            .expect("set-url");
+
+        let wt_path = git_create_worktree(&local, "offline-base-test", true, Some("main"), None)
+            .expect("worktree creation must not hard-fail when the remote is unreachable");
+        let head = run_git(Path::new(&wt_path), &["rev-parse", "HEAD"]).expect("worktree HEAD");
+        assert_eq!(head, stale, "offline fallback should use the existing (stale) origin/main");
+        assert_ne!(head, remote_tip, "remote tip is unreachable offline");
+
+        git_remove_worktree(Path::new(&wt_path), Some("offline-base-test"), true).expect("cleanup");
+    }
+
+    #[test]
+    fn fetch_origin_branch_updates_remote_tracking_ref() {
+        let (_dir, local, remote_tip) = setup_stale_clone_with_remote("fetch");
+        // `origin/<b>` input is normalised to `<b>` before fetching.
+        assert!(fetch_origin_branch(&local, "origin/main"), "fetch should succeed");
+        let updated = run_git(&local, &["rev-parse", "refs/remotes/origin/main"]).expect("ref");
+        assert_eq!(updated, remote_tip, "origin/main should now be at the true remote tip");
+    }
+
+    #[test]
+    fn fetch_origin_branch_is_noop_without_origin_remote() {
+        let (_dir, repo) = setup_test_repo();
+        assert!(!fetch_origin_branch(&repo, "main"), "no origin remote → no fetch");
+    }
+
+    #[test]
+    fn fetch_origin_branch_skips_absolute_and_empty_refs() {
+        let (_dir, repo) = setup_test_repo();
+        assert!(!fetch_origin_branch(&repo, "refs/heads/main"));
+        assert!(!fetch_origin_branch(&repo, ""));
+        assert!(!fetch_origin_branch(&repo, "origin/"));
     }
 
     #[test]
