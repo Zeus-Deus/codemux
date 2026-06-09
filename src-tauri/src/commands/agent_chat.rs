@@ -23,7 +23,7 @@ use crate::agent_provider::{
     ProviderRuntimeEvent, RequestId, SendTurnInput, SerializableProviderError,
     StartSessionInput, ThreadId, TurnId,
 };
-use crate::database::{AgentChatSessionRecord, DatabaseStore};
+use crate::database::{AgentChatCheckpointRecord, AgentChatSessionRecord, DatabaseStore};
 use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
 
@@ -347,9 +347,233 @@ pub async fn agent_chat_start_session(
                 "[codemux::agent_chat] failed to persist session record: {error}"
             );
         }
+        // Issue #80 — optional rollback checkpoint. Spawned AFTER the
+        // provider session is up and the session row is persisted, so
+        // not a single git operation (or even the settings-cache read)
+        // sits on the latency-to-first-token path. The opt-in gate is
+        // evaluated inside the task.
+        if let Some(cwd) = cwd_for_persist.clone() {
+            spawn_run_checkpoint(
+                &app,
+                session.thread_id.0.clone(),
+                workspace_id.clone(),
+                cwd,
+            );
+        }
     }
     crate::state::emit_app_state(&app);
     Ok(session.thread_id)
+}
+
+// ── Run checkpoints (issue #80) ──────────────────────────────────────
+//
+// When the (opt-in) setting is on, every session start snapshots the
+// working tree in the BACKGROUND via `git_checkpoint_create` — a
+// non-destructive shadow-ref commit that leaves the user's index,
+// worktree, and stash list untouched. The snapshot is recorded against
+// the thread so the pane header can offer "Restore checkpoint".
+
+/// Event emitted when a background checkpoint lands, so the pane
+/// header can reveal the restore affordance without polling.
+pub const AGENT_CHAT_CHECKPOINT_EVENT: &str = "agent_chat_checkpoint";
+
+/// Payload emitted on [`AGENT_CHAT_CHECKPOINT_EVENT`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChatCheckpointEventPayload {
+    pub thread_id: ThreadId,
+    pub checkpoint: AgentChatCheckpointRecord,
+}
+
+/// Whether the user opted into run-start checkpoints. Reads the synced
+/// settings cache (same pattern as session-restore in
+/// `terminal/mod.rs`); default is OFF.
+pub fn run_checkpoints_enabled() -> bool {
+    crate::settings_sync::load_cache()
+        .map(|s| s.agent_chat.checkpoints_enabled)
+        .unwrap_or(false)
+}
+
+/// Synchronous core of the background checkpoint: snapshot the repo at
+/// `repo_path`, persist the bookkeeping row, and prune old shadow refs
+/// (dropping their rows too). Blocking — run it on a blocking thread.
+///
+/// Returns `Ok(None)` when there was nothing to checkpoint (not a git
+/// repo / unborn HEAD). Public so integration tests can exercise the
+/// full create→restore round trip without a Tauri runtime.
+pub fn create_run_checkpoint_blocking(
+    db: &DatabaseStore,
+    repo_path: &std::path::Path,
+    thread_id: &str,
+    workspace_id: &str,
+) -> Result<Option<AgentChatCheckpointRecord>, String> {
+    let ref_name = crate::git::checkpoint_ref_name(thread_id);
+    let message = format!("codemux checkpoint: before agent run {thread_id}");
+    let Some(snapshot) = crate::git::git_checkpoint_create(repo_path, &ref_name, &message)?
+    else {
+        return Ok(None);
+    };
+    let record = AgentChatCheckpointRecord {
+        thread_id: thread_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        repo_path: repo_path.to_string_lossy().to_string(),
+        ref_name: snapshot.ref_name.clone(),
+        snapshot_commit: snapshot.snapshot_commit.clone(),
+        head_commit: snapshot.head_commit.clone(),
+        branch: snapshot.branch.clone(),
+        created_at: String::new(), // assigned by SQLite
+    };
+    db.upsert_agent_chat_checkpoint(&record)?;
+    // Cap shadow-ref growth. Best-effort: a prune failure must not
+    // fail the checkpoint that already landed.
+    for namespace in [
+        crate::git::CHECKPOINT_REF_PREFIX,
+        crate::git::PRE_RESTORE_REF_PREFIX,
+    ] {
+        match crate::git::git_checkpoint_prune(
+            repo_path,
+            namespace,
+            crate::git::CHECKPOINT_KEEP_PER_NAMESPACE,
+        ) {
+            Ok(pruned) => {
+                if let Err(error) = db.delete_agent_chat_checkpoints_by_refs(
+                    &record.repo_path,
+                    &pruned,
+                ) {
+                    eprintln!(
+                        "[codemux::agent_chat] failed to drop pruned checkpoint rows: {error}"
+                    );
+                }
+            }
+            Err(error) => eprintln!(
+                "[codemux::agent_chat] checkpoint prune failed: {error}"
+            ),
+        }
+    }
+    // Re-read so the caller (and the emitted event) sees the
+    // SQLite-assigned created_at.
+    Ok(db.get_agent_chat_checkpoint(thread_id).or(Some(record)))
+}
+
+/// Synchronous core of the restore path. Blocking — run it on a
+/// blocking thread. Public for integration tests.
+pub fn restore_run_checkpoint_blocking(
+    db: &DatabaseStore,
+    thread_id: &str,
+) -> Result<(), String> {
+    let record = db.get_agent_chat_checkpoint(thread_id).ok_or_else(|| {
+        "No checkpoint is recorded for this chat.".to_string()
+    })?;
+    crate::git::git_checkpoint_restore(
+        std::path::Path::new(&record.repo_path),
+        &record.snapshot_commit,
+        &record.head_commit,
+        record.branch.as_deref(),
+        &crate::git::pre_restore_ref_name(thread_id),
+    )
+}
+
+/// Fire-and-forget background checkpoint for a freshly started run.
+///
+/// The whole body — including the settings-cache read that decides
+/// whether the feature is even on — runs off the command path:
+/// `tauri::async_runtime::spawn` returns immediately and the git work
+/// happens on the blocking pool. Failures are logged, never surfaced:
+/// a checkpoint must not break (or slow) the chat it protects.
+fn spawn_run_checkpoint(
+    app: &AppHandle,
+    thread_id: String,
+    workspace_id: String,
+    cwd: String,
+) {
+    spawn_run_checkpoint_with_gate(app, thread_id, workspace_id, cwd, run_checkpoints_enabled);
+}
+
+/// [`spawn_run_checkpoint`] with the opt-in gate injected. Public (and
+/// generic over the runtime) so integration tests can drive the REAL
+/// background path — spawn, blocking pool, DB write through managed
+/// state, event emission — on a `tauri::test::mock_app` without
+/// touching the user's settings cache.
+pub fn spawn_run_checkpoint_with_gate<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: String,
+    workspace_id: String,
+    cwd: String,
+    gate: fn() -> bool,
+) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let blocking_app = app.clone();
+        let blocking_thread_id = thread_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            if !gate() {
+                return Ok(None);
+            }
+            let db: State<'_, DatabaseStore> = blocking_app.state();
+            create_run_checkpoint_blocking(
+                &db,
+                std::path::Path::new(&cwd),
+                &blocking_thread_id,
+                &workspace_id,
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(Some(checkpoint))) => {
+                eprintln!(
+                    "[codemux::agent_chat] checkpoint {} recorded for thread {thread_id}",
+                    checkpoint.snapshot_commit
+                );
+                let payload = AgentChatCheckpointEventPayload {
+                    thread_id: ThreadId(thread_id),
+                    checkpoint,
+                };
+                if let Err(error) = app.emit(AGENT_CHAT_CHECKPOINT_EVENT, &payload) {
+                    eprintln!(
+                        "[codemux::agent_chat] failed to emit {AGENT_CHAT_CHECKPOINT_EVENT}: {error}"
+                    );
+                }
+            }
+            Ok(Ok(None)) => { /* feature off, or nothing to snapshot */ }
+            Ok(Err(error)) => eprintln!(
+                "[codemux::agent_chat] background checkpoint failed for {thread_id}: {error}"
+            ),
+            Err(join_error) => eprintln!(
+                "[codemux::agent_chat] checkpoint task panicked for {thread_id}: {join_error}"
+            ),
+        }
+    });
+}
+
+/// Return the rollback checkpoint recorded for a thread, if any.
+///
+/// Not gated on the feature flag (mirrors `agent_chat_list_sessions`):
+/// the header should render "no checkpoint" rather than an error
+/// string when the flag is off.
+#[tauri::command]
+pub async fn agent_chat_get_checkpoint(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+) -> Result<Option<AgentChatCheckpointRecord>, String> {
+    Ok(db.get_agent_chat_checkpoint(&thread_id))
+}
+
+/// Roll the workspace back to the checkpoint taken when this run
+/// started. Mutates the working tree — the UI confirms first.
+#[tauri::command]
+pub async fn agent_chat_restore_checkpoint(
+    app: AppHandle,
+    thread_id: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    // Blocking pool, same rationale as commands/git.rs: a wedged git
+    // subprocess must not freeze the GTK main thread.
+    tokio::task::spawn_blocking(move || {
+        let db: State<'_, DatabaseStore> = app.state();
+        restore_run_checkpoint_blocking(&db, &thread_id)
+    })
+    .await
+    .map_err(|e| format!("agent_chat_restore_checkpoint task join failed: {e}"))?
 }
 
 /// Queue a user turn on an existing session.

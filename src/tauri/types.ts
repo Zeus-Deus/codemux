@@ -49,6 +49,13 @@ export interface SessionRestoreSettings {
   max_total_mb: number;
 }
 
+/** Mirrors src-tauri/src/settings_sync.rs:AgentChatSettings.
+ *  `checkpoints_enabled` is the opt-in for the run-start rollback
+ *  checkpoint (issue #80) — default OFF. */
+export interface AgentChatSyncSettings {
+  checkpoints_enabled: boolean;
+}
+
 export interface UserSettings {
   appearance: AppearanceSettings;
   editor: EditorSettings;
@@ -58,6 +65,7 @@ export interface UserSettings {
   notifications: NotificationSyncSettings;
   file_tree: FileTreeSyncSettings;
   session_restore: SessionRestoreSettings;
+  agent_chat: AgentChatSyncSettings;
 }
 
 // ── Resource Monitor ──

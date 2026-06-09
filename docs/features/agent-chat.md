@@ -508,11 +508,50 @@ string when the target provider is missing from the registry.
 | `agent_chat_set_model` | Swap a thread's model mid-session. |
 | `agent_chat_set_permission_mode` | Swap a thread's permission mode mid-session. |
 | `agent_chat_stop_session` | Gracefully close a session. Idempotent. |
+| `agent_chat_get_checkpoint` | Return the run-start rollback checkpoint recorded for a thread (or null). Not flag-gated — renders as "no checkpoint" instead of an error. |
+| `agent_chat_restore_checkpoint` | Roll the workspace back to the thread's run-start checkpoint. Mutates the working tree; the UI confirms first. |
 
 Provider errors are serialized as `SerializableProviderError` JSON so
 the UI can inspect the error subtype (e.g.
 `{"kind":"not_authenticated", ...}`) instead of parsing a free-form
 string.
+
+## Run checkpoints (issue #80)
+
+Opt-in rollback point taken when a chat session starts. Off by
+default; toggled via Settings → Agent → "Checkpoint before agent
+runs" (`UserSettings.agent_chat.checkpoints_enabled`, synced
+settings).
+
+- **Background, never on the first-token path.** `agent_chat_start_session`
+  spawns `tauri::async_runtime::spawn` + `spawn_blocking` AFTER the
+  provider session is up; even the settings-cache read happens inside
+  the spawned task.
+- **Non-destructive snapshot.** `git_checkpoint_create`
+  (`src-tauri/src/git.rs`) stages the worktree (tracked + untracked,
+  `.gitignore` respected) into a temporary `GIT_INDEX_FILE`, writes a
+  tree, and `commit-tree`s it onto HEAD — the user's index, worktree,
+  and stash list are untouched and no hooks run. The commit is
+  anchored at `refs/codemux/checkpoints/<sanitized-thread-id>` so gc
+  can't reap it. Skipped silently for non-repos and unborn-HEAD repos.
+- **Recorded per thread.** `agent_chat_checkpoints` table (FK →
+  `agent_chat_sessions`, ON DELETE CASCADE) stores snapshot commit,
+  HEAD commit, branch, repo path, ref name. On success the backend
+  emits `agent_chat_checkpoint` (`{thread_id, checkpoint}`); the
+  frontend hook `useAgentChatCheckpoint` (event + on-mount fetch)
+  feeds the pane header's restore button (history icon, hover-reveal,
+  hidden when no checkpoint, disabled mid-turn).
+- **Restore** (`git_checkpoint_restore`): refuses on branch mismatch
+  or pruned commits; takes a safety snapshot of the current state to
+  `refs/codemux/pre-restore/<id>` first; then `read-tree --reset -u
+  <snapshot>` + `clean -fd` + `reset --mixed <pre-run HEAD>`. Result:
+  run commits undone, run-created files deleted (ignored files
+  spared), pre-run changes back as unstaged edits / untracked files.
+  Known loss: the pre-run staged/unstaged split flattens to unstaged.
+- **Pruning.** Each create prunes both `refs/codemux/` namespaces to
+  the 20 newest refs and drops the matching bookkeeping rows.
+
+Design note: `docs/plans/agent-run-checkpoint.md`.
 
 ## Event bridge
 

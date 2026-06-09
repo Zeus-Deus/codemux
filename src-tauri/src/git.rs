@@ -427,6 +427,298 @@ pub fn git_stash_pop(repo_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ── Run checkpoints (issue #80) ─────────────────────────────────────
+//
+// Non-destructive working-tree snapshots taken in the background when
+// an agent-chat run starts, so the user can roll back everything the
+// run changed. Three invariants drive the implementation:
+//
+//   1. Creating a checkpoint must NOT disturb the user's index,
+//      worktree, or stash list. `git stash create` would qualify but
+//      ignores untracked files, so we instead build a snapshot commit
+//      through a temporary index (`GIT_INDEX_FILE`), which git treats
+//      as a fully independent staging area.
+//   2. The snapshot must survive `git gc` — it is anchored on a
+//      dedicated shadow ref under `refs/codemux/`.
+//   3. No hooks may fire (the user's `pre-commit` must not run on a
+//      background snapshot) — `git commit-tree` is plumbing and runs
+//      none.
+
+/// Ref namespace for run-start checkpoints.
+pub const CHECKPOINT_REF_PREFIX: &str = "refs/codemux/checkpoints";
+/// Ref namespace for the safety snapshots taken right before a restore.
+pub const PRE_RESTORE_REF_PREFIX: &str = "refs/codemux/pre-restore";
+/// How many refs to keep per namespace when pruning.
+pub const CHECKPOINT_KEEP_PER_NAMESPACE: usize = 20;
+
+/// A created working-tree snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitCheckpoint {
+    /// Fully-qualified ref anchoring the snapshot (gc protection).
+    pub ref_name: String,
+    /// Commit object whose tree is the full worktree content
+    /// (tracked changes + untracked non-ignored files).
+    pub snapshot_commit: String,
+    /// `HEAD` at snapshot time. Restore moves the branch back here,
+    /// undoing any commits the run made.
+    pub head_commit: String,
+    /// Checked-out branch at snapshot time (`None` when detached).
+    pub branch: Option<String>,
+}
+
+/// Sanitize an arbitrary id (e.g. an agent-chat thread id) into a
+/// single safe ref component. Conservative: anything outside
+/// `[A-Za-z0-9_-]` becomes `-`, which sidesteps every
+/// `git check-ref-format` rule (`..`, `@{`, leading `.`, `*.lock`, …).
+pub fn sanitize_ref_component(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    out.truncate(100);
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "checkpoint".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Full checkpoint ref for a thread id.
+pub fn checkpoint_ref_name(thread_id: &str) -> String {
+    format!("{CHECKPOINT_REF_PREFIX}/{}", sanitize_ref_component(thread_id))
+}
+
+/// Full pre-restore safety ref for a thread id.
+pub fn pre_restore_ref_name(thread_id: &str) -> String {
+    format!("{PRE_RESTORE_REF_PREFIX}/{}", sanitize_ref_component(thread_id))
+}
+
+/// Run git with a private index file so staging operations never touch
+/// the user's real index.
+fn run_git_with_index(
+    repo_path: &Path,
+    index_file: &Path,
+    args: &[&str],
+) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .env("GIT_INDEX_FILE", index_file)
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+}
+
+/// Snapshot the full working-tree state (staged + unstaged + untracked,
+/// `.gitignore` respected) into a commit anchored at `full_ref`,
+/// without touching the user's index, worktree, or stash list.
+///
+/// Returns `Ok(None)` when there is nothing snapshottable — the path
+/// is not inside a git repo, or the repo has an unborn HEAD (no
+/// commits yet). Callers treat `None` as "checkpoint skipped".
+pub fn git_checkpoint_create(
+    repo_path: &Path,
+    full_ref: &str,
+    message: &str,
+) -> Result<Option<GitCheckpoint>, String> {
+    // Resolve the worktree root; failure means "not a git repo" and
+    // also covers bare repos (no toplevel → nothing to snapshot).
+    let Ok(toplevel) = run_git(repo_path, &["rev-parse", "--show-toplevel"]) else {
+        return Ok(None);
+    };
+    let repo = Path::new(&toplevel);
+    // Unborn HEAD (fresh `git init`, zero commits): there is no parent
+    // to anchor the snapshot to and no baseline to roll back to.
+    let Ok(head) = run_git(repo, &["rev-parse", "HEAD"]) else {
+        return Ok(None);
+    };
+    let branch = {
+        let b = run_git_permissive(repo, &["branch", "--show-current"]);
+        if b.is_empty() {
+            None
+        } else {
+            Some(b)
+        }
+    };
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_index = std::env::temp_dir().join(format!(
+        "codemux-checkpoint-index-{}-{nanos}",
+        std::process::id()
+    ));
+
+    let result = (|| -> Result<String, String> {
+        // Seed the temp index from the real one when possible: the
+        // copied stat cache means the following `add -A` only rehashes
+        // files that actually changed, instead of the whole repo.
+        // Index writes are atomic (write + rename), so a concurrent
+        // git process can't hand us a torn file.
+        let index_rel = run_git(repo, &["rev-parse", "--git-path", "index"])?;
+        let real_index = {
+            let p = PathBuf::from(&index_rel);
+            if p.is_absolute() {
+                p
+            } else {
+                repo.join(p)
+            }
+        };
+        if real_index.exists() {
+            std::fs::copy(&real_index, &tmp_index)
+                .map_err(|e| format!("Failed to copy index for checkpoint: {e}"))?;
+        } else {
+            run_git_with_index(repo, &tmp_index, &["read-tree", "HEAD"])?;
+        }
+        // Stage everything (tracked modifications, deletions, and
+        // untracked files) into the PRIVATE index only.
+        run_git_with_index(repo, &tmp_index, &["add", "-A"])?;
+        let tree = run_git_with_index(repo, &tmp_index, &["write-tree"])?;
+        // Plumbing commit: no hooks, forced identity so a machine
+        // without user.name/email configured still checkpoints.
+        let snapshot = run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=Codemux",
+                "-c",
+                "user.email=checkpoint@codemux.invalid",
+                "commit-tree",
+                &tree,
+                "-p",
+                &head,
+                "-m",
+                message,
+            ],
+        )?;
+        run_git(repo, &["update-ref", full_ref, &snapshot])?;
+        Ok(snapshot)
+    })();
+    // Always clean up the temp index, success or failure.
+    let _ = std::fs::remove_file(&tmp_index);
+    let snapshot_commit = result?;
+
+    Ok(Some(GitCheckpoint {
+        ref_name: full_ref.to_string(),
+        snapshot_commit,
+        head_commit: head,
+        branch,
+    }))
+}
+
+/// Roll the working tree back to a checkpoint created by
+/// [`git_checkpoint_create`].
+///
+/// Effect: worktree content == snapshot, run-created files deleted
+/// (ignored files spared), run-made commits undone (branch reset to
+/// `head_commit`), and the restored pre-run dirty state shown as
+/// unstaged changes / untracked files. The pre-run staged-vs-unstaged
+/// split is flattened to unstaged — the snapshot records one tree,
+/// not the index.
+///
+/// Before mutating anything, the CURRENT state is snapshotted to
+/// `safety_ref` (parented on the run's last commit), so a restore is
+/// itself recoverable.
+pub fn git_checkpoint_restore(
+    repo_path: &Path,
+    snapshot_commit: &str,
+    head_commit: &str,
+    branch: Option<&str>,
+    safety_ref: &str,
+) -> Result<(), String> {
+    let toplevel = run_git(repo_path, &["rev-parse", "--show-toplevel"])
+        .map_err(|_| "Cannot restore: not a git repository".to_string())?;
+    let repo = Path::new(&toplevel);
+
+    // Both commits must still exist (a pruned checkpoint after `git gc`
+    // would otherwise fail halfway through the restore).
+    for (label, commit) in [("snapshot", snapshot_commit), ("base", head_commit)] {
+        run_git(repo, &["cat-file", "-e", &format!("{commit}^{{commit}}")]).map_err(|_| {
+            format!(
+                "Cannot restore: the checkpoint {label} commit no longer exists (it may have been pruned)"
+            )
+        })?;
+    }
+
+    // Same-branch guard: restoring a snapshot from branch A while B is
+    // checked out would silently reset B to A-era content.
+    let current = run_git_permissive(repo, &["branch", "--show-current"]);
+    let expected = branch.unwrap_or("");
+    if current != expected {
+        let cur_label = if current.is_empty() { "(detached)" } else { &current };
+        let exp_label = if expected.is_empty() { "(detached)" } else { expected };
+        return Err(format!(
+            "Cannot restore: the workspace is now on branch '{cur_label}' but the checkpoint was taken on '{exp_label}'. Switch back to that branch first."
+        ));
+    }
+
+    // Safety net: snapshot the CURRENT state (including any commits the
+    // run made — they stay reachable through this ref's parent chain)
+    // before we start rewriting the worktree. Best-effort.
+    if let Err(error) = git_checkpoint_create(repo, safety_ref, "codemux pre-restore safety snapshot")
+    {
+        eprintln!("[codemux::git] pre-restore safety snapshot failed: {error}");
+    }
+
+    // 1. Worktree + index → snapshot tree. `read-tree --reset -u` is
+    //    the plumbing behind `reset --hard`: it overwrites local
+    //    modifications and deletes files tracked in the old index that
+    //    are absent from the snapshot.
+    run_git(repo, &["read-tree", "--reset", "-u", snapshot_commit])?;
+    // 2. Delete run-created files. After step 1 the index == snapshot
+    //    tree, so anything untracked now did not exist at checkpoint
+    //    time. No `-x`: ignored files (node_modules, build dirs, …)
+    //    are spared.
+    run_git(repo, &["clean", "-fd"])?;
+    // 3. Move the branch back to the pre-run commit and reset the
+    //    index to it, leaving the snapshot content in the worktree as
+    //    unstaged changes. Formerly-untracked files fall out of the
+    //    index here and show as untracked again.
+    run_git(repo, &["reset", "--mixed", head_commit])?;
+    Ok(())
+}
+
+/// Delete all but the newest `keep` refs under `namespace` (ordered by
+/// committer date, newest first). Returns the deleted ref names so the
+/// caller can drop matching bookkeeping rows.
+pub fn git_checkpoint_prune(
+    repo_path: &Path,
+    namespace: &str,
+    keep: usize,
+) -> Result<Vec<String>, String> {
+    let out = run_git(
+        repo_path,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(refname)",
+            namespace,
+        ],
+    )?;
+    let mut pruned = Vec::new();
+    for ref_name in out.lines().filter(|l| !l.is_empty()).skip(keep) {
+        run_git(repo_path, &["update-ref", "-d", ref_name])?;
+        pruned.push(ref_name.to_string());
+    }
+    Ok(pruned)
+}
+
 pub fn git_discard_file(repo_path: &Path, file: &str) -> Result<(), String> {
     // Try git restore first (works for tracked files)
     let restore = run_git(repo_path, &["restore", "--", file]);
@@ -5222,6 +5514,332 @@ C  source.txt -> copy.txt";
         // No stash entries
         let result = git_stash_pop(&repo);
         assert!(result.is_err(), "pop with empty stash should error");
+    }
+
+    // ── git_checkpoint tests (issue #80) ──
+
+    /// Raw `git status --porcelain` so staged-vs-unstaged is visible.
+    fn porcelain(repo: &Path) -> String {
+        run_git_permissive(repo, &["status", "--porcelain"])
+    }
+
+    #[test]
+    fn checkpoint_sanitize_ref_component() {
+        assert_eq!(sanitize_ref_component("chat-pane-3-17000"), "chat-pane-3-17000");
+        assert_eq!(sanitize_ref_component("a b@{c..d}.lock"), "a-b--c--d--lock");
+        assert_eq!(sanitize_ref_component("???"), "checkpoint");
+        assert_eq!(sanitize_ref_component(""), "checkpoint");
+        let long = "x".repeat(300);
+        assert_eq!(sanitize_ref_component(&long).len(), 100);
+    }
+
+    #[test]
+    fn checkpoint_create_skips_non_repo_and_unborn_head() {
+        let dir = TempDir::new().unwrap();
+        // Plain directory — not a repo.
+        let result =
+            git_checkpoint_create(dir.path(), "refs/codemux/checkpoints/t", "msg").unwrap();
+        assert!(result.is_none(), "non-repo should skip");
+
+        // Fresh init, zero commits — unborn HEAD.
+        let unborn = TempDir::new().unwrap();
+        run_git(unborn.path(), &["init"]).unwrap();
+        let result =
+            git_checkpoint_create(unborn.path(), "refs/codemux/checkpoints/t", "msg").unwrap();
+        assert!(result.is_none(), "unborn HEAD should skip");
+    }
+
+    #[test]
+    fn checkpoint_create_does_not_disturb_index_worktree_or_stash() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+
+        // Build a mixed state: one committed+staged file, one
+        // committed+unstaged file, one untracked file.
+        std::fs::write(repo.join("staged.txt"), "v1").unwrap();
+        std::fs::write(repo.join("unstaged.txt"), "v1").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "base"]).unwrap();
+        std::fs::write(repo.join("staged.txt"), "v2-staged").unwrap();
+        run_git(&repo, &["add", "staged.txt"]).unwrap();
+        std::fs::write(repo.join("unstaged.txt"), "v2-unstaged").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "new").unwrap();
+
+        let before = porcelain(&repo);
+        assert!(before.contains("M  staged.txt"), "precondition: staged change");
+        assert!(before.contains(" M unstaged.txt"), "precondition: unstaged change");
+        assert!(before.contains("?? untracked.txt"), "precondition: untracked file");
+
+        let ref_name = "refs/codemux/checkpoints/thread-1";
+        let cp = git_checkpoint_create(&repo, ref_name, "test checkpoint")
+            .unwrap()
+            .expect("checkpoint should be created");
+
+        // The user's state is byte-identical afterwards.
+        assert_eq!(porcelain(&repo), before, "status must be undisturbed");
+        let stash = run_git_permissive(&repo, &["stash", "list"]);
+        assert!(stash.is_empty(), "stash list must stay empty, got: {stash}");
+
+        // The snapshot captured all three flavors of change.
+        for (file, expect) in [
+            ("staged.txt", "v2-staged"),
+            ("unstaged.txt", "v2-unstaged"),
+            ("untracked.txt", "new"),
+        ] {
+            let content = run_git(
+                &repo,
+                &["show", &format!("{}:{file}", cp.snapshot_commit)],
+            )
+            .unwrap();
+            assert_eq!(content, expect, "snapshot content for {file}");
+        }
+
+        // Anchored on the shadow ref, parented on HEAD.
+        let resolved = run_git(&repo, &["rev-parse", ref_name]).unwrap();
+        assert_eq!(resolved, cp.snapshot_commit);
+        let parent = run_git(&repo, &["rev-parse", &format!("{}^", cp.snapshot_commit)]).unwrap();
+        assert_eq!(parent, cp.head_commit);
+        // Branch name depends on the machine's init.defaultBranch —
+        // assert against whatever the repo actually reports.
+        let current_branch = run_git(&repo, &["branch", "--show-current"]).unwrap();
+        assert_eq!(cp.branch.as_deref(), Some(current_branch.as_str()), "branch recorded");
+    }
+
+    #[test]
+    fn checkpoint_restore_round_trip_undoes_a_simulated_run() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        // Default-branch name differs across git versions; pin it.
+        run_git(&repo, &["checkout", "-B", "main"]).unwrap();
+
+        // Pre-run state: tracked file with an unstaged edit, an
+        // untracked file, and an ignored file.
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(repo.join("code.txt"), "original").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "base"]).unwrap();
+        std::fs::write(repo.join("code.txt"), "user-edit").unwrap();
+        std::fs::write(repo.join("notes.txt"), "user-notes").unwrap();
+        std::fs::write(repo.join("ignored.txt"), "local-junk").unwrap();
+
+        let cp = git_checkpoint_create(
+            &repo,
+            "refs/codemux/checkpoints/run-1",
+            "run checkpoint",
+        )
+        .unwrap()
+        .expect("checkpoint created");
+
+        // Simulated agent run: edits, deletions, new files, a commit.
+        std::fs::write(repo.join("code.txt"), "agent-rewrite").unwrap();
+        std::fs::remove_file(repo.join("notes.txt")).unwrap();
+        std::fs::write(repo.join("agent-new.txt"), "agent artifact").unwrap();
+        run_git(&repo, &["add", "-A"]).unwrap();
+        run_git(&repo, &["commit", "-m", "agent commit"]).unwrap();
+        let agent_head = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(repo.join("agent-new2.txt"), "uncommitted artifact").unwrap();
+
+        git_checkpoint_restore(
+            &repo,
+            &cp.snapshot_commit,
+            &cp.head_commit,
+            cp.branch.as_deref(),
+            "refs/codemux/pre-restore/run-1",
+        )
+        .expect("restore should succeed");
+
+        // Branch is back on the pre-run commit.
+        assert_eq!(run_git(&repo, &["rev-parse", "HEAD"]).unwrap(), cp.head_commit);
+        assert_eq!(
+            run_git(&repo, &["branch", "--show-current"]).unwrap(),
+            "main"
+        );
+        // File contents are back to the pre-run state.
+        assert_eq!(
+            std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+            "user-edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "user-notes"
+        );
+        // Run artifacts are gone; ignored local files survive.
+        assert!(!repo.join("agent-new.txt").exists(), "committed artifact removed");
+        assert!(!repo.join("agent-new2.txt").exists(), "uncommitted artifact removed");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("ignored.txt")).unwrap(),
+            "local-junk",
+            "ignored file spared by clean"
+        );
+        // Restored dirty state shows as unstaged + untracked.
+        let status = porcelain(&repo);
+        assert!(status.contains(" M code.txt"), "edit unstaged, got: {status}");
+        assert!(status.contains("?? notes.txt"), "untracked again, got: {status}");
+        // The safety ref exists and keeps the agent's commit reachable.
+        let safety = run_git(&repo, &["rev-parse", "refs/codemux/pre-restore/run-1"]).unwrap();
+        let safety_parent = run_git(&repo, &["rev-parse", &format!("{safety}^")]).unwrap();
+        assert_eq!(safety_parent, agent_head, "safety snapshot parents the run's last commit");
+    }
+
+    #[test]
+    fn checkpoint_restore_refuses_branch_mismatch() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        run_git(&repo, &["checkout", "-B", "main"]).unwrap();
+        std::fs::write(repo.join("f.txt"), "x").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "base"]).unwrap();
+
+        let cp = git_checkpoint_create(&repo, "refs/codemux/checkpoints/t", "cp")
+            .unwrap()
+            .unwrap();
+
+        run_git(&repo, &["checkout", "-b", "other"]).unwrap();
+        let err = git_checkpoint_restore(
+            &repo,
+            &cp.snapshot_commit,
+            &cp.head_commit,
+            cp.branch.as_deref(),
+            "refs/codemux/pre-restore/t",
+        )
+        .expect_err("restore on the wrong branch must refuse");
+        assert!(err.contains("on branch 'other'"), "got: {err}");
+        assert!(err.contains("'main'"), "got: {err}");
+    }
+
+    #[test]
+    fn checkpoint_restore_refuses_missing_snapshot() {
+        let (_dir, repo) = setup_test_repo();
+        let head = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        let bogus = "0123456789abcdef0123456789abcdef01234567";
+        let err = git_checkpoint_restore(
+            &repo,
+            bogus,
+            &head,
+            None,
+            "refs/codemux/pre-restore/t",
+        )
+        .expect_err("missing snapshot must refuse");
+        assert!(err.contains("no longer exists"), "got: {err}");
+    }
+
+    #[test]
+    fn checkpoint_round_trip_works_in_a_linked_worktree() {
+        // Codemux workspaces are usually linked worktrees, not the
+        // main checkout: refs are SHARED with the main repo while the
+        // index and HEAD are per-worktree. The snapshot must read the
+        // worktree-specific index (`rev-parse --git-path index`) and
+        // the restore must only rewrite the worktree's own state.
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        run_git(&repo, &["add", "."]).unwrap();
+        run_git(&repo, &["commit", "-m", "base"]).unwrap();
+
+        let wt_path = git_create_worktree(&repo, "cp-branch", true, None, None)
+            .expect("create worktree");
+        let wt = PathBuf::from(&wt_path);
+
+        // Dirty the WORKTREE only.
+        std::fs::write(wt.join("base.txt"), "wt-edit").unwrap();
+        std::fs::write(wt.join("wt-untracked.txt"), "wt-new").unwrap();
+
+        let cp = git_checkpoint_create(&wt, "refs/codemux/checkpoints/wt-1", "wt cp")
+            .unwrap()
+            .expect("worktree is snapshottable");
+        assert_eq!(cp.branch.as_deref(), Some("cp-branch"));
+        // Ref is visible from the main repo too (shared ref store).
+        assert_eq!(
+            run_git(&repo, &["rev-parse", "refs/codemux/checkpoints/wt-1"]).unwrap(),
+            cp.snapshot_commit
+        );
+
+        // Simulated run inside the worktree.
+        std::fs::write(wt.join("base.txt"), "agent").unwrap();
+        std::fs::write(wt.join("agent.txt"), "artifact").unwrap();
+
+        git_checkpoint_restore(
+            &wt,
+            &cp.snapshot_commit,
+            &cp.head_commit,
+            cp.branch.as_deref(),
+            "refs/codemux/pre-restore/wt-1",
+        )
+        .expect("restore in worktree");
+
+        assert_eq!(
+            std::fs::read_to_string(wt.join("base.txt")).unwrap(),
+            "wt-edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("wt-untracked.txt")).unwrap(),
+            "wt-new"
+        );
+        assert!(!wt.join("agent.txt").exists());
+        // The MAIN checkout was never touched.
+        assert_eq!(
+            std::fs::read_to_string(repo.join("base.txt")).unwrap(),
+            "base"
+        );
+        let main_status = run_git_permissive(&repo, &["status", "--porcelain"]);
+        assert!(main_status.is_empty(), "main checkout stays clean: {main_status}");
+
+        // Cleanup the worktree so TempDir drop works on all platforms.
+        let _ = git_remove_worktree(&wt, Some("cp-branch"), true);
+    }
+
+    #[test]
+    fn checkpoint_prune_keeps_newest() {
+        let (_dir, repo) = setup_test_repo();
+        git_config(&repo);
+        // Three checkpoints with strictly increasing committer dates so
+        // the `-committerdate` sort is deterministic.
+        for (i, date) in [(1, "2024-01-01T00:00:00"), (2, "2024-01-02T00:00:00"), (3, "2024-01-03T00:00:00")] {
+            std::fs::write(repo.join(format!("f{i}.txt")), format!("v{i}")).unwrap();
+            let tree_msg = format!("cp {i}");
+            // Force the committer date through the env-free `-c` route:
+            // commit-tree honors GIT_COMMITTER_DATE, so wrap create
+            // manually here via update-ref on a dated commit.
+            let head = run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+            let tmp_index = std::env::temp_dir().join(format!(
+                "codemux-prune-test-index-{}-{i}",
+                std::process::id()
+            ));
+            run_git_with_index(&repo, &tmp_index, &["read-tree", "HEAD"]).unwrap();
+            run_git_with_index(&repo, &tmp_index, &["add", "-A"]).unwrap();
+            let tree = run_git_with_index(&repo, &tmp_index, &["write-tree"]).unwrap();
+            let _ = std::fs::remove_file(&tmp_index);
+            let output = Command::new("git")
+                .args([
+                    "-c", "user.name=Test", "-c", "user.email=t@t.t",
+                    "commit-tree", &tree, "-p", &head, "-m", &tree_msg,
+                ])
+                .env("GIT_COMMITTER_DATE", date)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            run_git(
+                &repo,
+                &["update-ref", &format!("refs/codemux/checkpoints/t{i}"), &commit],
+            )
+            .unwrap();
+        }
+
+        let pruned = git_checkpoint_prune(&repo, CHECKPOINT_REF_PREFIX, 2).unwrap();
+        assert_eq!(pruned, vec!["refs/codemux/checkpoints/t1".to_string()]);
+        let remaining = run_git(
+            &repo,
+            &["for-each-ref", "--format=%(refname)", CHECKPOINT_REF_PREFIX],
+        )
+        .unwrap();
+        assert!(remaining.contains("t2") && remaining.contains("t3"));
+        assert!(!remaining.contains("t1"));
+
+        // Pruning when under the cap is a no-op.
+        let pruned = git_checkpoint_prune(&repo, CHECKPOINT_REF_PREFIX, 20).unwrap();
+        assert!(pruned.is_empty());
     }
 
     // ── get_commit_files tests ──

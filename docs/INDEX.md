@@ -34,6 +34,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Settings panel: `docs/features/settings.md`
 - Settings sync: `docs/features/settings-sync.md`
 - Agent Chat (Beta-gated chat pane, providers, sidecar, attachments): `docs/features/agent-chat.md`
+- Agent run checkpoints (issue #80 — opt-in background rollback snapshot at run start + restore): `docs/features/agent-chat.md` (§ Run checkpoints); design note at `docs/plans/agent-run-checkpoint.md`
 - Multi-provider chat (Step 12): `docs/features/multi-provider-chat.md`; plan + final-state summary at `docs/plans/step-12-opencode-implementation-plan.md`; research at `docs/plans/step-12-opencode-research.md`; operator UI smoke at `docs/plans/step-12-ui-smoke-checklist.md`
 - Skills sync (E2E, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/plans/step-10-skills-sync.md`; research at `docs/plans/step-10-skills-sync-research.md`; operator UI smoke at `docs/plans/step-10-ui-smoke-checklist.md`
 - Attachments + context system (Step 8): `docs/plans/step-8-attachments.md` (research + locked plan)

@@ -169,6 +169,7 @@ The repo structure is clean and domain-split:
 - Permissions settings page with per-tool body rendering
 - Wired Debug mode pill with marker cleanup flow
 - Plain-quit on Beta toggle off (no auto-restart)
+- **Run checkpoints (issue #80, opt-in)**: background working-tree snapshot at session start (shadow ref via temp index — zero first-token latency, user's index/worktree/stash untouched), restore button in the pane header (confirm dialog, disabled mid-turn), Settings → Agent toggle, per-thread bookkeeping in `agent_chat_checkpoints`, ref pruning. See `docs/features/agent-chat.md` § Run checkpoints + `docs/plans/agent-run-checkpoint.md`
 - See `docs/features/agent-chat.md` for the canonical feature breakdown
 
 ### Infrastructure

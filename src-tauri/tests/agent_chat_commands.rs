@@ -383,3 +383,268 @@ async fn event_bridge_forwards_runtime_events_to_tauri() {
         other => panic!("unexpected event variant: {other:?}"),
     }
 }
+
+// ── Run checkpoints (issue #80) ──
+//
+// End-to-end backend round trip through the same blocking helpers the
+// Tauri commands and the start-session background task call: a REAL
+// temp git repo + an in-memory DatabaseStore. Create a checkpoint,
+// simulate an agent trashing the workspace (edits, deletions, new
+// files, a commit), restore, and verify the pre-run state is back.
+
+mod run_checkpoints {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use codemux_lib::commands::agent_chat::{
+        create_run_checkpoint_blocking, restore_run_checkpoint_blocking,
+    };
+    use codemux_lib::database::DatabaseStore;
+
+    fn git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    }
+
+    fn setup_repo() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().to_path_buf();
+        git(&path, &["init", "-b", "main"]);
+        git(&path, &["config", "user.name", "Test"]);
+        git(&path, &["config", "user.email", "t@t.t"]);
+        std::fs::write(path.join("code.txt"), "original").unwrap();
+        git(&path, &["add", "."]);
+        git(&path, &["commit", "-m", "base"]);
+        (dir, path)
+    }
+
+    fn session_db(thread_id: &str, repo: &Path) -> DatabaseStore {
+        let db = DatabaseStore::new_in_memory();
+        // The checkpoint row FKs onto the session row, mirroring the
+        // production ordering (session persisted before the
+        // checkpoint task runs).
+        db.upsert_agent_chat_session(
+            thread_id,
+            "ws-1",
+            Some(&repo.to_string_lossy()),
+            "claude",
+        )
+        .expect("session row");
+        db
+    }
+
+    #[test]
+    fn checkpoint_round_trip_restores_pre_run_state() {
+        let (_dir, repo) = setup_repo();
+        let db = session_db("thread-cp", &repo);
+
+        // Pre-run dirty state: unstaged edit + untracked file.
+        std::fs::write(repo.join("code.txt"), "user-edit").unwrap();
+        std::fs::write(repo.join("scratch.txt"), "user-notes").unwrap();
+
+        let record = create_run_checkpoint_blocking(&db, &repo, "thread-cp", "ws-1")
+            .expect("create ok")
+            .expect("repo is snapshottable");
+        assert_eq!(record.thread_id, "thread-cp");
+        assert_eq!(record.workspace_id, "ws-1");
+        assert!(!record.created_at.is_empty(), "created_at re-read from DB");
+        assert_eq!(record.branch.as_deref(), Some("main"));
+        // Recorded in the DB and anchored in the repo.
+        let stored = db
+            .get_agent_chat_checkpoint("thread-cp")
+            .expect("row persisted");
+        assert_eq!(stored.snapshot_commit, record.snapshot_commit);
+        assert_eq!(
+            git(&repo, &["rev-parse", &stored.ref_name]),
+            stored.snapshot_commit
+        );
+
+        // The checkpoint did not disturb the user's state.
+        let status = git(&repo, &["status", "--porcelain"]);
+        assert!(status.contains(" M code.txt"), "got: {status}");
+        assert!(status.contains("?? scratch.txt"), "got: {status}");
+
+        // Simulated agent run.
+        std::fs::write(repo.join("code.txt"), "agent-rewrite").unwrap();
+        std::fs::remove_file(repo.join("scratch.txt")).unwrap();
+        std::fs::write(repo.join("agent.txt"), "artifact").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-m", "agent went wild"]);
+
+        restore_run_checkpoint_blocking(&db, "thread-cp").expect("restore ok");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+            "user-edit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("scratch.txt")).unwrap(),
+            "user-notes"
+        );
+        assert!(!repo.join("agent.txt").exists(), "agent artifact removed");
+        assert_eq!(
+            git(&repo, &["rev-parse", "HEAD"]),
+            record.head_commit,
+            "agent commit undone"
+        );
+    }
+
+    #[test]
+    fn checkpoint_skips_non_repo_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = DatabaseStore::new_in_memory();
+        let result = create_run_checkpoint_blocking(&db, dir.path(), "t", "ws")
+            .expect("non-repo must not error");
+        assert!(result.is_none(), "non-repo is a silent skip");
+        assert!(db.get_agent_chat_checkpoint("t").is_none());
+    }
+
+    #[test]
+    fn restore_without_checkpoint_errors_cleanly() {
+        let db = DatabaseStore::new_in_memory();
+        let err = restore_run_checkpoint_blocking(&db, "unknown-thread")
+            .expect_err("no checkpoint recorded");
+        assert!(err.contains("No checkpoint"), "got: {err}");
+    }
+
+    #[test]
+    fn second_run_checkpoint_replaces_the_first() {
+        let (_dir, repo) = setup_repo();
+        let db = session_db("thread-a", &repo);
+
+        let first = create_run_checkpoint_blocking(&db, &repo, "thread-a", "ws-1")
+            .unwrap()
+            .unwrap();
+        std::fs::write(repo.join("code.txt"), "later").unwrap();
+        let second = create_run_checkpoint_blocking(&db, &repo, "thread-a", "ws-1")
+            .unwrap()
+            .unwrap();
+        assert_ne!(first.snapshot_commit, second.snapshot_commit);
+        let stored = db.get_agent_chat_checkpoint("thread-a").unwrap();
+        assert_eq!(stored.snapshot_commit, second.snapshot_commit);
+    }
+}
+
+/// Full production glue for the background run checkpoint (issue #80):
+/// `spawn_run_checkpoint_with_gate` on a mock app — async spawn →
+/// blocking pool → REAL git snapshot → DB row through managed state →
+/// `agent_chat_checkpoint` event emission. Only the settings-cache
+/// read is injected (gate fn), so the test never touches the user's
+/// real settings cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_checkpoint_spawn_persists_and_emits_event() {
+    use codemux_lib::commands::agent_chat::{
+        spawn_run_checkpoint_with_gate, AgentChatCheckpointEventPayload,
+        AGENT_CHAT_CHECKPOINT_EVENT,
+    };
+
+    // Real repo with a dirty worktree.
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let repo = dir.path().to_path_buf();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-b", "main"]);
+    git(&["config", "user.name", "Test"]);
+    git(&["config", "user.email", "t@t.t"]);
+    std::fs::write(repo.join("f.txt"), "v1").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+    std::fs::write(repo.join("f.txt"), "dirty").unwrap();
+
+    let app = tauri::test::mock_app();
+    let db = DatabaseStore::new_in_memory();
+    db.upsert_agent_chat_session(
+        "thread-bg",
+        "ws-1",
+        Some(&repo.to_string_lossy()),
+        "claude",
+    )
+    .expect("session row");
+    app.manage(db);
+    let handle = app.handle().clone();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<AgentChatCheckpointEventPayload>();
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+    handle.listen(AGENT_CHAT_CHECKPOINT_EVENT, move |event| {
+        let payload: AgentChatCheckpointEventPayload =
+            serde_json::from_str(event.payload()).expect("valid payload JSON");
+        if let Some(tx) = tx.lock().unwrap().take() {
+            let _ = tx.send(payload);
+        }
+    });
+
+    spawn_run_checkpoint_with_gate(
+        &handle,
+        "thread-bg".to_string(),
+        "ws-1".to_string(),
+        repo.to_string_lossy().to_string(),
+        || true,
+    );
+
+    let payload = timeout(Duration::from_secs(10), rx)
+        .await
+        .expect("checkpoint event should fire within 10s")
+        .expect("sender not dropped");
+    assert_eq!(payload.thread_id.0, "thread-bg");
+    assert_eq!(payload.checkpoint.workspace_id, "ws-1");
+    assert!(!payload.checkpoint.snapshot_commit.is_empty());
+
+    // The row is queryable through the same managed state the restore
+    // command uses.
+    let db = handle.state::<DatabaseStore>();
+    let stored = db
+        .get_agent_chat_checkpoint("thread-bg")
+        .expect("row persisted by the background task");
+    assert_eq!(stored.snapshot_commit, payload.checkpoint.snapshot_commit);
+    // And the snapshot is a real commit anchored in the repo.
+    let out = std::process::Command::new("git")
+        .args(["cat-file", "-t", &stored.snapshot_commit])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "commit");
+}
+
+/// The gate is evaluated INSIDE the background task: when it reports
+/// "feature off", nothing is written and no event fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_checkpoint_spawn_is_a_noop_when_gate_is_off() {
+    use codemux_lib::commands::agent_chat::spawn_run_checkpoint_with_gate;
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let app = tauri::test::mock_app();
+    app.manage(DatabaseStore::new_in_memory());
+    let handle = app.handle().clone();
+
+    spawn_run_checkpoint_with_gate(
+        &handle,
+        "thread-off".to_string(),
+        "ws-1".to_string(),
+        dir.path().to_string_lossy().to_string(),
+        || false,
+    );
+
+    // Give the spawned task time to run, then assert nothing landed.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let db = handle.state::<DatabaseStore>();
+    assert!(db.get_agent_chat_checkpoint("thread-off").is_none());
+}

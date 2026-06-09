@@ -187,6 +187,9 @@ const SYNCED_SETTINGS: UserSettings = {
     scrollback_lines: 10_000,
     max_total_mb: 100,
   },
+  // Checkpoints ON in the mock so the seeded chat pane exercises the
+  // restore affordance (issue #80) without a real backend.
+  agent_chat: { checkpoints_enabled: true },
 };
 
 const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
@@ -536,6 +539,26 @@ const handlers: Record<string, Handler> = {
   agent_chat_stop_session: () => undefined,
   agent_chat_rename_session: () => undefined,
   agent_chat_delete_session: () => undefined,
+  // Run-start rollback checkpoint (issue #80). The seeded thread has a
+  // checkpoint so the pane header shows the restore affordance;
+  // restore just logs (the mock has no real working tree to rewrite).
+  agent_chat_get_checkpoint: (a) =>
+    a.threadId === MOCK_CHAT_THREAD_ID
+      ? {
+          thread_id: MOCK_CHAT_THREAD_ID,
+          workspace_id: "ws-codemux-chat",
+          repo_path: `${MOCK_HOME_DIR}/projects/codemux`,
+          ref_name: `refs/codemux/checkpoints/${MOCK_CHAT_THREAD_ID}`,
+          snapshot_commit: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+          head_commit: "1234567890abcdef1234567890abcdef12345678",
+          branch: "main",
+          created_at: "2026-06-09 10:00:00",
+        }
+      : null,
+  agent_chat_restore_checkpoint: (a) => {
+    console.info("[tauri-mock] agent_chat_restore_checkpoint", a.threadId);
+    return undefined;
+  },
   grep_count_pattern: () => 0,
 
   // ── Presets ──

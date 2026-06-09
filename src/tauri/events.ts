@@ -239,6 +239,22 @@ export const onAgentChatEvent = (
 ): Promise<UnlistenFn> =>
   listen<AgentChatEventPayload>("agent_chat_event", (e) => cb(e.payload));
 
+/** Emitted when the background run-start checkpoint (issue #80) lands,
+ *  so the pane header can reveal the restore affordance without
+ *  polling. Mirrors AgentChatCheckpointEventPayload in
+ *  src-tauri/src/commands/agent_chat.rs. */
+export interface AgentChatCheckpointPayload {
+  thread_id: string;
+  checkpoint: import("./commands").AgentChatCheckpointRecord;
+}
+
+export const onAgentChatCheckpoint = (
+  cb: EventCallback<AgentChatCheckpointPayload>,
+): Promise<UnlistenFn> =>
+  listen<AgentChatCheckpointPayload>("agent_chat_checkpoint", (e) =>
+    cb(e.payload),
+  );
+
 // ── Tunnel health ──
 //
 // Mirror of src-tauri/src/ssh/tunnel_supervisor.rs:TunnelStatus

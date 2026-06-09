@@ -1298,6 +1298,31 @@ export const agentChatDeleteSession = (threadId: string) =>
 export const agentChatListMessages = (threadId: string) =>
   invoke<string[]>("agent_chat_list_messages", { threadId });
 
+// ── Run checkpoints (issue #80) ──
+
+/** Mirrors src-tauri/src/database.rs:AgentChatCheckpointRecord — the
+ *  background working-tree snapshot taken when a run started. */
+export interface AgentChatCheckpointRecord {
+  thread_id: string;
+  workspace_id: string;
+  repo_path: string;
+  ref_name: string;
+  snapshot_commit: string;
+  head_commit: string;
+  branch: string | null;
+  created_at: string;
+}
+
+export const agentChatGetCheckpoint = (threadId: string) =>
+  invoke<AgentChatCheckpointRecord | null>("agent_chat_get_checkpoint", {
+    threadId,
+  });
+
+/** Roll the workspace back to the checkpoint taken when this run
+ *  started. Mutates the working tree — confirm with the user first. */
+export const agentChatRestoreCheckpoint = (threadId: string) =>
+  invoke<void>("agent_chat_restore_checkpoint", { threadId });
+
 // ── OpenCode (Step 12 Stage 1) ──
 //
 // Wrappers for the discovery + ping commands that land alongside the

@@ -1347,6 +1347,26 @@ export function SettingsView() {
                   }}
                 />
               </SettingRow>
+              {/* Run-start rollback checkpoint (issue #80). Only shown
+                  when the Agent Chat beta is on — the snapshot fires on
+                  chat-session start, so without the beta the toggle
+                  would do nothing. */}
+              {enableAgentChat && (
+                <>
+                  <Separator />
+                  <SettingRow
+                    label="Checkpoint before agent runs"
+                    description="When an agent chat session starts, snapshot the working tree in the background so you can roll back everything the run changed. Never delays the agent's response."
+                  >
+                    <Switch
+                      checked={syncedSettings.agent_chat?.checkpoints_enabled ?? false}
+                      onCheckedChange={(checked) => {
+                        updateSyncedSetting("agent_chat", "checkpoints_enabled", checked).catch(console.error);
+                      }}
+                    />
+                  </SettingRow>
+                </>
+              )}
             </div>
           </div>
         );
