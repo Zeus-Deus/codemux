@@ -128,6 +128,14 @@ describe("resolveClaudeApiModelId", () => {
       "claude-opus-4-7",
     );
   });
+
+  it("never double-appends when the id already carries a pinned suffix", () => {
+    // The deployed CLI reports some models with the context window
+    // baked into the id (e.g. `claude-fable-5[1m]`).
+    expect(resolveClaudeApiModelId("claude-fable-5[1m]", "1m")).toBe(
+      "claude-fable-5[1m]",
+    );
+  });
 });
 
 describe("small predicates", () => {

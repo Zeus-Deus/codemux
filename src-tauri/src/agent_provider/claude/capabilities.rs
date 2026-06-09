@@ -51,10 +51,12 @@ fn claude_effort_label_map() -> HashMap<String, String> {
         ("high", "High"),
         ("xhigh", "Extra High"),
         ("max", "Max"),
-        // `ultracode` is xhigh + workflows in Claude Code's TUI slider
-        // (see `/effort` in claude >= 2.1.x). The deployed CLI accepts
-        // it as an `--effort` value even though the bundled SDK's
-        // `EffortLevel` type union doesn't list it yet.
+        // `ultracode` (xhigh + workflows) exists only in Claude Code's
+        // TUI `/model` effort slider. The headless CLI rejects it as an
+        // `--effort` value ("Valid values: low, medium, high, xhigh,
+        // max" as of claude 2.1.170), so no maintained entry lists it —
+        // the label stays only so a future SDK-reported level renders
+        // nicely instead of falling back to the raw token.
         ("ultracode", "Ultracode"),
         ("ultrathink", "Ultrathink"),
     ];
@@ -66,20 +68,47 @@ fn claude_effort_label_map() -> HashMap<String, String> {
 
 fn models() -> Vec<ChatModelInfo> {
     vec![
-        // Opus 4.8 — flagship, effort defaults to xhigh, supports ultrathink + 1M.
+        // Opus 4.8 — the recommended default, effort defaults to high
+        // (the level Claude Code's own `/model` slider marks as
+        // "(default)"), supports ultrathink + 1M. The CLI's picker
+        // calls this row "Default (recommended)".
         ChatModelInfo {
             id: "claude-opus-4-8".into(),
             label: "Claude Opus 4.8".into(),
-            description: Some("Strongest Claude model".into()),
+            description: Some("Best for everyday, complex tasks".into()),
             effort_levels: vec![
                 "low".into(),
                 "medium".into(),
                 "high".into(),
                 "xhigh".into(),
                 "max".into(),
-                "ultracode".into(),
             ],
-            default_effort: Some("xhigh".into()),
+            default_effort: Some("high".into()),
+            prompt_injected_effort_levels: vec!["ultrathink".into()],
+            context_window_options: vec![ctx_200k(), ctx_1m_default()],
+            supports_adaptive_thinking: true,
+            supports_thinking_toggle: false,
+            supports_fast_mode: false,
+            supports_images: true,
+            sub_provider: None,
+            is_free: false,
+        },
+        // Fable 5 — top tier above Opus. The deployed CLI reports it
+        // with the context window pinned into the id itself
+        // (`claude-fable-5[1m]`); the maintained entry is keyed by the
+        // bare id and the merge strips the suffix before lookup.
+        ChatModelInfo {
+            id: "claude-fable-5".into(),
+            label: "Claude Fable 5".into(),
+            description: Some("Most capable for the hardest, longest-running tasks".into()),
+            effort_levels: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+            ],
+            default_effort: Some("high".into()),
             prompt_injected_effort_levels: vec!["ultrathink".into()],
             context_window_options: vec![ctx_200k(), ctx_1m_default()],
             supports_adaptive_thinking: true,
@@ -100,9 +129,8 @@ fn models() -> Vec<ChatModelInfo> {
                 "high".into(),
                 "xhigh".into(),
                 "max".into(),
-                "ultracode".into(),
             ],
-            default_effort: Some("xhigh".into()),
+            default_effort: Some("high".into()),
             prompt_injected_effort_levels: vec!["ultrathink".into()],
             context_window_options: vec![ctx_200k(), ctx_1m_default()],
             supports_adaptive_thinking: true,
@@ -228,16 +256,33 @@ pub fn claude_fallback_capabilities() -> ProviderChatCapabilities {
     }
 }
 
+/// Split a model id into its base id and an optional pinned
+/// context-window bracket suffix: `claude-fable-5[1m]` →
+/// `("claude-fable-5", Some("[1m]"))`. The deployed CLI sometimes
+/// reports ids with the window already baked in; metadata lookups key
+/// on the base id, and a pinned id must never grow a second suffix.
+fn split_context_suffix(id: &str) -> (&str, Option<&str>) {
+    if let Some(open) = id.find('[') {
+        if id.ends_with(']') {
+            return (&id[..open], Some(&id[open..]));
+        }
+    }
+    (id, None)
+}
+
 /// Apply the reference impl's `resolveClaudeApiModelId` trick: when
 /// the context window is `"1m"`, the Anthropic API expects the model
 /// id to carry a `[1m]` bracket suffix. Any other value (or `None`)
-/// returns the id unchanged.
+/// returns the id unchanged — as does an id that already carries a
+/// bracket suffix (e.g. the SDK-reported `claude-fable-5[1m]`), so a
+/// pinned model never double-appends.
 pub fn resolve_claude_api_model_id(
     model_id: &str,
     context_window: Option<&str>,
 ) -> String {
+    let already_pinned = split_context_suffix(model_id).1.is_some();
     match context_window {
-        Some("1m") => format!("{model_id}[1m]"),
+        Some("1m") if !already_pinned => format!("{model_id}[1m]"),
         _ => model_id.to_string(),
     }
 }
@@ -444,18 +489,26 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
     };
     let family = ClaudeFamily::from_id(id);
     let (effort_levels, default_effort, prompt_injected, ctx) = match family {
-        ClaudeFamily::Opus => (
+        f if f.is_flagship() => (
             vec![
                 "low".into(),
                 "medium".into(),
                 "high".into(),
                 "xhigh".into(),
                 "max".into(),
-                "ultracode".into(),
             ],
-            Some("xhigh".into()),
+            // Claude Code's own `/model` slider marks `high` as the
+            // default for every current flagship row.
+            Some("high".into()),
             vec!["ultrathink".into()],
-            vec![ctx_200k(), ctx_1m_default()],
+            // The `default` alias has its context window chosen by the
+            // CLI — offering a picker would synthesize `default[1m]`,
+            // which is not a valid model id.
+            if family == ClaudeFamily::DefaultAlias {
+                vec![]
+            } else {
+                vec![ctx_200k(), ctx_1m_default()]
+            },
         ),
         ClaudeFamily::Sonnet => (
             vec!["low".into(), "medium".into(), "high".into()],
@@ -463,9 +516,14 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
             vec!["ultrathink".into()],
             vec![ctx_200k(), ctx_1m_default()],
         ),
-        ClaudeFamily::Haiku | ClaudeFamily::Other => {
-            (vec![], None, vec![], vec![])
-        }
+        _ => (vec![], None, vec![], vec![]),
+    };
+    // An id that already carries a bracket suffix (`…[1m]`) has its
+    // window pinned — a picker would double-append the suffix.
+    let context_window_options = if split_context_suffix(id).1.is_some() {
+        vec![]
+    } else {
+        ctx
     };
     ChatModelInfo {
         id: id.to_string(),
@@ -474,8 +532,8 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
         effort_levels,
         default_effort,
         prompt_injected_effort_levels: prompt_injected,
-        context_window_options: ctx,
-        supports_adaptive_thinking: matches!(family, ClaudeFamily::Opus),
+        context_window_options,
+        supports_adaptive_thinking: family.is_flagship(),
         supports_thinking_toggle: matches!(family, ClaudeFamily::Haiku),
         supports_fast_mode: false,
         supports_images: true,
@@ -486,16 +544,26 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClaudeFamily {
+    /// Top tier above Opus (e.g. `claude-fable-5`).
+    Fable,
     Opus,
     Sonnet,
     Haiku,
+    /// The CLI's `default` alias — the recommended flagship with the
+    /// context window already chosen by the CLI.
+    DefaultAlias,
     Other,
 }
 
 impl ClaudeFamily {
     fn from_id(id: &str) -> Self {
-        let lower = id.to_ascii_lowercase();
-        if lower.contains("opus") {
+        let (base, _) = split_context_suffix(id);
+        let lower = base.to_ascii_lowercase();
+        if lower == "default" {
+            Self::DefaultAlias
+        } else if lower.contains("fable") {
+            Self::Fable
+        } else if lower.contains("opus") {
             Self::Opus
         } else if lower.contains("sonnet") {
             Self::Sonnet
@@ -504,6 +572,14 @@ impl ClaudeFamily {
         } else {
             Self::Other
         }
+    }
+
+    /// Flagship-tier families share the full effort vocabulary, an
+    /// `xhigh` default, and prompt-injected `ultrathink`. New top-tier
+    /// families only need a `from_id` arm and a mention here to surface
+    /// fully-configured in the picker.
+    fn is_flagship(self) -> bool {
+        matches!(self, Self::Fable | Self::Opus | Self::DefaultAlias)
     }
 }
 
@@ -633,37 +709,58 @@ fn build_capabilities_from_sdk(
 /// effort vocabulary (since the deployed CLI is sometimes ahead of
 /// the bundled types); the maintained map fills in Codemux-specific
 /// UX bits the SDK doesn't surface (context windows, prompt-injected
-/// `ultrathink`, default effort, the Haiku thinking toggle).
+/// `ultrathink`, default effort, the Haiku thinking toggle). Family
+/// inference covers ids the maintained map doesn't know — including
+/// the CLI's alias ids (`default`, `sonnet`, `haiku`) and ids with a
+/// pinned context suffix (`claude-fable-5[1m]`, looked up by base id).
 fn merge_sdk_with_maintained(
     sdk: SdkModelInfo,
     maintained: &HashMap<String, ChatModelInfo>,
 ) -> ChatModelInfo {
-    let known = maintained.get(&sdk.value).cloned();
-    let inferred = || infer_model_info(&sdk.value, &sdk.display_name);
+    // The deployed CLI may pin the context window into the id itself
+    // (`claude-fable-5[1m]`). Look maintained metadata up by the base
+    // id so the pinned variant still gets its precise metadata.
+    let (base_id, pinned_suffix) = split_context_suffix(&sdk.value);
+    let known = maintained.get(base_id).cloned();
+    let inferred = infer_model_info(&sdk.value, &sdk.display_name);
 
-    // Effort levels — SDK runtime data wins (so newly-added levels
-    // like `ultracode` flow in). Fall back to maintained / inferred
-    // only when the SDK doesn't report any.
+    // Effort levels — SDK runtime data wins (so a newly-added level
+    // the maintained list hasn't been bumped for still flows in).
+    // Fall back to maintained / inferred only when the SDK doesn't
+    // report any.
     let effort_levels = if !sdk.supported_effort_levels.is_empty() {
         sdk.supported_effort_levels.clone()
     } else {
         known
             .as_ref()
             .map(|k| k.effort_levels.clone())
-            .unwrap_or_else(|| inferred().effort_levels)
+            .unwrap_or_else(|| inferred.effort_levels.clone())
     };
-    let default_effort = known
-        .as_ref()
-        .and_then(|k| k.default_effort.clone())
+    // Default effort: maintained wins, then the family-inferred
+    // default — each validated against the live vocabulary so we never
+    // default to a level the deployed CLI rejects. Only then fall to
+    // `high` / the first reported level (previously this jumped
+    // straight to `first()`, which made unrecognized flagship ids
+    // default to `low`).
+    let supported = |cand: Option<String>| cand.filter(|c| effort_levels.contains(c));
+    let default_effort = supported(known.as_ref().and_then(|k| k.default_effort.clone()))
+        .or_else(|| supported(inferred.default_effort.clone()))
+        .or_else(|| supported(Some("high".into())))
         .or_else(|| effort_levels.first().cloned());
     let prompt_injected_effort_levels = known
         .as_ref()
         .map(|k| k.prompt_injected_effort_levels.clone())
-        .unwrap_or_else(|| inferred().prompt_injected_effort_levels);
-    let context_window_options = known
-        .as_ref()
-        .map(|k| k.context_window_options.clone())
-        .unwrap_or_else(|| inferred().context_window_options);
+        .unwrap_or_else(|| inferred.prompt_injected_effort_levels.clone());
+    // A pinned id must never offer a context-window picker — resolving
+    // a pick would double-append the bracket suffix.
+    let context_window_options = if pinned_suffix.is_some() {
+        vec![]
+    } else {
+        known
+            .as_ref()
+            .map(|k| k.context_window_options.clone())
+            .unwrap_or_else(|| inferred.context_window_options.clone())
+    };
 
     let label = if sdk.display_name.trim().is_empty() {
         sdk.value.clone()
@@ -684,16 +781,22 @@ fn merge_sdk_with_maintained(
         default_effort,
         prompt_injected_effort_levels,
         context_window_options,
-        supports_adaptive_thinking: sdk
-            .supports_adaptive_thinking
-            .unwrap_or_else(|| known.as_ref().map(|k| k.supports_adaptive_thinking).unwrap_or(false)),
+        supports_adaptive_thinking: sdk.supports_adaptive_thinking.unwrap_or_else(|| {
+            known
+                .as_ref()
+                .map(|k| k.supports_adaptive_thinking)
+                .unwrap_or(inferred.supports_adaptive_thinking)
+        }),
         supports_thinking_toggle: known
             .as_ref()
             .map(|k| k.supports_thinking_toggle)
-            .unwrap_or(false),
-        supports_fast_mode: sdk
-            .supports_fast_mode
-            .unwrap_or_else(|| known.as_ref().map(|k| k.supports_fast_mode).unwrap_or(false)),
+            .unwrap_or(inferred.supports_thinking_toggle),
+        supports_fast_mode: sdk.supports_fast_mode.unwrap_or_else(|| {
+            known
+                .as_ref()
+                .map(|k| k.supports_fast_mode)
+                .unwrap_or(inferred.supports_fast_mode)
+        }),
         supports_images: true,
         sub_provider: None,
         is_free: false,
@@ -708,10 +811,36 @@ mod tests {
     fn fallback_includes_core_roster() {
         let caps = claude_fallback_capabilities();
         let ids: Vec<&str> = caps.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-fable-5"));
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-sonnet-4-6"));
         assert!(ids.contains(&"claude-haiku-4-5"));
         assert_eq!(caps.effort_granularity, EffortGranularity::PerSession);
+    }
+
+    #[test]
+    fn maintained_list_includes_fable_5() {
+        let caps = claude_fallback_capabilities();
+        let fable = caps
+            .models
+            .iter()
+            .find(|m| m.id == "claude-fable-5")
+            .expect("Fable 5 should be present in the maintained list");
+        assert_eq!(fable.default_effort.as_deref(), Some("high"));
+        assert!(fable.supports_adaptive_thinking);
+        assert!(
+            fable
+                .prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+        assert!(
+            fable.context_window_options.iter().any(|o| o.value == "1m"),
+            "bare Fable id should offer the 1M context window"
+        );
+        // The recommended default stays Opus 4.8 — `models()[0]` feeds
+        // `defaultModelId` on the frontend when capabilities are served
+        // from the fallback bundle.
+        assert_eq!(caps.models[0].id, "claude-opus-4-8");
     }
 
     #[test]
@@ -729,7 +858,7 @@ mod tests {
         // context window is now flagged as the default across every
         // multi-option Claude model.
         assert_eq!(default_ctx.value, "1m");
-        assert_eq!(opus.default_effort.as_deref(), Some("xhigh"));
+        assert_eq!(opus.default_effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -818,6 +947,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_api_model_id_never_double_appends_a_pinned_suffix() {
+        // The deployed CLI reports ids with the window already pinned
+        // (`claude-fable-5[1m]`) — resolving `"1m"` against one must be
+        // a no-op, not `claude-fable-5[1m][1m]`.
+        assert_eq!(
+            resolve_claude_api_model_id("claude-fable-5[1m]", Some("1m")),
+            "claude-fable-5[1m]"
+        );
+    }
+
+    #[test]
+    fn split_context_suffix_handles_pinned_and_bare_ids() {
+        assert_eq!(
+            split_context_suffix("claude-fable-5[1m]"),
+            ("claude-fable-5", Some("[1m]"))
+        );
+        assert_eq!(split_context_suffix("claude-opus-4-8"), ("claude-opus-4-8", None));
+        // Unterminated bracket — treated as part of the id, not a suffix.
+        assert_eq!(split_context_suffix("weird[id"), ("weird[id", None));
+    }
+
+    #[test]
     fn every_listed_model_supports_images() {
         // Stage 6: vision is universal across the Claude 4.x roster
         // we expose. Lock the contract so a future model addition
@@ -841,20 +992,27 @@ mod tests {
     }
 
     #[test]
-    fn opus_models_offer_ultracode_in_maintained_list() {
-        // `ultracode` is the top tier in Claude Code's `/effort` slider
-        // (xhigh + workflows) — every current-flagship Opus must expose
-        // it. Sonnet/Haiku stay at their narrower effort sets.
+    fn maintained_effort_vocab_matches_the_deployed_cli() {
+        // The headless CLI accepts exactly low..max as `--effort`
+        // values (`ultracode` is TUI-slider-only and is rejected with
+        // a warning as of claude 2.1.170). Maintained flagship entries
+        // must never list a level the CLI would refuse at launch.
         let caps = claude_fallback_capabilities();
-        for id in ["claude-opus-4-8", "claude-opus-4-7"] {
+        for id in ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"] {
             let m = caps
                 .models
                 .iter()
                 .find(|m| m.id == id)
                 .unwrap_or_else(|| panic!("{id} should be in the maintained list"));
-            assert!(
-                m.effort_levels.contains(&"ultracode".to_string()),
-                "{id} should expose the `ultracode` effort level"
+            assert_eq!(
+                m.effort_levels,
+                vec!["low", "medium", "high", "xhigh", "max"],
+                "{id} effort vocabulary must mirror the deployed CLI"
+            );
+            assert_eq!(
+                m.default_effort.as_deref(),
+                Some("high"),
+                "{id} default effort must match the CLI's `(default)` marker"
             );
         }
     }
@@ -869,7 +1027,7 @@ mod tests {
             .iter()
             .find(|m| m.id == "claude-opus-4-8")
             .expect("Opus 4.8 should be present in the maintained list");
-        assert_eq!(opus48.default_effort.as_deref(), Some("xhigh"));
+        assert_eq!(opus48.default_effort.as_deref(), Some("high"));
         assert!(
             opus48
                 .context_window_options
@@ -881,20 +1039,29 @@ mod tests {
 
     #[test]
     fn family_inference_from_id_handles_each_known_prefix() {
+        assert_eq!(ClaudeFamily::from_id("claude-fable-5"), ClaudeFamily::Fable);
         assert_eq!(ClaudeFamily::from_id("claude-opus-9-0"), ClaudeFamily::Opus);
         assert_eq!(ClaudeFamily::from_id("claude-sonnet-5-0"), ClaudeFamily::Sonnet);
         assert_eq!(ClaudeFamily::from_id("claude-haiku-5-0"), ClaudeFamily::Haiku);
+        assert_eq!(ClaudeFamily::from_id("default"), ClaudeFamily::DefaultAlias);
         assert_eq!(ClaudeFamily::from_id("xyzzy-thing"), ClaudeFamily::Other);
         // Case-insensitive — Anthropic ids are lowercase but be defensive.
         assert_eq!(ClaudeFamily::from_id("Claude-OPUS-9"), ClaudeFamily::Opus);
+        // A pinned context suffix doesn't hide the family.
+        assert_eq!(
+            ClaudeFamily::from_id("claude-fable-5[1m]"),
+            ClaudeFamily::Fable
+        );
     }
 
     #[test]
     fn infer_opus_gets_full_effort_and_1m() {
         let info = infer_model_info("claude-opus-9-9", "Claude Opus 9.9");
-        assert_eq!(info.effort_levels.len(), 6);
-        assert!(info.effort_levels.contains(&"ultracode".to_string()));
-        assert_eq!(info.default_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            info.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
         assert!(
             info.prompt_injected_effort_levels
                 .contains(&"ultrathink".to_string())
@@ -902,6 +1069,40 @@ mod tests {
         assert!(info.context_window_options.iter().any(|o| o.value == "1m"));
         assert!(info.supports_adaptive_thinking);
         assert_eq!(info.label, "Claude Opus 9.9");
+    }
+
+    #[test]
+    fn infer_fable_is_flagship_tier() {
+        let info = infer_model_info("claude-fable-6", "Claude Fable 6");
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
+        assert!(info.supports_adaptive_thinking);
+        assert!(
+            info.prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+        assert!(info.context_window_options.iter().any(|o| o.value == "1m"));
+    }
+
+    #[test]
+    fn infer_default_alias_is_flagship_without_context_picker() {
+        // `default` is the CLI's recommended-flagship alias; its window
+        // is the CLI's choice — `default[1m]` is not a valid id, so no
+        // context-window picker may be offered.
+        let info = infer_model_info("default", "Default (recommended)");
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
+        assert!(info.supports_adaptive_thinking);
+        assert!(info.context_window_options.is_empty());
+    }
+
+    #[test]
+    fn infer_pinned_suffix_suppresses_context_picker() {
+        let info = infer_model_info("claude-fable-5[1m]", "Fable 5");
+        assert!(
+            info.context_window_options.is_empty(),
+            "pinned id must not offer a context-window picker"
+        );
+        // Flagship metadata still applies.
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -960,7 +1161,10 @@ mod tests {
         let new = &caps.models[0];
         assert_eq!(new.id, "claude-opus-9-9");
         assert_eq!(new.label, "Claude Opus 9.9");
-        assert_eq!(new.effort_levels.len(), 6);
+        assert_eq!(
+            new.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
     }
 
     #[test]
@@ -1017,11 +1221,11 @@ mod tests {
 
     #[test]
     fn sdk_merge_uses_sdk_effort_levels_for_a_known_id() {
-        // SDK reports an effort vocabulary that includes `ultracode` —
-        // even though the maintained Opus 4.7 entry already lists it,
-        // the test confirms the SDK value wins (regression guard for
-        // when the deployed CLI ships a level the maintained list
-        // hasn't been bumped for yet).
+        // SDK reports an effort vocabulary with levels the maintained
+        // Opus 4.7 entry doesn't list (`ultracode`, `newlevel`) — the
+        // SDK value wins verbatim (regression guard for when the
+        // deployed CLI ships a level the maintained list hasn't been
+        // bumped for yet).
         let live = vec![sdk_model(
             "claude-opus-4-7",
             "Claude Opus 4.7",
@@ -1071,8 +1275,11 @@ mod tests {
         let live = vec![sdk_model("claude-opus-4-7", "Claude Opus 4.7", &[], None, None)];
         let caps = build_capabilities_from_sdk(live);
         let opus = &caps.models[0];
-        // Maintained Opus 4.7 has 6 effort levels including ultracode.
-        assert_eq!(opus.effort_levels.len(), 6);
+        // Maintained Opus 4.7 mirrors the deployed CLI: low..max.
+        assert_eq!(
+            opus.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
     }
 
     #[test]
@@ -1083,6 +1290,87 @@ mod tests {
         ];
         let caps = build_capabilities_from_sdk(live);
         assert_eq!(caps.models.len(), 1);
+    }
+
+    #[test]
+    fn sdk_merge_handles_pinned_fable_id() {
+        // The deployed CLI reports Fable with the window pinned into
+        // the id. The maintained `claude-fable-5` entry must be found
+        // via base-id lookup, the launch id must stay verbatim, and no
+        // context-window picker may be offered (resolving one would
+        // produce `claude-fable-5[1m][1m]`).
+        let live = vec![sdk_model(
+            "claude-fable-5[1m]",
+            "Fable 5",
+            &["low", "medium", "high", "xhigh", "max"],
+            Some(true),
+            None,
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        let fable = &caps.models[0];
+        assert_eq!(fable.id, "claude-fable-5[1m]");
+        assert_eq!(fable.label, "Fable 5");
+        assert_eq!(fable.default_effort.as_deref(), Some("high"));
+        assert!(fable.context_window_options.is_empty());
+        assert!(
+            fable
+                .prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+        assert!(fable.supports_adaptive_thinking);
+    }
+
+    #[test]
+    fn sdk_merge_alias_ids_get_family_default_effort_not_first_level() {
+        // Regression: alias ids (`default`, `sonnet`, `haiku`) miss the
+        // full-id maintained map; the default effort used to fall back
+        // to `effort_levels.first()` — i.e. "low" — for every alias.
+        let live = vec![
+            sdk_model(
+                "default",
+                "Default (recommended)",
+                &["low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(true),
+            ),
+            sdk_model(
+                "sonnet",
+                "Sonnet",
+                &["low", "medium", "high", "max"],
+                Some(true),
+                None,
+            ),
+            sdk_model("haiku", "Haiku", &[], None, None),
+        ];
+        let caps = build_capabilities_from_sdk(live);
+        let default = caps.models.iter().find(|m| m.id == "default").unwrap();
+        assert_eq!(default.default_effort.as_deref(), Some("high"));
+        assert!(
+            default.context_window_options.is_empty(),
+            "`default` must not offer a context-window picker"
+        );
+        assert!(default.supports_fast_mode);
+        let sonnet = caps.models.iter().find(|m| m.id == "sonnet").unwrap();
+        assert_eq!(sonnet.default_effort.as_deref(), Some("high"));
+        let haiku = caps.models.iter().find(|m| m.id == "haiku").unwrap();
+        assert_eq!(haiku.default_effort, None);
+        assert!(haiku.supports_thinking_toggle);
+    }
+
+    #[test]
+    fn sdk_merge_default_effort_must_be_in_the_live_vocabulary() {
+        // Maintained Opus default is `xhigh`; if the deployed CLI stops
+        // reporting that level, the default must degrade to a level the
+        // CLI actually accepts instead of erroring at launch.
+        let live = vec![sdk_model(
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            &["low", "medium", "high"],
+            Some(true),
+            None,
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        assert_eq!(caps.models[0].default_effort.as_deref(), Some("high"));
     }
 
     #[test]

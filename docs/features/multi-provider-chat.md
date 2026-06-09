@@ -18,7 +18,7 @@ OpenCode is the federated arm: a single rail entry whose flat model list shows e
 
 | Driver | Transport | Adapter | Capabilities |
 |---|---|---|---|
-| Claude | JSON-RPC stdio (`claude-agent` sidecar bin) | `src-tauri/src/agent_provider/claude/mod.rs` | Hand-maintained `claude_fallback_capabilities()` with 5 models, ultrathink prompt-injection effort level, 200k/1M context-window picker. |
+| Claude | JSON-RPC stdio (`claude-agent` sidecar bin) | `src-tauri/src/agent_provider/claude/mod.rs` | **Live harvest** via the sidecar's `list-models` RPC (SDK `supportedModels()`), merged with hand-maintained per-id metadata in `capabilities.rs`; `/v1/models` (API-key) and `claude_fallback_capabilities()` as fallbacks. Handles alias ids (`default`, `sonnet`, `haiku`) and pinned-window ids (`claude-fable-5[1m]`) via family inference; ultrathink prompt-injection effort level, 200k/1M context-window picker on bare flagship/Sonnet ids. |
 | Codex | JSON-RPC stdio (`codex app-server`) | `src-tauri/src/agent_provider/codex/mod.rs` | Hand-maintained `codex_fallback_capabilities()` with 4 models, sandbox-policy permission modes, per-turn effort. |
 | OpenCode | HTTP (Rust-direct `reqwest` against a managed `opencode serve` child) | `src-tauri/src/agent_provider/opencode/{server,manager,client,capabilities}.rs` | **Live harvest** at `harvest_opencode_capabilities` — calls `GET /provider`, flattens to per-model `ChatModelInfo` entries with `sub_provider` populated and connected-only filter applied. |
 

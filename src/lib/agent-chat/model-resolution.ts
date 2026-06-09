@@ -103,11 +103,17 @@ export function resolveContextWindow(
  * `[1m]` bracket suffix. Used by the frontend when constructing
  * `StartSessionInput` payloads for Claude — the Rust adapter also
  * applies the same mutation as a defense in depth.
+ *
+ * Ids that already carry a bracket suffix pass through unchanged: the
+ * deployed CLI reports some models with the window pinned into the id
+ * itself (e.g. `claude-fable-5[1m]`), and appending again would
+ * produce an invalid `…[1m][1m]` id.
  */
 export function resolveClaudeApiModelId(
   modelId: string,
   contextWindow: string | null | undefined,
 ): string {
-  if (contextWindow === "1m") return `${modelId}[1m]`;
+  const alreadyPinned = /\[[^\]]*\]$/.test(modelId);
+  if (contextWindow === "1m" && !alreadyPinned) return `${modelId}[1m]`;
   return modelId;
 }

@@ -71,7 +71,7 @@ describe("capability-defaults", () => {
     });
 
     it("falls back to the hardcoded Claude default when caps are unhydrated", () => {
-      expect(defaultModelId("claude")).toBe("claude-opus-4-7");
+      expect(defaultModelId("claude")).toBe("claude-opus-4-8");
     });
 
     it("falls back to the hardcoded Codex default when caps are unhydrated", () => {

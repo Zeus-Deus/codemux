@@ -131,6 +131,24 @@ fn is_safe_arg(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | ':'))
 }
 
+/// Model ids may legitimately carry a bracket context suffix — the
+/// deployed Claude CLI reports e.g. `claude-fable-5[1m]`. Validate the
+/// base id with the ordinary charset and require the suffix interior
+/// to be plain alphanumerics. Bracketed values are single-quoted at
+/// injection time, so the glob metacharacters never reach the shell
+/// unquoted.
+fn is_safe_model_arg(value: &str) -> bool {
+    match value.find('[') {
+        Some(open) if value.ends_with(']') => {
+            let inner = &value[open + 1..value.len() - 1];
+            is_safe_arg(&value[..open])
+                && !inner.is_empty()
+                && inner.chars().all(|c| c.is_ascii_alphanumeric())
+        }
+        _ => is_safe_arg(value),
+    }
+}
+
 /// Drop a `--flag <value>` / `--flag=<value>` / `<short> <value>` pair
 /// from a token list, wherever it appears. Used so an explicit user
 /// selection cleanly overrides a flag a preset already bakes in,
@@ -194,16 +212,19 @@ pub fn apply_model_selection(command: &str, selection: Option<&ModelSelection>) 
 
     // Model — every family accepts `--model`.
     if let Some(model) = field_value(&selection.model) {
-        if is_safe_arg(model) {
+        if is_safe_model_arg(model) {
             strip_flag(&mut tokens, "--model", Some("-m"));
             // Claude's 1M context window rides on the model id as a
             // `[1m]` bracket suffix (mirrors the agent-chat SDK path).
             // Context applies to Claude only and needs an explicit
-            // model to attach to.
-            let model_arg = if family == AgentFamily::Claude
-                && field_value(&selection.context) == Some("1m")
-            {
-                format!("{model}[1m]")
+            // model to attach to. Delegated to the shared resolver so
+            // ids the CLI reports with the window already pinned
+            // (`claude-fable-5[1m]`) never grow a second suffix.
+            let model_arg = if family == AgentFamily::Claude {
+                crate::agent_provider::claude::capabilities::resolve_claude_api_model_id(
+                    model,
+                    field_value(&selection.context),
+                )
             } else {
                 model.to_string()
             };
@@ -471,6 +492,27 @@ mod tests {
             out,
             "claude --dangerously-skip-permissions --model 'claude-sonnet-4-6[1m]'"
         );
+    }
+
+    #[test]
+    fn safe_model_arg_accepts_pinned_suffix_but_rejects_malformed_brackets() {
+        assert!(is_safe_model_arg("claude-fable-5[1m]"));
+        assert!(is_safe_model_arg("claude-opus-4-8"));
+        assert!(!is_safe_model_arg("claude[1m")); // unterminated
+        assert!(!is_safe_model_arg("claude[]")); // empty suffix
+        assert!(!is_safe_model_arg("claude[$(rm)]")); // unsafe interior
+        assert!(!is_safe_model_arg("[1m]")); // no base id
+    }
+
+    #[test]
+    fn claude_pinned_model_id_never_double_appends_1m() {
+        // The deployed CLI reports some models with the window pinned
+        // into the id itself — the injector must not append again.
+        let out = apply_model_selection(
+            "claude",
+            Some(&sel_ctx(Some("claude-fable-5[1m]"), None, Some("1m"))),
+        );
+        assert_eq!(out, "claude --model 'claude-fable-5[1m]'");
     }
 
     #[test]
