@@ -25,7 +25,8 @@ mod mock_agent_provider;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::Listener;
+use tauri::ipc::Channel;
+use tauri::{Listener, State};
 use tokio::time::timeout;
 
 use codemux_lib::agent_provider::{
@@ -33,8 +34,8 @@ use codemux_lib::agent_provider::{
     SendTurnInput, StartSessionInput, ThreadId, TurnId,
 };
 use codemux_lib::commands::agent_chat::{
-    feature_flag_on, forward_event, thread_id_for_event, AgentChatEventPayload,
-    ProviderRegistry, AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
+    feature_flag_on, forward_event, thread_id_for_event, AgentChatChannelRegistry,
+    AgentChatEventPayload, ProviderRegistry, AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
 };
 use codemux_lib::database::DatabaseStore;
 use codemux_lib::observability::{FeatureFlags, ObservabilityStore};
@@ -324,40 +325,64 @@ fn thread_id_for_event_extracts_bound_threads() {
     );
 }
 
-#[tokio::test]
-async fn event_bridge_forwards_runtime_events_to_tauri() {
-    // Build a MockRuntime app, subscribe to the agent_chat_event
-    // channel, and verify that forwarding a runtime event through
-    // forward_event produces a matching AgentChatEventPayload.
-    //
-    // forward_event persists ItemCompleted via DatabaseStore::append_*,
-    // so the mock app must manage a DatabaseStore or `app.state::<…>`
-    // panics with "state() called before manage()". An in-memory store
-    // is sufficient — we're only asserting on the emitted event, not
-    // on what gets written to disk.
+/// Build a MockRuntime app with the managed state `forward_event`
+/// touches: an in-memory DatabaseStore (transcript persistence) and
+/// the per-thread channel registry (issue #75 routing).
+fn mock_app_with_chat_state() -> tauri::App<tauri::test::MockRuntime> {
     let app = tauri::test::mock_app();
     app.manage(DatabaseStore::new_in_memory());
+    app.manage(AgentChatChannelRegistry::default());
+    app
+}
+
+/// Real `tauri::ipc::Channel` whose handler decodes and captures every
+/// payload, mirroring what the frontend's `useAgentChatEvents` channel
+/// receives.
+fn capture_channel() -> (
+    Channel<AgentChatEventPayload>,
+    Arc<std::sync::Mutex<Vec<AgentChatEventPayload>>>,
+) {
+    let captured: Arc<std::sync::Mutex<Vec<AgentChatEventPayload>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured_handler = captured.clone();
+    let channel = Channel::new(move |body| {
+        let payload = body
+            .deserialize::<AgentChatEventPayload>()
+            .expect("decode AgentChatEventPayload");
+        captured_handler.lock().unwrap().push(payload);
+        Ok(())
+    });
+    (channel, captured)
+}
+
+fn text_delta(thread: &str, text: &str) -> ProviderRuntimeEvent {
+    ProviderRuntimeEvent::ContentDelta {
+        thread_id: ThreadId(thread.into()),
+        turn_id: TurnId("turn-1".into()),
+        delta: codemux_lib::agent_provider::ContentDelta::Text { text: text.into() },
+    }
+}
+
+#[tokio::test]
+async fn event_bridge_routes_thread_events_to_attached_channel() {
+    // Thread-scoped events must arrive over the per-thread Channel —
+    // and must NOT be broadcast on the global agent_chat_event bus.
+    let app = mock_app_with_chat_state();
     let handle = app.handle().clone();
 
-    let received: Arc<tokio::sync::Mutex<Vec<AgentChatEventPayload>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
-
-    let received_clone = received.clone();
-    let tx_clone = tx.clone();
+    // Bus spy: any thread-scoped event landing here is a regression.
+    let bus_hits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let bus_hits_clone = bus_hits.clone();
     handle.listen(AGENT_CHAT_EVENT, move |event| {
-        let payload: AgentChatEventPayload =
-            serde_json::from_str(event.payload()).expect("valid payload JSON");
-        let received = received_clone.clone();
-        let tx = tx_clone.clone();
-        tauri::async_runtime::spawn(async move {
-            received.lock().await.push(payload);
-            if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(());
-            }
-        });
+        bus_hits_clone
+            .lock()
+            .unwrap()
+            .push(event.payload().to_string());
     });
+
+    let registry: State<'_, AgentChatChannelRegistry> = handle.state();
+    let (channel, captured) = capture_channel();
+    registry.attach("thread-bridge", channel);
 
     let event = ProviderRuntimeEvent::ItemCompleted {
         thread_id: ThreadId("thread-bridge".into()),
@@ -368,13 +393,10 @@ async fn event_bridge_forwards_runtime_events_to_tauri() {
     };
     forward_event(&handle, event);
 
-    timeout(Duration::from_secs(2), rx)
-        .await
-        .expect("listener should fire within 2s")
-        .expect("one-shot sender should send before dropping");
-
-    let received = received.lock().await;
-    assert_eq!(received.len(), 1, "exactly one event should be received");
+    // Channel delivery is synchronous in the mock runtime (the closure
+    // runs inline inside send), so the capture is observable now.
+    let received = captured.lock().unwrap();
+    assert_eq!(received.len(), 1, "exactly one event over the channel");
     assert_eq!(received[0].thread_id.0, "thread-bridge");
     match &received[0].event {
         ProviderRuntimeEvent::ItemCompleted { thread_id, .. } => {
@@ -382,6 +404,198 @@ async fn event_bridge_forwards_runtime_events_to_tauri() {
         }
         other => panic!("unexpected event variant: {other:?}"),
     }
+    drop(received);
+
+    // Give the (async) event bus a moment, then assert silence.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        bus_hits.lock().unwrap().is_empty(),
+        "thread-scoped events must not ride the global event bus"
+    );
+}
+
+#[tokio::test]
+async fn event_bridge_isolates_threads_and_preserves_order() {
+    // Two panes attached to two threads: each receives only its own
+    // thread's token stream, in emission order.
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+
+    let registry: State<'_, AgentChatChannelRegistry> = handle.state();
+    let (channel_a, captured_a) = capture_channel();
+    let (channel_b, captured_b) = capture_channel();
+    registry.attach("thread-a", channel_a);
+    registry.attach("thread-b", channel_b);
+
+    for i in 0..50 {
+        forward_event(&handle, text_delta("thread-a", &format!("a{i}")));
+        forward_event(&handle, text_delta("thread-b", &format!("b{i}")));
+    }
+
+    let a = captured_a.lock().unwrap();
+    let b = captured_b.lock().unwrap();
+    assert_eq!(a.len(), 50, "pane A sees exactly its own 50 deltas");
+    assert_eq!(b.len(), 50, "pane B sees exactly its own 50 deltas");
+    for (i, payload) in a.iter().enumerate() {
+        assert_eq!(payload.thread_id.0, "thread-a", "no cross-thread leakage");
+        match &payload.event {
+            ProviderRuntimeEvent::ContentDelta { delta, .. } => match delta {
+                codemux_lib::agent_provider::ContentDelta::Text { text } => {
+                    assert_eq!(text, &format!("a{i}"), "ordering preserved");
+                }
+                other => panic!("unexpected delta: {other:?}"),
+            },
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    for payload in b.iter() {
+        assert_eq!(payload.thread_id.0, "thread-b", "no cross-thread leakage");
+    }
+}
+
+#[tokio::test]
+async fn event_bridge_persists_transcript_even_without_channel() {
+    // The replay-semantics split: transcript events are persisted to
+    // the DB regardless of whether a pane is attached, so a
+    // late-attaching pane can hydrate the full transcript and the
+    // channel only ever needs to carry live events.
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+
+    // append_agent_chat_message silently drops rows whose parent
+    // session is missing (FK), so seed the session row the way
+    // agent_chat_start_session does.
+    {
+        let db: State<'_, DatabaseStore> = handle.state();
+        db.upsert_agent_chat_session("thread-unattached", "ws-1", None, "claude")
+            .expect("seed session row");
+    }
+
+    let event = ProviderRuntimeEvent::ItemCompleted {
+        thread_id: ThreadId("thread-unattached".into()),
+        turn_id: TurnId("turn-1".into()),
+        item: CompletedItem::AssistantText {
+            text: "persisted while nobody watched".into(),
+        },
+    };
+    // No channel attached — must not panic, must still persist.
+    forward_event(&handle, event);
+
+    let db: State<'_, DatabaseStore> = handle.state();
+    let messages = db.list_agent_chat_messages("thread-unattached");
+    assert_eq!(messages.len(), 1, "transcript persisted without subscriber");
+    assert!(messages[0].contains("persisted while nobody watched"));
+}
+
+#[tokio::test]
+async fn event_bridge_emits_threadless_warnings_on_event_bus() {
+    // Global RuntimeWarnings have no thread to route by; they keep the
+    // low-frequency global event bus.
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<AgentChatEventPayload>();
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+    handle.listen(AGENT_CHAT_EVENT, move |event| {
+        let payload: AgentChatEventPayload =
+            serde_json::from_str(event.payload()).expect("valid payload JSON");
+        if let Some(tx) = tx.lock().unwrap().take() {
+            let _ = tx.send(payload);
+        }
+    });
+
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: None,
+            message: "global warning".into(),
+            original_payload: None,
+        },
+    );
+
+    let payload = timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("bus listener should fire within 2s")
+        .expect("one-shot sender should send before dropping");
+    assert_eq!(payload.thread_id.0, "", "thread-less payload has empty id");
+    match payload.event {
+        ProviderRuntimeEvent::RuntimeWarning { message, .. } => {
+            assert_eq!(message, "global warning");
+        }
+        other => panic!("unexpected event variant: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn full_bridge_pipeline_streams_provider_events_per_thread() {
+    // End-to-end through the real pipeline: provider broadcast →
+    // spawn_event_bridge task → forward_event → per-thread Channel.
+    // This is the same path a live Claude/Codex session takes, with
+    // only the provider mocked.
+    let app = mock_app_with_chat_state();
+    app.manage(ProviderRegistry::new());
+    let handle = app.handle().clone();
+
+    let registry: State<'_, ProviderRegistry> = handle.state();
+    let provider = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
+    registry.set_claude(provider.clone() as _).await;
+
+    codemux_lib::commands::agent_chat::spawn_event_bridge(handle.clone()).await;
+
+    let channels: State<'_, AgentChatChannelRegistry> = handle.state();
+    let (channel_a, captured_a) = capture_channel();
+    let (channel_b, captured_b) = capture_channel();
+    channels.attach("pipe-a", channel_a);
+    channels.attach("pipe-b", channel_b);
+
+    // Interleave token streams for two threads plus a completion.
+    for i in 0..20 {
+        provider.emit(text_delta("pipe-a", &format!("tok-a{i}")));
+        provider.emit(text_delta("pipe-b", &format!("tok-b{i}")));
+    }
+    provider.emit(ProviderRuntimeEvent::ItemCompleted {
+        thread_id: ThreadId("pipe-a".into()),
+        turn_id: TurnId("turn-1".into()),
+        item: CompletedItem::AssistantText {
+            text: "done".into(),
+        },
+    });
+
+    // The bridge task consumes the broadcast asynchronously — poll
+    // until everything has flowed through (bounded by a timeout).
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if captured_a.lock().unwrap().len() == 21
+                && captured_b.lock().unwrap().len() == 20
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("bridge should deliver all events within 5s");
+
+    let a = captured_a.lock().unwrap();
+    assert!(a.iter().all(|p| p.thread_id.0 == "pipe-a"));
+    // Token ordering survives the async hop.
+    for (i, payload) in a.iter().take(20).enumerate() {
+        match &payload.event {
+            ProviderRuntimeEvent::ContentDelta { delta, .. } => match delta {
+                codemux_lib::agent_provider::ContentDelta::Text { text } => {
+                    assert_eq!(text, &format!("tok-a{i}"));
+                }
+                other => panic!("unexpected delta: {other:?}"),
+            },
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+    match &a[20].event {
+        ProviderRuntimeEvent::ItemCompleted { .. } => {}
+        other => panic!("expected trailing ItemCompleted, got {other:?}"),
+    }
+    let b = captured_b.lock().unwrap();
+    assert!(b.iter().all(|p| p.thread_id.0 == "pipe-b"));
 }
 
 // ── Run checkpoints (issue #80) ──

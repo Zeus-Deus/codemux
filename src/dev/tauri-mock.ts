@@ -156,15 +156,65 @@ function pushMockTerminalBanner(channel: unknown): void {
   }
 }
 
+// ── Agent chat: per-thread Channel streaming simulator ─────────────
+//
+// Mirrors the issue #75 backend: a chat pane registers a
+// `tauri::ipc::Channel` per thread via `attach_agent_chat_output`,
+// and live runtime events — crucially the `content_delta` token
+// stream — arrive over that channel only (never the global event
+// bus). The mock keeps a thread→channel map and pushes ordered
+// `{ index, message }` frames through the channel's
+// `transformCallback` dispatcher, exactly like the real IPC layer, so
+// the unmodified `@tauri-apps/api` Channel machinery (ordering buffer
+// included) runs for real in browser dev.
+
+interface MockChatChannelEntry {
+  /** The `@tauri-apps/api` Channel object passed by the frontend. */
+  channel: unknown;
+  /** Attach generation; detach only removes on match (issue #75). */
+  generation: number;
+  /** Next ordered frame index for this channel. */
+  nextIndex: number;
+}
+
+const chatChannels = new Map<string, MockChatChannelEntry>();
+let chatChannelGeneration = 0;
+
+function chatChannelPush(entry: MockChatChannelEntry, payload: unknown): void {
+  const id = (entry.channel as { id?: number } | undefined)?.id;
+  if (typeof id !== "number") return;
+  const cb = callbacks.get(id);
+  if (!cb) return;
+  try {
+    cb.fn({ index: entry.nextIndex++, message: payload } as unknown as never);
+  } catch (err) {
+    console.error("[dev mock] chat channel push threw:", err);
+  }
+}
+
+/** Route one runtime event to the thread's attached channel — the
+ *  mock twin of `forward_event`'s channel arm. No channel → drop. */
+function emitChatEvent(threadId: string, event: unknown): void {
+  const entry = chatChannels.get(threadId);
+  if (!entry) return;
+  chatChannelPush(entry, { thread_id: threadId, event });
+}
+
+// The turn simulator itself (`streamMockChatReply`) lives in the
+// "Agent chat (mocked end-to-end)" section below — it routes every
+// frame through `emitChatEvent`, so the channel is the only live
+// transport, exactly like the real backend.
+
 // ── Static command returns ──────────────────────────────────────────
 
 const FEATURE_FLAGS: FeatureFlags = {
   unstable_openflow: false,
   unstable_browser_automation: false,
   unstable_indexing: false,
-  // On in the mock so the seeded agent-chat workspace renders its chat
-  // pane (the virtualized transcript is a primary dev-iteration
-  // surface — issue #77). All chat IPC is mocked below.
+  // On in the mock so the seeded agent-chat workspaces render their
+  // chat panes: the virtualized long transcript (issue #77) and the
+  // per-thread Channel streaming path (issue #75) are both primary
+  // dev-iteration surfaces. All chat IPC is mocked below.
   enable_agent_chat: true,
   enable_lazy_workspace_creation: false,
 };
@@ -208,9 +258,10 @@ const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
 // `agent_chat_list_messages`, which returns a long generated
 // transcript replayed through the real reducer — so the virtualized
 // MessageList renders real ChatViewItems. `agent_chat_send_turn`
-// simulates a streaming reply through the real `agent_chat_event`
-// channel; `window.__codemuxChatMock.streamReply()` triggers one on
-// demand for scroll/perf testing.
+// simulates a streaming reply through the pane's attached per-thread
+// Channel (issue #75, `emitChatEvent` above);
+// `window.__codemuxChatMock.streamReply()` triggers one on demand for
+// scroll/perf testing.
 
 const MOCK_CHAT_MODEL: ChatModelInfo = {
   id: "mock-sonnet",
@@ -335,7 +386,12 @@ let mockChatTurnSeq = 0;
 
 /** Simulate a streaming assistant reply on the real event channel.
  *  Returns the turn id immediately; deltas tick on an interval so
- *  stick-to-bottom / scroll-up-freedom can be observed live. */
+ *  stick-to-bottom / scroll-up-freedom can be observed live.
+ *
+ *  Delivery is the per-thread Channel registered via
+ *  `attach_agent_chat_output` (issue #75) — the global event bus
+ *  carries no thread-scoped chat traffic anymore, matching the real
+ *  backend's `forward_event` routing. */
 function streamMockChatReply(
   threadId: string,
   opts: { tokens?: number; intervalMs?: number } = {},
@@ -343,8 +399,7 @@ function streamMockChatReply(
   const turnId = `live-turn-${++mockChatTurnSeq}`;
   const tokens = Math.max(1, opts.tokens ?? 120);
   const intervalMs = Math.max(5, opts.intervalMs ?? 40);
-  const send = (event: unknown) =>
-    emitEvent("agent_chat_event", { thread_id: threadId, event });
+  const send = (event: unknown) => emitChatEvent(threadId, event);
 
   send({
     type: "session_state_changed",
@@ -522,7 +577,9 @@ const handlers: Record<string, Handler> = {
   // ── Resource monitor ──
   get_resource_metrics: () => resourceMetrics(),
 
-  // ── Agent chat (mocked end-to-end for the seeded chat workspace) ──
+  // ── Agent chat (mocked end-to-end for the seeded chat workspaces) ──
+  // start_session echoes back the frontend-minted thread id;
+  // send_turn answers with the channel-streamed mock reply.
   list_chat_provider_capabilities: (a) =>
     a.provider === "claude" ? CLAUDE_CAPABILITIES : EMPTY_CAPABILITIES,
   agent_chat_list_messages: (a) =>
@@ -560,6 +617,29 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   grep_count_pattern: () => 0,
+
+  // ── Agent chat per-thread event channel (issue #75) ──
+  // Mirrors AgentChatChannelRegistry: newest attach wins, detach is
+  // generation-guarded so a stale unmount can't tear down a newer
+  // pane's channel.
+  attach_agent_chat_output: (a) => {
+    const threadId = a.threadId as string;
+    const generation = ++chatChannelGeneration;
+    chatChannels.set(threadId, {
+      channel: a.channel,
+      generation,
+      nextIndex: 0,
+    });
+    return generation;
+  },
+  detach_agent_chat_output: (a) => {
+    const threadId = a.threadId as string;
+    const entry = chatChannels.get(threadId);
+    if (entry && entry.generation === a.generation) {
+      chatChannels.delete(threadId);
+    }
+    return undefined;
+  },
 
   // ── Presets ──
   get_presets: () => EMPTY_PRESETS,

@@ -121,10 +121,17 @@ export const MOCK_CHAT_THREAD_ID = "thread-mock-chat";
 /** Build an agent-chat surface (+ tab) for a workspace. Mirrors the
  *  backend's `create_agent_chat_pane`: the surface root is an
  *  `agent_chat` pane and the tab keeps `kind: "terminal"` (TabKind has
- *  no chat variant — the pane node drives rendering). */
+ *  no chat variant — the pane node drives rendering).
+ *
+ *  `threadId` defaults to the pre-seeded transcript thread; pass
+ *  `null` for a fresh pane with no thread bound yet — exactly the
+ *  state `create_agent_chat_pane` leaves a new pane in, which drives
+ *  the start_session → attach channel → streamed `content_delta`
+ *  flow (issue #75). */
 function chatSurface(
   label: string,
   cwd: string,
+  threadId: string | null = MOCK_CHAT_THREAD_ID,
 ): { pane: PaneNodeSnapshot; surface: SurfaceSnapshot; tab: TabSnapshot } {
   const n = ++paneSeq;
   const paneId = `pane-${n}`;
@@ -135,7 +142,7 @@ function chatSurface(
     kind: "agent_chat",
     pane_id: paneId,
     title: label,
-    thread_id: MOCK_CHAT_THREAD_ID,
+    thread_id: threadId,
     provider: "claude",
     cwd,
   };
@@ -328,6 +335,33 @@ const wsCodemuxMock = makeWorkspace({
   git_changed_files: 6,
 });
 
+/** Live-streaming chat workspace: its `agent_chat` pane has NO thread
+ *  bound, so mounting it walks the fresh-session path — start_session,
+ *  per-thread channel attach, then token-by-token `content_delta`
+ *  streaming on send (issue #75). Complements `wsCodemuxChat` above,
+ *  which exercises the hydrated long-transcript path (issue #77). */
+const wsCodemuxChatLive = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/feature-75-chat-channel`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-chat-live",
+    title: "chat-streaming",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "feature/75-chat-channel",
+  });
+  const { surface, tab } = chatSurface("Agent Chat", cwd, null);
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
 const wsCodemuxPorts = makeWorkspace({
   workspace_id: "ws-codemux-ports",
   title: "port-detection",
@@ -445,6 +479,7 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxAuth,
   wsCodemuxSidebar,
   wsCodemuxMock,
+  wsCodemuxChatLive,
   wsCodemuxPorts,
   wsVexisMain,
   wsVexisCuda,

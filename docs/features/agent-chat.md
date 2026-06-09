@@ -556,18 +556,44 @@ Design note: `docs/plans/agent-run-checkpoint.md`.
 ## Event bridge
 
 Every registered provider's canonical event stream is forwarded to
-the frontend on a single Tauri channel named `agent_chat_event`.
-Payloads carry the originating `thread_id` alongside the raw
-`ProviderRuntimeEvent` so subscribers can filter without re-parsing.
-Global events (`RuntimeWarning` without a thread id) are still
-forwarded, with an empty `ThreadId`. The frontend hook
+the frontend per thread over a `tauri::ipc::Channel` (issue #75).
+Payloads (`AgentChatEventPayload`) carry the originating `thread_id`
+alongside the raw `ProviderRuntimeEvent`.
+
+Transport split:
+
+- **Thread-scoped events** — including the high-frequency streaming
+  `content_delta` tokens — are routed to the `Channel` the owning
+  pane registered via `attach_agent_chat_output(thread_id, channel)`
+  (`AgentChatChannelRegistry` in `commands/agent_chat.rs`, mirroring
+  the PTY `attach_pty_output` pattern). A pane only ever receives its
+  own thread's events; nothing is broadcast app-wide. Tauri's event
+  system is explicitly not designed for high-throughput streaming;
+  Channels are the documented mechanism for it.
+- **Thread-less events** (global `RuntimeWarning`s) keep the
+  low-frequency `agent_chat_event` global event bus, with an empty
+  `ThreadId`.
+
+Replay split: the channel carries **live events only**. Transcript
+events are persisted to SQLite by `forward_event` whether or not a
+channel is attached, and a late-attaching / resumed pane rebuilds
+history through the DB hydrate (`agent_chat_list_messages` →
+`hydrateThread`). Non-persisted lifecycle notices that fire while no
+pane is attached are dropped — the same outcome the event bus had
+for unmounted panes.
+
+Attach/detach lifecycle: `attach_agent_chat_output` returns a
+generation token; `detach_agent_chat_output(thread_id, generation)`
+only removes a matching generation, so a stale unmount can never tear
+down the channel a newer pane just installed. The frontend hook
 `useAgentChatEvents(threadId, handler)` in
-`src/hooks/use-agent-chat-events.ts` wires this up with a
-thread-id filter.
+`src/hooks/use-agent-chat-events.ts` owns this lifecycle: it attaches
+a `Channel` per mounted thread and serializes its detach behind the
+attach promise.
 
 The bridge is a thin loop: one background Tokio task per provider,
-each consuming the provider's `event_stream()` and re-emitting each
-event via `AppHandle::emit`. `broadcast::error::RecvError::Lagged`
+each consuming the provider's `event_stream()` and routing each
+event through `forward_event`. `broadcast::error::RecvError::Lagged`
 is already swallowed by each provider's event-stream helper, so slow
 subscribers never crash the loop — they just drop old events.
 

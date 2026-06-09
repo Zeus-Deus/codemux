@@ -288,11 +288,33 @@ mod tests {
                 .await
                 .unwrap();
 
-        // Exactly one `codemux` row — the always-on hardcoded one.
-        let codemux_rows: Vec<_> =
-            result.iter().filter(|s| s.name == "codemux").collect();
-        assert_eq!(codemux_rows.len(), 1);
-        assert_eq!(codemux_rows[0].primary_source(), McpConfigSource::Codemux);
+        // The project-scope `codemux` entry must be suppressed: no
+        // codemux row may carry a project-level source. (Scoped to
+        // project sources rather than a global count because
+        // `list_mcp_servers` also scans real user-level config paths —
+        // on a developer machine where `codemux-remote serve` has
+        // auto-registered itself into e.g. `~/.claude.json`, a
+        // user-level codemux row legitimately coexists with the
+        // hardcoded self row.)
+        assert!(
+            !result.iter().any(|s| {
+                s.name == "codemux"
+                    && s.sources.iter().any(|src| matches!(
+                        src,
+                        McpConfigSource::ClaudeProject | McpConfigSource::CodemuxProject
+                    ))
+            }),
+            "project-scope codemux entry leaked into {:?}",
+            result
+        );
+        // The always-on hardcoded self row is present exactly once.
+        assert_eq!(
+            result
+                .iter()
+                .filter(|s| s.primary_source() == McpConfigSource::Codemux)
+                .count(),
+            1
+        );
         // `demo` from the same file still shows up.
         assert!(result.iter().any(|s| s.name == "demo"));
     }
