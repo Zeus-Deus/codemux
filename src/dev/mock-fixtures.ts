@@ -112,6 +112,44 @@ function terminalSurface(label: string, cwd: string): PaneRefs {
   return { pane, surface, tab, session };
 }
 
+/** Build a one-chat surface (+ its tab) for a workspace: the surface
+ *  root is an `agent_chat` pane with no thread bound yet, exactly the
+ *  state `create_agent_chat_pane` leaves a fresh pane in. Mounting it
+ *  drives the full mock chat flow (start_session → attach channel →
+ *  send_turn → streamed `content_delta`s) in plain-browser dev. */
+function chatSurface(cwd: string): {
+  surface: SurfaceSnapshot;
+  tab: TabSnapshot;
+} {
+  const n = ++paneSeq;
+  const paneId = `pane-${n}`;
+  const pane: PaneNodeSnapshot = {
+    kind: "agent_chat",
+    pane_id: paneId,
+    title: "Agent Chat",
+    thread_id: null,
+    provider: "claude",
+    cwd,
+  };
+  const surface: SurfaceSnapshot = {
+    surface_id: `surface-${n}`,
+    title: "Agent Chat",
+    root: pane,
+    active_pane_id: paneId,
+  };
+  const tab: TabSnapshot = {
+    tab_id: `tab-${n}`,
+    // The real backend files chat tabs under TabKind::Terminal too
+    // (state_impl.rs::create_agent_chat_pane).
+    kind: "terminal",
+    title: "Agent Chat",
+    surface_id: surface.surface_id,
+    browser_id: null,
+    icon: null,
+  };
+  return { surface, tab };
+}
+
 interface WorkspaceSeed extends Partial<WorkspaceSnapshot> {
   workspace_id: string;
   title: string;
@@ -261,6 +299,32 @@ const wsCodemuxMock = makeWorkspace({
   git_changed_files: 6,
 });
 
+/** Chat workspace: its tab opens directly on an `agent_chat` pane so
+ *  the per-thread Channel streaming path (issue #75) is exercisable
+ *  in plain-browser dev. The extra chat surface REPLACES the default
+ *  terminal surface from `makeWorkspace`. */
+const wsCodemuxChat = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/feature-75-chat-channel`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-chat",
+    title: "chat-streaming",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "feature/75-chat-channel",
+  });
+  const { surface, tab } = chatSurface(cwd);
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
 const wsCodemuxPorts = makeWorkspace({
   workspace_id: "ws-codemux-ports",
   title: "port-detection",
@@ -377,6 +441,7 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxAuth,
   wsCodemuxSidebar,
   wsCodemuxMock,
+  wsCodemuxChat,
   wsCodemuxPorts,
   wsVexisMain,
   wsVexisCuda,

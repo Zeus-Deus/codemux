@@ -261,7 +261,7 @@ The frontend is React + Tailwind v4 + shadcn + Vite. The Rust backend is unchang
 - Pane splits (horizontal/vertical) with CSS Grid, resize handles, drag-to-swap
 - Right panel with Changes panel, File tree, and Review (PR) panel tabs
 - OpenFlow UI: orchestration view, agent config, communication panel, agent graph
-- Agent Chat UI: chat pane, composer (with `+` popup, `@` mention popup, slash command popup, image paste/drop), transcript, mode pill, model picker, session selector, attachment chips, plan proposal block, AskUserQuestion panel, thinking indicator, permission request block, tool-call card with per-tool body rendering, debug-mode banner + exit dialog
+- Agent Chat UI: chat pane, composer (with `+` popup, `@` mention popup, slash command popup, image paste/drop), transcript, mode pill, model picker, session selector, attachment chips, plan proposal block, AskUserQuestion panel, thinking indicator, permission request block, tool-call card with per-tool body rendering, debug-mode banner + exit dialog; runtime events (incl. `content_delta` token stream) arrive per-thread over a Tauri Channel (`attach_agent_chat_output`, issue #75) instead of the global event bus
 - Settings panel (15+ sections including Beta Features, Sync, Skills, MCP, Permissions)
 - Command palette (Ctrl+K) with fuzzy search
 - Search: file name search (Ctrl+Shift+P) and content search (Ctrl+Shift+F)

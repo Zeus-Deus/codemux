@@ -182,6 +182,12 @@ pub fn run() {
         .manage(encryption::EncryptionManager::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        // Per-thread live event channels for the chat pane: each
+        // mounted pane attaches a tauri::ipc::Channel keyed by
+        // thread_id; forward_event routes that thread's runtime
+        // events (incl. the content_delta token stream) to it instead
+        // of broadcasting on the global event bus. See issue #75.
+        .manage(commands::agent_chat::AgentChatChannelRegistry::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
@@ -1487,6 +1493,8 @@ pub fn run() {
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
+            commands::attach_agent_chat_output,
+            commands::detach_agent_chat_output,
             commands::opencode_check_availability,
             commands::opencode_ping,
             commands::opencode_list_models,

@@ -154,13 +154,119 @@ function pushMockTerminalBanner(channel: unknown): void {
   }
 }
 
+// ── Agent chat: per-thread Channel streaming simulator ─────────────
+//
+// Mirrors the issue #75 backend: a chat pane registers a
+// `tauri::ipc::Channel` per thread via `attach_agent_chat_output`,
+// and live runtime events — crucially the `content_delta` token
+// stream — arrive over that channel only (never the global event
+// bus). The mock keeps a thread→channel map and pushes ordered
+// `{ index, message }` frames through the channel's
+// `transformCallback` dispatcher, exactly like the real IPC layer, so
+// the unmodified `@tauri-apps/api` Channel machinery (ordering buffer
+// included) runs for real in browser dev.
+
+interface MockChatChannelEntry {
+  /** The `@tauri-apps/api` Channel object passed by the frontend. */
+  channel: unknown;
+  /** Attach generation; detach only removes on match (issue #75). */
+  generation: number;
+  /** Next ordered frame index for this channel. */
+  nextIndex: number;
+}
+
+const chatChannels = new Map<string, MockChatChannelEntry>();
+let chatChannelGeneration = 0;
+let chatTurnSeq = 0;
+
+function chatChannelPush(entry: MockChatChannelEntry, payload: unknown): void {
+  const id = (entry.channel as { id?: number } | undefined)?.id;
+  if (typeof id !== "number") return;
+  const cb = callbacks.get(id);
+  if (!cb) return;
+  try {
+    cb.fn({ index: entry.nextIndex++, message: payload } as unknown as never);
+  } catch (err) {
+    console.error("[dev mock] chat channel push threw:", err);
+  }
+}
+
+/** Route one runtime event to the thread's attached channel — the
+ *  mock twin of `forward_event`'s channel arm. No channel → drop. */
+function emitChatEvent(threadId: string, event: unknown): void {
+  const entry = chatChannels.get(threadId);
+  if (!entry) return;
+  chatChannelPush(entry, { thread_id: threadId, event });
+}
+
+const chatSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Simulate a full agent turn: running → token-by-token
+ *  `content_delta`s → `item_completed` → `turn_completed` → ready. */
+async function streamMockChatReply(
+  threadId: string,
+  turnId: string,
+  userText: string,
+): Promise<void> {
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "running", active_turn: turnId },
+  });
+  const reply =
+    "Streaming from the dev mock over a per-thread Tauri Channel — " +
+    "every token in this reply arrived as its own `content_delta` " +
+    "frame through the same `@tauri-apps/api` Channel dispatcher the " +
+    "real backend uses.\n\n" +
+    `You said: “${userText.trim().slice(0, 120)}”. ` +
+    "In a real session this text would come from the provider " +
+    "sidecar; run `npm run tauri:dev` for live IPC.";
+  const tokens = reply.match(/\S+\s*/g) ?? [];
+  let assembled = "";
+  for (const token of tokens) {
+    await chatSleep(24);
+    assembled += token;
+    emitChatEvent(threadId, {
+      type: "content_delta",
+      thread_id: threadId,
+      turn_id: turnId,
+      delta: { kind: "text", text: token },
+    });
+  }
+  emitChatEvent(threadId, {
+    type: "item_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    item: { kind: "assistant_text", text: assembled },
+  });
+  emitChatEvent(threadId, {
+    type: "turn_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    status: { kind: "success" },
+    usage: {
+      total_cost_usd: null,
+      duration_ms: tokens.length * 24,
+      num_turns: 1,
+    },
+  });
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "ready" },
+  });
+}
+
 // ── Static command returns ──────────────────────────────────────────
 
 const FEATURE_FLAGS: FeatureFlags = {
   unstable_openflow: false,
   unstable_browser_automation: false,
   unstable_indexing: false,
-  enable_agent_chat: false,
+  // ON so the seeded `agent_chat` pane (ws-codemux-chat) mounts the
+  // real chat UI and exercises the per-thread Channel streaming path
+  // (issue #75) against the mock token-stream simulator below.
+  enable_agent_chat: true,
   enable_lazy_workspace_creation: false,
 };
 
@@ -310,8 +416,54 @@ const handlers: Record<string, Handler> = {
   // ── Resource monitor ──
   get_resource_metrics: () => resourceMetrics(),
 
-  // ── Agent chat capabilities (gated off, returned safe anyway) ──
+  // ── Agent chat ──
   list_chat_provider_capabilities: () => EMPTY_CAPABILITIES,
+
+  // Session lifecycle: echo back the frontend-minted thread id, and
+  // answer the turn with the channel-streamed mock reply.
+  agent_chat_start_session: (a) => {
+    const input = a.input as { thread_id: string } | undefined;
+    if (!input?.thread_id) throw new Error("mock: missing thread_id");
+    return input.thread_id;
+  },
+  agent_chat_send_turn: (a) => {
+    const input = a.input as { thread_id: string; text: string } | undefined;
+    if (!input?.thread_id) throw new Error("mock: missing thread_id");
+    const turnId = `mock-turn-${++chatTurnSeq}`;
+    void streamMockChatReply(input.thread_id, turnId, input.text ?? "");
+    return turnId;
+  },
+  agent_chat_interrupt_turn: () => undefined,
+  agent_chat_stop_session: () => undefined,
+  agent_chat_set_model: () => undefined,
+  agent_chat_set_permission_mode: () => undefined,
+  agent_chat_respond_to_request: () => undefined,
+  agent_chat_list_sessions: () => [],
+  agent_chat_list_messages: () => [],
+  grep_count_pattern: () => 0,
+
+  // ── Agent chat per-thread event channel (issue #75) ──
+  // Mirrors AgentChatChannelRegistry: newest attach wins, detach is
+  // generation-guarded so a stale unmount can't tear down a newer
+  // pane's channel.
+  attach_agent_chat_output: (a) => {
+    const threadId = a.threadId as string;
+    const generation = ++chatChannelGeneration;
+    chatChannels.set(threadId, {
+      channel: a.channel,
+      generation,
+      nextIndex: 0,
+    });
+    return generation;
+  },
+  detach_agent_chat_output: (a) => {
+    const threadId = a.threadId as string;
+    const entry = chatChannels.get(threadId);
+    if (entry && entry.generation === a.generation) {
+      chatChannels.delete(threadId);
+    }
+    return undefined;
+  },
 
   // ── Presets ──
   get_presets: () => EMPTY_PRESETS,

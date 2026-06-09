@@ -7,7 +7,7 @@ import type {
   OpenCodeProviderEntry,
   ProviderChatCapabilities,
 } from "./types";
-import type { ApprovalDecision } from "./events";
+import type { AgentChatEventPayload, ApprovalDecision } from "./events";
 import type {
   UserSettings,
   AgentConfig,
@@ -1297,6 +1297,32 @@ export const agentChatDeleteSession = (threadId: string) =>
  */
 export const agentChatListMessages = (threadId: string) =>
   invoke<string[]>("agent_chat_list_messages", { threadId });
+
+/**
+ * Register a per-thread `Channel` that receives every live
+ * `AgentChatEventPayload` for `threadId` — including the
+ * high-frequency `content_delta` token stream. Mirrors the PTY
+ * `attach_pty_output` pattern: Channels are Tauri's high-throughput
+ * streaming primitive, unlike the broadcast event bus.
+ *
+ * Returns the attach generation. Pass it back to
+ * `detachAgentChatOutput` on teardown so a stale detach (unmount
+ * racing a remount) can never clobber a newer pane's channel.
+ *
+ * The channel carries live events only: late-attaching / resumed
+ * panes rebuild history via `agentChatListMessages` hydrate.
+ */
+export const attachAgentChatOutput = (
+  threadId: string,
+  channel: Channel<AgentChatEventPayload>,
+) => invoke<number>("attach_agent_chat_output", { threadId, channel });
+
+/** Tear down the channel installed by `attachAgentChatOutput`.
+ *  Idempotent; a mismatched generation is a silent no-op. */
+export const detachAgentChatOutput = (
+  threadId: string,
+  generation: number,
+) => invoke<void>("detach_agent_chat_output", { threadId, generation });
 
 // ── OpenCode (Step 12 Stage 1) ──
 //
