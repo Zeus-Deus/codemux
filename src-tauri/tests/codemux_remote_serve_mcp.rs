@@ -41,6 +41,15 @@ fn binary_path() -> PathBuf {
 struct ServeFixture {
     child: Child,
     state_dir: TempDir,
+    /// Isolated `HOME` for the daemon. Two reasons it must never be
+    /// the developer's real home: (1) `worktree_create` materialises
+    /// worktrees under `$HOME/.codemux/worktrees/...`; (2) on startup
+    /// the daemon auto-registers `codemux-remote mcp` into agent
+    /// configs (`~/.claude.json`, …) — pointing them at this build's
+    /// transient debug binary, which both pollutes the developer's
+    /// machine and breaks the `commands::mcp` discovery unit tests
+    /// that scan real user-level config paths.
+    home: TempDir,
     endpoint: String,
     secret: String,
 }
@@ -55,6 +64,7 @@ impl ServeFixture {
             bin
         );
         let state_dir = TempDir::new().expect("tempdir");
+        let home = TempDir::new().expect("home tempdir");
         // Spawn the daemon. Inherit stderr so test failures surface
         // the daemon's own diagnostics. Redirect stdout to /dev/null
         // because we don't care about it (the daemon logs to stderr).
@@ -62,6 +72,7 @@ impl ServeFixture {
         cmd.arg("serve")
             .arg("--state-dir")
             .arg(state_dir.path())
+            .env("HOME", home.path())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
         let child = cmd.spawn().expect("spawn codemux-remote serve");
@@ -108,7 +119,7 @@ impl ServeFixture {
             std::thread::sleep(Duration::from_millis(100));
         }
 
-        Self { child, state_dir, endpoint, secret }
+        Self { child, state_dir, home, endpoint, secret }
     }
 
     fn stop(mut self) {
@@ -214,6 +225,157 @@ fn http_workspace_create_then_list() {
     let body: Value = resp.json().unwrap();
     let workspaces = body["data"]["workspaces"].as_array().unwrap();
     assert!(workspaces.iter().any(|w| w["id"] == json!(id)));
+
+    fx.stop();
+}
+
+/// Run `git -C <dir> <args>`, asserting success; returns trimmed stdout.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("spawn git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Headless worktree provisioning parity (issue #78), end-to-end
+/// through the real daemon over HTTP:
+///
+/// 1. A bare "origin" + a local clone whose `origin/main` is one
+///    commit stale (a publisher clone pushed after the local clone).
+/// 2. `worktree_create` against the local clone must land the new
+///    branch on the FRESH origin tip (fetch-before-branch), not the
+///    stale local ref.
+/// 3. The gitignored `.env` must be copied into the worktree before
+///    the tool returns.
+/// 4. The project's `.codemux/config.json` setup script must run with
+///    the CODEMUX_* env + the deterministic port from the response.
+#[test]
+fn http_worktree_create_provisions_like_desktop() {
+    let work = TempDir::new().expect("work tempdir");
+
+    // Seed repo with provisioning config committed.
+    let seed = work.path().join("seed");
+    std::fs::create_dir_all(&seed).unwrap();
+    git(&seed, &["init", "--initial-branch=main"]);
+    git(&seed, &["config", "user.email", "t@e.com"]);
+    git(&seed, &["config", "user.name", "T"]);
+    std::fs::write(seed.join("README.md"), "hi").unwrap();
+    std::fs::write(seed.join(".gitignore"), ".env\nsetup-ran.txt\n").unwrap();
+    std::fs::create_dir_all(seed.join(".codemux")).unwrap();
+    std::fs::write(
+        seed.join(".codemux/config.json"),
+        r#"{"setup": ["printf '%s|%s|%s|%s' \"$CODEMUX_BRANCH\" \"$CODEMUX_PORT\" \"$CODEMUX_ROOT_PATH\" \"$CODEMUX_WORKSPACE_PATH\" > setup-ran.txt"]}"#,
+    )
+    .unwrap();
+    git(&seed, &["add", "."]);
+    git(&seed, &["commit", "-m", "init"]);
+
+    // Bare origin + local clone + publisher that makes local stale.
+    let bare = work.path().join("origin.git");
+    git(work.path(), &["clone", "--bare", seed.to_str().unwrap(), bare.to_str().unwrap()]);
+    let local = work.path().join("local");
+    git(work.path(), &["clone", bare.to_str().unwrap(), local.to_str().unwrap()]);
+    let publisher = work.path().join("publisher");
+    git(work.path(), &["clone", bare.to_str().unwrap(), publisher.to_str().unwrap()]);
+    git(
+        &publisher,
+        &["-c", "user.name=T", "-c", "user.email=t@e.com",
+          "commit", "--allow-empty", "-m", "remote-only"],
+    );
+    git(&publisher, &["push", "origin", "main"]);
+
+    let remote_tip = git(&bare, &["rev-parse", "main"]);
+    let stale = git(&local, &["rev-parse", "refs/remotes/origin/main"]);
+    assert_ne!(stale, remote_tip, "precondition: local origin/main must be stale");
+
+    // The gitignored .env exists only in the local clone's root —
+    // exactly the untracked artifact the includes step must carry over.
+    std::fs::write(local.join(".env"), "SECRET=remote-host").unwrap();
+
+    // The fixture isolates HOME, so the worktree lands in its tempdir.
+    let fx = ServeFixture::start();
+    let client = reqwest::blocking::Client::new();
+
+    let resp = client
+        .post(format!("{}/tools/call", fx.endpoint))
+        .bearer_auth(&fx.secret)
+        .json(&json!({
+            "name": "worktree_create",
+            "arguments": {
+                "repo_path": local.to_string_lossy(),
+                "branch": "provisioned",
+                "base": "main"
+            }
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().unwrap();
+    assert_eq!(body["ok"], json!(true), "body: {body}");
+
+    let ws = &body["data"]["workspace"];
+    let setup = &body["data"]["setup"];
+    let wt = PathBuf::from(ws["path"].as_str().expect("workspace.path"));
+    assert!(
+        wt.starts_with(fx.home.path()),
+        "worktree must live under the isolated HOME: {}",
+        wt.display()
+    );
+
+    // (2) Fetch-before-branch: new branch starts at the fresh tip.
+    assert_eq!(
+        git(&wt, &["rev-parse", "HEAD"]),
+        remote_tip,
+        "daemon-created branch must start at the freshly-fetched origin/main"
+    );
+
+    // (3) Includes copied synchronously.
+    assert_eq!(
+        std::fs::read_to_string(wt.join(".env")).unwrap(),
+        "SECRET=remote-host"
+    );
+    assert!(setup["includes_copied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == ".env"));
+
+    // (4) Setup script ran with CODEMUX_* env + the reported port.
+    assert_eq!(setup["setup_commands"], json!(1));
+    let port = setup["port"].as_u64().expect("setup.port");
+    let marker = wt.join("setup-ran.txt");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !marker.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "setup script never produced {}",
+            marker.display()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let recorded = std::fs::read_to_string(&marker).unwrap();
+    let parts: Vec<&str> = recorded.split('|').collect();
+    assert_eq!(parts.len(), 4, "marker: {recorded}");
+    assert_eq!(parts[0], "provisioned", "CODEMUX_BRANCH");
+    assert_eq!(parts[1], port.to_string(), "CODEMUX_PORT");
+    assert_eq!(
+        std::fs::canonicalize(parts[2]).unwrap(),
+        std::fs::canonicalize(&local).unwrap(),
+        "CODEMUX_ROOT_PATH"
+    );
+    assert_eq!(
+        std::fs::canonicalize(parts[3]).unwrap(),
+        std::fs::canonicalize(&wt).unwrap(),
+        "CODEMUX_WORKSPACE_PATH"
+    );
 
     fx.stop();
 }

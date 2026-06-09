@@ -137,7 +137,7 @@ Headless tool surface (advertised via `tools/list`):
 | Tool | Purpose |
 |---|---|
 | `workspace_create` | Register a new workspace. |
-| `worktree_create` | `git worktree add` a branch under `~/.codemux/worktrees/<repo>/<branch>` (desktop layout) and register it with `kind = worktree` sharing the parent repo's `project_uid`. |
+| `worktree_create` | `git worktree add` a branch under `~/.codemux/worktrees/<repo>/<branch>` (desktop layout) and register it with `kind = worktree` sharing the parent repo's `project_uid`. Desktop parity (issue #78): fetches `base` from origin first so new branches start at the remote tip (best-effort, 10s cap, offline falls back to local refs), copies gitignored include files (`.env` & co, `.codemuxinclude` → defaults) from the parent repo before returning, and runs the project's `.codemux/config.json` setup commands on a background thread with `CODEMUX_ROOT_PATH`/`CODEMUX_WORKSPACE_PATH`/`CODEMUX_BRANCH`/`CODEMUX_PORT` (+ NAME/ID) set — `CODEMUX_PORT` comes from the same deterministic `allocate_workspace_port` hash as the desktop. The response's `setup` field reports `{port, includes_copied, setup_commands, setup_running}`; setup progress/failures go to the daemon's stderr (journal). The Settings-UI script fallback is desktop-only (it lives in the desktop SQLite DB), so headless config is file-based only. |
 | `workspace_list` | All workspaces, newest first. |
 | `workspace_info` | One workspace by id. |
 | `workspace_update` | Mutate name/branch/notes. |

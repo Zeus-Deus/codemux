@@ -22,6 +22,8 @@ config/master.key
 
 Files are copied (not symlinked), preserving directory structure. Runs before setup scripts so copied files are available during setup.
 
+The same bootstrap (includes copy + setup scripts + env vars below) also runs when a worktree is created on a remote host through the headless daemon's `worktree_create` MCP tool — see `docs/features/setup-teardown.md` § "Headless Daemon Parity".
+
 ## Environment Variables
 
 Setup and teardown scripts receive:
