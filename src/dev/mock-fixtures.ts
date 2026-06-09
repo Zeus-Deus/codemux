@@ -112,6 +112,50 @@ function terminalSurface(label: string, cwd: string): PaneRefs {
   return { pane, surface, tab, session };
 }
 
+/** Thread id of the pre-seeded agent-chat workspace. The mock's
+ *  `agent_chat_list_messages` returns a long generated transcript for
+ *  this id so the virtualized MessageList can be exercised in a plain
+ *  browser (issue #77). */
+export const MOCK_CHAT_THREAD_ID = "thread-mock-chat";
+
+/** Build an agent-chat surface (+ tab) for a workspace. Mirrors the
+ *  backend's `create_agent_chat_pane`: the surface root is an
+ *  `agent_chat` pane and the tab keeps `kind: "terminal"` (TabKind has
+ *  no chat variant — the pane node drives rendering). */
+function chatSurface(
+  label: string,
+  cwd: string,
+): { pane: PaneNodeSnapshot; surface: SurfaceSnapshot; tab: TabSnapshot } {
+  const n = ++paneSeq;
+  const paneId = `pane-${n}`;
+  const surfaceId = `surface-${n}`;
+  const tabId = `tab-${n}`;
+
+  const pane: PaneNodeSnapshot = {
+    kind: "agent_chat",
+    pane_id: paneId,
+    title: label,
+    thread_id: MOCK_CHAT_THREAD_ID,
+    provider: "claude",
+    cwd,
+  };
+  const surface: SurfaceSnapshot = {
+    surface_id: surfaceId,
+    title: label,
+    root: pane,
+    active_pane_id: paneId,
+  };
+  const tab: TabSnapshot = {
+    tab_id: tabId,
+    kind: "terminal",
+    title: label,
+    surface_id: surfaceId,
+    browser_id: null,
+    icon: null,
+  };
+  return { pane, surface, tab };
+}
+
 interface WorkspaceSeed extends Partial<WorkspaceSnapshot> {
   workspace_id: string;
   title: string;
@@ -208,6 +252,29 @@ const wsCodemuxMain = makeWorkspace({
   git_branch: "main",
   status: "working", // amber pulsing dot on the primary row
 });
+
+/** Agent-chat workspace: a single `agent_chat` pane bound to
+ *  `MOCK_CHAT_THREAD_ID`. The mock hydrates a long transcript for it
+ *  so list virtualization is observable in the browser. */
+const wsCodemuxChat: WorkspaceSnapshot = (() => {
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-chat",
+    title: "agent-chat-demo",
+    cwd: codemuxRoot,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "main",
+    git_branch: "main",
+  });
+  const { surface, tab } = chatSurface("Agent Chat", codemuxRoot);
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
 
 const wsCodemuxAuth = makeWorkspace({
   workspace_id: "ws-codemux-auth",
@@ -374,6 +441,7 @@ const wsSiteRedesign = makeWorkspace({
 
 const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxMain,
+  wsCodemuxChat,
   wsCodemuxAuth,
   wsCodemuxSidebar,
   wsCodemuxMock,
