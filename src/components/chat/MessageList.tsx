@@ -1,5 +1,13 @@
 import { ChevronDown, ChevronUp } from "lucide-react";
-import { memo, useCallback, useMemo, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 
 import type {
   ChatViewItem,
@@ -11,6 +19,7 @@ import type { ApprovalDecision } from "@/tauri/events";
 import { AssistantMessage } from "./AssistantMessage";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
+import { ThinkingIndicator } from "./ThinkingIndicator";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
 
@@ -20,9 +29,20 @@ const RUN_COLLAPSE_THRESHOLD = 6;
 /** When a run is collapsed, keep this many most-recent tool calls
  *  visible — "a handful of the most recent tool calls happening." */
 const RUN_TAIL_VISIBLE = 4;
+/** How close to the bottom (px) the user must be for auto-scroll to
+ *  keep following the streaming tail. Matches the pre-virtualization
+ *  ChatTranscript pin threshold. */
+const PIN_THRESHOLD_PX = 80;
+/** Extra off-screen pixels Virtuoso keeps rendered above/below the
+ *  viewport. Trades a few more mounted rows for smoother scrolling. */
+const OVERSCAN_PX = 600;
 
 interface Props {
   messages: ChatViewItem[];
+  /** Render the tail "thinking" pulse as the last virtual row. Lives
+   *  inside the virtualized list (not a footer) so the stick-to-bottom
+   *  scroll keeps it visible while streaming. */
+  showThinking?: boolean;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   /** Plan-accept: parent flips the live session to `default` mode
    *  and sends a "Proceed with the plan." synthetic turn. The
@@ -32,12 +52,37 @@ interface Props {
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   /** Plan-reject: parent sends a generic "Please revise the plan."
    *  turn. No feedback is collected from the user — matching the
-   *  Cursor / VS Code plan UIs. */
+   *  plan UIs of other agentic editors. */
   onRejectPlan: (requestId: string) => void | Promise<void>;
 }
 
+/**
+ * Virtualized transcript body (issue #77). Only the on-screen window
+ * of rows (plus OVERSCAN_PX of slack) is mounted in the DOM, so a
+ * 5,000-message session scrolls like a 50-message one.
+ *
+ * Library choice: `react-virtuoso` (MIT). Evaluated against
+ * `@tanstack/react-virtual` and `react-window` — Virtuoso is the only
+ * one with built-in dynamic row measurement (ResizeObserver-driven,
+ * required because messages / tool cards / plan blocks / collapses
+ * vary wildly in height and resize on expand) plus first-class
+ * bottom-anchoring primitives. The commercially licensed
+ * `@virtuoso.dev/message-list` package is NOT used.
+ *
+ * MessageList owns the scroll container now (Virtuoso must control
+ * its own scroller to translate scroll offsets into the rendered
+ * window). The stick-to-bottom contract is unchanged from the
+ * pre-virtualization ChatTranscript:
+ *   - track "pinned" from scroll events (distance ≤ PIN_THRESHOLD_PX);
+ *   - after every transcript change (and thinking-pulse toggle), if
+ *     pinned, snap to the tail;
+ *   - content growth alone never unpins (growth fires no scroll
+ *     event), and a user wheel-up unpins on the next scroll event,
+ *     so auto-scroll never fights the user.
+ */
 export function MessageList({
   messages,
+  showThinking = false,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -83,6 +128,9 @@ export function MessageList({
   // transcript. Non-tool items break a run. Tool calls carrying an
   // active approval footer stay out of runs — the approval needs to
   // remain interactable without the user hunting for it.
+  //
+  // Each slot is one virtual row: a collapsed run is a single row that
+  // expands in place (Virtuoso re-measures it via ResizeObserver).
   const slots = useMemo<RenderSlot[]>(() => {
     const out: RenderSlot[] = [];
     let run: ToolCallItem[] = [];
@@ -107,52 +155,135 @@ export function MessageList({
       }
     }
     flush();
+    if (showThinking) out.push({ kind: "thinking" });
     return out;
-  }, [ordered]);
+  }, [ordered, showThinking]);
 
-  // Pre-resolve the approval lookup at the parent so MessageRow gets
-  // a stable `approval` reference instead of the requestsById map
-  // (which is a fresh Map ref on every parent render). Without this
-  // the React.memo on MessageRow can never skip a re-render — the
-  // map identity churn alone would force a re-mount of every row on
-  // every streaming token.
-  return (
-    <div className="flex flex-col gap-3">
-      {slots.map((slot) => {
-        if (slot.kind === "item") {
-          return (
-            <MessageRowMemo
-              key={slot.item.id}
-              item={slot.item}
-              approval={lookupApproval(slot.item, requestsById)}
-              isMerged={isMerged(slot.item, mergedRequestIds)}
+  const virtuosoRef = useRef<VirtuosoHandle | null>(null);
+  // Whether the user is at (or near) the bottom. Starts true so a
+  // freshly mounted pane follows the tail immediately — matching the
+  // pre-virtualization behavior.
+  const pinnedToBottomRef = useRef(true);
+
+  // Track pinned-ness from real scroll events on Virtuoso's scroller
+  // element. Content growth doesn't fire `scroll`, so streaming can
+  // never unpin by itself; only the user (or our own snap) moves it.
+  const scrollerCleanupRef = useRef<(() => void) | null>(null);
+  const handleScrollerRef = useCallback((el: HTMLElement | Window | null) => {
+    scrollerCleanupRef.current?.();
+    scrollerCleanupRef.current = null;
+    if (!(el instanceof HTMLElement)) return;
+    const onScroll = () => {
+      const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+      pinnedToBottomRef.current = distance <= PIN_THRESHOLD_PX;
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    scrollerCleanupRef.current = () =>
+      el.removeEventListener("scroll", onScroll);
+  }, []);
+
+  // After each transcript update — or when the thinking pulse toggles —
+  // if we were pinned, stick to the tail. `scrollToIndex(LAST, end)`
+  // also covers the tail-row-grows-without-count-change case (token
+  // deltas mutate the trailing assistant row in place). Runs on mount
+  // too (pinned starts true), so a remounted pane with an existing
+  // transcript opens at the tail, like a conversation should.
+  useLayoutEffect(() => {
+    if (!pinnedToBottomRef.current) return;
+    virtuosoRef.current?.scrollToIndex({ index: "LAST", align: "end" });
+  }, [slots]);
+
+  const itemContent = useCallback(
+    (_index: number, slot: RenderSlot) => {
+      if (slot.kind === "thinking") {
+        return (
+          <div className="px-4 pb-3">
+            <div
+              className="mx-auto w-full max-w-2xl"
+              role="status"
+              aria-label="Agent is thinking"
+            >
+              <ThinkingIndicator />
+            </div>
+          </div>
+        );
+      }
+      if (slot.kind === "item") {
+        return (
+          <div className="px-4 pb-3">
+            <div className="mx-auto w-full max-w-2xl">
+              <MessageRowMemo
+                item={slot.item}
+                approval={lookupApproval(slot.item, requestsById)}
+                isMerged={isMerged(slot.item, mergedRequestIds)}
+                onRespondToRequest={onRespondToRequest}
+                onAcceptPlan={onAcceptPlan}
+                onRejectPlan={onRejectPlan}
+              />
+            </div>
+          </div>
+        );
+      }
+      return (
+        <div className="px-4 pb-3">
+          <div className="mx-auto w-full max-w-2xl">
+            <ToolRunCollapse
+              items={slot.items}
+              requestsById={requestsById}
               onRespondToRequest={onRespondToRequest}
               onAcceptPlan={onAcceptPlan}
               onRejectPlan={onRejectPlan}
             />
-          );
-        }
-        return (
-          <ToolRunCollapse
-            // Key on the first item's id so React preserves expand
-            // state across re-renders even when new tool calls arrive
-            // at the tail of a streaming run.
-            key={`run:${slot.items[0].id}`}
-            items={slot.items}
-            requestsById={requestsById}
-            onRespondToRequest={onRespondToRequest}
-            onAcceptPlan={onAcceptPlan}
-            onRejectPlan={onRejectPlan}
-          />
-        );
-      })}
-    </div>
+          </div>
+        </div>
+      );
+    },
+    [
+      requestsById,
+      mergedRequestIds,
+      onRespondToRequest,
+      onAcceptPlan,
+      onRejectPlan,
+    ],
+  );
+
+  return (
+    <Virtuoso<RenderSlot>
+      ref={virtuosoRef}
+      scrollerRef={handleScrollerRef}
+      style={VIRTUOSO_STYLE}
+      data={slots}
+      computeItemKey={computeSlotKey}
+      itemContent={itemContent}
+      increaseViewportBy={OVERSCAN_PX}
+      components={VIRTUOSO_COMPONENTS}
+    />
   );
 }
 
+const VIRTUOSO_STYLE = { height: "100%" } as const;
+
+/** Top/bottom breathing room inside the scroller — replaces the old
+ *  ChatTranscript `py-4` + trailing `h-4` spacer. Stable component
+ *  refs (module scope) so Virtuoso never remounts them. */
+const VIRTUOSO_COMPONENTS = {
+  Header: () => <div className="h-4" />,
+  Footer: () => <div className="h-4" />,
+};
+
 type RenderSlot =
   | { kind: "item"; item: ChatViewItem }
-  | { kind: "toolRun"; items: ToolCallItem[] };
+  | { kind: "toolRun"; items: ToolCallItem[] }
+  | { kind: "thinking" };
+
+/** Stable per-slot keys: the same id-based keys the plain `.map()`
+ *  render used, so React row identity (and `MessageRowMemo` skips)
+ *  survives the virtualization window sliding around. */
+function computeSlotKey(_index: number, slot: RenderSlot): string {
+  if (slot.kind === "item") return slot.item.id;
+  if (slot.kind === "toolRun") return `run:${slot.items[0].id}`;
+  return "thinking";
+}
 
 function lookupApproval(
   item: ChatViewItem,
@@ -179,9 +310,9 @@ function isMerged(
  * calls into a "Show N earlier tool calls" toggle + the last
  * RUN_TAIL_VISIBLE rows. Click to expand; click again to collapse.
  *
- * Uses `display: contents` on the wrapper so the inner rows remain
- * direct flex children of the parent transcript and inherit its
- * `gap-3` vertical rhythm without introducing a nested box.
+ * The whole run is a single virtual row; expanding it grows the row
+ * in place and Virtuoso re-measures via its ResizeObserver. The inner
+ * rows reproduce the transcript's `gap-3` vertical rhythm.
  */
 function ToolRunCollapse({
   items,
@@ -202,7 +333,7 @@ function ToolRunCollapse({
   const pluralSuffix = hiddenCount === 1 ? "" : "s";
 
   return (
-    <div className="contents">
+    <div className="flex flex-col gap-3">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
