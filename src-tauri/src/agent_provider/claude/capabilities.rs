@@ -542,7 +542,7 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ClaudeFamily {
     /// Top tier above Opus (e.g. `claude-fable-5`).
     Fable,
@@ -574,8 +574,9 @@ impl ClaudeFamily {
         }
     }
 
-    /// Flagship-tier families share the full effort vocabulary, an
-    /// `xhigh` default, and prompt-injected `ultrathink`. New top-tier
+    /// Flagship-tier families share the full effort vocabulary, a
+    /// `high` default (the level the CLI's own `/model` slider marks
+    /// as "(default)"), and prompt-injected `ultrathink`. New top-tier
     /// families only need a `from_id` arm and a mention here to surface
     /// fully-configured in the picker.
     fn is_flagship(self) -> bool {
@@ -680,8 +681,40 @@ async fn harvest_via_sidecar() -> Result<ProviderChatCapabilities, HarvestError>
     Ok(build_capabilities_from_sdk(parsed.models))
 }
 
+/// The deployed CLI's `supportedModels()` is a *curated picker roster*,
+/// not the full launchable surface — Claude Code accepts previous model
+/// names via `--model` even when its picker no longer lists them (the
+/// `/model` menu itself says "For other/previous model names, specify
+/// with --model"). When the live roster carries no entry of a
+/// maintained family (e.g. the CLI demoted Opus into its `default`
+/// alias), append that family's maintained entries so every launchable
+/// model stays individually selectable.
+///
+/// The `default` alias deliberately does NOT mark any concrete family
+/// as present: it tracks the *user's own* configured default (whatever
+/// they last picked in `/model`), so it can't stand in for Opus — or
+/// any other family.
+fn append_missing_maintained_families(merged: &mut Vec<ChatModelInfo>) {
+    use std::collections::HashSet;
+    let present: HashSet<ClaudeFamily> = merged
+        .iter()
+        .map(|m| ClaudeFamily::from_id(&m.id))
+        .filter(|f| !matches!(f, ClaudeFamily::DefaultAlias | ClaudeFamily::Other))
+        .collect();
+    for m in models() {
+        let family = ClaudeFamily::from_id(&m.id);
+        if !matches!(family, ClaudeFamily::DefaultAlias | ClaudeFamily::Other)
+            && !present.contains(&family)
+        {
+            merged.push(m);
+        }
+    }
+}
+
 /// Build a `ProviderChatCapabilities` bundle from the SDK's live model
-/// list, merging with hand-maintained per-id metadata.
+/// list, merging with hand-maintained per-id metadata. Models the live
+/// roster omits but the CLI still launches are appended afterwards —
+/// see [`append_missing_maintained_families`].
 fn build_capabilities_from_sdk(
     sdk_models: Vec<SdkModelInfo>,
 ) -> ProviderChatCapabilities {
@@ -689,11 +722,12 @@ fn build_capabilities_from_sdk(
         .into_iter()
         .map(|m| (m.id.clone(), m))
         .collect();
-    let merged: Vec<ChatModelInfo> = sdk_models
+    let mut merged: Vec<ChatModelInfo> = sdk_models
         .into_iter()
         .filter(|m| !m.value.is_empty())
         .map(|sdk| merge_sdk_with_maintained(sdk, &maintained))
         .collect();
+    append_missing_maintained_families(&mut merged);
     ProviderChatCapabilities {
         models: merged,
         effort_granularity: EffortGranularity::PerSession,
@@ -1289,7 +1323,17 @@ mod tests {
             sdk_model("claude-opus-4-7", "Claude Opus 4.7", &["low"], None, None),
         ];
         let caps = build_capabilities_from_sdk(live);
-        assert_eq!(caps.models.len(), 1);
+        // The empty record is dropped; the single live entry leads the
+        // list (families the live roster lacks are appended after it).
+        assert!(caps.models.iter().all(|m| !m.id.is_empty()));
+        assert_eq!(caps.models[0].id, "claude-opus-4-7");
+        assert_eq!(
+            caps.models
+                .iter()
+                .filter(|m| ClaudeFamily::from_id(&m.id) == ClaudeFamily::Opus)
+                .count(),
+            1,
+        );
     }
 
     #[test]
@@ -1371,6 +1415,54 @@ mod tests {
         )];
         let caps = build_capabilities_from_sdk(live);
         assert_eq!(caps.models[0].default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn sdk_merge_appends_opus_when_live_roster_omits_the_family() {
+        // The deployed CLI's curated roster (default / fable / sonnet /
+        // haiku) carries no Opus entry, but `--model claude-opus-4-8`
+        // still launches. The maintained Opus entries must be appended
+        // after the live entries so they stay selectable. The `default`
+        // alias does not count as Opus — it tracks the user's own
+        // configured default.
+        let live = vec![
+            sdk_model("default", "Default (recommended)", &["low", "medium", "high", "xhigh", "max"], Some(true), Some(true)),
+            sdk_model("claude-fable-5[1m]", "Fable 5", &["low", "medium", "high", "xhigh", "max"], Some(true), None),
+            sdk_model("sonnet", "Sonnet", &["low", "medium", "high", "max"], Some(true), None),
+            sdk_model("haiku", "Haiku", &[], None, None),
+        ];
+        let caps = build_capabilities_from_sdk(live);
+        let ids: Vec<&str> = caps.models.iter().map(|m| m.id.as_str()).collect();
+        // Live entries first, in the CLI's order.
+        assert_eq!(&ids[..4], &["default", "claude-fable-5[1m]", "sonnet", "haiku"]);
+        // Every maintained Opus version appended afterwards.
+        for opus in ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"] {
+            assert!(ids.contains(&opus), "{opus} should be appended");
+        }
+        // Families already live must NOT be duplicated from the
+        // maintained list.
+        assert!(!ids.contains(&"claude-fable-5"));
+        assert!(!ids.contains(&"claude-sonnet-4-6"));
+        assert!(!ids.contains(&"claude-haiku-4-5"));
+        // Appended Opus keeps its precise maintained metadata.
+        let opus48 = caps.models.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
+        assert_eq!(opus48.label, "Claude Opus 4.8");
+        assert_eq!(opus48.default_effort.as_deref(), Some("high"));
+        assert!(opus48.context_window_options.iter().any(|o| o.value == "1m"));
+    }
+
+    #[test]
+    fn sdk_merge_does_not_append_a_family_the_live_roster_already_has() {
+        // If a future CLI lists Opus again (alias or full id), the
+        // maintained Opus entries must not duplicate it.
+        let live = vec![sdk_model("opus", "Opus", &["low", "medium", "high"], Some(true), None)];
+        let caps = build_capabilities_from_sdk(live);
+        let opus_rows = caps
+            .models
+            .iter()
+            .filter(|m| ClaudeFamily::from_id(&m.id) == ClaudeFamily::Opus)
+            .count();
+        assert_eq!(opus_rows, 1, "live opus row must suppress maintained opus entries");
     }
 
     #[test]
