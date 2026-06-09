@@ -1,18 +1,37 @@
-import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
+import { useEffect, useState } from "react";
+import {
+  History,
+  SplitSquareHorizontal,
+  SplitSquareVertical,
+  X,
+} from "lucide-react";
 
 import { SessionSelector } from "@/components/chat/SessionSelector";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { findWorkspaceIdForPane, useAppStore } from "@/stores/app-store";
 import {
+  agentChatGetCheckpoint,
   agentChatListMessages,
+  agentChatRestoreCheckpoint,
   agentChatStartSession,
   agentChatStopSession,
   closePane,
   splitPane,
   type AgentChatSessionRecord,
+  type WorkspaceCheckpoint,
 } from "@/tauri/commands";
 import type {
   AgentChatProviderKind,
@@ -157,6 +176,61 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
     closePane(pane.pane_id).catch(console.error);
   };
 
+  // Run-start rollback checkpoint (issue #80). The snapshot is taken
+  // in the background shortly after session start, so fetch once on
+  // thread bind and retry once after a short delay if it wasn't
+  // there yet. The affordance only renders when a checkpoint exists.
+  const [checkpoint, setCheckpoint] = useState<WorkspaceCheckpoint | null>(
+    null,
+  );
+  const [confirmRestoreOpen, setConfirmRestoreOpen] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  useEffect(() => {
+    setCheckpoint(null);
+    if (!pane.thread_id) return;
+    const threadId = pane.thread_id;
+    let cancelled = false;
+    let retryTimer: number | null = null;
+    const fetchCheckpoint = (retry: boolean) => {
+      agentChatGetCheckpoint(threadId)
+        .then((cp) => {
+          if (cancelled) return;
+          if (cp) {
+            setCheckpoint(cp);
+          } else if (retry) {
+            // The background snapshot may still be running right
+            // after session start — check again once.
+            retryTimer = window.setTimeout(
+              () => fetchCheckpoint(false),
+              4000,
+            );
+          }
+        })
+        .catch(() => {});
+    };
+    fetchCheckpoint(true);
+    return () => {
+      cancelled = true;
+      if (retryTimer != null) window.clearTimeout(retryTimer);
+    };
+  }, [pane.thread_id]);
+
+  const handleRestoreCheckpoint = async () => {
+    if (!pane.thread_id) return;
+    setRestoring(true);
+    try {
+      await agentChatRestoreCheckpoint(pane.thread_id);
+      toast.success(
+        "Workspace restored to the checkpoint taken when this run started.",
+      );
+    } catch (error) {
+      toast.error(`Restore failed: ${error}`);
+    } finally {
+      setRestoring(false);
+      setConfirmRestoreOpen(false);
+    }
+  };
+
   return (
     <header
       className={cn(
@@ -189,6 +263,18 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           target, 14px glyph, drop close to destructive-foreground when
           its red hover bg kicks in. */}
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
+        {checkpoint && (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={() => setConfirmRestoreOpen(true)}
+            aria-label="Restore checkpoint"
+            title="Restore workspace to the state before this run"
+          >
+            <History className="h-3.5 w-3.5" />
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="icon-sm"
@@ -220,6 +306,41 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           <X className="h-3.5 w-3.5" />
         </Button>
       </div>
+      <AlertDialog
+        open={confirmRestoreOpen}
+        onOpenChange={(open) => {
+          if (!restoring) setConfirmRestoreOpen(open);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Restore checkpoint?</AlertDialogTitle>
+            <AlertDialogDescription>
+              The working tree will be rolled back to the snapshot taken
+              when this run started
+              {checkpoint
+                ? ` (${checkpoint.commit.slice(0, 12)})`
+                : ""}
+              . Files created since then are removed; commits and ignored
+              files are kept. A safety snapshot of the current state is
+              recorded first.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={restoring}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              disabled={restoring}
+              onClick={(e) => {
+                e.preventDefault();
+                void handleRestoreCheckpoint();
+              }}
+            >
+              {restoring ? "Restoring…" : "Restore"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </header>
   );
 }

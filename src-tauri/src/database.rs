@@ -380,6 +380,12 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // server-schema change. Lets a pull land a repo ROOT on the right
         // branch and protect it even when `git_branch` is null.
         "ALTER TABLE workspaces_sync ADD COLUMN default_branch TEXT",
+        // Agent-run rollback checkpoints (issue #80): the snapshot
+        // commit pinned under refs/codemux/checkpoints/<thread> at run
+        // start, plus where HEAD pointed at that moment. Both null for
+        // sessions started with the opt-in setting off.
+        "ALTER TABLE agent_chat_sessions ADD COLUMN checkpoint_commit TEXT",
+        "ALTER TABLE agent_chat_sessions ADD COLUMN checkpoint_head TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -2308,6 +2314,61 @@ impl DatabaseStore {
         )
         .map_err(|e| format!("Failed to set sdk_session_id: {e}"))?;
         Ok(())
+    }
+
+    /// Record (or replace) the run-start rollback checkpoint for a
+    /// session (issue #80). Latest run wins — a resumed session's new
+    /// run overwrites the previous checkpoint, preserving "revert to
+    /// before this run" semantics.
+    pub fn set_agent_chat_checkpoint(
+        &self,
+        thread_id: &str,
+        checkpoint_commit: &str,
+        checkpoint_head: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_sessions
+                 SET checkpoint_commit = ?2, checkpoint_head = ?3
+                 WHERE thread_id = ?1",
+            params![thread_id, checkpoint_commit, checkpoint_head],
+        )
+        .map_err(|e| format!("Failed to set checkpoint: {e}"))?;
+        Ok(())
+    }
+
+    /// The working directory a session was started from. `None` when
+    /// the session is absent or recorded no cwd. Used by the
+    /// checkpoint-restore path to locate the repository.
+    pub fn get_agent_chat_session_cwd(&self, thread_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT cwd FROM agent_chat_sessions WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// The recorded run-start checkpoint for a session, as
+    /// `(checkpoint_commit, checkpoint_head)`. `None` when the session
+    /// is absent or was started with checkpoints disabled.
+    pub fn get_agent_chat_checkpoint(&self, thread_id: &str) -> Option<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT checkpoint_commit, checkpoint_head
+                 FROM agent_chat_sessions WHERE thread_id = ?1",
+            params![thread_id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .ok()
+        .and_then(|(commit, head)| Some((commit?, head?)))
     }
 
     /// Set (or replace) the dropdown title for a session. Called

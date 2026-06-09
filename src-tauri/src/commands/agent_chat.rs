@@ -13,10 +13,11 @@
 //! any session is bound to it. Provider-session commands and the
 //! event bridge land in follow-up commits.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tauri::{ipc::Channel, AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
@@ -27,21 +28,121 @@ use crate::database::{AgentChatSessionRecord, DatabaseStore};
 use crate::observability::ObservabilityStore;
 use crate::state::AppStateStore;
 
-/// Event name emitted by the backend whenever a provider produces a
-/// runtime event. The frontend's `useAgentChatEvents` hook subscribes
-/// to this channel and filters by `thread_id`.
+/// Event name used for the legacy global broadcast. Thread-scoped
+/// events — including the high-frequency `content_delta` token stream —
+/// now flow over per-thread [`Channel`]s registered via
+/// `attach_agent_chat_output` (Tauri's recommended mechanism for
+/// streaming data). Only events with NO owning thread (global
+/// `RuntimeWarning`s) still go out on this bus, since there is no
+/// per-thread subscriber to route them to.
 pub const AGENT_CHAT_EVENT: &str = "agent_chat_event";
 
-/// Payload emitted on the [`AGENT_CHAT_EVENT`] Tauri channel.
+/// Payload streamed to per-thread chat output channels (and, for
+/// threadless events only, emitted on the [`AGENT_CHAT_EVENT`] bus).
 ///
 /// Carries the originating thread id alongside the raw canonical
-/// event so subscribers can filter without re-parsing the payload.
+/// event so subscribers can route without re-parsing the payload.
 /// Events that are not scoped to a single thread (global
-/// `RuntimeWarning`s) are emitted with an empty `ThreadId`.
+/// `RuntimeWarning`s) carry an empty `ThreadId`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentChatEventPayload {
     pub thread_id: ThreadId,
     pub event: ProviderRuntimeEvent,
+}
+
+/// Per-thread registry of live streaming channels.
+///
+/// Mirrors the PTY pattern (`SessionRuntime.output_channel` in
+/// `terminal/mod.rs`): when a chat pane binds to a thread it invokes
+/// `attach_agent_chat_output` with a [`Channel`]; `forward_event`
+/// routes every thread-scoped provider event to the channels attached
+/// to that thread. This replaces the previous global `app.emit`
+/// broadcast, which fanned every token of every thread to every
+/// webview listener — Tauri's event system is explicitly not designed
+/// for high-throughput streaming, and the frontend had to filter by
+/// `thread_id` anyway.
+///
+/// Multiple panes may attach to the same thread (each gets its own
+/// channel); a pane detaches on unmount. Channels whose webview has
+/// gone away fail on `send` and are pruned lazily.
+#[derive(Default)]
+pub struct AgentChatChannelRegistry {
+    /// thread_id → attached channels. The channel's IPC id doubles as
+    /// the subscription id handed back to the frontend for detach.
+    channels: std::sync::Mutex<HashMap<String, Vec<Channel<AgentChatEventPayload>>>>,
+}
+
+impl AgentChatChannelRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a channel for a thread. Returns the subscription id
+    /// (the channel's IPC id) the frontend passes back on detach.
+    pub fn attach(&self, thread_id: &str, channel: Channel<AgentChatEventPayload>) -> u32 {
+        let id = channel.id();
+        let mut map = self.channels.lock().unwrap();
+        map.entry(thread_id.to_string()).or_default().push(channel);
+        id
+    }
+
+    /// Remove a previously attached channel. Idempotent — detaching
+    /// an unknown subscription is a no-op.
+    pub fn detach(&self, thread_id: &str, subscription_id: u32) {
+        let mut map = self.channels.lock().unwrap();
+        if let Some(list) = map.get_mut(thread_id) {
+            list.retain(|c| c.id() != subscription_id);
+            if list.is_empty() {
+                map.remove(thread_id);
+            }
+        }
+    }
+
+    /// Number of channels currently attached to a thread. Test hook.
+    pub fn attached_count(&self, thread_id: &str) -> usize {
+        self.channels
+            .lock()
+            .unwrap()
+            .get(thread_id)
+            .map(|l| l.len())
+            .unwrap_or(0)
+    }
+
+    /// Send a payload to every channel attached to its thread.
+    ///
+    /// The subscriber list is cloned out of the lock before sending so
+    /// a slow webview eval can never block attach/detach. Channels
+    /// that error (webview reloaded/closed without detaching) are
+    /// pruned afterwards.
+    pub fn route(&self, payload: &AgentChatEventPayload) {
+        let subscribers: Vec<Channel<AgentChatEventPayload>> = {
+            let map = self.channels.lock().unwrap();
+            match map.get(&payload.thread_id.0) {
+                Some(list) => list.clone(),
+                None => return,
+            }
+        };
+        let mut dead: Vec<u32> = Vec::new();
+        for channel in subscribers {
+            if let Err(error) = channel.send(payload.clone()) {
+                eprintln!(
+                    "[codemux::agent_chat] dropping dead chat channel {} for thread {}: {error}",
+                    channel.id(),
+                    payload.thread_id.0
+                );
+                dead.push(channel.id());
+            }
+        }
+        if !dead.is_empty() {
+            let mut map = self.channels.lock().unwrap();
+            if let Some(list) = map.get_mut(&payload.thread_id.0) {
+                list.retain(|c| !dead.contains(&c.id()));
+                if list.is_empty() {
+                    map.remove(&payload.thread_id.0);
+                }
+            }
+        }
+    }
 }
 
 /// Error string returned when a command runs with
@@ -348,8 +449,146 @@ pub async fn agent_chat_start_session(
             );
         }
     }
+    // Opt-in rollback checkpoint (issue #80): snapshot the workspace
+    // tree so this run can be rolled back. Fire-and-forget on the
+    // blocking pool AFTER the session is live — nothing on the
+    // first-token path awaits it, so checkpointing adds zero latency
+    // to the agent's first response.
+    spawn_run_checkpoint(&app, &session.thread_id.0, cwd_for_persist.as_deref());
     crate::state::emit_app_state(&app);
     Ok(session.thread_id)
+}
+
+/// Sanitize a thread id into a single git ref path component.
+/// Alphanumerics, `-` and `_` pass through; everything else becomes
+/// `-` so the result is always a valid `refs/codemux/...` segment.
+pub fn checkpoint_ref_component(thread_id: &str) -> String {
+    let out: String = thread_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
+}
+
+/// Fire the background run-start checkpoint when the opt-in
+/// `git.agent_checkpoint_enabled` setting is on.
+///
+/// Everything — including the settings-cache read — runs on the
+/// blocking pool so the caller returns immediately. Failures (not a
+/// git repo, empty repo, setting off) are logged and never surface
+/// as run errors; the checkpoint is best-effort by design.
+fn spawn_run_checkpoint<R: Runtime>(app: &AppHandle<R>, thread_id: &str, cwd: Option<&str>) {
+    let Some(cwd) = cwd.map(str::to_string) else {
+        return;
+    };
+    let thread_id = thread_id.to_string();
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let enabled = crate::settings_sync::load_cache()
+            .unwrap_or_default()
+            .git
+            .agent_checkpoint_enabled;
+        if !enabled {
+            return;
+        }
+        perform_run_checkpoint(&app, &thread_id, &cwd);
+    });
+}
+
+/// Synchronous body of the run-start checkpoint: snapshot the tree,
+/// pin the ref, persist the hashes on the session row. Extracted from
+/// [`spawn_run_checkpoint`] (which adds the opt-in gate + background
+/// spawn) so integration tests can drive it directly against a real
+/// temp repository.
+pub fn perform_run_checkpoint<R: Runtime>(app: &AppHandle<R>, thread_id: &str, cwd: &str) {
+    let ref_name = format!(
+        "refs/codemux/checkpoints/{}",
+        checkpoint_ref_component(thread_id)
+    );
+    match crate::git::git_create_workspace_checkpoint(
+        std::path::Path::new(cwd),
+        &ref_name,
+        "codemux: pre-run checkpoint",
+    ) {
+        Ok(checkpoint) => {
+            let db: State<'_, DatabaseStore> = app.state();
+            if let Err(error) =
+                db.set_agent_chat_checkpoint(thread_id, &checkpoint.commit, &checkpoint.head)
+            {
+                eprintln!("[codemux::agent_chat] failed to persist run checkpoint: {error}");
+            } else {
+                eprintln!(
+                    "[codemux::agent_chat] run checkpoint {} recorded for thread {thread_id}",
+                    &checkpoint.commit[..12.min(checkpoint.commit.len())]
+                );
+            }
+        }
+        Err(error) => {
+            // Expected for non-git workspaces / empty repos.
+            eprintln!("[codemux::agent_chat] run checkpoint skipped: {error}");
+        }
+    }
+}
+
+/// The recorded run-start rollback checkpoint for a thread, if any.
+/// Drives the visibility of the chat pane's "Restore checkpoint"
+/// action. Not feature-gated for the same reason as
+/// `agent_chat_list_sessions` — absence should render as "nothing to
+/// show", not an error string.
+#[tauri::command]
+pub async fn agent_chat_get_checkpoint(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+) -> Result<Option<crate::git::WorkspaceCheckpoint>, String> {
+    Ok(db
+        .get_agent_chat_checkpoint(&thread_id)
+        .map(|(commit, head)| crate::git::WorkspaceCheckpoint { commit, head }))
+}
+
+/// Roll the workspace tree back to the thread's run-start checkpoint.
+///
+/// Tree-only restore — branch refs never move (see
+/// `git::git_restore_workspace_checkpoint`). A safety snapshot of the
+/// pre-restore state is pinned under `refs/codemux/pre-restore/<thread>`
+/// so the action is itself recoverable.
+#[tauri::command]
+pub async fn agent_chat_restore_checkpoint(
+    app: AppHandle,
+    thread_id: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let db: State<'_, DatabaseStore> = app.state();
+    let (commit, _head) = db.get_agent_chat_checkpoint(&thread_id).ok_or_else(|| {
+        "no_checkpoint: this thread has no recorded run checkpoint".to_string()
+    })?;
+    let cwd = db.get_agent_chat_session_cwd(&thread_id).ok_or_else(|| {
+        "no_cwd: this session has no recorded working directory".to_string()
+    })?;
+    let safety_ref = format!(
+        "refs/codemux/pre-restore/{}",
+        checkpoint_ref_component(&thread_id)
+    );
+    tokio::task::spawn_blocking(move || {
+        crate::git::git_restore_workspace_checkpoint(
+            std::path::Path::new(&cwd),
+            &commit,
+            &safety_ref,
+        )
+        .map(|_| ())
+    })
+    .await
+    .map_err(|e| format!("restore task join failed: {e}"))?
 }
 
 /// Queue a user turn on an existing session.
@@ -692,17 +931,57 @@ pub async fn agent_chat_list_messages(
     Ok(db.list_agent_chat_messages(&thread_id))
 }
 
+// ── Streaming channel attach/detach ───────────────────────────────────
+
+/// Attach a per-thread streaming [`Channel`] for live provider events.
+///
+/// Called by the frontend when a chat pane binds to a thread. Live
+/// events (especially the `content_delta` token stream) arrive over
+/// this channel only; the pane hydrates the persisted transcript from
+/// the DB via `agent_chat_list_messages` on mount, so a late attach
+/// never misses completed items — the channel carries live deltas, the
+/// DB carries history.
+///
+/// Returns the subscription id to pass to `detach_agent_chat_output`
+/// on unmount.
+#[tauri::command]
+pub fn attach_agent_chat_output(
+    observability: State<'_, ObservabilityStore>,
+    channels: State<'_, AgentChatChannelRegistry>,
+    thread_id: String,
+    channel: Channel<AgentChatEventPayload>,
+) -> Result<u32, String> {
+    feature_flag_on(&observability)?;
+    Ok(channels.attach(&thread_id, channel))
+}
+
+/// Detach a previously attached chat output channel.
+///
+/// Idempotent, and deliberately NOT feature-gated: unmount cleanup
+/// must always succeed, even if the beta flag was switched off while
+/// the pane was open.
+#[tauri::command]
+pub fn detach_agent_chat_output(
+    channels: State<'_, AgentChatChannelRegistry>,
+    thread_id: String,
+    subscription_id: u32,
+) -> Result<(), String> {
+    channels.detach(&thread_id, subscription_id);
+    Ok(())
+}
+
 // ── Event bridge ──────────────────────────────────────────────────────
 
 /// Start the provider-event forwarding tasks.
 ///
 /// Spawns one Tokio task per registered provider. Each task consumes
-/// the provider's canonical event stream and re-emits each event on
-/// the [`AGENT_CHAT_EVENT`] Tauri channel wrapped in an
-/// [`AgentChatEventPayload`]. When a provider's stream ends (on
-/// shutdown) the task exits cleanly; the `event_stream()` helper on
-/// each provider already swallows `broadcast::error::RecvError::Lagged`
-/// and continues, so slow subscribers never crash this loop.
+/// the provider's canonical event stream and routes each event to the
+/// per-thread channels registered in [`AgentChatChannelRegistry`]
+/// (threadless events fall back to the [`AGENT_CHAT_EVENT`] bus).
+/// When a provider's stream ends (on shutdown) the task exits cleanly;
+/// the `event_stream()` helper on each provider already swallows
+/// `broadcast::error::RecvError::Lagged` and continues, so slow
+/// subscribers never crash this loop.
 ///
 /// Intended to be called once after the registry has been fully
 /// populated at startup. Idempotency is not required — call sites
@@ -728,7 +1007,12 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
     }
 }
 
-/// Emit a single provider event to the frontend.
+/// Forward a single provider event to the frontend.
+///
+/// Thread-scoped events are routed to the per-thread streaming
+/// channels in [`AgentChatChannelRegistry`]; only threadless events
+/// (global `RuntimeWarning`s) fall back to the legacy
+/// [`AGENT_CHAT_EVENT`] broadcast, since they have no owning pane.
 ///
 /// Extracted so tests can exercise the translation without spinning a
 /// Tokio task or a real provider. Also used as the inner loop of
@@ -786,14 +1070,27 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             }
         }
     }
-    let thread_id = thread_id_for_event(&event)
-        // Events without a thread_id (e.g. global RuntimeWarning) are
-        // forwarded with an empty ThreadId so the frontend at least
-        // sees them; a richer global-warning channel is a follow-up.
-        .unwrap_or_else(|| ThreadId(String::new()));
-    let payload = AgentChatEventPayload { thread_id, event };
-    if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
-        eprintln!("[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}");
+    match thread_id_for_event(&event) {
+        Some(thread_id) if !thread_id.0.is_empty() => {
+            // Thread-scoped: stream over the per-thread channels. If
+            // no pane is attached the event is dropped live — the DB
+            // persistence above already covers transcript replay, and
+            // partial deltas are superseded by their item_completed.
+            let channels: State<'_, AgentChatChannelRegistry> = app.state();
+            channels.route(&AgentChatEventPayload { thread_id, event });
+        }
+        _ => {
+            // Threadless (global RuntimeWarning): no per-thread
+            // subscriber exists, so keep the legacy low-frequency
+            // broadcast with an empty ThreadId.
+            let payload = AgentChatEventPayload {
+                thread_id: ThreadId(String::new()),
+                event,
+            };
+            if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
+                eprintln!("[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}");
+            }
+        }
     }
 }
 

@@ -1232,7 +1232,8 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 }?;
                 let port = crate::scripts::allocate_workspace_port(&ws_id);
                 crate::scripts::run_setup_scripts(
-                    std::path::Path::new(&cwd), &title, &ws_id, app, Some(&db),
+                    std::path::Path::new(&cwd), &title, &ws_id,
+                    &crate::scripts::SetupEmitter::App(app), Some(&db),
                     branch.as_deref(), Some(port),
                 )?;
                 Ok(serde_json::json!({ "workspace_id": ws_id, "status": "complete" }))

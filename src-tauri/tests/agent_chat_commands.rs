@@ -33,13 +33,14 @@ use codemux_lib::agent_provider::{
     SendTurnInput, StartSessionInput, ThreadId, TurnId,
 };
 use codemux_lib::commands::agent_chat::{
-    feature_flag_on, forward_event, thread_id_for_event, AgentChatEventPayload,
-    ProviderRegistry, AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
+    checkpoint_ref_component, feature_flag_on, forward_event, perform_run_checkpoint,
+    thread_id_for_event, AgentChatChannelRegistry, AgentChatEventPayload, ProviderRegistry,
+    AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
 };
 use codemux_lib::database::DatabaseStore;
 use codemux_lib::observability::{FeatureFlags, ObservabilityStore};
 use codemux_lib::state::AppStateStore;
-use tauri::Manager;
+use tauri::{Manager, State};
 
 use crate::mock_agent_provider::{MockAgentProvider, MockCall};
 
@@ -290,6 +291,115 @@ async fn registry_returns_none_when_provider_missing() {
     assert!(registry.get(ProviderKind::Codex).await.is_none());
 }
 
+// ── Run-start rollback checkpoints (issue #80) ──
+
+#[test]
+fn checkpoint_round_trips_through_session_row() {
+    let db = DatabaseStore::new_in_memory();
+    db.upsert_agent_chat_session("th-cp", "ws-1", Some("/tmp/repo"), "claude")
+        .expect("upsert session");
+
+    // No checkpoint recorded yet (setting off / snapshot pending).
+    assert!(db.get_agent_chat_checkpoint("th-cp").is_none());
+
+    db.set_agent_chat_checkpoint("th-cp", "abc123", "def456")
+        .expect("set checkpoint");
+    assert_eq!(
+        db.get_agent_chat_checkpoint("th-cp"),
+        Some(("abc123".to_string(), "def456".to_string()))
+    );
+    // The restore path resolves the repo via the session's cwd.
+    assert_eq!(
+        db.get_agent_chat_session_cwd("th-cp"),
+        Some("/tmp/repo".to_string())
+    );
+    // Unknown threads stay None.
+    assert!(db.get_agent_chat_checkpoint("th-other").is_none());
+}
+
+/// Full backend loop against a real repository: run-start checkpoint
+/// records hashes on the session row; the recorded commit restores
+/// the tree after an "agent run" mangles it.
+#[tokio::test]
+async fn run_checkpoint_records_and_restores_against_real_repo() {
+    let app = tauri::test::mock_app();
+    app.manage(DatabaseStore::new_in_memory());
+    let handle = app.handle().clone();
+
+    // Real repo with one committed file + one untracked WIP file.
+    let dir = tempfile::TempDir::new().unwrap();
+    let repo = dir.path();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.email", "t@e.com"]);
+    git(&["config", "user.name", "T"]);
+    std::fs::write(repo.join("code.txt"), "original\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "base"]);
+    std::fs::write(repo.join("wip.txt"), "user wip\n").unwrap();
+
+    let cwd = repo.to_string_lossy().to_string();
+    let db: State<'_, DatabaseStore> = handle.state();
+    db.upsert_agent_chat_session("th-real", "ws-1", Some(&cwd), "claude")
+        .expect("upsert");
+
+    // Run-start hook body (the spawn wrapper only adds the opt-in
+    // gate + background spawn around exactly this call).
+    perform_run_checkpoint(&handle, "th-real", &cwd);
+
+    let (commit, head) = db
+        .get_agent_chat_checkpoint("th-real")
+        .expect("checkpoint recorded on the session row");
+    assert!(!commit.is_empty() && !head.is_empty());
+
+    // "Agent run": clobber + junk + delete.
+    std::fs::write(repo.join("code.txt"), "agent broke this\n").unwrap();
+    std::fs::write(repo.join("junk.txt"), "junk\n").unwrap();
+    std::fs::remove_file(repo.join("wip.txt")).unwrap();
+
+    // Restore using exactly what the restore command reads from the DB.
+    codemux_lib::git::git_restore_workspace_checkpoint(
+        repo,
+        &commit,
+        &format!(
+            "refs/codemux/pre-restore/{}",
+            checkpoint_ref_component("th-real")
+        ),
+    )
+    .expect("restore");
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+        "original\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("wip.txt")).unwrap(),
+        "user wip\n"
+    );
+    assert!(!repo.join("junk.txt").exists());
+}
+
+#[test]
+fn checkpoint_ref_component_sanitizes_thread_ids() {
+    // Typical local thread id passes through untouched.
+    assert_eq!(
+        checkpoint_ref_component("chat-pane-1-1700000000"),
+        "chat-pane-1-1700000000"
+    );
+    // Ref-hostile characters are flattened to dashes.
+    assert_eq!(checkpoint_ref_component("a b/c~d:e?f"), "a-b-c-d-e-f");
+    // Never produces an empty ref segment.
+    assert_eq!(checkpoint_ref_component(""), "unknown");
+}
+
 // ── Event bridge ──
 
 #[test]
@@ -324,19 +434,159 @@ fn thread_id_for_event_extracts_bound_threads() {
     );
 }
 
-#[tokio::test]
-async fn event_bridge_forwards_runtime_events_to_tauri() {
-    // Build a MockRuntime app, subscribe to the agent_chat_event
-    // channel, and verify that forwarding a runtime event through
-    // forward_event produces a matching AgentChatEventPayload.
-    //
-    // forward_event persists ItemCompleted via DatabaseStore::append_*,
-    // so the mock app must manage a DatabaseStore or `app.state::<…>`
-    // panics with "state() called before manage()". An in-memory store
-    // is sufficient — we're only asserting on the emitted event, not
-    // on what gets written to disk.
+/// Build a mock app managing everything `forward_event` touches:
+/// DatabaseStore (transcript persistence) and the per-thread channel
+/// registry (live routing). Without either, `app.state::<…>` panics
+/// with "state() called before manage()".
+fn channel_test_app() -> tauri::App<tauri::test::MockRuntime> {
     let app = tauri::test::mock_app();
     app.manage(DatabaseStore::new_in_memory());
+    app.manage(AgentChatChannelRegistry::new());
+    app
+}
+
+/// Construct a test Channel whose deliveries land in the returned
+/// shared Vec. `Channel::send` invokes the handler synchronously, so
+/// tests can assert immediately after `forward_event` returns.
+fn collecting_channel() -> (
+    tauri::ipc::Channel<AgentChatEventPayload>,
+    Arc<std::sync::Mutex<Vec<AgentChatEventPayload>>>,
+) {
+    let received: Arc<std::sync::Mutex<Vec<AgentChatEventPayload>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = received.clone();
+    let channel = tauri::ipc::Channel::new(move |body: tauri::ipc::InvokeResponseBody| {
+        let payload: AgentChatEventPayload = body
+            .deserialize()
+            .expect("channel payload should deserialize");
+        sink.lock().unwrap().push(payload);
+        Ok(())
+    });
+    (channel, received)
+}
+
+fn item_completed(thread: &str, text: &str) -> ProviderRuntimeEvent {
+    ProviderRuntimeEvent::ItemCompleted {
+        thread_id: ThreadId(thread.into()),
+        turn_id: TurnId("turn-1".into()),
+        item: CompletedItem::AssistantText { text: text.into() },
+    }
+}
+
+#[tokio::test]
+async fn event_bridge_routes_thread_events_to_attached_channel() {
+    let app = channel_test_app();
+    let handle = app.handle().clone();
+
+    let (channel, received) = collecting_channel();
+    let registry: State<'_, AgentChatChannelRegistry> = handle.state();
+    registry.attach("thread-bridge", channel);
+
+    forward_event(&handle, item_completed("thread-bridge", "hello"));
+
+    let received = received.lock().unwrap();
+    assert_eq!(received.len(), 1, "exactly one event should be received");
+    assert_eq!(received[0].thread_id.0, "thread-bridge");
+    match &received[0].event {
+        ProviderRuntimeEvent::ItemCompleted { thread_id, .. } => {
+            assert_eq!(thread_id.0, "thread-bridge");
+        }
+        other => panic!("unexpected event variant: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn event_bridge_does_not_leak_across_threads() {
+    // A pane attached to thread A must never see thread B's events —
+    // the core no-cross-thread-leakage acceptance criterion of the
+    // channel migration.
+    let app = channel_test_app();
+    let handle = app.handle().clone();
+
+    let (channel_a, received_a) = collecting_channel();
+    let (channel_b, received_b) = collecting_channel();
+    let registry: State<'_, AgentChatChannelRegistry> = handle.state();
+    registry.attach("thread-a", channel_a);
+    registry.attach("thread-b", channel_b);
+
+    forward_event(&handle, item_completed("thread-b", "for b only"));
+
+    assert!(
+        received_a.lock().unwrap().is_empty(),
+        "thread-a channel must not receive thread-b events"
+    );
+    let received_b = received_b.lock().unwrap();
+    assert_eq!(received_b.len(), 1);
+    assert_eq!(received_b[0].thread_id.0, "thread-b");
+}
+
+#[tokio::test]
+async fn event_bridge_stops_delivery_after_detach() {
+    let app = channel_test_app();
+    let handle = app.handle().clone();
+
+    let (channel, received) = collecting_channel();
+    let registry: State<'_, AgentChatChannelRegistry> = handle.state();
+    let subscription_id = registry.attach("thread-detach", channel);
+    assert_eq!(registry.attached_count("thread-detach"), 1);
+
+    forward_event(&handle, item_completed("thread-detach", "first"));
+    registry.detach("thread-detach", subscription_id);
+    assert_eq!(registry.attached_count("thread-detach"), 0);
+    forward_event(&handle, item_completed("thread-detach", "second"));
+
+    let received = received.lock().unwrap();
+    assert_eq!(
+        received.len(),
+        1,
+        "only the pre-detach event should be delivered"
+    );
+}
+
+#[tokio::test]
+async fn event_bridge_preserves_delta_ordering() {
+    // Channel sends are synchronous and per-channel ordered; a burst
+    // of content deltas must arrive in emission order.
+    let app = channel_test_app();
+    let handle = app.handle().clone();
+
+    let (channel, received) = collecting_channel();
+    let registry: State<'_, AgentChatChannelRegistry> = handle.state();
+    registry.attach("thread-order", channel);
+
+    for i in 0..50 {
+        forward_event(
+            &handle,
+            ProviderRuntimeEvent::ContentDelta {
+                thread_id: ThreadId("thread-order".into()),
+                turn_id: TurnId("turn-1".into()),
+                delta: codemux_lib::agent_provider::ContentDelta::Text {
+                    text: format!("tok-{i}"),
+                },
+            },
+        );
+    }
+
+    let received = received.lock().unwrap();
+    assert_eq!(received.len(), 50);
+    for (i, payload) in received.iter().enumerate() {
+        match &payload.event {
+            ProviderRuntimeEvent::ContentDelta { delta, .. } => {
+                let codemux_lib::agent_provider::ContentDelta::Text { text } = delta else {
+                    panic!("unexpected delta kind");
+                };
+                assert_eq!(text, &format!("tok-{i}"), "delta order must be preserved");
+            }
+            other => panic!("unexpected event variant: {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn event_bridge_emits_threadless_warnings_on_legacy_bus() {
+    // Global RuntimeWarnings have no owning thread/pane, so they keep
+    // the legacy broadcast path with an empty ThreadId.
+    let app = channel_test_app();
     let handle = app.handle().clone();
 
     let received: Arc<tokio::sync::Mutex<Vec<AgentChatEventPayload>>> =
@@ -359,14 +609,14 @@ async fn event_bridge_forwards_runtime_events_to_tauri() {
         });
     });
 
-    let event = ProviderRuntimeEvent::ItemCompleted {
-        thread_id: ThreadId("thread-bridge".into()),
-        turn_id: TurnId("turn-1".into()),
-        item: CompletedItem::AssistantText {
-            text: "hello".into(),
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: None,
+            message: "global warning".into(),
+            original_payload: None,
         },
-    };
-    forward_event(&handle, event);
+    );
 
     timeout(Duration::from_secs(2), rx)
         .await
@@ -374,12 +624,6 @@ async fn event_bridge_forwards_runtime_events_to_tauri() {
         .expect("one-shot sender should send before dropping");
 
     let received = received.lock().await;
-    assert_eq!(received.len(), 1, "exactly one event should be received");
-    assert_eq!(received[0].thread_id.0, "thread-bridge");
-    match &received[0].event {
-        ProviderRuntimeEvent::ItemCompleted { thread_id, .. } => {
-            assert_eq!(thread_id.0, "thread-bridge");
-        }
-        other => panic!("unexpected event variant: {other:?}"),
-    }
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].thread_id.0, "", "threadless payload uses empty id");
 }

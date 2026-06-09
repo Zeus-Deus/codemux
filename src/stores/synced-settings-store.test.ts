@@ -30,7 +30,7 @@ const DARK_SETTINGS: UserSettings = {
   appearance: { theme: "dark", shell_font: "Fira Code", terminal_font_size: 16, show_resource_monitor: true },
   editor: { default_ide: "cursor" },
   terminal: { scrollback_limit: 5000, cursor_style: "block" },
-  git: { default_base_branch: "develop" },
+  git: { default_base_branch: "develop", agent_checkpoint_enabled: false },
   keyboard: { shortcuts: { "ctrl+s": "save" } },
   notifications: { sound_enabled: false, desktop_enabled: true },
   file_tree: { show_hidden_files: true },
@@ -194,7 +194,7 @@ describe("synced-settings-store", () => {
       const userBSettings: UserSettings = {
         ...DEFAULT_SETTINGS,
         appearance: { theme: "light", shell_font: null, terminal_font_size: 14, show_resource_monitor: true },
-        git: { default_base_branch: "develop" },
+        git: { default_base_branch: "develop", agent_checkpoint_enabled: false },
       };
       mockGetSyncedSettings.mockResolvedValue(userBSettings);
 

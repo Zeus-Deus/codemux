@@ -77,12 +77,20 @@ impl Default for TerminalSettings {
 pub struct GitSettings {
     #[serde(default = "default_base_branch")]
     pub default_base_branch: String,
+    /// Opt-in (issue #80): when an agent-chat run starts, snapshot the
+    /// workspace working tree in the background so the run can be
+    /// rolled back from the chat pane. Off by default — checkpoint
+    /// refs accumulate under `refs/codemux/` and not every user wants
+    /// that.
+    #[serde(default)]
+    pub agent_checkpoint_enabled: bool,
 }
 
 impl Default for GitSettings {
     fn default() -> Self {
         Self {
             default_base_branch: default_base_branch(),
+            agent_checkpoint_enabled: false,
         }
     }
 }
@@ -483,6 +491,7 @@ mod tests {
             },
             git: GitSettings {
                 default_base_branch: "develop".into(),
+                agent_checkpoint_enabled: true,
             },
             keyboard: KeyboardSettings {
                 shortcuts: {

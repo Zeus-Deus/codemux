@@ -14,7 +14,9 @@ import type {
 // the tests via `vi.mocked(...)`.
 
 vi.mock("@/tauri/commands", () => ({
+  agentChatGetCheckpoint: vi.fn().mockResolvedValue(null),
   agentChatListMessages: vi.fn().mockResolvedValue([]),
+  agentChatRestoreCheckpoint: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
   closePane: vi.fn().mockResolvedValue(undefined),

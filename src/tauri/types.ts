@@ -28,6 +28,9 @@ export interface TerminalSyncSettings {
 
 export interface GitSyncSettings {
   default_base_branch: string;
+  /** Opt-in (issue #80): snapshot the workspace tree in the background
+   *  when an agent-chat run starts so the run can be rolled back. */
+  agent_checkpoint_enabled: boolean;
 }
 
 export interface KeyboardSettings {

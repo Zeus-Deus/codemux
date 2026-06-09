@@ -47,6 +47,13 @@ struct ServeFixture {
 
 impl ServeFixture {
     fn start() -> Self {
+        Self::start_with(|_| {})
+    }
+
+    /// Same as [`start`](Self::start) but lets the caller adjust the
+    /// daemon's `Command` before spawn — e.g. overriding `HOME` so
+    /// worktrees land in a disposable directory.
+    fn start_with(configure: impl FnOnce(&mut Command)) -> Self {
         let bin = binary_path();
         assert!(
             bin.exists(),
@@ -64,6 +71,7 @@ impl ServeFixture {
             .arg(state_dir.path())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        configure(&mut cmd);
         let child = cmd.spawn().expect("spawn codemux-remote serve");
 
         // Wait for the manifest to appear (the daemon writes it
@@ -214,6 +222,103 @@ fn http_workspace_create_then_list() {
     let body: Value = resp.json().unwrap();
     let workspaces = body["data"]["workspaces"].as_array().unwrap();
     assert!(workspaces.iter().any(|w| w["id"] == json!(id)));
+
+    fx.stop();
+}
+
+/// End-to-end coverage for issue #78: a worktree created through the
+/// running daemon must be provisioned like a desktop-created one —
+/// the project's setup script runs (with `CODEMUX_*` env + the
+/// deterministic per-workspace port) and gitignored worktree includes
+/// (`.env`) are copied from the main checkout.
+#[test]
+fn http_worktree_create_runs_setup_scripts() {
+    // Isolated HOME so the daemon's `~/.codemux/worktrees/...` output
+    // lands in a disposable directory.
+    let home = TempDir::new().expect("home tempdir");
+    let fx = ServeFixture::start_with(|cmd| {
+        cmd.env("HOME", home.path());
+    });
+    let client = reqwest::blocking::Client::new();
+
+    // Seed repo: committed `.codemux/config.json` with a setup command
+    // that captures the injected env, plus a gitignored `.env`.
+    let repo = TempDir::new().expect("repo tempdir");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&["config", "user.email", "t@e.com"]);
+    git(&["config", "user.name", "T"]);
+    std::fs::create_dir_all(repo.path().join(".codemux")).unwrap();
+    std::fs::write(
+        repo.path().join(".codemux/config.json"),
+        json!({
+            "setup": [
+                "printf '%s\n%s\n' \"$CODEMUX_BRANCH\" \"$CODEMUX_PORT\" > setup-ran.txt"
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(repo.path().join(".gitignore"), ".env\n").unwrap();
+    std::fs::write(repo.path().join(".env"), "SECRET=e2e\n").unwrap();
+    std::fs::write(repo.path().join("f.txt"), "x").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-m", "init"]);
+
+    // worktree_create through the daemon's authed HTTP surface.
+    let resp = client
+        .post(format!("{}/tools/call", fx.endpoint))
+        .bearer_auth(&fx.secret)
+        .json(&json!({
+            "name": "worktree_create",
+            "arguments": {
+                "repo_path": repo.path().to_string_lossy(),
+                "branch": "feature/provision",
+                "base": "main"
+            }
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().unwrap();
+    assert_eq!(body["ok"], json!(true), "body: {body}");
+    assert_eq!(body["data"]["setup"]["configured"], json!(true));
+    let port = body["data"]["setup"]["port"].as_u64().expect("port");
+    let ws_path = PathBuf::from(
+        body["data"]["workspace"]["path"].as_str().expect("path"),
+    );
+
+    // Setup runs on a daemon background thread — poll for the marker.
+    let marker = ws_path.join("setup-ran.txt");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        marker.exists(),
+        "setup script never ran in daemon-created worktree at {}",
+        ws_path.display()
+    );
+    let contents = std::fs::read_to_string(&marker).unwrap();
+    let lines: Vec<&str> = contents.lines().collect();
+    assert_eq!(lines[0], "feature/provision", "CODEMUX_BRANCH injected");
+    assert_eq!(lines[1], port.to_string(), "CODEMUX_PORT matches response");
+
+    // Includes run before setup commands, so the marker existing
+    // implies the gitignored .env was already copied.
+    assert_eq!(
+        std::fs::read_to_string(ws_path.join(".env")).unwrap(),
+        "SECRET=e2e\n",
+        ".env must be copied from the main checkout"
+    );
 
     fx.stop();
 }

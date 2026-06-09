@@ -16,7 +16,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   },
   editor: { default_ide: null },
   terminal: { scrollback_limit: 10_000, cursor_style: "bar" },
-  git: { default_base_branch: "main" },
+  git: { default_base_branch: "main", agent_checkpoint_enabled: false },
   keyboard: { shortcuts: {} },
   notifications: { sound_enabled: true, desktop_enabled: true },
   file_tree: { show_hidden_files: false },

@@ -1223,6 +1223,21 @@ export function SettingsView() {
                   className="w-36 h-9"
                 />
               </SettingRow>
+              <SettingRow
+                label="Checkpoint before agent runs"
+                description="Snapshot the workspace in the background when an agent chat starts, so the run can be rolled back. Never delays the agent."
+              >
+                <Switch
+                  checked={syncedSettings.git.agent_checkpoint_enabled}
+                  onCheckedChange={(checked) => {
+                    updateSyncedSetting(
+                      "git",
+                      "agent_checkpoint_enabled",
+                      checked,
+                    ).catch(console.error);
+                  }}
+                />
+              </SettingRow>
             </div>
 
             <SectionGroup>

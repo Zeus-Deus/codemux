@@ -17,7 +17,7 @@ const mockSyncedState = {
     appearance: { theme: "system", shell_font: null as string | null, terminal_font_size: 13 },
     editor: { default_ide: null as string | null },
     terminal: { scrollback_limit: 10_000, cursor_style: "bar" },
-    git: { default_base_branch: "main" },
+    git: { default_base_branch: "main", agent_checkpoint_enabled: false },
     keyboard: { shortcuts: {} as Record<string, string> },
     notifications: { sound_enabled: true, desktop_enabled: true },
   },
@@ -139,7 +139,7 @@ describe("settings-store", () => {
       mockSyncedGetState.mockReturnValue({
         settings: {
           ...defaults,
-          git: { default_base_branch: "develop" },
+          git: { default_base_branch: "develop", agent_checkpoint_enabled: false },
         },
       });
       expect(getDefaultBaseBranch()).toBe("develop");

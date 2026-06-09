@@ -34,6 +34,33 @@ struct SetupComplete {
     workspace_id: String,
 }
 
+/// Destination for setup progress/failure events.
+///
+/// The desktop passes its Tauri [`AppHandle`] so the workspace-setup
+/// overlay receives `workspace-setup-progress` / `workspace-setup-failed`
+/// / `workspace-setup-complete` events. The headless daemon
+/// (`codemux-remote serve`) has no webview to emit to, so it logs the
+/// same payloads to stderr instead — which serve-mode redirects into
+/// `serve.log`, keeping setup failures inspectable on the host.
+pub enum SetupEmitter<'a> {
+    App(&'a AppHandle),
+    Log,
+}
+
+impl SetupEmitter<'_> {
+    fn emit<S: Serialize + Clone>(&self, event: &str, payload: S) {
+        match self {
+            SetupEmitter::App(app) => {
+                let _ = app.emit(event, payload);
+            }
+            SetupEmitter::Log => {
+                let json = serde_json::to_string(&payload).unwrap_or_default();
+                eprintln!("[codemux::scripts] {event}: {json}");
+            }
+        }
+    }
+}
+
 /// Build the common environment variables for setup/teardown/run scripts
 /// and terminal PTY sessions.
 pub fn script_env(
@@ -266,7 +293,7 @@ pub fn run_setup_scripts(
     workspace_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
-    app_handle: &AppHandle,
+    emitter: &SetupEmitter<'_>,
     db: Option<&DatabaseStore>,
     branch: Option<&str>,
     port: Option<u16>,
@@ -293,7 +320,7 @@ pub fn run_setup_scripts(
     // Step 1: Process worktree includes (copy gitignored files from main worktree)
     match process_worktree_includes(&root_path, workspace_path, &setting_patterns) {
         Ok(result) => {
-            let _ = app_handle.emit(
+            emitter.emit(
                 "worktree-includes-applied",
                 WorktreeIncludesApplied {
                     workspace_id: workspace_id.to_string(),
@@ -321,7 +348,7 @@ pub fn run_setup_scripts(
         workspace_path,
         workspace_name,
         workspace_id,
-        app_handle,
+        emitter,
         &config,
         &root_path,
         branch,
@@ -336,7 +363,7 @@ pub fn run_setup_scripts_with_config(
     workspace_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
-    app_handle: &AppHandle,
+    emitter: &SetupEmitter<'_>,
     config: &WorkspaceConfig,
     root_path: &Path,
     branch: Option<&str>,
@@ -356,7 +383,7 @@ pub fn run_setup_scripts_with_config(
     let total = config.setup.len();
 
     for (index, command) in config.setup.iter().enumerate() {
-        let _ = app_handle.emit(
+        emitter.emit(
             "workspace-setup-progress",
             SetupProgress {
                 workspace_id: workspace_id.to_string(),
@@ -385,7 +412,7 @@ pub fn run_setup_scripts_with_config(
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let exit_code = output.status.code();
 
-            let _ = app_handle.emit(
+            emitter.emit(
                 "workspace-setup-failed",
                 SetupFailed {
                     workspace_id: workspace_id.to_string(),
@@ -406,7 +433,7 @@ pub fn run_setup_scripts_with_config(
         }
     }
 
-    let _ = app_handle.emit(
+    emitter.emit(
         "workspace-setup-complete",
         SetupComplete {
             workspace_id: workspace_id.to_string(),

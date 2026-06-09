@@ -134,6 +134,7 @@ The "Configure" button opens Settings > Projects. Dismiss persists per-project.
 - Re-run setup via context menu, Tauri command, socket API, and CLI
 - DB-stored project scripts via `get_project_scripts` / `set_project_scripts` Tauri commands
 - Unit tests for config reading, git root resolution, worktree fallback, and DB roundtrip
+- **Headless daemon parity (issue #78)**: `worktree_create` on `codemux-remote` runs the same pipeline — worktree includes copy + setup scripts with `CODEMUX_*` env and the deterministic per-workspace port — in a background thread after registering the workspace. File-based config only (`.codemux/config.json`; the daemon has no settings DB). Progress/failure events that the desktop emits to the setup overlay are logged to stderr instead (captured in `serve.log`) via the `SetupEmitter::Log` variant in `scripts.rs`; the tool response carries `setup: { configured, port }`. Covered by a live-daemon e2e test (`http_worktree_create_runs_setup_scripts` in `src-tauri/tests/codemux_remote_serve_mcp.rs`).
 
 ## Current Constraints
 

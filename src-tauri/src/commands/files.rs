@@ -2,6 +2,15 @@ use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
 
+// Several commands here spawn subprocesses (`git check-ignore`, `rg`/`grep`,
+// `fd`/`find`, `xdg-open`) or do blocking file I/O. They MUST run on Tokio's
+// blocking pool: a sync `#[tauri::command]` runs on the GTK main thread, and
+// any wedged subprocess or slow/stuck filesystem freezes the whole UI hard
+// enough that even window-close requests can't be processed. The fix is
+// uniform — async command + `spawn_blocking`, same as `commands/git.rs`.
+// Frontend-side `invoke()` already returns a Promise either way, so no
+// caller changes are needed.
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
     pub name: String,
@@ -21,7 +30,19 @@ pub struct SearchResult {
 }
 
 #[tauri::command]
-pub fn list_directory(path: String, show_hidden: Option<bool>) -> Result<Vec<FileEntry>, String> {
+pub async fn list_directory(
+    path: String,
+    show_hidden: Option<bool>,
+) -> Result<Vec<FileEntry>, String> {
+    tokio::task::spawn_blocking(move || list_directory_blocking(path, show_hidden))
+        .await
+        .map_err(|e| format!("list_directory task join failed: {e}"))?
+}
+
+fn list_directory_blocking(
+    path: String,
+    show_hidden: Option<bool>,
+) -> Result<Vec<FileEntry>, String> {
     let dir = Path::new(&path);
     let show_hidden = show_hidden.unwrap_or(false);
     if !dir.is_dir() {
@@ -145,7 +166,7 @@ fn git_ignored_set(
 }
 
 #[tauri::command]
-pub fn search_in_files(
+pub async fn search_in_files(
     path: String,
     query: String,
     max_results: Option<u32>,
@@ -156,13 +177,17 @@ pub fn search_in_files(
 
     let limit = max_results.unwrap_or(100);
 
-    // Try ripgrep first
-    if let Ok(results) = search_with_rg(&path, &query, limit) {
-        return Ok(results);
-    }
+    tokio::task::spawn_blocking(move || {
+        // Try ripgrep first
+        if let Ok(results) = search_with_rg(&path, &query, limit) {
+            return Ok(results);
+        }
 
-    // Fall back to grep
-    search_with_grep(&path, &query, limit)
+        // Fall back to grep
+        search_with_grep(&path, &query, limit)
+    })
+    .await
+    .map_err(|e| format!("search_in_files task join failed: {e}"))?
 }
 
 fn search_with_rg(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResult>, String> {
@@ -281,7 +306,7 @@ fn search_with_grep(path: &str, query: &str, limit: u32) -> Result<Vec<SearchRes
 }
 
 #[tauri::command]
-pub fn search_file_names(
+pub async fn search_file_names(
     path: String,
     query: String,
     max_results: Option<u32>,
@@ -291,24 +316,29 @@ pub fn search_file_names(
     }
 
     let limit = max_results.unwrap_or(50);
-    let base = Path::new(&path);
 
-    // Try fd first
-    if let Ok(results) = search_with_fd(&path, &query, limit) {
-        // Convert to relative paths
-        return Ok(results
-            .into_iter()
-            .map(|p| {
-                Path::new(&p)
-                    .strip_prefix(base)
-                    .map(|r| r.to_string_lossy().to_string())
-                    .unwrap_or(p)
-            })
-            .collect());
-    }
+    tokio::task::spawn_blocking(move || {
+        let base = Path::new(&path);
 
-    // Fall back to find
-    search_with_find(&path, &query, limit, base)
+        // Try fd first
+        if let Ok(results) = search_with_fd(&path, &query, limit) {
+            // Convert to relative paths
+            return Ok(results
+                .into_iter()
+                .map(|p| {
+                    Path::new(&p)
+                        .strip_prefix(base)
+                        .map(|r| r.to_string_lossy().to_string())
+                        .unwrap_or(p)
+                })
+                .collect());
+        }
+
+        // Fall back to find
+        search_with_find(&path, &query, limit, base)
+    })
+    .await
+    .map_err(|e| format!("search_file_names task join failed: {e}"))?
 }
 
 fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, String> {
@@ -339,23 +369,29 @@ fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, St
 }
 
 #[tauri::command]
-pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
-    if Command::new("which")
-        .arg("xdg-open")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-        == false
-    {
-        return Err("xdg-open not found — cannot open file manager. Install xdg-utils.".to_string());
-    }
-    Command::new("xdg-open")
-        .arg(&path)
-        .spawn()
-        .map_err(|e| format!("Failed to open file manager: {e}"))?;
-    Ok(())
+pub async fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        if Command::new("which")
+            .arg("xdg-open")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            == false
+        {
+            return Err(
+                "xdg-open not found — cannot open file manager. Install xdg-utils.".to_string(),
+            );
+        }
+        Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file manager: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("reveal_in_file_manager task join failed: {e}"))?
 }
 
 fn search_with_find(
@@ -409,34 +445,42 @@ fn search_with_find(
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
 
 #[tauri::command]
-pub fn read_file(path: String) -> Result<String, String> {
-    let p = Path::new(&path);
-    if !p.is_file() {
-        return Err(format!("Not a file: {path}"));
-    }
+pub async fn read_file(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let p = Path::new(&path);
+        if !p.is_file() {
+            return Err(format!("Not a file: {path}"));
+        }
 
-    let metadata = std::fs::metadata(p).map_err(|e| format!("Cannot read metadata: {e}"))?;
-    if metadata.len() > MAX_FILE_SIZE {
-        return Err(format!(
-            "File too large ({:.1} MB, limit is 2 MB)",
-            metadata.len() as f64 / (1024.0 * 1024.0)
-        ));
-    }
+        let metadata = std::fs::metadata(p).map_err(|e| format!("Cannot read metadata: {e}"))?;
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(format!(
+                "File too large ({:.1} MB, limit is 2 MB)",
+                metadata.len() as f64 / (1024.0 * 1024.0)
+            ));
+        }
 
-    let bytes = std::fs::read(p).map_err(|e| format!("Failed to read file: {e}"))?;
+        let bytes = std::fs::read(p).map_err(|e| format!("Failed to read file: {e}"))?;
 
-    // Detect binary: check for null bytes in first 8 KB
-    let check_len = bytes.len().min(8192);
-    if bytes[..check_len].contains(&0) {
-        return Err("Binary file".into());
-    }
+        // Detect binary: check for null bytes in first 8 KB
+        let check_len = bytes.len().min(8192);
+        if bytes[..check_len].contains(&0) {
+            return Err("Binary file".into());
+        }
 
-    String::from_utf8(bytes).map_err(|_| "Binary file (not valid UTF-8)".into())
+        String::from_utf8(bytes).map_err(|_| "Binary file (not valid UTF-8)".into())
+    })
+    .await
+    .map_err(|e| format!("read_file task join failed: {e}"))?
 }
 
 #[tauri::command]
-pub fn write_file(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, &content).map_err(|e| format!("Failed to write file: {e}"))
+pub async fn write_file(path: String, content: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&path, &content).map_err(|e| format!("Failed to write file: {e}"))
+    })
+    .await
+    .map_err(|e| format!("write_file task join failed: {e}"))?
 }
 
 /// Hard ceiling for clipboard image payloads. Mirrors the soft 5 MB
@@ -511,8 +555,10 @@ fn write_clipboard_image_to_disk(bytes: &[u8], mime: &str) -> Result<String, Str
 /// reads the OS clipboard server-side and bypasses the JS round
 /// trip entirely.
 #[tauri::command]
-pub fn save_clipboard_image_bytes(bytes: Vec<u8>, mime: String) -> Result<String, String> {
-    write_clipboard_image_to_disk(&bytes, &mime)
+pub async fn save_clipboard_image_bytes(bytes: Vec<u8>, mime: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || write_clipboard_image_to_disk(&bytes, &mime))
+        .await
+        .map_err(|e| format!("save_clipboard_image_bytes task join failed: {e}"))?
 }
 
 /// Encode a raw RGBA pixel buffer (8 bits per channel) as PNG.
@@ -567,30 +613,34 @@ fn encode_rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, S
 ///      image viewers and agents cannot decode. Encoding PNG here
 ///      means the resulting attachment is a valid PNG.
 #[tauri::command]
-pub fn paste_clipboard_image_to_file<R: tauri::Runtime>(
+pub async fn paste_clipboard_image_to_file<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<String, String> {
-    use tauri_plugin_clipboard_manager::ClipboardExt;
+    tokio::task::spawn_blocking(move || {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
 
-    // `read_image` resolves with an error when the clipboard does
-    // not hold an image (e.g. text-only). Surface a stable error
-    // string so the frontend can distinguish "no image" from a
-    // genuine failure and let the default paste behaviour run.
-    let img = app
-        .clipboard()
-        .read_image()
-        .map_err(|e| format!("clipboard read_image failed: {e}"))?;
+        // `read_image` resolves with an error when the clipboard does
+        // not hold an image (e.g. text-only). Surface a stable error
+        // string so the frontend can distinguish "no image" from a
+        // genuine failure and let the default paste behaviour run.
+        let img = app
+            .clipboard()
+            .read_image()
+            .map_err(|e| format!("clipboard read_image failed: {e}"))?;
 
-    let width = img.width();
-    let height = img.height();
-    let rgba = img.rgba();
+        let width = img.width();
+        let height = img.height();
+        let rgba = img.rgba();
 
-    if width == 0 || height == 0 || rgba.is_empty() {
-        return Err("Clipboard image is empty".into());
-    }
+        if width == 0 || height == 0 || rgba.is_empty() {
+            return Err("Clipboard image is empty".into());
+        }
 
-    let png_bytes = encode_rgba_to_png(rgba, width, height)?;
-    write_clipboard_image_to_disk(&png_bytes, "image/png")
+        let png_bytes = encode_rgba_to_png(rgba, width, height)?;
+        write_clipboard_image_to_disk(&png_bytes, "image/png")
+    })
+    .await
+    .map_err(|e| format!("paste_clipboard_image_to_file task join failed: {e}"))?
 }
 
 /// Count occurrences of `pattern` across `cwd` using ripgrep.
@@ -802,11 +852,12 @@ mod tests {
         assert_eq!(clipboard_image_extension("image/x-icon"), "bin");
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_writes_png_and_returns_path() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_writes_png_and_returns_path() {
         // Minimal PNG signature — enough to verify the bytes round-trip.
         let payload: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         let path = save_clipboard_image_bytes(payload.clone(), "image/png".into())
+            .await
             .expect("png write should succeed");
 
         assert!(path.ends_with(".png"), "expected .png extension, got {path}");
@@ -821,8 +872,8 @@ mod tests {
         cleanup_clipboard_temp(&path);
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_uses_correct_extension_per_mime() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_uses_correct_extension_per_mime() {
         // Spot-check that the filename extension follows the MIME.
         // Doesn't re-test every mapping (clipboard_image_extension
         // covers that) — just verifies the command actually wires
@@ -834,6 +885,7 @@ mod tests {
         ];
         for (mime, expected_ext) in cases {
             let path = save_clipboard_image_bytes(vec![0xff, 0xd8, 0xff], mime.into())
+                .await
                 .expect("write should succeed");
             assert!(
                 path.ends_with(expected_ext),
@@ -843,72 +895,85 @@ mod tests {
         }
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_generates_unique_filenames() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_generates_unique_filenames() {
         // Two paste-cycles in a row must not clobber each other —
         // the UUID in the filename guarantees this. Regression
         // guard: if someone "simplifies" the naming and a user
         // pastes twice quickly, the second image would silently
         // overwrite the first attachment.
         let bytes = vec![0x89, 0x50, 0x4e, 0x47];
-        let a = save_clipboard_image_bytes(bytes.clone(), "image/png".into()).unwrap();
-        let b = save_clipboard_image_bytes(bytes, "image/png".into()).unwrap();
+        let a = save_clipboard_image_bytes(bytes.clone(), "image/png".into())
+            .await
+            .unwrap();
+        let b = save_clipboard_image_bytes(bytes, "image/png".into())
+            .await
+            .unwrap();
         assert_ne!(a, b, "consecutive saves must yield distinct paths");
         cleanup_clipboard_temp(&a);
         cleanup_clipboard_temp(&b);
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_rejects_empty_payload() {
-        let err = save_clipboard_image_bytes(vec![], "image/png".into()).unwrap_err();
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_rejects_empty_payload() {
+        let err = save_clipboard_image_bytes(vec![], "image/png".into())
+            .await
+            .unwrap_err();
         assert!(
             err.to_lowercase().contains("empty"),
             "expected empty-payload error, got: {err}",
         );
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_rejects_non_image_mime() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_rejects_non_image_mime() {
         // The frontend already filters for image/* before invoking
         // this command, but the IPC boundary must not trust the
         // caller — a misbehaving (or compromised) frontend mustn't
         // be able to write arbitrary blobs to the temp directory
         // via this command.
-        let err = save_clipboard_image_bytes(vec![1, 2, 3], "text/plain".into()).unwrap_err();
+        let err = save_clipboard_image_bytes(vec![1, 2, 3], "text/plain".into())
+            .await
+            .unwrap_err();
         assert!(
             err.contains("Unsupported"),
             "expected unsupported-mime error, got: {err}",
         );
 
-        let err = save_clipboard_image_bytes(vec![1, 2, 3], "application/pdf".into()).unwrap_err();
+        let err = save_clipboard_image_bytes(vec![1, 2, 3], "application/pdf".into())
+            .await
+            .unwrap_err();
         assert!(
             err.contains("Unsupported"),
             "expected unsupported-mime error, got: {err}",
         );
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_rejects_oversize_payload() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_rejects_oversize_payload() {
         // Use a payload exactly one byte over the cap. Allocating
         // 25 MB + 1 in a test is cheap (Vec::with_capacity is a
         // single allocation) and exercises the exact boundary
         // condition.
         let oversize = vec![0u8; MAX_CLIPBOARD_IMAGE_BYTES + 1];
-        let err = save_clipboard_image_bytes(oversize, "image/png".into()).unwrap_err();
+        let err = save_clipboard_image_bytes(oversize, "image/png".into())
+            .await
+            .unwrap_err();
         assert!(
             err.contains("too large"),
             "expected oversize error, got: {err}",
         );
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_writes_under_codemux_clipboard_dir() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_writes_under_codemux_clipboard_dir() {
         // The artifacts must land under a clearly-named subdir so
         // operators can wipe the cache without grepping through
         // every UUID in /tmp. Lock the directory name as part of
         // the contract.
-        let path =
-            save_clipboard_image_bytes(vec![0x89, 0x50, 0x4e, 0x47], "image/png".into()).unwrap();
+        let path = save_clipboard_image_bytes(vec![0x89, 0x50, 0x4e, 0x47], "image/png".into())
+            .await
+            .unwrap();
         assert!(
             path.contains("codemux-clipboard-images"),
             "expected path under codemux-clipboard-images/, got {path}",

@@ -182,6 +182,10 @@ pub fn run() {
         .manage(encryption::EncryptionManager::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        // Per-thread streaming channels for agent-chat events: panes
+        // attach a Channel per thread instead of filtering a global
+        // event-bus broadcast (issue #75).
+        .manage(commands::agent_chat::AgentChatChannelRegistry::new())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
@@ -1487,6 +1491,10 @@ pub fn run() {
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
+            commands::attach_agent_chat_output,
+            commands::detach_agent_chat_output,
+            commands::agent_chat_get_checkpoint,
+            commands::agent_chat_restore_checkpoint,
             commands::opencode_check_availability,
             commands::opencode_ping,
             commands::opencode_list_models,

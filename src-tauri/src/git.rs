@@ -427,6 +427,135 @@ pub fn git_stash_pop(repo_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+// ── Agent-run checkpoints (issue #80) ────────────────────────────────
+//
+// Non-destructive snapshot of the working tree taken in the background
+// when an agent-chat run starts (opt-in), so the user can roll the
+// tree back to its pre-run state. Design notes in
+// docs/plans/agent-run-checkpoints.md.
+
+/// A recorded rollback point for a workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceCheckpoint {
+    /// Snapshot commit capturing the full working tree at checkpoint
+    /// time — tracked changes AND untracked files (`git add -A` into a
+    /// scratch index respects `.gitignore`, so ignored artifacts are
+    /// excluded).
+    pub commit: String,
+    /// Where `HEAD` pointed when the checkpoint was taken. Recorded
+    /// for a potential future "reset branch too" affordance; the v1
+    /// restore is tree-only and never moves refs.
+    pub head: String,
+}
+
+/// Run git with `GIT_INDEX_FILE` pointing at a scratch index so the
+/// user's real index is never touched.
+fn run_git_with_index(
+    repo_path: &Path,
+    index_file: &Path,
+    args: &[&str],
+) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo_path)
+        .env("GIT_INDEX_FILE", index_file)
+        .output()
+        .map_err(|e| format!("Failed to run git: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "git {} failed: {}",
+            args.first().unwrap_or(&""),
+            stderr.trim()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim_end().to_string())
+}
+
+/// Snapshot the working tree WITHOUT disturbing the user's index or
+/// working tree.
+///
+/// Mechanism: a scratch index (`GIT_INDEX_FILE`) is seeded from
+/// `HEAD`, `git add -A` stages the live tree into it (capturing
+/// modified and untracked files — the common agent-output case that
+/// `git stash create` would miss), `write-tree` + `commit-tree`
+/// produce a commit parented on `HEAD`, and the commit is pinned
+/// under `ref_name` (e.g. `refs/codemux/checkpoints/<thread>`) so GC
+/// can't reap it. The user's `.git/index` and working tree are never
+/// modified.
+///
+/// Errors are expected for non-repos and empty repos (no `HEAD`);
+/// callers treat the checkpoint as best-effort.
+pub fn git_create_workspace_checkpoint(
+    repo_path: &Path,
+    ref_name: &str,
+    message: &str,
+) -> Result<WorkspaceCheckpoint, String> {
+    let head = run_git(repo_path, &["rev-parse", "HEAD"])?;
+
+    let index_file = std::env::temp_dir().join(format!(
+        "codemux-checkpoint-index-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        run_git_with_index(repo_path, &index_file, &["read-tree", "HEAD"])?;
+        run_git_with_index(repo_path, &index_file, &["add", "-A"])?;
+        let tree = run_git_with_index(repo_path, &index_file, &["write-tree"])?;
+        let commit = run_git_with_index(
+            repo_path,
+            &index_file,
+            &["commit-tree", &tree, "-p", &head, "-m", message],
+        )?;
+        run_git(repo_path, &["update-ref", ref_name, &commit])?;
+        Ok(WorkspaceCheckpoint {
+            commit,
+            head: head.clone(),
+        })
+    })();
+    let _ = std::fs::remove_file(&index_file);
+    result
+}
+
+/// Restore the working tree + index to a checkpoint snapshot.
+///
+/// Tree-only rollback — branch refs and `HEAD` are never moved, so
+/// commits made during the run stay in history; only file contents
+/// revert. Sequence:
+///
+/// 1. Verify the checkpoint commit still exists.
+/// 2. Take a fresh *safety* snapshot of the current state under
+///    `safety_ref` so the restore is itself recoverable. A failed
+///    safety snapshot aborts the restore.
+/// 3. `git read-tree --reset -u <commit>` — index + worktree now match
+///    the snapshot, including files that were untracked at checkpoint
+///    time (they were captured in the snapshot tree).
+/// 4. `git clean -fd` — removes files created after the checkpoint
+///    (now untracked). Ignored files (`node_modules`, `.env`, …)
+///    survive because `clean` without `-x` skips them.
+pub fn git_restore_workspace_checkpoint(
+    repo_path: &Path,
+    checkpoint_commit: &str,
+    safety_ref: &str,
+) -> Result<WorkspaceCheckpoint, String> {
+    run_git(
+        repo_path,
+        &["cat-file", "-e", &format!("{checkpoint_commit}^{{commit}}")],
+    )
+    .map_err(|_| "Checkpoint commit no longer exists in this repository".to_string())?;
+
+    let safety = git_create_workspace_checkpoint(
+        repo_path,
+        safety_ref,
+        "codemux pre-restore safety checkpoint",
+    )?;
+
+    run_git(repo_path, &["read-tree", "--reset", "-u", checkpoint_commit])?;
+    run_git(repo_path, &["clean", "-fd"])?;
+    Ok(safety)
+}
+
 pub fn git_discard_file(repo_path: &Path, file: &str) -> Result<(), String> {
     // Try git restore first (works for tracked files)
     let restore = run_git(repo_path, &["restore", "--", file]);
@@ -2717,6 +2846,142 @@ C  source.txt -> copy.txt";
 
         let branches_after = git_list_branches(&repo, false).expect("list branches after");
         assert!(!branches_after.contains(&"feature-test".to_string()), "branch should be deleted");
+    }
+
+    // ── Agent-run checkpoints (issue #80) ──
+
+    fn commit_all(repo: &Path, msg: &str) {
+        run_git(repo, &["add", "."]).expect("git add");
+        run_git(
+            repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@test.com",
+                "commit",
+                "-m",
+                msg,
+            ],
+        )
+        .expect("git commit");
+    }
+
+    #[test]
+    fn test_checkpoint_captures_tree_without_disturbing_state() {
+        let (_dir, repo) = setup_test_repo();
+        std::fs::write(repo.join("tracked.txt"), "v1\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        commit_all(&repo, "base");
+
+        // Dirty state: modified tracked file, untracked file, ignored file.
+        std::fs::write(repo.join("tracked.txt"), "v2\n").unwrap();
+        std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
+        std::fs::write(repo.join("ignored.txt"), "secret\n").unwrap();
+
+        let status_before = run_git(&repo, &["status", "--porcelain"]).unwrap();
+        let cp = git_create_workspace_checkpoint(
+            &repo,
+            "refs/codemux/checkpoints/test-thread",
+            "codemux run checkpoint",
+        )
+        .expect("checkpoint");
+        let status_after = run_git(&repo, &["status", "--porcelain"]).unwrap();
+        assert_eq!(
+            status_before, status_after,
+            "checkpoint must not disturb the user's index or worktree"
+        );
+
+        // Snapshot tree contains the modified + untracked files, not ignored.
+        let files = run_git(&repo, &["ls-tree", "-r", "--name-only", &cp.commit]).unwrap();
+        assert!(files.contains("tracked.txt"));
+        assert!(files.contains("untracked.txt"), "untracked captured: {files}");
+        assert!(!files.contains("ignored.txt"), "ignored excluded: {files}");
+        assert_eq!(
+            run_git(&repo, &["show", &format!("{}:tracked.txt", cp.commit)]).unwrap(),
+            "v2",
+            "snapshot carries the modified contents"
+        );
+
+        // Pinned ref + recorded HEAD.
+        assert_eq!(
+            run_git(&repo, &["rev-parse", "refs/codemux/checkpoints/test-thread"]).unwrap(),
+            cp.commit
+        );
+        assert_eq!(cp.head, run_git(&repo, &["rev-parse", "HEAD"]).unwrap());
+    }
+
+    #[test]
+    fn test_restore_checkpoint_rolls_tree_back() {
+        let (_dir, repo) = setup_test_repo();
+        std::fs::write(repo.join("code.txt"), "original\n").unwrap();
+        std::fs::write(repo.join(".gitignore"), "node_modules/\n").unwrap();
+        commit_all(&repo, "base");
+        std::fs::create_dir_all(repo.join("node_modules")).unwrap();
+        std::fs::write(repo.join("node_modules/dep.js"), "dep\n").unwrap();
+        // User work-in-progress, untracked at checkpoint time.
+        std::fs::write(repo.join("wip.txt"), "user wip\n").unwrap();
+
+        let cp = git_create_workspace_checkpoint(
+            &repo,
+            "refs/codemux/checkpoints/t",
+            "codemux run checkpoint",
+        )
+        .expect("checkpoint");
+
+        // Simulate the agent run: clobber a file, add junk, delete the WIP.
+        std::fs::write(repo.join("code.txt"), "agent broke this\n").unwrap();
+        std::fs::write(repo.join("agent-junk.txt"), "junk\n").unwrap();
+        std::fs::remove_file(repo.join("wip.txt")).unwrap();
+
+        git_restore_workspace_checkpoint(&repo, &cp.commit, "refs/codemux/pre-restore/t")
+            .expect("restore");
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("code.txt")).unwrap(),
+            "original\n",
+            "modified file reverts"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("wip.txt")).unwrap(),
+            "user wip\n",
+            "file untracked at checkpoint time comes back"
+        );
+        assert!(
+            !repo.join("agent-junk.txt").exists(),
+            "files created after the checkpoint are removed"
+        );
+        assert!(
+            repo.join("node_modules/dep.js").exists(),
+            "ignored files survive the restore"
+        );
+        // The restore is itself recoverable from the safety ref…
+        run_git(&repo, &["rev-parse", "refs/codemux/pre-restore/t"]).expect("safety ref");
+        // …and no refs were moved.
+        assert_eq!(cp.head, run_git(&repo, &["rev-parse", "HEAD"]).unwrap());
+    }
+
+    #[test]
+    fn test_restore_rejects_missing_checkpoint_commit() {
+        let (_dir, repo) = setup_test_repo();
+        let err = git_restore_workspace_checkpoint(
+            &repo,
+            "0123456789abcdef0123456789abcdef01234567",
+            "refs/codemux/pre-restore/x",
+        )
+        .unwrap_err();
+        assert!(err.contains("no longer exists"), "got: {err}");
+    }
+
+    #[test]
+    fn test_checkpoint_errors_outside_a_repo() {
+        let dir = TempDir::new().unwrap();
+        assert!(git_create_workspace_checkpoint(
+            dir.path(),
+            "refs/codemux/checkpoints/x",
+            "m"
+        )
+        .is_err());
     }
 
     #[test]

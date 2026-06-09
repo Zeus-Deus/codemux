@@ -1298,6 +1298,49 @@ export const agentChatDeleteSession = (threadId: string) =>
 export const agentChatListMessages = (threadId: string) =>
   invoke<string[]>("agent_chat_list_messages", { threadId });
 
+// ── Run-start rollback checkpoints (issue #80) ──
+
+/** A recorded rollback point for a thread's workspace tree. */
+export interface WorkspaceCheckpoint {
+  /** Snapshot commit pinned under refs/codemux/checkpoints/<thread>. */
+  commit: string;
+  /** Where HEAD pointed when the checkpoint was taken. */
+  head: string;
+}
+
+/** The recorded run-start checkpoint for a thread, if any. */
+export const agentChatGetCheckpoint = (threadId: string) =>
+  invoke<WorkspaceCheckpoint | null>("agent_chat_get_checkpoint", {
+    threadId,
+  });
+
+/**
+ * Roll the workspace tree back to the thread's run-start checkpoint.
+ * Tree-only: branch refs never move; a safety snapshot of the
+ * pre-restore state is pinned under refs/codemux/pre-restore/<thread>.
+ */
+export const agentChatRestoreCheckpoint = (threadId: string) =>
+  invoke<void>("agent_chat_restore_checkpoint", { threadId });
+
+// ── Live event streaming (per-thread Channel) ──
+
+/**
+ * Attach a streaming `Channel` for a thread's live provider events.
+ * Mirrors `attachPtyOutput`: high-frequency streams use Tauri Channels
+ * instead of the global event bus. Resolves with the subscription id
+ * to pass to `detachAgentChatOutput` on unmount.
+ */
+export const attachAgentChatOutput = (
+  threadId: string,
+  channel: Channel<import("@/tauri/events").AgentChatEventPayload>,
+) => invoke<number>("attach_agent_chat_output", { threadId, channel });
+
+/** Detach a previously attached chat event channel. Idempotent. */
+export const detachAgentChatOutput = (
+  threadId: string,
+  subscriptionId: number,
+) => invoke<void>("detach_agent_chat_output", { threadId, subscriptionId });
+
 // ── OpenCode (Step 12 Stage 1) ──
 //
 // Wrappers for the discovery + ping commands that land alongside the

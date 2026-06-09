@@ -516,21 +516,61 @@ string.
 
 ## Event bridge
 
-Every registered provider's canonical event stream is forwarded to
-the frontend on a single Tauri channel named `agent_chat_event`.
-Payloads carry the originating `thread_id` alongside the raw
-`ProviderRuntimeEvent` so subscribers can filter without re-parsing.
-Global events (`RuntimeWarning` without a thread id) are still
-forwarded, with an empty `ThreadId`. The frontend hook
-`useAgentChatEvents(threadId, handler)` in
-`src/hooks/use-agent-chat-events.ts` wires this up with a
-thread-id filter.
+Every registered provider's canonical event stream is routed to the
+frontend over **per-thread Tauri Channels** (issue #75 — Tauri's
+recommended mechanism for high-throughput streaming, mirroring the
+PTY output path). When a pane binds to a thread, the
+`useAgentChatEvents(threadId, handler)` hook
+(`src/hooks/use-agent-chat-events.ts`) invokes
+`attach_agent_chat_output(thread_id, channel)`; on unmount it calls
+`detach_agent_chat_output(thread_id, subscription_id)`. The backend's
+`AgentChatChannelRegistry` (`commands/agent_chat.rs`) maps each
+thread id to its attached channels and `forward_event` sends each
+thread-scoped event — including the high-frequency `content_delta`
+token stream — only to that thread's channels, so a pane never
+receives (or filters) another thread's traffic. Multiple panes may
+attach to the same thread; dead channels (webview reload without
+detach) fail on send and are pruned lazily.
+
+Only **threadless** events (global `RuntimeWarning`s with no owning
+pane) still go out on the legacy `agent_chat_event` broadcast bus,
+with an empty `ThreadId`.
+
+Replay semantics: transcript-mutating events are persisted to
+`agent_chat_messages` (unchanged), so a late-attaching or resumed
+pane hydrates history from the DB via `agent_chat_list_messages`
+while the channel carries only live deltas. Partial deltas are never
+persisted — they're superseded by their `item_completed`.
 
 The bridge is a thin loop: one background Tokio task per provider,
-each consuming the provider's `event_stream()` and re-emitting each
-event via `AppHandle::emit`. `broadcast::error::RecvError::Lagged`
+each consuming the provider's `event_stream()` and routing each
+event through `forward_event`. `broadcast::error::RecvError::Lagged`
 is already swallowed by each provider's event-stream helper, so slow
 subscribers never crash the loop — they just drop old events.
+
+## Run-start rollback checkpoints (issue #80, opt-in)
+
+When `git.agent_checkpoint_enabled` is on (Settings → Git; default
+**off**), `agent_chat_start_session` fires a **background** snapshot
+of the workspace working tree after the session is live — nothing on
+the first-token path awaits it. The snapshot uses a scratch index
+(`GIT_INDEX_FILE`), so it captures modified **and untracked** files
+without ever touching the user's real index or worktree, and is
+pinned under `refs/codemux/checkpoints/<thread>`; the commit + HEAD
+hashes are recorded on the `agent_chat_sessions` row
+(`checkpoint_commit` / `checkpoint_head`).
+
+The pane header shows a "Restore checkpoint" action (History icon,
+hover-reveal) when the thread has a recorded checkpoint. Restore is
+**tree-only**: a safety snapshot of the current state is pinned under
+`refs/codemux/pre-restore/<thread>` first, then
+`git read-tree --reset -u` + `git clean -fd` make the tree match the
+snapshot — files created after the checkpoint are removed, ignored
+files and branch refs/commits are untouched. Commands:
+`agent_chat_get_checkpoint`, `agent_chat_restore_checkpoint`; git
+helpers in `src-tauri/src/git.rs`
+(`git_create_workspace_checkpoint` / `git_restore_workspace_checkpoint`).
+Design notes: `docs/plans/agent-run-checkpoints.md`.
 
 ## Feature flag
 

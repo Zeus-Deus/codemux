@@ -228,16 +228,18 @@ export type ProviderRuntimeEvent =
       resume_cursor: unknown;
     };
 
-/** Canonical provider event payload as emitted to the frontend. */
+/**
+ * Canonical provider event payload as streamed to the frontend.
+ *
+ * Thread-scoped events arrive over the per-thread `Channel` attached
+ * via `attachAgentChatOutput` (see `use-agent-chat-events.ts`), not
+ * the global event bus; only threadless runtime warnings still use
+ * the legacy `agent_chat_event` broadcast.
+ */
 export interface AgentChatEventPayload {
   thread_id: string;
   event: ProviderRuntimeEvent;
 }
-
-export const onAgentChatEvent = (
-  cb: EventCallback<AgentChatEventPayload>,
-): Promise<UnlistenFn> =>
-  listen<AgentChatEventPayload>("agent_chat_event", (e) => cb(e.payload));
 
 // ── Tunnel health ──
 //

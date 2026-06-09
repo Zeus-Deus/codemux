@@ -178,7 +178,7 @@ const SYNCED_SETTINGS: UserSettings = {
   },
   editor: { default_ide: null },
   terminal: { scrollback_limit: 10_000, cursor_style: "bar" },
-  git: { default_base_branch: "main" },
+  git: { default_base_branch: "main", agent_checkpoint_enabled: true },
   keyboard: { shortcuts: {} },
   notifications: { sound_enabled: true, desktop_enabled: true },
   file_tree: { show_hidden_files: false },
@@ -205,9 +205,10 @@ const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
 // `agent_chat_list_messages`, which returns a long generated
 // transcript replayed through the real reducer — so the virtualized
 // MessageList renders real ChatViewItems. `agent_chat_send_turn`
-// simulates a streaming reply through the real `agent_chat_event`
-// channel; `window.__codemuxChatMock.streamReply()` triggers one on
-// demand for scroll/perf testing.
+// simulates a streaming reply over the pane's attached per-thread
+// `Channel` (same path as the real backend — issue #75);
+// `window.__codemuxChatMock.streamReply()` triggers one on demand for
+// scroll/perf testing.
 
 const MOCK_CHAT_MODEL: ChatModelInfo = {
   id: "mock-sonnet",
@@ -330,9 +331,61 @@ function mockChatTranscript(): string[] {
 
 let mockChatTurnSeq = 0;
 
-/** Simulate a streaming assistant reply on the real event channel.
- *  Returns the turn id immediately; deltas tick on an interval so
- *  stick-to-bottom / scroll-up-freedom can be observed live. */
+// ── Per-thread chat event channels (mirrors the real backend) ──────
+//
+// The real backend streams thread-scoped events over per-thread Tauri
+// `Channel`s registered via `attach_agent_chat_output` (issue #75).
+// A `Channel` registers its ordered dispatcher through
+// `transformCallback` and expects `{ index, message }` payloads with a
+// per-channel sequential index starting at 0. We track attached
+// channel callback-ids per thread plus each channel's next index.
+
+// thread_id -> Set of channel callback ids
+const mockChatChannels = new Map<string, Set<number>>();
+// channel callback id -> next message index
+const mockChatChannelIndexes = new Map<number, number>();
+
+function attachMockChatChannel(threadId: string, channel: unknown): number {
+  const id = (channel as { id?: number } | undefined)?.id;
+  if (typeof id !== "number") return 0;
+  let set = mockChatChannels.get(threadId);
+  if (!set) {
+    set = new Set();
+    mockChatChannels.set(threadId, set);
+  }
+  set.add(id);
+  mockChatChannelIndexes.set(id, 0);
+  return id;
+}
+
+function detachMockChatChannel(threadId: string, subscriptionId: number): void {
+  mockChatChannels.get(threadId)?.delete(subscriptionId);
+  mockChatChannelIndexes.delete(subscriptionId);
+}
+
+/** Deliver one AgentChatEventPayload to every channel attached to the
+ *  thread, preserving the Channel dispatcher's ordered-index contract. */
+function sendMockChatEvent(threadId: string, event: unknown): void {
+  const subs = mockChatChannels.get(threadId);
+  if (!subs || subs.size === 0) return;
+  const payload = { thread_id: threadId, event };
+  for (const id of subs) {
+    const cb = callbacks.get(id);
+    if (!cb) continue;
+    const index = mockChatChannelIndexes.get(id) ?? 0;
+    mockChatChannelIndexes.set(id, index + 1);
+    try {
+      cb.fn({ index, message: payload } as unknown as never);
+    } catch (err) {
+      console.error("[dev mock] chat channel dispatch threw:", err);
+    }
+  }
+}
+
+/** Simulate a streaming assistant reply over the thread's attached
+ *  channels. Returns the turn id immediately; deltas tick on an
+ *  interval so stick-to-bottom / scroll-up-freedom can be observed
+ *  live. */
 function streamMockChatReply(
   threadId: string,
   opts: { tokens?: number; intervalMs?: number } = {},
@@ -340,8 +393,7 @@ function streamMockChatReply(
   const turnId = `live-turn-${++mockChatTurnSeq}`;
   const tokens = Math.max(1, opts.tokens ?? 120);
   const intervalMs = Math.max(5, opts.intervalMs ?? 40);
-  const send = (event: unknown) =>
-    emitEvent("agent_chat_event", { thread_id: threadId, event });
+  const send = (event: unknown) => sendMockChatEvent(threadId, event);
 
   send({
     type: "session_state_changed",
@@ -536,6 +588,26 @@ const handlers: Record<string, Handler> = {
   agent_chat_stop_session: () => undefined,
   agent_chat_rename_session: () => undefined,
   agent_chat_delete_session: () => undefined,
+  attach_agent_chat_output: (a) =>
+    attachMockChatChannel(a.threadId as string, a.channel),
+  detach_agent_chat_output: (a) => {
+    detachMockChatChannel(a.threadId as string, a.subscriptionId as number);
+    return undefined;
+  },
+  // Run-start rollback checkpoint (issue #80): the seeded thread has
+  // one so the header's restore affordance + confirm dialog can be
+  // exercised in plain-browser dev.
+  agent_chat_get_checkpoint: (a) =>
+    a.threadId === MOCK_CHAT_THREAD_ID
+      ? {
+          commit: "c0ffee1234567890c0ffee1234567890c0ffee12",
+          head: "feedface1234567890feedface1234567890feed",
+        }
+      : null,
+  agent_chat_restore_checkpoint: (a) => {
+    console.log("[dev mock] agent_chat_restore_checkpoint", a.threadId);
+    return undefined;
+  },
   grep_count_pattern: () => 0,
 
   // ── Presets ──

@@ -35,7 +35,7 @@ const FULL_CUSTOM: UserSettings = {
   appearance: { theme: "dark", shell_font: "Fira Code", terminal_font_size: 20, show_resource_monitor: true },
   editor: { default_ide: "cursor" },
   terminal: { scrollback_limit: 2000, cursor_style: "underline" },
-  git: { default_base_branch: "develop" },
+  git: { default_base_branch: "develop", agent_checkpoint_enabled: false },
   keyboard: { shortcuts: { "ctrl+s": "save", "ctrl+p": "palette" } },
   notifications: { sound_enabled: false, desktop_enabled: false },
   file_tree: { show_hidden_files: true },
@@ -117,7 +117,7 @@ describe("settings single-store integration", () => {
       const userBSettings: UserSettings = {
         ...DEFAULT_SETTINGS,
         appearance: { theme: "light", shell_font: null, terminal_font_size: 14, show_resource_monitor: true },
-        git: { default_base_branch: "release" },
+        git: { default_base_branch: "release", agent_checkpoint_enabled: false },
       };
       mockGetSyncedSettings.mockResolvedValue(userBSettings);
       await useSyncedSettingsStore.getState().loadSettings();

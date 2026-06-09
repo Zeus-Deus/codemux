@@ -1765,7 +1765,8 @@ fn spawn_setup_scripts(
         if let Some(config) = config {
             if !config.setup.is_empty() {
                 if let Err(e) = crate::scripts::run_setup_scripts_with_config(
-                    &ws_path, &ws_title, &ws_id, &app2, &config, &root_path,
+                    &ws_path, &ws_title, &ws_id,
+                    &crate::scripts::SetupEmitter::App(&app2), &config, &root_path,
                     ws_branch.as_deref(), Some(port),
                 ) {
                     eprintln!("[codemux::scripts] Setup failed for workspace {ws_id}: {e}");
@@ -1804,7 +1805,8 @@ pub fn run_workspace_setup(
     };
     let port = crate::scripts::allocate_workspace_port(&workspace_id);
     crate::scripts::run_setup_scripts(
-        Path::new(&cwd), &title, &workspace_id, &app, Some(&db),
+        Path::new(&cwd), &title, &workspace_id,
+        &crate::scripts::SetupEmitter::App(&app), Some(&db),
         branch.as_deref(), Some(port),
     )
 }

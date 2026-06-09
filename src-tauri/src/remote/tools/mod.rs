@@ -277,7 +277,49 @@ fn worktree_create(params: &Value, store: &WorkspaceStore) -> ToolResult {
             Some(created.repo_root.to_string_lossy().to_string()),
         )
         .map_err(workspace_err)?;
-    Ok(json!({ "workspace": ws }))
+
+    // Desktop parity (#78): provision the new worktree in the
+    // background — copy gitignored includes (.env etc.) and run the
+    // project's setup scripts with the same CODEMUX_* env and stable
+    // per-workspace port the desktop injects. File-based config only
+    // (`.codemux/config.json` in the worktree or repo root): the
+    // daemon has no settings DB. Failures never fail the tool call —
+    // they're logged to stderr, which serve-mode captures in
+    // `serve.log` — matching the desktop's fire-and-forget background
+    // thread. With no config present the pipeline is a clean no-op
+    // (includes still copy the default `.env*` patterns).
+    let setup_configured = crate::config::workspace_config::read_workspace_config(
+        std::path::Path::new(&ws.path),
+    )
+    .map(|c| !c.setup.is_empty())
+    .unwrap_or(false);
+    let port = crate::scripts::allocate_workspace_port(&ws.id);
+    {
+        let ws_path = std::path::PathBuf::from(&ws.path);
+        let ws_name = ws.name.clone();
+        let ws_id = ws.id.clone();
+        let ws_branch = ws.branch.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::scripts::run_setup_scripts(
+                &ws_path,
+                &ws_name,
+                &ws_id,
+                &crate::scripts::SetupEmitter::Log,
+                None,
+                ws_branch.as_deref(),
+                Some(port),
+            ) {
+                eprintln!(
+                    "[codemux-remote] setup scripts failed for workspace {ws_id}: {e}"
+                );
+            }
+        });
+    }
+
+    Ok(json!({
+        "workspace": ws,
+        "setup": { "configured": setup_configured, "port": port },
+    }))
 }
 
 fn workspace_list(store: &WorkspaceStore) -> ToolResult {
@@ -503,7 +545,115 @@ mod tests {
         // main + worktree of the same local repo share a project_uid.
         assert!(ws["project_uid"].is_string());
 
+        // No `.codemux/config.json` in this repo → setup is reported
+        // as unconfigured (the background pipeline is a clean no-op),
+        // but a deterministic port is still allocated.
+        assert_eq!(out["setup"]["configured"], false);
+        assert!(out["setup"]["port"].as_u64().is_some());
+
         // restore HOME
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn worktree_create_runs_setup_scripts_with_env_and_includes() {
+        // Desktop-parity coverage for issue #78: a daemon-created
+        // worktree must (1) copy gitignored worktree includes (.env)
+        // from the main checkout, and (2) run the project's setup
+        // scripts with the CODEMUX_* env + deterministic port.
+        let home = TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let repo = TempDir::new().unwrap();
+        init_repo(repo.path());
+
+        // Project setup config: the command captures the injected env
+        // into a marker file inside the new worktree (cwd = worktree).
+        std::fs::create_dir_all(repo.path().join(".codemux")).unwrap();
+        let config = json!({
+            "setup": [
+                "printf '%s\n%s\n%s\n%s\n' \"$CODEMUX_BRANCH\" \"$CODEMUX_PORT\" \"$CODEMUX_WORKSPACE_PATH\" \"$CODEMUX_ROOT_PATH\" > setup-ran.txt"
+            ]
+        });
+        std::fs::write(
+            repo.path().join(".codemux/config.json"),
+            config.to_string(),
+        )
+        .unwrap();
+        // Gitignored .env in the repo root — the includes step must
+        // copy it into the worktree (default `.env*` patterns).
+        std::fs::write(repo.path().join(".gitignore"), ".env\n").unwrap();
+        std::fs::write(repo.path().join(".env"), "SECRET=1\n").unwrap();
+        let run = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repo.path())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?}"
+            );
+        };
+        run(&["add", "."]);
+        run(&["commit", "-m", "add setup config"]);
+
+        let store_dir = TempDir::new().unwrap();
+        let store = open_store(&store_dir);
+
+        let params = json!({
+            "repo_path": repo.path().to_string_lossy(),
+            "branch": "feature/setup",
+            "base": "main"
+        });
+        let out = worktree_create(&params, &store).expect("worktree_create");
+
+        assert_eq!(out["setup"]["configured"], true);
+        let port = out["setup"]["port"].as_u64().expect("port allocated");
+        let ws_path =
+            std::path::PathBuf::from(out["workspace"]["path"].as_str().unwrap());
+
+        // Setup runs on a background thread (parity with the desktop's
+        // fire-and-forget spawn) — poll for the marker.
+        let marker = ws_path.join("setup-ran.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(marker.exists(), "setup script should have run in the worktree");
+
+        let contents = std::fs::read_to_string(&marker).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+        assert_eq!(lines[0], "feature/setup", "CODEMUX_BRANCH injected");
+        assert_eq!(lines[1], port.to_string(), "CODEMUX_PORT matches response");
+        assert_eq!(
+            lines[2],
+            ws_path.to_string_lossy(),
+            "CODEMUX_WORKSPACE_PATH points at the worktree"
+        );
+        // Canonicalize both sides — the root recorded in the worktree's
+        // `.git` file may differ from the TempDir path by symlinks.
+        assert_eq!(
+            std::fs::canonicalize(lines[3]).unwrap(),
+            std::fs::canonicalize(repo.path()).unwrap(),
+            "CODEMUX_ROOT_PATH resolves to the main checkout"
+        );
+
+        // Includes run before setup commands, so the marker existing
+        // implies the .env copy already happened.
+        assert_eq!(
+            std::fs::read_to_string(ws_path.join(".env")).unwrap(),
+            "SECRET=1\n",
+            "gitignored .env must be copied from the main checkout"
+        );
+
         match prev_home {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),

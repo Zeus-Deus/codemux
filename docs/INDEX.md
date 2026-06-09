@@ -40,6 +40,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - MCP host runtime (Step 9 — Codemux as MCP host/client for chat): current behavior in `docs/features/agent-chat.md` (§ MCP host runtime) + `docs/features/mcp-server.md`; research at `docs/plans/step-9-mcp-servers.md`; Codex MCP gateway feasibility spike (future Step 11) at `docs/plans/step-9-codex-mcp-spike.md`
 - Beta Features toggle (Step 13): `docs/plans/step-13-beta-toggle-research.md`; operator UI smoke at `docs/plans/step-13-ui-smoke-checklist.md`
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
+- Agent-run rollback checkpoints (opt-in run-start snapshot + restore, issue #80): current behavior in `docs/features/agent-chat.md` (§ Run-start rollback checkpoints); plan at `docs/plans/agent-run-checkpoints.md`
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md` (browser stream stability fix archived at `docs/archive/browser-stream-fix.md`)
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
