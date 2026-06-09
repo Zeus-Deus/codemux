@@ -33,12 +33,14 @@
  * falls through to a logged, shape-safe default.
  */
 import {
+  MOCK_CHAT_THREAD_ID,
   MOCK_HOME_DIR,
   MOCK_USER,
   createSeedAppState,
 } from "./mock-fixtures";
 import type {
   AppStateSnapshot,
+  ChatModelInfo,
   CliToolInfo,
   FeatureFlags,
   PresetStoreSnapshot,
@@ -177,7 +179,6 @@ interface MockChatChannelEntry {
 
 const chatChannels = new Map<string, MockChatChannelEntry>();
 let chatChannelGeneration = 0;
-let chatTurnSeq = 0;
 
 function chatChannelPush(entry: MockChatChannelEntry, payload: unknown): void {
   const id = (entry.channel as { id?: number } | undefined)?.id;
@@ -199,63 +200,10 @@ function emitChatEvent(threadId: string, event: unknown): void {
   chatChannelPush(entry, { thread_id: threadId, event });
 }
 
-const chatSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-/** Simulate a full agent turn: running → token-by-token
- *  `content_delta`s → `item_completed` → `turn_completed` → ready. */
-async function streamMockChatReply(
-  threadId: string,
-  turnId: string,
-  userText: string,
-): Promise<void> {
-  emitChatEvent(threadId, {
-    type: "session_state_changed",
-    thread_id: threadId,
-    status: { status: "running", active_turn: turnId },
-  });
-  const reply =
-    "Streaming from the dev mock over a per-thread Tauri Channel — " +
-    "every token in this reply arrived as its own `content_delta` " +
-    "frame through the same `@tauri-apps/api` Channel dispatcher the " +
-    "real backend uses.\n\n" +
-    `You said: “${userText.trim().slice(0, 120)}”. ` +
-    "In a real session this text would come from the provider " +
-    "sidecar; run `npm run tauri:dev` for live IPC.";
-  const tokens = reply.match(/\S+\s*/g) ?? [];
-  let assembled = "";
-  for (const token of tokens) {
-    await chatSleep(24);
-    assembled += token;
-    emitChatEvent(threadId, {
-      type: "content_delta",
-      thread_id: threadId,
-      turn_id: turnId,
-      delta: { kind: "text", text: token },
-    });
-  }
-  emitChatEvent(threadId, {
-    type: "item_completed",
-    thread_id: threadId,
-    turn_id: turnId,
-    item: { kind: "assistant_text", text: assembled },
-  });
-  emitChatEvent(threadId, {
-    type: "turn_completed",
-    thread_id: threadId,
-    turn_id: turnId,
-    status: { kind: "success" },
-    usage: {
-      total_cost_usd: null,
-      duration_ms: tokens.length * 24,
-      num_turns: 1,
-    },
-  });
-  emitChatEvent(threadId, {
-    type: "session_state_changed",
-    thread_id: threadId,
-    status: { status: "ready" },
-  });
-}
+// The turn simulator itself (`streamMockChatReply`) lives in the
+// "Agent chat (mocked end-to-end)" section below — it routes every
+// frame through `emitChatEvent`, so the channel is the only live
+// transport, exactly like the real backend.
 
 // ── Static command returns ──────────────────────────────────────────
 
@@ -263,9 +211,10 @@ const FEATURE_FLAGS: FeatureFlags = {
   unstable_openflow: false,
   unstable_browser_automation: false,
   unstable_indexing: false,
-  // ON so the seeded `agent_chat` pane (ws-codemux-chat) mounts the
-  // real chat UI and exercises the per-thread Channel streaming path
-  // (issue #75) against the mock token-stream simulator below.
+  // On in the mock so the seeded agent-chat workspaces render their
+  // chat panes: the virtualized long transcript (issue #77) and the
+  // per-thread Channel streaming path (issue #75) are both primary
+  // dev-iteration surfaces. All chat IPC is mocked below.
   enable_agent_chat: true,
   enable_lazy_workspace_creation: false,
 };
@@ -297,6 +246,215 @@ const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
   permission_modes: [],
   default_permission_mode: null,
   permission_granularity: "per_session",
+};
+
+// ── Agent chat (mocked end-to-end) ──────────────────────────────────
+//
+// The seeded `ws-codemux-chat` workspace carries an `agent_chat` pane
+// bound to MOCK_CHAT_THREAD_ID. On mount the pane hydrates via
+// `agent_chat_list_messages`, which returns a long generated
+// transcript replayed through the real reducer — so the virtualized
+// MessageList renders real ChatViewItems. `agent_chat_send_turn`
+// simulates a streaming reply through the pane's attached per-thread
+// Channel (issue #75, `emitChatEvent` above);
+// `window.__codemuxChatMock.streamReply()` triggers one on demand for
+// scroll/perf testing.
+
+const MOCK_CHAT_MODEL: ChatModelInfo = {
+  id: "mock-sonnet",
+  label: "Mock Sonnet",
+  description: "Simulated model served by the dev mock",
+  effort_levels: [],
+  default_effort: null,
+  prompt_injected_effort_levels: [],
+  context_window_options: [],
+  supports_adaptive_thinking: false,
+  supports_thinking_toggle: false,
+  supports_fast_mode: false,
+  supports_images: false,
+  sub_provider: null,
+  is_free: false,
+};
+
+const CLAUDE_CAPABILITIES: ProviderChatCapabilities = {
+  models: [MOCK_CHAT_MODEL],
+  effort_granularity: "per_session",
+  effort_label_map: {},
+  permission_modes: [
+    {
+      value: "bypassPermissions",
+      label: "Full access",
+      description: "Run every tool without asking",
+      is_default: true,
+    },
+    {
+      value: "default",
+      label: "Ask first",
+      description: "Prompt before tool use",
+      is_default: false,
+    },
+  ],
+  default_permission_mode: "bypassPermissions",
+  permission_granularity: "per_session",
+};
+
+/** Number of simulated turns in the seeded transcript. Every 5th turn
+ *  includes an 8-call tool burst (exercises the run-collapse row), so
+ *  the item total lands well past 1,200 — enough to make unbounded
+ *  row mounting obvious in devtools if virtualization ever regresses. */
+const MOCK_CHAT_TURNS = 220;
+
+const ASSISTANT_BODIES = [
+  "Short answer: yes — the transcript only mounts the rows that intersect the viewport.",
+  "Here's the longer explanation.\n\nThe message list used to render every item with a plain `.map()`, which meant a 5,000-message session mounted 5,000 DOM subtrees. Virtualization replaces that with a window: rows are measured as they appear and recycled as they leave.\n\n- Stable keys keep React row identity\n- `React.memo` still skips untouched rows\n- The tail snap only fires while you're pinned to the bottom",
+  "Let me check a few files to confirm the behavior before answering.",
+  "```ts\nconst distance = el.scrollHeight - el.scrollTop - el.clientHeight;\npinned = distance <= PIN_THRESHOLD_PX;\n```\n\nThat predicate decides whether the next token snaps the view to the tail or leaves you reading history in peace.",
+  "Done. The change keeps the DOM bounded regardless of conversation length, so session-open time and scroll cost stop scaling with history size.\n\nA second paragraph pads this message out so row heights vary — fixed-height assumptions are exactly what dynamic measurement has to absorb.\n\nAnd a third paragraph for good measure, because real assistant turns are rarely uniform.",
+];
+
+let mockChatTranscriptCache: string[] | null = null;
+
+/** Generate the persisted-payload list `agent_chat_list_messages`
+ *  returns for the seeded thread: the same JSON envelopes the real
+ *  backend stores, replayed by the frontend through the pure reducer. */
+function mockChatTranscript(): string[] {
+  if (mockChatTranscriptCache) return mockChatTranscriptCache;
+  const T = MOCK_CHAT_THREAD_ID;
+  const out: string[] = [];
+  const push = (envelope: unknown) => out.push(JSON.stringify(envelope));
+  for (let i = 0; i < MOCK_CHAT_TURNS; i++) {
+    const turnId = `seed-turn-${i + 1}`;
+    push({
+      type: "user_message",
+      thread_id: T,
+      text: `Turn ${i + 1}: how does the virtualized transcript hold up at scale?`,
+    });
+    if (i % 5 === 4) {
+      // Tool burst — 8 consecutive calls so the run-collapse toggle
+      // ("Show 4 earlier tool calls") appears inside one virtual row.
+      for (let k = 0; k < 8; k++) {
+        const toolUseId = `seed-tu-${i}-${k}`;
+        push({
+          type: "item_completed",
+          thread_id: T,
+          turn_id: turnId,
+          item: {
+            kind: "tool_use",
+            tool_name: "Read",
+            input: { file_path: `/src/components/chat/file-${i}-${k}.ts` },
+            tool_use_id: toolUseId,
+          },
+        });
+        push({
+          type: "item_completed",
+          thread_id: T,
+          turn_id: turnId,
+          item: {
+            kind: "tool_result",
+            tool_use_id: toolUseId,
+            content: `// mock contents ${i}-${k}\nexport const value = ${k};`,
+            is_error: false,
+          },
+        });
+      }
+    }
+    push({
+      type: "item_completed",
+      thread_id: T,
+      turn_id: turnId,
+      item: {
+        kind: "assistant_text",
+        text: `(${i + 1}/${MOCK_CHAT_TURNS}) ${ASSISTANT_BODIES[i % ASSISTANT_BODIES.length]}`,
+      },
+    });
+    push({
+      type: "turn_completed",
+      thread_id: T,
+      turn_id: turnId,
+      status: { kind: "success" },
+      usage: null,
+    });
+  }
+  mockChatTranscriptCache = out;
+  return out;
+}
+
+let mockChatTurnSeq = 0;
+
+/** Simulate a streaming assistant reply on the real event channel.
+ *  Returns the turn id immediately; deltas tick on an interval so
+ *  stick-to-bottom / scroll-up-freedom can be observed live.
+ *
+ *  Delivery is the per-thread Channel registered via
+ *  `attach_agent_chat_output` (issue #75) — the global event bus
+ *  carries no thread-scoped chat traffic anymore, matching the real
+ *  backend's `forward_event` routing. */
+function streamMockChatReply(
+  threadId: string,
+  opts: { tokens?: number; intervalMs?: number } = {},
+): string {
+  const turnId = `live-turn-${++mockChatTurnSeq}`;
+  const tokens = Math.max(1, opts.tokens ?? 120);
+  const intervalMs = Math.max(5, opts.intervalMs ?? 40);
+  const send = (event: unknown) => emitChatEvent(threadId, event);
+
+  send({
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "running", active_turn: turnId },
+  });
+
+  let emitted = 0;
+  let fullText = "";
+  const timer = window.setInterval(() => {
+    emitted += 1;
+    const chunk =
+      emitted % 12 === 0
+        ? `token ${emitted}.\n\n`
+        : `token ${emitted} `;
+    fullText += chunk;
+    send({
+      type: "content_delta",
+      thread_id: threadId,
+      turn_id: turnId,
+      delta: { kind: "text", text: chunk },
+    });
+    if (emitted >= tokens) {
+      window.clearInterval(timer);
+      send({
+        type: "item_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        item: { kind: "assistant_text", text: fullText },
+      });
+      send({
+        type: "turn_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        status: { kind: "success" },
+        usage: null,
+      });
+      send({
+        type: "session_state_changed",
+        thread_id: threadId,
+        status: { status: "ready" },
+      });
+    }
+  }, intervalMs);
+  return turnId;
+}
+
+// Expose the stream trigger for browser-console / automation use.
+(
+  window as unknown as {
+    __codemuxChatMock: {
+      threadId: string;
+      streamReply: typeof streamMockChatReply;
+    };
+  }
+).__codemuxChatMock = {
+  threadId: MOCK_CHAT_THREAD_ID,
+  streamReply: streamMockChatReply,
 };
 
 const EMPTY_PRESETS: PresetStoreSnapshot = {
@@ -416,30 +574,25 @@ const handlers: Record<string, Handler> = {
   // ── Resource monitor ──
   get_resource_metrics: () => resourceMetrics(),
 
-  // ── Agent chat ──
-  list_chat_provider_capabilities: () => EMPTY_CAPABILITIES,
-
-  // Session lifecycle: echo back the frontend-minted thread id, and
-  // answer the turn with the channel-streamed mock reply.
-  agent_chat_start_session: (a) => {
-    const input = a.input as { thread_id: string } | undefined;
-    if (!input?.thread_id) throw new Error("mock: missing thread_id");
-    return input.thread_id;
-  },
-  agent_chat_send_turn: (a) => {
-    const input = a.input as { thread_id: string; text: string } | undefined;
-    if (!input?.thread_id) throw new Error("mock: missing thread_id");
-    const turnId = `mock-turn-${++chatTurnSeq}`;
-    void streamMockChatReply(input.thread_id, turnId, input.text ?? "");
-    return turnId;
-  },
+  // ── Agent chat (mocked end-to-end for the seeded chat workspaces) ──
+  // start_session echoes back the frontend-minted thread id;
+  // send_turn answers with the channel-streamed mock reply.
+  list_chat_provider_capabilities: (a) =>
+    a.provider === "claude" ? CLAUDE_CAPABILITIES : EMPTY_CAPABILITIES,
+  agent_chat_list_messages: (a) =>
+    a.threadId === MOCK_CHAT_THREAD_ID ? mockChatTranscript() : [],
+  agent_chat_list_sessions: () => [],
+  agent_chat_start_session: (a) =>
+    (a.input as { thread_id: string }).thread_id,
+  agent_chat_send_turn: (a) =>
+    streamMockChatReply((a.input as { thread_id: string }).thread_id),
   agent_chat_interrupt_turn: () => undefined,
-  agent_chat_stop_session: () => undefined,
+  agent_chat_respond_to_request: () => undefined,
   agent_chat_set_model: () => undefined,
   agent_chat_set_permission_mode: () => undefined,
-  agent_chat_respond_to_request: () => undefined,
-  agent_chat_list_sessions: () => [],
-  agent_chat_list_messages: () => [],
+  agent_chat_stop_session: () => undefined,
+  agent_chat_rename_session: () => undefined,
+  agent_chat_delete_session: () => undefined,
   grep_count_pattern: () => 0,
 
   // ── Agent chat per-thread event channel (issue #75) ──

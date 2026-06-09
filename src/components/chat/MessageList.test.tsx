@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { VirtuosoMockContext } from "react-virtuoso";
 
 import type {
   ChatViewItem,
@@ -11,6 +12,21 @@ import type {
 import { MessageList } from "./MessageList";
 
 afterEach(() => cleanup());
+
+/** Render the (virtualized) MessageList inside react-virtuoso's mock
+ *  context — jsdom has no layout, so Virtuoso needs synthetic viewport
+ *  and row heights to decide what to mount. 2000/100 → a 20-row
+ *  window, comfortably larger than any fixture in this file except
+ *  the windowing test (which relies on the bound). */
+function renderList(messages: ChatViewItem[]) {
+  return render(
+    <VirtuosoMockContext.Provider
+      value={{ viewportHeight: 2000, itemHeight: 100 }}
+    >
+      <MessageList messages={messages} {...noopHandlers} />
+    </VirtuosoMockContext.Provider>,
+  );
+}
 
 function planReq(
   overrides: Partial<PermissionRequestItem> = {},
@@ -81,7 +97,7 @@ const noopHandlers = {
 describe("MessageList dispatch", () => {
   it("routes request_kind=plan to PlanProposalBlock", () => {
     const messages: ChatViewItem[] = [planReq()];
-    render(<MessageList messages={messages} {...noopHandlers} />);
+    renderList(messages);
     // PlanProposalBlock's "Plan proposed" label is a stable marker.
     expect(screen.getByText("Plan proposed")).toBeInTheDocument();
     expect(screen.getByText("Accept & execute")).toBeInTheDocument();
@@ -89,7 +105,7 @@ describe("MessageList dispatch", () => {
 
   it("reduces request_kind=user-input to a transcript marker; full panel lives with the composer", () => {
     const messages: ChatViewItem[] = [askReq()];
-    render(<MessageList messages={messages} {...noopHandlers} />);
+    renderList(messages);
     // The inline transcript row is just a one-line pointer — the
     // actual interactive panel is mounted above the composer by
     // AgentChatPane (see ComposerPendingInputPanel).
@@ -104,7 +120,7 @@ describe("MessageList dispatch", () => {
 
   it("falls back to PermissionRequestBlock for unknown request_kind", () => {
     const messages: ChatViewItem[] = [genericReq()];
-    render(<MessageList messages={messages} {...noopHandlers} />);
+    renderList(messages);
     // Generic fallback renders the classic "Approval requested" label.
     expect(screen.getByText(/Approval requested/)).toBeInTheDocument();
   });
@@ -135,9 +151,7 @@ describe("MessageList dispatch", () => {
         request_id: "tu-plan-x",
         tool_use_id: "tu-plan-x",
       });
-      render(
-        <MessageList messages={[tool, req]} {...noopHandlers} />,
-      );
+      renderList([tool, req]);
       // PlanProposalBlock renders, not the generic approval block.
       expect(screen.getByText("Plan proposed")).toBeInTheDocument();
       expect(screen.getByText("Accept & execute")).toBeInTheDocument();
@@ -160,9 +174,7 @@ describe("MessageList dispatch", () => {
         request_id: "tu-ask-x",
         tool_use_id: "tu-ask-x",
       });
-      render(
-        <MessageList messages={[tool, req]} {...noopHandlers} />,
-      );
+      renderList([tool, req]);
       // The dispatch survives the orphan-ToolCallItem scenario: the
       // user-input request still resolves to the transcript marker
       // (not the generic PermissionRequestBlock fallback).
@@ -201,7 +213,7 @@ describe("MessageList dispatch", () => {
         readCall(3, "/d"),
         readCall(4, "/e"),
       ];
-      render(<MessageList messages={messages} {...noopHandlers} />);
+      renderList(messages);
       expect(screen.queryByText(/earlier tool call/)).toBeNull();
       expect(screen.getByText("/a")).toBeInTheDocument();
       expect(screen.getByText("/e")).toBeInTheDocument();
@@ -212,7 +224,7 @@ describe("MessageList dispatch", () => {
       // default, latest 4 stay visible.
       const messages: ChatViewItem[] = [];
       for (let i = 0; i < 8; i++) messages.push(readCall(i, `/f${i}`));
-      render(<MessageList messages={messages} {...noopHandlers} />);
+      renderList(messages);
 
       // Collapsed state: f0..f3 hidden, f4..f7 visible.
       expect(
@@ -245,7 +257,7 @@ describe("MessageList dispatch", () => {
         streaming: false,
       });
       for (let i = 6; i < 11; i++) messages.push(readCall(i, `/y${i}`));
-      render(<MessageList messages={messages} {...noopHandlers} />);
+      renderList(messages);
       expect(screen.queryByText(/earlier tool call/)).toBeNull();
       expect(screen.getByText("between bursts")).toBeInTheDocument();
       // Every row from both runs is rendered.
@@ -265,7 +277,7 @@ describe("MessageList dispatch", () => {
         streaming: false,
       });
       for (let i = 8; i < 15; i++) messages.push(readCall(i, `/q${i}`));
-      render(<MessageList messages={messages} {...noopHandlers} />);
+      renderList(messages);
       // Each run has 7 items → hides 3, shows 4 → two independent
       // "Show 3 earlier tool calls" toggles.
       const toggles = screen.getAllByText(/Show 3 earlier tool calls/);

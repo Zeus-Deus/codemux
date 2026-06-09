@@ -114,6 +114,35 @@ The chat pane stack:
   in CI to dodge the `fake_codex_app_server` helper-binary build race
   under cargo's parallel scheduler.
 
+## Transcript virtualization (issue #77)
+
+The transcript body (`MessageList.tsx`) is virtualized with
+`react-virtuoso` (MIT — chosen over `@tanstack/react-virtual` and
+`react-window` for its built-in dynamic row measurement and
+bottom-anchoring; the commercially licensed `@virtuoso.dev/message-list`
+package is NOT used). Only the on-screen window of rows is mounted, so
+a 5,000-message session (the reducer cap) scrolls like a short one.
+
+Contract preserved from the pre-virtualization renderer:
+
+- **Stable keys + memo rows.** Per-slot keys are still `slot.item.id`
+  / `run:<first-id>`, and rows render through `MessageRowMemo` — a
+  streaming token mutates exactly one row.
+- **Stick-to-bottom.** `MessageList` owns the scroller now (Virtuoso
+  must control it). Pinned-ness is tracked from real scroll events
+  (≤ 80 px from the bottom); after every transcript change (or
+  thinking-pulse toggle), if pinned, it snaps to the tail via
+  `scrollToIndex(LAST, end)`. Content growth alone never unpins, so
+  auto-scroll never fights a user reading history.
+- **Variable heights.** Tool-run collapses expand in place as a single
+  virtual row; Virtuoso re-measures via ResizeObserver.
+- **Thinking pulse** renders as the last virtual row (not a footer) so
+  the tail snap keeps it visible while streaming.
+
+`ChatTranscript` is now a thin shell that derives `showThinking` and
+sizes the list. jsdom tests wrap renders in `VirtuosoMockContext`
+(see `MessageList.test.tsx` / `MessageList.virtualization.test.tsx`).
+
 ## Current Constraints
 
 - **Beta-gated.** The chat pane is hidden unless the user opts in via
@@ -575,6 +604,15 @@ debug builds when `enable_agent_chat` is on. It invokes
 `dev_agent_chat_spawn_test_pane` to drop a chat pane into the active
 workspace. Useful for quick manual testing without going through the
 sidebar `+` flow.
+
+Under `npm run dev` (plain-browser mock), the seeded
+**agent-chat-demo** workspace carries an `agent_chat` pane bound to
+`MOCK_CHAT_THREAD_ID`. The mock hydrates a ~790-row transcript through
+the real reducer (`agent_chat_list_messages`), streams a simulated
+reply on `agent_chat_send_turn`, and exposes
+`window.__codemuxChatMock.streamReply()` for on-demand streaming —
+the standing harness for transcript-virtualization and scroll-pinning
+work.
 
 ## Step 9 — Cross-provider MCP server runtime (shipped)
 

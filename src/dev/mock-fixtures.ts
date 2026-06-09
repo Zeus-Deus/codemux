@@ -112,42 +112,55 @@ function terminalSurface(label: string, cwd: string): PaneRefs {
   return { pane, surface, tab, session };
 }
 
-/** Build a one-chat surface (+ its tab) for a workspace: the surface
- *  root is an `agent_chat` pane with no thread bound yet, exactly the
- *  state `create_agent_chat_pane` leaves a fresh pane in. Mounting it
- *  drives the full mock chat flow (start_session → attach channel →
- *  send_turn → streamed `content_delta`s) in plain-browser dev. */
-function chatSurface(cwd: string): {
-  surface: SurfaceSnapshot;
-  tab: TabSnapshot;
-} {
+/** Thread id of the pre-seeded agent-chat workspace. The mock's
+ *  `agent_chat_list_messages` returns a long generated transcript for
+ *  this id so the virtualized MessageList can be exercised in a plain
+ *  browser (issue #77). */
+export const MOCK_CHAT_THREAD_ID = "thread-mock-chat";
+
+/** Build an agent-chat surface (+ tab) for a workspace. Mirrors the
+ *  backend's `create_agent_chat_pane`: the surface root is an
+ *  `agent_chat` pane and the tab keeps `kind: "terminal"` (TabKind has
+ *  no chat variant — the pane node drives rendering).
+ *
+ *  `threadId` defaults to the pre-seeded transcript thread; pass
+ *  `null` for a fresh pane with no thread bound yet — exactly the
+ *  state `create_agent_chat_pane` leaves a new pane in, which drives
+ *  the start_session → attach channel → streamed `content_delta`
+ *  flow (issue #75). */
+function chatSurface(
+  label: string,
+  cwd: string,
+  threadId: string | null = MOCK_CHAT_THREAD_ID,
+): { pane: PaneNodeSnapshot; surface: SurfaceSnapshot; tab: TabSnapshot } {
   const n = ++paneSeq;
   const paneId = `pane-${n}`;
+  const surfaceId = `surface-${n}`;
+  const tabId = `tab-${n}`;
+
   const pane: PaneNodeSnapshot = {
     kind: "agent_chat",
     pane_id: paneId,
-    title: "Agent Chat",
-    thread_id: null,
+    title: label,
+    thread_id: threadId,
     provider: "claude",
     cwd,
   };
   const surface: SurfaceSnapshot = {
-    surface_id: `surface-${n}`,
-    title: "Agent Chat",
+    surface_id: surfaceId,
+    title: label,
     root: pane,
     active_pane_id: paneId,
   };
   const tab: TabSnapshot = {
-    tab_id: `tab-${n}`,
-    // The real backend files chat tabs under TabKind::Terminal too
-    // (state_impl.rs::create_agent_chat_pane).
+    tab_id: tabId,
     kind: "terminal",
-    title: "Agent Chat",
-    surface_id: surface.surface_id,
+    title: label,
+    surface_id: surfaceId,
     browser_id: null,
     icon: null,
   };
-  return { surface, tab };
+  return { pane, surface, tab };
 }
 
 interface WorkspaceSeed extends Partial<WorkspaceSnapshot> {
@@ -247,6 +260,29 @@ const wsCodemuxMain = makeWorkspace({
   status: "working", // amber pulsing dot on the primary row
 });
 
+/** Agent-chat workspace: a single `agent_chat` pane bound to
+ *  `MOCK_CHAT_THREAD_ID`. The mock hydrates a long transcript for it
+ *  so list virtualization is observable in the browser. */
+const wsCodemuxChat: WorkspaceSnapshot = (() => {
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-chat",
+    title: "agent-chat-demo",
+    cwd: codemuxRoot,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "main",
+    git_branch: "main",
+  });
+  const { surface, tab } = chatSurface("Agent Chat", codemuxRoot);
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
 const wsCodemuxAuth = makeWorkspace({
   workspace_id: "ws-codemux-auth",
   title: "auth-refactor",
@@ -299,14 +335,15 @@ const wsCodemuxMock = makeWorkspace({
   git_changed_files: 6,
 });
 
-/** Chat workspace: its tab opens directly on an `agent_chat` pane so
- *  the per-thread Channel streaming path (issue #75) is exercisable
- *  in plain-browser dev. The extra chat surface REPLACES the default
- *  terminal surface from `makeWorkspace`. */
-const wsCodemuxChat = (() => {
+/** Live-streaming chat workspace: its `agent_chat` pane has NO thread
+ *  bound, so mounting it walks the fresh-session path — start_session,
+ *  per-thread channel attach, then token-by-token `content_delta`
+ *  streaming on send (issue #75). Complements `wsCodemuxChat` above,
+ *  which exercises the hydrated long-transcript path (issue #77). */
+const wsCodemuxChatLive = (() => {
   const cwd = `${HOME}/.codemux/worktrees/codemux/feature-75-chat-channel`;
   const ws = makeWorkspace({
-    workspace_id: "ws-codemux-chat",
+    workspace_id: "ws-codemux-chat-live",
     title: "chat-streaming",
     cwd,
     worktree_path: cwd,
@@ -315,7 +352,7 @@ const wsCodemuxChat = (() => {
     workspace_kind: "worktree",
     git_branch: "feature/75-chat-channel",
   });
-  const { surface, tab } = chatSurface(cwd);
+  const { surface, tab } = chatSurface("Agent Chat", cwd, null);
   return {
     ...ws,
     tabs: [tab],
@@ -438,10 +475,11 @@ const wsSiteRedesign = makeWorkspace({
 
 const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxMain,
+  wsCodemuxChat,
   wsCodemuxAuth,
   wsCodemuxSidebar,
   wsCodemuxMock,
-  wsCodemuxChat,
+  wsCodemuxChatLive,
   wsCodemuxPorts,
   wsVexisMain,
   wsVexisCuda,

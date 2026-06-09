@@ -544,6 +544,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     })();
     return () => {
       cancelled = true;
+      // Release the attempt marker on teardown. Without this, React
+      // StrictMode's dev-only mount→unmount→remount cycle cancels the
+      // first invocation's in-flight fetch and the second invocation
+      // bails on the marker — so a dev build never hydrates. The
+      // remount re-runs the effect with a clean slate; in production
+      // (single mount) this cleanup only runs on real unmounts, where
+      // the ref dies anyway.
+      if (hydrateAttemptedRef.current === threadId) {
+        hydrateAttemptedRef.current = null;
+      }
     };
   }, [threadId]);
 

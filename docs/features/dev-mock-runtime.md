@@ -42,18 +42,24 @@ Command handling:
 - Mutations re-emit `app-state-changed`, so interactive flows update live
 - Compatible with the Codemux browser commands (`codemux browser open http://localhost:1420`, `snapshot`, `screenshot`) for visual proof
 - Tree-shaken out of production builds; dormant under `npm run tauri:dev`
-- **Agent-chat streaming simulator** (issue #75): the seed includes a
-  `chat-streaming` workspace whose tab opens directly on an
-  `agent_chat` pane (`enable_agent_chat` is ON in the mock flags).
-  The mock implements `agent_chat_start_session` / `agent_chat_send_turn`
-  plus the per-thread channel pair
-  `attach_agent_chat_output` / `detach_agent_chat_output`, and answers
-  each turn by streaming token-by-token `content_delta` frames through
+- **Agent-chat mocked end-to-end** (`enable_agent_chat` is ON in the
+  mock flags; issues #75/#77). Two seeded workspaces cover both chat
+  paths:
+  - `agent-chat-demo` — its `agent_chat` pane is pre-bound to
+    `MOCK_CHAT_THREAD_ID`; `agent_chat_list_messages` hydrates a long
+    generated transcript so the virtualized MessageList is exercisable,
+    and `window.__codemuxChatMock.streamReply()` triggers a live
+    streamed reply on demand.
+  - `chat-streaming` — its pane has no thread bound, walking the
+    fresh-session flow: `agent_chat_start_session`, then the
+    per-thread channel pair
+    `attach_agent_chat_output` / `detach_agent_chat_output`.
+
+  Live replies stream token-by-token `content_delta` frames through
   the registered `@tauri-apps/api` `Channel` — same ordered
   `{ index, message }` dispatch the real IPC layer uses — followed by
-  `item_completed` / `turn_completed` / `session_state_changed`. This
-  exercises the real chat pane, reducer, and channel machinery in
-  plain-browser dev.
+  `item_completed` / `turn_completed` / `session_state_changed`,
+  mirroring the backend's `forward_event` channel routing.
 
 ## Current Constraints
 
