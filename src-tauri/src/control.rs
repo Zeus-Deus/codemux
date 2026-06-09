@@ -585,6 +585,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .and_then(Value::as_str)
                 .map(str::to_string);
             crate::commands::workspace::create_workspace_impl(app.clone(), &state, &db, path)
+                .await
                 .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id }))
         }
         "split_pane" => {

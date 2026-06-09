@@ -97,7 +97,11 @@ pub(crate) async fn populate_git_info_async(
     apply_workspace_git_info(state, workspace_id, info);
 }
 
-pub(crate) fn create_workspace_impl(
+/// `async fn` so the git-info gather runs on the blocking pool instead of
+/// whichever thread drives the caller (the GTK main thread for the Tauri
+/// command, a Tokio worker for the control socket). Both callers are
+/// already async, so the `.await` plumbs straight through.
+pub(crate) async fn create_workspace_impl(
     app: tauri::AppHandle,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
@@ -118,7 +122,7 @@ pub(crate) fn create_workspace_impl(
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
         .unwrap_or_else(|| repo_path.clone());
     state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
-    populate_git_info(state, &workspace_id.0, &repo_path);
+    populate_git_info_async(state, &workspace_id.0, repo_path.clone()).await;
 
     if let Some(session_id) = state.active_terminal_session_id() {
         terminal::spawn_pty_for_session(app.clone(), session_id.0);
@@ -184,18 +188,24 @@ pub fn regenerate_mcp_config(
     Ok(())
 }
 
+// `async fn` so this command runs on Tokio's worker pool instead of the GTK
+// main thread: `populate_git_info` shells out to 5-8 git subprocesses, and a
+// sync handler would block every other IPC call (and the UI) while they run.
+// Same pattern as `commands/git.rs` — see the note at the top of that file.
 #[tauri::command]
-pub fn create_workspace(
+pub async fn create_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     cwd: Option<String>,
 ) -> Result<String, String> {
-    create_workspace_impl(app, &state, &db, cwd)
+    create_workspace_impl(app, &state, &db, cwd).await
 }
 
+// `async fn` so the git-info subprocesses run on the blocking pool instead
+// of the GTK main thread (same rationale as `create_workspace` above).
 #[tauri::command]
-pub fn create_empty_workspace(
+pub async fn create_empty_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
@@ -212,7 +222,7 @@ pub fn create_empty_workspace(
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
         .unwrap_or_else(|| repo_path.clone());
     state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
-    populate_git_info(&state, &workspace_id.0, &repo_path);
+    populate_git_info_async(&state, &workspace_id.0, repo_path.clone()).await;
 
     // Home-chat surfaces and other non-project workspaces pass
     // skip_setup=true to bypass project-level ceremony: no setup
@@ -238,8 +248,11 @@ pub fn create_empty_workspace(
 /// call lazily recreates one (no delete protection by design). Creation
 /// passes `skip_setup=true` semantics — no `.mcp.json` injection, no
 /// setup scripts — since the home directory is not a project.
+///
+/// `async fn` so the git-info subprocesses run on the blocking pool
+/// instead of the GTK main thread (same rationale as `create_workspace`).
 #[tauri::command]
-pub fn get_or_create_home_workspace(
+pub async fn get_or_create_home_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
 ) -> Result<String, String> {
@@ -256,7 +269,7 @@ pub fn get_or_create_home_workspace(
     let project_root = crate::config::workspace_config::find_git_root(&repo_path)
         .unwrap_or_else(|| repo_path.clone());
     state.set_workspace_project_root(&workspace_id.0, project_root.display().to_string());
-    populate_git_info(&state, &workspace_id.0, &repo_path);
+    populate_git_info_async(&state, &workspace_id.0, repo_path.clone()).await;
 
     state.set_workspace_type(&workspace_id.0, WorkspaceType::Home);
 
@@ -280,8 +293,10 @@ pub fn create_openflow_workspace(
     Ok(workspace_id.0)
 }
 
+// `async fn` so the git-info subprocesses run on the blocking pool instead
+// of the GTK main thread (same rationale as `create_workspace` above).
 #[tauri::command]
-pub fn create_workspace_with_preset(
+pub async fn create_workspace_with_preset(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
@@ -308,7 +323,7 @@ pub fn create_workspace_with_preset(
     };
 
     state.set_workspace_project_root(&workspace_id.0, repo_path.display().to_string());
-    populate_git_info(&state, &workspace_id.0, &repo_path);
+    populate_git_info_async(&state, &workspace_id.0, repo_path.clone()).await;
 
     let snapshot = state.snapshot();
     let session_ids = snapshot
@@ -1465,8 +1480,11 @@ pub fn rename_tab(
     Ok(())
 }
 
+// `async fn` so `populate_git_info_async`'s 5-8 git subprocesses run on the
+// blocking pool instead of the GTK main thread. Same pattern as
+// `commands/git.rs` — see the note at the top of that file.
 #[tauri::command]
-pub fn refresh_workspace_git_info(
+pub async fn refresh_workspace_git_info(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     workspace_id: String,
@@ -1478,7 +1496,7 @@ pub fn refresh_workspace_git_info(
         .find(|w| w.workspace_id.0 == workspace_id)
         .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
     let cwd = workspace.cwd.clone();
-    populate_git_info(&state, &workspace_id, Path::new(&cwd));
+    populate_git_info_async(&state, &workspace_id, PathBuf::from(&cwd)).await;
     crate::state::emit_app_state(&app);
     Ok(())
 }
@@ -1491,8 +1509,11 @@ pub fn refresh_workspace_git_info(
 /// Used by the sidebar's right-click "Checkout default branch" action to
 /// close the intent gap where `Open ↵ main` attaches to a repo currently on
 /// a different branch (attach-only by design — no HEAD mutation).
+///
+/// `async fn` so neither the checkout itself (which can be slow on large
+/// repos) nor the follow-up git-info gather runs on the GTK main thread.
 #[tauri::command]
-pub fn checkout_default_branch_in_workspace(
+pub async fn checkout_default_branch_in_workspace(
     app: tauri::AppHandle,
     state: State<'_, AppStateStore>,
     workspace_id: String,
@@ -1506,14 +1527,21 @@ pub fn checkout_default_branch_in_workspace(
             .map(|w| w.cwd.clone())
             .ok_or_else(|| "Workspace not found".to_string())?
     };
-    let repo_path = Path::new(&cwd);
+    let repo_path = PathBuf::from(&cwd);
 
-    match crate::git::checkout_default_branch(repo_path) {
+    let checkout_result = {
+        let repo_path = repo_path.clone();
+        tokio::task::spawn_blocking(move || crate::git::checkout_default_branch(&repo_path))
+            .await
+            .map_err(|e| format!("checkout_default_branch task join failed: {e}"))?
+    };
+
+    match checkout_result {
         Ok(Some(branch)) => {
-            // Sync refresh: closes the 0–5s sidebar-label lag from the
+            // Eager refresh: closes the 0–5s sidebar-label lag from the
             // background polling loop by writing fresh branch info before
             // we emit.
-            populate_git_info(&state, &workspace_id, repo_path);
+            populate_git_info_async(&state, &workspace_id, repo_path).await;
             crate::state::emit_app_state(&app);
             Ok(branch)
         }
