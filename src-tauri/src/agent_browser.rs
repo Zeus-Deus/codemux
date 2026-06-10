@@ -440,6 +440,9 @@ struct StreamSession {
     /// CLI session name used for `agent-browser close --session ...`.
     /// Stored alongside the port so `close()` can issue a graceful
     /// daemon shutdown without the caller having to remember it.
+    /// Only read by the process-teardown path, which is compiled out of
+    /// unit-test builds (see `shutdown_session_processes`).
+    #[cfg_attr(test, allow(dead_code))]
     cli_session_name: String,
     /// Last time we saw signs of life on this session (TCP probe success
     /// or first-frame timestamp passed in by the frontend). Used by the
@@ -1632,17 +1635,44 @@ impl AgentBrowserManager {
     /// callers should not be blocked from retrying or moving on.
     pub async fn close(&self, browser_id: &str) -> Result<(), String> {
         let session = session_name(browser_id).to_string();
-        let bin = resolve_binary();
 
         // Step 1: pop the session under the lock so nothing else races us.
         let removed = self.sessions.lock().await.remove(browser_id);
+
+        // Steps 2–4 spawn external processes (the agent-browser CLI for a
+        // graceful shutdown, then PID/port-based kills). They are compiled
+        // out of unit-test builds: the close() tests assert session-map and
+        // port-allocator semantics and must not depend on a real
+        // agent-browser binary on the test host. The CLI `close` invocation
+        // goes through `Command::output()` with no timeout, and the daemon
+        // auto-start behind it can wedge — observed on CI Windows runners,
+        // where it hung `cargo test` until the 30-minute job timeout.
+        #[cfg(not(test))]
+        Self::shutdown_session_processes(&session, removed);
+        #[cfg(test)]
+        let _ = removed;
+
+        // Step 5: drop our PID file. Ignore failures — the file may not
+        // exist if PID-file integration was skipped.
+        clear_session_pid(&session);
+
+        Ok(())
+    }
+
+    /// Best-effort teardown of the daemon behind a closed session:
+    /// graceful CLI `close`, then a kill by tracked PID with a port-based
+    /// fallback. Spawns external processes — which is exactly why
+    /// `close()` only calls this in non-test builds.
+    #[cfg(not(test))]
+    fn shutdown_session_processes(session: &str, removed: Option<StreamSession>) {
+        let bin = resolve_binary();
 
         // Step 2: graceful daemon shutdown via the CLI.
         #[cfg(target_os = "windows")]
         {
             let _ = run_agent_browser_native(
                 &bin,
-                &["close".into(), "--session".into(), session.clone()],
+                &["close".into(), "--session".into(), session.to_string()],
                 0,
                 true,
             );
@@ -1672,16 +1702,10 @@ impl AgentBrowserManager {
         } else {
             // Session wasn't tracked but caller asked us to close it —
             // fall through to a best-effort PID-file kill.
-            if let Some(p) = read_agent_browser_daemon_pid(&session) {
+            if let Some(p) = read_agent_browser_daemon_pid(session) {
                 kill_pid(p);
             }
         }
-
-        // Step 5: drop our PID file. Ignore failures — the file may not
-        // exist if PID-file integration was skipped.
-        clear_session_pid(&session);
-
-        Ok(())
     }
 
     /// Start the browser session and return the WebSocket stream URL.
