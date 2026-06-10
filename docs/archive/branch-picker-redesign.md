@@ -1,10 +1,10 @@
 # Branch Picker Redesign
 
-- Purpose: Track implementation of the redesigned branch picker in the workspace creation flow.
-- Audience: Anyone implementing or reviewing this work.
-- Authority: Active work plan only, not current truth.
-- Update when: Priorities, open questions, or likely touch points change.
-- Read next: `docs/features/`, `docs/core/STATUS.md`
+- Purpose: Archived design note for the redesigned branch picker in the workspace creation flow.
+- Audience: Anyone needing historical context on the branch-picker design.
+- Authority: Archived note, superseded — not current truth. Current behavior lives in `docs/features/workspace-creation.md`.
+- Update when: Never; this file is historical.
+- Read next: `docs/features/workspace-creation.md`, `docs/core/STATUS.md`
 
 ## Goal
 

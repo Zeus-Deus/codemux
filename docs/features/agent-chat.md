@@ -207,10 +207,11 @@ TypeScript subprocess and talk to it over JSON-RPC. This is the
 officially supported integration path, and it means Codemux's Rust
 side stays provider-agnostic.
 
-**Current state.** Scaffold only. The sidecar implements a single
-`ping` method that echoes its params back with a server timestamp.
-No SDK dependency yet — that lands in a follow-up task on top of a
-known-good foundation.
+**Current state.** Full SDK host. The sidecar depends on
+`@anthropic-ai/claude-agent-sdk` and exposes 13 JSON-RPC methods
+(session lifecycle, turn streaming, approvals, probes — see "Exposed
+RPCs" under "Claude Agent SDK integration" below). The original
+`ping` scaffold method remains as the liveness probe.
 
 **Toolchain.** [Bun](https://bun.sh) 1.3+ is the sole dependency. Bun
 handles install, test, and `bun build --compile` to produce a
@@ -264,7 +265,8 @@ fails with `provider_not_configured: Claude`.
 Rust side spawns the sidecar through
 [`JsonRpcChild`](../../src-tauri/src/json_rpc_child/mod.rs) — the same
 helper the Codex adapter uses — so adding new methods is a matter of
-registering handlers in `sidecar/claude-agent/src/main.ts`.
+registering handlers in `buildMethods` in
+`sidecar/claude-agent/src/methods/index.ts` (dispatched from `main.ts`).
 
 ## Claude Agent SDK integration
 
@@ -324,6 +326,7 @@ Two side-channel notifications are emitted in addition to the raw
 | `interrupt` | Halt the current turn (`query.interrupt`). |
 | `set-model` | Swap the session's default model. |
 | `set-permission-mode` | Change the session's permission mode. |
+| `update-mcp-tools` | Push an updated MCP tool list into the live session (`query.setMcpServers`); lets servers that come up after `start-session` surface without a chat restart. Empty list removes the codemux MCP. Idempotent. |
 | `respond-to-request` | Resolve a pending `canUseTool` approval. |
 | `respond-to-user-input` | Answer an `AskUserQuestion` prompt. |
 | `initialization-result` | Read the SDK's cached init payload. |
@@ -332,13 +335,14 @@ Two side-channel notifications are emitted in addition to the raw
 | `probe-authenticated` | Shell out to `<binary> auth status`. |
 | `ping` | Liveness probe from the scaffold. |
 
-Deliberately NOT exposed (per the integration research): the ~16
+Deliberately NOT exposed (per the integration research): the ~15
 other `Query` methods (`setMaxThinkingTokens`, `applyFlagSettings`,
 `supportedCommands`, `supportedModels`, `supportedAgents`,
 `mcpServerStatus`, `getContextUsage`, `reloadPlugins`, `accountInfo`,
 `rewindFiles`, `seedReadState`, `reconnectMcpServer`,
-`toggleMcpServer`, `setMcpServers`, `streamInput`, `stopTask`).
-These ship as follow-ups only when UI calls for them.
+`toggleMcpServer`, `streamInput`, `stopTask`). These ship as
+follow-ups only when UI calls for them. (`setMcpServers` graduated
+from this list — `update-mcp-tools` wraps it.)
 
 ### Options construction
 
@@ -354,9 +358,11 @@ left unset — they become features when the UI surfaces them.
 
 ### Testing
 
-The sidecar ships with 38 Bun tests: 11 ping (scaffold), 18 session
-unit tests using a `FakeQuery` injected via `setQueryFactoryForTests`,
-and 9 permissions tests exercising the canUseTool bridge. The Rust
+The sidecar ships with 70 Bun tests across six files: ping/liveness,
+session unit tests using a `FakeQuery` injected via
+`setQueryFactoryForTests`, permissions tests exercising the canUseTool
+bridge, MCP-bridge tests, respond-to-request tests, and Stage 3
+real-tools coverage. The Rust
 side has 7 end-to-end integration tests (`sidecar_sdk.rs`) that spawn
 the compiled binary and cover the paths that don't require real
 Anthropic auth. Testing a real session is a manual smoke test — it
