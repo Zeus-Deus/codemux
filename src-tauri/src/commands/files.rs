@@ -2,6 +2,15 @@ use serde::Serialize;
 use std::path::Path;
 use std::process::Command;
 
+// Commands here either spawn subprocesses (`git check-ignore`, `rg`/`grep`,
+// `fd`/`find`, `xdg-open`) or do blocking file I/O. They MUST run off the
+// GTK main thread: a sync `#[tauri::command]` runs on the GTK main thread,
+// and any wedged subprocess or slow disk freezes the whole UI hard enough
+// that even window-close requests can't be processed. The fix is uniform —
+// async command + `tokio::task::spawn_blocking`, same as `commands/git.rs`
+// (see the note at the top of that file). Frontend-side `invoke()` already
+// returns a Promise either way, so no caller changes are needed.
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FileEntry {
     pub name: String,
@@ -20,9 +29,23 @@ pub struct SearchResult {
     pub match_end: u32,
 }
 
+// `async fn` so the directory read + `git check-ignore` subprocess run on
+// the blocking pool instead of the GTK main thread (see note at top of file).
 #[tauri::command]
-pub fn list_directory(path: String, show_hidden: Option<bool>) -> Result<Vec<FileEntry>, String> {
-    let dir = Path::new(&path);
+pub async fn list_directory(
+    path: String,
+    show_hidden: Option<bool>,
+) -> Result<Vec<FileEntry>, String> {
+    tokio::task::spawn_blocking(move || list_directory_blocking(&path, show_hidden))
+        .await
+        .map_err(|e| format!("list_directory task join failed: {e}"))?
+}
+
+fn list_directory_blocking(
+    path: &str,
+    show_hidden: Option<bool>,
+) -> Result<Vec<FileEntry>, String> {
+    let dir = Path::new(path);
     let show_hidden = show_hidden.unwrap_or(false);
     if !dir.is_dir() {
         return Err(format!("Not a directory: {path}"));
@@ -102,22 +125,32 @@ fn git_ignored_set(
         return ignored;
     }
 
-    // Build stdin: one path per line
-    let paths: Vec<String> = entries
+    // Feed paths RELATIVE to `dir` (just the entry name, with a
+    // trailing `/` for directories) and use `-z` (NUL separators).
+    // Both halves matter: `check-ignore` echoes matching input paths
+    // back verbatim, and in line mode git C-quotes any "unusual"
+    // output — the backslashes of a Windows absolute path or any
+    // non-ASCII byte (core.quotepath) — producing lines like
+    // `"C:\\Users\\..."` whose extracted basename carries a stray
+    // trailing quote and never matches the entry name. That's how
+    // gitignore flagging silently broke on Windows. Relative names
+    // keep the round-trip independent of how the caller spelled the
+    // directory path; `-z` disables quoting entirely, so the echoed
+    // bytes match the fed names exactly on every platform.
+    let stdin_data: Vec<u8> = entries
         .iter()
-        .map(|(_, p, is_dir, _)| {
-            let s = p.to_string_lossy().to_string();
+        .flat_map(|(name, _, is_dir, _)| {
+            let mut bytes = name.clone().into_bytes();
             if *is_dir {
-                format!("{s}/")
-            } else {
-                s
+                bytes.push(b'/');
             }
+            bytes.push(0);
+            bytes
         })
         .collect();
-    let stdin_data = paths.join("\n");
 
     let output = Command::new("git")
-        .args(["check-ignore", "--stdin"])
+        .args(["check-ignore", "--stdin", "-z"])
         .current_dir(dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -126,26 +159,31 @@ fn git_ignored_set(
         .and_then(|mut child| {
             use std::io::Write;
             if let Some(ref mut stdin) = child.stdin {
-                let _ = stdin.write_all(stdin_data.as_bytes());
+                let _ = stdin.write_all(&stdin_data);
             }
             child.wait_with_output()
         });
 
     if let Ok(output) = output {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let p = Path::new(line.trim_end_matches('/'));
-            if let Some(name) = p.file_name() {
-                ignored.insert(name.to_string_lossy().to_string());
+        // `-z` output: each ignored input path echoed back verbatim,
+        // NUL-terminated. We fed bare entry names, so each chunk IS
+        // the entry name (modulo the directory marker we appended).
+        for chunk in output.stdout.split(|b| *b == 0) {
+            if chunk.is_empty() {
+                continue;
             }
+            let name = String::from_utf8_lossy(chunk);
+            ignored.insert(name.trim_end_matches('/').to_string());
         }
     }
 
     ignored
 }
 
+// `async fn` so the `rg`/`grep` subprocess runs on the blocking pool instead
+// of the GTK main thread (see note at top of file).
 #[tauri::command]
-pub fn search_in_files(
+pub async fn search_in_files(
     path: String,
     query: String,
     max_results: Option<u32>,
@@ -156,13 +194,17 @@ pub fn search_in_files(
 
     let limit = max_results.unwrap_or(100);
 
-    // Try ripgrep first
-    if let Ok(results) = search_with_rg(&path, &query, limit) {
-        return Ok(results);
-    }
+    tokio::task::spawn_blocking(move || {
+        // Try ripgrep first
+        if let Ok(results) = search_with_rg(&path, &query, limit) {
+            return Ok(results);
+        }
 
-    // Fall back to grep
-    search_with_grep(&path, &query, limit)
+        // Fall back to grep
+        search_with_grep(&path, &query, limit)
+    })
+    .await
+    .map_err(|e| format!("search_in_files task join failed: {e}"))?
 }
 
 fn search_with_rg(path: &str, query: &str, limit: u32) -> Result<Vec<SearchResult>, String> {
@@ -280,8 +322,10 @@ fn search_with_grep(path: &str, query: &str, limit: u32) -> Result<Vec<SearchRes
     Ok(results)
 }
 
+// `async fn` so the `fd`/`find` subprocess runs on the blocking pool instead
+// of the GTK main thread (see note at top of file).
 #[tauri::command]
-pub fn search_file_names(
+pub async fn search_file_names(
     path: String,
     query: String,
     max_results: Option<u32>,
@@ -291,24 +335,29 @@ pub fn search_file_names(
     }
 
     let limit = max_results.unwrap_or(50);
-    let base = Path::new(&path);
 
-    // Try fd first
-    if let Ok(results) = search_with_fd(&path, &query, limit) {
-        // Convert to relative paths
-        return Ok(results
-            .into_iter()
-            .map(|p| {
-                Path::new(&p)
-                    .strip_prefix(base)
-                    .map(|r| r.to_string_lossy().to_string())
-                    .unwrap_or(p)
-            })
-            .collect());
-    }
+    tokio::task::spawn_blocking(move || {
+        let base = Path::new(&path);
 
-    // Fall back to find
-    search_with_find(&path, &query, limit, base)
+        // Try fd first
+        if let Ok(results) = search_with_fd(&path, &query, limit) {
+            // Convert to relative paths
+            return Ok(results
+                .into_iter()
+                .map(|p| {
+                    Path::new(&p)
+                        .strip_prefix(base)
+                        .map(|r| r.to_string_lossy().to_string())
+                        .unwrap_or(p)
+                })
+                .collect());
+        }
+
+        // Fall back to find
+        search_with_find(&path, &query, limit, base)
+    })
+    .await
+    .map_err(|e| format!("search_file_names task join failed: {e}"))?
 }
 
 fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, String> {
@@ -338,24 +387,32 @@ fn search_with_fd(path: &str, query: &str, limit: u32) -> Result<Vec<String>, St
         .collect())
 }
 
+// `async fn` so the `which` + `xdg-open` subprocesses run on the blocking
+// pool instead of the GTK main thread (see note at top of file).
 #[tauri::command]
-pub fn reveal_in_file_manager(path: String) -> Result<(), String> {
-    if Command::new("which")
-        .arg("xdg-open")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-        == false
-    {
-        return Err("xdg-open not found — cannot open file manager. Install xdg-utils.".to_string());
-    }
-    Command::new("xdg-open")
-        .arg(&path)
-        .spawn()
-        .map_err(|e| format!("Failed to open file manager: {e}"))?;
-    Ok(())
+pub async fn reveal_in_file_manager(path: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        if Command::new("which")
+            .arg("xdg-open")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            == false
+        {
+            return Err(
+                "xdg-open not found — cannot open file manager. Install xdg-utils.".to_string(),
+            );
+        }
+        Command::new("xdg-open")
+            .arg(&path)
+            .spawn()
+            .map_err(|e| format!("Failed to open file manager: {e}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("reveal_in_file_manager task join failed: {e}"))?
 }
 
 fn search_with_find(
@@ -408,35 +465,47 @@ fn search_with_find(
 
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024; // 2 MB
 
+// `async fn` so the metadata stat + file read run on the blocking pool
+// instead of the GTK main thread (see note at top of file).
 #[tauri::command]
-pub fn read_file(path: String) -> Result<String, String> {
-    let p = Path::new(&path);
-    if !p.is_file() {
-        return Err(format!("Not a file: {path}"));
-    }
+pub async fn read_file(path: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let p = Path::new(&path);
+        if !p.is_file() {
+            return Err(format!("Not a file: {path}"));
+        }
 
-    let metadata = std::fs::metadata(p).map_err(|e| format!("Cannot read metadata: {e}"))?;
-    if metadata.len() > MAX_FILE_SIZE {
-        return Err(format!(
-            "File too large ({:.1} MB, limit is 2 MB)",
-            metadata.len() as f64 / (1024.0 * 1024.0)
-        ));
-    }
+        let metadata = std::fs::metadata(p).map_err(|e| format!("Cannot read metadata: {e}"))?;
+        if metadata.len() > MAX_FILE_SIZE {
+            return Err(format!(
+                "File too large ({:.1} MB, limit is 2 MB)",
+                metadata.len() as f64 / (1024.0 * 1024.0)
+            ));
+        }
 
-    let bytes = std::fs::read(p).map_err(|e| format!("Failed to read file: {e}"))?;
+        let bytes = std::fs::read(p).map_err(|e| format!("Failed to read file: {e}"))?;
 
-    // Detect binary: check for null bytes in first 8 KB
-    let check_len = bytes.len().min(8192);
-    if bytes[..check_len].contains(&0) {
-        return Err("Binary file".into());
-    }
+        // Detect binary: check for null bytes in first 8 KB
+        let check_len = bytes.len().min(8192);
+        if bytes[..check_len].contains(&0) {
+            return Err("Binary file".into());
+        }
 
-    String::from_utf8(bytes).map_err(|_| "Binary file (not valid UTF-8)".into())
+        String::from_utf8(bytes).map_err(|_| "Binary file (not valid UTF-8)".into())
+    })
+    .await
+    .map_err(|e| format!("read_file task join failed: {e}"))?
 }
 
+// `async fn` so the file write runs on the blocking pool instead of the GTK
+// main thread (see note at top of file).
 #[tauri::command]
-pub fn write_file(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, &content).map_err(|e| format!("Failed to write file: {e}"))
+pub async fn write_file(path: String, content: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        std::fs::write(&path, &content).map_err(|e| format!("Failed to write file: {e}"))
+    })
+    .await
+    .map_err(|e| format!("write_file task join failed: {e}"))?
 }
 
 /// Hard ceiling for clipboard image payloads. Mirrors the soft 5 MB
@@ -510,9 +579,14 @@ fn write_clipboard_image_to_disk(bytes: &[u8], mime: &str) -> Result<String, Str
 /// dialog's paste flow is `paste_clipboard_image_to_file`, which
 /// reads the OS clipboard server-side and bypasses the JS round
 /// trip entirely.
+///
+/// `async fn` so the temp-dir create + file write run on the blocking
+/// pool instead of the GTK main thread (see note at top of file).
 #[tauri::command]
-pub fn save_clipboard_image_bytes(bytes: Vec<u8>, mime: String) -> Result<String, String> {
-    write_clipboard_image_to_disk(&bytes, &mime)
+pub async fn save_clipboard_image_bytes(bytes: Vec<u8>, mime: String) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || write_clipboard_image_to_disk(&bytes, &mime))
+        .await
+        .map_err(|e| format!("save_clipboard_image_bytes task join failed: {e}"))?
 }
 
 /// Encode a raw RGBA pixel buffer (8 bits per channel) as PNG.
@@ -566,31 +640,39 @@ fn encode_rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, S
 ///      from JS produces a file with a misleading extension that
 ///      image viewers and agents cannot decode. Encoding PNG here
 ///      means the resulting attachment is a valid PNG.
+/// `async fn` so the clipboard read (an OS round-trip that can stall),
+/// the CPU-heavy PNG encode (~8 MB of RGBA for a 1080p screenshot), and
+/// the file write all run on the blocking pool instead of the GTK main
+/// thread (see note at top of file).
 #[tauri::command]
-pub fn paste_clipboard_image_to_file<R: tauri::Runtime>(
+pub async fn paste_clipboard_image_to_file<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<String, String> {
-    use tauri_plugin_clipboard_manager::ClipboardExt;
+    tokio::task::spawn_blocking(move || {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
 
-    // `read_image` resolves with an error when the clipboard does
-    // not hold an image (e.g. text-only). Surface a stable error
-    // string so the frontend can distinguish "no image" from a
-    // genuine failure and let the default paste behaviour run.
-    let img = app
-        .clipboard()
-        .read_image()
-        .map_err(|e| format!("clipboard read_image failed: {e}"))?;
+        // `read_image` resolves with an error when the clipboard does
+        // not hold an image (e.g. text-only). Surface a stable error
+        // string so the frontend can distinguish "no image" from a
+        // genuine failure and let the default paste behaviour run.
+        let img = app
+            .clipboard()
+            .read_image()
+            .map_err(|e| format!("clipboard read_image failed: {e}"))?;
 
-    let width = img.width();
-    let height = img.height();
-    let rgba = img.rgba();
+        let width = img.width();
+        let height = img.height();
+        let rgba = img.rgba();
 
-    if width == 0 || height == 0 || rgba.is_empty() {
-        return Err("Clipboard image is empty".into());
-    }
+        if width == 0 || height == 0 || rgba.is_empty() {
+            return Err("Clipboard image is empty".into());
+        }
 
-    let png_bytes = encode_rgba_to_png(rgba, width, height)?;
-    write_clipboard_image_to_disk(&png_bytes, "image/png")
+        let png_bytes = encode_rgba_to_png(rgba, width, height)?;
+        write_clipboard_image_to_disk(&png_bytes, "image/png")
+    })
+    .await
+    .map_err(|e| format!("paste_clipboard_image_to_file task join failed: {e}"))?
 }
 
 /// Count occurrences of `pattern` across `cwd` using ripgrep.
@@ -647,8 +729,9 @@ pub async fn grep_count_pattern(cwd: String, pattern: String) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::{
-        clipboard_image_extension, encode_rgba_to_png, grep_count_pattern,
-        save_clipboard_image_bytes, MAX_CLIPBOARD_IMAGE_BYTES,
+        clipboard_image_extension, encode_rgba_to_png, grep_count_pattern, list_directory,
+        read_file, save_clipboard_image_bytes, search_in_files, write_file,
+        MAX_CLIPBOARD_IMAGE_BYTES,
     };
     use std::fs;
 
@@ -802,11 +885,12 @@ mod tests {
         assert_eq!(clipboard_image_extension("image/x-icon"), "bin");
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_writes_png_and_returns_path() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_writes_png_and_returns_path() {
         // Minimal PNG signature — enough to verify the bytes round-trip.
         let payload: Vec<u8> = vec![0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         let path = save_clipboard_image_bytes(payload.clone(), "image/png".into())
+            .await
             .expect("png write should succeed");
 
         assert!(path.ends_with(".png"), "expected .png extension, got {path}");
@@ -821,8 +905,8 @@ mod tests {
         cleanup_clipboard_temp(&path);
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_uses_correct_extension_per_mime() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_uses_correct_extension_per_mime() {
         // Spot-check that the filename extension follows the MIME.
         // Doesn't re-test every mapping (clipboard_image_extension
         // covers that) — just verifies the command actually wires
@@ -834,6 +918,7 @@ mod tests {
         ];
         for (mime, expected_ext) in cases {
             let path = save_clipboard_image_bytes(vec![0xff, 0xd8, 0xff], mime.into())
+                .await
                 .expect("write should succeed");
             assert!(
                 path.ends_with(expected_ext),
@@ -843,72 +928,85 @@ mod tests {
         }
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_generates_unique_filenames() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_generates_unique_filenames() {
         // Two paste-cycles in a row must not clobber each other —
         // the UUID in the filename guarantees this. Regression
         // guard: if someone "simplifies" the naming and a user
         // pastes twice quickly, the second image would silently
         // overwrite the first attachment.
         let bytes = vec![0x89, 0x50, 0x4e, 0x47];
-        let a = save_clipboard_image_bytes(bytes.clone(), "image/png".into()).unwrap();
-        let b = save_clipboard_image_bytes(bytes, "image/png".into()).unwrap();
+        let a = save_clipboard_image_bytes(bytes.clone(), "image/png".into())
+            .await
+            .unwrap();
+        let b = save_clipboard_image_bytes(bytes, "image/png".into())
+            .await
+            .unwrap();
         assert_ne!(a, b, "consecutive saves must yield distinct paths");
         cleanup_clipboard_temp(&a);
         cleanup_clipboard_temp(&b);
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_rejects_empty_payload() {
-        let err = save_clipboard_image_bytes(vec![], "image/png".into()).unwrap_err();
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_rejects_empty_payload() {
+        let err = save_clipboard_image_bytes(vec![], "image/png".into())
+            .await
+            .unwrap_err();
         assert!(
             err.to_lowercase().contains("empty"),
             "expected empty-payload error, got: {err}",
         );
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_rejects_non_image_mime() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_rejects_non_image_mime() {
         // The frontend already filters for image/* before invoking
         // this command, but the IPC boundary must not trust the
         // caller — a misbehaving (or compromised) frontend mustn't
         // be able to write arbitrary blobs to the temp directory
         // via this command.
-        let err = save_clipboard_image_bytes(vec![1, 2, 3], "text/plain".into()).unwrap_err();
+        let err = save_clipboard_image_bytes(vec![1, 2, 3], "text/plain".into())
+            .await
+            .unwrap_err();
         assert!(
             err.contains("Unsupported"),
             "expected unsupported-mime error, got: {err}",
         );
 
-        let err = save_clipboard_image_bytes(vec![1, 2, 3], "application/pdf".into()).unwrap_err();
+        let err = save_clipboard_image_bytes(vec![1, 2, 3], "application/pdf".into())
+            .await
+            .unwrap_err();
         assert!(
             err.contains("Unsupported"),
             "expected unsupported-mime error, got: {err}",
         );
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_rejects_oversize_payload() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_rejects_oversize_payload() {
         // Use a payload exactly one byte over the cap. Allocating
         // 25 MB + 1 in a test is cheap (Vec::with_capacity is a
         // single allocation) and exercises the exact boundary
         // condition.
         let oversize = vec![0u8; MAX_CLIPBOARD_IMAGE_BYTES + 1];
-        let err = save_clipboard_image_bytes(oversize, "image/png".into()).unwrap_err();
+        let err = save_clipboard_image_bytes(oversize, "image/png".into())
+            .await
+            .unwrap_err();
         assert!(
             err.contains("too large"),
             "expected oversize error, got: {err}",
         );
     }
 
-    #[test]
-    fn save_clipboard_image_bytes_writes_under_codemux_clipboard_dir() {
+    #[tokio::test]
+    async fn save_clipboard_image_bytes_writes_under_codemux_clipboard_dir() {
         // The artifacts must land under a clearly-named subdir so
         // operators can wipe the cache without grepping through
         // every UUID in /tmp. Lock the directory name as part of
         // the contract.
-        let path =
-            save_clipboard_image_bytes(vec![0x89, 0x50, 0x4e, 0x47], "image/png".into()).unwrap();
+        let path = save_clipboard_image_bytes(vec![0x89, 0x50, 0x4e, 0x47], "image/png".into())
+            .await
+            .unwrap();
         assert!(
             path.contains("codemux-clipboard-images"),
             "expected path under codemux-clipboard-images/, got {path}",
@@ -992,6 +1090,389 @@ mod tests {
         assert!(
             err.contains("overflow") || err.contains("does not match"),
             "expected overflow or mismatch error, got: {err}",
+        );
+    }
+
+    // ── async file commands (off-main-thread conversion) ─────────
+    //
+    // These exercise the real command fns end-to-end: actual
+    // subprocesses (`git check-ignore`, `rg`/`grep`, `fd`/`find`)
+    // against real temp directories, through the async +
+    // `spawn_blocking` path the GTK process uses. They double as
+    // behavior-preservation guards for the conversion — each command
+    // here used to be a sync `#[tauri::command]` that ran on the GTK
+    // main thread.
+
+    fn path_str(p: &std::path::Path) -> String {
+        p.to_string_lossy().to_string()
+    }
+
+    #[tokio::test]
+    async fn list_directory_sorts_dirs_first_then_alphabetical() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("zeta-dir")).unwrap();
+        fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+        fs::write(dir.path().join("Beta.txt"), "b").unwrap();
+
+        let entries = list_directory(path_str(dir.path()), None).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["zeta-dir", "alpha.txt", "Beta.txt"],
+            "directories first, then case-insensitive alphabetical"
+        );
+        assert!(entries[0].is_dir);
+        assert_eq!(entries[0].size, None, "directories report no size");
+        assert_eq!(entries[1].size, Some(1));
+    }
+
+    #[tokio::test]
+    async fn list_directory_errors_on_non_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("plain.txt");
+        fs::write(&file, "x").unwrap();
+        let err = list_directory(path_str(&file), None).await.unwrap_err();
+        assert!(err.contains("Not a directory"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn list_directory_hides_dotfiles_unless_show_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".hidden"), "h").unwrap();
+        fs::write(dir.path().join("visible.txt"), "v").unwrap();
+
+        let default = list_directory(path_str(dir.path()), None).await.unwrap();
+        assert!(
+            default.iter().all(|e| e.name != ".hidden"),
+            "dotfiles must be hidden by default"
+        );
+
+        let shown = list_directory(path_str(dir.path()), Some(true))
+            .await
+            .unwrap();
+        assert!(
+            shown.iter().any(|e| e.name == ".hidden"),
+            "show_hidden=true must surface dotfiles"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_directory_always_skips_git_dir_and_build_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        fs::create_dir(dir.path().join("node_modules")).unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+
+        let entries = list_directory(path_str(dir.path()), Some(true))
+            .await
+            .unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["src"],
+            ".git and node_modules must be skipped even with show_hidden"
+        );
+    }
+
+    /// E2E through the real `git check-ignore` subprocess: entries
+    /// matched by `.gitignore` must come back flagged.
+    #[tokio::test]
+    async fn list_directory_marks_gitignored_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be installed for this test");
+        assert!(init.status.success(), "git init failed");
+
+        fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(dir.path().join("ignored.txt"), "x").unwrap();
+        fs::write(dir.path().join("kept.txt"), "x").unwrap();
+
+        let entries = list_directory(path_str(dir.path()), None).await.unwrap();
+        let ignored = entries
+            .iter()
+            .find(|e| e.name == "ignored.txt")
+            .expect("ignored.txt should be listed");
+        assert!(ignored.is_gitignored, "ignored.txt must be flagged");
+        let kept = entries
+            .iter()
+            .find(|e| e.name == "kept.txt")
+            .expect("kept.txt should be listed");
+        assert!(!kept.is_gitignored, "kept.txt must not be flagged");
+    }
+
+    /// Same as above, but the directory is reached through a symlink —
+    /// the path handed to `list_directory` then differs from the
+    /// physical path `getcwd()` reports inside the `git check-ignore`
+    /// subprocess (the kernel resolves symlinks for cwd). Real-world
+    /// shape: macOS `/tmp` → `/private/tmp`, or a project tree behind
+    /// a symlinked home dir. Locks in that the cwd-relative feed stays
+    /// immune to how the caller spelled the directory path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_directory_marks_gitignored_entries_via_symlinked_path() {
+        let real = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(real.path())
+            .output()
+            .expect("git must be installed for this test");
+        assert!(init.status.success(), "git init failed");
+
+        fs::write(real.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(real.path().join("ignored.txt"), "x").unwrap();
+        fs::write(real.path().join("kept.txt"), "x").unwrap();
+
+        // Reach the repo through a symlink so the caller-visible path
+        // and git's resolved cwd disagree.
+        let link_parent = tempfile::tempdir().unwrap();
+        let link = link_parent.path().join("repo-link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let entries = list_directory(path_str(&link), None).await.unwrap();
+        let ignored = entries
+            .iter()
+            .find(|e| e.name == "ignored.txt")
+            .expect("ignored.txt should be listed");
+        assert!(
+            ignored.is_gitignored,
+            "ignored.txt must be flagged even when listed via a symlinked path"
+        );
+        let kept = entries
+            .iter()
+            .find(|e| e.name == "kept.txt")
+            .expect("kept.txt should be listed");
+        assert!(!kept.is_gitignored, "kept.txt must not be flagged");
+    }
+
+    /// Regression guard for `core.quotepath` mangling: when a path fed
+    /// to `git check-ignore --stdin` contains bytes git considers
+    /// "unusual" (non-ASCII, or the backslashes in every Windows
+    /// absolute path), git C-quotes the echoed output line —
+    /// `"tsch\303\274ss.txt"`, literal double quotes included. A parser
+    /// that splits the raw line then extracts a basename with a stray
+    /// trailing quote and the flag silently never matches. This is
+    /// exactly how gitignore flagging broke on the Windows runner
+    /// (absolute `C:\...` input → quoted output); a non-ASCII filename
+    /// reproduces the same class on every platform.
+    #[tokio::test]
+    async fn list_directory_marks_gitignored_entries_with_non_ascii_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(dir.path())
+            .output()
+            .expect("git must be installed for this test");
+        assert!(init.status.success(), "git init failed");
+
+        fs::write(dir.path().join(".gitignore"), "tschüss.txt\n").unwrap();
+        fs::write(dir.path().join("tschüss.txt"), "x").unwrap();
+        fs::write(dir.path().join("kept.txt"), "x").unwrap();
+
+        let entries = list_directory(path_str(dir.path()), None).await.unwrap();
+        let ignored = entries
+            .iter()
+            .find(|e| e.name == "tschüss.txt")
+            .expect("tschüss.txt should be listed");
+        assert!(
+            ignored.is_gitignored,
+            "non-ASCII ignored entry must be flagged — if this fails, \
+             git's core.quotepath quoting is leaking into the parsed names"
+        );
+        let kept = entries
+            .iter()
+            .find(|e| e.name == "kept.txt")
+            .expect("kept.txt should be listed");
+        assert!(!kept.is_gitignored, "kept.txt must not be flagged");
+    }
+
+    /// E2E through the real `rg` (or `grep` fallback) subprocess.
+    #[tokio::test]
+    async fn search_in_files_finds_matches_with_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("haystack.txt"),
+            "nothing on line one\nthe needle is here\nmore filler\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("other.txt"), "no match in this one\n").unwrap();
+
+        let results = search_in_files(path_str(dir.path()), "needle".to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "exactly one line matches: {results:?}");
+        let r = &results[0];
+        assert!(
+            r.file_path.ends_with("haystack.txt"),
+            "unexpected file: {}",
+            r.file_path
+        );
+        assert_eq!(r.line_number, 2);
+        assert_eq!(r.line_content, "the needle is here");
+        assert_eq!(
+            &r.line_content[r.match_start as usize..r.match_end as usize],
+            "needle",
+            "match offsets must point at the query"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_in_files_empty_query_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        let results = search_in_files(path_str(dir.path()), String::new(), None)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// E2E through the real `fd` (or `find` fallback) subprocess.
+    /// Unix-only: the Windows CI runner ships neither `fd` nor a
+    /// POSIX `find`, and the expected relative paths use `/`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_file_names_returns_relative_paths() {
+        use super::search_file_names;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("nested")).unwrap();
+        fs::write(dir.path().join("alpha-one.txt"), "").unwrap();
+        fs::write(dir.path().join("nested").join("alpha-two.txt"), "").unwrap();
+        fs::write(dir.path().join("beta.txt"), "").unwrap();
+
+        let mut results = search_file_names(path_str(dir.path()), "alpha".to_string(), None)
+            .await
+            .unwrap();
+        results.sort();
+        assert_eq!(
+            results,
+            vec!["alpha-one.txt".to_string(), "nested/alpha-two.txt".to_string()],
+            "matches must come back relative to the search root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn search_file_names_empty_query_returns_empty() {
+        use super::search_file_names;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "").unwrap();
+        let results = search_file_names(path_str(dir.path()), String::new(), None)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_file_then_read_file_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("note.txt");
+        let content = "line one\nline two — utf-8 ✓\n";
+
+        write_file(path_str(&file), content.to_string())
+            .await
+            .unwrap();
+        let back = read_file(path_str(&file)).await.unwrap();
+        assert_eq!(back, content);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_file(path_str(&dir.path().join("nope.txt")))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Not a file"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_binary_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("blob.bin");
+        fs::write(&file, [0x00u8, 0x01, 0x02, 0x00]).unwrap();
+        let err = read_file(path_str(&file)).await.unwrap_err();
+        assert!(err.contains("Binary file"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_oversize_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("big.txt");
+        fs::write(&file, vec![b'a'; (super::MAX_FILE_SIZE + 1) as usize]).unwrap();
+        let err = read_file(path_str(&file)).await.unwrap_err();
+        assert!(err.contains("too large"), "got: {err}");
+    }
+
+    /// The point of the whole conversion: a command stuck in blocking
+    /// I/O must NOT wedge the thread that drives the async executor
+    /// (in production: the GTK main thread).
+    ///
+    /// Setup: `write_file` against a FIFO with no reader blocks inside
+    /// `std::fs::write` until a reader opens the pipe. We drive the
+    /// command on a single-threaded runtime and check that a timer on
+    /// that same thread still fires while the write is wedged — which
+    /// is only possible if the blocking work was shipped off to the
+    /// blocking pool.
+    ///
+    /// A reader thread opens the FIFO after 2 s. It plays two roles:
+    /// it lets the write complete, and it un-wedges a regressed
+    /// (inline-blocking) implementation so this test fails fast on the
+    /// `is_finished` assertion instead of hanging forever.
+    #[cfg(unix)]
+    #[test]
+    fn write_file_does_not_block_the_async_executor_thread() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) },
+            0,
+            "mkfifo failed"
+        );
+
+        let reader_path = fifo.clone();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(2));
+            fs::read(&reader_path).unwrap()
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let task = tokio::spawn(write_file(
+                fifo.to_string_lossy().to_string(),
+                "payload".to_string(),
+            ));
+
+            // This timer shares the executor thread with `task`. With
+            // spawn_blocking it fires at ~200 ms while the write is
+            // still pending. If the command blocked inline, the
+            // executor would be wedged in open(2) until the reader
+            // thread drains the FIFO at ~2 s — by which point the task
+            // has finished and the assertion below fails.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                !task.is_finished(),
+                "write_file completed before the FIFO had a reader — the \
+                 blocking write ran inline on the executor thread instead \
+                 of the blocking pool"
+            );
+
+            task.await
+                .unwrap()
+                .expect("write should succeed once the reader opens");
+        });
+
+        assert_eq!(
+            reader.join().unwrap(),
+            b"payload",
+            "reader must observe the written bytes"
         );
     }
 }
