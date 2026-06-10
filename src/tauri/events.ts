@@ -240,6 +240,26 @@ export interface AgentChatEventPayload {
   event: ProviderRuntimeEvent;
 }
 
+/** Emitted when the background run-start checkpoint (issue #80) lands,
+ *  so the pane header can reveal the restore affordance without
+ *  polling. Stays on the GLOBAL event bus (not the per-thread
+ *  Channel): the checkpoint task outlives the start_session command
+ *  and there is exactly one event per run, so a broadcast with a
+ *  thread-id filter on the subscriber side is the right transport.
+ *  Mirrors AgentChatCheckpointEventPayload in
+ *  src-tauri/src/commands/agent_chat.rs. */
+export interface AgentChatCheckpointPayload {
+  thread_id: string;
+  checkpoint: import("./commands").AgentChatCheckpointRecord;
+}
+
+export const onAgentChatCheckpoint = (
+  cb: EventCallback<AgentChatCheckpointPayload>,
+): Promise<UnlistenFn> =>
+  listen<AgentChatCheckpointPayload>("agent_chat_checkpoint", (e) =>
+    cb(e.payload),
+  );
+
 // ── Tunnel health ──
 //
 // Mirror of src-tauri/src/ssh/tunnel_supervisor.rs:TunnelStatus

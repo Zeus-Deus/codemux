@@ -1,13 +1,26 @@
-import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
+import { useState } from "react";
+import { History, SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 
 import { SessionSelector } from "@/components/chat/SessionSelector";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { useAgentChatCheckpoint } from "@/hooks/use-agent-chat-checkpoint";
 import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
-import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { selectThread, useAgentChatStore } from "@/stores/agent-chat-store";
 import { findWorkspaceIdForPane, useAppStore } from "@/stores/app-store";
 import {
   agentChatListMessages,
+  agentChatRestoreCheckpoint,
   agentChatStartSession,
   agentChatStopSession,
   closePane,
@@ -53,6 +66,33 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
     return ws?.cwd ?? null;
   });
   const cwd = pane.cwd ?? fallbackCwd;
+
+  // Run-start rollback checkpoint (issue #80). `checkpoint` stays null
+  // when the opt-in setting is off / the snapshot hasn't landed, which
+  // hides the restore affordance entirely.
+  const checkpoint = useAgentChatCheckpoint(pane.thread_id ?? null);
+  const turnActive = useAgentChatStore((s) => {
+    const slice = pane.thread_id ? selectThread(pane.thread_id)(s) : null;
+    return slice ? slice.activeTurnId != null || slice.streaming : false;
+  });
+  const [confirmRestoreOpen, setConfirmRestoreOpen] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+
+  const handleRestoreConfirmed = async () => {
+    if (!pane.thread_id) return;
+    setRestoring(true);
+    try {
+      await agentChatRestoreCheckpoint(pane.thread_id);
+      toast.success(
+        "Workspace restored to the snapshot taken when this run started.",
+      );
+    } catch (error) {
+      toast.error(`Restore failed: ${error}`);
+    } finally {
+      setRestoring(false);
+      setConfirmRestoreOpen(false);
+    }
+  };
 
   const handleSelect = async (record: AgentChatSessionRecord) => {
     if (!cwd) {
@@ -189,6 +229,26 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           target, 14px glyph, drop close to destructive-foreground when
           its red hover bg kicks in. */}
       <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
+        {checkpoint && (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={() => setConfirmRestoreOpen(true)}
+            // Restoring under a running agent would yank files out
+            // from under its tools — stop the turn first.
+            disabled={turnActive || restoring}
+            aria-label="Restore checkpoint"
+            title={
+              turnActive
+                ? "Stop the running turn before restoring"
+                : "Restore workspace to before this run"
+            }
+            data-testid="restore-checkpoint-button"
+          >
+            <History className="h-3.5 w-3.5" />
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="icon-sm"
@@ -220,6 +280,40 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           <X className="h-3.5 w-3.5" />
         </Button>
       </div>
+      <AlertDialog open={confirmRestoreOpen} onOpenChange={setConfirmRestoreOpen}>
+        <AlertDialogContent
+          // The header's pointer-down handler starts drag-to-swap;
+          // keep dialog interactions out of it.
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <AlertDialogHeader>
+            <AlertDialogTitle>Restore workspace to before this run?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Files go back to the snapshot taken when this chat session
+              started{checkpoint?.branch ? ` (branch ${checkpoint.branch})` : ""}.
+              Commits made during the run are undone, files the run created are
+              deleted, and your pre-run changes come back as unstaged edits. A
+              safety snapshot of the current state is kept under{" "}
+              <code className="font-mono text-[11px]">refs/codemux/pre-restore</code>.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={restoring}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={restoring}
+              onClick={(e) => {
+                // Keep the dialog open while the restore runs; we
+                // close it ourselves in the finally block.
+                e.preventDefault();
+                void handleRestoreConfirmed();
+              }}
+              data-testid="restore-checkpoint-confirm"
+            >
+              {restoring ? "Restoring…" : "Restore"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </header>
   );
 }

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 import type {
   AgentChatProviderKind,
@@ -14,11 +14,20 @@ import type {
 // the tests via `vi.mocked(...)`.
 
 vi.mock("@/tauri/commands", () => ({
+  agentChatGetCheckpoint: vi.fn().mockResolvedValue(null),
   agentChatListMessages: vi.fn().mockResolvedValue([]),
+  agentChatRestoreCheckpoint: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
   closePane: vi.fn().mockResolvedValue(undefined),
   splitPane: vi.fn().mockResolvedValue(undefined),
+}));
+
+// The checkpoint hook subscribes to the `agent_chat_checkpoint` Tauri
+// event; under jsdom there is no Tauri runtime, so stub the listener
+// registration with a resolved no-op unlisten.
+vi.mock("@/tauri/events", () => ({
+  onAgentChatCheckpoint: vi.fn().mockResolvedValue(() => {}),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -76,9 +85,12 @@ vi.mock("@/stores/app-store", async () => {
 
 import { AgentChatPaneHeader } from "./AgentChatPaneHeader";
 import {
+  agentChatGetCheckpoint,
   agentChatListMessages,
+  agentChatRestoreCheckpoint,
   agentChatStartSession,
   agentChatStopSession,
+  type AgentChatCheckpointRecord,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
@@ -265,5 +277,105 @@ describe("AgentChatPaneHeader — resume hydration", () => {
     renderHeader();
     await lastSessionSelectorProps.current!.onSelect(makeRecord());
     expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Run checkpoint restore (issue #80) ──
+
+function makeCheckpoint(
+  overrides: Partial<AgentChatCheckpointRecord> = {},
+): AgentChatCheckpointRecord {
+  return {
+    thread_id: "thread-old",
+    workspace_id: "ws-1",
+    repo_path: "/projects/foo",
+    ref_name: "refs/codemux/checkpoints/thread-old",
+    snapshot_commit: "a".repeat(40),
+    head_commit: "b".repeat(40),
+    branch: "main",
+    created_at: "2026-06-09 10:00:00",
+    ...overrides,
+  };
+}
+
+describe("AgentChatPaneHeader — checkpoint restore", () => {
+  beforeEach(() => {
+    useAgentChatStore.setState({ threads: {} });
+    vi.mocked(agentChatGetCheckpoint).mockReset();
+    vi.mocked(agentChatRestoreCheckpoint).mockReset();
+    vi.mocked(toast.error).mockReset();
+    vi.mocked(toast.success).mockReset();
+    vi.mocked(agentChatGetCheckpoint).mockResolvedValue(null);
+    vi.mocked(agentChatRestoreCheckpoint).mockResolvedValue(undefined);
+  });
+
+  it("hides the restore button when no checkpoint is recorded", async () => {
+    const { queryByTestId } = renderHeader();
+    // Let the on-mount fetch (null) settle.
+    await act(async () => {});
+    expect(queryByTestId("restore-checkpoint-button")).toBeNull();
+  });
+
+  it("shows the restore button once the checkpoint fetch resolves", async () => {
+    vi.mocked(agentChatGetCheckpoint).mockResolvedValue(makeCheckpoint());
+    const { findByTestId } = renderHeader();
+    const button = await findByTestId("restore-checkpoint-button");
+    expect(button).toBeEnabled();
+    expect(vi.mocked(agentChatGetCheckpoint)).toHaveBeenCalledWith(
+      "thread-old",
+    );
+  });
+
+  it("invokes agent_chat_restore_checkpoint after explicit confirmation", async () => {
+    vi.mocked(agentChatGetCheckpoint).mockResolvedValue(makeCheckpoint());
+    const { findByTestId } = renderHeader();
+    const button = await findByTestId("restore-checkpoint-button");
+
+    fireEvent.click(button);
+    // Nothing restored yet — the confirm dialog gates the mutation.
+    expect(vi.mocked(agentChatRestoreCheckpoint)).not.toHaveBeenCalled();
+
+    const confirm = await findByTestId("restore-checkpoint-confirm");
+    fireEvent.click(confirm);
+    await waitFor(() =>
+      expect(vi.mocked(agentChatRestoreCheckpoint)).toHaveBeenCalledWith(
+        "thread-old",
+      ),
+    );
+    await waitFor(() => expect(vi.mocked(toast.success)).toHaveBeenCalled());
+  });
+
+  it("surfaces an error toast when the restore fails", async () => {
+    vi.mocked(agentChatGetCheckpoint).mockResolvedValue(makeCheckpoint());
+    vi.mocked(agentChatRestoreCheckpoint).mockRejectedValue(
+      "Cannot restore: the checkpoint snapshot no longer exists",
+    );
+    const { findByTestId } = renderHeader();
+    fireEvent.click(await findByTestId("restore-checkpoint-button"));
+    fireEvent.click(await findByTestId("restore-checkpoint-confirm"));
+    await waitFor(() => expect(vi.mocked(toast.error)).toHaveBeenCalled());
+    expect(vi.mocked(toast.success)).not.toHaveBeenCalled();
+  });
+
+  it("disables the restore button while a turn is running", async () => {
+    vi.mocked(agentChatGetCheckpoint).mockResolvedValue(makeCheckpoint());
+    const { findByTestId } = renderHeader();
+    const button = await findByTestId("restore-checkpoint-button");
+    expect(button).toBeEnabled();
+
+    // Mark the thread as mid-turn; restoring under a running agent
+    // would yank files out from under its tools.
+    act(() => {
+      useAgentChatStore.setState((s) => ({
+        threads: {
+          ...s.threads,
+          "thread-old": {
+            ...s.threads["thread-old"],
+            activeTurnId: "turn-1",
+          },
+        },
+      }));
+    });
+    await waitFor(() => expect(button).toBeDisabled());
   });
 });

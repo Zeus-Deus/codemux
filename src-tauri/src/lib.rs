@@ -1493,6 +1493,8 @@ pub fn run() {
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
+            commands::agent_chat_get_checkpoint,
+            commands::agent_chat_restore_checkpoint,
             commands::attach_agent_chat_output,
             commands::detach_agent_chat_output,
             commands::opencode_check_availability,
