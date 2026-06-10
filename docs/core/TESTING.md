@@ -32,6 +32,13 @@ The mock lives in `src/dev/` and only loads when no real Tauri runtime is detect
 - frontend interaction tests for important workspace, pane, and browser flows
 - focused end-to-end coverage later for a few critical workflows rather than every UI detail
 
+## End-to-End Harnesses (manual, off by default)
+
+- `scripts/e2e/*.sh` — live Docker-backed harnesses run manually from the repo root:
+  - `daemon-worktree-setup-e2e.sh` — clean containerized host for headless `worktree_create` provisioning (issue #78): drives the real authed HTTP `tools/call` surface and asserts worktree creation + setup-script run + gitignored-include copy on the container's filesystem. Requires docker, python3, and a debug `codemux-remote` build (`CMX_WT_E2E_BIN` overrides the binary).
+  - `opencode-sync-e2e.sh` / `opencode-real-session-e2e.sh` — OpenCode conversation sync across workspace push/pull against a Docker SSH host (issue #16).
+- Env-gated Rust integration tests skip by default and run live when pointed at a host: `CODEMUX_E2E_SSH_HOST` gates `src-tauri/tests/codemux_ssh_roundtrip.rs`, `opencode_sync_roundtrip.rs`, and `opencode_real_roundtrip.rs` (the OpenCode pair also needs `CMX_OC_E2E_*` variables — see the script headers).
+
 ## Manual Validation Rules
 
 - Implemented is not the same as verified.

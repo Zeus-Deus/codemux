@@ -86,6 +86,7 @@
 - End-to-end encrypted skills sync across devices
 - Permission settings page with per-tool body rendering and AllowAlways rule persistence
 - Session history selector + transcript persistence + replay on session resume
+- Run checkpoints (opt-in via Settings → Agent): background working-tree snapshot at session start, restore button in the pane header rolls the workspace back to the pre-run state
 - Permission-mode mid-session restart
 - Favorites on the model picker with `localStorage` persistence
 - Debug-mode banner with explicit exit dialog
