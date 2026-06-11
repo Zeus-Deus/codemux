@@ -16,13 +16,13 @@ import { useAppStore } from "@/stores/app-store";
 import { basename } from "@/lib/path";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import {
-  pickFolderDialog,
   createEmptyRepo,
   gitCloneRepo,
   dbAddRecentProject,
   createEmptyWorkspace,
   activateWorkspace,
 } from "@/tauri/commands";
+import { pickFolder } from "@/lib/file-dialog";
 
 type Mode = "empty" | "clone";
 
@@ -69,7 +69,7 @@ export function NewProjectScreen() {
   const effectiveName = mode === "clone" ? repoName || derivedName : repoName;
 
   const handleBrowse = async () => {
-    const folder = await pickFolderDialog("Select project location");
+    const folder = await pickFolder("Select project location");
     if (folder) setParentDir(folder);
   };
 

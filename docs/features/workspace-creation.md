@@ -68,6 +68,14 @@ After onboarding: scripts saved to project config, worktree workspace created, w
 - No workspace templates or saved configurations
 - No multi-issue linking (one issue per workspace)
 - Package detection is best-effort (one pass on project open)
+- Native folder/file pickers on Linux need either a working XDG
+  desktop portal (with a FileChooser backend such as
+  xdg-desktop-portal-gtk) or zenity installed. When neither exists
+  (minimal i3/dwm setups — issue #95), the Rust side preflights and
+  rejects with a `NO_FILE_PICKER_BACKEND` error, and every UI call
+  site goes through `src/lib/file-dialog.ts`, which shows an
+  install-hint toast instead of silently doing nothing. `codemux
+  doctor` diagnoses this from a terminal.
 
 ## Important Touch Points
 

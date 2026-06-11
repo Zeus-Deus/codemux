@@ -29,6 +29,9 @@ pub mod github;
 pub mod github_cache;
 pub mod control;
 pub mod diagnostics;
+pub mod dialog_preflight;
+pub mod app_logs;
+pub mod doctor;
 pub mod encryption;
 pub mod execution;
 pub mod indexing;
@@ -220,6 +223,24 @@ pub fn run() {
             database::DatabaseStore::new_in_memory()
         }))
         .plugin(tauri_plugin_opener::init())
+        // Persistent native logging: app log dir + stderr. Warn-level
+        // globally so dependency chatter stays out, which still
+        // captures the failures that used to vanish — e.g. rfd's
+        // "Failed to pick folder" when no dialog backend exists
+        // (issue #95). Users can read the file via `codemux logs`.
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Warn)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some(crate::app_logs::LOG_FILE_STEM.into()),
+                    }),
+                ])
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())

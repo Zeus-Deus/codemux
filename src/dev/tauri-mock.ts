@@ -570,6 +570,31 @@ const handlers: Record<string, Handler> = {
   db_get_recent_projects: () => [],
   db_add_recent_project: () => undefined,
 
+  // ── File dialogs ──
+  // Default: resolve as a cancel (null / empty) like the previous
+  // fall-through did. Set the sessionStorage flag below to simulate
+  // the Linux "no file picker backend" preflight rejection (issue
+  // #95) and visually verify the error toast in the browser:
+  //   sessionStorage.setItem("codemux-mock-no-file-picker", "1")
+  pick_folder_dialog: () => {
+    if (sessionStorage.getItem("codemux-mock-no-file-picker")) {
+      return Promise.reject(
+        "NO_FILE_PICKER_BACKEND: cannot open a file dialog (dev mock simulation). " +
+          "The XDG desktop portal is unavailable and zenity is not installed.",
+      );
+    }
+    return null;
+  },
+  pick_files_dialog: () => {
+    if (sessionStorage.getItem("codemux-mock-no-file-picker")) {
+      return Promise.reject(
+        "NO_FILE_PICKER_BACKEND: cannot open a file dialog (dev mock simulation). " +
+          "The XDG desktop portal is unavailable and zenity is not installed.",
+      );
+    }
+    return [];
+  },
+
   // ── Theme / appearance ──
   get_current_theme: () => THEME,
   get_shell_appearance: () => SHELL_APPEARANCE,

@@ -59,13 +59,13 @@ import {
   checkGhAvailable,
   checkGithubRepo,
   listPullRequests,
-  pickFilesDialog,
   pasteClipboardImageToFile,
   suggestIssueBranchName,
   linkWorkspaceIssue,
   getGithubIssueByPath,
   applyPreset,
 } from "@/tauri/commands";
+import { pickFiles } from "@/lib/file-dialog";
 import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue } from "@/tauri/types";
 
 const ISSUE_BODY_MAX_CHARS = 10_000;
@@ -935,7 +935,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                       aria-label="Attach files"
                       className="inline-flex size-7 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground outline-none"
                       onClick={async () => {
-                        const files = await pickFilesDialog("Attach files");
+                        const files = await pickFiles("Attach files");
                         if (files.length > 0) {
                           setAttachments((prev) => {
                             const existing = new Set(prev);

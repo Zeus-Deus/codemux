@@ -312,6 +312,11 @@ pub async fn pick_folder_dialog<R: Runtime>(
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
+    // Fail loudly when no dialog backend exists (issue #95) — without
+    // this the portal-only backend resolves `None` exactly like a user
+    // cancel and the UI silently does nothing.
+    crate::dialog_preflight::ensure_file_picker_backend().await?;
+
     let (tx, rx) = oneshot::channel();
 
     let mut builder = app
@@ -339,6 +344,9 @@ pub async fn pick_files_dialog<R: Runtime>(
 ) -> Result<Vec<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
+
+    // See pick_folder_dialog — same silent-failure guard (issue #95).
+    crate::dialog_preflight::ensure_file_picker_backend().await?;
 
     let (tx, rx) = oneshot::channel();
 
@@ -379,6 +387,9 @@ pub async fn pick_save_file_dialog<R: Runtime>(
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
+
+    // See pick_folder_dialog — same silent-failure guard (issue #95).
+    crate::dialog_preflight::ensure_file_picker_backend().await?;
 
     let (tx, rx) = oneshot::channel();
 
@@ -421,6 +432,9 @@ pub async fn pick_open_file_dialog<R: Runtime>(
 ) -> Result<Option<String>, String> {
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
+
+    // See pick_folder_dialog — same silent-failure guard (issue #95).
+    crate::dialog_preflight::ensure_file_picker_backend().await?;
 
     let (tx, rx) = oneshot::channel();
 

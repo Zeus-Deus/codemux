@@ -1,6 +1,5 @@
 import { useCallback } from "react";
 import {
-  pickFolderDialog,
   checkIsGitRepo,
   initGitRepo,
   dbAddRecentProject,
@@ -8,6 +7,7 @@ import {
   createEmptyWorkspace,
   activateWorkspace,
 } from "@/tauri/commands";
+import { pickFolder } from "@/lib/file-dialog";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
@@ -44,7 +44,7 @@ export function useProjectActions() {
   const setShowCloneDialog = useUIStore((s) => s.setShowCloneDialog);
 
   const openProject = useCallback(async (): Promise<OpenProjectResult> => {
-    const folder = await pickFolderDialog("Open project");
+    const folder = await pickFolder("Open project");
     if (!folder) return { success: false };
 
     const name = basename(folder);
