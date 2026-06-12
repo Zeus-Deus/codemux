@@ -4,6 +4,7 @@ import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { shouldLoadWebglAddon } from "./webgl-renderer-probe";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
 import {
@@ -285,30 +286,39 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     term.loadAddon(serializeAddon);
     term.open(containerEl);
 
-    // ── WebGL renderer ──
+    // ── WebGL renderer (hardware GL only) ──
     // Offload glyph rendering to the GPU — substantially faster and smoother
     // for the long-running, high-output agent sessions Codemux runs. Must load
     // AFTER term.open() because the addon needs the opened terminal's DOM
-    // element. Wrapped in try/catch so an environment without WebGL2 support
-    // (e.g. a software-only WebView) falls back to the default DOM renderer
-    // instead of throwing and breaking the whole pane.
+    // element. Gated on a one-time probe (`webgl-renderer-probe.ts`): when the
+    // WebView's WebGL2 is backed by a software rasterizer (SwiftShader,
+    // llvmpipe, …) the addon *constructs fine* but rasterizes every frame on
+    // the CPU, which adds per-keystroke input latency vs the DOM renderer —
+    // the v0.9.0 typing-lag regression. Linux WebKitGTK is declined outright
+    // (masked renderer strings + documented input-lag history; see the probe
+    // module for the full policy and the localStorage escape hatch). Also
+    // wrapped in try/catch so an environment without WebGL2 support falls
+    // back to the default DOM renderer instead of throwing and breaking the
+    // whole pane.
     let webglAddon: WebglAddon | null = null;
-    try {
-      const addon = new WebglAddon();
-      // Required: when the GPU drops the canvas context, dispose the addon so
-      // xterm falls back to the DOM renderer rather than rendering a blank pane.
-      addon.onContextLoss(() => {
-        addon.dispose();
-        webglAddonRef.current = null;
-      });
-      term.loadAddon(addon);
-      webglAddon = addon;
-    } catch (err) {
-      console.warn(
-        "[codemux::terminal] WebGL renderer unavailable, using DOM renderer:",
-        err,
-      );
-      webglAddon = null;
+    if (shouldLoadWebglAddon().use) {
+      try {
+        const addon = new WebglAddon();
+        // Required: when the GPU drops the canvas context, dispose the addon so
+        // xterm falls back to the DOM renderer rather than rendering a blank pane.
+        addon.onContextLoss(() => {
+          addon.dispose();
+          webglAddonRef.current = null;
+        });
+        term.loadAddon(addon);
+        webglAddon = addon;
+      } catch (err) {
+        console.warn(
+          "[codemux::terminal] WebGL renderer unavailable, using DOM renderer:",
+          err,
+        );
+        webglAddon = null;
+      }
     }
 
     termRef.current = term;
