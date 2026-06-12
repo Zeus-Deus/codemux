@@ -42,6 +42,17 @@ Command handling:
 - Mutations re-emit `app-state-changed`, so interactive flows update live
 - Compatible with the Codemux browser commands (`codemux browser open http://localhost:1420`, `snapshot`, `screenshot`) for visual proof
 - Tree-shaken out of production builds; dormant under `npm run tauri:dev`
+- **Browser pane exercisable end-to-end**: the seeded `browser-demo`
+  workspace hosts a `browser` pane (id `MOCK_BROWSER_ID`), and the
+  mock's `start_browser_stream` handler returns `ws://127.0.0.1:9777`.
+  Spawn a real daemon on that port first —
+  `AGENT_BROWSER_STREAM_PORT=9777 agent-browser open <url> --headless --session devmock`
+  — and the pane streams real frames with full input forwarding
+  (drag-select, hover, cursor probe, clipboard bridge) in plain-browser
+  dev. Without a daemon the pane shows its connecting/retry state,
+  identical to a dead daemon in the real app. (`agent_browser_run` is a
+  mock no-op, so toolbar navigation/viewport calls are accepted and
+  ignored — navigate the daemon via the `agent-browser` CLI instead.)
 - **Agent-chat mocked end-to-end** (`enable_agent_chat` is ON in the
   mock flags; issues #75/#77). Two seeded workspaces cover both chat
   paths:
