@@ -549,6 +549,21 @@ const handlers: Record<string, Handler> = {
     errorCount: 0,
   }),
 
+  // ── Browser pane ──
+  //
+  // The pane connects its stream WebSocket to whatever URL this
+  // returns. To exercise the browser pane end-to-end in plain-browser
+  // dev, run a real daemon on the dev stream port first:
+  //
+  //   AGENT_BROWSER_STREAM_PORT=9777 agent-browser open https://example.com --headless --session devmock
+  //
+  // Without a daemon the pane sits in its connecting/retry state —
+  // the same UI as a dead daemon in the real app.
+  start_browser_stream: () => "ws://127.0.0.1:9777",
+  // Toolbar/viewport/inspector commands shell out to the CLI in the
+  // real app; the mock accepts and ignores them.
+  agent_browser_run: () => null,
+
   // ── Core state ──
   get_app_state: () => appState,
   get_home_dir: () => MOCK_HOME_DIR,

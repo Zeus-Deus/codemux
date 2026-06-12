@@ -163,6 +163,49 @@ function chatSurface(
   return { pane, surface, tab };
 }
 
+/** Browser-pane id used by the pre-seeded browser workspace. The mock's
+ *  `start_browser_stream` handler points at the dev stream port, so with
+ *  a real `agent-browser` daemon running there the pane streams real
+ *  frames in plain-browser dev (see `tauri-mock.ts`). Without a daemon
+ *  it shows its connecting state and retries — same as a dead daemon. */
+export const MOCK_BROWSER_ID = "browser-mock-1";
+
+/** Build a browser surface (+ tab) for a workspace. Mirrors the
+ *  backend's `create_browser_pane`: the surface root is a `browser`
+ *  pane node carrying the browser id. */
+function browserSurface(label: string): {
+  pane: PaneNodeSnapshot;
+  surface: SurfaceSnapshot;
+  tab: TabSnapshot;
+} {
+  const n = ++paneSeq;
+  const paneId = `pane-${n}`;
+  const surfaceId = `surface-${n}`;
+  const tabId = `tab-${n}`;
+
+  const pane: PaneNodeSnapshot = {
+    kind: "browser",
+    pane_id: paneId,
+    browser_id: MOCK_BROWSER_ID,
+    title: label,
+  };
+  const surface: SurfaceSnapshot = {
+    surface_id: surfaceId,
+    title: label,
+    root: pane,
+    active_pane_id: paneId,
+  };
+  const tab: TabSnapshot = {
+    tab_id: tabId,
+    kind: "terminal",
+    title: label,
+    surface_id: surfaceId,
+    browser_id: MOCK_BROWSER_ID,
+    icon: null,
+  };
+  return { pane, surface, tab };
+}
+
 interface WorkspaceSeed extends Partial<WorkspaceSnapshot> {
   workspace_id: string;
   title: string;
@@ -274,6 +317,29 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
     git_branch: "main",
   });
   const { surface, tab } = chatSurface("Agent Chat", codemuxRoot);
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
+/** Browser-pane workspace: a single `browser` pane streaming from the
+ *  dev stream port — lets browser-pane UI work be exercised end-to-end
+ *  in plain-browser dev when a daemon is running (issue-free without). */
+const wsCodemuxBrowser: WorkspaceSnapshot = (() => {
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-browser",
+    title: "browser-demo",
+    cwd: codemuxRoot,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "main",
+    git_branch: "main",
+  });
+  const { surface, tab } = browserSurface("Browser");
   return {
     ...ws,
     tabs: [tab],
@@ -476,6 +542,7 @@ const wsSiteRedesign = makeWorkspace({
 const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxMain,
   wsCodemuxChat,
+  wsCodemuxBrowser,
   wsCodemuxAuth,
   wsCodemuxSidebar,
   wsCodemuxMock,
