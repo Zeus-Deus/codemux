@@ -11,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { FolderOpen, Loader2 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useProjectActions } from "@/hooks/use-project-actions";
-import { pickFolderDialog } from "@/tauri/commands";
+import { pickFolder } from "@/lib/file-dialog";
 
 export function CloneDialog() {
   const open = useUIStore((s) => s.showCloneDialog);
@@ -57,7 +57,7 @@ export function CloneDialog() {
   };
 
   const handlePickDir = async () => {
-    const folder = await pickFolderDialog("Clone destination");
+    const folder = await pickFolder("Clone destination");
     if (folder) setTargetDir(folder);
   };
 

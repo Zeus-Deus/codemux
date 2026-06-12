@@ -45,6 +45,25 @@ All six pieces are bundled in `ObservabilitySnapshot` and persisted as one JSON 
 - **No external exporter** — the data never leaves the local machine. No OTLP, no Prometheus, no structured log shipping. That's deliberate for v1 (local-first principle), but means remote debugging requires shipping the JSON file manually.
 - **Feature flags are boolean only** — no percentages, no ramps, no user targeting. A flag is either on or off for the current user.
 
+## Native Log File (tauri-plugin-log)
+
+Separate from `ObservabilityStore`, the desktop app installs a real
+`log`-crate logger via tauri-plugin-log (registered in `lib.rs`),
+writing warn-and-above to stderr **and** to a rotating file in the
+platform app-log dir (`~/.local/share/com.codemux.app/logs/codemux.log`
+on Linux, 2 MB cap, one rotation kept). This exists because
+dependencies report real failures through the `log` crate — rfd's
+"Failed to pick folder" when no dialog backend exists (issue #95) was
+invisible before a logger was installed.
+
+Support surface:
+
+- `codemux logs [--tail <n>]` — print recent log lines, no running app
+  required (`src-tauri/src/app_logs.rs`).
+- `codemux doctor` — environment diagnostics including the file-dialog
+  backend preflight (`src-tauri/src/doctor.rs`,
+  `src-tauri/src/dialog_preflight.rs`).
+
 ## Important Touch Points
 
 - `src-tauri/src/observability.rs`:

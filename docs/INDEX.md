@@ -63,7 +63,8 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Automations (scheduled host-side agent runs): `docs/features/automations.md`; roadmap at `docs/plans/automations.md`; Phase 2 (sync + remote-host) detailed plan at `docs/plans/automations-sync.md`; Superset research at `docs/research/superset-automations.md`
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
-- Observability (flags, metrics, safety config): `docs/features/observability.md`
+- Observability (flags, metrics, safety config + native log file / `codemux logs` / `codemux doctor`): `docs/features/observability.md`
+- Linux file-dialog backend preflight (issue #95 — portal/zenity detection, install-hint toast): `docs/features/workspace-creation.md` (§ constraints), `docs/reference/CONTROL.md` (§ local diagnostics)
 - Port detection (incl. Docker-published container ports for open worktrees): `docs/features/ports.md`
 - Search: `docs/features/search.md`
 - Code indexing: `docs/features/code-indexing.md`

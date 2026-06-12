@@ -44,6 +44,12 @@ libc = "0.2"
 tauri-plugin-single-instance = "2.4.0"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
+# Persistent native-side logging (file in the app log dir + stderr).
+# Without an installed logger every `log::error!` from dependencies —
+# notably rfd's "Failed to pick folder" when no dialog backend exists
+# (issue #95) — vanished silently. `codemux logs` tails the file.
+tauri-plugin-log = "2"
+log = "0.4"
 # WebKit2GTK strips clipboard image payloads from the standard
 # `paste` event for security reasons, so reading clipboard images
 # from JS via `e.clipboardData` always comes back empty on Linux.
@@ -93,6 +99,15 @@ tower = "0.5"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Used by dialog_preflight.rs to ask the XDG desktop portal whether a
+# FileChooser backend actually exists before opening a file dialog.
+# The dialog plugin above is portal-only, and on minimal window-manager
+# setups (i3, dwm, ...) no portal backend may be running — the dialog
+# then silently resolves as if cancelled (issue #95). zbus is already
+# in the tree via rfd -> ashpd, so this adds no new build cost.
+zbus = "5"
 
 [target.'cfg(windows)'.dependencies]
 tauri-plugin-dialog = { version = "2" }

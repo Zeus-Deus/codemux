@@ -15,8 +15,8 @@ import {
   createOpenflowRun,
   spawnOpenflowAgents,
   activateWorkspace,
-  pickFolderDialog,
 } from "@/tauri/commands";
+import { pickFolder } from "@/lib/file-dialog";
 import {
   Dialog,
   DialogContent,
@@ -165,7 +165,7 @@ export function NewRunDialog({ defaultCwd }: NewRunDialogProps) {
   );
 
   const handlePickFolder = async () => {
-    const folder = await pickFolderDialog("Choose folder");
+    const folder = await pickFolder("Choose folder");
     if (folder) setCwd(folder);
   };
 

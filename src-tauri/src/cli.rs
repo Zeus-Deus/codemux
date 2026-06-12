@@ -38,6 +38,15 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Print recent lines from the desktop app's log file
+    Logs {
+        /// Number of lines from the end of the log to print
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
+    },
+    /// Check the local environment for common problems (file dialogs,
+    /// logs). Works without a running Codemux instance.
+    Doctor,
     /// List all available codemux commands and capabilities
     Capabilities,
     /// Start MCP server (JSON-RPC over stdio)
@@ -568,6 +577,32 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
             println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
             Ok(true)
         }
+        Some(CommandSet::Logs { tail }) => {
+            // Purely local — reads the file tauri-plugin-log writes, so
+            // it works even when (especially when) the app won't start.
+            match crate::app_logs::app_log_file() {
+                Some(path) if path.exists() => {
+                    eprintln!("# {}", path.display());
+                    for line in
+                        crate::app_logs::tail_lines(&path, tail).map_err(|e| e.to_string())?
+                    {
+                        println!("{line}");
+                    }
+                }
+                Some(path) => {
+                    println!(
+                        "No log file at {} yet. It is created the first time the desktop app runs.",
+                        path.display()
+                    );
+                }
+                None => println!("Could not resolve the platform log directory."),
+            }
+            Ok(true)
+        }
+        Some(CommandSet::Doctor) => {
+            crate::doctor::run().await;
+            Ok(true)
+        }
         Some(CommandSet::Mcp) => {
             crate::mcp_server::run_mcp_server().await?;
             Ok(true)
@@ -645,6 +680,8 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     "status": { "description": "Show Codemux app status" },
                     "notify": { "args": "<message>", "description": "Send a notification to the user" },
                     "handoff": { "description": "Generate project handoff summary" },
+                    "logs": { "args": "[--tail <n>]", "description": "Print recent lines from the desktop app's log file" },
+                    "doctor": { "description": "Diagnose the local environment (file dialogs, logs)" },
                     "capabilities": { "description": "List all available commands (this output)" }
                 },
                 "environment": {

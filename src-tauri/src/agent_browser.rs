@@ -1961,6 +1961,17 @@ mod tests {
     fn resolve_binary_finds_native_binary_from_project_root() {
         // Run from the project root where node_modules exists
         let result = resolve_binary();
+        // Step 1 of resolve_binary() prefers a system-wide install on
+        // PATH (e.g. /usr/bin/agent-browser from a packaged install).
+        // On dev machines that also run a packaged Codemux, that branch
+        // legitimately wins over the node_modules lookup this test was
+        // written for — accept it instead of failing on those hosts.
+        if let Ok(system) = which::which("agent-browser") {
+            if result == system.to_string_lossy() {
+                assert!(system.is_file(), "system agent-browser vanished: {result}");
+                return;
+            }
+        }
         // On this machine, the native binary should be found in node_modules
         if !result.starts_with("npx ") {
             assert!(
