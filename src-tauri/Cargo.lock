@@ -930,6 +930,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "clap",
+ "codemux",
  "dirs",
  "futures-core",
  "futures-util",

@@ -190,6 +190,15 @@ sizes the list. jsdom tests wrap renders in `VirtuosoMockContext`
 - `src-tauri/tests/helpers/fake_codex_app_server/main.rs` — scripted
   fixture that impersonates the `codex app-server` subprocess.
 
+The three `fake_*` helper `[[bin]]` targets are gated behind the
+`test-fixtures` cargo feature (`required-features` in
+`src-tauri/Cargo.toml`). Tauri's CLI bundles every ungated `[[bin]]` of
+the app package, so without the gate the fixtures shipped in the
+deb/rpm/AppImage at `usr/bin` (through v0.9.1). A self-referential
+dev-dependency turns the feature on for `cargo test`, so plain
+`cargo test` still builds the fixtures and `env!("CARGO_BIN_EXE_fake_*")`
+resolves — no `--features` flag needed anywhere.
+
 ## Notes
 
 - Keep this file about current truth, not future plans. Future chunks (Claude

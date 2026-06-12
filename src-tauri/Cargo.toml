@@ -121,6 +121,16 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[features]
+# Gates the fake_* test helper [[bin]] targets below. Off by default
+# so plain `cargo build --release` never produces them and tauri-cli
+# excludes them from bundles (it skips [[bin]] entries whose
+# required-features are disabled — see get_binaries in tauri-cli's
+# interface/rust.rs). Through v0.9.1 the fixtures shipped in the
+# deb/rpm/AppImage at usr/bin because every ungated [[bin]] of the
+# app package gets bundled.
+test-fixtures = []
+
 [dev-dependencies]
 mockito = "1"
 serial_test = "3"
@@ -129,6 +139,13 @@ serial_test = "3"
 # means this flag activates at every build, but the `test` feature
 # is additive and doesn't change runtime behavior.
 tauri = { version = "2", features = ["test"] }
+# Self-referential dev-dependency: activates `test-fixtures` whenever
+# dev targets build (i.e. `cargo test`), so the fake_* helper bins are
+# compiled and `env!("CARGO_BIN_EXE_fake_*")` in the integration tests
+# resolves — while normal/release builds keep the feature off and the
+# fixtures out of shipped bundles. Cyclic dev-dependencies are
+# explicitly supported by Cargo.
+codemux = { path = ".", features = ["test-fixtures"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 # Used by auth/api.rs tests to dup2 stderr for the log-leak
@@ -139,32 +156,37 @@ tauri = { version = "2", features = ["test"] }
 gag = "1"
 
 # Test helper binary used by `tests/json_rpc_child.rs` — simulates a JSON-RPC
-# peer over stdio. Compiled with the crate; not shipped in distributions
-# because tests do not run against release builds.
+# peer over stdio. Gated behind `test-fixtures` (auto-enabled for
+# `cargo test` via the self dev-dependency) so release builds skip it
+# and tauri-cli keeps it out of the deb/rpm/AppImage bundles.
 [[bin]]
 name = "fake_rpc_child"
 path = "tests/helpers/fake_rpc_child/main.rs"
 test = false
 doctest = false
 bench = false
+required-features = ["test-fixtures"]
 
 # Test helper binary used by `tests/codex_adapter.rs` — simulates the
-# `codex app-server` JSON-RPC peer.
+# `codex app-server` JSON-RPC peer. Gated like fake_rpc_child above.
 [[bin]]
 name = "fake_codex_app_server"
 path = "tests/helpers/fake_codex_app_server/main.rs"
 test = false
 doctest = false
 bench = false
+required-features = ["test-fixtures"]
 
 # Test helper binary used by `tests/claude_adapter.rs` — simulates the
-# claude-agent sidecar without involving the real SDK.
+# claude-agent sidecar without involving the real SDK. Gated like
+# fake_rpc_child above.
 [[bin]]
 name = "fake_claude_sidecar"
 path = "tests/helpers/fake_claude_sidecar/main.rs"
 test = false
 doctest = false
 bench = false
+required-features = ["test-fixtures"]
 
 # `codemux-remote` — the slim server-side binary that runs on the
 # remote host the laptop pushes workspaces to. Same Rust crate
