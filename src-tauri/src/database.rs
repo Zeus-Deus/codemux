@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -44,6 +44,23 @@ pub struct AgentChatSessionRecord {
     pub title: Option<String>,
     pub created_at: String,
     pub last_active_at: String,
+}
+
+/// Persisted bookkeeping for the run-start rollback checkpoint
+/// (issue #80): the background working-tree snapshot taken when an
+/// agent-chat session starts. The snapshot itself lives in the repo's
+/// object database, anchored on `ref_name`; this row records where it
+/// is and what state to restore (`head_commit` / `branch`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChatCheckpointRecord {
+    pub thread_id: String,
+    pub workspace_id: String,
+    pub repo_path: String,
+    pub ref_name: String,
+    pub snapshot_commit: String,
+    pub head_commit: String,
+    pub branch: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -165,6 +182,30 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_messages_thread
             ON agent_chat_messages(thread_id, id ASC);
+
+        -- Run-start rollback checkpoints (issue #80). One row per
+        -- thread: the background snapshot taken when the agent-chat
+        -- session started. `ref_name` is the shadow git ref anchoring
+        -- the snapshot (refs/codemux/checkpoints/<id>); pruning that
+        -- ref deletes this row too. Cascade with the session so
+        -- deleting a chat from the history dropdown cleans up its
+        -- checkpoint bookkeeping.
+        CREATE TABLE IF NOT EXISTS agent_chat_checkpoints (
+            thread_id TEXT PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            repo_path TEXT NOT NULL,
+            ref_name TEXT NOT NULL,
+            snapshot_commit TEXT NOT NULL,
+            head_commit TEXT NOT NULL,
+            branch TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            FOREIGN KEY (thread_id)
+                REFERENCES agent_chat_sessions(thread_id)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_agent_chat_checkpoints_ref
+            ON agent_chat_checkpoints(ref_name);
 
         -- Hosts (Step 2 of cloud push — Settings → Hosts pane data model).
         --
@@ -2610,6 +2651,102 @@ impl DatabaseStore {
     }
 }
 
+// ── Agent Chat Checkpoints (issue #80) ──
+//
+// One row per thread: the background run-start snapshot. Writes come
+// from the checkpoint background task; reads from the pane header's
+// restore affordance. Rows die with the session (FK CASCADE) or when
+// the shadow ref is pruned (`delete_agent_chat_checkpoints_by_refs`).
+
+impl DatabaseStore {
+    /// Insert or replace the checkpoint row for a thread. A thread has
+    /// at most one run-start checkpoint, so conflict = full replace.
+    pub fn upsert_agent_chat_checkpoint(
+        &self,
+        record: &AgentChatCheckpointRecord,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO agent_chat_checkpoints
+                 (thread_id, workspace_id, repo_path, ref_name,
+                  snapshot_commit, head_commit, branch, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+             ON CONFLICT(thread_id) DO UPDATE SET
+                 workspace_id = ?2,
+                 repo_path = ?3,
+                 ref_name = ?4,
+                 snapshot_commit = ?5,
+                 head_commit = ?6,
+                 branch = ?7,
+                 created_at = datetime('now')",
+            params![
+                record.thread_id,
+                record.workspace_id,
+                record.repo_path,
+                record.ref_name,
+                record.snapshot_commit,
+                record.head_commit,
+                record.branch,
+            ],
+        )
+        .map_err(|e| format!("Failed to upsert agent_chat_checkpoint: {e}"))?;
+        Ok(())
+    }
+
+    /// Fetch the checkpoint recorded for a thread, if any.
+    pub fn get_agent_chat_checkpoint(
+        &self,
+        thread_id: &str,
+    ) -> Option<AgentChatCheckpointRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT thread_id, workspace_id, repo_path, ref_name,
+                    snapshot_commit, head_commit, branch, created_at
+             FROM agent_chat_checkpoints WHERE thread_id = ?1",
+            params![thread_id],
+            |row| {
+                Ok(AgentChatCheckpointRecord {
+                    thread_id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    repo_path: row.get(2)?,
+                    ref_name: row.get(3)?,
+                    snapshot_commit: row.get(4)?,
+                    head_commit: row.get(5)?,
+                    branch: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Drop the bookkeeping rows whose shadow refs were just pruned
+    /// from a repo. `ref_name` alone is ambiguous across repos (two
+    /// repos can both have `refs/codemux/checkpoints/x`), so the
+    /// delete is scoped to the repo path.
+    pub fn delete_agent_chat_checkpoints_by_refs(
+        &self,
+        repo_path: &str,
+        ref_names: &[String],
+    ) -> Result<(), String> {
+        if ref_names.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        for ref_name in ref_names {
+            conn.execute(
+                "DELETE FROM agent_chat_checkpoints
+                 WHERE repo_path = ?1 AND ref_name = ?2",
+                params![repo_path, ref_name],
+            )
+            .map_err(|e| format!("Failed to delete pruned checkpoint rows: {e}"))?;
+        }
+        Ok(())
+    }
+}
+
 // ── Auth Tokens ──
 
 impl DatabaseStore {
@@ -3364,6 +3501,98 @@ mod tests {
         assert_eq!(rec.provider, "claude");
         assert_eq!(rec.title, None);
         assert_eq!(rec.sdk_session_id, None);
+    }
+
+    // ── agent_chat_checkpoints (issue #80) ──
+
+    fn sample_checkpoint(thread_id: &str) -> AgentChatCheckpointRecord {
+        AgentChatCheckpointRecord {
+            thread_id: thread_id.to_string(),
+            workspace_id: "ws-1".to_string(),
+            repo_path: "/tmp/repo".to_string(),
+            ref_name: format!("refs/codemux/checkpoints/{thread_id}"),
+            snapshot_commit: "a".repeat(40),
+            head_commit: "b".repeat(40),
+            branch: Some("main".to_string()),
+            created_at: String::new(), // assigned by SQLite on insert
+        }
+    }
+
+    #[test]
+    fn agent_chat_checkpoint_upsert_and_fetch() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t1", "ws-1", Some("/tmp/repo"), "claude")
+            .unwrap();
+        db.upsert_agent_chat_checkpoint(&sample_checkpoint("t1"))
+            .unwrap();
+
+        let rec = db.get_agent_chat_checkpoint("t1").expect("row exists");
+        assert_eq!(rec.thread_id, "t1");
+        assert_eq!(rec.workspace_id, "ws-1");
+        assert_eq!(rec.repo_path, "/tmp/repo");
+        assert_eq!(rec.ref_name, "refs/codemux/checkpoints/t1");
+        assert_eq!(rec.snapshot_commit, "a".repeat(40));
+        assert_eq!(rec.head_commit, "b".repeat(40));
+        assert_eq!(rec.branch.as_deref(), Some("main"));
+        assert!(!rec.created_at.is_empty(), "created_at assigned by SQLite");
+
+        // Replace-on-conflict: a fresh checkpoint for the same thread
+        // overwrites the previous one wholesale.
+        let mut updated = sample_checkpoint("t1");
+        updated.snapshot_commit = "c".repeat(40);
+        updated.branch = None;
+        db.upsert_agent_chat_checkpoint(&updated).unwrap();
+        let rec = db.get_agent_chat_checkpoint("t1").unwrap();
+        assert_eq!(rec.snapshot_commit, "c".repeat(40));
+        assert_eq!(rec.branch, None);
+
+        assert!(db.get_agent_chat_checkpoint("missing").is_none());
+    }
+
+    #[test]
+    fn agent_chat_checkpoint_cascades_with_session_delete() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t1", "ws-1", None, "claude")
+            .unwrap();
+        db.upsert_agent_chat_checkpoint(&sample_checkpoint("t1"))
+            .unwrap();
+        assert!(db.get_agent_chat_checkpoint("t1").is_some());
+
+        db.delete_agent_chat_session("t1").unwrap();
+        assert!(
+            db.get_agent_chat_checkpoint("t1").is_none(),
+            "checkpoint row should cascade-delete with the session"
+        );
+    }
+
+    #[test]
+    fn agent_chat_checkpoint_delete_by_pruned_refs_is_repo_scoped() {
+        let db = init_test_database();
+        for (thread, repo) in [("t1", "/repo/a"), ("t2", "/repo/b")] {
+            db.upsert_agent_chat_session(thread, "ws-1", Some(repo), "claude")
+                .unwrap();
+            let mut cp = sample_checkpoint(thread);
+            cp.repo_path = repo.to_string();
+            // Same ref name in both repos — the prune delete must only
+            // hit the matching repo's row.
+            cp.ref_name = "refs/codemux/checkpoints/shared".to_string();
+            db.upsert_agent_chat_checkpoint(&cp).unwrap();
+        }
+
+        db.delete_agent_chat_checkpoints_by_refs(
+            "/repo/a",
+            &["refs/codemux/checkpoints/shared".to_string()],
+        )
+        .unwrap();
+        assert!(db.get_agent_chat_checkpoint("t1").is_none(), "pruned row gone");
+        assert!(
+            db.get_agent_chat_checkpoint("t2").is_some(),
+            "other repo's row untouched"
+        );
+
+        // Empty list is a no-op.
+        db.delete_agent_chat_checkpoints_by_refs("/repo/b", &[]).unwrap();
+        assert!(db.get_agent_chat_checkpoint("t2").is_some());
     }
 
     #[test]

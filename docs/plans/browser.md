@@ -10,9 +10,8 @@
 
 1. Finish a focused manual pass for back, forward, reload, address-bar flow, and text entry on real sites.
 2. Harden resize, focus, redraw, and lifecycle behavior inside split layouts.
-3. Improve interaction fidelity where the current screenshot-driven pane blocks real workflows.
-4. Expose a more useful console log and error stream.
-5. Integrate the current browser runtime more cleanly into OpenFlow verification flows.
+3. Expose a more useful console log and error stream.
+4. Integrate the current browser runtime more cleanly into OpenFlow verification flows.
 
 ## Open Questions
 
@@ -34,6 +33,7 @@
 ## Already Landed
 
 - `agent-browser` v0.24.0 (pure Rust, direct CDP) — Playwright/Node.js path removed
+- native-feel interaction pass: drag-to-select, hover effects, double/triple-click, right/middle-click, live remote cursor, host-clipboard bridge, probe-based stream liveness (no more false "reconnecting" on static pages), corner reconnect pill + slow self-heal loop — see `docs/features/browser.md`
 - stealth Chromium flags and realistic user-agent spoofing
 - per-workspace browser sessions with dynamic stream ports (9223-9299)
 - browser reconnection on pane recreation

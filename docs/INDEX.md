@@ -34,6 +34,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Settings panel: `docs/features/settings.md`
 - Settings sync: `docs/features/settings-sync.md`
 - Agent Chat (Beta-gated chat pane, providers, sidecar, attachments): `docs/features/agent-chat.md`
+- Agent run checkpoints (issue #80 — opt-in background rollback snapshot at run start + restore): `docs/features/agent-chat.md` (§ Run checkpoints); design note at `docs/plans/agent-run-checkpoint.md`
 - Multi-provider chat (Step 12): `docs/features/multi-provider-chat.md`; plan + final-state summary at `docs/plans/step-12-opencode-implementation-plan.md`; research at `docs/plans/step-12-opencode-research.md`; operator UI smoke at `docs/plans/step-12-ui-smoke-checklist.md`
 - Skills sync (E2E, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/plans/step-10-skills-sync.md`; research at `docs/plans/step-10-skills-sync-research.md`; operator UI smoke at `docs/plans/step-10-ui-smoke-checklist.md`
 - Attachments + context system (Step 8): `docs/plans/step-8-attachments.md` (research + locked plan)
@@ -56,13 +57,14 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Terminal presets: `docs/features/presets.md`
 - Session persistence: `docs/features/session-persistence.md`
 - Persistent agents (PTY daemon — now the default spawn path, no setting): `docs/features/persistent-agents.md`
-- Remote hosts (DevicePicker + `codemux-remote` binary + SSH transport + zero-touch workspace push + headless `serve` MCP daemon + background version-upgrade poller + **post-`v0.7.8` SSH tunnel-health UI pill + defer-upgrade-restart-while-agents-run**): `docs/features/remote-hosts.md`; deferred desktop pieces (Steps 1/5/6/9) tracked in `docs/plans/mcp-on-remote.md`
+- Remote hosts (DevicePicker + `codemux-remote` binary + SSH transport + zero-touch workspace push + headless `serve` MCP daemon + background version-upgrade poller + **`v0.7.9` SSH tunnel-health UI pill + defer-upgrade-restart-while-agents-run**): `docs/features/remote-hosts.md`; deferred desktop pieces (Steps 1/5/6/9) tracked in `docs/plans/mcp-on-remote.md`
 - OpenCode conversation sync across cloud-push (issue #16 — `opencode export`/`import` so a pushed/pulled OpenCode pane continues the same session; sibling of the Claude JSONL sync): `docs/features/opencode-conversation-sync.md`
 - Operate a remote workspace in place — **"Open on host"** (attach-in-place: terminal/agent runs on the host with no local copy; detached pty-daemon survives app close and reattaches on reopen; overview action + `attach_only`/`remote_cwd` snapshot fields): `docs/features/remote-in-place.md`
 - Automations (scheduled host-side agent runs): `docs/features/automations.md`; roadmap at `docs/plans/automations.md`; Phase 2 (sync + remote-host) detailed plan at `docs/plans/automations-sync.md`; Superset research at `docs/research/superset-automations.md`
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
-- Observability (flags, metrics, safety config): `docs/features/observability.md`
+- Observability (flags, metrics, safety config + native log file / `codemux logs` / `codemux doctor`): `docs/features/observability.md`
+- Linux file-dialog backend preflight (issue #95 — portal/zenity detection, install-hint toast): `docs/features/workspace-creation.md` (§ constraints), `docs/reference/CONTROL.md` (§ local diagnostics)
 - Port detection (incl. Docker-published container ports for open worktrees): `docs/features/ports.md`
 - Search: `docs/features/search.md`
 - Code indexing: `docs/features/code-indexing.md`
@@ -71,11 +73,13 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Workspace creation: `docs/features/workspace-creation.md`; model-selection-at-launch plan at `docs/plans/model-selection-before-launch.md`
 - Workspaces overview (full-screen device-grouped list with filters, sibling-device adoption, confirm-before-push + undo, divergence chip, elapsed-time pill): `docs/features/workspaces-overview.md`
 - Project identity (first-class `project_uid` + `main`/`worktree` kind + boot sweep, Superset-adapted): `docs/plans/project-identity.md`
-- Workspaces sync (cross-device workspace registry — `/api/workspaces` + 30s pull/push loop + git-HEAD divergence tracking + **asymmetric auto-publish from `codemux-remote` hosts** via the 60s `hosts_inventory` SSH poller): `docs/features/workspaces-sync.md`; **repo-unit sync** (treat repo root + worktrees as one shared-history unit instead of cloning the default-branch checkout into a divergent copy; protected non-deletable `repo root` entry + `standalone copy` warning chip — shipped `v0.7.8`, snapshot-local only) — current behavior in `docs/features/workspaces-sync.md` + `docs/features/workspaces-overview.md`, plan + remaining follow-ups (SSH round-trip validation) at `docs/plans/repo-unit-sync.md`; **post-`v0.7.8` multi-device robustness pass** (project-first "Pull project" + protected root + `default_branch`, serialized adopts, `dedupe_sibling_rows`, one-repo-root-per-project, uid-keyed collision-safe host paths, non-destructive "Reconcile copy") in `docs/features/workspaces-sync.md` § "Robustness hardening"
+- Workspaces sync (cross-device workspace registry — `/api/workspaces` + 30s pull/push loop + git-HEAD divergence tracking + **asymmetric auto-publish from `codemux-remote` hosts** via the 60s `hosts_inventory` SSH poller): `docs/features/workspaces-sync.md`; **repo-unit sync** (treat repo root + worktrees as one shared-history unit instead of cloning the default-branch checkout into a divergent copy; protected non-deletable `repo root` entry + `standalone copy` warning chip — shipped `v0.7.8`, snapshot-local only) — current behavior in `docs/features/workspaces-sync.md` + `docs/features/workspaces-overview.md`, plan + remaining follow-ups (SSH round-trip validation) at `docs/plans/repo-unit-sync.md`; **`v0.7.9` multi-device robustness pass** (project-first "Pull project" + protected root + `default_branch`, serialized adopts, `dedupe_sibling_rows`, one-repo-root-per-project, uid-keyed collision-safe host paths, non-destructive "Reconcile copy") in `docs/features/workspaces-sync.md` § "Robustness hardening"
+- Project avatars (sidebar project image + color customization, favicon derivation + cache-bust): `docs/features/project-avatars.md`
 - IDE integration: `docs/features/ide-integration.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`
 - Windows cross-platform work: `docs/plans/windows-support.md`
+- Dev mock runtime (dual-guarded `src/dev/` Tauri shim that boots the real UI in a plain browser under `npm run dev` with seed data, for visual/screenshot work): `docs/features/dev-mock-runtime.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
 - Keyboard shortcuts: `docs/reference/SHORTCUTS.md`
 - Feature inventory: `docs/reference/FEATURES.md`

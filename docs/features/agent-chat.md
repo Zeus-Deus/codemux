@@ -114,6 +114,35 @@ The chat pane stack:
   in CI to dodge the `fake_codex_app_server` helper-binary build race
   under cargo's parallel scheduler.
 
+## Transcript virtualization (issue #77)
+
+The transcript body (`MessageList.tsx`) is virtualized with
+`react-virtuoso` (MIT — chosen over `@tanstack/react-virtual` and
+`react-window` for its built-in dynamic row measurement and
+bottom-anchoring; the commercially licensed `@virtuoso.dev/message-list`
+package is NOT used). Only the on-screen window of rows is mounted, so
+a 5,000-message session (the reducer cap) scrolls like a short one.
+
+Contract preserved from the pre-virtualization renderer:
+
+- **Stable keys + memo rows.** Per-slot keys are still `slot.item.id`
+  / `run:<first-id>`, and rows render through `MessageRowMemo` — a
+  streaming token mutates exactly one row.
+- **Stick-to-bottom.** `MessageList` owns the scroller now (Virtuoso
+  must control it). Pinned-ness is tracked from real scroll events
+  (≤ 80 px from the bottom); after every transcript change (or
+  thinking-pulse toggle), if pinned, it snaps to the tail via
+  `scrollToIndex(LAST, end)`. Content growth alone never unpins, so
+  auto-scroll never fights a user reading history.
+- **Variable heights.** Tool-run collapses expand in place as a single
+  virtual row; Virtuoso re-measures via ResizeObserver.
+- **Thinking pulse** renders as the last virtual row (not a footer) so
+  the tail snap keeps it visible while streaming.
+
+`ChatTranscript` is now a thin shell that derives `showThinking` and
+sizes the list. jsdom tests wrap renders in `VirtuosoMockContext`
+(see `MessageList.test.tsx` / `MessageList.virtualization.test.tsx`).
+
 ## Current Constraints
 
 - **Beta-gated.** The chat pane is hidden unless the user opts in via
@@ -161,6 +190,15 @@ The chat pane stack:
 - `src-tauri/tests/helpers/fake_codex_app_server/main.rs` — scripted
   fixture that impersonates the `codex app-server` subprocess.
 
+The three `fake_*` helper `[[bin]]` targets are gated behind the
+`test-fixtures` cargo feature (`required-features` in
+`src-tauri/Cargo.toml`). Tauri's CLI bundles every ungated `[[bin]]` of
+the app package, so without the gate the fixtures shipped in the
+deb/rpm/AppImage at `usr/bin` (through v0.9.1). A self-referential
+dev-dependency turns the feature on for `cargo test`, so plain
+`cargo test` still builds the fixtures and `env!("CARGO_BIN_EXE_fake_*")`
+resolves — no `--features` flag needed anywhere.
+
 ## Notes
 
 - Keep this file about current truth, not future plans. Future chunks (Claude
@@ -178,10 +216,11 @@ TypeScript subprocess and talk to it over JSON-RPC. This is the
 officially supported integration path, and it means Codemux's Rust
 side stays provider-agnostic.
 
-**Current state.** Scaffold only. The sidecar implements a single
-`ping` method that echoes its params back with a server timestamp.
-No SDK dependency yet — that lands in a follow-up task on top of a
-known-good foundation.
+**Current state.** Full SDK host. The sidecar depends on
+`@anthropic-ai/claude-agent-sdk` and exposes 13 JSON-RPC methods
+(session lifecycle, turn streaming, approvals, probes — see "Exposed
+RPCs" under "Claude Agent SDK integration" below). The original
+`ping` scaffold method remains as the liveness probe.
 
 **Toolchain.** [Bun](https://bun.sh) 1.3+ is the sole dependency. Bun
 handles install, test, and `bun build --compile` to produce a
@@ -235,7 +274,8 @@ fails with `provider_not_configured: Claude`.
 Rust side spawns the sidecar through
 [`JsonRpcChild`](../../src-tauri/src/json_rpc_child/mod.rs) — the same
 helper the Codex adapter uses — so adding new methods is a matter of
-registering handlers in `sidecar/claude-agent/src/main.ts`.
+registering handlers in `buildMethods` in
+`sidecar/claude-agent/src/methods/index.ts` (dispatched from `main.ts`).
 
 ## Claude Agent SDK integration
 
@@ -295,6 +335,7 @@ Two side-channel notifications are emitted in addition to the raw
 | `interrupt` | Halt the current turn (`query.interrupt`). |
 | `set-model` | Swap the session's default model. |
 | `set-permission-mode` | Change the session's permission mode. |
+| `update-mcp-tools` | Push an updated MCP tool list into the live session (`query.setMcpServers`); lets servers that come up after `start-session` surface without a chat restart. Empty list removes the codemux MCP. Idempotent. |
 | `respond-to-request` | Resolve a pending `canUseTool` approval. |
 | `respond-to-user-input` | Answer an `AskUserQuestion` prompt. |
 | `initialization-result` | Read the SDK's cached init payload. |
@@ -303,13 +344,14 @@ Two side-channel notifications are emitted in addition to the raw
 | `probe-authenticated` | Shell out to `<binary> auth status`. |
 | `ping` | Liveness probe from the scaffold. |
 
-Deliberately NOT exposed (per the integration research): the ~16
+Deliberately NOT exposed (per the integration research): the ~15
 other `Query` methods (`setMaxThinkingTokens`, `applyFlagSettings`,
 `supportedCommands`, `supportedModels`, `supportedAgents`,
 `mcpServerStatus`, `getContextUsage`, `reloadPlugins`, `accountInfo`,
 `rewindFiles`, `seedReadState`, `reconnectMcpServer`,
-`toggleMcpServer`, `setMcpServers`, `streamInput`, `stopTask`).
-These ship as follow-ups only when UI calls for them.
+`toggleMcpServer`, `streamInput`, `stopTask`). These ship as
+follow-ups only when UI calls for them. (`setMcpServers` graduated
+from this list — `update-mcp-tools` wraps it.)
 
 ### Options construction
 
@@ -325,9 +367,11 @@ left unset — they become features when the UI surfaces them.
 
 ### Testing
 
-The sidecar ships with 38 Bun tests: 11 ping (scaffold), 18 session
-unit tests using a `FakeQuery` injected via `setQueryFactoryForTests`,
-and 9 permissions tests exercising the canUseTool bridge. The Rust
+The sidecar ships with 70 Bun tests across six files: ping/liveness,
+session unit tests using a `FakeQuery` injected via
+`setQueryFactoryForTests`, permissions tests exercising the canUseTool
+bridge, MCP-bridge tests, respond-to-request tests, and Stage 3
+real-tools coverage. The Rust
 side has 7 end-to-end integration tests (`sidecar_sdk.rs`) that spawn
 the compiled binary and cover the paths that don't require real
 Anthropic auth. Testing a real session is a manual smoke test — it
@@ -479,27 +523,92 @@ string when the target provider is missing from the registry.
 | `agent_chat_set_model` | Swap a thread's model mid-session. |
 | `agent_chat_set_permission_mode` | Swap a thread's permission mode mid-session. |
 | `agent_chat_stop_session` | Gracefully close a session. Idempotent. |
+| `agent_chat_get_checkpoint` | Return the run-start rollback checkpoint recorded for a thread (or null). Not flag-gated — renders as "no checkpoint" instead of an error. |
+| `agent_chat_restore_checkpoint` | Roll the workspace back to the thread's run-start checkpoint. Mutates the working tree; the UI confirms first. |
 
 Provider errors are serialized as `SerializableProviderError` JSON so
 the UI can inspect the error subtype (e.g.
 `{"kind":"not_authenticated", ...}`) instead of parsing a free-form
 string.
 
+## Run checkpoints (issue #80)
+
+Opt-in rollback point taken when a chat session starts. Off by
+default; toggled via Settings → Agent → "Checkpoint before agent
+runs" (`UserSettings.agent_chat.checkpoints_enabled`, synced
+settings).
+
+- **Background, never on the first-token path.** `agent_chat_start_session`
+  spawns `tauri::async_runtime::spawn` + `spawn_blocking` AFTER the
+  provider session is up; even the settings-cache read happens inside
+  the spawned task.
+- **Non-destructive snapshot.** `git_checkpoint_create`
+  (`src-tauri/src/git.rs`) stages the worktree (tracked + untracked,
+  `.gitignore` respected) into a temporary `GIT_INDEX_FILE`, writes a
+  tree, and `commit-tree`s it onto HEAD — the user's index, worktree,
+  and stash list are untouched and no hooks run. The commit is
+  anchored at `refs/codemux/checkpoints/<sanitized-thread-id>` so gc
+  can't reap it. Skipped silently for non-repos and unborn-HEAD repos.
+- **Recorded per thread.** `agent_chat_checkpoints` table (FK →
+  `agent_chat_sessions`, ON DELETE CASCADE) stores snapshot commit,
+  HEAD commit, branch, repo path, ref name. On success the backend
+  emits `agent_chat_checkpoint` (`{thread_id, checkpoint}`); the
+  frontend hook `useAgentChatCheckpoint` (event + on-mount fetch)
+  feeds the pane header's restore button (history icon, hover-reveal,
+  hidden when no checkpoint, disabled mid-turn).
+- **Restore** (`git_checkpoint_restore`): refuses on branch mismatch
+  or pruned commits; takes a safety snapshot of the current state to
+  `refs/codemux/pre-restore/<id>` first; then `read-tree --reset -u
+  <snapshot>` + `clean -fd` + `reset --mixed <pre-run HEAD>`. Result:
+  run commits undone, run-created files deleted (ignored files
+  spared), pre-run changes back as unstaged edits / untracked files.
+  Known loss: the pre-run staged/unstaged split flattens to unstaged.
+- **Pruning.** Each create prunes both `refs/codemux/` namespaces to
+  the 20 newest refs and drops the matching bookkeeping rows.
+
+Design note: `docs/plans/agent-run-checkpoint.md`.
+
 ## Event bridge
 
 Every registered provider's canonical event stream is forwarded to
-the frontend on a single Tauri channel named `agent_chat_event`.
-Payloads carry the originating `thread_id` alongside the raw
-`ProviderRuntimeEvent` so subscribers can filter without re-parsing.
-Global events (`RuntimeWarning` without a thread id) are still
-forwarded, with an empty `ThreadId`. The frontend hook
+the frontend per thread over a `tauri::ipc::Channel` (issue #75).
+Payloads (`AgentChatEventPayload`) carry the originating `thread_id`
+alongside the raw `ProviderRuntimeEvent`.
+
+Transport split:
+
+- **Thread-scoped events** — including the high-frequency streaming
+  `content_delta` tokens — are routed to the `Channel` the owning
+  pane registered via `attach_agent_chat_output(thread_id, channel)`
+  (`AgentChatChannelRegistry` in `commands/agent_chat.rs`, mirroring
+  the PTY `attach_pty_output` pattern). A pane only ever receives its
+  own thread's events; nothing is broadcast app-wide. Tauri's event
+  system is explicitly not designed for high-throughput streaming;
+  Channels are the documented mechanism for it.
+- **Thread-less events** (global `RuntimeWarning`s) keep the
+  low-frequency `agent_chat_event` global event bus, with an empty
+  `ThreadId`.
+
+Replay split: the channel carries **live events only**. Transcript
+events are persisted to SQLite by `forward_event` whether or not a
+channel is attached, and a late-attaching / resumed pane rebuilds
+history through the DB hydrate (`agent_chat_list_messages` →
+`hydrateThread`). Non-persisted lifecycle notices that fire while no
+pane is attached are dropped — the same outcome the event bus had
+for unmounted panes.
+
+Attach/detach lifecycle: `attach_agent_chat_output` returns a
+generation token; `detach_agent_chat_output(thread_id, generation)`
+only removes a matching generation, so a stale unmount can never tear
+down the channel a newer pane just installed. The frontend hook
 `useAgentChatEvents(threadId, handler)` in
-`src/hooks/use-agent-chat-events.ts` wires this up with a
-thread-id filter.
+`src/hooks/use-agent-chat-events.ts` owns this lifecycle: it attaches
+a `Channel` per mounted thread and serializes its detach behind the
+attach promise.
 
 The bridge is a thin loop: one background Tokio task per provider,
-each consuming the provider's `event_stream()` and re-emitting each
-event via `AppHandle::emit`. `broadcast::error::RecvError::Lagged`
+each consuming the provider's `event_stream()` and routing each
+event through `forward_event`. `broadcast::error::RecvError::Lagged`
 is already swallowed by each provider's event-stream helper, so slow
 subscribers never crash the loop — they just drop old events.
 
@@ -549,6 +658,15 @@ debug builds when `enable_agent_chat` is on. It invokes
 `dev_agent_chat_spawn_test_pane` to drop a chat pane into the active
 workspace. Useful for quick manual testing without going through the
 sidebar `+` flow.
+
+Under `npm run dev` (plain-browser mock), the seeded
+**agent-chat-demo** workspace carries an `agent_chat` pane bound to
+`MOCK_CHAT_THREAD_ID`. The mock hydrates a ~790-row transcript through
+the real reducer (`agent_chat_list_messages`), streams a simulated
+reply on `agent_chat_send_turn`, and exposes
+`window.__codemuxChatMock.streamReply()` for on-demand streaming —
+the standing harness for transcript-virtualization and scroll-pinning
+work.
 
 ## Step 9 — Cross-provider MCP server runtime (shipped)
 

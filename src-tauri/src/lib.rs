@@ -30,6 +30,9 @@ pub mod github;
 pub mod github_cache;
 pub mod control;
 pub mod diagnostics;
+pub mod dialog_preflight;
+pub mod app_logs;
+pub mod doctor;
 pub mod encryption;
 pub mod execution;
 pub mod indexing;
@@ -183,6 +186,12 @@ pub fn run() {
         .manage(encryption::EncryptionManager::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
+        // Per-thread live event channels for the chat pane: each
+        // mounted pane attaches a tauri::ipc::Channel keyed by
+        // thread_id; forward_event routes that thread's runtime
+        // events (incl. the content_delta token stream) to it instead
+        // of broadcasting on the global event bus. See issue #75.
+        .manage(commands::agent_chat::AgentChatChannelRegistry::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
@@ -223,6 +232,24 @@ pub fn run() {
             database::DatabaseStore::new_in_memory()
         }))
         .plugin(tauri_plugin_opener::init())
+        // Persistent native logging: app log dir + stderr. Warn-level
+        // globally so dependency chatter stays out, which still
+        // captures the failures that used to vanish — e.g. rfd's
+        // "Failed to pick folder" when no dialog backend exists
+        // (issue #95). Users can read the file via `codemux logs`.
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Warn)
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stderr),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some(crate::app_logs::LOG_FILE_STEM.into()),
+                    }),
+                ])
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .build(),
+        )
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -1497,6 +1524,10 @@ pub fn run() {
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
+            commands::agent_chat_get_checkpoint,
+            commands::agent_chat_restore_checkpoint,
+            commands::attach_agent_chat_output,
+            commands::detach_agent_chat_output,
             commands::opencode_check_availability,
             commands::opencode_ping,
             commands::opencode_list_models,

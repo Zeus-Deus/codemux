@@ -329,18 +329,46 @@ pub fn run_setup_scripts(
     )
 }
 
-/// Run setup scripts with a pre-resolved config and root path.
-/// The `root_path` should be resolved on the calling thread (not inside a spawned thread)
-/// to avoid race conditions with worktree `.git` file resolution.
-pub fn run_setup_scripts_with_config(
+/// Progress notifications from the shared setup-command runner core.
+///
+/// The desktop (`run_setup_scripts_with_config`) maps these to the Tauri
+/// events the frontend listens for (`workspace-setup-progress` /
+/// `workspace-setup-failed` / `workspace-setup-complete`); the headless
+/// daemon (`remote::tools::worktree_create`) logs them to stderr because
+/// there is no frontend to notify. Fields are borrowed: events are
+/// consumed synchronously by the notifier.
+pub enum SetupEvent<'a> {
+    Progress {
+        command: &'a str,
+        index: usize,
+        total: usize,
+    },
+    Failed {
+        command: &'a str,
+        stdout: &'a str,
+        stderr: &'a str,
+        exit_code: Option<i32>,
+    },
+    Complete,
+}
+
+/// UI-free core of the setup-command runner — shared by the desktop and
+/// the headless daemon's `worktree_create` tool so both paths run
+/// identical commands with identical env (`CODEMUX_ROOT_PATH` /
+/// `CODEMUX_WORKSPACE_PATH` / `CODEMUX_BRANCH` / `CODEMUX_PORT` plus
+/// `CODEMUX_WORKSPACE_NAME` / `CODEMUX_WORKSPACE_ID`). Commands run
+/// sequentially via `sh -c` in `workspace_path`; the first failure stops
+/// the pipeline and is returned as `Err`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_setup_commands(
     workspace_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
-    app_handle: &AppHandle,
     config: &WorkspaceConfig,
     root_path: &Path,
     branch: Option<&str>,
     port: Option<u16>,
+    notify: &mut dyn FnMut(SetupEvent<'_>),
 ) -> Result<(), String> {
     if config.setup.is_empty() {
         return Ok(());
@@ -356,15 +384,11 @@ pub fn run_setup_scripts_with_config(
     let total = config.setup.len();
 
     for (index, command) in config.setup.iter().enumerate() {
-        let _ = app_handle.emit(
-            "workspace-setup-progress",
-            SetupProgress {
-                workspace_id: workspace_id.to_string(),
-                command: command.clone(),
-                index,
-                total,
-            },
-        );
+        notify(SetupEvent::Progress {
+            command,
+            index,
+            total,
+        });
 
         let mut cmd = std::process::Command::new("sh");
         cmd.arg("-c")
@@ -385,16 +409,12 @@ pub fn run_setup_scripts_with_config(
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let exit_code = output.status.code();
 
-            let _ = app_handle.emit(
-                "workspace-setup-failed",
-                SetupFailed {
-                    workspace_id: workspace_id.to_string(),
-                    command: command.clone(),
-                    stdout: stdout.clone(),
-                    stderr: stderr.clone(),
-                    exit_code,
-                },
-            );
+            notify(SetupEvent::Failed {
+                command,
+                stdout: &stdout,
+                stderr: &stderr,
+                exit_code,
+            });
 
             return Err(format!(
                 "Setup command `{command}` failed (exit {}): {}",
@@ -406,14 +426,80 @@ pub fn run_setup_scripts_with_config(
         }
     }
 
-    let _ = app_handle.emit(
-        "workspace-setup-complete",
-        SetupComplete {
-            workspace_id: workspace_id.to_string(),
-        },
-    );
+    notify(SetupEvent::Complete);
 
     Ok(())
+}
+
+/// Run setup scripts with a pre-resolved config and root path.
+/// The `root_path` should be resolved on the calling thread (not inside a spawned thread)
+/// to avoid race conditions with worktree `.git` file resolution.
+///
+/// Thin Tauri wrapper over [`run_setup_commands`]: forwards each
+/// [`SetupEvent`] to the frontend as the events it has always listened
+/// for, with unchanged payload shapes.
+#[allow(clippy::too_many_arguments)]
+pub fn run_setup_scripts_with_config(
+    workspace_path: &Path,
+    workspace_name: &str,
+    workspace_id: &str,
+    app_handle: &AppHandle,
+    config: &WorkspaceConfig,
+    root_path: &Path,
+    branch: Option<&str>,
+    port: Option<u16>,
+) -> Result<(), String> {
+    run_setup_commands(
+        workspace_path,
+        workspace_name,
+        workspace_id,
+        config,
+        root_path,
+        branch,
+        port,
+        &mut |event| match event {
+            SetupEvent::Progress {
+                command,
+                index,
+                total,
+            } => {
+                let _ = app_handle.emit(
+                    "workspace-setup-progress",
+                    SetupProgress {
+                        workspace_id: workspace_id.to_string(),
+                        command: command.to_string(),
+                        index,
+                        total,
+                    },
+                );
+            }
+            SetupEvent::Failed {
+                command,
+                stdout,
+                stderr,
+                exit_code,
+            } => {
+                let _ = app_handle.emit(
+                    "workspace-setup-failed",
+                    SetupFailed {
+                        workspace_id: workspace_id.to_string(),
+                        command: command.to_string(),
+                        stdout: stdout.to_string(),
+                        stderr: stderr.to_string(),
+                        exit_code,
+                    },
+                );
+            }
+            SetupEvent::Complete => {
+                let _ = app_handle.emit(
+                    "workspace-setup-complete",
+                    SetupComplete {
+                        workspace_id: workspace_id.to_string(),
+                    },
+                );
+            }
+        },
+    )
 }
 
 pub fn run_teardown_scripts(

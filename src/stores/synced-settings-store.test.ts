@@ -35,6 +35,7 @@ const DARK_SETTINGS: UserSettings = {
   notifications: { sound_enabled: false, desktop_enabled: true },
   file_tree: { show_hidden_files: true },
   session_restore: { enabled: true, scrollback_lines: 10000, max_total_mb: 100 },
+  agent_chat: { checkpoints_enabled: true },
 };
 
 describe("synced-settings-store", () => {

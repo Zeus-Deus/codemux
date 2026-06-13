@@ -51,6 +51,88 @@ pub fn git_root(repo_path: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Wall-clock cap for the best-effort base fetch in
+/// [`fetch_origin_branch`]. Mirrors the desktop's timeout.
+const BASE_FETCH_TIMEOUT_SECS: u64 = 10;
+
+/// Best-effort, scoped `git fetch origin <branch>` so
+/// `refs/remotes/origin/<branch>` reflects the true remote tip before
+/// [`create_worktree`] resolves it as the base of a new branch. Mirrors
+/// the desktop's `crate::git::fetch_origin_branch` — same scoping, same
+/// graceful degradation:
+/// - Skipped when there is no `origin` remote (remote-host projects are
+///   frequently local-only) or for absolute `refs/...` bases.
+/// - `origin/<b>` is normalised to `<b>`.
+/// - `GIT_TERMINAL_PROMPT=0` so git never hangs on a credential prompt.
+/// - Killed after [`BASE_FETCH_TIMEOUT_SECS`] so a slow or unreachable
+///   remote can't stall worktree creation.
+/// - All failures are swallowed; callers fall back to local refs.
+fn fetch_origin_branch(repo_root: &Path, branch: &str) -> bool {
+    let branch = match branch.strip_prefix("origin/") {
+        Some(rest) => rest,
+        None if branch.starts_with("refs/") => return false,
+        None => branch,
+    };
+    if branch.is_empty() {
+        return false;
+    }
+    let has_origin = run_git(repo_root, &["remote"])
+        .map(|out| out.lines().any(|r| r.trim() == "origin"))
+        .unwrap_or(false);
+    if !has_origin {
+        return false;
+    }
+    let Ok(mut child) = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["fetch", "--quiet", "--no-tags", "origin", branch])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(BASE_FETCH_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Resolve `branch` to its `origin/<branch>` remote-tracking ref when one
+/// exists locally. Mirrors the desktop's `find_remote_ref`: inputs that
+/// are already remote (`origin/...`) or absolute (`refs/...`) pass
+/// through unchanged; otherwise `None` when origin has no such branch.
+fn find_remote_ref(repo_root: &Path, branch: &str) -> Option<String> {
+    if branch.starts_with("origin/") || branch.starts_with("refs/") {
+        return Some(branch.to_string());
+    }
+    let remote_ref = format!("origin/{branch}");
+    run_git(
+        repo_root,
+        &["rev-parse", "--verify", &format!("refs/remotes/{remote_ref}")],
+    )
+    .ok()
+    .map(|_| remote_ref)
+}
+
 /// Sanitise a branch name into a single safe path segment. Mirrors the
 /// desktop's worktree-path sanitisation: ASCII-alphanumeric + `_ - .`
 /// survive, everything else (including `/`) becomes `-`.
@@ -116,11 +198,57 @@ fn existing_worktree_matches(repo_root: &Path, target: &Path, branch: &str) -> b
     matched
 }
 
+/// True when `git worktree list` reports a worktree registered at
+/// `target` for ANY branch — i.e. git still tracks this directory, so
+/// reclaiming it would corrupt that worktree.
+fn path_is_registered_worktree(repo_root: &Path, target: &Path) -> bool {
+    let Ok(output) = run_git(repo_root, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("worktree ")
+            .map(|p| Path::new(p) == target)
+            .unwrap_or(false)
+    })
+}
+
+/// Decide whether the directory already at a would-be worktree path is a
+/// safe-to-remove leftover: an orphaned Codemux worktree dir whose git
+/// registration is gone, holding nothing but Codemux's own metadata.
+/// Returns true ONLY when deleting it can't lose user data or corrupt a
+/// live worktree. Mirrors the desktop's `git_create_worktree` policy so a
+/// remote-host agent reclaiming a stale issue-branch dir behaves the same.
+fn is_reclaimable_orphan_worktree(repo_root: &Path, path: &Path) -> bool {
+    if path_is_registered_worktree(repo_root, path) {
+        return false;
+    }
+    if path.join(".git").exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    const CODEMUX_METADATA: &[&str] = &[".codemux"];
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        match entry.file_name().to_str() {
+            Some(name) if CODEMUX_METADATA.contains(&name) => continue,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Create (or reuse) a git worktree for `branch` off `repo_path`.
 ///
 /// - `new_branch = true`: create a new branch `branch` based on `base`
 ///   (defaults to the repo's current HEAD when `base` is None) and check
-///   it out in a fresh worktree.
+///   it out in a fresh worktree. When the repo has an `origin` remote,
+///   `base` is first fetched from it (best-effort, scoped, time-capped)
+///   and resolved to `origin/<base>` so the new branch starts from the
+///   latest remote commit; offline / local-only repos fall back to the
+///   local ref.
 /// - `new_branch = false`: attach a worktree to an existing local
 ///   `branch`.
 ///
@@ -160,6 +288,17 @@ pub fn create_worktree(
         });
     }
 
+    // Path exists but isn't our registered worktree. Reclaim it when it's
+    // a safe orphan — a leftover Codemux dir whose registration is gone —
+    // so `worktree add` doesn't die with `fatal: '<path>' already exists`.
+    // `worktree prune` below only drops registrations whose dir is MISSING,
+    // so it can't clear an on-disk orphan; this can.
+    if worktree_path.exists() && is_reclaimable_orphan_worktree(&repo_root, &worktree_path) {
+        std::fs::remove_dir_all(&worktree_path).map_err(|e| {
+            format!("failed to reclaim leftover worktree dir '{}': {e}", worktree_path.display())
+        })?;
+    }
+
     // Prune stale worktree registrations before adding. Without this, a
     // branch still "claimed" by a registration whose directory was
     // removed (manually, or by a half-finished teardown) makes
@@ -170,11 +309,22 @@ pub fn create_worktree(
     let _ = run_git(&repo_root, &["worktree", "prune"]);
 
     if new_branch {
+        // Resolve base: prefer origin/<base> so new branches start from
+        // the latest remote commit, not a potentially stale local ref —
+        // same policy as the desktop's `git_create_worktree`. The scoped
+        // fetch freshens `refs/remotes/origin/<base>` first; offline or
+        // local-only repos fall back to whatever ref already exists
+        // (stale origin/<base>, else local <base>).
+        let resolved_base = base
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .map(|b| {
+                fetch_origin_branch(&repo_root, b);
+                find_remote_ref(&repo_root, b).unwrap_or_else(|| b.to_string())
+            });
         let mut args = vec!["worktree", "add", "-b", branch, path_str.as_str()];
-        if let Some(b) = base {
-            if !b.trim().is_empty() {
-                args.push(b);
-            }
+        if let Some(ref b) = resolved_base {
+            args.push(b.as_str());
         }
         run_git(&repo_root, &args)?;
     } else {
@@ -257,6 +407,31 @@ mod tests {
     }
 
     #[test]
+    fn create_worktree_reclaims_orphan_leftover_dir() {
+        // Daemon parity with the desktop fix: a worktree dir left on disk
+        // after its git registration was pruned (holding only a stray
+        // `.codemux/`) must be reclaimed, not error with "already exists".
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        init_repo(repo.path());
+
+        // The path create_worktree will derive for this branch.
+        let repo_name = git_root(repo.path()).unwrap();
+        let repo_name = repo_name.file_name().unwrap().to_string_lossy();
+        let orphan = conventional_worktree_path(home.path(), &repo_name, "feature-orphan");
+        std::fs::create_dir_all(orphan.join(".codemux")).unwrap();
+        std::fs::write(orphan.join(".codemux").join("index.json"), "{}").unwrap();
+        assert!(orphan.exists() && !orphan.join(".git").exists(), "orphan precondition");
+
+        let created =
+            create_worktree(home.path(), repo.path(), "feature-orphan", true, Some("main"))
+                .expect("must reclaim orphan, not error");
+        assert_eq!(created.worktree_path, orphan);
+        assert!(created.worktree_path.join(".git").is_file(), "now a real worktree");
+        assert!(created.worktree_path.join("README.md").exists(), "populated checkout");
+    }
+
+    #[test]
     fn create_worktree_rejects_non_repo() {
         let not_repo = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
@@ -271,5 +446,85 @@ mod tests {
         init_repo(repo.path());
         let err = create_worktree(home.path(), repo.path(), "  ", true, None).unwrap_err();
         assert!(err.contains("branch is required"), "got: {err}");
+    }
+
+    /// Stale-clone scenario (issue #76, daemon parity): bare "origin", a
+    /// `local` clone whose `origin/main` is one commit behind, and the
+    /// true remote tip sha pushed by a second clone.
+    fn setup_stale_clone(root: &Path) -> (PathBuf, String) {
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        init_repo(&seed);
+
+        let bare = root.join("origin.git");
+        run_git(root, &["clone", "--bare", seed.to_str().unwrap(), bare.to_str().unwrap()])
+            .expect("clone bare");
+        let local = root.join("local");
+        run_git(root, &["clone", bare.to_str().unwrap(), local.to_str().unwrap()])
+            .expect("clone local");
+        let publisher = root.join("publisher");
+        run_git(root, &["clone", bare.to_str().unwrap(), publisher.to_str().unwrap()])
+            .expect("clone publisher");
+        run_git(
+            &publisher,
+            &["-c", "user.name=Test", "-c", "user.email=test@example.com",
+              "commit", "--allow-empty", "-m", "remote-only"],
+        )
+        .expect("publisher commit");
+        run_git(&publisher, &["push", "origin", "main"]).expect("publisher push");
+
+        let remote_tip = run_git(&bare, &["rev-parse", "main"]).expect("bare tip");
+        let stale = run_git(&local, &["rev-parse", "refs/remotes/origin/main"]).expect("stale");
+        assert_ne!(stale, remote_tip, "precondition: local origin/main must be stale");
+        (local, remote_tip)
+    }
+
+    #[test]
+    fn new_branch_starts_from_freshly_fetched_origin_base() {
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let (local, remote_tip) = setup_stale_clone(dir.path());
+
+        let created = create_worktree(home.path(), &local, "fresh-base", true, Some("main"))
+            .expect("create worktree");
+        let head = run_git(&created.worktree_path, &["rev-parse", "HEAD"]).expect("HEAD");
+        assert_eq!(
+            head, remote_tip,
+            "daemon-created branch should start at the freshly-fetched remote tip"
+        );
+    }
+
+    #[test]
+    fn new_branch_offline_falls_back_to_stale_origin_ref() {
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let (local, remote_tip) = setup_stale_clone(dir.path());
+        let stale = run_git(&local, &["rev-parse", "refs/remotes/origin/main"]).expect("stale");
+
+        // Sever the remote so the fetch fails (offline simulation).
+        run_git(&local, &["remote", "set-url", "origin", "/nonexistent/origin.git"])
+            .expect("set-url");
+
+        let created = create_worktree(home.path(), &local, "offline-base", true, Some("main"))
+            .expect("creation must not hard-fail when the remote is unreachable");
+        let head = run_git(&created.worktree_path, &["rev-parse", "HEAD"]).expect("HEAD");
+        assert_eq!(head, stale, "offline fallback should use the existing (stale) origin/main");
+        assert_ne!(head, remote_tip);
+    }
+
+    #[test]
+    fn new_branch_without_remote_uses_local_base() {
+        // Local-only repos (routine on headless hosts) must keep working:
+        // no origin remote → fetch is skipped, base resolves to the local
+        // branch.
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        init_repo(repo.path());
+        let local_tip = run_git(repo.path(), &["rev-parse", "main"]).expect("tip");
+
+        let created = create_worktree(home.path(), repo.path(), "no-remote-base", true, Some("main"))
+            .expect("create worktree");
+        let head = run_git(&created.worktree_path, &["rev-parse", "HEAD"]).expect("HEAD");
+        assert_eq!(head, local_tip);
     }
 }

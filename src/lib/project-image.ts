@@ -22,7 +22,20 @@ export interface ResolvedImage {
   domain: string | null;
 }
 
-export function resolveImageUrl(input: string): ResolvedImage {
+/**
+ * @param input     Raw user input (image URL, data URL, website, or domain).
+ * @param cacheBust Optional token appended to derived favicon URLs as `&v=`.
+ *   The favicon service URL is otherwise identical for a given domain, so the
+ *   WebView's image cache serves the same bytes forever — meaning a site that
+ *   changes its favicon never visibly updates. Passing a token that changes
+ *   when the user re-saves (or re-opens the picker) forces a fresh fetch.
+ *   Only applied to derived favicons; direct/data URLs are passed through
+ *   untouched so we never corrupt a signed or already-complete URL.
+ */
+export function resolveImageUrl(
+  input: string,
+  cacheBust?: string | number | null,
+): ResolvedImage {
   const trimmed = input.trim();
   if (!trimmed) return { url: "", isFavicon: false, domain: null };
 
@@ -39,11 +52,11 @@ export function resolveImageUrl(input: string): ResolvedImage {
   // Try to interpret as a website / bare domain.
   const domain = extractDomain(trimmed);
   if (domain) {
-    return {
-      url: `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=128`,
-      isFavicon: true,
-      domain,
-    };
+    let url = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=128`;
+    if (cacheBust) {
+      url += `&v=${encodeURIComponent(String(cacheBust))}`;
+    }
+    return { url, isFavicon: true, domain };
   }
 
   // Fallback: pass through and let the <img onError> fallback handle it.

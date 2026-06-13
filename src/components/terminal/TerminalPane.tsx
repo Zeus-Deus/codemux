@@ -3,6 +3,8 @@ import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { shouldLoadWebglAddon } from "./webgl-renderer-probe";
 import { isAppShortcut } from "@/lib/app-shortcuts";
 import { matchesKeyCombo } from "@/lib/keybind-utils";
 import {
@@ -26,6 +28,8 @@ import {
   resizePty,
   detachPtyOutput,
   attachPtyOutput,
+  pausePtyOutput,
+  resumePtyOutput,
   getTerminalStatus,
   clearAgentStatus,
   getTerminalScrollback,
@@ -130,6 +134,7 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const serializeAddonRef = useRef<SerializeAddon | null>(null);
+  const webglAddonRef = useRef<WebglAddon | null>(null);
   const attachedSessionRef = useRef<string | null>(null);
   // Adapter captures from the scrollback restore — persists across tab switches
   // even when the pane state (layout.json) doesn't have them.
@@ -281,9 +286,45 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     term.loadAddon(serializeAddon);
     term.open(containerEl);
 
+    // ── WebGL renderer (hardware GL only) ──
+    // Offload glyph rendering to the GPU — substantially faster and smoother
+    // for the long-running, high-output agent sessions Codemux runs. Must load
+    // AFTER term.open() because the addon needs the opened terminal's DOM
+    // element. Gated on a one-time probe (`webgl-renderer-probe.ts`): when the
+    // WebView's WebGL2 is backed by a software rasterizer (SwiftShader,
+    // llvmpipe, …) the addon *constructs fine* but rasterizes every frame on
+    // the CPU, which adds per-keystroke input latency vs the DOM renderer —
+    // the v0.9.0 typing-lag regression. Linux WebKitGTK is declined outright
+    // (masked renderer strings + documented input-lag history; see the probe
+    // module for the full policy and the localStorage escape hatch). Also
+    // wrapped in try/catch so an environment without WebGL2 support falls
+    // back to the default DOM renderer instead of throwing and breaking the
+    // whole pane.
+    let webglAddon: WebglAddon | null = null;
+    if (shouldLoadWebglAddon().use) {
+      try {
+        const addon = new WebglAddon();
+        // Required: when the GPU drops the canvas context, dispose the addon so
+        // xterm falls back to the DOM renderer rather than rendering a blank pane.
+        addon.onContextLoss(() => {
+          addon.dispose();
+          webglAddonRef.current = null;
+        });
+        term.loadAddon(addon);
+        webglAddon = addon;
+      } catch (err) {
+        console.warn(
+          "[codemux::terminal] WebGL renderer unavailable, using DOM renderer:",
+          err,
+        );
+        webglAddon = null;
+      }
+    }
+
     termRef.current = term;
     fitAddonRef.current = fitAddon;
     serializeAddonRef.current = serializeAddon;
+    webglAddonRef.current = webglAddon;
     kittyStackRef.current = [];
     kittyLevelRef.current = 0;
 
@@ -497,14 +538,42 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     let cancelled = false;
     const attachStarted = performance.now();
 
-    // ── Throttled write pump ──
+    // ── Throttled write pump + PTY producer back-pressure ──
     //
     // Every byte that reaches xterm — disk scrollback restore, the PTY
     // reattach replay, and steady live output — goes through this single
     // ordered queue, drained a budget-bounded batch per macrotask so a
     // multi-MB reattach replay can't peg the main thread and freeze the
     // workspace switch. See ./terminal-write-pump.ts for the full rationale.
-    const pump = createWritePump((data) => term.write(data));
+    //
+    // The consumer-side throttle alone can't stop a fast producer (`yes`, a
+    // verbose build, a runaway agent) from outrunning xterm's ~5–35 MB/s
+    // ingest — without a signal back to the producer, the backend's
+    // pending_output ring grows until it evicts (drops) the oldest output.
+    // So we also watch the pump's queued-byte depth: above HIGH we ask the
+    // backend to pause this session's PTY read loop (the child then blocks on
+    // write() once the kernel PTY buffer fills — real back-pressure); below
+    // LOW we resume. `flowPaused` tracks whether we currently hold that pause
+    // so cleanup can always release it (the backend also self-heals via a
+    // resume-on-attach + max-park backstop).
+    let flowPaused = false;
+    const pump = createWritePump((data) => term.write(data), {
+      onHighWatermark: () => {
+        flowPaused = true;
+        pausePtyOutput(sid).catch((err) => {
+          // Pause didn't land (e.g. the session just exited). Drop the local
+          // guard so cleanup won't issue a spurious resume.
+          flowPaused = false;
+          console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
+        });
+      },
+      onLowWatermark: () => {
+        flowPaused = false;
+        resumePtyOutput(sid).catch((err) => {
+          console.error(`[codemux] flow-control resume failed for ${sid}:`, err);
+        });
+      },
+    });
 
     (async () => {
       // O(1) reverse-index lookup; see `buildSessionWorkspaceIndex`.
@@ -654,6 +723,15 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       // in-flight drain can't write into the terminal we're about to dispose.
       pump.cancel();
 
+      // If we're unmounting while holding a flow-control pause, release it so
+      // a backgrounded (daemon-backed) agent isn't left blocked on write().
+      // The backend also self-heals (resume-on-attach + max-park backstop),
+      // but resuming here makes it immediate.
+      if (flowPaused) {
+        flowPaused = false;
+        resumePtyOutput(sid).catch(console.error);
+      }
+
       containerEl.removeEventListener("input", blockNewline, true);
       blockNewlineRef.current = null;
 
@@ -682,6 +760,12 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       }
 
       unregisterSerialize();
+      // Dispose the WebGL addon before the terminal so its GPU context /
+      // canvas is released deterministically (no leak across mounts). The
+      // wrapped dispose unregisters it from xterm's addon manager, so the
+      // following term.dispose() won't double-dispose it.
+      webglAddonRef.current?.dispose();
+      webglAddonRef.current = null;
       serializeAddonRef.current = null;
       fitAddonRef.current = null;
       kittyStackRef.current = [];

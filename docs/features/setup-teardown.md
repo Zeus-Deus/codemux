@@ -98,6 +98,24 @@ Setup can be re-run on an existing workspace:
 
 Re-run executes the full pipeline: `.codemuxinclude` file copy, then setup commands.
 
+### Headless Daemon Parity (remote hosts)
+
+The headless `codemux-remote serve` daemon runs the same pipeline when an
+agent creates a worktree via the `worktree_create` MCP tool (issue #78):
+
+- Worktree includes copy runs synchronously before the tool returns.
+- Setup commands run on a background thread via the shared
+  `crate::scripts::run_setup_commands` core — identical commands,
+  identical `CODEMUX_*` env, same deterministic `CODEMUX_PORT`.
+- Progress goes to the daemon's stderr (journal) instead of Tauri
+  events; the tool response carries a `setup` summary
+  (`{port, includes_copied, setup_commands, setup_running}`).
+- Config is file-based only (`.codemux/config.json` in worktree → repo
+  root). The Settings-UI fallback lives in the desktop SQLite DB and
+  does not exist on a headless host.
+- A failing setup script never fails the tool call — the workspace is
+  still created and registered, like the desktop.
+
 ### Run Command Behavior
 
 - `Ctrl+Shift+G` or command palette "Run Dev Command"
@@ -146,8 +164,9 @@ The "Configure" button opens Settings > Projects. Dismiss persists per-project.
 
 - `src-tauri/src/config/workspace_config.rs` — config struct, reader, git root resolver, `read_effective_config`
 - `src-tauri/src/database.rs` — `ProjectScripts` struct, DB get/set methods
-- `src-tauri/src/scripts.rs` — setup/teardown/run execution, `.codemuxinclude` processing, port allocation
+- `src-tauri/src/scripts.rs` — setup/teardown/run execution, `.codemuxinclude` processing, port allocation; `run_setup_commands` is the UI-free core shared with the headless daemon
 - `src-tauri/src/commands/workspace.rs` — lifecycle hooks, `run_project_dev_command`, Tauri commands
+- `src-tauri/src/remote/tools/mod.rs` — headless `worktree_create` provisioning (`provision_worktree_workspace`)
 - `src-tauri/src/control.rs` — `rerun_setup` socket command
 - `src-tauri/src/cli.rs` — `codemux workspace rerun-setup` CLI command
 - `src-tauri/src/commands/database.rs` — `get_project_scripts`, `set_project_scripts` commands

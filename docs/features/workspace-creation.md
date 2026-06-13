@@ -29,6 +29,10 @@ Creation dispatches one of:
 - `importWorktreeWorkspace()` — existing orphan worktree
 - `createWorkspace()` — standard workspace
 
+**Base resolution for new branches**: before resolving the base ref, the backend runs a scoped, best-effort `git fetch origin <base>` (10s cap, `GIT_TERMINAL_PROMPT=0`) so the new branch starts from the latest remote commit, not a stale `origin/<base>` snapshot. Offline / no-remote repos fall back to the existing `origin/<base>` ref, else the local branch — creation never hard-fails on fetch problems. Both the desktop path (`src-tauri/src/git.rs::git_create_worktree`) and the headless daemon path (`src-tauri/src/remote/git.rs::create_worktree`) apply the same policy; the fetch runs on the blocking pool so the UI never freezes.
+
+**Orphan worktree reclamation**: a worktree's conventional path is `~/.codemux/worktrees/<repo>/<branch>`. When a previous worktree for the same branch was removed from git's registry but its directory was left on disk (e.g. spinning up a workspace from an already-worked, often closed, issue branch whose `feature/<n>-<slug>` name is auto-suggested), `git worktree add` would otherwise die with `fatal: '<path>' already exists`. Creation now detects a **safe orphan** — a path git no longer tracks as a worktree, with no `.git` entry, holding nothing but Codemux's own `.codemux/` metadata (or empty) — and removes it before adding. Anything resembling user data, or a real path collision against a different registered branch, is left untouched so git still fails loudly. Both the desktop and headless daemon paths share this policy (`is_reclaimable_orphan_worktree`).
+
 After creation: preset applied, issue linked, project marked as recent, workspace activated.
 
 ### Project Onboarding
@@ -126,6 +130,14 @@ instead of accepting the agent's default and restarting.
   context flag (their context window is fixed per model).
 - Model selection is not yet wired into `project-onboarding.tsx` (the
   first-project flow) — only the New Workspace dialog.
+- Native folder/file pickers on Linux need either a working XDG
+  desktop portal (with a FileChooser backend such as
+  xdg-desktop-portal-gtk) or zenity installed. When neither exists
+  (minimal i3/dwm setups — issue #95), the Rust side preflights and
+  rejects with a `NO_FILE_PICKER_BACKEND` error, and every UI call
+  site goes through `src/lib/file-dialog.ts`, which shows an
+  install-hint toast instead of silently doing nothing. `codemux
+  doctor` diagnoses this from a terminal.
 
 ## Important Touch Points
 

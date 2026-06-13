@@ -75,7 +75,7 @@ All six phases are implemented and unit-tested (`cargo test`, `npm run check`, `
 
 Prior related work this builds on: project-identity `project_uid` + `kind` (`docs/plans/project-identity.md`), the worktree-kind repo-rsync adoption path (`adopt_worktree_via_repo_rsync`, `docs/plans/remote-workspace-pull-fix.md`), and the v0.7.6 adopt-failure rollback hardening (`docs/features/workspaces-sync.md`).
 
-## Follow-ups Landed (post-`v0.7.8`)
+## Follow-ups Landed (`v0.7.9`)
 
 A second pass closed most of the gaps below. Current behavior lives in `docs/features/workspaces-sync.md` § "Robustness hardening" and `docs/features/workspaces-overview.md`.
 

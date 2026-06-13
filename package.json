@@ -1,6 +1,6 @@
 {
   "name": "codemux",
-  "version": "0.7.9",
+  "version": "0.9.1",
   "description": "The Agentic Development Environment for Builders",
   "type": "module",
   "scripts": {
@@ -64,6 +64,7 @@
     "react-icons": "^5.6.0",
     "react-markdown": "^10.1.0",
     "react-resizable-panels": "^4.7.5",
+    "react-virtuoso": "^4.18.7",
     "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1",
     "sonner": "^2.0.7",

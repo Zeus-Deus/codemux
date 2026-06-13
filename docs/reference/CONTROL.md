@@ -65,7 +65,25 @@ codemux browser snapshot
 codemux memory show
 codemux handoff
 codemux index build
+codemux logs --tail 200
+codemux doctor
 ```
+
+## Local Diagnostics
+
+`codemux logs` and `codemux doctor` run entirely locally — no running
+Codemux instance or control socket needed, so they work precisely when
+the app itself is misbehaving.
+
+- `codemux logs [--tail <n>]` prints the last `n` lines (default 200)
+  of the desktop app's persistent log file (written via
+  tauri-plugin-log to the platform app-log dir, e.g.
+  `~/.local/share/com.codemux.app/logs/codemux.log` on Linux).
+- `codemux doctor` checks the local environment and prints an
+  actionable report: desktop/session info, whether the XDG desktop
+  portal file chooser or the zenity fallback is available (file
+  dialogs silently failed on portal-less minimal WM setups before the
+  issue #95 fix), and where the log file lives.
 
 ## Browser Note
 

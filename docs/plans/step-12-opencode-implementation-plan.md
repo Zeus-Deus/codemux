@@ -373,7 +373,7 @@ Seven stages. Pattern matches Step 9/10 cadence — research locked first, demoa
 **Deliverables:**
 - Error UX: "OpenCode CLI not installed" message + install instructions. "0 upstream providers connected" guidance toward `opencode auth login`.
 - Per-status indicator on the OpenCode rail icon (running / probing / error) reusing Step 9 status-dot patterns.
-- New canonical doc `docs/features/opencode-provider.md` describing the integration.
+- New canonical doc describing the integration (shipped as `docs/features/multi-provider-chat.md`, with conversation-sync split into `docs/features/opencode-conversation-sync.md`).
 - Update `docs/INDEX.md`, `docs/core/STATUS.md`, `docs/core/PLAN.md`.
 - Live cross-environment smoke against three real upstream provider keys (OpenAI, Anthropic, Google) on dev machine. Document checklist in `docs/plans/step-12-ui-smoke-checklist.md`.
 - `docs/plans/step-12-opencode-implementation-plan.md` (this doc) closed out with per-stage deltas.

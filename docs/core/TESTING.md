@@ -16,11 +16,28 @@
 
 Default to `npm run verify` after meaningful work. Use the narrower commands when iterating on one layer.
 
+## Visual Verification (UI work)
+
+When iterating on UI, verify visually against the real React UI running in a browser pane:
+
+1. `npm run dev` — boots Vite at `http://localhost:1420` with the dev-only Tauri mock auto-installed.
+2. `codemux browser open http://localhost:1420` — the real Codemux UI loads with seed data.
+3. `codemux browser screenshot` — capture visual proof.
+
+The mock lives in `src/dev/` and only loads when no real Tauri runtime is detected (dual-guarded in `main.tsx`), so it never ships in production and stays dormant under `npm run tauri:dev`. It is a fixture/in-memory backend — not a real one — so terminals, git, agents, and other Rust-backed behavior are not exercised this way; use `npm run tauri:dev` (desktop window, not browser-pane-visible) for real-IPC testing. See `docs/features/dev-mock-runtime.md`.
+
 ## Testing Layers
 
 - Rust domain tests for workspaces, pane trees, terminal lifecycle, persistence, notifications, memory, indexing, and OpenFlow runtime logic
 - frontend interaction tests for important workspace, pane, and browser flows
 - focused end-to-end coverage later for a few critical workflows rather than every UI detail
+
+## End-to-End Harnesses (manual, off by default)
+
+- `scripts/e2e/*.sh` — live Docker-backed harnesses run manually from the repo root:
+  - `daemon-worktree-setup-e2e.sh` — clean containerized host for headless `worktree_create` provisioning (issue #78): drives the real authed HTTP `tools/call` surface and asserts worktree creation + setup-script run + gitignored-include copy on the container's filesystem. Requires docker, python3, and a debug `codemux-remote` build (`CMX_WT_E2E_BIN` overrides the binary).
+  - `opencode-sync-e2e.sh` / `opencode-real-session-e2e.sh` — OpenCode conversation sync across workspace push/pull against a Docker SSH host (issue #16).
+- Env-gated Rust integration tests skip by default and run live when pointed at a host: `CODEMUX_E2E_SSH_HOST` gates `src-tauri/tests/codemux_ssh_roundtrip.rs`, `opencode_sync_roundtrip.rs`, and `opencode_real_roundtrip.rs` (the OpenCode pair also needs `CMX_OC_E2E_*` variables — see the script headers).
 
 ## Manual Validation Rules
 

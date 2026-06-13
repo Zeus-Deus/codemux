@@ -24,6 +24,8 @@ pub struct UserSettings {
     pub file_tree: FileTreeSettings,
     #[serde(default)]
     pub session_restore: SessionRestoreSettings,
+    #[serde(default)]
+    pub agent_chat: AgentChatSettings,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -114,6 +116,18 @@ impl Default for NotificationSettings {
 pub struct FileTreeSettings {
     #[serde(default)]
     pub show_hidden_files: bool,
+}
+
+/// Agent-chat behavior knobs. `checkpoints_enabled` is the opt-in for
+/// the run-start rollback checkpoint (issue #80): when on, starting an
+/// agent-chat session snapshots the working tree in the background so
+/// the run's changes can be rolled back. Defaults to OFF — the
+/// snapshot writes objects into the user's repo, which must be a
+/// deliberate choice.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct AgentChatSettings {
+    #[serde(default)]
+    pub checkpoints_enabled: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -504,6 +518,9 @@ mod tests {
                 scrollback_lines: 5000,
                 max_total_mb: 50,
             },
+            agent_chat: AgentChatSettings {
+                checkpoints_enabled: true,
+            },
         };
 
         let json = serde_json::to_string(&s).unwrap();
@@ -524,6 +541,17 @@ mod tests {
         assert!(!back.session_restore.enabled);
         assert_eq!(back.session_restore.scrollback_lines, 5000);
         assert_eq!(back.session_restore.max_total_mb, 50);
+        assert!(back.agent_chat.checkpoints_enabled);
+    }
+
+    /// A settings blob saved before the agent_chat section existed
+    /// still deserializes — and the checkpoint opt-in stays OFF.
+    #[test]
+    #[serial]
+    fn missing_agent_chat_section_defaults_to_checkpoints_off() {
+        let legacy = r#"{"appearance":{"theme":"dark"}}"#;
+        let parsed: UserSettings = serde_json::from_str(legacy).unwrap();
+        assert!(!parsed.agent_chat.checkpoints_enabled);
     }
 
     /// Patching one section preserves all other sections when round-tripped through cache.

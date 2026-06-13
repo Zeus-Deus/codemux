@@ -113,8 +113,11 @@ export const onSyncStateChanged = (
 //
 // Mirror of src-tauri/src/commands/agent_chat.rs:AgentChatEventPayload
 // and src-tauri/src/agent_provider/events.rs:ProviderRuntimeEvent.
-// The Rust side emits a single channel name; subscribers filter by
-// thread_id via the useAgentChatEvents hook.
+// Thread-scoped events stream over a per-thread `Channel` registered
+// via `attachAgentChatOutput` (see `useAgentChatEvents`), NOT the
+// global event bus — the bus only carries the rare thread-less
+// `runtime_warning` on the `agent_chat_event` name. The payload shape
+// is identical on both transports.
 
 export type ApprovalDecision =
   | {
@@ -228,16 +231,34 @@ export type ProviderRuntimeEvent =
       resume_cursor: unknown;
     };
 
-/** Canonical provider event payload as emitted to the frontend. */
+/** Canonical provider event payload as delivered to the frontend —
+ *  over the per-thread Channel for thread-scoped events, or on the
+ *  `agent_chat_event` bus for thread-less warnings (empty
+ *  `thread_id`). */
 export interface AgentChatEventPayload {
   thread_id: string;
   event: ProviderRuntimeEvent;
 }
 
-export const onAgentChatEvent = (
-  cb: EventCallback<AgentChatEventPayload>,
+/** Emitted when the background run-start checkpoint (issue #80) lands,
+ *  so the pane header can reveal the restore affordance without
+ *  polling. Stays on the GLOBAL event bus (not the per-thread
+ *  Channel): the checkpoint task outlives the start_session command
+ *  and there is exactly one event per run, so a broadcast with a
+ *  thread-id filter on the subscriber side is the right transport.
+ *  Mirrors AgentChatCheckpointEventPayload in
+ *  src-tauri/src/commands/agent_chat.rs. */
+export interface AgentChatCheckpointPayload {
+  thread_id: string;
+  checkpoint: import("./commands").AgentChatCheckpointRecord;
+}
+
+export const onAgentChatCheckpoint = (
+  cb: EventCallback<AgentChatCheckpointPayload>,
 ): Promise<UnlistenFn> =>
-  listen<AgentChatEventPayload>("agent_chat_event", (e) => cb(e.payload));
+  listen<AgentChatCheckpointPayload>("agent_chat_checkpoint", (e) =>
+    cb(e.payload),
+  );
 
 // ── Tunnel health ──
 //
