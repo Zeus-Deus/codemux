@@ -68,6 +68,7 @@ import {
 import { pickFiles } from "@/lib/file-dialog";
 import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue, ModelSelection } from "@/tauri/types";
 import { LaunchModelPicker } from "./launch-model-picker";
+import { LaunchReasoningPicker } from "./launch-reasoning-picker";
 import {
   detectLaunchFamily,
   familyToProviderKind,
@@ -468,16 +469,16 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     !capsLoaded &&
     launchModels.length === 0;
 
-  // Reasoning + context options are read live from the selected
-  // model's capability entry, so the picker reflects exactly what that
-  // model supports. Before a concrete model is picked, the family's
-  // default (first) model stands in so the rows stay discoverable.
+  // Reasoning + context options are read live from the *selected*
+  // model's capability entry, so the reasoning/context pill reflects
+  // exactly what that model supports. There is deliberately no
+  // first-model fallback: on "Default" (no concrete model) this is null,
+  // so the reasoning/context pill hides — reasoning/context belong to a
+  // chosen model and shouldn't be pickable before one is selected.
   const launchCapsModel = useMemo(() => {
     if (!launchCaps) return null;
     return (
-      launchCaps.models.find((m) => m.id === modelSelection.model) ??
-      launchCaps.models[0] ??
-      null
+      launchCaps.models.find((m) => m.id === modelSelection.model) ?? null
     );
   }, [launchCaps, modelSelection.model]);
 
@@ -1173,25 +1174,44 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   Codemux can inject a `--model` flag for. Sourced from
                   the same capability harvest as the Beta chat picker. */}
               {launchFamily && (
-                <LaunchModelPicker
-                  providerKind={launchProviderKind}
-                  models={launchModels}
-                  loading={launchModelsLoading}
-                  selectedModel={modelSelection.model}
-                  selectedReasoning={effectiveReasoning}
-                  reasoningOptions={reasoningOptions}
-                  contextOptions={launchContextOptions}
-                  selectedContext={effectiveContext}
-                  onModelChange={(model) =>
-                    setModelSelection((prev) => ({ ...prev, model }))
-                  }
-                  onReasoningChange={(reasoning) =>
-                    setModelSelection((prev) => ({ ...prev, reasoning }))
-                  }
-                  onContextChange={(context) =>
-                    setModelSelection((prev) => ({ ...prev, context }))
-                  }
-                />
+                <>
+                  <LaunchModelPicker
+                    providerKind={launchProviderKind}
+                    models={launchModels}
+                    loading={launchModelsLoading}
+                    selectedModel={modelSelection.model}
+                    onModelChange={(model) =>
+                      // Picking "Default" (null) clears reasoning/context
+                      // too — they're attributes of a concrete model.
+                      setModelSelection((prev) =>
+                        model === null
+                          ? { model: null, reasoning: null, context: null }
+                          : { ...prev, model },
+                      )
+                    }
+                  />
+                  {/* Reasoning/context for the chosen model — a sibling
+                      pill that hides on Default and for models with no
+                      options (Haiku), mirroring the chat composer. */}
+                  <LaunchReasoningPicker
+                    reasoningOptions={reasoningOptions}
+                    selectedReasoning={effectiveReasoning}
+                    defaultReasoning={launchCapsModel?.default_effort ?? null}
+                    onReasoningChange={(reasoning) =>
+                      setModelSelection((prev) => ({ ...prev, reasoning }))
+                    }
+                    contextOptions={launchContextOptions}
+                    selectedContext={effectiveContext}
+                    defaultContext={
+                      launchCapsModel?.context_window_options.find(
+                        (o) => o.is_default,
+                      )?.value ?? null
+                    }
+                    onContextChange={(context) =>
+                      setModelSelection((prev) => ({ ...prev, context }))
+                    }
+                  />
+                </>
               )}
               </div>
 

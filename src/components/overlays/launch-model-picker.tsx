@@ -19,7 +19,6 @@ import { cn } from "@/lib/utils";
 import {
   MODEL_SEARCH_THRESHOLD,
   type LaunchModel,
-  type ReasoningOption,
 } from "@/lib/launch-models";
 import {
   pickerFavoriteKey,
@@ -37,17 +36,9 @@ interface Props {
   loading?: boolean;
   /** The user's explicit model override, or `null` for the agent default. */
   selectedModel: string | null;
-  /** The user's explicit reasoning override, or `null` for the default. */
-  selectedReasoning: string | null;
-  /** Reasoning levels the agent's CLI accepts. Empty → no reasoning row. */
-  reasoningOptions: ReasoningOption[];
-  /** Context-window options for the selected model (Claude only).
-   *  Empty → no context row. */
-  contextOptions: ReasoningOption[];
-  selectedContext: string | null;
+  /** Set the model, or `null` to reset to the agent default. Picking
+   *  `null` (the "Default" row) also clears reasoning/context upstream. */
   onModelChange: (model: string | null) => void;
-  onReasoningChange: (reasoning: string | null) => void;
-  onContextChange: (context: string | null) => void;
 }
 
 /** Scrollbar styling shared with the chat picker — overrides cmdk's
@@ -79,7 +70,13 @@ function matchesQuery(model: LaunchModel, query: string): boolean {
 }
 
 /**
- * Launch-time model + reasoning picker for the New Workspace dialog.
+ * Launch-time model picker for the New Workspace dialog.
+ *
+ * Models only — reasoning and context are attributes of the chosen
+ * model and live in the sibling `LaunchReasoningPicker` pill (mirroring
+ * the chat composer's `ModelPicker` + `ReasoningPicker` split). Picking
+ * a model closes the popover; the reasoning/context pill then appears
+ * next to this one.
  *
  * Renders a compact pill next to the agent picker. The popover adapts
  * to list size: a short list (Claude, Codex, Gemini) is a flat
@@ -87,23 +84,17 @@ function matchesQuery(model: LaunchModel, query: string): boolean {
  * box, per-`subProvider` group headers, and star-to-favorite rows.
  *
  * Every row ends in one fixed-width trailing slot at the right edge —
- * a favorite star on model rows, a checkmark on the Default / reasoning
- * rows — so the two line up in a single column. The selected model row
- * is marked by a background tint (the star keeps the slot). "Default"
- * leaves the choice to the agent and emits no flag.
+ * a favorite star on model rows, a checkmark on the Default row — so the
+ * two line up in a single column. The selected model row is marked by a
+ * background tint (the star keeps the slot). "Default" leaves the choice
+ * to the agent and emits no flag.
  */
 export function LaunchModelPicker({
   providerKind,
   models,
   loading,
   selectedModel,
-  selectedReasoning,
-  reasoningOptions,
-  contextOptions,
-  selectedContext,
   onModelChange,
-  onReasoningChange,
-  onContextChange,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -150,27 +141,8 @@ export function LaunchModelPicker({
     return models.find((m) => m.id === selectedModel)?.label ?? selectedModel;
   }, [models, selectedModel]);
 
-  // Compact pill suffix — reasoning and context shown after the model
-  // name as "· High · 1M" when set.
-  const pillExtras = useMemo(() => {
-    const parts: string[] = [];
-    if (selectedReasoning) {
-      parts.push(
-        reasoningOptions.find((r) => r.value === selectedReasoning)?.label ??
-          selectedReasoning,
-      );
-    }
-    if (selectedContext) {
-      parts.push(
-        contextOptions.find((c) => c.value === selectedContext)?.label ??
-          selectedContext,
-      );
-    }
-    return parts;
-  }, [selectedReasoning, selectedContext, reasoningOptions, contextOptions]);
-
   /** A simple right-edge row: label + a checkmark in the shared
-   *  trailing slot. Used for "Default" and the reasoning options. */
+   *  trailing slot. Used for the "Default" row. */
   const renderChoiceRow = (
     key: string,
     value: string,
@@ -213,10 +185,12 @@ export function LaunchModelPicker({
         key={model.id}
         value={`model:${model.id}`}
         data-checked={isSelected ? "true" : undefined}
-        // Keep the popover open after a model pick so the Reasoning and
-        // Context Window sections below stay reachable in the same
-        // interaction — a model pick should not dismiss the picker.
-        onSelect={() => onModelChange(model.id)}
+        // Close on pick: reasoning/context now live in a sibling pill,
+        // so a model choice completes this popover's job.
+        onSelect={() => {
+          onModelChange(model.id);
+          setOpen(false);
+        }}
         className={cn(
           "gap-2 text-xs",
           isSelected && "bg-accent/70 data-[selected=true]:bg-accent/70",
@@ -279,9 +253,6 @@ export function LaunchModelPicker({
           className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground"
         >
           <span className="max-w-[150px] truncate">{selectedModelLabel}</span>
-          {pillExtras.length > 0 ? (
-            <span className="opacity-50">· {pillExtras.join(" · ")}</span>
-          ) : null}
           <ChevronDown className="h-2.5 w-2.5 opacity-40" />
         </button>
       </PopoverTrigger>
@@ -306,22 +277,19 @@ export function LaunchModelPicker({
             className={cn("max-h-[340px] overflow-y-auto", SCROLLBAR)}
             onWheel={(e) => e.stopPropagation()}
           >
-            {/* One master "Default" — resets model, reasoning, and
-                context together. Checked only when nothing is
-                overridden; the sections below carry no "Default" rows
-                of their own, so there is exactly one in the popover. */}
+            {/* One master "Default" — resets to the agent's own default
+                (and clears reasoning/context upstream via
+                `onModelChange(null)`). Checked when no model is
+                overridden. */}
             <CommandGroup>
               {renderChoiceRow(
                 "default-all",
                 "default:__all__",
                 "Default",
-                selectedModel === null &&
-                  selectedReasoning === null &&
-                  selectedContext === null,
+                selectedModel === null,
                 () => {
                   onModelChange(null);
-                  onReasoningChange(null);
-                  onContextChange(null);
+                  setOpen(false);
                 },
               )}
             </CommandGroup>
@@ -362,40 +330,6 @@ export function LaunchModelPicker({
                 {list.map(renderModelRow)}
               </CommandGroup>
             ))}
-
-            {reasoningOptions.length > 0 ? (
-              <>
-                <CommandSeparator />
-                <CommandGroup heading="Reasoning">
-                  {reasoningOptions.map((opt) =>
-                    renderChoiceRow(
-                      `reasoning-${opt.value}`,
-                      `reasoning:${opt.value}`,
-                      opt.label,
-                      selectedReasoning === opt.value,
-                      () => onReasoningChange(opt.value),
-                    ),
-                  )}
-                </CommandGroup>
-              </>
-            ) : null}
-
-            {contextOptions.length > 0 ? (
-              <>
-                <CommandSeparator />
-                <CommandGroup heading="Context Window">
-                  {contextOptions.map((opt) =>
-                    renderChoiceRow(
-                      `context-${opt.value}`,
-                      `context:${opt.value}`,
-                      opt.label,
-                      selectedContext === opt.value,
-                      () => onContextChange(opt.value),
-                    ),
-                  )}
-                </CommandGroup>
-              </>
-            ) : null}
           </CommandList>
         </Command>
       </PopoverContent>

@@ -13,20 +13,6 @@ const CLAUDE_MODELS: LaunchModel[] = [
   { id: "haiku", label: "Claude Haiku" },
 ];
 
-// Reasoning / context option shapes the dialog now derives live from
-// the capability bundle; the picker just renders whatever it is given.
-const CLAUDE_REASONING = [
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "xhigh", label: "Extra High" },
-];
-
-const CONTEXT_OPTIONS = [
-  { value: "200k", label: "200k" },
-  { value: "1m", label: "1M" },
-];
-
 function manyModels(count: number): LaunchModel[] {
   return Array.from({ length: count }, (_, i) => ({
     id: `model-${i}`,
@@ -43,13 +29,7 @@ function renderPicker(overrides: Partial<PickerProps> = {}) {
     providerKind: "claude",
     models: CLAUDE_MODELS,
     selectedModel: null,
-    selectedReasoning: null,
-    reasoningOptions: [],
-    contextOptions: [],
-    selectedContext: null,
     onModelChange: vi.fn(),
-    onReasoningChange: vi.fn(),
-    onContextChange: vi.fn(),
     ...overrides,
   };
   const result = render(<LaunchModelPicker {...props} />);
@@ -71,79 +51,38 @@ describe("LaunchModelPicker — pill label", () => {
     expect(trigger.textContent).toContain("Default");
   });
 
-  it("shows the model label plus reasoning and context suffixes", () => {
-    const { trigger } = renderPicker({
-      selectedModel: "sonnet",
-      selectedReasoning: "high",
-      reasoningOptions: CLAUDE_REASONING,
-      contextOptions: CONTEXT_OPTIONS,
-      selectedContext: "1m",
-    });
+  it("shows the model label (and no reasoning/context suffix — those live in the sibling pill)", () => {
+    const { trigger } = renderPicker({ selectedModel: "sonnet" });
     expect(trigger.textContent).toContain("Claude Sonnet");
-    expect(trigger.textContent).toContain("High");
-    expect(trigger.textContent).toContain("1M");
+    // The model pill carries the model only; reasoning/context are a
+    // separate pill now.
+    expect(trigger.textContent).not.toContain("·");
   });
 });
 
 describe("LaunchModelPicker — interaction", () => {
-  it("opens the popover and reports the picked model", async () => {
+  it("opens the popover and reports the picked model, then closes", async () => {
     const onModelChange = vi.fn();
     const { trigger } = renderPicker({ onModelChange });
     await userEvent.click(trigger);
     await userEvent.click(screen.getByText("Claude Opus"));
     expect(onModelChange).toHaveBeenCalledWith("opus");
+    // Popover closes on pick — the model list is gone.
+    expect(screen.queryByText("Claude Sonnet")).not.toBeInTheDocument();
   });
 
-  it("has a single 'Default' row that resets model, reasoning, and context", async () => {
+  it("has a single 'Default' row that resets the model to null", async () => {
     const onModelChange = vi.fn();
-    const onReasoningChange = vi.fn();
-    const onContextChange = vi.fn();
-    const { trigger } = renderPicker({
-      selectedModel: "opus",
-      selectedReasoning: "high",
-      selectedContext: "1m",
-      reasoningOptions: CLAUDE_REASONING,
-      contextOptions: CONTEXT_OPTIONS,
-      onModelChange,
-      onReasoningChange,
-      onContextChange,
-    });
+    const { trigger } = renderPicker({ selectedModel: "opus", onModelChange });
     await userEvent.click(trigger);
     // Exactly one "Default" in the whole popover — the master row.
     expect(screen.getAllByText("Default")).toHaveLength(1);
     await userEvent.click(screen.getByText("Default"));
     expect(onModelChange).toHaveBeenCalledWith(null);
-    expect(onReasoningChange).toHaveBeenCalledWith(null);
-    expect(onContextChange).toHaveBeenCalledWith(null);
   });
 
-  it("renders the reasoning section and reports the picked level", async () => {
-    const onReasoningChange = vi.fn();
-    const { trigger } = renderPicker({
-      reasoningOptions: CLAUDE_REASONING,
-      onReasoningChange,
-    });
-    await userEvent.click(trigger);
-    expect(screen.getByText("Reasoning")).toBeInTheDocument();
-    await userEvent.click(screen.getByText("Extra High"));
-    expect(onReasoningChange).toHaveBeenCalledWith("xhigh");
-  });
-
-  it("renders the context section and reports the picked window", async () => {
-    const onContextChange = vi.fn();
-    const { trigger } = renderPicker({
-      selectedModel: "sonnet",
-      contextOptions: CONTEXT_OPTIONS,
-      onContextChange,
-    });
-    await userEvent.click(trigger);
-    expect(screen.getByText("Context Window")).toBeInTheDocument();
-    await userEvent.click(screen.getByText("1M"));
-    expect(onContextChange).toHaveBeenCalledWith("1m");
-  });
-
-  it("hides reasoning and context sections when no options are given", async () => {
-    const { trigger } = renderPicker({ providerKind: "opencode" });
+  it("no longer renders reasoning or context sections (moved to LaunchReasoningPicker)", async () => {
+    const { trigger } = renderPicker({ selectedModel: "sonnet" });
     await userEvent.click(trigger);
     expect(screen.queryByText("Reasoning")).not.toBeInTheDocument();
     expect(screen.queryByText("Context Window")).not.toBeInTheDocument();
