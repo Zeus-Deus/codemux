@@ -30,6 +30,8 @@ Creation dispatches one of:
 
 **Base resolution for new branches**: before resolving the base ref, the backend runs a scoped, best-effort `git fetch origin <base>` (10s cap, `GIT_TERMINAL_PROMPT=0`) so the new branch starts from the latest remote commit, not a stale `origin/<base>` snapshot. Offline / no-remote repos fall back to the existing `origin/<base>` ref, else the local branch — creation never hard-fails on fetch problems. Both the desktop path (`src-tauri/src/git.rs::git_create_worktree`) and the headless daemon path (`src-tauri/src/remote/git.rs::create_worktree`) apply the same policy; the fetch runs on the blocking pool so the UI never freezes.
 
+**Orphan worktree reclamation**: a worktree's conventional path is `~/.codemux/worktrees/<repo>/<branch>`. When a previous worktree for the same branch was removed from git's registry but its directory was left on disk (e.g. spinning up a workspace from an already-worked, often closed, issue branch whose `feature/<n>-<slug>` name is auto-suggested), `git worktree add` would otherwise die with `fatal: '<path>' already exists`. Creation now detects a **safe orphan** — a path git no longer tracks as a worktree, with no `.git` entry, holding nothing but Codemux's own `.codemux/` metadata (or empty) — and removes it before adding. Anything resembling user data, or a real path collision against a different registered branch, is left untouched so git still fails loudly. Both the desktop and headless daemon paths share this policy (`is_reclaimable_orphan_worktree`).
+
 After creation: preset applied, issue linked, project marked as recent, workspace activated.
 
 ### Project Onboarding

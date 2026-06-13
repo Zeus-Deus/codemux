@@ -2471,6 +2471,60 @@ pub fn git_recreate_worktree_for_adopted_repo(
     git_create_worktree(repo_path, branch, false, None, None)
 }
 
+/// True when `git worktree list` reports a worktree registered at
+/// `target_path` for ANY branch. Used to refuse reclaiming a directory
+/// git still tracks — removing it would corrupt that worktree.
+fn path_is_registered_worktree(repo_path: &Path, target_path: &Path) -> bool {
+    let Ok(output) = run_git(repo_path, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("worktree ")
+            .map(|p| Path::new(p) == target_path)
+            .unwrap_or(false)
+    })
+}
+
+/// Decide whether the directory already sitting at a would-be worktree
+/// path is a safe-to-remove leftover: an orphaned Codemux worktree dir
+/// whose git registration is already gone, holding nothing but Codemux's
+/// own metadata. Returns true ONLY when deleting it cannot lose user data
+/// or corrupt a live worktree.
+///
+/// This unblocks the common case where a previous worktree for the same
+/// (often issue-derived) branch was pruned from git's registry but its
+/// directory was left on disk: without reclaiming, `git worktree add`
+/// dies with `fatal: '<path>' already exists`.
+fn is_reclaimable_orphan_worktree(repo_path: &Path, path: &Path) -> bool {
+    // Never touch a path git still tracks as a worktree (for ANY branch):
+    // removing it would corrupt that worktree. A path collision against a
+    // different branch must keep failing loudly.
+    if path_is_registered_worktree(repo_path, path) {
+        return false;
+    }
+    // A `.git` entry marks a real worktree checkout (possibly mid-teardown,
+    // or pruned-but-not-cleaned). Treat as user data — don't delete.
+    if path.join(".git").exists() {
+        return false;
+    }
+    // Every top-level entry must be Codemux-owned metadata; anything else
+    // (source, configs, the user's edits) makes removal unsafe. An empty
+    // directory is trivially reclaimable.
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    const CODEMUX_METADATA: &[&str] = &[".codemux"];
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        match entry.file_name().to_str() {
+            Some(name) if CODEMUX_METADATA.contains(&name) => continue,
+            _ => return false,
+        }
+    }
+    true
+}
+
 pub fn git_create_worktree(
     repo_path: &Path,
     branch: &str,
@@ -2522,9 +2576,22 @@ pub fn git_create_worktree(
         if existing_worktree_matches(repo_path, &path_str, branch) {
             return Ok(path_str);
         }
-        // Path exists but isn't a registered worktree for `branch`. Let
-        // git fail with its own diagnostic so the brain sees the real
-        // reason (e.g. a leftover dir from a half-deleted worktree).
+        // Path exists but git doesn't register it as OUR worktree. If it's
+        // a safe-to-remove orphan — a leftover Codemux dir (e.g. from a
+        // previously-worked issue branch) whose registration is already
+        // gone — reclaim it so creation proceeds instead of dying with
+        // `fatal: '<path>' already exists`. Anything resembling user data,
+        // or a path git still tracks (a real collision against a different
+        // branch), is left untouched so git fails loudly as before.
+        if is_reclaimable_orphan_worktree(repo_path, &worktree_path) {
+            std::fs::remove_dir_all(&worktree_path).map_err(|e| {
+                format!("Failed to reclaim leftover worktree directory '{path_str}': {e}")
+            })?;
+            // A registration may still claim this branch from a now-missing
+            // path; prune so `worktree add` starts clean. Permissive: a
+            // repo with no stale entries is a no-op.
+            let _ = run_git_permissive(repo_path, &["worktree", "prune"]);
+        }
     }
 
     if new_branch {
@@ -3153,6 +3220,94 @@ C  source.txt -> copy.txt";
             !existing_worktree_matches(&repo, "/tmp/nonexistent-path", "main"),
             "no registered worktrees => no match"
         );
+    }
+
+    #[test]
+    fn worktree_create_reclaims_orphan_leftover_dir() {
+        // Regression: a previous worktree for this branch was pruned from
+        // git's registry but its directory was left on disk (a stray
+        // `.codemux/` and nothing else). Re-creating the worktree must
+        // reclaim that orphan instead of dying with
+        // `fatal: '<path>' already exists` — the exact failure seen when
+        // spinning up a workspace from an already-worked (often closed)
+        // issue branch.
+        let (_dir, repo) = setup_test_repo();
+        let branch = unique_branch("orphan");
+        run_git(&repo, &["branch", &branch]).expect("create branch");
+
+        // Materialize the worktree, then drop ONLY its registration + dir
+        // (the branch survives) — this is the exact path git will derive.
+        let wt_path =
+            git_create_worktree(&repo, &branch, false, None, None).expect("first create");
+        run_git(&repo, &["worktree", "remove", "--force", &wt_path])
+            .expect("remove worktree, keep branch");
+        assert!(!PathBuf::from(&wt_path).exists(), "dir gone after remove");
+
+        // Recreate the orphan leftover: dir back on disk holding only
+        // Codemux metadata, with no git registration behind it.
+        let orphan = PathBuf::from(&wt_path);
+        std::fs::create_dir_all(orphan.join(".codemux")).expect("mk .codemux");
+        std::fs::write(orphan.join(".codemux").join("index.json"), "{}").expect("write metadata");
+
+        // Create must now reclaim the orphan and produce a real worktree.
+        let again = git_create_worktree(&repo, &branch, false, None, None)
+            .expect("must reclaim orphan, not error with 'already exists'");
+        assert_eq!(again, wt_path, "reclaimed path matches the original");
+        assert!(
+            PathBuf::from(&again).join(".git").is_file(),
+            "reclaimed dir is now a real linked worktree"
+        );
+
+        git_remove_worktree(Path::new(&again), Some(&branch), true).expect("cleanup");
+    }
+
+    #[test]
+    fn is_reclaimable_orphan_worktree_distinguishes_safe_from_unsafe() {
+        let (_dir, repo) = setup_test_repo();
+        let tmp = TempDir::new().expect("tmp");
+
+        // Empty dir → reclaimable.
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(is_reclaimable_orphan_worktree(&repo, &empty), "empty dir is reclaimable");
+
+        // Only Codemux metadata → reclaimable.
+        let meta_only = tmp.path().join("meta");
+        std::fs::create_dir_all(meta_only.join(".codemux")).unwrap();
+        std::fs::write(meta_only.join(".codemux").join("index.json"), "{}").unwrap();
+        assert!(
+            is_reclaimable_orphan_worktree(&repo, &meta_only),
+            "Codemux-metadata-only dir is reclaimable"
+        );
+
+        // Contains user data → NOT reclaimable.
+        let with_user = tmp.path().join("userdata");
+        std::fs::create_dir_all(&with_user).unwrap();
+        std::fs::write(with_user.join("main.rs"), "fn main() {}").unwrap();
+        assert!(
+            !is_reclaimable_orphan_worktree(&repo, &with_user),
+            "a dir with user files must never be reclaimed"
+        );
+
+        // Contains a `.git` → NOT reclaimable (looks like a real checkout).
+        let with_git = tmp.path().join("hasgit");
+        std::fs::create_dir_all(&with_git).unwrap();
+        std::fs::write(with_git.join(".git"), "gitdir: /somewhere").unwrap();
+        assert!(
+            !is_reclaimable_orphan_worktree(&repo, &with_git),
+            "a dir with a .git entry must never be reclaimed"
+        );
+
+        // A live registered worktree → NOT reclaimable even though its
+        // only non-tracked content might look disposable.
+        let branch = unique_branch("registered");
+        run_git(&repo, &["branch", &branch]).unwrap();
+        let wt = git_create_worktree(&repo, &branch, false, None, None).unwrap();
+        assert!(
+            !is_reclaimable_orphan_worktree(&repo, Path::new(&wt)),
+            "a registered worktree must never be reclaimed"
+        );
+        git_remove_worktree(Path::new(&wt), Some(&branch), true).unwrap();
     }
 
     #[test]

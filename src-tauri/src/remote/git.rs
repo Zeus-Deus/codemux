@@ -198,6 +198,48 @@ fn existing_worktree_matches(repo_root: &Path, target: &Path, branch: &str) -> b
     matched
 }
 
+/// True when `git worktree list` reports a worktree registered at
+/// `target` for ANY branch — i.e. git still tracks this directory, so
+/// reclaiming it would corrupt that worktree.
+fn path_is_registered_worktree(repo_root: &Path, target: &Path) -> bool {
+    let Ok(output) = run_git(repo_root, &["worktree", "list", "--porcelain"]) else {
+        return false;
+    };
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("worktree ")
+            .map(|p| Path::new(p) == target)
+            .unwrap_or(false)
+    })
+}
+
+/// Decide whether the directory already at a would-be worktree path is a
+/// safe-to-remove leftover: an orphaned Codemux worktree dir whose git
+/// registration is gone, holding nothing but Codemux's own metadata.
+/// Returns true ONLY when deleting it can't lose user data or corrupt a
+/// live worktree. Mirrors the desktop's `git_create_worktree` policy so a
+/// remote-host agent reclaiming a stale issue-branch dir behaves the same.
+fn is_reclaimable_orphan_worktree(repo_root: &Path, path: &Path) -> bool {
+    if path_is_registered_worktree(repo_root, path) {
+        return false;
+    }
+    if path.join(".git").exists() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    const CODEMUX_METADATA: &[&str] = &[".codemux"];
+    for entry in entries {
+        let Ok(entry) = entry else { return false };
+        match entry.file_name().to_str() {
+            Some(name) if CODEMUX_METADATA.contains(&name) => continue,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Create (or reuse) a git worktree for `branch` off `repo_path`.
 ///
 /// - `new_branch = true`: create a new branch `branch` based on `base`
@@ -244,6 +286,17 @@ pub fn create_worktree(
             repo_root,
             branch: branch.to_string(),
         });
+    }
+
+    // Path exists but isn't our registered worktree. Reclaim it when it's
+    // a safe orphan — a leftover Codemux dir whose registration is gone —
+    // so `worktree add` doesn't die with `fatal: '<path>' already exists`.
+    // `worktree prune` below only drops registrations whose dir is MISSING,
+    // so it can't clear an on-disk orphan; this can.
+    if worktree_path.exists() && is_reclaimable_orphan_worktree(&repo_root, &worktree_path) {
+        std::fs::remove_dir_all(&worktree_path).map_err(|e| {
+            format!("failed to reclaim leftover worktree dir '{}': {e}", worktree_path.display())
+        })?;
     }
 
     // Prune stale worktree registrations before adding. Without this, a
@@ -351,6 +404,31 @@ mod tests {
         let again = create_worktree(home.path(), repo.path(), "feature-x", true, Some("main"))
             .expect("reuse worktree");
         assert_eq!(again.worktree_path, created.worktree_path);
+    }
+
+    #[test]
+    fn create_worktree_reclaims_orphan_leftover_dir() {
+        // Daemon parity with the desktop fix: a worktree dir left on disk
+        // after its git registration was pruned (holding only a stray
+        // `.codemux/`) must be reclaimed, not error with "already exists".
+        let repo = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        init_repo(repo.path());
+
+        // The path create_worktree will derive for this branch.
+        let repo_name = git_root(repo.path()).unwrap();
+        let repo_name = repo_name.file_name().unwrap().to_string_lossy();
+        let orphan = conventional_worktree_path(home.path(), &repo_name, "feature-orphan");
+        std::fs::create_dir_all(orphan.join(".codemux")).unwrap();
+        std::fs::write(orphan.join(".codemux").join("index.json"), "{}").unwrap();
+        assert!(orphan.exists() && !orphan.join(".git").exists(), "orphan precondition");
+
+        let created =
+            create_worktree(home.path(), repo.path(), "feature-orphan", true, Some("main"))
+                .expect("must reclaim orphan, not error");
+        assert_eq!(created.worktree_path, orphan);
+        assert!(created.worktree_path.join(".git").is_file(), "now a real worktree");
+        assert!(created.worktree_path.join("README.md").exists(), "populated checkout");
     }
 
     #[test]
