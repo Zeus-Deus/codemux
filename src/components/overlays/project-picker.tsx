@@ -14,7 +14,6 @@ import {
   CommandSeparator,
 } from "@/components/ui/command";
 import { Check, ChevronDown, FolderOpen, FolderPlus } from "lucide-react";
-import { cn } from "@/lib/utils";
 import {
   useAppStore,
   useHomeDir,
@@ -24,6 +23,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { basename } from "@/lib/path";
 import { dbGetRecentProjects, dbGetUiState } from "@/tauri/commands";
 import { useProjectActions } from "@/hooks/use-project-actions";
+import { ProjectAvatar } from "@/components/ui/project-avatar";
 
 interface ProjectPickerProps {
   value: string | null;
@@ -35,91 +35,82 @@ interface RecentProject {
   name: string;
 }
 
-function hexToRgba(hex: string, alpha: number): string {
-  const r = parseInt(hex.slice(1, 3), 16);
-  const g = parseInt(hex.slice(3, 5), 16);
-  const b = parseInt(hex.slice(5, 7), 16);
-  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+/**
+ * Per-project avatar inputs, mirrored from the same device-local UI state the
+ * sidebar reads (`project.color:`, `project.image:`, `project.image.v:`) so the
+ * picker renders the exact same circular favicon/color/letter the sidebar does.
+ */
+interface ProjectAvatarState {
+  color: string | null;
+  image: string | null;
+  imageVersion: string | null;
 }
 
-function ProjectAvatar({
-  name,
-  color,
-  className,
-  size = "md",
-}: {
-  name: string;
-  color: string | null | undefined;
-  className?: string;
-  /**
-   * Visual size variant.
-   * - `md` (default, 20px): the original size; used inside the
-   *   dropdown CommandItem list where there's plenty of vertical
-   *   room and the badge serves as the primary visual ID.
-   * - `sm` (14px): used inside the trigger pill so the pill stays
-   *   the same height as the neighboring device/branch pills,
-   *   which use 14px lucide icons. Without this the trigger pill
-   *   rendered ~6px taller than its row-mates.
-   */
-  size?: "sm" | "md";
-}) {
-  const letter = (name || "?").charAt(0).toUpperCase();
-  const hasColor = !!color;
-  const sizeClasses =
-    size === "sm"
-      ? "size-3.5 text-[8px] border"
-      : "size-5 text-[10px] border-[1.5px]";
-  return (
-    <div
-      className={cn(
-        "rounded flex items-center justify-center shrink-0 font-medium",
-        sizeClasses,
-        !hasColor && "bg-muted text-muted-foreground border-border",
-        className,
-      )}
-      style={
-        hasColor
-          ? {
-              borderColor: hexToRgba(color!, 0.6),
-              backgroundColor: hexToRgba(color!, 0.15),
-              color: color!,
-            }
-          : undefined
-      }
-    >
-      {letter}
-    </div>
-  );
-}
+const EMPTY_AVATAR: ProjectAvatarState = {
+  color: null,
+  image: null,
+  imageVersion: null,
+};
 
 export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
   const [open, setOpen] = useState(false);
   const [recentProjects, setRecentProjects] = useState<RecentProject[]>([]);
-  const [projectColors, setProjectColors] = useState<Record<string, string>>(
-    {},
-  );
+  const [projectAvatars, setProjectAvatars] = useState<
+    Record<string, ProjectAvatarState>
+  >({});
 
   const workspaces = useAppStore((s) => s.appState?.workspaces ?? []);
   const homeDir = useHomeDir();
   const projectGroups = useProjectGroupedWorkspaces(workspaces, homeDir);
 
-  // Load recent projects and project colors when popover opens
+  // Load recent projects plus each project's avatar (accent color + custom
+  // image + favicon cache-bust token) when the popover opens, so the picker
+  // shows the same circular favicon the sidebar does instead of a bare letter.
   useEffect(() => {
     if (!open) return;
-    dbGetRecentProjects(10)
-      .then((projects) => setRecentProjects(projects))
-      .catch(() => setRecentProjects([]));
+    let cancelled = false;
 
-    // Load colors for all active projects
-    const colors: Record<string, string> = {};
-    const promises = projectGroups.map((g) =>
-      dbGetUiState(`project.color:${g.projectPath}`)
-        .then((val) => {
-          if (val) colors[g.projectPath] = val;
-        })
-        .catch(() => {}),
-    );
-    Promise.all(promises).then(() => setProjectColors(colors));
+    const loadAvatar = async (
+      path: string,
+    ): Promise<[string, ProjectAvatarState]> => {
+      const [color, image, imageVersion] = await Promise.all([
+        dbGetUiState(`project.color:${path}`).catch(() => null),
+        dbGetUiState(`project.image:${path}`).catch(() => null),
+        dbGetUiState(`project.image.v:${path}`).catch(() => null),
+      ]);
+      return [
+        path,
+        {
+          color: color || null,
+          image: image || null,
+          imageVersion: imageVersion || null,
+        },
+      ];
+    };
+
+    (async () => {
+      let recents: RecentProject[] = [];
+      try {
+        recents = await dbGetRecentProjects(10);
+      } catch {
+        recents = [];
+      }
+      if (cancelled) return;
+      setRecentProjects(recents);
+
+      // Resolve avatar state for every project shown in either group.
+      const paths = new Set<string>([
+        ...projectGroups.map((g) => g.projectPath),
+        ...recents.map((p) => p.path),
+      ]);
+      const entries = await Promise.all([...paths].map(loadAvatar));
+      if (cancelled) return;
+      setProjectAvatars(Object.fromEntries(entries));
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, [open, projectGroups]);
 
   const activeProjectPaths = useMemo(
@@ -141,7 +132,9 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
     return basename(value);
   }, [value, projectGroups, recentProjects]);
 
-  const selectedColor = value ? projectColors[value] || null : null;
+  const selectedAvatar = value
+    ? projectAvatars[value] ?? EMPTY_AVATAR
+    : EMPTY_AVATAR;
   const { openProject } = useProjectActions();
   const setShowNewProjectScreen = useUIStore(
     (s) => s.setShowNewProjectScreen,
@@ -169,8 +162,11 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
             // is still used inside the dropdown list below.
             <ProjectAvatar
               name={selectedName}
-              color={selectedColor}
+              color={selectedAvatar.color}
+              imageUrl={selectedAvatar.image}
+              cacheBust={selectedAvatar.imageVersion}
               size="sm"
+              shape="circle"
             />
           ) : (
             <FolderOpen className="h-3.5 w-3.5" />
@@ -200,7 +196,11 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                   >
                     <ProjectAvatar
                       name={g.projectName}
-                      color={projectColors[g.projectPath]}
+                      color={projectAvatars[g.projectPath]?.color}
+                      imageUrl={projectAvatars[g.projectPath]?.image}
+                      cacheBust={projectAvatars[g.projectPath]?.imageVersion}
+                      size="md"
+                      shape="circle"
                     />
                     <span className="flex-1 truncate">{g.projectName}</span>
                     {value === g.projectPath && (
@@ -222,7 +222,14 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
                     }}
                     className="text-xs gap-2"
                   >
-                    <ProjectAvatar name={p.name} color={null} />
+                    <ProjectAvatar
+                      name={p.name}
+                      color={projectAvatars[p.path]?.color}
+                      imageUrl={projectAvatars[p.path]?.image}
+                      cacheBust={projectAvatars[p.path]?.imageVersion}
+                      size="md"
+                      shape="circle"
+                    />
                     <span className="flex-1 truncate">{p.name}</span>
                     {value === p.path && (
                       <Check className="ml-auto h-3.5 w-3.5 text-primary" />
