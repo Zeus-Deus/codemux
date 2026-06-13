@@ -168,13 +168,13 @@ fn flatten_model(
         context_window_options: Vec::new(),
         supports_adaptive_thinking: false,
         supports_thinking_toggle: false,
-        // Fast-mode / vision flags don't ride on the OpenCode wire
-        // shape we decode (they're under each model's
-        // `capabilities.input.image` etc.). Stage 5/6 polish can plumb
-        // those through `RawModel`; for Stage 3 the conservative
-        // defaults match the Codex baseline.
+        // Fast mode isn't an OpenCode concept; vision is harvested live
+        // from each model's `capabilities.input.image` (decoded in
+        // `client.rs`) rather than hardcoded — roughly half of
+        // OpenCode's models are vision-capable and the set shifts as
+        // upstreams add models.
         supports_fast_mode: false,
-        supports_images: false,
+        supports_images: model.supports_images,
         sub_provider: Some(provider.id.clone()),
         // Only OpenCode Zen's own free-tier signal makes it onto the
         // chat-side `is_free` flag. Every other provider's
@@ -214,12 +214,23 @@ mod tests {
         variants: &[&str],
         context_window: Option<u64>,
     ) -> OpenCodeModel {
+        make_model_vision(id, name, variants, context_window, false)
+    }
+
+    fn make_model_vision(
+        id: &str,
+        name: &str,
+        variants: &[&str],
+        context_window: Option<u64>,
+        supports_images: bool,
+    ) -> OpenCodeModel {
         OpenCodeModel {
             id: id.to_string(),
             name: name.to_string(),
             description: Some("test-family".into()),
             variants: variants.iter().map(|s| (*s).to_string()).collect(),
             context_window,
+            supports_images,
             is_free: false,
         }
     }
@@ -299,6 +310,33 @@ mod tests {
     }
 
     #[test]
+    fn flatten_carries_live_vision_flag_per_model() {
+        // Vision rides on `capabilities.input.image` from the harvest —
+        // a model that reports it gets `supports_images: true`, one that
+        // doesn't stays `false` (no blanket hardcoding either way).
+        let p = make_provider(
+            "anthropic",
+            "Anthropic",
+            true,
+            &[
+                (
+                    "claude-sonnet-4-6",
+                    make_model_vision("claude-sonnet-4-6", "Sonnet", &["high"], Some(200_000), true),
+                ),
+                (
+                    "text-only",
+                    make_model_vision("text-only", "Text Only", &[], None, false),
+                ),
+            ],
+        );
+        let models = flatten_into_chat_models(&[p]);
+        let sonnet = models.iter().find(|m| m.id.ends_with("claude-sonnet-4-6")).unwrap();
+        let text_only = models.iter().find(|m| m.id.ends_with("text-only")).unwrap();
+        assert!(sonnet.supports_images, "vision model must report supports_images");
+        assert!(!text_only.supports_images, "text-only model must not");
+    }
+
+    #[test]
     fn flatten_handles_models_with_no_variants() {
         // Some providers report empty `variants` maps. Default effort
         // should fall through to None so the picker can suppress the
@@ -329,6 +367,7 @@ mod tests {
                     description: None,
                     variants: Vec::new(),
                     context_window: None,
+                    supports_images: false,
                     is_free: false,
                 },
             )],
@@ -399,6 +438,7 @@ mod tests {
                     description: None,
                     variants: Vec::new(),
                     context_window: None,
+                    supports_images: false,
                     is_free: true,
                 },
             )],
@@ -415,6 +455,7 @@ mod tests {
                     description: None,
                     variants: Vec::new(),
                     context_window: None,
+                    supports_images: false,
                     is_free: true,
                 },
             )],
@@ -431,6 +472,7 @@ mod tests {
                     description: None,
                     variants: Vec::new(),
                     context_window: None,
+                    supports_images: false,
                     // Copilot is subscription-billed; cost-zero is a
                     // false positive at the wire layer.
                     is_free: true,
@@ -449,6 +491,7 @@ mod tests {
                     description: None,
                     variants: Vec::new(),
                     context_window: None,
+                    supports_images: false,
                     // User-supplied creds: OpenCode reports cost-zero
                     // because it doesn't track the user's billing
                     // tier. False positive.

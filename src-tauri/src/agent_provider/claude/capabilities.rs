@@ -270,6 +270,36 @@ fn split_context_suffix(id: &str) -> (&str, Option<&str>) {
     (id, None)
 }
 
+/// The inner window value of a pinned id (`claude-fable-5[1m]` →
+/// `Some("1m")`); `None` for a bare id. This is the value that should
+/// become the default in the model's context-window picker.
+fn pinned_window(id: &str) -> Option<&str> {
+    split_context_suffix(id)
+        .1
+        .map(|s| s.trim_start_matches('[').trim_end_matches(']'))
+}
+
+/// Mark `pinned` as the sole default in a context-window option set,
+/// clearing the other defaults. Lets the CLI's baked-in window choice
+/// (e.g. the `[1m]` the deployed roster pins on Fable) drive the picker
+/// default instead of the generic highest-is-default rule, while still
+/// offering the full set so the window stays user-selectable. When
+/// nothing is pinned (or the pinned value isn't one of the options) the
+/// set is returned with its own defaults intact.
+fn with_pinned_default(
+    mut opts: Vec<ContextWindowOption>,
+    pinned: Option<&str>,
+) -> Vec<ContextWindowOption> {
+    if let Some(win) = pinned {
+        if opts.iter().any(|o| o.value == win) {
+            for o in &mut opts {
+                o.is_default = o.value == win;
+            }
+        }
+    }
+    opts
+}
+
 /// Apply the reference impl's `resolveClaudeApiModelId` trick: when
 /// the context window is `"1m"`, the Anthropic API expects the model
 /// id to carry a `[1m]` bracket suffix. Any other value (or `None`)
@@ -487,6 +517,10 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
     } else {
         display_name.to_string()
     };
+    // Normalize a pinned id (`claude-fable-5[1m]`) to its base id and
+    // surface the pinned window as the picker default — so a pinned and
+    // a bare flagship id behave identically (consistent context picker).
+    let (base_id, _) = split_context_suffix(id);
     let family = ClaudeFamily::from_id(id);
     let (effort_levels, default_effort, prompt_injected, ctx) = match family {
         f if f.is_flagship() => (
@@ -518,15 +552,9 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
         ),
         _ => (vec![], None, vec![], vec![]),
     };
-    // An id that already carries a bracket suffix (`…[1m]`) has its
-    // window pinned — a picker would double-append the suffix.
-    let context_window_options = if split_context_suffix(id).1.is_some() {
-        vec![]
-    } else {
-        ctx
-    };
+    let context_window_options = with_pinned_default(ctx, pinned_window(id));
     ChatModelInfo {
-        id: id.to_string(),
+        id: base_id.to_string(),
         label,
         description: None,
         effort_levels,
@@ -753,9 +781,12 @@ fn merge_sdk_with_maintained(
 ) -> ChatModelInfo {
     // The deployed CLI may pin the context window into the id itself
     // (`claude-fable-5[1m]`). Look maintained metadata up by the base
-    // id so the pinned variant still gets its precise metadata.
-    let (base_id, pinned_suffix) = split_context_suffix(&sdk.value);
-    let known = maintained.get(base_id).cloned();
+    // id, normalize the model id to that base, and surface the pinned
+    // window as the picker default — captured as owned values upfront
+    // so later moves out of `sdk` don't fight the borrow checker.
+    let base_id = split_context_suffix(&sdk.value).0.to_string();
+    let pinned = pinned_window(&sdk.value).map(str::to_string);
+    let known = maintained.get(&base_id).cloned();
     let inferred = infer_model_info(&sdk.value, &sdk.display_name);
 
     // Effort levels — SDK runtime data wins (so a newly-added level
@@ -785,19 +816,22 @@ fn merge_sdk_with_maintained(
         .as_ref()
         .map(|k| k.prompt_injected_effort_levels.clone())
         .unwrap_or_else(|| inferred.prompt_injected_effort_levels.clone());
-    // A pinned id must never offer a context-window picker — resolving
-    // a pick would double-append the bracket suffix.
-    let context_window_options = if pinned_suffix.is_some() {
-        vec![]
-    } else {
+    // Context-window options. A pinned id (`claude-fable-5[1m]`) is
+    // normalized to the base id, and its pinned window becomes the
+    // picker default — so it offers the same `[200k, 1m]` toggle as a
+    // bare flagship/Sonnet id rather than being silently fixed. The
+    // launch path re-applies the suffix from the chosen window via
+    // `resolve_claude_api_model_id`, so the base id round-trips.
+    let context_window_options = with_pinned_default(
         known
             .as_ref()
             .map(|k| k.context_window_options.clone())
-            .unwrap_or_else(|| inferred.context_window_options.clone())
-    };
+            .unwrap_or_else(|| inferred.context_window_options.clone()),
+        pinned.as_deref(),
+    );
 
     let label = if sdk.display_name.trim().is_empty() {
-        sdk.value.clone()
+        base_id.clone()
     } else {
         sdk.display_name
     };
@@ -808,7 +842,7 @@ fn merge_sdk_with_maintained(
     };
 
     ChatModelInfo {
-        id: sdk.value,
+        id: base_id,
         label,
         description,
         effort_levels,
@@ -1129,14 +1163,41 @@ mod tests {
     }
 
     #[test]
-    fn infer_pinned_suffix_suppresses_context_picker() {
+    fn infer_pinned_suffix_normalizes_id_and_keeps_a_consistent_picker() {
+        // A pinned id (`claude-fable-5[1m]`) is normalized to the base
+        // id and offers the SAME `[200k, 1m]` toggle as a bare flagship
+        // id — with the pinned window (1m) as the default — rather than
+        // being silently fixed. This is what makes Fable consistent with
+        // Sonnet/Opus in the picker.
         let info = infer_model_info("claude-fable-5[1m]", "Fable 5");
-        assert!(
-            info.context_window_options.is_empty(),
-            "pinned id must not offer a context-window picker"
-        );
-        // Flagship metadata still applies.
+        assert_eq!(info.id, "claude-fable-5", "id must be normalized to base");
+        let values: Vec<&str> = info
+            .context_window_options
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["200k", "1m"]);
+        let default = info
+            .context_window_options
+            .iter()
+            .find(|o| o.is_default)
+            .unwrap();
+        assert_eq!(default.value, "1m", "pinned window must be the default");
         assert_eq!(info.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn infer_pinned_non_default_window_becomes_the_picker_default() {
+        // If the CLI ever pins a non-1m window, that window — not the
+        // generic highest-is-default — drives the picker default.
+        let info = infer_model_info("claude-opus-9-9[200k]", "Opus 9.9");
+        assert_eq!(info.id, "claude-opus-9-9");
+        let default = info
+            .context_window_options
+            .iter()
+            .find(|o| o.is_default)
+            .unwrap();
+        assert_eq!(default.value, "200k");
     }
 
     #[test]
@@ -1337,12 +1398,15 @@ mod tests {
     }
 
     #[test]
-    fn sdk_merge_handles_pinned_fable_id() {
-        // The deployed CLI reports Fable with the window pinned into
-        // the id. The maintained `claude-fable-5` entry must be found
-        // via base-id lookup, the launch id must stay verbatim, and no
-        // context-window picker may be offered (resolving one would
-        // produce `claude-fable-5[1m][1m]`).
+    fn sdk_merge_normalizes_pinned_fable_id_to_a_consistent_picker() {
+        // The deployed CLI reports Fable with the window pinned into the
+        // id (`claude-fable-5[1m]`). The merge normalizes it to the base
+        // id `claude-fable-5` (looked up in the maintained map) and
+        // offers the same `[200k, 1m]` context toggle as Sonnet/Opus,
+        // with the pinned window (1m) as default. The launch path
+        // re-applies `[1m]` from the chosen window, so the base id is
+        // correct to store. This is the fix for the Fable-vs-Sonnet
+        // picker inconsistency.
         let live = vec![sdk_model(
             "claude-fable-5[1m]",
             "Fable 5",
@@ -1351,17 +1415,39 @@ mod tests {
             None,
         )];
         let caps = build_capabilities_from_sdk(live);
-        let fable = &caps.models[0];
-        assert_eq!(fable.id, "claude-fable-5[1m]");
+        let fable = caps
+            .models
+            .iter()
+            .find(|m| m.id == "claude-fable-5")
+            .expect("pinned id must be normalized to base");
         assert_eq!(fable.label, "Fable 5");
         assert_eq!(fable.default_effort.as_deref(), Some("high"));
-        assert!(fable.context_window_options.is_empty());
+        let values: Vec<&str> = fable
+            .context_window_options
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["200k", "1m"]);
+        assert_eq!(
+            fable
+                .context_window_options
+                .iter()
+                .find(|o| o.is_default)
+                .unwrap()
+                .value,
+            "1m",
+        );
         assert!(
             fable
                 .prompt_injected_effort_levels
                 .contains(&"ultrathink".to_string())
         );
         assert!(fable.supports_adaptive_thinking);
+        // No duplicate Fable row from the family-append pass.
+        assert_eq!(
+            caps.models.iter().filter(|m| m.id == "claude-fable-5").count(),
+            1,
+        );
     }
 
     #[test]
@@ -1433,15 +1519,17 @@ mod tests {
         ];
         let caps = build_capabilities_from_sdk(live);
         let ids: Vec<&str> = caps.models.iter().map(|m| m.id.as_str()).collect();
-        // Live entries first, in the CLI's order.
-        assert_eq!(&ids[..4], &["default", "claude-fable-5[1m]", "sonnet", "haiku"]);
+        // Live entries first, in the CLI's order. The pinned Fable id is
+        // normalized to its base id (`claude-fable-5`).
+        assert_eq!(&ids[..4], &["default", "claude-fable-5", "sonnet", "haiku"]);
         // Every maintained Opus version appended afterwards.
         for opus in ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"] {
             assert!(ids.contains(&opus), "{opus} should be appended");
         }
         // Families already live must NOT be duplicated from the
-        // maintained list.
-        assert!(!ids.contains(&"claude-fable-5"));
+        // maintained list (the maintained `claude-sonnet-4-6` /
+        // `claude-haiku-4-5` ids stay out because the alias rows cover
+        // those families).
         assert!(!ids.contains(&"claude-sonnet-4-6"));
         assert!(!ids.contains(&"claude-haiku-4-5"));
         // Appended Opus keeps its precise maintained metadata.

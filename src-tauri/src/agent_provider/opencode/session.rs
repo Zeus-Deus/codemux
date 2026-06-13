@@ -51,6 +51,11 @@ pub struct OpenCodeSession {
     /// by `set_model`. The chat send path uses this when no per-turn
     /// override is supplied.
     pub current_model: Mutex<Option<String>>,
+    /// Session-level reasoning variant (OpenCode's per-prompt effort
+    /// selector — `low`/`medium`/`high`/`max`/…). Seeded from the
+    /// session's initial effort; the send path uses it when no per-turn
+    /// effort override is supplied.
+    pub current_variant: Mutex<Option<String>>,
     server_handle: OpenCodeServerHandle,
     http: reqwest::Client,
     /// Routing context shared with the SSE listener — the listener
@@ -69,6 +74,7 @@ impl OpenCodeSession {
         manager: Arc<OpenCodeServerManager>,
         thread_id: ThreadId,
         initial_model: Option<String>,
+        initial_variant: Option<String>,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     ) -> Result<Arc<Self>, ProviderError> {
         let server_handle = manager.ensure_running().await.map_err(|err| {
@@ -148,6 +154,7 @@ impl OpenCodeSession {
             thread_id,
             provider_session_id,
             current_model: Mutex::new(initial_model),
+            current_variant: Mutex::new(initial_variant),
             server_handle,
             http,
             event_ctx,
@@ -163,6 +170,7 @@ impl OpenCodeSession {
         text: String,
         images: Vec<ImageInput>,
         model_override: Option<String>,
+        effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
         let turn_id = TurnId(format!("turn_{}", Uuid::new_v4()));
         {
@@ -174,8 +182,16 @@ impl OpenCodeSession {
             Some(m) => Some(m),
             None => self.current_model.lock().await.clone(),
         };
-        let body = build_prompt_async_request(text, model.as_deref(), &images)
-            .map_err(|err| ProviderError::ValidationError { message: err })?;
+        // Per-turn effort wins; otherwise fall back to the session's
+        // variant. OpenCode's `variant` selects the model's reasoning
+        // effort on each `prompt_async`.
+        let variant = match effort_override {
+            Some(v) => Some(v),
+            None => self.current_variant.lock().await.clone(),
+        };
+        let body =
+            build_prompt_async_request(text, model.as_deref(), variant.as_deref(), &images)
+                .map_err(|err| ProviderError::ValidationError { message: err })?;
         let url = format!(
             "{}/session/{}/prompt_async",
             self.server_handle.base_url.trim_end_matches('/'),
@@ -343,6 +359,7 @@ mod tests {
             thread_id: ThreadId("t1".into()),
             provider_session_id,
             current_model: Mutex::new(Some("openai/gpt-5".into())),
+            current_variant: Mutex::new(None),
             server_handle: handle,
             http,
             event_ctx,
@@ -365,7 +382,7 @@ mod tests {
             mock_session(server.url(), "pw".into(), "sess_1").await;
 
         let turn_id = session
-            .send_turn("hello".into(), Vec::<ImageInput>::new(), None)
+            .send_turn("hello".into(), Vec::<ImageInput>::new(), None, None)
             .await
             .expect("send_turn must succeed");
 
@@ -385,6 +402,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_turn_threads_effort_override_into_the_prompt_variant() {
+        // A per-turn effort override reaches OpenCode as the prompt
+        // `variant` (its reasoning-effort selector) — the regression
+        // guard for the previously shown-but-ignored picker.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/session/sess_1/prompt_async")
+            .match_header("authorization", mockito::Matcher::Any)
+            .match_body(mockito::Matcher::PartialJsonString(
+                r#"{"variant":"high"}"#.into(),
+            ))
+            .with_status(204)
+            .create_async()
+            .await;
+        let (session, _tx, _rx) =
+            mock_session(server.url(), "pw".into(), "sess_1").await;
+
+        session
+            .send_turn("hi".into(), vec![], None, Some("high".into()))
+            .await
+            .expect("send_turn must succeed");
+
+        // The mock only matches if the body carried `variant: "high"`.
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn send_turn_surfaces_http_error_with_status_code() {
         let mut server = Server::new_async().await;
         let mock = server
@@ -397,7 +441,7 @@ mod tests {
             mock_session(server.url(), "pw".into(), "sess_1").await;
 
         let err = session
-            .send_turn("hi".into(), vec![], None)
+            .send_turn("hi".into(), vec![], None, None)
             .await
             .expect_err("400 must surface");
         mock.assert_async().await;
@@ -416,7 +460,7 @@ mod tests {
             mock_session(server.url(), "pw".into(), "sess_1").await;
         // Override with an id missing the `provider/` prefix.
         let err = session
-            .send_turn("hi".into(), vec![], Some("invalid".into()))
+            .send_turn("hi".into(), vec![], Some("invalid".into()), None)
             .await
             .expect_err("must reject");
         match err {
@@ -507,7 +551,7 @@ mod tests {
             .set_model("anthropic/claude-sonnet-4-6".into())
             .await;
         session
-            .send_turn("hi".into(), vec![], None)
+            .send_turn("hi".into(), vec![], None, None)
             .await
             .expect("send_turn ok");
         mock.assert_async().await;

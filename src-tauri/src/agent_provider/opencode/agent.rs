@@ -150,6 +150,7 @@ impl AgentProvider for OpenCodeAgentProvider {
             self.manager.clone(),
             thread_id.clone(),
             input.model.clone(),
+            input.effort.clone(),
             self.event_tx.clone(),
         )
         .await?;
@@ -170,7 +171,12 @@ impl AgentProvider for OpenCodeAgentProvider {
     async fn send_turn(&self, input: SendTurnInput) -> Result<TurnStartResult, ProviderError> {
         let session = self.lookup(&input.thread_id).await?;
         let turn_id = session
-            .send_turn(input.text, input.images, input.model_override)
+            .send_turn(
+                input.text,
+                input.images,
+                input.model_override,
+                input.effort_override,
+            )
             .await?;
         Ok(TurnStartResult { turn_id })
     }
