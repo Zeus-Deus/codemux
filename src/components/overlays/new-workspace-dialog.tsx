@@ -387,7 +387,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     setPrompt(e.target.value);
     const ta = e.target;
     ta.style.height = "auto";
-    ta.style.height = `${Math.min(Math.max(ta.scrollHeight, 40), 192)}px`;
+    ta.style.height = `${Math.min(Math.max(ta.scrollHeight, 96), 192)}px`;
   };
 
   // Accept clipboard images alongside the paperclip-attach flow.
@@ -758,7 +758,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         showCloseButton={false}
-        className="sm:max-w-[560px] max-h-[min(70vh,600px)] !top-[calc(50%-min(35vh,300px))] !-translate-y-0 bg-popover p-0 gap-0 overflow-visible"
+        className="sm:max-w-2xl max-h-[min(70vh,600px)] !top-[calc(50%-min(35vh,300px))] !-translate-y-0 bg-popover p-0 gap-0 overflow-visible"
         onKeyDown={handleKeyDown}
       >
         <DialogHeader className="sr-only">
@@ -799,7 +799,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               onChange={handleTextareaChange}
               onPaste={handlePasteImage}
               placeholder="What do you want to do?"
-              className="min-h-10 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-sm px-4 pt-3 pb-1"
+              className="min-h-24 max-h-48 resize-none border-0 bg-transparent dark:bg-transparent shadow-none focus-visible:ring-0 text-sm px-4 pt-3 pb-1"
               rows={1}
             />
 
