@@ -66,7 +66,23 @@ import {
   applyPreset,
 } from "@/tauri/commands";
 import { pickFiles } from "@/lib/file-dialog";
-import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue } from "@/tauri/types";
+import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue, ModelSelection } from "@/tauri/types";
+import { LaunchModelPicker } from "./launch-model-picker";
+import { LaunchReasoningPicker } from "./launch-reasoning-picker";
+import {
+  detectLaunchFamily,
+  familyToProviderKind,
+  GEMINI_MODELS,
+  parseBakedModel,
+  REASONING_FLAG_FAMILIES,
+  type LaunchModel,
+  type ReasoningOption,
+} from "@/lib/launch-models";
+import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import {
+  useLaunchGeminiModels,
+  useLaunchGeminiModelsInit,
+} from "@/stores/gemini-models-store";
 
 const ISSUE_BODY_MAX_CHARS = 10_000;
 
@@ -115,6 +131,24 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const removePendingWorkspace = useUIStore((s) => s.removePendingWorkspace);
   const failPendingWorkspace = useUIStore((s) => s.failPendingWorkspace);
   const setLastSelectedAgentId = useUIStore((s) => s.setLastSelectedAgentId);
+  const setLastModelSelection = useUIStore((s) => s.setLastModelSelection);
+
+  // Provider capability slots — the live model harvest shared with the
+  // Beta agent-chat picker. The launch dialog reads the same data so a
+  // model picked here is sourced dynamically (OpenCode live-harvested,
+  // Claude/Codex from the maintained bundle).
+  const claudeCaps = useProviderCapabilities((s) => s.claude);
+  const codexCaps = useProviderCapabilities((s) => s.codex);
+  const opencodeCaps = useProviderCapabilities((s) => s.opencode);
+  const capsLoaded = useProviderCapabilities((s) => s.loaded);
+  const refreshCaps = useProviderCapabilities((s) => s.refresh);
+
+  // Gemini isn't a chat provider, so its launch list comes from the
+  // backend hybrid harvest (`list_launch_gemini_models`) instead. The
+  // init hook kicks a lazy first fetch on dialog mount; subsequent
+  // opens reuse the cached value.
+  const geminiModels = useLaunchGeminiModels((s) => s.models);
+  useLaunchGeminiModelsInit();
 
   const defaultDir =
     storeProjectDir || activeWs?.project_root || activeWs?.cwd || "";
@@ -127,6 +161,14 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [selectedAgentId, setSelectedAgentId] = useState<string | null>(
     lastSelectedAgentId || "builtin-claude",
   );
+  // Launch-time model + reasoning override. `{ null, null }` = use the
+  // agent's own default (emits no flag). Resolved per agent family by
+  // the effect below.
+  const [modelSelection, setModelSelection] = useState<ModelSelection>({
+    model: null,
+    reasoning: null,
+    context: null,
+  });
   const [baseBranch, setBaseBranch] = useState("main");
   // True once the user has manually picked a branch from the BranchPicker,
   // so the `useDefaultBranch` effect below knows not to clobber their
@@ -382,6 +424,151 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     [presets, selectedAgentId],
   );
 
+  // ── Launch-time model selection ──────────────────────────────────
+  // Detect the agent family from the selected preset's command. A
+  // preset that launches an already-modeled CLI lights up the model
+  // pill automatically; an unknown binary leaves `launchFamily` null
+  // and the pill stays hidden.
+  const launchFamily = useMemo(
+    () => detectLaunchFamily(selectedAgent?.commands?.[0]),
+    [selectedAgent],
+  );
+  const launchProviderKind = launchFamily
+    ? familyToProviderKind(launchFamily)
+    : null;
+  // The capability bundle for the selected family (Gemini has none).
+  const launchCaps =
+    launchFamily === "claude"
+      ? claudeCaps
+      : launchFamily === "codex"
+        ? codexCaps
+        : launchFamily === "opencode"
+          ? opencodeCaps
+          : null;
+
+  // Model list: Gemini routes through the backend hybrid harvest
+  // (`list_launch_gemini_models`) — live from Google's API when
+  // GEMINI_API_KEY is set, otherwise the maintained fallback. The
+  // frontend `GEMINI_MODELS` const stays as a paper backstop for the
+  // window between mount and the first fetch resolving. Every other
+  // family reads the shared chat-capability harvest.
+  const launchModels = useMemo<LaunchModel[]>(() => {
+    if (launchFamily === "gemini") return geminiModels ?? GEMINI_MODELS;
+    return (
+      launchCaps?.models.map((m) => ({
+        id: m.id,
+        label: m.label,
+        subProvider: m.sub_provider,
+      })) ?? []
+    );
+  }, [launchFamily, launchCaps, geminiModels]);
+
+  const launchModelsLoading =
+    launchFamily !== null &&
+    launchFamily !== "gemini" &&
+    !capsLoaded &&
+    launchModels.length === 0;
+
+  // Reasoning + context options are read live from the *selected*
+  // model's capability entry, so the reasoning/context pill reflects
+  // exactly what that model supports. There is deliberately no
+  // first-model fallback: on "Default" (no concrete model) this is null,
+  // so the reasoning/context pill hides — reasoning/context belong to a
+  // chosen model and shouldn't be pickable before one is selected.
+  const launchCapsModel = useMemo(() => {
+    if (!launchCaps) return null;
+    return (
+      launchCaps.models.find((m) => m.id === modelSelection.model) ?? null
+    );
+  }, [launchCaps, modelSelection.model]);
+
+  // Reasoning levels — dynamic from the model's `effort_levels`, gated
+  // to the families whose CLI actually exposes a reasoning flag.
+  const reasoningOptions = useMemo<ReasoningOption[]>(() => {
+    if (!launchFamily || !REASONING_FLAG_FAMILIES.has(launchFamily)) return [];
+    const labels = launchCaps?.effort_label_map ?? {};
+    return (launchCapsModel?.effort_levels ?? []).map((lvl) => ({
+      value: lvl,
+      label: labels[lvl] ?? lvl,
+    }));
+  }, [launchFamily, launchCaps, launchCapsModel]);
+
+  // Context-window options — dynamic from the model's
+  // `context_window_options`. The capability bundle only populates
+  // these for Claude, so other families get an empty list (no row).
+  const launchContextOptions = useMemo<ReasoningOption[]>(
+    () =>
+      (launchCapsModel?.context_window_options ?? []).map((o) => ({
+        value: o.value,
+        label: o.label,
+      })),
+    [launchCapsModel],
+  );
+
+  // Drop a stored reasoning / context value the current model no longer
+  // supports (e.g. after switching from Opus to Sonnet). While the
+  // capability harvest is still in flight there is no model entry to
+  // validate against — pass the stored value through untouched rather
+  // than treating "unknown" as "unsupported", which would silently
+  // drop (and then re-persist away) a remembered pick.
+  const capsReady = launchFamily === "gemini" || launchCaps !== null;
+  const effectiveReasoning =
+    !capsReady ||
+    reasoningOptions.some((o) => o.value === modelSelection.reasoning)
+      ? modelSelection.reasoning
+      : null;
+  const effectiveContext =
+    !capsReady ||
+    launchContextOptions.some((o) => o.value === modelSelection.context)
+      ? modelSelection.context
+      : null;
+
+  // Backstop the app-level capability harvest: if the dialog opens
+  // before a provider's slot has hydrated, kick a refresh for it.
+  useEffect(() => {
+    if (!open || !launchProviderKind) return;
+    const caps =
+      launchProviderKind === "claude"
+        ? claudeCaps
+        : launchProviderKind === "codex"
+          ? codexCaps
+          : opencodeCaps;
+    if (caps === null) void refreshCaps(launchProviderKind);
+  }, [open, launchProviderKind, claudeCaps, codexCaps, opencodeCaps, refreshCaps]);
+
+  // Resolve the model selection when the dialog opens, when the chosen
+  // agent changes, or once the preset list first loads. Deliberately
+  // keyed on `selectedAgentId` + `presetsLoaded` (primitives) rather
+  // than the `selectedAgent` object: a mid-dialog `presets` refresh
+  // (e.g. switching project) must NOT clobber the user's in-dialog pick.
+  const presetsLoaded = presets.length > 0;
+  useEffect(() => {
+    if (!open || !presetsLoaded) return;
+    const cmd = presets.find((p) => p.id === selectedAgentId)?.commands?.[0];
+    const family = detectLaunchFamily(cmd);
+    if (!family) {
+      setModelSelection({ model: null, reasoning: null, context: null });
+      return;
+    }
+    const remembered = useUIStore.getState().lastModelSelections[family];
+    if (remembered) {
+      // Normalise: entries persisted before `context` existed lack it.
+      setModelSelection({
+        model: remembered.model ?? null,
+        reasoning: remembered.reasoning ?? null,
+        context: remembered.context ?? null,
+      });
+    } else {
+      setModelSelection({
+        model: parseBakedModel(cmd),
+        reasoning: null,
+        context: null,
+      });
+    }
+    // `presets` is read but intentionally not a dependency — see above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, selectedAgentId, presetsLoaded]);
+
   // Auto-resize textarea (min 96px = ~5 lines, max 192px = ~10 lines)
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     setPrompt(e.target.value);
@@ -486,6 +673,42 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
     const fullPrompt = userPrompt;
 
+    // Launch-time model selection — only meaningful when the chosen
+    // agent is a family Codemux can inject model flags for. The 1M
+    // context window rides on the model id (`model[1m]`), so it needs a
+    // concrete model: when the user left the model on "Default",
+    // resolve to the capability default, and drop 1M if that model
+    // can't do it (e.g. Haiku). Remember the pick per family so
+    // reopening the dialog restores it.
+    let resolvedModel = modelSelection.model;
+    let resolvedContext = effectiveContext;
+    if (launchFamily === "claude" && resolvedContext === "1m") {
+      const target = resolvedModel ?? claudeCaps?.models[0]?.id ?? null;
+      const supports1m = !!claudeCaps?.models
+        .find((m) => m.id === target)
+        ?.context_window_options.some((o) => o.value === "1m");
+      if (target && supports1m) {
+        resolvedModel = target;
+      } else {
+        resolvedContext = null;
+      }
+    }
+    const resolvedSelection: ModelSelection = {
+      model: resolvedModel,
+      reasoning: effectiveReasoning,
+      context: resolvedContext,
+    };
+    const launchSelection: ModelSelection | null = launchFamily
+      ? resolvedSelection
+      : null;
+    if (launchFamily) {
+      // Persist the user's *literal* pick, not the launch-resolved one
+      // (which may have dropped 1M or substituted a default model when
+      // capabilities had not loaded). This keeps the saved preference
+      // intact across reopens regardless of harvest timing.
+      setLastModelSelection(launchFamily, modelSelection);
+    }
+
     // Close dialog immediately (optimistic)
     onOpenChange(false);
 
@@ -548,13 +771,21 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             null,
             fullPrompt || null,
             selectedAgentId,
+            null,
+            launchSelection,
           );
           agentHandled = true;
         }
 
         // Launch agent for paths that don't handle it internally
         if (!agentHandled && selectedAgentId && fullPrompt) {
-          await applyPreset(wsId, selectedAgentId, "current_terminal", fullPrompt);
+          await applyPreset(
+          wsId,
+          selectedAgentId,
+          "current_terminal",
+          fullPrompt,
+          launchSelection,
+        );
         }
 
         const pName = basename(projectDir);
@@ -654,6 +885,8 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             isNewBranch ? baseBranch || null : null,
             fullPrompt || null,
             selectedAgentId,
+            null,
+            launchSelection,
           );
           agentHandled = true;
         }
@@ -661,7 +894,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
       // Launch agent for paths that don't handle it internally
       if (!agentHandled && selectedAgentId && fullPrompt) {
-        await applyPreset(wsId, selectedAgentId, "current_terminal", fullPrompt);
+        await applyPreset(
+          wsId,
+          selectedAgentId,
+          "current_terminal",
+          fullPrompt,
+          launchSelection,
+        );
       }
 
       // Track as recent project
@@ -706,6 +945,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     prompt,
     attachments,
     selectedAgentId,
+    launchFamily,
+    modelSelection,
+    effectiveReasoning,
+    effectiveContext,
+    claudeCaps,
+    setLastModelSelection,
     baseBranch,
     allBranches,
     branchMode,
@@ -924,6 +1169,50 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   ))}
                 </DropdownMenuContent>
               </DropdownMenu>
+
+              {/* Model picker — appears only for agents whose CLI
+                  Codemux can inject a `--model` flag for. Sourced from
+                  the same capability harvest as the Beta chat picker. */}
+              {launchFamily && (
+                <>
+                  <LaunchModelPicker
+                    providerKind={launchProviderKind}
+                    models={launchModels}
+                    loading={launchModelsLoading}
+                    selectedModel={modelSelection.model}
+                    onModelChange={(model) =>
+                      // Picking "Default" (null) clears reasoning/context
+                      // too — they're attributes of a concrete model.
+                      setModelSelection((prev) =>
+                        model === null
+                          ? { model: null, reasoning: null, context: null }
+                          : { ...prev, model },
+                      )
+                    }
+                  />
+                  {/* Reasoning/context for the chosen model — a sibling
+                      pill that hides on Default and for models with no
+                      options (Haiku), mirroring the chat composer. */}
+                  <LaunchReasoningPicker
+                    reasoningOptions={reasoningOptions}
+                    selectedReasoning={effectiveReasoning}
+                    defaultReasoning={launchCapsModel?.default_effort ?? null}
+                    onReasoningChange={(reasoning) =>
+                      setModelSelection((prev) => ({ ...prev, reasoning }))
+                    }
+                    contextOptions={launchContextOptions}
+                    selectedContext={effectiveContext}
+                    defaultContext={
+                      launchCapsModel?.context_window_options.find(
+                        (o) => o.is_default,
+                      )?.value ?? null
+                    }
+                    onContextChange={(context) =>
+                      setModelSelection((prev) => ({ ...prev, context }))
+                    }
+                  />
+                </>
+              )}
               </div>
 
               <div className="flex items-center gap-1">

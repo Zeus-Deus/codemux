@@ -19,6 +19,7 @@ import {
   type SessionStartInput,
 } from "../session.ts";
 import type { ApprovalDecision } from "../permissions.ts";
+import { listModels } from "./list-models.ts";
 import { ping } from "./ping.ts";
 
 /** The live sessions this process is managing, keyed by `threadId`. */
@@ -333,6 +334,17 @@ const probeAuthenticatedMethod: MethodHandler = async (params) => {
   return probeAuthenticated(binaryPath);
 };
 
+const listModelsMethod: MethodHandler = async (params) => {
+  const p = asObject(params, "list-models");
+  return listModels({
+    cwd: asString(p["cwd"], "cwd"),
+    pathToClaudeCodeExecutable: asString(
+      p["pathToClaudeCodeExecutable"],
+      "pathToClaudeCodeExecutable",
+    ),
+  });
+};
+
 // ---------------------------------------------------------------------------
 // Public: build the registry
 // ---------------------------------------------------------------------------
@@ -355,6 +367,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "stop-session": stopSession,
     "probe-installed": probeInstalledMethod,
     "probe-authenticated": probeAuthenticatedMethod,
+    "list-models": listModelsMethod,
   };
 }
 

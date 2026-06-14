@@ -17,7 +17,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * synchronous and non-null.
  */
 const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> = {
-  claude: "claude-opus-4-7",
+  claude: "claude-opus-4-8",
   codex: "gpt-5.4",
   // Step 12 Stage 1 placeholder. OpenCode capabilities are harvested
   // live in Stage 2 and effectively zero out this fallback once the

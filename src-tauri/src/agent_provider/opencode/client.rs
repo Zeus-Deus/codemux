@@ -192,6 +192,10 @@ pub struct OpenCodeProviderEntry {
 ///   model. Stage 3 maps these into `ChatModelInfo.effort_levels`.
 /// * `context_window` — upstream `limit.context`. Wired verbatim;
 ///   the frontend already knows how to format token counts.
+/// * `supports_images` — upstream `capabilities.input.image`. Drives
+///   the chat image-attachment affordance; harvested live rather than
+///   hardcoded (≈half of OpenCode's models are vision-capable and the
+///   set shifts as upstreams add models).
 /// * `is_free` — `true` when both the input and output token costs
 ///   the upstream reports are exactly 0 (free-tier models that the
 ///   upstream provider exposes at no cost). Some OpenCode upstreams
@@ -208,6 +212,8 @@ pub struct OpenCodeModel {
     pub variants: Vec<String>,
     #[serde(default)]
     pub context_window: Option<u64>,
+    #[serde(default)]
+    pub supports_images: bool,
     #[serde(default)]
     pub is_free: bool,
 }
@@ -256,6 +262,8 @@ struct RawModel {
     #[serde(default)]
     variants: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     #[serde(default)]
+    capabilities: Option<RawModelCapabilities>,
+    #[serde(default)]
     cost: Option<RawModelCost>,
 }
 
@@ -263,6 +271,22 @@ struct RawModel {
 struct RawModelLimit {
     #[serde(default)]
     context: Option<u64>,
+}
+
+/// Subset of the upstream `capabilities` block we act on. OpenCode
+/// reports a rich capability tree (`reasoning`, `toolcall`,
+/// `input`/`output` modality maps, …); we only decode the image-input
+/// flag today, which drives the chat attachment affordance.
+#[derive(Debug, Clone, Deserialize)]
+struct RawModelCapabilities {
+    #[serde(default)]
+    input: Option<RawModelModalities>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct RawModelModalities {
+    #[serde(default)]
+    image: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -312,6 +336,11 @@ fn flatten_model(raw: RawModel) -> OpenCodeModel {
         .map(|map| map.into_keys().collect())
         .unwrap_or_default();
     let context_window = raw.limit.and_then(|l| l.context);
+    let supports_images = raw
+        .capabilities
+        .and_then(|c| c.input)
+        .map(|i| i.image)
+        .unwrap_or(false);
     // Strict zero-cost test (no float epsilon). The upstream emits
     // `0` as an integer literal in JSON for free models, which
     // deserialises as `0.0` exactly; any non-free model has at
@@ -327,6 +356,7 @@ fn flatten_model(raw: RawModel) -> OpenCodeModel {
         description: raw.family,
         variants,
         context_window,
+        supports_images,
         is_free,
     }
 }
@@ -429,7 +459,7 @@ mod tests {
                             "capabilities": {
                                 "temperature": true, "reasoning": true,
                                 "attachment": true, "toolcall": true,
-                                "input": { "text": true, "audio": false, "image": false, "video": false, "pdf": false },
+                                "input": { "text": true, "audio": false, "image": true, "video": false, "pdf": false },
                                 "output": { "text": true, "audio": false, "image": false, "video": false, "pdf": false },
                                 "interleaved": false
                             },
@@ -494,6 +524,8 @@ mod tests {
         assert_eq!(gpt5.name, "GPT-5");
         assert_eq!(gpt5.description.as_deref(), Some("gpt-5"));
         assert_eq!(gpt5.context_window, Some(200_000));
+        // Vision decoded live from `capabilities.input.image`.
+        assert!(gpt5.supports_images, "gpt-5 fixture has input.image=true");
         // Variants come from the keys of the upstream object — order
         // is BTreeMap iteration order (alphabetical).
         assert_eq!(gpt5.variants, vec!["high", "low", "medium"]);
@@ -507,6 +539,10 @@ mod tests {
         assert_eq!(sonnet.context_window, Some(1_000_000));
         assert_eq!(sonnet.description, None, "no family → no description");
         assert!(sonnet.variants.is_empty(), "no variants object → empty list");
+        assert!(
+            !sonnet.supports_images,
+            "no capabilities block → vision defaults false"
+        );
     }
 
     #[tokio::test]

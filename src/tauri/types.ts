@@ -615,6 +615,17 @@ export interface TabSnapshot {
 
 export type AgentChatProviderKind = "claude" | "codex" | "opencode";
 
+/** Launch-time model / reasoning / context choice for a CLI agent
+ *  preset. Every field is optional — `null` means "use the agent's own
+ *  default" and emits no flag. `context` is Claude-only (`"1m"` opts
+ *  into the 1M window). Mirrors the Rust `agent_capability::ModelSelection`
+ *  consumed by `apply_preset` / `create_worktree_workspace`. */
+export interface ModelSelection {
+  model: string | null;
+  reasoning: string | null;
+  context: string | null;
+}
+
 /** Step 12 Stage 1 — driver-equals-instance shim (`"claude"` /
  *  `"codex"` / `"opencode"`). v2 lifts this to a richer
  *  `(driver, instance)` map; today it round-trips with
@@ -931,6 +942,22 @@ export type LaunchMode = "split_pane" | "new_tab";
  *  frontend `materializeWithPreset` dispatches on this field. */
 export type PresetKind = "cli" | "chat_agent";
 
+/** Structured "agent launcher" configuration (mirror of the Rust
+ *  `presets::PresetLaunchConfig`). Present when a preset was built with the
+ *  structured editor; `null` for raw command presets. The model/reasoning/
+ *  context are NOT baked into the command — they ride in `model_selection`
+ *  and are applied at launch via `apply_model_selection` (the same path the
+ *  New Workspace dialog uses). The prompt is baked into
+ *  `TerminalPreset.commands[0]` as a trailing positional arg. */
+export interface PresetLaunchConfig {
+  /** Base agent invocation (binary + autonomy flag), no prompt or model. */
+  agent_command: string;
+  /** Model / reasoning / context, applied at launch. */
+  model_selection: ModelSelection;
+  /** Free-form prompt passed to the agent (may be empty). */
+  prompt: string;
+}
+
 export interface TerminalPreset {
   id: string;
   name: string;
@@ -946,6 +973,9 @@ export interface TerminalPreset {
   /** Defaults to `"cli"` on the Rust side for presets persisted
    *  before this field existed. */
   kind: PresetKind;
+  /** Structured agent-launcher config, when built with the structured
+   *  editor. `null`/absent for raw command presets. */
+  launch_config?: PresetLaunchConfig | null;
 }
 
 export interface PresetStoreSnapshot {

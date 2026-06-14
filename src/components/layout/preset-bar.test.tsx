@@ -141,7 +141,7 @@ describe("PresetBar — preset failure feedback", () => {
     await userEvent.click(button);
     await flushPromises();
 
-    expect(mockApplyPreset).toHaveBeenCalledWith("ws-1", "claude-code", undefined);
+    expect(mockApplyPreset).toHaveBeenCalledWith("ws-1", "claude-code", undefined, null, null);
     expect(mockToast.error).toHaveBeenCalledTimes(1);
     expect(mockToast.error).toHaveBeenCalledWith(
       "Claude Code: claude is not installed",
@@ -217,7 +217,7 @@ describe("PresetBar — preset failure feedback", () => {
     fireEvent.click(button, { shiftKey: true });
     await flushPromises();
 
-    expect(mockApplyPreset).toHaveBeenCalledWith("ws-1", "claude-code", "split_pane");
+    expect(mockApplyPreset).toHaveBeenCalledWith("ws-1", "claude-code", "split_pane", null, null);
   });
 });
 

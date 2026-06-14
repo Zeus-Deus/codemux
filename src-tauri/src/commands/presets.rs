@@ -6,7 +6,7 @@ use tauri::State;
 use crate::database::DatabaseStore;
 use crate::presets::{
     emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, PresetKind,
-    PresetStoreSnapshot, PresetStoreState, TerminalPreset,
+    PresetLaunchConfig, PresetStoreSnapshot, PresetStoreState, TerminalPreset,
 };
 use crate::state::AppStateStore;
 use crate::terminal;
@@ -57,6 +57,7 @@ pub(crate) fn list_presets_with_availability(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn create_preset(
     app: tauri::AppHandle,
     db: State<'_, DatabaseStore>,
@@ -67,6 +68,8 @@ pub fn create_preset(
     working_directory: Option<String>,
     launch_mode: LaunchMode,
     pinned: bool,
+    icon: Option<String>,
+    launch_config: Option<PresetLaunchConfig>,
 ) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let preset = TerminalPreset {
@@ -76,7 +79,7 @@ pub fn create_preset(
         commands,
         working_directory,
         launch_mode,
-        icon: None,
+        icon,
         pinned,
         is_builtin: false,
         auto_run_on_workspace: false,
@@ -84,6 +87,10 @@ pub fn create_preset(
         // User-created presets default to CLI. If we later add UI
         // for creating ChatAgent presets, plumb a `kind` arg through.
         kind: PresetKind::Cli,
+        // For structured "agent launcher" presets, the frontend passes
+        // the assembled `commands` *and* the source `launch_config` so the
+        // editor can round-trip the pickers. Raw presets pass `None`.
+        launch_config,
     };
 
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -96,6 +103,7 @@ pub fn create_preset(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn update_preset(
     app: tauri::AppHandle,
     db: State<'_, DatabaseStore>,
@@ -110,6 +118,8 @@ pub fn update_preset(
     icon: Option<String>,
     auto_run_on_workspace: Option<bool>,
     auto_run_on_new_tab: Option<bool>,
+    launch_config: Option<PresetLaunchConfig>,
+    clear_launch_config: Option<bool>,
 ) -> Result<(), String> {
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     let preset = store
@@ -145,6 +155,16 @@ pub fn update_preset(
     }
     if let Some(v) = auto_run_on_new_tab {
         preset.auto_run_on_new_tab = v;
+    }
+    // Structured launch config follows a set/clear/leave-unchanged
+    // convention: `launch_config: Some(..)` sets it (structured save),
+    // `clear_launch_config: Some(true)` removes it (switching to a raw
+    // command preset), and passing neither leaves it untouched (so
+    // unrelated updates like the auto-run toggles don't wipe it).
+    if let Some(cfg) = launch_config {
+        preset.launch_config = Some(cfg);
+    } else if clear_launch_config == Some(true) {
+        preset.launch_config = None;
     }
 
     save_presets(&db, &store)?;
@@ -280,6 +300,7 @@ pub fn apply_preset(
     preset_id: String,
     override_mode: Option<String>,
     initial_prompt: Option<String>,
+    model_selection: Option<crate::agent_capability::ModelSelection>,
 ) -> Result<(), String> {
     // Look up the preset
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -324,14 +345,23 @@ pub fn apply_preset(
         },
     };
 
-    // If preset has no commands (e.g. Shell preset), just create tab/split with no command
+    // If preset has no commands (e.g. Shell preset), just create tab/split with no command.
+    // The launch-time model selection (if any) is spliced into each command
+    // *before* agent-context injection so the Gemini env wrapper and the
+    // Claude/Codex `--system-prompt` suffix compose around it correctly.
     let commands = if preset.commands.is_empty() {
         vec![String::new()]
     } else {
         preset
             .commands
             .iter()
-            .map(|cmd| crate::agent_context::inject_agent_context(cmd, &workspace_id))
+            .map(|cmd| {
+                let cmd = crate::agent_capability::apply_model_selection(
+                    cmd,
+                    model_selection.as_ref(),
+                );
+                crate::agent_context::inject_agent_context(&cmd, &workspace_id)
+            })
             .collect()
     };
 
@@ -1412,6 +1442,7 @@ mod tests {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind,
+            launch_config: None,
         }
     }
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Settings } from "lucide-react";
+import { Settings, Plus } from "lucide-react";
 import {
   DndContext,
   PointerSensor,
@@ -271,7 +271,11 @@ export function PresetBar({
     }
 
     const mode = e.shiftKey ? ("split_pane" as const) : undefined;
-    applyPreset(workspaceId, preset.id, mode).catch((err) => {
+    // Structured "agent launcher" presets carry their own model/reasoning
+    // choice — apply it the same way the New Workspace launch picker does
+    // (the prompt is already baked into the preset's command).
+    const modelSelection = preset.launch_config?.model_selection ?? null;
+    applyPreset(workspaceId, preset.id, mode, null, modelSelection).catch((err) => {
       // Backend returns `Err("{binary} is not installed")` (or other strings)
       // from `apply_preset` when `command_binary_exists` fails. Previously this
       // was swallowed into `console.error` and the user saw nothing — clicking
@@ -378,6 +382,7 @@ export function PresetBar({
   };
 
   const setShowSettings = useUIStore.getState().setShowSettings;
+  const requestNewPreset = useUIStore.getState().requestNewPreset;
 
   // Translate a vertical mouse-wheel delta into horizontal scrolling so
   // the bar can be panned with a plain wheel when many pinned presets
@@ -416,6 +421,10 @@ export function PresetBar({
             Show Preset Bar
           </DropdownMenuCheckboxItem>
           <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={() => requestNewPreset()}>
+            <Plus className="h-4 w-4" />
+            <span>New Preset</span>
+          </DropdownMenuItem>
           <DropdownMenuItem onClick={() => setShowSettings(true, "presets")}>
             <Settings className="h-4 w-4" />
             <span>Manage Presets</span>

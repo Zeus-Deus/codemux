@@ -76,6 +76,11 @@ vi.mock("@/tauri/commands", () => ({
   // module-level promise rejects with the Tauri `invoke` bridge being
   // undefined under jsdom and crashes every dialog test.
   getDefaultBranch: vi.fn().mockResolvedValue("main"),
+  // The dialog calls this on mount via the Gemini lazy-init hook.
+  // Resolved to an empty array so the store sees a successful response
+  // but the dialog (using GEMINI_MODELS as a paper backstop) is
+  // unaffected for tests that don't exercise the Gemini path.
+  listLaunchGeminiModels: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -98,6 +103,7 @@ import {
   generateRandomBranchName,
   pasteClipboardImageToFile,
   getDefaultBranch,
+  getPresets,
 } from "@/tauri/commands";
 import {
   _defaultBranchCache,
@@ -194,6 +200,7 @@ beforeEach(() => {
     newWorkspaceProjectDir: null,
     pendingWorkspaces: [],
     lastSelectedAgentId: null,
+    lastModelSelections: {},
   });
 });
 
@@ -368,11 +375,77 @@ describe("Submit flow", () => {
         expect.any(String),
         null,
         "builtin-claude",
+        null,
+        // 9th arg = launch-time model selection. This mock's preset
+        // omits `kind`, so it's filtered from the cli-preset list and
+        // no family is detected — the model picker stays absent and
+        // the selection is null. The picker's own behaviour is covered
+        // by launch-model-picker.test.tsx.
+        null,
       );
     });
 
     expect(generateBranchName).not.toHaveBeenCalled();
     expect(generateRandomBranchName).not.toHaveBeenCalled();
+  });
+
+  it("threads a remembered model selection through to workspace creation", async () => {
+    // A cli-kind preset so the model-selection wiring actually engages
+    // (the shared mock preset omits `kind` and is filtered out of the
+    // cli-preset list, leaving the model picker absent).
+    (getPresets as Mock).mockResolvedValueOnce({
+      presets: [
+        {
+          id: "builtin-claude",
+          name: "Claude",
+          description: null,
+          commands: ["claude --dangerously-skip-permissions"],
+          working_directory: null,
+          launch_mode: "NewTab",
+          icon: null,
+          pinned: true,
+          is_builtin: true,
+          auto_run_on_workspace: false,
+          auto_run_on_new_tab: false,
+          kind: "cli",
+        },
+      ],
+    });
+    // A remembered pick for the Claude family — including a reasoning
+    // level, which must survive even though the capability harvest
+    // never resolves in this test (regression guard for the
+    // caps-not-loaded data-loss path).
+    useUIStore.setState({
+      lastModelSelections: {
+        claude: { model: "claude-sonnet-4-6", reasoning: "high", context: null },
+      },
+    });
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByPlaceholderText("branch name"), {
+      target: { value: "my-feature" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(createWorktreeWorkspace).toHaveBeenCalled();
+    });
+    // 9th arg is the launch-time ModelSelection — the remembered pick,
+    // intact (not dropped despite capabilities never loading).
+    const call = (createWorktreeWorkspace as Mock).mock.calls[0];
+    expect(call[8]).toEqual({
+      model: "claude-sonnet-4-6",
+      reasoning: "high",
+      context: null,
+    });
+    // And the stored preference is not corrupted by the launch.
+    expect(useUIStore.getState().lastModelSelections.claude).toEqual({
+      model: "claude-sonnet-4-6",
+      reasoning: "high",
+      context: null,
+    });
   });
 
   it("activates existing workspace when branch already has one", async () => {

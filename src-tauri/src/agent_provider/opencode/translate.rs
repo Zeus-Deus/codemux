@@ -55,6 +55,7 @@ pub fn split_model_id(model_id: &str) -> Option<ModelRef> {
 pub fn build_prompt_async_request(
     text: String,
     model_id: Option<&str>,
+    variant: Option<&str>,
     images: &[crate::agent_provider::types::ImageInput],
 ) -> Result<PromptAsyncRequest, String> {
     let model = match model_id {
@@ -76,6 +77,13 @@ pub fn build_prompt_async_request(
         message_id: None,
         model,
         agent: None,
+        // Normalize an empty/whitespace variant to `None` so a cleared
+        // reasoning picker doesn't send `variant: ""` (OpenCode would
+        // reject that as an unknown variant key).
+        variant: variant
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
         parts,
     })
 }
@@ -403,9 +411,15 @@ mod tests {
             data: vec![1, 2, 3, 4],
             media_type: "image/png".into(),
         }];
-        let req =
-            build_prompt_async_request("hello".into(), Some("openai/gpt-5"), &images).unwrap();
+        let req = build_prompt_async_request(
+            "hello".into(),
+            Some("openai/gpt-5"),
+            None,
+            &images,
+        )
+        .unwrap();
         assert_eq!(req.parts.len(), 2);
+        assert_eq!(req.variant, None);
         match &req.parts[0] {
             PartInput::Text { text } => assert_eq!(text, "hello"),
             other => panic!("wrong part: {other:?}"),
@@ -420,8 +434,31 @@ mod tests {
     }
 
     #[test]
+    fn build_prompt_async_request_carries_the_reasoning_variant() {
+        // A picked reasoning level rides on `variant` (OpenCode's
+        // per-prompt effort selector) and serializes into the body.
+        let req =
+            build_prompt_async_request("hi".into(), Some("anthropic/claude-sonnet-4-5"), Some("high"), &[])
+                .unwrap();
+        assert_eq!(req.variant.as_deref(), Some("high"));
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["variant"], "high");
+    }
+
+    #[test]
+    fn build_prompt_async_request_normalizes_blank_variant_to_none() {
+        // A cleared picker (empty/whitespace) must not send `variant: ""`.
+        let req =
+            build_prompt_async_request("hi".into(), Some("openai/gpt-5"), Some("   "), &[]).unwrap();
+        assert_eq!(req.variant, None);
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("variant").is_none(), "blank variant must be omitted");
+    }
+
+    #[test]
     fn build_prompt_async_request_rejects_invalid_model() {
-        let err = build_prompt_async_request("hi".into(), Some("invalid"), &[]).unwrap_err();
+        let err =
+            build_prompt_async_request("hi".into(), Some("invalid"), None, &[]).unwrap_err();
         assert!(err.starts_with("invalid_model_id"));
     }
 

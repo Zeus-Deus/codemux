@@ -3,6 +3,7 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 export { Channel };
 import type {
   AgentChatProviderKind,
+  ModelSelection,
   OpenCodeAvailability,
   OpenCodeProviderEntry,
   ProviderChatCapabilities,
@@ -11,6 +12,7 @@ import type { AgentChatEventPayload, ApprovalDecision } from "./events";
 import type {
   UserSettings,
   AgentConfig,
+  PresetLaunchConfig,
   AgentSessionState,
   AppStateSnapshot,
   AuthResponse,
@@ -315,6 +317,13 @@ export const listChatProviderCapabilities = (
     provider,
   });
 
+/** Gemini launch-time model list. Backend serves a live harvest when
+ *  `GEMINI_API_KEY` is set, otherwise the maintained fallback. Either
+ *  way it returns quickly; failure inside the live path is caught by
+ *  the backend and returns the maintained list. */
+export const listLaunchGeminiModels = () =>
+  invoke<Array<{ id: string; label: string }>>("list_launch_gemini_models");
+
 export const regenerateMcpConfig = (workspaceId: string) =>
   invoke<void>("regenerate_mcp_config", { workspaceId });
 
@@ -405,6 +414,7 @@ export const createWorktreeWorkspace = (
   initialPrompt?: string | null,
   agentPresetId?: string | null,
   prNumber?: number | null,
+  modelSelection?: ModelSelection | null,
 ) =>
   invoke<string>("create_worktree_workspace", {
     repoPath,
@@ -414,6 +424,7 @@ export const createWorktreeWorkspace = (
     layout,
     initialPrompt: initialPrompt ?? null,
     agentPresetId: agentPresetId ?? null,
+    modelSelection: modelSelection ?? null,
     prNumber: prNumber ?? null,
   });
 
@@ -924,7 +935,10 @@ export const createPreset = (params: {
   commands: string[];
   workingDirectory: string | null;
   launchMode: LaunchMode;
+  pinned: boolean;
   icon: string | null;
+  /** Structured agent-launcher source, or null for raw presets. */
+  launchConfig?: PresetLaunchConfig | null;
 }) =>
   invoke<string>("create_preset", params);
 
@@ -938,6 +952,10 @@ export const updatePreset = (params: {
   icon: string | null;
   autoRunOnWorkspace?: boolean;
   autoRunOnNewTab?: boolean;
+  /** Set the structured agent-launcher config (structured save). */
+  launchConfig?: PresetLaunchConfig | null;
+  /** Remove the structured config (switching to a raw command preset). */
+  clearLaunchConfig?: boolean;
 }) =>
   invoke("update_preset", params);
 
@@ -952,8 +970,15 @@ export const applyPreset = (
   presetId: string,
   overrideMode?: LaunchMode | "current_terminal" | "existing_panes",
   initialPrompt?: string | null,
+  modelSelection?: ModelSelection | null,
 ) =>
-  invoke("apply_preset", { workspaceId, presetId, overrideMode, initialPrompt });
+  invoke("apply_preset", {
+    workspaceId,
+    presetId,
+    overrideMode,
+    initialPrompt,
+    modelSelection: modelSelection ?? null,
+  });
 
 export const setPresetBarVisible = (visible: boolean) =>
   invoke("set_preset_bar_visible", { visible });

@@ -9,6 +9,7 @@ pub const APP_DIR_NAME: &str = "codemux-dev";
 #[cfg(not(debug_assertions))]
 pub const APP_DIR_NAME: &str = "codemux";
 
+pub mod agent_capability;
 pub mod agent_context;
 pub mod agent_provider;
 pub mod ai;
@@ -205,6 +206,14 @@ pub fn run() {
         // call for the Codex provider.
         .manage(std::sync::Arc::new(
             crate::agent_provider::codex::capabilities::CodexCapabilityCache::new(),
+        ))
+        // Claude capability cache — populated lazily on the first
+        // `list_chat_provider_capabilities` call for Claude when
+        // `ANTHROPIC_API_KEY` is set (hybrid live harvest against
+        // `/v1/models`); otherwise the dispatcher serves the
+        // hand-maintained bundle without touching this cache.
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::claude::capabilities::ClaudeCapabilityCache::new(),
         ))
         // MCP runtime registry. `agent_chat_start_session` reads this
         // via `app.state::<McpRegistry>()` to lazily prime servers
@@ -1510,6 +1519,7 @@ pub fn run() {
             commands::agent_chat_set_model,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
+            commands::list_launch_gemini_models,
             commands::agent_chat_stop_session,
             commands::agent_chat_list_sessions,
             commands::agent_chat_rename_session,

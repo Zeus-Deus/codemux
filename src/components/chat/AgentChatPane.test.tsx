@@ -1017,9 +1017,9 @@ describe("AgentChatPane default-model seed effect", () => {
     expect(setModelMock).toHaveBeenCalled();
     const [threadId, model] = setModelMock.mock.calls[0];
     expect(threadId).toBe("thread-x");
-    // defaultModelForProvider("claude") falls back to "claude-opus-4-7"
+    // defaultModelForProvider("claude") falls back to "claude-opus-4-8"
     // when capabilities aren't in the test environment.
-    expect(model).toBe("claude-opus-4-7");
+    expect(model).toBe("claude-opus-4-8");
   });
 
   it("does not call setModel when there is no thread_id yet", () => {

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -40,6 +40,7 @@ import {
   PinOff,
   Trash2,
   X,
+  Plus,
   UserCircle,
   LogOut,
   Globe,
@@ -80,18 +81,34 @@ import {
   clearBrowserCookies,
   clearAllBrowserData,
 } from "@/tauri/commands";
-import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind } from "@/tauri/types";
+import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind, ModelSelection } from "@/tauri/types";
 import { MultiProviderModelPicker } from "@/components/chat/pickers/MultiProviderModelPicker";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
   getPresets,
+  createPreset,
   reorderPresets,
   setPresetPinned,
   setPresetBarVisible,
   deletePreset,
   updatePreset,
 } from "@/tauri/commands";
+import {
+  detectLaunchFamily,
+  familyToProviderKind,
+  REASONING_FLAG_FAMILIES,
+  GEMINI_MODELS,
+  type LaunchModel,
+  type ReasoningOption,
+} from "@/lib/launch-models";
+import { LaunchModelPicker } from "@/components/overlays/launch-model-picker";
+import { LaunchReasoningPicker } from "@/components/overlays/launch-reasoning-picker";
+import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
+import {
+  useLaunchGeminiModels,
+  useLaunchGeminiModelsInit,
+} from "@/stores/gemini-models-store";
 import { onPresetsChanged } from "@/tauri/events";
 import {
   DndContext,
@@ -467,15 +484,54 @@ function BrowserSection() {
   );
 }
 
+// Trigger styling that makes the launch model/reasoning pickers render as
+// full-width form fields matching the editor's Select dropdowns, instead of
+// the composer's rounded-full pills. tailwind-merge lets these override the
+// pickers' built-in pill classes (rounded-full, text-[11px], etc.).
+const LAUNCH_FIELD_TRIGGER =
+  "h-9 w-full justify-between rounded-lg border-input bg-transparent px-3 text-sm font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
+
+/** Wrap a string as a double-quoted shell argument. */
+function quotePrompt(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/** Assemble a structured preset's launchable command: base agent command +
+ *  the prompt as a trailing positional. Model/reasoning are NOT baked in —
+ *  they ride in `model_selection` and are applied at launch. */
+function structuredCommandFor(agentCommand: string, prompt: string): string {
+  const p = prompt.trim();
+  return p ? `${agentCommand} ${quotePrompt(p)}` : agentCommand;
+}
+
 function PresetEditorSheet({
   preset,
   open,
   onOpenChange,
+  agentOptions,
+  isDraft = false,
+  onCreate,
 }: {
   preset: TerminalPreset | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Builtin CLI agents shown in the Agent dropdown (id, command, icon). */
+  agentOptions: TerminalPreset[];
+  /** When true, this is an unsaved new preset — nothing is persisted until
+   *  the user presses "Create preset". Edits stay local; auto-save is off. */
+  isDraft?: boolean;
+  onCreate?: (payload: Parameters<typeof createPreset>[0]) => void;
 }) {
+  // Capability stores — shared with the New Workspace launch picker, so a
+  // preset picks models from the exact same live-harvested source.
+  const claudeCaps = useProviderCapabilities((s) => s.claude);
+  const codexCaps = useProviderCapabilities((s) => s.codex);
+  const opencodeCaps = useProviderCapabilities((s) => s.opencode);
+  const capsLoaded = useProviderCapabilities((s) => s.loaded);
+  const refreshCaps = useProviderCapabilities((s) => s.refresh);
+  const geminiModels = useLaunchGeminiModels((s) => s.models);
+  useLaunchGeminiModelsInit();
+
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [commands, setCommands] = useState<string[]>([""]);
@@ -483,6 +539,15 @@ function PresetEditorSheet({
   const [pinned, setPinned] = useState(true);
   const [autoRunOnWorkspace, setAutoRunOnWorkspace] = useState(false);
   const [autoRunOnNewTab, setAutoRunOnNewTab] = useState(false);
+  // Structured ("agent launcher") state.
+  const [structured, setStructured] = useState(false);
+  const [agentCommand, setAgentCommand] = useState("");
+  const [modelSelection, setModelSelection] = useState<ModelSelection>({
+    model: null,
+    reasoning: null,
+    context: null,
+  });
+  const [prompt, setPrompt] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Sync when preset changes
@@ -495,26 +560,223 @@ function PresetEditorSheet({
     setPinned(preset.pinned);
     setAutoRunOnWorkspace(preset.auto_run_on_workspace);
     setAutoRunOnNewTab(preset.auto_run_on_new_tab);
+    const lc = preset.launch_config ?? null;
+    setStructured(lc != null);
+    setAgentCommand(lc?.agent_command ?? "");
+    setModelSelection(
+      lc?.model_selection ?? { model: null, reasoning: null, context: null },
+    );
+    setPrompt(lc?.prompt ?? "");
     setConfirmDelete(false);
   }, [preset]);
 
+  // ── Launch model/reasoning sourcing (mirrors new-workspace-dialog) ──
+  const launchFamily = detectLaunchFamily(agentCommand);
+  const launchProviderKind = launchFamily ? familyToProviderKind(launchFamily) : null;
+  const launchCaps =
+    launchFamily === "claude"
+      ? claudeCaps
+      : launchFamily === "codex"
+        ? codexCaps
+        : launchFamily === "opencode"
+          ? opencodeCaps
+          : null;
+  const launchModels = useMemo<LaunchModel[]>(() => {
+    if (launchFamily === "gemini") return geminiModels ?? GEMINI_MODELS;
+    return (
+      launchCaps?.models.map((m) => ({
+        id: m.id,
+        label: m.label,
+        subProvider: m.sub_provider,
+      })) ?? []
+    );
+  }, [launchFamily, launchCaps, geminiModels]);
+  const launchModelsLoading =
+    launchFamily !== null &&
+    launchFamily !== "gemini" &&
+    !capsLoaded &&
+    launchModels.length === 0;
+  const launchCapsModel = useMemo(
+    () => launchCaps?.models.find((m) => m.id === modelSelection.model) ?? null,
+    [launchCaps, modelSelection.model],
+  );
+  const reasoningOptions = useMemo<ReasoningOption[]>(() => {
+    if (!launchFamily || !REASONING_FLAG_FAMILIES.has(launchFamily)) return [];
+    const labels = launchCaps?.effort_label_map ?? {};
+    return (launchCapsModel?.effort_levels ?? []).map((lvl) => ({
+      value: lvl,
+      label: labels[lvl] ?? lvl,
+    }));
+  }, [launchFamily, launchCaps, launchCapsModel]);
+  const launchContextOptions = useMemo<ReasoningOption[]>(
+    () =>
+      (launchCapsModel?.context_window_options ?? []).map((o) => ({
+        value: o.value,
+        label: o.label,
+      })),
+    [launchCapsModel],
+  );
+  const capsReady = launchFamily === "gemini" || launchCaps !== null;
+  const effectiveReasoning =
+    !capsReady || reasoningOptions.some((o) => o.value === modelSelection.reasoning)
+      ? modelSelection.reasoning
+      : null;
+  const effectiveContext =
+    !capsReady ||
+    launchContextOptions.some((o) => o.value === modelSelection.context)
+      ? modelSelection.context
+      : null;
+
+  // Backstop the app-level capability harvest if a slot hasn't hydrated.
+  useEffect(() => {
+    if (!open || !launchProviderKind) return;
+    const caps =
+      launchProviderKind === "claude"
+        ? claudeCaps
+        : launchProviderKind === "codex"
+          ? codexCaps
+          : opencodeCaps;
+    if (caps === null) void refreshCaps(launchProviderKind);
+  }, [open, launchProviderKind, claudeCaps, codexCaps, opencodeCaps, refreshCaps]);
+
   if (!preset) return null;
 
-  const save = (updates: Partial<{
-    name: string;
-    description: string | null;
-    commands: string[];
+  // The agent dropdown selection + icon, derived from the base command.
+  const selectedAgentId =
+    agentOptions.find((a) => a.commands[0] === agentCommand)?.id ?? "";
+  const agentIcon =
+    agentOptions.find((a) => a.id === selectedAgentId)?.icon ?? preset.icon;
+
+  // Unified save (no-op for drafts). Immediate handlers (pickers/selects
+  // fire before React state settles) pass explicit overrides. Structured
+  // presets store the assembled command + launch_config; raw presets store
+  // the literal commands. Fields not passed are left untouched on the Rust
+  // side, so e.g. the auto-run toggles never wipe launch_config.
+  const save = (over?: Partial<{
     launchMode: LaunchMode;
+    agentCommand: string;
+    modelSelection: ModelSelection;
+    prompt: string;
+    icon: string | null;
+    commands: string[];
+    autoRunOnWorkspace: boolean;
+    autoRunOnNewTab: boolean;
   }>) => {
-    updatePreset({
-      id: preset.id,
-      name: updates.name ?? name,
-      description: updates.description !== undefined ? updates.description : (description || null),
-      commands: updates.commands ?? commands.filter((c) => c.trim()),
-      workingDirectory: preset.working_directory,
-      launchMode: updates.launchMode ?? launchMode,
-      icon: preset.icon,
-    }).catch(console.error);
+    if (isDraft) return;
+    const lm = over?.launchMode ?? launchMode;
+    const aw = over?.autoRunOnWorkspace ?? autoRunOnWorkspace;
+    const an = over?.autoRunOnNewTab ?? autoRunOnNewTab;
+    if (structured) {
+      const ac = over?.agentCommand ?? agentCommand;
+      const ms = over?.modelSelection ?? modelSelection;
+      const pr = over?.prompt ?? prompt;
+      const cmd = structuredCommandFor(ac, pr);
+      const ic =
+        over?.icon ??
+        (agentOptions.find((a) => a.commands[0] === ac)?.icon ?? preset.icon);
+      updatePreset({
+        id: preset.id,
+        name,
+        description: description || null,
+        commands: cmd ? [cmd] : [],
+        workingDirectory: preset.working_directory,
+        launchMode: lm,
+        icon: ic,
+        autoRunOnWorkspace: aw,
+        autoRunOnNewTab: an,
+        launchConfig: { agent_command: ac, model_selection: ms, prompt: pr },
+      }).catch(console.error);
+    } else {
+      updatePreset({
+        id: preset.id,
+        name,
+        description: description || null,
+        commands: over?.commands ?? commands.filter((c) => c.trim()),
+        workingDirectory: preset.working_directory,
+        launchMode: lm,
+        icon: preset.icon,
+        autoRunOnWorkspace: aw,
+        autoRunOnNewTab: an,
+      }).catch(console.error);
+    }
+  };
+
+  const handleAgentChange = (agentId: string) => {
+    const opt = agentOptions.find((a) => a.id === agentId);
+    if (!opt) return;
+    const ac = opt.commands[0] ?? "";
+    // Model/reasoning are agent-specific — reset them when the agent
+    // changes; the user's prompt is preserved.
+    const ms: ModelSelection = { model: null, reasoning: null, context: null };
+    setAgentCommand(ac);
+    setModelSelection(ms);
+    save({ agentCommand: ac, modelSelection: ms, icon: opt.icon ?? null });
+  };
+
+  const handleModelChange = (model: string | null) => {
+    // Picking "Default" (null) clears reasoning/context too — they are
+    // attributes of a concrete model.
+    const ms: ModelSelection =
+      model === null
+        ? { model: null, reasoning: null, context: null }
+        : { ...modelSelection, model };
+    setModelSelection(ms);
+    save({ modelSelection: ms });
+  };
+
+  const handleReasoningChange = (reasoning: string) => {
+    const ms = { ...modelSelection, reasoning };
+    setModelSelection(ms);
+    save({ modelSelection: ms });
+  };
+
+  const handleContextChange = (context: string) => {
+    const ms = { ...modelSelection, context };
+    setModelSelection(ms);
+    save({ modelSelection: ms });
+  };
+
+  // Switch between the structured "agent launcher" and raw command editors.
+  const handleModeChange = (mode: string) => {
+    if (mode === "structured" && !structured) {
+      const opt =
+        agentOptions.find((a) => a.id === "builtin-claude") ?? agentOptions[0];
+      const ac = opt?.commands[0] ?? "";
+      const ms: ModelSelection = { model: null, reasoning: null, context: null };
+      setStructured(true);
+      setAgentCommand(ac);
+      setModelSelection(ms);
+      if (!isDraft) {
+        const cmd = structuredCommandFor(ac, prompt);
+        updatePreset({
+          id: preset.id,
+          name,
+          description: description || null,
+          commands: cmd ? [cmd] : [],
+          workingDirectory: preset.working_directory,
+          launchMode,
+          icon: opt?.icon ?? preset.icon,
+          launchConfig: { agent_command: ac, model_selection: ms, prompt },
+        }).catch(console.error);
+      }
+    } else if (mode === "raw" && structured) {
+      const cmd = structuredCommandFor(agentCommand, prompt);
+      const cmds = cmd ? [cmd] : [];
+      setStructured(false);
+      setCommands(cmds.length > 0 ? cmds : [""]);
+      if (!isDraft) {
+        updatePreset({
+          id: preset.id,
+          name,
+          description: description || null,
+          commands: cmds,
+          workingDirectory: preset.working_directory,
+          launchMode,
+          icon: preset.icon,
+          clearLaunchConfig: true,
+        }).catch(console.error);
+      }
+    }
   };
 
   const handleDelete = () => {
@@ -524,7 +786,40 @@ function PresetEditorSheet({
 
   const handlePinnedChange = (checked: boolean) => {
     setPinned(checked);
+    if (isDraft) return;
     setPresetPinned(preset.id, checked).catch(console.error);
+  };
+
+  // Snapshot of local editor state shaped for `createPreset` — used when a
+  // draft is confirmed.
+  const buildCreatePayload = (): Parameters<typeof createPreset>[0] => {
+    if (structured) {
+      const cmd = structuredCommandFor(agentCommand, prompt);
+      return {
+        name: name.trim() || "New preset",
+        description: description.trim() || null,
+        commands: cmd ? [cmd] : [],
+        workingDirectory: preset.working_directory ?? null,
+        launchMode,
+        pinned,
+        icon: agentIcon,
+        launchConfig: {
+          agent_command: agentCommand,
+          model_selection: modelSelection,
+          prompt,
+        },
+      };
+    }
+    return {
+      name: name.trim() || "New preset",
+      description: description.trim() || null,
+      commands: commands.filter((c) => c.trim()),
+      workingDirectory: preset.working_directory ?? null,
+      launchMode,
+      pinned,
+      icon: preset.icon,
+      launchConfig: null,
+    };
   };
 
   const handleCommandChange = (index: number, value: string) => {
@@ -533,9 +828,7 @@ function PresetEditorSheet({
     setCommands(next);
   };
 
-  const handleCommandBlur = () => {
-    save({ commands: commands.filter((c) => c.trim()) });
-  };
+  const handleCommandBlur = () => save();
 
   const addCommand = () => setCommands([...commands, ""]);
 
@@ -556,11 +849,11 @@ function PresetEditorSheet({
         {/* Header */}
         <SheetHeader className="border-b p-4">
           <SheetTitle className="flex items-center gap-2 text-sm">
-            <PresetIcon icon={preset.icon} className="h-4 w-4 shrink-0" />
-            {preset.name}
+            <PresetIcon icon={agentIcon} className="h-4 w-4 shrink-0" />
+            {name || preset.name}
           </SheetTitle>
           <SheetDescription>
-            Configure commands, targeting, and launch options.
+            Configure how this preset launches.
           </SheetDescription>
         </SheetHeader>
 
@@ -572,8 +865,8 @@ function PresetEditorSheet({
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              onBlur={() => name !== preset.name && save({ name })}
-              placeholder="e.g. Dev Server"
+              onBlur={() => name !== preset.name && save()}
+              placeholder="e.g. Git Pull"
               className="h-9"
             />
           </div>
@@ -584,48 +877,160 @@ function PresetEditorSheet({
             <Input
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              onBlur={() => save({ description: description || null })}
+              onBlur={() => save()}
               placeholder="Optional description"
               className="h-9"
             />
           </div>
 
-          {/* Commands */}
+          {/* Type — agent launcher vs raw command */}
           <div className="space-y-2">
-            <label className="text-sm font-medium">Commands</label>
-            <div className="flex flex-col gap-1.5">
-              {commands.map((cmd, i) => (
-                <div key={i} className="group/cmd flex items-center gap-2">
-                  <Input
-                    value={cmd}
-                    onChange={(e) => handleCommandChange(i, e.target.value)}
-                    onBlur={handleCommandBlur}
-                    placeholder="e.g. bun run dev"
-                    className="h-9 flex-1 font-mono text-sm"
-                  />
-                  {commands.length > 1 && (
-                    <Button
-                      variant="ghost"
-                      size="icon-xs"
-                      onClick={() => removeCommand(i)}
-                      className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
-                      aria-label="Remove command"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </Button>
-                  )}
-                </div>
-              ))}
-              <Button
-                variant="ghost"
-                size="sm"
-                className="mt-1 w-fit gap-1.5 text-muted-foreground hover:text-foreground"
-                onClick={addCommand}
-              >
-                + Add command
-              </Button>
-            </div>
+            <label className="text-sm font-medium">Type</label>
+            <Select value={structured ? "structured" : "raw"} onValueChange={handleModeChange}>
+              <SelectTrigger className="h-9">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="structured">Agent launcher</SelectItem>
+                <SelectItem value="raw">Raw command</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {structured
+                ? "Pick an agent, model, and prompt — Codemux builds the command."
+                : "Type the exact shell command(s) to run."}
+            </p>
           </div>
+
+          {structured ? (
+            <div className="space-y-5">
+              {/* Agent */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Agent</label>
+                <Select value={selectedAgentId} onValueChange={handleAgentChange}>
+                  <SelectTrigger className="h-9">
+                    <SelectValue placeholder="Select an agent" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {agentOptions.map((a) => (
+                      <SelectItem key={a.id} value={a.id}>
+                        <span className="flex items-center gap-2">
+                          <PresetIcon icon={a.icon} className="h-3.5 w-3.5" />
+                          {a.name}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Model + reasoning — the same capability-driven pickers the
+                  New Workspace dialog uses, but styled as full-width form
+                  fields (via triggerClassName) to match the Select fields in
+                  this editor instead of the composer's rounded-full pills.
+                  Shown only for agents Codemux can inject a model flag for
+                  (Claude/Codex/OpenCode/Gemini); applied at launch via
+                  apply_model_selection. */}
+              {launchFamily ? (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Model</label>
+                    <LaunchModelPicker
+                      providerKind={launchProviderKind}
+                      models={launchModels}
+                      loading={launchModelsLoading}
+                      selectedModel={modelSelection.model}
+                      onModelChange={handleModelChange}
+                      triggerClassName={LAUNCH_FIELD_TRIGGER}
+                    />
+                  </div>
+                  {(reasoningOptions.length > 0 ||
+                    launchContextOptions.length > 0) && (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Reasoning</label>
+                      <LaunchReasoningPicker
+                        reasoningOptions={reasoningOptions}
+                        selectedReasoning={effectiveReasoning}
+                        defaultReasoning={launchCapsModel?.default_effort ?? null}
+                        onReasoningChange={handleReasoningChange}
+                        contextOptions={launchContextOptions}
+                        selectedContext={effectiveContext}
+                        defaultContext={
+                          launchCapsModel?.context_window_options.find(
+                            (o) => o.is_default,
+                          )?.value ?? null
+                        }
+                        onContextChange={handleContextChange}
+                        triggerClassName={LAUNCH_FIELD_TRIGGER}
+                      />
+                    </div>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    Applied at launch. Leave on Default to use the agent's default.
+                  </p>
+                </>
+              ) : (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Model</label>
+                  <p className="text-xs text-muted-foreground">
+                    Model selection isn't available for this agent.
+                  </p>
+                </div>
+              )}
+
+              {/* Prompt */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Prompt</label>
+                <Textarea
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  onBlur={() => save()}
+                  placeholder="e.g. pull the latest changes and resolve any conflicts"
+                  className="min-h-[72px] text-sm"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Sent to the agent as its first instruction. Leave blank to just launch the agent.
+                </p>
+              </div>
+            </div>
+          ) : (
+            /* Raw commands */
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Commands</label>
+              <div className="flex flex-col gap-1.5">
+                {commands.map((cmd, i) => (
+                  <div key={i} className="group/cmd flex items-center gap-2">
+                    <Input
+                      value={cmd}
+                      onChange={(e) => handleCommandChange(i, e.target.value)}
+                      onBlur={handleCommandBlur}
+                      placeholder="e.g. bun run dev"
+                      className="h-9 flex-1 font-mono text-sm"
+                    />
+                    {commands.length > 1 && (
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        onClick={() => removeCommand(i)}
+                        className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+                        aria-label="Remove command"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    )}
+                  </div>
+                ))}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mt-1 w-fit gap-1.5 text-muted-foreground hover:text-foreground"
+                  onClick={addCommand}
+                >
+                  + Add command
+                </Button>
+              </div>
+            </div>
+          )}
 
           {/* Advanced section */}
           <div className="space-y-5 border-t border-border/40 pt-5">
@@ -653,7 +1058,9 @@ function PresetEditorSheet({
               </Select>
             </div>
 
-            {/* Auto-run */}
+            {/* Auto-run — hidden for unsaved drafts (applies to an existing
+                preset; configurable after the preset is created). */}
+            {!isDraft && (
             <div className="space-y-3">
               <label className="text-sm font-medium">Auto-run</label>
               <div className="space-y-4">
@@ -662,17 +1069,7 @@ function PresetEditorSheet({
                     checked={autoRunOnWorkspace}
                     onCheckedChange={(checked) => {
                       setAutoRunOnWorkspace(checked);
-                      updatePreset({
-                        id: preset.id,
-                        name,
-                        description: description || null,
-                        commands: commands.filter((c) => c.trim()),
-                        workingDirectory: preset.working_directory,
-                        launchMode,
-                        icon: preset.icon,
-                        autoRunOnWorkspace: checked,
-                        autoRunOnNewTab: autoRunOnNewTab,
-                      }).catch(console.error);
+                      save({ autoRunOnWorkspace: checked });
                     }}
                     className="mt-0.5"
                   />
@@ -688,17 +1085,7 @@ function PresetEditorSheet({
                     checked={autoRunOnNewTab}
                     onCheckedChange={(checked) => {
                       setAutoRunOnNewTab(checked);
-                      updatePreset({
-                        id: preset.id,
-                        name,
-                        description: description || null,
-                        commands: commands.filter((c) => c.trim()),
-                        workingDirectory: preset.working_directory,
-                        launchMode,
-                        icon: preset.icon,
-                        autoRunOnWorkspace: autoRunOnWorkspace,
-                        autoRunOnNewTab: checked,
-                      }).catch(console.error);
+                      save({ autoRunOnNewTab: checked });
                     }}
                     className="mt-0.5"
                   />
@@ -711,6 +1098,7 @@ function PresetEditorSheet({
                 </div>
               </div>
             </div>
+            )}
 
             {/* Pinned */}
             <div className="flex items-center justify-between">
@@ -727,7 +1115,11 @@ function PresetEditorSheet({
 
         {/* Footer */}
         <SheetFooter className="border-t p-4 sm:flex-row sm:items-center sm:justify-between">
-          {!preset.is_builtin ? (
+          {isDraft ? (
+            <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+          ) : !preset.is_builtin ? (
             confirmDelete ? (
               <div className="flex items-center gap-2">
                 <Button variant="destructive" size="sm" onClick={handleDelete}>
@@ -753,9 +1145,13 @@ function PresetEditorSheet({
           <Button
             size="sm"
             className="bg-foreground text-background hover:bg-foreground/90"
-            onClick={() => onOpenChange(false)}
+            onClick={
+              isDraft
+                ? () => onCreate?.(buildCreatePayload())
+                : () => onOpenChange(false)
+            }
           >
-            Done
+            {isDraft ? "Create preset" : "Done"}
           </Button>
         </SheetFooter>
       </SheetContent>
@@ -805,6 +1201,18 @@ export function SettingsView() {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+  // An unsaved new preset being edited; persisted only on "Create preset".
+  const [draftPreset, setDraftPreset] = useState<TerminalPreset | null>(null);
+
+  // Builtin CLI agents that populate the editor's Agent dropdown. Excludes
+  // the Shell (no command) and the Chat Agent (native pane) builtins.
+  const agentOptions = useMemo(
+    () =>
+      presetStore?.presets.filter(
+        (p) => p.is_builtin && p.kind === "cli" && p.commands.length > 0,
+      ) ?? [],
+    [presetStore],
+  );
 
   // Drag-to-reorder presets list. 5px activation distance keeps a
   // plain row click from engaging drag, so clicks still open the
@@ -906,6 +1314,65 @@ export function SettingsView() {
     const unlisten = onPresetsChanged((snapshot) => setPresetStore(snapshot));
     return () => { unlisten.then((fn) => fn()); };
   }, []);
+
+  // Create a new structured preset (defaults to a Claude launcher) and
+  // open its editor. Used by the "New preset" button here and by the
+  // preset bar's gear menu (via the `pendingPresetCreate` ui-store flag).
+  const handleNewPreset = useCallback(() => {
+    // Default the draft to a Claude launcher (first builtin as fallback).
+    const claude =
+      agentOptions.find((p) => p.id === "builtin-claude") ?? agentOptions[0] ?? null;
+    const agentCommand = claude?.commands[0] ?? "claude --dangerously-skip-permissions";
+    // Open an unsaved draft — nothing is persisted until the user presses
+    // "Create preset" in the editor.
+    setSelectedPresetId(null);
+    setDraftPreset({
+      id: "",
+      name: "New preset",
+      description: null,
+      commands: [agentCommand],
+      working_directory: null,
+      launch_mode: "new_tab",
+      icon: claude?.icon ?? "claude",
+      pinned: true,
+      is_builtin: false,
+      auto_run_on_workspace: false,
+      auto_run_on_new_tab: false,
+      kind: "cli",
+      launch_config: {
+        agent_command: agentCommand,
+        model_selection: { model: null, reasoning: null, context: null },
+        prompt: "",
+      },
+    });
+  }, [agentOptions]);
+
+  // Persist a confirmed draft, then close the editor.
+  const handleCreatePreset = useCallback(
+    async (payload: Parameters<typeof createPreset>[0]) => {
+      try {
+        await createPreset(payload);
+        setDraftPreset(null);
+      } catch (err) {
+        console.error("[settings] create preset failed:", err);
+      }
+    },
+    [],
+  );
+
+  // Honor a "new preset" request raised elsewhere (e.g. the preset bar's
+  // gear menu, which opens settings and sets this flag).
+  const pendingPresetCreate = useUIStore((s) => s.pendingPresetCreate);
+  useEffect(() => {
+    if (!pendingPresetCreate) return;
+    // Read+clear from the store so StrictMode's double-invoked effect (or
+    // any re-fire) can't create the preset twice — only the first run
+    // observes the flag still set.
+    if (!useUIStore.getState().pendingPresetCreate) return;
+    useUIStore.getState().clearPendingPresetCreate();
+    setActiveSection("presets");
+    handleNewPreset();
+  }, [pendingPresetCreate, handleNewPreset]);
 
   useEffect(() => {
     detectEditors()
@@ -1156,6 +1623,12 @@ export function SettingsView() {
               <SubsectionHeader
                 title="Your presets"
                 description="Drag the grip to reorder. Click a preset to edit, pin, or delete."
+                action={
+                  <Button variant="outline" size="sm" className="gap-1.5" onClick={handleNewPreset}>
+                    <Plus className="h-3.5 w-3.5" />
+                    New preset
+                  </Button>
+                }
               />
               {presetStore ? (
                 <DndContext
@@ -1198,11 +1671,20 @@ export function SettingsView() {
               </a>
             </p>
 
-            {/* Editor sheet — renders via portal, not inline */}
+            {/* Editor sheet — renders via portal, not inline. A draft (new,
+                unsaved) preset takes precedence over a selected existing one. */}
             <PresetEditorSheet
-              preset={selectedPreset}
-              open={!!selectedPreset}
-              onOpenChange={(open) => { if (!open) setSelectedPresetId(null); }}
+              preset={draftPreset ?? selectedPreset}
+              agentOptions={agentOptions}
+              isDraft={draftPreset != null}
+              open={draftPreset != null || selectedPreset != null}
+              onCreate={handleCreatePreset}
+              onOpenChange={(open) => {
+                if (!open) {
+                  setDraftPreset(null);
+                  setSelectedPresetId(null);
+                }
+              }}
             />
           </div>
         );
@@ -1778,6 +2260,23 @@ function SortablePresetRow({
         )}
       </div>
       <div className="flex items-center gap-0.5 shrink-0">
+        {/* Delete sits to the LEFT of the pin so the pin stays anchored to
+            the row's right edge — keeping it aligned across builtin rows
+            (pin only) and custom rows (pin + delete). */}
+        {!preset.is_builtin && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            title="Delete preset"
+            className="h-7 w-7 opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="icon-xs"
@@ -1797,20 +2296,6 @@ function SortablePresetRow({
             <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
           )}
         </Button>
-        {!preset.is_builtin && (
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            title="Delete preset"
-            className="h-7 w-7 opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete();
-            }}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </Button>
-        )}
       </div>
     </div>
   );

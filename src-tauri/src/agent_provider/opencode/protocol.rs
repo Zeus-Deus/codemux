@@ -87,6 +87,14 @@ pub struct PromptAsyncRequest {
     /// OpenCode picks its default agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// Optional model variant — OpenCode's per-prompt reasoning-effort
+    /// selector (`POST /session/{id}/prompt_async` accepts `variant`).
+    /// The keys come from each model's `variants` map
+    /// (`low`/`medium`/`high`/`max`/`xhigh`/…), surfaced to the picker
+    /// as the model's `effort_levels`. `None` lets OpenCode use the
+    /// model's default reasoning behaviour.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
     /// Conversation parts. Always at least one text part for the
     /// user's message; image attachments append `File` parts.
     pub parts: Vec<PartInput>,
@@ -464,11 +472,13 @@ mod tests {
                 model_id: "gpt-5".into(),
             }),
             agent: None,
+            variant: None,
             parts: vec![PartInput::Text {
                 text: "hi".into(),
             }],
         };
         let json = serde_json::to_value(&req).unwrap();
+        // `variant: None` is omitted from the body.
         assert_eq!(
             json,
             serde_json::json!({
@@ -476,6 +486,19 @@ mod tests {
                 "parts": [{ "type": "text", "text": "hi" }]
             })
         );
+    }
+
+    #[test]
+    fn prompt_async_request_serializes_variant_when_set() {
+        let req = PromptAsyncRequest {
+            message_id: None,
+            model: None,
+            agent: None,
+            variant: Some("high".into()),
+            parts: vec![PartInput::Text { text: "hi".into() }],
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["variant"], "high");
     }
 
     #[test]

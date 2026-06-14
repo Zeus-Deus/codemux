@@ -893,6 +893,10 @@ pub async fn list_chat_provider_capabilities(
         '_,
         std::sync::Arc<crate::agent_provider::codex::capabilities::CodexCapabilityCache>,
     >,
+    claude_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::claude::capabilities::ClaudeCapabilityCache>,
+    >,
 ) -> Result<ProviderChatCapabilities, String> {
     // Note: `feature_flag_on(&observability)?;` was deliberately
     // removed when settings began consuming capabilities. See the
@@ -902,9 +906,25 @@ pub async fn list_chat_provider_capabilities(
     // need for app-handle-scoped state.
     let _ = app;
     match provider {
-        ProviderKind::Claude => Ok(
-            crate::agent_provider::claude::capabilities::claude_fallback_capabilities(),
-        ),
+        ProviderKind::Claude => {
+            // Cache + cascade: sidecar `list-models` (SDK
+            // `supportedModels()` — works for any Claude Code user) →
+            // Anthropic `/v1/models` REST API (requires
+            // `ANTHROPIC_API_KEY`) → hand-maintained fallback. The
+            // cache wraps the cascade so a successful live harvest is
+            // reused; failure at every live tier logs and serves the
+            // maintained bundle so the picker is never blank.
+            match claude_cache.get_or_harvest().await {
+                Ok(caps) => Ok(caps),
+                Err(err) => {
+                    eprintln!(
+                        "[claude] live harvest failed, falling back to maintained: {}",
+                        err.to_command_string()
+                    );
+                    Ok(crate::agent_provider::claude::capabilities::claude_fallback_capabilities())
+                }
+            }
+        }
         ProviderKind::Codex => {
             // Live harvest from `codex app-server` via `model/list`,
             // memoised in the Tauri-managed cache. The fallback static

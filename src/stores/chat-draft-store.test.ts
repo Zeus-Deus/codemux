@@ -41,12 +41,12 @@ describe("chat-draft-store", () => {
       // (Effort, ContextWindow) render on first paint. In the test
       // environment the `provider-capabilities-store` is not
       // hydrated, so `defaultModelId` returns the hardcoded fallback
-      // `claude-opus-4-7`, and `capabilityDefaults` returns null
+      // `claude-opus-4-8`, and `capabilityDefaults` returns null
       // effort / contextWindow because the model payload isn't
       // available yet. The Stage C Effort-lock fix means these null
       // values flow through materialize into the slice; real runtime
       // gets non-null values once caps hydrate.
-      expect(draft.model).toBe("claude-opus-4-7");
+      expect(draft.model).toBe("claude-opus-4-8");
       expect(draft.effort).toBeNull();
       expect(draft.contextWindow).toBeNull();
       expect(draft.threadId).toBeTruthy();

@@ -10,11 +10,17 @@
 //! table (`apps/server/src/provider/Layers/ClaudeProvider.ts:48-141`).
 
 use std::collections::HashMap;
+use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::json;
+use tokio::sync::Mutex;
 
 use crate::agent_provider::{
     ChatModelInfo, ContextWindowOption, EffortGranularity, PermissionModeOption,
     ProviderChatCapabilities,
 };
+use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 // Highest-is-default rule: when a model exposes multiple context
 // windows, the largest is flagged as the default. Users who want the
@@ -45,6 +51,13 @@ fn claude_effort_label_map() -> HashMap<String, String> {
         ("high", "High"),
         ("xhigh", "Extra High"),
         ("max", "Max"),
+        // `ultracode` (xhigh + workflows) exists only in Claude Code's
+        // TUI `/model` effort slider. The headless CLI rejects it as an
+        // `--effort` value ("Valid values: low, medium, high, xhigh,
+        // max" as of claude 2.1.170), so no maintained entry lists it —
+        // the label stays only so a future SDK-reported level renders
+        // nicely instead of falling back to the raw token.
+        ("ultracode", "Ultracode"),
         ("ultrathink", "Ultrathink"),
     ];
     pairs
@@ -55,11 +68,14 @@ fn claude_effort_label_map() -> HashMap<String, String> {
 
 fn models() -> Vec<ChatModelInfo> {
     vec![
-        // Opus 4.7 — flagship, effort defaults to xhigh, supports ultrathink + 1M.
+        // Opus 4.8 — the recommended default, effort defaults to high
+        // (the level Claude Code's own `/model` slider marks as
+        // "(default)"), supports ultrathink + 1M. The CLI's picker
+        // calls this row "Default (recommended)".
         ChatModelInfo {
-            id: "claude-opus-4-7".into(),
-            label: "Claude Opus 4.7".into(),
-            description: Some("Strongest Claude model".into()),
+            id: "claude-opus-4-8".into(),
+            label: "Claude Opus 4.8".into(),
+            description: Some("Best for everyday, complex tasks".into()),
             effort_levels: vec![
                 "low".into(),
                 "medium".into(),
@@ -67,7 +83,54 @@ fn models() -> Vec<ChatModelInfo> {
                 "xhigh".into(),
                 "max".into(),
             ],
-            default_effort: Some("xhigh".into()),
+            default_effort: Some("high".into()),
+            prompt_injected_effort_levels: vec!["ultrathink".into()],
+            context_window_options: vec![ctx_200k(), ctx_1m_default()],
+            supports_adaptive_thinking: true,
+            supports_thinking_toggle: false,
+            supports_fast_mode: false,
+            supports_images: true,
+            sub_provider: None,
+            is_free: false,
+        },
+        // Fable 5 — top tier above Opus. The deployed CLI reports it
+        // with the context window pinned into the id itself
+        // (`claude-fable-5[1m]`); the maintained entry is keyed by the
+        // bare id and the merge strips the suffix before lookup.
+        ChatModelInfo {
+            id: "claude-fable-5".into(),
+            label: "Claude Fable 5".into(),
+            description: Some("Most capable for the hardest, longest-running tasks".into()),
+            effort_levels: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+            ],
+            default_effort: Some("high".into()),
+            prompt_injected_effort_levels: vec!["ultrathink".into()],
+            context_window_options: vec![ctx_200k(), ctx_1m_default()],
+            supports_adaptive_thinking: true,
+            supports_thinking_toggle: false,
+            supports_fast_mode: false,
+            supports_images: true,
+            sub_provider: None,
+            is_free: false,
+        },
+        // Opus 4.7 — previous flagship.
+        ChatModelInfo {
+            id: "claude-opus-4-7".into(),
+            label: "Claude Opus 4.7".into(),
+            description: None,
+            effort_levels: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+            ],
+            default_effort: Some("high".into()),
             prompt_injected_effort_levels: vec!["ultrathink".into()],
             context_window_options: vec![ctx_200k(), ctx_1m_default()],
             supports_adaptive_thinking: true,
@@ -193,17 +256,618 @@ pub fn claude_fallback_capabilities() -> ProviderChatCapabilities {
     }
 }
 
+/// Split a model id into its base id and an optional pinned
+/// context-window bracket suffix: `claude-fable-5[1m]` →
+/// `("claude-fable-5", Some("[1m]"))`. The deployed CLI sometimes
+/// reports ids with the window already baked in; metadata lookups key
+/// on the base id, and a pinned id must never grow a second suffix.
+fn split_context_suffix(id: &str) -> (&str, Option<&str>) {
+    if let Some(open) = id.find('[') {
+        if id.ends_with(']') {
+            return (&id[..open], Some(&id[open..]));
+        }
+    }
+    (id, None)
+}
+
+/// The inner window value of a pinned id (`claude-fable-5[1m]` →
+/// `Some("1m")`); `None` for a bare id. This is the value that should
+/// become the default in the model's context-window picker.
+fn pinned_window(id: &str) -> Option<&str> {
+    split_context_suffix(id)
+        .1
+        .map(|s| s.trim_start_matches('[').trim_end_matches(']'))
+}
+
+/// Mark `pinned` as the sole default in a context-window option set,
+/// clearing the other defaults. Lets the CLI's baked-in window choice
+/// (e.g. the `[1m]` the deployed roster pins on Fable) drive the picker
+/// default instead of the generic highest-is-default rule, while still
+/// offering the full set so the window stays user-selectable. When
+/// nothing is pinned (or the pinned value isn't one of the options) the
+/// set is returned with its own defaults intact.
+fn with_pinned_default(
+    mut opts: Vec<ContextWindowOption>,
+    pinned: Option<&str>,
+) -> Vec<ContextWindowOption> {
+    if let Some(win) = pinned {
+        if opts.iter().any(|o| o.value == win) {
+            for o in &mut opts {
+                o.is_default = o.value == win;
+            }
+        }
+    }
+    opts
+}
+
 /// Apply the reference impl's `resolveClaudeApiModelId` trick: when
 /// the context window is `"1m"`, the Anthropic API expects the model
 /// id to carry a `[1m]` bracket suffix. Any other value (or `None`)
-/// returns the id unchanged.
+/// returns the id unchanged — as does an id that already carries a
+/// bracket suffix (e.g. the SDK-reported `claude-fable-5[1m]`), so a
+/// pinned model never double-appends.
 pub fn resolve_claude_api_model_id(
     model_id: &str,
     context_window: Option<&str>,
 ) -> String {
+    let already_pinned = split_context_suffix(model_id).1.is_some();
     match context_window {
-        Some("1m") => format!("{model_id}[1m]"),
+        Some("1m") if !already_pinned => format!("{model_id}[1m]"),
         _ => model_id.to_string(),
+    }
+}
+
+// ── Live harvest from the Anthropic /v1/models API ───────────────────
+//
+// Anthropic's SDK / OAuth path exposes no model-list endpoint, so for
+// subscription users we still serve the hand-maintained `models()` list
+// above. Users with `ANTHROPIC_API_KEY` set get a live harvest:
+// `GET /v1/models` returns the current model id list, which we merge
+// against the maintained per-id metadata. Ids we recognise keep their
+// precise metadata; ids we don't (e.g. a freshly-released model) get
+// family-pattern-inferred defaults so they appear in the picker without
+// a code change.
+
+const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
+const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const HARVEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Deserialize)]
+struct ApiModel {
+    id: String,
+    #[serde(default)]
+    display_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiModelsResponse {
+    data: Vec<ApiModel>,
+}
+
+#[derive(Debug, Clone)]
+pub enum HarvestError {
+    /// `ANTHROPIC_API_KEY` is not set — caller should fall back to the
+    /// maintained list rather than treat this as a failure.
+    NoApiKey,
+    /// Network / HTTP / decode failure — original message preserved.
+    HarvestFailed { message: String },
+}
+
+impl HarvestError {
+    pub fn to_command_string(&self) -> String {
+        match self {
+            Self::NoApiKey => "claude_no_api_key".into(),
+            Self::HarvestFailed { message } => {
+                format!("claude_harvest_failed: {message}")
+            }
+        }
+    }
+}
+
+/// Process-wide cache of the harvested capabilities. Mirrors
+/// `CodexCapabilityCache` — populated on the first call and reused for
+/// the rest of the app's lifetime; an eventual settings-panel button
+/// can `invalidate()` to force a refresh.
+#[derive(Default)]
+pub struct ClaudeCapabilityCache {
+    inner: Mutex<Option<ProviderChatCapabilities>>,
+}
+
+impl ClaudeCapabilityCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return the cached value if present; otherwise run a live
+    /// harvest, cache it, and return. Cascades the harvest paths:
+    ///
+    ///   1. **Sidecar** — calls the SDK's `supportedModels()` via the
+    ///      `list-models` RPC method on the claude-agent sidecar.
+    ///      Works for every Claude Code user (subscription, OAuth, or
+    ///      API key) and surfaces the *deployed* CLI's actual
+    ///      effort vocabulary (including levels like `ultracode` the
+    ///      bundled SDK type union doesn't enumerate yet).
+    ///   2. **Anthropic `/v1/models`** — only when
+    ///      `ANTHROPIC_API_KEY` is set. Kept as a fallback for the
+    ///      narrow case where the sidecar can't reach the SDK but the
+    ///      user has an API key handy.
+    ///
+    /// The dispatcher falls back to the hand-maintained
+    /// [`claude_fallback_capabilities`] when both paths fail.
+    pub async fn get_or_harvest(
+        &self,
+    ) -> Result<ProviderChatCapabilities, HarvestError> {
+        {
+            let guard = self.inner.lock().await;
+            if let Some(cached) = guard.clone() {
+                return Ok(cached);
+            }
+        }
+        let result = match harvest_via_sidecar().await {
+            Ok(caps) => Ok(caps),
+            Err(sidecar_err) => match harvest_via_api().await {
+                Ok(caps) => Ok(caps),
+                Err(api_err) => {
+                    // If the API path bailed only because there's no
+                    // key, surface the sidecar's error (more
+                    // actionable: install / log into Claude Code);
+                    // otherwise surface the API's error.
+                    eprintln!(
+                        "[claude] sidecar harvest failed: {}",
+                        sidecar_err.to_command_string()
+                    );
+                    Err(match api_err {
+                        HarvestError::NoApiKey => sidecar_err,
+                        other => other,
+                    })
+                }
+            },
+        };
+        if let Ok(ref caps) = result {
+            let mut guard = self.inner.lock().await;
+            *guard = Some(caps.clone());
+        }
+        result
+    }
+
+    /// Drop any cached value. The next call re-harvests.
+    pub async fn invalidate(&self) {
+        let mut guard = self.inner.lock().await;
+        *guard = None;
+    }
+}
+
+/// Live-harvest the Claude model list from Anthropic's REST API.
+/// Requires `ANTHROPIC_API_KEY` in the environment; returns
+/// [`HarvestError::NoApiKey`] otherwise so the caller (`get_or_harvest`)
+/// can fall through to the maintained bundle.
+async fn harvest_via_api() -> Result<ProviderChatCapabilities, HarvestError> {
+    let api_key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or(HarvestError::NoApiKey)?;
+    let client = reqwest::Client::builder()
+        .timeout(HARVEST_TIMEOUT)
+        .build()
+        .map_err(|e| HarvestError::HarvestFailed {
+            message: format!("client build: {e}"),
+        })?;
+    let resp = client
+        .get(format!("{ANTHROPIC_API_BASE}/v1/models?limit=1000"))
+        .header("x-api-key", api_key)
+        .header("anthropic-version", ANTHROPIC_API_VERSION)
+        .send()
+        .await
+        .map_err(|e| HarvestError::HarvestFailed {
+            message: format!("request: {e}"),
+        })?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(HarvestError::HarvestFailed {
+            message: format!("HTTP {status}: {body}"),
+        });
+    }
+    let parsed: ApiModelsResponse =
+        resp.json()
+            .await
+            .map_err(|e| HarvestError::HarvestFailed {
+                message: format!("decode: {e}"),
+            })?;
+    Ok(build_capabilities_from_live(parsed.data))
+}
+
+/// Merge a live model list with the hand-maintained per-id metadata.
+/// Pulled out so it's unit-testable against fixture data without a
+/// live API call (`#[cfg(test)]` tests in this module reach it via
+/// `use super::*`).
+fn build_capabilities_from_live(live: Vec<ApiModel>) -> ProviderChatCapabilities {
+    let maintained: HashMap<String, ChatModelInfo> = models()
+        .into_iter()
+        .map(|m| (m.id.clone(), m))
+        .collect();
+    let merged: Vec<ChatModelInfo> = live
+        .into_iter()
+        .filter(|m| !m.id.is_empty())
+        .map(|m| {
+            maintained
+                .get(&m.id)
+                .cloned()
+                .unwrap_or_else(|| infer_model_info(&m.id, &m.display_name))
+        })
+        .collect();
+    ProviderChatCapabilities {
+        models: merged,
+        effort_granularity: EffortGranularity::PerSession,
+        effort_label_map: claude_effort_label_map(),
+        permission_modes: claude_permission_modes(),
+        default_permission_mode: Some("bypassPermissions".into()),
+        permission_granularity: EffortGranularity::PerSession,
+    }
+}
+
+/// Build a `ChatModelInfo` for a Claude model id Codemux's maintained
+/// list doesn't (yet) know about. Capabilities are inferred from the
+/// family prefix; conservative defaults keep an unknown model usable
+/// without overpromising (an unsupported effort level would error at
+/// launch).
+fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
+    let label = if display_name.trim().is_empty() {
+        id.to_string()
+    } else {
+        display_name.to_string()
+    };
+    // Normalize a pinned id (`claude-fable-5[1m]`) to its base id and
+    // surface the pinned window as the picker default — so a pinned and
+    // a bare flagship id behave identically (consistent context picker).
+    let (base_id, _) = split_context_suffix(id);
+    let family = ClaudeFamily::from_id(id);
+    let (effort_levels, default_effort, prompt_injected, ctx) = match family {
+        f if f.is_flagship() => (
+            vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into(),
+            ],
+            // Claude Code's own `/model` slider marks `high` as the
+            // default for every current flagship row.
+            Some("high".into()),
+            vec!["ultrathink".into()],
+            // The `default` alias has its context window chosen by the
+            // CLI — offering a picker would synthesize `default[1m]`,
+            // which is not a valid model id.
+            if family == ClaudeFamily::DefaultAlias {
+                vec![]
+            } else {
+                vec![ctx_200k(), ctx_1m_default()]
+            },
+        ),
+        ClaudeFamily::Sonnet => (
+            vec!["low".into(), "medium".into(), "high".into()],
+            Some("high".into()),
+            vec!["ultrathink".into()],
+            vec![ctx_200k(), ctx_1m_default()],
+        ),
+        _ => (vec![], None, vec![], vec![]),
+    };
+    let context_window_options = with_pinned_default(ctx, pinned_window(id));
+    ChatModelInfo {
+        id: base_id.to_string(),
+        label,
+        description: None,
+        effort_levels,
+        default_effort,
+        prompt_injected_effort_levels: prompt_injected,
+        context_window_options,
+        supports_adaptive_thinking: family.is_flagship(),
+        supports_thinking_toggle: matches!(family, ClaudeFamily::Haiku),
+        supports_fast_mode: false,
+        supports_images: true,
+        sub_provider: None,
+        is_free: false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ClaudeFamily {
+    /// Top tier above Opus (e.g. `claude-fable-5`).
+    Fable,
+    Opus,
+    Sonnet,
+    Haiku,
+    /// The CLI's `default` alias — the recommended flagship with the
+    /// context window already chosen by the CLI.
+    DefaultAlias,
+    Other,
+}
+
+impl ClaudeFamily {
+    fn from_id(id: &str) -> Self {
+        let (base, _) = split_context_suffix(id);
+        let lower = base.to_ascii_lowercase();
+        if lower == "default" {
+            Self::DefaultAlias
+        } else if lower.contains("fable") {
+            Self::Fable
+        } else if lower.contains("opus") {
+            Self::Opus
+        } else if lower.contains("sonnet") {
+            Self::Sonnet
+        } else if lower.contains("haiku") {
+            Self::Haiku
+        } else {
+            Self::Other
+        }
+    }
+
+    /// Flagship-tier families share the full effort vocabulary, a
+    /// `high` default (the level the CLI's own `/model` slider marks
+    /// as "(default)"), and prompt-injected `ultrathink`. New top-tier
+    /// families only need a `from_id` arm and a mention here to surface
+    /// fully-configured in the picker.
+    fn is_flagship(self) -> bool {
+        matches!(self, Self::Fable | Self::Opus | Self::DefaultAlias)
+    }
+}
+
+// ── Live harvest via the sidecar / SDK `supportedModels()` ───────────
+//
+// Anthropic's Agent SDK exposes a live `query.supportedModels()` API
+// over whichever auth Claude Code is using (subscription, OAuth, API
+// key — the SDK handles it transparently). The sidecar exposes a
+// `list-models` JSON-RPC method that opens a transient `query()`,
+// awaits `supportedModels()`, and returns the array. The result is
+// the *deployed* CLI's actual supported model + effort vocabulary —
+// so effort levels the bundled SDK type union doesn't enumerate yet
+// (currently `ultracode`) still surface.
+
+#[derive(Debug, Deserialize)]
+struct SdkModelInfo {
+    /// SDK's identifier for the model (e.g. `claude-opus-4-8`).
+    value: String,
+    #[serde(default, rename = "displayName")]
+    display_name: String,
+    #[serde(default)]
+    description: String,
+    /// Effort levels the SDK reports for this model. Open-ended
+    /// `Vec<String>` so a runtime addition (like `ultracode`) the
+    /// `.d.ts` union doesn't list still flows through verbatim.
+    #[serde(default, rename = "supportedEffortLevels")]
+    supported_effort_levels: Vec<String>,
+    #[serde(default, rename = "supportsAdaptiveThinking")]
+    supports_adaptive_thinking: Option<bool>,
+    #[serde(default, rename = "supportsFastMode")]
+    supports_fast_mode: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListModelsResponse {
+    #[serde(default)]
+    models: Vec<SdkModelInfo>,
+}
+
+/// Live-harvest the Claude model list via the SDK, by sending a
+/// `list-models` JSON-RPC request to a transient claude-agent sidecar.
+/// Works for every Claude Code user — the SDK uses whatever auth
+/// Claude Code already has — and returns the deployed CLI's actual
+/// supported model + effort vocabulary.
+async fn harvest_via_sidecar() -> Result<ProviderChatCapabilities, HarvestError> {
+    let sidecar = crate::agent_provider::claude::sidecar_path::resolve_sidecar_path()
+        .map_err(|e| HarvestError::HarvestFailed {
+            message: format!("resolve sidecar: {e:?}"),
+        })?;
+    let claude_binary = which::which("claude").map_err(|_| HarvestError::HarvestFailed {
+        message: "claude binary not on PATH (install Claude Code or sign in to it)".into(),
+    })?;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+
+    let child = tokio::time::timeout(
+        Duration::from_secs(20),
+        JsonRpcChild::spawn(SpawnConfig {
+            program: sidecar,
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            default_timeout: Duration::from_secs(20),
+        }),
+    )
+    .await
+    .map_err(|_| HarvestError::HarvestFailed {
+        message: "sidecar spawn timed out".into(),
+    })?
+    .map_err(|e| HarvestError::HarvestFailed {
+        message: format!("sidecar spawn: {e}"),
+    })?;
+
+    let response = child
+        .request(
+            "list-models",
+            json!({
+                "cwd": cwd,
+                "pathToClaudeCodeExecutable": claude_binary.to_string_lossy(),
+            }),
+        )
+        .await;
+    let _ = child.shutdown().await;
+    let response = response.map_err(|e| HarvestError::HarvestFailed {
+        message: format!("list-models RPC: {e}"),
+    })?;
+
+    let parsed: ListModelsResponse =
+        serde_json::from_value(response).map_err(|e| HarvestError::HarvestFailed {
+            message: format!("decode: {e}"),
+        })?;
+
+    if parsed.models.is_empty() {
+        return Err(HarvestError::HarvestFailed {
+            message: "SDK returned an empty model list".into(),
+        });
+    }
+
+    Ok(build_capabilities_from_sdk(parsed.models))
+}
+
+/// The deployed CLI's `supportedModels()` is a *curated picker roster*,
+/// not the full launchable surface — Claude Code accepts previous model
+/// names via `--model` even when its picker no longer lists them (the
+/// `/model` menu itself says "For other/previous model names, specify
+/// with --model"). When the live roster carries no entry of a
+/// maintained family (e.g. the CLI demoted Opus into its `default`
+/// alias), append that family's maintained entries so every launchable
+/// model stays individually selectable.
+///
+/// The `default` alias deliberately does NOT mark any concrete family
+/// as present: it tracks the *user's own* configured default (whatever
+/// they last picked in `/model`), so it can't stand in for Opus — or
+/// any other family.
+fn append_missing_maintained_families(merged: &mut Vec<ChatModelInfo>) {
+    use std::collections::HashSet;
+    let present: HashSet<ClaudeFamily> = merged
+        .iter()
+        .map(|m| ClaudeFamily::from_id(&m.id))
+        .filter(|f| !matches!(f, ClaudeFamily::DefaultAlias | ClaudeFamily::Other))
+        .collect();
+    for m in models() {
+        let family = ClaudeFamily::from_id(&m.id);
+        if !matches!(family, ClaudeFamily::DefaultAlias | ClaudeFamily::Other)
+            && !present.contains(&family)
+        {
+            merged.push(m);
+        }
+    }
+}
+
+/// Build a `ProviderChatCapabilities` bundle from the SDK's live model
+/// list, merging with hand-maintained per-id metadata. Models the live
+/// roster omits but the CLI still launches are appended afterwards —
+/// see [`append_missing_maintained_families`].
+fn build_capabilities_from_sdk(
+    sdk_models: Vec<SdkModelInfo>,
+) -> ProviderChatCapabilities {
+    let maintained: HashMap<String, ChatModelInfo> = models()
+        .into_iter()
+        .map(|m| (m.id.clone(), m))
+        .collect();
+    let mut merged: Vec<ChatModelInfo> = sdk_models
+        .into_iter()
+        .filter(|m| !m.value.is_empty())
+        .map(|sdk| merge_sdk_with_maintained(sdk, &maintained))
+        .collect();
+    append_missing_maintained_families(&mut merged);
+    ProviderChatCapabilities {
+        models: merged,
+        effort_granularity: EffortGranularity::PerSession,
+        effort_label_map: claude_effort_label_map(),
+        permission_modes: claude_permission_modes(),
+        default_permission_mode: Some("bypassPermissions".into()),
+        permission_granularity: EffortGranularity::PerSession,
+    }
+}
+
+/// Merge a single SDK model record with hand-maintained metadata. The
+/// SDK is authoritative for the live model id, display name, and
+/// effort vocabulary (since the deployed CLI is sometimes ahead of
+/// the bundled types); the maintained map fills in Codemux-specific
+/// UX bits the SDK doesn't surface (context windows, prompt-injected
+/// `ultrathink`, default effort, the Haiku thinking toggle). Family
+/// inference covers ids the maintained map doesn't know — including
+/// the CLI's alias ids (`default`, `sonnet`, `haiku`) and ids with a
+/// pinned context suffix (`claude-fable-5[1m]`, looked up by base id).
+fn merge_sdk_with_maintained(
+    sdk: SdkModelInfo,
+    maintained: &HashMap<String, ChatModelInfo>,
+) -> ChatModelInfo {
+    // The deployed CLI may pin the context window into the id itself
+    // (`claude-fable-5[1m]`). Look maintained metadata up by the base
+    // id, normalize the model id to that base, and surface the pinned
+    // window as the picker default — captured as owned values upfront
+    // so later moves out of `sdk` don't fight the borrow checker.
+    let base_id = split_context_suffix(&sdk.value).0.to_string();
+    let pinned = pinned_window(&sdk.value).map(str::to_string);
+    let known = maintained.get(&base_id).cloned();
+    let inferred = infer_model_info(&sdk.value, &sdk.display_name);
+
+    // Effort levels — SDK runtime data wins (so a newly-added level
+    // the maintained list hasn't been bumped for still flows in).
+    // Fall back to maintained / inferred only when the SDK doesn't
+    // report any.
+    let effort_levels = if !sdk.supported_effort_levels.is_empty() {
+        sdk.supported_effort_levels.clone()
+    } else {
+        known
+            .as_ref()
+            .map(|k| k.effort_levels.clone())
+            .unwrap_or_else(|| inferred.effort_levels.clone())
+    };
+    // Default effort: maintained wins, then the family-inferred
+    // default — each validated against the live vocabulary so we never
+    // default to a level the deployed CLI rejects. Only then fall to
+    // `high` / the first reported level (previously this jumped
+    // straight to `first()`, which made unrecognized flagship ids
+    // default to `low`).
+    let supported = |cand: Option<String>| cand.filter(|c| effort_levels.contains(c));
+    let default_effort = supported(known.as_ref().and_then(|k| k.default_effort.clone()))
+        .or_else(|| supported(inferred.default_effort.clone()))
+        .or_else(|| supported(Some("high".into())))
+        .or_else(|| effort_levels.first().cloned());
+    let prompt_injected_effort_levels = known
+        .as_ref()
+        .map(|k| k.prompt_injected_effort_levels.clone())
+        .unwrap_or_else(|| inferred.prompt_injected_effort_levels.clone());
+    // Context-window options. A pinned id (`claude-fable-5[1m]`) is
+    // normalized to the base id, and its pinned window becomes the
+    // picker default — so it offers the same `[200k, 1m]` toggle as a
+    // bare flagship/Sonnet id rather than being silently fixed. The
+    // launch path re-applies the suffix from the chosen window via
+    // `resolve_claude_api_model_id`, so the base id round-trips.
+    let context_window_options = with_pinned_default(
+        known
+            .as_ref()
+            .map(|k| k.context_window_options.clone())
+            .unwrap_or_else(|| inferred.context_window_options.clone()),
+        pinned.as_deref(),
+    );
+
+    let label = if sdk.display_name.trim().is_empty() {
+        base_id.clone()
+    } else {
+        sdk.display_name
+    };
+    let description = if sdk.description.trim().is_empty() {
+        known.as_ref().and_then(|k| k.description.clone())
+    } else {
+        Some(sdk.description)
+    };
+
+    ChatModelInfo {
+        id: base_id,
+        label,
+        description,
+        effort_levels,
+        default_effort,
+        prompt_injected_effort_levels,
+        context_window_options,
+        supports_adaptive_thinking: sdk.supports_adaptive_thinking.unwrap_or_else(|| {
+            known
+                .as_ref()
+                .map(|k| k.supports_adaptive_thinking)
+                .unwrap_or(inferred.supports_adaptive_thinking)
+        }),
+        supports_thinking_toggle: known
+            .as_ref()
+            .map(|k| k.supports_thinking_toggle)
+            .unwrap_or(inferred.supports_thinking_toggle),
+        supports_fast_mode: sdk.supports_fast_mode.unwrap_or_else(|| {
+            known
+                .as_ref()
+                .map(|k| k.supports_fast_mode)
+                .unwrap_or(inferred.supports_fast_mode)
+        }),
+        supports_images: true,
+        sub_provider: None,
+        is_free: false,
     }
 }
 
@@ -215,10 +879,36 @@ mod tests {
     fn fallback_includes_core_roster() {
         let caps = claude_fallback_capabilities();
         let ids: Vec<&str> = caps.models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-fable-5"));
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-sonnet-4-6"));
         assert!(ids.contains(&"claude-haiku-4-5"));
         assert_eq!(caps.effort_granularity, EffortGranularity::PerSession);
+    }
+
+    #[test]
+    fn maintained_list_includes_fable_5() {
+        let caps = claude_fallback_capabilities();
+        let fable = caps
+            .models
+            .iter()
+            .find(|m| m.id == "claude-fable-5")
+            .expect("Fable 5 should be present in the maintained list");
+        assert_eq!(fable.default_effort.as_deref(), Some("high"));
+        assert!(fable.supports_adaptive_thinking);
+        assert!(
+            fable
+                .prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+        assert!(
+            fable.context_window_options.iter().any(|o| o.value == "1m"),
+            "bare Fable id should offer the 1M context window"
+        );
+        // The recommended default stays Opus 4.8 — `models()[0]` feeds
+        // `defaultModelId` on the frontend when capabilities are served
+        // from the fallback bundle.
+        assert_eq!(caps.models[0].id, "claude-opus-4-8");
     }
 
     #[test]
@@ -236,7 +926,7 @@ mod tests {
         // context window is now flagged as the default across every
         // multi-option Claude model.
         assert_eq!(default_ctx.value, "1m");
-        assert_eq!(opus.default_effort.as_deref(), Some("xhigh"));
+        assert_eq!(opus.default_effort.as_deref(), Some("high"));
     }
 
     #[test]
@@ -325,6 +1015,28 @@ mod tests {
     }
 
     #[test]
+    fn resolve_api_model_id_never_double_appends_a_pinned_suffix() {
+        // The deployed CLI reports ids with the window already pinned
+        // (`claude-fable-5[1m]`) — resolving `"1m"` against one must be
+        // a no-op, not `claude-fable-5[1m][1m]`.
+        assert_eq!(
+            resolve_claude_api_model_id("claude-fable-5[1m]", Some("1m")),
+            "claude-fable-5[1m]"
+        );
+    }
+
+    #[test]
+    fn split_context_suffix_handles_pinned_and_bare_ids() {
+        assert_eq!(
+            split_context_suffix("claude-fable-5[1m]"),
+            ("claude-fable-5", Some("[1m]"))
+        );
+        assert_eq!(split_context_suffix("claude-opus-4-8"), ("claude-opus-4-8", None));
+        // Unterminated bracket — treated as part of the id, not a suffix.
+        assert_eq!(split_context_suffix("weird[id"), ("weird[id", None));
+    }
+
+    #[test]
     fn every_listed_model_supports_images() {
         // Stage 6: vision is universal across the Claude 4.x roster
         // we expose. Lock the contract so a future model addition
@@ -343,6 +1055,518 @@ mod tests {
     fn label_map_covers_all_effort_levels() {
         let caps = claude_fallback_capabilities();
         assert_eq!(caps.effort_label_map.get("xhigh").map(String::as_str), Some("Extra High"));
+        assert_eq!(caps.effort_label_map.get("ultracode").map(String::as_str), Some("Ultracode"));
         assert_eq!(caps.effort_label_map.get("ultrathink").map(String::as_str), Some("Ultrathink"));
+    }
+
+    #[test]
+    fn maintained_effort_vocab_matches_the_deployed_cli() {
+        // The headless CLI accepts exactly low..max as `--effort`
+        // values (`ultracode` is TUI-slider-only and is rejected with
+        // a warning as of claude 2.1.170). Maintained flagship entries
+        // must never list a level the CLI would refuse at launch.
+        let caps = claude_fallback_capabilities();
+        for id in ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"] {
+            let m = caps
+                .models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} should be in the maintained list"));
+            assert_eq!(
+                m.effort_levels,
+                vec!["low", "medium", "high", "xhigh", "max"],
+                "{id} effort vocabulary must mirror the deployed CLI"
+            );
+            assert_eq!(
+                m.default_effort.as_deref(),
+                Some("high"),
+                "{id} default effort must match the CLI's `(default)` marker"
+            );
+        }
+    }
+
+    // ── Live-harvest mapping tests ───────────────────────────────────
+
+    #[test]
+    fn maintained_list_includes_opus_4_8() {
+        let caps = claude_fallback_capabilities();
+        let opus48 = caps
+            .models
+            .iter()
+            .find(|m| m.id == "claude-opus-4-8")
+            .expect("Opus 4.8 should be present in the maintained list");
+        assert_eq!(opus48.default_effort.as_deref(), Some("high"));
+        assert!(
+            opus48
+                .context_window_options
+                .iter()
+                .any(|o| o.value == "1m"),
+            "Opus 4.8 should support the 1M context window"
+        );
+    }
+
+    #[test]
+    fn family_inference_from_id_handles_each_known_prefix() {
+        assert_eq!(ClaudeFamily::from_id("claude-fable-5"), ClaudeFamily::Fable);
+        assert_eq!(ClaudeFamily::from_id("claude-opus-9-0"), ClaudeFamily::Opus);
+        assert_eq!(ClaudeFamily::from_id("claude-sonnet-5-0"), ClaudeFamily::Sonnet);
+        assert_eq!(ClaudeFamily::from_id("claude-haiku-5-0"), ClaudeFamily::Haiku);
+        assert_eq!(ClaudeFamily::from_id("default"), ClaudeFamily::DefaultAlias);
+        assert_eq!(ClaudeFamily::from_id("xyzzy-thing"), ClaudeFamily::Other);
+        // Case-insensitive — Anthropic ids are lowercase but be defensive.
+        assert_eq!(ClaudeFamily::from_id("Claude-OPUS-9"), ClaudeFamily::Opus);
+        // A pinned context suffix doesn't hide the family.
+        assert_eq!(
+            ClaudeFamily::from_id("claude-fable-5[1m]"),
+            ClaudeFamily::Fable
+        );
+    }
+
+    #[test]
+    fn infer_opus_gets_full_effort_and_1m() {
+        let info = infer_model_info("claude-opus-9-9", "Claude Opus 9.9");
+        assert_eq!(
+            info.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
+        assert!(
+            info.prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+        assert!(info.context_window_options.iter().any(|o| o.value == "1m"));
+        assert!(info.supports_adaptive_thinking);
+        assert_eq!(info.label, "Claude Opus 9.9");
+    }
+
+    #[test]
+    fn infer_fable_is_flagship_tier() {
+        let info = infer_model_info("claude-fable-6", "Claude Fable 6");
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
+        assert!(info.supports_adaptive_thinking);
+        assert!(
+            info.prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+        assert!(info.context_window_options.iter().any(|o| o.value == "1m"));
+    }
+
+    #[test]
+    fn infer_default_alias_is_flagship_without_context_picker() {
+        // `default` is the CLI's recommended-flagship alias; its window
+        // is the CLI's choice — `default[1m]` is not a valid id, so no
+        // context-window picker may be offered.
+        let info = infer_model_info("default", "Default (recommended)");
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
+        assert!(info.supports_adaptive_thinking);
+        assert!(info.context_window_options.is_empty());
+    }
+
+    #[test]
+    fn infer_pinned_suffix_normalizes_id_and_keeps_a_consistent_picker() {
+        // A pinned id (`claude-fable-5[1m]`) is normalized to the base
+        // id and offers the SAME `[200k, 1m]` toggle as a bare flagship
+        // id — with the pinned window (1m) as the default — rather than
+        // being silently fixed. This is what makes Fable consistent with
+        // Sonnet/Opus in the picker.
+        let info = infer_model_info("claude-fable-5[1m]", "Fable 5");
+        assert_eq!(info.id, "claude-fable-5", "id must be normalized to base");
+        let values: Vec<&str> = info
+            .context_window_options
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["200k", "1m"]);
+        let default = info
+            .context_window_options
+            .iter()
+            .find(|o| o.is_default)
+            .unwrap();
+        assert_eq!(default.value, "1m", "pinned window must be the default");
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn infer_pinned_non_default_window_becomes_the_picker_default() {
+        // If the CLI ever pins a non-1m window, that window — not the
+        // generic highest-is-default — drives the picker default.
+        let info = infer_model_info("claude-opus-9-9[200k]", "Opus 9.9");
+        assert_eq!(info.id, "claude-opus-9-9");
+        let default = info
+            .context_window_options
+            .iter()
+            .find(|o| o.is_default)
+            .unwrap();
+        assert_eq!(default.value, "200k");
+    }
+
+    #[test]
+    fn infer_sonnet_gets_three_efforts_and_1m_and_falls_back_to_id_when_label_empty() {
+        let info = infer_model_info("claude-sonnet-5-0", "");
+        assert_eq!(info.effort_levels, vec!["low", "medium", "high"]);
+        assert_eq!(info.default_effort.as_deref(), Some("high"));
+        assert!(info.context_window_options.iter().any(|o| o.value == "1m"));
+        // Empty display_name → label falls back to the id.
+        assert_eq!(info.label, "claude-sonnet-5-0");
+    }
+
+    #[test]
+    fn infer_haiku_is_conservative_no_effort_no_1m() {
+        let info = infer_model_info("claude-haiku-9-0", "Haiku 9");
+        assert!(info.effort_levels.is_empty());
+        assert!(info.context_window_options.is_empty());
+        assert!(info.supports_thinking_toggle);
+        assert!(!info.supports_adaptive_thinking);
+    }
+
+    #[test]
+    fn infer_unknown_family_gets_minimal_metadata() {
+        let info = infer_model_info("some-future-model", "Future Model");
+        assert!(info.effort_levels.is_empty());
+        assert!(info.context_window_options.is_empty());
+    }
+
+    #[test]
+    fn merge_uses_maintained_metadata_for_known_ids() {
+        // The maintained Opus 4.7 entry has `description: None` (demoted
+        // from flagship). An inferred Opus would carry no description
+        // either, so we discriminate by the precise label — maintained
+        // is "Claude Opus 4.7", and the api `display_name` we feed is
+        // deliberately different to prove maintained wins.
+        let live = vec![ApiModel {
+            id: "claude-opus-4-7".into(),
+            display_name: "DIFFERENT NAME".into(),
+        }];
+        let caps = build_capabilities_from_live(live);
+        let opus47 = &caps.models[0];
+        assert_eq!(opus47.id, "claude-opus-4-7");
+        // Maintained label wins, NOT the api display_name.
+        assert_eq!(opus47.label, "Claude Opus 4.7");
+    }
+
+    #[test]
+    fn merge_surfaces_unknown_ids_via_inference() {
+        // A model id Codemux has never heard of must still appear in
+        // the picker, with family-inferred metadata.
+        let live = vec![ApiModel {
+            id: "claude-opus-9-9".into(),
+            display_name: "Claude Opus 9.9".into(),
+        }];
+        let caps = build_capabilities_from_live(live);
+        let new = &caps.models[0];
+        assert_eq!(new.id, "claude-opus-9-9");
+        assert_eq!(new.label, "Claude Opus 9.9");
+        assert_eq!(
+            new.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn merge_skips_empty_ids() {
+        let live = vec![
+            ApiModel { id: "".into(), display_name: "".into() },
+            ApiModel {
+                id: "claude-opus-4-7".into(),
+                display_name: "Opus 4.7".into(),
+            },
+        ];
+        let caps = build_capabilities_from_live(live);
+        assert_eq!(caps.models.len(), 1);
+    }
+
+    #[test]
+    fn merge_carries_the_correct_provider_chrome() {
+        // The merged bundle should serve the same effort label map,
+        // permission modes, and granularity as the fallback bundle.
+        let caps = build_capabilities_from_live(vec![]);
+        assert_eq!(caps.effort_granularity, EffortGranularity::PerSession);
+        assert_eq!(caps.default_permission_mode.as_deref(), Some("bypassPermissions"));
+        assert!(caps.permission_modes.iter().any(|m| m.value == "bypassPermissions"));
+    }
+
+    #[test]
+    fn harvest_error_command_strings_have_stable_prefixes() {
+        assert_eq!(HarvestError::NoApiKey.to_command_string(), "claude_no_api_key");
+        assert!(
+            HarvestError::HarvestFailed { message: "x".into() }
+                .to_command_string()
+                .starts_with("claude_harvest_failed:")
+        );
+    }
+
+    // ── SDK / sidecar harvest mapping tests ──────────────────────────
+
+    fn sdk_model(
+        value: &str,
+        display: &str,
+        effort: &[&str],
+        adaptive: Option<bool>,
+        fast: Option<bool>,
+    ) -> SdkModelInfo {
+        SdkModelInfo {
+            value: value.into(),
+            display_name: display.into(),
+            description: "".into(),
+            supported_effort_levels: effort.iter().map(|s| s.to_string()).collect(),
+            supports_adaptive_thinking: adaptive,
+            supports_fast_mode: fast,
+        }
+    }
+
+    #[test]
+    fn sdk_merge_uses_sdk_effort_levels_for_a_known_id() {
+        // SDK reports an effort vocabulary with levels the maintained
+        // Opus 4.7 entry doesn't list (`ultracode`, `newlevel`) — the
+        // SDK value wins verbatim (regression guard for when the
+        // deployed CLI ships a level the maintained list hasn't been
+        // bumped for yet).
+        let live = vec![sdk_model(
+            "claude-opus-4-7",
+            "Claude Opus 4.7",
+            &["low", "medium", "high", "xhigh", "max", "ultracode", "newlevel"],
+            Some(true),
+            Some(false),
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        let opus = &caps.models[0];
+        assert!(opus.effort_levels.contains(&"newlevel".to_string()));
+        // Maintained metadata still fills in context windows + ultrathink.
+        assert!(opus.context_window_options.iter().any(|o| o.value == "1m"));
+        assert!(
+            opus.prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+    }
+
+    #[test]
+    fn sdk_merge_surfaces_unknown_id_with_inferred_metadata() {
+        // SDK reports a brand-new id Codemux's maintained map has
+        // never seen — must surface in the picker with family-pattern
+        // inferred metadata (1M context for opus, ultrathink, etc.).
+        let live = vec![sdk_model(
+            "claude-opus-5-0",
+            "Claude Opus 5.0",
+            &["low", "medium", "high", "xhigh", "max", "ultracode"],
+            Some(true),
+            Some(false),
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        let new = &caps.models[0];
+        assert_eq!(new.id, "claude-opus-5-0");
+        assert_eq!(new.label, "Claude Opus 5.0");
+        assert!(new.effort_levels.contains(&"ultracode".to_string()));
+        assert!(new.context_window_options.iter().any(|o| o.value == "1m"));
+        assert!(
+            new.prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+    }
+
+    #[test]
+    fn sdk_merge_falls_back_to_maintained_when_sdk_reports_no_effort() {
+        // SDK returns the id with an empty effort vocabulary —
+        // maintained metadata fills in.
+        let live = vec![sdk_model("claude-opus-4-7", "Claude Opus 4.7", &[], None, None)];
+        let caps = build_capabilities_from_sdk(live);
+        let opus = &caps.models[0];
+        // Maintained Opus 4.7 mirrors the deployed CLI: low..max.
+        assert_eq!(
+            opus.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max"]
+        );
+    }
+
+    #[test]
+    fn sdk_merge_skips_empty_value_records() {
+        let live = vec![
+            sdk_model("", "", &["low"], None, None),
+            sdk_model("claude-opus-4-7", "Claude Opus 4.7", &["low"], None, None),
+        ];
+        let caps = build_capabilities_from_sdk(live);
+        // The empty record is dropped; the single live entry leads the
+        // list (families the live roster lacks are appended after it).
+        assert!(caps.models.iter().all(|m| !m.id.is_empty()));
+        assert_eq!(caps.models[0].id, "claude-opus-4-7");
+        assert_eq!(
+            caps.models
+                .iter()
+                .filter(|m| ClaudeFamily::from_id(&m.id) == ClaudeFamily::Opus)
+                .count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn sdk_merge_normalizes_pinned_fable_id_to_a_consistent_picker() {
+        // The deployed CLI reports Fable with the window pinned into the
+        // id (`claude-fable-5[1m]`). The merge normalizes it to the base
+        // id `claude-fable-5` (looked up in the maintained map) and
+        // offers the same `[200k, 1m]` context toggle as Sonnet/Opus,
+        // with the pinned window (1m) as default. The launch path
+        // re-applies `[1m]` from the chosen window, so the base id is
+        // correct to store. This is the fix for the Fable-vs-Sonnet
+        // picker inconsistency.
+        let live = vec![sdk_model(
+            "claude-fable-5[1m]",
+            "Fable 5",
+            &["low", "medium", "high", "xhigh", "max"],
+            Some(true),
+            None,
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        let fable = caps
+            .models
+            .iter()
+            .find(|m| m.id == "claude-fable-5")
+            .expect("pinned id must be normalized to base");
+        assert_eq!(fable.label, "Fable 5");
+        assert_eq!(fable.default_effort.as_deref(), Some("high"));
+        let values: Vec<&str> = fable
+            .context_window_options
+            .iter()
+            .map(|o| o.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["200k", "1m"]);
+        assert_eq!(
+            fable
+                .context_window_options
+                .iter()
+                .find(|o| o.is_default)
+                .unwrap()
+                .value,
+            "1m",
+        );
+        assert!(
+            fable
+                .prompt_injected_effort_levels
+                .contains(&"ultrathink".to_string())
+        );
+        assert!(fable.supports_adaptive_thinking);
+        // No duplicate Fable row from the family-append pass.
+        assert_eq!(
+            caps.models.iter().filter(|m| m.id == "claude-fable-5").count(),
+            1,
+        );
+    }
+
+    #[test]
+    fn sdk_merge_alias_ids_get_family_default_effort_not_first_level() {
+        // Regression: alias ids (`default`, `sonnet`, `haiku`) miss the
+        // full-id maintained map; the default effort used to fall back
+        // to `effort_levels.first()` — i.e. "low" — for every alias.
+        let live = vec![
+            sdk_model(
+                "default",
+                "Default (recommended)",
+                &["low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(true),
+            ),
+            sdk_model(
+                "sonnet",
+                "Sonnet",
+                &["low", "medium", "high", "max"],
+                Some(true),
+                None,
+            ),
+            sdk_model("haiku", "Haiku", &[], None, None),
+        ];
+        let caps = build_capabilities_from_sdk(live);
+        let default = caps.models.iter().find(|m| m.id == "default").unwrap();
+        assert_eq!(default.default_effort.as_deref(), Some("high"));
+        assert!(
+            default.context_window_options.is_empty(),
+            "`default` must not offer a context-window picker"
+        );
+        assert!(default.supports_fast_mode);
+        let sonnet = caps.models.iter().find(|m| m.id == "sonnet").unwrap();
+        assert_eq!(sonnet.default_effort.as_deref(), Some("high"));
+        let haiku = caps.models.iter().find(|m| m.id == "haiku").unwrap();
+        assert_eq!(haiku.default_effort, None);
+        assert!(haiku.supports_thinking_toggle);
+    }
+
+    #[test]
+    fn sdk_merge_default_effort_must_be_in_the_live_vocabulary() {
+        // Maintained Opus default is `xhigh`; if the deployed CLI stops
+        // reporting that level, the default must degrade to a level the
+        // CLI actually accepts instead of erroring at launch.
+        let live = vec![sdk_model(
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            &["low", "medium", "high"],
+            Some(true),
+            None,
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        assert_eq!(caps.models[0].default_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn sdk_merge_appends_opus_when_live_roster_omits_the_family() {
+        // The deployed CLI's curated roster (default / fable / sonnet /
+        // haiku) carries no Opus entry, but `--model claude-opus-4-8`
+        // still launches. The maintained Opus entries must be appended
+        // after the live entries so they stay selectable. The `default`
+        // alias does not count as Opus — it tracks the user's own
+        // configured default.
+        let live = vec![
+            sdk_model("default", "Default (recommended)", &["low", "medium", "high", "xhigh", "max"], Some(true), Some(true)),
+            sdk_model("claude-fable-5[1m]", "Fable 5", &["low", "medium", "high", "xhigh", "max"], Some(true), None),
+            sdk_model("sonnet", "Sonnet", &["low", "medium", "high", "max"], Some(true), None),
+            sdk_model("haiku", "Haiku", &[], None, None),
+        ];
+        let caps = build_capabilities_from_sdk(live);
+        let ids: Vec<&str> = caps.models.iter().map(|m| m.id.as_str()).collect();
+        // Live entries first, in the CLI's order. The pinned Fable id is
+        // normalized to its base id (`claude-fable-5`).
+        assert_eq!(&ids[..4], &["default", "claude-fable-5", "sonnet", "haiku"]);
+        // Every maintained Opus version appended afterwards.
+        for opus in ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"] {
+            assert!(ids.contains(&opus), "{opus} should be appended");
+        }
+        // Families already live must NOT be duplicated from the
+        // maintained list (the maintained `claude-sonnet-4-6` /
+        // `claude-haiku-4-5` ids stay out because the alias rows cover
+        // those families).
+        assert!(!ids.contains(&"claude-sonnet-4-6"));
+        assert!(!ids.contains(&"claude-haiku-4-5"));
+        // Appended Opus keeps its precise maintained metadata.
+        let opus48 = caps.models.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
+        assert_eq!(opus48.label, "Claude Opus 4.8");
+        assert_eq!(opus48.default_effort.as_deref(), Some("high"));
+        assert!(opus48.context_window_options.iter().any(|o| o.value == "1m"));
+    }
+
+    #[test]
+    fn sdk_merge_does_not_append_a_family_the_live_roster_already_has() {
+        // If a future CLI lists Opus again (alias or full id), the
+        // maintained Opus entries must not duplicate it.
+        let live = vec![sdk_model("opus", "Opus", &["low", "medium", "high"], Some(true), None)];
+        let caps = build_capabilities_from_sdk(live);
+        let opus_rows = caps
+            .models
+            .iter()
+            .filter(|m| ClaudeFamily::from_id(&m.id) == ClaudeFamily::Opus)
+            .count();
+        assert_eq!(opus_rows, 1, "live opus row must suppress maintained opus entries");
+    }
+
+    #[test]
+    fn sdk_merge_uses_id_as_label_when_displayname_is_blank() {
+        let live = vec![sdk_model("claude-opus-9-9", "", &["high"], None, None)];
+        let caps = build_capabilities_from_sdk(live);
+        assert_eq!(caps.models[0].label, "claude-opus-9-9");
+    }
+
+    #[test]
+    fn sdk_merge_carries_provider_chrome_through() {
+        let caps = build_capabilities_from_sdk(vec![]);
+        assert_eq!(caps.effort_granularity, EffortGranularity::PerSession);
+        assert_eq!(
+            caps.default_permission_mode.as_deref(),
+            Some("bypassPermissions")
+        );
     }
 }

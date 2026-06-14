@@ -39,6 +39,38 @@ impl Default for PresetKind {
     }
 }
 
+/// Structured configuration for an "agent launcher" preset.
+///
+/// When present, the preset was built with the structured editor (pick an
+/// agent, then its model / reasoning / context via the same launch pickers
+/// the New Workspace dialog uses, plus an optional prompt). These fields are
+/// the *source* the editor round-trips; the launchable command lives in
+/// [`TerminalPreset::commands`].
+///
+/// The model/reasoning/context are NOT baked into the command — they ride in
+/// [`model_selection`] and are spliced in at launch by
+/// [`crate::agent_capability::apply_model_selection`] (the exact mechanism
+/// the launch dialog uses), so stale flags can never desync from the picks.
+/// The prompt *is* baked into `commands[0]` as a trailing positional arg.
+///
+/// `None` on a preset means a plain raw-command preset — edit `commands`
+/// directly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PresetLaunchConfig {
+    /// Base agent invocation — binary + autonomy flag, no prompt or model
+    /// (e.g. `claude --dangerously-skip-permissions`). Drives agent-family
+    /// detection for the model/reasoning pickers on re-open.
+    pub agent_command: String,
+    /// Model / reasoning / context choice, applied at launch via
+    /// `apply_model_selection`. All-optional; empty means "agent default".
+    #[serde(default)]
+    pub model_selection: crate::agent_capability::ModelSelection,
+    /// Free-form prompt passed to the agent (may be empty). Baked into
+    /// `commands[0]` as a quoted positional argument.
+    #[serde(default)]
+    pub prompt: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalPreset {
     pub id: String,
@@ -60,6 +92,12 @@ pub struct TerminalPreset {
     /// lack this field) round-trip correctly.
     #[serde(default)]
     pub kind: PresetKind,
+    /// Structured agent-launcher configuration, when this preset was
+    /// built with the structured editor. `None` for raw command presets
+    /// and for presets persisted before this field existed. See
+    /// [`PresetLaunchConfig`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_config: Option<PresetLaunchConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,12 +142,13 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         TerminalPreset {
             id: "builtin-codex".into(),
             name: "Codex".into(),
             description: Some("Launch OpenAI Codex agent".into()),
-            commands: vec!["codex --full-auto".into()],
+            commands: vec!["codex --dangerously-bypass-approvals-and-sandbox".into()],
             working_directory: None,
             launch_mode: LaunchMode::NewTab,
             icon: Some("codex".into()),
@@ -118,6 +157,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         TerminalPreset {
             id: "builtin-opencode".into(),
@@ -132,6 +172,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         TerminalPreset {
             id: "builtin-gemini".into(),
@@ -146,6 +187,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         // Antigravity CLI — Google's successor to Gemini CLI (binary
         // `agy`). `--dangerously-skip-permissions` is the verified
@@ -164,6 +206,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         // GitHub Copilot CLI. `--allow-all` is documented as the
         // equivalent of `--allow-all-tools --allow-all-paths
@@ -181,6 +224,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         // Cursor Agent CLI. `--yolo` is the documented alias for
         // `--force` ("Run Everything").
@@ -197,6 +241,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         // Amp (Sourcegraph). `--dangerously-allow-all` disables all
         // command confirmation prompts.
@@ -213,6 +258,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         // Grok CLI (xAI). `--always-approve` auto-approves all tool
         // executions.
@@ -229,6 +275,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         // Factory Droid. Interactive `droid` has no skip-permissions
         // flag; full autonomy is set via a runtime settings file passed
@@ -248,6 +295,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         // Mastracode (Mastra). YOLO mode (auto-approve all tool calls)
         // is on by default for the interactive TUI — no launch flag.
@@ -264,6 +312,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         TerminalPreset {
             id: "builtin-pi".into(),
@@ -278,6 +327,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         TerminalPreset {
             id: "builtin-shell".into(),
@@ -292,6 +342,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         },
         TerminalPreset {
             id: "builtin-chat-agent".into(),
@@ -314,6 +365,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::ChatAgent,
+            launch_config: None,
         },
     ]
 }
@@ -539,6 +591,7 @@ mod tests {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind: PresetKind::Cli,
+            launch_config: None,
         }
     }
 
