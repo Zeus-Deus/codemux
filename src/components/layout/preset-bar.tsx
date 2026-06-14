@@ -271,7 +271,11 @@ export function PresetBar({
     }
 
     const mode = e.shiftKey ? ("split_pane" as const) : undefined;
-    applyPreset(workspaceId, preset.id, mode).catch((err) => {
+    // Structured "agent launcher" presets carry their own model/reasoning
+    // choice — apply it the same way the New Workspace launch picker does
+    // (the prompt is already baked into the preset's command).
+    const modelSelection = preset.launch_config?.model_selection ?? null;
+    applyPreset(workspaceId, preset.id, mode, null, modelSelection).catch((err) => {
       // Backend returns `Err("{binary} is not installed")` (or other strings)
       // from `apply_preset` when `command_binary_exists` fails. Previously this
       // was swallowed into `console.error` and the user saw nothing — clicking

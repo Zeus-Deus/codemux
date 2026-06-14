@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -81,7 +81,7 @@ import {
   clearBrowserCookies,
   clearAllBrowserData,
 } from "@/tauri/commands";
-import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind, AgentCatalogEntry, PresetAgentConfig } from "@/tauri/types";
+import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind, ModelSelection } from "@/tauri/types";
 import { MultiProviderModelPicker } from "@/components/chat/pickers/MultiProviderModelPicker";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -95,14 +95,20 @@ import {
   updatePreset,
 } from "@/tauri/commands";
 import {
-  useAgentCatalog,
-  ensureAgentCatalog,
-} from "@/lib/presets/use-agent-catalog";
+  detectLaunchFamily,
+  familyToProviderKind,
+  REASONING_FLAG_FAMILIES,
+  GEMINI_MODELS,
+  type LaunchModel,
+  type ReasoningOption,
+} from "@/lib/launch-models";
+import { LaunchModelPicker } from "@/components/overlays/launch-model-picker";
+import { LaunchReasoningPicker } from "@/components/overlays/launch-reasoning-picker";
+import { useProviderCapabilities } from "@/stores/provider-capabilities-store";
 import {
-  assembleAgentCommand,
-  defaultAgentConfig,
-  findAgentEntry,
-} from "@/lib/presets/agent-command";
+  useLaunchGeminiModels,
+  useLaunchGeminiModelsInit,
+} from "@/stores/gemini-models-store";
 import { onPresetsChanged } from "@/tauri/events";
 import {
   DndContext,
@@ -478,27 +484,47 @@ function BrowserSection() {
   );
 }
 
-// Radix <SelectItem> forbids an empty-string value, so the "Default /
-// none" reasoning option is represented in the Select by this sentinel
-// and mapped back to "" (→ null reasoning) on change.
-const REASONING_DEFAULT = "__default__";
+/** Wrap a string as a double-quoted shell argument. */
+function quotePrompt(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/** Assemble a structured preset's launchable command: base agent command +
+ *  the prompt as a trailing positional. Model/reasoning are NOT baked in —
+ *  they ride in `model_selection` and are applied at launch. */
+function structuredCommandFor(agentCommand: string, prompt: string): string {
+  const p = prompt.trim();
+  return p ? `${agentCommand} ${quotePrompt(p)}` : agentCommand;
+}
 
 function PresetEditorSheet({
   preset,
   open,
   onOpenChange,
+  agentOptions,
   isDraft = false,
   onCreate,
 }: {
   preset: TerminalPreset | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Builtin CLI agents shown in the Agent dropdown (id, command, icon). */
+  agentOptions: TerminalPreset[];
   /** When true, this is an unsaved new preset — nothing is persisted until
    *  the user presses "Create preset". Edits stay local; auto-save is off. */
   isDraft?: boolean;
   onCreate?: (payload: Parameters<typeof createPreset>[0]) => void;
 }) {
-  const catalog = useAgentCatalog();
+  // Capability stores — shared with the New Workspace launch picker, so a
+  // preset picks models from the exact same live-harvested source.
+  const claudeCaps = useProviderCapabilities((s) => s.claude);
+  const codexCaps = useProviderCapabilities((s) => s.codex);
+  const opencodeCaps = useProviderCapabilities((s) => s.opencode);
+  const capsLoaded = useProviderCapabilities((s) => s.loaded);
+  const refreshCaps = useProviderCapabilities((s) => s.refresh);
+  const geminiModels = useLaunchGeminiModels((s) => s.models);
+  useLaunchGeminiModelsInit();
+
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [commands, setCommands] = useState<string[]>([""]);
@@ -506,7 +532,15 @@ function PresetEditorSheet({
   const [pinned, setPinned] = useState(true);
   const [autoRunOnWorkspace, setAutoRunOnWorkspace] = useState(false);
   const [autoRunOnNewTab, setAutoRunOnNewTab] = useState(false);
-  const [agentConfig, setAgentConfig] = useState<PresetAgentConfig | null>(null);
+  // Structured ("agent launcher") state.
+  const [structured, setStructured] = useState(false);
+  const [agentCommand, setAgentCommand] = useState("");
+  const [modelSelection, setModelSelection] = useState<ModelSelection>({
+    model: null,
+    reasoning: null,
+    context: null,
+  });
+  const [prompt, setPrompt] = useState("");
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Sync when preset changes
@@ -519,108 +553,222 @@ function PresetEditorSheet({
     setPinned(preset.pinned);
     setAutoRunOnWorkspace(preset.auto_run_on_workspace);
     setAutoRunOnNewTab(preset.auto_run_on_new_tab);
-    setAgentConfig(preset.agent_config ?? null);
+    const lc = preset.launch_config ?? null;
+    setStructured(lc != null);
+    setAgentCommand(lc?.agent_command ?? "");
+    setModelSelection(
+      lc?.model_selection ?? { model: null, reasoning: null, context: null },
+    );
+    setPrompt(lc?.prompt ?? "");
     setConfirmDelete(false);
   }, [preset]);
 
+  // ── Launch model/reasoning sourcing (mirrors new-workspace-dialog) ──
+  const launchFamily = detectLaunchFamily(agentCommand);
+  const launchProviderKind = launchFamily ? familyToProviderKind(launchFamily) : null;
+  const launchCaps =
+    launchFamily === "claude"
+      ? claudeCaps
+      : launchFamily === "codex"
+        ? codexCaps
+        : launchFamily === "opencode"
+          ? opencodeCaps
+          : null;
+  const launchModels = useMemo<LaunchModel[]>(() => {
+    if (launchFamily === "gemini") return geminiModels ?? GEMINI_MODELS;
+    return (
+      launchCaps?.models.map((m) => ({
+        id: m.id,
+        label: m.label,
+        subProvider: m.sub_provider,
+      })) ?? []
+    );
+  }, [launchFamily, launchCaps, geminiModels]);
+  const launchModelsLoading =
+    launchFamily !== null &&
+    launchFamily !== "gemini" &&
+    !capsLoaded &&
+    launchModels.length === 0;
+  const launchCapsModel = useMemo(
+    () => launchCaps?.models.find((m) => m.id === modelSelection.model) ?? null,
+    [launchCaps, modelSelection.model],
+  );
+  const reasoningOptions = useMemo<ReasoningOption[]>(() => {
+    if (!launchFamily || !REASONING_FLAG_FAMILIES.has(launchFamily)) return [];
+    const labels = launchCaps?.effort_label_map ?? {};
+    return (launchCapsModel?.effort_levels ?? []).map((lvl) => ({
+      value: lvl,
+      label: labels[lvl] ?? lvl,
+    }));
+  }, [launchFamily, launchCaps, launchCapsModel]);
+  const launchContextOptions = useMemo<ReasoningOption[]>(
+    () =>
+      (launchCapsModel?.context_window_options ?? []).map((o) => ({
+        value: o.value,
+        label: o.label,
+      })),
+    [launchCapsModel],
+  );
+  const capsReady = launchFamily === "gemini" || launchCaps !== null;
+  const effectiveReasoning =
+    !capsReady || reasoningOptions.some((o) => o.value === modelSelection.reasoning)
+      ? modelSelection.reasoning
+      : null;
+  const effectiveContext =
+    !capsReady ||
+    launchContextOptions.some((o) => o.value === modelSelection.context)
+      ? modelSelection.context
+      : null;
+
+  // Backstop the app-level capability harvest if a slot hasn't hydrated.
+  useEffect(() => {
+    if (!open || !launchProviderKind) return;
+    const caps =
+      launchProviderKind === "claude"
+        ? claudeCaps
+        : launchProviderKind === "codex"
+          ? codexCaps
+          : opencodeCaps;
+    if (caps === null) void refreshCaps(launchProviderKind);
+  }, [open, launchProviderKind, claudeCaps, codexCaps, opencodeCaps, refreshCaps]);
+
   if (!preset) return null;
 
-  const structured = agentConfig != null;
-  const entry = structured ? findAgentEntry(catalog, agentConfig.agent_id) : null;
-  const assembled = entry && agentConfig ? assembleAgentCommand(entry, agentConfig) : "";
+  // The agent dropdown selection + icon, derived from the base command.
+  const selectedAgentId =
+    agentOptions.find((a) => a.commands[0] === agentCommand)?.id ?? "";
+  const agentIcon =
+    agentOptions.find((a) => a.id === selectedAgentId)?.icon ?? preset.icon;
 
-  const save = (updates: Partial<{
-    name: string;
-    description: string | null;
-    commands: string[];
+  // Unified save (no-op for drafts). Immediate handlers (pickers/selects
+  // fire before React state settles) pass explicit overrides. Structured
+  // presets store the assembled command + launch_config; raw presets store
+  // the literal commands. Fields not passed are left untouched on the Rust
+  // side, so e.g. the auto-run toggles never wipe launch_config.
+  const save = (over?: Partial<{
     launchMode: LaunchMode;
+    agentCommand: string;
+    modelSelection: ModelSelection;
+    prompt: string;
+    icon: string | null;
+    commands: string[];
+    autoRunOnWorkspace: boolean;
+    autoRunOnNewTab: boolean;
   }>) => {
-    // Draft presets are not persisted until "Create preset" — edits live in
-    // local state and are read by buildCreatePayload on confirm.
     if (isDraft) return;
-    updatePreset({
-      id: preset.id,
-      name: updates.name ?? name,
-      description: updates.description !== undefined ? updates.description : (description || null),
-      commands: updates.commands ?? commands.filter((c) => c.trim()),
-      workingDirectory: preset.working_directory,
-      launchMode: updates.launchMode ?? launchMode,
-      icon: preset.icon,
-    }).catch(console.error);
-  };
-
-  // Persist a structured config: assemble its command and store both the
-  // command (what launches) and the config (what the editor round-trips).
-  const saveStructured = (next: PresetAgentConfig, nextEntry: AgentCatalogEntry) => {
-    const command = assembleAgentCommand(nextEntry, next);
-    const cmds = command ? [command] : [];
-    setAgentConfig(next);
-    setCommands(cmds.length > 0 ? cmds : [""]);
-    if (isDraft) return;
-    updatePreset({
-      id: preset.id,
-      name,
-      description: description || null,
-      commands: cmds,
-      workingDirectory: preset.working_directory,
-      launchMode,
-      icon: nextEntry.icon,
-      agentConfig: next,
-    }).catch(console.error);
+    const lm = over?.launchMode ?? launchMode;
+    const aw = over?.autoRunOnWorkspace ?? autoRunOnWorkspace;
+    const an = over?.autoRunOnNewTab ?? autoRunOnNewTab;
+    if (structured) {
+      const ac = over?.agentCommand ?? agentCommand;
+      const ms = over?.modelSelection ?? modelSelection;
+      const pr = over?.prompt ?? prompt;
+      const cmd = structuredCommandFor(ac, pr);
+      const ic =
+        over?.icon ??
+        (agentOptions.find((a) => a.commands[0] === ac)?.icon ?? preset.icon);
+      updatePreset({
+        id: preset.id,
+        name,
+        description: description || null,
+        commands: cmd ? [cmd] : [],
+        workingDirectory: preset.working_directory,
+        launchMode: lm,
+        icon: ic,
+        autoRunOnWorkspace: aw,
+        autoRunOnNewTab: an,
+        launchConfig: { agent_command: ac, model_selection: ms, prompt: pr },
+      }).catch(console.error);
+    } else {
+      updatePreset({
+        id: preset.id,
+        name,
+        description: description || null,
+        commands: over?.commands ?? commands.filter((c) => c.trim()),
+        workingDirectory: preset.working_directory,
+        launchMode: lm,
+        icon: preset.icon,
+        autoRunOnWorkspace: aw,
+        autoRunOnNewTab: an,
+      }).catch(console.error);
+    }
   };
 
   const handleAgentChange = (agentId: string) => {
-    const nextEntry = findAgentEntry(catalog, agentId);
-    if (!nextEntry || !agentConfig) return;
-    // Reset model/reasoning/autonomy to the new agent's defaults but keep
-    // the user's prompt — switching agent shouldn't lose their intent.
-    const next: PresetAgentConfig = {
-      ...defaultAgentConfig(nextEntry),
-      prompt: agentConfig.prompt,
-    };
-    saveStructured(next, nextEntry);
+    const opt = agentOptions.find((a) => a.id === agentId);
+    if (!opt) return;
+    const ac = opt.commands[0] ?? "";
+    // Model/reasoning are agent-specific — reset them when the agent
+    // changes; the user's prompt is preserved.
+    const ms: ModelSelection = { model: null, reasoning: null, context: null };
+    setAgentCommand(ac);
+    setModelSelection(ms);
+    save({ agentCommand: ac, modelSelection: ms, icon: opt.icon ?? null });
   };
 
-  const handleModelBlur = () => {
-    if (entry && agentConfig) saveStructured(agentConfig, entry);
+  const handleModelChange = (model: string | null) => {
+    // Picking "Default" (null) clears reasoning/context too — they are
+    // attributes of a concrete model.
+    const ms: ModelSelection =
+      model === null
+        ? { model: null, reasoning: null, context: null }
+        : { ...modelSelection, model };
+    setModelSelection(ms);
+    save({ modelSelection: ms });
   };
 
-  const handleReasoningChange = (value: string) => {
-    if (!entry || !agentConfig) return;
-    saveStructured({ ...agentConfig, reasoning: value || null }, entry);
+  const handleReasoningChange = (reasoning: string) => {
+    const ms = { ...modelSelection, reasoning };
+    setModelSelection(ms);
+    save({ modelSelection: ms });
   };
 
-  const handlePromptBlur = () => {
-    if (entry && agentConfig) saveStructured(agentConfig, entry);
-  };
-
-  const handleSkipPermissionsChange = (checked: boolean) => {
-    if (!entry || !agentConfig) return;
-    saveStructured({ ...agentConfig, skip_permissions: checked }, entry);
+  const handleContextChange = (context: string) => {
+    const ms = { ...modelSelection, context };
+    setModelSelection(ms);
+    save({ modelSelection: ms });
   };
 
   // Switch between the structured "agent launcher" and raw command editors.
   const handleModeChange = (mode: string) => {
     if (mode === "structured" && !structured) {
-      const nextEntry =
-        findAgentEntry(catalog, "claude") ?? catalog[0] ?? null;
-      if (!nextEntry) return;
-      saveStructured(defaultAgentConfig(nextEntry), nextEntry);
+      const opt =
+        agentOptions.find((a) => a.id === "builtin-claude") ?? agentOptions[0];
+      const ac = opt?.commands[0] ?? "";
+      const ms: ModelSelection = { model: null, reasoning: null, context: null };
+      setStructured(true);
+      setAgentCommand(ac);
+      setModelSelection(ms);
+      if (!isDraft) {
+        const cmd = structuredCommandFor(ac, prompt);
+        updatePreset({
+          id: preset.id,
+          name,
+          description: description || null,
+          commands: cmd ? [cmd] : [],
+          workingDirectory: preset.working_directory,
+          launchMode,
+          icon: opt?.icon ?? preset.icon,
+          launchConfig: { agent_command: ac, model_selection: ms, prompt },
+        }).catch(console.error);
+      }
     } else if (mode === "raw" && structured) {
-      const cmds = assembled ? [assembled] : [];
-      setAgentConfig(null);
+      const cmd = structuredCommandFor(agentCommand, prompt);
+      const cmds = cmd ? [cmd] : [];
+      setStructured(false);
       setCommands(cmds.length > 0 ? cmds : [""]);
-      if (isDraft) return;
-      updatePreset({
-        id: preset.id,
-        name,
-        description: description || null,
-        commands: cmds,
-        workingDirectory: preset.working_directory,
-        launchMode,
-        icon: preset.icon,
-        clearAgentConfig: true,
-      }).catch(console.error);
+      if (!isDraft) {
+        updatePreset({
+          id: preset.id,
+          name,
+          description: description || null,
+          commands: cmds,
+          workingDirectory: preset.working_directory,
+          launchMode,
+          icon: preset.icon,
+          clearLaunchConfig: true,
+        }).catch(console.error);
+      }
     }
   };
 
@@ -637,20 +785,35 @@ function PresetEditorSheet({
 
   // Snapshot of local editor state shaped for `createPreset` — used when a
   // draft is confirmed.
-  const buildCreatePayload = (): Parameters<typeof createPreset>[0] => ({
-    name: name.trim() || "New preset",
-    description: description.trim() || null,
-    commands: structured
-      ? assembled
-        ? [assembled]
-        : []
-      : commands.filter((c) => c.trim()),
-    workingDirectory: preset.working_directory ?? null,
-    launchMode,
-    pinned,
-    icon: structured ? entry?.icon ?? null : preset.icon,
-    agentConfig: structured ? agentConfig : null,
-  });
+  const buildCreatePayload = (): Parameters<typeof createPreset>[0] => {
+    if (structured) {
+      const cmd = structuredCommandFor(agentCommand, prompt);
+      return {
+        name: name.trim() || "New preset",
+        description: description.trim() || null,
+        commands: cmd ? [cmd] : [],
+        workingDirectory: preset.working_directory ?? null,
+        launchMode,
+        pinned,
+        icon: agentIcon,
+        launchConfig: {
+          agent_command: agentCommand,
+          model_selection: modelSelection,
+          prompt,
+        },
+      };
+    }
+    return {
+      name: name.trim() || "New preset",
+      description: description.trim() || null,
+      commands: commands.filter((c) => c.trim()),
+      workingDirectory: preset.working_directory ?? null,
+      launchMode,
+      pinned,
+      icon: preset.icon,
+      launchConfig: null,
+    };
+  };
 
   const handleCommandChange = (index: number, value: string) => {
     const next = [...commands];
@@ -658,9 +821,7 @@ function PresetEditorSheet({
     setCommands(next);
   };
 
-  const handleCommandBlur = () => {
-    save({ commands: commands.filter((c) => c.trim()) });
-  };
+  const handleCommandBlur = () => save();
 
   const addCommand = () => setCommands([...commands, ""]);
 
@@ -670,8 +831,6 @@ function PresetEditorSheet({
     setCommands(cleaned);
     save({ commands: cleaned.filter((c) => c.trim()) });
   };
-
-  const reasoningOptions = entry?.reasoning?.options ?? [];
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -683,7 +842,7 @@ function PresetEditorSheet({
         {/* Header */}
         <SheetHeader className="border-b p-4">
           <SheetTitle className="flex items-center gap-2 text-sm">
-            <PresetIcon icon={entry?.icon ?? preset.icon} className="h-4 w-4 shrink-0" />
+            <PresetIcon icon={agentIcon} className="h-4 w-4 shrink-0" />
             {name || preset.name}
           </SheetTitle>
           <SheetDescription>
@@ -699,7 +858,7 @@ function PresetEditorSheet({
             <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              onBlur={() => name !== preset.name && save({ name })}
+              onBlur={() => name !== preset.name && save()}
               placeholder="e.g. Git Pull"
               className="h-9"
             />
@@ -711,7 +870,7 @@ function PresetEditorSheet({
             <Input
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              onBlur={() => save({ description: description || null })}
+              onBlur={() => save()}
               placeholder="Optional description"
               className="h-9"
             />
@@ -736,21 +895,21 @@ function PresetEditorSheet({
             </p>
           </div>
 
-          {structured && agentConfig ? (
+          {structured ? (
             <div className="space-y-5">
               {/* Agent */}
               <div className="space-y-2">
                 <label className="text-sm font-medium">Agent</label>
-                <Select value={agentConfig.agent_id} onValueChange={handleAgentChange}>
+                <Select value={selectedAgentId} onValueChange={handleAgentChange}>
                   <SelectTrigger className="h-9">
                     <SelectValue placeholder="Select an agent" />
                   </SelectTrigger>
                   <SelectContent>
-                    {catalog.map((a) => (
+                    {agentOptions.map((a) => (
                       <SelectItem key={a.id} value={a.id}>
                         <span className="flex items-center gap-2">
                           <PresetIcon icon={a.icon} className="h-3.5 w-3.5" />
-                          {a.label}
+                          {a.name}
                         </span>
                       </SelectItem>
                     ))}
@@ -758,105 +917,61 @@ function PresetEditorSheet({
                 </Select>
               </div>
 
-              {/* Model */}
-              {entry?.accepts_model && (
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Model</label>
-                  <Input
-                    value={agentConfig.model ?? ""}
-                    onChange={(e) =>
-                      setAgentConfig({ ...agentConfig, model: e.target.value || null })
-                    }
-                    onBlur={handleModelBlur}
-                    placeholder="Default"
-                    list={entry.models.length > 0 ? `models-${entry.id}` : undefined}
-                    className="h-9 font-mono text-sm"
-                  />
-                  {entry.models.length > 0 && (
-                    <datalist id={`models-${entry.id}`}>
-                      {entry.models.map((m) => (
-                        <option key={m.value} value={m.value}>
-                          {m.label}
-                        </option>
-                      ))}
-                    </datalist>
-                  )}
+              {/* Model + reasoning — the same capability-driven pickers the
+                  New Workspace dialog uses. Shown only for agents Codemux
+                  can inject a model flag for (Claude/Codex/OpenCode/Gemini);
+                  applied at launch via apply_model_selection. */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Model</label>
+                {launchFamily ? (
+                  <>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <LaunchModelPicker
+                        providerKind={launchProviderKind}
+                        models={launchModels}
+                        loading={launchModelsLoading}
+                        selectedModel={modelSelection.model}
+                        onModelChange={handleModelChange}
+                      />
+                      <LaunchReasoningPicker
+                        reasoningOptions={reasoningOptions}
+                        selectedReasoning={effectiveReasoning}
+                        defaultReasoning={launchCapsModel?.default_effort ?? null}
+                        onReasoningChange={handleReasoningChange}
+                        contextOptions={launchContextOptions}
+                        selectedContext={effectiveContext}
+                        defaultContext={
+                          launchCapsModel?.context_window_options.find(
+                            (o) => o.is_default,
+                          )?.value ?? null
+                        }
+                        onContextChange={handleContextChange}
+                      />
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      Applied at launch. Leave on Default to use the agent's default.
+                    </p>
+                  </>
+                ) : (
                   <p className="text-xs text-muted-foreground">
-                    {entry.models.length > 0
-                      ? "Pick a suggestion or type any model your agent accepts. Blank uses the agent's default."
-                      : "Type any model your agent accepts, or leave blank for its default."}
+                    Model selection isn't available for this agent.
                   </p>
-                </div>
-              )}
-
-              {/* Reasoning */}
-              {reasoningOptions.length > 0 && (
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Reasoning</label>
-                  <Select
-                    value={agentConfig.reasoning ? agentConfig.reasoning : REASONING_DEFAULT}
-                    onValueChange={(v) =>
-                      handleReasoningChange(v === REASONING_DEFAULT ? "" : v)
-                    }
-                  >
-                    <SelectTrigger className="h-9">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {reasoningOptions.map((o) => (
-                        <SelectItem
-                          key={o.value || REASONING_DEFAULT}
-                          value={o.value || REASONING_DEFAULT}
-                        >
-                          {o.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              )}
+                )}
+              </div>
 
               {/* Prompt */}
-              {entry?.supports_prompt && (
-                <div className="space-y-2">
-                  <label className="text-sm font-medium">Prompt</label>
-                  <Textarea
-                    value={agentConfig.prompt}
-                    onChange={(e) =>
-                      setAgentConfig({ ...agentConfig, prompt: e.target.value })
-                    }
-                    onBlur={handlePromptBlur}
-                    placeholder="e.g. pull the latest changes and resolve any conflicts"
-                    className="min-h-[72px] text-sm"
-                  />
-                  <p className="text-xs text-muted-foreground">
-                    Sent to the agent as its first instruction. Leave blank to just launch the agent.
-                  </p>
-                </div>
-              )}
-
-              {/* Skip permissions */}
-              {entry?.autonomy_flag && (
-                <div className="flex items-center justify-between">
-                  <div className="space-y-0.5">
-                    <p className="text-sm font-medium">Skip permissions</p>
-                    <p className="text-xs text-muted-foreground">
-                      Run in full-auto mode (<code className="font-mono">{entry.autonomy_flag}</code>).
-                    </p>
-                  </div>
-                  <Switch
-                    checked={agentConfig.skip_permissions}
-                    onCheckedChange={handleSkipPermissionsChange}
-                  />
-                </div>
-              )}
-
-              {/* Command preview */}
               <div className="space-y-2">
-                <label className="text-sm font-medium">Command preview</label>
-                <pre className="rounded-md border border-border/50 bg-muted/40 px-3 py-2 text-[12px] font-mono text-muted-foreground whitespace-pre-wrap break-all">
-                  {assembled || "—"}
-                </pre>
+                <label className="text-sm font-medium">Prompt</label>
+                <Textarea
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  onBlur={() => save()}
+                  placeholder="e.g. pull the latest changes and resolve any conflicts"
+                  className="min-h-[72px] text-sm"
+                />
+                <p className="text-xs text-muted-foreground">
+                  Sent to the agent as its first instruction. Leave blank to just launch the agent.
+                </p>
               </div>
             </div>
           ) : (
@@ -935,17 +1050,7 @@ function PresetEditorSheet({
                     checked={autoRunOnWorkspace}
                     onCheckedChange={(checked) => {
                       setAutoRunOnWorkspace(checked);
-                      updatePreset({
-                        id: preset.id,
-                        name,
-                        description: description || null,
-                        commands: commands.filter((c) => c.trim()),
-                        workingDirectory: preset.working_directory,
-                        launchMode,
-                        icon: preset.icon,
-                        autoRunOnWorkspace: checked,
-                        autoRunOnNewTab: autoRunOnNewTab,
-                      }).catch(console.error);
+                      save({ autoRunOnWorkspace: checked });
                     }}
                     className="mt-0.5"
                   />
@@ -961,17 +1066,7 @@ function PresetEditorSheet({
                     checked={autoRunOnNewTab}
                     onCheckedChange={(checked) => {
                       setAutoRunOnNewTab(checked);
-                      updatePreset({
-                        id: preset.id,
-                        name,
-                        description: description || null,
-                        commands: commands.filter((c) => c.trim()),
-                        workingDirectory: preset.working_directory,
-                        launchMode,
-                        icon: preset.icon,
-                        autoRunOnWorkspace: autoRunOnWorkspace,
-                        autoRunOnNewTab: checked,
-                      }).catch(console.error);
+                      save({ autoRunOnNewTab: checked });
                     }}
                     className="mt-0.5"
                   />
@@ -1090,6 +1185,16 @@ export function SettingsView() {
   // An unsaved new preset being edited; persisted only on "Create preset".
   const [draftPreset, setDraftPreset] = useState<TerminalPreset | null>(null);
 
+  // Builtin CLI agents that populate the editor's Agent dropdown. Excludes
+  // the Shell (no command) and the Chat Agent (native pane) builtins.
+  const agentOptions = useMemo(
+    () =>
+      presetStore?.presets.filter(
+        (p) => p.is_builtin && p.kind === "cli" && p.commands.length > 0,
+      ) ?? [],
+    [presetStore],
+  );
+
   // Drag-to-reorder presets list. 5px activation distance keeps a
   // plain row click from engaging drag, so clicks still open the
   // editor while drag motion engages sort. The reorder mutation
@@ -1194,34 +1299,34 @@ export function SettingsView() {
   // Create a new structured preset (defaults to a Claude launcher) and
   // open its editor. Used by the "New preset" button here and by the
   // preset bar's gear menu (via the `pendingPresetCreate` ui-store flag).
-  const handleNewPreset = useCallback(async () => {
-    try {
-      const cat = await ensureAgentCatalog();
-      const entry = findAgentEntry(cat, "claude") ?? cat[0] ?? null;
-      const config = entry ? defaultAgentConfig(entry) : null;
-      const command = entry && config ? assembleAgentCommand(entry, config) : "";
-      // Open an unsaved draft — nothing is persisted until the user presses
-      // "Create preset" in the editor.
-      setSelectedPresetId(null);
-      setDraftPreset({
-        id: "",
-        name: "New preset",
-        description: null,
-        commands: command ? [command] : [],
-        working_directory: null,
-        launch_mode: "new_tab",
-        icon: entry?.icon ?? null,
-        pinned: true,
-        is_builtin: false,
-        auto_run_on_workspace: false,
-        auto_run_on_new_tab: false,
-        kind: "cli",
-        agent_config: config,
-      });
-    } catch (err) {
-      console.error("[settings] new preset draft failed:", err);
-    }
-  }, []);
+  const handleNewPreset = useCallback(() => {
+    // Default the draft to a Claude launcher (first builtin as fallback).
+    const claude =
+      agentOptions.find((p) => p.id === "builtin-claude") ?? agentOptions[0] ?? null;
+    const agentCommand = claude?.commands[0] ?? "claude --dangerously-skip-permissions";
+    // Open an unsaved draft — nothing is persisted until the user presses
+    // "Create preset" in the editor.
+    setSelectedPresetId(null);
+    setDraftPreset({
+      id: "",
+      name: "New preset",
+      description: null,
+      commands: [agentCommand],
+      working_directory: null,
+      launch_mode: "new_tab",
+      icon: claude?.icon ?? "claude",
+      pinned: true,
+      is_builtin: false,
+      auto_run_on_workspace: false,
+      auto_run_on_new_tab: false,
+      kind: "cli",
+      launch_config: {
+        agent_command: agentCommand,
+        model_selection: { model: null, reasoning: null, context: null },
+        prompt: "",
+      },
+    });
+  }, [agentOptions]);
 
   // Persist a confirmed draft, then close the editor.
   const handleCreatePreset = useCallback(
@@ -1551,6 +1656,7 @@ export function SettingsView() {
                 unsaved) preset takes precedence over a selected existing one. */}
             <PresetEditorSheet
               preset={draftPreset ?? selectedPreset}
+              agentOptions={agentOptions}
               isDraft={draftPreset != null}
               open={draftPreset != null || selectedPreset != null}
               onCreate={handleCreatePreset}

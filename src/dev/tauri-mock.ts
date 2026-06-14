@@ -39,7 +39,6 @@ import {
   createSeedAppState,
 } from "./mock-fixtures";
 import type {
-  AgentCatalogEntry,
   AppStateSnapshot,
   ChatModelInfo,
   CliToolInfo,
@@ -477,7 +476,7 @@ function mkPreset(p: Partial<TerminalPreset> & { id: string; name: string }): Te
     auto_run_on_workspace: false,
     auto_run_on_new_tab: false,
     kind: "cli",
-    agent_config: null,
+    launch_config: null,
     ...p,
   };
 }
@@ -498,6 +497,20 @@ const presetState: PresetStoreSnapshot = {
       icon: "codex",
       is_builtin: true,
     }),
+    mkPreset({
+      id: "builtin-gemini",
+      name: "Gemini",
+      commands: ["gemini --yolo"],
+      icon: "gemini",
+      is_builtin: true,
+    }),
+    mkPreset({
+      id: "builtin-copilot",
+      name: "Copilot",
+      commands: ["copilot --allow-all"],
+      icon: "copilot",
+      is_builtin: true,
+    }),
   ],
   bar_visible: true,
   default_preset_id: null,
@@ -506,65 +519,6 @@ const presetState: PresetStoreSnapshot = {
 function emitPresets(): void {
   emitEvent("presets-changed", presetState);
 }
-
-// Representative subset of the Rust agent catalog (see agent_catalog.rs).
-const MOCK_AGENT_CATALOG: AgentCatalogEntry[] = [
-  {
-    id: "claude",
-    label: "Claude Code",
-    icon: "claude",
-    binary: "claude",
-    autonomy_flag: "--dangerously-skip-permissions",
-    accepts_model: true,
-    model_flag: "--model",
-    models: [
-      { value: "opus", label: "Opus" },
-      { value: "sonnet", label: "Sonnet" },
-      { value: "haiku", label: "Haiku" },
-    ],
-    reasoning: {
-      flag_template: null,
-      options: [
-        { value: "", label: "Default", prompt_prefix: null },
-        { value: "think", label: "Think", prompt_prefix: "Think step by step. " },
-        { value: "ultrathink", label: "Ultrathink", prompt_prefix: "Ultrathink. " },
-      ],
-    },
-    supports_prompt: true,
-  },
-  {
-    id: "codex",
-    label: "Codex",
-    icon: "codex",
-    binary: "codex",
-    autonomy_flag: "--full-auto",
-    accepts_model: true,
-    model_flag: "--model",
-    models: [],
-    reasoning: {
-      flag_template: '-c model_reasoning_effort="{value}"',
-      options: [
-        { value: "", label: "Default", prompt_prefix: null },
-        { value: "low", label: "Low", prompt_prefix: null },
-        { value: "medium", label: "Medium", prompt_prefix: null },
-        { value: "high", label: "High", prompt_prefix: null },
-      ],
-    },
-    supports_prompt: true,
-  },
-  {
-    id: "copilot",
-    label: "Copilot",
-    icon: "copilot",
-    binary: "copilot",
-    autonomy_flag: "--allow-all",
-    accepts_model: true,
-    model_flag: "--model",
-    models: [],
-    reasoning: null,
-    supports_prompt: true,
-  },
-];
 
 // A plausible dark palette so `useTerminalThemeSync` has real values to
 // apply to xterm instead of choking on a partial object.
@@ -783,7 +737,6 @@ const handlers: Record<string, Handler> = {
 
   // ── Presets ──
   get_presets: () => presetState,
-  list_agent_catalog: () => MOCK_AGENT_CATALOG,
   create_preset: (a) => {
     const id = `custom-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
     presetState.presets.push(
@@ -796,8 +749,8 @@ const handlers: Record<string, Handler> = {
         launch_mode: (a.launchMode as TerminalPreset["launch_mode"]) ?? "new_tab",
         icon: (a.icon as string | null) ?? null,
         pinned: (a.pinned as boolean) ?? true,
-        agent_config:
-          (a.agentConfig as TerminalPreset["agent_config"]) ?? null,
+        launch_config:
+          (a.launchConfig as TerminalPreset["launch_config"]) ?? null,
       }),
     );
     emitPresets();
@@ -813,8 +766,8 @@ const handlers: Record<string, Handler> = {
       if (a.icon !== undefined) p.icon = (a.icon as string | null) ?? null;
       if (a.autoRunOnWorkspace != null) p.auto_run_on_workspace = a.autoRunOnWorkspace as boolean;
       if (a.autoRunOnNewTab != null) p.auto_run_on_new_tab = a.autoRunOnNewTab as boolean;
-      if (a.agentConfig != null) p.agent_config = a.agentConfig as TerminalPreset["agent_config"];
-      else if (a.clearAgentConfig === true) p.agent_config = null;
+      if (a.launchConfig != null) p.launch_config = a.launchConfig as TerminalPreset["launch_config"];
+      else if (a.clearLaunchConfig === true) p.launch_config = null;
       emitPresets();
     }
     return undefined;
