@@ -39,11 +39,13 @@ import {
   createSeedAppState,
 } from "./mock-fixtures";
 import type {
+  AgentCatalogEntry,
   AppStateSnapshot,
   ChatModelInfo,
   CliToolInfo,
   FeatureFlags,
   PresetStoreSnapshot,
+  TerminalPreset,
   ProviderChatCapabilities,
   ResourceMetricsSnapshot,
   ShellAppearance,
@@ -460,11 +462,109 @@ function streamMockChatReply(
   streamReply: streamMockChatReply,
 };
 
-const EMPTY_PRESETS: PresetStoreSnapshot = {
-  presets: [],
-  bar_visible: false,
+// A small, mutable preset store so the preset bar + structured editor are
+// exercisable in the browser dev environment. Mirrors the real backend:
+// mutations update this object and re-emit `presets-changed`.
+function mkPreset(p: Partial<TerminalPreset> & { id: string; name: string }): TerminalPreset {
+  return {
+    description: null,
+    commands: [],
+    working_directory: null,
+    launch_mode: "new_tab",
+    icon: null,
+    pinned: true,
+    is_builtin: false,
+    auto_run_on_workspace: false,
+    auto_run_on_new_tab: false,
+    kind: "cli",
+    agent_config: null,
+    ...p,
+  };
+}
+
+const presetState: PresetStoreSnapshot = {
+  presets: [
+    mkPreset({
+      id: "builtin-claude",
+      name: "Claude Code",
+      commands: ["claude --dangerously-skip-permissions"],
+      icon: "claude",
+      is_builtin: true,
+    }),
+    mkPreset({
+      id: "builtin-codex",
+      name: "Codex",
+      commands: ["codex --full-auto"],
+      icon: "codex",
+      is_builtin: true,
+    }),
+  ],
+  bar_visible: true,
   default_preset_id: null,
 };
+
+function emitPresets(): void {
+  emitEvent("presets-changed", presetState);
+}
+
+// Representative subset of the Rust agent catalog (see agent_catalog.rs).
+const MOCK_AGENT_CATALOG: AgentCatalogEntry[] = [
+  {
+    id: "claude",
+    label: "Claude Code",
+    icon: "claude",
+    binary: "claude",
+    autonomy_flag: "--dangerously-skip-permissions",
+    accepts_model: true,
+    model_flag: "--model",
+    models: [
+      { value: "opus", label: "Opus" },
+      { value: "sonnet", label: "Sonnet" },
+      { value: "haiku", label: "Haiku" },
+    ],
+    reasoning: {
+      flag_template: null,
+      options: [
+        { value: "", label: "Default", prompt_prefix: null },
+        { value: "think", label: "Think", prompt_prefix: "Think step by step. " },
+        { value: "ultrathink", label: "Ultrathink", prompt_prefix: "Ultrathink. " },
+      ],
+    },
+    supports_prompt: true,
+  },
+  {
+    id: "codex",
+    label: "Codex",
+    icon: "codex",
+    binary: "codex",
+    autonomy_flag: "--full-auto",
+    accepts_model: true,
+    model_flag: "--model",
+    models: [],
+    reasoning: {
+      flag_template: '-c model_reasoning_effort="{value}"',
+      options: [
+        { value: "", label: "Default", prompt_prefix: null },
+        { value: "low", label: "Low", prompt_prefix: null },
+        { value: "medium", label: "Medium", prompt_prefix: null },
+        { value: "high", label: "High", prompt_prefix: null },
+      ],
+    },
+    supports_prompt: true,
+  },
+  {
+    id: "copilot",
+    label: "Copilot",
+    icon: "copilot",
+    binary: "copilot",
+    autonomy_flag: "--allow-all",
+    accepts_model: true,
+    model_flag: "--model",
+    models: [],
+    reasoning: null,
+    supports_prompt: true,
+  },
+];
 
 // A plausible dark palette so `useTerminalThemeSync` has real values to
 // apply to xterm instead of choking on a partial object.
@@ -682,7 +782,72 @@ const handlers: Record<string, Handler> = {
   },
 
   // ── Presets ──
-  get_presets: () => EMPTY_PRESETS,
+  get_presets: () => presetState,
+  list_agent_catalog: () => MOCK_AGENT_CATALOG,
+  create_preset: (a) => {
+    const id = `custom-${Date.now()}-${Math.floor(Math.random() * 1e6)}`;
+    presetState.presets.push(
+      mkPreset({
+        id,
+        name: (a.name as string) ?? "New preset",
+        description: (a.description as string | null) ?? null,
+        commands: (a.commands as string[]) ?? [],
+        working_directory: (a.workingDirectory as string | null) ?? null,
+        launch_mode: (a.launchMode as TerminalPreset["launch_mode"]) ?? "new_tab",
+        icon: (a.icon as string | null) ?? null,
+        pinned: (a.pinned as boolean) ?? true,
+        agent_config:
+          (a.agentConfig as TerminalPreset["agent_config"]) ?? null,
+      }),
+    );
+    emitPresets();
+    return id;
+  },
+  update_preset: (a) => {
+    const p = presetState.presets.find((x) => x.id === a.id);
+    if (p) {
+      if (a.name != null) p.name = a.name as string;
+      if (a.description !== undefined) p.description = (a.description as string | null) ?? null;
+      if (a.commands != null) p.commands = a.commands as string[];
+      if (a.launchMode != null) p.launch_mode = a.launchMode as TerminalPreset["launch_mode"];
+      if (a.icon !== undefined) p.icon = (a.icon as string | null) ?? null;
+      if (a.autoRunOnWorkspace != null) p.auto_run_on_workspace = a.autoRunOnWorkspace as boolean;
+      if (a.autoRunOnNewTab != null) p.auto_run_on_new_tab = a.autoRunOnNewTab as boolean;
+      if (a.agentConfig != null) p.agent_config = a.agentConfig as TerminalPreset["agent_config"];
+      else if (a.clearAgentConfig === true) p.agent_config = null;
+      emitPresets();
+    }
+    return undefined;
+  },
+  delete_preset: (a) => {
+    presetState.presets = presetState.presets.filter((x) => x.id !== a.id);
+    emitPresets();
+    return undefined;
+  },
+  set_preset_pinned: (a) => {
+    const p = presetState.presets.find((x) => x.id === a.id);
+    if (p) {
+      p.pinned = a.pinned as boolean;
+      emitPresets();
+    }
+    return undefined;
+  },
+  set_preset_bar_visible: (a) => {
+    presetState.bar_visible = a.visible as boolean;
+    emitPresets();
+    return undefined;
+  },
+  reorder_presets: (a) => {
+    const from = presetState.presets.findIndex((x) => x.id === a.presetId);
+    const to = a.targetIndex as number;
+    if (from >= 0 && to >= 0 && to < presetState.presets.length) {
+      const [moved] = presetState.presets.splice(from, 1);
+      presetState.presets.splice(to, 0, moved);
+      emitPresets();
+    }
+    return undefined;
+  },
+  apply_preset: () => undefined,
 
   // ── Editors / tooling ──
   detect_editors: () => [],

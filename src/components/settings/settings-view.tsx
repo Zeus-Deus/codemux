@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -40,6 +40,7 @@ import {
   PinOff,
   Trash2,
   X,
+  Plus,
   UserCircle,
   LogOut,
   Globe,
@@ -80,18 +81,28 @@ import {
   clearBrowserCookies,
   clearAllBrowserData,
 } from "@/tauri/commands";
-import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind } from "@/tauri/types";
+import type { EditorInfo, PresetStoreSnapshot, TerminalPreset, LaunchMode, AgentChatProviderKind, AgentCatalogEntry, PresetAgentConfig } from "@/tauri/types";
 import { MultiProviderModelPicker } from "@/components/chat/pickers/MultiProviderModelPicker";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
   getPresets,
+  createPreset,
   reorderPresets,
   setPresetPinned,
   setPresetBarVisible,
   deletePreset,
   updatePreset,
 } from "@/tauri/commands";
+import {
+  useAgentCatalog,
+  ensureAgentCatalog,
+} from "@/lib/presets/use-agent-catalog";
+import {
+  assembleAgentCommand,
+  defaultAgentConfig,
+  findAgentEntry,
+} from "@/lib/presets/agent-command";
 import { onPresetsChanged } from "@/tauri/events";
 import {
   DndContext,
@@ -467,15 +478,27 @@ function BrowserSection() {
   );
 }
 
+// Radix <SelectItem> forbids an empty-string value, so the "Default /
+// none" reasoning option is represented in the Select by this sentinel
+// and mapped back to "" (→ null reasoning) on change.
+const REASONING_DEFAULT = "__default__";
+
 function PresetEditorSheet({
   preset,
   open,
   onOpenChange,
+  isDraft = false,
+  onCreate,
 }: {
   preset: TerminalPreset | null;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** When true, this is an unsaved new preset — nothing is persisted until
+   *  the user presses "Create preset". Edits stay local; auto-save is off. */
+  isDraft?: boolean;
+  onCreate?: (payload: Parameters<typeof createPreset>[0]) => void;
 }) {
+  const catalog = useAgentCatalog();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [commands, setCommands] = useState<string[]>([""]);
@@ -483,6 +506,7 @@ function PresetEditorSheet({
   const [pinned, setPinned] = useState(true);
   const [autoRunOnWorkspace, setAutoRunOnWorkspace] = useState(false);
   const [autoRunOnNewTab, setAutoRunOnNewTab] = useState(false);
+  const [agentConfig, setAgentConfig] = useState<PresetAgentConfig | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Sync when preset changes
@@ -495,10 +519,15 @@ function PresetEditorSheet({
     setPinned(preset.pinned);
     setAutoRunOnWorkspace(preset.auto_run_on_workspace);
     setAutoRunOnNewTab(preset.auto_run_on_new_tab);
+    setAgentConfig(preset.agent_config ?? null);
     setConfirmDelete(false);
   }, [preset]);
 
   if (!preset) return null;
+
+  const structured = agentConfig != null;
+  const entry = structured ? findAgentEntry(catalog, agentConfig.agent_id) : null;
+  const assembled = entry && agentConfig ? assembleAgentCommand(entry, agentConfig) : "";
 
   const save = (updates: Partial<{
     name: string;
@@ -506,6 +535,9 @@ function PresetEditorSheet({
     commands: string[];
     launchMode: LaunchMode;
   }>) => {
+    // Draft presets are not persisted until "Create preset" — edits live in
+    // local state and are read by buildCreatePayload on confirm.
+    if (isDraft) return;
     updatePreset({
       id: preset.id,
       name: updates.name ?? name,
@@ -517,6 +549,81 @@ function PresetEditorSheet({
     }).catch(console.error);
   };
 
+  // Persist a structured config: assemble its command and store both the
+  // command (what launches) and the config (what the editor round-trips).
+  const saveStructured = (next: PresetAgentConfig, nextEntry: AgentCatalogEntry) => {
+    const command = assembleAgentCommand(nextEntry, next);
+    const cmds = command ? [command] : [];
+    setAgentConfig(next);
+    setCommands(cmds.length > 0 ? cmds : [""]);
+    if (isDraft) return;
+    updatePreset({
+      id: preset.id,
+      name,
+      description: description || null,
+      commands: cmds,
+      workingDirectory: preset.working_directory,
+      launchMode,
+      icon: nextEntry.icon,
+      agentConfig: next,
+    }).catch(console.error);
+  };
+
+  const handleAgentChange = (agentId: string) => {
+    const nextEntry = findAgentEntry(catalog, agentId);
+    if (!nextEntry || !agentConfig) return;
+    // Reset model/reasoning/autonomy to the new agent's defaults but keep
+    // the user's prompt — switching agent shouldn't lose their intent.
+    const next: PresetAgentConfig = {
+      ...defaultAgentConfig(nextEntry),
+      prompt: agentConfig.prompt,
+    };
+    saveStructured(next, nextEntry);
+  };
+
+  const handleModelBlur = () => {
+    if (entry && agentConfig) saveStructured(agentConfig, entry);
+  };
+
+  const handleReasoningChange = (value: string) => {
+    if (!entry || !agentConfig) return;
+    saveStructured({ ...agentConfig, reasoning: value || null }, entry);
+  };
+
+  const handlePromptBlur = () => {
+    if (entry && agentConfig) saveStructured(agentConfig, entry);
+  };
+
+  const handleSkipPermissionsChange = (checked: boolean) => {
+    if (!entry || !agentConfig) return;
+    saveStructured({ ...agentConfig, skip_permissions: checked }, entry);
+  };
+
+  // Switch between the structured "agent launcher" and raw command editors.
+  const handleModeChange = (mode: string) => {
+    if (mode === "structured" && !structured) {
+      const nextEntry =
+        findAgentEntry(catalog, "claude") ?? catalog[0] ?? null;
+      if (!nextEntry) return;
+      saveStructured(defaultAgentConfig(nextEntry), nextEntry);
+    } else if (mode === "raw" && structured) {
+      const cmds = assembled ? [assembled] : [];
+      setAgentConfig(null);
+      setCommands(cmds.length > 0 ? cmds : [""]);
+      if (isDraft) return;
+      updatePreset({
+        id: preset.id,
+        name,
+        description: description || null,
+        commands: cmds,
+        workingDirectory: preset.working_directory,
+        launchMode,
+        icon: preset.icon,
+        clearAgentConfig: true,
+      }).catch(console.error);
+    }
+  };
+
   const handleDelete = () => {
     deletePreset(preset.id).catch(console.error);
     onOpenChange(false);
@@ -524,8 +631,26 @@ function PresetEditorSheet({
 
   const handlePinnedChange = (checked: boolean) => {
     setPinned(checked);
+    if (isDraft) return;
     setPresetPinned(preset.id, checked).catch(console.error);
   };
+
+  // Snapshot of local editor state shaped for `createPreset` — used when a
+  // draft is confirmed.
+  const buildCreatePayload = (): Parameters<typeof createPreset>[0] => ({
+    name: name.trim() || "New preset",
+    description: description.trim() || null,
+    commands: structured
+      ? assembled
+        ? [assembled]
+        : []
+      : commands.filter((c) => c.trim()),
+    workingDirectory: preset.working_directory ?? null,
+    launchMode,
+    pinned,
+    icon: structured ? entry?.icon ?? null : preset.icon,
+    agentConfig: structured ? agentConfig : null,
+  });
 
   const handleCommandChange = (index: number, value: string) => {
     const next = [...commands];
@@ -546,6 +671,8 @@ function PresetEditorSheet({
     save({ commands: cleaned.filter((c) => c.trim()) });
   };
 
+  const reasoningOptions = entry?.reasoning?.options ?? [];
+
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
@@ -556,11 +683,11 @@ function PresetEditorSheet({
         {/* Header */}
         <SheetHeader className="border-b p-4">
           <SheetTitle className="flex items-center gap-2 text-sm">
-            <PresetIcon icon={preset.icon} className="h-4 w-4 shrink-0" />
-            {preset.name}
+            <PresetIcon icon={entry?.icon ?? preset.icon} className="h-4 w-4 shrink-0" />
+            {name || preset.name}
           </SheetTitle>
           <SheetDescription>
-            Configure commands, targeting, and launch options.
+            Configure how this preset launches.
           </SheetDescription>
         </SheetHeader>
 
@@ -573,7 +700,7 @@ function PresetEditorSheet({
               value={name}
               onChange={(e) => setName(e.target.value)}
               onBlur={() => name !== preset.name && save({ name })}
-              placeholder="e.g. Dev Server"
+              placeholder="e.g. Git Pull"
               className="h-9"
             />
           </div>
@@ -590,42 +717,186 @@ function PresetEditorSheet({
             />
           </div>
 
-          {/* Commands */}
+          {/* Type — agent launcher vs raw command */}
           <div className="space-y-2">
-            <label className="text-sm font-medium">Commands</label>
-            <div className="flex flex-col gap-1.5">
-              {commands.map((cmd, i) => (
-                <div key={i} className="group/cmd flex items-center gap-2">
-                  <Input
-                    value={cmd}
-                    onChange={(e) => handleCommandChange(i, e.target.value)}
-                    onBlur={handleCommandBlur}
-                    placeholder="e.g. bun run dev"
-                    className="h-9 flex-1 font-mono text-sm"
-                  />
-                  {commands.length > 1 && (
-                    <Button
-                      variant="ghost"
-                      size="icon-xs"
-                      onClick={() => removeCommand(i)}
-                      className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
-                      aria-label="Remove command"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </Button>
-                  )}
-                </div>
-              ))}
-              <Button
-                variant="ghost"
-                size="sm"
-                className="mt-1 w-fit gap-1.5 text-muted-foreground hover:text-foreground"
-                onClick={addCommand}
-              >
-                + Add command
-              </Button>
-            </div>
+            <label className="text-sm font-medium">Type</label>
+            <Select value={structured ? "structured" : "raw"} onValueChange={handleModeChange}>
+              <SelectTrigger className="h-9">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="structured">Agent launcher</SelectItem>
+                <SelectItem value="raw">Raw command</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {structured
+                ? "Pick an agent, model, and prompt — Codemux builds the command."
+                : "Type the exact shell command(s) to run."}
+            </p>
           </div>
+
+          {structured && agentConfig ? (
+            <div className="space-y-5">
+              {/* Agent */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Agent</label>
+                <Select value={agentConfig.agent_id} onValueChange={handleAgentChange}>
+                  <SelectTrigger className="h-9">
+                    <SelectValue placeholder="Select an agent" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {catalog.map((a) => (
+                      <SelectItem key={a.id} value={a.id}>
+                        <span className="flex items-center gap-2">
+                          <PresetIcon icon={a.icon} className="h-3.5 w-3.5" />
+                          {a.label}
+                        </span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+
+              {/* Model */}
+              {entry?.accepts_model && (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Model</label>
+                  <Input
+                    value={agentConfig.model ?? ""}
+                    onChange={(e) =>
+                      setAgentConfig({ ...agentConfig, model: e.target.value || null })
+                    }
+                    onBlur={handleModelBlur}
+                    placeholder="Default"
+                    list={entry.models.length > 0 ? `models-${entry.id}` : undefined}
+                    className="h-9 font-mono text-sm"
+                  />
+                  {entry.models.length > 0 && (
+                    <datalist id={`models-${entry.id}`}>
+                      {entry.models.map((m) => (
+                        <option key={m.value} value={m.value}>
+                          {m.label}
+                        </option>
+                      ))}
+                    </datalist>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    {entry.models.length > 0
+                      ? "Pick a suggestion or type any model your agent accepts. Blank uses the agent's default."
+                      : "Type any model your agent accepts, or leave blank for its default."}
+                  </p>
+                </div>
+              )}
+
+              {/* Reasoning */}
+              {reasoningOptions.length > 0 && (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Reasoning</label>
+                  <Select
+                    value={agentConfig.reasoning ? agentConfig.reasoning : REASONING_DEFAULT}
+                    onValueChange={(v) =>
+                      handleReasoningChange(v === REASONING_DEFAULT ? "" : v)
+                    }
+                  >
+                    <SelectTrigger className="h-9">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {reasoningOptions.map((o) => (
+                        <SelectItem
+                          key={o.value || REASONING_DEFAULT}
+                          value={o.value || REASONING_DEFAULT}
+                        >
+                          {o.label}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              )}
+
+              {/* Prompt */}
+              {entry?.supports_prompt && (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Prompt</label>
+                  <Textarea
+                    value={agentConfig.prompt}
+                    onChange={(e) =>
+                      setAgentConfig({ ...agentConfig, prompt: e.target.value })
+                    }
+                    onBlur={handlePromptBlur}
+                    placeholder="e.g. pull the latest changes and resolve any conflicts"
+                    className="min-h-[72px] text-sm"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Sent to the agent as its first instruction. Leave blank to just launch the agent.
+                  </p>
+                </div>
+              )}
+
+              {/* Skip permissions */}
+              {entry?.autonomy_flag && (
+                <div className="flex items-center justify-between">
+                  <div className="space-y-0.5">
+                    <p className="text-sm font-medium">Skip permissions</p>
+                    <p className="text-xs text-muted-foreground">
+                      Run in full-auto mode (<code className="font-mono">{entry.autonomy_flag}</code>).
+                    </p>
+                  </div>
+                  <Switch
+                    checked={agentConfig.skip_permissions}
+                    onCheckedChange={handleSkipPermissionsChange}
+                  />
+                </div>
+              )}
+
+              {/* Command preview */}
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Command preview</label>
+                <pre className="rounded-md border border-border/50 bg-muted/40 px-3 py-2 text-[12px] font-mono text-muted-foreground whitespace-pre-wrap break-all">
+                  {assembled || "—"}
+                </pre>
+              </div>
+            </div>
+          ) : (
+            /* Raw commands */
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Commands</label>
+              <div className="flex flex-col gap-1.5">
+                {commands.map((cmd, i) => (
+                  <div key={i} className="group/cmd flex items-center gap-2">
+                    <Input
+                      value={cmd}
+                      onChange={(e) => handleCommandChange(i, e.target.value)}
+                      onBlur={handleCommandBlur}
+                      placeholder="e.g. bun run dev"
+                      className="h-9 flex-1 font-mono text-sm"
+                    />
+                    {commands.length > 1 && (
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        onClick={() => removeCommand(i)}
+                        className="shrink-0 opacity-0 group-hover/cmd:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+                        aria-label="Remove command"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    )}
+                  </div>
+                ))}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="mt-1 w-fit gap-1.5 text-muted-foreground hover:text-foreground"
+                  onClick={addCommand}
+                >
+                  + Add command
+                </Button>
+              </div>
+            </div>
+          )}
 
           {/* Advanced section */}
           <div className="space-y-5 border-t border-border/40 pt-5">
@@ -653,7 +924,9 @@ function PresetEditorSheet({
               </Select>
             </div>
 
-            {/* Auto-run */}
+            {/* Auto-run — hidden for unsaved drafts (applies to an existing
+                preset; configurable after the preset is created). */}
+            {!isDraft && (
             <div className="space-y-3">
               <label className="text-sm font-medium">Auto-run</label>
               <div className="space-y-4">
@@ -711,6 +984,7 @@ function PresetEditorSheet({
                 </div>
               </div>
             </div>
+            )}
 
             {/* Pinned */}
             <div className="flex items-center justify-between">
@@ -727,7 +1001,11 @@ function PresetEditorSheet({
 
         {/* Footer */}
         <SheetFooter className="border-t p-4 sm:flex-row sm:items-center sm:justify-between">
-          {!preset.is_builtin ? (
+          {isDraft ? (
+            <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)}>
+              Cancel
+            </Button>
+          ) : !preset.is_builtin ? (
             confirmDelete ? (
               <div className="flex items-center gap-2">
                 <Button variant="destructive" size="sm" onClick={handleDelete}>
@@ -753,9 +1031,13 @@ function PresetEditorSheet({
           <Button
             size="sm"
             className="bg-foreground text-background hover:bg-foreground/90"
-            onClick={() => onOpenChange(false)}
+            onClick={
+              isDraft
+                ? () => onCreate?.(buildCreatePayload())
+                : () => onOpenChange(false)
+            }
           >
-            Done
+            {isDraft ? "Create preset" : "Done"}
           </Button>
         </SheetFooter>
       </SheetContent>
@@ -805,6 +1087,8 @@ export function SettingsView() {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const [presetStore, setPresetStore] = useState<PresetStoreSnapshot | null>(null);
   const [selectedPresetId, setSelectedPresetId] = useState<string | null>(null);
+  // An unsaved new preset being edited; persisted only on "Create preset".
+  const [draftPreset, setDraftPreset] = useState<TerminalPreset | null>(null);
 
   // Drag-to-reorder presets list. 5px activation distance keeps a
   // plain row click from engaging drag, so clicks still open the
@@ -906,6 +1190,65 @@ export function SettingsView() {
     const unlisten = onPresetsChanged((snapshot) => setPresetStore(snapshot));
     return () => { unlisten.then((fn) => fn()); };
   }, []);
+
+  // Create a new structured preset (defaults to a Claude launcher) and
+  // open its editor. Used by the "New preset" button here and by the
+  // preset bar's gear menu (via the `pendingPresetCreate` ui-store flag).
+  const handleNewPreset = useCallback(async () => {
+    try {
+      const cat = await ensureAgentCatalog();
+      const entry = findAgentEntry(cat, "claude") ?? cat[0] ?? null;
+      const config = entry ? defaultAgentConfig(entry) : null;
+      const command = entry && config ? assembleAgentCommand(entry, config) : "";
+      // Open an unsaved draft — nothing is persisted until the user presses
+      // "Create preset" in the editor.
+      setSelectedPresetId(null);
+      setDraftPreset({
+        id: "",
+        name: "New preset",
+        description: null,
+        commands: command ? [command] : [],
+        working_directory: null,
+        launch_mode: "new_tab",
+        icon: entry?.icon ?? null,
+        pinned: true,
+        is_builtin: false,
+        auto_run_on_workspace: false,
+        auto_run_on_new_tab: false,
+        kind: "cli",
+        agent_config: config,
+      });
+    } catch (err) {
+      console.error("[settings] new preset draft failed:", err);
+    }
+  }, []);
+
+  // Persist a confirmed draft, then close the editor.
+  const handleCreatePreset = useCallback(
+    async (payload: Parameters<typeof createPreset>[0]) => {
+      try {
+        await createPreset(payload);
+        setDraftPreset(null);
+      } catch (err) {
+        console.error("[settings] create preset failed:", err);
+      }
+    },
+    [],
+  );
+
+  // Honor a "new preset" request raised elsewhere (e.g. the preset bar's
+  // gear menu, which opens settings and sets this flag).
+  const pendingPresetCreate = useUIStore((s) => s.pendingPresetCreate);
+  useEffect(() => {
+    if (!pendingPresetCreate) return;
+    // Read+clear from the store so StrictMode's double-invoked effect (or
+    // any re-fire) can't create the preset twice — only the first run
+    // observes the flag still set.
+    if (!useUIStore.getState().pendingPresetCreate) return;
+    useUIStore.getState().clearPendingPresetCreate();
+    setActiveSection("presets");
+    handleNewPreset();
+  }, [pendingPresetCreate, handleNewPreset]);
 
   useEffect(() => {
     detectEditors()
@@ -1156,6 +1499,12 @@ export function SettingsView() {
               <SubsectionHeader
                 title="Your presets"
                 description="Drag the grip to reorder. Click a preset to edit, pin, or delete."
+                action={
+                  <Button variant="outline" size="sm" className="gap-1.5" onClick={handleNewPreset}>
+                    <Plus className="h-3.5 w-3.5" />
+                    New preset
+                  </Button>
+                }
               />
               {presetStore ? (
                 <DndContext
@@ -1198,11 +1547,19 @@ export function SettingsView() {
               </a>
             </p>
 
-            {/* Editor sheet — renders via portal, not inline */}
+            {/* Editor sheet — renders via portal, not inline. A draft (new,
+                unsaved) preset takes precedence over a selected existing one. */}
             <PresetEditorSheet
-              preset={selectedPreset}
-              open={!!selectedPreset}
-              onOpenChange={(open) => { if (!open) setSelectedPresetId(null); }}
+              preset={draftPreset ?? selectedPreset}
+              isDraft={draftPreset != null}
+              open={draftPreset != null || selectedPreset != null}
+              onCreate={handleCreatePreset}
+              onOpenChange={(open) => {
+                if (!open) {
+                  setDraftPreset(null);
+                  setSelectedPresetId(null);
+                }
+              }}
             />
           </div>
         );
@@ -1778,6 +2135,23 @@ function SortablePresetRow({
         )}
       </div>
       <div className="flex items-center gap-0.5 shrink-0">
+        {/* Delete sits to the LEFT of the pin so the pin stays anchored to
+            the row's right edge — keeping it aligned across builtin rows
+            (pin only) and custom rows (pin + delete). */}
+        {!preset.is_builtin && (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            title="Delete preset"
+            className="h-7 w-7 opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete();
+            }}
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="icon-xs"
@@ -1797,20 +2171,6 @@ function SortablePresetRow({
             <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
           )}
         </Button>
-        {!preset.is_builtin && (
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            title="Delete preset"
-            className="h-7 w-7 opacity-0 group-hover/preset:opacity-100 transition-opacity hover:bg-destructive/10 hover:text-destructive"
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete();
-            }}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </Button>
-        )}
       </div>
     </div>
   );

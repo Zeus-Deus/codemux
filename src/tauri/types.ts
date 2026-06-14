@@ -931,6 +931,25 @@ export type LaunchMode = "split_pane" | "new_tab";
  *  frontend `materializeWithPreset` dispatches on this field. */
 export type PresetKind = "cli" | "chat_agent";
 
+/** Structured "agent launcher" configuration (mirror of the Rust
+ *  `presets::AgentConfig`). Present when a preset was built with the
+ *  structured editor; `null` for raw command presets. The assembled
+ *  command lives in `TerminalPreset.commands` — this is only the source the
+ *  editor round-trips. See `src/lib/presets/agent-command.ts`. Named with a
+ *  `Preset` prefix to avoid colliding with the OpenFlow `AgentConfig`. */
+export interface PresetAgentConfig {
+  /** Catalog id of the chosen agent (e.g. `"claude"`). */
+  agent_id: string;
+  /** Selected model value, or null to omit the model flag. */
+  model: string | null;
+  /** Selected reasoning option value, or null for the default. */
+  reasoning: string | null;
+  /** Free-form prompt passed to the agent (may be empty). */
+  prompt: string;
+  /** Whether the agent's autonomy / skip-permissions flag is enabled. */
+  skip_permissions: boolean;
+}
+
 export interface TerminalPreset {
   id: string;
   name: string;
@@ -946,6 +965,48 @@ export interface TerminalPreset {
   /** Defaults to `"cli"` on the Rust side for presets persisted
    *  before this field existed. */
   kind: PresetKind;
+  /** Structured agent-launcher config, when built with the structured
+   *  editor. `null`/absent for raw command presets. */
+  agent_config?: PresetAgentConfig | null;
+}
+
+// ── Agent catalog (drives the structured preset editor) ──
+
+/** A curated, editable model suggestion. Mirror of Rust `AgentModelOption`. */
+export interface AgentModelOption {
+  value: string;
+  label: string;
+}
+
+/** One reasoning level. Mirror of Rust `AgentReasoningOption`. */
+export interface AgentReasoningOption {
+  value: string;
+  label: string;
+  /** Prepended to the prompt when the agent has no real reasoning flag. */
+  prompt_prefix?: string | null;
+}
+
+/** How an agent expresses a reasoning level. Mirror of Rust `AgentReasoning`. */
+export interface AgentReasoning {
+  /** Real CLI flag template with a `{value}` placeholder. When null,
+   *  reasoning is applied via the option's `prompt_prefix` instead. */
+  flag_template?: string | null;
+  options: AgentReasoningOption[];
+}
+
+/** Static per-agent metadata. Mirror of Rust `AgentCatalogEntry`. */
+export interface AgentCatalogEntry {
+  id: string;
+  label: string;
+  icon: string;
+  binary: string;
+  /** Skip-permissions / autonomy flag, or null when the agent has none. */
+  autonomy_flag?: string | null;
+  accepts_model: boolean;
+  model_flag: string;
+  models: AgentModelOption[];
+  reasoning?: AgentReasoning | null;
+  supports_prompt: boolean;
 }
 
 export interface PresetStoreSnapshot {

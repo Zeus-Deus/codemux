@@ -5,7 +5,7 @@ use tauri::State;
 
 use crate::database::DatabaseStore;
 use crate::presets::{
-    emit_presets_changed, save_presets, snapshot_from_store, LaunchMode, PresetKind,
+    emit_presets_changed, save_presets, snapshot_from_store, AgentConfig, LaunchMode, PresetKind,
     PresetStoreSnapshot, PresetStoreState, TerminalPreset,
 };
 use crate::state::AppStateStore;
@@ -16,6 +16,14 @@ use crate::terminal::PtyState;
 pub fn get_presets(presets: State<'_, PresetStoreState>) -> Result<PresetStoreSnapshot, String> {
     let store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     Ok(snapshot_from_store(&store))
+}
+
+/// Return the static agent catalog that drives the structured preset
+/// editor (agent picker, model suggestions, reasoning options). See
+/// [`crate::agent_catalog`] for the metadata contract.
+#[tauri::command]
+pub fn list_agent_catalog() -> Vec<crate::agent_catalog::AgentCatalogEntry> {
+    crate::agent_catalog::agent_catalog()
 }
 
 /// Listing of presets with each entry's runtime-binary availability resolved
@@ -57,6 +65,7 @@ pub(crate) fn list_presets_with_availability(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn create_preset(
     app: tauri::AppHandle,
     db: State<'_, DatabaseStore>,
@@ -67,6 +76,8 @@ pub fn create_preset(
     working_directory: Option<String>,
     launch_mode: LaunchMode,
     pinned: bool,
+    icon: Option<String>,
+    agent_config: Option<AgentConfig>,
 ) -> Result<String, String> {
     let id = uuid::Uuid::new_v4().to_string();
     let preset = TerminalPreset {
@@ -76,7 +87,7 @@ pub fn create_preset(
         commands,
         working_directory,
         launch_mode,
-        icon: None,
+        icon,
         pinned,
         is_builtin: false,
         auto_run_on_workspace: false,
@@ -84,6 +95,10 @@ pub fn create_preset(
         // User-created presets default to CLI. If we later add UI
         // for creating ChatAgent presets, plumb a `kind` arg through.
         kind: PresetKind::Cli,
+        // For structured "agent launcher" presets, the frontend passes
+        // the assembled `commands` *and* the source `agent_config` so the
+        // editor can round-trip the dropdowns. Raw presets pass `None`.
+        agent_config,
     };
 
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -96,6 +111,7 @@ pub fn create_preset(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub fn update_preset(
     app: tauri::AppHandle,
     db: State<'_, DatabaseStore>,
@@ -110,6 +126,8 @@ pub fn update_preset(
     icon: Option<String>,
     auto_run_on_workspace: Option<bool>,
     auto_run_on_new_tab: Option<bool>,
+    agent_config: Option<AgentConfig>,
+    clear_agent_config: Option<bool>,
 ) -> Result<(), String> {
     let mut store = presets.inner.lock().unwrap_or_else(|e| e.into_inner());
     let preset = store
@@ -145,6 +163,16 @@ pub fn update_preset(
     }
     if let Some(v) = auto_run_on_new_tab {
         preset.auto_run_on_new_tab = v;
+    }
+    // Structured agent config follows a set/clear/leave-unchanged
+    // convention: `agent_config: Some(..)` sets it (structured save),
+    // `clear_agent_config: Some(true)` removes it (switching to a raw
+    // command preset), and passing neither leaves it untouched (so
+    // unrelated updates like the auto-run toggles don't wipe it).
+    if let Some(cfg) = agent_config {
+        preset.agent_config = Some(cfg);
+    } else if clear_agent_config == Some(true) {
+        preset.agent_config = None;
     }
 
     save_presets(&db, &store)?;
@@ -1412,6 +1440,7 @@ mod tests {
             auto_run_on_workspace: false,
             auto_run_on_new_tab: false,
             kind,
+            agent_config: None,
         }
     }
 

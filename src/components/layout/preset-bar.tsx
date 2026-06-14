@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Settings } from "lucide-react";
+import { Settings, Plus } from "lucide-react";
 import {
   DndContext,
   PointerSensor,
@@ -378,6 +378,7 @@ export function PresetBar({
   };
 
   const setShowSettings = useUIStore.getState().setShowSettings;
+  const requestNewPreset = useUIStore.getState().requestNewPreset;
 
   // Translate a vertical mouse-wheel delta into horizontal scrolling so
   // the bar can be panned with a plain wheel when many pinned presets
@@ -416,6 +417,10 @@ export function PresetBar({
             Show Preset Bar
           </DropdownMenuCheckboxItem>
           <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={() => requestNewPreset()}>
+            <Plus className="h-4 w-4" />
+            <span>New Preset</span>
+          </DropdownMenuItem>
           <DropdownMenuItem onClick={() => setShowSettings(true, "presets")}>
             <Settings className="h-4 w-4" />
             <span>Manage Presets</span>

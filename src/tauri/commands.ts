@@ -11,6 +11,8 @@ import type { AgentChatEventPayload, ApprovalDecision } from "./events";
 import type {
   UserSettings,
   AgentConfig,
+  AgentCatalogEntry,
+  PresetAgentConfig,
   AgentSessionState,
   AppStateSnapshot,
   AuthResponse,
@@ -918,13 +920,19 @@ export const getShellAppearance = () =>
 export const getPresets = () =>
   invoke<PresetStoreSnapshot>("get_presets");
 
+export const listAgentCatalog = () =>
+  invoke<AgentCatalogEntry[]>("list_agent_catalog");
+
 export const createPreset = (params: {
   name: string;
   description: string | null;
   commands: string[];
   workingDirectory: string | null;
   launchMode: LaunchMode;
+  pinned: boolean;
   icon: string | null;
+  /** Structured agent-launcher source, or null for raw presets. */
+  agentConfig?: PresetAgentConfig | null;
 }) =>
   invoke<string>("create_preset", params);
 
@@ -938,6 +946,10 @@ export const updatePreset = (params: {
   icon: string | null;
   autoRunOnWorkspace?: boolean;
   autoRunOnNewTab?: boolean;
+  /** Set the structured agent-launcher config (structured save). */
+  agentConfig?: PresetAgentConfig | null;
+  /** Remove the structured config (switching to a raw command preset). */
+  clearAgentConfig?: boolean;
 }) =>
   invoke("update_preset", params);
 
