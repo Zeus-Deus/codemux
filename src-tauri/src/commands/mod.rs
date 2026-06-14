@@ -312,10 +312,28 @@ pub async fn pick_folder_dialog<R: Runtime>(
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
-    // Fail loudly when no dialog backend exists (issue #95) — without
-    // this the portal-only backend resolves `None` exactly like a user
-    // cancel and the UI silently does nothing.
-    crate::dialog_preflight::ensure_file_picker_backend().await?;
+    // Decide the dialog backend up front (issue #95). On Linux, when
+    // the portal is unusable but zenity exists, drive zenity ourselves
+    // with a sanitized env + timeout instead of letting rfd inherit the
+    // broken session environment (which hangs the picker).
+    #[cfg(target_os = "linux")]
+    {
+        match crate::dialog_preflight::select_backend().await {
+            crate::dialog_preflight::Backend::Portal => {}
+            crate::dialog_preflight::Backend::Zenity(zenity) => {
+                let dialog_title = title.clone().unwrap_or_else(|| "Choose folder".to_string());
+                return Ok(crate::dialog_fallback::pick_folder(&zenity, &dialog_title)
+                    .await?
+                    .map(|path| path.to_string_lossy().into_owned()));
+            }
+            crate::dialog_preflight::Backend::None(message) => {
+                return Err(format!(
+                    "{}: {message}",
+                    crate::dialog_preflight::NO_BACKEND_MARKER
+                ));
+            }
+        }
+    }
 
     let (tx, rx) = oneshot::channel();
 
@@ -345,8 +363,27 @@ pub async fn pick_files_dialog<R: Runtime>(
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
-    // See pick_folder_dialog — same silent-failure guard (issue #95).
-    crate::dialog_preflight::ensure_file_picker_backend().await?;
+    // See pick_folder_dialog — same backend decision (issue #95).
+    #[cfg(target_os = "linux")]
+    {
+        match crate::dialog_preflight::select_backend().await {
+            crate::dialog_preflight::Backend::Portal => {}
+            crate::dialog_preflight::Backend::Zenity(zenity) => {
+                let dialog_title = title.clone().unwrap_or_else(|| "Attach files".to_string());
+                return Ok(crate::dialog_fallback::pick_files(&zenity, &dialog_title)
+                    .await?
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect());
+            }
+            crate::dialog_preflight::Backend::None(message) => {
+                return Err(format!(
+                    "{}: {message}",
+                    crate::dialog_preflight::NO_BACKEND_MARKER
+                ));
+            }
+        }
+    }
 
     let (tx, rx) = oneshot::channel();
 
@@ -388,8 +425,31 @@ pub async fn pick_save_file_dialog<R: Runtime>(
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
-    // See pick_folder_dialog — same silent-failure guard (issue #95).
-    crate::dialog_preflight::ensure_file_picker_backend().await?;
+    // See pick_folder_dialog — same backend decision (issue #95).
+    #[cfg(target_os = "linux")]
+    {
+        match crate::dialog_preflight::select_backend().await {
+            crate::dialog_preflight::Backend::Portal => {}
+            crate::dialog_preflight::Backend::Zenity(zenity) => {
+                let dialog_title = title.clone().unwrap_or_else(|| "Save as".to_string());
+                return Ok(crate::dialog_fallback::save_file(
+                    &zenity,
+                    &dialog_title,
+                    default_filename.as_deref(),
+                    filter_name.as_deref(),
+                    filter_extensions.as_deref(),
+                )
+                .await?
+                .map(|path| path.to_string_lossy().into_owned()));
+            }
+            crate::dialog_preflight::Backend::None(message) => {
+                return Err(format!(
+                    "{}: {message}",
+                    crate::dialog_preflight::NO_BACKEND_MARKER
+                ));
+            }
+        }
+    }
 
     let (tx, rx) = oneshot::channel();
 
@@ -433,8 +493,30 @@ pub async fn pick_open_file_dialog<R: Runtime>(
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
-    // See pick_folder_dialog — same silent-failure guard (issue #95).
-    crate::dialog_preflight::ensure_file_picker_backend().await?;
+    // See pick_folder_dialog — same backend decision (issue #95).
+    #[cfg(target_os = "linux")]
+    {
+        match crate::dialog_preflight::select_backend().await {
+            crate::dialog_preflight::Backend::Portal => {}
+            crate::dialog_preflight::Backend::Zenity(zenity) => {
+                let dialog_title = title.clone().unwrap_or_else(|| "Open".to_string());
+                return Ok(crate::dialog_fallback::pick_open_file(
+                    &zenity,
+                    &dialog_title,
+                    filter_name.as_deref(),
+                    filter_extensions.as_deref(),
+                )
+                .await?
+                .map(|path| path.to_string_lossy().into_owned()));
+            }
+            crate::dialog_preflight::Backend::None(message) => {
+                return Err(format!(
+                    "{}: {message}",
+                    crate::dialog_preflight::NO_BACKEND_MARKER
+                ));
+            }
+        }
+    }
 
     let (tx, rx) = oneshot::channel();
 

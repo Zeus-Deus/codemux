@@ -29,6 +29,7 @@ pub mod github;
 pub mod github_cache;
 pub mod control;
 pub mod diagnostics;
+pub mod dialog_fallback;
 pub mod dialog_preflight;
 pub mod app_logs;
 pub mod doctor;

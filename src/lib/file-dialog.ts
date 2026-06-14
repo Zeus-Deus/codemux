@@ -30,8 +30,19 @@ function describeError(err: unknown): string {
 function surfaceDialogError(err: unknown): void {
   const message = describeError(err);
   if (message.includes(NO_FILE_PICKER_BACKEND)) {
-    toast.error("No file picker available on this system", {
+    // The Rust preflight builds a cause-specific, actionable message
+    // (portal not installed vs installed-but-not-starting, plus the
+    // zenity fallback). Surface it verbatim instead of a fixed
+    // "install packages" hint that's wrong when the packages are
+    // already there but the portal just isn't starting (issue #95).
+    const markerAt = message.indexOf(NO_FILE_PICKER_BACKEND);
+    const detail = message
+      .slice(markerAt + NO_FILE_PICKER_BACKEND.length)
+      .replace(/^[:\s]+/, "")
+      .trim();
+    toast.error("Can't open a file picker on this system", {
       description:
+        detail ||
         "Install xdg-desktop-portal and xdg-desktop-portal-gtk, then restart your session. Installing zenity also works.",
     });
   } else {

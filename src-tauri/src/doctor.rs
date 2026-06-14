@@ -63,7 +63,11 @@ pub async fn run() {
             println!("  [ok]   file dialogs should work");
         } else {
             println!("  [FAIL] file dialogs cannot open on this system.");
-            println!("         {}", crate::dialog_preflight::INSTALL_HINT);
+            let reason = diagnosis.portal.as_ref().err().cloned().unwrap_or_default();
+            println!(
+                "         {}",
+                crate::dialog_preflight::no_backend_remediation(&reason)
+            );
         }
         println!();
     }
