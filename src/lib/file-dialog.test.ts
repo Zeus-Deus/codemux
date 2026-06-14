@@ -41,11 +41,12 @@ describe("pickFolder", () => {
     expect(mockToastError).not.toHaveBeenCalled();
   });
 
-  it("turns the missing-backend rejection into an actionable toast and resolves null", async () => {
-    // The Rust preflight rejects with this marker when neither the
-    // XDG portal nor zenity exists (issue #95).
+  it("surfaces the cause-specific backend message as the toast description", async () => {
+    // The Rust preflight rejects with the marker plus a cause-specific
+    // remediation (issue #95). The wrapper must surface that detail
+    // verbatim, not a fixed "install packages" hint.
     mockPickFolderDialog.mockRejectedValue(
-      `${NO_FILE_PICKER_BACKEND}: cannot open a file dialog. The XDG desktop portal is unavailable and zenity is not installed.`,
+      `${NO_FILE_PICKER_BACKEND}: The xdg-desktop-portal is installed but is not starting in this session. Export it to D-Bus and restart Codemux. Alternatively, install zenity and Codemux will use it as a fallback file picker.`,
     );
 
     await expect(pickFolder("Open project")).resolves.toBeNull();
@@ -53,6 +54,9 @@ describe("pickFolder", () => {
     expect(mockToastError).toHaveBeenCalledTimes(1);
     const [headline, opts] = mockToastError.mock.calls[0];
     expect(headline).toMatch(/file picker/i);
+    // The marker prefix is stripped; the actionable detail survives.
+    expect(opts?.description).not.toContain(NO_FILE_PICKER_BACKEND);
+    expect(opts?.description).toMatch(/not starting in this session/);
     expect(opts?.description).toMatch(/xdg-desktop-portal/);
     expect(opts?.description).toMatch(/zenity/);
   });
