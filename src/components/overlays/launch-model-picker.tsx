@@ -39,6 +39,10 @@ interface Props {
   /** Set the model, or `null` to reset to the agent default. Picking
    *  `null` (the "Default" row) also clears reasoning/context upstream. */
   onModelChange: (model: string | null) => void;
+  /** Extra classes for the trigger button. Lets a non-composer host (e.g.
+   *  the preset editor, a settings form) override the default rounded-full
+   *  pill to match surrounding form fields. */
+  triggerClassName?: string;
 }
 
 /** Scrollbar styling shared with the chat picker — overrides cmdk's
@@ -95,6 +99,7 @@ export function LaunchModelPicker({
   loading,
   selectedModel,
   onModelChange,
+  triggerClassName,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -250,10 +255,13 @@ export function LaunchModelPicker({
         <button
           type="button"
           aria-label="Select model"
-          className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground"
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground",
+            triggerClassName,
+          )}
         >
           <span className="max-w-[150px] truncate">{selectedModelLabel}</span>
-          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+          <ChevronDown className="h-2.5 w-2.5 opacity-40 ml-auto" />
         </button>
       </PopoverTrigger>
       <PopoverContent

@@ -484,6 +484,13 @@ function BrowserSection() {
   );
 }
 
+// Trigger styling that makes the launch model/reasoning pickers render as
+// full-width form fields matching the editor's Select dropdowns, instead of
+// the composer's rounded-full pills. tailwind-merge lets these override the
+// pickers' built-in pill classes (rounded-full, text-[11px], etc.).
+const LAUNCH_FIELD_TRIGGER =
+  "h-9 w-full justify-between rounded-lg border-input bg-transparent px-3 text-sm font-normal text-foreground dark:bg-input/30 dark:hover:bg-input/50";
+
 /** Wrap a string as a double-quoted shell argument. */
 function quotePrompt(value: string): string {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -918,21 +925,29 @@ function PresetEditorSheet({
               </div>
 
               {/* Model + reasoning — the same capability-driven pickers the
-                  New Workspace dialog uses. Shown only for agents Codemux
-                  can inject a model flag for (Claude/Codex/OpenCode/Gemini);
-                  applied at launch via apply_model_selection. */}
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Model</label>
-                {launchFamily ? (
-                  <>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <LaunchModelPicker
-                        providerKind={launchProviderKind}
-                        models={launchModels}
-                        loading={launchModelsLoading}
-                        selectedModel={modelSelection.model}
-                        onModelChange={handleModelChange}
-                      />
+                  New Workspace dialog uses, but styled as full-width form
+                  fields (via triggerClassName) to match the Select fields in
+                  this editor instead of the composer's rounded-full pills.
+                  Shown only for agents Codemux can inject a model flag for
+                  (Claude/Codex/OpenCode/Gemini); applied at launch via
+                  apply_model_selection. */}
+              {launchFamily ? (
+                <>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Model</label>
+                    <LaunchModelPicker
+                      providerKind={launchProviderKind}
+                      models={launchModels}
+                      loading={launchModelsLoading}
+                      selectedModel={modelSelection.model}
+                      onModelChange={handleModelChange}
+                      triggerClassName={LAUNCH_FIELD_TRIGGER}
+                    />
+                  </div>
+                  {(reasoningOptions.length > 0 ||
+                    launchContextOptions.length > 0) && (
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">Reasoning</label>
                       <LaunchReasoningPicker
                         reasoningOptions={reasoningOptions}
                         selectedReasoning={effectiveReasoning}
@@ -946,18 +961,22 @@ function PresetEditorSheet({
                           )?.value ?? null
                         }
                         onContextChange={handleContextChange}
+                        triggerClassName={LAUNCH_FIELD_TRIGGER}
                       />
                     </div>
-                    <p className="text-xs text-muted-foreground">
-                      Applied at launch. Leave on Default to use the agent's default.
-                    </p>
-                  </>
-                ) : (
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    Applied at launch. Leave on Default to use the agent's default.
+                  </p>
+                </>
+              ) : (
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Model</label>
                   <p className="text-xs text-muted-foreground">
                     Model selection isn't available for this agent.
                   </p>
-                )}
-              </div>
+                </div>
+              )}
 
               {/* Prompt */}
               <div className="space-y-2">

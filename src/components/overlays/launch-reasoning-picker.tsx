@@ -32,6 +32,9 @@ interface Props {
   defaultContext: string | null;
   onContextChange: (context: string) => void;
   disabled?: boolean;
+  /** Extra classes for the trigger button — lets a settings-form host
+   *  override the default rounded-full pill to match nearby fields. */
+  triggerClassName?: string;
 }
 
 /**
@@ -64,6 +67,7 @@ export function LaunchReasoningPicker({
   defaultContext,
   onContextChange,
   disabled,
+  triggerClassName,
 }: Props) {
   const [open, setOpen] = useState(false);
 
@@ -128,13 +132,16 @@ export function LaunchReasoningPicker({
           type="button"
           aria-label="Select reasoning and context"
           disabled={disabled}
-          className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground disabled:opacity-50"
+          className={cn(
+            "inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 px-2.5 py-1 text-[11px] text-muted-foreground transition-colors outline-none hover:bg-muted hover:text-foreground disabled:opacity-50",
+            triggerClassName,
+          )}
         >
           <Brain className="h-3 w-3" />
           {pillLabel ? (
             <span className="max-w-[160px] truncate">{pillLabel}</span>
           ) : null}
-          <ChevronDown className="h-2.5 w-2.5 opacity-40" />
+          <ChevronDown className="h-2.5 w-2.5 opacity-40 ml-auto" />
         </button>
       </PopoverTrigger>
       <PopoverContent
