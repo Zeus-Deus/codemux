@@ -134,6 +134,51 @@ pub fn no_backend_remediation(portal_error: &str) -> String {
     }
 }
 
+/// Which backend a dialog command should drive, decided once up front
+/// so we never call rfd's portal path on a session where it hangs.
+#[cfg(target_os = "linux")]
+pub enum Backend {
+    /// The portal answered; let rfd (tauri-plugin-dialog) handle it.
+    Portal,
+    /// The portal is unusable but a `zenity` binary exists; drive it
+    /// ourselves with a sanitized environment + timeout
+    /// (`dialog_fallback`) instead of relying on rfd inheriting the
+    /// broken session env.
+    Zenity(std::path::PathBuf),
+    /// Nothing can open a dialog; `String` is the actionable message
+    /// (already prefixed-free; the caller adds the marker).
+    None(String),
+}
+
+/// Probe once and decide. Linux-only; other platforms always use their
+/// native dialog via rfd.
+#[cfg(target_os = "linux")]
+pub async fn select_backend() -> Backend {
+    let diagnosis = diagnose().await;
+    if diagnosis.portal.is_ok() {
+        return Backend::Portal;
+    }
+    let portal_error = diagnosis
+        .portal
+        .err()
+        .unwrap_or_else(|| "portal unavailable".to_string());
+    match diagnosis.zenity {
+        Some(path) => {
+            log::warn!(
+                "desktop portal unusable ({portal_error}); falling back to zenity at {}",
+                path.display()
+            );
+            Backend::Zenity(path)
+        }
+        None => {
+            log::error!(
+                "no file picker backend: portal probe failed ({portal_error}); zenity not on PATH"
+            );
+            Backend::None(no_backend_remediation(&portal_error))
+        }
+    }
+}
+
 /// `Err(actionable message)` when no file-dialog backend can possibly
 /// work, `Ok(())` otherwise. Called by every dialog command before
 /// the dialog is built.
