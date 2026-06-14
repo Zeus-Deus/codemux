@@ -31,9 +31,12 @@ Workspace dialog. It must be:
 
 ## Status
 
-**Implemented and verified on this branch.** Model + reasoning selection
-ships for all four modeled families in one pass (the staged plan below is
-kept for history):
+**Landed on `main` (PR #104), unreleased after the `v0.8.0` tag.** Model +
+reasoning selection ships for all four modeled families in one pass, and
+the same `LaunchModelPicker`/`LaunchReasoningPicker` pickers are reused by
+the structured "agent launcher" presets (see `docs/features/presets.md`).
+The staged plan below is kept for history; the Deferred list at the end of
+this section is the remaining future work:
 
 - Backend `agent_capability` module — `ModelSelection`, `detect_family`,
   `apply_model_selection` with strip-then-append override semantics; 19

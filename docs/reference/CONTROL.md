@@ -83,7 +83,11 @@ the app itself is misbehaving.
   actionable report: desktop/session info, whether the XDG desktop
   portal file chooser or the zenity fallback is available (file
   dialogs silently failed on portal-less minimal WM setups before the
-  issue #95 fix), and where the log file lives.
+  issue #95 fix), and where the log file lives. When the portal can't
+  serve a dialog it prints a cause-specific remediation that
+  distinguishes "portal not installed" from "portal installed but not
+  starting" (the common minimal-WM case, where reinstalling packages
+  does nothing) — the same message the in-app toast shows.
 
 ## Browser Note
 

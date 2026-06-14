@@ -132,12 +132,20 @@ instead of accepting the agent's default and restarting.
   first-project flow) — only the New Workspace dialog.
 - Native folder/file pickers on Linux need either a working XDG
   desktop portal (with a FileChooser backend such as
-  xdg-desktop-portal-gtk) or zenity installed. When neither exists
-  (minimal i3/dwm setups — issue #95), the Rust side preflights and
-  rejects with a `NO_FILE_PICKER_BACKEND` error, and every UI call
-  site goes through `src/lib/file-dialog.ts`, which shows an
-  install-hint toast instead of silently doing nothing. `codemux
-  doctor` diagnoses this from a terminal.
+  xdg-desktop-portal-gtk) or zenity (issue #95). Every dialog command
+  calls `dialog_preflight::select_backend` first, which probes the
+  portal (4 s timeout) + `which zenity` and returns one of three
+  backends: **Portal** (let rfd handle it), **Zenity** (the portal is
+  unusable but zenity exists → Codemux drives zenity *itself* via
+  `dialog_fallback.rs` with a sanitized env + 180 s timeout, because
+  rfd's own zenity fallback only triggers on a portal *error*, not a
+  *hang*, and would inherit the broken session env), or **None**
+  (nothing can open a dialog). The None case rejects with a
+  `NO_FILE_PICKER_BACKEND` marker carrying a cause-specific message
+  (portal-not-installed vs installed-but-not-starting vs
+  no-session-bus); `src/lib/file-dialog.ts` turns it into an
+  actionable toast instead of silently doing nothing. `codemux doctor`
+  prints the same diagnosis from a terminal.
 
 ## Important Touch Points
 
@@ -154,3 +162,5 @@ instead of accepting the agent's default and restarting.
 - `src/lib/launch-models.ts` — family detection, reasoning tables, Gemini list
 - `src-tauri/src/agent_capability.rs` — `ModelSelection`, `detect_family`, `apply_model_selection` flag injection
 - `src-tauri/src/commands/presets.rs`, `workspace.rs` — `apply_preset` / `create_worktree_workspace` thread the selection through
+- `src-tauri/src/dialog_preflight.rs` — `select_backend` / `diagnose` / `no_backend_remediation`: the Linux file-dialog backend decision (Portal / Zenity / None) + cause-specific remediation
+- `src-tauri/src/dialog_fallback.rs` — driving `zenity` directly with a sanitized env + timeout when the portal is unusable but zenity exists

@@ -64,7 +64,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
 - Observability (flags, metrics, safety config + native log file / `codemux logs` / `codemux doctor`): `docs/features/observability.md`
-- Linux file-dialog backend preflight (issue #95 — portal/zenity detection, install-hint toast): `docs/features/workspace-creation.md` (§ constraints), `docs/reference/CONTROL.md` (§ local diagnostics)
+- Linux file-dialog backend preflight (issue #95 — `select_backend` Portal/Zenity/None decision, Codemux-driven zenity fallback with sanitized env + timeout for the portal-hangs case, cause-specific remediation toast): `docs/features/workspace-creation.md` (§ constraints), `docs/features/observability.md` (§ native log file), `docs/reference/CONTROL.md` (§ local diagnostics)
 - Port detection (incl. Docker-published container ports for open worktrees): `docs/features/ports.md`
 - Search: `docs/features/search.md`
 - Code indexing: `docs/features/code-indexing.md`

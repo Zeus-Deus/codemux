@@ -62,7 +62,12 @@ Support surface:
   required (`src-tauri/src/app_logs.rs`).
 - `codemux doctor` — environment diagnostics including the file-dialog
   backend preflight (`src-tauri/src/doctor.rs`,
-  `src-tauri/src/dialog_preflight.rs`).
+  `src-tauri/src/dialog_preflight.rs`); it reports the portal/zenity
+  state and prints the same cause-specific remediation
+  (`no_backend_remediation`) the in-app toast uses when no backend can
+  open a dialog. When the portal is unusable but `zenity` exists,
+  Codemux drives zenity itself (`src-tauri/src/dialog_fallback.rs`,
+  sanitized env + timeout) rather than relying on rfd's portal path.
 
 ## Important Touch Points
 
