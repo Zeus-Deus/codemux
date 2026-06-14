@@ -10,6 +10,7 @@ pub const APP_DIR_NAME: &str = "codemux-dev";
 pub const APP_DIR_NAME: &str = "codemux";
 
 pub mod agent_capability;
+pub mod agent_catalog;
 pub mod agent_context;
 pub mod agent_provider;
 pub mod ai;
@@ -1641,6 +1642,7 @@ pub fn run() {
             commands::get_detected_ports,
             commands::kill_port,
             commands::get_presets,
+            commands::list_agent_catalog,
             commands::create_preset,
             commands::update_preset,
             commands::delete_preset,
