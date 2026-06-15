@@ -58,7 +58,7 @@ After onboarding: scripts saved to project config, worktree workspace created, w
 - Manual branch name editing (stops auto-generation)
 - GitHub issue linking with branch name suggestion and prompt context injection
 - PR linking with branch auto-fill
-- File attachment (paths appended to prompt)
+- File attachment (paths appended to prompt) — staged as bordered chips (`workspace-attachment-chip.tsx`) with a per-type leading badge: image files show a real thumbnail (Tauri asset protocol, falling back to a glyph if it can't load), other files a file glyph, and clipboard pastes a friendly "Pasted image" label (full path on hover)
 - Agent preset selection from pinned presets
 - Package manager detection (npm, bun, pnpm, yarn, cargo, pip, uv, poetry, go, bundle, etc.)
 - Setup/teardown script configuration with environment variables
