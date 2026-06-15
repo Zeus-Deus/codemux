@@ -857,8 +857,10 @@ describe("Clipboard image paste", () => {
     );
     firePaste(textarea);
 
-    // The chip renders the trailing filename component (the existing
-    // attachment-strip logic lifts it via `.split("/").pop()`).
+    // Pasted clipboard images carry a `paste-<uuid>` temp filename
+    // that's noise to the user, so the chip shows a friendly "Pasted
+    // image" label and keeps the real path in the hover title (which is
+    // what the submit flow consumes).
     //
     // The default 1000ms waitFor isn't enough on a busy Windows CI
     // runner: paste → await mock → setAttachments → React commit can
@@ -867,11 +869,15 @@ describe("Clipboard image paste", () => {
     // so we widen the budget rather than pushing on a real bug.
     await waitFor(
       () => {
-        const chips = within(dialog).getAllByText("paste-xyz.png");
+        const chips = within(dialog).getAllByText("Pasted image");
         expect(chips.length).toBeGreaterThan(0);
       },
       { timeout: 5000 },
     );
+    const chip = within(dialog)
+      .getByText("Pasted image")
+      .closest("[title]");
+    expect(chip?.getAttribute("title")).toContain("paste-xyz.png");
   });
 
   it("stays silent when the OS clipboard has no image", async () => {
@@ -895,10 +901,10 @@ describe("Clipboard image paste", () => {
       expect(pasteClipboardImageToFile).toHaveBeenCalled();
     });
 
-    // No chip should appear. Probe by the paste-* filename pattern
+    // No chip should appear. Probe by the friendly pasted-image label
     // so the test isn't sensitive to other chip text.
     await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(within(dialog).queryByText(/paste-.*\.png/)).toBeNull();
+    expect(within(dialog).queryByText("Pasted image")).toBeNull();
   });
 
   it("does not double-add the same path on repeated paste", async () => {
@@ -919,7 +925,7 @@ describe("Clipboard image paste", () => {
     );
     firePaste(textarea);
     await waitFor(() => {
-      expect(within(dialog).getAllByText("paste-dupe.png").length).toBe(1);
+      expect(within(dialog).getAllByText("Pasted image").length).toBe(1);
     });
 
     firePaste(textarea);
@@ -927,6 +933,6 @@ describe("Clipboard image paste", () => {
       expect(pasteClipboardImageToFile).toHaveBeenCalledTimes(2);
     });
     // Still exactly one chip.
-    expect(within(dialog).getAllByText("paste-dupe.png").length).toBe(1);
+    expect(within(dialog).getAllByText("Pasted image").length).toBe(1);
   });
 });

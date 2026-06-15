@@ -79,3 +79,15 @@ vi.mock('@tauri-apps/api/window', () => ({
     requestUserAttention: () => Promise.resolve(),
   }),
 }));
+
+// `convertFileSrc()` from `@tauri-apps/api/core` reads
+// `window.__TAURI_INTERNALS__.convertFileSrc`, which only exists under the
+// Tauri runtime. Components that render local-file thumbnails (e.g. image
+// attachment chips) call it during render, so without a stub they crash
+// under jsdom. Override only `convertFileSrc` and keep the module's other
+// exports (notably `invoke`, used by the real command wrapper) intact —
+// tests that assert on the resolved URL still override this themselves.
+vi.mock('@tauri-apps/api/core', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@tauri-apps/api/core')>();
+  return { ...actual, convertFileSrc: (filePath: string) => filePath };
+});

@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { basename } from "@/lib/path";
 import { BranchPicker } from "./branch-picker";
+import { WorkspaceAttachmentChip } from "./workspace-attachment-chip";
 import { DevicePicker } from "@/components/hosts/device-picker";
 import {
   Tooltip,
@@ -1050,21 +1051,31 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
             {/* Attachment chips + linked issue chip */}
             {(attachments.length > 0 || linkedIssue) && (
-              <div className="flex flex-wrap gap-1.5 px-4 pb-2">
+              <div className="flex flex-wrap gap-2 px-4 pb-2.5">
                 {/* Linked issue chip */}
                 {linkedIssue && (
-                  <span className="inline-flex items-center gap-1.5 rounded-full bg-muted px-2.5 py-0.5 text-[11px] text-muted-foreground">
+                  <span
+                    className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/50 py-0.5 pl-1 pr-1 text-[11px] text-foreground"
+                    title={`#${linkedIssue.number} ${linkedIssue.title}`}
+                  >
                     <span
                       className={cn(
-                        "size-1.5 rounded-full shrink-0",
-                        linkedIssue.state === "Open" ? "bg-success" : "bg-muted-foreground",
+                        "flex size-5 shrink-0 items-center justify-center rounded",
+                        linkedIssue.state === "Open"
+                          ? "bg-success/15 text-success"
+                          : "bg-foreground/10 text-muted-foreground",
                       )}
-                    />
-                    <span className="font-mono tabular-nums">#{linkedIssue.number}</span>
-                    <span className="max-w-[180px] truncate">{linkedIssue.title}</span>
+                    >
+                      <CircleDot className="h-3 w-3" />
+                    </span>
+                    <span className="font-mono tabular-nums text-muted-foreground">
+                      #{linkedIssue.number}
+                    </span>
+                    <span className="max-w-[160px] truncate">{linkedIssue.title}</span>
                     <button
                       type="button"
-                      className="ml-0.5 rounded-full p-0.5 hover:bg-foreground/10 transition-colors"
+                      aria-label={`Remove issue #${linkedIssue.number}`}
+                      className="ml-0.5 rounded-full p-0.5 text-muted-foreground/70 transition-colors hover:bg-foreground/10 hover:text-foreground"
                       onClick={() => {
                         setLinkedIssue(null);
                         if (branchAutoFilled) {
@@ -1078,24 +1089,13 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                   </span>
                 )}
                 {attachments.map((file) => (
-                  <span
+                  <WorkspaceAttachmentChip
                     key={file}
-                    className="inline-flex items-center gap-1 rounded-full bg-muted px-2.5 py-0.5 text-[11px] text-muted-foreground"
-                  >
-                    <Paperclip className="h-2.5 w-2.5" />
-                    <span className="max-w-[160px] truncate">
-                      {basename(file)}
-                    </span>
-                    <button
-                      type="button"
-                      className="ml-0.5 rounded-full p-0.5 hover:bg-foreground/10 transition-colors"
-                      onClick={() =>
-                        setAttachments((prev) => prev.filter((f) => f !== file))
-                      }
-                    >
-                      <X className="h-2.5 w-2.5" />
-                    </button>
-                  </span>
+                    path={file}
+                    onRemove={() =>
+                      setAttachments((prev) => prev.filter((f) => f !== file))
+                    }
+                  />
                 ))}
               </div>
             )}
