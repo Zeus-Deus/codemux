@@ -26,7 +26,9 @@ const STEALTH_CHROMIUM_ARGS: &str = "\
 fn stealth_user_agent() -> String {
     let candidates = ["chromium", "chromium-browser", "google-chrome-stable", "google-chrome"];
     for bin in candidates {
-        if let Ok(output) = std::process::Command::new(bin).arg("--version").output() {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("--version");
+        if let Ok(output) = output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT) {
             if output.status.success() {
                 let version_str = String::from_utf8_lossy(&output.stdout);
                 // Parse version like "Chromium 131.0.6778.204" or "Google Chrome 131.0.6778.204"
@@ -71,6 +73,177 @@ fn base64_encode(data: &[u8]) -> String {
     result
 }
 
+// ── External-process timeouts ───────────────────────────────────────────
+//
+// Every agent-browser CLI / process-control invocation in this module runs
+// through `output_capture_with_timeout` or `launch_status_with_timeout` so a
+// wedged child can never block the calling task — or the async executor —
+// forever. Before this guard a hung `agent-browser` invocation hung
+// `cargo test` on the Windows CI image until the 30-minute job timeout
+// (issue #96); the production `close()` / `start_stream()` / automation
+// paths had the same unbounded-wait failure mode. The async callers also
+// run the blocking work through `tokio::task::spawn_blocking` so a slow CLI
+// can't stall the runtime's worker threads.
+
+/// Quick process-control commands (kill, probe, `which`, `--version`). These
+/// return in well under a second in the normal case; the ceiling only exists
+/// so a stuck syscall can't wedge startup/shutdown.
+const PROC_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Graceful daemon shutdown via `agent-browser close`. The issue calls for
+/// ~10s here: long enough for a healthy daemon to flush Chromium state,
+/// short enough that a wedged one is reaped quickly.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Daemon launch / page-load actions (`open`, `wait`). These legitimately
+/// wait on a real page load, so they get a much larger ceiling than the
+/// snappy DOM actions.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Interactive DOM actions (click, fill, screenshot, snapshot, eval, …).
+/// Bounded well above their normal sub-second latency.
+const ACTION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Per-action timeout for the agent-browser CLI. `open`/`wait` can block on a
+/// real page load, so they get [`OPEN_TIMEOUT`]; everything else is a fast,
+/// already-connected daemon round-trip bounded by [`ACTION_TIMEOUT`].
+fn action_timeout(action: &str) -> Duration {
+    match action {
+        "open_url" | "open" | "wait" => OPEN_TIMEOUT,
+        _ => ACTION_TIMEOUT,
+    }
+}
+
+/// Drain a child's stdout/stderr pipe on a background thread so a process
+/// that fills the OS pipe buffer can't deadlock our wait. Returns the bytes
+/// read once the write end closes (the child exits or is killed).
+fn drain_stream<R: std::io::Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = reader.read_to_end(&mut buf);
+        buf
+    })
+}
+
+/// Forcibly terminate a child that blew its deadline, then reap it.
+///
+/// On Unix the timed-out child is started in its own process group (via
+/// `process_group(0)` in [`spawn_wait_collect`]), so we signal the entire
+/// group: this kills `sh -c '<bin> … && <bin> wait …'` *and* the
+/// agent-browser process it spawned, not just the `sh` wrapper that would
+/// otherwise leave the real CLI orphaned and still wedged. A direct
+/// `child.kill()` follows as a backstop (and is the whole story on Windows,
+/// where the child is the agent-browser executable itself, not a shell).
+fn kill_timed_out_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as i32;
+        if pid > 0 {
+            // Negative pid → deliver SIGKILL to the whole process group.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+/// Block until `child` exits or `timeout` elapses. On timeout the child (and,
+/// on Unix, its process group) is killed and reaped, and an `io::Error` of
+/// kind `TimedOut` is returned so callers can treat a wedged CLI exactly like
+/// a spawn failure. Polls with `try_wait` rather than taking a new crate
+/// dependency; the 20ms cadence is irrelevant next to multi-second CLI
+/// latencies.
+fn wait_with_timeout(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if start.elapsed() >= timeout {
+            kill_timed_out_child(child);
+            // Reap the (now-killed) child so it doesn't linger as a zombie.
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("process exceeded {timeout:?} timeout and was killed"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Core timeout runner: spawns an already-stdio-configured command, drains
+/// whichever of stdout/stderr the caller piped (so a full pipe can't
+/// deadlock the wait), and enforces `timeout` via [`wait_with_timeout`].
+///
+/// On the timeout path the reader threads are deliberately NOT joined: if a
+/// detached daemon inherited a pipe the read would never see EOF. They end on
+/// their own once the write end finally closes (immediately for the
+/// group-killed common case). Joining only on the success path is safe
+/// because the child has fully exited there.
+fn spawn_wait_collect(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group so a timeout can SIGKILL the whole `sh -c …`
+        // subtree, not just the shell wrapper.
+        command.process_group(0);
+    }
+    let mut child = command.spawn()?;
+    let out_reader = child.stdout.take().map(drain_stream);
+    let err_reader = child.stderr.take().map(drain_stream);
+
+    let status = wait_with_timeout(&mut child, timeout)?;
+
+    let stdout = out_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = err_reader
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// `Command::output()` with a hard timeout. Captures stdout+stderr and kills
+/// the child on overrun. Drop-in replacement for the unbounded `.output()`
+/// calls that previously hung the browser teardown / automation paths.
+fn output_capture_with_timeout(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::Output> {
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    spawn_wait_collect(command, timeout)
+}
+
+/// Timeout-bounded spawn for daemon-launch commands (`agent-browser open …`).
+/// Unlike [`output_capture_with_timeout`] this discards stdout (`/dev/null`)
+/// and leaves stderr as the caller configured it (a per-session log file, or
+/// inherited) — the launcher forks a long-lived daemon, and piping its std
+/// handles risks a reader that never sees EOF. Returns the launcher's exit
+/// status, or `TimedOut` if it wedged.
+fn launch_status_with_timeout(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> std::io::Result<std::process::ExitStatus> {
+    command.stdout(std::process::Stdio::null());
+    // stderr intentionally left untouched so a caller-set log file / inherited
+    // handle is preserved; it is a file or inherited fd, never a pipe we own.
+    spawn_wait_collect(command, timeout).map(|o| o.status)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrowserAutomationResult {
     pub request_id: String,
@@ -99,10 +272,10 @@ pub fn kill_stream_daemons() {
         // its full name `agent-browser-win32-x64.exe`. Kill both forms so
         // restarts don't leak daemons in either deployment mode.
         for image in ["agent-browser.exe", "agent-browser-win32-x64.exe"] {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/IM", image])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
+            let mut cmd = std::process::Command::new("taskkill");
+            cmd.args(["/F", "/IM", image])
+                .creation_flags(CREATE_NO_WINDOW);
+            let _ = output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT);
         }
 
         // After killing the processes, sweep the per-session lock files
@@ -118,9 +291,9 @@ pub fn kill_stream_daemons() {
     }
     #[cfg(not(windows))]
     {
-        let _ = std::process::Command::new("sh")
-            .args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"])
-            .output();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "pkill -f 'agent-browser.*daemon' 2>/dev/null; pkill -f 'agent-browser.*--session' 2>/dev/null"]);
+        let _ = output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT);
     }
 }
 
@@ -198,11 +371,12 @@ fn kill_process_on_port(port: u16) {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-        let Ok(netstat) = std::process::Command::new("netstat")
-            .args(["-ano"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        else {
+        let netstat_cmd = {
+            let mut c = std::process::Command::new("netstat");
+            c.args(["-ano"]).creation_flags(CREATE_NO_WINDOW);
+            c
+        };
+        let Ok(netstat) = output_capture_with_timeout(netstat_cmd, PROC_CONTROL_TIMEOUT) else {
             eprintln!(
                 "[codemux::browser] kill_process_on_port({}): failed to spawn netstat",
                 port
@@ -217,17 +391,17 @@ fn kill_process_on_port(port: u16) {
         let pids = pids_listening_on_port(&stdout, port);
 
         for pid in pids {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .creation_flags(CREATE_NO_WINDOW)
-                .output();
+            let mut cmd = std::process::Command::new("taskkill");
+            cmd.args(["/PID", &pid.to_string(), "/F"])
+                .creation_flags(CREATE_NO_WINDOW);
+            let _ = output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT);
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = std::process::Command::new("sh")
-            .args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)])
-            .output();
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &format!("fuser -k {}/tcp 2>/dev/null", port)]);
+        let _ = output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT);
     }
 }
 
@@ -317,33 +491,33 @@ fn kill_pid(pid: u32) {
     #[cfg(unix)]
     {
         // SIGTERM first — gives the daemon a chance to flush state.
-        let _ = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output();
+        let mut term = std::process::Command::new("kill");
+        term.args(["-TERM", &pid.to_string()]);
+        let _ = output_capture_with_timeout(term, PROC_CONTROL_TIMEOUT);
         // Brief grace period before escalating.
         std::thread::sleep(Duration::from_millis(200));
         // SIGKILL fallback — `kill -0` returns success only while the PID
         // is alive, so use it to decide whether escalation is needed.
         // If the PID is already gone this is a no-op.
-        if std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
+        let mut probe = std::process::Command::new("kill");
+        probe.args(["-0", &pid.to_string()]);
+        if output_capture_with_timeout(probe, PROC_CONTROL_TIMEOUT)
             .map(|o| o.status.success())
             .unwrap_or(false)
         {
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output();
+            let mut hard = std::process::Command::new("kill");
+            hard.args(["-9", &pid.to_string()]);
+            let _ = output_capture_with_timeout(hard, PROC_CONTROL_TIMEOUT);
         }
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/PID", &pid.to_string(), "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT);
     }
 }
 
@@ -382,9 +556,9 @@ fn pid_alive(pid: u32) -> bool {
     {
         // `kill -0 PID` returns 0 (success) while the process is alive,
         // ESRCH otherwise. Cheap, no actual signal delivered.
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .output()
+        let mut cmd = std::process::Command::new("kill");
+        cmd.args(["-0", &pid.to_string()]);
+        output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT)
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
@@ -393,11 +567,13 @@ fn pid_alive(pid: u32) -> bool {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         // tasklist exits 0 even when no match — we have to check stdout.
-        let Ok(output) = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        else {
+        let cmd = {
+            let mut c = std::process::Command::new("tasklist");
+            c.args(["/FI", &format!("PID eq {pid}"), "/NH"])
+                .creation_flags(CREATE_NO_WINDOW);
+            c
+        };
+        let Ok(output) = output_capture_with_timeout(cmd, PROC_CONTROL_TIMEOUT) else {
             return false;
         };
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -561,15 +737,16 @@ fn resolve_binary() -> String {
     // now, Windows falls through to the Tauri sidecar lookup and then
     // the `npx agent-browser` fallback.
     #[cfg(unix)]
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("agent-browser")
-        .output()
     {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            // Skip the node_modules/.bin shim — we want the native binary directly
-            if !path.is_empty() && !path.contains("node_modules/.bin") {
-                return path;
+        let mut which_cmd = std::process::Command::new("which");
+        which_cmd.arg("agent-browser");
+        if let Ok(output) = output_capture_with_timeout(which_cmd, PROC_CONTROL_TIMEOUT) {
+            if output.status.success() {
+                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                // Skip the node_modules/.bin shim — we want the native binary directly
+                if !path.is_empty() && !path.contains("node_modules/.bin") {
+                    return path;
+                }
             }
         }
     }
@@ -1040,6 +1217,7 @@ fn run_agent_browser_native(
     argv: &[String],
     stream_port: u16,
     discard_stderr: bool,
+    timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
     let (program, prefix_args) = split_resolved_binary(bin);
     let mut cmd = std::process::Command::new(&program);
@@ -1052,10 +1230,15 @@ fn run_agent_browser_native(
     cmd.env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
         .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
         .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+    cmd.stdout(std::process::Stdio::piped());
     if discard_stderr {
         cmd.stderr(std::process::Stdio::null());
+    } else {
+        cmd.stderr(std::process::Stdio::piped());
     }
-    cmd.output()
+    // Hard timeout + kill so a wedged agent-browser.exe can't block the
+    // calling task forever (issue #96).
+    spawn_wait_collect(cmd, timeout)
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1172,7 +1355,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
         let mut combined_stderr = String::new();
         let mut all_ok = true;
         for argv in &groups {
-            let out = run_agent_browser_native(&bin, argv, stream_port, false)
+            let out = run_agent_browser_native(&bin, argv, stream_port, false, action_timeout(action))
                 .map_err(|e| format!("Failed to run agent-browser: {}", e))?;
             combined_stdout.push_str(&String::from_utf8_lossy(&out.stdout));
             combined_stderr.push_str(&String::from_utf8_lossy(&out.stderr));
@@ -1187,12 +1370,12 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
     #[cfg(not(target_os = "windows"))]
     let (stdout, stderr, status_success) = {
         let shell_cmd = build_agent_browser_command(session, action, &params)?;
-        let output = std::process::Command::new("sh")
-            .args(["-c", &shell_cmd])
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", &shell_cmd])
             .env("AGENT_BROWSER_STREAM_PORT", stream_port.to_string())
             .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-            .output()
+            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+        let output = output_capture_with_timeout(cmd, action_timeout(action))
             .map_err(|error| format!("Failed to run agent-browser: {}", error))?;
         (
             String::from_utf8_lossy(&output.stdout).to_string(),
@@ -1226,17 +1409,18 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
             let bin = resolve_binary();
             match build_agent_browser_argv_groups(session, "eval", &dom_params) {
                 Ok(groups) if !groups.is_empty() => {
-                    run_agent_browser_native(&bin, &groups[0], stream_port, false).ok()
+                    run_agent_browser_native(&bin, &groups[0], stream_port, false, ACTION_TIMEOUT).ok()
                 }
                 _ => None,
             }
         };
         #[cfg(not(target_os = "windows"))]
         let dom_output_opt = match build_agent_browser_command(session, "eval", &dom_params) {
-            Ok(dom_cmd) => std::process::Command::new("sh")
-                .args(["-c", &dom_cmd])
-                .output()
-                .ok(),
+            Ok(dom_cmd) => {
+                let mut cmd = std::process::Command::new("sh");
+                cmd.args(["-c", &dom_cmd]);
+                output_capture_with_timeout(cmd, ACTION_TIMEOUT).ok()
+            }
             Err(_) => None,
         };
 
@@ -1505,8 +1689,7 @@ impl AgentBrowserManager {
     }
 
     pub async fn spawn(&self, browser_id: &str) -> Result<(), String> {
-        let session = session_name(browser_id);
-        let bin = resolve_binary();
+        let session = session_name(browser_id).to_string();
         let port = self.allocate_port(browser_id).await?;
 
         {
@@ -1516,34 +1699,49 @@ impl AgentBrowserManager {
             }
         }
 
-        #[cfg(target_os = "windows")]
-        let output = {
-            // `--executable-path` is a top-level flag — must come before
-            // the `open` subcommand or clap rejects it.
-            let mut argv: Vec<String> = windows_executable_path_args();
-            argv.extend([
-                "open".into(),
-                "about:blank".into(),
-                "--headless".into(),
-                "--session".into(),
-                session.to_string(),
-            ]);
-            run_agent_browser_native(&bin, &argv, port, false)
-                .map_err(|e| format!("Failed to start agent-browser: {}", e))?
-        };
-        #[cfg(not(target_os = "windows"))]
-        let output = std::process::Command::new("sh")
-            .args(["-c", &format!("{} open about:blank --headless --session {}", bin, session)])
-            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
-            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-            .output()
-            .map_err(|e| format!("Failed to start agent-browser: {}", e))?;
+        // The launch shells out to agent-browser (which forks the daemon) and
+        // can block on a real page load — run it on a blocking thread with a
+        // hard timeout so it can never stall the async runtime (issue #96).
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            let bin = resolve_binary();
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to start browser: {}", stderr));
-        }
+            #[cfg(target_os = "windows")]
+            let output = {
+                // `--executable-path` is a top-level flag — must come before
+                // the `open` subcommand or clap rejects it.
+                let mut argv: Vec<String> = windows_executable_path_args();
+                argv.extend([
+                    "open".into(),
+                    "about:blank".into(),
+                    "--headless".into(),
+                    "--session".into(),
+                    session.clone(),
+                ]);
+                run_agent_browser_native(&bin, &argv, port, false, OPEN_TIMEOUT)
+                    .map_err(|e| format!("Failed to start agent-browser: {}", e))?
+            };
+            #[cfg(not(target_os = "windows"))]
+            let output = {
+                let mut cmd = std::process::Command::new("sh");
+                cmd.args([
+                    "-c",
+                    &format!("{} open about:blank --headless --session {}", bin, session),
+                ])
+                .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
+                .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+                .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+                output_capture_with_timeout(cmd, OPEN_TIMEOUT)
+                    .map_err(|e| format!("Failed to start agent-browser: {}", e))?
+            };
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("Failed to start browser: {}", stderr));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("agent-browser spawn task failed: {e}"))??;
 
         self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| s.running = true);
         Ok(())
@@ -1556,62 +1754,80 @@ impl AgentBrowserManager {
         // we call it. Setting this early prevents a concurrent start_stream
         // (from BrowserPane mounting) from killing the daemon mid-command.
         self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| s.running = true);
-        execute_agent_browser_action(browser_id, action, params, port)
+        // Run the (timeout-bounded) CLI work on a blocking thread so a slow
+        // agent-browser round-trip never stalls the async executor.
+        let browser_id = browser_id.to_string();
+        let action = action.to_string();
+        tokio::task::spawn_blocking(move || {
+            execute_agent_browser_action(&browser_id, &action, params, port)
+        })
+        .await
+        .map_err(|e| format!("agent-browser action task failed: {e}"))?
     }
 
     pub async fn get_screenshot(&self, browser_id: &str) -> Result<String, String> {
-        let session = session_name(browser_id);
-        let bin = resolve_binary();
+        let session = session_name(browser_id).to_string();
         let port = self.allocate_port(browser_id).await?;
 
-        #[cfg(target_os = "windows")]
-        let output = run_agent_browser_native(
-            &bin,
-            &[
-                "screenshot".into(),
-                "--session".into(),
-                session.to_string(),
-            ],
-            port,
-            false,
-        )
-        .map_err(|e| format!("Failed to get screenshot: {}", e))?;
-        #[cfg(not(target_os = "windows"))]
-        let output = std::process::Command::new("sh")
-            .args(["-c", &format!("{} screenshot --session {}", bin, session)])
-            .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
-            .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-            .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-            .output()
+        // The CLI call + file read are blocking; run them off the executor
+        // under a hard timeout so a wedged screenshot can't hang the runtime.
+        tokio::task::spawn_blocking(move || -> Result<String, String> {
+            let bin = resolve_binary();
+
+            #[cfg(target_os = "windows")]
+            let output = run_agent_browser_native(
+                &bin,
+                &[
+                    "screenshot".into(),
+                    "--session".into(),
+                    session.clone(),
+                ],
+                port,
+                false,
+                ACTION_TIMEOUT,
+            )
             .map_err(|e| format!("Failed to get screenshot: {}", e))?;
+            #[cfg(not(target_os = "windows"))]
+            let output = {
+                let mut cmd = std::process::Command::new("sh");
+                cmd.args(["-c", &format!("{} screenshot --session {}", bin, session)])
+                    .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
+                    .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+                    .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+                output_capture_with_timeout(cmd, ACTION_TIMEOUT)
+                    .map_err(|e| format!("Failed to get screenshot: {}", e))?
+            };
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
-        // Parse the screenshot path from output like "Screenshot saved to /path/to/file.png"
-        // Strip ANSI codes (escape sequences like \x1b[32m)
-        let mut clean = String::new();
-        let mut in_ansi = false;
-        for c in stdout.chars() {
-            if c == '\x1b' {
-                in_ansi = true;
-            } else if in_ansi && c == 'm' {
-                in_ansi = false;
-            } else if !in_ansi {
-                clean.push(c);
+            // Parse the screenshot path from output like "Screenshot saved to /path/to/file.png"
+            // Strip ANSI codes (escape sequences like \x1b[32m)
+            let mut clean = String::new();
+            let mut in_ansi = false;
+            for c in stdout.chars() {
+                if c == '\x1b' {
+                    in_ansi = true;
+                } else if in_ansi && c == 'm' {
+                    in_ansi = false;
+                } else if !in_ansi {
+                    clean.push(c);
+                }
             }
-        }
 
-        if let Some(path_start) = clean.find("Screenshot saved to ") {
-            let path = clean[path_start + 19..].trim();
+            if let Some(path_start) = clean.find("Screenshot saved to ") {
+                let path = clean[path_start + 19..].trim();
 
-            // Read the file and convert to base64
-            if let Ok(data) = std::fs::read(path) {
-                let base64 = base64_encode(&data);
-                return Ok(format!("data:image/png;base64,{}", base64));
+                // Read the file and convert to base64
+                if let Ok(data) = std::fs::read(path) {
+                    let base64 = base64_encode(&data);
+                    return Ok(format!("data:image/png;base64,{}", base64));
+                }
             }
-        }
 
-        Ok(clean)
+            Ok(clean)
+        })
+        .await
+        .map_err(|e| format!("agent-browser screenshot task failed: {e}"))?
     }
 
     /// Atomic teardown for a session (P3 from
@@ -1643,12 +1859,19 @@ impl AgentBrowserManager {
         // graceful shutdown, then PID/port-based kills). They are compiled
         // out of unit-test builds: the close() tests assert session-map and
         // port-allocator semantics and must not depend on a real
-        // agent-browser binary on the test host. The CLI `close` invocation
-        // goes through `Command::output()` with no timeout, and the daemon
-        // auto-start behind it can wedge — observed on CI Windows runners,
-        // where it hung `cargo test` until the 30-minute job timeout.
+        // agent-browser binary on the test host. Every CLI/kill invocation
+        // now carries a hard timeout, and the whole teardown runs on a
+        // blocking thread so a wedged daemon can't hang close() or stall the
+        // async executor — the failure mode that hung `cargo test` to the
+        // 30-minute CI job timeout on Windows runners (issue #96).
         #[cfg(not(test))]
-        Self::shutdown_session_processes(&session, removed);
+        {
+            let session_for_shutdown = session.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                Self::shutdown_session_processes(&session_for_shutdown, removed);
+            })
+            .await;
+        }
         #[cfg(test)]
         let _ = removed;
 
@@ -1667,7 +1890,7 @@ impl AgentBrowserManager {
     fn shutdown_session_processes(session: &str, removed: Option<StreamSession>) {
         let bin = resolve_binary();
 
-        // Step 2: graceful daemon shutdown via the CLI.
+        // Step 2: graceful daemon shutdown via the CLI (hard-timeout bounded).
         #[cfg(target_os = "windows")]
         {
             let _ = run_agent_browser_native(
@@ -1675,15 +1898,18 @@ impl AgentBrowserManager {
                 &["close".into(), "--session".into(), session.to_string()],
                 0,
                 true,
+                CLOSE_TIMEOUT,
             );
         }
         #[cfg(not(target_os = "windows"))]
-        let _ = std::process::Command::new("sh")
-            .args([
+        {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args([
                 "-c",
                 &format!("{} close --session {} 2>/dev/null", bin, session),
-            ])
-            .output();
+            ]);
+            let _ = output_capture_with_timeout(cmd, CLOSE_TIMEOUT);
+        }
 
         // Step 3 + 4: kill by tracked PID; fall back to port-based kill
         // only when we never captured one. This is the change that stops
@@ -1728,7 +1954,6 @@ impl AgentBrowserManager {
     ///   6. Return the WebSocket URL.
     pub async fn start_stream(&self, browser_id: &str) -> Result<String, String> {
         let session = session_name(browser_id).to_string();
-        let bin = resolve_binary();
 
         // Serialize start_stream calls. The old code held a single Mutex<bool>
         // across the entire operation (including sleeps). Without this, concurrent
@@ -1765,48 +1990,67 @@ impl AgentBrowserManager {
         // stale daemon's port as occupied, skips it, and allocates a different port.
         // The agent-browser CLI would then reuse the stale daemon (by session name)
         // while BrowserPane connects to the newly allocated (empty) port.
-        #[cfg(target_os = "windows")]
-        {
-            // discard_stderr=true mirrors the `2>/dev/null` redirect on the
-            // Unix shell form below — stale-close errors are noise.
-            let _ = run_agent_browser_native(
-                &bin,
-                &["close".into(), "--session".into(), session.clone()],
-                0,
-                true,
-            );
-        }
-        #[cfg(not(target_os = "windows"))]
-        let _ = std::process::Command::new("sh")
-            .args([
-                "-c",
-                &format!("{} close --session {} 2>/dev/null", bin, session),
-            ])
-            .output();
+        //
+        // resolve_binary() and the stale-close both shell out, so run them on a
+        // blocking thread under a hard timeout (issue #96). The resolved binary
+        // path is returned so the launch step below can reuse it.
+        let bin = {
+            let session_for_close = session.clone();
+            tokio::task::spawn_blocking(move || {
+                let bin = resolve_binary();
+                #[cfg(target_os = "windows")]
+                {
+                    // discard_stderr=true mirrors the `2>/dev/null` redirect on
+                    // the Unix shell form below — stale-close errors are noise.
+                    let _ = run_agent_browser_native(
+                        &bin,
+                        &["close".into(), "--session".into(), session_for_close.clone()],
+                        0,
+                        true,
+                        CLOSE_TIMEOUT,
+                    );
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let mut cmd = std::process::Command::new("sh");
+                    cmd.args([
+                        "-c",
+                        &format!("{} close --session {} 2>/dev/null", bin, session_for_close),
+                    ]);
+                    let _ = output_capture_with_timeout(cmd, CLOSE_TIMEOUT);
+                }
+                bin
+            })
+            .await
+            .map_err(|e| format!("agent-browser stale-close task failed: {e}"))?
+        };
 
         let port = self.allocate_port(browser_id).await?;
 
-        // Reclaim the port if anything else is sitting on it. With the
-        // bind-test in allocate_port this is mostly belt-and-suspenders,
-        // but on Linux/macOS a daemon could have grabbed it between the
-        // bind-test drop and now.
-        kill_process_on_port(port);
-        std::thread::sleep(Duration::from_millis(500));
+        // Reclaim the port, launch the daemon, health-probe it, and capture
+        // its PID. Every step here shells out, sleeps, or blocks on a TCP
+        // probe, so the whole sequence runs on a blocking thread under hard
+        // timeouts so it can never stall the async runtime (issue #96).
+        let (port_alive, pid) = tokio::task::spawn_blocking(move || -> (bool, Option<u32>) {
+            // Reclaim the port if anything else is sitting on it. With the
+            // bind-test in allocate_port this is mostly belt-and-suspenders,
+            // but on Linux/macOS a daemon could have grabbed it between the
+            // bind-test drop and now.
+            kill_process_on_port(port);
+            std::thread::sleep(Duration::from_millis(500));
 
-        // Launch browser via CLI. The v0.24.0 Rust daemon auto-starts and
-        // streaming is enabled by default when AGENT_BROWSER_STREAM_PORT is set.
-        eprintln!(
-            "[codemux::browser] Starting browser session={} port={}",
-            session, port
-        );
+            // Launch browser via CLI. The v0.24.0 Rust daemon auto-starts and
+            // streaming is enabled by default when AGENT_BROWSER_STREAM_PORT is set.
+            eprintln!(
+                "[codemux::browser] Starting browser session={} port={}",
+                session, port
+            );
 
-        // P7: stderr to a per-session log file under ~/.codemux/run/.
-        // Best-effort — if we can't open the log file we fall back to the
-        // inherited stderr so behavior matches the pre-fix baseline.
-        let log_path = session_log_path(&session);
-        let log_file = log_path
-            .as_ref()
-            .and_then(|p| {
+            // P7: stderr to a per-session log file under ~/.codemux/run/.
+            // Best-effort — if we can't open the log file we fall back to the
+            // inherited stderr so behavior matches the pre-fix baseline.
+            let log_path = session_log_path(&session);
+            let log_file = log_path.as_ref().and_then(|p| {
                 std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -1814,95 +2058,93 @@ impl AgentBrowserManager {
                     .ok()
             });
 
-        #[cfg(target_os = "windows")]
-        {
-            // The Windows native runner already has a discard_stderr knob;
-            // when log capture is desired we run the spawn manually so we
-            // can redirect to the file directly.
-            if let Some(log) = log_file {
-                use std::os::windows::process::CommandExt;
-                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-                let (program, prefix_args) = split_resolved_binary(&bin);
-                let mut cmd = std::process::Command::new(&program);
-                for a in &prefix_args {
-                    cmd.arg(a);
+            #[cfg(target_os = "windows")]
+            {
+                // The Windows native runner already has a discard_stderr knob;
+                // when log capture is desired we run the spawn manually so we
+                // can redirect to the file directly.
+                if let Some(log) = log_file {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                    let (program, prefix_args) = split_resolved_binary(&bin);
+                    let mut cmd = std::process::Command::new(&program);
+                    for a in &prefix_args {
+                        cmd.arg(a);
+                    }
+                    let mut argv: Vec<String> = windows_executable_path_args();
+                    argv.extend([
+                        "open".into(),
+                        "about:blank".into(),
+                        "--headless".into(),
+                        "--session".into(),
+                        session.clone(),
+                    ]);
+                    for a in &argv {
+                        cmd.arg(a);
+                    }
+                    cmd.env("AGENT_BROWSER_STREAM_PORT", port.to_string())
+                        .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
+                        .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
+                        .stderr(log)
+                        .creation_flags(CREATE_NO_WINDOW);
+                    let _ = launch_status_with_timeout(cmd, OPEN_TIMEOUT);
+                } else {
+                    let mut argv: Vec<String> = windows_executable_path_args();
+                    argv.extend([
+                        "open".into(),
+                        "about:blank".into(),
+                        "--headless".into(),
+                        "--session".into(),
+                        session.clone(),
+                    ]);
+                    let _ = run_agent_browser_native(&bin, &argv, port, false, OPEN_TIMEOUT);
                 }
-                let mut argv: Vec<String> = windows_executable_path_args();
-                argv.extend([
-                    "open".into(),
-                    "about:blank".into(),
-                    "--headless".into(),
-                    "--session".into(),
-                    session.clone(),
-                ]);
-                for a in &argv {
-                    cmd.arg(a);
-                }
-                cmd.env("AGENT_BROWSER_STREAM_PORT", port.to_string())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                let launch_cmd = format!(
+                    "{} open about:blank --headless --session {}",
+                    bin, session
+                );
+                let mut cmd = std::process::Command::new("sh");
+                cmd.args(["-c", &launch_cmd])
+                    .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
                     .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-                    .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent())
-                    .stderr(log)
-                    .creation_flags(CREATE_NO_WINDOW);
-                let _ = cmd.output();
-            } else {
-                let _ = run_agent_browser_native(
-                    &bin,
-                    &{
-                        let mut argv: Vec<String> = windows_executable_path_args();
-                        argv.extend([
-                            "open".into(),
-                            "about:blank".into(),
-                            "--headless".into(),
-                            "--session".into(),
-                            session.clone(),
-                        ]);
-                        argv
-                    },
-                    port,
-                    false,
+                    .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
+                if let Some(log) = log_file {
+                    cmd.stderr(log);
+                }
+                let _ = launch_status_with_timeout(cmd, OPEN_TIMEOUT);
+            }
+
+            // P5: real health check. Probe the port up to ~5s; only mark
+            // running when we have actual evidence the daemon is alive.
+            let port_alive = probe_stream_port(port, 25, Duration::from_millis(200));
+
+            // P1: capture the daemon's PID. agent-browser writes its PID file
+            // synchronously while initialising, so by the time the probe
+            // succeeds the file should exist. We try once before and once
+            // after to handle either ordering.
+            let mut pid = read_agent_browser_daemon_pid(&session);
+            if pid.is_none() {
+                std::thread::sleep(Duration::from_millis(100));
+                pid = read_agent_browser_daemon_pid(&session);
+            }
+            if let Some(p) = pid {
+                write_session_pid(&session, p);
+            }
+
+            if !port_alive {
+                eprintln!(
+                    "[codemux::browser] WARN session={session} port={port}: daemon launch did not pass health probe; \
+                     returning URL but caller should expect a degraded stream"
                 );
             }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            let launch_cmd = format!(
-                "{} open about:blank --headless --session {}",
-                bin, session
-            );
-            let mut cmd = std::process::Command::new("sh");
-            cmd.args(["-c", &launch_cmd])
-                .env("AGENT_BROWSER_STREAM_PORT", port.to_string())
-                .env("AGENT_BROWSER_ARGS", STEALTH_CHROMIUM_ARGS)
-                .env("AGENT_BROWSER_USER_AGENT", stealth_user_agent());
-            if let Some(log) = log_file {
-                cmd.stderr(log);
-            }
-            let _ = cmd.output();
-        }
 
-        // P5: real health check. Probe the port up to ~5s; only mark
-        // running when we have actual evidence the daemon is alive.
-        let port_alive = probe_stream_port(port, 25, Duration::from_millis(200));
-
-        // P1: capture the daemon's PID. agent-browser writes its PID file
-        // synchronously while initialising, so by the time the probe
-        // succeeds the file should exist. We try once before and once
-        // after to handle either ordering.
-        let mut pid = read_agent_browser_daemon_pid(&session);
-        if pid.is_none() {
-            std::thread::sleep(Duration::from_millis(100));
-            pid = read_agent_browser_daemon_pid(&session);
-        }
-        if let Some(p) = pid {
-            write_session_pid(&session, p);
-        }
-
-        if !port_alive {
-            eprintln!(
-                "[codemux::browser] WARN session={session} port={port}: daemon launch did not pass health probe; \
-                 returning URL but caller should expect a degraded stream"
-            );
-        }
+            (port_alive, pid)
+        })
+        .await
+        .map_err(|e| format!("agent-browser launch task failed: {e}"))?;
 
         let now = Some(Instant::now());
         self.sessions
@@ -1936,6 +2178,141 @@ impl AgentBrowserManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── External-process timeout guard (issue #96) ───────────────────
+    //
+    // These exercise the hard-timeout wrappers with OS built-ins
+    // (`sh`/`cmd`/`sleep`/`ping`) so they stay hermetic — no agent-browser
+    // binary required. The whole point of the feature is that a wedged
+    // child is killed, so a broken implementation fails fast (or trips the
+    // assertion), it does not hang the suite.
+
+    #[test]
+    fn action_timeout_open_and_wait_get_long_ceiling() {
+        assert_eq!(action_timeout("open"), OPEN_TIMEOUT);
+        assert_eq!(action_timeout("open_url"), OPEN_TIMEOUT);
+        assert_eq!(action_timeout("wait"), OPEN_TIMEOUT);
+        // Snappy already-connected DOM actions get the shorter ceiling.
+        assert_eq!(action_timeout("click"), ACTION_TIMEOUT);
+        assert_eq!(action_timeout("screenshot"), ACTION_TIMEOUT);
+        assert_eq!(action_timeout("snapshot"), ACTION_TIMEOUT);
+        assert_eq!(action_timeout("eval"), ACTION_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_capture_with_timeout_collects_stdout_on_fast_exit() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "printf hello"]);
+        let out = output_capture_with_timeout(cmd, Duration::from_secs(5))
+            .expect("fast command should complete");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_capture_with_timeout_kills_wedged_child_fast() {
+        // A 30s sleeper bounded to 300ms must return promptly with
+        // TimedOut — proving the child was killed, not waited out.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        let result = output_capture_with_timeout(cmd, Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        let err = result.expect_err("a 30s sleep must trip the 300ms timeout");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "timed-out child should be killed quickly, took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_whole_process_group_not_just_the_shell() {
+        // `sh -c 'sleep 30; true'` forces sh to FORK `sleep` as a
+        // grandchild rather than exec it in place. A naive `child.kill()`
+        // on the shell would orphan that sleep; the process-group SIGKILL
+        // must reap it too.
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30; true"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sh");
+        let pgid = child.id() as i32;
+
+        let result = wait_with_timeout(&mut child, Duration::from_millis(300));
+        assert!(result.is_err(), "wedged child should time out");
+
+        // Poll until the process group is empty (init reaps the SIGKILL'd
+        // grandchild). `kill(-pgid, 0)` returns 0 while any member is
+        // alive, -1/ESRCH once the group is gone.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut group_gone = false;
+        while Instant::now() < deadline {
+            let alive = unsafe { libc::kill(-pgid, 0) } == 0;
+            if !alive {
+                group_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            group_gone,
+            "process group {pgid} still has live members — grandchild sleep was not killed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_status_with_timeout_returns_status_on_fast_exit() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exit 0"]);
+        let status = launch_status_with_timeout(cmd, Duration::from_secs(5))
+            .expect("fast launch should complete");
+        assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_status_with_timeout_kills_wedged_launch() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let start = Instant::now();
+        let err = launch_status_with_timeout(cmd, Duration::from_millis(300))
+            .expect_err("wedged launch must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_capture_with_timeout_collects_stdout_on_fast_exit_windows() {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "echo hello"]);
+        let out = output_capture_with_timeout(cmd, Duration::from_secs(5))
+            .expect("fast command should complete");
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_capture_with_timeout_kills_wedged_child_fast_windows() {
+        // `ping -n 30 127.0.0.1` sleeps ~29s; bound it to 500ms. This is
+        // the exact failure shape that hung `cargo test` on the Windows CI
+        // image before the timeout guard.
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "ping -n 30 127.0.0.1"]);
+        let start = Instant::now();
+        let err = output_capture_with_timeout(cmd, Duration::from_millis(500))
+            .expect_err("a ~29s ping must trip the 500ms timeout");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(start.elapsed() < Duration::from_secs(8));
+    }
 
     #[test]
     fn resolve_binary_returns_existing_path_or_npx_fallback() {
