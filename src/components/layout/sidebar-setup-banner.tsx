@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { basename } from "@/lib/path";
 import { useUIStore } from "@/stores/ui-store";
+import { useSidebar } from "@/components/ui/sidebar";
 import {
   dbGetUiState,
   dbSetUiState,
@@ -13,6 +14,7 @@ import {
 } from "@/tauri/commands";
 
 export function SidebarSetupBanner() {
+  const { state } = useSidebar();
   const appState = useAppStore((s) => s.appState);
   const homeDir = useHomeDir();
   const setShowSettings = useUIStore((s) => s.setShowSettings);
@@ -73,8 +75,16 @@ export function SidebarSetupBanner() {
       .catch(() => setHasScripts(true));
   }, [projectRoot]);
 
-  // Don't show if: no project, already dismissed, already has scripts, or no workspaces
-  if (!projectRoot || dismissed || hasScripts || !hasProjectWorkspaces) {
+  // Don't show if: collapsed to the icon rail (the banner is a wide,
+  // text-heavy card that has no place in a 52px rail), no project, already
+  // dismissed, already has scripts, or no workspaces.
+  if (
+    state === "collapsed" ||
+    !projectRoot ||
+    dismissed ||
+    hasScripts ||
+    !hasProjectWorkspaces
+  ) {
     return null;
   }
 

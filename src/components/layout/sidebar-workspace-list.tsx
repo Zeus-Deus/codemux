@@ -2,7 +2,9 @@ import { useState, useRef, useCallback } from "react";
 import {
   SidebarGroup,
   SidebarGroupContent,
+  useSidebar,
 } from "@/components/ui/sidebar";
+import { SidebarRailProjects } from "./sidebar-rail-projects";
 import {
   useAppStore,
   useHomeDir,
@@ -24,6 +26,7 @@ interface DropTarget {
 }
 
 export function SidebarWorkspaceList() {
+  const { state } = useSidebar();
   const appState = useAppStore((s) => s.appState);
   const allWorkspaces = appState?.workspaces ?? [];
   // Home-rooted workspaces flow through the same grouping pipeline as
@@ -299,6 +302,13 @@ export function SidebarWorkspaceList() {
     },
     [],
   );
+
+  // Collapsed icon rail: projects render as avatars with aggregate
+  // agent-status dots and a hover flyout. Drag-and-drop reordering is an
+  // expanded-only affordance, so the rail bypasses the DnD list entirely.
+  if (state === "collapsed") {
+    return <SidebarRailProjects />;
+  }
 
   return (
     <SidebarGroup className="p-0">

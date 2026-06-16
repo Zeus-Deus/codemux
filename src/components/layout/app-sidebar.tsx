@@ -8,9 +8,11 @@ import { NewRunDialog } from "@/components/openflow/new-run-dialog";
 
 export function AppSidebar() {
   return (
-    <Sidebar side="left" variant="sidebar" collapsible="offcanvas">
+    <Sidebar side="left" variant="sidebar" collapsible="icon">
       <SidebarActionRow />
-      <SidebarContent>
+      {/* Override the primitive's icon-mode `overflow-hidden` so the project
+          rail can still scroll vertically when there are many projects. */}
+      <SidebarContent className="group-data-[collapsible=icon]:overflow-auto">
         <SidebarWorkspaceList />
       </SidebarContent>
       <SidebarSetupBanner />

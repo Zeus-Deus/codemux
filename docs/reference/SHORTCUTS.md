@@ -15,7 +15,7 @@ Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, an
 | Shortcut | Action | Notes |
 |----------|--------|-------|
 | Ctrl+K | Command palette | Fuzzy search for any action |
-| Ctrl+B | Toggle sidebar | Collapse/expand the left sidebar |
+| Ctrl+B | Toggle sidebar | Collapse the left sidebar to an icon rail / expand it (see `docs/features/sidebar.md`) |
 | Ctrl+, | Open settings | Opens the settings panel |
 | Ctrl+Shift+P | Find file by name | File name search overlay (via fd/find) |
 | Ctrl+Shift+F | Search in files | Keyword search across workspace files (via rg/grep) |
