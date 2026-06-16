@@ -66,7 +66,13 @@ export function scanKittySequences(str: string): KittyScanResult {
     pushValues.push(parseInt(m[1], 10));
   }
 
-  const popCount = (str.match(/\x1b\[<u/g) ?? []).length;
+  // Pop op is `CSI < number u`, where `number` is how many entries to pop and
+  // defaults to 1 when omitted (Kitty keyboard protocol). Sum the counts so a
+  // numbered pop like `CSI < 3 u` removes 3 entries instead of being missed.
+  let popCount = 0;
+  for (const m of str.matchAll(/\x1b\[<([0-9]*)u/g)) {
+    popCount += m[1] ? parseInt(m[1], 10) : 1;
+  }
 
   // DA query: shell sends \x1b[c (DA1) or \x1b[>c (DA2) on startup.
   // Either form may include an explicit 0 param (\x1b[0c / \x1b[>0c).
