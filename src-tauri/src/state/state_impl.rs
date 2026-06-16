@@ -2342,12 +2342,20 @@ impl AppStateStore {
                 .get_mut(surface_index)
                 .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
 
+            let ordered_before = collect_leaf_pane_ids(&surface.root);
+            let active_before = surface.active_pane_id.clone();
             let updated_root = remove_pane_from_tree(&surface.root, pane_id);
 
             if let Some(new_root) = updated_root {
-                // Pane removed but surface still has content
-                let next_active_pane = first_leaf_pane_id(&new_root)
-                    .ok_or_else(|| "No fallback pane available after close".to_string())?;
+                // Pane removed but surface still has content. Keep focus on the
+                // current pane when a different pane was closed; when the active
+                // pane itself was closed, move to the adjacent pane (next, then
+                // previous) rather than the leftmost leaf.
+                let next_active_pane =
+                    active_id_after_removal(&ordered_before, &active_before, pane_id)
+                        .filter(|pid| pane_tree_contains_pane(&new_root, &pid.0))
+                        .or_else(|| first_leaf_pane_id(&new_root))
+                        .ok_or_else(|| "No fallback pane available after close".to_string())?;
                 surface.root = new_root;
                 surface.active_pane_id = next_active_pane;
                 workspace.active_surface_id = surface.surface_id.clone();
@@ -4373,6 +4381,22 @@ fn first_leaf_pane_id(root: &PaneNodeSnapshot) -> Option<PaneId> {
     }
 }
 
+/// Pick the pane to focus after `removed` is closed. If a *different* pane was
+/// closed, keep the current `active` pane; if the active pane itself was
+/// closed, move to the next pane in leaf order, falling back to the previous
+/// one — instead of jumping focus to the leftmost leaf. `ordered` is the leaf
+/// order *before* removal (so `removed` is still present in it).
+fn active_id_after_removal(ordered: &[PaneId], active: &PaneId, removed: &str) -> Option<PaneId> {
+    if active.0 != removed {
+        return Some(active.clone());
+    }
+    let idx = ordered.iter().position(|p| p.0 == removed)?;
+    ordered
+        .get(idx + 1)
+        .cloned()
+        .or_else(|| idx.checked_sub(1).and_then(|prev| ordered.get(prev).cloned()))
+}
+
 fn clone_pane_node(root: &PaneNodeSnapshot, target_pane_id: &str) -> Option<PaneNodeSnapshot> {
     match root {
         PaneNodeSnapshot::Terminal { pane_id, .. }
@@ -4875,6 +4899,37 @@ mod tests {
             }
             _ => panic!("expected split"),
         }
+    }
+
+    fn close_pane_with_root(active: &str, close: &str) -> String {
+        let store = AppStateStore::default();
+        let mut snap = store.snapshot();
+        {
+            let surface = &mut snap.workspaces[0].surfaces[0];
+            surface.root = custom_sized_triple_split();
+            surface.active_pane_id = PaneId(active.into());
+        }
+        store.replace_snapshot(snap);
+        store.close_pane(close).unwrap();
+        store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id
+            .0
+            .clone()
+    }
+
+    #[test]
+    fn close_active_pane_focuses_next_then_previous() {
+        // Closing the active middle pane focuses the next (right) pane…
+        assert_eq!(close_pane_with_root("pane-b", "pane-b"), "pane-c");
+        // …and closing the active last pane focuses the previous one.
+        assert_eq!(close_pane_with_root("pane-c", "pane-c"), "pane-b");
+    }
+
+    #[test]
+    fn close_inactive_pane_keeps_focus() {
+        // Closing a different pane must not move focus off the active pane.
+        assert_eq!(close_pane_with_root("pane-b", "pane-a"), "pane-b");
+        assert_eq!(close_pane_with_root("pane-b", "pane-c"), "pane-b");
     }
 
     #[test]
