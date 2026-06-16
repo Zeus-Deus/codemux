@@ -11,7 +11,10 @@
  * sites that don't expose /favicon.ico at the root.
  */
 
-const IMAGE_EXTENSIONS = /\.(png|jpe?g|gif|svg|webp|ico|avif|bmp)(\?.*)?$/i;
+// Allow an optional trailing query string (?v=1) or fragment (#section) after
+// the extension — both are valid on a direct image URL and must not cause it to
+// be misread as a website and routed through the favicon service.
+const IMAGE_EXTENSIONS = /\.(png|jpe?g|gif|svg|webp|ico|avif|bmp)([?#].*)?$/i;
 
 export interface ResolvedImage {
   /** The final URL to put on an <img src>. Empty when input is blank. */

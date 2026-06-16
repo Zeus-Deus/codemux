@@ -35,6 +35,10 @@ describe("resolveImageUrl", () => {
     const ico = "https://example.com/fav.ico?x=1";
     expect(resolveImageUrl(ico).isFavicon).toBe(false);
     expect(resolveImageUrl(ico).url).toBe(ico);
+    // …and so is one with a trailing fragment.
+    const frag = "https://example.com/logo.png#section";
+    expect(resolveImageUrl(frag).isFavicon).toBe(false);
+    expect(resolveImageUrl(frag).url).toBe(frag);
   });
 
   it("derives a favicon URL from a bare domain", () => {
