@@ -47,7 +47,12 @@ vi.mock("@/stores/workspaces-sync-store", () => ({
   useWorkspacesSync: () => mockSyncRows,
 }));
 
-import { useOverviewItems, remoteProjectName } from "./use-overview-items";
+import {
+  useOverviewItems,
+  remoteProjectName,
+  detectDivergence,
+  type OverviewItem,
+} from "./use-overview-items";
 
 // ── Factories ─────────────────────────────────────────────────────
 
@@ -128,7 +133,91 @@ function makeHost(
   };
 }
 
+function makeRemoteItem(
+  id: number,
+  sync: Partial<WorkspaceSyncView>,
+): OverviewItem {
+  return {
+    kind: "remote",
+    key: `remote:${id}`,
+    sync: makeSync({ id, ...sync }),
+    hostServerId: sync.host_server_id ?? null,
+    projectName: null,
+    projectPath: null,
+    projectKey: null,
+  };
+}
+
 afterEach(() => cleanup());
+
+describe("detectDivergence", () => {
+  const label = (hostServerId: string | null) =>
+    hostServerId ?? "another device";
+
+  it("excludes rows with no git_head_sha from divergence", () => {
+    const items = [
+      makeRemoteItem(1, {
+        project_remote: "R",
+        git_branch: "main",
+        git_head_sha: "aaa",
+        host_server_id: "dev-a",
+      }),
+      makeRemoteItem(2, {
+        project_remote: "R",
+        git_branch: "main",
+        git_head_sha: "bbb",
+        host_server_id: "dev-b",
+      }),
+      makeRemoteItem(3, {
+        project_remote: "R",
+        git_branch: "main",
+        git_head_sha: null,
+        host_server_id: "dev-c",
+      }),
+    ];
+    const result = detectDivergence(items, label);
+    // The two rows with distinct shas diverge…
+    expect(result.has("remote:1")).toBe(true);
+    expect(result.has("remote:2")).toBe(true);
+    // …but the sha-less row can't be compared, so it gets no chip.
+    expect(result.has("remote:3")).toBe(false);
+    // And it must not inflate the fork count or the "other device" label.
+    expect(result.get("remote:1")?.forks).toBe(2);
+    expect(result.get("remote:1")?.otherLabel).toBe("dev-b");
+  });
+
+  it("does not diverge when only one sha is known", () => {
+    const items = [
+      makeRemoteItem(1, {
+        project_remote: "R",
+        git_branch: "main",
+        git_head_sha: "aaa",
+      }),
+      makeRemoteItem(2, {
+        project_remote: "R",
+        git_branch: "main",
+        git_head_sha: null,
+      }),
+    ];
+    expect(detectDivergence(items, label).size).toBe(0);
+  });
+
+  it("does not diverge when shas match", () => {
+    const items = [
+      makeRemoteItem(1, {
+        project_remote: "R",
+        git_branch: "main",
+        git_head_sha: "same",
+      }),
+      makeRemoteItem(2, {
+        project_remote: "R",
+        git_branch: "main",
+        git_head_sha: "same",
+      }),
+    ];
+    expect(detectDivergence(items, label).size).toBe(0);
+  });
+});
 
 describe("useOverviewItems", () => {
   beforeEach(() => {
