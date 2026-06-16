@@ -3484,17 +3484,21 @@ fn remove_browser_nodes(node: &PaneNodeSnapshot) -> Option<PaneNodeSnapshot> {
             child_sizes,
             children,
         } => {
-            let remaining: Vec<_> = children
-                .iter()
-                .filter_map(remove_browser_nodes)
-                .collect();
+            let mut remaining: Vec<PaneNodeSnapshot> = Vec::new();
+            let mut kept: Vec<usize> = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(new_child) = remove_browser_nodes(child) {
+                    remaining.push(new_child);
+                    kept.push(i);
+                }
+            }
             match remaining.len() {
                 0 => None,
                 1 => remaining.into_iter().next(),
                 _ => Some(PaneNodeSnapshot::Split {
                     pane_id: pane_id.clone(),
                     direction: direction.clone(),
-                    child_sizes: rebalance_sizes(child_sizes, remaining.len()),
+                    child_sizes: retained_sizes(child_sizes, &kept),
                     children: remaining,
                 }),
             }
@@ -3817,10 +3821,14 @@ fn remove_terminal_from_tree(
             child_sizes,
             children,
         } => {
-            let remaining_children = children
-                .iter()
-                .filter_map(|child| remove_terminal_from_tree(child, target_session_id))
-                .collect::<Vec<_>>();
+            let mut remaining_children: Vec<PaneNodeSnapshot> = Vec::new();
+            let mut kept: Vec<usize> = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(new_child) = remove_terminal_from_tree(child, target_session_id) {
+                    remaining_children.push(new_child);
+                    kept.push(i);
+                }
+            }
 
             match remaining_children.len() {
                 0 => None,
@@ -3828,7 +3836,7 @@ fn remove_terminal_from_tree(
                 _ => Some(PaneNodeSnapshot::Split {
                     pane_id: pane_id.clone(),
                     direction: direction.clone(),
-                    child_sizes: rebalance_sizes(child_sizes, remaining_children.len()),
+                    child_sizes: retained_sizes(child_sizes, &kept),
                     children: remaining_children,
                 }),
             }
@@ -3854,10 +3862,14 @@ fn remove_terminals_from_tree(
             child_sizes,
             children,
         } => {
-            let remaining_children = children
-                .iter()
-                .filter_map(|child| remove_terminals_from_tree(child, session_ids))
-                .collect::<Vec<_>>();
+            let mut remaining_children: Vec<PaneNodeSnapshot> = Vec::new();
+            let mut kept: Vec<usize> = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(new_child) = remove_terminals_from_tree(child, session_ids) {
+                    remaining_children.push(new_child);
+                    kept.push(i);
+                }
+            }
 
             match remaining_children.len() {
                 0 => None,
@@ -3865,7 +3877,7 @@ fn remove_terminals_from_tree(
                 _ => Some(PaneNodeSnapshot::Split {
                     pane_id: pane_id.clone(),
                     direction: direction.clone(),
-                    child_sizes: rebalance_sizes(child_sizes, remaining_children.len()),
+                    child_sizes: retained_sizes(child_sizes, &kept),
                     children: remaining_children,
                 }),
             }
@@ -3955,6 +3967,25 @@ fn rebalance_sizes(existing: &[f32], target_len: usize) -> Vec<f32> {
     }
 
     normalize_sizes(vec![1.0 / target_len as f32; target_len])
+}
+
+/// Sizes for the children that survived a removal, renormalized so their
+/// relative proportions are preserved. `kept` holds the original indices of
+/// the surviving children. Unlike resetting to equal weights, closing one
+/// pane in a custom-sized split leaves the remaining panes' ratios intact
+/// (e.g. closing the third child of a `[0.5, 0.3, 0.2]` split yields
+/// `[0.625, 0.375]`, not `[0.5, 0.5]`).
+fn retained_sizes(child_sizes: &[f32], kept: &[usize]) -> Vec<f32> {
+    let fallback = if child_sizes.is_empty() {
+        0.0
+    } else {
+        1.0 / child_sizes.len() as f32
+    };
+    let sizes: Vec<f32> = kept
+        .iter()
+        .map(|&i| child_sizes.get(i).copied().unwrap_or(fallback))
+        .collect();
+    normalize_sizes(sizes)
 }
 
 fn normalize_sizes(mut sizes: Vec<f32>) -> Vec<f32> {
@@ -4580,10 +4611,14 @@ fn remove_pane_from_tree(
             child_sizes,
             children,
         } => {
-            let remaining_children = children
-                .iter()
-                .filter_map(|child| remove_pane_from_tree(child, target_pane_id))
-                .collect::<Vec<_>>();
+            let mut remaining_children: Vec<PaneNodeSnapshot> = Vec::new();
+            let mut kept: Vec<usize> = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(new_child) = remove_pane_from_tree(child, target_pane_id) {
+                    remaining_children.push(new_child);
+                    kept.push(i);
+                }
+            }
 
             match remaining_children.len() {
                 0 => None,
@@ -4591,7 +4626,7 @@ fn remove_pane_from_tree(
                 _ => Some(PaneNodeSnapshot::Split {
                     pane_id: pane_id.clone(),
                     direction: direction.clone(),
-                    child_sizes: rebalance_sizes(child_sizes, remaining_children.len()),
+                    child_sizes: retained_sizes(child_sizes, &kept),
                     children: remaining_children,
                 }),
             }
@@ -4793,6 +4828,77 @@ mod tests {
                 assert_eq!(session_id.0, "session-b");
             }
             _ => panic!("expected collapsed terminal node"),
+        }
+    }
+
+    fn terminal_leaf(pane: &str, session: &str) -> PaneNodeSnapshot {
+        PaneNodeSnapshot::Terminal {
+            pane_id: PaneId(pane.into()),
+            session_id: SessionId(session.into()),
+            title: pane.to_string(),
+        }
+    }
+
+    fn custom_sized_triple_split() -> PaneNodeSnapshot {
+        PaneNodeSnapshot::Split {
+            pane_id: PaneId("pane-root".into()),
+            direction: SplitDirection::Horizontal,
+            child_sizes: vec![0.5, 0.3, 0.2],
+            children: vec![
+                terminal_leaf("pane-a", "session-a"),
+                terminal_leaf("pane-b", "session-b"),
+                terminal_leaf("pane-c", "session-c"),
+            ],
+        }
+    }
+
+    #[test]
+    fn remove_pane_preserves_sibling_proportions() {
+        let tree = custom_sized_triple_split();
+
+        // Closing the last child keeps the first two at their 0.5:0.3 ratio
+        // (renormalized to 0.625:0.375), not reset to equal 0.5:0.5.
+        match remove_pane_from_tree(&tree, "pane-c").unwrap() {
+            PaneNodeSnapshot::Split { child_sizes, children, .. } => {
+                assert_eq!(children.len(), 2);
+                assert!((child_sizes[0] - 0.625).abs() < 1e-4, "got {child_sizes:?}");
+                assert!((child_sizes[1] - 0.375).abs() < 1e-4, "got {child_sizes:?}");
+            }
+            _ => panic!("expected split"),
+        }
+
+        // Closing the middle child keeps the outer two at their 0.5:0.2 ratio.
+        match remove_pane_from_tree(&tree, "pane-b").unwrap() {
+            PaneNodeSnapshot::Split { child_sizes, .. } => {
+                assert!((child_sizes[0] - 0.5 / 0.7).abs() < 1e-4, "got {child_sizes:?}");
+                assert!((child_sizes[1] - 0.2 / 0.7).abs() < 1e-4, "got {child_sizes:?}");
+            }
+            _ => panic!("expected split"),
+        }
+    }
+
+    #[test]
+    fn close_pane_preserves_sibling_proportions() {
+        // Exercise the real public close path on a live store/surface.
+        let store = AppStateStore::default();
+        let mut snap = store.snapshot();
+        {
+            let surface = &mut snap.workspaces[0].surfaces[0];
+            surface.root = custom_sized_triple_split();
+            surface.active_pane_id = PaneId("pane-a".into());
+        }
+        store.replace_snapshot(snap);
+
+        store.close_pane("pane-c").unwrap();
+
+        let snap = store.snapshot();
+        match &snap.workspaces[0].surfaces[0].root {
+            PaneNodeSnapshot::Split { child_sizes, children, .. } => {
+                assert_eq!(children.len(), 2);
+                assert!((child_sizes[0] - 0.625).abs() < 1e-4, "got {child_sizes:?}");
+                assert!((child_sizes[1] - 0.375).abs() < 1e-4, "got {child_sizes:?}");
+            }
+            _ => panic!("expected split after closing one pane"),
         }
     }
 
