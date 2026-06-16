@@ -889,6 +889,31 @@ fn parse_porcelain_status(output: &str) -> Vec<GitFileStatus> {
     results
 }
 
+/// Extract the destination path from a `git diff --numstat` path field,
+/// handling git's compact rename forms so the key matches what
+/// `git diff --name-status` reports (and stats attach correctly):
+///   "old => new"        -> "new"
+///   "dir/{old => new}"  -> "dir/new"
+///   "{old => new}/file" -> "new/file"
+///   "a/{old => new}/b"  -> "a/new/b"
+/// Non-rename paths are returned unchanged.
+fn numstat_new_path(raw: &str) -> String {
+    if !raw.contains(" => ") {
+        return raw.to_string();
+    }
+    if let (Some(open), Some(close)) = (raw.find('{'), raw.find('}')) {
+        if open < close {
+            let prefix = &raw[..open];
+            let inside = &raw[open + 1..close];
+            let suffix = &raw[close + 1..];
+            let new_part = inside.split(" => ").nth(1).unwrap_or(inside);
+            return format!("{prefix}{new_part}{suffix}");
+        }
+    }
+    // No braces: the whole field is "old => new".
+    raw.split(" => ").nth(1).unwrap_or(raw).to_string()
+}
+
 fn parse_numstat_per_file(unstaged: &str, staged: &str) -> std::collections::HashMap<String, (u32, u32)> {
     let mut map = std::collections::HashMap::new();
     for line in unstaged.lines().chain(staged.lines()) {
@@ -896,7 +921,7 @@ fn parse_numstat_per_file(unstaged: &str, staged: &str) -> std::collections::Has
         if parts.len() >= 3 {
             let adds = parts[0].parse::<u32>().unwrap_or(0);
             let dels = parts[1].parse::<u32>().unwrap_or(0);
-            let path = parts[2].to_string();
+            let path = numstat_new_path(parts[2]);
             let entry = map.entry(path).or_insert((0, 0));
             entry.0 += adds;
             entry.1 += dels;
@@ -966,15 +991,9 @@ fn parse_single_numstat(output: &str) -> std::collections::HashMap<String, (u32,
         if parts.len() >= 3 {
             let adds = parts[0].parse::<u32>().unwrap_or(0);
             let dels = parts[1].parse::<u32>().unwrap_or(0);
-            // Handle renames: numstat shows "old => new" or just the path
-            let raw_path = parts[2];
-            let path = if let Some(arrow) = raw_path.find(" => ") {
-                // e.g. "{src => dest}/file.txt" or "old.txt => new.txt"
-                let after = &raw_path[arrow + 4..];
-                after.trim_matches('}').to_string()
-            } else {
-                raw_path.to_string()
-            };
+            // Handle renames: numstat shows compact forms like
+            // "src/lib/{old => new}" — reconstruct the full destination path.
+            let path = numstat_new_path(parts[2]);
             let entry = map.entry(path).or_insert((0, 0));
             entry.0 += adds;
             entry.1 += dels;
@@ -3026,6 +3045,46 @@ C  source.txt -> copy.txt";
         let (adds, dels) = parse_numstat("");
         assert_eq!(adds, 0);
         assert_eq!(dels, 0);
+    }
+
+    #[test]
+    fn numstat_new_path_handles_rename_forms() {
+        // Non-rename path is unchanged.
+        assert_eq!(numstat_new_path("src/a.txt"), "src/a.txt");
+        // Whole-path rename (no shared component).
+        assert_eq!(numstat_new_path("old.txt => new.txt"), "new.txt");
+        assert_eq!(
+            numstat_new_path("src/a.txt => dest/b.txt"),
+            "dest/b.txt"
+        );
+        // Shared prefix / suffix / both, in git's brace form.
+        assert_eq!(
+            numstat_new_path("src/lib/{old.txt => new.txt}"),
+            "src/lib/new.txt"
+        );
+        assert_eq!(
+            numstat_new_path("{src => dest}/file.txt"),
+            "dest/file.txt"
+        );
+        assert_eq!(
+            numstat_new_path("src/{a => b}/file.txt"),
+            "src/b/file.txt"
+        );
+    }
+
+    #[test]
+    fn parse_single_numstat_attaches_stats_to_renamed_path() {
+        // The key must be the full destination path so it matches
+        // `git diff --name-status` (`src/lib/new.txt`) and stats attach.
+        let map = parse_single_numstat("5\t3\tsrc/lib/{old.txt => new.txt}\n");
+        assert_eq!(map.get("src/lib/new.txt"), Some(&(5, 3)));
+        assert_eq!(map.get("new.txt"), None);
+    }
+
+    #[test]
+    fn parse_numstat_per_file_attaches_stats_to_renamed_path() {
+        let map = parse_numstat_per_file("4\t1\t{src => dest}/file.txt\n", "");
+        assert_eq!(map.get("dest/file.txt"), Some(&(4, 1)));
     }
 
     #[test]
