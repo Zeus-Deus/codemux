@@ -55,13 +55,15 @@ describe("getModifiers", () => {
     ...overrides,
   });
 
-  it("encodes the CDP modifier bitmask", () => {
+  it("encodes the CDP modifier bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8)", () => {
+    // Bit values are fixed by CDP and must match the Rust sender
+    // (stream_input.rs `parse_key_combo`), which drives the same daemon.
     expect(getModifiers(ev({}))).toBe(0);
-    expect(getModifiers(ev({ shiftKey: true }))).toBe(1);
+    expect(getModifiers(ev({ altKey: true }))).toBe(1);
     expect(getModifiers(ev({ ctrlKey: true }))).toBe(2);
-    expect(getModifiers(ev({ altKey: true }))).toBe(4);
-    expect(getModifiers(ev({ metaKey: true }))).toBe(8);
-    expect(getModifiers(ev({ shiftKey: true, ctrlKey: true }))).toBe(3);
+    expect(getModifiers(ev({ metaKey: true }))).toBe(4);
+    expect(getModifiers(ev({ shiftKey: true }))).toBe(8);
+    expect(getModifiers(ev({ shiftKey: true, ctrlKey: true }))).toBe(10);
   });
 });
 
