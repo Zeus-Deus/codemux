@@ -143,15 +143,17 @@ pub(crate) fn remote_import_script(remote_cwd: &str, remote_bundle: &str) -> Str
 /// absence of the marker means "nothing to pull" (no session, or opencode
 /// not on the host), not a transport error.
 pub(crate) fn remote_extract_script(remote_cwd: &str, remote_bundle: &str) -> String {
+    // Build the query with the shared SQL helper (which SQL-escapes the
+    // directory) and pass it as a single shell-quoted argument. Splicing the
+    // path through a `$dir` shell variable into the SQL literal would break
+    // the query for any path containing an apostrophe (e.g. /Users/O'Brien/…),
+    // silently yielding "nothing to pull".
     format!(
-        "dir={cwd}\n\
-         sid=$(opencode db \"SELECT id FROM session WHERE directory = '$dir' \
-AND parent_id IS NULL ORDER BY time_updated DESC LIMIT 1\" 2>/dev/null \
-| grep -m1 '^ses_')\n\
+        "sid=$(opencode db {sql} 2>/dev/null | grep -m1 '^ses_')\n\
          if [ -n \"$sid\" ]; then\n\
            opencode export \"$sid\" > {bundle} 2>/dev/null && echo \"CMX_OC_SID=$sid\"\n\
          fi\n",
-        cwd = shell_sq(remote_cwd),
+        sql = shell_sq(&newest_session_sql(remote_cwd)),
         bundle = shell_sq(remote_bundle),
     )
 }
@@ -576,11 +578,30 @@ mod tests {
     #[test]
     fn remote_extract_script_queries_then_exports_with_marker() {
         let s = remote_extract_script("/home/me/ws", "/tmp/codemux-opencode-2.json");
-        assert!(s.contains("dir='/home/me/ws'"));
+        // The query is built by the shared SQL helper and passed as one
+        // shell-quoted argument (no raw $dir splice into the SQL literal).
+        assert!(s.contains(&shell_sq(&newest_session_sql("/home/me/ws"))));
         assert!(s.contains("opencode db"));
         assert!(s.contains("parent_id IS NULL"));
         assert!(s.contains("opencode export \"$sid\" > '/tmp/codemux-opencode-2.json'"));
         assert!(s.contains("echo \"CMX_OC_SID=$sid\""));
+    }
+
+    #[test]
+    fn remote_extract_script_sql_escapes_apostrophe_paths() {
+        // A path with an apostrophe must be SQL-escaped into the query (the
+        // apostrophe doubled), exactly like the local-side newest_session_sql —
+        // never spliced raw via a shell variable, which breaks the SQL literal.
+        let cwd = "/Users/O'Brien/ws";
+        let s = remote_extract_script(cwd, "/tmp/b.json");
+        assert!(
+            s.contains(&shell_sq(&newest_session_sql(cwd))),
+            "must embed the SQL-escaped query; got:\n{s}"
+        );
+        assert!(
+            !s.contains("'$dir'"),
+            "must not splice the raw path into the SQL string literal"
+        );
     }
 
     #[test]
