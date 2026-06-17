@@ -2363,12 +2363,26 @@ impl AppStateStore {
                 // Last pane closed — remove the surface and its tab
                 let surface_id = workspace.surfaces[surface_index].surface_id.clone();
                 workspace.surfaces.remove(surface_index);
+                // Index of the tab about to be removed, so we can focus its
+                // neighbor instead of always jumping to the first tab.
+                let removed_tab_index = workspace
+                    .tabs
+                    .iter()
+                    .position(|t| t.surface_id.as_ref() == Some(&surface_id));
+                let was_active = workspace.active_surface_id == surface_id;
                 workspace.tabs.retain(|t| t.surface_id.as_ref() != Some(&surface_id));
                 if workspace.tabs.is_empty() {
                     workspace.active_tab_id = String::new();
                     workspace.active_surface_id = SurfaceId(String::new());
-                } else if workspace.active_surface_id == surface_id {
-                    let new_tab = &workspace.tabs[0];
+                } else if was_active {
+                    // Focus the adjacent tab (next, then previous) — matches
+                    // close_tab and active_id_after_removal.
+                    let new_index = match removed_tab_index {
+                        Some(idx) if idx < workspace.tabs.len() => idx,
+                        Some(idx) => idx.saturating_sub(1),
+                        None => 0,
+                    };
+                    let new_tab = &workspace.tabs[new_index];
                     workspace.active_tab_id = new_tab.tab_id.clone();
                     if let Some(ref sid) = new_tab.surface_id {
                         workspace.active_surface_id = sid.clone();
@@ -5651,6 +5665,57 @@ mod tests {
         assert_eq!(
             ws.active_tab_id, t3,
             "closing the active middle tab should select the NEXT tab, not the previous"
+        );
+    }
+
+    #[test]
+    fn closing_last_pane_of_active_middle_tab_focuses_next_tab() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-close-lastpane-next"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+
+        // Default tab + two more → [default, t2, t3], each a single-pane tab.
+        let (t2, _) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create t2");
+        let (t3, _) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create t3");
+        store.activate_tab(&ws_id.0, &t2).expect("activate t2");
+
+        // The only pane in t2's surface.
+        let pane_id = {
+            let snap = store.snapshot();
+            let ws = workspace_by_id(&snap, &ws_id);
+            let sid = ws
+                .tabs
+                .iter()
+                .find(|t| t.tab_id == t2)
+                .and_then(|t| t.surface_id.clone())
+                .expect("t2 has a surface");
+            let surface = ws
+                .surfaces
+                .iter()
+                .find(|s| s.surface_id == sid)
+                .expect("surface exists");
+            first_leaf_pane_id(&surface.root).expect("a pane").0
+        };
+
+        // Closing the last pane removes the tab; focus should move to the next.
+        store.close_pane(&pane_id).expect("close pane");
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        assert!(
+            !ws.tabs.iter().any(|t| t.tab_id == t2),
+            "t2 should be gone after closing its last pane"
+        );
+        assert_eq!(
+            ws.active_tab_id, t3,
+            "closing the last pane of the active middle tab should focus the NEXT tab"
         );
     }
 
