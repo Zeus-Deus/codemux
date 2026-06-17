@@ -846,6 +846,15 @@ async fn dispatch(request: JsonRpcRequest) -> Option<JsonRpcResponse> {
 // Tool call handler
 // ---------------------------------------------------------------------------
 
+/// The scroll-`amount` (ticks) value to embed in a `scroll_at` browser action,
+/// as an INTEGER JSON number. The receiver reads it with `Value::as_i64`, which
+/// returns `None` for a float-backed number — so emitting it via `as_f64`
+/// (`3.0`) silently pinned every MCP scroll to the default 3. The CLI path
+/// emits an integer; this matches it. Defaults to 3 (per the tool schema).
+fn scroll_amount_value(arguments: &Value) -> Value {
+    json!(arguments.get("amount").and_then(Value::as_i64).unwrap_or(3))
+}
+
 async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
     let tool_name = match params.get("name").and_then(Value::as_str) {
         Some(name) => name.to_string(),
@@ -940,7 +949,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let x = arguments.get("x").and_then(Value::as_f64).unwrap_or(0.0);
             let y = arguments.get("y").and_then(Value::as_f64).unwrap_or(0.0);
             let dir = arguments.get("direction").and_then(Value::as_str).unwrap_or("down");
-            let amt = arguments.get("amount").and_then(Value::as_f64).unwrap_or(3.0);
+            let amt = scroll_amount_value(&arguments);
             call_socket("browser_automation", json!({
                 "workspace_id": &workspace_id,
                 "action": { "kind": "scroll_at", "x": x, "y": y, "direction": dir, "amount": amt }
@@ -1753,6 +1762,21 @@ pub fn remove_mcp_config(workspace_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_amount_reaches_receiver_as_i64() {
+        // The receiver (stream_input handle_vision_action) reads `amount` with
+        // Value::as_i64, which rejects float-backed numbers. The emitted value
+        // must therefore be an integer JSON number.
+        let v = scroll_amount_value(&json!({ "amount": 10 }));
+        assert_eq!(
+            v.as_i64(),
+            Some(10),
+            "MCP scroll amount must survive the receiver's as_i64 read"
+        );
+        // Absent → the documented default of 3.
+        assert_eq!(scroll_amount_value(&json!({})).as_i64(), Some(3));
+    }
 
     /// Helper: create a unique temp directory for a test.
     fn test_dir(name: &str) -> std::path::PathBuf {
