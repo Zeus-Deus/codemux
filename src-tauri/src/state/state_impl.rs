@@ -3097,7 +3097,15 @@ impl AppStateStore {
                 workspace.active_tab_id = String::new();
                 workspace.active_surface_id = SurfaceId(String::new());
             } else {
-                let new_index = if tab_index > 0 { tab_index - 1 } else { 0 };
+                // Select the next tab — after the removal it slid into
+                // tab_index — falling back to the previous tab when the closed
+                // tab was last. Mirrors active_id_after_removal and standard
+                // editor/browser tab behavior (was: always the previous tab).
+                let new_index = if tab_index < workspace.tabs.len() {
+                    tab_index
+                } else {
+                    tab_index - 1
+                };
                 let new_tab = &workspace.tabs[new_index];
                 workspace.active_tab_id = new_tab.tab_id.clone();
                 if let Some(ref sid) = new_tab.surface_id {
@@ -5617,6 +5625,35 @@ mod tests {
 
     /// Regression guard mirroring `close_workspace_result_contains_session_ids`
     /// for `close_tab`. `CloseTabResult.removed_sessions` is what the
+    #[test]
+    fn close_active_middle_tab_focuses_next_tab() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-close-tab-next"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+
+        // Default tab + two more → order [default, t2, t3].
+        let (t2, _) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create t2");
+        let (t3, _) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create t3");
+
+        // Make the middle tab active, then close it.
+        store.activate_tab(&ws_id.0, &t2).expect("activate t2");
+        store.close_tab(&ws_id.0, &t2).expect("close t2");
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        assert_eq!(
+            ws.active_tab_id, t3,
+            "closing the active middle tab should select the NEXT tab, not the previous"
+        );
+    }
+
     /// `close_tab` command hands to `terminate_pty_session` for PTY cleanup;
     /// if this list ever drops a session the corresponding PTY leaks.
     #[test]
