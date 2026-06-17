@@ -22,7 +22,7 @@ export function normalizeKeyCombo(event: KeyboardEvent): string {
 }
 
 /** Normalize a raw event.key value to canonical display form */
-function normalizeKeyName(key: string): string {
+export function normalizeKeyName(key: string): string {
   // Space is event.key " " (length 1) but should display as "Space"
   if (key === " ") return "Space";
   // Single alphabetic character → uppercase
