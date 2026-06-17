@@ -266,6 +266,19 @@ pub enum NotificationLevel {
     Attention,
 }
 
+impl NotificationLevel {
+    /// Parse a level string as sent by the `notify` control command / MCP tool
+    /// (schema: "info" | "attention" | "error"). "info" → Info; "attention",
+    /// "error", and anything unrecognized → Attention (the most severe level
+    /// the enum exposes — there is no dedicated Error variant).
+    pub fn from_str_or_attention(s: &str) -> Self {
+        match s {
+            "info" => NotificationLevel::Info,
+            _ => NotificationLevel::Attention,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationSnapshot {
     pub notification_id: String,
@@ -5639,6 +5652,30 @@ mod tests {
 
     /// Regression guard mirroring `close_workspace_result_contains_session_ids`
     /// for `close_tab`. `CloseTabResult.removed_sessions` is what the
+    #[test]
+    fn notification_level_parses_from_string() {
+        // "info" must map to Info — the notify control handler used to drop the
+        // level and hardcode Attention, wrongly elevating info notifications.
+        assert!(matches!(
+            NotificationLevel::from_str_or_attention("info"),
+            NotificationLevel::Info
+        ));
+        assert!(matches!(
+            NotificationLevel::from_str_or_attention("attention"),
+            NotificationLevel::Attention
+        ));
+        // "error" has no dedicated variant → surfaces at Attention.
+        assert!(matches!(
+            NotificationLevel::from_str_or_attention("error"),
+            NotificationLevel::Attention
+        ));
+        // Unknown → Attention (safe default).
+        assert!(matches!(
+            NotificationLevel::from_str_or_attention("bogus"),
+            NotificationLevel::Attention
+        ));
+    }
+
     #[test]
     fn close_active_middle_tab_focuses_next_tab() {
         let store = AppStateStore::default();
