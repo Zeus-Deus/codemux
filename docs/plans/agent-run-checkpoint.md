@@ -6,6 +6,10 @@
 - Update when: Scope, restore semantics, or follow-ups change.
 - Read next: `docs/features/agent-chat.md`, `docs/core/STATUS.md`
 
+> **Status: SHIPPED in `v0.9.0`** (Settings → Agent, opt-in). Current behavior
+> is documented in `docs/features/agent-chat.md` § Run checkpoints; the rest of
+> this file is the original design note, kept for history.
+
 ## Goal
 
 When an agent-chat session starts, take an **opt-in, background** snapshot of the
