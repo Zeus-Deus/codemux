@@ -89,32 +89,57 @@ pub(crate) fn comm_log_entry_for_chunk(role: &str, data: &[u8]) -> Option<String
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
     let mut in_escape = false;
-    let mut escape_buf = String::new();
+    let mut first = false; // next char is the byte right after ESC
+    let mut in_osc = false; // OSC (ESC ]) ends only on BEL or ST, never a letter
+    let mut osc_saw_esc = false; // inside OSC, saw ESC — awaiting '\' for ST
 
     for c in s.chars() {
-        if c == '\x1b' {
-            in_escape = true;
-            escape_buf.clear();
-        } else if in_escape {
-            if c.is_ascii_alphanumeric()
-                || c == '@'
-                || c == '['
-                || c == ']'
-                || c == ';'
-                || c == '?'
-                || c == ' '
-            {
-                escape_buf.push(c);
-                // CSI sequences end with letters, OSC with bell/ST
-                if c.is_ascii_lowercase() || c.is_ascii_uppercase() || c == '@' || c == '`' {
-                    in_escape = false;
-                }
-            } else if c == '\\' || c == '\x07' {
-                // ST (String Terminator) or BEL
-                in_escape = false;
+        if !in_escape {
+            if c == '\x1b' {
+                in_escape = true;
+                first = true;
+                in_osc = false;
+                osc_saw_esc = false;
+            } else {
+                result.push(c);
             }
-        } else {
-            result.push(c);
+            continue;
+        }
+
+        // The byte right after ESC selects the sequence type.
+        if first {
+            first = false;
+            if c == ']' {
+                in_osc = true;
+                continue;
+            }
+            // `[` (CSI) and any other escape (charset selector, ESC-letter,
+            // …) fall through to the letter-terminated heuristic below.
+        }
+
+        if in_osc {
+            // OSC command strings terminate only on BEL (0x07) or ST (ESC \),
+            // NOT on the letters in their payload (e.g. a window title).
+            if osc_saw_esc {
+                osc_saw_esc = false;
+                if c == '\\' || c == '\x07' {
+                    in_escape = false;
+                } else if c == '\x1b' {
+                    osc_saw_esc = true;
+                }
+            } else if c == '\x07' {
+                in_escape = false;
+            } else if c == '\x1b' {
+                osc_saw_esc = true;
+            }
+            continue;
+        }
+
+        // CSI / other escapes end on a final letter (or @/`), or on ST/BEL.
+        if c.is_ascii_lowercase() || c.is_ascii_uppercase() || c == '@' || c == '`' {
+            in_escape = false;
+        } else if c == '\\' || c == '\x07' {
+            in_escape = false;
         }
     }
     result
@@ -3278,6 +3303,22 @@ mod tests {
         assert!(
             comm_log_entry_for_chunk("b", b"No orchestration progress detected yet").is_none(),
         );
+    }
+
+    #[test]
+    fn strip_ansi_codes_handles_osc_sequences() {
+        // OSC window-title (ESC ] 0 ; <title> BEL) is terminated by BEL, not by
+        // the letters in its payload — the whole sequence must vanish.
+        assert_eq!(strip_ansi_codes("\x1b]0;bash\x07"), "");
+        assert_eq!(strip_ansi_codes("\x1b]0;bash\x07$ ls"), "$ ls");
+        // OSC terminated by ST (ESC \) — e.g. a hyperlink.
+        assert_eq!(strip_ansi_codes("\x1b]8;;http://x\x1b\\done"), "done");
+        // CSI and charset/ESC-letter escapes still strip correctly.
+        assert_eq!(strip_ansi_codes("\x1b[2J\x1b[Hhello"), "hello");
+        assert_eq!(strip_ansi_codes("\x1b(Bplain"), "plain");
+        assert_eq!(strip_ansi_codes("\x1bcreset"), "reset");
+        // A pure title escape is noise, exactly like the CSI-only case.
+        assert!(comm_log_entry_for_chunk("b", b"\x1b]0;bash\x07").is_none());
     }
 
     // ── Regression tests for the cross-machine push spawn bugs ────────
