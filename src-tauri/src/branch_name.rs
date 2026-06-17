@@ -53,8 +53,17 @@ pub fn sanitize_branch_name(raw: &str) -> String {
         }
     }
 
-    // Trim leading/trailing hyphens and dots
-    name.trim_matches(|c| c == '-' || c == '.').to_string()
+    // Trim leading/trailing hyphens and dots.
+    let mut name = name.trim_matches(|c| c == '-' || c == '.').to_string();
+
+    // Git rejects refs ending in ".lock", so strip any such suffix and
+    // re-trim any separator it exposes (loop handles e.g. "foo.lock.lock").
+    while let Some(stripped) = name.strip_suffix(".lock") {
+        name = stripped
+            .trim_end_matches(|c| c == '-' || c == '.')
+            .to_string();
+    }
+    name
 }
 
 /// Check name against a set of existing branches, appending -2..-99 on conflict.
@@ -243,6 +252,16 @@ mod tests {
     fn sanitize_trims_leading_trailing() {
         assert_eq!(sanitize_branch_name("-foo-bar-"), "foo-bar");
         assert_eq!(sanitize_branch_name(".foo.bar."), "foo.bar");
+    }
+
+    #[test]
+    fn sanitize_strips_trailing_lock_suffix() {
+        // Git forbids refs ending in ".lock".
+        assert_eq!(sanitize_branch_name("update.lock"), "update");
+        assert_eq!(sanitize_branch_name("hotfix.lock.lock"), "hotfix");
+        assert!(!sanitize_branch_name("release.lock").ends_with(".lock"));
+        // Only the trailing suffix is stripped — ".lock" elsewhere stays.
+        assert_eq!(sanitize_branch_name("my.lockfile"), "my.lockfile");
     }
 
     #[test]

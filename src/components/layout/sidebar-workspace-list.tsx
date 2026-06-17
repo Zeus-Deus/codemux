@@ -10,6 +10,7 @@ import {
 } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { SidebarProjectGroup } from "./sidebar-project-group";
+import { computeWorkspaceReorder } from "./workspace-reorder";
 import { NewWorkspaceDialog } from "@/components/overlays/new-workspace-dialog";
 import { reorderWorkspaces } from "@/tauri/commands";
 
@@ -230,25 +231,13 @@ export function SidebarWorkspaceList() {
 
       try {
         if (ds.type === "workspace") {
-          // Reorder within project group, then rebuild flat list
-          const newIds: string[] = [];
-          for (const group of projectGroups) {
-            const groupIds = group.workspaces
-              .map((w) => w.workspace_id)
-              .filter((id) => id !== ds.id);
-
-            if (group.projectPath === ds.sourceProjectPath) {
-              const idx = Math.min(dt.index, groupIds.length);
-              groupIds.splice(idx, 0, ds.id);
-            }
-
-            newIds.push(...groupIds);
-          }
-
-          if (!newIds.includes(ds.id)) {
-            newIds.push(ds.id);
-          }
-
+          // Reorder within project group, then rebuild flat list.
+          const newIds = computeWorkspaceReorder(
+            projectGroups,
+            ds.id,
+            ds.sourceProjectPath,
+            dt.index,
+          );
           await reorderWorkspaces(newIds);
         } else if (ds.type === "project") {
           // Reorder project folders

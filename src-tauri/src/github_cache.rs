@@ -56,7 +56,16 @@ fn list_key(repo_path: &Path, search: Option<&str>) -> ListKey {
 static ISSUE_LIST_CACHE: LazyLock<Mutex<HashMap<ListKey, CacheEntry<Vec<GitHubIssue>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static ISSUE_DETAIL_CACHE: LazyLock<Mutex<HashMap<u64, CacheEntry<GitHubIssue>>>> =
+/// Detail caches key on `(repo_path, number)`. Issue/PR numbers are
+/// per-repository (every repo has an issue #1), so a bare-number key would
+/// serve repo A's issue #1 in response to repo B's issue #1 lookup.
+type IssueDetailKey = (String, u64);
+
+fn issue_detail_key(repo_path: &Path, number: u64) -> IssueDetailKey {
+    (repo_path.display().to_string(), number)
+}
+
+static ISSUE_DETAIL_CACHE: LazyLock<Mutex<HashMap<IssueDetailKey, CacheEntry<GitHubIssue>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Stage 5 — PR list cache, keyed by `(repo_path, state)` since
@@ -70,14 +79,24 @@ fn pr_list_key(repo_path: &Path, state: &str) -> PrListKey {
 static PR_LIST_CACHE: LazyLock<Mutex<HashMap<PrListKey, CacheEntry<Vec<PullRequestInfo>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-static PR_DETAIL_CACHE: LazyLock<Mutex<HashMap<u32, CacheEntry<PullRequestInfo>>>> =
+type PrDetailKey = (String, u32);
+
+fn pr_detail_key(repo_path: &Path, number: u32) -> PrDetailKey {
+    (repo_path.display().to_string(), number)
+}
+
+static PR_DETAIL_CACHE: LazyLock<Mutex<HashMap<PrDetailKey, CacheEntry<PullRequestInfo>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Diffs are bigger and shift more often than the PR header; key by
-/// `(number, full)` so a request for a name-only diff doesn't return
-/// a previously-cached full diff (or vice versa). The string is the
-/// diff body verbatim.
-type PrDiffKey = (u32, bool);
+/// `(repo_path, number, full)` so a request for a name-only diff doesn't
+/// return a previously-cached full diff (or another repo's diff). The string
+/// is the diff body verbatim.
+type PrDiffKey = (String, u32, bool);
+
+fn pr_diff_key(repo_path: &Path, number: u32, full: bool) -> PrDiffKey {
+    (repo_path.display().to_string(), number, full)
+}
 
 static PR_DIFF_CACHE: LazyLock<Mutex<HashMap<PrDiffKey, CacheEntry<String>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -111,8 +130,9 @@ pub fn cached_list_issues(
 /// longer than list TTL because a single-issue detail rarely changes
 /// during a user's chat-popup interaction.
 pub fn cached_get_issue(repo_path: &Path, number: u64) -> Result<GitHubIssue, String> {
+    let key = issue_detail_key(repo_path, number);
     if let Ok(cache) = ISSUE_DETAIL_CACHE.lock() {
-        if let Some(entry) = cache.get(&number) {
+        if let Some(entry) = cache.get(&key) {
             if entry.is_fresh(DETAIL_TTL) {
                 return Ok(entry.value.clone());
             }
@@ -121,7 +141,7 @@ pub fn cached_get_issue(repo_path: &Path, number: u64) -> Result<GitHubIssue, St
 
     let fresh = github::get_github_issue(repo_path, number)?;
     if let Ok(mut cache) = ISSUE_DETAIL_CACHE.lock() {
-        cache.insert(number, CacheEntry::fresh(fresh.clone()));
+        cache.insert(key, CacheEntry::fresh(fresh.clone()));
     }
     Ok(fresh)
 }
@@ -155,8 +175,9 @@ pub fn cached_get_pull_request(
     repo_path: &Path,
     number: u32,
 ) -> Result<PullRequestInfo, String> {
+    let key = pr_detail_key(repo_path, number);
     if let Ok(cache) = PR_DETAIL_CACHE.lock() {
-        if let Some(entry) = cache.get(&number) {
+        if let Some(entry) = cache.get(&key) {
             if entry.is_fresh(DETAIL_TTL) {
                 return Ok(entry.value.clone());
             }
@@ -165,7 +186,7 @@ pub fn cached_get_pull_request(
 
     let fresh = github::get_pull_request(repo_path, number)?;
     if let Ok(mut cache) = PR_DETAIL_CACHE.lock() {
-        cache.insert(number, CacheEntry::fresh(fresh.clone()));
+        cache.insert(key, CacheEntry::fresh(fresh.clone()));
     }
     Ok(fresh)
 }
@@ -178,7 +199,7 @@ pub fn cached_get_pr_diff(
     number: u32,
     full: bool,
 ) -> Result<String, String> {
-    let key = (number, full);
+    let key = pr_diff_key(repo_path, number, full);
     if let Ok(cache) = PR_DIFF_CACHE.lock() {
         if let Some(entry) = cache.get(&key) {
             if entry.is_fresh(DETAIL_TTL) {
@@ -202,8 +223,10 @@ pub fn cached_get_pr_diff(
 pub fn invalidate_pr_cache(number: Option<u32>) {
     if let Ok(mut cache) = PR_DETAIL_CACHE.lock() {
         match number {
+            // Number-scoped invalidation drops PR #n across every repo —
+            // over-invalidation just triggers a refetch, never a stale hit.
             Some(n) => {
-                cache.remove(&n);
+                cache.retain(|(_, num), _| *num != n);
             }
             None => cache.clear(),
         }
@@ -211,7 +234,7 @@ pub fn invalidate_pr_cache(number: Option<u32>) {
     if let Ok(mut cache) = PR_DIFF_CACHE.lock() {
         match number {
             Some(n) => {
-                cache.retain(|(k, _), _| *k != n);
+                cache.retain(|(_, num, _), _| *num != n);
             }
             None => cache.clear(),
         }
@@ -230,7 +253,7 @@ pub fn invalidate_issue_cache(number: Option<u64>) {
     if let Ok(mut cache) = ISSUE_DETAIL_CACHE.lock() {
         match number {
             Some(n) => {
-                cache.remove(&n);
+                cache.retain(|(_, num), _| *num != n);
             }
             None => cache.clear(),
         }
@@ -246,6 +269,14 @@ pub fn invalidate_issue_cache(number: Option<u64>) {
 mod tests {
     use super::*;
     use crate::github::IssueState;
+
+    /// Cache tests share global statics, and one test issues a global
+    /// `invalidate_issue_cache(None)`. Serialize the cache-state tests so that
+    /// clear can't race another test's insert→assert window.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn fixture_issue(number: u64) -> GitHubIssue {
         GitHubIssue {
@@ -283,49 +314,83 @@ mod tests {
 
     #[test]
     fn detail_cache_round_trip() {
+        let _serial = serial();
         // Per-test unique key so parallel test runs don't stomp.
         let unique_num: u64 = 9_999_001;
+        let repo = Path::new("/repos/round-trip");
+        let key = issue_detail_key(repo, unique_num);
         let issue = fixture_issue(unique_num);
         ISSUE_DETAIL_CACHE
             .lock()
             .unwrap()
-            .insert(unique_num, CacheEntry::fresh(issue.clone()));
-        let entry = ISSUE_DETAIL_CACHE
-            .lock()
-            .unwrap()
-            .get(&unique_num)
-            .cloned();
+            .insert(key.clone(), CacheEntry::fresh(issue.clone()));
+        let entry = ISSUE_DETAIL_CACHE.lock().unwrap().get(&key).cloned();
         assert!(entry.is_some());
         let cached = entry.unwrap();
         assert_eq!(cached.value.number, unique_num);
         invalidate_issue_cache(Some(unique_num));
-        assert!(ISSUE_DETAIL_CACHE.lock().unwrap().get(&unique_num).is_none());
+        assert!(ISSUE_DETAIL_CACHE.lock().unwrap().get(&key).is_none());
+    }
+
+    #[test]
+    fn detail_cache_is_repo_scoped() {
+        let _serial = serial();
+        // Repo A caches its issue #N; repo B's issue #N must NOT hit it.
+        let n: u64 = 9_999_021;
+        let repo_a = Path::new("/repos/repo-a");
+        let repo_b = Path::new("/repos/repo-b");
+        let mut a = fixture_issue(n);
+        a.title = "Repo-A only".into();
+        ISSUE_DETAIL_CACHE
+            .lock()
+            .unwrap()
+            .insert(issue_detail_key(repo_a, n), CacheEntry::fresh(a));
+
+        let b_hit = ISSUE_DETAIL_CACHE
+            .lock()
+            .unwrap()
+            .get(&issue_detail_key(repo_b, n))
+            .map(|e| e.value.title.clone());
+        assert_eq!(b_hit, None, "repo B must not hit repo A's cached issue #N");
+        // Repo A's own lookup still hits.
+        assert!(ISSUE_DETAIL_CACHE
+            .lock()
+            .unwrap()
+            .get(&issue_detail_key(repo_a, n))
+            .is_some());
+
+        invalidate_issue_cache(Some(n));
     }
 
     #[test]
     fn targeted_invalidation_keeps_other_detail_entries() {
+        let _serial = serial();
         // Two unrelated issue numbers — invalidating one must not
         // touch the other. Unique constants keep the test isolated
         // from parallel siblings.
+        let repo = Path::new("/repos/targeted");
         let keep: u64 = 9_999_011;
         let drop: u64 = 9_999_012;
+        let keep_key = issue_detail_key(repo, keep);
+        let drop_key = issue_detail_key(repo, drop);
         ISSUE_DETAIL_CACHE
             .lock()
             .unwrap()
-            .insert(keep, CacheEntry::fresh(fixture_issue(keep)));
+            .insert(keep_key.clone(), CacheEntry::fresh(fixture_issue(keep)));
         ISSUE_DETAIL_CACHE
             .lock()
             .unwrap()
-            .insert(drop, CacheEntry::fresh(fixture_issue(drop)));
+            .insert(drop_key.clone(), CacheEntry::fresh(fixture_issue(drop)));
         invalidate_issue_cache(Some(drop));
-        assert!(ISSUE_DETAIL_CACHE.lock().unwrap().contains_key(&keep));
-        assert!(!ISSUE_DETAIL_CACHE.lock().unwrap().contains_key(&drop));
+        assert!(ISSUE_DETAIL_CACHE.lock().unwrap().contains_key(&keep_key));
+        assert!(!ISSUE_DETAIL_CACHE.lock().unwrap().contains_key(&drop_key));
         // Cleanup so we don't leak into parallel tests.
-        ISSUE_DETAIL_CACHE.lock().unwrap().remove(&keep);
+        ISSUE_DETAIL_CACHE.lock().unwrap().remove(&keep_key);
     }
 
     #[test]
     fn global_invalidation_clears_a_planted_list_entry() {
+        let _serial = serial();
         // Use a unique path so other parallel tests' global
         // invalidations don't race us between insert and assert.
         // Hold the lock across insert + read so no other thread can

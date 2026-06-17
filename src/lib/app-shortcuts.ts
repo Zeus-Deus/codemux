@@ -7,7 +7,7 @@
  */
 
 import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
-import { parseKeyCombo } from "@/lib/keybind-utils";
+import { parseKeyCombo, normalizeKeyName } from "@/lib/keybind-utils";
 import { KEYBIND_REGISTRY } from "@/lib/keybind-registry";
 
 export interface AppShortcut {
@@ -55,7 +55,10 @@ updateAppShortcuts({});
  * to let the event bubble (return false) or keep it (return true).
  */
 export function isAppShortcut(event: KeyboardEvent): boolean {
-  const key = event.key.toLowerCase();
+  // Normalize the raw event key the same way the cached key was derived
+  // (via parseKeyCombo's canonical names) — otherwise Space, whose
+  // event.key is " ", never matches its cached "space" entry.
+  const key = normalizeKeyName(event.key).toLowerCase();
   return _cached.some(
     (s) =>
       s.key === key &&

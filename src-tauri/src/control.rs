@@ -763,8 +763,14 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         "notify" => {
             let state: State<'_, AppStateStore> = app.state();
             let message = request.params.get("message").and_then(Value::as_str).unwrap_or("Attention needed");
+            let level = request.params.get("level").and_then(Value::as_str).unwrap_or("attention");
             state
-                .add_notification(None, None, message.to_string(), crate::state::NotificationLevel::Attention)
+                .add_notification(
+                    None,
+                    None,
+                    message.to_string(),
+                    crate::state::NotificationLevel::from_str_or_attention(level),
+                )
                 .map(|notification_id| {
                     crate::state::emit_app_state(app);
                     serde_json::json!({ "notification_id": notification_id })

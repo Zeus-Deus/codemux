@@ -40,6 +40,15 @@ export function heldButtonFromButtons(buttons: number): CdpButton {
   return "none";
 }
 
+/**
+ * Encode a keyboard/mouse event's modifier keys as the CDP `modifiers`
+ * bitmask sent to the stream daemon (forwarded verbatim to Chromium's
+ * `Input.dispatch*Event`). The bit values are fixed by CDP: Alt=1, Ctrl=2,
+ * Meta/Command=4, Shift=8 — and must match the Rust sender's `parse_key_combo`
+ * (src-tauri/src/stream_input.rs), which drives the same daemon over the same
+ * `modifiers` field. (Previously Shift/Alt/Meta were on the wrong bits, so a
+ * Shift+click arrived at the page as Alt-held, etc.)
+ */
 export function getModifiers(e: {
   shiftKey: boolean;
   ctrlKey: boolean;
@@ -47,10 +56,10 @@ export function getModifiers(e: {
   metaKey: boolean;
 }): number {
   let m = 0;
-  if (e.shiftKey) m |= 1;
+  if (e.altKey) m |= 1;
   if (e.ctrlKey) m |= 2;
-  if (e.altKey) m |= 4;
-  if (e.metaKey) m |= 8;
+  if (e.metaKey) m |= 4;
+  if (e.shiftKey) m |= 8;
   return m;
 }
 

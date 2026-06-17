@@ -636,7 +636,14 @@ pub fn suggest_branch_name(number: u64, title: &str) -> String {
     // Truncate title portion to ~60 chars, break at word boundary
     let max_title_len = 60;
     let title_slug = if trimmed.len() > max_title_len {
-        let truncated = &trimmed[..max_title_len];
+        // Back off to a char boundary so a multibyte slug (CJK, accented,
+        // Cyrillic — all kept by is_alphanumeric above) never panics on the
+        // byte-index slice. Mirrors the body-truncation sites elsewhere here.
+        let mut end = max_title_len;
+        while end > 0 && !trimmed.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = &trimmed[..end];
         // Find last hyphen to break at word boundary
         if let Some(pos) = truncated.rfind('-') {
             &truncated[..pos]
@@ -1617,6 +1624,17 @@ mod tests {
             suggest_branch_name(10, "Über die Straße gehen"),
             "feature/10-über-die-straße-gehen"
         );
+    }
+
+    #[test]
+    fn test_suggest_branch_name_long_multibyte_title_does_not_panic() {
+        // 'a' (1 byte) + 20×'技' (3 bytes) = 61-byte slug with no hyphens, so
+        // the truncation runs and byte 60 lands mid-character. Slicing there
+        // by raw byte index would panic; the cut must back off to a boundary.
+        let title = format!("a{}", "技".repeat(20));
+        let name = suggest_branch_name(1, &title);
+        assert!(name.starts_with("feature/1-a"), "got: {name}");
+        assert!(name.contains('技'));
     }
 
     #[test]

@@ -266,6 +266,19 @@ pub enum NotificationLevel {
     Attention,
 }
 
+impl NotificationLevel {
+    /// Parse a level string as sent by the `notify` control command / MCP tool
+    /// (schema: "info" | "attention" | "error"). "info" → Info; "attention",
+    /// "error", and anything unrecognized → Attention (the most severe level
+    /// the enum exposes — there is no dedicated Error variant).
+    pub fn from_str_or_attention(s: &str) -> Self {
+        match s {
+            "info" => NotificationLevel::Info,
+            _ => NotificationLevel::Attention,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationSnapshot {
     pub notification_id: String,
@@ -2342,12 +2355,20 @@ impl AppStateStore {
                 .get_mut(surface_index)
                 .ok_or_else(|| "Surface disappeared while closing pane".to_string())?;
 
+            let ordered_before = collect_leaf_pane_ids(&surface.root);
+            let active_before = surface.active_pane_id.clone();
             let updated_root = remove_pane_from_tree(&surface.root, pane_id);
 
             if let Some(new_root) = updated_root {
-                // Pane removed but surface still has content
-                let next_active_pane = first_leaf_pane_id(&new_root)
-                    .ok_or_else(|| "No fallback pane available after close".to_string())?;
+                // Pane removed but surface still has content. Keep focus on the
+                // current pane when a different pane was closed; when the active
+                // pane itself was closed, move to the adjacent pane (next, then
+                // previous) rather than the leftmost leaf.
+                let next_active_pane =
+                    active_id_after_removal(&ordered_before, &active_before, pane_id)
+                        .filter(|pid| pane_tree_contains_pane(&new_root, &pid.0))
+                        .or_else(|| first_leaf_pane_id(&new_root))
+                        .ok_or_else(|| "No fallback pane available after close".to_string())?;
                 surface.root = new_root;
                 surface.active_pane_id = next_active_pane;
                 workspace.active_surface_id = surface.surface_id.clone();
@@ -2355,12 +2376,26 @@ impl AppStateStore {
                 // Last pane closed — remove the surface and its tab
                 let surface_id = workspace.surfaces[surface_index].surface_id.clone();
                 workspace.surfaces.remove(surface_index);
+                // Index of the tab about to be removed, so we can focus its
+                // neighbor instead of always jumping to the first tab.
+                let removed_tab_index = workspace
+                    .tabs
+                    .iter()
+                    .position(|t| t.surface_id.as_ref() == Some(&surface_id));
+                let was_active = workspace.active_surface_id == surface_id;
                 workspace.tabs.retain(|t| t.surface_id.as_ref() != Some(&surface_id));
                 if workspace.tabs.is_empty() {
                     workspace.active_tab_id = String::new();
                     workspace.active_surface_id = SurfaceId(String::new());
-                } else if workspace.active_surface_id == surface_id {
-                    let new_tab = &workspace.tabs[0];
+                } else if was_active {
+                    // Focus the adjacent tab (next, then previous) — matches
+                    // close_tab and active_id_after_removal.
+                    let new_index = match removed_tab_index {
+                        Some(idx) if idx < workspace.tabs.len() => idx,
+                        Some(idx) => idx.saturating_sub(1),
+                        None => 0,
+                    };
+                    let new_tab = &workspace.tabs[new_index];
                     workspace.active_tab_id = new_tab.tab_id.clone();
                     if let Some(ref sid) = new_tab.surface_id {
                         workspace.active_surface_id = sid.clone();
@@ -3089,7 +3124,15 @@ impl AppStateStore {
                 workspace.active_tab_id = String::new();
                 workspace.active_surface_id = SurfaceId(String::new());
             } else {
-                let new_index = if tab_index > 0 { tab_index - 1 } else { 0 };
+                // Select the next tab — after the removal it slid into
+                // tab_index — falling back to the previous tab when the closed
+                // tab was last. Mirrors active_id_after_removal and standard
+                // editor/browser tab behavior (was: always the previous tab).
+                let new_index = if tab_index < workspace.tabs.len() {
+                    tab_index
+                } else {
+                    tab_index - 1
+                };
                 let new_tab = &workspace.tabs[new_index];
                 workspace.active_tab_id = new_tab.tab_id.clone();
                 if let Some(ref sid) = new_tab.surface_id {
@@ -3484,17 +3527,21 @@ fn remove_browser_nodes(node: &PaneNodeSnapshot) -> Option<PaneNodeSnapshot> {
             child_sizes,
             children,
         } => {
-            let remaining: Vec<_> = children
-                .iter()
-                .filter_map(remove_browser_nodes)
-                .collect();
+            let mut remaining: Vec<PaneNodeSnapshot> = Vec::new();
+            let mut kept: Vec<usize> = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(new_child) = remove_browser_nodes(child) {
+                    remaining.push(new_child);
+                    kept.push(i);
+                }
+            }
             match remaining.len() {
                 0 => None,
                 1 => remaining.into_iter().next(),
                 _ => Some(PaneNodeSnapshot::Split {
                     pane_id: pane_id.clone(),
                     direction: direction.clone(),
-                    child_sizes: rebalance_sizes(child_sizes, remaining.len()),
+                    child_sizes: retained_sizes(child_sizes, &kept),
                     children: remaining,
                 }),
             }
@@ -3817,10 +3864,14 @@ fn remove_terminal_from_tree(
             child_sizes,
             children,
         } => {
-            let remaining_children = children
-                .iter()
-                .filter_map(|child| remove_terminal_from_tree(child, target_session_id))
-                .collect::<Vec<_>>();
+            let mut remaining_children: Vec<PaneNodeSnapshot> = Vec::new();
+            let mut kept: Vec<usize> = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(new_child) = remove_terminal_from_tree(child, target_session_id) {
+                    remaining_children.push(new_child);
+                    kept.push(i);
+                }
+            }
 
             match remaining_children.len() {
                 0 => None,
@@ -3828,7 +3879,7 @@ fn remove_terminal_from_tree(
                 _ => Some(PaneNodeSnapshot::Split {
                     pane_id: pane_id.clone(),
                     direction: direction.clone(),
-                    child_sizes: rebalance_sizes(child_sizes, remaining_children.len()),
+                    child_sizes: retained_sizes(child_sizes, &kept),
                     children: remaining_children,
                 }),
             }
@@ -3854,10 +3905,14 @@ fn remove_terminals_from_tree(
             child_sizes,
             children,
         } => {
-            let remaining_children = children
-                .iter()
-                .filter_map(|child| remove_terminals_from_tree(child, session_ids))
-                .collect::<Vec<_>>();
+            let mut remaining_children: Vec<PaneNodeSnapshot> = Vec::new();
+            let mut kept: Vec<usize> = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(new_child) = remove_terminals_from_tree(child, session_ids) {
+                    remaining_children.push(new_child);
+                    kept.push(i);
+                }
+            }
 
             match remaining_children.len() {
                 0 => None,
@@ -3865,7 +3920,7 @@ fn remove_terminals_from_tree(
                 _ => Some(PaneNodeSnapshot::Split {
                     pane_id: pane_id.clone(),
                     direction: direction.clone(),
-                    child_sizes: rebalance_sizes(child_sizes, remaining_children.len()),
+                    child_sizes: retained_sizes(child_sizes, &kept),
                     children: remaining_children,
                 }),
             }
@@ -3955,6 +4010,25 @@ fn rebalance_sizes(existing: &[f32], target_len: usize) -> Vec<f32> {
     }
 
     normalize_sizes(vec![1.0 / target_len as f32; target_len])
+}
+
+/// Sizes for the children that survived a removal, renormalized so their
+/// relative proportions are preserved. `kept` holds the original indices of
+/// the surviving children. Unlike resetting to equal weights, closing one
+/// pane in a custom-sized split leaves the remaining panes' ratios intact
+/// (e.g. closing the third child of a `[0.5, 0.3, 0.2]` split yields
+/// `[0.625, 0.375]`, not `[0.5, 0.5]`).
+fn retained_sizes(child_sizes: &[f32], kept: &[usize]) -> Vec<f32> {
+    let fallback = if child_sizes.is_empty() {
+        0.0
+    } else {
+        1.0 / child_sizes.len() as f32
+    };
+    let sizes: Vec<f32> = kept
+        .iter()
+        .map(|&i| child_sizes.get(i).copied().unwrap_or(fallback))
+        .collect();
+    normalize_sizes(sizes)
 }
 
 fn normalize_sizes(mut sizes: Vec<f32>) -> Vec<f32> {
@@ -4342,6 +4416,22 @@ fn first_leaf_pane_id(root: &PaneNodeSnapshot) -> Option<PaneId> {
     }
 }
 
+/// Pick the pane to focus after `removed` is closed. If a *different* pane was
+/// closed, keep the current `active` pane; if the active pane itself was
+/// closed, move to the next pane in leaf order, falling back to the previous
+/// one — instead of jumping focus to the leftmost leaf. `ordered` is the leaf
+/// order *before* removal (so `removed` is still present in it).
+fn active_id_after_removal(ordered: &[PaneId], active: &PaneId, removed: &str) -> Option<PaneId> {
+    if active.0 != removed {
+        return Some(active.clone());
+    }
+    let idx = ordered.iter().position(|p| p.0 == removed)?;
+    ordered
+        .get(idx + 1)
+        .cloned()
+        .or_else(|| idx.checked_sub(1).and_then(|prev| ordered.get(prev).cloned()))
+}
+
 fn clone_pane_node(root: &PaneNodeSnapshot, target_pane_id: &str) -> Option<PaneNodeSnapshot> {
     match root {
         PaneNodeSnapshot::Terminal { pane_id, .. }
@@ -4580,10 +4670,14 @@ fn remove_pane_from_tree(
             child_sizes,
             children,
         } => {
-            let remaining_children = children
-                .iter()
-                .filter_map(|child| remove_pane_from_tree(child, target_pane_id))
-                .collect::<Vec<_>>();
+            let mut remaining_children: Vec<PaneNodeSnapshot> = Vec::new();
+            let mut kept: Vec<usize> = Vec::new();
+            for (i, child) in children.iter().enumerate() {
+                if let Some(new_child) = remove_pane_from_tree(child, target_pane_id) {
+                    remaining_children.push(new_child);
+                    kept.push(i);
+                }
+            }
 
             match remaining_children.len() {
                 0 => None,
@@ -4591,7 +4685,7 @@ fn remove_pane_from_tree(
                 _ => Some(PaneNodeSnapshot::Split {
                     pane_id: pane_id.clone(),
                     direction: direction.clone(),
-                    child_sizes: rebalance_sizes(child_sizes, remaining_children.len()),
+                    child_sizes: retained_sizes(child_sizes, &kept),
                     children: remaining_children,
                 }),
             }
@@ -4793,6 +4887,108 @@ mod tests {
                 assert_eq!(session_id.0, "session-b");
             }
             _ => panic!("expected collapsed terminal node"),
+        }
+    }
+
+    fn terminal_leaf(pane: &str, session: &str) -> PaneNodeSnapshot {
+        PaneNodeSnapshot::Terminal {
+            pane_id: PaneId(pane.into()),
+            session_id: SessionId(session.into()),
+            title: pane.to_string(),
+        }
+    }
+
+    fn custom_sized_triple_split() -> PaneNodeSnapshot {
+        PaneNodeSnapshot::Split {
+            pane_id: PaneId("pane-root".into()),
+            direction: SplitDirection::Horizontal,
+            child_sizes: vec![0.5, 0.3, 0.2],
+            children: vec![
+                terminal_leaf("pane-a", "session-a"),
+                terminal_leaf("pane-b", "session-b"),
+                terminal_leaf("pane-c", "session-c"),
+            ],
+        }
+    }
+
+    #[test]
+    fn remove_pane_preserves_sibling_proportions() {
+        let tree = custom_sized_triple_split();
+
+        // Closing the last child keeps the first two at their 0.5:0.3 ratio
+        // (renormalized to 0.625:0.375), not reset to equal 0.5:0.5.
+        match remove_pane_from_tree(&tree, "pane-c").unwrap() {
+            PaneNodeSnapshot::Split { child_sizes, children, .. } => {
+                assert_eq!(children.len(), 2);
+                assert!((child_sizes[0] - 0.625).abs() < 1e-4, "got {child_sizes:?}");
+                assert!((child_sizes[1] - 0.375).abs() < 1e-4, "got {child_sizes:?}");
+            }
+            _ => panic!("expected split"),
+        }
+
+        // Closing the middle child keeps the outer two at their 0.5:0.2 ratio.
+        match remove_pane_from_tree(&tree, "pane-b").unwrap() {
+            PaneNodeSnapshot::Split { child_sizes, .. } => {
+                assert!((child_sizes[0] - 0.5 / 0.7).abs() < 1e-4, "got {child_sizes:?}");
+                assert!((child_sizes[1] - 0.2 / 0.7).abs() < 1e-4, "got {child_sizes:?}");
+            }
+            _ => panic!("expected split"),
+        }
+    }
+
+    fn close_pane_with_root(active: &str, close: &str) -> String {
+        let store = AppStateStore::default();
+        let mut snap = store.snapshot();
+        {
+            let surface = &mut snap.workspaces[0].surfaces[0];
+            surface.root = custom_sized_triple_split();
+            surface.active_pane_id = PaneId(active.into());
+        }
+        store.replace_snapshot(snap);
+        store.close_pane(close).unwrap();
+        store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id
+            .0
+            .clone()
+    }
+
+    #[test]
+    fn close_active_pane_focuses_next_then_previous() {
+        // Closing the active middle pane focuses the next (right) pane…
+        assert_eq!(close_pane_with_root("pane-b", "pane-b"), "pane-c");
+        // …and closing the active last pane focuses the previous one.
+        assert_eq!(close_pane_with_root("pane-c", "pane-c"), "pane-b");
+    }
+
+    #[test]
+    fn close_inactive_pane_keeps_focus() {
+        // Closing a different pane must not move focus off the active pane.
+        assert_eq!(close_pane_with_root("pane-b", "pane-a"), "pane-b");
+        assert_eq!(close_pane_with_root("pane-b", "pane-c"), "pane-b");
+    }
+
+    #[test]
+    fn close_pane_preserves_sibling_proportions() {
+        // Exercise the real public close path on a live store/surface.
+        let store = AppStateStore::default();
+        let mut snap = store.snapshot();
+        {
+            let surface = &mut snap.workspaces[0].surfaces[0];
+            surface.root = custom_sized_triple_split();
+            surface.active_pane_id = PaneId("pane-a".into());
+        }
+        store.replace_snapshot(snap);
+
+        store.close_pane("pane-c").unwrap();
+
+        let snap = store.snapshot();
+        match &snap.workspaces[0].surfaces[0].root {
+            PaneNodeSnapshot::Split { child_sizes, children, .. } => {
+                assert_eq!(children.len(), 2);
+                assert!((child_sizes[0] - 0.625).abs() < 1e-4, "got {child_sizes:?}");
+                assert!((child_sizes[1] - 0.375).abs() < 1e-4, "got {child_sizes:?}");
+            }
+            _ => panic!("expected split after closing one pane"),
         }
     }
 
@@ -5456,6 +5652,110 @@ mod tests {
 
     /// Regression guard mirroring `close_workspace_result_contains_session_ids`
     /// for `close_tab`. `CloseTabResult.removed_sessions` is what the
+    #[test]
+    fn notification_level_parses_from_string() {
+        // "info" must map to Info — the notify control handler used to drop the
+        // level and hardcode Attention, wrongly elevating info notifications.
+        assert!(matches!(
+            NotificationLevel::from_str_or_attention("info"),
+            NotificationLevel::Info
+        ));
+        assert!(matches!(
+            NotificationLevel::from_str_or_attention("attention"),
+            NotificationLevel::Attention
+        ));
+        // "error" has no dedicated variant → surfaces at Attention.
+        assert!(matches!(
+            NotificationLevel::from_str_or_attention("error"),
+            NotificationLevel::Attention
+        ));
+        // Unknown → Attention (safe default).
+        assert!(matches!(
+            NotificationLevel::from_str_or_attention("bogus"),
+            NotificationLevel::Attention
+        ));
+    }
+
+    #[test]
+    fn close_active_middle_tab_focuses_next_tab() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-close-tab-next"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+
+        // Default tab + two more → order [default, t2, t3].
+        let (t2, _) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create t2");
+        let (t3, _) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create t3");
+
+        // Make the middle tab active, then close it.
+        store.activate_tab(&ws_id.0, &t2).expect("activate t2");
+        store.close_tab(&ws_id.0, &t2).expect("close t2");
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        assert_eq!(
+            ws.active_tab_id, t3,
+            "closing the active middle tab should select the NEXT tab, not the previous"
+        );
+    }
+
+    #[test]
+    fn closing_last_pane_of_active_middle_tab_focuses_next_tab() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/project-close-lastpane-next"),
+            WorkspacePresetLayout::Single,
+        );
+        store.activate_workspace(&ws_id.0);
+
+        // Default tab + two more → [default, t2, t3], each a single-pane tab.
+        let (t2, _) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create t2");
+        let (t3, _) = store
+            .create_tab(&ws_id.0, TabKind::Terminal)
+            .expect("create t3");
+        store.activate_tab(&ws_id.0, &t2).expect("activate t2");
+
+        // The only pane in t2's surface.
+        let pane_id = {
+            let snap = store.snapshot();
+            let ws = workspace_by_id(&snap, &ws_id);
+            let sid = ws
+                .tabs
+                .iter()
+                .find(|t| t.tab_id == t2)
+                .and_then(|t| t.surface_id.clone())
+                .expect("t2 has a surface");
+            let surface = ws
+                .surfaces
+                .iter()
+                .find(|s| s.surface_id == sid)
+                .expect("surface exists");
+            first_leaf_pane_id(&surface.root).expect("a pane").0
+        };
+
+        // Closing the last pane removes the tab; focus should move to the next.
+        store.close_pane(&pane_id).expect("close pane");
+
+        let snap = store.snapshot();
+        let ws = workspace_by_id(&snap, &ws_id);
+        assert!(
+            !ws.tabs.iter().any(|t| t.tab_id == t2),
+            "t2 should be gone after closing its last pane"
+        );
+        assert_eq!(
+            ws.active_tab_id, t3,
+            "closing the last pane of the active middle tab should focus the NEXT tab"
+        );
+    }
+
     /// `close_tab` command hands to `terminate_pty_session` for PTY cleanup;
     /// if this list ever drops a session the corresponding PTY leaks.
     #[test]

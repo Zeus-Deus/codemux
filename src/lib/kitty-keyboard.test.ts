@@ -155,6 +155,14 @@ describe("scanKittySequences", () => {
     expect(scanKittySequences("\x1b[<u\x1b[<u").popCount).toBe(2);
   });
 
+  it("counts a numbered pop CSI<N u as N entries", () => {
+    expect(scanKittySequences("\x1b[<3u").popCount).toBe(3);
+  });
+
+  it("sums bare and numbered pops together", () => {
+    expect(scanKittySequences("\x1b[<u\x1b[<2u").popCount).toBe(3);
+  });
+
   it("detects DA1 query \\x1b[c", () => {
     expect(scanKittySequences("\x1b[c").hasDAQuery).toBe(true);
   });

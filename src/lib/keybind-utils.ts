@@ -22,7 +22,7 @@ export function normalizeKeyCombo(event: KeyboardEvent): string {
 }
 
 /** Normalize a raw event.key value to canonical display form */
-function normalizeKeyName(key: string): string {
+export function normalizeKeyName(key: string): string {
   // Space is event.key " " (length 1) but should display as "Space"
   if (key === " ") return "Space";
   // Single alphabetic character → uppercase
@@ -67,14 +67,29 @@ export interface ParsedKeyCombo {
 
 /** Parse a canonical combo string like "Ctrl+Shift+D" into its parts */
 export function parseKeyCombo(combo: string): ParsedKeyCombo {
-  const parts = combo.split("+");
-  const key = parts[parts.length - 1];
-  return {
-    alt: parts.includes("Alt"),
-    ctrl: parts.includes("Ctrl"),
-    shift: parts.includes("Shift"),
-    key,
-  };
+  // Strip the leading run of modifier prefixes (canonical order Alt, Ctrl,
+  // Shift). The remainder is the literal key — which may itself be "+", so we
+  // must NOT split on "+" (that dropped a "+" binding, e.g. "Ctrl++" parsed to
+  // an empty key and could never match).
+  let rest = combo;
+  let alt = false;
+  let ctrl = false;
+  let shift = false;
+  for (;;) {
+    if (rest.startsWith("Alt+")) {
+      alt = true;
+      rest = rest.slice(4);
+    } else if (rest.startsWith("Ctrl+")) {
+      ctrl = true;
+      rest = rest.slice(5);
+    } else if (rest.startsWith("Shift+")) {
+      shift = true;
+      rest = rest.slice(6);
+    } else {
+      break;
+    }
+  }
+  return { alt, ctrl, shift, key: rest };
 }
 
 /** Check if a keyboard event matches a canonical combo string */
