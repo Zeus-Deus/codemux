@@ -1344,6 +1344,21 @@ fn make_request_id() -> String {
     )
 }
 
+/// Truncate a string to at most `max_bytes`, backing off to a UTF-8 char
+/// boundary. agent-browser output is arbitrary page/DOM text (often multibyte),
+/// so a raw byte-index slice for a log preview would panic when the cut lands
+/// inside a character.
+fn truncate_on_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_json::Value, stream_port: u16) -> Result<BrowserAutomationResult, String> {
     let session = session_name(browser_id);
 
@@ -1386,9 +1401,9 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
 
     // Debug logging for snapshot commands
     if action == "snapshot" || action == "accessibility_snapshot" {
-        eprintln!("[codemux::browser] Snapshot stdout ({} bytes): {}", stdout.len(), &stdout[..stdout.len().min(200)]);
+        eprintln!("[codemux::browser] Snapshot stdout ({} bytes): {}", stdout.len(), truncate_on_boundary(&stdout, 200));
         if !stderr.is_empty() {
-            eprintln!("[codemux::browser] Snapshot stderr: {}", &stderr[..stderr.len().min(200)]);
+            eprintln!("[codemux::browser] Snapshot stderr: {}", truncate_on_boundary(&stderr, 200));
         }
     }
 
@@ -1398,7 +1413,7 @@ fn execute_agent_browser_action(browser_id: &str, action: &str, params: serde_js
 
     // For snapshot: detect useless ARIA result and fall back to DOM-based query
     if action == "snapshot" || action == "accessibility_snapshot" {
-        eprintln!("[codemux::browser] Snapshot raw stdout for fallback check: {:?}", &stdout[..stdout.len().min(300)]);
+        eprintln!("[codemux::browser] Snapshot raw stdout for fallback check: {:?}", truncate_on_boundary(&stdout, 300));
     }
     if (action == "snapshot" || action == "accessibility_snapshot") && needs_dom_fallback(&stdout) {
         eprintln!("[codemux::browser] ARIA snapshot empty, falling back to DOM query");
@@ -2178,6 +2193,21 @@ impl AgentBrowserManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_on_boundary_never_splits_a_multibyte_char() {
+        // 67×'技' = 201 bytes; byte 200 is inside the 67th char (198..201),
+        // so a raw `&s[..200]` would panic. The helper backs off to byte 198.
+        let s = "技".repeat(67);
+        let out = truncate_on_boundary(&s, 200);
+        assert_eq!(out, "技".repeat(66));
+        assert!(out.len() <= 200);
+        // Shorter-than-limit and ASCII inputs pass through / cut cleanly.
+        assert_eq!(truncate_on_boundary("hello", 200), "hello");
+        assert_eq!(truncate_on_boundary("hello", 3), "hel");
+        // A cut exactly on a boundary keeps the whole char.
+        assert_eq!(truncate_on_boundary("a技b", 4), "a技");
+    }
 
     // ── External-process timeout guard (issue #96) ───────────────────
     //
