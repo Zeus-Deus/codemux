@@ -91,6 +91,28 @@ mod tests {
     }
 
     #[test]
+    fn next_occurrence_preserves_wall_clock_time_across_dst() {
+        // A daily 06:00 America/Los_Angeles rule must keep firing at 06:00
+        // local wall-clock time across the spring-forward (Sun 2026-03-08,
+        // 02:00 PST → 03:00 PDT). The UTC instant therefore shifts by an hour:
+        // 06:00 PST = 14:00 UTC before, 06:00 PDT = 13:00 UTC after. (Superset's
+        // hand-rolled scheduler drifted here; codemux delegates to the rrule
+        // crate + a TZID-anchored DTSTART, which the UI builder emits.)
+        let schedule =
+            "DTSTART;TZID=America/Los_Angeles:20260301T060000\nRRULE:FREQ=DAILY";
+        let before_dst =
+            next_occurrence(schedule, Utc.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(before_dst, Utc.with_ymd_and_hms(2026, 3, 7, 14, 0, 0).unwrap());
+        let after_dst =
+            next_occurrence(schedule, Utc.with_ymd_and_hms(2026, 3, 9, 0, 0, 0).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(after_dst, Utc.with_ymd_and_hms(2026, 3, 9, 13, 0, 0).unwrap());
+    }
+
+    #[test]
     fn validate_rejects_a_rule_without_a_dtstart() {
         // `RRULE` alone is not a valid `RRuleSet` — it has no anchor.
         assert!(validate("RRULE:FREQ=DAILY").is_err());
