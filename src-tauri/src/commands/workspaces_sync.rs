@@ -148,9 +148,15 @@ fn adopt_worktree_landing_via_repo(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(project_name);
-    crate::workspace_paths::expand_tilde(
-        &crate::workspace_paths::conventional_remote_path(root_basename, branch),
-    )
+    // Predict git_create_worktree's path EXACTLY: it lands the worktree at
+    // ~/.codemux/worktrees/<root_basename>/<sanitize_branch_for_worktree_path(branch)>.
+    // conventional_remote_path's sanitize_segment is stricter on the branch
+    // (e.g. it maps '+' -> '-'), so routing the branch through it would predict
+    // a directory that differs from where the worktree actually lands.
+    let branch_seg = crate::git::sanitize_branch_for_worktree_path(branch);
+    crate::workspace_paths::expand_tilde(&std::path::PathBuf::from(format!(
+        "~/.codemux/worktrees/{root_basename}/{branch_seg}"
+    )))
     .to_string_lossy()
     .to_string()
 }
@@ -2086,6 +2092,24 @@ mod landing_tests {
             n.ends_with(&format!("/worktrees/{FIXTURE}/feature-x")),
             "got {n}"
         );
+    }
+
+    #[test]
+    fn worktree_via_repo_landing_matches_git_create_worktree_branch_sanitizer() {
+        // git_create_worktree only maps the Windows-forbidden set, so a branch
+        // like `feat+ui` keeps its `+`. The preview must predict the same dir —
+        // conventional_remote_path's sanitize_segment would wrongly map it to
+        // `feat-ui`, so the dialog (and its path-in-use check) would point at a
+        // directory the workspace never lands in.
+        let branch = "feat+ui";
+        let landing = adopt_worktree_landing_via_repo(Some(UID_A), FIXTURE, branch);
+        let expected_seg = crate::git::sanitize_branch_for_worktree_path(branch);
+        assert_eq!(expected_seg, "feat+ui");
+        assert!(
+            landing.ends_with(&format!("/{expected_seg}")),
+            "preview landing must match git_create_worktree's branch dir; got {landing}"
+        );
+        assert!(!landing.ends_with("/feat-ui"), "got {landing}");
     }
 
     #[test]
