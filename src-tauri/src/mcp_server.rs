@@ -855,6 +855,18 @@ fn scroll_amount_value(arguments: &Value) -> Value {
     json!(arguments.get("amount").and_then(Value::as_i64).unwrap_or(3))
 }
 
+/// The split `direction` string for the pane-split MCP tools. Matches the
+/// app-wide convention enforced by the pane renderer (PaneNode.tsx) and every
+/// in-app Split control: "horizontal" lays panes out in columns (new pane to
+/// the RIGHT), "vertical" in rows (new pane BELOW). The tools previously sent
+/// the inverted strings, so agent-driven splits went the opposite way asked.
+fn pane_split_direction(tool: &str) -> &'static str {
+    match tool {
+        "pane_split_down" => "vertical",
+        _ => "horizontal", // pane_split_right
+    }
+}
+
 async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
     let tool_name = match params.get("name").and_then(Value::as_str) {
         Some(name) => name.to_string(),
@@ -1184,11 +1196,13 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         }
         "pane_split_right" => {
             let pane_id = arguments.get("pane_id").and_then(Value::as_str).unwrap_or_default();
-            call_socket("split_pane", json!({ "pane_id": pane_id, "direction": "vertical" })).await
+            let direction = pane_split_direction("pane_split_right");
+            call_socket("split_pane", json!({ "pane_id": pane_id, "direction": direction })).await
         }
         "pane_split_down" => {
             let pane_id = arguments.get("pane_id").and_then(Value::as_str).unwrap_or_default();
-            call_socket("split_pane", json!({ "pane_id": pane_id, "direction": "horizontal" })).await
+            let direction = pane_split_direction("pane_split_down");
+            call_socket("split_pane", json!({ "pane_id": pane_id, "direction": direction })).await
         }
 
         // -- Notification tools --
@@ -1776,6 +1790,16 @@ mod tests {
         );
         // Absent → the documented default of 3.
         assert_eq!(scroll_amount_value(&json!({})).as_i64(), Some(3));
+    }
+
+    #[test]
+    fn pane_split_tools_match_in_app_direction_convention() {
+        // PaneNode.tsx renders "horizontal" as gridTemplateColumns (new pane to
+        // the right) and "vertical" as gridTemplateRows (new pane below); every
+        // in-app Split-right control sends "horizontal". The MCP tools must
+        // match (they were inverted).
+        assert_eq!(pane_split_direction("pane_split_right"), "horizontal");
+        assert_eq!(pane_split_direction("pane_split_down"), "vertical");
     }
 
     /// Helper: create a unique temp directory for a test.
