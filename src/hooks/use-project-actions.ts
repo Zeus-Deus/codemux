@@ -40,39 +40,46 @@ interface OpenProjectResult {
   name?: string;
 }
 
+/**
+ * Folder-picker "open project" flow as a plain async function (no React
+ * hooks) so it can be driven both from the `useProjectActions` hook and from
+ * the global keyboard-shortcut dispatcher (Ctrl+O), which runs outside React.
+ */
+export async function openProjectFlow(): Promise<OpenProjectResult> {
+  const folder = await pickFolder("Open project");
+  if (!folder) return { success: false };
+
+  const name = basename(folder);
+  const isGit = await checkIsGitRepo(folder);
+
+  if (!isGit) {
+    const confirmed = window.confirm(
+      `"${name}" is not a git repository. Initialize one?`,
+    );
+    if (!confirmed) return { success: false };
+    await initGitRepo(folder);
+  }
+
+  await dbAddRecentProject(folder, name);
+
+  // Only show the onboarding wizard for truly first-time users — no existing
+  // workspaces AND they have never seen/dismissed onboarding before. The
+  // `hasSeenOnboarding` flag persists so that closing all workspaces or
+  // opening a second project doesn't re-arm the wizard.
+  const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
+  const wsId = await createEmptyWorkspace(folder);
+  await activateWorkspace(wsId);
+  if (!hasWorkspaces && !shouldSkipOnboarding()) {
+    useUIStore.getState().setOnboardingProjectDir(folder);
+  }
+
+  return { success: true, path: folder, name };
+}
+
 export function useProjectActions() {
   const setShowCloneDialog = useUIStore((s) => s.setShowCloneDialog);
 
-  const openProject = useCallback(async (): Promise<OpenProjectResult> => {
-    const folder = await pickFolder("Open project");
-    if (!folder) return { success: false };
-
-    const name = basename(folder);
-    const isGit = await checkIsGitRepo(folder);
-
-    if (!isGit) {
-      const confirmed = window.confirm(
-        `"${name}" is not a git repository. Initialize one?`,
-      );
-      if (!confirmed) return { success: false };
-      await initGitRepo(folder);
-    }
-
-    await dbAddRecentProject(folder, name);
-
-    // Only show the onboarding wizard for truly first-time users — no existing
-    // workspaces AND they have never seen/dismissed onboarding before. The
-    // `hasSeenOnboarding` flag persists so that closing all workspaces or
-    // opening a second project doesn't re-arm the wizard.
-    const hasWorkspaces = (useAppStore.getState().appState?.workspaces.length ?? 0) > 0;
-    const wsId = await createEmptyWorkspace(folder);
-    await activateWorkspace(wsId);
-    if (!hasWorkspaces && !shouldSkipOnboarding()) {
-      useUIStore.getState().setOnboardingProjectDir(folder);
-    }
-
-    return { success: true, path: folder, name };
-  }, []);
+  const openProject = useCallback(() => openProjectFlow(), []);
 
   const openCloneDialog = useCallback(() => {
     setShowCloneDialog(true);

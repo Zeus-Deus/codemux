@@ -6,10 +6,16 @@ import {
   closeTab,
   cycleWorkspace,
   activateTab,
+  activateWorkspace,
+  createEmptyWorkspace,
+  agentChatCreatePane,
   runProjectDevCommand,
 } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { openProjectFlow } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { normalizeKeyCombo } from "@/lib/keybind-utils";
 import { getRegistryEntry } from "@/lib/keybind-registry";
@@ -127,6 +133,38 @@ export function dispatch(actionId: string, _e: KeyboardEvent): boolean {
     return true;
   }
 
+  // ── New agent (mirrors the sidebar "New agent" + button) ──
+  // Works without an active workspace, so it sits before the appState guard.
+  if (actionId === "newAgent") {
+    const flags = useFeatureFlags.getState();
+    if (!flags.enableAgentChat) {
+      ui.setShowNewWorkspaceDialog(true);
+      return true;
+    }
+    if (flags.enableLazyWorkspaceCreation) {
+      const store = useChatDraftStore.getState();
+      // `lockedToHome` mirrors the sidebar button: a home-directory chat that
+      // won't be redirected to whatever project is active in the sidebar.
+      const draft = store.getOrCreateHomeDraft({ lockedToHome: true });
+      store.setActiveDraft(draft.draftId);
+      return true;
+    }
+    ui.setShowNewWorkspaceDialog(true);
+    return true;
+  }
+
+  // ── Open project (folder picker) ──
+  if (actionId === "openProject") {
+    openProjectFlow().catch(console.error);
+    return true;
+  }
+
+  // ── Show keyboard shortcuts ──
+  if (actionId === "showShortcuts") {
+    ui.setShowSettings(true, "shortcuts");
+    return true;
+  }
+
   // ── Workspaces ──
   if (actionId === "nextWorkspace") {
     cycleWorkspace(1).catch(console.error);
@@ -153,6 +191,36 @@ export function dispatch(actionId: string, _e: KeyboardEvent): boolean {
     return true;
   }
 
+  // ── New workspace in the current project (quick-create) ──
+  // Mirrors the per-project "+" in the sidebar, scoped to the active
+  // workspace's project. A home-rooted workspace just creates another home
+  // workspace, which is the sensible "current context" there.
+  if (actionId === "newWorkspaceInProject") {
+    const projectPath = ws.project_root ?? ws.cwd;
+    const flags = useFeatureFlags.getState();
+    if (!flags.enableAgentChat) {
+      ui.setShowNewWorkspaceDialog(true, projectPath);
+      return true;
+    }
+    if (flags.enableLazyWorkspaceCreation) {
+      const store = useChatDraftStore.getState();
+      const draft = store.getOrCreateProjectDraft(projectPath);
+      store.setActiveDraft(draft.draftId);
+      return true;
+    }
+    void (async () => {
+      try {
+        const wsId = await createEmptyWorkspace(projectPath);
+        await activateWorkspace(wsId);
+        await agentChatCreatePane(wsId, null, projectPath);
+      } catch (err) {
+        console.error("[shortcut] new workspace in project failed:", err);
+        ui.setShowNewWorkspaceDialog(true, projectPath);
+      }
+    })();
+    return true;
+  }
+
   // ── Tabs ──
   if (actionId === "newTab") {
     createTab(ws.workspace_id, "terminal").catch(console.error);
@@ -176,6 +244,10 @@ export function dispatch(actionId: string, _e: KeyboardEvent): boolean {
   // ── Panes ──
   if (actionId === "splitPaneRight") {
     if (activePaneId) splitPane(activePaneId, "horizontal").catch(console.error);
+    return true;
+  }
+  if (actionId === "splitPaneDown") {
+    if (activePaneId) splitPane(activePaneId, "vertical").catch(console.error);
     return true;
   }
   if (actionId === "closePane") {

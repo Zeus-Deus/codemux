@@ -21,6 +21,8 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "commandPalette", label: "Command palette", category: "general", defaultKeys: "Ctrl+K" },
   { id: "toggleSidebar", label: "Toggle sidebar", category: "general", defaultKeys: "Ctrl+B" },
   { id: "openSettings", label: "Open settings", category: "general", defaultKeys: "Ctrl+," },
+  { id: "openProject", label: "Open project", category: "general", defaultKeys: "Ctrl+O", description: "Open an existing folder as a project" },
+  { id: "showShortcuts", label: "Keyboard shortcuts", category: "general", defaultKeys: "Ctrl+Shift+?", description: "Open Settings to the keyboard-shortcuts page" },
   { id: "closeOverlay", label: "Close overlay", category: "general", defaultKeys: "Escape", description: "Close settings, search, or command palette" },
   { id: "blockReload", label: "Block reload", category: "general", defaultKeys: "Ctrl+R", description: "Prevents accidental app reload" },
   { id: "blockHardReload", label: "Block hard reload", category: "general", defaultKeys: "Ctrl+Shift+R", description: "Prevents accidental app reload" },
@@ -31,6 +33,8 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "contentSearch", label: "Search in files", category: "search", defaultKeys: "Ctrl+Shift+F" },
 
   // ── Workspaces ──
+  { id: "newAgent", label: "New agent", category: "workspaces", defaultKeys: "Ctrl+N", description: "New chat in home directory, or the New Workspace dialog (same as the sidebar +)" },
+  { id: "newWorkspaceInProject", label: "New workspace in current project", category: "workspaces", defaultKeys: "Ctrl+Shift+N", description: "Quick-create a workspace/agent in the active workspace's project" },
   { id: "nextWorkspace", label: "Next workspace", category: "workspaces", defaultKeys: "Ctrl+]" },
   { id: "prevWorkspace", label: "Previous workspace", category: "workspaces", defaultKeys: "Ctrl+[" },
   { id: "runDevCommand", label: "Run dev command", category: "workspaces", defaultKeys: "Ctrl+Shift+G" },
@@ -50,6 +54,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
 
   // ── Panes ──
   { id: "splitPaneRight", label: "Split pane right", category: "panes", defaultKeys: "Ctrl+Shift+D" },
+  { id: "splitPaneDown", label: "Split pane down", category: "panes", defaultKeys: "Ctrl+Shift+E" },
   { id: "closePane", label: "Close pane", category: "panes", defaultKeys: "Ctrl+Shift+W" },
 
   // ── Terminal (handled inside xterm) ──

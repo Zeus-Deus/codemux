@@ -17,6 +17,7 @@ beforeEach(() => {
     showFileSearch: false,
     showContentSearch: false,
     showCommandPalette: false,
+    showNewWorkspaceDialog: false,
   });
   window.localStorage.clear();
 });
@@ -130,6 +131,27 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
 
     it("openSettings opens settings", () => {
       const handled = dispatch("openSettings", FAKE_EVENT);
+      expect(handled).toBe(true);
+      expect(useUIStore.getState().showSettings).toBe(true);
+    });
+
+    it("newAgent opens the New Workspace dialog when agent chat is off", () => {
+      // Default feature flags have agent chat disabled, so the New agent
+      // shortcut falls back to the dialog (same as the sidebar + button).
+      expect(useUIStore.getState().showNewWorkspaceDialog).toBe(false);
+      const handled = dispatch("newAgent", FAKE_EVENT);
+      expect(handled).toBe(true);
+      expect(useUIStore.getState().showNewWorkspaceDialog).toBe(true);
+    });
+
+    it("newAgent works with no active workspace (runs before the appState guard)", () => {
+      useAppStore.setState({ appState: null });
+      const handled = dispatch("newAgent", FAKE_EVENT);
+      expect(handled).toBe(true);
+    });
+
+    it("showShortcuts opens settings", () => {
+      const handled = dispatch("showShortcuts", FAKE_EVENT);
       expect(handled).toBe(true);
       expect(useUIStore.getState().showSettings).toBe(true);
     });

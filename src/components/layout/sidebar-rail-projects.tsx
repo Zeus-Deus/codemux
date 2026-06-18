@@ -22,6 +22,7 @@ import {
   createEmptyWorkspace,
 } from "@/tauri/commands";
 import { getProjectStatus, getWorkspaceStatus } from "@/lib/pane-status";
+import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import { Cloud, GitBranch, Home, Laptop, Plus, Workflow } from "lucide-react";
@@ -145,6 +146,8 @@ function RailProjectFlyout({
   const setShowNewWorkspaceDialog = useUIStore(
     (s) => s.setShowNewWorkspaceDialog,
   );
+  const { getKeysForAction } = useResolvedKeybinds();
+  const newWsKeys = getKeysForAction("newWorkspaceInProject");
 
   const handleNew = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -194,6 +197,11 @@ function RailProjectFlyout({
       >
         <Plus className="h-3.5 w-3.5" />
         New workspace
+        {newWsKeys && (
+          <span className="ml-auto text-[10px] tabular-nums text-muted-foreground/50">
+            {newWsKeys}
+          </span>
+        )}
       </button>
     </div>
   );
