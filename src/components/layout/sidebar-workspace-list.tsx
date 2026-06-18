@@ -12,7 +12,6 @@ import {
 } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { SidebarProjectGroup } from "./sidebar-project-group";
-import { NewWorkspaceDialog } from "@/components/overlays/new-workspace-dialog";
 import { reorderWorkspaces } from "@/tauri/commands";
 
 interface DragState {
@@ -35,8 +34,6 @@ export function SidebarWorkspaceList() {
   const homeDir = useHomeDir();
   const projectGroups = useProjectGroupedWorkspaces(allWorkspaces, homeDir);
   const activeWorkspaceId = appState?.active_workspace_id ?? "";
-  const showDialog = useUIStore((s) => s.showNewWorkspaceDialog);
-  const setShowDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const pendingWorkspaces = useUIStore((s) => s.pendingWorkspaces);
 
   const [dragState, setDragState] = useState<DragState | null>(null);
@@ -362,7 +359,6 @@ export function SidebarWorkspaceList() {
           ))}
         </div>
       </SidebarGroupContent>
-      <NewWorkspaceDialog open={showDialog} onOpenChange={setShowDialog} />
     </SidebarGroup>
   );
 }
