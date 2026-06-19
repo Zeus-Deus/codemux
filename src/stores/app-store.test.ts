@@ -218,6 +218,109 @@ describe("project grouping", () => {
     const names = groups.map((g) => g.projectName).sort();
     expect(names).toEqual(["personal/app", "work/app"]);
   });
+
+  it("grows the path tail until duplicate labels are actually unique", () => {
+    // Both roots end in the same two segments (`projects/app`), so a
+    // fixed 2-segment tail would leave them identical. The tail must
+    // grow to three segments to disambiguate.
+    const workspaces = [
+      makeWs({ workspace_id: "ws-1", project_root: "/home/alice/projects/app" }),
+      makeWs({ workspace_id: "ws-2", project_root: "/home/bob/projects/app" }),
+    ];
+
+    const groups = groupWorkspacesByProject(workspaces, null);
+
+    const names = groups.map((g) => g.projectName).sort();
+    expect(names).toEqual(["alice/projects/app", "bob/projects/app"]);
+    // Crucially, the broken identical "projects/app" label never appears.
+    expect(names).not.toContain("projects/app");
+  });
+
+  it("tags the remote copy with its host and keeps the local copy clean", () => {
+    // Same repo basename on two machines: local `/home/zeus/...` and the
+    // remote `/home/deus/...` on host id 7 ("pandora"). Local must stay
+    // "partpilot"; the remote gets a " · pandora" suffix.
+    const workspaces = [
+      makeWs({
+        workspace_id: "ws-local",
+        project_root: "/home/zeus/projects/partpilot",
+        host_id: null,
+      }),
+      makeWs({
+        workspace_id: "ws-remote",
+        project_root: "/home/deus/projects/partpilot",
+        host_id: 7,
+      }),
+    ];
+
+    const groups = groupWorkspacesByProject(
+      workspaces,
+      null,
+      new Map([[7, "pandora"]]),
+    );
+
+    const byName = new Map(groups.map((g) => [g.projectName, g]));
+    expect(byName.has("partpilot")).toBe(true);
+    expect(byName.get("partpilot")!.projectPath).toBe(
+      "/home/zeus/projects/partpilot",
+    );
+    expect(byName.has("partpilot · pandora")).toBe(true);
+    expect(byName.get("partpilot · pandora")!.projectPath).toBe(
+      "/home/deus/projects/partpilot",
+    );
+    // The old broken "projects/partpilot" label is gone.
+    expect(groups.map((g) => g.projectName)).not.toContain(
+      "projects/partpilot",
+    );
+  });
+
+  it("falls back to path tails when host names are unavailable", () => {
+    // host_id is set but no name map is provided — disambiguation can't
+    // use the host, so it must still produce unique path-based labels.
+    const workspaces = [
+      makeWs({
+        workspace_id: "ws-local",
+        project_root: "/home/zeus/projects/partpilot",
+        host_id: null,
+      }),
+      makeWs({
+        workspace_id: "ws-remote",
+        project_root: "/home/deus/projects/partpilot",
+        host_id: 7,
+      }),
+    ];
+
+    const groups = groupWorkspacesByProject(workspaces, null);
+
+    const names = groups.map((g) => g.projectName).sort();
+    expect(names).toEqual(["deus/projects/partpilot", "zeus/projects/partpilot"]);
+  });
+
+  it("disambiguates two same-named projects on the same remote host by path", () => {
+    // Both remote on host 7: host alone can't tell them apart, so we
+    // grow the path tail. Neither should keep a bare "app" label.
+    const workspaces = [
+      makeWs({
+        workspace_id: "ws-1",
+        project_root: "/home/deus/work/app",
+        host_id: 7,
+      }),
+      makeWs({
+        workspace_id: "ws-2",
+        project_root: "/home/deus/personal/app",
+        host_id: 7,
+      }),
+    ];
+
+    const groups = groupWorkspacesByProject(
+      workspaces,
+      null,
+      new Map([[7, "pandora"]]),
+    );
+
+    const names = groups.map((g) => g.projectName).sort();
+    expect(names).toEqual(["personal/app", "work/app"]);
+  });
 });
 
 describe("groupWorkspacesByProject — Home labelling (Stage A)", () => {

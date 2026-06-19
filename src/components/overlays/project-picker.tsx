@@ -20,6 +20,7 @@ import {
   useProjectGroupedWorkspaces,
 } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useHosts } from "@/stores/hosts-store";
 import { basename } from "@/lib/path";
 import { dbGetRecentProjects, dbGetUiState } from "@/tauri/commands";
 import { useProjectActions } from "@/hooks/use-project-actions";
@@ -61,7 +62,11 @@ export function ProjectPicker({ value, onChange }: ProjectPickerProps) {
 
   const workspaces = useAppStore((s) => s.appState?.workspaces ?? []);
   const homeDir = useHomeDir();
-  const projectGroups = useProjectGroupedWorkspaces(workspaces, homeDir);
+  // Pass hosts so a project that exists both locally and on a remote
+  // host is disambiguated by host name (local stays clean, remote gets
+  // a " · <host>" suffix) — matching the sidebar's labels.
+  const hosts = useHosts();
+  const projectGroups = useProjectGroupedWorkspaces(workspaces, homeDir, hosts);
 
   // Load recent projects plus each project's avatar (accent color + custom
   // image + favicon cache-bust token) when the popover opens, so the picker

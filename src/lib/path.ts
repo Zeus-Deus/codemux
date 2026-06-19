@@ -22,3 +22,9 @@ export function tailSegments(path: string, n: number): string {
   const parts = path.split(SEP).filter(Boolean);
   return parts.slice(-n).join("/");
 }
+
+/** Number of non-empty segments in a path. Used to bound how far the
+ *  duplicate-label disambiguation can grow the trailing tail. */
+export function segmentCount(path: string): number {
+  return path.split(SEP).filter(Boolean).length;
+}

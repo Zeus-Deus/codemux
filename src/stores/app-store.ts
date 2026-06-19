@@ -6,7 +6,8 @@ import type {
   WorkspaceSnapshot,
   SurfaceSnapshot,
 } from "@/tauri/types";
-import { basename, tailSegments } from "@/lib/path";
+import { basename, tailSegments, segmentCount } from "@/lib/path";
+import type { HostView } from "@/tauri/commands";
 
 interface AppStore {
   appState: AppStateSnapshot | null;
@@ -294,9 +295,26 @@ export function resolveProjectRoot(ws: WorkspaceSnapshot): string {
  * stops filtering out `workspace_type === "home"` workspaces, so this
  * label rule is what surfaces them correctly in the sidebar.
  */
+/**
+ * The single host a group's workspaces live on, or `null` when they're
+ * local. Returns `undefined` when the group is empty or its workspaces
+ * straddle multiple hosts — in that case the host can't disambiguate
+ * the group and we fall back to path tails.
+ */
+function groupHostId(workspaces: WorkspaceSnapshot[]): number | null | undefined {
+  let hostId: number | null | undefined = undefined;
+  for (const ws of workspaces) {
+    const h = ws.host_id ?? null;
+    if (hostId === undefined) hostId = h;
+    else if (hostId !== h) return undefined; // mixed → ambiguous
+  }
+  return hostId;
+}
+
 export function groupWorkspacesByProject(
   workspaces: WorkspaceSnapshot[],
   homeDir: string | null,
+  hostNameById?: ReadonlyMap<number, string> | null,
 ): ProjectGroup[] {
   const groups = new Map<string, { name: string; path: string; workspaces: WorkspaceSnapshot[] }>();
 
@@ -319,18 +337,49 @@ export function groupWorkspacesByProject(
     workspaces: g.workspaces,
   }));
 
-  // Disambiguate duplicate project names by adding parent path. The
-  // "Home" group is always unique (single homeDir path), so this
-  // never rewrites it.
-  const nameCounts = new Map<string, number>();
+  // Disambiguate duplicate project names. Two project roots can share a
+  // basename when the same repo lives on different machines (e.g. a
+  // local `~/projects/app` and the same `app` on a remote host) or in
+  // sibling directories. We prefer the host as the distinguishing tag:
+  // the local copy keeps its clean basename and each remote copy is
+  // suffixed with " · <host>". When the host can't tell the copies
+  // apart (both local, both on the same host, or host names
+  // unavailable) we fall back to appending just enough trailing path
+  // segments to make every colliding label unique. The "Home" group is
+  // always unique (single homeDir path), so this never rewrites it.
+  const byName = new Map<string, typeof result>();
   for (const g of result) {
-    nameCounts.set(g.projectName, (nameCounts.get(g.projectName) || 0) + 1);
+    const list = byName.get(g.projectName);
+    if (list) list.push(g);
+    else byName.set(g.projectName, [g]);
   }
-  for (const g of result) {
-    if ((nameCounts.get(g.projectName) || 0) > 1) {
-      const tail = tailSegments(g.projectPath, 2);
-      if (tail.includes("/")) {
-        g.projectName = tail;
+
+  for (const colliding of byName.values()) {
+    if (colliding.length < 2) continue;
+
+    // Pass 1 — tag remote groups with their host name; locals (and
+    // groups whose host we can't name) keep the clean basename.
+    for (const g of colliding) {
+      const hostId = groupHostId(g.workspaces);
+      const hostName = hostId != null ? hostNameById?.get(hostId) ?? null : null;
+      if (hostName) g.projectName = `${g.projectName} · ${hostName}`;
+    }
+
+    const unique = (gs: typeof colliding) =>
+      new Set(gs.map((g) => g.projectName)).size === gs.length;
+    if (unique(colliding)) continue;
+
+    // Pass 2 — fall back to trailing path segments, growing the tail
+    // until every label is unique. Group keys are distinct absolute
+    // paths, so this always converges by the longest path's depth.
+    const maxSegments = Math.max(...colliding.map((g) => segmentCount(g.projectPath)));
+    for (let n = 2; n <= maxSegments; n++) {
+      const tails = colliding.map((g) => tailSegments(g.projectPath, n));
+      if (new Set(tails).size === colliding.length) {
+        colliding.forEach((g, i) => {
+          if (tails[i].includes("/")) g.projectName = tails[i];
+        });
+        break;
       }
     }
   }
@@ -341,9 +390,12 @@ export function groupWorkspacesByProject(
 export function useProjectGroupedWorkspaces(
   workspaces: WorkspaceSnapshot[],
   homeDir: string | null,
+  hosts?: HostView[],
 ): ProjectGroup[] {
-  return useMemo(
-    () => groupWorkspacesByProject(workspaces, homeDir),
-    [workspaces, homeDir],
-  );
+  return useMemo(() => {
+    const hostNameById = hosts
+      ? new Map(hosts.map((h) => [h.id, h.name] as const))
+      : null;
+    return groupWorkspacesByProject(workspaces, homeDir, hostNameById);
+  }, [workspaces, homeDir, hosts]);
 }

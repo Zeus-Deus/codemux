@@ -253,13 +253,16 @@ export function AutomationsSection() {
   // and editing an automation keeps its saved path via custom mode.
   const openWorkspaces = useAppStore((s) => s.appState?.workspaces);
   const homeDir = useHomeDir();
-  const projects = useMemo<ProjectOption[]>(
-    () =>
-      groupWorkspacesByProject(openWorkspaces ?? [], homeDir)
-        .map((g) => ({ name: g.projectName, path: g.projectPath }))
-        .sort((a, b) => a.name.localeCompare(b.name)),
-    [openWorkspaces, homeDir],
-  );
+  const projects = useMemo<ProjectOption[]>(() => {
+    // Disambiguate a project that lives both locally and on a remote
+    // host by host name (local stays clean, remote gets " · <host>"),
+    // consistent with the sidebar. `hosts` may be empty until the
+    // first load resolves — the memo recomputes when it arrives.
+    const hostNameById = new Map(hosts.map((h) => [h.id, h.name] as const));
+    return groupWorkspacesByProject(openWorkspaces ?? [], homeDir, hostNameById)
+      .map((g) => ({ name: g.projectName, path: g.projectPath }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [openWorkspaces, homeDir, hosts]);
 
   // `null` = not editing. A draft with no matching automation = create.
   const [draft, setDraft] = useState<FormDraft | null>(null);
