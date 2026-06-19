@@ -41,6 +41,7 @@ import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useAppStore, useHomeDir } from "@/stores/app-store";
+import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import type { WorkspaceSnapshot, PendingWorkspace } from "@/tauri/types";
 
 const PROJECT_COLORS = [
@@ -79,6 +80,8 @@ export function SidebarProjectGroup({
   dragStateId,
   pendingWorkspaces = [],
 }: Props) {
+  const { getKeysForAction } = useResolvedKeybinds();
+  const newWsKeys = getKeysForAction("newWorkspaceInProject");
   const [collapsed, setCollapsed] = useState(false);
   const [customColor, setCustomColor] = useState<string | null>(null);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
@@ -246,6 +249,7 @@ export function SidebarProjectGroup({
               </TooltipTrigger>
               <TooltipContent side="bottom" sideOffset={4} className="text-xs">
                 {enableAgentChat ? "New workspace · Shift+click for CLI" : "New workspace"}
+                {newWsKeys ? ` · ${newWsKeys}` : ""}
               </TooltipContent>
             </Tooltip>
 

@@ -1,4 +1,4 @@
-import { SidebarHeader as ShadcnSidebarHeader, SidebarSeparator } from "@/components/ui/sidebar";
+import { SidebarHeader as ShadcnSidebarHeader, SidebarSeparator, useSidebar } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -16,8 +16,12 @@ import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { Plus, FolderPlus, FolderOpen, CalendarClock, LayoutGrid } from "lucide-react";
 import { useProjectActions } from "@/hooks/use-project-actions";
+import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 
 export function SidebarActionRow() {
+  const { state } = useSidebar();
+  const { getKeysForAction } = useResolvedKeybinds();
+  const newAgentKeys = getKeysForAction("newAgent");
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const setShowNewProjectScreen = useUIStore((s) => s.setShowNewProjectScreen);
   const setShowAutomations = useUIStore((s) => s.setShowAutomations);
@@ -48,6 +52,102 @@ export function SidebarActionRow() {
     setShowNewWorkspaceDialog(true);
   };
 
+  // Collapsed icon rail: the same actions as vertical icon buttons, each
+  // labelled by a right-side tooltip. New agent is accented as the primary
+  // create action; Add repository keeps its dropdown (opening to the right).
+  if (state === "collapsed") {
+    return (
+      <ShadcnSidebarHeader className="gap-0 p-0">
+        <div className="flex flex-col items-center gap-1 px-1 py-2">
+          <Tooltip delayDuration={300}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="New agent"
+                onClick={handleNewAgent}
+                className="size-8 text-primary hover:bg-primary/10 hover:text-primary"
+              >
+                <Plus className="size-[18px]" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="right" className="text-xs">
+              New agent{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
+            </TooltipContent>
+          </Tooltip>
+
+          <DropdownMenu>
+            <Tooltip delayDuration={300}>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    aria-label="Add repository"
+                    className="size-8 text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+                  >
+                    <FolderPlus className="size-[18px]" />
+                  </Button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent side="right" className="text-xs">
+                Add repository
+              </TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent side="right" align="start">
+              <DropdownMenuItem onClick={() => openProject()} className="text-xs">
+                <FolderOpen className="mr-2 h-3.5 w-3.5" />
+                Open project
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => setShowNewProjectScreen(true)}
+                className="text-xs"
+              >
+                <FolderPlus className="mr-2 h-3.5 w-3.5" />
+                New project
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          <Tooltip delayDuration={300}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Automations"
+                onClick={() => setShowAutomations(true)}
+                className="size-8 text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+              >
+                <CalendarClock className="size-[18px]" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="right" className="text-xs">
+              Automations
+            </TooltipContent>
+          </Tooltip>
+
+          <Tooltip delayDuration={300}>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Workspaces"
+                onClick={() => setShowWorkspacesOverview(true)}
+                className="size-8 text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
+              >
+                <LayoutGrid className="size-[18px]" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="right" className="text-xs">
+              Workspaces
+            </TooltipContent>
+          </Tooltip>
+        </div>
+        <SidebarSeparator />
+      </ShadcnSidebarHeader>
+    );
+  }
+
   return (
     <ShadcnSidebarHeader className="gap-0 p-0">
       <div className="flex items-center gap-1 px-2 py-1.5">
@@ -64,7 +164,7 @@ export function SidebarActionRow() {
             </Button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-            New chat in home directory · Shift+click for workspace dialog
+            New chat in home directory{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
           </TooltipContent>
         </Tooltip>
 

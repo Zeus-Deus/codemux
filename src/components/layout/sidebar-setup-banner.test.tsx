@@ -36,6 +36,13 @@ vi.mock("@/stores/app-store", () => ({
   useHomeDir: vi.fn(() => mockHomeDir),
 }));
 
+// The banner now reads the sidebar collapse state to hide itself in the
+// icon rail. These tests render it outside a SidebarProvider, so stub the
+// hook to the expanded state (where the banner's own visibility logic applies).
+vi.mock("@/components/ui/sidebar", () => ({
+  useSidebar: () => ({ state: "expanded" }),
+}));
+
 import { SidebarSetupBanner } from "./sidebar-setup-banner";
 
 function flushPromises() {

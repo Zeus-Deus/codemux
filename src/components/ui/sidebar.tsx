@@ -27,7 +27,10 @@ const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
 const SIDEBAR_WIDTH_MIN = 180
 const SIDEBAR_WIDTH_MAX = 400
 const SIDEBAR_WIDTH_MOBILE = "18rem"
-const SIDEBAR_WIDTH_ICON = "3rem"
+// 52px icon rail — enough for a centered avatar/icon button (size-8) plus a
+// little breathing room for the status dot / notification badge that overlays
+// its top-right corner. Matches the reference rail width.
+const SIDEBAR_WIDTH_ICON = "3.25rem"
 
 type SidebarContextProps = {
   state: "expanded" | "collapsed"

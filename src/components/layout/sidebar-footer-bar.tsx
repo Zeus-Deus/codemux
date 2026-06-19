@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { SidebarSeparator } from "@/components/ui/sidebar";
+import { SidebarSeparator, useSidebar } from "@/components/ui/sidebar";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -118,6 +118,20 @@ function AppMenu() {
 }
 
 export function SidebarFooterBar() {
+  const { state } = useSidebar();
+
+  if (state === "collapsed") {
+    return (
+      <>
+        <SidebarSeparator />
+        <div className="flex flex-col items-center gap-1 px-1 py-1.5">
+          <AppMenu />
+          <SidebarPortsPopover />
+        </div>
+      </>
+    );
+  }
+
   return (
     <>
       <SidebarSeparator />

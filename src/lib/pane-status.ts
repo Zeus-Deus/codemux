@@ -46,3 +46,17 @@ export function getWorkspaceStatus(
   );
   return getHighestPriorityStatus(statuses);
 }
+
+/**
+ * Aggregate status across a set of workspaces (e.g. every workspace in a
+ * project). Used by the collapsed sidebar rail to surface a single
+ * status dot on a project's avatar that reflects its busiest workspace.
+ */
+export function getProjectStatus(
+  workspaces: { surfaces: SurfaceSnapshot[] }[],
+  paneStatuses: Record<string, PaneStatus>,
+): ActivePaneStatus | null {
+  return getHighestPriorityStatus(
+    workspaces.map((w) => getWorkspaceStatus(w.surfaces, paneStatuses) ?? undefined),
+  );
+}

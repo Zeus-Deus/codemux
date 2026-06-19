@@ -15,10 +15,14 @@ Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, an
 | Shortcut | Action | Notes |
 |----------|--------|-------|
 | Ctrl+K | Command palette | Fuzzy search for any action |
-| Ctrl+B | Toggle sidebar | Collapse/expand the left sidebar |
+| Ctrl+B | Toggle sidebar | Collapse the left sidebar to an icon rail / expand it (see `docs/features/sidebar.md`) |
 | Ctrl+, | Open settings | Opens the settings panel |
+| Ctrl+Shift+? | Keyboard shortcuts | Opens Settings to the keyboard-shortcuts page (press Ctrl+Shift+/) |
+| Ctrl+O | Open project | Opens a folder picker to add an existing project |
 | Ctrl+Shift+P | Find file by name | File name search overlay (via fd/find) |
 | Ctrl+Shift+F | Search in files | Keyword search across workspace files (via rg/grep) |
+| Ctrl+N | New agent | Same as the sidebar **+**: new home chat draft, or the New Workspace dialog |
+| Ctrl+Shift+N | New workspace in current project | Quick-create a workspace/agent in the active workspace's project |
 | Ctrl+] | Next workspace | Cycles through sidebar workspace list |
 | Ctrl+[ | Previous workspace | |
 | Ctrl+Shift+G | Run dev command | Runs the project's configured dev server command |
@@ -26,7 +30,10 @@ Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, an
 | Ctrl+W | Close active tab | Only when workspace has more than one tab |
 | Ctrl+1 through Ctrl+9 | Jump to tab by position | Tab 1 = leftmost |
 | Ctrl+Shift+D | Split active pane right | Horizontal split |
+| Ctrl+Shift+E | Split active pane down | Vertical split |
 | Ctrl+Shift+W | Close active pane | |
+
+All shortcuts are rebindable in **Settings → Keyboard shortcuts** (rendered from `src/lib/keybind-registry.ts`).
 
 ## Terminal Shortcuts
 

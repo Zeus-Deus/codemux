@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useRef, useState } from "react";
+import { startTransition, useEffect, useState } from "react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -68,6 +68,7 @@ import {
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import { StatusIndicator } from "@/components/ui/status-indicator";
+import { AsciiSpinner } from "@/components/ui/ascii-spinner";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
 import { useDefaultBranch } from "./default-branch-cache";
@@ -494,27 +495,6 @@ export function WorkspaceContextMenuItems({
         Close Worktree
       </ContextMenuItem>
     </ContextMenuContent>
-  );
-}
-
-const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-function AsciiSpinner() {
-  const [frame, setFrame] = useState(0);
-  const frameRef = useRef(0);
-
-  useEffect(() => {
-    const id = setInterval(() => {
-      frameRef.current = (frameRef.current + 1) % SPINNER_FRAMES.length;
-      setFrame(frameRef.current);
-    }, 80);
-    return () => clearInterval(id);
-  }, []);
-
-  return (
-    <span className="text-amber-500 text-sm leading-none select-none" aria-label="Agent working">
-      {SPINNER_FRAMES[frame]}
-    </span>
   );
 }
 
