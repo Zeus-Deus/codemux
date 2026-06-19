@@ -63,6 +63,14 @@ dot without a tooltip fighting the HoverCard), the `AsciiSpinner`
   new-workspace action.
 - Project avatar custom colors/images carry into the rail.
 - Re-expanding restores the full sidebar (DnD reorder, diff stats, etc.) unchanged.
+- **Duplicate project names are disambiguated** (PR #109): two project roots that
+  share a basename (a local `~/projects/app` and the same app on a remote host, or
+  sibling dirs) no longer collapse to identical labels. The host is preferred as the
+  distinguishing tag — the local copy keeps its clean basename, each remote copy is
+  suffixed with ` · <host>`; when the host can't separate them (both local, same
+  host, or host names unavailable) the label grows its trailing path tail until every
+  label is unique. Wired through the sidebar, the project picker, and the automations
+  project dropdown.
 
 ## Current Constraints
 
@@ -88,6 +96,8 @@ dot without a tooltip fighting the HoverCard), the `AsciiSpinner`
 - `src/components/ui/status-indicator.tsx` — `withTooltip` prop
 - `src/components/ui/ascii-spinner.tsx` — shared working spinner
 - `src/lib/pane-status.ts` — `getProjectStatus` aggregate helper
+- `src/lib/path.ts` — `tailSegments` / `segmentCount` project-label helpers
+- `src/stores/app-store.ts` — duplicate-project-label disambiguation (host tag → path tail)
 
 ## Notes
 
