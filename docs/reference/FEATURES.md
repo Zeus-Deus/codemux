@@ -35,9 +35,17 @@
 - Switch tabs by clicking or Ctrl+1 through Ctrl+9
 - Tab state persists when switching between workspaces
 
+## Presets & Launchers
+
+- Quick-launch preset bar for coding agents (Claude Code, Codex, OpenCode, Gemini, Antigravity, Copilot, Cursor Agent, Amp, Grok, Droid, Mastracode, Pi, Shell, Chat Agent) — each agent preset launches in its CLI's skip-permissions / YOLO mode
+- Two preset kinds: **raw command** presets (literal shell command lines) and structured **"agent launcher"** presets (pick an agent + model + reasoning + a prompt using the same capability-driven pickers as the New Workspace dialog)
+- Create custom presets from the UI via a **New preset** button (Settings → Presets header, or the preset-bar gear menu); edit, delete, pin/unpin, and reorder presets
+- Auto-run a preset on workspace creation or new tab; agent-context injection for supported agents
+- Preset failures surface as toasts
+
 ## Terminals
 
-- xterm.js with WebGL rendering (canvas/DOM fallback)
+- xterm.js with WebGL rendering, gated by a hardware-GL probe (DOM renderer on software-rendered WebGL and Linux WebKitGTK; DOM fallback also on context loss / missing WebGL2)
 - Kitty keyboard protocol support for enhanced key reporting in agent tools
 - Custom key handlers: Ctrl+Backspace (kill word), Ctrl+Shift+C/V (copy/paste)
 - Terminal theme syncs with Omarchy color palette (foreground, cursor, selection, 16 ANSI colors)
@@ -65,6 +73,7 @@
 - Open current URL in system browser via external link button
 - Screenshot-based rendering with 1-second refresh polling
 - Click-to-interact on rendered viewport (coordinates mapped from display to actual viewport)
+- Native-feel manual interaction: drag-to-select text, hover effects, double/triple-click selection, right/middle-click, a live cursor mirroring the remote page, and a host-clipboard bridge (Ctrl/Cmd+C/X/V)
 - Loading spinner and error banner display
 - Agent-driven browser mode for automated testing
 - Viewport presets via `codemux browser viewport <mobile|tablet|desktop|WxH|reset>` — real CDP-driven viewport resize so CSS media queries fire and screenshots capture at the simulated dimensions
@@ -252,10 +261,11 @@
 ## Workspace Creation
 
 - Multi-step creation dialog with task description, branch selection, and agent preset
+- Model + reasoning (+ Claude context-window) selection before launch, via a model pill next to the agent picker — appears for any preset launching a modeled CLI (`claude`/`codex`/`opencode`/`gemini`); "Default" emits no flag
 - AI-generated branch names from task description
 - GitHub issue linking with auto-branch naming and prompt context injection
 - PR linking with branch auto-fill
-- File attachments appended to agent prompt
+- File attachments appended to agent prompt — staged as chips with per-type badges (image thumbnails, "Pasted image" labels for clipboard pastes)
 - Project onboarding flow with package manager detection and setup script configuration
 - Orphan worktree detection and import
 

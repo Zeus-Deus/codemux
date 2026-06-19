@@ -305,9 +305,12 @@ async fn handle_connection(
     // socket. Detach removes the entry.
     let mut attached: HashMap<String, broadcast::Receiver<SessionFrame>> = HashMap::new();
 
-    let mut line = String::new();
+    // Persistent accumulation buffer for the request line currently being
+    // read. It MUST survive across loop iterations: the read below times out
+    // periodically to go drain output, and any bytes already pulled off the
+    // socket stay buffered here until the terminating newline arrives.
+    let mut pending: Vec<u8> = Vec::new();
     loop {
-        line.clear();
         // Multiplex: either read a new request line OR forward any pending
         // output from attached sessions. tokio::select! across the attach
         // receivers requires they all be polled — we sequentially poll each
@@ -368,20 +371,42 @@ async fn handle_connection(
         } else {
             std::time::Duration::from_millis(10)
         };
-        let read_result =
-            tokio::time::timeout(read_timeout, reader.read_line(&mut line)).await;
-        let read_n = match read_result {
-            Ok(Ok(n)) => n,
-            Ok(Err(error)) => return Err(format!("read_line: {error}")),
-            Err(_elapsed) => {
-                // Timeout — go back to draining.
+        // Accumulate bytes until a full newline-terminated line is available.
+        // `fill_buf` + `consume` is cancellation-safe — both the BufReader's
+        // internal buffer and `pending` persist if the timeout cancels this
+        // future — so a request that straddles the poll timeout is preserved.
+        // (`read_line` is NOT cancellation-safe: on timeout it drops the
+        // partial bytes it had already consumed, corrupting large or chunked
+        // requests such as a big paste forwarded as one `Write`.)
+        let fill = tokio::time::timeout(read_timeout, reader.fill_buf()).await;
+        let chunk = match fill {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(error)) => return Err(format!("read: {error}")),
+            Err(_elapsed) => continue, // timeout — go back to draining
+        };
+        if chunk.is_empty() {
+            return Ok(()); // EOF — client closed
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(chunk.len(), |i| i + 1);
+        pending.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if newline.is_none() {
+            continue; // partial line — keep accumulating across iterations
+        }
+
+        let line_bytes = std::mem::take(&mut pending);
+        let line = match std::str::from_utf8(&line_bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                let frame = Frame::Response(ServerResponse::Error {
+                    request_id: 0,
+                    message: "invalid request: non-utf8 line".to_string(),
+                });
+                write_frame(&mut write_half, &frame).await?;
                 continue;
             }
         };
-        if read_n == 0 {
-            return Ok(()); // client closed cleanly
-        }
-
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed.is_empty() {
             continue;
@@ -915,5 +940,54 @@ mod tests {
                 .unwrap(),
             "/tmp/codemux-ptyd-abc.sock.pid"
         );
+    }
+
+    // A request whose bytes arrive split across the server's read timeout must
+    // still be parsed (not silently corrupted). Reproduces the read_line
+    // cancellation-safety bug: the first half is consumed off the socket, the
+    // ~10ms timeout fires, and the old code dropped those bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn request_split_across_read_timeout_is_not_lost() {
+        use super::{handle_connection, DaemonState};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::sync::Mutex;
+
+        let state = Arc::new(Mutex::new(DaemonState::default()));
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let handle = tokio::spawn(handle_connection(server, state));
+
+        let (client_read, mut client_write) = client.into_split();
+
+        // Send a valid `Hello` request in two halves, with a gap well past the
+        // server's ~10ms read timeout so the read times out mid-line.
+        client_write
+            .write_all(b"{\"type\":\"hello\",\"requ")
+            .await
+            .unwrap();
+        client_write.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client_write.write_all(b"est_id\":7}\n").await.unwrap();
+        client_write.flush().await.unwrap();
+
+        let mut reader = BufReader::new(client_read);
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut response))
+            .await
+            .expect("server did not respond in time")
+            .expect("read response");
+
+        assert!(
+            response.contains("protocol_version") && response.contains("hello"),
+            "expected a Hello response, got: {response}"
+        );
+        assert!(
+            !response.contains("invalid request"),
+            "request was corrupted by the read timeout: {response}"
+        );
+
+        handle.abort();
     }
 }

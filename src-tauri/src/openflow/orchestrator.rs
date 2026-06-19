@@ -200,9 +200,15 @@ impl Orchestrator {
     }
 
     pub fn parse_timestamp(timestamp_str: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        chrono::DateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
+        // Comm-log timestamps are written zone-less (`chrono::Local::now()
+        // .format("%Y-%m-%d %H:%M:%S")`). DateTime::parse_from_str REQUIRES an
+        // offset and so always failed on this format, silently disabling the
+        // timestamp-based activity signal in stuck detection. Parse as naive
+        // (the activity check only compares stamps to each other, so a
+        // consistent zone is all that matters).
+        chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%d %H:%M:%S")
             .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map(|ndt| ndt.and_utc())
     }
 
     /// Parse an "ASSIGN ROLE-N: task" line and extract the instance id + task.
@@ -740,6 +746,23 @@ mod tests {
             role: role.to_string(),
             message: message.to_string(),
         }
+    }
+
+    #[test]
+    fn parse_timestamp_parses_the_comm_log_format() {
+        // The exact format the comm log is written in (zone-less).
+        let ts = Orchestrator::parse_timestamp("2026-03-18 09:30:00");
+        assert!(ts.is_some(), "comm-log timestamp must parse");
+        assert_eq!(
+            ts.unwrap().format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-18 09:30:00"
+        );
+        // The activity signal relies on stamp ordering being preserved.
+        let earlier = Orchestrator::parse_timestamp("2026-03-18 09:29:59").unwrap();
+        let later = Orchestrator::parse_timestamp("2026-03-18 09:30:00").unwrap();
+        assert!(later > earlier);
+        // Garbage still rejected.
+        assert!(Orchestrator::parse_timestamp("not a timestamp").is_none());
     }
 
     #[test]

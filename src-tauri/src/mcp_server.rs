@@ -846,6 +846,27 @@ async fn dispatch(request: JsonRpcRequest) -> Option<JsonRpcResponse> {
 // Tool call handler
 // ---------------------------------------------------------------------------
 
+/// The scroll-`amount` (ticks) value to embed in a `scroll_at` browser action,
+/// as an INTEGER JSON number. The receiver reads it with `Value::as_i64`, which
+/// returns `None` for a float-backed number — so emitting it via `as_f64`
+/// (`3.0`) silently pinned every MCP scroll to the default 3. The CLI path
+/// emits an integer; this matches it. Defaults to 3 (per the tool schema).
+fn scroll_amount_value(arguments: &Value) -> Value {
+    json!(arguments.get("amount").and_then(Value::as_i64).unwrap_or(3))
+}
+
+/// The split `direction` string for the pane-split MCP tools. Matches the
+/// app-wide convention enforced by the pane renderer (PaneNode.tsx) and every
+/// in-app Split control: "horizontal" lays panes out in columns (new pane to
+/// the RIGHT), "vertical" in rows (new pane BELOW). The tools previously sent
+/// the inverted strings, so agent-driven splits went the opposite way asked.
+fn pane_split_direction(tool: &str) -> &'static str {
+    match tool {
+        "pane_split_down" => "vertical",
+        _ => "horizontal", // pane_split_right
+    }
+}
+
 async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
     let tool_name = match params.get("name").and_then(Value::as_str) {
         Some(name) => name.to_string(),
@@ -940,7 +961,7 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
             let x = arguments.get("x").and_then(Value::as_f64).unwrap_or(0.0);
             let y = arguments.get("y").and_then(Value::as_f64).unwrap_or(0.0);
             let dir = arguments.get("direction").and_then(Value::as_str).unwrap_or("down");
-            let amt = arguments.get("amount").and_then(Value::as_f64).unwrap_or(3.0);
+            let amt = scroll_amount_value(&arguments);
             call_socket("browser_automation", json!({
                 "workspace_id": &workspace_id,
                 "action": { "kind": "scroll_at", "x": x, "y": y, "direction": dir, "amount": amt }
@@ -1175,11 +1196,13 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         }
         "pane_split_right" => {
             let pane_id = arguments.get("pane_id").and_then(Value::as_str).unwrap_or_default();
-            call_socket("split_pane", json!({ "pane_id": pane_id, "direction": "vertical" })).await
+            let direction = pane_split_direction("pane_split_right");
+            call_socket("split_pane", json!({ "pane_id": pane_id, "direction": direction })).await
         }
         "pane_split_down" => {
             let pane_id = arguments.get("pane_id").and_then(Value::as_str).unwrap_or_default();
-            call_socket("split_pane", json!({ "pane_id": pane_id, "direction": "horizontal" })).await
+            let direction = pane_split_direction("pane_split_down");
+            call_socket("split_pane", json!({ "pane_id": pane_id, "direction": direction })).await
         }
 
         // -- Notification tools --
@@ -1753,6 +1776,31 @@ pub fn remove_mcp_config(workspace_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_amount_reaches_receiver_as_i64() {
+        // The receiver (stream_input handle_vision_action) reads `amount` with
+        // Value::as_i64, which rejects float-backed numbers. The emitted value
+        // must therefore be an integer JSON number.
+        let v = scroll_amount_value(&json!({ "amount": 10 }));
+        assert_eq!(
+            v.as_i64(),
+            Some(10),
+            "MCP scroll amount must survive the receiver's as_i64 read"
+        );
+        // Absent → the documented default of 3.
+        assert_eq!(scroll_amount_value(&json!({})).as_i64(), Some(3));
+    }
+
+    #[test]
+    fn pane_split_tools_match_in_app_direction_convention() {
+        // PaneNode.tsx renders "horizontal" as gridTemplateColumns (new pane to
+        // the right) and "vertical" as gridTemplateRows (new pane below); every
+        // in-app Split-right control sends "horizontal". The MCP tools must
+        // match (they were inverted).
+        assert_eq!(pane_split_direction("pane_split_right"), "horizontal");
+        assert_eq!(pane_split_direction("pane_split_down"), "vertical");
+    }
 
     /// Helper: create a unique temp directory for a test.
     fn test_dir(name: &str) -> std::path::PathBuf {

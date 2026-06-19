@@ -9,6 +9,12 @@
 - Read next: `docs/features/workspace-creation.md`,
   `docs/features/multi-provider-chat.md`, `docs/features/presets.md`
 
+> **Status: SHIPPED in `v0.9.2`.** Model/reasoning/context selection before
+> launch is live in the New Workspace dialog and is reused by the structured
+> "agent launcher" presets. Current behavior lives in
+> `docs/features/workspace-creation.md` and `docs/features/presets.md`; the
+> rest of this file is the original implementation plan, kept for history.
+
 ## Goal
 
 The New Workspace dialog (`new-workspace-dialog.tsx`) — the default,
@@ -31,7 +37,7 @@ Workspace dialog. It must be:
 
 ## Status
 
-**Landed on `main` (PR #104), unreleased after the `v0.8.0` tag.** Model +
+**Shipped in `v0.9.2`** (PR #104). Model +
 reasoning selection ships for all four modeled families in one pass, and
 the same `LaunchModelPicker`/`LaunchReasoningPicker` pickers are reused by
 the structured "agent launcher" presets (see `docs/features/presets.md`).

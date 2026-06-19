@@ -158,15 +158,19 @@ export function detectDivergence(
     groups.set(groupKey, list);
   }
 
-  // For each group with >=2 entries AND >=2 distinct shas, mark
-  // every entry in that group as diverged. Skip groups where any
-  // entry's sha is null (insufficient info).
+  // For each group with >=2 entries AND >=2 distinct shas, mark every
+  // entry as diverged. Rows with no git_head_sha are excluded entirely —
+  // we can't determine divergence without a sha on both sides, so they
+  // neither receive a chip nor count toward the fork count / device list.
   const result = new Map<string, DivergenceInfo>();
-  for (const entries of groups.values()) {
+  for (const group of groups.values()) {
+    const entries = group.filter((e): e is typeof e & { sha: string } =>
+      Boolean(e.sha),
+    );
     if (entries.length < 2) continue;
     const shas = new Set<string>();
     for (const e of entries) {
-      if (e.sha) shas.add(e.sha);
+      shas.add(e.sha);
     }
     if (shas.size < 2) continue;
     for (const entry of entries) {

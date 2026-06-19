@@ -76,6 +76,14 @@ describe("parseKeyCombo", () => {
   it("parses Alt+Ctrl+Shift+key", () => {
     expect(parseKeyCombo("Alt+Ctrl+Shift+X")).toEqual({ alt: true, ctrl: true, shift: true, key: "X" });
   });
+
+  it("parses the '+' key itself without dropping it", () => {
+    // "+" is both the modifier delimiter and a valid key — splitting on "+"
+    // dropped the key entirely.
+    expect(parseKeyCombo("+")).toEqual({ alt: false, ctrl: false, shift: false, key: "+" });
+    expect(parseKeyCombo("Ctrl++")).toEqual({ alt: false, ctrl: true, shift: false, key: "+" });
+    expect(parseKeyCombo("Ctrl+Shift++")).toEqual({ alt: false, ctrl: true, shift: true, key: "+" });
+  });
 });
 
 describe("matchesKeyCombo", () => {
@@ -101,6 +109,14 @@ describe("matchesKeyCombo", () => {
 
   it("returns false for empty combo", () => {
     expect(matchesKeyCombo(fakeEvent({ key: "a" }), "")).toBe(false);
+  });
+
+  it("round-trips a '+' key binding (e.g. zoom in)", () => {
+    const ev = fakeEvent({ ctrlKey: true, key: "+" });
+    // The producer encodes Ctrl + "+" as "Ctrl++"; the matcher must accept it.
+    expect(normalizeKeyCombo(ev)).toBe("Ctrl++");
+    expect(matchesKeyCombo(ev, "Ctrl++")).toBe(true);
+    expect(matchesKeyCombo(fakeEvent({ key: "+" }), "+")).toBe(true);
   });
 });
 

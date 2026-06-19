@@ -15,11 +15,11 @@ export interface SplitLine {
   right: DiffLine | null;
 }
 
-const METADATA_PREFIXES = [
+// Structural metadata never collides with hunk content, because every
+// in-hunk content line starts with `+`, `-`, or a space. Safe to skip anywhere.
+const STRUCTURAL_PREFIXES = [
   "diff ",
   "index ",
-  "--- ",
-  "+++ ",
   "new file",
   "deleted file",
   "old mode",
@@ -29,22 +29,38 @@ const METADATA_PREFIXES = [
   "\\ No newline",
 ];
 
+// `--- ` and `+++ ` are file headers ONLY outside a hunk body. Inside a hunk
+// they are content: a deleted source line `-- x` renders as `--- x`, and an
+// added line `++ x` renders as `+++ x`. Skipping those as metadata silently
+// dropped the change and desynced every following line number.
+const FILE_HEADER_PREFIXES = ["--- ", "+++ "];
+
 /**
  * Parse unified diff text into structured lines.
- * Ported from src-old/components/diff/DiffContent.svelte.
  */
 export function parseDiff(text: string): DiffLine[] {
   if (!text) return [];
   const lines: DiffLine[] = [];
   let oldLine = 0;
   let newLine = 0;
+  let inHunk = false;
 
   for (const raw of text.split("\n")) {
-    if (METADATA_PREFIXES.some((p) => raw.startsWith(p))) {
+    // A new file's metadata block resets hunk context. In git output the
+    // `diff ` line always precedes that file's `--- `/`+++ ` headers.
+    if (raw.startsWith("diff ")) {
+      inHunk = false;
+    }
+
+    if (STRUCTURAL_PREFIXES.some((p) => raw.startsWith(p))) {
+      continue;
+    }
+    if (!inHunk && FILE_HEADER_PREFIXES.some((p) => raw.startsWith(p))) {
       continue;
     }
 
     if (raw.startsWith("@@")) {
+      inHunk = true;
       const match = raw.match(/@@ -(\d+)/);
       if (match) {
         oldLine = parseInt(match[1], 10);
