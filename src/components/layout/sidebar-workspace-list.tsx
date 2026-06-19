@@ -11,6 +11,7 @@ import {
   useProjectGroupedWorkspaces,
 } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useHosts } from "@/stores/hosts-store";
 import { SidebarProjectGroup } from "./sidebar-project-group";
 import { computeWorkspaceReorder } from "./workspace-reorder";
 import { reorderWorkspaces } from "@/tauri/commands";
@@ -33,7 +34,13 @@ export function SidebarWorkspaceList() {
   // any other project now; `groupWorkspacesByProject` labels them as
   // "Home" when their `project_root` matches the cached $HOME.
   const homeDir = useHomeDir();
-  const projectGroups = useProjectGroupedWorkspaces(allWorkspaces, homeDir);
+  // Pass the configured hosts so duplicate project names that span
+  // machines (a local repo and the same repo on a remote host) are
+  // disambiguated by host name — local stays clean, remote gets a
+  // " · <host>" suffix — instead of both collapsing to an identical
+  // parent-path label.
+  const hosts = useHosts();
+  const projectGroups = useProjectGroupedWorkspaces(allWorkspaces, homeDir, hosts);
   const activeWorkspaceId = appState?.active_workspace_id ?? "";
   const pendingWorkspaces = useUIStore((s) => s.pendingWorkspaces);
 
