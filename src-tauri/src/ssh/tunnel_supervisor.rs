@@ -167,7 +167,7 @@ async fn run_supervisor(
             remote_binary: &remote_binary,
         };
         let argv = build_tunnel_argv(&opts);
-        eprintln!("[tunnel-supervisor] attempt {} argv: ssh {}", attempt + 1, argv.join(" "));
+        crate::trace_cloud_push!("[tunnel-supervisor] attempt {} argv: ssh {}", attempt + 1, argv.join(" "));
         let mut cmd = Command::new("ssh");
         for arg in &argv {
             cmd.arg(arg);
@@ -179,7 +179,7 @@ async fn run_supervisor(
         let spawn_res = cmd.spawn();
         let mut child = match spawn_res {
             Ok(c) => {
-                eprintln!(
+                crate::trace_cloud_push!(
                     "[tunnel-supervisor] ssh spawned ok, pid={:?}",
                     c.id()
                 );
@@ -294,7 +294,7 @@ async fn wait_for_socket(
 ) -> Result<(), String> {
     let start = Instant::now();
     let mut last_log_at_secs: u64 = 0;
-    eprintln!(
+    crate::trace_cloud_push!(
         "[tunnel-supervisor] waiting for local socket {:?} (deadline {:?})",
         local_socket, deadline
     );
@@ -313,7 +313,7 @@ async fn wait_for_socket(
         if local_socket.exists() {
             // Tiny grace beat so the daemon's listener is fully up.
             tokio::time::sleep(Duration::from_millis(50)).await;
-            eprintln!(
+            crate::trace_cloud_push!(
                 "[tunnel-supervisor] local socket appeared after {:?}",
                 start.elapsed()
             );
@@ -322,7 +322,7 @@ async fn wait_for_socket(
         let elapsed_secs = start.elapsed().as_secs();
         if elapsed_secs > last_log_at_secs {
             // Per-second progress so we know the loop is alive.
-            eprintln!(
+            crate::trace_cloud_push!(
                 "[tunnel-supervisor] still waiting for socket (elapsed {}s, ssh alive)",
                 elapsed_secs
             );

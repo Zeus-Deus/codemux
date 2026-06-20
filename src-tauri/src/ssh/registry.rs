@@ -92,7 +92,7 @@ pub async fn install_supervisor(
     let map = registry().await;
     let mut guard = map.lock().await;
     let prev = guard.insert(workspace_id.to_string(), supervisor);
-    eprintln!(
+    crate::trace_cloud_push!(
         "[registry] install_supervisor({workspace_id}, replaced_existing={})",
         prev.is_some()
     );
@@ -112,7 +112,7 @@ pub async fn get_supervisor(
     let map = registry().await;
     let guard = map.lock().await;
     let result = guard.get(workspace_id).cloned();
-    eprintln!(
+    crate::trace_cloud_push!(
         "[registry] get_supervisor({workspace_id}) -> {} (registry has {} entries: {:?})",
         if result.is_some() { "FOUND" } else { "MISS" },
         guard.len(),
@@ -292,7 +292,7 @@ pub async fn client_for_workspace(
     // iteration to pick up changes between awaits.
     let initial_status = rx.borrow_and_update().clone();
     let deadline = Instant::now() + tunnel_wait;
-    eprintln!(
+    crate::trace_cloud_push!(
         "[client_for_workspace:{workspace_id}] waiting for tunnel local-socket bind \
          (initial supervisor status: {initial_status:?})"
     );
@@ -304,13 +304,13 @@ pub async fn client_for_workspace(
         // Log every iteration for the first few + every ~5s after
         // so the log doesn't drown but we see the polling alive.
         if iter <= 3 || iter % 10 == 0 {
-            eprintln!(
+            crate::trace_cloud_push!(
                 "[client_for_workspace:{workspace_id}] poll iter={iter} status={status:?}"
             );
         }
         match status {
             TunnelStatus::Connected { ssh_pid } => {
-                eprintln!(
+                crate::trace_cloud_push!(
                     "[client_for_workspace:{workspace_id}] tunnel local-socket bound, ssh_pid={ssh_pid}"
                 );
                 break;

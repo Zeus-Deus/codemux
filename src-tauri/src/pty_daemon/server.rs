@@ -725,7 +725,7 @@ async fn spawn_pty(
     // where we know the local HOME.
     let resolved_cwd = crate::project::expand_tilde(&cwd);
     let cwd_exists = std::path::Path::new(&resolved_cwd).exists();
-    eprintln!(
+    crate::trace_cloud_push!(
         "[daemon::spawn] session={session_id} input_cwd={cwd:?} \
          resolved_cwd={resolved_cwd:?} exists={cwd_exists} \
          HOME={:?}",

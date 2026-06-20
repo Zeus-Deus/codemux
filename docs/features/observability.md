@@ -69,6 +69,35 @@ Support surface:
   Codemux drives zenity itself (`src-tauri/src/dialog_fallback.rs`,
   sanitized env + timeout) rather than relying on rfd's portal path.
 
+## Cloud-Push Diagnostic Tracing (`CODEMUX_TRACE_CLOUD_PUSH`)
+
+The push-to-host spawn path (SSH tunnel → remote PTY daemon → agent
+relaunch) is wired with detailed per-step tracing that was essential to
+finding the original cross-machine bug stack. In normal operation those
+lines are pure noise — a single 4-pane push would otherwise emit dozens
+of `[trace:session-id] …`, `[client_for_workspace:…]`, and
+`[tunnel-supervisor] …` lines — so they are gated behind an environment
+variable instead of printed unconditionally.
+
+- **Default (unset):** a normal 4-pane push emits fewer than ten lines of
+  cloud-push logs, and the ones that remain are actionable — errors
+  (`tunnel did not come up`, `daemon list failed`), agent-not-installed
+  preflight, the connection landmarks (`[tunnel-supervisor] start` /
+  `published Connected`, `daemon reached: pid=… version=…`), and the
+  per-pane relaunch landmark (`remote relaunch for X: claude --resume Y`).
+- **Re-enabling:** set `CODEMUX_TRACE_CLOUD_PUSH` to any value (e.g.
+  `CODEMUX_TRACE_CLOUD_PUSH=1`) in the environment of the process whose
+  stderr you want to inspect — the desktop app for the laptop-side trace,
+  or the `codemux-remote` daemon for the host-side `[daemon::spawn]`
+  trace. No recompile and no code change required; the full diagnostic
+  trace returns.
+
+Implementation: `src-tauri/src/trace.rs` defines `cloud_push_enabled()`
+(a process-wide cached env check) and the `trace_cloud_push!` macro — an
+`eprintln!`-compatible wrapper that emits only when the gate is on. Gated
+call sites live in `terminal/daemon_backed.rs`, `ssh/registry.rs`,
+`ssh/tunnel_supervisor.rs`, and `pty_daemon/server.rs`.
+
 ## Important Touch Points
 
 - `src-tauri/src/observability.rs`:
@@ -76,6 +105,7 @@ Support surface:
   - Store: `ObservabilityStore::default`, `snapshot`, `log`, `increment_metric`, `set_feature_flags`, `set_permission_policy`, `set_safety_config`, `add_replay_record`
   - Persistence: `load_observability_store`, `save_snapshot`, `snapshot_path`, `trim_logs`, `trim_replays`, `default_snapshot`
 - `src-tauri/src/commands/mod.rs` — Tauri commands: `get_observability_snapshot`, `add_structured_log`, `update_feature_flags`, `update_permission_policy`, `update_safety_config`, `add_replay_record`
+- `src-tauri/src/trace.rs` — `cloud_push_enabled()` + the `trace_cloud_push!` macro (`CODEMUX_TRACE_CLOUD_PUSH` gate for cloud-push diagnostics)
 - `src/stores/observability-store.ts` — Zustand store consuming the snapshot
 - `src-tauri/src/openflow/orchestrator.rs` — reads `PermissionPolicy` and `SafetyConfig` to gate risky actions and enforce run budgets
 - Persisted file: `dirs::data_dir() / codemux / observability.json` (platform-specific: `~/.local/share/codemux/observability.json` on Linux, `%APPDATA%\codemux\observability.json` on Windows, `~/Library/Application Support/codemux/observability.json` on macOS)
