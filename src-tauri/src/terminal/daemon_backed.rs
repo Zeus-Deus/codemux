@@ -274,7 +274,7 @@ pub async fn spawn_pty_for_agent_via_daemon(
     };
 
     let pid = if let Some(existing) = existing {
-        eprintln!(
+        crate::trace_cloud_push!(
             "[codemux::terminal::daemon_backed] reattaching to live daemon session \
              {session_id} pid={}",
             existing.pid
@@ -414,7 +414,7 @@ pub async fn spawn_pty_for_agent_via_daemon(
             }
             queue_or_send_output(&read_sessions, &read_session_id, chunk);
         }
-        eprintln!(
+        crate::trace_cloud_push!(
             "[codemux::terminal::daemon_backed] read loop ended for session {read_session_id}"
         );
         // Only emit Exited if WE'RE still the runtime's daemon client.
@@ -452,7 +452,7 @@ pub async fn spawn_pty_for_session_via_daemon(
     session_id: String,
 ) -> Result<(), String> {
     let entry_ts = std::time::Instant::now();
-    eprintln!(
+    crate::trace_cloud_push!(
         "[trace:{session_id}] spawn_via_daemon ENTRY t=0ms"
     );
     let terminal_state: State<'_, PtyState> = app.state();
@@ -460,7 +460,7 @@ pub async fn spawn_pty_for_session_via_daemon(
     let sessions = terminal_state.sessions.clone();
 
     if !super::try_reserve_session_spawn(&sessions, &session_id) {
-        eprintln!(
+        crate::trace_cloud_push!(
             "[trace:{session_id}] try_reserve FAILED at t={}ms",
             entry_ts.elapsed().as_millis()
         );
@@ -549,7 +549,7 @@ pub async fn spawn_pty_for_session_via_daemon(
     // keep using the local cwd as before.
     let mut effective_cwd = if is_remote {
         let computed = remote_spawn_cwd(owning_ws);
-        eprintln!(
+        crate::trace_cloud_push!(
             "[codemux::terminal::daemon_backed] remote cwd for {session_id}: \
              {computed} (owning_ws={}, attach_only={}, remote_cwd={:?}, \
              project_root={:?}, git_branch={:?})",
@@ -672,13 +672,13 @@ pub async fn spawn_pty_for_session_via_daemon(
                 );
                 auto_resume_command = Some(cmd);
             } else if has_evidence {
-                eprintln!(
+                crate::trace_cloud_push!(
                     "[codemux::terminal::daemon_backed] remote respawn for {session_id} \
                      has no original_command (was a plain shell, or preset wasn't yet \
                      applied) — spawning bare bash"
                 );
             } else {
-                eprintln!(
+                crate::trace_cloud_push!(
                     "[codemux::terminal::daemon_backed] skipping remote in-memory synthesis \
                      for {session_id}: no disk_meta and no captured agent session id — \
                      treating as a fresh preset launch (apply_preset owns the PTY write)"
@@ -732,7 +732,7 @@ pub async fn spawn_pty_for_session_via_daemon(
                     meta,
                     &adapter_state,
                 ) {
-                    eprintln!(
+                    crate::trace_cloud_push!(
                         "[codemux::terminal::daemon_backed] local restore via \
                          disk_meta+adapter for {session_id} at {ws_id}/{pane_id}"
                     );
@@ -780,7 +780,7 @@ pub async fn spawn_pty_for_session_via_daemon(
                         auto_resume_command = Some(cmd);
                     }
                 } else {
-                    eprintln!(
+                    crate::trace_cloud_push!(
                         "[codemux::terminal::daemon_backed] skipping in-memory synthesis for \
                          {session_id}: no disk_meta and no captured agent session id — \
                          treating as a fresh preset launch (apply_preset owns the PTY write)"
@@ -859,7 +859,7 @@ pub async fn spawn_pty_for_session_via_daemon(
             .collect::<Vec<_>>()
             .join(",")
     });
-    eprintln!(
+    crate::trace_cloud_push!(
         "[trace:{session_id}] daemon.list() at t={}ms returned: [{}]",
         entry_ts.elapsed().as_millis(),
         list_snapshot.unwrap_or_else(|| "ERR".to_string())
@@ -871,7 +871,7 @@ pub async fn spawn_pty_for_session_via_daemon(
     let reattached;
     let pid = if let Some(existing) = existing {
         reattached = true;
-        eprintln!(
+        crate::trace_cloud_push!(
             "[trace:{session_id}] DECISION=reattach pid={} at t={}ms",
             existing.pid,
             entry_ts.elapsed().as_millis()
@@ -879,7 +879,7 @@ pub async fn spawn_pty_for_session_via_daemon(
         existing.pid
     } else {
         reattached = false;
-        eprintln!(
+        crate::trace_cloud_push!(
             "[trace:{session_id}] DECISION=fresh_spawn at t={}ms",
             entry_ts.elapsed().as_millis()
         );
@@ -930,7 +930,7 @@ pub async fn spawn_pty_for_session_via_daemon(
     // message bug). Only write on fresh_spawn where the new bash
     // genuinely needs the agent launched.
     let auto_resume_clone = if reattached {
-        eprintln!(
+        crate::trace_cloud_push!(
             "[trace:{session_id}] reattached — suppressing auto-write of resume command"
         );
         None
@@ -1111,7 +1111,7 @@ pub async fn spawn_pty_for_session_via_daemon(
             }
             queue_or_send_output(&read_sessions, &read_session_id, chunk);
         }
-        eprintln!(
+        crate::trace_cloud_push!(
             "[codemux::terminal::daemon_backed] shell read loop ended for {read_session_id}"
         );
         // Skip emit if this is a stale read task whose session was

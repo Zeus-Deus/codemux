@@ -475,3 +475,6 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 
 **Tunnel says "ssh exited before tunnel came up":**
 - Usually a `-L` bind failure: the local socket already exists from a stale prior tunnel, OR the remote socket dir doesn't exist + can't be created. The tunnel command's `rm -f` + `mkdir -p` covers most of this; if it still fails, check the SSH stderr from the captured error message.
+
+**A push spawns blank/wrong panes and the kept stderr landmarks aren't enough:**
+- Restore the full per-step cloud-push trace (`[trace:…]`, `[client_for_workspace:…]`, per-attempt tunnel/socket polling, `[daemon::spawn]`) by setting `CODEMUX_TRACE_CLOUD_PUSH=1` in the environment of the process you want to inspect — the desktop app for the laptop-side trace, the `codemux-remote` daemon for the host-side trace. No recompile needed. Details + the kept-vs-gated breakdown: `docs/features/observability.md` (§ Cloud-Push Diagnostic Tracing).

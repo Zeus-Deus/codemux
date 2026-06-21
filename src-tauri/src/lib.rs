@@ -77,6 +77,9 @@ pub mod state;
 pub mod hooks;
 pub mod stream_input;
 pub mod terminal;
+// Opt-in cloud-push diagnostic tracing. Defines the crate-wide
+// `trace_cloud_push!` macro (gated on `CODEMUX_TRACE_CLOUD_PUSH`).
+pub mod trace;
 
 /// Save window dimensions and position to SQLite before close.
 fn save_window_state(handle: &tauri::AppHandle) {
