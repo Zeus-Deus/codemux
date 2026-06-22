@@ -40,7 +40,8 @@ function ShortcutHint({ actionId }: { actionId: string }) {
 
 export function CommandPalette({ open, onOpenChange }: Props) {
   const appState = useAppStore((s) => s.appState);
-  const toggleRightPanel = useUIStore((s) => s.toggleRightPanel);
+  const getRightPanelTab = useUIStore((s) => s.getRightPanelTab);
+  const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
@@ -189,12 +190,15 @@ export function CommandPalette({ open, onOpenChange }: Props) {
         <CommandGroup heading="View">
           <CommandItem
             onSelect={() =>
-              run(() =>
-                ws && toggleRightPanel(ws.workspace_id, "files"),
-              )
+              run(() => {
+                if (!ws) return;
+                const current = getRightPanelTab(ws.workspace_id);
+                setRightPanelTab(ws.workspace_id, current == null ? "files" : null);
+              })
             }
           >
             Toggle Right Panel
+            <ShortcutHint actionId="toggleRightPanel" />
           </CommandItem>
           <CommandItem onSelect={() => run(toggleSidebar)}>
             Toggle Sidebar

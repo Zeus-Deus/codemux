@@ -30,7 +30,7 @@
 - Browser tabs open a full-pane embedded browser
 - Diff tabs with unified and split views, syntax highlighting, and section filtering
 - Editor tabs with CodeMirror 6, language detection, and markdown preview
-- Add tab via "+" dropdown or keyboard shortcuts (Ctrl+T, Ctrl+Shift+B, Ctrl+Shift+D)
+- Add tab via "+" dropdown or keyboard shortcuts (Ctrl+T new terminal tab, Ctrl+Shift+D split pane right)
 - Close tabs with X button or Ctrl+W (cannot close the last tab)
 - Switch tabs by clicking or Ctrl+1 through Ctrl+9
 - Tab state persists when switching between workspaces

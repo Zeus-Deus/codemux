@@ -37,7 +37,7 @@ Actions are defined as `CommandItem` components organized into `CommandGroup` co
 - Search in Files (Ctrl+Shift+F)
 
 **View**
-- Toggle Right Panel
+- Toggle Right Panel (Ctrl+Shift+B)
 - Toggle Sidebar (Ctrl+B)
 - Toggle Preset Bar
 - Open Settings (Ctrl+,)
