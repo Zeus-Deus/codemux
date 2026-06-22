@@ -1,20 +1,14 @@
-// Stage 1 smoke test: end-to-end encryption + transport + storage +
-// decryption loop against the live `/api/skills` endpoints. THROWAWAY
-// — once Stage 2 wires the real sync layer this binary becomes
-// redundant. Kept around as a focused integration check that
-// sidesteps the UI and the in-app sync orchestration.
+// Smoke test: transport + storage round-trip against the live
+// `/api/skills` endpoints. Skills are stored server-side (plaintext
+// columns, no client-held key), so this proves the plaintext wire
+// format round-trips cleanly through the deployed server.
 //
 // What it proves:
-//   1. `derive_login_credentials(password, email)` produces an
-//      `encryption_key` that, when used to encrypt a blob with
-//      `crate::encryption::encrypt`, can be round-tripped through
-//      the deployed `/api/skills` server and decrypted back to the
-//      original plaintext.
-//   2. The wire format is byte-stable across the HTTP boundary —
-//      the server doesn't mutate base64 strings (would break
-//      Poly1305 auth on decrypt).
-//   3. Per-record CRUD (POST → GET → PUT → GET → DELETE → GET)
-//      composes correctly.
+//   1. `derive_auth_secret(password, email)` produces an AuthSecret
+//      that signs in against the deployed `/api/auth/desktop/signin`.
+//   2. A skill's `name` + `content` round-trip byte-for-byte through
+//      POST → GET (the server stores and returns them unchanged).
+//   3. Per-record CRUD (POST → GET → DELETE) composes correctly.
 //
 // The smoke handles full account lifecycle on each run:
 //   1. Tries `signin` with the derived AuthSecret. If that succeeds
@@ -28,7 +22,7 @@
 //   3. After verification, re-run the binary — signin will succeed
 //      this time and the loop completes.
 //
-// Run:
+// Run (after the server is deployed with the plaintext skills schema):
 //   API_URL=https://api.codemux.org \
 //   SMOKE_EMAIL=smoke@example.test \
 //   SMOKE_PASSWORD=smoke-test-password-12345 \
@@ -38,12 +32,7 @@
 //   docker compose exec -T postgres psql -U codemux -d codemux \
 //     -c "DELETE FROM \"user\" WHERE email = 'smoke@example.test';"
 
-use base64::Engine as _;
-// On agent-chat, derive_login_credentials lives directly in
-// `auth.rs` (single-file module). When main is merged in, the path
-// becomes `codemux_lib::auth::derivation::derive_login_credentials`.
-use codemux_lib::auth::derive_login_credentials;
-use codemux_lib::encryption::{decrypt, encrypt, EncryptedData, KEY_LEN};
+use codemux_lib::auth::derive_auth_secret;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_API_URL: &str = "https://api.codemux.org";
@@ -69,10 +58,8 @@ struct SignInResponse {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SkillUpload {
-    encrypted_name: String,
-    nonce_name: String,
-    encrypted_content: String,
-    nonce_content: String,
+    name: String,
+    content: String,
     provider: String,
     scope: String,
 }
@@ -81,10 +68,10 @@ struct SkillUpload {
 #[serde(rename_all = "camelCase")]
 struct SkillRow {
     remote_id: String,
-    encrypted_name: String,
-    nonce_name: String,
-    encrypted_content: String,
-    nonce_content: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    content: String,
     provider: String,
     scope: String,
 }
@@ -99,36 +86,6 @@ struct SkillCreateResponse {
     skill: SkillRow,
 }
 
-fn b64_encode(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-fn b64_decode(s: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .map_err(|e| format!("base64 decode: {e}"))
-}
-
-fn encrypt_to_wire(
-    plaintext: &[u8],
-    key: &[u8; KEY_LEN],
-) -> Result<(String, String), String> {
-    let blob = encrypt(plaintext, key)?;
-    Ok((b64_encode(&blob.ciphertext), b64_encode(&blob.nonce)))
-}
-
-fn decrypt_from_wire(
-    ciphertext_b64: &str,
-    nonce_b64: &str,
-    key: &[u8; KEY_LEN],
-) -> Result<Vec<u8>, String> {
-    let blob = EncryptedData {
-        ciphertext: b64_decode(ciphertext_b64)?,
-        nonce: b64_decode(nonce_b64)?,
-    };
-    decrypt(&blob, key)
-}
-
 fn main() {
     let api_url = std::env::var("API_URL").unwrap_or_else(|_| DEFAULT_API_URL.into());
     let email = std::env::var("SMOKE_EMAIL").expect("SMOKE_EMAIL must be set");
@@ -137,10 +94,12 @@ fn main() {
     println!("[smoke] API_URL = {api_url}");
     println!("[smoke] email   = {email}");
 
-    // 1. Derive AuthSecret + encryption_key
-    let (auth, key) = derive_login_credentials(&password, &email)
-        .expect("derivation failed");
-    println!("[smoke] derivation done; auth_secret length = {}", auth.expose_for_external_signin().len());
+    // 1. Derive the AuthSecret (the server never sees the raw password).
+    let auth = derive_auth_secret(&password, &email).expect("derivation failed");
+    println!(
+        "[smoke] derivation done; auth_secret length = {}",
+        auth.expose_for_external_signin().len()
+    );
 
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -181,7 +140,7 @@ fn main() {
             .json(&SignUpBody {
                 email: email.clone(),
                 password: auth_secret_string.clone(),
-                name: "Stage1 Smoke".into(),
+                name: "Skills Smoke".into(),
             })
             .send()
             .expect("signup request");
@@ -201,25 +160,12 @@ fn main() {
         panic!("signin failed ({signin_status}): {signin_text}");
     };
 
-    // 3. Encrypt a fake skill blob client-side
-    let plaintext_name = b"my-secret-skill";
-    let plaintext_content = b"# My secret skill\n\nThis content is end-to-end encrypted.";
-    let (enc_name, nonce_name) =
-        encrypt_to_wire(plaintext_name, key.expose_for_smoke_test()).unwrap();
-    let (enc_content, nonce_content) =
-        encrypt_to_wire(plaintext_content, key.expose_for_smoke_test()).unwrap();
-    println!(
-        "[smoke] encrypted: name {} bytes ct, content {} bytes ct",
-        enc_name.len(),
-        enc_content.len()
-    );
-
-    // 4. POST /api/skills
+    // 3. POST /api/skills with a plaintext skill.
+    let skill_name = "my-smoke-skill";
+    let skill_content = "# My smoke skill\n\nThis content is stored server-side.";
     let upload = SkillUpload {
-        encrypted_name: enc_name.clone(),
-        nonce_name: nonce_name.clone(),
-        encrypted_content: enc_content.clone(),
-        nonce_content: nonce_content.clone(),
+        name: skill_name.into(),
+        content: skill_content.into(),
         provider: "claude".into(),
         scope: "user".into(),
     };
@@ -239,7 +185,7 @@ fn main() {
         serde_json::from_str(&post_text).expect("POST response shape");
     println!("[smoke] POST ok; remoteId = {}", created.skill.remote_id);
 
-    // 5. GET /api/skills
+    // 4. GET /api/skills
     let get_resp = client
         .get(&post_url)
         .bearer_auth(&bearer)
@@ -258,27 +204,15 @@ fn main() {
         .find(|s| s.remote_id == created.skill.remote_id)
         .expect("our skill not in GET response");
 
-    // 6. Wire-format byte-for-byte roundtrip check
-    assert_eq!(our.encrypted_name, enc_name, "encryptedName drifted on wire");
-    assert_eq!(our.nonce_name, nonce_name, "nonceName drifted on wire");
-    assert_eq!(our.encrypted_content, enc_content, "encryptedContent drifted");
-    assert_eq!(our.nonce_content, nonce_content, "nonceContent drifted");
+    // 5. Plaintext round-trip check — the server returns exactly
+    //    what we stored.
+    assert_eq!(our.name, skill_name, "name drifted on wire");
+    assert_eq!(our.content, skill_content, "content drifted on wire");
     assert_eq!(our.provider, "claude");
     assert_eq!(our.scope, "user");
-    println!("[smoke] wire format roundtripped byte-for-byte");
+    println!("[smoke] name + content round-tripped byte-for-byte");
 
-    // 7. Decrypt the pulled blob
-    let recovered_name =
-        decrypt_from_wire(&our.encrypted_name, &our.nonce_name, key.expose_for_smoke_test())
-            .expect("decrypt name");
-    let recovered_content =
-        decrypt_from_wire(&our.encrypted_content, &our.nonce_content, key.expose_for_smoke_test())
-            .expect("decrypt content");
-    assert_eq!(recovered_name.as_slice(), plaintext_name);
-    assert_eq!(recovered_content.as_slice(), plaintext_content);
-    println!("[smoke] decryption matches original plaintext");
-
-    // 8. Clean up — delete the test skill so re-runs are idempotent
+    // 6. Clean up — delete the test skill so re-runs are idempotent.
     let del_url = format!("{api_url}/api/skills/{}", created.skill.remote_id);
     let del_resp = client
         .delete(&del_url)
@@ -295,5 +229,5 @@ fn main() {
         println!("[smoke] cleanup ok");
     }
 
-    println!("[smoke] PASS — Stage 1 end-to-end loop verified");
+    println!("[smoke] PASS — server-side skills round-trip verified");
 }

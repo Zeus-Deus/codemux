@@ -34,7 +34,6 @@ pub mod dialog_fallback;
 pub mod dialog_preflight;
 pub mod app_logs;
 pub mod doctor;
-pub mod encryption;
 pub mod execution;
 pub mod indexing;
 pub mod mcp;
@@ -187,7 +186,6 @@ pub fn run() {
         .manage(session_adapters::AdapterState::new())
         .manage(scrollback::ScrollbackCache::default())
         .manage(auth::AuthState::default())
-        .manage(encryption::EncryptionManager::default())
         .manage(skills_sync::SyncEngine::new())
         .manage(commands::agent_chat::ProviderRegistry::new())
         // Per-thread live event channels for the chat pane: each
@@ -1673,14 +1671,11 @@ pub fn run() {
             commands::sign_out,
             commands::get_auth_token,
             commands::get_sync_status,
-            commands::setup_sync_password,
-            commands::provide_password_for_sync,
             commands::skills_sync_now,
             commands::skills_sync_status,
             commands::get_export_recommended_filename,
             commands::export_skills_to_file,
             commands::import_skills_from_file,
-            commands::wipe_remote_skills_for_reset,
             commands::get_synced_settings,
             commands::update_synced_settings,
             commands::update_setting,

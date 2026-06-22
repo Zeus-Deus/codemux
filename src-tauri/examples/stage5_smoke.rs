@@ -14,8 +14,7 @@
 //     home).
 //   - Edit-then-resync produces an update on the server, not a
 //     duplicate.
-//   - Local export → wipe local → import re-pushes the skills
-//     under the same key.
+//   - Local export → wipe server → import re-pushes the skills.
 //
 // Operator flow (same shape as Stage 1's `skills_smoke`):
 //
@@ -33,8 +32,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use codemux_lib::auth::derive_login_credentials;
-use codemux_lib::encryption::EncryptionManager;
+use codemux_lib::auth::derive_auth_secret;
 use codemux_lib::skills_sync::api_client;
 use codemux_lib::skills_sync::export::{
     export_all_synced_skills, import_exported_skills,
@@ -91,7 +89,7 @@ async fn main() {
 
     // ── Derivation + signin ──────────────────────────────────
     step("derive credentials + signin");
-    let (auth, key) = derive_login_credentials(&password, &email)
+    let auth = derive_auth_secret(&password, &email)
         .unwrap_or_else(|e| fail(format!("derivation failed: {e}")));
     let auth_secret = auth.expose_for_external_signin().to_string();
 
@@ -113,10 +111,6 @@ async fn main() {
     fs::create_dir_all(&skills_root).unwrap();
 
     let engine = SyncEngine::with_home(home.path());
-    let encryption = EncryptionManager::default();
-    encryption
-        .set_key(*key.expose_for_smoke_test())
-        .unwrap_or_else(|e| fail(format!("set_key: {e}")));
 
     let user_paths: Vec<PathBuf> = vec![skills_root.clone()];
     ok(format!("engine home={}", home.path().display()));
@@ -129,7 +123,7 @@ async fn main() {
     fs::write(&skill_path, "# Stage 5 smoke\n\nfirst version\n").unwrap();
 
     let r1 = engine
-        .sync_now(&bearer, &encryption, user_paths.clone())
+        .sync_now(&bearer, user_paths.clone())
         .await
         .unwrap_or_else(|e| fail(format!("sync_now cycle 1: {e}")));
     if r1.pushed_count != 1 {
@@ -157,7 +151,7 @@ async fn main() {
     )
     .unwrap();
     let r2 = engine
-        .sync_now(&bearer, &encryption, user_paths.clone())
+        .sync_now(&bearer, user_paths.clone())
         .await
         .unwrap_or_else(|e| fail(format!("sync_now cycle 2: {e}")));
     if r2.pushed_count != 1 {
@@ -177,7 +171,7 @@ async fn main() {
     // ── Cycle 3: idempotent sync_now is a no-op ─────────────
     step("cycle 3: sync_now with no local changes → no-op");
     let r3 = engine
-        .sync_now(&bearer, &encryption, user_paths.clone())
+        .sync_now(&bearer, user_paths.clone())
         .await
         .unwrap_or_else(|e| fail(format!("sync_now cycle 3: {e}")));
     if r3.pushed_count != 0 {
@@ -192,7 +186,7 @@ async fn main() {
     let fresh_paths: Vec<PathBuf> = vec![fresh_home.path().join(".codemux/skills")];
 
     let r4 = fresh_engine
-        .sync_now(&bearer, &encryption, fresh_paths.clone())
+        .sync_now(&bearer, fresh_paths.clone())
         .await
         .unwrap_or_else(|e| fail(format!("fresh sync_now: {e}")));
     if r4.pulled_count != 1 {
@@ -219,7 +213,7 @@ async fn main() {
     // ── Export → wipe local → import → re-push ──────────────
     step("export → wipe local → import → re-push");
     let export_path = home.path().join("stage5-export.json");
-    let exported = export_all_synced_skills(&bearer, &encryption, &export_path, &email)
+    let exported = export_all_synced_skills(&bearer, &export_path, &email)
         .await
         .unwrap_or_else(|e| fail(format!("export: {e}")));
     if exported.skill_count != 1 {
@@ -245,7 +239,7 @@ async fn main() {
     }
     ok("server wiped to empty");
 
-    let imported = import_exported_skills(&bearer, &encryption, &export_path, &email)
+    let imported = import_exported_skills(&bearer, &export_path, &email)
         .await
         .unwrap_or_else(|e| fail(format!("import: {e}")));
     if imported.queued_count != 1 || imported.failed_count != 0 || imported.mismatched_email {

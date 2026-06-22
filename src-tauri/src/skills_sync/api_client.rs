@@ -2,9 +2,16 @@
 //
 // Mirrors `crate::settings_sync` for shape: free async functions
 // that take a bearer token and return decoded payloads. The wire
-// types match the Stage 1 server-side definition in
+// types match the server-side definition in
 // `~/codemux-api/api/src/index.ts`. Field names are camelCase on
 // the wire to match the Rust `SkillWire` shape the server expects.
+//
+// Skills are stored **server-side**: the skill name and content
+// travel as plaintext and the server persists them in plaintext
+// columns (protected at rest by the database/disk, server-readable
+// — the same model Codemux's `user_settings` sync already uses).
+// There is no client-held encryption key, so single-sign-on users
+// (GitHub OAuth) sync without ever setting a password.
 //
 // Errors are surfaced as `String` — the sync engine wraps them
 // with context. Network failures vs HTTP-error-status are not
@@ -17,14 +24,20 @@ use crate::auth::api_base_url;
 
 /// Wire-format skill row, returned by GET / POST / PUT.
 /// `remote_id` is a stringified BIGSERIAL (Stage 1 contract).
+///
+/// `name` and `content` are plaintext. They default to empty
+/// strings when missing so legacy rows that predate the
+/// server-side migration (which only carried ciphertext columns)
+/// deserialize cleanly; the engine skips any row whose `name` is
+/// empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillWire {
     pub remote_id: String,
-    pub encrypted_name: String,
-    pub nonce_name: String,
-    pub encrypted_content: String,
-    pub nonce_content: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub content: String,
     pub provider: String,
     pub scope: String,
     pub updated_at: String,
@@ -36,10 +49,8 @@ pub struct SkillWire {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillUpload {
-    pub encrypted_name: String,
-    pub nonce_name: String,
-    pub encrypted_content: String,
-    pub nonce_content: String,
+    pub name: String,
+    pub content: String,
     pub provider: String,
     pub scope: String,
 }
@@ -54,9 +65,8 @@ struct CreateUpdateResponse {
     skill: SkillWire,
 }
 
-/// `GET /api/skills` — list every encrypted skill the user has
-/// synced, newest-updated first. Returned ciphertext is opaque to
-/// this layer; the engine decrypts on the way through.
+/// `GET /api/skills` — list every skill the user has synced,
+/// newest-updated first. Names + contents come back as plaintext.
 pub async fn list_skills(token: &str) -> Result<Vec<SkillWire>, String> {
     let base = api_base_url();
     let resp = reqwest::Client::new()
@@ -101,8 +111,8 @@ pub async fn create_skill(
     Ok(body.skill)
 }
 
-/// `PUT /api/skills/:id` — replace the ciphertext + metadata for
-/// an existing skill. 404 means "another device wiped this skill
+/// `PUT /api/skills/:id` — replace the name + content + metadata
+/// for an existing skill. 404 means "another device wiped this skill
 /// from the server" (or the local mapping is stale); the caller
 /// should drop the mapping entry and retry as a create.
 pub async fn update_skill(

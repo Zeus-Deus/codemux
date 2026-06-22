@@ -46,9 +46,8 @@ pub struct MappingEntry {
     /// Server-assigned BIGSERIAL id, serialized as a string on the
     /// wire (Stage 1 contract: bigint > JS Number.MAX_SAFE_INTEGER).
     pub remote_id: String,
-    /// Skill name in plaintext. Cached locally because the server
-    /// stores only the encrypted name; pulling without a cached
-    /// name means decrypt-everything-to-find-this-row.
+    /// Skill name. Cached locally so the push pipeline can map a
+    /// local file to its server row without re-reading the server.
     pub name: String,
     pub provider: String,
     pub scope: String,
@@ -68,6 +67,16 @@ pub struct SkillMapping {
     pub version: u32,
     #[serde(default)]
     pub skills: Vec<MappingEntry>,
+    /// One-time flag for the E2E→server-side migration. Mappings
+    /// written before skills moved to plaintext server-side storage
+    /// deserialize this to `false` (serde default), which tells the
+    /// engine to force a single re-push of every mapped skill so the
+    /// server rows are rewritten from ciphertext to plaintext **in
+    /// place** (PUT to the existing `remote_id` — no duplicate rows,
+    /// no data loss). The engine sets it `true` after the migrating
+    /// cycle. Fresh installs start `true` via `Default`.
+    #[serde(default)]
+    pub plaintext_migrated: bool,
 }
 
 impl Default for SkillMapping {
@@ -75,6 +84,9 @@ impl Default for SkillMapping {
         Self {
             version: MAPPING_SCHEMA_VERSION,
             skills: Vec::new(),
+            // A brand-new mapping has no legacy ciphertext rows to
+            // migrate, so it starts already-migrated.
+            plaintext_migrated: true,
         }
     }
 }
