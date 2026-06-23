@@ -92,9 +92,8 @@ The login screen is shown when `isAuthenticated: false`. While `isLoading: true`
 
 - `src-tauri/src/auth/mod.rs` — Encryption, token storage, CSRF state, machine key derivation
 - `src-tauri/src/auth/api.rs` — Better Auth HTTP helpers (typed `AuthSecret` boundary so raw passwords cannot leak into outgoing requests at compile time)
-- `src-tauri/src/auth/derivation.rs` — `derive_login_credentials(password, email)`: Argon2id (m=64MiB, t=3, p=4) → HKDF-SHA256 fan-out to `AuthSecret` (sent to Better Auth in place of the password) + `EncryptionKey` (32 raw bytes, never leaves the device). Cross-product byte-identical with Vexis via the shared `codemux-api-*` HKDF labels; pinned in CI by `auth_secret_matches_vexis_*` and `encryption_key_matches_vexis_for_known_input` hex tests.
-- `src-tauri/src/commands/auth.rs` — Tauri commands: OAuth flow, email sign-in/up, check auth, sign out, sync-password setup/repair, custom `set_password_api` HTTP helper for the upstream Better Auth bug workaround
-- `src-tauri/src/encryption/` — `EncryptionManager` for the skills-sync key (Mutex<Option<[u8; 32]>>, `with_key(closure)` escape route, machine-bound disk persistence)
+- `src-tauri/src/auth/derivation.rs` — `derive_auth_secret(password, email)`: Argon2id (m=64MiB, t=3, p=4) → HKDF-SHA256 → `AuthSecret` (sent to Better Auth in place of the password). The sibling `derive_login_credentials` also derives an `EncryptionKey` (32 raw bytes), but since skills moved server-side in PR #112 that half is unused by Codemux and retained only as a Vexis cross-product canary. Pinned in CI by `auth_secret_matches_vexis_*` and `encryption_key_matches_vexis_for_known_input` hex tests.
+- `src-tauri/src/commands/auth.rs` — Tauri commands: OAuth flow, email sign-in/up, check auth, sign out (the OAuth sync-password setup/repair commands + the custom `set_password_api` helper were removed with the E2E skills model in PR #112)
 - `src/stores/auth-store.ts` — Zustand store: user state, dev bypass, loading flags, `syncAvailable`, `authMethod`
 - `src/components/auth/login-screen.tsx` — Login UI with all 4 views
 - `src/tauri/types.ts` — `AuthUser`, `AuthResponse` types

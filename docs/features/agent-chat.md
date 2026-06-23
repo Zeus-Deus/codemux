@@ -87,7 +87,7 @@ The chat pane stack:
   `docs/plans/step-8-attachments.md`.
 - **Slash command popup** with cross-provider parsing.
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
-  compat. End-to-end encrypted sync (see `docs/features/skills-sync.md`).
+  compat. Server-side sync (see `docs/features/skills-sync.md`).
 - **MCP host runtime** (Step 9): Codemux discovers user-installed MCP
   servers across Codemux / Claude / Cursor paths, spawns each child once,
   exposes tools to the Claude SDK via an in-process facade with dynamic

@@ -1,5 +1,7 @@
 # Step 10 — Skills Sync (COMPLETE — All 6 Stages Shipped)
 
+> **Superseded (PR #112):** the end-to-end-encrypted model recorded below shipped, then was replaced with **server-side plaintext storage** so GitHub OAuth / SSO users can sync without inventing a sync password. The `EncryptionManager`, `sync-key.enc`, `encryption/` module, OAuth sync-password setup, and reset-password dialog described in these stages are gone. This doc is kept as the E2E-era audit trail; for current behavior read `docs/features/skills-sync.md`.
+
 - Purpose: Per-stage history + final state for Step 10. Current behavior lives in `docs/features/skills-sync.md`; this doc is the audit trail.
 - Audience: Anyone wanting to know what happened in each stage, plus the cumulative test counts and operator artifacts.
 - Authority: Closed plan. Future maintenance work goes in new plan docs (e.g. `docs/plans/step-10.5-project-scoped-sync.md` when 10.5 starts).

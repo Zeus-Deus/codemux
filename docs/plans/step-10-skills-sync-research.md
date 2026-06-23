@@ -1,5 +1,7 @@
 # Step 10 — Skills Sync: E2E Research Spike
 
+> **Outcome reversed (PR #112):** this spike recommended GO-E2E and Step 10 shipped that way, but skills sync was later moved to **server-side plaintext storage** because the E2E model forced GitHub OAuth / SSO users to invent a sync password before they could sync at all. Read this as the original design rationale, not current behavior — see `docs/features/skills-sync.md`.
+
 - Purpose: Decide whether Codemux's user-skill sync should ship with end-to-end encryption (E2E) or server-side encryption only.
 - Audience: Whoever owns Step 10 implementation.
 - Authority: Pre-implementation research. No code yet.

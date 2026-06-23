@@ -92,7 +92,7 @@
 - Attachments via `+` and `@`: files, folders, GitHub issues + PRs, images via paste / drop / picker
 - Slash command popup with cross-provider parsing
 - Cross-provider skill system (watcher, conflicts, disable, refined compat)
-- End-to-end encrypted skills sync across devices
+- Server-side skills sync across devices (plaintext name/content, encrypted at rest; no client-held key, so OAuth/SSO users sync with no password prompt)
 - Permission settings page with per-tool body rendering and AllowAlways rule persistence
 - Session history selector + transcript persistence + replay on session resume
 - Run checkpoints (opt-in via Settings → Agent): background working-tree snapshot at session start, restore button in the pane header rolls the workspace back to the pre-run state
@@ -243,12 +243,11 @@
 
 - GitHub OAuth, email/password with email verification
 - AES-256-GCM encrypted token storage with machine-bound key
-- Zero-knowledge auth derivation: Argon2id → HKDF-SHA256 → split `AuthSecret` (server) + `EncryptionKey` (client-only)
+- Auth derivation: Argon2id → HKDF-SHA256 → `AuthSecret` (server) via `derive_auth_secret`; the sibling `EncryptionKey` (client-only) is now a Vexis-only protocol canary since skills moved server-side in PR #112
 - Cross-product byte-identical with Vexis (pinned in CI)
-- End-to-end encrypted skills sync across devices (XChaCha20-Poly1305, machine-bound key persistence)
-- Settings → Account → Sync surface with live status + relative-time + Export/Import/Forgot-password controls
+- Server-side skills sync across devices (plaintext name/content, encrypted at rest; no client-held key, so OAuth/SSO users sync with no password prompt)
+- Settings → Account → Sync surface with live status + relative-time + Export/Import controls (two-state ready/sign-in dashboard)
 - Per-user synced settings with server sync, offline cache, and dirty flag
-- Multi-step reset flow that enforces export-or-explicit-skip before the destructive wipe
 
 ## Command Palette
 

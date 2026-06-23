@@ -1,5 +1,7 @@
 # Step 10 — Manual UI Smoke Checklist
 
+> **Partly obsolete (PR #112):** skills sync moved from end-to-end-encrypted to **server-side plaintext storage**. The sync-password setup, "Forgot your sync password?" reset dialog, and `~/.local/share/codemux/sync-key.enc` steps below no longer exist; OAuth users are now sync-ready with no password. The skill-file create / edit / cross-device-pull / export / import steps still apply. Current behavior: `docs/features/skills-sync.md`.
+
 - Purpose: Operator-driven walkthrough that exercises the visible surface of skills sync end-to-end. Run after a fresh `npm run dev` build.
 - Audience: Anyone validating a Step 10 release or debugging a regression report.
 - Authority: Manual verification protocol. Programmatic coverage lives in the Vitest suite + `examples/skills_smoke.rs` + `examples/stage5_smoke.rs`; this checklist is the human-driven complement.
