@@ -16,6 +16,7 @@ Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, an
 |----------|--------|-------|
 | Ctrl+K | Command palette | Fuzzy search for any action |
 | Ctrl+B | Toggle sidebar | Collapse the left sidebar to an icon rail / expand it (see `docs/features/sidebar.md`) |
+| Ctrl+Shift+B | Toggle right panel | Show/hide the right panel (Files, Changes, Review) for the active workspace |
 | Ctrl+, | Open settings | Opens the settings panel |
 | Ctrl+Shift+? | Keyboard shortcuts | Opens Settings to the keyboard-shortcuts page (press Ctrl+Shift+/) |
 | Ctrl+O | Open project | Opens a folder picker to add an existing project |

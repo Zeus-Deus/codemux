@@ -191,6 +191,16 @@ export function dispatch(actionId: string, _e: KeyboardEvent): boolean {
     return true;
   }
 
+  // ── Toggle right panel ──
+  // True toggle: any open tab closes the panel; closed opens straight to
+  // Files. Mirrors the tab-bar button — using the store's by-tab-identity
+  // `toggleRightPanel` would switch tabs instead of closing.
+  if (actionId === "toggleRightPanel") {
+    const current = ui.getRightPanelTab(ws.workspace_id);
+    ui.setRightPanelTab(ws.workspace_id, current == null ? "files" : null);
+    return true;
+  }
+
   // ── New workspace in the current project (quick-create) ──
   // Mirrors the per-project "+" in the sidebar, scoped to the active
   // workspace's project. A home-rooted workspace just creates another home

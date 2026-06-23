@@ -20,6 +20,7 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   // ── General ──
   { id: "commandPalette", label: "Command palette", category: "general", defaultKeys: "Ctrl+K" },
   { id: "toggleSidebar", label: "Toggle sidebar", category: "general", defaultKeys: "Ctrl+B" },
+  { id: "toggleRightPanel", label: "Toggle right panel", category: "general", defaultKeys: "Ctrl+Shift+B", description: "Show/hide the right panel (Files, Changes, Review)" },
   { id: "openSettings", label: "Open settings", category: "general", defaultKeys: "Ctrl+," },
   { id: "openProject", label: "Open project", category: "general", defaultKeys: "Ctrl+O", description: "Open an existing folder as a project" },
   { id: "showShortcuts", label: "Keyboard shortcuts", category: "general", defaultKeys: "Ctrl+Shift+?", description: "Open Settings to the keyboard-shortcuts page" },
