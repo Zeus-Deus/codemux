@@ -3,10 +3,8 @@
 // Two trigger sources:
 //
 //   1. "Sync just became available" — emitted as part of the
-//      Stage 2 `sync-state-changed` event when the user signs in
-//      with a key already loaded, or when they finish
-//      `setup_sync_password` for the first time. We want the
-//      first pull to land immediately so the user sees their
+//      `sync-state-changed` event when the user signs in. We want
+//      the first pull to land immediately so the user sees their
 //      skills appear without manually pressing anything.
 //
 //   2. "Skills directory changed" — emitted by Step 7's existing

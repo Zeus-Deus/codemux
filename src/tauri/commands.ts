@@ -146,48 +146,28 @@ export const signOut = () =>
 export const getAuthToken = () =>
   invoke<string | null>("get_auth_token");
 
-// ── Skills Sync (Step 10 — Stage 2) ──
+// ── Skills Sync (Step 10) ──
 //
-// `syncAvailable` reports whether the in-memory encryption key is
-// loaded — sync features can only fire when this is true. False
-// means either:
-//   - GitHub OAuth user who hasn't run `setupSyncPassword` yet
-//   - Local `sync-key.enc` was lost (call `providePasswordForSync`)
-//   - User just signed out
-//
-// `authMethod` distinguishes "needs setup" from "needs repair":
-//   - `"github"` + sync_available=false  → SetupSyncPasswordForm
-//   - `"email"` or null + sync_available=false → ProvidePasswordForm
+// Skills sync is stored server-side (no client-held key), so
+// `syncAvailable` is simply "the user is signed in." `authMethod`
+// is reported so the UI can tailor copy. There's no password to set
+// up and no device-local key to repair.
 
 export interface SyncStatus {
   syncAvailable: boolean;
   authMethod: "email" | "github" | null;
 }
 
-/// Read the current sync state. Cheap, in-memory; no API roundtrip.
-/// Use this on Settings → Sync mount and after any setup/repair.
+/// Read the current sync state. Cheap; no API roundtrip. Use this
+/// on Settings → Sync mount.
 export const getSyncStatus = () => invoke<SyncStatus>("get_sync_status");
 
-/// One-time GitHub-OAuth-user setup. Derives credentials from
-/// `(password, user.email)`, posts the AuthSecret to Better Auth's
-/// `/api/auth/set-password`, then persists the encryption key
-/// machine-bound at `~/.local/share/codemux/sync-key.enc` and loads
-/// it into in-process memory. Returns the updated SyncStatus.
-export const setupSyncPassword = (password: string) =>
-  invoke<SyncStatus>("setup_sync_password", { password });
-
-/// Repair flow: re-derive the encryption key when the local
-/// `sync-key.enc` file is missing or undecryptable. No server call;
-/// wrong password is detected lazily by Stage 3's first sync attempt.
-export const providePasswordForSync = (password: string) =>
-  invoke<SyncStatus>("provide_password_for_sync", { password });
-
-// ── Skills sync engine (Stage 3) ──
+// ── Skills sync engine ──
 //
-// `skills_sync_now` pulls every encrypted skill from /api/skills,
-// decrypts + writes to ~/.codemux/skills/, then walks every
-// syncable user-scope skill path and pushes anything that's
-// changed. Idempotent; safe to call back-to-back.
+// `skills_sync_now` pulls every skill from /api/skills, writes them
+// to ~/.codemux/skills/, then walks every syncable user-scope skill
+// path and pushes anything that's changed. Idempotent; safe to call
+// back-to-back.
 //
 // `skills_sync_status` is a cheap status read for UI rendering.
 // The engine's state is also broadcast over the Tauri
@@ -215,22 +195,16 @@ export const skillsSyncNow = () =>
 export const skillsSyncStatus = () =>
   invoke<SkillsSyncStateSnapshot>("skills_sync_status");
 
-// ── Skills sync — local export / import / reset (Stage 4) ──
+// ── Skills sync — local export / import ──
 //
-// `exportSkillsToFile` pulls every encrypted skill, decrypts with
-// the in-memory key, and writes a plaintext JSON file at the
-// path the user picked via the OS save-dialog.
+// `exportSkillsToFile` pulls every synced skill and writes a
+// plaintext JSON file at the path the user picked via the OS
+// save-dialog.
 //
-// `importSkillsFromFile` is the inverse: read a JSON backup,
-// re-encrypt every skill with the CURRENT key (post-reset), and
-// push to the server. Use `mismatchedEmail` to surface a soft
-// warning when the backup belongs to a different account.
-//
-// `wipeRemoteSkillsForReset` is the destructive helper used by
-// the reset-sync-password dialog: it wipes the server's
-// encrypted skills, clears the local key, and triggers Better
-// Auth's email-reset flow. The user finishes the reset by
-// clicking the link in their email and then signs back in here.
+// `importSkillsFromFile` is the inverse: read a JSON backup and
+// re-push every skill to the server. Use `mismatchedEmail` to
+// surface a soft warning when the backup belongs to a different
+// account.
 
 export interface ExportSummary {
   path: string;
@@ -253,9 +227,6 @@ export const exportSkillsToFile = (filePath: string) =>
 
 export const importSkillsFromFile = (filePath: string) =>
   invoke<ImportSummary>("import_skills_from_file", { filePath });
-
-export const wipeRemoteSkillsForReset = () =>
-  invoke<void>("wipe_remote_skills_for_reset");
 
 // ── Settings Sync ──
 

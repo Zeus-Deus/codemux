@@ -8,7 +8,6 @@ use tauri::Manager;
 
 use crate::commands::SyncStatus;
 use crate::database::DatabaseStore;
-use crate::encryption::EncryptionManager;
 
 // fs is used by machine_id() and token_file_path() (migration support)
 use std::fs;
@@ -360,90 +359,6 @@ pub fn is_token_expired(expires_at: &str) -> bool {
         .unwrap_or(true)
 }
 
-// ── Sync encryption key (Stage 2) ────────────────────────────────
-//
-// The 32-byte symmetric `encryption_key` from
-// `derive_login_credentials` is persisted as a separate file at
-// `~/.local/share/codemux/sync-key.enc`, encrypted with the same
-// machine-bound AES-256-GCM wrap as the auth token. Mirrors Vexis's
-// `auth/token_store.rs::save_encryption_key` pattern.
-//
-// Why a separate file rather than alongside the auth token: the
-// auth token's lifecycle (signin, refresh, logout) is independent
-// of the sync key's lifecycle (setup, repair, reset_sync). Keeping
-// them in separate files means a partially-corrupted token file
-// doesn't take the sync key down with it and vice versa.
-//
-// Why the same machine-bound wrap: the threat model is identical —
-// neither file should be useful when copied to a different machine.
-// `derive_key(salt)` uses the host's `/etc/machine-id` (with macOS
-// and hostname fallbacks) as the master input, so a stolen
-// `sync-key.enc` from laptop A cannot be decrypted on laptop B.
-
-pub(crate) fn sync_key_file_path() -> PathBuf {
-    let data_dir = dirs::data_dir()
-        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
-    data_dir.join(crate::APP_DIR_NAME).join("sync-key.enc")
-}
-
-/// Encrypt `key` with the machine-bound wrap and write to
-/// `sync-key.enc`. Returns the resolved path so callers can log it
-/// at info level (the path is not sensitive — only the file
-/// contents are, and those are already AES-GCM-wrapped).
-pub fn save_encryption_key(key: &[u8; 32]) -> Result<PathBuf, String> {
-    let path = sync_key_file_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create data dir: {e}"))?;
-    }
-    let encrypted = encrypt_data(key)?;
-    fs::write(&path, &encrypted).map_err(|e| format!("write sync-key.enc: {e}"))?;
-    Ok(path)
-}
-
-/// Read `sync-key.enc` if present and decrypt the 32-byte key.
-/// Returns `Ok(None)` if the file does not exist (fresh install,
-/// post-logout, or pre-setup state). Returns `Err` only on
-/// genuinely unexpected errors — a missing file is a normal state.
-///
-/// A decrypt failure also returns `Ok(None)` rather than `Err`: the
-/// most common cause is "file copied from another machine" or "the
-/// machine's `/etc/machine-id` was regenerated", in which case the
-/// only sane recovery is to treat the key as missing and prompt the
-/// user to re-derive via `provide_password_for_sync`.
-pub fn load_encryption_key() -> Result<Option<[u8; 32]>, String> {
-    let path = sync_key_file_path();
-    let data = match fs::read(&path) {
-        Ok(d) => d,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(format!("read sync-key.enc: {err}")),
-    };
-    let plaintext = match decrypt_data(&data) {
-        Ok(b) => b,
-        Err(_) => return Ok(None),
-    };
-    if plaintext.len() != 32 {
-        // Wrong size means the file was tampered with or written by
-        // a different version. Treat as missing — Stage 3 will
-        // route the user through provide_password_for_sync.
-        return Ok(None);
-    }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&plaintext);
-    Ok(Some(key))
-}
-
-/// Delete the persisted sync key. Used on logout and as part of
-/// the `reset_sync` recovery flow. Missing-file is treated as
-/// success — the caller wanted the file gone, and it is.
-pub fn delete_encryption_key() -> Result<(), String> {
-    let path = sync_key_file_path();
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(format!("remove sync-key.enc: {err}")),
-    }
-}
-
 // ── Localhost callback server ────────────────────────────────────
 
 pub fn start_callback_server(
@@ -566,20 +481,15 @@ pub fn start_callback_server(
                         // Emit auth event to frontend
                         emit_auth_state(&handle_clone, token, expires_at);
 
-                        // Mirror the signin_email pattern: tell the
-                        // frontend the sync state immediately. OAuth
-                        // signin doesn't load an encryption key (no
-                        // password was typed), so `sync_available`
-                        // is whatever EncryptionManager reports. The
-                        // important field for the Settings UI is
-                        // `auth_method=github` — that's what selects
-                        // SetupSyncPasswordForm.
-                        let encryption_local: tauri::State<'_, EncryptionManager> =
-                            handle_clone.state();
+                        // Tell the frontend that skills sync is
+                        // available immediately. Skills sync is
+                        // server-side now, so an OAuth user is sync-
+                        // ready the moment they're signed in — no
+                        // password to set, no device-local key.
                         let _ = handle_clone.emit(
                             "sync-state-changed",
                             &SyncStatus {
-                                sync_available: encryption_local.is_available(),
+                                sync_available: true,
                                 auth_method: Some("github".into()),
                             },
                         );

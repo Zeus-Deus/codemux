@@ -20,12 +20,11 @@ interface AuthStore {
   error: string | null;
   devBypass: boolean;
 
-  // Skills sync (Stage 2). Backend keeps the encryption key bytes;
-  // the frontend only sees a boolean + the auth method that picked
-  // the user's session. The pair drives the Settings → Sync UI fork:
-  //   - syncAvailable=true                        → "Sync ready"
-  //   - syncAvailable=false, authMethod=github    → SetupSyncPasswordForm
-  //   - syncAvailable=false, authMethod=email|nil → ProvidePasswordForm
+  // Skills sync. Stored server-side (no client-held key), so
+  // `syncAvailable` is simply "the user is signed in." `authMethod`
+  // is kept so the UI can tailor copy.
+  //   - syncAvailable=true  → Settings → Sync shows the dashboard
+  //   - syncAvailable=false → "sign in to sync" hint
   syncAvailable: boolean;
   authMethod: AuthMethod;
 
@@ -72,10 +71,9 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         const user = await checkAuthCmd();
         if (user) {
           set({ user, isAuthenticated: true, isLoading: false });
-          // Pull the cold-start sync state. Backend may have loaded
-          // the persisted sync-key.enc, in which case we want to
-          // mark the session as sync-ready immediately rather than
-          // waiting for the `sync-state-changed` event.
+          // Pull the cold-start sync state so we can mark the
+          // session sync-ready immediately rather than waiting for
+          // the `sync-state-changed` event.
           try {
             const status = await getSyncStatusCmd();
             set({

@@ -1,20 +1,23 @@
-// Skills sync engine (Step 10 — Stage 3).
+// Skills sync engine (Step 10).
 //
 // Top-level module that ties together:
 //
 //   - `path_detection` — "is this path syncable?"
 //   - `mapping`        — local↔remote_id JSON table on disk
 //   - `api_client`     — POST/PUT/GET/DELETE /api/skills wrappers
-//   - `crate::encryption::EncryptionManager` — the in-memory key
-//   - `crate::encryption::{encrypt, decrypt}` — XChaCha20-Poly1305
+//
+// Skills are stored **server-side** (plaintext columns, protected
+// at rest by the database — the same model `user_settings` sync
+// uses). There is no client-held encryption key, so single-sign-on
+// users sync without ever setting a sync password.
 //
 // Single public entry point: `SyncEngine::sync_now(token)`. The
 // engine is a Tauri-managed singleton. Every call walks the
 // pull-then-push cycle:
 //
 //   1. Pull the full server list.
-//   2. For each remote skill: decrypt, decide whether to write to
-//      disk based on conflict-resolution rules.
+//   2. For each remote skill: decide whether to write to disk
+//      based on conflict-resolution rules.
 //   3. Walk all syncable user-scope skill paths on disk.
 //   4. For each local SKILL.md: decide whether to push based on
 //      mtime vs the mapping's last_synced_at.
@@ -47,10 +50,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::Engine as _;
 use serde::Serialize;
 
-use crate::encryption::{decrypt, encrypt, EncryptedData, EncryptionManager};
 use api_client::{SkillUpload, SkillWire};
 use mapping::{default_mapping_path, load_mapping, save_mapping, MappingEntry, SkillMapping};
 use path_detection::{destination_path_after_pull, detect_skill_path};
@@ -150,7 +151,6 @@ impl SyncEngine {
     pub async fn sync_now(
         &self,
         token: &str,
-        encryption: &EncryptionManager,
         enumerate_paths: Vec<PathBuf>,
     ) -> Result<SyncResult, String> {
         let started_millis = now_millis();
@@ -165,9 +165,7 @@ impl SyncEngine {
             };
         }
 
-        let result = self
-            .run_cycle(token, encryption, enumerate_paths)
-            .await;
+        let result = self.run_cycle(token, enumerate_paths).await;
 
         // Update final state.
         {
@@ -192,7 +190,6 @@ impl SyncEngine {
     async fn run_cycle(
         &self,
         token: &str,
-        encryption: &EncryptionManager,
         enumerate_paths: Vec<PathBuf>,
     ) -> Result<SyncResult, String> {
         let (mapping_path, home, skills_root) = {
@@ -206,11 +203,27 @@ impl SyncEngine {
         let mut mapping = load_mapping(&mapping_path);
         let mut result = SyncResult::default();
 
+        // ── ONE-TIME E2E → server-side migration ──────────────
+        // A mapping written by a build that still encrypted skills
+        // client-side has `plaintext_migrated == false`. Zero every
+        // entry's `last_synced_at_millis` so the push pass below
+        // treats every local skill as dirty and re-uploads it as
+        // plaintext via PUT to its existing `remote_id` — rewriting
+        // the old ciphertext row in place (no duplicate rows, no
+        // data loss). Setting the flag now means this runs exactly
+        // once; it's persisted in the `save_mapping` at the end.
+        if !mapping.plaintext_migrated {
+            for entry in mapping.skills.iter_mut() {
+                entry.last_synced_at_millis = 0;
+            }
+            mapping.plaintext_migrated = true;
+        }
+
         // ── PULL ──────────────────────────────────────────────
         let remote = api_client::list_skills(token).await?;
 
         for wire in &remote {
-            match self.apply_remote_skill(wire, &mut mapping, encryption, &home, &skills_root) {
+            match self.apply_remote_skill(wire, &mut mapping, &home, &skills_root) {
                 Ok(applied) => {
                     if applied {
                         result.pulled_count += 1;
@@ -236,10 +249,7 @@ impl SyncEngine {
         // whether it needs an update.
         let local_files = collect_local_skill_files(&enumerate_paths);
         for local in &local_files {
-            match self
-                .push_one(local, &mut mapping, token, encryption, &home)
-                .await
-            {
+            match self.push_one(local, &mut mapping, token, &home).await {
                 Ok(PushOutcome::Pushed) => result.pushed_count += 1,
                 Ok(PushOutcome::Skipped) => {}
                 Ok(PushOutcome::Conflict) => {
@@ -265,10 +275,18 @@ impl SyncEngine {
         &self,
         wire: &SkillWire,
         mapping: &mut SkillMapping,
-        encryption: &EncryptionManager,
         home: &Path,
         skills_root: &Path,
     ) -> Result<bool, String> {
+        // Skip rows the server couldn't give us a usable name for.
+        // This covers legacy ciphertext-only rows that predate the
+        // server-side migration and haven't been re-pushed yet —
+        // the server returns them with an empty name. They get
+        // rewritten in place the next time the owning device pushes.
+        if wire.name.is_empty() {
+            return Ok(false);
+        }
+
         let server_updated_millis = parse_iso_to_millis(&wire.updated_at)
             .ok_or_else(|| format!("invalid server updated_at: {}", wire.updated_at))?;
 
@@ -282,31 +300,9 @@ impl SyncEngine {
             }
         }
 
-        // Decrypt name + content. Done as one closure so the key
-        // never crosses outside `with_key`.
-        let (name_plain, content_plain) = encryption
-            .with_key(|key| -> Result<(String, String), String> {
-                let name_bytes = decrypt(
-                    &EncryptedData {
-                        ciphertext: base64_decode(&wire.encrypted_name)?,
-                        nonce: base64_decode(&wire.nonce_name)?,
-                    },
-                    key,
-                )?;
-                let content_bytes = decrypt(
-                    &EncryptedData {
-                        ciphertext: base64_decode(&wire.encrypted_content)?,
-                        nonce: base64_decode(&wire.nonce_content)?,
-                    },
-                    key,
-                )?;
-                let name = String::from_utf8(name_bytes)
-                    .map_err(|e| format!("name not utf-8: {e}"))?;
-                let content = String::from_utf8(content_bytes)
-                    .map_err(|e| format!("content not utf-8: {e}"))?;
-                Ok((name, content))
-            })
-            .ok_or_else(|| "sync key not loaded".to_string())??;
+        // Names + contents arrive as plaintext from the server.
+        let name_plain = wire.name.clone();
+        let content_plain = wire.content.clone();
 
         // Decide the destination path. New entries always land at
         // the canonical `~/.codemux/skills/<name>/SKILL.md`.
@@ -382,7 +378,6 @@ impl SyncEngine {
         local: &Path,
         mapping: &mut SkillMapping,
         token: &str,
-        encryption: &EncryptionManager,
         home: &Path,
     ) -> Result<PushOutcome, String> {
         // Path classification first — drop anything plugin /
@@ -408,19 +403,6 @@ impl SyncEngine {
         let name = skill_name_from_path(local)
             .ok_or_else(|| format!("could not derive skill name from {}", local.display()))?;
 
-        let (encrypted_name, nonce_name, encrypted_content, nonce_content) = encryption
-            .with_key(|key| {
-                let n = encrypt(name.as_bytes(), key)?;
-                let c = encrypt(content.as_bytes(), key)?;
-                Ok::<_, String>((
-                    base64_encode(&n.ciphertext),
-                    base64_encode(&n.nonce),
-                    base64_encode(&c.ciphertext),
-                    base64_encode(&c.nonce),
-                ))
-            })
-            .ok_or_else(|| "sync key not loaded".to_string())??;
-
         // Use the mapping's recorded provider when available so
         // origin survives across receiving-device edits (where the
         // file ends up under `~/.codemux/skills/` regardless of
@@ -436,10 +418,8 @@ impl SyncEngine {
             .unwrap_or(path_info.scope);
 
         let upload = SkillUpload {
-            encrypted_name,
-            nonce_name,
-            encrypted_content,
-            nonce_content,
+            name: name.clone(),
+            content,
             provider: provider.clone(),
             scope: scope.clone(),
         };
@@ -518,16 +498,6 @@ fn parse_iso_to_millis(iso: &str) -> Option<u128> {
         .map(|dt| dt.timestamp_millis() as u128)
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .map_err(|e| format!("base64 decode: {e}"))
-}
-
 /// Derive the skill name from a SKILL.md path: the parent
 /// directory's last component is the name. Returns None for
 /// malformed paths (no parent, root parent, etc.).
@@ -582,48 +552,24 @@ mod tests {
     use std::path::PathBuf;
     use tempfile::TempDir;
 
-    // Helper to build a `SkillWire` with deterministic, decryptable
-    // ciphertext. Used by the conflict-resolution test path that
-    // needs a real round-trip through `decrypt`.
-    fn encrypt_wire(
+    // Helper to build a plaintext `SkillWire` the way the server
+    // now returns them (name + content in the clear).
+    fn plain_wire(
         name: &str,
         content: &str,
         provider: &str,
         scope: &str,
         remote_id: &str,
         updated_at_iso: &str,
-        key: &[u8; 32],
     ) -> SkillWire {
-        let n = encrypt(name.as_bytes(), key).unwrap();
-        let c = encrypt(content.as_bytes(), key).unwrap();
         SkillWire {
             remote_id: remote_id.into(),
-            encrypted_name: base64_encode(&n.ciphertext),
-            nonce_name: base64_encode(&n.nonce),
-            encrypted_content: base64_encode(&c.ciphertext),
-            nonce_content: base64_encode(&c.nonce),
+            name: name.into(),
+            content: content.into(),
             provider: provider.into(),
             scope: scope.into(),
             updated_at: updated_at_iso.into(),
         }
-    }
-
-    fn manager_with_known_key() -> EncryptionManager {
-        let m = EncryptionManager::default();
-        let mut k = [0u8; 32];
-        for (i, b) in k.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_add(7);
-        }
-        m.set_key(k).unwrap();
-        m
-    }
-
-    fn known_key() -> [u8; 32] {
-        let mut k = [0u8; 32];
-        for (i, b) in k.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_add(7);
-        }
-        k
     }
 
     // ── skill_name_from_path ───────────────────────────────────
@@ -686,24 +632,20 @@ mod tests {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
         let mut mapping = SkillMapping::default();
-        let key = known_key();
-        let encryption = manager_with_known_key();
 
-        let wire = encrypt_wire(
+        let wire = plain_wire(
             "demo",
             "# Demo skill\n\nbody",
             "codemux",
             "user",
             "1",
             "2026-04-29T20:00:00Z",
-            &key,
         );
 
         let applied = engine
             .apply_remote_skill(
                 &wire,
                 &mut mapping,
-                &encryption,
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
@@ -723,8 +665,6 @@ mod tests {
     fn apply_remote_skill_skips_when_server_updated_at_unchanged() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
-        let key = known_key();
-        let encryption = manager_with_known_key();
 
         // Seed mapping with a stale entry.
         let mut mapping = SkillMapping::default();
@@ -742,21 +682,19 @@ mod tests {
 
         // Server returns a wire with the same updated_at — nothing
         // should be written.
-        let wire = encrypt_wire(
+        let wire = plain_wire(
             "demo",
             "ignored",
             "codemux",
             "user",
             "1",
             "2026-04-29T20:00:00Z",
-            &key,
         );
 
         let applied = engine
             .apply_remote_skill(
                 &wire,
                 &mut mapping,
-                &encryption,
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
@@ -769,8 +707,6 @@ mod tests {
     fn apply_remote_skill_writes_when_server_newer_than_recorded() {
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
-        let key = known_key();
-        let encryption = manager_with_known_key();
 
         // Seed an existing mapping pointing at a real on-disk
         // file with old content.
@@ -788,21 +724,19 @@ mod tests {
         });
 
         // Server has newer content.
-        let wire = encrypt_wire(
+        let wire = plain_wire(
             "demo",
             "new body from server",
             "codemux",
             "user",
             "1",
             "2026-04-29T20:00:00Z",
-            &key,
         );
 
         let applied = engine
             .apply_remote_skill(
                 &wire,
                 &mut mapping,
-                &encryption,
                 home.path(),
                 &home.path().join(".codemux/skills"),
             )
@@ -812,24 +746,26 @@ mod tests {
     }
 
     #[test]
-    fn apply_remote_skill_returns_error_when_no_key_loaded() {
+    fn apply_remote_skill_skips_legacy_row_with_empty_name() {
+        // A ciphertext-only row that predates the server-side
+        // migration comes back with an empty name. The engine must
+        // skip it rather than writing an empty-named skill to disk.
         let home = TempDir::new().unwrap();
         let engine = SyncEngine::with_home(home.path());
-        let key = known_key();
-        let encryption_no_key = EncryptionManager::default();
-
-        let wire = encrypt_wire("demo", "x", "codemux", "user", "1", "2026-04-29T20:00:00Z", &key);
         let mut mapping = SkillMapping::default();
 
-        let res = engine.apply_remote_skill(
-            &wire,
-            &mut mapping,
-            &encryption_no_key,
-            home.path(),
-            &home.path().join(".codemux/skills"),
-        );
-        assert!(res.is_err());
-        assert!(res.unwrap_err().contains("sync key not loaded"));
+        let wire = plain_wire("", "", "codemux", "user", "1", "2026-04-29T20:00:00Z");
+
+        let applied = engine
+            .apply_remote_skill(
+                &wire,
+                &mut mapping,
+                home.path(),
+                &home.path().join(".codemux/skills"),
+            )
+            .unwrap();
+        assert!(!applied, "legacy empty-name row must be skipped");
+        assert!(mapping.skills.is_empty());
     }
 
     // ── snapshot / state transitions ───────────────────────────

@@ -1,39 +1,26 @@
-// Skills sync — local export / import (Step 10 — Stage 4).
+// Skills sync — local export / import (Step 10).
 //
-// The catastrophic-loss mitigation for E2E sync: if the user forgets
-// their sync password, the server-stored ciphertext is unrecoverable
-// (by design — the server has no key material). Without a backup,
-// resetting their password destroys every synced skill.
+// A user-facing backup/restore for synced skills. Export pulls
+// every synced skill from the server and writes them to a JSON
+// file the user picks via the OS file dialog; import reads such a
+// file back and re-pushes each skill to the server.
 //
-// This module provides the safety net: pull every encrypted skill,
-// decrypt it with the in-memory key, and write the plaintext to a
-// JSON file the user picks via the OS file dialog. The reset flow
-// in `commands/skills_sync.rs` enforces this as a step before
-// triggering the email-based password reset.
-//
-// Format choice: plaintext JSON, not encrypted. The backup is on
-// the user's own disk, encrypted "at rest" only by whatever
-// disk-level protection their OS provides. Encrypting the export
-// would have required asking for an export password (terrible
-// UX) or deriving one from the same forgotten password (defeats
-// the purpose). Vexis's `commands/dictionary.rs::export_dictionary`
+// Format choice: plaintext JSON. The backup lives on the user's own
+// disk, protected "at rest" only by whatever disk-level protection
+// their OS provides. Vexis's `commands/dictionary.rs::export_dictionary`
 // follows the same plaintext-JSON pattern.
 //
-// Import path: re-encrypt each skill with the CURRENT in-memory
-// encryption_key (the new password's key, after reset) and push
-// via `crate::skills_sync::api_client::create_skill`. This is
-// effectively "replay your synced skills under the new key." We
-// don't try to restore the original `remote_id`s — the server
-// assigns fresh ones on POST and the local mapping table catches
-// up on the next sync cycle.
+// Import path: push each skill via
+// `crate::skills_sync::api_client::create_skill`. We don't try to
+// restore the original `remote_id`s — the server assigns fresh ones
+// on POST and the local mapping table catches up on the next sync
+// cycle.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::encryption::{decrypt, encrypt, EncryptedData, EncryptionManager};
 use crate::skills_sync::api_client::{self, SkillUpload};
 
 /// Bumped when the on-disk shape changes incompatibly. Readers
@@ -111,13 +98,11 @@ pub fn recommended_export_filename() -> String {
     format!("codemux-skills-export-{today}.json")
 }
 
-/// Pull every encrypted skill, decrypt, and atomic-write a JSON
-/// file. Caller passes the bearer token + the in-memory key
-/// holder; we don't reach into Tauri state from here so the
-/// module stays unit-testable.
+/// Pull every synced skill and atomic-write a JSON file. Caller
+/// passes the bearer token; we don't reach into Tauri state from
+/// here so the module stays unit-testable.
 pub async fn export_all_synced_skills(
     token: &str,
-    encryption: &EncryptionManager,
     output_path: &Path,
     user_email: &str,
 ) -> Result<ExportSummary, String> {
@@ -126,16 +111,15 @@ pub async fn export_all_synced_skills(
     let mut failed_count = 0usize;
 
     for wire in remote {
-        match decrypt_wire(&wire, encryption) {
-            Ok(skill) => skills.push(skill),
-            Err(err) => {
-                eprintln!(
-                    "[skills_sync/export] failed to decrypt remote_id={}: {err}",
-                    wire.remote_id
-                );
-                failed_count += 1;
-            }
+        // Skip legacy ciphertext-only rows the server can't give us
+        // a plaintext name for (they predate the server-side
+        // migration). Counted as "failed" so the UI surfaces that
+        // something was left out.
+        if wire.name.is_empty() {
+            failed_count += 1;
+            continue;
         }
+        skills.push(wire_to_exported(&wire));
     }
 
     let exported_at = chrono::Utc::now().to_rfc3339();
@@ -158,11 +142,10 @@ pub async fn export_all_synced_skills(
 }
 
 /// Read a previously-exported file, validate its envelope, and
-/// re-push every skill to the server using the CURRENT
-/// encryption key. Returns a summary the UI surfaces as a toast.
+/// re-push every skill to the server. Returns a summary the UI
+/// surfaces as a toast.
 pub async fn import_exported_skills(
     token: &str,
-    encryption: &EncryptionManager,
     file_path: &Path,
     current_user_email: &str,
 ) -> Result<ImportSummary, String> {
@@ -189,7 +172,7 @@ pub async fn import_exported_skills(
     let mut failed_count = 0usize;
 
     for skill in envelope.skills {
-        match push_one_skill(token, encryption, &skill).await {
+        match push_one_skill(token, &skill).await {
             Ok(()) => queued_count += 1,
             Err(err) => {
                 eprintln!(
@@ -211,59 +194,24 @@ pub async fn import_exported_skills(
 // ────────────────────────────────────────────────────────────────
 // Helpers.
 
-fn decrypt_wire(
-    wire: &api_client::SkillWire,
-    encryption: &EncryptionManager,
-) -> Result<ExportedSkill, String> {
-    encryption
-        .with_key(|key| -> Result<ExportedSkill, String> {
-            let name_bytes = decrypt(
-                &EncryptedData {
-                    ciphertext: base64_decode(&wire.encrypted_name)?,
-                    nonce: base64_decode(&wire.nonce_name)?,
-                },
-                key,
-            )?;
-            let content_bytes = decrypt(
-                &EncryptedData {
-                    ciphertext: base64_decode(&wire.encrypted_content)?,
-                    nonce: base64_decode(&wire.nonce_content)?,
-                },
-                key,
-            )?;
-            Ok(ExportedSkill {
-                name: String::from_utf8(name_bytes)
-                    .map_err(|e| format!("name not utf-8: {e}"))?,
-                content: String::from_utf8(content_bytes)
-                    .map_err(|e| format!("content not utf-8: {e}"))?,
-                provider: wire.provider.clone(),
-                scope: wire.scope.clone(),
-                origin_path: None,
-                updated_at: wire.updated_at.clone(),
-            })
-        })
-        .ok_or_else(|| "sync key not loaded".to_string())?
+fn wire_to_exported(wire: &api_client::SkillWire) -> ExportedSkill {
+    ExportedSkill {
+        name: wire.name.clone(),
+        content: wire.content.clone(),
+        provider: wire.provider.clone(),
+        scope: wire.scope.clone(),
+        origin_path: None,
+        updated_at: wire.updated_at.clone(),
+    }
 }
 
-async fn push_one_skill(
-    token: &str,
-    encryption: &EncryptionManager,
-    skill: &ExportedSkill,
-) -> Result<(), String> {
-    let upload = encryption
-        .with_key(|key| -> Result<SkillUpload, String> {
-            let name = encrypt(skill.name.as_bytes(), key)?;
-            let content = encrypt(skill.content.as_bytes(), key)?;
-            Ok(SkillUpload {
-                encrypted_name: base64_encode(&name.ciphertext),
-                nonce_name: base64_encode(&name.nonce),
-                encrypted_content: base64_encode(&content.ciphertext),
-                nonce_content: base64_encode(&content.nonce),
-                provider: skill.provider.clone(),
-                scope: skill.scope.clone(),
-            })
-        })
-        .ok_or_else(|| "sync key not loaded".to_string())??;
+async fn push_one_skill(token: &str, skill: &ExportedSkill) -> Result<(), String> {
+    let upload = SkillUpload {
+        name: skill.name.clone(),
+        content: skill.content.clone(),
+        provider: skill.provider.clone(),
+        scope: skill.scope.clone(),
+    };
     api_client::create_skill(token, &upload).await?;
     Ok(())
 }
@@ -296,34 +244,10 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<u64, String
     Ok(bytes)
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(bytes)
-}
-
-fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .map_err(|e| format!("base64 decode: {e}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    fn known_key() -> [u8; 32] {
-        let mut k = [0u8; 32];
-        for (i, b) in k.iter_mut().enumerate() {
-            *b = (i as u8).wrapping_add(7);
-        }
-        k
-    }
-
-    fn manager_with_known_key() -> EncryptionManager {
-        let m = EncryptionManager::default();
-        m.set_key(known_key()).unwrap();
-        m
-    }
 
     fn sample_export_file(skills: Vec<ExportedSkill>, email: &str) -> SkillsExportFile {
         SkillsExportFile {
@@ -398,17 +322,13 @@ mod tests {
         assert_eq!(recovered.skills[0].content, "second");
     }
 
-    // ── decrypt_wire (export decryption) ───────────────────────
+    // ── wire_to_exported (plaintext mapping) ───────────────────
 
-    fn fake_wire(name: &str, content: &str, remote_id: &str, key: &[u8; 32]) -> api_client::SkillWire {
-        let n = encrypt(name.as_bytes(), key).unwrap();
-        let c = encrypt(content.as_bytes(), key).unwrap();
+    fn plain_wire(name: &str, content: &str, remote_id: &str) -> api_client::SkillWire {
         api_client::SkillWire {
             remote_id: remote_id.into(),
-            encrypted_name: base64_encode(&n.ciphertext),
-            nonce_name: base64_encode(&n.nonce),
-            encrypted_content: base64_encode(&c.ciphertext),
-            nonce_content: base64_encode(&c.nonce),
+            name: name.into(),
+            content: content.into(),
             provider: "codemux".into(),
             scope: "user".into(),
             updated_at: "2026-04-29T20:00:00Z".into(),
@@ -416,34 +336,14 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_wire_recovers_plaintext_with_correct_key() {
-        let key = known_key();
-        let mgr = manager_with_known_key();
-        let wire = fake_wire("demo", "# Demo\nbody", "1", &key);
-        let skill = decrypt_wire(&wire, &mgr).unwrap();
+    fn wire_to_exported_copies_plaintext_fields() {
+        let wire = plain_wire("demo", "# Demo\nbody", "1");
+        let skill = wire_to_exported(&wire);
         assert_eq!(skill.name, "demo");
         assert_eq!(skill.content, "# Demo\nbody");
         assert_eq!(skill.provider, "codemux");
         assert_eq!(skill.scope, "user");
-    }
-
-    #[test]
-    fn decrypt_wire_fails_when_no_key_loaded() {
-        let key = known_key();
-        let wire = fake_wire("demo", "content", "1", &key);
-        let mgr_no_key = EncryptionManager::default();
-        let res = decrypt_wire(&wire, &mgr_no_key);
-        assert!(res.is_err());
-        assert!(res.unwrap_err().contains("sync key not loaded"));
-    }
-
-    #[test]
-    fn decrypt_wire_fails_with_wrong_key() {
-        let mut other_key = known_key();
-        other_key[0] ^= 0xff;
-        let wire = fake_wire("demo", "content", "1", &other_key);
-        let mgr = manager_with_known_key();
-        assert!(decrypt_wire(&wire, &mgr).is_err());
+        assert_eq!(skill.updated_at, "2026-04-29T20:00:00Z");
     }
 
     // ── Export envelope structure ──────────────────────────────
@@ -480,14 +380,7 @@ mod tests {
         });
         fs::write(&p, envelope.to_string()).unwrap();
 
-        let mgr = manager_with_known_key();
-        let res = import_exported_skills(
-            "ignored-token",
-            &mgr,
-            &p,
-            "user@example.com",
-        )
-        .await;
+        let res = import_exported_skills("ignored-token", &p, "user@example.com").await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("version"));
     }
@@ -506,14 +399,7 @@ mod tests {
         });
         fs::write(&p, envelope.to_string()).unwrap();
 
-        let mgr = manager_with_known_key();
-        let res = import_exported_skills(
-            "ignored-token",
-            &mgr,
-            &p,
-            "user@example.com",
-        )
-        .await;
+        let res = import_exported_skills("ignored-token", &p, "user@example.com").await;
         assert!(res.is_err());
         let msg = res.unwrap_err();
         assert!(msg.contains("different product") || msg.contains("vexis"));
@@ -525,14 +411,7 @@ mod tests {
         let p = dir.path().join("garbage.json");
         fs::write(&p, b"not valid json {").unwrap();
 
-        let mgr = manager_with_known_key();
-        let res = import_exported_skills(
-            "ignored-token",
-            &mgr,
-            &p,
-            "user@example.com",
-        )
-        .await;
+        let res = import_exported_skills("ignored-token", &p, "user@example.com").await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("parse"));
     }
@@ -542,14 +421,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let p = dir.path().join("does-not-exist.json");
 
-        let mgr = manager_with_known_key();
-        let res = import_exported_skills(
-            "ignored-token",
-            &mgr,
-            &p,
-            "user@example.com",
-        )
-        .await;
+        let res = import_exported_skills("ignored-token", &p, "user@example.com").await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("read"));
     }
