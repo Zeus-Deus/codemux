@@ -7,6 +7,7 @@ import {
   Loader2,
   Pencil,
   Plus,
+  RefreshCw,
   Server,
   Trash2,
   X,
@@ -17,11 +18,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
+import { toast } from "@/lib/toast";
 import {
   hostsAdd,
   hostsBootstrapInstall,
   hostsDelete,
   hostsList,
+  hostsReinstallRemote,
   hostsTestConnection,
   hostsUpdate,
   type HostTestResult,
@@ -115,6 +118,7 @@ export function HostsSection() {
   );
   const [testingId, setTestingId] = useState<number | null>(null);
   const [installingId, setInstallingId] = useState<number | null>(null);
+  const [reinstallingId, setReinstallingId] = useState<number | null>(null);
 
   const reload = useCallback(async () => {
     setLoading(true);
@@ -296,6 +300,31 @@ export function HostsSection() {
     },
     [],
   );
+
+  // Force a fresh codemux-remote onto the host and restart its daemon.
+  // The dev-workflow escape hatch (issue #24): rebuilding the agent
+  // keeps the version string the same, so the push-time version check
+  // skips the upgrade and the host keeps running the stale binary. This
+  // re-uploads the freshly built bits unconditionally, so the next push
+  // uses them — no manual scp + pkill needed. Unlike Install, this needs
+  // no prior Test connection: the backend re-probes the uname itself.
+  const handleReinstallRemote = useCallback(async (host: HostView) => {
+    setReinstallingId(host.id);
+    try {
+      const result = await hostsReinstallRemote(host.id);
+      if (result.ok) {
+        toast.success("Agent reinstalled", { description: result.message });
+      } else {
+        toast.error("Reinstall failed", { description: result.message });
+      }
+    } catch (err) {
+      toast.error("Reinstall failed", {
+        description: typeof err === "string" ? err : String(err),
+      });
+    } finally {
+      setReinstallingId(null);
+    }
+  }, []);
 
   if (loading) {
     return (
@@ -653,6 +682,44 @@ export function HostsSection() {
                     )}
                 </div>
               )}
+            </div>
+
+            {/* Reinstall agent — dev-workflow escape hatch (issue #24).
+                The push-time version check skips the upgrade when the
+                version string is unchanged (which it always is across
+                local rebuilds), so this re-uploads the freshly built
+                codemux-remote and restarts its daemon unconditionally. */}
+            <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[13px] font-medium text-foreground">Reinstall agent</p>
+                  <p className="text-[11.5px] text-muted-foreground/75 leading-relaxed mt-0.5">
+                    Re-upload codemux-remote and restart it on the host. Use after
+                    rebuilding the agent locally — pushes skip the update when the
+                    version string is unchanged.
+                  </p>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="h-8 text-[12px] gap-1.5 shrink-0"
+                  disabled={reinstallingId === selected.id}
+                  onClick={() => void handleReinstallRemote(selected)}
+                >
+                  {reinstallingId === selected.id ? (
+                    <>
+                      <Loader2 className="size-3.5 animate-spin" />
+                      Reinstalling…
+                    </>
+                  ) : (
+                    <>
+                      <RefreshCw className="size-3.5" />
+                      Reinstall
+                    </>
+                  )}
+                </Button>
+              </div>
             </div>
 
             <div className="flex items-center justify-between pt-4 border-t border-border/40">

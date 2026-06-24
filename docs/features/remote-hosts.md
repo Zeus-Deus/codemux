@@ -420,6 +420,7 @@ The pane built in 2a now uses the real probe + bootstrap:
 
 - **Test connection** → calls `hosts_test_connection`, surfaces the result inline.
 - **Install button** appears when the probe reports `needs_install: true`. Opens a `window.confirm` modal that names the binary, says it's ~8MB and runs in the user's account (no root), and links to the source repo. On confirm → calls `hosts_bootstrap_install` and surfaces the result.
+- **Reinstall agent** (issue #24) → always-visible card on the host detail pane. Calls `hosts_reinstall_remote`, which force-reinstalls `codemux-remote` regardless of the installed version and restarts its pty-daemon, then fires a success/error toast. This is the dev-workflow escape hatch: rebuilding `codemux-remote` from a branch keeps the version string the same, so the push-time version check (`ensure_remote_binary_current`) sees a match and skips the upgrade — leaving the host on a stale binary. The command reuses the proven `force_reinstall_remote_binary` helper (uname probe → `pkill -f 'codemux-remote pty-daemon'` → scp + chmod + verify → restart `serve`), the same body the push-time upgrade runs after its version check. No prior Test connection is required — the backend re-probes the uname itself. Replaces the manual `scp` + `pkill` workaround.
 
 ## Test coverage
 
@@ -448,7 +449,7 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 ## Important Touch Points
 
 - `src-tauri/src/state/state_impl.rs` — `WorkspaceSnapshot.host_id`, `set_workspace_host_id`.
-- `src-tauri/src/commands/hosts.rs` — `set_workspace_host`, `hosts_test_connection` (real impl), `hosts_bootstrap_install`.
+- `src-tauri/src/commands/hosts.rs` — `set_workspace_host`, `hosts_test_connection` (real impl), `hosts_bootstrap_install`, `hosts_reinstall_remote` (issue #24 — force reinstall + daemon restart, shares `force_reinstall_remote_binary` with the push-time `ensure_remote_binary_current`).
 - `src-tauri/src/commands/workspace.rs` — `close_workspace` / `close_workspace_with_worktree` capture `host_id` and tear down the tunnel supervisor + cached client on close (post-`v0.7.6`).
 - `src-tauri/src/bin/codemux_remote.rs` — binary entry point. Subcommands: `version`, `pty-daemon`, `scheduler`, `serve` (+ `status`, `stop`), `mcp`, `workspace register`, `workspace list` (reads the daemon SQLite directly for the host-inventory poller). Unix-only — Windows builds a no-op stub.
 - `src-tauri/src/remote/` — headless MCP daemon module: `manifest.rs` (atomic write + pid liveness), `auth.rs` (bearer-token axum middleware), `identity.rs` (`Local | Cloud { user_id, org_id, role }`), `workspace.rs` (self-contained SQLite registry with nullable `owner_id`), `pty.rs` (portable-pty wrapper + 1 MiB ring buffer), `server.rs` (axum routes), `mcp.rs` (stdio JSON-RPC bridge), `mcp_register.rs` (auto-write into agent configs on startup), `tools/mod.rs` (12-tool catalog), `git.rs` (`worktree_create` + adoption worktree recreate), `config.rs` (state-dir resolution).
@@ -458,7 +459,7 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 - `src/stores/tunnel-status-store.ts` / `src/hooks/use-tunnel-status-events.ts` / `src/tauri/events.ts` — frontend tunnel-health store + app-root event hook + `TunnelStatus` wire type; `sidebar-workspace-row.tsx` renders the "Reconnecting…" / "Connection lost — re-push" pill.
 - `src/components/hosts/device-picker.tsx` — shared pill component.
 - `src/components/overlays/new-workspace-dialog.tsx` — DevicePicker wired into bottom bar.
-- `src/components/settings/hosts-section.tsx` — uses real probe + bootstrap modal.
+- `src/components/settings/hosts-section.tsx` — uses real probe + bootstrap modal + "Reinstall agent" card (`hosts-section.test.tsx` covers the reinstall wiring: success toast, error-result toast, thrown-error toast).
 - `src/tauri/commands.ts` — new bindings: `setWorkspaceHost`, `hostsBootstrapInstall`, `HostBootstrapResult`.
 - `Cargo.toml` — `[[bin]] codemux-remote`; embedded `axum`, `tower`, `rusqlite`, `portable-pty` for the headless daemon.
 - `scripts/codemux-remote.service.example` — sample systemd user unit (used both by manual install and `provision_serve`).
