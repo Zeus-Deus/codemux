@@ -767,6 +767,16 @@ pub async fn workspace_push_to_host(
                 // which sees host_id is set → remote daemon →
                 // fresh shells appear on the host machine.
                 terminate_workspace_sessions(&app, &workspace_id);
+                // Show a "Switching to <host>…" overlay on every pane for the
+                // window between the old PTYs dying and the remote replacements
+                // producing output. Without it the user stares at frozen local
+                // scrollback with no signal anything is happening. Auto-dismissed
+                // when the respawned session goes Ready / emits its first output.
+                crate::terminal::emit_migrating_for_workspace(
+                    &app,
+                    &workspace_id,
+                    &format!("Switching to {}…", host.name),
+                );
                 crate::terminal::spawn_missing_ptys_for_workspace(
                     app.clone(),
                     &workspace_id,
@@ -1107,6 +1117,14 @@ pub async fn workspace_pull_back_impl(
                 // local singleton). Same agent-caveat as push —
                 // see the long comment in `workspace_push_to_host`.
                 terminate_workspace_sessions(&app, &workspace_id);
+                // Mirror of the push overlay: "Returning to this device…" while
+                // the remote PTYs are torn down and the local replacements come
+                // up. Same auto-dismiss on Ready / first output.
+                crate::terminal::emit_migrating_for_workspace(
+                    &app,
+                    &workspace_id,
+                    "Returning to this device…",
+                );
                 crate::terminal::spawn_missing_ptys_for_workspace(
                     app.clone(),
                     &workspace_id,

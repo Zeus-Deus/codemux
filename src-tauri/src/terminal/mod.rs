@@ -196,6 +196,14 @@ const MAX_STARTUP_SESSIONS: usize = 50;
 #[serde(rename_all = "snake_case")]
 pub enum TerminalLifecycleState {
     Starting,
+    /// Transient overlay shown on each pane while a workspace is being
+    /// pushed to / pulled back from a remote host. Lives between the old
+    /// PTY being terminated and the replacement session's first output.
+    /// Maps to `Starting` in the persisted app-state (`map_status_state`)
+    /// — it's just a start with a workspace-specific message — but rides
+    /// the `terminal-status` event with its own `migrating` discriminant
+    /// so the frontend can give it a distinct "Switching to <host>…" look.
+    Migrating,
     Ready,
     Exited,
     Failed,
@@ -433,6 +441,11 @@ fn is_session_spawn_active(
 fn map_status_state(state: &TerminalLifecycleState) -> TerminalSessionState {
     match state {
         TerminalLifecycleState::Starting => TerminalSessionState::Starting,
+        // Migrating is a transient start with a host-specific message; the
+        // persisted session state has no separate variant for it, so collapse
+        // it to Starting. The `migrating` discriminant only matters on the
+        // `terminal-status` event the frontend overlay reads.
+        TerminalLifecycleState::Migrating => TerminalSessionState::Starting,
         TerminalLifecycleState::Ready => TerminalSessionState::Ready,
         TerminalLifecycleState::Exited => TerminalSessionState::Exited,
         TerminalLifecycleState::Failed => TerminalSessionState::Failed,
@@ -1812,6 +1825,38 @@ pub fn spawn_missing_ptys_for_workspace(app: AppHandle, workspace_id: &str) {
 
     for session_id in session_ids.into_iter().take(MAX_STARTUP_SESSIONS) {
         spawn_pty_for_session(app.clone(), session_id);
+    }
+}
+
+/// Emit a transient `Migrating` lifecycle status for every terminal session in
+/// `workspace_id`. The cloud-push / pull-back flow calls this AFTER the old
+/// PTYs are terminated and BEFORE the replacements spawn, so each pane shows a
+/// "Switching to <host>…" (push) or "Returning to this device…" (pull-back)
+/// overlay during the few seconds the session is being migrated instead of a
+/// frozen copy of the old scrollback.
+///
+/// The overlay auto-dismisses when the respawned session emits `Ready` (or its
+/// first output chunk reaches the frontend — the renderer treats live output on
+/// a migrating pane as proof the new PTY is alive).
+///
+/// Rides the same `last_status` plumbing as every other lifecycle emit, so a
+/// mid-migration workspace switch + return still shows the overlay
+/// (`get_terminal_status` replays `last_status`).
+pub fn emit_migrating_for_workspace(app: &AppHandle, workspace_id: &str, message: &str) {
+    let app_state: State<'_, AppStateStore> = app.state();
+    let pty_state: State<'_, PtyState> = app.state();
+    let snapshot = app_state.snapshot();
+    for session_id in collect_workspace_session_ids(&snapshot, workspace_id) {
+        emit_terminal_status(
+            app,
+            &pty_state.sessions,
+            TerminalStatusPayload {
+                session_id,
+                state: TerminalLifecycleState::Migrating,
+                message: Some(message.to_string()),
+                exit_code: None,
+            },
+        );
     }
 }
 
@@ -3303,6 +3348,28 @@ mod tests {
         assert!(
             comm_log_entry_for_chunk("b", b"No orchestration progress detected yet").is_none(),
         );
+    }
+
+    #[test]
+    fn migrating_state_serializes_to_migrating_discriminant() {
+        // The frontend overlay (TerminalStatusPayload union in types.ts) keys
+        // off this exact string. If the snake_case rename ever drifts, the
+        // "Switching to <host>…" overlay silently stops rendering — pin the
+        // wire value here so that regression fails a test instead of shipping.
+        let json = serde_json::to_string(&TerminalLifecycleState::Migrating).unwrap();
+        assert_eq!(json, "\"migrating\"");
+    }
+
+    #[test]
+    fn migrating_maps_to_starting_session_state() {
+        // Migrating has no separate persisted variant — it collapses to
+        // Starting so existing state consumers (overview, sidebar dots,
+        // session persistence) are untouched. Only the transient
+        // `terminal-status` event carries the `migrating` discriminant.
+        assert!(matches!(
+            map_status_state(&TerminalLifecycleState::Migrating),
+            TerminalSessionState::Starting
+        ));
     }
 
     #[test]
