@@ -116,6 +116,12 @@ function buildThemeFromCSS(): ITheme {
 //   };
 // }
 
+// How long the status overlay takes to fade out once the session is alive
+// (state → ready, or first output on a migrating pane). Must match the
+// `transition: opacity` duration on `.terminal-overlay` in globals.css so the
+// element is only removed from layout (display:none) after the fade completes.
+const OVERLAY_FADE_MS = 160;
+
 function extractBytes(payload: unknown): Uint8Array | null {
   if (payload instanceof Uint8Array) return payload;
   if (payload instanceof ArrayBuffer) return new Uint8Array(payload);
@@ -148,6 +154,8 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     exit_code: null,
   });
   const statusOverlayRef = useRef<HTMLDivElement>(null);
+  // Pending display:none after a fade-out, so a status flip mid-fade can cancel it.
+  const overlayHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyDecoderRef = useRef(new TextDecoder("utf-8", { fatal: false }));
   const blockNewlineRef = useRef<((e: Event) => void) | null>(null);
   const dataDisposableRef = useRef<{ dispose: () => void } | null>(null);
@@ -223,14 +231,35 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     const el = statusOverlayRef.current;
     if (!el) return;
     if (status.state === "ready") {
-      el.style.display = "none";
+      // Session is alive — fade the overlay out, then drop it from layout once
+      // the opacity transition finishes so the hidden card can't swallow clicks
+      // on the live terminal underneath. Skip if already hidden (steady-state
+      // Ready re-emits) so we don't restart the fade on every keystroke echo.
+      if (overlayHideTimerRef.current === null && el.style.display !== "none") {
+        el.style.opacity = "0";
+        overlayHideTimerRef.current = setTimeout(() => {
+          overlayHideTimerRef.current = null;
+          // Guard against a flip back to a visible state mid-fade (e.g. a fast
+          // exit right after ready) — only hide if we're still ready.
+          if (statusRef.current.state === "ready") el.style.display = "none";
+        }, OVERLAY_FADE_MS);
+      }
       return;
     }
+    // A visible state arrived — cancel any in-flight fade-out and show now.
+    if (overlayHideTimerRef.current !== null) {
+      clearTimeout(overlayHideTimerRef.current);
+      overlayHideTimerRef.current = null;
+    }
     el.style.display = "flex";
+    el.style.opacity = "1";
     // Keep the base classes (positioning, backdrop) and append
     // the state for any state-specific CSS hooks downstream.
     el.className = `terminal-overlay ${status.state} absolute inset-0 z-0 flex items-center justify-center p-6 bg-background/95 backdrop-blur-sm`;
     const failed = status.state === "failed";
+    // Migrating reads as a deliberate transition, not a fresh shell start, so it
+    // gets its own heading; it keeps the spinner (it's an in-progress state).
+    const migrating = status.state === "migrating";
     // Swap spinner vs warning indicator visibility.
     const spinner = el.querySelector<HTMLElement>(".status-indicator .spinner");
     const warning = el.querySelector<HTMLElement>(".status-indicator .warning");
@@ -240,7 +269,11 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     const p = el.querySelector("p");
     const code = el.querySelector(".status-meta");
     if (h2)
-      h2.textContent = failed ? "Terminal unavailable" : "Terminal starting";
+      h2.textContent = failed
+        ? "Terminal unavailable"
+        : migrating
+          ? "Migrating workspace"
+          : "Terminal starting";
     if (p) p.textContent = status.message ?? "Waiting for shell status...";
     if (code)
       code.textContent =
@@ -642,6 +675,18 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
         if (cancelled) return;
         const bytes = extractBytes(payload);
         if (!bytes) return;
+        // First live byte on a migrating pane means the replacement PTY is
+        // producing output — dismiss the "Switching to <host>…" overlay even if
+        // the Ready lifecycle event hasn't landed yet (the two ride different
+        // IPC paths, so output can win the race). Cheap string compare per chunk.
+        if (statusRef.current.state === "migrating") {
+          updateStatusOverlay({
+            session_id: sid,
+            state: "ready",
+            message: null,
+            exit_code: null,
+          });
+        }
         scanKittyProtocol(bytes);
         pump.enqueue(bytes);
       });
@@ -742,6 +787,10 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       if (windowResizeTimerRef.current !== null) {
         clearTimeout(windowResizeTimerRef.current);
         windowResizeTimerRef.current = null;
+      }
+      if (overlayHideTimerRef.current !== null) {
+        clearTimeout(overlayHideTimerRef.current);
+        overlayHideTimerRef.current = null;
       }
 
       resizeObserverRef.current?.disconnect();

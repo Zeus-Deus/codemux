@@ -161,7 +161,11 @@ export interface TerminalSessionSnapshot {
 
 export interface TerminalStatusPayload {
   session_id: string;
-  state: "starting" | "ready" | "exited" | "failed";
+  // "migrating" is a transient cloud-push / pull-back state — shown as a
+  // "Switching to <host>…" overlay between the old PTY dying and the
+  // replacement session's first output. It only ever rides this event;
+  // the persisted session snapshot collapses it to "starting".
+  state: "starting" | "migrating" | "ready" | "exited" | "failed";
   message: string | null;
   exit_code: number | null;
 }

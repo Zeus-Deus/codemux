@@ -150,6 +150,15 @@
   transition: opacity 0.1s ease;
 }
 
+/* Terminal lifecycle overlay (starting / migrating / failed). Opacity is
+   driven imperatively from TerminalPane.tsx (DOM-mutation path, for perf):
+   it fades to 0 on `ready` before display:none, so the card doesn't snap
+   away the instant a (re)spawned or migrated session comes alive. Keep this
+   duration in sync with OVERLAY_FADE_MS in TerminalPane.tsx. */
+.terminal-overlay {
+  transition: opacity 0.16s ease-out;
+}
+
 /* Prevent terminals, canvases, and iframes from stealing pointer events during pane resize drag */
 body.pane-resizing .xterm,
 body.pane-resizing canvas,
