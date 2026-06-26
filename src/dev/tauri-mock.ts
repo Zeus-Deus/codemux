@@ -814,7 +814,53 @@ const handlers: Record<string, Handler> = {
   list_incoming_prs: () => [],
 
   // ── Hosts (remote devices) ──
-  hosts_list: () => [],
+  //
+  // Seed one host so the Settings → Hosts detail pane (Test connection,
+  // Reinstall agent, Edit/Remove) renders in the browser dev runtime.
+  // The mutating commands echo back plausible payloads — nothing here
+  // touches a real SSH target.
+  hosts_list: () => [
+    {
+      id: 1,
+      server_id: null,
+      name: "homelab",
+      ssh_target: "deus@homelab.local",
+      created_at: "2026-01-01T00:00:00Z",
+      updated_at: "2026-01-01T00:00:00Z",
+      dirty: false,
+    },
+  ],
+  hosts_add: (a) => ({
+    id: Date.now(),
+    server_id: null,
+    name: String(a.name ?? "new-device"),
+    ssh_target: String(a.sshTarget ?? "user@host"),
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    dirty: true,
+  }),
+  hosts_update: (a) => ({
+    id: Number(a.id ?? 1),
+    server_id: null,
+    name: String(a.name ?? "homelab"),
+    ssh_target: String(a.sshTarget ?? "deus@homelab.local"),
+    created_at: "2026-01-01T00:00:00Z",
+    updated_at: "2026-01-01T00:00:00Z",
+    dirty: true,
+  }),
+  hosts_delete: () => undefined,
+  hosts_test_connection: () => ({
+    ok: true,
+    message: "Connected. codemux-remote v0.9.5 is installed (Linux x86_64)",
+    needs_install: false,
+    uname: null,
+  }),
+  hosts_reinstall_remote: () => ({
+    ok: true,
+    message:
+      "codemux-remote v0.9.5 reinstalled on homelab — daemon restarted; " +
+      "the next push uses the fresh binary.",
+  }),
 
   // ── MCP runtime ──
   get_mcp_runtime_status: () => ({ servers: [], running: false }),

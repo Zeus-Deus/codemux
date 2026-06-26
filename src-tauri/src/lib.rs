@@ -1686,6 +1686,7 @@ pub fn run() {
             commands::hosts_delete,
             commands::hosts_test_connection,
             commands::hosts_bootstrap_install,
+            commands::hosts_reinstall_remote,
             commands::set_workspace_host,
             commands::workspace_push_to_host,
             commands::workspace_pull_back,
