@@ -250,11 +250,10 @@ describe("WorkspacesOverviewSection", () => {
     expect(getByText("ui-polish worktree")).toBeInTheDocument();
   });
 
-  it("does not render project headers for one-off projects", () => {
-    // Distinct projects (one workspace each) stay in a flat grid with
-    // no per-project header — avoids cluttering a device full of
-    // unrelated projects. The project names never appear (rows render
-    // titles only), so their absence proves no header was emitted.
+  it("renders a project header for every project, including one-off projects", () => {
+    // Each project gets its own folder header so the device → project →
+    // workspace hierarchy is consistent (the redesign nests every card
+    // under a project, even single-workspace ones).
     mockWorkspaces = [
       makeWorkspace({
         workspace_id: "ws-a",
@@ -267,12 +266,13 @@ describe("WorkspacesOverviewSection", () => {
         project_root: "/home/test/proj-b",
       }),
     ];
-    const { getByText, queryByText } = render(<WorkspacesOverviewSection />);
+    const { getByText } = render(<WorkspacesOverviewSection />);
 
     expect(getByText("alpha-title")).toBeInTheDocument();
     expect(getByText("beta-title")).toBeInTheDocument();
-    expect(queryByText("proj-a")).toBeNull();
-    expect(queryByText("proj-b")).toBeNull();
+    // Both one-off projects now surface their own folder header.
+    expect(getByText("proj-a")).toBeInTheDocument();
+    expect(getByText("proj-b")).toBeInTheDocument();
   });
 
   it("marks the active workspace as attached", () => {

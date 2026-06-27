@@ -371,11 +371,11 @@ function LocalRow({
         }
       }}
       className={cn(
-        "group/row relative flex h-full cursor-pointer flex-col gap-2 rounded-lg border bg-card/40 px-3.5 py-3 transition-colors",
-        "hover:border-border hover:bg-muted/40",
+        "group/row relative flex h-full cursor-pointer flex-col gap-2 rounded-lg border bg-card/70 px-3.5 py-3 shadow-sm transition-colors",
+        "hover:border-border hover:bg-card",
         isAttached
           ? "border-emerald-500/40 ring-1 ring-emerald-500/20"
-          : "border-border/50",
+          : "border-border/60",
       )}
     >
       <div className="flex items-start gap-2">

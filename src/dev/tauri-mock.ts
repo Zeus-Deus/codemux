@@ -822,9 +822,9 @@ const handlers: Record<string, Handler> = {
   hosts_list: () => [
     {
       id: 1,
-      server_id: null,
-      name: "homelab",
-      ssh_target: "deus@homelab.local",
+      server_id: "srv-pandora",
+      name: "pandora",
+      ssh_target: "deus@pandora",
       created_at: "2026-01-01T00:00:00Z",
       updated_at: "2026-01-01T00:00:00Z",
       dirty: false,
@@ -858,9 +858,72 @@ const handlers: Record<string, Handler> = {
   hosts_reinstall_remote: () => ({
     ok: true,
     message:
-      "codemux-remote v0.9.5 reinstalled on homelab — daemon restarted; " +
+      "codemux-remote v0.9.5 reinstalled on pandora — daemon restarted; " +
       "the next push uses the fresh binary.",
   }),
+
+  // ── Cross-device workspace sync registry ──
+  //
+  // Seed a few sibling-device rows (workspace_id: null) on the "pandora"
+  // host so the Workspaces overview renders its second device bucket with
+  // "lives on another device" cards. Mirrors the redesign mock data.
+  workspaces_sync_list: () => [
+    {
+      id: 9001,
+      server_id: "ws-partpilot",
+      workspace_id: null,
+      title: "partpilot",
+      host_server_id: "srv-pandora",
+      project_path: "/home/deus/projects/partpilot",
+      project_remote: "github.com/deus/partpilot",
+      git_branch: "main",
+      git_head_sha: null,
+      project_uid: "uid-partpilot",
+      workspace_kind: "main",
+      default_branch: "main",
+      origin_path: "/home/deus/projects/partpilot",
+      created_at: "2026-06-20T00:00:00Z",
+      updated_at: "2026-06-26T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 9002,
+      server_id: "ws-activity-labels",
+      workspace_id: null,
+      title: "activity-labels",
+      host_server_id: "srv-pandora",
+      project_path: "/home/deus/projects/partpilot",
+      project_remote: "github.com/deus/partpilot",
+      git_branch: "chat-ux-activity-labels",
+      git_head_sha: null,
+      project_uid: "uid-partpilot",
+      workspace_kind: "worktree",
+      default_branch: "main",
+      origin_path: "/home/deus/projects/partpilot-activity-labels",
+      created_at: "2026-06-21T00:00:00Z",
+      updated_at: "2026-06-26T00:00:00Z",
+      dirty: false,
+    },
+    {
+      id: 9003,
+      server_id: "ws-passpage",
+      workspace_id: null,
+      title: "passpage",
+      host_server_id: "srv-pandora",
+      project_path: "/home/deus/projects/passpage",
+      project_remote: "github.com/deus/passpage",
+      git_branch: "main",
+      git_head_sha: null,
+      project_uid: "uid-passpage",
+      workspace_kind: "main",
+      default_branch: "main",
+      origin_path: "/home/deus/projects/passpage",
+      created_at: "2026-06-22T00:00:00Z",
+      updated_at: "2026-06-26T00:00:00Z",
+      dirty: false,
+    },
+  ],
+  workspaces_sync_now: () => undefined,
 
   // ── MCP runtime ──
   get_mcp_runtime_status: () => ({ servers: [], running: false }),

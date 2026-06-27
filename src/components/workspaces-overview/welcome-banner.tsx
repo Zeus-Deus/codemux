@@ -144,7 +144,7 @@ export function WelcomeBanner({
   return (
     <div
       className={cn(
-        "mx-auto max-w-6xl flex items-start gap-3 rounded-lg border border-sky-500/20 bg-gradient-to-r from-sky-500/8 to-emerald-500/5 px-4 py-3 mb-4",
+        "mx-auto max-w-6xl flex items-start gap-3 rounded-xl border border-sky-500/25 bg-sky-500/8 px-4 py-3.5 mb-5",
       )}
     >
       <Sparkles className="mt-0.5 size-4 shrink-0 text-sky-400" />

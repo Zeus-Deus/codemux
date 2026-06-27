@@ -47,7 +47,7 @@ export function WorkspacesOverviewView() {
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <span className="text-[13px] font-medium text-foreground">
+        <span className="text-[14px] font-semibold tracking-tight text-foreground">
           Workspaces
         </span>
       </div>
