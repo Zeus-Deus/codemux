@@ -3,6 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, act, waitFor, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { useSettingsStore } from "@/stores/settings-store";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 // ── Mocks ──
@@ -474,5 +475,65 @@ describe("Muted indicator on the workspace row", () => {
     expect(
       unmuted.container.querySelector("svg.lucide-bell-off"),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("Workspace row detail level (Settings → Appearance → Sidebar)", () => {
+  const setDetail = (level: "clean" | "branch" | "detailed") =>
+    act(() => {
+      useSettingsStore.setState({
+        settings: { "sidebar.workspace_detail": level },
+      });
+    });
+
+  // The store is process-global; restore the default after each case so
+  // the rest of the suite (which relies on "detailed") is unaffected.
+  beforeEach(() => setDetail("detailed"));
+
+  const wsWithStats = () =>
+    makeWorkspace({
+      worktree_path: null,
+      git_branch: "feature/x",
+      git_ahead: 2,
+      git_additions: 5,
+    });
+
+  it("'detailed' shows the branch name and the git stats", () => {
+    setDetail("detailed");
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={wsWithStats()} isActive={false} />
+      </TooltipProvider>,
+    );
+    expect(container.textContent).toContain("feature/x");
+    expect(container.textContent).toContain("↑2");
+    expect(container.textContent).toContain("+5");
+  });
+
+  it("'branch' shows the branch name but hides the git stats", () => {
+    setDetail("branch");
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={wsWithStats()} isActive={false} />
+      </TooltipProvider>,
+    );
+    expect(container.textContent).toContain("feature/x");
+    expect(container.textContent).not.toContain("↑2");
+    expect(container.textContent).not.toContain("+5");
+  });
+
+  it("'clean' hides the whole metadata line (no branch, no stats)", () => {
+    setDetail("clean");
+    const { container } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={wsWithStats()} isActive={false} />
+      </TooltipProvider>,
+    );
+    // Title (line 1) still renders…
+    expect(container.textContent).toContain("Test Workspace");
+    // …but the metadata line (branch + stats) is gone.
+    expect(container.textContent).not.toContain("feature/x");
+    expect(container.textContent).not.toContain("↑2");
+    expect(container.textContent).not.toContain("+5");
   });
 });

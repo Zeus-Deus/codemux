@@ -14,7 +14,15 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   ai_resolver_model: "",
   ai_resolver_strategy: "smart_merge",
   auto_mcp_config: "true",
+  // How much detail each project-sidebar workspace row shows:
+  //   "clean"    — icon + name + live status only
+  //   "branch"   — also the git branch name
+  //   "detailed" — also ahead/behind + diff stats (the original behavior)
+  "sidebar.workspace_detail": "detailed",
 };
+
+/** Sidebar workspace-row detail level. */
+export type SidebarWorkspaceDetail = "clean" | "branch" | "detailed";
 
 interface SettingsState {
   loaded: boolean;
@@ -93,3 +101,9 @@ export const selectTerminalColorTheme = (s: SettingsStore): string =>
 
 export const selectTerminalFontFamily = (s: SettingsStore): string =>
   s.settings["terminal.font_family"] ?? SETTINGS_DEFAULTS["terminal.font_family"]!;
+
+export const selectSidebarWorkspaceDetail = (
+  s: SettingsStore,
+): SidebarWorkspaceDetail =>
+  (s.settings["sidebar.workspace_detail"] ??
+    SETTINGS_DEFAULTS["sidebar.workspace_detail"]!) as SidebarWorkspaceDetail;

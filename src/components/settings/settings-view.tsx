@@ -63,6 +63,8 @@ import {
 import {
   useSettingsStore,
   selectTerminalColorTheme,
+  selectSidebarWorkspaceDetail,
+  type SidebarWorkspaceDetail,
 } from "@/stores/settings-store";
 import {
   detectEditors,
@@ -218,23 +220,23 @@ function SettingRow({ label, description, children }: {
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex items-start justify-between gap-8 py-4">
+    <div className="flex items-center justify-between gap-8 py-4">
       <div className="space-y-1 min-w-0">
-        <p className="text-[13px] font-medium leading-none text-foreground">{label}</p>
+        <p className="text-[13.5px] font-semibold leading-tight text-foreground">{label}</p>
         {description && (
-          <p className="text-[12px] text-muted-foreground/85 leading-relaxed">{description}</p>
+          <p className="text-[12px] text-muted-foreground/80 leading-relaxed">{description}</p>
         )}
       </div>
-      <div className="shrink-0 pt-0.5">{children}</div>
+      <div className="shrink-0">{children}</div>
     </div>
   );
 }
 
 function SectionHeader({ title, description }: { title: string; description: string }) {
   return (
-    <div className="mb-8">
-      <h2 className="text-[17px] font-semibold tracking-tight text-foreground">{title}</h2>
-      <p className="text-[13px] text-muted-foreground/85 mt-1.5 leading-relaxed max-w-prose">{description}</p>
+    <div className="mb-7">
+      <h2 className="text-[21px] font-bold tracking-tight text-foreground">{title}</h2>
+      <p className="text-[13.5px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">{description}</p>
     </div>
   );
 }
@@ -257,11 +259,11 @@ function SubsectionHeader({
   return (
     <div className={cn("mb-3 flex items-end justify-between gap-4", className)}>
       <div className="min-w-0">
-        <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+        <p className="font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
           {title}
         </p>
         {description && (
-          <p className="text-[12px] text-muted-foreground/85 mt-1.5 leading-relaxed max-w-prose">
+          <p className="text-[12px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">
             {description}
           </p>
         )}
@@ -351,6 +353,50 @@ function FormField({
   );
 }
 
+/** Segmented control — a bordered pill of mutually-exclusive options
+ *  with a neutral foreground-filled active segment (the design system's
+ *  "white is the baseline" rule for toggles/selection). */
+function SegmentedControl<T extends string>({
+  value,
+  onChange,
+  options,
+  ariaLabel,
+}: {
+  value: T;
+  onChange: (value: T) => void;
+  options: { value: T; label: string }[];
+  ariaLabel?: string;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel}
+      className="inline-flex items-center gap-0.5 rounded-lg border border-border bg-muted/30 p-0.5"
+    >
+      {options.map((opt) => {
+        const active = opt.value === value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(opt.value)}
+            className={cn(
+              "rounded-md px-3 py-1 text-[12px] font-medium transition-colors",
+              active
+                ? "bg-foreground text-background"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function SettingsNavItem({ icon: Icon, label, active, onClick }: {
   icon: React.ElementType;
   label: string;
@@ -362,17 +408,17 @@ function SettingsNavItem({ icon: Icon, label, active, onClick }: {
       type="button"
       onClick={onClick}
       className={cn(
-        "group/nav w-full flex items-center gap-2.5 px-2.5 h-7 rounded-md text-[13px] text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
+        "group/nav w-full flex items-center gap-2.5 px-2.5 h-8 rounded-lg text-[13px] font-medium text-left transition-colors duration-150 outline-none focus-visible:ring-1 focus-visible:ring-ring",
         active
-          ? "bg-muted text-foreground"
-          : "text-muted-foreground hover:bg-muted/40 hover:text-foreground",
+          ? "bg-foreground/[0.09] text-foreground"
+          : "text-muted-foreground/90 hover:bg-foreground/[0.06] hover:text-foreground",
       )}
     >
       <Icon
         className={cn(
-          "h-3.5 w-3.5 shrink-0 transition-colors",
+          "h-[15px] w-[15px] shrink-0 transition-colors",
           active
-            ? "text-foreground/80"
+            ? "text-foreground/85"
             : "text-muted-foreground/70 group-hover/nav:text-foreground/80",
         )}
       />
@@ -1170,6 +1216,7 @@ export function SettingsView() {
   const fontSize = useSyncedSettingsStore(selectTerminalFontSize);
   const baseBranch = useSyncedSettingsStore(selectDefaultBaseBranch);
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
+  const sidebarWorkspaceDetail = useSettingsStore(selectSidebarWorkspaceDetail);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
@@ -1430,10 +1477,10 @@ export function SettingsView() {
             {authUser && (
               <SectionGroup>
                 <SubsectionHeader title="Session" />
-                <SettingsCard className="flex items-center justify-between gap-4">
+                <SettingsCard className="flex items-center justify-between gap-4 border-destructive/25 bg-destructive/[0.07]">
                   <div className="min-w-0">
-                    <p className="text-[13px] font-medium text-foreground">Sign out of Codemux</p>
-                    <p className="text-[12px] text-muted-foreground/85 mt-0.5">
+                    <p className="text-[13.5px] font-semibold text-foreground">Sign out of Codemux</p>
+                    <p className="text-[12px] text-muted-foreground/80 mt-0.5">
                       You'll need to sign in again to sync settings and use cloud features.
                     </p>
                   </div>
@@ -1491,6 +1538,32 @@ export function SettingsView() {
                 />
               </SettingRow>
             </div>
+
+            <SectionGroup>
+              <SubsectionHeader
+                title="Sidebar"
+                description="How much detail each project-sidebar workspace row shows."
+              />
+              <div className="space-y-1">
+                <SettingRow
+                  label="Workspace rows"
+                  description="Clean keeps just the icon, name, and live status. Branch adds the git branch; Detailed also shows ahead/behind and diff stats."
+                >
+                  <SegmentedControl<SidebarWorkspaceDetail>
+                    ariaLabel="Workspace row detail level"
+                    value={sidebarWorkspaceDetail}
+                    onChange={(value) =>
+                      storeSet("sidebar.workspace_detail", value)
+                    }
+                    options={[
+                      { value: "clean", label: "Clean" },
+                      { value: "branch", label: "Branch" },
+                      { value: "detailed", label: "Detailed" },
+                    ]}
+                  />
+                </SettingRow>
+              </div>
+            </SectionGroup>
           </div>
         );
 
@@ -2138,12 +2211,12 @@ export function SettingsView() {
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <div className="flex items-center gap-2 text-[13px]">
-          <span className="font-medium text-foreground">Settings</span>
+        <div className="flex items-center gap-2 text-[14px]">
+          <span className="font-semibold tracking-tight text-foreground">Settings</span>
           {activeLabel && (
             <>
               <span className="text-muted-foreground/40">/</span>
-              <span className="text-muted-foreground">{activeLabel}</span>
+              <span className="font-semibold text-muted-foreground">{activeLabel}</span>
             </>
           )}
         </div>
@@ -2154,15 +2227,16 @@ export function SettingsView() {
         {/* Left nav — refined-minimal pill rows matching the new
             sidebar aesthetic: inset margins, soft muted hover, calm
             type hierarchy. Group separation is whitespace alone (no
-            dividers) so the nav reads as one continuous list. */}
-        <nav className="w-52 shrink-0 border-r border-border py-4">
+            dividers) so the nav reads as one continuous list. Mono
+            group captions echo the design system's metadata voice. */}
+        <nav className="w-60 shrink-0 border-r border-border bg-background py-4">
           <div className="space-y-5">
             {navGroups.map((group) => (
               <div key={group.label}>
-                <p className="px-4 pb-1.5 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/60">
+                <p className="px-4 pb-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground/55">
                   {group.label}
                 </p>
-                <div className="space-y-px px-2">
+                <div className="space-y-px px-3">
                   {group.items.map((item) => (
                     <SettingsNavItem
                       key={item.id}
@@ -2180,7 +2254,7 @@ export function SettingsView() {
 
         {/* Content */}
         <ScrollArea className="flex-1 bg-card">
-          <div className="mx-auto max-w-3xl px-10 py-10">
+          <div className="mx-auto max-w-3xl px-11 pt-8 pb-20">
             {renderSection()}
           </div>
         </ScrollArea>

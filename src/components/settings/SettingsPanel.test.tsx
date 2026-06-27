@@ -50,6 +50,7 @@ vi.mock("@/stores/settings-store", () => {
     "terminal.color_theme": "app",
     "terminal.font_family": "'JetBrains Mono Variable', monospace",
     auto_mcp_config: "true",
+    "sidebar.workspace_detail": "detailed",
   };
   return {
     useSettingsStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -59,6 +60,7 @@ vi.mock("@/stores/settings-store", () => {
         settings: defaults,
       }),
     selectTerminalColorTheme: () => "app",
+    selectSidebarWorkspaceDetail: () => "detailed",
   };
 });
 
