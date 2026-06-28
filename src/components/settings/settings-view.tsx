@@ -1449,7 +1449,7 @@ export function SettingsView() {
               {authUser ? (
                 <>
                   <SettingRow label="Email" description="Your sign-in email address.">
-                    <span className="text-sm text-muted-foreground">{authUser.email}</span>
+                    <span className="font-mono text-[13px] text-muted-foreground">{authUser.email}</span>
                   </SettingRow>
                   <Separator />
                   <SettingRow label="Name" description="Your display name.">
@@ -1519,7 +1519,17 @@ export function SettingsView() {
               </SettingRow>
               <Separator />
               <SettingRow label="Font family" description="Applied to the entire app shell and terminal.">
-                <span className="text-sm text-muted-foreground">DM Sans Variable</span>
+                {/* FLAG: display-only — the app shell font is fixed to DM Sans
+                    today. Rendered as the design's Select for visual parity;
+                    onValueChange is a no-op until a font-swap backend exists. */}
+                <Select value="dm-sans" onValueChange={() => {}}>
+                  <SelectTrigger className="w-48 h-9">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="dm-sans">DM Sans Variable</SelectItem>
+                  </SelectContent>
+                </Select>
               </SettingRow>
               <Separator />
               <SettingRow label="Border radius" description="Controls the roundness of all UI elements.">
@@ -2021,7 +2031,7 @@ export function SettingsView() {
         return (
           <div>
             <SectionHeader
-              title="Scripts"
+              title="Projects"
               description={`Automate your workspace lifecycle for ${projectName}. Changes are saved automatically.`}
             />
             {hasConfigFile && (
