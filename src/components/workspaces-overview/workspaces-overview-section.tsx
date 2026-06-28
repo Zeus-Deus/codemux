@@ -83,7 +83,7 @@ function filterTriggerCls(active: boolean): string {
   // replaces the SelectTrigger's own `data-[size=default]:h-8` instead of
   // colliding with it at equal specificity (the bare class would lose).
   return cn(
-    "data-[size=default]:h-10 rounded-[10px] text-[12.5px] font-semibold transition-colors",
+    "data-[size=default]:h-10 rounded-lg text-[12.5px] font-semibold transition-colors",
     active
       ? "border-primary/45 bg-primary/5 text-foreground"
       : "text-muted-foreground",
@@ -539,7 +539,7 @@ export function WorkspacesOverviewSection() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search by name, branch, or project…"
-              className="h-10 rounded-[10px] pl-9 text-[13px]"
+              className="h-10 rounded-lg pl-9 text-[13px]"
             />
             {search && (
               <button
@@ -560,7 +560,7 @@ export function WorkspacesOverviewSection() {
             >
               <SelectValue placeholder="All projects" />
             </SelectTrigger>
-            <SelectContent position="popper" className="max-h-72 rounded-[11px]">
+            <SelectContent position="popper" className="max-h-72 rounded-xl">
               <SelectItem value="all">All projects</SelectItem>
               {projects.map((p) => (
                 <SelectItem key={p.path} value={p.path}>
@@ -580,7 +580,7 @@ export function WorkspacesOverviewSection() {
             >
               <SelectValue placeholder="All devices" />
             </SelectTrigger>
-            <SelectContent position="popper" className="rounded-[11px]">
+            <SelectContent position="popper" className="rounded-xl">
               <SelectItem value="all">All devices</SelectItem>
               <SelectItem value="local">This device</SelectItem>
               {hosts
@@ -603,7 +603,7 @@ export function WorkspacesOverviewSection() {
             >
               <SelectValue placeholder="Any status" />
             </SelectTrigger>
-            <SelectContent position="popper" className="rounded-[11px]">
+            <SelectContent position="popper" className="rounded-xl">
               <SelectItem value="all">Any status</SelectItem>
               <SelectItem value="attached">
                 <StatusToneDot className="bg-emerald-400" />
@@ -634,7 +634,7 @@ export function WorkspacesOverviewSection() {
             >
               <SelectValue />
             </SelectTrigger>
-            <SelectContent position="popper" className="rounded-[11px]">
+            <SelectContent position="popper" className="rounded-xl">
               <SelectItem value="recent">Recently active</SelectItem>
               <SelectItem value="name">Name (A–Z)</SelectItem>
               <SelectItem value="branch">Branch (A–Z)</SelectItem>
@@ -682,7 +682,7 @@ export function WorkspacesOverviewSection() {
               type="button"
               variant="secondary"
               size="sm"
-              className="h-9 gap-1.5 rounded-[9px] px-3.5 text-[12.5px] font-semibold"
+              className="h-9 gap-1.5 px-3.5 text-[12.5px] font-semibold"
               onClick={() => {
                 setShowWorkspacesOverview(false);
                 setShowSettings(true, "hosts");
@@ -696,7 +696,7 @@ export function WorkspacesOverviewSection() {
             <Button
               type="button"
               size="sm"
-              className="h-9 gap-1.5 rounded-[9px] px-3.5 text-[12.5px] font-bold"
+              className="h-9 gap-1.5 px-3.5 text-[12.5px] font-bold"
               onClick={() => {
                 setShowWorkspacesOverview(false);
                 setShowNewWorkspaceDialog(true);
@@ -832,7 +832,7 @@ function DeviceSection({
           />
           <span
             className={cn(
-              "flex size-7 shrink-0 items-center justify-center rounded-[7px]",
+              "flex size-7 shrink-0 items-center justify-center rounded-md",
               isLocal
                 ? "bg-emerald-500/12 text-emerald-400"
                 : "bg-sky-500/12 text-sky-300",

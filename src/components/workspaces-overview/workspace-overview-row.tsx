@@ -392,7 +392,7 @@ function LocalRow({
         // step above the page — the design's headline "real elevation and
         // contrast". Hover lifts to a lighter surface (the design's
         // `card → card-h`).
-        "group/row relative flex h-full cursor-pointer flex-col gap-1.5 overflow-hidden rounded-[11px] border bg-card p-[15px] shadow-sm transition-colors",
+        "group/row relative flex h-full cursor-pointer flex-col gap-1.5 overflow-hidden rounded-xl border bg-card p-[15px] shadow-sm transition-colors",
         "hover:border-border hover:bg-muted/60",
         isAttached
           ? "border-emerald-500/40 ring-1 ring-emerald-500/20"
@@ -537,7 +537,7 @@ function LocalRow({
               <DropdownMenuContent
                 align="end"
                 onClick={(e) => e.stopPropagation()}
-                className="min-w-[200px] rounded-[11px]"
+                className="min-w-[200px] rounded-xl"
               >
                 <DropdownMenuItem onClick={handleOpen}>
                   <ExternalLink className="mr-2 size-3.5" />
@@ -758,7 +758,7 @@ function RemoteRow({
       role="group"
       aria-label={`${row.title}, lives on another device`}
       className={cn(
-        "group/row relative flex h-full flex-col gap-1.5 rounded-[11px] border border-dashed border-sky-500/30 bg-sky-500/5 p-[15px]",
+        "group/row relative flex h-full flex-col gap-1.5 rounded-xl border border-dashed border-sky-500/30 bg-sky-500/5 p-[15px]",
         "hover:border-sky-500/50 hover:bg-sky-500/8 transition-colors",
       )}
     >
@@ -826,7 +826,7 @@ function RemoteRow({
             <DropdownMenuContent
               align="end"
               onClick={(e) => e.stopPropagation()}
-              className="min-w-[220px] rounded-[11px]"
+              className="min-w-[220px] rounded-xl"
             >
               <DropdownMenuLabel className="text-[10px] uppercase tracking-wider text-muted-foreground/60">
                 Lives on another device
