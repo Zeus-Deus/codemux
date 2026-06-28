@@ -151,6 +151,13 @@ async function flushDefaultBranchFetch() {
 
 beforeEach(() => {
   cleanup();
+  // Pin the sidebar detail level to "detailed" for the broad suite so
+  // tests that assert on branch / git-stat / indicator rendering don't
+  // depend on the product default (which is "clean"). The detail-level
+  // describe block overrides this per-case.
+  useSettingsStore.setState({
+    settings: { "sidebar.workspace_detail": "detailed" },
+  });
   mockCheckoutDefault.mockReset();
   mockGetDefaultBranch.mockReset();
   mockGetDefaultBranch.mockResolvedValue("main");

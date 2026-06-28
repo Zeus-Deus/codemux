@@ -49,7 +49,15 @@ vi.mock("@/tauri/commands", () => ({
 // `useDefaultBranch` uses a module-level cache; reset between suites so a
 // mock return from a prior test doesn't leak in.
 import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
-beforeEach(() => __resetDefaultBranchCacheForTests());
+import { useSettingsStore } from "@/stores/settings-store";
+beforeEach(() => {
+  __resetDefaultBranchCacheForTests();
+  // These suites assert on branch / git-stat / indicator rendering, so
+  // pin the sidebar row to "detailed" rather than the "clean" default.
+  useSettingsStore.setState({
+    settings: { "sidebar.workspace_detail": "detailed" },
+  });
+});
 
 // Flush pending microtasks + unmount before the next test so late-resolving
 // `getDefaultBranch` promises finish their React update inside the jsdom

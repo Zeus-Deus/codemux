@@ -15,10 +15,10 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   ai_resolver_strategy: "smart_merge",
   auto_mcp_config: "true",
   // How much detail each project-sidebar workspace row shows:
-  //   "clean"    — icon + name + live status only
+  //   "clean"    — icon + name + live status only (default — calmest)
   //   "branch"   — also the git branch name
-  //   "detailed" — also ahead/behind + diff stats (the original behavior)
-  "sidebar.workspace_detail": "detailed",
+  //   "detailed" — also ahead/behind + diff stats
+  "sidebar.workspace_detail": "clean",
 };
 
 /** Sidebar workspace-row detail level. */
