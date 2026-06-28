@@ -19,10 +19,22 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   //   "branch"   — also the git branch name
   //   "detailed" — also ahead/behind + diff stats
   "sidebar.workspace_detail": "clean",
+  // Color palette variant — "cool" (Graphite, default/recommended) or
+  // "warm" (Ember). Applied via the root `data-pal` attribute.
+  "appearance.palette": "cool",
+  // Spacing density — "comfortable" (default) or "compact". Scales card
+  // padding, grid gaps, and group rhythm via the root `data-density` attr.
+  "appearance.density": "comfortable",
 };
 
 /** Sidebar workspace-row detail level. */
 export type SidebarWorkspaceDetail = "clean" | "branch" | "detailed";
+
+/** Color palette variant. */
+export type AppearancePalette = "cool" | "warm";
+
+/** Spacing density mode. */
+export type AppearanceDensity = "comfortable" | "compact";
 
 interface SettingsState {
   loaded: boolean;
@@ -107,3 +119,11 @@ export const selectSidebarWorkspaceDetail = (
 ): SidebarWorkspaceDetail =>
   (s.settings["sidebar.workspace_detail"] ??
     SETTINGS_DEFAULTS["sidebar.workspace_detail"]!) as SidebarWorkspaceDetail;
+
+export const selectPalette = (s: SettingsStore): AppearancePalette =>
+  (s.settings["appearance.palette"] ??
+    SETTINGS_DEFAULTS["appearance.palette"]!) as AppearancePalette;
+
+export const selectDensity = (s: SettingsStore): AppearanceDensity =>
+  (s.settings["appearance.density"] ??
+    SETTINGS_DEFAULTS["appearance.density"]!) as AppearanceDensity;

@@ -159,6 +159,57 @@
     --sidebar-ring: oklch(0.705 0.152 47);
 }
 
+/*
+ * Density scale — Comfortable (default) vs Compact. Drives card padding,
+ * grid gaps, and group rhythm on density-aware surfaces (e.g. the
+ * Workspaces overview). Applied via the root `data-density` attribute.
+ */
+:root {
+  --cpad: 15px;
+  --cgap: 13px;
+  --rowgap: 20px;
+}
+[data-density="compact"] {
+  --cpad: 10px;
+  --cgap: 8px;
+  --rowgap: 13px;
+}
+
+/*
+ * Warm · Ember palette variant — opt-in via the root `data-pal="warm"`
+ * attribute. Re-hues the role tokens to the warm (ember) surfaces; the
+ * shared status tones (--c-*, --success/--danger/--warning) are identical
+ * across palettes, so they're intentionally not overridden here.
+ */
+.dark[data-pal="warm"] {
+    --background: oklch(0.178 0.006 40);
+    --foreground: oklch(0.935 0.004 67);
+    --card: oklch(0.238 0.006 58);
+    --card-foreground: oklch(0.935 0.004 67);
+    --popover: oklch(0.206 0.006 50);
+    --popover-foreground: oklch(0.935 0.004 67);
+    --primary: oklch(0.700 0.150 47);
+    --primary-foreground: oklch(0.180 0.030 47);
+    --secondary: oklch(0.255 0.006 58);
+    --secondary-foreground: oklch(0.935 0.004 67);
+    --muted: oklch(0.272 0.006 55);
+    --muted-foreground: oklch(0.725 0.006 56);
+    --accent: oklch(0.272 0.006 55);
+    --accent-foreground: oklch(0.935 0.004 67);
+    --border: oklch(0.315 0.006 55);
+    --input: oklch(0.315 0.006 55);
+    --ring: oklch(0.700 0.150 47);
+    --titlebar: oklch(0.158 0.006 40);
+    --sidebar: oklch(0.206 0.006 50);
+    --sidebar-foreground: oklch(0.935 0.004 67);
+    --sidebar-primary: oklch(0.700 0.150 47);
+    --sidebar-primary-foreground: oklch(0.180 0.030 47);
+    --sidebar-accent: oklch(0.255 0.006 58);
+    --sidebar-accent-foreground: oklch(0.935 0.004 67);
+    --sidebar-border: oklch(0.272 0.006 55);
+    --sidebar-ring: oklch(0.700 0.150 47);
+}
+
 .pane-drop-overlay {
   position: absolute;
   inset: 0;

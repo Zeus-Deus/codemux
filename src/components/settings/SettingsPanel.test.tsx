@@ -51,6 +51,8 @@ vi.mock("@/stores/settings-store", () => {
     "terminal.font_family": "'JetBrains Mono Variable', monospace",
     auto_mcp_config: "true",
     "sidebar.workspace_detail": "detailed",
+    "appearance.palette": "cool",
+    "appearance.density": "comfortable",
   };
   return {
     useSettingsStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -61,6 +63,8 @@ vi.mock("@/stores/settings-store", () => {
       }),
     selectTerminalColorTheme: () => "app",
     selectSidebarWorkspaceDetail: () => "detailed",
+    selectPalette: () => "cool",
+    selectDensity: () => "comfortable",
   };
 });
 

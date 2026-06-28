@@ -720,7 +720,7 @@ export function WorkspacesOverviewSection() {
             allItems.filter((it) => it.kind === "local").length
           }
         />
-        <div className="mx-auto max-w-[1180px] space-y-8">
+        <div className="mx-auto max-w-[1180px] space-y-[var(--rowgap)]">
           {buckets.length === 0 ? (
             <EmptyFilters onClear={clearFilters} />
           ) : (
@@ -1079,7 +1079,7 @@ function RowGrid({
   divergenceByKey: Map<string, DivergenceInfo>;
 }) {
   return (
-    <ul className="grid grid-cols-1 gap-[13px] md:grid-cols-2">
+    <ul className="grid grid-cols-1 gap-[var(--cgap)] md:grid-cols-2">
       {items.map((it) => (
         <li
           key={it.key}

@@ -64,7 +64,11 @@ import {
   useSettingsStore,
   selectTerminalColorTheme,
   selectSidebarWorkspaceDetail,
+  selectPalette,
+  selectDensity,
   type SidebarWorkspaceDetail,
+  type AppearancePalette,
+  type AppearanceDensity,
 } from "@/stores/settings-store";
 import {
   detectEditors,
@@ -1217,6 +1221,8 @@ export function SettingsView() {
   const baseBranch = useSyncedSettingsStore(selectDefaultBaseBranch);
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
   const sidebarWorkspaceDetail = useSettingsStore(selectSidebarWorkspaceDetail);
+  const palette = useSettingsStore(selectPalette);
+  const density = useSettingsStore(selectDensity);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
@@ -1538,6 +1544,43 @@ export function SettingsView() {
                 />
               </SettingRow>
             </div>
+
+            <SectionGroup>
+              <SubsectionHeader
+                title="Theme"
+                description="Switch the surface palette and overall spacing density. Changes apply immediately across the app."
+              />
+              <div className="space-y-1">
+                <SettingRow
+                  label="Color palette"
+                  description="Cool keeps a neutral graphite tone (recommended). Warm is the previous ember-tinted surface."
+                >
+                  <SegmentedControl<AppearancePalette>
+                    ariaLabel="Color palette"
+                    value={palette}
+                    onChange={(value) => storeSet("appearance.palette", value)}
+                    options={[
+                      { value: "cool", label: "Cool" },
+                      { value: "warm", label: "Warm" },
+                    ]}
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Density"
+                  description="Comfortable gives cards and lists more breathing room. Compact tightens padding and gaps to fit more on screen."
+                >
+                  <SegmentedControl<AppearanceDensity>
+                    ariaLabel="Spacing density"
+                    value={density}
+                    onChange={(value) => storeSet("appearance.density", value)}
+                    options={[
+                      { value: "comfortable", label: "Comfortable" },
+                      { value: "compact", label: "Compact" },
+                    ]}
+                  />
+                </SettingRow>
+              </div>
+            </SectionGroup>
 
             <SectionGroup>
               <SubsectionHeader

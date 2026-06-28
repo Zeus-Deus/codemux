@@ -392,7 +392,7 @@ function LocalRow({
         // step above the page — the design's headline "real elevation and
         // contrast". Hover lifts to a lighter surface (the design's
         // `card → card-h`).
-        "group/row relative flex h-full cursor-pointer flex-col gap-1.5 overflow-hidden rounded-xl border bg-card p-[15px] shadow-sm transition-colors",
+        "group/row relative flex h-full cursor-pointer flex-col gap-1.5 overflow-hidden rounded-xl border bg-card p-[var(--cpad)] shadow-sm transition-colors",
         "hover:border-border hover:bg-muted/60",
         isAttached
           ? "border-emerald-500/40 ring-1 ring-emerald-500/20"
@@ -758,7 +758,7 @@ function RemoteRow({
       role="group"
       aria-label={`${row.title}, lives on another device`}
       className={cn(
-        "group/row relative flex h-full flex-col gap-1.5 rounded-xl border border-dashed border-sky-500/30 bg-sky-500/5 p-[15px]",
+        "group/row relative flex h-full flex-col gap-1.5 rounded-xl border border-dashed border-sky-500/30 bg-sky-500/5 p-[var(--cpad)]",
         "hover:border-sky-500/50 hover:bg-sky-500/8 transition-colors",
       )}
     >
