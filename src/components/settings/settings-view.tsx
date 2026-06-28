@@ -36,8 +36,6 @@ import {
   Bot,
   Zap,
   FolderCog,
-  Pin,
-  PinOff,
   Trash2,
   X,
   Plus,
@@ -133,7 +131,7 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { GripVertical } from "lucide-react";
+import { GripVertical, Star } from "lucide-react";
 
 type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
@@ -1721,7 +1719,7 @@ export function SettingsView() {
         return (
           <div>
             <SectionHeader
-              title="Terminal Presets"
+              title="Presets"
               description="Quick-launch presets for CLI agents and tools. Pinned presets appear in the preset bar."
             />
             <div className="space-y-1">
@@ -1756,7 +1754,7 @@ export function SettingsView() {
                     items={presetStore.presets.map((p) => p.id)}
                     strategy={verticalListSortingStrategy}
                   >
-                    <div className="space-y-1.5">
+                    <div className="overflow-hidden rounded-xl border border-border/60">
                       {presetStore.presets.map((preset) => (
                         <SortablePresetRow
                           key={preset.id}
@@ -2342,10 +2340,8 @@ function SortablePresetRow({
       ref={setNodeRef}
       style={style}
       className={cn(
-        "group/preset flex items-center gap-3 pl-1.5 pr-2 py-2 rounded-lg border cursor-pointer transition-colors duration-150",
-        selected
-          ? "border-border bg-muted/60"
-          : "border-border/40 bg-card/40 hover:bg-muted/30 hover:border-border/60",
+        "group/preset flex items-center gap-3 pl-2 pr-2.5 py-2.5 border-b border-border/40 last:border-b-0 cursor-pointer transition-colors duration-150",
+        selected ? "bg-muted/60" : "hover:bg-muted/30",
       )}
       onClick={onSelect}
     >
@@ -2360,7 +2356,11 @@ function SortablePresetRow({
       >
         <GripVertical className="h-3.5 w-3.5" />
       </button>
-      <PresetIcon icon={preset.icon} className="h-4 w-4 shrink-0" />
+      {/* Glyph tile — the agent icon seated in a rounded tile, per the
+          design's preset rows. */}
+      <span className="flex size-6 shrink-0 items-center justify-center rounded-md bg-muted/60">
+        <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
+      </span>
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2">
           <span className="text-[13px] font-medium truncate text-foreground">{preset.name}</span>
@@ -2408,9 +2408,9 @@ function SortablePresetRow({
           }}
         >
           {preset.pinned ? (
-            <Pin className="h-3.5 w-3.5 text-foreground" />
+            <Star className="h-3.5 w-3.5 fill-current text-foreground" />
           ) : (
-            <PinOff className="h-3.5 w-3.5 text-muted-foreground" />
+            <Star className="h-3.5 w-3.5 text-muted-foreground" />
           )}
         </Button>
       </div>
