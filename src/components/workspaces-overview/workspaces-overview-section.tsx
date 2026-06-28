@@ -83,7 +83,7 @@ function filterTriggerCls(active: boolean): string {
   // replaces the SelectTrigger's own `data-[size=default]:h-8` instead of
   // colliding with it at equal specificity (the bare class would lose).
   return cn(
-    "data-[size=default]:h-9 rounded-lg text-[12.5px] font-medium transition-colors",
+    "data-[size=default]:h-10 rounded-[10px] text-[12.5px] font-semibold transition-colors",
     active
       ? "border-primary/45 bg-primary/5 text-foreground"
       : "text-muted-foreground",
@@ -531,7 +531,7 @@ export function WorkspacesOverviewSection() {
     <div className="flex h-full min-h-0 flex-col">
       {/* Filter bar */}
       <div className="shrink-0 border-b border-border/60 bg-background/60 px-6 py-3 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-2">
+        <div className="mx-auto flex max-w-[1180px] flex-wrap items-center gap-2">
           {/* Search */}
           <div className="relative min-w-[220px] flex-1">
             <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/60" />
@@ -539,7 +539,7 @@ export function WorkspacesOverviewSection() {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search by name, branch, or project…"
-              className="h-9 rounded-lg pl-9 text-[13px]"
+              className="h-10 rounded-[10px] pl-9 text-[13px]"
             />
             {search && (
               <button
@@ -560,7 +560,7 @@ export function WorkspacesOverviewSection() {
             >
               <SelectValue placeholder="All projects" />
             </SelectTrigger>
-            <SelectContent position="popper" className="max-h-72">
+            <SelectContent position="popper" className="max-h-72 rounded-[11px]">
               <SelectItem value="all">All projects</SelectItem>
               {projects.map((p) => (
                 <SelectItem key={p.path} value={p.path}>
@@ -580,7 +580,7 @@ export function WorkspacesOverviewSection() {
             >
               <SelectValue placeholder="All devices" />
             </SelectTrigger>
-            <SelectContent position="popper">
+            <SelectContent position="popper" className="rounded-[11px]">
               <SelectItem value="all">All devices</SelectItem>
               <SelectItem value="local">This device</SelectItem>
               {hosts
@@ -603,7 +603,7 @@ export function WorkspacesOverviewSection() {
             >
               <SelectValue placeholder="Any status" />
             </SelectTrigger>
-            <SelectContent position="popper">
+            <SelectContent position="popper" className="rounded-[11px]">
               <SelectItem value="all">Any status</SelectItem>
               <SelectItem value="attached">
                 <StatusToneDot className="bg-emerald-400" />
@@ -634,7 +634,7 @@ export function WorkspacesOverviewSection() {
             >
               <SelectValue />
             </SelectTrigger>
-            <SelectContent position="popper">
+            <SelectContent position="popper" className="rounded-[11px]">
               <SelectItem value="recent">Recently active</SelectItem>
               <SelectItem value="name">Name (A–Z)</SelectItem>
               <SelectItem value="branch">Branch (A–Z)</SelectItem>
@@ -646,7 +646,7 @@ export function WorkspacesOverviewSection() {
               type="button"
               variant="ghost"
               size="sm"
-              className="h-9 gap-1.5 text-[12px] text-muted-foreground"
+              className="h-10 gap-1.5 text-[12px] text-muted-foreground"
               onClick={clearFilters}
             >
               <Filter className="size-3.5" />
@@ -658,7 +658,7 @@ export function WorkspacesOverviewSection() {
 
       {/* Result count + how-it-works + new-workspace shortcut */}
       <div className="shrink-0 border-b border-border/40 px-6 py-2">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3">
+        <div className="mx-auto flex max-w-[1180px] items-center justify-between gap-3">
           <div className="flex items-center gap-1.5">
             <p className="text-[11.5px] text-muted-foreground/70 tabular-nums">
               {totalShown === totalAll
@@ -682,7 +682,7 @@ export function WorkspacesOverviewSection() {
               type="button"
               variant="secondary"
               size="sm"
-              className="h-8 gap-1.5 text-[12px]"
+              className="h-9 gap-1.5 rounded-[9px] px-3.5 text-[12.5px] font-semibold"
               onClick={() => {
                 setShowWorkspacesOverview(false);
                 setShowSettings(true, "hosts");
@@ -696,7 +696,7 @@ export function WorkspacesOverviewSection() {
             <Button
               type="button"
               size="sm"
-              className="h-8 gap-1.5 text-[12px] font-semibold"
+              className="h-9 gap-1.5 rounded-[9px] px-3.5 text-[12.5px] font-bold"
               onClick={() => {
                 setShowWorkspacesOverview(false);
                 setShowNewWorkspaceDialog(true);
@@ -720,7 +720,7 @@ export function WorkspacesOverviewSection() {
             allItems.filter((it) => it.kind === "local").length
           }
         />
-        <div className="mx-auto max-w-6xl space-y-8">
+        <div className="mx-auto max-w-[1180px] space-y-8">
           {buckets.length === 0 ? (
             <EmptyFilters onClear={clearFilters} />
           ) : (
@@ -832,7 +832,7 @@ function DeviceSection({
           />
           <span
             className={cn(
-              "flex size-7 shrink-0 items-center justify-center rounded-md",
+              "flex size-7 shrink-0 items-center justify-center rounded-[7px]",
               isLocal
                 ? "bg-emerald-500/12 text-emerald-400"
                 : "bg-sky-500/12 text-sky-300",
@@ -900,7 +900,7 @@ function DeviceSection({
             return (
               <div className="space-y-5">
                 {groups.map((group) => (
-                  <div key={group.key} className="space-y-2 md:pl-7">
+                  <div key={group.key} className="space-y-2 md:pl-[38px]">
                     <ProjectGroupHeader
                       name={group.name}
                       count={group.items.length}
@@ -922,7 +922,7 @@ function DeviceSection({
                   </div>
                 ))}
                 {rest.length > 0 && (
-                  <div className="md:pl-7">
+                  <div className="md:pl-[38px]">
                     <RowGrid items={rest} {...rowGridProps} />
                   </div>
                 )}
@@ -1034,7 +1034,7 @@ function ProjectGroupHeader({
   return (
     <div className="flex items-center gap-1.5 pl-0.5 text-[11px] text-muted-foreground/70">
       <Folder className="size-3.5 text-muted-foreground/50" aria-hidden />
-      <span className="truncate font-mono text-[12px] font-medium text-foreground/80">
+      <span className="truncate font-mono text-[12px] font-semibold text-foreground/80">
         {name}
       </span>
       <span className="tabular-nums text-muted-foreground/45">{count}</span>
@@ -1079,7 +1079,7 @@ function RowGrid({
   divergenceByKey: Map<string, DivergenceInfo>;
 }) {
   return (
-    <ul className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+    <ul className="grid grid-cols-1 gap-[13px] md:grid-cols-2">
       {items.map((it) => (
         <li
           key={it.key}
