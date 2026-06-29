@@ -132,7 +132,10 @@
     --destructive-foreground: oklch(0.965 0.003 264);
     --border: oklch(0.305 0.006 264);
     --input: oklch(0.305 0.006 264);
-    --ring: oklch(0.705 0.152 47);
+    /* Focus ring is a muted neutral — ember is reserved for primary
+     * actions, links, selection checks, and status accents, never a
+     * default focus/active outline. */
+    --ring: oklch(0.55 0.01 264);
     --chart-1: oklch(0.705 0.152 47);
     --chart-2: oklch(0.74 0.14 156);
     --chart-3: oklch(0.80 0.13 80);
@@ -156,7 +159,7 @@
     --sidebar-accent: oklch(0.255 0.006 264);
     --sidebar-accent-foreground: oklch(0.965 0.003 264);
     --sidebar-border: oklch(0.262 0.005 264);
-    --sidebar-ring: oklch(0.705 0.152 47);
+    --sidebar-ring: oklch(0.55 0.01 264);
 }
 
 /*
@@ -198,7 +201,7 @@
     --accent-foreground: oklch(0.935 0.004 67);
     --border: oklch(0.315 0.006 55);
     --input: oklch(0.315 0.006 55);
-    --ring: oklch(0.700 0.150 47);
+    --ring: oklch(0.55 0.009 56);
     --titlebar: oklch(0.158 0.006 40);
     --sidebar: oklch(0.206 0.006 50);
     --sidebar-foreground: oklch(0.935 0.004 67);
@@ -207,7 +210,7 @@
     --sidebar-accent: oklch(0.255 0.006 58);
     --sidebar-accent-foreground: oklch(0.935 0.004 67);
     --sidebar-border: oklch(0.272 0.006 55);
-    --sidebar-ring: oklch(0.700 0.150 47);
+    --sidebar-ring: oklch(0.55 0.009 56);
 }
 
 .pane-drop-overlay {
