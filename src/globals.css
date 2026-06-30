@@ -185,6 +185,12 @@
   --success: var(--status-open);
   --warning: var(--status-working);
   --danger:  var(--status-attention);
+  /* The shadcn preset ships a saturated-blue --sidebar-primary (used for
+   * the sidebar accent + the terminal cursor). CodeMux has no blue brand
+   * colour, so route that accent to ember here — overrides the preset's
+   * value and survives preset re-apply. */
+  --sidebar-primary: var(--accent-ember);
+  --sidebar-primary-foreground: var(--primary-foreground);
 }
 
 /*
@@ -214,8 +220,8 @@
   --ring: oklch(0.55 0.009 56);
   --sidebar: oklch(0.206 0.006 50);
   --sidebar-foreground: oklch(0.935 0.004 67);
-  --sidebar-primary: oklch(0.925 0.004 70);
-  --sidebar-primary-foreground: oklch(0.205 0.006 40);
+  /* --sidebar-primary intentionally inherits the ember accent from the
+   * CodeMux custom-token block (no blue, consistent across palettes). */
   --sidebar-accent: oklch(0.255 0.006 58);
   --sidebar-accent-foreground: oklch(0.935 0.004 67);
   --sidebar-border: oklch(0.272 0.006 55);
