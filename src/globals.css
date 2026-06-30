@@ -53,113 +53,99 @@
     --color-success: var(--success);
     --color-danger: var(--danger);
     --color-warning: var(--warning);
-    /* Radius scale — the design system's NEW global dimensional scale
-     * (was a 6px base). Explicit px so each step lands on the spec:
-     * controls (rounded-lg) 10px, cards/menus (rounded-xl) 11px, with
-     * small chips and large frames bracketing them. Small icon buttons
-     * cap their own radius via `min(var(--radius-md), …)`. */
-    --radius-sm: 6px;
-    --radius-md: 8px;
-    --radius-lg: 10px;
-    --radius-xl: 11px;
-    --radius-2xl: 13px;
-    --radius-3xl: 16px;
-    --radius-4xl: 20px;
+    /* CodeMux custom tokens → Tailwind utilities. Enables text-status-open,
+     * bg-status-working/15, border-status-attention, text-accent-ember, etc.
+     * Values live in the "CodeMux custom tokens" block below. */
+    --color-accent-ember: var(--accent-ember);
+    --color-status-open: var(--status-open);
+    --color-status-working: var(--status-working);
+    --color-status-attention: var(--status-attention);
+    --color-status-remote: var(--status-remote);
+    /* Radius scale — fully token-driven from the preset's --radius. Change
+     * the preset (or --radius) and every rounded utility re-skins. */
+    --radius-sm: calc(var(--radius) - 4px);
+    --radius-md: calc(var(--radius) - 2px);
+    --radius-lg: var(--radius);
+    --radius-xl: calc(var(--radius) + 4px);
+    --radius-2xl: calc(var(--radius) + 8px);
+    --radius-3xl: calc(var(--radius) + 14px);
+    --radius-4xl: calc(var(--radius) + 22px);
 }
 
 :root {
     --background: oklch(1 0 0);
-    --foreground: oklch(0.141 0.005 285.823);
+    --foreground: oklch(0.145 0 0);
     --card: oklch(1 0 0);
-    --card-foreground: oklch(0.141 0.005 285.823);
+    --card-foreground: oklch(0.145 0 0);
     --popover: oklch(1 0 0);
-    --popover-foreground: oklch(0.141 0.005 285.823);
-    --primary: oklch(0.488 0.243 264.376);
-    --primary-foreground: oklch(0.97 0.014 254.604);
-    --secondary: oklch(0.967 0.001 286.375);
-    --secondary-foreground: oklch(0.21 0.006 285.885);
-    --muted: oklch(0.967 0.001 286.375);
-    --muted-foreground: oklch(0.552 0.016 285.938);
-    --accent: oklch(0.967 0.001 286.375);
-    --accent-foreground: oklch(0.21 0.006 285.885);
+    --popover-foreground: oklch(0.145 0 0);
+    --primary: oklch(0.205 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.556 0 0);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.205 0 0);
     --destructive: oklch(0.577 0.245 27.325);
-    --border: oklch(0.92 0.004 286.32);
-    --input: oklch(0.92 0.004 286.32);
-    --ring: oklch(0.705 0.015 286.067);
-    --chart-1: oklch(0.837 0.128 66.29);
-    --chart-2: oklch(0.705 0.213 47.604);
-    --chart-3: oklch(0.646 0.222 41.116);
-    --chart-4: oklch(0.553 0.195 38.402);
-    --chart-5: oklch(0.47 0.157 37.304);
+    --border: oklch(0.922 0 0);
+    --input: oklch(0.922 0 0);
+    --ring: oklch(0.708 0 0);
+    --chart-1: oklch(0.865 0.127 207.078);
+    --chart-2: oklch(0.715 0.143 215.221);
+    --chart-3: oklch(0.609 0.126 221.723);
+    --chart-4: oklch(0.52 0.105 223.128);
+    --chart-5: oklch(0.45 0.085 224.283);
     --radius: 0.625rem;
-    --success: oklch(0.723 0.191 142.5);
-    --danger: oklch(0.707 0.165 19.57);
-    --warning: oklch(0.795 0.184 86.047);
     --sidebar: oklch(0.985 0 0);
-    --sidebar-foreground: oklch(0.141 0.005 285.823);
-    --sidebar-primary: oklch(0.546 0.245 262.881);
-    --sidebar-primary-foreground: oklch(0.97 0.014 254.604);
-    --sidebar-accent: oklch(0.967 0.001 286.375);
-    --sidebar-accent-foreground: oklch(0.21 0.006 285.885);
-    --sidebar-border: oklch(0.92 0.004 286.32);
-    --sidebar-ring: oklch(0.705 0.015 286.067);
+    --sidebar-foreground: oklch(0.145 0 0);
+    --sidebar-primary: oklch(0.205 0 0);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.97 0 0);
+    --sidebar-accent-foreground: oklch(0.205 0 0);
+    --sidebar-border: oklch(0.922 0 0);
+    --sidebar-ring: oklch(0.708 0 0);
 }
 
-/*
- * Active theme: Cool · Graphite (the design system's default — neutral,
- * graphite hue 264). Role tokens are mapped from the design's semantic
- * palette: --background=bg, --card=card, --popover=bg2 (raised menu
- * surface), --primary=ember accent, --muted/--accent=hairline-soft fill,
- * --border=bd. The previous Warm · Ember palette is preserved in
- * src/themes/ember-dark.css as the optional variant.
- */
+/* Dark theme tokens — owned by the shadcn preset (b1uGGRs5B, neutral base,
+ * near-white --primary). Re-applying the preset rewrites this block, so no
+ * project-specific overrides live here — those go in "CodeMux custom
+ * tokens" and ".theme-warm" below. */
 .dark {
-    --background: oklch(0.165 0.004 264);
-    --foreground: oklch(0.965 0.003 264);
-    --card: oklch(0.224 0.005 264);
-    --card-foreground: oklch(0.965 0.003 264);
-    --popover: oklch(0.198 0.004 264);
-    --popover-foreground: oklch(0.965 0.003 264);
-    --primary: oklch(0.705 0.152 47);
-    --primary-foreground: oklch(0.180 0.030 47);
-    --secondary: oklch(0.245 0.006 264);
-    --secondary-foreground: oklch(0.965 0.003 264);
-    --muted: oklch(0.262 0.005 264);
-    --muted-foreground: oklch(0.730 0.008 264);
-    --accent: oklch(0.262 0.005 264);
-    --accent-foreground: oklch(0.965 0.003 264);
-    --destructive: oklch(0.685 0.170 22);
-    --destructive-foreground: oklch(0.965 0.003 264);
-    --border: oklch(0.305 0.006 264);
-    --input: oklch(0.305 0.006 264);
+    --background: oklch(0.145 0 0);
+    --foreground: oklch(0.985 0 0);
+    --card: oklch(0.205 0 0);
+    --card-foreground: oklch(0.985 0 0);
+    --popover: oklch(0.205 0 0);
+    --popover-foreground: oklch(0.985 0 0);
+    --primary: oklch(0.922 0 0);
+    --primary-foreground: oklch(0.205 0 0);
+    --secondary: oklch(0.269 0 0);
+    --secondary-foreground: oklch(0.985 0 0);
+    --muted: oklch(0.269 0 0);
+    --muted-foreground: oklch(0.708 0 0);
+    --accent: oklch(0.269 0 0);
+    --accent-foreground: oklch(0.985 0 0);
+    --destructive: oklch(0.704 0.191 22.216);
+    --border: oklch(1 0 0 / 10%);
+    --input: oklch(1 0 0 / 15%);
     /* Focus ring is a muted neutral — ember is reserved for primary
      * actions, links, selection checks, and status accents, never a
      * default focus/active outline. */
-    --ring: oklch(0.55 0.01 264);
-    --chart-1: oklch(0.705 0.152 47);
-    --chart-2: oklch(0.74 0.14 156);
-    --chart-3: oklch(0.80 0.13 80);
-    --chart-4: oklch(0.74 0.10 232);
-    --chart-5: oklch(0.72 0.13 290);
-    --success: oklch(0.74 0.14 156);
-    --danger: oklch(0.685 0.17 22);
-    --warning: oklch(0.80 0.13 80);
-    /* Shared status tones (design `--c-*`) — for status dots, badges,
-     * and semantic accents across every screen. */
-    --c-green: oklch(0.74 0.14 156);
-    --c-amber: oklch(0.80 0.13 80);
-    --c-red: oklch(0.685 0.17 22);
-    --c-sky: oklch(0.74 0.10 232);
-    --c-violet: oklch(0.72 0.13 290);
-    --titlebar: oklch(0.145 0.004 264);
-    --sidebar: oklch(0.198 0.004 264);
-    --sidebar-foreground: oklch(0.965 0.003 264);
-    --sidebar-primary: oklch(0.705 0.152 47);
-    --sidebar-primary-foreground: oklch(0.180 0.030 47);
-    --sidebar-accent: oklch(0.255 0.006 264);
-    --sidebar-accent-foreground: oklch(0.965 0.003 264);
-    --sidebar-border: oklch(0.262 0.005 264);
-    --sidebar-ring: oklch(0.55 0.01 264);
+    --ring: oklch(0.556 0 0);
+    --chart-1: oklch(0.865 0.127 207.078);
+    --chart-2: oklch(0.715 0.143 215.221);
+    --chart-3: oklch(0.609 0.126 221.723);
+    --chart-4: oklch(0.52 0.105 223.128);
+    --chart-5: oklch(0.45 0.085 224.283);
+    --sidebar: oklch(0.205 0 0);
+    --sidebar-foreground: oklch(0.985 0 0);
+    --sidebar-primary: oklch(0.488 0.243 264.376);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: oklch(0.269 0 0);
+    --sidebar-accent-foreground: oklch(0.985 0 0);
+    --sidebar-border: oklch(1 0 0 / 10%);
+    --sidebar-ring: oklch(0.556 0 0);
 }
 
 /*
@@ -179,38 +165,59 @@
 }
 
 /*
- * Warm · Ember palette variant — opt-in via the root `data-pal="warm"`
- * attribute. Re-hues the role tokens to the warm (ember) surfaces; the
- * shared status tones (--c-*, --success/--danger/--warning) are identical
- * across palettes, so they're intentionally not overridden here.
+ * CodeMux custom tokens — the brand layer presets can't express. These are
+ * NON-standard variables, so re-applying/switching the shadcn preset never
+ * touches them. Never hardcode these colours in components: consume them as
+ * the utilities mapped in @theme inline (text-status-open, bg-status-working,
+ * text-accent-ember, …). Status tones are identical across palettes.
  */
-.dark[data-pal="warm"] {
-    --background: oklch(0.178 0.006 40);
-    --foreground: oklch(0.935 0.004 67);
-    --card: oklch(0.238 0.006 58);
-    --card-foreground: oklch(0.935 0.004 67);
-    --popover: oklch(0.206 0.006 50);
-    --popover-foreground: oklch(0.935 0.004 67);
-    --primary: oklch(0.700 0.150 47);
-    --primary-foreground: oklch(0.180 0.030 47);
-    --secondary: oklch(0.255 0.006 58);
-    --secondary-foreground: oklch(0.935 0.004 67);
-    --muted: oklch(0.272 0.006 55);
-    --muted-foreground: oklch(0.725 0.006 56);
-    --accent: oklch(0.272 0.006 55);
-    --accent-foreground: oklch(0.935 0.004 67);
-    --border: oklch(0.315 0.006 55);
-    --input: oklch(0.315 0.006 55);
-    --ring: oklch(0.55 0.009 56);
-    --titlebar: oklch(0.158 0.006 40);
-    --sidebar: oklch(0.206 0.006 50);
-    --sidebar-foreground: oklch(0.935 0.004 67);
-    --sidebar-primary: oklch(0.700 0.150 47);
-    --sidebar-primary-foreground: oklch(0.180 0.030 47);
-    --sidebar-accent: oklch(0.255 0.006 58);
-    --sidebar-accent-foreground: oklch(0.935 0.004 67);
-    --sidebar-border: oklch(0.272 0.006 55);
-    --sidebar-ring: oklch(0.55 0.009 56);
+:root,
+.dark {
+  --accent-ember:     oklch(0.705 0.152 47);  /* sparing: selection, links, small accents */
+  --status-open:      oklch(0.74 0.14 156);   /* green — open / ready / connected / +    */
+  --status-working:   oklch(0.80 0.13 80);    /* amber — agent working / behind / changed */
+  --status-attention: oklch(0.685 0.17 22);   /* red   — needs input / destructive / −    */
+  --status-remote:    oklch(0.74 0.10 232);   /* sky   — on host / other device / cloud   */
+  /* Legacy semantic aliases kept as one value source for existing
+   * text-success / bg-warning / text-danger utilities. */
+  --success: var(--status-open);
+  --warning: var(--status-working);
+  --danger:  var(--status-attention);
+}
+
+/*
+ * Warm palette variant — opt-in via a `.theme-warm` class on the root.
+ * Overrides only the surface/role tokens with warm-grey oklch values; the
+ * primary stays near-white (white buttons), and the status tokens are
+ * intentionally NOT overridden (shared across palettes). One component set,
+ * two token maps.
+ */
+.theme-warm {
+  --background: oklch(0.178 0.006 40);
+  --foreground: oklch(0.935 0.004 67);
+  --card: oklch(0.238 0.006 58);
+  --card-foreground: oklch(0.935 0.004 67);
+  --popover: oklch(0.238 0.006 58);
+  --popover-foreground: oklch(0.935 0.004 67);
+  --primary: oklch(0.925 0.004 70);
+  --primary-foreground: oklch(0.205 0.006 40);
+  --secondary: oklch(0.272 0.006 55);
+  --secondary-foreground: oklch(0.935 0.004 67);
+  --muted: oklch(0.272 0.006 55);
+  --muted-foreground: oklch(0.725 0.006 56);
+  --accent: oklch(0.272 0.006 55);
+  --accent-foreground: oklch(0.935 0.004 67);
+  --border: oklch(0.315 0.006 55);
+  --input: oklch(0.315 0.006 55);
+  --ring: oklch(0.55 0.009 56);
+  --sidebar: oklch(0.206 0.006 50);
+  --sidebar-foreground: oklch(0.935 0.004 67);
+  --sidebar-primary: oklch(0.925 0.004 70);
+  --sidebar-primary-foreground: oklch(0.205 0.006 40);
+  --sidebar-accent: oklch(0.255 0.006 58);
+  --sidebar-accent-foreground: oklch(0.935 0.004 67);
+  --sidebar-border: oklch(0.272 0.006 55);
+  --sidebar-ring: oklch(0.55 0.009 56);
 }
 
 .pane-drop-overlay {
@@ -288,7 +295,7 @@ body.pane-resizing iframe {
 .markdown-rendered h3 { font-size: 1.15em; }
 .markdown-rendered h4 { font-size: 1em; }
 .markdown-rendered p { margin: 0.75em 0; }
-.markdown-rendered a { color: var(--sidebar-primary); text-decoration: underline; text-underline-offset: 2px; }
+.markdown-rendered a { color: var(--accent-ember); text-decoration: underline; text-underline-offset: 2px; }
 .markdown-rendered a:hover { opacity: 0.8; }
 .markdown-rendered strong { font-weight: 600; }
 .markdown-rendered em { font-style: italic; }
@@ -346,7 +353,7 @@ body.pane-resizing iframe {
 .markdown-rendered img { max-width: 100%; border-radius: 6px; margin: 0.75em 0; }
 .markdown-rendered input[type="checkbox"] {
   margin-right: 0.5em;
-  accent-color: var(--sidebar-primary);
+  accent-color: var(--accent-ember);
 }
 
 /* Transcript-tail "thinking" indicator (see ThinkingIndicator.tsx).
@@ -374,15 +381,15 @@ body.pane-resizing iframe {
  * dwell time to notice without becoming annoying. */
 @keyframes cm-pulse-attention {
   0% {
-    box-shadow: 0 0 0 0 rgb(56 189 248 / 0.55);
+    box-shadow: 0 0 0 0 color-mix(in oklch, var(--status-remote) 55%, transparent);
     transform: scale(1);
   }
   50% {
-    box-shadow: 0 0 0 8px rgb(56 189 248 / 0);
+    box-shadow: 0 0 0 8px transparent;
     transform: scale(1.015);
   }
   100% {
-    box-shadow: 0 0 0 0 rgb(56 189 248 / 0);
+    box-shadow: 0 0 0 0 transparent;
     transform: scale(1);
   }
 }

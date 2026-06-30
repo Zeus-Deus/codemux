@@ -54,7 +54,10 @@ export function AppShell() {
 
   useEffect(() => {
     const root = document.documentElement;
-    root.dataset.pal = palette;
+    // Warm palette is a `.theme-warm` token override on the root; Cool is
+    // the default token map (no class). Density stays a data attribute.
+    root.classList.toggle("theme-warm", palette === "warm");
+    delete root.dataset.pal; // clean up the legacy attribute if present
     root.dataset.density = density;
   }, [palette, density]);
 

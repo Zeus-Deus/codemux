@@ -19,8 +19,9 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   //   "branch"   — also the git branch name
   //   "detailed" — also ahead/behind + diff stats
   "sidebar.workspace_detail": "clean",
-  // Color palette variant — "cool" (Graphite, default/recommended) or
-  // "warm" (Ember). Applied via the root `data-pal` attribute.
+  // Color palette variant — "cool" (neutral graphite, default) or "warm".
+  // Applied via a `.theme-warm` class on the root that overrides the
+  // surface tokens (see globals.css). Cool = the default token map.
   "appearance.palette": "cool",
   // Spacing density — "comfortable" (default) or "compact". Scales card
   // padding, grid gaps, and group rhythm via the root `data-density` attr.
