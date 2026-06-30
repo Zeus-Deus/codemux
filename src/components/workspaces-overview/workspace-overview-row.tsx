@@ -116,7 +116,7 @@ function DivergenceChip({ info }: { info: DivergenceInfo }) {
   return (
     <span
       title={`Diverged — different commits on ${info.otherLabel}. Push from one device to share, or pull to overwrite the other.`}
-      className="shrink-0 inline-flex items-center gap-1 rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-amber-300"
+      className="shrink-0 inline-flex items-center gap-1 rounded-full border border-status-working/30 bg-status-working/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-status-working"
     >
       <svg
         viewBox="0 0 12 12"
@@ -367,13 +367,13 @@ function LocalRow({
   // static "open now" accent, matching the meta-line precedence below.
   const accentTone =
     workspaceStatus === "working"
-      ? "bg-amber-400"
+      ? "bg-status-working"
       : workspaceStatus === "permission"
-        ? "bg-red-400"
+        ? "bg-status-attention"
         : workspaceStatus === "review"
-          ? "bg-emerald-400"
+          ? "bg-status-open"
           : isAttached
-            ? "bg-emerald-400"
+            ? "bg-status-open"
             : null;
 
   return (
@@ -395,7 +395,7 @@ function LocalRow({
         "group/row relative flex h-full cursor-pointer flex-col gap-1.5 overflow-hidden rounded-xl border bg-card p-[var(--cpad)] shadow-sm transition-colors",
         "hover:border-border hover:bg-muted/60",
         isAttached
-          ? "border-emerald-500/40 ring-1 ring-emerald-500/20"
+          ? "border-status-open/40 ring-1 ring-status-open/20"
           : "border-border/60",
       )}
     >
@@ -431,7 +431,7 @@ function LocalRow({
             {isAttachOnly && (
               <span
                 title="Running in place on its host — no local copy. Closing detaches; the host process keeps running."
-                className="shrink-0 inline-flex items-center gap-1 rounded-full border border-sky-400/30 bg-sky-500/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-sky-300"
+                className="shrink-0 inline-flex items-center gap-1 rounded-full border border-status-remote/30 bg-status-remote/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-status-remote"
               >
                 <Server className="size-2.5" aria-hidden />
                 on host
@@ -448,7 +448,7 @@ function LocalRow({
             {isDivergentCopy && (
               <span
                 title="Standalone copy — this is a full copy of the repo in the worktrees folder, not linked to the project's real history, so it will drift. Delete it and pull again: new pulls land the repo root cleanly under ~/.codemux/projects/."
-                className="shrink-0 rounded-full border border-amber-400/30 bg-amber-500/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-amber-300/90"
+                className="shrink-0 rounded-full border border-status-working/30 bg-status-working/10 px-1.5 py-0 text-[10px] font-medium leading-[14px] text-status-working/90"
               >
                 standalone copy
               </span>
@@ -473,23 +473,23 @@ function LocalRow({
           <p className="mt-[3px] truncate text-[11.5px] text-muted-foreground/65">
             {project ? project.name : "—"}
             {isWorking && (
-              <span className="ml-1.5 text-amber-400/90">
+              <span className="ml-1.5 text-status-working/90">
                 · agent working
               </span>
             )}
             {!isWorking && workspaceStatus === "permission" && (
-              <span className="ml-1.5 text-red-400/90">· needs input</span>
+              <span className="ml-1.5 text-status-attention/90">· needs input</span>
             )}
             {!isWorking && workspaceStatus === "review" && (
-              <span className="ml-1.5 text-emerald-400/90">
+              <span className="ml-1.5 text-status-open/90">
                 · ready to review
               </span>
             )}
             {!workspaceStatus && isAttached && (
-              <span className="ml-1.5 text-emerald-400/80">· open now</span>
+              <span className="ml-1.5 text-status-open/80">· open now</span>
             )}
             {!workspaceStatus && isRemote && !isAttached && (
-              <span className="ml-1.5 text-sky-300/70">· remote</span>
+              <span className="ml-1.5 text-status-remote/70">· remote</span>
             )}
           </p>
         </div>
@@ -758,15 +758,15 @@ function RemoteRow({
       role="group"
       aria-label={`${row.title}, lives on another device`}
       className={cn(
-        "group/row relative flex h-full flex-col gap-1.5 rounded-xl border border-dashed border-sky-500/30 bg-sky-500/5 p-[var(--cpad)]",
-        "hover:border-sky-500/50 hover:bg-sky-500/8 transition-colors",
+        "group/row relative flex h-full flex-col gap-1.5 rounded-xl border border-dashed border-status-remote/30 bg-status-remote/5 p-[var(--cpad)]",
+        "hover:border-status-remote/50 hover:bg-status-remote/8 transition-colors",
       )}
     >
       <div className="flex items-start gap-2">
         <span
           aria-label="Lives on another device"
           title="This workspace lives on another device of your account."
-          className="mt-[5px] flex size-2 shrink-0 rounded-full bg-sky-400/70 ring-[3px] ring-sky-400/15"
+          className="mt-[5px] flex size-2 shrink-0 rounded-full bg-status-remote/70 ring-[3px] ring-status-remote/15"
         />
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
@@ -791,14 +791,14 @@ function RemoteRow({
             )}
             <span
               title="This workspace lives on another device of your account. Pull it down to interact with it here."
-              className="shrink-0 rounded-full border border-sky-400/30 bg-sky-500/10 px-1.5 py-0 text-[10px] font-medium uppercase tracking-wider leading-[14px] text-sky-300"
+              className="shrink-0 rounded-full border border-status-remote/30 bg-status-remote/10 px-1.5 py-0 text-[10px] font-medium uppercase tracking-wider leading-[14px] text-status-remote"
             >
               other device
             </span>
           </div>
           <p className="mt-[3px] truncate text-[11.5px] text-muted-foreground/65">
             {item.projectName ?? "—"}
-            <span className="ml-1.5 text-sky-300/70">
+            <span className="ml-1.5 text-status-remote/70">
               · not on this device
             </span>
           </p>
@@ -937,13 +937,13 @@ function StatusDot({
         // flat muted dot so it recedes.
         "mt-[5px] flex size-2 shrink-0 items-center justify-center rounded-full",
         inFlight
-          ? "bg-amber-400/80 ring-[3px] ring-amber-400/15"
+          ? "bg-status-working/80 ring-[3px] ring-status-working/15"
           : attached
-            ? "bg-emerald-400 ring-[3px] ring-emerald-400/15"
+            ? "bg-status-open ring-[3px] ring-status-open/15"
             : remote
-              ? "bg-sky-400/80 ring-[3px] ring-sky-400/15"
+              ? "bg-status-remote/80 ring-[3px] ring-status-remote/15"
               : openFlow
-                ? "bg-violet-400/70 ring-[3px] ring-violet-400/15"
+                ? "bg-accent-violet/70 ring-[3px] ring-accent-violet/15"
                 : "bg-muted-foreground/40",
       )}
     />

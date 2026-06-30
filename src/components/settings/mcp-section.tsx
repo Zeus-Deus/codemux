@@ -240,7 +240,7 @@ function CapBanner({ info }: { info: CappedTools }) {
   return (
     <div
       data-testid="mcp-cap-banner"
-      className="mb-4 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+      className="mb-4 flex items-start gap-2 rounded-md border border-status-working/30 bg-status-working/10 px-3 py-2 text-xs text-status-working dark:text-status-working"
     >
       <AlertTriangle className="size-3.5 shrink-0 mt-0.5" aria-hidden />
       <div className="flex-1">
@@ -248,7 +248,7 @@ function CapBanner({ info }: { info: CappedTools }) {
           {info.totalBeforeCap - info.droppedCount} of {info.totalBeforeCap}{" "}
           tools registered with the agent
         </p>
-        <p className="mt-0.5 text-amber-700/80 dark:text-amber-300/80">
+        <p className="mt-0.5 text-status-working/80 dark:text-status-working/80">
           Codemux's built-in tools are protected; {info.droppedCount} user
           MCP tool{info.droppedCount === 1 ? " was" : "s were"} dropped to
           fit the cap. Disable a server in this list to reclaim slots.
@@ -401,7 +401,7 @@ function ServerRow({
               <TooltipTrigger asChild>
                 <Badge
                   variant="outline"
-                  className="text-[10px] cursor-help border-amber-500/50 text-amber-600 dark:text-amber-400"
+                  className="text-[10px] cursor-help border-status-working/50 text-status-working dark:text-status-working"
                   data-testid={`mcp-row-${server.id}-capped`}
                 >
                   capped
@@ -519,11 +519,11 @@ function McpStatusBadge({
   if (runtime.status.kind === "running") {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-emerald-600 dark:text-emerald-400"
+        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-status-open dark:text-status-open"
         data-testid={`mcp-row-${server.id}-status`}
         data-status="running"
       >
-        <span className="size-1.5 rounded-full bg-emerald-500" />
+        <span className="size-1.5 rounded-full bg-status-open" />
         {runtime.status.toolCount} tool{runtime.status.toolCount === 1 ? "" : "s"}
       </span>
     );

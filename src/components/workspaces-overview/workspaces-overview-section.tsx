@@ -606,15 +606,15 @@ export function WorkspacesOverviewSection() {
             <SelectContent position="popper" className="rounded-xl">
               <SelectItem value="all">Any status</SelectItem>
               <SelectItem value="attached">
-                <StatusToneDot className="bg-emerald-400" />
+                <StatusToneDot className="bg-status-open" />
                 Currently open
               </SelectItem>
               <SelectItem value="remote-host">
-                <StatusToneDot className="bg-sky-400" />
+                <StatusToneDot className="bg-status-remote" />
                 On a remote host
               </SelectItem>
               <SelectItem value="sibling-device">
-                <StatusToneDot className="bg-sky-400" />
+                <StatusToneDot className="bg-status-remote" />
                 On another device
               </SelectItem>
               <SelectItem value="dirty">
@@ -834,8 +834,8 @@ function DeviceSection({
             className={cn(
               "flex size-7 shrink-0 items-center justify-center rounded-md",
               isLocal
-                ? "bg-emerald-500/12 text-emerald-400"
-                : "bg-sky-500/12 text-sky-300",
+                ? "bg-status-open/12 text-status-open"
+                : "bg-status-remote/12 text-status-remote",
             )}
           >
             {isLocal ? (

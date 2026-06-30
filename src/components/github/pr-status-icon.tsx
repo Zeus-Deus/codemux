@@ -10,8 +10,8 @@ interface IconSpec {
 }
 
 const STATE_TO_ICON: Record<PrStatusState, IconSpec> = {
-  merged: { Icon: GitMerge, colorCls: "text-purple-500" },
-  open: { Icon: GitPullRequest, colorCls: "text-emerald-500" },
+  merged: { Icon: GitMerge, colorCls: "text-accent-violet" },
+  open: { Icon: GitPullRequest, colorCls: "text-status-open" },
   closed: { Icon: GitPullRequestClosed, colorCls: "text-destructive" },
   draft: { Icon: GitPullRequestDraft, colorCls: "text-muted-foreground" },
 };
@@ -20,8 +20,8 @@ const STATE_TO_ICON: Record<PrStatusState, IconSpec> = {
  *  the icon color at low opacity so the row reads "this PR is merged/open/…"
  *  at a glance. Mirrors Superset's color-coded badge style. */
 const STATE_TO_TONE: Record<PrStatusState, string> = {
-  merged: "text-purple-500 bg-purple-500/15",
-  open: "text-emerald-500 bg-emerald-500/15",
+  merged: "text-accent-violet bg-accent-violet/15",
+  open: "text-status-open bg-status-open/15",
   closed: "text-destructive bg-destructive/15",
   draft: "text-muted-foreground bg-muted-foreground/15",
 };

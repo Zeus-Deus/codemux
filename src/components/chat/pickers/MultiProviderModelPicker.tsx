@@ -506,7 +506,7 @@ function ProviderRail({
                     )}
                   >
                     <Star
-                      className="h-5 w-5 shrink-0 text-amber-500"
+                      className="h-5 w-5 shrink-0 text-status-working"
                       fill="currentColor"
                     />
                   </button>
@@ -665,7 +665,7 @@ function ModelRow({
       {model.is_free ? (
         <span
           data-testid="model-row-free-badge"
-          className="mt-0.5 shrink-0 self-start rounded border border-emerald-500/35 bg-emerald-500/15 px-1 py-px text-[9px] font-bold uppercase leading-none tracking-wide text-emerald-700 dark:border-emerald-400/30 dark:bg-emerald-400/12 dark:text-emerald-300"
+          className="mt-0.5 shrink-0 self-start rounded border border-status-open/35 bg-status-open/15 px-1 py-px text-[9px] font-bold uppercase leading-none tracking-wide text-status-open dark:border-status-open/30 dark:bg-status-open/12 dark:text-status-open"
           aria-label="Free model"
         >
           Free
@@ -693,7 +693,7 @@ function ModelRow({
         className={cn(
           "shrink-0 rounded p-1 transition-opacity hover:bg-accent",
           isFavorite
-            ? "text-amber-500 opacity-100"
+            ? "text-status-working opacity-100"
             : "opacity-0 hover:opacity-100 group-hover:opacity-60 focus-visible:opacity-100",
         )}
       >

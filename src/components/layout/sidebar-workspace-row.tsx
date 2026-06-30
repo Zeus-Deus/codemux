@@ -141,7 +141,7 @@ function RemoveWorkspaceDialog({
         </DialogHeader>
 
         {hasWarnings && (
-          <div className="flex items-center gap-2 rounded-md border border-yellow-500/20 bg-yellow-500/10 px-2.5 py-1.5 text-xs text-yellow-400">
+          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-xs text-status-working">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
             {warningMessage}
           </div>

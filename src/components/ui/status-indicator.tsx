@@ -8,20 +8,20 @@ import {
 
 const STATUS_CONFIG = {
   permission: {
-    pingColor: "bg-red-400",
-    dotColor: "bg-red-500",
+    pingColor: "bg-status-attention",
+    dotColor: "bg-status-attention",
     pulse: true,
     tooltip: "Needs input",
   },
   working: {
-    pingColor: "bg-amber-400",
-    dotColor: "bg-amber-500",
+    pingColor: "bg-status-working",
+    dotColor: "bg-status-working",
     pulse: true,
     tooltip: "Agent working",
   },
   review: {
     pingColor: "",
-    dotColor: "bg-emerald-500",
+    dotColor: "bg-status-open",
     pulse: false,
     tooltip: "Ready for review",
   },

@@ -77,7 +77,7 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
             const bgClass = isOursMarker
               ? "bg-primary/15 border-l-2 border-primary"
               : isTheirsMarker
-                ? "bg-purple-500/15 border-l-2 border-purple-400"
+                ? "bg-accent-violet/15 border-l-2 border-accent-violet"
                 : isSeparator
                   ? "bg-muted/40 border-l-2 border-muted-foreground"
                   : line.type === "add"
@@ -117,7 +117,7 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
                 </span>
                 <span className="flex-1 min-w-0 pr-4">
                   {isOursMarker && <span className="text-[9px] font-bold text-primary mr-2">OURS</span>}
-                  {isTheirsMarker && <span className="text-[9px] font-bold text-purple-400 mr-2">THEIRS</span>}
+                  {isTheirsMarker && <span className="text-[9px] font-bold text-accent-violet mr-2">THEIRS</span>}
                   {line.content}
                 </span>
               </div>

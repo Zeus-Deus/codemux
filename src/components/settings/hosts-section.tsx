@@ -412,7 +412,7 @@ export function HostsSection() {
                       className={cn(
                         "flex flex-col items-center gap-1 rounded-md border px-2 py-2 text-center transition-colors",
                         draftKind === kind.id
-                          ? "border-sky-500/40 bg-sky-500/10 text-foreground"
+                          ? "border-status-remote/40 bg-status-remote/10 text-foreground"
                           : "border-border/60 bg-background/40 text-muted-foreground hover:border-border hover:bg-muted/30 hover:text-foreground",
                       )}
                     >
@@ -420,7 +420,7 @@ export function HostsSection() {
                         className={cn(
                           "size-4",
                           draftKind === kind.id
-                            ? "text-sky-400"
+                            ? "text-status-remote"
                             : "text-muted-foreground/70",
                         )}
                       />

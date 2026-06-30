@@ -247,7 +247,7 @@ function HighlightedLine({
   return (
     <>
       {content.substring(0, matchStart)}
-      <mark className="bg-yellow-500/30 text-inherit rounded-sm px-px">
+      <mark className="bg-accent-ember/30 text-inherit rounded-sm px-px">
         {content.substring(matchStart, matchEnd)}
       </mark>
       {content.substring(matchEnd)}

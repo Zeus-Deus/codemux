@@ -21,8 +21,8 @@ export function CommLogMessage({ entry, isDelivered }: CommLogMessageProps) {
     <div
       className={cn(
         "px-3 py-1.5 text-xs border-l-2",
-        isAssign && "border-l-amber-400/60 bg-amber-400/5",
-        isDone && "border-l-emerald-400/60 bg-emerald-400/5",
+        isAssign && "border-l-status-working/60 bg-status-working/5",
+        isDone && "border-l-status-open/60 bg-status-open/5",
         !isAssign && !isDone && "border-l-transparent",
         isSystem && "opacity-60 italic",
       )}
@@ -43,7 +43,7 @@ export function CommLogMessage({ entry, isDelivered }: CommLogMessageProps) {
         {isUser && isDelivered && (
           <Badge
             variant="outline"
-            className="h-3.5 px-1 text-[9px] border-emerald-400/30 text-emerald-400"
+            className="h-3.5 px-1 text-[9px] border-status-open/30 text-status-open"
           >
             Delivered
           </Badge>

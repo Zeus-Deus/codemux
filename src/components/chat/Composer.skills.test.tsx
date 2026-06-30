@@ -286,12 +286,12 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
     const mirror = getByTestId("composer-highlight-mirror");
     expect(mirror).toHaveTextContent("hi test /omarchy");
 
-    // The matched skill must be wrapped in an amber-colored span so the
-    // user sees it as a syntax-highlighted token. Plain prose around it
+    // The matched skill must be wrapped in a status-working-colored span so
+    // the user sees it as a syntax-highlighted token. Plain prose around it
     // stays in the default foreground color.
-    const amberSpans = mirror.querySelectorAll("span.text-amber-500");
-    expect(amberSpans).toHaveLength(1);
-    expect(amberSpans[0].textContent).toBe("/omarchy");
+    const highlightSpans = mirror.querySelectorAll("span.text-status-working");
+    expect(highlightSpans).toHaveLength(1);
+    expect(highlightSpans[0].textContent).toBe("/omarchy");
   });
 
   it("does NOT highlight an unregistered /token (silent miss, plain prose)", () => {

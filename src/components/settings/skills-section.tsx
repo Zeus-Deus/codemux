@@ -272,7 +272,7 @@ function ConflictsSection({
   return (
     <section data-testid="skills-conflicts">
       <header className="mb-2 flex items-baseline justify-between">
-        <h3 className="text-xs font-semibold uppercase tracking-wider text-amber-600 dark:text-amber-400">
+        <h3 className="text-xs font-semibold uppercase tracking-wider text-status-working dark:text-status-working">
           Naming conflicts
         </h3>
         <span className="text-[10px] text-muted-foreground/70">
@@ -288,7 +288,7 @@ function ConflictsSection({
         {entries.map(([name, skills]) => (
           <div
             key={name}
-            className="rounded-md border border-amber-500/30 bg-amber-500/5 p-2"
+            className="rounded-md border border-status-working/30 bg-status-working/5 p-2"
             data-testid={`conflict-group-${name}`}
           >
             <div className="mb-1.5 px-1 text-xs font-mono text-foreground">
@@ -297,7 +297,7 @@ function ConflictsSection({
                 ({skills.length} sources)
               </span>
             </div>
-            <ul className="divide-y divide-amber-500/20">
+            <ul className="divide-y divide-status-working/20">
               {skills.map((skill) => (
                 <li key={skill.id}>
                   <ConflictRow

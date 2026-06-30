@@ -23,7 +23,7 @@ export function AsciiSpinner({ className }: { className?: string }) {
   return (
     <span
       className={cn(
-        "text-amber-500 text-sm leading-none select-none",
+        "text-status-working text-sm leading-none select-none",
         className,
       )}
       aria-label="Agent working"

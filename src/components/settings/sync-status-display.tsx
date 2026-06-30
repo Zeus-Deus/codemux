@@ -34,7 +34,7 @@ export function SyncStateIcon({ state }: { state: SyncStateKind }) {
     case "idle":
       return (
         <CheckCircle2
-          className="h-4 w-4 shrink-0 text-emerald-500"
+          className="h-4 w-4 shrink-0 text-status-open"
           aria-label="Sync ready"
         />
       );

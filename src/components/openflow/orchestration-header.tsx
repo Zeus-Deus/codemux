@@ -127,7 +127,7 @@ export function OrchestrationHeader({
             <Button
               variant="ghost"
               size="sm"
-              className="h-6 px-2 text-[10px] text-emerald-400 hover:text-emerald-300"
+              className="h-6 px-2 text-[10px] text-status-open hover:text-status-open"
               onClick={handleApprove}
             >
               <CheckCircle className="h-3 w-3 mr-1" />
@@ -136,7 +136,7 @@ export function OrchestrationHeader({
             <Button
               variant="ghost"
               size="sm"
-              className="h-6 px-2 text-[10px] text-red-400 hover:text-red-300"
+              className="h-6 px-2 text-[10px] text-status-attention hover:text-status-attention"
               onClick={handleReject}
             >
               <XCircle className="h-3 w-3 mr-1" />
@@ -170,7 +170,7 @@ export function OrchestrationHeader({
         <Button
           variant="ghost"
           size="sm"
-          className="h-6 px-2 text-[10px] text-red-400 hover:text-red-300"
+          className="h-6 px-2 text-[10px] text-status-attention hover:text-status-attention"
           onClick={handleStop}
         >
           <Square className="h-3 w-3 mr-1" />

@@ -72,8 +72,8 @@ export function HowItWorksPopover() {
               aria-hidden
               className="absolute -top-0.5 -right-0.5 flex size-2"
             >
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-sky-400 opacity-75" />
-              <span className="relative inline-flex size-2 rounded-full bg-sky-500" />
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-status-remote opacity-75" />
+              <span className="relative inline-flex size-2 rounded-full bg-status-remote" />
             </span>
           )}
         </Button>
@@ -83,7 +83,7 @@ export function HowItWorksPopover() {
         sideOffset={6}
         className="w-[320px] p-0 overflow-hidden"
       >
-        <div className="bg-gradient-to-br from-sky-500/10 via-transparent to-emerald-500/8 px-4 py-3 border-b border-border/40">
+        <div className="bg-gradient-to-br from-status-remote/10 via-transparent to-status-open/8 px-4 py-3 border-b border-border/40">
           <p className="text-[12.5px] font-semibold text-foreground">
             How workspaces sync across devices
           </p>
@@ -95,20 +95,20 @@ export function HowItWorksPopover() {
         <ol className="px-4 py-3 space-y-3 text-[11.5px] leading-relaxed">
           <Step
             n="1"
-            icon={<ArrowUpRight className="size-3 text-emerald-400" />}
+            icon={<ArrowUpRight className="size-3 text-status-open" />}
             title="Push from any device"
             body="Right-click a workspace → Move to <device>. Files rsync to the destination."
           />
           <Step
             n="2"
-            icon={<Cloud className="size-3 text-sky-400" />}
+            icon={<Cloud className="size-3 text-status-remote" />}
             title="Sync makes it visible everywhere"
             body="The workspace appears in this overview on every device you're signed in to."
           />
           <Step
             n="3"
             icon={
-              <ArrowDownToLine className="size-3 text-violet-400" />
+              <ArrowDownToLine className="size-3 text-accent-violet" />
             }
             title="Pull to any device when you want it"
             body="Sibling-device rows offer Pull to this device → files come over via rsync or git clone."

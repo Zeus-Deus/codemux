@@ -346,7 +346,7 @@ export function BranchPicker({
                           {hasPr && (
                             <Badge
                               variant="secondary"
-                              className="text-[9px] px-1 py-0 shrink-0 bg-purple-500/15 text-purple-400 border-purple-500/20"
+                              className="text-[9px] px-1 py-0 shrink-0 bg-accent-violet/15 text-accent-violet border-accent-violet/20"
                             >
                               PR
                             </Badge>

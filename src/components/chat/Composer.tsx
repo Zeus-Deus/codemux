@@ -1955,7 +1955,7 @@ export function Composer({
                   return (
                     <span
                       key={i}
-                      className="text-amber-500 dark:text-amber-400"
+                      className="text-status-working dark:text-status-working"
                     >
                       {seg.text}
                     </span>
