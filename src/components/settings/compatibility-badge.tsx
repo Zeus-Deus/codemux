@@ -19,7 +19,7 @@ const CONFIG: Record<Props["level"], BadgeConfig> = {
     // Amber → "may reference external tools" (run-of-the-mill bash
     // blocks, CLI mentions). Distinct enough from foreground that it
     // reads as a status without grabbing the whole row's attention.
-    className: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+    className: "bg-status-working/15 text-status-working dark:text-status-working",
     label: "Tool refs",
   },
   "hard-warn": {

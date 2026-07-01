@@ -3,7 +3,11 @@ import { useAppStore } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
-import { useSettingsStore } from "@/stores/settings-store";
+import {
+  useSettingsStore,
+  selectPalette,
+  selectDensity,
+} from "@/stores/settings-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "./app-sidebar";
@@ -39,9 +43,23 @@ export function AppShell() {
   const setCommandPaletteOpen = useUIStore((s) => s.setShowCommandPalette);
   const [sidebarOpen, setSidebarOpen] = useState(true);
 
+  // Appearance: palette (Cool/Warm) + density (Comfortable/Compact) are
+  // applied as root attributes so the CSS variable blocks swap app-wide.
+  const palette = useSettingsStore(selectPalette);
+  const density = useSettingsStore(selectDensity);
+
   useEffect(() => {
     useSettingsStore.getState().load();
   }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    // Warm palette is a `.theme-warm` token override on the root; Cool is
+    // the default token map (no class). Density stays a data attribute.
+    root.classList.toggle("theme-warm", palette === "warm");
+    delete root.dataset.pal; // clean up the legacy attribute if present
+    root.dataset.density = density;
+  }, [palette, density]);
 
   useWorktreeIncludeToast();
 

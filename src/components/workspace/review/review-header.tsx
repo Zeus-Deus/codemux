@@ -14,15 +14,15 @@ interface ReviewDecisionConfig {
 const REVIEW_DECISION_CONFIG: Record<string, ReviewDecisionConfig> = {
   APPROVED: {
     label: "Approved",
-    className: "border border-emerald-500/20 bg-emerald-500/10 text-emerald-400",
+    className: "border border-status-open/20 bg-status-open/10 text-status-open",
   },
   CHANGES_REQUESTED: {
     label: "Changes requested",
-    className: "border border-red-500/20 bg-red-500/10 text-red-400",
+    className: "border border-status-attention/20 bg-status-attention/10 text-status-attention",
   },
   REVIEW_REQUIRED: {
     label: "Review pending",
-    className: "border border-amber-500/20 bg-amber-500/10 text-amber-400",
+    className: "border border-status-working/20 bg-status-working/10 text-status-working",
   },
 };
 

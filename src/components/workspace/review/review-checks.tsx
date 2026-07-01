@@ -23,7 +23,7 @@ const CheckIcon = memo(function CheckIcon({ status }: { status: string }) {
   if (s === "skipping" || s === "skipped" || s === "cancel" || s === "cancelled")
     return <Minus className="h-3 w-3 text-muted-foreground shrink-0" />;
   // pending / queued / in-progress / anything else → spinning amber loader
-  return <Loader2 className="h-3 w-3 text-amber-500 shrink-0 animate-spin" />;
+  return <Loader2 className="h-3 w-3 text-status-working shrink-0 animate-spin" />;
 });
 
 interface Props {

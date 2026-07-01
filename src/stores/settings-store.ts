@@ -14,7 +14,28 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   ai_resolver_model: "",
   ai_resolver_strategy: "smart_merge",
   auto_mcp_config: "true",
+  // How much detail each project-sidebar workspace row shows:
+  //   "clean"    — icon + name + live status only (default — calmest)
+  //   "branch"   — also the git branch name
+  //   "detailed" — also ahead/behind + diff stats
+  "sidebar.workspace_detail": "clean",
+  // Color palette variant — "cool" (neutral graphite, default) or "warm".
+  // Applied via a `.theme-warm` class on the root that overrides the
+  // surface tokens (see globals.css). Cool = the default token map.
+  "appearance.palette": "cool",
+  // Spacing density — "comfortable" (default) or "compact". Scales card
+  // padding, grid gaps, and group rhythm via the root `data-density` attr.
+  "appearance.density": "comfortable",
 };
+
+/** Sidebar workspace-row detail level. */
+export type SidebarWorkspaceDetail = "clean" | "branch" | "detailed";
+
+/** Color palette variant. */
+export type AppearancePalette = "cool" | "warm";
+
+/** Spacing density mode. */
+export type AppearanceDensity = "comfortable" | "compact";
 
 interface SettingsState {
   loaded: boolean;
@@ -93,3 +114,17 @@ export const selectTerminalColorTheme = (s: SettingsStore): string =>
 
 export const selectTerminalFontFamily = (s: SettingsStore): string =>
   s.settings["terminal.font_family"] ?? SETTINGS_DEFAULTS["terminal.font_family"]!;
+
+export const selectSidebarWorkspaceDetail = (
+  s: SettingsStore,
+): SidebarWorkspaceDetail =>
+  (s.settings["sidebar.workspace_detail"] ??
+    SETTINGS_DEFAULTS["sidebar.workspace_detail"]!) as SidebarWorkspaceDetail;
+
+export const selectPalette = (s: SettingsStore): AppearancePalette =>
+  (s.settings["appearance.palette"] ??
+    SETTINGS_DEFAULTS["appearance.palette"]!) as AppearancePalette;
+
+export const selectDensity = (s: SettingsStore): AppearanceDensity =>
+  (s.settings["appearance.density"] ??
+    SETTINGS_DEFAULTS["appearance.density"]!) as AppearanceDensity;

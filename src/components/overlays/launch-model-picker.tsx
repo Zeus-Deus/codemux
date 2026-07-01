@@ -235,7 +235,7 @@ export function LaunchModelPicker({
               className={cn(
                 "size-3.5",
                 isFav
-                  ? "fill-current text-amber-500"
+                  ? "fill-current text-status-working"
                   : "text-muted-foreground/40",
               )}
             />

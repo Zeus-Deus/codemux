@@ -102,7 +102,7 @@ export function CommunicationPanel({ runId }: CommunicationPanelProps) {
       <div className="flex items-center gap-2 border-b border-border/50 px-3 py-2">
         <h3 className="text-xs font-semibold text-foreground">Communication</h3>
         <span className="flex items-center gap-1">
-          <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          <span className="h-1.5 w-1.5 rounded-full bg-status-open animate-pulse" />
           <span className="text-[10px] text-muted-foreground">Live</span>
         </span>
         <span className="ml-auto text-[10px] text-muted-foreground tabular-nums">

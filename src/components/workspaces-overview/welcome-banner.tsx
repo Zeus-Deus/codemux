@@ -144,10 +144,10 @@ export function WelcomeBanner({
   return (
     <div
       className={cn(
-        "mx-auto max-w-6xl flex items-start gap-3 rounded-lg border border-sky-500/20 bg-gradient-to-r from-sky-500/8 to-emerald-500/5 px-4 py-3 mb-4",
+        "mx-auto max-w-[1180px] flex items-start gap-3 rounded-[12px] border border-status-remote/25 bg-status-remote/8 px-4 py-3.5 mb-5",
       )}
     >
-      <Sparkles className="mt-0.5 size-4 shrink-0 text-sky-400" />
+      <Sparkles className="mt-0.5 size-4 shrink-0 text-status-remote" />
       <div className="min-w-0 flex-1 space-y-1.5">
         <h3 className="text-[13px] font-semibold text-foreground">
           {headline}

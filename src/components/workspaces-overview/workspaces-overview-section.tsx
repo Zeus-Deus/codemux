@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
   ArrowDownToLine,
+  ChevronRight,
   Cloud,
   Filter,
   Folder,
@@ -70,6 +71,36 @@ const CREATED_WITHIN_DAYS: Record<Exclude<CreatedWithin, "all">, number> = {
   "90d": 90,
 };
 
+/**
+ * Filter-control trigger styling. Inactive (default value) reads as a
+ * quiet bordered pill; once a non-default value is picked the trigger
+ * earns an ember (`primary`) border + brighter text so the active
+ * filter is legible at a glance — the design's "ember is signal, not
+ * decoration" rule applied to filters.
+ */
+function filterTriggerCls(active: boolean): string {
+  // `data-[size=default]:h-9` (rather than a bare `h-9`) so tailwind-merge
+  // replaces the SelectTrigger's own `data-[size=default]:h-8` instead of
+  // colliding with it at equal specificity (the bare class would lose).
+  return cn(
+    "data-[size=default]:h-10 rounded-lg text-[12.5px] font-semibold transition-colors",
+    active
+      ? "border-primary/45 bg-primary/5 text-foreground"
+      : "text-muted-foreground",
+  );
+}
+
+/** A small status-coloured dot rendered inside the Status filter to
+ *  carry meaning in colour, matching the per-row status accents. */
+function StatusToneDot({ className }: { className: string }) {
+  return (
+    <span
+      aria-hidden
+      className={cn("size-1.5 shrink-0 rounded-full", className)}
+    />
+  );
+}
+
 export function WorkspacesOverviewSection() {
   const workspaces = useAppStore((s) => s.appState?.workspaces ?? null);
   const activeWorkspaceId = useAppStore(
@@ -91,6 +122,21 @@ export function WorkspacesOverviewSection() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [createdWithin, setCreatedWithin] = useState<CreatedWithin>("all");
   const [sortBy, setSortBy] = useState<SortBy>("recent");
+
+  // Collapsed device buckets (by bucket key). Click a device header to
+  // fold its workspaces away — handy when one device dominates the list.
+  // Collapse is view-only state; it resets when the overlay remounts.
+  const [collapsedDevices, setCollapsedDevices] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const toggleDeviceCollapsed = useCallback((key: string) => {
+    setCollapsedDevices((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, []);
 
   // Cross-device adoption dialog state — hoisted here so any
   // sibling-device row's `⋯ → Pull to this device` opens the same
@@ -485,22 +531,22 @@ export function WorkspacesOverviewSection() {
     <div className="flex h-full min-h-0 flex-col">
       {/* Filter bar */}
       <div className="shrink-0 border-b border-border/60 bg-background/60 px-6 py-3 backdrop-blur">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-2">
+        <div className="mx-auto flex max-w-[1180px] flex-wrap items-center gap-2">
           {/* Search */}
           <div className="relative min-w-[220px] flex-1">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/60" />
+            <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/60" />
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search by name, branch, or project…"
-              className="h-8 pl-8 text-[13px]"
+              className="h-10 rounded-lg pl-9 text-[13px]"
             />
             {search && (
               <button
                 type="button"
                 onClick={() => setSearch("")}
                 aria-label="Clear search"
-                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground/60 hover:text-foreground"
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground/60 hover:text-foreground"
               >
                 <X className="size-3.5" />
               </button>
@@ -509,10 +555,12 @@ export function WorkspacesOverviewSection() {
 
           {/* Project filter */}
           <Select value={projectFilter} onValueChange={setProjectFilter}>
-            <SelectTrigger className="h-8 w-[160px] text-[12.5px]">
+            <SelectTrigger
+              className={cn(filterTriggerCls(projectFilter !== "all"), "w-[160px]")}
+            >
               <SelectValue placeholder="All projects" />
             </SelectTrigger>
-            <SelectContent position="popper" className="max-h-72">
+            <SelectContent position="popper" className="max-h-72 rounded-xl">
               <SelectItem value="all">All projects</SelectItem>
               {projects.map((p) => (
                 <SelectItem key={p.path} value={p.path}>
@@ -527,10 +575,12 @@ export function WorkspacesOverviewSection() {
             value={hostFilter}
             onValueChange={(v) => setHostFilter(v as HostFilter)}
           >
-            <SelectTrigger className="h-8 w-[160px] text-[12.5px]">
+            <SelectTrigger
+              className={cn(filterTriggerCls(hostFilter !== "all"), "w-[160px]")}
+            >
               <SelectValue placeholder="All devices" />
             </SelectTrigger>
-            <SelectContent position="popper">
+            <SelectContent position="popper" className="rounded-xl">
               <SelectItem value="all">All devices</SelectItem>
               <SelectItem value="local">This device</SelectItem>
               {hosts
@@ -548,15 +598,29 @@ export function WorkspacesOverviewSection() {
             value={statusFilter}
             onValueChange={(v) => setStatusFilter(v as StatusFilter)}
           >
-            <SelectTrigger className="h-8 w-[160px] text-[12.5px]">
+            <SelectTrigger
+              className={cn(filterTriggerCls(statusFilter !== "all"), "w-[170px]")}
+            >
               <SelectValue placeholder="Any status" />
             </SelectTrigger>
-            <SelectContent position="popper">
+            <SelectContent position="popper" className="rounded-xl">
               <SelectItem value="all">Any status</SelectItem>
-              <SelectItem value="attached">Currently open</SelectItem>
-              <SelectItem value="remote-host">On a remote host</SelectItem>
-              <SelectItem value="sibling-device">On another device</SelectItem>
-              <SelectItem value="dirty">Has uncommitted work</SelectItem>
+              <SelectItem value="attached">
+                <StatusToneDot className="bg-status-open" />
+                Currently open
+              </SelectItem>
+              <SelectItem value="remote-host">
+                <StatusToneDot className="bg-status-remote" />
+                On a remote host
+              </SelectItem>
+              <SelectItem value="sibling-device">
+                <StatusToneDot className="bg-status-remote" />
+                On another device
+              </SelectItem>
+              <SelectItem value="dirty">
+                <StatusToneDot className="bg-warning" />
+                Has uncommitted work
+              </SelectItem>
             </SelectContent>
           </Select>
 
@@ -565,10 +629,12 @@ export function WorkspacesOverviewSection() {
             value={sortBy}
             onValueChange={(v) => setSortBy(v as SortBy)}
           >
-            <SelectTrigger className="h-8 w-[150px] text-[12.5px]">
+            <SelectTrigger
+              className={cn(filterTriggerCls(sortBy !== "recent"), "w-[150px]")}
+            >
               <SelectValue />
             </SelectTrigger>
-            <SelectContent position="popper">
+            <SelectContent position="popper" className="rounded-xl">
               <SelectItem value="recent">Recently active</SelectItem>
               <SelectItem value="name">Name (A–Z)</SelectItem>
               <SelectItem value="branch">Branch (A–Z)</SelectItem>
@@ -580,7 +646,7 @@ export function WorkspacesOverviewSection() {
               type="button"
               variant="ghost"
               size="sm"
-              className="h-8 gap-1.5 text-[12px] text-muted-foreground"
+              className="h-10 gap-1.5 text-[12px] text-muted-foreground"
               onClick={clearFilters}
             >
               <Filter className="size-3.5" />
@@ -592,7 +658,7 @@ export function WorkspacesOverviewSection() {
 
       {/* Result count + how-it-works + new-workspace shortcut */}
       <div className="shrink-0 border-b border-border/40 px-6 py-2">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-3">
+        <div className="mx-auto flex max-w-[1180px] items-center justify-between gap-3">
           <div className="flex items-center gap-1.5">
             <p className="text-[11.5px] text-muted-foreground/70 tabular-nums">
               {totalShown === totalAll
@@ -607,16 +673,16 @@ export function WorkspacesOverviewSection() {
             </p>
             <HowItWorksPopover />
           </div>
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-2">
             {/* Add Device is intentionally surfaced here as well as
                 in Settings — a brand-new user who's just signed in
                 shouldn't have to hunt through Settings to find the
                 primary "make this useful" action. */}
             <Button
               type="button"
-              variant="ghost"
+              variant="secondary"
               size="sm"
-              className="h-7 gap-1.5 text-[12px] text-muted-foreground hover:text-foreground"
+              className="h-9 gap-1.5 px-3.5 text-[12.5px] font-semibold"
               onClick={() => {
                 setShowWorkspacesOverview(false);
                 setShowSettings(true, "hosts");
@@ -625,11 +691,12 @@ export function WorkspacesOverviewSection() {
               <Server className="size-3.5" />
               Add device
             </Button>
+            {/* The one ember (primary) action on this screen — "ember is
+                earned, signal not decoration" per the design system. */}
             <Button
               type="button"
-              variant="ghost"
               size="sm"
-              className="h-7 gap-1.5 text-[12px] text-muted-foreground hover:text-foreground"
+              className="h-9 gap-1.5 px-3.5 text-[12.5px] font-bold"
               onClick={() => {
                 setShowWorkspacesOverview(false);
                 setShowNewWorkspaceDialog(true);
@@ -653,7 +720,7 @@ export function WorkspacesOverviewSection() {
             allItems.filter((it) => it.kind === "local").length
           }
         />
-        <div className="mx-auto max-w-6xl space-y-8">
+        <div className="mx-auto max-w-[1180px] space-y-[var(--rowgap)]">
           {buckets.length === 0 ? (
             <EmptyFilters onClear={clearFilters} />
           ) : (
@@ -662,6 +729,8 @@ export function WorkspacesOverviewSection() {
                 key={bucket.key}
                 bucket={bucket}
                 activeWorkspaceId={activeWorkspaceId}
+                collapsed={collapsedDevices.has(bucket.key)}
+                onToggleCollapsed={() => toggleDeviceCollapsed(bucket.key)}
                 onCloseOverview={() => setShowWorkspacesOverview(false)}
                 onRequestPull={handleRequestPull}
                 onPullProject={handlePullProject}
@@ -692,6 +761,8 @@ export function WorkspacesOverviewSection() {
 function DeviceSection({
   bucket,
   activeWorkspaceId,
+  collapsed,
+  onToggleCollapsed,
   onCloseOverview,
   onRequestPull,
   onPullProject,
@@ -704,6 +775,10 @@ function DeviceSection({
 }: {
   bucket: DeviceBucket;
   activeWorkspaceId: string | null;
+  /** Whether this device's workspaces are folded away. */
+  collapsed: boolean;
+  /** Fold / unfold this device's workspaces. */
+  onToggleCollapsed: () => void;
   onCloseOverview: () => void;
   onRequestPull: (
     item: Extract<OverviewItem, { kind: "remote" }>,
@@ -737,14 +812,30 @@ function DeviceSection({
 
   return (
     <section>
-      <header className="mb-2.5 flex items-end justify-between gap-3 border-b border-border/40 pb-2">
-        <div className="flex min-w-0 items-center gap-2.5">
+      {/* Device header — a full-width toggle that folds the device's
+          workspaces away. The tone-coloured icon chip (emerald laptop
+          for local, sky cloud for a remote device) carries the
+          local-vs-remote signal in colour. */}
+      <header className="mb-3">
+        <button
+          type="button"
+          onClick={onToggleCollapsed}
+          aria-expanded={!collapsed}
+          className="flex w-full items-center gap-2.5 rounded-lg border-b border-border/40 px-1 pt-1 pb-2 text-left transition-colors hover:bg-muted/25"
+        >
+          <ChevronRight
+            aria-hidden
+            className={cn(
+              "size-3.5 shrink-0 text-muted-foreground/55 transition-transform",
+              !collapsed && "rotate-90",
+            )}
+          />
           <span
             className={cn(
-              "flex size-7 shrink-0 items-center justify-center rounded-md border",
+              "flex size-7 shrink-0 items-center justify-center rounded-md",
               isLocal
-                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-400"
-                : "border-sky-500/25 bg-sky-500/8 text-sky-300",
+                ? "bg-status-open/12 text-status-open"
+                : "bg-status-remote/12 text-status-remote",
             )}
           >
             {isLocal ? (
@@ -753,110 +844,96 @@ function DeviceSection({
               <Cloud className="size-3.5" aria-hidden />
             )}
           </span>
-          <div className="min-w-0">
-            <h3 className="truncate text-[13px] font-semibold tracking-tight text-foreground">
+          <div className="flex min-w-0 items-baseline gap-2">
+            <h3 className="truncate text-[15px] font-bold tracking-tight text-foreground">
               {bucket.label}
             </h3>
             {bucket.sublabel && (
-              <p className="truncate font-mono text-[10.5px] text-muted-foreground/60">
+              <span className="truncate font-mono text-[11px] text-muted-foreground/55">
                 {bucket.sublabel}
-              </p>
+              </span>
             )}
           </div>
-        </div>
-        <div className="flex shrink-0 items-baseline gap-2 text-[10px] uppercase tracking-[0.14em] text-muted-foreground/55">
-          {hiddenByFilter > 0 && (
-            <span
-              title={`${hiddenByFilter} hidden by filter`}
-              className="rounded bg-muted/40 px-1.5 py-0.5 text-warning/80 normal-case tracking-normal"
-            >
-              {hiddenByFilter} filtered
+          <div className="ml-auto flex shrink-0 items-center gap-2 pl-3">
+            {hiddenByFilter > 0 && (
+              <span
+                title={`${hiddenByFilter} hidden by filter`}
+                className="rounded bg-muted/40 px-1.5 py-0.5 text-[10px] font-medium text-warning/80"
+              >
+                {hiddenByFilter} filtered
+              </span>
+            )}
+            <span className="text-[11.5px] tabular-nums text-muted-foreground/65">
+              {bucket.items.length}{" "}
+              {bucket.items.length === 1 ? "workspace" : "workspaces"}
             </span>
-          )}
-          <span className="tabular-nums text-muted-foreground/70 normal-case tracking-normal">
-            {bucket.items.length}{" "}
-            {bucket.items.length === 1 ? "workspace" : "workspaces"}
-          </span>
-        </div>
+          </div>
+        </button>
       </header>
 
-      {bucket.items.length === 0 ? (
-        <EmptyBucketCTA
-          isLocal={isLocal}
-          hiddenByFilter={hiddenByFilter}
-          hasAnySibling={hasAnySibling}
-          bucketLabel={bucket.label}
-          onScrollToFirstRemote={onScrollToFirstRemote}
-          onCloseOverview={onCloseOverview}
-        />
-      ) : (
-        (() => {
-          // Within a device, cluster workspaces that belong to the same
-          // project so siblings (e.g. a repo's root checkout + its
-          // worktrees) visibly read as one project rather than as
-          // unrelated cards. Only projects with 2+ workspaces get a
-          // header; lone workspaces fall through to a plain grid so a
-          // device full of one-off projects isn't littered with
-          // single-item headers.
-          const { clustered, rest } = partitionByProject(bucket.items);
-          const rowGridProps = {
-            activeWorkspaceId,
-            onCloseOverview,
-            onRequestPull,
-            registerRemoteRow,
-            pulseKeys,
-            divergenceByKey,
-          };
-          if (clustered.length === 0) {
-            return <RowGrid items={bucket.items} {...rowGridProps} />;
-          }
-          return (
-            <div className="space-y-4">
-              {clustered.map((group) => (
-                <div key={group.key} className="space-y-1.5">
-                  <ProjectGroupHeader
-                    name={group.name}
-                    count={group.items.length}
-                    pullable={
-                      group.projectUid !== null &&
-                      group.pullableRemoteCount > 0
-                    }
-                    pulling={
-                      group.projectUid !== null &&
-                      pullingProjectUid === group.projectUid
-                    }
-                    onPull={
-                      group.projectUid
-                        ? () =>
-                            onPullProject(group.projectUid!, group.name)
-                        : undefined
-                    }
-                  />
-                  <RowGrid items={group.items} {...rowGridProps} />
-                </div>
-              ))}
-              {rest.length > 0 && (
-                <RowGrid items={rest} {...rowGridProps} />
-              )}
-            </div>
-          );
-        })()
-      )}
+      {!collapsed &&
+        (bucket.items.length === 0 ? (
+          <EmptyBucketCTA
+            isLocal={isLocal}
+            hiddenByFilter={hiddenByFilter}
+            hasAnySibling={hasAnySibling}
+            bucketLabel={bucket.label}
+            onScrollToFirstRemote={onScrollToFirstRemote}
+            onCloseOverview={onCloseOverview}
+          />
+        ) : (
+          (() => {
+            // Within a device, group workspaces by project so a repo's
+            // root checkout and its worktrees read as one project under a
+            // shared folder header. Cards nest under their project header
+            // (indented on wider viewports) for a clear device → project →
+            // workspace hierarchy.
+            const { groups, rest } = groupByProject(bucket.items);
+            const rowGridProps = {
+              activeWorkspaceId,
+              onCloseOverview,
+              onRequestPull,
+              registerRemoteRow,
+              pulseKeys,
+              divergenceByKey,
+            };
+            return (
+              <div className="space-y-5">
+                {groups.map((group) => (
+                  <div key={group.key} className="space-y-2 md:pl-[38px]">
+                    <ProjectGroupHeader
+                      name={group.name}
+                      count={group.items.length}
+                      pullable={
+                        group.projectUid !== null &&
+                        group.pullableRemoteCount > 0
+                      }
+                      pulling={
+                        group.projectUid !== null &&
+                        pullingProjectUid === group.projectUid
+                      }
+                      onPull={
+                        group.projectUid
+                          ? () => onPullProject(group.projectUid!, group.name)
+                          : undefined
+                      }
+                    />
+                    <RowGrid items={group.items} {...rowGridProps} />
+                  </div>
+                ))}
+                {rest.length > 0 && (
+                  <div className="md:pl-[38px]">
+                    <RowGrid items={rest} {...rowGridProps} />
+                  </div>
+                )}
+              </div>
+            );
+          })()
+        ))}
     </section>
   );
 }
 
-/**
- * Split a bucket's items into same-project clusters (2+ workspaces
- * sharing a project name) plus the leftover singletons. Items keep
- * their incoming sort order within each group; `rest` is filtered
- * from the original list so its order is preserved too. Project
- * identity is the stable `projectKey` (the deterministic `project_uid`
- * when known, else the project path/name), so a root checkout and its
- * worktrees — which carry different paths but the same project_uid —
- * cluster together, while two unrelated repos that merely share a
- * basename do not. Falls back to the project name when no key exists.
- */
 /** True when an overview item is the repo ROOT (the protected main
  *  checkout) rather than a per-branch worktree. Used to float the root to
  *  the top of its project cluster so worktrees read as nested under it. */
@@ -882,53 +959,59 @@ type ProjectCluster = {
   pullableRemoteCount: number;
 };
 
-function partitionByProject(items: OverviewItem[]): {
-  clustered: ProjectCluster[];
+/**
+ * Group a bucket's items by project so every project renders under its
+ * own folder header (device → project → workspace hierarchy). Items keep
+ * their incoming sort order within each group, with the protected repo
+ * root floated to the top. Project identity is the stable `projectKey`
+ * (the deterministic `project_uid` when known, else the project
+ * path/name), so a root checkout and its worktrees — different paths,
+ * same project_uid — group together, while two unrelated repos sharing a
+ * basename do not. Nameless rows (no recorded project) fall into `rest`.
+ */
+function groupByProject(items: OverviewItem[]): {
+  groups: ProjectCluster[];
   rest: OverviewItem[];
 } {
-  const groups = new Map<string, { name: string; items: OverviewItem[] }>();
+  const byKey = new Map<string, { name: string; items: OverviewItem[] }>();
+  const rest: OverviewItem[] = [];
   for (const it of items) {
     const name = it.projectName;
-    if (!name) continue;
+    // The rare nameless row (a sibling root with no recorded project)
+    // can't anchor a folder header; render it in a flat trailing grid.
+    if (!name) {
+      rest.push(it);
+      continue;
+    }
     const key = (it.projectKey ?? name).toLowerCase();
-    const g = groups.get(key);
+    const g = byKey.get(key);
     if (g) g.items.push(it);
-    else groups.set(key, { name, items: [it] });
+    else byKey.set(key, { name, items: [it] });
   }
 
-  const clustered: ProjectCluster[] = [];
-  const clusteredKeys = new Set<string>();
-  for (const [key, g] of groups) {
-    if (g.items.length >= 2) {
-      // Float the protected root to the top so its worktrees read as
-      // nested beneath it; otherwise preserve incoming order (stable sort).
-      g.items.sort((a, b) => Number(isRootItem(b)) - Number(isRootItem(a)));
-      const projectUid =
-        g.items.map((it) => it.sync?.project_uid).find(Boolean) ?? null;
-      const pullableRemoteCount = g.items.filter(
-        (it) => it.kind === "remote",
-      ).length;
-      clustered.push({
-        key,
-        name: g.name,
-        projectUid,
-        items: g.items,
-        pullableRemoteCount,
-      });
-      clusteredKeys.add(key);
-    }
+  const groups: ProjectCluster[] = [];
+  for (const [key, g] of byKey) {
+    // Float the protected root to the top so its worktrees read as
+    // nested beneath it; otherwise preserve incoming order (stable sort).
+    g.items.sort((a, b) => Number(isRootItem(b)) - Number(isRootItem(a)));
+    const projectUid =
+      g.items.map((it) => it.sync?.project_uid).find(Boolean) ?? null;
+    const pullableRemoteCount = g.items.filter(
+      (it) => it.kind === "remote",
+    ).length;
+    groups.push({
+      key,
+      name: g.name,
+      projectUid,
+      items: g.items,
+      pullableRemoteCount,
+    });
   }
-  clustered.sort((a, b) =>
+  groups.sort((a, b) =>
     a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
   );
 
-  const rest = items.filter((it) => {
-    const name = it.projectName;
-    if (!name) return true;
-    return !clusteredKeys.has((it.projectKey ?? name).toLowerCase());
-  });
-
-  return { clustered, rest };
+  return { groups, rest };
 }
 
 /** Subtle caption above a same-project cluster inside a device bucket.
@@ -950,8 +1033,10 @@ function ProjectGroupHeader({
 }) {
   return (
     <div className="flex items-center gap-1.5 pl-0.5 text-[11px] text-muted-foreground/70">
-      <Folder className="size-3 text-muted-foreground/50" aria-hidden />
-      <span className="truncate font-medium text-foreground/75">{name}</span>
+      <Folder className="size-3.5 text-muted-foreground/50" aria-hidden />
+      <span className="truncate font-mono text-[12px] font-semibold text-foreground/80">
+        {name}
+      </span>
       <span className="tabular-nums text-muted-foreground/45">{count}</span>
       {pullable && onPull && (
         <Button
@@ -994,7 +1079,7 @@ function RowGrid({
   divergenceByKey: Map<string, DivergenceInfo>;
 }) {
   return (
-    <ul className="grid grid-cols-1 gap-1.5 md:grid-cols-2">
+    <ul className="grid grid-cols-1 gap-[var(--cgap)] md:grid-cols-2">
       {items.map((it) => (
         <li
           key={it.key}

@@ -84,7 +84,7 @@ export function SkillViewModal({ skill, onClose }: Props) {
             className={cn(
               "rounded-md border p-3 text-xs",
               skill.compatibility === "soft-warn" &&
-                "border-amber-500/30 bg-amber-500/5",
+                "border-status-working/30 bg-status-working/5",
               skill.compatibility === "hard-warn" &&
                 "border-destructive/30 bg-destructive/10",
             )}

@@ -111,9 +111,9 @@ export function PermissionsSection({ projectRoot }: Props) {
         description="Tool-permission rules persist approvals so the agent doesn't keep asking for the same tools."
       />
 
-      <p className="mb-4 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
+      <p className="mb-4 flex items-start gap-2 rounded-md border border-status-working/30 bg-status-working/5 px-3 py-2 text-xs text-muted-foreground">
         <AlertTriangle
-          className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-500"
+          className="mt-0.5 h-3.5 w-3.5 shrink-0 text-status-working"
           aria-hidden
         />
         <span>
@@ -243,7 +243,7 @@ function BehaviorIcon({ behavior }: { behavior: PermissionRule["behavior"] }) {
     case "allow":
       return (
         <Check
-          className="h-3.5 w-3.5 shrink-0 text-emerald-500"
+          className="h-3.5 w-3.5 shrink-0 text-status-open"
           aria-label="Allow"
         />
       );

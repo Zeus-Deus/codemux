@@ -33,13 +33,13 @@ export function isTerminalStatus(
 }
 
 const ROLE_COLORS: Record<string, string> = {
-  orchestrator: "text-emerald-400",
-  builder: "text-amber-400",
-  tester: "text-cyan-400",
-  reviewer: "text-violet-400",
-  planner: "text-blue-400",
-  researcher: "text-sky-400",
-  debugger: "text-orange-400",
+  orchestrator: "text-status-open",
+  builder: "text-status-working",
+  tester: "text-status-remote",
+  reviewer: "text-accent-violet",
+  planner: "text-status-remote",
+  researcher: "text-status-remote",
+  debugger: "text-accent-ember",
   system: "text-muted-foreground",
   "user/inject": "text-primary",
 };
@@ -53,13 +53,13 @@ export function getRoleColor(role: string): string {
 }
 
 const ROLE_BG_COLORS: Record<string, string> = {
-  orchestrator: "bg-emerald-400/10",
-  builder: "bg-amber-400/10",
-  tester: "bg-cyan-400/10",
-  reviewer: "bg-violet-400/10",
-  planner: "bg-blue-400/10",
-  researcher: "bg-sky-400/10",
-  debugger: "bg-orange-400/10",
+  orchestrator: "bg-status-open/10",
+  builder: "bg-status-working/10",
+  tester: "bg-status-remote/10",
+  reviewer: "bg-accent-violet/10",
+  planner: "bg-status-remote/10",
+  researcher: "bg-status-remote/10",
+  debugger: "bg-accent-ember/10",
   system: "bg-muted/50",
   "user/inject": "bg-primary/10",
 };
@@ -121,9 +121,9 @@ export function getStatusTone(status: string): StatusTone {
 }
 
 const TONE_DOT_CLASSES: Record<StatusTone, string> = {
-  success: "bg-emerald-400",
-  danger: "bg-red-400",
-  warning: "bg-amber-400",
+  success: "bg-status-open",
+  danger: "bg-status-attention",
+  warning: "bg-status-working",
   muted: "bg-muted-foreground/50",
 };
 
@@ -132,9 +132,9 @@ export function getStatusDotClass(status: string): string {
 }
 
 const TONE_BADGE_CLASSES: Record<StatusTone, string> = {
-  success: "border-emerald-400/30 text-emerald-400 bg-emerald-400/10",
-  danger: "border-red-400/30 text-red-400 bg-red-400/10",
-  warning: "border-amber-400/30 text-amber-400 bg-amber-400/10",
+  success: "border-status-open/30 text-status-open bg-status-open/10",
+  danger: "border-status-attention/30 text-status-attention bg-status-attention/10",
+  warning: "border-status-working/30 text-status-working bg-status-working/10",
   muted: "border-border text-muted-foreground bg-muted/50",
 };
 

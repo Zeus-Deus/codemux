@@ -119,10 +119,16 @@ vi.mock("@/stores/ui-store", () => ({
 vi.mock("@/stores/settings-store", () => ({
   useSettingsStore: Object.assign(
     vi.fn((selector: (s: unknown) => unknown) =>
-      selector({ loaded: settingsLoaded }),
+      selector({
+        loaded: settingsLoaded,
+        settings: {},
+      }),
     ),
     { getState: () => ({ load: vi.fn() }) },
   ),
+  // Appearance selectors read by AppShell to apply palette/density attrs.
+  selectPalette: () => "cool",
+  selectDensity: () => "comfortable",
 }));
 
 vi.mock("@/stores/synced-settings-store", () => ({

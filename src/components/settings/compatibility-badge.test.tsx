@@ -12,7 +12,7 @@ describe("CompatibilityBadge", () => {
     const badge = screen.getByTestId("compatibility-badge");
     expect(badge).toHaveTextContent("Tool refs");
     expect(badge).toHaveAttribute("data-level", "soft-warn");
-    expect(badge.className).toContain("text-amber-600");
+    expect(badge.className).toContain("text-status-working");
   });
 
   it("renders 'May not work' label and destructive styling for hard-warn", () => {

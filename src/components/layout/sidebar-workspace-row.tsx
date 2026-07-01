@@ -56,6 +56,10 @@ import {
 } from "@/tauri/commands";
 import { useHosts } from "@/stores/hosts-store";
 import {
+  useSettingsStore,
+  selectSidebarWorkspaceDetail,
+} from "@/stores/settings-store";
+import {
   ConfirmPushDialog,
   shouldSkipPushConfirm,
 } from "@/components/overlays/confirm-push-dialog";
@@ -137,7 +141,7 @@ function RemoveWorkspaceDialog({
         </DialogHeader>
 
         {hasWarnings && (
-          <div className="flex items-center gap-2 rounded-md border border-yellow-500/20 bg-yellow-500/10 px-2.5 py-1.5 text-xs text-yellow-400">
+          <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-xs text-status-working">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
             {warningMessage}
           </div>
@@ -645,6 +649,15 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   const hasDiff = workspace.git_additions > 0 || workspace.git_deletions > 0;
   const hasAheadBehind = workspace.git_ahead > 0 || workspace.git_behind > 0;
 
+  // Sidebar row density (Settings → Appearance → Sidebar):
+  //   clean    — hide the whole metadata line (icon + name + status only)
+  //   branch   — show the branch name (and health/indicators) but no git numbers
+  //   detailed — also show ahead/behind + diff stats (the original behavior)
+  const sidebarDetail = useSettingsStore(selectSidebarWorkspaceDetail);
+  const showMetaLine = sidebarDetail !== "clean";
+  const showGitStats = sidebarDetail === "detailed";
+  const gitStatsVisible = showGitStats && (hasDiff || hasAheadBehind);
+
   return (
     <>
       <ContextMenu>
@@ -752,7 +765,8 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   indicators. Everything that's optional only renders
                   when relevant — when none of these apply the row is
                   one line, keeping the sidebar calm. */}
-              {(workspace.git_branch || hasDiff || hasAheadBehind || tunnelKind) && (
+              {showMetaLine &&
+                (workspace.git_branch || gitStatsVisible || tunnelKind) && (
                 <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/60 font-mono leading-tight mt-0.5">
                   {workspace.git_branch && (
                     <span className="truncate min-w-0">{workspace.git_branch}</span>
@@ -772,7 +786,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                     </span>
                   )}
 
-                  {hasAheadBehind && (
+                  {showGitStats && hasAheadBehind && (
                     <span className={cn(
                       "flex items-center gap-1 shrink-0 tabular-nums",
                       // Fade out with the diff stats on hover so the issue
@@ -791,7 +805,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
 
                   {/* diff stats inline (no pill background) — fades on
                       hover so the hover-reveal X has its slot. */}
-                  {hasDiff && (
+                  {showGitStats && hasDiff && (
                     <span className={cn(
                       "flex items-center gap-1 shrink-0 tabular-nums ml-auto",
                       canDelete && "transition-opacity group-hover/row:opacity-0",
@@ -813,7 +827,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   {(workspace.linked_issue || workspace.notifications_muted) && (
                     <div className={cn(
                       "flex items-center gap-1 shrink-0 rounded-md px-1",
-                      !hasDiff && "ml-auto",
+                      !gitStatsVisible && "ml-auto",
                       // The hover-reveal remove (X) button is pinned at the
                       // right edge and overlays this slot. Unlike the diff
                       // stats / notification badge (which fade out on hover),

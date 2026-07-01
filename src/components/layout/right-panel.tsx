@@ -66,13 +66,13 @@ function ReviewTabBadge({
         </span>
       )}
       {status === "pending" && (
-        <Loader2 className="ml-1 size-3 animate-spin text-amber-500" />
+        <Loader2 className="ml-1 size-3 animate-spin text-status-working" />
       )}
       {status === "success" && (
-        <Check className="ml-1 size-3 text-emerald-500" />
+        <Check className="ml-1 size-3 text-status-open" />
       )}
       {status === "failure" && (
-        <X className="ml-1 size-3 text-red-500" />
+        <X className="ml-1 size-3 text-status-attention" />
       )}
     </>
   );
