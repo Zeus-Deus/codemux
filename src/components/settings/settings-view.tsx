@@ -1515,7 +1515,7 @@ export function SettingsView() {
             />
             <div className="space-y-1">
               <SettingRow label="Theme preset" description="shadcn preset code used to generate the color system.">
-                <Badge variant="secondary" className="font-mono text-xs px-3 py-1">b1HXvpqM5</Badge>
+                <Badge variant="secondary" className="font-mono text-xs px-3 py-1">b1HYEHloH</Badge>
               </SettingRow>
               <Separator />
               <SettingRow label="Font family" description="Applied to the entire app shell and terminal.">
