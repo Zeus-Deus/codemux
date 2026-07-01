@@ -77,6 +77,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Project avatars (sidebar project image + color customization, favicon derivation + cache-bust): `docs/features/project-avatars.md`
 - IDE integration: `docs/features/ide-integration.md`
 - Left sidebar (two-state expanded ↔ icon rail, with aggregate agent-status dots on collapsed project avatars + per-project hover flyout — Superset-adapted): `docs/features/sidebar.md`
+- Workspace context bar (bottom status strip under the work surface: branch · kind · ↑↓ · diff · PR/issue chips · device for the active workspace — the detail home for the clean sidebar appearance): `docs/features/workspace-context-bar.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`
 - Windows cross-platform work: `docs/plans/windows-support.md`

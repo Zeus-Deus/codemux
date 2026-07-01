@@ -63,6 +63,14 @@ dot without a tooltip fighting the HoverCard), the `AsciiSpinner`
   new-workspace action.
 - Project avatar custom colors/images carry into the rail.
 - Re-expanding restores the full sidebar (DnD reorder, diff stats, etc.) unchanged.
+- **Workspace-row density** is a real Appearance setting
+  (`sidebar.workspace_detail`: clean / branch / detailed, default clean —
+  segmented control in Settings → Appearance → Sidebar). Clean shows name +
+  status icon only; Branch adds the branch line; Detailed also shows ↑↓ and
+  diff numbers. The PR-state icon and working spinner stay in every mode.
+  The full labeled detail for the **active** workspace lives in the
+  **workspace context bar** at the bottom of the content area
+  (`docs/features/workspace-context-bar.md`), so Clean loses no information.
 - **Duplicate project names are disambiguated** (PR #109): two project roots that
   share a basename (a local `~/projects/app` and the same app on a remote host, or
   sibling dirs) no longer collapse to identical labels. The host is preferred as the

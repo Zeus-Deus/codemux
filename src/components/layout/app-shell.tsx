@@ -13,6 +13,7 @@ import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
 import { AppSidebar } from "./app-sidebar";
 import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
+import { WorkspaceContextBar } from "./workspace-context-bar";
 import { EmptyState } from "./empty-state";
 import { SettingsView } from "@/components/settings/settings-view";
 import { AutomationsView } from "@/components/automations/automations-view";
@@ -120,6 +121,11 @@ export function AppShell() {
         <AppSidebar />
         <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
           <WorkspaceMain />
+          {/* Passive git/PR/issue status for the active workspace — the
+              "one home for the details" now that the sidebar defaults to
+              its clean appearance. Renders nothing when there's nothing
+              to report (draft chat, onboarding, non-git workspace). */}
+          <WorkspaceContextBar />
         </SidebarInset>
         <CommandPalette
           open={commandPaletteOpen}

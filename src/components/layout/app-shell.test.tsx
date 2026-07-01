@@ -27,6 +27,11 @@ vi.mock("./app-sidebar", () => ({
 vi.mock("./workspace-main", () => ({
   WorkspaceMain: () => <div data-testid="workspace-main" />,
 }));
+// The context bar has its own dedicated test file
+// (workspace-context-bar.test.tsx); here it's just a shell child.
+vi.mock("./workspace-context-bar", () => ({
+  WorkspaceContextBar: () => <div data-testid="workspace-context-bar" />,
+}));
 vi.mock("./empty-state", () => ({
   EmptyState: () => <div data-testid="empty-state" />,
 }));
