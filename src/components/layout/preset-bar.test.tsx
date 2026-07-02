@@ -533,3 +533,74 @@ describe("PresetBar — Step 13 Beta toggle gating", () => {
     ).toBeInTheDocument();
   });
 });
+
+describe("PresetBar — Chat Agent pinned leftmost", () => {
+  it("renders the chat_agent preset before every CLI preset even when it is last in the store", async () => {
+    useFeatureFlags.setState({
+      enableAgentChat: true,
+      enableLazyWorkspaceCreation: true,
+      loaded: true,
+    });
+
+    // Store order deliberately puts Chat Agent LAST — the bar must
+    // still hoist it to the leftmost slot.
+    const claude = makePreset({ id: "builtin-claude", name: "Claude Code", kind: "cli" });
+    const codex = makePreset({ id: "builtin-codex", name: "Codex", kind: "cli", commands: ["codex"] });
+    const chatAgent = makePreset({
+      id: "builtin-chat-agent",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([claude, codex, chatAgent]));
+
+    renderPresetBar();
+    await flushPromises();
+
+    const chatBtn = screen.getByRole("button", { name: /chat agent/i });
+    const claudeBtn = screen.getByRole("button", { name: /claude code/i });
+    const codexBtn = screen.getByRole("button", { name: /codex/i });
+
+    // Chat Agent precedes both CLI presets in DOM order (leftmost).
+    // DOCUMENT_POSITION_FOLLOWING (4) is set when the argument follows
+    // the reference node.
+    expect(
+      chatBtn.compareDocumentPosition(claudeBtn) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      chatBtn.compareDocumentPosition(codexBtn) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("does not change CLI order when the Beta toggle is off (chat preset hidden, Claude first)", async () => {
+    useFeatureFlags.setState({
+      enableAgentChat: false,
+      enableLazyWorkspaceCreation: false,
+      loaded: true,
+    });
+
+    const claude = makePreset({ id: "builtin-claude", name: "Claude Code", kind: "cli" });
+    const codex = makePreset({ id: "builtin-codex", name: "Codex", kind: "cli", commands: ["codex"] });
+    const chatAgent = makePreset({
+      id: "builtin-chat-agent",
+      name: "Chat Agent",
+      kind: "chat_agent",
+      commands: [],
+    });
+    mockGetPresets.mockResolvedValue(makeSnapshot([claude, codex, chatAgent]));
+
+    renderPresetBar();
+    await flushPromises();
+
+    // Chat Agent hidden entirely; CLI order unchanged (Claude first).
+    expect(screen.queryByRole("button", { name: /chat agent/i })).toBeNull();
+    const claudeBtn = screen.getByRole("button", { name: /claude code/i });
+    const codexBtn = screen.getByRole("button", { name: /codex/i });
+    expect(
+      claudeBtn.compareDocumentPosition(codexBtn) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+});

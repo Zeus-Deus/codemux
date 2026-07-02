@@ -157,10 +157,16 @@ export function PresetBar({
   // changes.
   const [localPinnedOrder, setLocalPinnedOrder] = useState<string[]>([]);
 
+  // The sortable/drag set deliberately excludes the native chat preset
+  // (`chat_agent`): it's pinned leftmost and rendered outside the drag
+  // context (see `fixedChatPresets` below), so it never participates in
+  // reorder math. Keeping it out here keeps `localPinnedOrder` — which
+  // drives the SortableContext and the drag index arithmetic — in sync
+  // with what's actually draggable.
   const serverPinnedIds = useMemo(
     () =>
       (presetStore?.presets ?? [])
-        .filter((p) => p.pinned)
+        .filter((p) => p.pinned && p.kind !== "chat_agent")
         .map((p) => p.id),
     [presetStore],
   );
@@ -206,17 +212,33 @@ export function PresetBar({
     ? presetStore.presets
     : presetStore.presets.filter((p) => p.kind !== "chat_agent");
   const presetById = new Map(allPresets.map((p) => [p.id, p]));
+
+  // The native chat preset(s) are pinned to the far left, ahead of every
+  // CLI preset, because clicking one opens the GUI chat pane rather than
+  // just a terminal — so it should be the easiest to find. They render
+  // outside the sortable/drag context and are not reorderable. Gating is
+  // already applied via `allPresets` (empty of chat_agent when the Beta
+  // toggle is off), so this list is empty in that case and nothing
+  // changes for users who never opted in.
+  const fixedChatPresets = allPresets.filter(
+    (p) => p.pinned && p.kind === "chat_agent",
+  );
+
+  // The draggable/reorderable set: every other pinned preset, in the
+  // user/backend-defined order. `chat_agent` is excluded here (it lives
+  // in `fixedChatPresets`) and from `serverPinnedIds`/`localPinnedOrder`
+  // above, so the drag index math never sees it.
   const pinnedPresets: TerminalPreset[] = [];
   const seen = new Set<string>();
   for (const id of localPinnedOrder) {
     const p = presetById.get(id);
-    if (p && p.pinned) {
+    if (p && p.pinned && p.kind !== "chat_agent") {
       pinnedPresets.push(p);
       seen.add(id);
     }
   }
   for (const p of allPresets) {
-    if (p.pinned && !seen.has(p.id)) {
+    if (p.pinned && p.kind !== "chat_agent" && !seen.has(p.id)) {
       pinnedPresets.push(p);
     }
   }
@@ -435,6 +457,27 @@ export function PresetBar({
       {/* Divider */}
       <Separator orientation="vertical" className="!h-4 !self-auto mx-0.5" />
 
+      {/* Native chat preset(s) — pinned leftmost, ahead of the CLI
+          presets, and not draggable. Rendered outside the DndContext so
+          reorder never moves them. Empty (renders nothing) when the
+          agent-chat Beta toggle is off. */}
+      {fixedChatPresets.map((preset) => {
+        const buttonDisabled = isPresetDisabled(preset);
+        const tooltip =
+          presetDisabledTooltip(preset) ??
+          (inDraftMode ? null : "Shift+click to split");
+        return (
+          <div key={preset.id} className="shrink-0">
+            <PresetButton
+              preset={preset}
+              disabled={buttonDisabled}
+              tooltip={tooltip}
+              onClick={(e) => handleLaunch(preset, e)}
+            />
+          </div>
+        );
+      })}
+
       {/* Preset buttons — drag to reorder. The 5px activation distance
           (PointerSensor) means a normal click still launches the
           preset; only sustained drag motion engages the sort. */}
@@ -486,6 +529,49 @@ interface SortablePresetButtonProps {
   onClick: (e: React.MouseEvent) => void;
 }
 
+/** The visual preset button — icon + name, optionally wrapped in a
+ *  tooltip. Shared by the draggable `SortablePresetButton` and the
+ *  fixed leftmost chat presets so both render identically. */
+function PresetButton({
+  preset,
+  disabled,
+  tooltip,
+  onClick,
+}: {
+  preset: TerminalPreset;
+  disabled: boolean;
+  tooltip: string | null;
+  onClick: (e: React.MouseEvent) => void;
+}) {
+  const button = (
+    <Button
+      variant="ghost"
+      size="xs"
+      className={cn(
+        "gap-1.5 shrink-0",
+        disabled && "opacity-40 cursor-not-allowed",
+      )}
+      disabled={disabled}
+      aria-disabled={disabled}
+      onClick={onClick}
+    >
+      <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
+      <span className="truncate max-w-[120px]">{preset.name}</span>
+    </Button>
+  );
+
+  if (!tooltip) return button;
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{button}</TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+        {tooltip}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
 function SortablePresetButton({
   preset,
   disabled,
@@ -508,32 +594,13 @@ function SortablePresetButton({
     opacity: isDragging ? 0.4 : undefined,
   };
 
-  const button = (
-    <Button
-      variant="ghost"
-      size="xs"
-      className={cn(
-        "gap-1.5 shrink-0",
-        disabled && "opacity-40 cursor-not-allowed",
-      )}
+  const inner = (
+    <PresetButton
+      preset={preset}
       disabled={disabled}
-      aria-disabled={disabled}
+      tooltip={tooltip}
       onClick={onClick}
-    >
-      <PresetIcon icon={preset.icon} className="h-3.5 w-3.5" />
-      <span className="truncate max-w-[120px]">{preset.name}</span>
-    </Button>
-  );
-
-  const inner = tooltip ? (
-    <Tooltip>
-      <TooltipTrigger asChild>{button}</TooltipTrigger>
-      <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-        {tooltip}
-      </TooltipContent>
-    </Tooltip>
-  ) : (
-    button
+    />
   );
 
   // dnd-kit's `attributes` adds `role="button"` and `tabIndex=0` to
