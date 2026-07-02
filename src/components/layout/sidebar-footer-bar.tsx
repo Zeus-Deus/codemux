@@ -133,12 +133,13 @@ export function SidebarFooterBar() {
   }
 
   return (
-    <>
-      <SidebarSeparator />
-      <div className="flex items-center justify-between gap-1 px-2 py-1.5">
-        <AppMenu />
-        <SidebarPortsPopover />
-      </div>
-    </>
+    // Fixed 42px with a border-top (instead of SidebarSeparator + padding)
+    // so its top edge lands on the exact same pixel row as the workspace
+    // context bar's border-top — the two read as one continuous line
+    // across the bottom of the app.
+    <div className="flex h-[42px] items-center justify-between gap-1 border-t border-sidebar-border px-2">
+      <AppMenu />
+      <SidebarPortsPopover />
+    </div>
   );
 }

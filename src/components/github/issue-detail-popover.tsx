@@ -17,9 +17,23 @@ import type { LinkedIssue, GitHubIssue } from "@/tauri/types";
 interface Props {
   workspaceId: string;
   issue: LinkedIssue;
+  /** Trigger appearance. `"row"` (default) is the tiny dot + `#N` used
+   *  inline in the sidebar workspace row; `"chip"` is the bordered
+   *  `Issue #N` button used by the workspace context bar. */
+  variant?: "row" | "chip";
+  /** Which side the detail popover opens on. The sidebar row opens
+   *  right (into the content area); the bottom context bar opens up. */
+  side?: "top" | "right" | "bottom" | "left";
+  align?: "start" | "center" | "end";
 }
 
-export function IssueDetailPopover({ workspaceId, issue }: Props) {
+export function IssueDetailPopover({
+  workspaceId,
+  issue,
+  variant = "row",
+  side = "right",
+  align = "start",
+}: Props) {
   const [open, setOpen] = useState(false);
   const [fullIssue, setFullIssue] = useState<GitHubIssue | null>(null);
   const [loading, setLoading] = useState(false);
@@ -44,7 +58,11 @@ export function IssueDetailPopover({ workspaceId, issue }: Props) {
       <PopoverTrigger asChild>
         <button
           type="button"
-          className="inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors"
+          className={cn(
+            variant === "chip"
+              ? "inline-flex h-[26px] shrink-0 items-center gap-1.5 rounded-md border border-border bg-background px-2.5 text-[11px] font-semibold text-foreground/80 transition-colors hover:bg-muted"
+              : "inline-flex items-center gap-1 shrink-0 hover:text-foreground transition-colors",
+          )}
           onClick={(e) => e.stopPropagation()}
           onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") e.stopPropagation(); }}
         >
@@ -54,14 +72,19 @@ export function IssueDetailPopover({ workspaceId, issue }: Props) {
               issue.state === "Open" ? "bg-success" : "bg-muted-foreground",
             )}
           />
-          <span className="text-[10px] tabular-nums">
-            #{issue.number}
+          <span
+            className={cn(
+              "tabular-nums",
+              variant === "chip" ? "text-[11px]" : "text-[10px]",
+            )}
+          >
+            {variant === "chip" ? `Issue #${issue.number}` : `#${issue.number}`}
           </span>
         </button>
       </PopoverTrigger>
       <PopoverContent
-        side="right"
-        align="start"
+        side={side}
+        align={align}
         sideOffset={8}
         className="w-[380px] p-0"
       >

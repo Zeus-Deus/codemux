@@ -811,6 +811,28 @@ const handlers: Record<string, Handler> = {
   check_gh_status: () => ({ status: "Authenticated", username: "mock-dev" }),
   refresh_workspace_pr: (a) => findWorkspace(a.workspaceId)?.pr_number ?? null,
   refresh_workspace_issue: () => null,
+  // Issue detail popover (sidebar row + workspace context bar): expand
+  // the workspace's seeded `linked_issue` into a full GitHubIssue so
+  // the popover renders real content instead of an empty shell.
+  get_github_issue: (a) => {
+    const linked = findWorkspace(a.workspaceId)?.linked_issue;
+    if (!linked || linked.number !== (a.issueNumber as number)) return null;
+    return {
+      number: linked.number,
+      title: linked.title,
+      state: linked.state,
+      labels: linked.labels,
+      assignees: ["mock-dev"],
+      url: `https://github.com/mock/repo/issues/${linked.number}`,
+      body:
+        "Seeded by the dev mock runtime so the issue-detail popover is " +
+        "fully exercisable in a plain browser.\n\nIn the real app this " +
+        "body comes from `gh issue view`.",
+      comments: [],
+      totalComments: 0,
+      updatedAt: null,
+    };
+  },
   list_incoming_prs: () => [],
 
   // ── Hosts (remote devices) ──
