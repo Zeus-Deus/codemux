@@ -511,6 +511,16 @@ const presetState: PresetStoreSnapshot = {
       icon: "copilot",
       is_builtin: true,
     }),
+    // Seeded LAST on purpose: the preset bar pins the native chat preset
+    // to the far-left slot regardless of its position in the store, so
+    // its trailing seed order proves that render-time pinning works.
+    mkPreset({
+      id: "builtin-chat-agent",
+      name: "Chat Agent",
+      icon: "chat-agent",
+      kind: "chat_agent",
+      is_builtin: true,
+    }),
   ],
   bar_visible: true,
   default_preset_id: null,
