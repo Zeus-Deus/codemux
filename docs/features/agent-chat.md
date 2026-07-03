@@ -57,14 +57,27 @@ The chat pane stack:
   hosts Anthropic's Claude Agent SDK. Codemux never talks to Anthropic
   directly; the sidecar is a transport-only bridge that runs SDK
   `query()` in-process and forwards messages.
-- **`src/components/chat/`** — chat pane UI: `AgentChatPane`, `Composer`
-  (with `+` popup, `@` mention popup, slash command popup, image
-  paste/drop), `ChatTranscript`, `MessageList`, `ToolCallCard` + per-tool
-  bodies, `PlanProposalBlock`, `ComposerPendingInputPanel` for
-  AskUserQuestion, `ThinkingIndicator`, `PermissionRequestBlock`,
-  `ModePill`, `SessionSelector`, `DraftChatSurface`, `ChatHomeLanding`,
+- **`src/components/chat/`** — chat pane UI (redesigned on the shadcn
+  chat primitives, June 2026): `AgentChatPane`, `Composer` (with `+`
+  popup, `@` mention popup, slash command popup, image paste/drop),
+  `ChatTranscript`, `MessageList` (shadcn MessageScroller shell),
+  `transcript-slots.ts` (pure turn-grouping/tool-folding slot builder),
+  `AssistantAvatar`, `ReasoningBlock` (collapsible thinking),
+  `ToolCallCard` + per-tool bodies, `ToolGroupCard` (folded runs),
+  `DiffView` (red/green edit surface), `TaskSummaryCard` (TodoWrite
+  checklist), `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
+  (icon/tint mapping), `PlanProposalBlock`, `ComposerPendingInputPanel`
+  for AskUserQuestion, `PermissionRequestBlock`, `ModePill`,
+  `SessionSelector`, `DraftChatSurface`, `ChatHomeLanding`,
   `DebugCleanupBanner`, `DebugExitDialog`, and the picker family under
-  `src/components/chat/pickers/`.
+  `src/components/chat/pickers/`. Shared primitives live in
+  `src/components/ui/` (message-scroller, message, bubble, attachment,
+  marker, avatar, spinner) and `src/components/ai-elements/` (vendored
+  AI Elements — reasoning, tool, task, prompt-input, shimmer,
+  message/MessageResponse, code-block — with all Vercel AI SDK type
+  imports replaced by local unions; the AI SDK is NOT a dependency).
+  Assistant markdown renders through **Streamdown**
+  (`parseIncompleteMarkdown` keeps mid-stream fences/emphasis clean).
 
 ## What Works Today
 
@@ -76,9 +89,14 @@ The chat pane stack:
     child (`kill_on_drop`, generated `OPENCODE_SERVER_PASSWORD`).
   - All three render in a single 2-column picker (provider rail + searchable
     model list); favorites persist via zustand + `localStorage`.
-- **Streaming chat UX**: messages, tool approvals (per-tool body rendering),
-  plan proposals (`ExitPlanMode`), AskUserQuestion panels, thinking
-  indicator, debug-mode banner + exit dialog.
+- **Streaming chat UX**: Streamdown-rendered messages, tool approvals
+  (per-tool body rendering), collapsible reasoning blocks (thinking
+  deltas reduce into a `reasoning` ChatViewItem that seals on any
+  non-thinking boundary and finalizes with a "Thought for Ns"
+  duration), tool-group cards, red/green diff cards for edits,
+  TodoWrite task checklists, plan proposals (`ExitPlanMode`),
+  AskUserQuestion panels, shimmer streaming marker, debug-mode banner
+  + exit dialog.
 - **Mode pills**: Ask / Allow always / Plan / Debug, with Shift+Tab cycling
   and silent-restart on pill removal.
 - **Attachments** via `+` and `@`: files, folders, GitHub issues + PRs,
@@ -114,34 +132,52 @@ The chat pane stack:
   in CI to dodge the `fake_codex_app_server` helper-binary build race
   under cargo's parallel scheduler.
 
-## Transcript virtualization (issue #77)
+## Transcript scroller (issue #77 contract, shadcn MessageScroller)
 
-The transcript body (`MessageList.tsx`) is virtualized with
-`react-virtuoso` (MIT — chosen over `@tanstack/react-virtual` and
-`react-window` for its built-in dynamic row measurement and
-bottom-anchoring; the commercially licensed `@virtuoso.dev/message-list`
-package is NOT used). Only the on-screen window of rows is mounted, so
-a 5,000-message session (the reducer cap) scrolls like a short one.
+The transcript body (`MessageList.tsx`) renders on the shadcn
+**MessageScroller** (June 2026; styled wrapper over the `@shadcn/react`
+headless engine). It replaced `react-virtuoso`: rows are contained with
+`content-visibility:auto` + `contain-intrinsic-size` instead of
+windowed mounting, so all rows exist in the DOM but off-screen rows
+skip layout/paint — measured ~60 fps through the ~1,200-item mock
+transcript; the reducer's 5,000-message cap bounds the worst case.
 
-Contract preserved from the pre-virtualization renderer:
+Layout derivation lives in the pure `buildTranscriptSlots`
+(`transcript-slots.ts`): turn grouping (avatar once per assistant
+turn), tool-run folding into group cards, and per-slot identity.
+
+Contract preserved from the pre-redesign renderer:
 
 - **Stable keys + memo rows.** Per-slot keys are still `slot.item.id`
-  / `run:<first-id>`, and rows render through `MessageRowMemo` — a
-  streaming token mutates exactly one row.
-- **Stick-to-bottom.** `MessageList` owns the scroller now (Virtuoso
-  must control it). Pinned-ness is tracked from real scroll events
+  / `run:<first-id>` (as `MessageScrollerItem messageId`), and rows
+  render through memoized leaves (`ItemRowMemo` / `ToolGroupRowMemo`)
+  — a streaming token mutates exactly one row.
+- **Stick-to-bottom.** Pinned-ness is tracked from real scroll events
   (≤ 80 px from the bottom); after every transcript change (or
-  thinking-pulse toggle), if pinned, it snaps to the tail via
-  `scrollToIndex(LAST, end)`. Content growth alone never unpins, so
-  auto-scroll never fights a user reading history.
-- **Variable heights.** Tool-run collapses expand in place as a single
-  virtual row; Virtuoso re-measures via ResizeObserver.
-- **Thinking pulse** renders as the last virtual row (not a footer) so
-  the tail snap keeps it visible while streaming.
+  streaming-marker toggle), if pinned, it snaps to the tail. Content
+  growth alone never unpins, so auto-scroll never fights a user
+  reading history. This is implemented directly in `MessageList.tsx`
+  (mount tail-snap with a bounded settle loop + pinned-follow effect)
+  because `content-visibility` rows expose only estimated heights
+  until rendered — the engine's own mount positioning and smooth
+  `scrollToEnd` land short on large hydrated transcripts.
+- **Turn anchoring is deliberately OFF** (`scrollAnchor={false}` on
+  every row): with hundreds of pre-hydrated rows the engine's anchor
+  handling scrolls the viewport to a stale early anchor when new items
+  register mid-stream, breaking the pin. Do not re-enable it without
+  re-testing against the `agent-chat-demo` mock workspace.
+- **Variable heights.** Tool-group cards expand in place as a single
+  scroller row; the browser re-derives sizes as rows materialize.
+- **Streaming marker** (shimmer status) renders as the last row inside
+  the scroller content (not a footer) so the tail snap keeps it
+  visible while streaming; the jump-to-latest pill is the restyled
+  `MessageScrollerButton` with a direct-DOM snap fallback.
 
-`ChatTranscript` is now a thin shell that derives `showThinking` and
-sizes the list. jsdom tests wrap renders in `VirtuosoMockContext`
-(see `MessageList.test.tsx` / `MessageList.virtualization.test.tsx`).
+`ChatTranscript` is a thin shell that derives `showThinking`, forwards
+the optional `sessionStartedAt` (top session-start divider), and sizes
+the list. jsdom tests assert on the slot builder and rendered DOM
+(see `MessageList.test.tsx` / `MessageList.virtualization.test.tsx` /
+`transcript-slots.test.ts`).
 
 ## Current Constraints
 

@@ -133,8 +133,10 @@ interface Props {
   showStopButton?: boolean;
   /** Optional replacement for the Zone 1 strip (the cwd / "Home"
    *  label above the textarea). The draft surface uses this to thread
-   *  a project picker in when the draft target is Home. Pass `null`
-   *  (or omit) to keep the default cwd label. */
+   *  a project picker in when the draft target is Home. Omit
+   *  (`undefined`) to keep the default cwd label; pass `null` to
+   *  render nothing above the textarea (a running chat keeps its
+   *  scope in the workspace context bar instead). */
   zone1Override?: React.ReactNode;
   /** Step 8 Stage 1 — staged attachments rendered as a chip strip
    *  inside the composer card, above the textarea. Empty array hides
@@ -227,7 +229,7 @@ export function Composer({
   mode,
   errorMessage = null,
   showStopButton = true,
-  zone1Override = null,
+  zone1Override,
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
   onToggleExpandPr,
@@ -1718,13 +1720,13 @@ export function Composer({
   return (
     <div className="w-full px-4 pb-3">
       <div className="mx-auto w-full max-w-[760px]">
-        {zone1Override !== null
-          ? <div className="pb-1">{zone1Override}</div>
-          : cwd && (
-              <div className="px-3 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
-                {cwd}
-              </div>
-            )}
+        {zone1Override !== null && zone1Override !== undefined ? (
+          <div className="pb-1">{zone1Override}</div>
+        ) : zone1Override === undefined && cwd ? (
+          <div className="px-3 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
+            {cwd}
+          </div>
+        ) : null}
         <div
           data-testid="composer-wrapper"
           data-dragging={isDragging || undefined}

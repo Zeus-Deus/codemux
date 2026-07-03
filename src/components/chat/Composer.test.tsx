@@ -121,6 +121,16 @@ describe("Composer", () => {
       // Nothing rendered above the textarea.
       expect(container.textContent).not.toContain("Home");
     });
+
+    it("renders nothing above the textarea when the override is null (running chat)", () => {
+      const { queryByText } = renderComposer({
+        zone1Override: null,
+        cwd: "/home/user/projects/foo",
+      });
+      // `null` suppresses the default cwd label — a running chat keeps
+      // its scope in the workspace context bar instead.
+      expect(queryByText("/home/user/projects/foo")).toBeNull();
+    });
   });
 
   describe("staged attachment chip strip (Step 8 Stage 1 — image-only post-2.1)", () => {

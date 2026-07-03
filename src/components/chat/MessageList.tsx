@@ -1,5 +1,12 @@
 import { ArrowDown } from "lucide-react";
-import { memo, useCallback, useMemo, type CSSProperties } from "react";
+import {
+  memo,
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type CSSProperties,
+} from "react";
 
 import {
   MessageScroller,
@@ -46,10 +53,12 @@ interface Props {
 
 /**
  * Transcript body on the shadcn **MessageScroller** (design D2). The
- * scroller owns auto-follow-at-live-edge, turn anchoring (`scrollAnchor`
- * on user rows), prepend preservation and the jump-to-latest button;
- * `content-visibility:auto` per row keeps thousands of turns cheap, and
- * the reducer's 5,000-message cap bounds the worst case.
+ * scroller provides the viewport/rows/jump-button anatomy and
+ * `content-visibility:auto` row containment (thousands of turns stay
+ * cheap; the reducer's 5,000-message cap bounds the worst case), while
+ * tail tracking uses the preserved stick-to-bottom contract implemented
+ * below (mount snap + pinned follow) — the engine's turn anchoring is
+ * disabled because it mis-scrolls against fully hydrated transcripts.
  *
  * Layout is derived by the pure `buildTranscriptSlots` (turn grouping,
  * tool-run folding, avatar/turn-boundary metadata). Each slot is one
@@ -84,7 +93,73 @@ export function MessageList({
 
   const slots = useMemo(() => buildTranscriptSlots(ordered), [ordered]);
 
+  // --- Tail snap ------------------------------------------------------
+  // `content-visibility:auto` rows expose only ESTIMATED heights until
+  // they render, so the engine's mount-time "end" positioning (and a
+  // smooth scrollToEnd across tens of thousands of estimated pixels)
+  // can land far from the real tail. Direct scrollTop assignment is
+  // reliable — the browser re-clamps as row sizes materialise — so we
+  // snap the DOM directly: once on first mount (re-snapping across a
+  // few frames until the viewport actually rests at the bottom), and on
+  // every jump-button press.
+  const shellRef = useRef<HTMLDivElement | null>(null);
+  const snapToTail = useCallback(() => {
+    const viewport = shellRef.current?.querySelector<HTMLElement>(
+      '[data-slot="message-scroller-viewport"]',
+    );
+    if (viewport) viewport.scrollTop = viewport.scrollHeight;
+  }, []);
+  const hasContent = slots.length > 0;
+  const initialSnapDoneRef = useRef(false);
+  useLayoutEffect(() => {
+    if (!hasContent || initialSnapDoneRef.current) return;
+    initialSnapDoneRef.current = true;
+    snapToTail();
+    let tries = 0;
+    let frame = 0;
+    const settle = () => {
+      const viewport = shellRef.current?.querySelector<HTMLElement>(
+        '[data-slot="message-scroller-viewport"]',
+      );
+      if (!viewport) return;
+      const distance =
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+      if (distance > 4 && tries < 20) {
+        tries += 1;
+        viewport.scrollTop = viewport.scrollHeight;
+        frame = requestAnimationFrame(settle);
+      }
+    };
+    frame = requestAnimationFrame(settle);
+    return () => cancelAnimationFrame(frame);
+  }, [hasContent, snapToTail]);
+
+  // --- Pinned follow ---------------------------------------------------
+  // The preserved stick-to-bottom contract (issue #77 semantics):
+  // pinned-ness is tracked from REAL scroll events (≤80px from the
+  // bottom counts as pinned); after every transcript change, if pinned,
+  // snap to the tail. Content growth alone never fires a scroll event,
+  // so streaming can never unpin a reader who scrolled up.
+  const pinnedRef = useRef(true);
+  useLayoutEffect(() => {
+    const viewport = shellRef.current?.querySelector<HTMLElement>(
+      '[data-slot="message-scroller-viewport"]',
+    );
+    if (!viewport) return;
+    const onScroll = () => {
+      const distance =
+        viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+      pinnedRef.current = distance <= PIN_THRESHOLD_PX;
+    };
+    viewport.addEventListener("scroll", onScroll, { passive: true });
+    return () => viewport.removeEventListener("scroll", onScroll);
+  }, []);
+  useLayoutEffect(() => {
+    if (pinnedRef.current) snapToTail();
+  }, [slots, showThinking, snapToTail]);
+
   return (
+    <div ref={shellRef} style={SHELL_STYLE}>
     <MessageScrollerProvider autoScroll>
       <MessageScroller>
         <MessageScrollerViewport style={WS_FADE_STYLE}>
@@ -98,7 +173,13 @@ export function MessageList({
               <MessageScrollerItem
                 key={slot.key}
                 messageId={slot.messageId}
-                scrollAnchor={slot.scrollAnchor}
+                // Turn anchoring is deliberately OFF: with a fully
+                // hydrated transcript (hundreds of pre-existing rows)
+                // the engine's anchor handling scrolls the viewport to
+                // a stale early anchor when new items register mid-
+                // stream, which breaks the stick-to-bottom contract.
+                // The pinned-follow effect below owns tail tracking.
+                scrollAnchor={false}
                 className={slot.turnStart ? "mt-5" : "mt-[13px]"}
               >
                 {slot.body.kind === "toolGroup" ? (
@@ -128,8 +209,10 @@ export function MessageList({
         </MessageScrollerViewport>
         <MessageScrollerButton
           direction="end"
+          behavior="auto"
           variant="secondary"
           size="sm"
+          onClick={snapToTail}
           className="bottom-4 h-8 w-auto gap-1.5 rounded-full border border-border bg-card px-3.5 text-[11.5px] font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
         >
           Jump to latest
@@ -137,8 +220,17 @@ export function MessageList({
         </MessageScrollerButton>
       </MessageScroller>
     </MessageScrollerProvider>
+    </div>
   );
 }
+
+/** Layout-transparent wrapper so the tail-snap logic can reach the
+ *  scroller viewport without adding a real box to the flex chain. */
+const SHELL_STYLE: CSSProperties = { display: "contents" };
+
+/** Distance from the bottom (px) still counted as "pinned to the tail"
+ *  — matches the pre-redesign transcript contract. */
+const PIN_THRESHOLD_PX = 80;
 
 /** Viewport edge fade (design `wsFade`): dissolve content at the top/bottom
  *  of the scroll surface. A mask, not an overlay, so it works over any

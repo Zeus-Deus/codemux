@@ -386,7 +386,10 @@ function mockChatTranscript(): string[] {
       turn_id: turnId,
       item: {
         kind: "assistant_text",
-        text: `(${i + 1}/${MOCK_CHAT_TURNS}) ${ASSISTANT_BODIES[i % ASSISTANT_BODIES.length]}`,
+        // Counter prefix on its own paragraph — inlining it before a
+        // body that starts with a ``` fence would break the fence
+        // (CommonMark fences must start at the beginning of a line).
+        text: `(${i + 1}/${MOCK_CHAT_TURNS})\n\n${ASSISTANT_BODIES[i % ASSISTANT_BODIES.length]}`,
       },
     });
     push({

@@ -832,10 +832,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       return renderScopePills(draft.target.projectPath, draft.target);
     }
     if (draft.target.kind === "existing_workspace") {
-      if (!existingWorkspaceProjectRoot) return null;
+      // `undefined` → Composer's default cwd label as the fallback
+      // when the workspace has no resolvable project root.
+      if (!existingWorkspaceProjectRoot) return undefined;
       return renderScopePills(existingWorkspaceProjectRoot, draft.target);
     }
-    return null;
+    return undefined;
   })();
 
   const composerEl = (

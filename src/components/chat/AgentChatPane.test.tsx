@@ -795,6 +795,35 @@ describe("AgentChatPane Stage D — Zone 1 dispatch", () => {
     ).toBeNull();
   });
 
+  it("hides the Zone 1 scope pills once the conversation has messages", () => {
+    mockAppState.appState = {
+      active_workspace_id: "ws-foo",
+      workspaces: [
+        {
+          workspace_id: "ws-foo",
+          workspace_type: "standard",
+          project_root: "/projects/foo",
+          cwd: "/projects/foo",
+        },
+      ],
+    };
+    workspaceIdForPaneOverride = "ws-foo";
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    const projectPane = {
+      ...pane,
+      pane_id: "pane-foo",
+      thread_id: "thread-x",
+      cwd: "/projects/foo",
+    };
+    const { container } = render(<AgentChatPane pane={projectPane} />);
+    expect(
+      container.querySelector('[data-testid="worktree-picker-stub"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[data-testid="project-picker-stub"]'),
+    ).toBeNull();
+  });
+
   it("WorktreePicker onSwitchWorkspace clears the active draft and activates the workspace", async () => {
     mockAppState.appState = {
       active_workspace_id: "ws-foo",

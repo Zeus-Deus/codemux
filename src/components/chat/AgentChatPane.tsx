@@ -1829,7 +1829,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // this pane's project so the user can switch worktrees or create
   // one inline.
   const zone1Override = (() => {
-    if (!workspaceProjectRoot) return null;
+    // `undefined` keeps the Composer's default cwd label.
+    if (!workspaceProjectRoot) return undefined;
+    // Scope pills sit above the composer only while the chat is new.
+    // Once the conversation is running, scope detail lives in the
+    // workspace context bar instead (bottom strip), so nothing renders
+    // above the composer (`null` suppresses the cwd label too).
+    if (messages.length > 0) return null;
     if (isHomeWorkspace) {
       return (
         <ProjectPicker
@@ -1946,6 +1952,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     <Composer
       draft={draft}
       cwd={cwd}
+      // An empty pane reads as a new chat: "Describe what you want the
+      // agent to do…" until the first turn lands (design D10 copy).
+      isDraft={messages.length === 0}
       zone1Override={zone1Override}
       provider={provider}
       model={model}
