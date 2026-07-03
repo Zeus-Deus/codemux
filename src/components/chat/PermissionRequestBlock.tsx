@@ -50,7 +50,7 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
   };
 
   return (
-    <div className="rounded-md bg-muted/30 p-3 space-y-2">
+    <div className="rounded-[10px] border border-border/60 bg-muted/40 p-3 space-y-2">
       <div className="text-xs text-muted-foreground">
         Approval requested{toolName ? `: ${toolName}` : ""}
       </div>

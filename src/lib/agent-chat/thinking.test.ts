@@ -5,6 +5,7 @@ import type {
   AssistantMessageItem,
   ChatViewItem,
   PermissionRequestItem,
+  ReasoningItem,
   ToolCallItem,
   UserMessageItem,
 } from "./types";
@@ -71,6 +72,17 @@ function req(
   };
 }
 
+function reasoning(seq: number, streaming: boolean): ReasoningItem {
+  return {
+    kind: "reasoning",
+    id: `re${seq}`,
+    seq,
+    turn_id: "t1",
+    text: "considering",
+    streaming,
+  };
+}
+
 describe("shouldShowThinkingIndicator", () => {
   it("is false when not streaming", () => {
     expect(shouldShowThinkingIndicator([userMsg(0)], false)).toBe(false);
@@ -101,6 +113,16 @@ describe("shouldShowThinkingIndicator", () => {
 
   it("shows after a tool call has finished (between-tool gap)", () => {
     const msgs: ChatViewItem[] = [userMsg(0), toolCall(1, "done")];
+    expect(shouldShowThinkingIndicator(msgs, true)).toBe(true);
+  });
+
+  it("hides while a reasoning block is streaming (its own header shows Thinking…)", () => {
+    const msgs: ChatViewItem[] = [userMsg(0), reasoning(1, true)];
+    expect(shouldShowThinkingIndicator(msgs, true)).toBe(false);
+  });
+
+  it("shows after a reasoning block has sealed (between-activity gap)", () => {
+    const msgs: ChatViewItem[] = [userMsg(0), reasoning(1, false)];
     expect(shouldShowThinkingIndicator(msgs, true)).toBe(true);
   });
 

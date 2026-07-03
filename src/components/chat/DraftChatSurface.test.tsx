@@ -468,6 +468,17 @@ describe("DraftChatSurface", () => {
       expect(container.textContent).toContain("worktree:/projects/foo");
     });
 
+    it("renders the D11 scope hint spelling out the new worktree base branch", () => {
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      // The hint reflects the derivative branch (defaults to "main").
+      expect(container.textContent).toContain("new worktree from");
+      expect(container.textContent).toContain("main");
+    });
+
     it("renders the WorktreePicker for existing_workspace drafts scoped to that workspace's project", () => {
       // Seed app-state so the surface can resolve the workspace's project_root.
       const appStateStub = {

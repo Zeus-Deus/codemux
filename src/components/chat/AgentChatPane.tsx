@@ -49,6 +49,7 @@ import {
   activateWorkspace,
   agentChatInterruptTurn,
   agentChatListMessages,
+  agentChatListSessions,
   agentChatRespondToRequest,
   agentChatSendTurn,
   agentChatSetModel,
@@ -153,6 +154,14 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
   const [provider, setProvider] = useState<AgentChatProviderKind>(initialProvider);
   const [threadId, setThreadId] = useState<string | null>(pane.thread_id);
+  // Session-created timestamp for the transcript's top-of-thread marker
+  // (design D2). Resolved from the persisted sessions list, keyed by the
+  // active thread id; `undefined` until it resolves (or when no record
+  // matches) so ChatTranscript falls back to the plain "Session started"
+  // divider.
+  const [sessionStartedAt, setSessionStartedAt] = useState<number | undefined>(
+    undefined,
+  );
   const [starting, setStarting] = useState(false);
   const [restarting, setRestarting] = useState(false);
   // Optimistic in-flight flag mirroring the reference impl's
@@ -446,6 +455,34 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (model !== null) return;
     setStoreModel(threadId, defaultModelForProvider(provider));
   }, [threadId, model, provider, setStoreModel]);
+
+  // Resolve the session-start timestamp for the D2 transcript marker.
+  // The persisted sessions list is the only place a chat's wall-clock
+  // creation time lives (ChatViewItems carry only a monotonic seq), so
+  // we look the current thread up there and hand ChatTranscript the
+  // parsed `created_at`. A missing workspace/thread, no matching record,
+  // an unparseable timestamp, or a failed fetch all clear it back to
+  // `undefined` — the marker then renders the plain divider.
+  useEffect(() => {
+    if (!workspaceIdForPane || !threadId) {
+      setSessionStartedAt(undefined);
+      return;
+    }
+    let cancelled = false;
+    agentChatListSessions(workspaceIdForPane, cwd)
+      .then((records) => {
+        if (cancelled) return;
+        const record = records.find((r) => r.thread_id === threadId);
+        const parsed = record ? Date.parse(record.created_at) : Number.NaN;
+        setSessionStartedAt(Number.isNaN(parsed) ? undefined : parsed);
+      })
+      .catch(() => {
+        if (!cancelled) setSessionStartedAt(undefined);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceIdForPane, threadId, cwd]);
 
   // Stage 6 grep-on-chat-open: when the pane mounts (or the project
   // root changes), background-check whether the workspace already
@@ -1970,13 +2007,19 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           <ChatTranscript
             messages={messages}
             streaming={streaming || isSending}
+            sessionStartedAt={sessionStartedAt}
             onRespondToRequest={handleRespond}
             onAcceptPlan={handleAcceptPlan}
             onRejectPlan={handleRejectPlan}
           />
-          {pendingInputPanelEl}
-          {debugBannerEl}
-          {composerEl}
+          {/* Composer region (design D10): a hairline lifts the whole
+              composer column — AskUserQuestion panel, debug banner, and
+              the composer card — off the scrolling transcript. */}
+          <div className="border-t border-border/50 pt-3.5">
+            {pendingInputPanelEl}
+            {debugBannerEl}
+            {composerEl}
+          </div>
         </>
       )}
       <DebugExitDialog

@@ -175,8 +175,13 @@ export function ComposerFooter({
             type="button"
             onClick={onStop}
             className={cn(
+              // Streaming interrupt: a saturated red circle (design's
+              // `color-mix(red 85%, fg)`) so the stop affordance reads
+              // as the one destructive action in the row. Distinct from
+              // the neutral near-white Send so an in-flight turn is
+              // obvious at a glance.
               "inline-flex h-7 w-7 items-center justify-center rounded-full",
-              "bg-foreground text-background hover:bg-foreground/90",
+              "bg-destructive text-destructive-foreground hover:bg-destructive/90",
             )}
             aria-label="Stop"
             title="Stop"

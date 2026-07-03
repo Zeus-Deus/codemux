@@ -429,12 +429,25 @@ describe("Composer", () => {
       ).toBeInTheDocument();
     });
 
-    it("keeps the default placeholder when mode is default", () => {
+    it("uses the live-session default placeholder when mode is default", () => {
       const { getByPlaceholderText } = renderComposer({
         mode: "default",
         sessionReady: true,
       });
-      expect(getByPlaceholderText("Message the agent…")).toBeInTheDocument();
+      expect(
+        getByPlaceholderText("Reply or steer the agent…"),
+      ).toBeInTheDocument();
+    });
+
+    it("uses the draft-variant default placeholder when isDraft is set", () => {
+      const { getByPlaceholderText } = renderComposer({
+        mode: "default",
+        sessionReady: true,
+        isDraft: true,
+      });
+      expect(
+        getByPlaceholderText("Describe what you want the agent to do…"),
+      ).toBeInTheDocument();
     });
 
     // Stage 8 replaces the auto-activate-on-typing flow with a popup.

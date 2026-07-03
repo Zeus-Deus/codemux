@@ -6,17 +6,11 @@ import { ChatMarkdown } from "./ChatMarkdown";
 import { StreamingIndicator } from "./streaming-indicator";
 
 /**
- * Prose-only rendering. Per the chat-ui skill:
- *  - no container / border / avatar / label
- *  - markdown headers render as emphasized prose, NOT <h1>/<h2>
- *  - inline code keeps the prose font with a subtle background
- *  - fenced code blocks share the same neutral monospace styling as
- *    tool-output blocks (see ToolCallBlock)
- *  - bold/italic only when the source asks for it
- *
- * All component overrides live in `ChatMarkdown` so the plan renderer
- * (Stage 2) and future mode-pill renderers share the exact same prose
- * without drift.
+ * Assistant prose (design D4). No bubble, no avatar (the avatar lives in
+ * the turn gutter, drawn once by MessageList) — just the streaming
+ * markdown at 13.5px / 1.62 line-height. All element styling lives in
+ * `ChatMarkdown` so the plan renderer and reasoning body share one prose
+ * treatment. The pulsing caret trails a streaming row.
  */
 export const AssistantMessage = memo(function AssistantMessage({
   item,
@@ -26,7 +20,7 @@ export const AssistantMessage = memo(function AssistantMessage({
   const showIndicator = item.streaming && item.text.length === 0;
 
   return (
-    <div className="text-sm leading-relaxed text-foreground break-words">
+    <div className="text-[13.5px] leading-[1.62] text-foreground break-words">
       <ChatMarkdown>{item.text}</ChatMarkdown>
       {item.streaming && !showIndicator && (
         <StreamingIndicator className="ml-0.5" />

@@ -16,7 +16,9 @@ export function ChatHomeLanding({ composer }: Props) {
       <h1 className="text-3xl font-medium tracking-tight text-foreground text-center">
         What should we do today?
       </h1>
-      <div className="w-full max-w-2xl">{composer}</div>
+      {/* Match the composer's own 760px column (design D10/D12) so the
+          landing card lines up with the mid-conversation composer. */}
+      <div className="w-full max-w-[760px]">{composer}</div>
     </div>
   );
 }

@@ -24,6 +24,10 @@ export function shouldShowThinkingIndicator(
   switch (last.kind) {
     case "assistant_message":
       return !last.streaming;
+    case "reasoning":
+      // A streaming reasoning block renders its own "Thinking…" header, so
+      // the tail pulse steps back; once sealed it's dead time again.
+      return !last.streaming;
     case "tool_call":
       return last.status !== "running";
     case "permission_request":

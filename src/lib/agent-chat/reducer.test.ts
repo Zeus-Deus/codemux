@@ -8,19 +8,27 @@ import {
   appendUserMessage,
   createEmptyThreadState,
   markRequestResponding,
+  type Clock,
 } from "./reducer";
 import type {
   AssistantMessageItem,
   ChatThreadState,
   PermissionRequestItem,
+  ReasoningItem,
   ToolCallItem,
 } from "./types";
 
 function runEvents(
   events: ProviderRuntimeEvent[],
   initial: ChatThreadState = createEmptyThreadState(),
+  now?: Clock,
 ): ChatThreadState {
-  return events.reduce<ChatThreadState>(applyEvent, initial);
+  // NOTE: apply via an arrow, not `reduce(applyEvent)` — Array.reduce would
+  // pass the element index as applyEvent's third (clock) argument.
+  return events.reduce<ChatThreadState>(
+    (state, event) => applyEvent(state, event, now),
+    initial,
+  );
 }
 
 describe("agent-chat reducer", () => {
@@ -828,5 +836,249 @@ describe("agent-chat reducer", () => {
     }
     expect(state.pendingRequestIds).toEqual(["req-1"]);
     expect(state.messages.length).toBe(5_500);
+  });
+
+  describe("reasoning items (D5 thinking blocks)", () => {
+    const thinkingDelta = (
+      turn: string,
+      text: string,
+    ): ProviderRuntimeEvent => ({
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: turn,
+      delta: { kind: "thinking", text },
+    });
+    const thinkingDone = (turn: string, text: string): ProviderRuntimeEvent => ({
+      type: "item_completed",
+      thread_id: "t1",
+      turn_id: turn,
+      item: { kind: "assistant_thinking", text },
+    });
+    const textDelta = (turn: string, text: string): ProviderRuntimeEvent => ({
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: turn,
+      delta: { kind: "text", text },
+    });
+    const toolUse = (
+      turn: string,
+      id: string,
+      name = "Read",
+    ): ProviderRuntimeEvent => ({
+      type: "item_completed",
+      thread_id: "t1",
+      turn_id: turn,
+      item: { kind: "tool_use", tool_use_id: id, tool_name: name, input: {} },
+    });
+    const reasoningItems = (state: ChatThreadState): ReasoningItem[] =>
+      state.messages.filter((m): m is ReasoningItem => m.kind === "reasoning");
+
+    it("accumulates thinking deltas into one streaming reasoning item", () => {
+      const state = runEvents(
+        [
+          {
+            type: "session_state_changed",
+            thread_id: "t1",
+            status: { status: "running", active_turn: "turn-1" },
+          },
+          thinkingDelta("turn-1", "First"),
+          thinkingDelta("turn-1", " then more"),
+        ],
+        undefined,
+        () => 1234,
+      );
+      const reasoning = reasoningItems(state);
+      expect(reasoning).toHaveLength(1);
+      expect(reasoning[0].text).toBe("First then more");
+      expect(reasoning[0].streaming).toBe(true);
+      expect(reasoning[0].started_at).toBe(1234);
+      expect(reasoning[0].duration_ms).toBeUndefined();
+      expect(state.streaming).toBe(true);
+    });
+
+    it("finalizes on assistant_thinking: replaces text, seals, and records duration first-delta→completion", () => {
+      let t = 0;
+      const clock: Clock = () => t;
+      let state = createEmptyThreadState();
+      t = 1000;
+      state = applyEvent(state, thinkingDelta("turn-1", "Let me "), clock);
+      t = 3000; // second delta appends — must NOT reset started_at
+      state = applyEvent(
+        state,
+        thinkingDelta("turn-1", "inspect the file."),
+        clock,
+      );
+      t = 7000; // completion → duration = 7000 - 1000
+      state = applyEvent(
+        state,
+        thinkingDone("turn-1", "Let me inspect the file."),
+        clock,
+      );
+      const reasoning = reasoningItems(state);
+      expect(reasoning).toHaveLength(1);
+      expect(reasoning[0].text).toBe("Let me inspect the file.");
+      expect(reasoning[0].streaming).toBe(false);
+      expect(reasoning[0].started_at).toBe(1000);
+      expect(reasoning[0].duration_ms).toBe(6000);
+    });
+
+    it("materialises a sealed reasoning item from a completion that carried no deltas (no duration)", () => {
+      const state = runEvents([thinkingDone("turn-1", "Instant thought")]);
+      const reasoning = reasoningItems(state);
+      expect(reasoning).toHaveLength(1);
+      expect(reasoning[0].text).toBe("Instant thought");
+      expect(reasoning[0].streaming).toBe(false);
+      expect(reasoning[0].started_at).toBeUndefined();
+      expect(reasoning[0].duration_ms).toBeUndefined();
+    });
+
+    it("seals a streaming reasoning block when a tool_use lands after it (no completion seen)", () => {
+      let t = 100;
+      const clock: Clock = () => t;
+      let state = createEmptyThreadState();
+      state = applyEvent(state, thinkingDelta("turn-1", "pondering"), clock);
+      t = 900; // tool_use boundary → duration = 900 - 100
+      state = applyEvent(state, toolUse("turn-1", "tu-1"), clock);
+      const reasoning = reasoningItems(state);
+      expect(reasoning).toHaveLength(1);
+      expect(reasoning[0].streaming).toBe(false);
+      expect(reasoning[0].duration_ms).toBe(800);
+      expect(state.messages.map((m) => m.kind)).toEqual([
+        "reasoning",
+        "tool_call",
+      ]);
+    });
+
+    it("a text delta after a streaming reasoning block seals it and starts a fresh assistant row", () => {
+      const state = runEvents([
+        thinkingDelta("turn-1", "considering"),
+        textDelta("turn-1", "Here is the answer"),
+      ]);
+      const reasoning = reasoningItems(state);
+      expect(reasoning[0].streaming).toBe(false);
+      const assistants = state.messages.filter(
+        (m): m is AssistantMessageItem => m.kind === "assistant_message",
+      );
+      expect(assistants).toHaveLength(1);
+      expect(assistants[0].text).toBe("Here is the answer");
+      expect(assistants[0].streaming).toBe(true);
+      expect(state.messages.map((m) => m.kind)).toEqual([
+        "reasoning",
+        "assistant_message",
+      ]);
+    });
+
+    it("interleaves reasoning, a tool call, and assistant text in chronological seq order", () => {
+      const state = runEvents([
+        {
+          type: "session_state_changed",
+          thread_id: "t1",
+          status: { status: "running", active_turn: "turn-1" },
+        },
+        thinkingDelta("turn-1", "checking"),
+        thinkingDone("turn-1", "checking the repo"),
+        toolUse("turn-1", "tu-1"),
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_result",
+            tool_use_id: "tu-1",
+            content: "ok",
+            is_error: false,
+          },
+        },
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: { kind: "assistant_text", text: "Found it" },
+        },
+      ]);
+      const ordered = state.messages
+        .slice()
+        .sort((a, b) => a.seq - b.seq)
+        .map((m) => m.kind);
+      expect(ordered).toEqual([
+        "reasoning",
+        "tool_call",
+        "assistant_message",
+      ]);
+      const reasoning = reasoningItems(state);
+      expect(reasoning[0].text).toBe("checking the repo");
+      expect(reasoning[0].streaming).toBe(false);
+    });
+
+    it("starts a NEW reasoning block for a second thinking segment after the first sealed", () => {
+      const state = runEvents([
+        thinkingDelta("turn-1", "first"),
+        thinkingDone("turn-1", "first"),
+        thinkingDelta("turn-1", "second"),
+        thinkingDone("turn-1", "second"),
+      ]);
+      const reasoning = reasoningItems(state);
+      expect(reasoning).toHaveLength(2);
+      expect(reasoning.map((r) => r.text)).toEqual(["first", "second"]);
+      expect(reasoning.every((r) => !r.streaming)).toBe(true);
+    });
+
+    it("preserves the reasoning seq across delta accumulation (mutation keeps seq)", () => {
+      let state = createEmptyThreadState();
+      state = appendUserMessage(state, "go");
+      state = applyEvent(state, thinkingDelta("turn-1", "a"));
+      const firstSeq = state.messages[1].seq;
+      state = applyEvent(state, thinkingDelta("turn-1", "b"));
+      const reasoning = state.messages[1] as ReasoningItem;
+      expect(reasoning.kind).toBe("reasoning");
+      expect(reasoning.text).toBe("ab");
+      expect(reasoning.seq).toBe(firstSeq);
+      // user(0) + reasoning(1); the second delta MUTATED, so nextSeq === 2.
+      expect(state.nextSeq).toBe(2);
+    });
+
+    it("turn_completed seals a still-streaming reasoning block", () => {
+      let t = 10;
+      const clock: Clock = () => t;
+      let state = createEmptyThreadState();
+      state = applyEvent(state, thinkingDelta("turn-1", "mid-thought"), clock);
+      t = 40;
+      state = applyEvent(
+        state,
+        {
+          type: "turn_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          status: { kind: "success" },
+          usage: null,
+        },
+        clock,
+      );
+      const reasoning = reasoningItems(state);
+      expect(reasoning[0].streaming).toBe(false);
+      expect(reasoning[0].duration_ms).toBe(30);
+      expect(state.streaming).toBe(false);
+    });
+
+    it("subjects reasoning items to the 5,000-message cap like any other row", () => {
+      let state = createEmptyThreadState();
+      // A reasoning block near the head, then quiesce so the cap can fire.
+      state = applyEvent(state, thinkingDelta("turn-1", "head thought"));
+      state = applyEvent(state, thinkingDone("turn-1", "head thought"));
+      state = applyEvent(state, {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      });
+      expect(reasoningItems(state)).toHaveLength(1);
+      for (let i = 0; i < 5200; i += 1) {
+        state = appendUserMessage(state, `m-${i}`);
+      }
+      expect(state.messages.length).toBeLessThanOrEqual(5_000);
+      // The head reasoning block was trimmed with the rest — no special-casing.
+      expect(reasoningItems(state)).toHaveLength(0);
+    });
   });
 });

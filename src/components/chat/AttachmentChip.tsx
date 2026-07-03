@@ -34,23 +34,23 @@ interface KindConfig {
 const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
   file: {
     icon: FileIcon,
-    className: "bg-foreground/10 text-foreground",
+    className: "bg-foreground/10 text-foreground border-border/60",
   },
   folder: {
     icon: FolderOpen,
-    className: "bg-foreground/10 text-foreground",
+    className: "bg-foreground/10 text-foreground border-border/60",
   },
   issue: {
     icon: CircleDot,
-    className: "bg-warning/15 text-warning",
+    className: "bg-warning/15 text-warning border-warning/25",
   },
   pr: {
     icon: GitPullRequest,
-    className: "bg-primary/15 text-primary",
+    className: "bg-primary/15 text-primary border-primary/25",
   },
   image: {
     icon: ImageIcon,
-    className: "bg-accent/15 text-accent-foreground",
+    className: "bg-accent/15 text-accent-foreground border-accent/30",
   },
 };
 
@@ -63,14 +63,14 @@ const KIND_CONFIG: Record<AttachmentKind, KindConfig> = {
 function classNameForAttachment(attachment: Attachment): string {
   const state = attachment.metadata.state;
   if (attachment.kind === "issue" && state === "closed") {
-    return "bg-foreground/10 text-muted-foreground";
+    return "bg-foreground/10 text-muted-foreground border-border/60";
   }
   if (attachment.kind === "pr") {
     if (state === "merged") {
-      return "bg-chart-4/15 text-chart-4";
+      return "bg-chart-4/15 text-chart-4 border-chart-4/25";
     }
     if (state === "closed" || state === "draft") {
-      return "bg-foreground/10 text-muted-foreground";
+      return "bg-foreground/10 text-muted-foreground border-border/60";
     }
   }
   return KIND_CONFIG[attachment.kind].className;
@@ -147,7 +147,11 @@ export function AttachmentChip({
   const chip = (
     <div
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs",
+        // Bordered chip (design D3/D10): a matching-tint hairline gives
+        // each staged ref the card look the design applies to the
+        // green issue chip; the per-kind tint below sets both fill and
+        // border colour.
+        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs",
         classNameForAttachment(attachment),
       )}
       role="status"

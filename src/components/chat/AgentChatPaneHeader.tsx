@@ -200,7 +200,7 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
   return (
     <header
       className={cn(
-        "flex h-7 shrink-0 items-center gap-1 border-b border-border/30 px-1.5 transition-colors",
+        "flex h-7 shrink-0 items-center gap-1 border-b border-border/50 px-1.5 transition-colors",
         isActive ? "bg-card" : "bg-background",
       )}
       onPointerDown={onPointerDown}

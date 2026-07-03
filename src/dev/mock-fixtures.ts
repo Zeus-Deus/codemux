@@ -585,6 +585,108 @@ const MOCK_PERSISTENCE: PersistenceSchema = {
 export const MOCK_HOME_DIR = HOME;
 
 /**
+ * Runtime-event envelopes for the final seeded chat turn so the redesigned
+ * transcript surfaces every new presentation in browser dev: a reasoning
+ * block (streamed thinking → sealed), a tool group card (a run of reads),
+ * a diff card (an Edit with old/new text) and a task summary card (a
+ * TodoWrite with a todos array). Consumed by tauri-mock's
+ * `mockChatTranscript`; shapes mirror `ProviderRuntimeEvent`.
+ */
+export function richChatTurnEnvelopes(
+  threadId: string,
+  turnId: string,
+): unknown[] {
+  const evt = (rest: Record<string, unknown>) => ({
+    thread_id: threadId,
+    turn_id: turnId,
+    ...rest,
+  });
+  const read = (n: number, file: string): unknown[] => {
+    const id = `${turnId}-read-${n}`;
+    return [
+      evt({
+        type: "item_completed",
+        item: { kind: "tool_use", tool_name: "Read", tool_use_id: id, input: { file_path: file } },
+      }),
+      evt({
+        type: "item_completed",
+        item: { kind: "tool_result", tool_use_id: id, content: `// ${file}\n`, is_error: false },
+      }),
+    ];
+  };
+  const editId = `${turnId}-edit`;
+  const todoId = `${turnId}-todo`;
+  const thinking =
+    "The issue cites gateway/run.py:225, but line numbers rarely survive across versions. " +
+    "I'll grep for the actual symbol and compare against origin/main before editing anything.";
+
+  return [
+    // Reasoning: two streamed thinking deltas then a sealed completion.
+    evt({ type: "content_delta", delta: { kind: "thinking", text: thinking.slice(0, 90) } }),
+    evt({ type: "content_delta", delta: { kind: "thinking", text: thinking.slice(90) } }),
+    evt({ type: "item_completed", item: { kind: "assistant_thinking", text: thinking } }),
+    evt({
+      type: "item_completed",
+      item: {
+        kind: "assistant_text",
+        text: "I'll locate the symbol upstream, then apply the fix where the bug actually lives.",
+      },
+    }),
+    // Tool group card: a run of reads.
+    ...read(0, "gateway/run.py"),
+    ...read(1, "gateway/errors.py"),
+    ...read(2, "tests/test_traceback.py"),
+    // Diff card: an Edit carrying old_string / new_string.
+    evt({
+      type: "item_completed",
+      item: {
+        kind: "tool_use",
+        tool_name: "Edit",
+        tool_use_id: editId,
+        input: {
+          file_path: "gateway/run.py",
+          old_string: "        cur = cur.__cause__ or cur.__context__",
+          new_string:
+            '        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)',
+        },
+      },
+    }),
+    evt({
+      type: "item_completed",
+      item: { kind: "tool_result", tool_use_id: editId, content: "Applied edit to gateway/run.py", is_error: false },
+    }),
+    // Task summary card: a TodoWrite with a todos array.
+    evt({
+      type: "item_completed",
+      item: {
+        kind: "tool_use",
+        tool_name: "TodoWrite",
+        tool_use_id: todoId,
+        input: {
+          todos: [
+            { content: "Branch fix/57298 off origin/main", status: "completed" },
+            { content: "Patch the traceback chain walker", status: "completed" },
+            { content: "Add a regression test", status: "completed" },
+            { content: "Open a PR against origin/main", status: "in_progress" },
+          ],
+        },
+      },
+    }),
+    evt({
+      type: "item_completed",
+      item: { kind: "tool_result", tool_use_id: todoId, content: "Todos updated", is_error: false },
+    }),
+    evt({
+      type: "item_completed",
+      item: {
+        kind: "assistant_text",
+        text: "Done — issue #57298 implemented and the regression test passes.",
+      },
+    }),
+  ];
+}
+
+/**
  * Build a fresh, deep-ish-cloned `AppStateSnapshot`. The mock holds a
  * single mutable instance and re-emits it after mutating commands, so
  * we hand out a structuredClone to keep the canonical seed pristine

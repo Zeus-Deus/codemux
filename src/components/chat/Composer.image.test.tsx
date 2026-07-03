@@ -256,7 +256,7 @@ describe("Composer image attach (Step 8 Stage 6)", () => {
       // Walk up to the outermost composer card. Three levels: the
       // textarea sits inside a `relative` wrapper which sits inside
       // the rounded card.
-      const wrapper = textarea.closest('[class*="rounded-xl"]')!;
+      const wrapper = textarea.closest('[data-testid="composer-wrapper"]')!;
 
       const file = pngFile();
       fireEvent.drop(wrapper, {
@@ -272,7 +272,7 @@ describe("Composer image attach (Step 8 Stage 6)", () => {
       const textarea = container.querySelector(
         "textarea",
       ) as HTMLTextAreaElement;
-      const wrapper = textarea.closest('[class*="rounded-xl"]')!;
+      const wrapper = textarea.closest('[data-testid="composer-wrapper"]')!;
 
       const event = new Event("dragover", { bubbles: true, cancelable: true });
       // Pollute event with a synthetic dataTransfer so the handler
@@ -290,7 +290,7 @@ describe("Composer image attach (Step 8 Stage 6)", () => {
       const textarea = container.querySelector(
         "textarea",
       ) as HTMLTextAreaElement;
-      const wrapper = textarea.closest('[class*="rounded-xl"]')!;
+      const wrapper = textarea.closest('[data-testid="composer-wrapper"]')!;
 
       const txtFile = new File(["hi"], "notes.txt", {
         type: "text/plain",

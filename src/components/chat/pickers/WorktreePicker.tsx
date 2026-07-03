@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, GitBranch, Loader2, Plus } from "lucide-react";
+import { ChevronDown, Folder, GitBranch, Loader2, Plus } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import {
@@ -133,9 +133,9 @@ export function WorktreePicker({
         <button
           type="button"
           disabled={disabled}
-          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none disabled:opacity-50"
+          className="inline-flex h-7 items-center gap-1.5 rounded-full border border-primary/40 bg-muted/40 px-3 text-xs font-medium text-foreground transition-colors hover:bg-muted outline-none disabled:opacity-50"
         >
-          <GitBranch className="h-3 w-3" />
+          <Folder className="h-3 w-3" />
           <span className="max-w-[200px] truncate font-mono">
             {triggerLabel}
           </span>

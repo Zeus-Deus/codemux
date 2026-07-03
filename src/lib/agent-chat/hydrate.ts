@@ -52,8 +52,22 @@ export function replayPayloads(payloads: string[]): ChatThreadState {
   // reducer's turn_completed handler already clears `streaming`, but
   // not every transcript ends with one (interrupted resume, partial
   // history, …). Belt and braces.
+  //
+  // A transcript truncated mid-thinking (no `assistant_thinking`
+  // completion, no trailing boundary item) can leave a reasoning block
+  // flagged `streaming`. Seal those so a restored thread never renders a
+  // perpetual "Thinking…" shimmer.
+  const hasStreamingReasoning = state.messages.some(
+    (m) => m.kind === "reasoning" && m.streaming,
+  );
+  const messages = hasStreamingReasoning
+    ? state.messages.map((m) =>
+        m.kind === "reasoning" && m.streaming ? { ...m, streaming: false } : m,
+      )
+    : state.messages;
   return {
     ...state,
+    messages,
     streaming: false,
     pendingRequestIds: [],
   };

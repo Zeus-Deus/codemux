@@ -1,19 +1,10 @@
 import { memo, useRef, useState } from "react";
 import {
-  BookOpen,
   Check,
-  CheckSquare,
   ChevronDown,
   ChevronRight,
   Clock,
-  FileText,
-  FolderSearch,
-  Globe,
   Loader2,
-  Pencil,
-  Search,
-  Terminal,
-  Wrench,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -40,6 +31,7 @@ import type { ApprovalDecision } from "@/tauri/events";
 import { ToolCallBlock } from "./ToolCallBlock";
 import { ToolCallBody } from "./ToolCallBodies";
 import { ToolCallStatus } from "./ToolCallStatus";
+import { categoryTint, toolCategory, toolIcon } from "./tool-visuals";
 
 interface Props {
   item: ToolCallItem;
@@ -80,15 +72,20 @@ export const ToolCallCard = memo(function ToolCallCard({
   const isSuccess = item.status === "done";
   const isError = item.status === "error";
 
-  // Default collapsed behavior per Stage 1 spec:
+  // Default collapsed behavior:
   //  - pending_approval: expanded so user can see what they're approving.
   //  - error: expanded (auto-expand on error).
+  //  - Edit/Write diffs: expanded so the diff card reads inline (design D7).
   //  - everything else: collapsed; user can toggle.
-  const defaultExpanded = isPendingApproval || isError;
+  const isDiffTool =
+    item.tool_name === "Edit" ||
+    item.tool_name === "MultiEdit" ||
+    item.tool_name === "Write";
+  const defaultExpanded = isPendingApproval || isError || isDiffTool;
   const [expanded, setExpanded] = useState(defaultExpanded);
 
-  const Icon = TOOL_ICONS[item.tool_name] ?? FALLBACK_ICON;
-  const StatusGlyph = glyphForState({
+  const Icon = toolIcon(item.tool_name);
+  const glyph = glyphForState({
     isPendingApproval,
     isResponding,
     isDenied,
@@ -102,34 +99,35 @@ export const ToolCallCard = memo(function ToolCallCard({
     ? safeStringify(item.input)
     : null;
   const canExpand = hasResultBody || inputText !== null;
+  const showBody =
+    expanded && !isPendingApproval && !isResponding && !isDenied;
 
   return (
-    <div className="space-y-1">
-      {/* Header row: icon · status-line · glyph · chevron, all hugging
-          left. `min-w-0 truncate` on the label lets long commands
+    <div className="overflow-hidden rounded-[10px] border border-border/60 bg-muted/40">
+      {/* Header row: tinted icon chip · mono command · status glyph ·
+          chevron. `min-w-0 truncate` on the label lets long commands
           ellipsize rather than push the trailing glyphs off-screen. */}
-      <div className="flex items-center gap-2 min-w-0">
-        <Icon
+      <div className="flex items-center gap-2.5 px-3 py-2.5 min-w-0">
+        <span
           className={cn(
-            "h-3 w-3 shrink-0",
-            isDenied ? "text-muted-foreground/50" : "text-muted-foreground",
+            "flex h-[22px] w-[22px] shrink-0 items-center justify-center rounded-md",
+            categoryTint(toolCategory(item.tool_name)),
+            isDenied && "opacity-50",
           )}
-          aria-hidden
-        />
+        >
+          <Icon className="h-3 w-3" strokeWidth={1.5} aria-hidden />
+        </span>
         <div
           className={cn(
-            "min-w-0 truncate",
+            "min-w-0 flex-1 truncate",
             isDenied && "line-through text-muted-foreground/60",
           )}
         >
           <ToolCallStatus item={item} />
         </div>
-        {StatusGlyph && (
-          <StatusGlyph
-            className={cn(
-              "h-3 w-3 shrink-0 text-muted-foreground",
-              isExecuting && "animate-spin",
-            )}
+        {glyph && (
+          <glyph.Icon
+            className={cn("h-3.5 w-3.5 shrink-0", glyph.className)}
             aria-hidden
           />
         )}
@@ -164,22 +162,24 @@ export const ToolCallCard = memo(function ToolCallCard({
 
       {/* In-flight decision marker */}
       {isResponding && (
-        <div className="py-0.5 text-xs text-muted-foreground/70">
+        <div className="border-t border-border/60 px-3 py-2 text-xs text-muted-foreground/70">
           Submitting decision…
         </div>
       )}
 
       {/* Denied terminal state */}
       {isDenied && resolution?.state === "resolved" && (
-        <div className="py-0.5 text-xs text-muted-foreground">
+        <div className="border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
           {denialLabel(resolution.decision)}
         </div>
       )}
 
       {/* Result body when expanded — known tools get a polished
           renderer, unknown tools fall back to the raw JSON dump. */}
-      {expanded && !isPendingApproval && !isResponding && !isDenied && (
-        <ToolCallBody item={item} />
+      {showBody && (
+        <div className="border-t border-border/60 px-3 py-2.5">
+          <ToolCallBody item={item} />
+        </div>
       )}
     </div>
   );
@@ -248,7 +248,7 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
   };
 
   return (
-    <div className="rounded-md bg-muted/30 p-3 space-y-2">
+    <div className="border-t border-border/60 p-3 space-y-2">
       {inputText !== null && (
         <ToolCallBlock content={null} text={inputText} />
       )}
@@ -362,21 +362,14 @@ function ApprovalFooter({ inputText, onDecide, toolName }: ApprovalFooterProps) 
 // Helpers
 // ---------------------------------------------------------------------------
 
-const TOOL_ICONS: Record<string, LucideIcon> = {
-  Read: FileText,
-  Write: Pencil,
-  Edit: Pencil,
-  MultiEdit: Pencil,
-  Bash: Terminal,
-  Glob: FolderSearch,
-  Grep: Search,
-  WebFetch: Globe,
-  WebSearch: Globe,
-  TodoWrite: CheckSquare,
-  NotebookEdit: BookOpen,
-};
-const FALLBACK_ICON: LucideIcon = Wrench;
+interface StatusGlyph {
+  Icon: LucideIcon;
+  className: string;
+}
 
+/** Trailing status glyph + its tint. Green check on success, red ✗ on
+ *  error, ember spinner while executing — neutral for the transient
+ *  approval states. */
 function glyphForState(states: {
   isPendingApproval: boolean;
   isResponding: boolean;
@@ -384,13 +377,15 @@ function glyphForState(states: {
   isExecuting: boolean;
   isSuccess: boolean;
   isError: boolean;
-}): LucideIcon | null {
-  if (states.isPendingApproval) return Clock;
-  if (states.isResponding) return Loader2;
-  if (states.isExecuting) return Loader2;
-  if (states.isSuccess) return Check;
-  if (states.isError) return X;
-  if (states.isDenied) return X;
+}): StatusGlyph | null {
+  if (states.isPendingApproval) return { Icon: Clock, className: "text-muted-foreground" };
+  if (states.isResponding)
+    return { Icon: Loader2, className: "animate-spin text-muted-foreground" };
+  if (states.isExecuting)
+    return { Icon: Loader2, className: "animate-spin text-accent-ember" };
+  if (states.isSuccess) return { Icon: Check, className: "text-status-open" };
+  if (states.isError) return { Icon: X, className: "text-status-attention" };
+  if (states.isDenied) return { Icon: X, className: "text-muted-foreground" };
   return null;
 }
 

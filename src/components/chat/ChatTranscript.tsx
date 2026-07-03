@@ -8,8 +8,11 @@ interface Props {
   messages: ChatViewItem[];
   /** True while a turn is in flight — either the backend has
    *  acknowledged streaming OR the composer's optimistic flag is set.
-   *  Drives the transcript-tail "thinking" pulse. */
+   *  Drives the transcript-tail "working" marker. */
   streaming: boolean;
+  /** Optional session-created timestamp for the top session-start marker
+   *  (design D2). Forwarded to MessageList; Stage 3 wires the real value. */
+  sessionStartedAt?: number;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -25,6 +28,7 @@ interface Props {
 export function ChatTranscript({
   messages,
   streaming,
+  sessionStartedAt,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -36,6 +40,7 @@ export function ChatTranscript({
       <MessageList
         messages={messages}
         showThinking={showThinking}
+        sessionStartedAt={sessionStartedAt}
         onRespondToRequest={onRespondToRequest}
         onAcceptPlan={onAcceptPlan}
         onRejectPlan={onRejectPlan}

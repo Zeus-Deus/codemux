@@ -1,11 +1,20 @@
-import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { Streamdown } from "streamdown";
 
 import { cn } from "@/lib/utils";
 
 /**
  * Shared markdown renderer for chat surfaces (assistant messages,
  * plan proposals).
+ *
+ * Streaming renderer: `streamdown` (the drop-in react-markdown
+ * replacement shadcn's AI Elements are built on). `parseIncompleteMarkdown`
+ * closes unterminated fences / emphasis / lists mid-stream so a
+ * half-arrived token never flashes broken markup. We keep the same
+ * `remarkGfm`-only plugin set the previous react-markdown renderer used
+ * (no math/KaTeX) and skip streamdown's shiki `code` plugin, so fenced
+ * blocks render as plain `<pre>` styled by the prose chain below — no
+ * async highlighter, identical DOM semantics.
  *
  * Built on `@tailwindcss/typography` (registered as a `@plugin` in
  * `globals.css`). The `prose` class provides a typography stack;
@@ -71,7 +80,13 @@ const proseClasses = [
 export function ChatMarkdown({ children }: { children: string }) {
   return (
     <div className={cn(proseClasses)}>
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{children}</ReactMarkdown>
+      <Streamdown
+        parseIncompleteMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[]}
+      >
+        {children}
+      </Streamdown>
     </div>
   );
 }

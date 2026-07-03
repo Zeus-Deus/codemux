@@ -165,7 +165,7 @@ export function DerivativeBranchPicker({
           type="button"
           disabled={disabled}
           aria-label="Derivative branch"
-          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none disabled:opacity-50"
+          className="inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-muted/40 px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none disabled:opacity-50"
         >
           <span className="text-[10px] opacity-60">from</span>
           <GitBranch className="h-3 w-3" />

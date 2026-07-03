@@ -36,6 +36,18 @@ describe("AttachmentChip", () => {
       expect(chip.className).toContain("text-foreground");
     });
 
+    it("renders a bordered card chip in its own tint (design D3/D10)", () => {
+      // The redesign gives every staged ref the bordered-card look the
+      // design shows on the green issue chip; the border colour tracks
+      // the per-kind tint.
+      const { getByRole } = render(
+        <AttachmentChip attachment={makeAttachment()} onRemove={vi.fn()} />,
+      );
+      const chip = getByRole("status");
+      expect(chip.className).toContain("border");
+      expect(chip.className).toContain("border-border/60");
+    });
+
     it("omits the line-count slot when lineCount is undefined", () => {
       const { queryByText } = render(
         <AttachmentChip

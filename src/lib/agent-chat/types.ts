@@ -33,6 +33,35 @@ export interface AssistantMessageItem {
   streaming: boolean;
 }
 
+/**
+ * A collapsible "thinking" block. Thinking `content_delta`s accumulate
+ * into the trailing reasoning item using the same tail-merge discipline as
+ * assistant text: while it is the streaming tail, further thinking deltas
+ * append to `text`; it seals (`streaming: false`) when an
+ * `assistant_thinking` completion finalises it, or when any non-thinking
+ * item lands after it. Renders via the D5 `ReasoningBlock`
+ * ("Thinking…" while streaming, "Thought for Ns" once sealed).
+ */
+export interface ReasoningItem {
+  kind: "reasoning";
+  id: ChatItemId;
+  seq: number;
+  turn_id: string | null;
+  text: string;
+  streaming: boolean;
+  /** Wall-clock ms (from the injected clock, default `Date.now`) when the
+   *  first thinking delta of this block landed. Absent when the block was
+   *  materialised straight from an `assistant_thinking` completion that
+   *  carried no deltas, or when a hydrate/replay never observed a first
+   *  delta. Drives `duration_ms`. */
+  started_at?: number;
+  /** Thinking duration in ms (first-delta → seal). Set when the block
+   *  seals — via the `assistant_thinking` completion or a trailing
+   *  non-thinking item. Absent until sealed, and when `started_at` was
+   *  never captured (nothing to measure from). */
+  duration_ms?: number;
+}
+
 export interface ToolCallItem {
   kind: "tool_call";
   id: ChatItemId;
@@ -80,6 +109,7 @@ export interface TurnEndedItem {
 export type ChatViewItem =
   | UserMessageItem
   | AssistantMessageItem
+  | ReasoningItem
   | ToolCallItem
   | PermissionRequestItem
   | TurnEndedItem;

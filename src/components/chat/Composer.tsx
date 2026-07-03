@@ -114,6 +114,12 @@ interface Props {
   streaming: boolean;
   sessionReady: boolean;
   showProviderPicker: boolean;
+  /** True on the pre-session draft surface (no live session yet). Only
+   *  affects the default-mode placeholder copy: draft reads "Describe
+   *  what you want the agent to do…", a live session reads "Reply or
+   *  steer the agent…" (design D10). Mode-specific placeholders
+   *  (plan/ask/debug) are unaffected. Defaults to false. */
+  isDraft?: boolean;
   /** Composer-level Cursor-style mode pill. Swaps the placeholder,
    *  hides the permission picker, and toggles the mode selector
    *  (dropdown → pill). */
@@ -217,6 +223,7 @@ export function Composer({
   streaming,
   sessionReady,
   showProviderPicker,
+  isDraft = false,
   mode,
   errorMessage = null,
   showStopButton = true,
@@ -1710,7 +1717,7 @@ export function Composer({
 
   return (
     <div className="w-full px-4 pb-3">
-      <div className="mx-auto w-full max-w-2xl">
+      <div className="mx-auto w-full max-w-[760px]">
         {zone1Override !== null
           ? <div className="pb-1">{zone1Override}</div>
           : cwd && (
@@ -1727,20 +1734,26 @@ export function Composer({
           onDrop={handleDrop}
           className={cn(
             "relative",
-            "rounded-xl bg-muted/30 ring-1 ring-border/60 focus-within:ring-muted-foreground/60",
+            // Composer card (design D10): 15px radius, a real hairline
+            // border on the slightly-elevated surface, and a soft
+            // shadow so the card lifts off the pane background. Focus
+            // sharpens the border rather than stacking a ring.
+            "rounded-[15px] border border-border bg-muted/40 shadow-sm",
             // Composer is mounted for the entire chat session and re-
             // renders frequently as the draft / attachments change.
             // `transition-all` would animate every property change;
-            // scope to the two properties that actually transition
-            // here (drag-state ring colour + tinted background, plus
-            // focus-within ring colour shift) so the compositor only
-            // has work to do on those changes.
-            "transition-[box-shadow,background-color]",
+            // scope to the properties that actually transition here
+            // (drag-state border + tinted background, plus focus-within
+            // border shift) so the compositor only has work to do on
+            // those changes.
+            "transition-[box-shadow,border-color,background-color]",
+            "focus-within:border-muted-foreground/50",
             // Drag-over uses a neutral foreground-tinted ring instead
             // of the primary accent: the chat-ui skill reserves accent
             // for the app shell, and the brightness shift alone is
             // enough to confirm the drop target.
-            isDragging && "ring-2 ring-foreground/40 bg-foreground/[0.04]",
+            isDragging &&
+              "border-foreground/40 bg-foreground/[0.04] ring-1 ring-foreground/40",
           )}
         >
           {/* Step 8 Stage 6 — hidden image picker. The `+ → Image…`
@@ -2082,7 +2095,9 @@ export function Composer({
                 }
               }}
               placeholder={
-                sessionReady ? placeholderForMode(mode) : "Starting session…"
+                sessionReady
+                  ? placeholderForMode(mode, isDraft)
+                  : "Starting session…"
               }
               rows={1}
               className={cn(
@@ -2157,7 +2172,7 @@ function formatMcpRowStatus(
   }
 }
 
-function placeholderForMode(mode: ChatMode): string {
+function placeholderForMode(mode: ChatMode, isDraft: boolean): string {
   switch (mode) {
     case "plan":
       return "Plan and design before coding…";
@@ -2166,6 +2181,10 @@ function placeholderForMode(mode: ChatMode): string {
     case "debug":
       return "Debug and troubleshoot issues…";
     case "default":
-      return "Message the agent…";
+      // Design D10: the empty draft surface invites a fresh task; a
+      // live session invites a follow-up / steer.
+      return isDraft
+        ? "Describe what you want the agent to do…"
+        : "Reply or steer the agent…";
   }
 }
