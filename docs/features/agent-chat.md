@@ -179,6 +179,56 @@ the list. jsdom tests assert on the slot builder and rendered DOM
 (see `MessageList.test.tsx` / `MessageList.virtualization.test.tsx` /
 `transcript-slots.test.ts`).
 
+### Navigation trail (turn rail)
+
+`MessageTrail.tsx` renders a slim **navigation trail** in the
+transcript's left gutter — one tick mark per user turn — so long threads
+can be scanned and jumped without scrubbing the scrollbar. It lives
+inside `MessageList`'s `<MessageScroller>` (inside the provider, a
+sibling of the viewport), absolutely positioned over the dead left
+margin of the `mx-auto max-w-[760px] px-7` transcript column, so it
+never overlaps text. It needs **no new setting** — it is part of the
+already Beta-gated pane and simply hides on short threads.
+
+- **Data source is `visibleMessageIds`, not `currentAnchorId`.** The
+  pure helpers in `message-trail.ts` (`buildTrailEntries` /
+  `deriveActiveTrailIndex`) derive one entry per user-turn slot and the
+  active turn from the scroller's `useMessageScrollerVisibility()`
+  document-order visible list. `currentAnchorId` only reports rows with
+  `data-scroll-anchor="true"`, and this transcript keeps
+  `scrollAnchor={false}` on **every** row (see below), so it is always
+  `null` here — active tracking routes the first visible row's id
+  through a `messageId → slotIndex` map because the first visible row is
+  usually an assistant / tool-group row, not the user turn itself.
+- **Threshold.** Hidden entirely below `TRAIL_MIN_TURNS` (3). The
+  subscribing rail only mounts past the threshold, so short threads pay
+  nothing for visibility tracking (the engine's tracking is pay-for-use).
+- **Bounded density.** A very long thread downsamples evenly to a
+  height-derived tick cap (≤ `TRAIL_MAX_TICKS`, 60) so the gutter never
+  overflows; the in-view turn's tick is always re-injected so the active
+  turn stays represented.
+- **Jump behavior.** Clicking a tick calls
+  `scrollToMessage(messageId, { align: "start", behavior: "auto",
+  scrollMargin })` for a rough jump, then runs a bounded rAF **correction**
+  loop: `content-visibility:auto` rows expose only estimated heights, so a
+  cold jump across thousands of estimated pixels lands the target well off
+  (and re-calling `scrollToMessage` reproduces the same wrong offset), so
+  the loop instead nudges `scrollTop` by the target row's *measured* offset
+  error each frame until it rests near the top (same spirit as
+  `MessageList`'s own mount settle loop). Jumping up fires real scroll
+  events, so the `#77` `pinnedRef` unpins itself — no extra coordination.
+  The rail overlays the viewport's left gutter but is its **sibling**, so
+  its `<nav>` forwards `onWheel` to the viewport's `scrollTop` — otherwise
+  wheeling over that 28px strip would be a dead zone. Ticks are real `<button>`s (`Enter`/`Space`,
+  focus-visible, `aria-label` "Jump to turn N: …"); the rail is a
+  `<nav aria-label="Conversation turns">`. Hovering a tick shows one
+  shared preview card (prompt + reply start) after a short delay.
+- **Anchoring stays off.** The trail is the reason turn anchoring can
+  stay disabled: it gives long threads their jump affordance without
+  re-enabling the engine anchor handling that breaks the stick-to-bottom
+  pin on hydrated transcripts. Unit tests cover the pure helpers
+  (`message-trail.test.ts`) and the component (`MessageTrail.test.tsx`).
+
 ## Current Constraints
 
 - **Beta-gated.** The chat pane is hidden unless the user opts in via

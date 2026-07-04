@@ -26,6 +26,7 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 
 import { AssistantAvatar } from "./AssistantAvatar";
 import { AssistantMessage } from "./AssistantMessage";
+import { MessageTrail } from "./MessageTrail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
 import { ReasoningBlock } from "./ReasoningBlock";
@@ -168,6 +169,10 @@ export function MessageList({
     <div ref={shellRef} style={SHELL_STYLE}>
     <MessageScrollerProvider autoScroll>
       <MessageScroller>
+        {/* Navigation trail — a turn rail in the left gutter (inside the
+            provider, sibling of the viewport). Reads the active turn from
+            `visibleMessageIds`; hides itself on short threads. */}
+        <MessageTrail slots={slots} />
         <MessageScrollerViewport style={WS_FADE_STYLE}>
           <MessageScrollerContent
             aria-busy={showThinking || undefined}
