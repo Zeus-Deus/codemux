@@ -157,41 +157,47 @@ struct AgentChatChannelEntry {
     /// pane that already lost the thread (unmount racing a remount, or
     /// a second pane re-attaching the same thread) can never tear down
     /// the channel a newer subscriber just installed. Same guard idea
-    /// as `SessionRuntime::output_channel_generation` on the PTY path.
+    /// as `OutputSubscriber::generation` on the PTY path.
     generation: u64,
 }
 
 /// Registry of per-thread frontend event channels (Tauri-managed
 /// state).
 ///
-/// Analogous to `SessionRuntime.output_channel` in `terminal/mod.rs`:
+/// Analogous to `SessionRuntime.output_subscribers` in `terminal/mod.rs`:
 /// when a chat pane mounts with a bound thread it invokes
 /// [`attach_agent_chat_output`] with a fresh `Channel`; the event
-/// bridge ([`forward_event`]) then routes that thread's live events —
-/// crucially the high-frequency `content_delta` token stream — to
-/// exactly that channel instead of broadcasting them app-wide.
+/// bridge ([`forward_event`]) then fans that thread's live events —
+/// crucially the high-frequency `content_delta` token stream — out to
+/// every attached channel instead of broadcasting them app-wide.
+///
+/// Each thread maps to a **list** of subscribers, not a single one, so
+/// the same thread can be mirrored to several consumers at once (the
+/// desktop window plus any browser client rendering the same thread).
+/// Every subscriber receives an identical event stream.
 ///
 /// Replay split (decided in issue #75): the channel carries **live
 /// events only**. Transcript-affecting events are persisted to SQLite
 /// by `forward_event` regardless of whether a channel is attached, and
 /// a late-attaching / resumed pane rebuilds history through the
 /// existing DB hydrate (`agent_chat_list_messages` +
-/// `hydrateThread`). Events that fire while no channel is attached and
-/// that are not persisted (lifecycle notices like
+/// `hydrateThread`) — so no replay-on-attach machinery is needed here
+/// even for a fresh mirror client. Events that fire while no channel is
+/// attached and that are not persisted (lifecycle notices like
 /// `session_state_changed`) are dropped — exactly the behaviour the
 /// event-bus path had for unmounted panes, where no listener was
 /// registered to hear them.
 #[derive(Default)]
 pub struct AgentChatChannelRegistry {
-    channels: Mutex<HashMap<String, AgentChatChannelEntry>>,
+    channels: Mutex<HashMap<String, Vec<AgentChatChannelEntry>>>,
     next_generation: AtomicU64,
 }
 
 impl AgentChatChannelRegistry {
-    /// Install `channel` as the live subscriber for `thread_id`,
-    /// replacing any previous subscriber (newest pane wins, like a PTY
-    /// reattach). Returns the generation token the caller must hand
-    /// back to [`detach`](Self::detach).
+    /// Add `channel` as a live subscriber for `thread_id`, alongside any
+    /// existing subscribers (fan-out — every attached consumer receives
+    /// the thread's events). Returns the generation token the caller
+    /// must hand back to [`detach`](Self::detach).
     pub fn attach(
         &self,
         thread_id: &str,
@@ -199,45 +205,56 @@ impl AgentChatChannelRegistry {
     ) -> u64 {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut channels = self.channels.lock().expect("channel registry poisoned");
-        channels.insert(
-            thread_id.to_string(),
-            AgentChatChannelEntry {
+        channels
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(AgentChatChannelEntry {
                 channel,
                 generation,
-            },
-        );
+            });
         generation
     }
 
-    /// Remove the subscriber for `thread_id`, but only when
-    /// `generation` still matches the installed entry. Returns whether
-    /// an entry was actually removed. Idempotent: detaching an unknown
-    /// thread or a superseded generation is a no-op.
+    /// Remove the subscriber for `thread_id` whose generation matches.
+    /// Returns whether an entry was actually removed. Idempotent:
+    /// detaching an unknown thread or a superseded generation is a
+    /// no-op, and other subscribers on the same thread are untouched.
     pub fn detach(&self, thread_id: &str, generation: u64) -> bool {
         let mut channels = self.channels.lock().expect("channel registry poisoned");
-        match channels.get(thread_id) {
-            Some(entry) if entry.generation == generation => {
-                channels.remove(thread_id);
-                true
-            }
-            _ => false,
+        let Some(entries) = channels.get_mut(thread_id) else {
+            return false;
+        };
+        let before = entries.len();
+        entries.retain(|entry| entry.generation != generation);
+        let removed = entries.len() != before;
+        // Drop the now-empty bucket so the map doesn't accumulate keys
+        // for threads with no subscribers.
+        if entries.is_empty() {
+            channels.remove(thread_id);
         }
+        removed
     }
 
-    /// Clone the live channel for `thread_id`, if any. Cloning is
-    /// cheap (the `Channel` is internally ref-counted) and keeps the
-    /// lock scope tight on the hot streaming path.
-    pub fn channel_for(&self, thread_id: &str) -> Option<Channel<AgentChatEventPayload>> {
+    /// Clone every live channel for `thread_id`. Cloning is cheap (the
+    /// `Channel` is internally ref-counted) and keeps the lock scope
+    /// tight on the hot streaming path — the caller sends outside the
+    /// lock. Returns an empty vec when no consumer is attached.
+    pub fn channels_for(&self, thread_id: &str) -> Vec<Channel<AgentChatEventPayload>> {
         let channels = self.channels.lock().expect("channel registry poisoned");
-        channels.get(thread_id).map(|entry| entry.channel.clone())
+        channels
+            .get(thread_id)
+            .map(|entries| entries.iter().map(|entry| entry.channel.clone()).collect())
+            .unwrap_or_default()
     }
 }
 
 /// Register a per-thread `Channel` that will receive every live
 /// runtime event for `thread_id` (see [`AgentChatChannelRegistry`]).
-/// Returns the attach generation; the frontend passes it back to
-/// [`detach_agent_chat_output`] on unmount so a stale detach cannot
-/// clobber a newer attach.
+/// Multiple consumers can attach to the same thread at once (mirror
+/// mode); each gets an identical event stream. Returns the attach
+/// generation; the frontend passes it back to
+/// [`detach_agent_chat_output`] on unmount so a stale detach only ever
+/// removes its own subscriber, never a sibling's.
 ///
 /// Not gated on `enable_agent_chat`, same rationale as
 /// `agent_chat_list_messages`: a pane bound to a session that predates
@@ -257,7 +274,8 @@ pub fn attach_agent_chat_output(
 
 /// Tear down the per-thread channel installed by
 /// [`attach_agent_chat_output`]. Idempotent; a mismatched generation
-/// (a newer pane re-attached first) is a silent no-op.
+/// (the subscriber already went away, or belongs to a sibling consumer)
+/// is a silent no-op that leaves other subscribers on the thread intact.
 #[tauri::command]
 pub fn detach_agent_chat_output(
     channels: State<'_, AgentChatChannelRegistry>,
@@ -1195,13 +1213,14 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
         return;
     }
     // Thread-scoped events (incl. the content_delta token stream) go
-    // over the per-thread Channel only — never the global bus. A
-    // missing channel means no pane is currently attached to this
-    // thread; transcript events were already persisted above, so the
-    // DB hydrate replays them on (re)attach.
+    // over the per-thread Channels only — never the global bus. An empty
+    // subscriber list means no pane is currently attached to this thread;
+    // transcript events were already persisted above, so the DB hydrate
+    // replays them on (re)attach. When several consumers are attached
+    // (mirror mode), each receives an identical copy.
     let channels: State<'_, AgentChatChannelRegistry> = app.state();
-    if let Some(channel) = channels.channel_for(&thread_id.0) {
-        if let Err(error) = channel.send(payload) {
+    for channel in channels.channels_for(&thread_id.0) {
+        if let Err(error) = channel.send(payload.clone()) {
             eprintln!(
                 "[codemux::agent_chat] Failed to send event on thread channel {}: {error}",
                 thread_id.0
@@ -1503,14 +1522,25 @@ mod tests {
         }
     }
 
+    /// Fan a payload out to every channel the registry holds for a thread,
+    /// exactly as `forward_event` does for thread-scoped events.
+    fn fan_out(
+        registry: &AgentChatChannelRegistry,
+        thread: &str,
+        payload: AgentChatEventPayload,
+    ) {
+        for channel in registry.channels_for(thread) {
+            channel.send(payload.clone()).expect("send ok");
+        }
+    }
+
     #[test]
     fn registry_attach_routes_sends_through_channel() {
         let registry = AgentChatChannelRegistry::default();
         let (channel, captured) = capture_channel();
         registry.attach("t1", channel);
 
-        let live = registry.channel_for("t1").expect("channel installed");
-        live.send(delta_payload("t1", "hello")).expect("send ok");
+        fan_out(&registry, "t1", delta_payload("t1", "hello"));
 
         let received = captured.lock().unwrap();
         assert_eq!(received.len(), 1);
@@ -1525,13 +1555,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_channel_for_unknown_thread_is_none() {
+    fn registry_channels_for_unknown_thread_is_empty() {
         let registry = AgentChatChannelRegistry::default();
-        assert!(registry.channel_for("nope").is_none());
+        assert!(registry.channels_for("nope").is_empty());
     }
 
+    /// Two panes attached to the SAME thread (mirror mode) BOTH receive every
+    /// event — the multi-client fan-out guarantee.
     #[test]
-    fn registry_newest_attach_wins() {
+    fn registry_fans_out_to_all_subscribers() {
         let registry = AgentChatChannelRegistry::default();
         let (first, first_captured) = capture_channel();
         let (second, second_captured) = capture_channel();
@@ -1539,36 +1571,59 @@ mod tests {
         let g2 = registry.attach("t1", second);
         assert_ne!(g1, g2, "each attach mints a fresh generation");
 
-        registry
-            .channel_for("t1")
-            .expect("channel installed")
-            .send(delta_payload("t1", "x"))
-            .expect("send ok");
+        fan_out(&registry, "t1", delta_payload("t1", "x"));
 
+        assert_eq!(
+            first_captured.lock().unwrap().len(),
+            1,
+            "first subscriber receives its copy"
+        );
+        assert_eq!(
+            second_captured.lock().unwrap().len(),
+            1,
+            "second subscriber receives its copy"
+        );
+    }
+
+    /// Detaching one subscriber removes exactly that one and leaves the other
+    /// streaming (the per-generation teardown).
+    #[test]
+    fn registry_detach_removes_only_matching_subscriber() {
+        let registry = AgentChatChannelRegistry::default();
+        let (first, first_captured) = capture_channel();
+        let (second, second_captured) = capture_channel();
+        let g1 = registry.attach("t1", first);
+        let _g2 = registry.attach("t1", second);
+
+        assert!(registry.detach("t1", g1), "matching detach removes the entry");
+
+        fan_out(&registry, "t1", delta_payload("t1", "after"));
         assert!(
             first_captured.lock().unwrap().is_empty(),
-            "superseded channel must not receive events"
+            "detached subscriber must receive nothing further"
         );
-        assert_eq!(second_captured.lock().unwrap().len(), 1);
+        assert_eq!(
+            second_captured.lock().unwrap().len(),
+            1,
+            "the surviving subscriber keeps streaming"
+        );
     }
 
     #[test]
     fn registry_detach_with_stale_generation_is_noop() {
         let registry = AgentChatChannelRegistry::default();
-        let (first, _) = capture_channel();
-        let (second, second_captured) = capture_channel();
-        let stale = registry.attach("t1", first);
-        let _current = registry.attach("t1", second);
+        let (channel, captured) = capture_channel();
+        let generation = registry.attach("t1", channel);
 
-        // The unmounting pane that owned `first` detaches late — the
-        // newer subscriber must survive.
-        assert!(!registry.detach("t1", stale));
-        registry
-            .channel_for("t1")
-            .expect("newer channel still installed")
-            .send(delta_payload("t1", "still-live"))
-            .expect("send ok");
-        assert_eq!(second_captured.lock().unwrap().len(), 1);
+        // A late detach carrying a generation that was never issued (or already
+        // removed) must not tear down the live subscriber.
+        assert!(!registry.detach("t1", generation + 999));
+        fan_out(&registry, "t1", delta_payload("t1", "still-live"));
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            1,
+            "live subscriber survives a stale detach"
+        );
     }
 
     #[test]
@@ -1577,7 +1632,7 @@ mod tests {
         let (channel, _) = capture_channel();
         let generation = registry.attach("t1", channel);
         assert!(registry.detach("t1", generation));
-        assert!(registry.channel_for("t1").is_none());
+        assert!(registry.channels_for("t1").is_empty());
         // Idempotent on repeat.
         assert!(!registry.detach("t1", generation));
     }
@@ -1590,11 +1645,7 @@ mod tests {
         registry.attach("thread-a", a);
         registry.attach("thread-b", b);
 
-        registry
-            .channel_for("thread-a")
-            .unwrap()
-            .send(delta_payload("thread-a", "for-a"))
-            .unwrap();
+        fan_out(&registry, "thread-a", delta_payload("thread-a", "for-a"));
 
         assert_eq!(a_captured.lock().unwrap().len(), 1);
         assert!(

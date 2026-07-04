@@ -302,6 +302,38 @@ pub fn save_auth(
     db.save_auth_token(&encrypted)
 }
 
+/// Dev/test-only: seed an offline auth session so an automated end-to-end
+/// harness can drive the app without a real Codemux account or any network
+/// access.
+///
+/// Compiled **only into debug builds** (the `debug_assertions` gate) and, even
+/// there, dormant unless `CODEMUX_DEV_OFFLINE_LOGIN=1` is set — so it can never
+/// affect a shipped release. It writes a cached local user via the normal
+/// [`save_auth`] path; combined with pointing `CODEMUX_API_URL` at an
+/// unreachable endpoint, `check_auth` returns this user through its existing
+/// offline/network-error fallback branch (`Ok(load_cached_user(..))`). No-ops
+/// when a real session is already stored so it never clobbers a genuine login.
+#[cfg(debug_assertions)]
+pub fn seed_dev_offline_login(db: &DatabaseStore) {
+    if std::env::var("CODEMUX_DEV_OFFLINE_LOGIN").ok().as_deref() != Some("1") {
+        return;
+    }
+    if load_token(db).is_some() {
+        return;
+    }
+    let user = AuthUser {
+        id: "dev-offline".to_string(),
+        email: "dev@localhost".to_string(),
+        name: Some("Dev Mode".to_string()),
+        image: None,
+    };
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(3650)).to_rfc3339();
+    match save_auth(db, "dev-offline-token", &expires_at, Some(&user)) {
+        Ok(()) => eprintln!("[codemux::auth] seeded offline dev login (debug/e2e affordance)"),
+        Err(e) => eprintln!("[codemux::auth] seed_dev_offline_login failed: {e}"),
+    }
+}
+
 /// Update only the `auth_method` field of the stored auth record,
 /// preserving token/expires_at/user. Called by the signin paths
 /// (email, github) and by `setup_sync_password` so the value

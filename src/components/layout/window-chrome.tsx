@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Minus, Square, Copy, X } from "lucide-react";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 
 /**
  * Standalone window controls (minimize / maximize / close) used by full-
@@ -27,10 +28,16 @@ import { Minus, Square, Copy, X } from "lucide-react";
  * way to manipulate the window.
  */
 export function WindowControls() {
+  // The web remote client drives a browser tab, not the desktop OS window —
+  // minimize/maximize/close would target the wrong (or no) window. Render
+  // nothing there and skip the window-plugin IPC entirely. Desktop is
+  // unchanged: `remote` is always false inside the real Tauri webview.
+  const remote = isRemoteClient();
   const [isMaximized, setIsMaximized] = useState(false);
   const appWindow = getCurrentWindow();
 
   useEffect(() => {
+    if (remote) return;
     appWindow.isMaximized().then(setIsMaximized);
     const unlisten = appWindow.onResized(() => {
       appWindow.isMaximized().then(setIsMaximized);
@@ -38,7 +45,9 @@ export function WindowControls() {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [appWindow]);
+  }, [appWindow, remote]);
+
+  if (remote) return null;
 
   return (
     <div className="flex items-center">
@@ -88,6 +97,13 @@ export function WindowControls() {
  * drag region and the controls each re-enable pointer events on themselves.
  */
 export function WindowChrome() {
+  // On the web remote client there is no OS window to drag or control, so the
+  // whole strip (drag region + controls) is inert. Render nothing — callers
+  // reserve the top spacing (`pt-7`) themselves, so layout stays stable and
+  // the strip's `data-tauri-drag-region` overlay never becomes a click dead
+  // zone in the browser. Desktop behavior is unchanged.
+  if (isRemoteClient()) return null;
+
   return (
     <div className="pointer-events-none absolute inset-x-0 top-0 z-50 flex h-7 items-center justify-end">
       <div

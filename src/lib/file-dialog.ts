@@ -15,6 +15,8 @@
 
 import { pickFolderDialog, pickFilesDialog } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { openRemotePathPicker } from "@/components/remote/remote-path-picker-store";
 
 /** Marker prefix the Rust preflight puts on the error when no file
  *  picker backend exists. Kept in sync with `NO_BACKEND_MARKER` in
@@ -53,8 +55,17 @@ function surfaceDialogError(err: unknown): void {
 
 /** Folder picker that never throws: resolves the chosen path, or
  *  `null` on cancel AND on failure — failures additionally surface
- *  as an error toast instead of a silent no-op. */
+ *  as an error toast instead of a silent no-op.
+ *
+ *  On the web remote client there is no native OS dialog to reach, so
+ *  this routes to the in-app path browser (see {@link openRemotePathPicker})
+ *  which walks the *host* filesystem and returns the same
+ *  `absolute path | null` shape the native command does. */
 export async function pickFolder(title: string): Promise<string | null> {
+  if (isRemoteClient()) {
+    const paths = await openRemotePathPicker("folder", title);
+    return paths && paths.length > 0 ? paths[0] : null;
+  }
   try {
     return await pickFolderDialog(title);
   } catch (err) {
@@ -64,8 +75,18 @@ export async function pickFolder(title: string): Promise<string | null> {
 }
 
 /** Multi-file picker with the same never-throw contract as
- *  {@link pickFolder}; failure resolves to an empty list. */
+ *  {@link pickFolder}; failure resolves to an empty list. On the web
+ *  remote client this routes to the in-app path browser in multi-file
+ *  mode, returning the same `absolute path[]` shape as the native
+ *  command (empty on cancel). */
 export async function pickFiles(title?: string): Promise<string[]> {
+  if (isRemoteClient()) {
+    const paths = await openRemotePathPicker(
+      "files",
+      title ?? "Select files",
+    );
+    return paths ?? [];
+  }
   try {
     return await pickFilesDialog(title);
   } catch (err) {

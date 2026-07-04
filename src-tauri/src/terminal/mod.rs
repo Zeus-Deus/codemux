@@ -217,14 +217,41 @@ pub struct TerminalStatusPayload {
     pub exit_code: Option<u32>,
 }
 
+/// One live consumer of a session's PTY output stream.
+///
+/// A single PTY reader fans its output out to every subscriber in
+/// `SessionRuntime::output_subscribers`. In the common case there is
+/// exactly one (the desktop window's xterm), but the stream can be
+/// mirrored to additional consumers (e.g. a browser client rendering the
+/// same session) — each attaches its own `Channel` and gets an identical
+/// byte stream.
+pub struct OutputSubscriber {
+    /// Monotonic id minted by `attach_pty_output`. A detach (or a failed
+    /// send) only removes the subscriber whose generation matches, so a
+    /// stale teardown from a consumer that already went away can never
+    /// evict a newer subscriber that attached concurrently.
+    pub generation: u64,
+    pub channel: Channel<Vec<u8>>,
+    /// This subscriber's flow-control request. The PTY reader only parks
+    /// (applies back-pressure to the child) when EVERY subscriber has set
+    /// this — see [`recompute_flow_paused`]. A caught-up subscriber keeps
+    /// bytes flowing for all of them.
+    pub flow_paused: bool,
+}
+
 pub struct SessionRuntime {
     pub writer: Option<Box<dyn Write + Send>>,
     pub master: Option<Box<dyn MasterPty + Send>>,
-    pub output_channel: Option<Channel<Vec<u8>>>,
-    /// Monotonic generation for the currently installed output channel.
-    /// Incremented on attach/detach so a failed send from an old cloned
-    /// channel cannot clear a newer channel that attached concurrently.
-    pub output_channel_generation: u64,
+    /// Live consumers of this session's PTY output. Empty when nothing is
+    /// attached (output then accumulates in `pending_output` for replay on
+    /// the next attach). `queue_or_send_output` fans each chunk out to all
+    /// entries and prunes any whose channel send fails.
+    pub output_subscribers: Vec<OutputSubscriber>,
+    /// Monotonic source of subscriber generations. Bumped on every attach so
+    /// each subscriber gets a unique id; a stale detach/failed-send can then
+    /// target exactly one subscriber and never clobber a newer one that
+    /// attached concurrently.
+    pub next_output_generation: u64,
     pub pending_output: VecDeque<Vec<u8>>,
     /// Running total of `chunk.len()` across every entry in `pending_output`.
     /// Maintained alongside the deque so the eviction loop can cap by bytes
@@ -248,23 +275,30 @@ pub struct SessionRuntime {
     /// across attach/detach cycles so the cumulative loss across a session
     /// is observable, not just the most recent overflow.
     pub dropped_chunks: u64,
-    /// PTY producer back-pressure flag for the **in-process** read loop. When
-    /// set, `batched_reader_loop` stops draining the PTY master fd; the kernel
-    /// PTY buffer then fills and the child's next `write()` blocks — real
-    /// back-pressure straight to the producer instead of an unbounded renderer
-    /// queue (or, worse, `pending_output` eviction once the 256 MiB ring caps).
+    /// Effective PTY producer back-pressure flag for the **in-process** read
+    /// loop. When set, `batched_reader_loop` stops draining the PTY master fd;
+    /// the kernel PTY buffer then fills and the child's next `write()` blocks —
+    /// real back-pressure straight to the producer instead of an unbounded
+    /// renderer queue (or, worse, `pending_output` eviction once the 256 MiB
+    /// ring caps).
     ///
-    /// Set/cleared by `set_pty_flow_paused` (the `pause_pty_output` /
+    /// This is a *derived* flag: `recompute_flow_paused` sets it true only when
+    /// there is at least one subscriber and EVERY subscriber has requested a
+    /// pause (see [`OutputSubscriber::flow_paused`]). A single caught-up
+    /// subscriber keeps bytes flowing for the whole fan-out. The per-subscriber
+    /// requests are driven by `set_pty_flow_paused` (the `pause_pty_output` /
     /// `resume_pty_output` commands the renderer calls at its HIGH/LOW
-    /// watermarks). Self-heals three ways so a dropped resume can never wedge a
-    /// PTY: cleared on `attach_pty_output` (a reattaching pane starts live),
-    /// cleared on `detach_pty_output` (a backgrounded agent isn't left
-    /// blocked), and a `FLOW_MAX_PARK` backstop inside the read loop.
+    /// watermarks), and the derived flag is recomputed on every attach, detach,
+    /// and pause/resume. Self-heals so a dropped resume can never wedge a PTY:
+    /// a fresh attach adds an unpaused subscriber (clearing the derived flag), a
+    /// detach drops that subscriber's request with it, and a `FLOW_MAX_PARK`
+    /// backstop inside the read loop force-resumes as a last resort.
     ///
     /// Shared (`Arc`) with the reader thread so toggling it needs no lock on
     /// the hot read path. Daemon-backed (persistent) sessions don't run the
     /// in-process loop — their back-pressure routes through the daemon's own
-    /// `flow_paused` flag — so this stays unread for them (harmless).
+    /// `flow_paused` flag (the recomputed verdict is forwarded there) — so this
+    /// stays unread for them (harmless).
     pub flow_paused: Arc<AtomicBool>,
     pub last_status: TerminalStatusPayload,
     pub child_pid: Option<u32>,
@@ -315,8 +349,8 @@ impl SessionRuntime {
         Self {
             writer: None,
             master: None,
-            output_channel: None,
-            output_channel_generation: 0,
+            output_subscribers: Vec::new(),
+            next_output_generation: 0,
             pending_output: VecDeque::new(),
             pending_output_bytes: 0,
             dropped_chunks: 0,
@@ -639,12 +673,35 @@ fn emit_terminal_status(
     }
 }
 
+/// Recompute a session's derived `flow_paused` back-pressure flag from its
+/// current subscriber set and store it into the shared atomic the in-process
+/// reader polls. Returns the new effective value.
+///
+/// Fan-out flow-control policy: a single PTY reader feeds N live subscribers
+/// (the desktop window plus any mirror consumers). It must only stop draining
+/// the PTY — applying real back-pressure to the child — when EVERY current
+/// subscriber has asked to pause; one caught-up subscriber keeps bytes flowing
+/// for all of them. With zero subscribers the reader keeps running and its
+/// output accumulates in the bounded replay ring. A subscriber's pause request
+/// is released automatically when it detaches, because it stops counting toward
+/// the "all paused" verdict.
+///
+/// Pure w.r.t. side channels (no daemon I/O, no task spawn) so it can run under
+/// the sessions lock and be unit-tested directly; the daemon forward lives in
+/// `apply_flow_control`.
+fn recompute_flow_paused(runtime: &SessionRuntime) -> bool {
+    let effective = !runtime.output_subscribers.is_empty()
+        && runtime.output_subscribers.iter().all(|s| s.flow_paused);
+    runtime.flow_paused.store(effective, Ordering::Relaxed);
+    effective
+}
+
 fn queue_or_send_output(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
     chunk: Vec<u8>,
 ) {
-    let channel_to_send = with_session_runtime(
+    let subscribers_to_send = with_session_runtime(
         sessions,
         session_id,
         || SessionRuntime::new(session_id),
@@ -671,7 +728,7 @@ fn queue_or_send_output(
                 runtime.pending_output_bytes = runtime
                     .pending_output_bytes
                     .saturating_sub(evicted.len());
-                if runtime.output_channel.is_none() {
+                if runtime.output_subscribers.is_empty() {
                     let dropped = runtime.dropped_chunks.saturating_add(1);
                     runtime.dropped_chunks = dropped;
                     // Log on the first drop and then on each power-of-two boundary
@@ -681,37 +738,58 @@ fn queue_or_send_output(
                     if dropped == 1 || dropped.is_power_of_two() {
                         eprintln!(
                             "[codemux::terminal] session={session_id} dropped pending_output \
-                             chunk (cumulative={dropped}). Indicates the frontend was \
-                             detached when the buffer overflowed."
+                             chunk (cumulative={dropped}). Indicates no consumer was \
+                             attached when the buffer overflowed."
                         );
                     }
                 }
             }
 
+            // Snapshot (generation, channel) for every subscriber so the sends
+            // happen OUTSIDE the lock. Cloning a `Channel` is cheap (it's
+            // internally ref-counted).
             runtime
-                .output_channel
-                .clone()
-                .map(|channel| (channel, runtime.output_channel_generation))
+                .output_subscribers
+                .iter()
+                .map(|s| (s.generation, s.channel.clone()))
+                .collect::<Vec<_>>()
         },
     );
 
-    let Some((channel, generation)) = channel_to_send else {
+    if subscribers_to_send.is_empty() {
         return;
-    };
+    }
 
     // Tauri IPC delivery can be slower than the in-memory bookkeeping above,
     // especially when the WebView is busy parsing terminal output. Never hold
     // the global sessions mutex while sending, otherwise active keystrokes
     // (`write_to_pty`) block behind unrelated PTY output from other sessions.
-    if let Err(error) = channel.send(chunk) {
-        eprintln!("[codemux::terminal] Failed to send terminal output: {error}");
+    //
+    // Fan out to every subscriber; collect the generations whose send failed so
+    // they can be pruned. A failure means that consumer's channel is dead (the
+    // webview navigated away, a mirror client dropped) — evicting it by
+    // generation can never touch a newer subscriber that attached concurrently.
+    let mut failed: Vec<u64> = Vec::new();
+    for (generation, channel) in subscribers_to_send {
+        if let Err(error) = channel.send(chunk.clone()) {
+            eprintln!("[codemux::terminal] Failed to send terminal output: {error}");
+            failed.push(generation);
+        }
+    }
+
+    if !failed.is_empty() {
         with_existing_session_runtime(sessions, session_id, |runtime| {
-            if runtime.output_channel_generation == generation {
-                runtime.output_channel = None;
-                runtime.output_channel_generation =
-                    runtime.output_channel_generation.saturating_add(1);
-            }
+            runtime
+                .output_subscribers
+                .retain(|s| !failed.contains(&s.generation));
+            // Losing a subscriber can flip the "all paused" verdict.
+            recompute_flow_paused(runtime);
         });
+        // Keep a daemon-backed session's flow gate in step with the pruned set.
+        // For daemon sessions this runs on the daemon read task (a tokio
+        // context); for in-process sessions there is no daemon client, so it is
+        // a no-op that never spawns. Cheap: only reached when a send failed.
+        forward_flow_control_to_daemon(sessions, session_id);
     }
 }
 
@@ -1984,7 +2062,7 @@ pub(crate) fn terminate_pty_session(
         // client.
         let daemon_client = runtime.daemon_client.take();
         if was_persistent {
-            runtime.output_channel = None;
+            runtime.output_subscribers.clear();
             runtime.pending_output.clear();
             runtime.pending_output_bytes = 0;
             // Drop runtime first so any held Arcs (writer, etc.) release before
@@ -2028,7 +2106,7 @@ pub(crate) fn terminate_pty_session(
     // Clear child_pid to None *first* so the `Drop for SessionRuntime`
     // safety-net impl stays silent on the happy path. Any non-None value
     // printed by Drop means something skipped this function.
-    runtime.output_channel = None;
+    runtime.output_subscribers.clear();
     runtime.pending_output.clear();
     runtime.pending_output_bytes = 0;
     if let Some(master) = runtime.master.as_mut() {
@@ -2083,7 +2161,7 @@ pub fn close_terminal_session(
     Ok(fallback_session.0)
 }
 
-/// Like `terminate_pty_session` but preserves `output_channel` +
+/// Like `terminate_pty_session` but preserves `output_subscribers` +
 /// `pending_output` for daemon-backed (persistent) sessions, so the
 /// frontend's xterm stays connected across the kill-and-respawn that
 /// happens on workspace push/pull.
@@ -2122,7 +2200,7 @@ pub(crate) fn terminate_pty_session_keep_channel(
         rt.is_spawning = false;
         rt.skip_preset_launch = false;
         rt.resume_command = None;
-        // PRESERVED (the whole point): output_channel,
+        // PRESERVED (the whole point): output_subscribers,
         // pending_output, pending_output_bytes, last_status.
         Some(daemon_client)
     })
@@ -2211,6 +2289,17 @@ pub fn get_terminal_status(
     Ok(status)
 }
 
+/// Register `channel` as a live subscriber to a session's PTY output and
+/// return the subscriber's generation token. The caller passes that token to
+/// [`detach_pty_output`] (and `pause_pty_output`/`resume_pty_output`) so a
+/// stale teardown from a superseded consumer can never touch a newer one.
+///
+/// Multiple subscribers can attach to the same session simultaneously (the
+/// desktop window plus any mirror clients); each receives an identical byte
+/// stream via the fan-out in `queue_or_send_output`. The `pending_output`
+/// replay ring is flushed **only to the newly attached channel**, so a late
+/// joiner catches up without re-delivering history to the existing
+/// subscribers.
 #[tauri::command]
 pub fn attach_pty_output(
     terminal_state: State<'_, PtyState>,
@@ -2218,7 +2307,7 @@ pub fn attach_pty_output(
     channel: Channel<Vec<u8>>,
     session_id: Option<String>,
     skip_pending: Option<bool>,
-) -> Result<(), String> {
+) -> Result<u64, String> {
     let session_id = session_id
         .or_else(|| {
             app_state
@@ -2227,42 +2316,65 @@ pub fn attach_pty_output(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
-    let pending_chunks = with_session_runtime(
+    let (generation, pending_chunks) = with_session_runtime(
         &terminal_state.sessions,
         &session_id,
         || SessionRuntime::new(&session_id),
         |runtime| {
-            runtime.output_channel = Some(channel.clone());
-            runtime.output_channel_generation =
-                runtime.output_channel_generation.saturating_add(1);
-            // Self-heal: a freshly attached renderer is, by definition, caught
-            // up. Clear any stale flow-control pause so the in-process read
-            // loop resumes — guards against a prior pane that paused and was
-            // torn down before its resume landed. (The daemon clears its own
-            // flag on `Attach` for the same reason.)
-            runtime.flow_paused.store(false, Ordering::Relaxed);
-            if skip_pending.unwrap_or(false) {
+            runtime.next_output_generation =
+                runtime.next_output_generation.saturating_add(1);
+            let generation = runtime.next_output_generation;
+            runtime.output_subscribers.push(OutputSubscriber {
+                generation,
+                channel: channel.clone(),
+                // A freshly attached consumer is, by definition, caught up, so
+                // it starts unpaused.
+                flow_paused: false,
+            });
+            // Self-heal: adding an unpaused subscriber means "all subscribers
+            // paused" can no longer hold, so the in-process read loop resumes.
+            // Guards against a prior consumer that paused and was torn down
+            // before its resume landed. (The daemon clears its own flag on
+            // `Attach` for the same reason; the recomputed verdict is also
+            // forwarded to it below.)
+            recompute_flow_paused(runtime);
+            let pending = if skip_pending.unwrap_or(false) {
                 vec![]
             } else {
                 runtime.pending_output.iter().cloned().collect::<Vec<_>>()
-            }
+            };
+            (generation, pending)
         },
     );
 
+    // Forward the recomputed back-pressure verdict to the daemon (no-op for
+    // in-process sessions). Done outside the sessions lock.
+    forward_flow_control_to_daemon(&terminal_state.sessions, &session_id);
+
+    // Replay history to the NEW subscriber only — the existing subscribers
+    // already have it. Sent outside the lock like all other channel I/O.
     for chunk in pending_chunks {
         channel
             .send(chunk)
             .map_err(|error| format!("Failed to flush buffered PTY output: {error}"))?;
     }
 
-    Ok(())
+    Ok(generation)
 }
 
+/// Tear down a subscriber installed by [`attach_pty_output`]. A
+/// `Some(generation)` removes only that subscriber, so a late detach from a
+/// consumer that already lost the session (unmount racing a remount, or a
+/// second consumer attaching the same session) can never evict a newer
+/// subscriber. `None` removes every subscriber for the session (legacy
+/// whole-session detach). Idempotent: an unknown session or a superseded
+/// generation is a no-op.
 #[tauri::command]
 pub fn detach_pty_output(
     terminal_state: State<'_, PtyState>,
     app_state: State<'_, AppStateStore>,
     session_id: Option<String>,
+    generation: Option<u64>,
 ) -> Result<(), String> {
     let session_id = session_id
         .or_else(|| {
@@ -2272,90 +2384,133 @@ pub fn detach_pty_output(
         })
         .ok_or_else(|| "No active terminal session found".to_string())?;
 
-    with_session_runtime(
+    with_existing_session_runtime(
         &terminal_state.sessions,
         &session_id,
-        || SessionRuntime::new(&session_id),
         |runtime| {
-            runtime.output_channel = None;
-            runtime.output_channel_generation =
-                runtime.output_channel_generation.saturating_add(1);
-            // Self-heal: the renderer that requested back-pressure is going
-            // away. Resume the in-process read loop so a backgrounded child
-            // (e.g. a daemon-less agent left running on tab switch) is not left
-            // blocked on `write()` indefinitely. The renderer also resumes
-            // explicitly on unmount; this is the backend belt-and-suspenders.
-            runtime.flow_paused.store(false, Ordering::Relaxed);
+            match generation {
+                Some(generation) => runtime
+                    .output_subscribers
+                    .retain(|s| s.generation != generation),
+                None => runtime.output_subscribers.clear(),
+            }
+            // Self-heal: the removed consumer's pause request dies with it, so
+            // recomputing may resume the reader — a backgrounded child (e.g. a
+            // daemon-less agent left running on tab switch) is not left blocked
+            // on `write()`. Removing the last subscriber also resumes (an empty
+            // set never parks).
+            recompute_flow_paused(runtime);
         },
     );
+
+    // Push the recomputed verdict to the daemon (no-op for in-process sessions).
+    forward_flow_control_to_daemon(&terminal_state.sessions, &session_id);
 
     Ok(())
 }
 
-/// Pause a session's PTY read loop (terminal output flow control). The renderer
-/// calls this when a fast producer outruns its xterm write queue; pausing makes
-/// the child block on `write()` once the kernel PTY buffer fills — real
-/// back-pressure instead of an ever-growing renderer queue (or, worse,
-/// `pending_output` eviction once the 256 MiB ring caps).
+/// Pause one subscriber's view of a session's PTY output (terminal flow
+/// control). The renderer calls this when a fast producer outruns its xterm
+/// write queue. Pausing does not stop the reader outright: the child only
+/// blocks on `write()` (real back-pressure) once EVERY subscriber has paused —
+/// a caught-up mirror consumer keeps the stream flowing. `Some(generation)` is
+/// the token returned by [`attach_pty_output`], identifying the calling
+/// subscriber; `None` pauses every subscriber for the session (legacy).
 ///
-/// Works on BOTH spawn paths: daemon-backed sessions route to the daemon's
-/// read loop; in-process sessions flip the shared `flow_paused` flag the
-/// in-process `batched_reader_loop` polls. Both paths self-heal (resume on
-/// attach/detach + a max-park backstop) so a paused PTY can never wedge even
+/// Works on BOTH spawn paths: the recomputed "all paused" verdict drives the
+/// in-process `batched_reader_loop`'s shared flag and is forwarded to the
+/// daemon's read loop for daemon-backed sessions. Both paths self-heal (resume
+/// on attach/detach + a max-park backstop) so a paused PTY can never wedge even
 /// if the matching resume is never delivered.
 #[tauri::command]
 pub fn pause_pty_output(
     terminal_state: State<'_, PtyState>,
     session_id: String,
+    generation: Option<u64>,
 ) -> Result<(), String> {
-    set_pty_flow_paused(&terminal_state.sessions, &session_id, true);
+    set_pty_flow_paused(&terminal_state.sessions, &session_id, generation, true);
     Ok(())
 }
 
-/// Resume a session's PTY read loop. See `pause_pty_output`. Idempotent.
+/// Resume one subscriber's view of a session's PTY output. `None` resumes every
+/// subscriber for the session. See `pause_pty_output`. Idempotent.
 #[tauri::command]
 pub fn resume_pty_output(
     terminal_state: State<'_, PtyState>,
     session_id: String,
+    generation: Option<u64>,
 ) -> Result<(), String> {
-    set_pty_flow_paused(&terminal_state.sessions, &session_id, false);
+    set_pty_flow_paused(&terminal_state.sessions, &session_id, generation, false);
     Ok(())
 }
 
-/// Apply a flow-control pause/resume to whichever read loop owns `session_id`.
+/// Record a flow-control request (`paused`), recompute the session's derived
+/// "all paused" verdict, and apply it to whichever read loop owns the session.
 ///
-/// In-process path: flip the session's shared `flow_paused` atomic — the
-/// `batched_reader_loop` polls it and stops/starts draining the master fd.
-/// Daemon path: ALSO route to the daemon (fire-and-forget, mirroring
-/// `DaemonWriter`); flow control is advisory and a failure (e.g. the session
-/// just exited) is benign. Setting the in-process flag for a daemon-backed
-/// session is harmless — no in-process loop reads it for that session.
+/// `Some(generation)` sets just that subscriber's request; a generation that no
+/// longer matches any subscriber is a benign no-op (the consumer detached
+/// between the renderer's watermark check and this IPC). `None` sets the
+/// request on every current subscriber (legacy whole-session pause/resume).
 fn set_pty_flow_paused(
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
+    generation: Option<u64>,
     paused: bool,
 ) {
-    // Flip the in-process flag under the lock and grab the daemon client (if
-    // any) in the same pass, so we touch the session map exactly once.
-    let daemon_client = with_existing_session_runtime(sessions, session_id, |runtime| {
-        runtime.flow_paused.store(paused, Ordering::Relaxed);
+    with_existing_session_runtime(sessions, session_id, |runtime| {
+        match generation {
+            Some(generation) => {
+                if let Some(sub) = runtime
+                    .output_subscribers
+                    .iter_mut()
+                    .find(|s| s.generation == generation)
+                {
+                    sub.flow_paused = paused;
+                }
+            }
+            None => {
+                for sub in runtime.output_subscribers.iter_mut() {
+                    sub.flow_paused = paused;
+                }
+            }
+        }
+        recompute_flow_paused(runtime);
+    });
+
+    // Push the recomputed verdict to the daemon (no-op for in-process sessions).
+    forward_flow_control_to_daemon(sessions, session_id);
+}
+
+/// Forward a session's current derived `flow_paused` verdict to the daemon's
+/// own flow gate for daemon-backed sessions. Fire-and-forget (mirroring
+/// `DaemonWriter`): flow control is advisory and a failure (e.g. the session
+/// just exited) is benign. A no-op for in-process sessions — no daemon client
+/// exists, and the in-process reader already reads the shared atomic directly.
+fn forward_flow_control_to_daemon(
+    sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+    session_id: &str,
+) {
+    // Read the already-recomputed verdict and grab the daemon client (if any)
+    // in one lock pass.
+    let snapshot = with_existing_session_runtime(sessions, session_id, |runtime| {
+        let effective = runtime.flow_paused.load(Ordering::Relaxed);
         #[cfg(unix)]
         {
-            runtime.daemon_client.clone()
+            (effective, runtime.daemon_client.clone())
         }
         #[cfg(not(unix))]
         {
-            Option::<()>::None
+            (effective, Option::<()>::None)
         }
     });
 
     #[cfg(unix)]
-    if let Some(client) = daemon_client.flatten() {
+    if let Some((effective, Some(client))) = snapshot {
         let session_id = session_id.to_string();
         tauri::async_runtime::spawn(async move {
-            if let Err(error) = client.set_flow_paused(session_id.clone(), paused).await {
+            if let Err(error) = client.set_flow_paused(session_id.clone(), effective).await {
                 eprintln!(
-                    "[codemux::terminal] flow-control set_flow_paused(paused={paused}) \
+                    "[codemux::terminal] flow-control set_flow_paused(paused={effective}) \
                      for {session_id} failed (benign if the session just exited): {error}"
                 );
             }
@@ -2363,7 +2518,7 @@ fn set_pty_flow_paused(
     }
     #[cfg(not(unix))]
     {
-        let _ = daemon_client;
+        let _ = snapshot;
     }
 }
 
@@ -3327,6 +3482,48 @@ mod tests {
         Arc::new(Mutex::new(HashMap::new()))
     }
 
+    /// Install a fresh output subscriber exactly the way `attach_pty_output`
+    /// does (mint a generation, push an unpaused entry, recompute flow) and
+    /// return its generation. Test-only mirror of the command body so the
+    /// unit tests don't need a real Tauri `State`/`AppHandle`.
+    fn attach_subscriber(
+        sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+        session_id: &str,
+        channel: Channel<Vec<u8>>,
+    ) -> u64 {
+        with_session_runtime(
+            sessions,
+            session_id,
+            || SessionRuntime::new(session_id),
+            |runtime| {
+                runtime.next_output_generation =
+                    runtime.next_output_generation.saturating_add(1);
+                let generation = runtime.next_output_generation;
+                runtime.output_subscribers.push(OutputSubscriber {
+                    generation,
+                    channel,
+                    flow_paused: false,
+                });
+                recompute_flow_paused(runtime);
+                generation
+            },
+        )
+    }
+
+    /// Remove a subscriber by generation the way `detach_pty_output` does.
+    fn detach_subscriber(
+        sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
+        session_id: &str,
+        generation: u64,
+    ) {
+        with_existing_session_runtime(sessions, session_id, |runtime| {
+            runtime
+                .output_subscribers
+                .retain(|s| s.generation != generation);
+            recompute_flow_paused(runtime);
+        });
+    }
+
     #[test]
     fn comm_log_entry_formats_and_filters() {
         // Real agent output → a tagged, timestamped line.
@@ -3484,7 +3681,7 @@ mod tests {
     }
 
     /// `terminate_pty_session_keep_channel` for a daemon-backed
-    /// (persistent) session must PRESERVE `output_channel` and
+    /// (persistent) session must PRESERVE `output_subscribers` and
     /// `pending_output` so the frontend's xterm stays attached
     /// across the kill-and-respawn that happens on workspace push.
     /// Without this, the respawned PTY's output buffers in
@@ -3977,29 +4174,17 @@ mod tests {
         assert_eq!(after_first_overflow, 7);
 
         // Simulate attach (mirrors attach_pty_output body): install a
-        // channel, drain pending_output, then detach again. Reset the
+        // subscriber, drain pending_output, then detach again. Reset the
         // byte counter alongside the deque to keep the invariant —
         // production code does this in `close_terminal_session`; tests
         // touching the deque directly must do the same.
         let channel: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
-        with_session_runtime(
-            &sessions,
-            "persist",
-            || SessionRuntime::new("persist"),
-            |runtime| {
-                runtime.output_channel = Some(channel);
-                runtime.pending_output.clear();
-                runtime.pending_output_bytes = 0;
-            },
-        );
-        with_session_runtime(
-            &sessions,
-            "persist",
-            || SessionRuntime::new("persist"),
-            |runtime| {
-                runtime.output_channel = None;
-            },
-        );
+        let generation = attach_subscriber(&sessions, "persist", channel);
+        with_existing_session_runtime(&sessions, "persist", |runtime| {
+            runtime.pending_output.clear();
+            runtime.pending_output_bytes = 0;
+        });
+        detach_subscriber(&sessions, "persist", generation);
 
         // Counter should still reflect the prior overflow.
         let guard = sessions.lock().unwrap();
@@ -4072,15 +4257,20 @@ mod tests {
         });
 
         // Mirror the attach_pty_output Tauri command body directly: install
-        // the channel, snapshot pending_output, then forward each chunk.
+        // the subscriber, snapshot pending_output, then forward each chunk.
         let pending_chunks = with_session_runtime(
             &sessions,
             "replay",
             || SessionRuntime::new("replay"),
             |runtime| {
-                runtime.output_channel = Some(channel.clone());
-                runtime.output_channel_generation =
-                    runtime.output_channel_generation.saturating_add(1);
+                runtime.next_output_generation =
+                    runtime.next_output_generation.saturating_add(1);
+                let generation = runtime.next_output_generation;
+                runtime.output_subscribers.push(OutputSubscriber {
+                    generation,
+                    channel: channel.clone(),
+                    flow_paused: false,
+                });
                 runtime.pending_output.iter().cloned().collect::<Vec<_>>()
             },
         );
@@ -4124,16 +4314,7 @@ mod tests {
             captured_handler.lock().unwrap().push(bytes);
             Ok(())
         });
-        with_session_runtime(
-            &sessions,
-            "live",
-            || SessionRuntime::new("live"),
-            |runtime| {
-                runtime.output_channel = Some(channel);
-                runtime.output_channel_generation =
-                    runtime.output_channel_generation.saturating_add(1);
-            },
-        );
+        attach_subscriber(&sessions, "live", channel);
 
         // Drive the same path the reader thread uses for each batched flush.
         for i in 0..OUTPUT_BUFFER_BYTE_LIMIT + 5 {
@@ -4186,16 +4367,7 @@ mod tests {
             Ok(())
         });
 
-        with_session_runtime(
-            &sessions,
-            "live-lock",
-            || SessionRuntime::new("live-lock"),
-            |runtime| {
-                runtime.output_channel = Some(channel);
-                runtime.output_channel_generation =
-                    runtime.output_channel_generation.saturating_add(1);
-            },
-        );
+        attach_subscriber(&sessions, "live-lock", channel);
 
         queue_or_send_output(&sessions, "live-lock", vec![42]);
 
@@ -4203,6 +4375,168 @@ mod tests {
             send_observed_unlocked_mutex.load(Ordering::SeqCst),
             "channel.send must not run while the global sessions mutex is held"
         );
+    }
+
+    /// Real `tauri::ipc::Channel` whose handler records every decoded chunk, in
+    /// order. Shared shape used by the fan-out tests below.
+    fn recording_channel() -> (Channel<Vec<u8>>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let captured: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let handler = captured.clone();
+        let channel: Channel<Vec<u8>> = Channel::new(move |body| {
+            let bytes = body.deserialize::<Vec<u8>>().expect("decode body");
+            handler.lock().unwrap().push(bytes);
+            Ok(())
+        });
+        (channel, captured)
+    }
+
+    /// Multi-client fan-out: two subscribers attached to the same session must
+    /// BOTH receive every chunk, in the same interleaved order the reader
+    /// produced them. This is the core mirror-mode delivery guarantee.
+    #[test]
+    fn test_fan_out_delivers_to_all_subscribers() {
+        let sessions = make_sessions();
+        let (ch_a, cap_a) = recording_channel();
+        let (ch_b, cap_b) = recording_channel();
+        attach_subscriber(&sessions, "fan", ch_a);
+        attach_subscriber(&sessions, "fan", ch_b);
+
+        for i in 0..8u8 {
+            queue_or_send_output(&sessions, "fan", vec![i, i + 200]);
+        }
+
+        let a = cap_a.lock().unwrap().clone();
+        let b = cap_b.lock().unwrap().clone();
+        assert_eq!(a.len(), 8, "subscriber A must see every chunk");
+        assert_eq!(b.len(), 8, "subscriber B must see every chunk");
+        for i in 0..8u8 {
+            assert_eq!(a[i as usize], vec![i, i + 200], "A order preserved");
+            assert_eq!(b[i as usize], vec![i, i + 200], "B order preserved");
+        }
+    }
+
+    /// Detaching one subscriber must leave the other streaming uninterrupted —
+    /// removing A never touches B's delivery.
+    #[test]
+    fn test_detach_one_leaves_other_streaming() {
+        let sessions = make_sessions();
+        let (ch_a, cap_a) = recording_channel();
+        let (ch_b, cap_b) = recording_channel();
+        let gen_a = attach_subscriber(&sessions, "detach", ch_a);
+        attach_subscriber(&sessions, "detach", ch_b);
+
+        queue_or_send_output(&sessions, "detach", vec![1]);
+        // Both saw the first chunk.
+        assert_eq!(cap_a.lock().unwrap().len(), 1);
+        assert_eq!(cap_b.lock().unwrap().len(), 1);
+
+        detach_subscriber(&sessions, "detach", gen_a);
+        // Only B remains a subscriber.
+        with_existing_session_runtime(&sessions, "detach", |runtime| {
+            assert_eq!(runtime.output_subscribers.len(), 1, "A removed");
+        });
+
+        queue_or_send_output(&sessions, "detach", vec![2]);
+        queue_or_send_output(&sessions, "detach", vec![3]);
+
+        assert_eq!(
+            cap_a.lock().unwrap().clone(),
+            vec![vec![1u8]],
+            "detached A must receive nothing further"
+        );
+        assert_eq!(
+            cap_b.lock().unwrap().clone(),
+            vec![vec![1u8], vec![2u8], vec![3u8]],
+            "B keeps streaming across A's detach"
+        );
+    }
+
+    /// Replay-on-attach targets the NEW subscriber only: a late joiner catches
+    /// up from the `pending_output` ring while the existing subscriber does not
+    /// re-receive history it already streamed live.
+    #[test]
+    fn test_replay_on_attach_reaches_only_the_attacher() {
+        let sessions = make_sessions();
+        let (ch_a, cap_a) = recording_channel();
+        attach_subscriber(&sessions, "join", ch_a);
+
+        // Produce output while only A is attached — A gets it live, and it also
+        // lands in the replay ring.
+        for i in 0..5u8 {
+            queue_or_send_output(&sessions, "join", vec![i]);
+        }
+        assert_eq!(cap_a.lock().unwrap().len(), 5, "A streamed 5 chunks live");
+
+        // B attaches late. Mirror attach_pty_output: install B, snapshot
+        // pending_output, replay to B's channel only.
+        let (ch_b, cap_b) = recording_channel();
+        let pending = with_session_runtime(
+            &sessions,
+            "join",
+            || SessionRuntime::new("join"),
+            |runtime| {
+                runtime.next_output_generation =
+                    runtime.next_output_generation.saturating_add(1);
+                let generation = runtime.next_output_generation;
+                runtime.output_subscribers.push(OutputSubscriber {
+                    generation,
+                    channel: ch_b.clone(),
+                    flow_paused: false,
+                });
+                runtime.pending_output.iter().cloned().collect::<Vec<_>>()
+            },
+        );
+        for chunk in pending {
+            ch_b.send(chunk).expect("replay send");
+        }
+
+        // A must NOT have received the replay again (still 5 live chunks); B
+        // catches up with exactly the ring's history.
+        assert_eq!(
+            cap_a.lock().unwrap().len(),
+            5,
+            "existing subscriber must not re-receive replayed history"
+        );
+        assert_eq!(
+            cap_b.lock().unwrap().clone(),
+            (0..5u8).map(|i| vec![i]).collect::<Vec<_>>(),
+            "late joiner replays the full ring in order"
+        );
+
+        // A subsequent live chunk now reaches BOTH.
+        queue_or_send_output(&sessions, "join", vec![99]);
+        assert_eq!(*cap_a.lock().unwrap().last().unwrap(), vec![99u8]);
+        assert_eq!(*cap_b.lock().unwrap().last().unwrap(), vec![99u8]);
+    }
+
+    /// A detach carrying a stale/superseded generation must not remove the
+    /// current subscriber — the guard that keeps an unmount race from tearing
+    /// down a newer attach.
+    #[test]
+    fn test_detach_with_stale_generation_is_noop() {
+        let sessions = make_sessions();
+        let (channel, captured) = recording_channel();
+        let generation = attach_subscriber(&sessions, "stale-detach", channel);
+
+        // Detach a generation that was never issued → nothing removed.
+        detach_subscriber(&sessions, "stale-detach", generation + 1);
+        with_existing_session_runtime(&sessions, "stale-detach", |runtime| {
+            assert_eq!(
+                runtime.output_subscribers.len(),
+                1,
+                "stale detach must not remove the live subscriber"
+            );
+        });
+
+        // The live subscriber still streams.
+        queue_or_send_output(&sessions, "stale-detach", vec![7]);
+        assert_eq!(captured.lock().unwrap().clone(), vec![vec![7u8]]);
+
+        // The matching generation does remove it.
+        detach_subscriber(&sessions, "stale-detach", generation);
+        with_existing_session_runtime(&sessions, "stale-detach", |runtime| {
+            assert!(runtime.output_subscribers.is_empty(), "matching detach removes");
+        });
     }
 
     #[test]
@@ -4528,18 +4862,13 @@ mod tests {
             Ok(())
         });
 
-        // Start unpaused; grab the shared flow flag (mirrors the spawn path).
-        let flow_paused = with_session_runtime(
-            &sessions,
-            "fire",
-            || SessionRuntime::new("fire"),
-            |runtime| {
-                runtime.output_channel = Some(channel);
-                runtime.output_channel_generation += 1;
-                runtime.flow_paused.store(false, Ordering::Relaxed);
-                runtime.flow_paused.clone()
-            },
-        );
+        // Start unpaused; install the subscriber and grab the shared flow flag
+        // (mirrors the spawn + attach paths).
+        attach_subscriber(&sessions, "fire", channel);
+        let flow_paused = with_existing_session_runtime(&sessions, "fire", |runtime| {
+            runtime.flow_paused.clone()
+        })
+        .expect("runtime exists");
 
         let read_sessions = sessions.clone();
         let read_flow_paused = flow_paused.clone();
@@ -4625,49 +4954,99 @@ mod tests {
     }
 
     /// `set_pty_flow_paused` must flip the in-process `flow_paused` flag for a
-    /// session with no daemon client — i.e. pause/resume is no longer a no-op on
-    /// the in-process path (issue #73 acceptance criterion). Attach then clears
-    /// it (self-heal).
+    /// single-subscriber session with no daemon client — i.e. pause/resume is
+    /// not a no-op on the in-process path (issue #73 acceptance criterion). A
+    /// fresh reattach then clears it (self-heal: a new unpaused subscriber can't
+    /// leave "all subscribers paused" true).
     #[test]
     fn test_set_pty_flow_paused_toggles_in_process_flag() {
         let sessions = make_sessions();
-        let flag = with_session_runtime(
-            &sessions,
-            "inproc",
-            || SessionRuntime::new("inproc"),
-            |runtime| {
-                // No daemon_client set → this is an in-process session.
-                runtime.flow_paused.clone()
-            },
-        );
+        // No daemon_client set → this is an in-process session.
+        let channel: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
+        let generation = attach_subscriber(&sessions, "inproc", channel);
+        let flag = with_existing_session_runtime(&sessions, "inproc", |runtime| {
+            runtime.flow_paused.clone()
+        })
+        .expect("runtime exists");
         assert!(
             !flag.load(Ordering::Relaxed),
-            "a fresh session starts unpaused"
+            "a fresh subscriber starts unpaused"
         );
 
-        set_pty_flow_paused(&sessions, "inproc", true);
+        set_pty_flow_paused(&sessions, "inproc", Some(generation), true);
         assert!(
             flag.load(Ordering::Relaxed),
-            "pause must set the in-process flow_paused flag (not a no-op)"
+            "pausing the only subscriber must set the in-process flow_paused flag"
         );
 
-        set_pty_flow_paused(&sessions, "inproc", false);
+        set_pty_flow_paused(&sessions, "inproc", Some(generation), false);
         assert!(
             !flag.load(Ordering::Relaxed),
             "resume must clear the in-process flow_paused flag"
         );
 
-        // Re-pause, then simulate a reattach: attach_pty_output clears the flag
-        // as a self-heal so a reattaching pane always starts live.
-        set_pty_flow_paused(&sessions, "inproc", true);
+        // Re-pause, then simulate a reattach: a fresh unpaused subscriber makes
+        // "all subscribers paused" false, so the derived flag clears.
+        set_pty_flow_paused(&sessions, "inproc", Some(generation), true);
         assert!(flag.load(Ordering::Relaxed));
-        with_existing_session_runtime(&sessions, "inproc", |runtime| {
-            // Mirror the self-heal line in attach_pty_output.
-            runtime.flow_paused.store(false, Ordering::Relaxed);
-        });
+        let channel2: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
+        attach_subscriber(&sessions, "inproc", channel2);
         assert!(
             !flag.load(Ordering::Relaxed),
-            "attach self-heal must clear a stale pause"
+            "a fresh attach must clear a stale pause (new subscriber is unpaused)"
+        );
+    }
+
+    /// A subscriber pausing alone must NOT park the reader while another
+    /// subscriber is still caught up — the fan-out only parks when EVERY
+    /// subscriber has paused. This is the core multi-client flow-control rule.
+    #[test]
+    fn test_flow_parks_only_when_all_subscribers_paused() {
+        let sessions = make_sessions();
+        let ch_a: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
+        let ch_b: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
+        let gen_a = attach_subscriber(&sessions, "multi", ch_a);
+        let gen_b = attach_subscriber(&sessions, "multi", ch_b);
+        let flag = with_existing_session_runtime(&sessions, "multi", |runtime| {
+            runtime.flow_paused.clone()
+        })
+        .expect("runtime exists");
+
+        // A pauses alone → B still unpaused → reader must NOT park.
+        set_pty_flow_paused(&sessions, "multi", Some(gen_a), true);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "one paused subscriber must not park the reader while another is live"
+        );
+
+        // B also pauses → all paused → reader parks.
+        set_pty_flow_paused(&sessions, "multi", Some(gen_b), true);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "reader must park once every subscriber has paused"
+        );
+
+        // A resumes → no longer all paused → reader resumes.
+        set_pty_flow_paused(&sessions, "multi", Some(gen_a), false);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "reader must resume as soon as any subscriber resumes"
+        );
+
+        // Detaching the still-paused B (with A unpaused) leaves the reader
+        // running; detaching A too (leaving only paused... none) → empty set
+        // never parks.
+        set_pty_flow_paused(&sessions, "multi", Some(gen_a), true);
+        assert!(flag.load(Ordering::Relaxed), "both paused → parked");
+        detach_subscriber(&sessions, "multi", gen_b);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "only the paused subscriber remains → still parked"
+        );
+        detach_subscriber(&sessions, "multi", gen_a);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "no subscribers left → reader must run (empty set never parks)"
         );
     }
 
@@ -4677,11 +5056,32 @@ mod tests {
     fn test_set_pty_flow_paused_missing_session_is_noop() {
         let sessions = make_sessions();
         // Must not panic / must not create a phantom runtime.
-        set_pty_flow_paused(&sessions, "ghost", true);
+        set_pty_flow_paused(&sessions, "ghost", Some(1), true);
         let guard = sessions.lock().unwrap();
         assert!(
             guard.get("ghost").is_none(),
             "flow control on a missing session must not materialize a runtime"
+        );
+    }
+
+    /// A stale `generation` (a subscriber that already detached) must not toggle
+    /// the flag for the surviving subscribers.
+    #[test]
+    fn test_set_pty_flow_paused_stale_generation_is_noop() {
+        let sessions = make_sessions();
+        let channel: Channel<Vec<u8>> = Channel::new(|_| Ok(()));
+        let generation = attach_subscriber(&sessions, "stale", channel);
+        let flag = with_existing_session_runtime(&sessions, "stale", |runtime| {
+            runtime.flow_paused.clone()
+        })
+        .expect("runtime exists");
+
+        // Pause a generation that was never installed → no subscriber matches →
+        // recompute leaves the live (unpaused) subscriber flowing.
+        set_pty_flow_paused(&sessions, "stale", Some(generation + 999), true);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a pause aimed at a non-existent generation must not park the reader"
         );
     }
 

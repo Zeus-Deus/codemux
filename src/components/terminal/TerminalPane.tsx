@@ -142,6 +142,11 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   const serializeAddonRef = useRef<SerializeAddon | null>(null);
   const webglAddonRef = useRef<WebglAddon | null>(null);
   const attachedSessionRef = useRef<string | null>(null);
+  // Subscriber generation returned by `attachPtyOutput`. Threaded back into
+  // detach / pause / resume so a stale teardown only ever targets this pane's
+  // own subscriber (and never a mirror consumer that attached the same
+  // session). `null` until the attach resolves.
+  const attachedGenerationRef = useRef<number | null>(null);
   // Adapter captures from the scrollback restore — persists across tab switches
   // even when the pane state (layout.json) doesn't have them.
   const restoredCapturesRef = useRef<Record<string, string>>({});
@@ -593,7 +598,13 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     const pump = createWritePump((data) => term.write(data), {
       onHighWatermark: () => {
         flowPaused = true;
-        pausePtyOutput(sid).catch((err) => {
+        // Before attach resolves this pane is not yet a subscriber (and the
+        // reader isn't feeding it live bytes — only finite disk scrollback is
+        // in the pump), so there is nothing to back-pressure yet. The intent is
+        // recorded in `flowPaused` and reconciled once we hold a generation.
+        const generation = attachedGenerationRef.current;
+        if (generation == null) return;
+        pausePtyOutput(sid, generation).catch((err) => {
           // Pause didn't land (e.g. the session just exited). Drop the local
           // guard so cleanup won't issue a spurious resume.
           flowPaused = false;
@@ -602,7 +613,9 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       },
       onLowWatermark: () => {
         flowPaused = false;
-        resumePtyOutput(sid).catch((err) => {
+        const generation = attachedGenerationRef.current;
+        if (generation == null) return;
+        resumePtyOutput(sid, generation).catch((err) => {
           console.error(`[codemux] flow-control resume failed for ${sid}:`, err);
         });
       },
@@ -692,9 +705,29 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       });
 
       try {
-        await attachPtyOutput(sid, channel);
-        if (cancelled) return;
+        const generation = (await attachPtyOutput(sid, channel)) ?? null;
+        if (cancelled) {
+          // Unmounted during the attach round-trip: the cleanup below ran
+          // before we recorded the generation, so tear down the subscriber we
+          // just installed here — otherwise it lingers in the backend fan-out
+          // set (dropping bytes via the `cancelled` guard) until the session
+          // closes.
+          if (generation != null) {
+            detachPtyOutput(sid, generation).catch(console.error);
+          }
+          return;
+        }
         attachedSessionRef.current = sid;
+        attachedGenerationRef.current = generation;
+        // Reconcile a pause that crossed the HIGH watermark during the
+        // pre-attach scrollback restore, when we had no generation to attribute
+        // it to. Now that we're a subscriber, apply it.
+        if (flowPaused && generation != null) {
+          pausePtyOutput(sid, generation).catch((err) => {
+            flowPaused = false;
+            console.error(`[codemux] flow-control pause failed for ${sid}:`, err);
+          });
+        }
       } catch (err) {
         if (cancelled) return;
         updateStatusOverlay({
@@ -757,10 +790,17 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
     return () => {
       cancelled = true;
 
-      if (attachedSessionRef.current) {
-        detachPtyOutput(attachedSessionRef.current).catch(console.error);
-        attachedSessionRef.current = null;
+      const attachedGeneration = attachedGenerationRef.current;
+      if (attachedSessionRef.current && attachedGeneration != null) {
+        // Detaching this subscriber (by generation) already drops its pause
+        // request via the backend recompute — but only removes THIS pane's
+        // subscriber, leaving any mirror consumer streaming.
+        detachPtyOutput(attachedSessionRef.current, attachedGeneration).catch(
+          console.error,
+        );
       }
+      attachedSessionRef.current = null;
+      attachedGenerationRef.current = null;
       dataDisposable.dispose();
       dataDisposableRef.current = null;
 
@@ -770,11 +810,15 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
 
       // If we're unmounting while holding a flow-control pause, release it so
       // a backgrounded (daemon-backed) agent isn't left blocked on write().
-      // The backend also self-heals (resume-on-attach + max-park backstop),
-      // but resuming here makes it immediate.
+      // The detach above already recomputes back-pressure (a removed
+      // subscriber's pause dies with it), and the backend self-heals besides
+      // (resume-on-attach + max-park backstop); this is belt-and-suspenders and
+      // only meaningful if we somehow paused without a live subscriber.
       if (flowPaused) {
         flowPaused = false;
-        resumePtyOutput(sid).catch(console.error);
+        if (attachedGeneration != null) {
+          resumePtyOutput(sid, attachedGeneration).catch(console.error);
+        }
       }
 
       containerEl.removeEventListener("input", blockNewline, true);

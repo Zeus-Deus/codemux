@@ -8,7 +8,10 @@ import { useScrollbackSerializer } from "@/hooks/use-scrollback-serializer";
 import { useTerminalCacheGc } from "@/hooks/use-terminal-cache-gc";
 import { useTerminalThemeSync } from "@/hooks/use-terminal-theme-sync";
 import { useAutomationFireToast } from "@/hooks/use-automation-fire-toast";
+import { useWebNotifications } from "@/hooks/use-web-notifications";
 import { AppShell } from "@/components/layout/app-shell";
+import { RemotePathPicker } from "@/components/remote/remote-path-picker";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Toaster } from "@/components/ui/sonner";
 import { UpdateToast } from "@/components/update/update-toast";
 import { LoginScreen } from "@/components/auth/login-screen";
@@ -70,6 +73,9 @@ function App() {
   useTerminalCacheGc();
   useTerminalThemeSync();
   useAutomationFireToast();
+  // Web remote client only: bridge backend `notification` events into the
+  // browser (Web Notifications API with a toast fallback). No-op on desktop.
+  useWebNotifications();
 
   if (isLoading || !isAuthenticated) {
     return <LoginScreen />;
@@ -79,6 +85,9 @@ function App() {
     <>
       <AppShell />
       <UpdateToast />
+      {/* Web remote client only: the in-app path browser that stands in for
+          the native OS file dialog. Never mounted on desktop. */}
+      {isRemoteClient() && <RemotePathPicker />}
       <Toaster />
     </>
   );

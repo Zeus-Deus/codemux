@@ -94,8 +94,24 @@ rrule = "0.14"
 # tunnelled via SSH when remote) is the v1 design constraint that lets
 # us drop in an optional cloud relay later without changing the daemon.
 # See docs/plans/mcp-on-remote.md.
-axum = "0.7"
+#
+# The `ws` feature is required by the embedded web-remote-access server
+# (`src/web_remote/`), which upgrades `/ws` connections to drive the same
+# frontend bundle from a browser on another device. It pulls in
+# tokio-tungstenite + sha1 + base64 (all already in the tree).
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
+# Streaming body for the authenticated `/api/assets` route: `ReaderStream`
+# wraps a `tokio::fs::File` so large files (images referenced from the web
+# client) are piped chunk-by-chunk instead of buffered whole into memory.
+# The `io` feature adds no new transitive crates (bytes/futures-core are
+# already in the tree).
+tokio-util = { version = "0.7", features = ["io"] }
+# Local network-interface enumeration for the web-remote endpoint list
+# (loopback + LAN IPs). Thin wrapper over `getifaddrs`/`GetAdaptersAddresses`;
+# `libc` (already a dependency) backs it on Unix. Tailnet IPs + MagicDNS are
+# discovered separately by shelling out to `tailscale status --json`.
+if-addrs = "0.13"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

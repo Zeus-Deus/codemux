@@ -23,6 +23,7 @@ import {
   mapToViewport,
   sanitizeCursor,
   httpBaseFromStreamUrl,
+  remoteBrowserEndpoints,
   buildCursorProbeScript,
   SELECTION_SCRIPT,
   buildInsertTextScript,
@@ -31,6 +32,7 @@ import {
   probeDaemon,
   evalOnDaemon,
 } from "./stream-protocol";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 
 interface Props {
   browserId: string;
@@ -231,7 +233,23 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
       // The daemon serves HTTP on the same port as the stream WS —
       // used for the liveness probe, cursor probe, and clipboard bridge.
-      httpBaseRef.current = httpBaseFromStreamUrl(streamUrl);
+      //
+      // Desktop connects to the daemon's loopback socket directly. A remote
+      // (browser) client can't reach loopback, so it derives its WS + HTTP
+      // endpoints from the served origin's authenticated `/proxy/browser/<port>`
+      // routes instead (cookie rides along same-origin). Desktop path unchanged.
+      let connectUrl = streamUrl;
+      if (isRemoteClient()) {
+        const endpoints = remoteBrowserEndpoints(streamUrl, window.location.origin);
+        if (endpoints) {
+          connectUrl = endpoints.wsUrl;
+          httpBaseRef.current = endpoints.httpBase;
+        } else {
+          httpBaseRef.current = httpBaseFromStreamUrl(streamUrl);
+        }
+      } else {
+        httpBaseRef.current = httpBaseFromStreamUrl(streamUrl);
+      }
 
       // Auto-reconnecting WebSocket — retries until screencast is live.
       // The stream server fails with "Browser not launched" if we connect
@@ -251,7 +269,7 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         // Past the fast budget: stay in "error" while slow-retrying so
         // the pill/overlay keeps showing the disconnect honestly.
 
-        ws = new WebSocket(streamUrl);
+        ws = new WebSocket(connectUrl);
         wsRef.current = ws;
 
         ws.onopen = () => {

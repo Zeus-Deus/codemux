@@ -1,0 +1,200 @@
+# Web Remote Access
+
+- Purpose: Describe the embedded, default-off HTTP + WebSocket server that turns the desktop app into a second frontend for its own backend — a browser on another device loads the same UI bundle and drives the same running instance.
+- Audience: Anyone touching the `web_remote` server, the `src/remote/` WebSocket shim, the Remote Access settings pane, the stream fan-out in terminal/agent-chat, or the web fallbacks (path picker, notifications, assets, browser-pane proxy, updater).
+- Authority: Canonical feature-level reality doc for web remote access.
+- Update when: The WS protocol contract, the auth model, the fan-out semantics, the endpoint enumeration, or any web fallback changes.
+- Read next: `docs/plans/web-remote-access.md` (locked design contract + remaining work), `docs/features/dev-mock-runtime.md`, `docs/features/remote-hosts.md`, `docs/features/terminal.md`, `docs/features/agent-chat.md`.
+
+## What This Feature Is
+
+The desktop app grows an embedded HTTP + WebSocket server. When the user turns it on, a browser on another machine — a laptop, a phone on the same LAN or the user's mesh VPN — loads the *same* UI bundle the desktop runs and drives the *same* running desktop instance: the same projects, workspaces, terminals, agent chats, git state. It is a **second frontend for one backend**, not a second app.
+
+This is a **UI transport**. It is the sibling of remote-hosts, which is a **compute transport** (same frontend, a remote backend reached over SSH). The two compose: a paired web client automatically sees and drives the desktop's remote hosts, because all of that logic already lives behind the invoke surface the web client speaks to. See "Relationship to remote hosts" below.
+
+Default off. Nothing binds until the user enables it in Settings → Remote Access. Work continues when the browser disconnects — the persistent PTY daemon already guarantees a shell survives the app losing its UI, and the web client is just another UI.
+
+## Current Model
+
+### The seam: `window.__TAURI_INTERNALS__`
+
+The entire React UI talks to its backend through exactly one object, `window.__TAURI_INTERNALS__`. The dev mock runtime (`src/dev/tauri-mock.ts`) already proved the UI runs unmodified in a plain browser against a shim of that object. Web remote access installs a **production** twin of that shim (`src/remote/shim.ts`) backed by a real WebSocket to the desktop instead of in-process fixtures. **Zero app components change** — every `invoke()`, `listen`/`emit`/`once`, `Channel`, `convertFileSrc`, and plugin call routes through the shim.
+
+`src/main.tsx` selects the runtime before React mounts, three-way:
+
+1. The Tauri desktop WebView injects the real internals — nothing installed, real IPC.
+2. `npm run dev` in a plain browser with no real internals → dev mock.
+3. A plain browser served by the desktop's web-remote server → the WebSocket shim (`src/remote/bootstrap.tsx` handles pairing, then installs the shim and connects before mounting).
+
+Both shims stay dormant under the desktop WebView, so real-IPC behavior is byte-identical to before this feature existed. `import.meta.env.DEV` statically tree-shakes the dev-mock branch out of the production bundle. `?remote=1` under `npm run dev` forces the WebSocket shim so it can be exercised against a live server instead of the mock.
+
+### The embedded server
+
+New module `src-tauri/src/web_remote/` runs an axum server (axum is already a dependency) inside the desktop process. When enabled it binds `0.0.0.0:<port>` (default **4377**, configurable); disabling sends a graceful-shutdown oneshot that unbinds it. Config (`enabled`, `port`, `require_approval`) persists in the existing settings storage under `web_remote.config`, and `restore_on_boot` re-binds on app start if the feature was left enabled — a bind failure (port taken) is logged, never fatal.
+
+Module layout:
+
+- `mod.rs` — managed `WebRemoteState`, config persistence, server lifecycle, the Tauri command surface, the boot-restore + e2e-autostart hooks.
+- `server.rs` — the axum router, the connection registry, the WebSocket lifecycle (writer task, keepalive pinger, reader loop), and the shared session-admission gate.
+- `auth.rs` — pairing tokens, sessions, WS tickets, the rate limiter, origin checks.
+- `dispatch.rs` — invoke dispatch via synthesized `on_message`, plus the channel interceptor/router.
+- `events.rs` — the `listen_any` fan-out hub with per-event refcounting.
+- `endpoints.rs` — reachable-endpoint enumeration (loopback / LAN / tailnet / MagicDNS).
+- `assets.rs` — the authenticated `/api/assets` file route (`convertFileSrc` replacement).
+- `proxy.rs` — the auth-gated browser-pane WS + HTTP proxy to loopback `agent-browser` daemons.
+
+The frontend served is the app's own bundle, resolved through Tauri's `AssetResolver` (assets are embedded in the release binary — there is no `dist/` on disk in production; a debug-only `dist/` fallback keeps `npm run tauri:dev` serviceable). A path with no file extension falls back to `index.html` for client-side routing.
+
+### WS protocol contract
+
+The transport is `GET /ws?ticket=<one-time-ticket>`, upgraded after ticket validation. Both sides (`src-tauri/src/web_remote/{server,dispatch,events}.rs` and `src/remote/{transport,shim}.ts`) match this exactly:
+
+Text frames (JSON):
+
+- C→S `{"t":"invoke","id":<u64>,"cmd":"<name>","args":{...}}`. `Channel` instances serialize (via `@tauri-apps/api`'s `toJSON`) to `"__CHANNEL__:<callbackId>"` strings, minted by the shim's own `transformCallback` registry.
+- S→C `{"t":"ok","id":<u64>,"data":<json>}` / `{"t":"err","id":<u64>,"error":<json>}` — id-matched. The server spawns one task per invoke, so responses may return out of order (allowed by design).
+- C→S `{"t":"listen","event":"<name>"}` / `{"t":"unlisten","event":"<name>"}`; S→C `{"t":"event","event":"<name>","payload":<json>}`.
+- S→C JSON channel body: `{"t":"chan","ch":<callbackId>,"idx":<u64>,"data":<json>}`.
+
+Binary frames (raw channel bodies, e.g. PTY bytes): `[0x01][u32 BE callbackId][u64 BE idx][payload]`. The shim delivers `{index, message}` to the stored callback exactly as the dev mock does — the mock is the reference for what `@tauri-apps/api`'s `Channel` expects.
+
+Keepalive: the server pings every 30s; two unanswered pings closes the socket. On close the shim reconnects with exponential backoff (1s → 16s cap), re-sends its `listen` subscriptions, and re-issues a WS ticket first. In-flight invokes reject on disconnect; the UI's own `get_app_state`-on-mount plus snapshot events self-heal the view.
+
+### Invoke dispatch (Rust ladder, Option 1)
+
+A browser's `invoke` frame is turned into a real `tauri::webview::InvokeRequest` and driven through the main window's webview via `WebviewWindow::on_message` — the same entry point the desktop's own IPC uses (`dispatch::dispatch_invoke`). This reuses argument deserialization, `State`/`AppHandle`/`Window` extraction, ACL resolution, and error formatting for **every one of the app's ~300 commands with zero per-command wiring**. The request reuses the main window's own URL so ACL resolves identically to a desktop-initiated invoke. `on_message` runs on `spawn_blocking` (a sync command runs inline, an async command is handed to Tauri's runtime); a oneshot carries the `InvokeResponse` back to the WS task, which emits the id-matched `ok`/`err` frame. `InvokeResponseBody::Json` → `data`; a panicking command resolves to an `err` frame via the dropped oneshot, never crashing the server.
+
+### Channels and binary PTY frames
+
+A `tauri::ipc::Channel` deserialized inside a synthesized invoke would, by default, post its frames to the *desktop* webview's JS — the wrong client. Tauri exposes a **channel interceptor**, registered on the `Builder` in `lib.rs`, that fires for every channel send with `(callback_id, index, body)`. Before dispatching an invoke, the dispatcher walks the args and rewrites each `__CHANNEL__:<clientId>` marker to a fresh **server-side** channel id, registering a route `server_id → (this WS, clientId)` in `ChannelRouter`. When the command later sends on that channel, the interceptor calls `ChannelRouter::route`, which serializes the body to the owning WS — a `chan` text frame for JSON, the compact `[0x01]…` binary frame for raw bodies — and returns `true` to suppress the desktop delivery.
+
+This is uniform across every channel-taking command (`attach_pty_output`, `attach_agent_chat_output`, …) and needs no knowledge of their signatures, so it is unaffected by concurrent changes to those commands' fan-out internals. A fast-path atomic (`active` route count) lets the desktop-only hot path — local PTY output with no web channels open — skip the router lock entirely and pay only one relaxed load. Routes die with their WS connection (`remove_conn` on socket close).
+
+### Event hub
+
+Browsers subscribe to app events over the WS; `events::EventHub` multiplexes all subscribers onto a single `AppHandle::listen_any` registration **per event name**, reference-counted by subscriber. The first subscriber registers the desktop-side listener; the last to leave (or disconnect) unregisters it. So there is exactly one desktop listener per active event no matter how many browsers watch it, and none once no one is — the desktop's own event bus sees no extra churn. Payloads forward verbatim (re-parsed to a value so they nest rather than double-encode).
+
+## Auth model
+
+The trust model is **pairing token → persistent revocable session**, with short-lived tickets keeping the session secret out of WS URLs and logs.
+
+1. **Pairing token** — 32 random bytes, 10-minute TTL, single use, in memory only (`auth::PairingStore`). Minted by the desktop (`web_remote_create_pairing`) and handed to a browser out-of-band as a QR code or a `/#pair=<token>` deep link.
+2. **Session** — created when a browser presents a valid pairing token to `POST /api/pair`. Persisted in SQLite (`web_remote_sessions`: id, name, user_agent, `token_hash`, timestamps, `approved`, `revoked`). The session token is SHA-256 hashed at rest; the plaintext is returned to the browser once and never stored. `authenticate` resolves a presented token by constant-time comparing its SHA-256 against **every** active row's hash without early-return, so timing leaks neither which row matched nor whether one did.
+3. **WS ticket** — 30-second TTL, single use, in memory (`auth::TicketStore`). A browser trades its session (bearer or cookie) at `POST /api/ws-ticket` for a ticket, then opens `/ws?ticket=…`. Ticket redemption is atomic (remove-then-TTL-check under one lock), so two simultaneous `GET /ws` with the same ticket resolve to exactly one winner. `ws_upgrade` **re-validates** `!revoked && approved` after redeeming the ticket, in case the session was revoked during the ticket's 30s window.
+
+Credentials travel two ways, both funneled through the same `authenticate`: an `Authorization: Bearer <token>` header (the shim's `fetch`), and an `HttpOnly; SameSite=Strict; Path=/` cookie (`cmux_web_session`) for `<img>`/asset GETs that can't set a header. There is no confusion/privilege gap between them.
+
+**Approval mode** (`require_approval`, off by default): a new pairing is inserted `approved = 0` and gets no tickets until the desktop approves it. The desktop's Remote Access pane surfaces pending devices with approve/reject; reject closes any live sockets and deletes the row.
+
+**Revocation severs live sockets immediately.** `web_remote_revoke_session` marks the row revoked and calls `ConnectionRegistry::close_session`, which frames a `Close` and trips a per-connection `watch` that unwinds the read loop (releasing its channels + event subscriptions). `web_remote_active_session_hashes` filters `WHERE revoked = 0`, so a revoked token can never re-authenticate.
+
+**Rate limiting**: `POST /api/pair` is capped at 5 attempts per minute per IP, keyed on the real TCP peer (`ConnectInfo<SocketAddr>.ip()`) — not `X-Forwarded-For`, so a spoofed header can't bypass it. A rejected attempt is not recorded, so a backing-off client recovers.
+
+**Origin checks** run on every state-touching route — the `/ws` upgrade, `/api/pair`, `/api/ws-ticket`, `/api/assets`, and both `/proxy/browser/*` routes. A present `Origin` must match the request `Host`; a missing `Origin` is allowed (native clients and same-origin asset GETs don't send one, and CSRF requires a browser that always does). A present-but-mismatched Origin is the cross-site case and is rejected.
+
+## Endpoint enumeration
+
+`web_remote_list_endpoints` (`endpoints::list`) enumerates every URL a browser could use to reach the bound server, so the settings UI can show copy-ready links with an accurate per-endpoint security note:
+
+- **loopback** (`127.0.0.1`) — always first, and the one origin a browser treats as a **secure context** over plain HTTP (so clipboard/notifications keep working here).
+- **lan** — every non-loopback private IPv4 (RFC 1918 + link-local) and non-link-local IPv6 on a local interface.
+- **tailnet** — interface IPs inside the `100.64.0.0/10` CGNAT range, plus whatever `tailscale status --json` reports for this node (when the mesh CLI is present).
+- **magicdns** — the node's MagicDNS name, labeled with a hint to enable the mesh's HTTPS serve for a trusted certificate.
+
+Only loopback reports `secure: true`. LAN/tailnet are plain HTTP from the server's point of view — it can't know whether a mesh proxy is terminating TLS in front of it — so they report `secure: false` and the UI surfaces the consequence. Everything degrades gracefully: no interfaces, no `tailscale` binary, or a malformed status blob just yields fewer entries, never an error.
+
+## Settings & device management UX
+
+Settings → Remote Access (`src/components/settings/remote-access-section.tsx`) is the desktop control surface:
+
+- **Master toggle** with a plain-language exposure warning (turning it on lets other devices drive this one).
+- **Port field** with validation; a port change while running rebinds the listener.
+- **Endpoint list** with copy buttons and a per-endpoint security note (secure loopback vs plain-HTTP LAN vs mesh HTTPS), from `web_remote_list_endpoints`.
+- **Pairing generator** — a link plus a client-side-rendered **QR code** (`use-qr-svg.ts`) encoding the `/#pair=<token>` URL, with a live countdown to the token's 10-minute expiry.
+- **Paired/connected devices list** — name, platform (derived from the user agent), last-seen relative time, and a live-connection dot, with per-device **revoke** and **revoke-all**.
+- **Approval-mode toggle** and the **pending-approval flow** — newly pending devices raise a desktop notification + badge and show approve/reject controls.
+
+Everything live-updates: every server/session state change emits `web-remote-state-changed` on the global bus, which both the desktop pane and any paired web client listen to. Clipboard copy is secure-context aware (it degrades where the browser blocks the Clipboard API on an insecure origin).
+
+Once paired, the web client shows a persistent "Remote — connected to `<host>`" indicator (`src/remote/status-banner.ts`) that degrades to a pulsing amber "Reconnecting…" on a socket drop and to an offline state on revocation (then reloads back to the pairing screen).
+
+## Multi-client semantics
+
+**Mirror mode (v1).** All clients — the desktop window and every paired browser — see the same `AppStateSnapshot`, including `active_workspace_id` and focus. Switching a workspace on the phone switches it on the desktop. Per-client (non-mirrored) views are explicitly out of scope for v1 (a deep state-model refactor; deferred).
+
+**Stream fan-out.** The live streams that used to target a single desktop channel now fan out to N subscribers so the desktop and one or more browsers can watch the same terminal or agent chat at once:
+
+- **Terminal** (`src-tauri/src/terminal/mod.rs`): `SessionRuntime` replaced its single `output_channel` with a subscriber list keyed by generation. `attach_pty_output` returns its generation and replays the `pending_output` ring **only to the new channel**; `detach_pty_output` takes a required generation arg and removes only that subscriber (never clobbering a newer attach). Flow control pauses the PTY reader **only when ALL subscribers request pause** (a per-generation pause set), and an attach clears only its own generation's pause — so a paused-then-detached browser can't park the reader forever, backed by the `FLOW_MAX_PARK` backstop. `dropped_chunks` counts only when there are zero subscribers.
+- **Agent chat** (`src-tauri/src/commands/agent_chat.rs`): `AgentChatChannelRegistry` became list-per-thread; attach pushes, detach removes by generation with empty-bucket cleanup, and `forward_event` iterates all subscribers of a thread. No replay is needed — SQLite history covers a late joiner.
+
+The frontend threads the generation token from `attachPtyOutput` through to `detachPtyOutput` on cleanup (`TerminalPane.tsx`). Desktop single-client behavior is byte-identical to before fan-out.
+
+**The desktop window owns scrollback serialization.** Web clients never ack `serialize-terminal-buffers` and never write scrollback files — `use-scrollback-serializer.ts` no-ops when `isRemoteClient()` is true. There is exactly one serialization owner regardless of how many browsers are attached.
+
+## Web fallbacks & parity
+
+The desktop UI assumes affordances a plain browser lacks. Each is bridged behind `isRemoteClient()` (`src/components/remote/is-remote-client.ts`), the single source of truth set by the shim before mount, so desktop behavior is never touched:
+
+- **File/folder picking → in-app path browser.** `pickFolder`/`pickFiles` (`src/lib/file-dialog.ts`) route to a path-browser modal (`src/components/remote/remote-path-picker.tsx`) backed by the existing directory-listing commands, returning the same `absolute path | null` / `path[]` shape the native dialog does. This unlocks **opening new projects and creating workspaces from the browser** — a first-class goal, not an afterthought.
+- **Notifications → Web Notifications with toast fallback.** The backend emits a global `notification` event alongside every native desktop notification. On the web client, `use-web-notifications.ts` raises a real OS notification via the Web Notifications API when permission is granted and the tab is hidden, and an in-app toast otherwise. Permission is requested lazily on the first event, never on mount. The desktop ignores the event (the OS notification already fired).
+- **`convertFileSrc` → `/api/assets`.** The shim maps a local file path to `GET /api/assets?path=<absolute>` on the server origin; `assets.rs` streams the file back with a guessed MIME type so `<img src>` and editor previews resolve exactly as the desktop `asset:` protocol does. Auth-gated (bearer or cookie + same-origin); directories and non-regular files collapse to a bare 404 (no path leak, no directory listing).
+- **Browser-pane proxy.** A remote client can't reach the loopback `agent-browser` daemons (ports 9223–9299), so `proxy.rs` bridges them through the authenticated origin: `GET /proxy/browser/:port/ws` upgrades and pipes the screencast socket frame-for-frame (binary-safe, backpressure-aware), and `ANY /proxy/browser/:port/api/*rest` forwards the daemon's HTTP endpoints. The port is validated strictly against the agent-browser range before any connection, keeping the proxy from becoming a general-purpose loopback forwarder. The HTTP forwarder rebuilds a **minimal** request (request line + `Host` + body headers only, single `write_all`) to respect the daemon's single-segment ~1.4 KB read constraint and to never leak the session's cookies/bearer to the daemon; it rejects any path segment containing an ASCII control character so a percent-decoded `%0d%0a` can't smuggle a header or a second request line into the daemon.
+- **Hidden window chrome.** The custom title-bar window controls and drag regions (`window-chrome.tsx`, `title-bar.tsx`) render nothing on the web — there is no OS window to minimize/maximize/close. The shim answers the window/webview plugin calls as no-ops so nothing crashes.
+- **Update defer + web-triggered desktop update.** The web client has no updater plugin, so the desktop's `useUpdateChecker` hook is the single updater. When a desktop update is ready it publishes availability to the server (`web_remote_publish_update_available`), which rides `web-remote-state-changed` (and the `web_remote_status` snapshot, so late joiners see it) to paired browsers. A browser can ask the desktop to run its normal download-and-restart flow (`web_remote_request_update` → the `web-remote-update-requested` event the desktop updater listens for; the desktop confirmation UX still applies). Conversely, while any remote device is attached (`connected_sessions > 0`), the desktop **defers** an auto-update restart by default and its update toast surfaces a "remote devices are connected" hint. The PTY daemon keeps agents alive across a restart; the web client reconnects via the shim's backoff loop.
+
+## Security model and constraints
+
+- **Default off.** Nothing binds until the user enables it; disabling tears the listener down.
+- **A paired session has desktop-level control by design.** It *is* the desktop (decision 5 in the plan). The `/api/assets` route is arbitrary-file-read on purpose — the same capability the desktop `asset:` protocol already has. The security boundary is pairing + revocation + the network layer, **not** per-command ACLs. Per-command scopes for paired devices are future work.
+- **Plain-HTTP endpoints are not secure contexts.** Only loopback qualifies. On a LAN/tailnet plain-HTTP origin a browser blocks the Clipboard API and can restrict notifications; the settings UI surfaces this per endpoint. For trusted HTTPS the recommended path is the user's **mesh VPN serve feature** (which fronts the plain-HTTP server with a valid certificate) or the user's own reverse proxy — TLS is delegated, not embedded, in v1.
+- **No PTY bytes through any cloud service.** Browser ⇄ desktop traffic is direct. There is no relay in v1.
+- **Account (OAuth) sign-in stays desktop-only by design.** The web client does not carry the account login; it authenticates to a *device* (the desktop) via pairing, and inherits whatever account the desktop is already signed into. Signing into a Codemux account happens on the desktop.
+- **localStorage session trade-off.** The paired session token lives in the browser's `localStorage`, so pairing survives a refresh without re-scanning a QR. On a shared machine that is a documented trade-off; revoke-from-desktop is the mitigation and severs the socket instantly.
+- **DoS hygiene (accepted v1 trade-offs):** the per-connection outbound queue is unbounded and each invoke spawns a task, but both are reachable only by an authed full-control session and the PTY path is flow-controlled; axum caps inbound WS messages at 64 MiB by default. The pairing rate-limiter's per-IP map is not aged-out, but entries are tiny and the population is a LAN/tailnet device set.
+
+## Dev/test affordances
+
+All three are compiled only into debug builds and, even there, dormant unless an env var is set — no release path is weakened:
+
+- **`web_remote::e2e_autostart`** (`#[cfg(debug_assertions)]` + `CODEMUX_WEB_REMOTE_E2E=1`): on boot, enables the server on `CODEMUX_WEB_REMOTE_PORT` (default 4377) with approval off, mints a one-time pairing token, and writes the full pairing URL to the file named by `CODEMUX_WEB_REMOTE_E2E_PAIRING_FILE` (created `0600` so only the launching user can read the token). `restore_on_boot` yields to this hook under the same gate so they never race on the bind. Lets an automated harness drive the served web client without a human clicking inside the native window.
+- **`auth::seed_dev_offline_login`** (`#[cfg(debug_assertions)]` + `CODEMUX_DEV_OFFLINE_LOGIN=1`): seeds a cached offline auth user via the normal `save_auth` path so a harness can boot the app without a real account or network. No-ops when a real session is already stored, so it never clobbers a genuine login.
+- **`?remote=1` under `npm run dev`**: forces `main.tsx` to install the real WebSocket shim (against a running server) instead of the in-process dev mock, so the production transport can be exercised in a plain browser during development.
+
+## Verification
+
+- **Rust unit/integration** (`cargo test`, `src-tauri`): the `web_remote` suite covers the pairing lifecycle (single-use, TTL, unknown/expired rejection), ticket single-use + binding + expiry, the rate limiter, `authenticate` round-trip + revocation + pending-approval, the origin check matrix, the connection registry (targeted `close_session` frame + signal), the session-admission gate (bearer + cookie, missing/unknown/pending/cross-origin), the channel router (marker rewrite incl. nested, JSON `chan` frame + binary frame shape, per-connection route teardown), the event fan-out, the endpoint enumeration (tailnet/LAN range detection, loopback-first-and-secure, IPv6 bracketing), the asset route (regular-file MIME + length, directory/missing → 404, MIME guessing), and the proxy path guards (port range, control-char rejection). The terminal and agent-chat suites cover the fan-out invariants (two subscribers interleave, detach(A) leaves B streaming, pause(A alone) doesn't stall B, replay reaches only the attacher, registry detach removes only the matching subscriber).
+- **Frontend** (`npm run test`): shim contract tests against a fake WS (invoke round-trip, channel ordering, listen refcounting), the transport (reconnect/ticket flow), the path-browser utils, the web-notifications delivery matrix, the remote-access settings utils + section, and the update-defer decision.
+- **Live end-to-end** (Stage 4): the real desktop app (`npm run tauri:dev`) with the server enabled, driven through the Codemux browser pane — pair via link + QR, watch a live terminal (replay + live bytes + input), run an agent-chat turn, open an existing project, create a new workspace via the web path-browser, second-client mirroring (desktop + web at once), revoke mid-session (socket drops), and reconnect behavior.
+
+## Relationship to remote hosts
+
+Web remote access is a **UI transport**: a second frontend for the same backend. Remote hosts (`docs/features/remote-hosts.md`) is a **compute transport**: the same frontend driving a backend on another machine over SSH. They are orthogonal and compose cleanly:
+
+- A paired **web client** issues the same invokes the desktop does, so it transparently sees and drives whatever remote hosts the desktop has configured — pushing a workspace to a host, watching a host-side agent, adopting a sibling workspace — with no web-specific host code.
+- The two never share a byte path: web traffic is browser ⇄ desktop (direct), host traffic is desktop ⇄ host (SSH). A future relay/account tier for web access is a strictly additive phase and does not touch the remote-hosts SSH stack.
+
+The clean mental model: remote hosts move *where the work runs*; web remote access moves *where you watch and steer it from*.
+
+## Important Touch Points
+
+- `src-tauri/src/web_remote/` — the embedded server: `mod.rs` (state/lifecycle/commands/boot hooks), `server.rs` (router, connection registry, WS lifecycle, session gate), `auth.rs` (pairing/session/ticket/rate-limit/origin), `dispatch.rs` (invoke via `on_message` + channel router), `events.rs` (`listen_any` hub), `endpoints.rs` (endpoint enumeration), `assets.rs` (`/api/assets`), `proxy.rs` (browser-pane proxy).
+- `src-tauri/src/lib.rs` — registers `WebRemoteState`, wires the channel interceptor to `channel_router().route`, calls `restore_on_boot` + `e2e_autostart` in `setup`, and lists the twelve `web_remote_*` commands in `generate_handler!`.
+- `src-tauri/src/database.rs` — the `web_remote_sessions` table + its accessors (insert/get/list/active-hashes/touch/approve/revoke/delete).
+- `src-tauri/src/terminal/mod.rs`, `src-tauri/src/commands/agent_chat.rs` — the multi-subscriber stream fan-out.
+- `src-tauri/src/notifications.rs` — emits the global `notification` event the web bridge consumes.
+- `src/main.tsx` — three-way runtime shim selection (real / dev mock / web shim; `?remote=1` dev override).
+- `src/remote/` — `bootstrap.tsx` (pairing screen + connect loop), `shim.ts` (installs `__TAURI_INTERNALS__`), `transport.ts` (WS + reconnect + ticket flow), `session.ts` (localStorage session), `status-banner.ts` (remote indicator), `web-remote-events.ts` (`web-remote-state-changed` helper), `bootstrap-entry.ts`.
+- `src/components/remote/` — `is-remote-client.ts` (the `isRemoteClient()` source of truth), `remote-path-picker.tsx` + `-store.ts` + `path-utils.ts` (web file/folder picker).
+- `src/components/settings/remote-access-section.tsx` (+ `remote-access-utils.ts`, `use-qr-svg.ts`) — the Remote Access settings pane.
+- `src/hooks/use-web-notifications.ts` — Web Notifications / toast bridge.
+- `src/hooks/use-update-checker.ts` — desktop updater as the single updater; publishes availability + defers restart while remote devices attach.
+- `src/hooks/use-scrollback-serializer.ts` — no-ops on the web client (desktop owns serialization).
+- `src/lib/file-dialog.ts` — routes to the web path picker when remote.
+- `src/components/layout/{window-chrome,title-bar}.tsx`, `src/components/browser/BrowserPane.tsx` — remote-gated chrome + browser-pane proxy wiring.
+- `docs/plans/web-remote-access.md` — the locked design contract, WS protocol reference, and remaining work.
+
+## Notes
+
+- The dev mock (`src/dev/tauri-mock.ts`) is the reference for the `Channel` `{index, message}` delivery shape; keep the production shim's channel dispatch aligned with it.
+- Keep the WS protocol frame shapes in `dispatch.rs`/`events.rs` and `transport.ts`/`shim.ts` in lockstep — they are two ends of one contract.
+- Current-truth lives here; active next steps (relay/account tier, per-client views, per-command ACL scopes, browser-pane screencast confirmation on a real display, updater UX against a published release) live in `docs/plans/web-remote-access.md`.

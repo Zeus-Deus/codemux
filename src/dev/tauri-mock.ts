@@ -36,7 +36,12 @@ import {
   MOCK_CHAT_THREAD_ID,
   MOCK_HOME_DIR,
   MOCK_USER,
+  MOCK_WEB_REMOTE_PORT,
   createSeedAppState,
+  mockListDirectory,
+  mockWebRemoteEndpoints,
+  mockWebRemotePairing,
+  mockWebRemoteSessions,
   richChatTurnEnvelopes,
 } from "./mock-fixtures";
 import type {
@@ -51,6 +56,8 @@ import type {
   ShellAppearance,
   ThemeColors,
   UserSettings,
+  WebRemoteSessionView,
+  WebRemoteStatus,
   WorkspaceSnapshot,
 } from "@/tauri/types";
 
@@ -181,6 +188,11 @@ interface MockChatChannelEntry {
 
 const chatChannels = new Map<string, MockChatChannelEntry>();
 let chatChannelGeneration = 0;
+
+/** Monotonic PTY-output attach generation, minted by `attach_pty_output`
+ *  so callers get a real token to thread into detach/pause/resume — the
+ *  same contract the desktop backend and web-remote dispatch honour. */
+let ptyOutputGeneration = 0;
 
 function chatChannelPush(entry: MockChatChannelEntry, payload: unknown): void {
   const id = (entry.channel as { id?: number } | undefined)?.id;
@@ -644,6 +656,81 @@ function resourceMetrics(): ResourceMetricsSnapshot {
   };
 }
 
+// ── Web Remote Access (mocked server state machine) ─────────────────
+//
+// A small mutable twin of the real `web_remote` server so the Settings →
+// Remote Access panel is fully exercisable in plain-browser dev.
+// enable/disable/set_config/approve/revoke all mutate this state and
+// re-emit `web-remote-state-changed`, exactly like the backend's
+// `emit_state_changed`. Starts DISABLED (matching the real default-off
+// posture) with three seeded devices and approval mode on so the pending
+// row shows the moment the server is turned on.
+
+let webRemotePort = MOCK_WEB_REMOTE_PORT;
+let webRemoteEnabled = false;
+let webRemoteRequireApproval = true;
+let webRemoteSessions: WebRemoteSessionView[] = mockWebRemoteSessions();
+let webRemoteLiveSeq = 0;
+
+function buildWebRemoteStatus(): WebRemoteStatus {
+  return {
+    enabled: webRemoteEnabled,
+    running: webRemoteEnabled,
+    port: webRemotePort,
+    require_approval: webRemoteRequireApproval,
+    active_connections: webRemoteEnabled
+      ? webRemoteSessions.filter((s) => s.approved && s.connected).length
+      : 0,
+    // Mirrors the backend: distinct devices with a live socket (connected
+    // implies approved). Drives the "N connected" badge + updater defer.
+    connected_sessions: webRemoteEnabled
+      ? webRemoteSessions.filter((s) => s.connected).length
+      : 0,
+    sessions: webRemoteSessions,
+  };
+}
+
+function emitWebRemoteState(): void {
+  emitEvent("web-remote-state-changed", buildWebRemoteStatus());
+}
+
+// Console/automation hook: inject a brand-new pending device so the live
+// "device wants to connect" toast + pending badge can be observed in dev.
+//   window.__codemuxRemoteMock.addPendingDevice("iPad")
+(
+  window as unknown as {
+    __codemuxRemoteMock: {
+      addPendingDevice(name?: string): string;
+      setConnected(id: string, connected: boolean): void;
+    };
+  }
+).__codemuxRemoteMock = {
+  addPendingDevice(name?: string): string {
+    const id = `sess-live-${++webRemoteLiveSeq}`;
+    webRemoteSessions = [
+      ...webRemoteSessions,
+      {
+        id,
+        name: name ?? `New device ${webRemoteLiveSeq}`,
+        user_agent:
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        created_at: new Date().toISOString(),
+        last_seen_at: null,
+        approved: false,
+        connected: false,
+      },
+    ];
+    emitWebRemoteState();
+    return id;
+  },
+  setConnected(id: string, connected: boolean): void {
+    webRemoteSessions = webRemoteSessions.map((s) =>
+      s.id === id ? { ...s, connected } : s,
+    );
+    emitWebRemoteState();
+  },
+};
+
 // ── Command router ──────────────────────────────────────────────────
 //
 // Keyed by exact Tauri command name. Boot-critical reads return seed
@@ -727,6 +814,13 @@ const handlers: Record<string, Handler> = {
     }
     return [];
   },
+
+  // ── Filesystem listing ──
+  // Backs the web-remote path browser (Stage 3b). Serves a small static
+  // tree (see `mockListDirectory`) and rejects unknown paths like the real
+  // `list_directory` so manual-path validation is exercisable in dev.
+  list_directory: (a) =>
+    mockListDirectory(String(a.path ?? "/"), Boolean(a.showHidden)),
 
   // ── Theme / appearance ──
   get_current_theme: () => THEME,
@@ -963,6 +1057,51 @@ const handlers: Record<string, Handler> = {
       "the next push uses the fresh binary.",
   }),
 
+  // ── Web Remote Access ──
+  //
+  // Server state machine defined above. Reads reflect current state;
+  // mutators patch it and re-emit `web-remote-state-changed`, so the panel
+  // (and any second desktop UI) live-updates just like the real backend.
+  web_remote_status: () => buildWebRemoteStatus(),
+  web_remote_enable: () => {
+    webRemoteEnabled = true;
+    emitWebRemoteState();
+    return buildWebRemoteStatus();
+  },
+  web_remote_disable: () => {
+    webRemoteEnabled = false;
+    emitWebRemoteState();
+    return buildWebRemoteStatus();
+  },
+  web_remote_set_config: (a) => {
+    if (typeof a.port === "number") webRemotePort = a.port;
+    if (typeof a.requireApproval === "boolean") {
+      webRemoteRequireApproval = a.requireApproval;
+    }
+    emitWebRemoteState();
+    return buildWebRemoteStatus();
+  },
+  web_remote_create_pairing: () => mockWebRemotePairing(),
+  web_remote_list_endpoints: () => mockWebRemoteEndpoints(webRemotePort),
+  web_remote_list_sessions: () => webRemoteSessions,
+  web_remote_revoke_session: (a) => {
+    webRemoteSessions = webRemoteSessions.filter((s) => s.id !== a.sessionId);
+    emitWebRemoteState();
+    return buildWebRemoteStatus();
+  },
+  web_remote_approve_session: (a) => {
+    webRemoteSessions = webRemoteSessions.map((s) =>
+      s.id === a.sessionId ? { ...s, approved: true, connected: true } : s,
+    );
+    emitWebRemoteState();
+    return buildWebRemoteStatus();
+  },
+  web_remote_reject_session: (a) => {
+    webRemoteSessions = webRemoteSessions.filter((s) => s.id !== a.sessionId);
+    emitWebRemoteState();
+    return buildWebRemoteStatus();
+  },
+
   // ── Cross-device workspace sync registry ──
   //
   // Seed a few sibling-device rows (workspace_id: null) on the "pandora"
@@ -1063,7 +1202,10 @@ const handlers: Record<string, Handler> = {
   get_terminal_scrollback: () => null,
   attach_pty_output: (a) => {
     pushMockTerminalBanner(a.channel);
-    return undefined;
+    // Mint a real generation like the desktop backend + web-remote
+    // dispatch do, so `detach/pause/resumePtyOutput` are exercised with a
+    // concrete token instead of `undefined`.
+    return ++ptyOutputGeneration;
   },
   resize_pty: () => undefined,
   write_to_pty: () => undefined,
@@ -1261,5 +1403,26 @@ const internals: TauriInternals = {
     };
   }
 ).__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener };
+
+// Dev affordance: fire a backend-style global `notification` event from the
+// browser console to exercise the web-remote notification bridge
+// (`useWebNotifications`). Enable the remote flag first so the hook is live:
+//   window.__CODEMUX_REMOTE__ = true
+//   __codemuxMockNotify("Agent finished — Demo", "Ready for review", "Demo")
+(
+  window as unknown as {
+    __codemuxMockNotify: (
+      title: string,
+      body?: string,
+      workspaceTitle?: string,
+    ) => void;
+  }
+).__codemuxMockNotify = (
+  title,
+  body = "Codemux is waiting for your review.",
+  workspaceTitle = "Demo",
+) => {
+  emitEvent("notification", { title, body, workspace_title: workspaceTitle });
+};
 
 export {};

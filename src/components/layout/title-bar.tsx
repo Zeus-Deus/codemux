@@ -5,6 +5,7 @@ import {
   ExternalLink,
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { ResourceMonitor } from "./resource-monitor";
 import {
   DropdownMenu,
@@ -211,7 +212,13 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
             when disabled. */}
         <ResourceMonitor />
         <IdeLauncher />
-        <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
+        {/* The separator only divides the content cluster from the native
+            window controls — on the web remote client those controls render
+            nothing, so the separator would dangle at the right edge. Hide it
+            there. */}
+        {!isRemoteClient() && (
+          <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
+        )}
         <WindowControls />
       </div>
     </div>

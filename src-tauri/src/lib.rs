@@ -79,6 +79,10 @@ pub mod terminal;
 // Opt-in cloud-push diagnostic tracing. Defines the crate-wide
 // `trace_cloud_push!` macro (gated on `CODEMUX_TRACE_CLOUD_PUSH`).
 pub mod trace;
+// Embedded web remote-access server (default-off HTTP+WebSocket). Lets a
+// browser on another device drive this running instance as a second
+// frontend. See docs/plans/web-remote-access.md.
+pub mod web_remote;
 
 /// Save window dimensions and position to SQLite before close.
 fn save_window_state(handle: &tauri::AppHandle) {
@@ -152,6 +156,14 @@ pub fn run() {
             start
         ));
     }
+
+    // Web-remote state must exist before the builder so the channel
+    // interceptor (registered below) and the WS dispatcher share one
+    // channel routing table. The interceptor reroutes a synthesized
+    // invoke's channel frames to the owning browser instead of the
+    // desktop webview.
+    let web_remote_state = web_remote::WebRemoteState::default();
+    let web_remote_channel_router = web_remote_state.channel_router();
 
     tauri::Builder::default()
         // This plugin should run before the rest of the app setup so duplicate
@@ -233,6 +245,14 @@ pub fn run() {
             eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
             database::DatabaseStore::new_in_memory()
         }))
+        .manage(web_remote_state)
+        // Reroute channel frames opened by a web-remote invoke to the
+        // browser that opened them. Returns true only for server-allocated
+        // channel ids (the router owns them); genuine desktop-webview
+        // channels fall through to Tauri's default delivery.
+        .channel_interceptor(move |_webview, callback, index, body| {
+            web_remote_channel_router.route(callback.0, index, body)
+        })
         .plugin(tauri_plugin_opener::init())
         // Persistent native logging: app log dir + stderr. Warn-level
         // globally so dependency chatter stays out, which still
@@ -1383,6 +1403,25 @@ pub fn run() {
                 }
             }
 
+            // Dev/test-only: an automated harness can set
+            // `CODEMUX_DEV_OFFLINE_LOGIN=1` (paired with an unreachable
+            // `CODEMUX_API_URL`) to seed an offline dev login so the served
+            // app is usable without a real account. No-op in release builds
+            // and dormant without the env var.
+            #[cfg(debug_assertions)]
+            crate::auth::seed_dev_offline_login(&app.state::<crate::database::DatabaseStore>());
+
+            // Restore web remote-access: if the user left it enabled, this
+            // re-binds the server on boot (non-fatal if the port is taken).
+            crate::web_remote::restore_on_boot(app.handle());
+
+            // Dev/test-only: an automated end-to-end harness can set
+            // `CODEMUX_WEB_REMOTE_E2E=1` to have the server come up and a
+            // pairing URL written to disk on boot. No-op in release builds
+            // (gated on `debug_assertions`) and dormant without the env var.
+            #[cfg(debug_assertions)]
+            crate::web_remote::e2e_autostart(app.handle());
+
             #[cfg(debug_assertions)]
             {
                 let pid = std::process::id();
@@ -1718,6 +1757,19 @@ pub fn run() {
             session_adapters::validate_resume,
             session_adapters::get_adapter_info,
             session_adapters::get_scanner_captures,
+            // Web remote access (docs/plans/web-remote-access.md).
+            web_remote::web_remote_status,
+            web_remote::web_remote_enable,
+            web_remote::web_remote_disable,
+            web_remote::web_remote_set_config,
+            web_remote::web_remote_create_pairing,
+            web_remote::web_remote_list_endpoints,
+            web_remote::web_remote_list_sessions,
+            web_remote::web_remote_revoke_session,
+            web_remote::web_remote_approve_session,
+            web_remote::web_remote_reject_session,
+            web_remote::web_remote_publish_update_available,
+            web_remote::web_remote_request_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

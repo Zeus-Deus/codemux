@@ -1,9 +1,25 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use tauri::{AppHandle, Manager};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::state::AppStateStore;
+
+/// Global event mirrored to web clients alongside the native desktop
+/// notification. Stage 3b's frontend surfaces it via the Web Notifications API
+/// (with a toast fallback); the desktop path is unchanged.
+const NOTIFICATION_EVENT: &str = "notification";
+
+/// Payload for the global [`NOTIFICATION_EVENT`]. Serialized snake_case so web
+/// clients see stable field names. `title`/`body` carry exactly what the
+/// native notification shows; `workspace_title` is the originating workspace.
+#[derive(Debug, Clone, Serialize)]
+pub struct NotificationPayload {
+    pub title: String,
+    pub body: String,
+    pub workspace_title: String,
+}
 
 #[cfg(target_os = "linux")]
 const FREEDESKTOP_COMPLETE: &str = "/usr/share/sounds/freedesktop/stereo/complete.oga";
@@ -26,11 +42,31 @@ pub fn should_suppress(app: &AppHandle, pane_in_active_workspace: bool) -> bool 
 /// Clicking the notification focuses the Codemux window (and on Hyprland,
 /// jumps to whichever workspace it lives on).
 pub fn dispatch_agent_complete(app: &AppHandle, workspace_title: &str) {
-    let summary = format!("Agent finished — {}", workspace_title);
-    let body = "Codemux is waiting for your review.".to_string();
+    let payload = agent_complete_payload(workspace_title);
 
-    show_desktop_notification(app, &summary, &body);
+    // Native desktop path — byte-identical to before: same summary/body
+    // strings, same show + sound calls in the same order.
+    show_desktop_notification(app, &payload.title, &payload.body);
     play_completion_sound(app);
+
+    // Web-remote bridge: mirror the same notification onto the global event
+    // bus so a paired browser can raise an OS notification client-side (Stage
+    // 3b). Purely additive — emitting is independent of the native path and a
+    // no-op when nobody is listening. Web-side suppression (e.g. the tab is
+    // focused) is the frontend's policy, not ours.
+    let _ = app.emit(NOTIFICATION_EVENT, payload);
+}
+
+/// Build the payload for an "agent finished" notification. Split out so the
+/// title/body/serialization contract is unit-testable without firing a real
+/// desktop notification. The strings must match the native summary/body so the
+/// web and desktop notifications read identically.
+fn agent_complete_payload(workspace_title: &str) -> NotificationPayload {
+    NotificationPayload {
+        title: format!("Agent finished — {}", workspace_title),
+        body: "Codemux is waiting for your review.".to_string(),
+        workspace_title: workspace_title.to_string(),
+    }
 }
 
 fn show_desktop_notification(app: &AppHandle, summary: &str, body: &str) {
@@ -143,5 +179,26 @@ fn play_completion_sound(app: &AppHandle) {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_complete_payload_matches_native_strings_and_serializes_snake_case() {
+        let payload = agent_complete_payload("My Project");
+        // Must equal the strings the native notification renders.
+        assert_eq!(payload.title, "Agent finished — My Project");
+        assert_eq!(payload.body, "Codemux is waiting for your review.");
+        assert_eq!(payload.workspace_title, "My Project");
+
+        // The web bridge event carries snake_case keys web clients rely on.
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(v["title"], "Agent finished — My Project");
+        assert_eq!(v["body"], "Codemux is waiting for your review.");
+        assert_eq!(v["workspace_title"], "My Project");
+        assert!(v.get("workspaceTitle").is_none(), "no camelCase leakage");
     }
 }

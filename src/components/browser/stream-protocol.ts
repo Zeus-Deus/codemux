@@ -218,6 +218,76 @@ export function httpBaseFromStreamUrl(streamUrl: string | null | undefined): str
   return url.origin;
 }
 
+// ---------------------------------------------------------------------------
+// Remote (web-remote) browser-pane proxy endpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse the port from an agent-browser daemon stream URL such as
+ * `ws://127.0.0.1:9250`. Returns null for anything that isn't a `ws(s)://`
+ * URL carrying an explicit port.
+ */
+export function portFromLoopbackStreamUrl(
+  streamUrl: string | null | undefined,
+): number | null {
+  if (!streamUrl || typeof streamUrl !== "string") return null;
+  let url: URL;
+  try {
+    url = new URL(streamUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "ws:" && url.protocol !== "wss:") return null;
+  if (url.port === "") return null;
+  const port = Number(url.port);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+  return port;
+}
+
+export interface RemoteBrowserEndpoints {
+  /** Proxied stream WebSocket URL on the served origin. */
+  wsUrl: string;
+  /** Proxied HTTP base (no trailing slash) for `/api/status` + `/api/command`. */
+  httpBase: string;
+}
+
+/**
+ * Derive the browser-pane proxy endpoints for a remote (browser) client.
+ *
+ * A remote client can't reach the agent-browser daemon's loopback socket
+ * (`ws://127.0.0.1:<port>`), so its stream WebSocket and HTTP sidecar are
+ * bridged through the authenticated web-remote origin's
+ * `/proxy/browser/<port>/…` routes (see `src-tauri/src/web_remote/proxy.rs`).
+ * The session cookie rides along automatically because these requests are
+ * same-origin as the served page.
+ *
+ * `pageOrigin` is the served page's origin (`window.location.origin`), e.g.
+ * `http://192.168.1.5:4377` or `https://host.tailnet.ts.net` — its scheme
+ * decides ws/wss and http/https. Returns null when the daemon port can't be
+ * parsed from `loopbackStreamUrl`.
+ */
+export function remoteBrowserEndpoints(
+  loopbackStreamUrl: string | null | undefined,
+  pageOrigin: string,
+): RemoteBrowserEndpoints | null {
+  const port = portFromLoopbackStreamUrl(loopbackStreamUrl);
+  if (port === null) return null;
+  let origin: URL;
+  try {
+    origin = new URL(pageOrigin);
+  } catch {
+    return null;
+  }
+  const secure = origin.protocol === "https:";
+  const httpScheme = secure ? "https:" : "http:";
+  const wsScheme = secure ? "wss:" : "ws:";
+  const authority = origin.host; // host[:port]
+  return {
+    httpBase: `${httpScheme}//${authority}/proxy/browser/${port}`,
+    wsUrl: `${wsScheme}//${authority}/proxy/browser/${port}/ws`,
+  };
+}
+
 /**
  * Unwrap a daemon command response. The daemon envelopes results as
  * `{id, success, data: {result, ...}}`; older shapes use a bare
