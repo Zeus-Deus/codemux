@@ -23,7 +23,7 @@ All types live in `src-tauri/src/observability.rs`:
 - **`ReplayRecord`** — `{ replay_id, title, summary, created_at_ms }`. The UI keeps the most recent 50 records so the user can see past OpenFlow runs without opening the full run.
 - **`SafetyConfig`** — `{ model_budget_usd, max_concurrency, auto_apply, approval_required_for_completion }`. Read by OpenFlow runtime to decide whether to pause a run that's about to exceed budget or start too many concurrent agents.
 
-All six pieces are bundled in `ObservabilitySnapshot` and persisted as one JSON file to `dirs::data_dir() / codemux / observability.json` (exact path via `snapshot_path()`). `load_observability_store()` reads the file on app startup; every mutation writes the snapshot back synchronously via `save_snapshot(&snapshot)`.
+All six pieces are bundled in `ObservabilitySnapshot` and persisted as one JSON file to `dirs::data_dir() / APP_DIR_NAME / observability.json` — `codemux` for release builds, `codemux-dev` for debug builds (exact path via `snapshot_path()`). The per-build scoping matters: feature flags (including the Agent Chat Beta toggle) live in this file, and an earlier machine-shared location (`~/.codemux/observability.json`) made the toggle flip in both the installed release and a locally-running dev build at once. `load_observability_store()` reads the file on app startup — falling back once to the legacy `~/.codemux/observability.json` and copying it into the per-build location when the new file doesn't exist yet (the legacy file is left in place for older versions) — and every mutation writes the snapshot back synchronously via `save_snapshot(&snapshot)`.
 
 ## What Works Today
 
@@ -108,4 +108,4 @@ call sites live in `terminal/daemon_backed.rs`, `ssh/registry.rs`,
 - `src-tauri/src/trace.rs` — `cloud_push_enabled()` + the `trace_cloud_push!` macro (`CODEMUX_TRACE_CLOUD_PUSH` gate for cloud-push diagnostics)
 - `src/stores/observability-store.ts` — Zustand store consuming the snapshot
 - `src-tauri/src/openflow/orchestrator.rs` — reads `PermissionPolicy` and `SafetyConfig` to gate risky actions and enforce run budgets
-- Persisted file: `dirs::data_dir() / codemux / observability.json` (platform-specific: `~/.local/share/codemux/observability.json` on Linux, `%APPDATA%\codemux\observability.json` on Windows, `~/Library/Application Support/codemux/observability.json` on macOS)
+- Persisted file: `dirs::data_dir() / APP_DIR_NAME / observability.json`, where `APP_DIR_NAME` is `codemux` for release builds and `codemux-dev` for debug builds (platform-specific: `~/.local/share/codemux/observability.json` on Linux, `%APPDATA%\codemux\observability.json` on Windows, `~/Library/Application Support/codemux/observability.json` on macOS). The legacy machine-shared `~/.codemux/observability.json` is read once and migrated forward when the per-build file doesn't exist yet.
