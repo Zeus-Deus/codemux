@@ -15,7 +15,8 @@
 5. relevant feature docs in `docs/features/`
 6. `docs/reference/ARCHITECTURE.md` if you need the repo/layer map
 7. `docs/reference/CONTROL.md` if touching CLI, socket, browser automation, memory, or indexing
-8. `AGENTS.md` for Codemux-specific agent operating rules
+8. `docs/reference/DESIGN-SYSTEM.md` if touching UI, components, colors, or theming
+9. `AGENTS.md` for Codemux-specific agent operating rules
 
 If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_REINDEX.md`.
 
@@ -83,6 +84,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Windows cross-platform work: `docs/plans/windows-support.md`
 - Dev mock runtime (dual-guarded `src/dev/` Tauri shim that boots the real UI in a plain browser under `npm run dev` with seed data, for visual/screenshot work): `docs/features/dev-mock-runtime.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
+- Design system (color tokens, theming layers, `.theme-warm`/density scales, the no-hardcoded-colors rule — shadcn stone base `b1HYEHloH`): `docs/reference/DESIGN-SYSTEM.md`
 - Keyboard shortcuts: `docs/reference/SHORTCUTS.md`
 - Feature inventory: `docs/reference/FEATURES.md`
 - Control and automation work: `docs/reference/CONTROL.md`
