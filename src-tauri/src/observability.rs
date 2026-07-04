@@ -1,7 +1,6 @@
-use crate::git::ensure_git_exclude;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +40,9 @@ pub struct FeatureFlags {
     /// Defaults to `false`: the chat pane is not selectable in the UI,
     /// lifecycle commands return `FeatureDisabled`, and the provider
     /// registry is not initialised at startup. Flip to `true` via
-    /// `update_feature_flags` or by editing
-    /// `.codemux/observability.json` to dogfood the scaffolding.
+    /// `update_feature_flags` or by editing the persisted
+    /// `observability.json` (see [`snapshot_path`]) to dogfood the
+    /// scaffolding.
     #[serde(default)]
     pub enable_agent_chat: bool,
     /// Gates the lazy-workspace-creation path: sidebar-plus and
@@ -51,8 +51,8 @@ pub struct FeatureFlags {
     /// real workspace on first message send.
     ///
     /// Defaults to `false`: today's eager flow is preserved. Flip to
-    /// `true` via `update_feature_flags` or by editing
-    /// `.codemux/observability.json`.
+    /// `true` via `update_feature_flags` or by editing the persisted
+    /// `observability.json` (see [`snapshot_path`]).
     #[serde(default)]
     pub enable_lazy_workspace_creation: bool,
 }
@@ -212,14 +212,26 @@ impl ObservabilityStore {
 }
 
 pub fn load_observability_store() -> ObservabilityStore {
-    let path = snapshot_path();
-    match fs::read_to_string(&path) {
+    let snapshot = load_or_migrate_snapshot(&snapshot_path(), &legacy_snapshot_path());
+    ObservabilityStore {
+        inner: Arc::new(Mutex::new(snapshot)),
+    }
+}
+
+/// Outcome of trying to read a snapshot file, distinguishing "file is
+/// absent" (safe to look elsewhere) from "file exists but is broken"
+/// (fall back to defaults loudly — do NOT resurrect state from another
+/// location, which could silently flip feature flags).
+enum ReadOutcome {
+    Loaded(Box<ObservabilitySnapshot>),
+    Missing,
+    Unreadable,
+}
+
+fn read_snapshot(path: &Path) -> ReadOutcome {
+    match fs::read_to_string(path) {
         Ok(contents) => match serde_json::from_str::<ObservabilitySnapshot>(&contents) {
-            Ok(snapshot) => {
-                return ObservabilityStore {
-                    inner: Arc::new(Mutex::new(snapshot)),
-                };
-            }
+            Ok(snapshot) => ReadOutcome::Loaded(Box::new(snapshot)),
             Err(error) => {
                 // Don't swallow: partial/corrupt JSON silently defaulting to
                 // `enable_agent_chat: false` cost us hours. Log and continue.
@@ -227,20 +239,49 @@ pub fn load_observability_store() -> ObservabilityStore {
                     "[codemux::observability] Failed to parse {}: {error}. Falling back to defaults.",
                     path.display()
                 );
+                ReadOutcome::Unreadable
             }
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // First run on this machine — nothing to log.
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReadOutcome::Missing,
         Err(error) => {
             eprintln!(
                 "[codemux::observability] Failed to read {}: {error}. Falling back to defaults.",
                 path.display()
             );
+            ReadOutcome::Unreadable
         }
     }
+}
 
-    ObservabilityStore::default()
+/// Load the snapshot from the per-build `path`; when it doesn't exist
+/// yet, fall back to the legacy machine-shared location and copy it
+/// forward once.
+///
+/// The copy (rather than a move) keeps the legacy file intact so an
+/// older installed release that still reads `~/.codemux/` keeps
+/// working after a downgrade. After migration each build owns its own
+/// file, so they diverge from that point on — which is the fix for
+/// the shared-flags bug (see [`snapshot_path`]).
+fn load_or_migrate_snapshot(path: &Path, legacy_path: &Path) -> ObservabilitySnapshot {
+    match read_snapshot(path) {
+        ReadOutcome::Loaded(snapshot) => *snapshot,
+        ReadOutcome::Unreadable => default_snapshot(),
+        ReadOutcome::Missing => match read_snapshot(legacy_path) {
+            ReadOutcome::Loaded(snapshot) => {
+                if let Err(error) = save_snapshot_to(path, &snapshot) {
+                    // Non-fatal: the next mutation re-attempts the write via
+                    // `save_snapshot`. Until then we serve the legacy state.
+                    eprintln!(
+                        "[codemux::observability] Failed to migrate legacy snapshot {} -> {}: {error}",
+                        legacy_path.display(),
+                        path.display()
+                    );
+                }
+                *snapshot
+            }
+            _ => default_snapshot(),
+        },
+    }
 }
 
 fn default_snapshot() -> ObservabilitySnapshot {
@@ -281,18 +322,18 @@ fn default_snapshot() -> ObservabilitySnapshot {
 }
 
 fn save_snapshot(snapshot: &ObservabilitySnapshot) -> Result<(), String> {
-    let path = snapshot_path();
+    save_snapshot_to(&snapshot_path(), snapshot)
+}
+
+fn save_snapshot_to(path: &Path, snapshot: &ObservabilitySnapshot) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create observability dir: {error}"))?;
     }
-    if let Some(workspace_dir) = path.parent().and_then(|p| p.parent()) {
-        ensure_git_exclude(workspace_dir, ".codemux");
-    }
 
     let json = serde_json::to_string_pretty(snapshot)
         .map_err(|error| format!("Failed to serialize observability snapshot: {error}"))?;
-    fs::write(&path, json).map_err(|error| {
+    fs::write(path, json).map_err(|error| {
         format!(
             "Failed to write observability snapshot {}: {error}",
             path.display()
@@ -300,13 +341,43 @@ fn save_snapshot(snapshot: &ObservabilitySnapshot) -> Result<(), String> {
     })
 }
 
+/// Per-build snapshot location:
+/// `~/.local/share/codemux/observability.json` for release builds,
+/// `~/.local/share/codemux-dev/observability.json` for debug builds
+/// (platform-specific `dirs::data_dir()` on Windows/macOS).
+///
+/// Two hard-won constraints:
+///
+/// 1. Anchor to the XDG data dir, not CWD. CWD drifts between build
+///    modes (`cargo tauri dev` launches from `src-tauri/`, the
+///    installed binary from wherever the user invoked it), so a
+///    CWD-relative path produces a different file per launch —
+///    feature flags and safety config appear to "not stick" across
+///    restarts. See feature/agent-chat debugging for the incident.
+/// 2. Scope by `APP_DIR_NAME`, like every other piece of local state
+///    (sqlite db, auth tokens, settings cache). The previous location,
+///    `~/.codemux/observability.json`, was shared by every Codemux
+///    build on the machine, so flipping Settings → Beta Features →
+///    Agent Chat in a dev build also flipped it in the installed
+///    release (and vice versa) — feature flags leaked across
+///    otherwise-isolated instances and accounts.
 fn snapshot_path() -> PathBuf {
-    // Anchor to $HOME, not CWD. CWD drifts between build modes (`cargo
-    // tauri dev` launches from `src-tauri/`, the installed binary from
-    // wherever the user invoked it), so a CWD-relative path produces a
-    // different file per launch — feature flags and safety config
-    // appear to "not stick" across restarts. See feature/agent-chat
-    // debugging for the incident.
+    data_root().join("observability.json")
+}
+
+/// Mirrors `settings_sync::cache_dir()` — the canonical per-build
+/// local-state root.
+fn data_root() -> PathBuf {
+    let data_dir = dirs::data_dir()
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".local/share"));
+    data_dir.join(crate::APP_DIR_NAME)
+}
+
+/// Pre-migration location, shared by every build on the machine.
+/// Read-only from here on: consulted once when the per-build file
+/// doesn't exist yet, never written to. Left in place so older
+/// installed versions that still read it keep working.
+fn legacy_snapshot_path() -> PathBuf {
     let root = dirs::home_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     root.join(".codemux").join("observability.json")
@@ -337,29 +408,118 @@ fn current_time_ms() -> u64 {
 mod tests {
     use super::*;
 
-    // Regresses the dev-vs-release drift bug: the old CWD-relative
-    // `snapshot_path` resolved to `src-tauri/.codemux/observability.json`
-    // under `cargo tauri dev` and `$HOME/.codemux/observability.json`
-    // under the installed binary — so edits in one file never affected
-    // the other launch mode. Pinning to `$HOME` keeps both in sync.
+    // Regresses two path bugs:
+    //
+    // 1. CWD drift: an early CWD-relative `snapshot_path` resolved to
+    //    `src-tauri/.codemux/observability.json` under `cargo tauri
+    //    dev` and a different file under the installed binary — flags
+    //    appeared to "not stick". The path must not depend on CWD.
+    // 2. Cross-build leak: the follow-up `$HOME/.codemux/` anchor was
+    //    shared by every build on the machine, so the Agent Chat Beta
+    //    toggle flipped in BOTH the installed release and a dev build
+    //    at once. The path must be scoped by `APP_DIR_NAME` like the
+    //    rest of local state.
     #[test]
     #[serial_test::serial]
-    fn snapshot_path_is_home_anchored_regardless_of_cwd() {
-        let home = dirs::home_dir().expect("HOME must be set for this test");
+    fn snapshot_path_is_build_scoped_and_cwd_independent() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let prev_cwd = std::env::current_dir().expect("current_dir");
-        std::env::set_current_dir(tmp.path()).expect("set_current_dir to tempdir");
 
-        let path = snapshot_path();
+        let path_before = snapshot_path();
+        std::env::set_current_dir(tmp.path()).expect("set_current_dir to tempdir");
+        let path_after = snapshot_path();
 
         std::env::set_current_dir(&prev_cwd).expect("restore cwd");
 
-        assert!(
-            path.starts_with(&home),
-            "snapshot_path() = {} should live under HOME = {}",
-            path.display(),
-            home.display()
+        assert_eq!(
+            path_before, path_after,
+            "snapshot_path() must not depend on CWD"
         );
+        assert!(
+            path_after.ends_with(
+                Path::new(crate::APP_DIR_NAME).join("observability.json")
+            ),
+            "snapshot_path() = {} must be scoped by APP_DIR_NAME = {} so dev and release builds don't share feature flags",
+            path_after.display(),
+            crate::APP_DIR_NAME
+        );
+        assert!(
+            !path_after
+                .components()
+                .any(|c| c.as_os_str() == ".codemux"),
+            "snapshot_path() = {} must not resolve to the legacy machine-shared ~/.codemux location",
+            path_after.display()
+        );
+    }
+
+    /// First launch after the path change: the per-build file doesn't
+    /// exist, but the legacy machine-shared one does. The legacy state
+    /// must be adopted (users who opted into the Beta keep it) and
+    /// copied into the per-build location so subsequent flips no
+    /// longer touch shared state. The legacy file itself stays intact
+    /// for older installed versions.
+    #[test]
+    fn load_migrates_legacy_snapshot_once() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let legacy = tmp.path().join(".codemux").join("observability.json");
+        let new = tmp.path().join("data").join("observability.json");
+
+        let mut snapshot = default_snapshot();
+        snapshot.feature_flags.enable_agent_chat = true;
+        snapshot.feature_flags.enable_lazy_workspace_creation = true;
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, serde_json::to_string_pretty(&snapshot).unwrap()).unwrap();
+
+        let loaded = load_or_migrate_snapshot(&new, &legacy);
+
+        assert!(loaded.feature_flags.enable_agent_chat, "legacy opt-in must survive the path move");
+        assert!(new.exists(), "legacy snapshot must be copied to the per-build path");
+        assert!(legacy.exists(), "legacy file must be left in place for older versions");
+
+        let copied: ObservabilitySnapshot =
+            serde_json::from_str(&fs::read_to_string(&new).unwrap()).unwrap();
+        assert!(copied.feature_flags.enable_agent_chat);
+    }
+
+    /// Once the per-build file exists it is authoritative — the legacy
+    /// shared file must never override it again, otherwise the
+    /// cross-build leak comes back through the migration path.
+    #[test]
+    fn per_build_snapshot_wins_over_legacy() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let legacy = tmp.path().join(".codemux").join("observability.json");
+        let new = tmp.path().join("data").join("observability.json");
+
+        let mut legacy_snapshot = default_snapshot();
+        legacy_snapshot.feature_flags.enable_agent_chat = true;
+        legacy_snapshot.feature_flags.enable_lazy_workspace_creation = true;
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, serde_json::to_string_pretty(&legacy_snapshot).unwrap()).unwrap();
+
+        let new_snapshot = default_snapshot(); // Beta off
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        fs::write(&new, serde_json::to_string_pretty(&new_snapshot).unwrap()).unwrap();
+
+        let loaded = load_or_migrate_snapshot(&new, &legacy);
+
+        assert!(
+            !loaded.feature_flags.enable_agent_chat,
+            "the per-build snapshot must win over the legacy shared file"
+        );
+    }
+
+    /// Fresh machine: neither file exists. Defaults apply and nothing
+    /// is written until the first real mutation.
+    #[test]
+    fn load_defaults_when_no_snapshot_exists() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let legacy = tmp.path().join(".codemux").join("observability.json");
+        let new = tmp.path().join("data").join("observability.json");
+
+        let loaded = load_or_migrate_snapshot(&new, &legacy);
+
+        assert!(!loaded.feature_flags.enable_agent_chat);
+        assert!(!new.exists(), "load must not create files when there is nothing to migrate");
     }
 
     /// Step 13 — Agent Chat is OFF by default for new users. The

@@ -636,11 +636,13 @@ Three ways to flip it on locally:
    });
    ```
 
-2. **Config file:** edit `.codemux/observability.json` in the project
-   root, set `feature_flags.enable_agent_chat: true`, restart.
+2. **Config file:** edit the per-build snapshot at
+   `~/.local/share/codemux/observability.json` (release) or
+   `~/.local/share/codemux-dev/observability.json` (debug build), set
+   `feature_flags.enable_agent_chat: true`, restart.
 
-3. **Fresh project:** the default store is persisted lazily, so a
-   brand-new Codemux project has no file yet. Start the app once
+3. **Fresh install:** the default store is persisted lazily, so a
+   brand-new Codemux install has no file yet. Start the app once
    (to create the file), then edit it and restart.
 
 After the flag is on, open the browser devtools and call:
