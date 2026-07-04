@@ -6,8 +6,19 @@ import {
   type ChatThreadState,
   type ChatViewItem,
   type PermissionRequestItem,
+  type ReasoningItem,
   type ToolCallItem,
 } from "./types";
+
+/**
+ * Wall-clock source for reasoning-block timing. Injectable so tests can
+ * pin `started_at` / `duration_ms` deterministically; production uses
+ * `Date.now`. Threaded through `applyEvent` / `appendUserMessage` rather
+ * than read from a module global so the reducer stays a pure function of
+ * (state, event, clock).
+ */
+export type Clock = () => number;
+const defaultClock: Clock = () => Date.now();
 
 let idCounter = 0;
 function nextId(prefix: string): string {
@@ -119,11 +130,59 @@ function findPermissionRequest(
   return null;
 }
 
+/**
+ * Locate the trailing reasoning item for `turnId`, mirroring
+ * `findTrailingAssistant`. Scans back skipping non-reasoning rows; bails
+ * once it crosses into a different turn so a prior turn's block is never
+ * mistaken for the active one.
+ */
+function findTrailingReasoning(
+  messages: ChatViewItem[],
+  turnId: string,
+): { index: number; item: ReasoningItem } | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const item = messages[i];
+    if (item.kind !== "reasoning") continue;
+    if (item.turn_id && item.turn_id !== turnId) return null;
+    return { index: i, item };
+  }
+  return null;
+}
+
+/**
+ * Seal the trailing reasoning block when it is still streaming. Called
+ * before appending any NON-thinking item so a reasoning block that was
+ * interrupted (a tool call, assistant text, approval, new turn, or user
+ * message landing after it) flips out of its "Thinking…" state instead of
+ * shimmering forever. No-op — returns the same reference — when the tail
+ * is not a streaming reasoning item, so it is cheap to call unconditionally
+ * at boundary sites. Computes `duration_ms` from `started_at` when known.
+ */
+function sealTrailingReasoning(
+  state: ChatThreadState,
+  now: Clock,
+): ChatThreadState {
+  const lastIndex = state.messages.length - 1;
+  const tail = state.messages[lastIndex];
+  if (!tail || tail.kind !== "reasoning" || !tail.streaming) return state;
+  const sealed: ReasoningItem = {
+    ...tail,
+    streaming: false,
+    duration_ms:
+      tail.started_at != null
+        ? Math.max(0, now() - tail.started_at)
+        : tail.duration_ms,
+  };
+  return { ...state, messages: replaceItem(state.messages, lastIndex, sealed) };
+}
+
 function appendUserMessageLocal(
   state: ChatThreadState,
   text: string,
+  now: Clock,
 ): ChatThreadState {
-  const { seq, next } = takeSeq(state);
+  const sealed = sealTrailingReasoning(state, now);
+  const { seq, next } = takeSeq(sealed);
   const item: ChatViewItem = {
     kind: "user_message",
     id: nextId("user"),
@@ -141,8 +200,9 @@ function appendUserMessageLocal(
 export function appendUserMessage(
   state: ChatThreadState,
   text: string,
+  now: Clock = defaultClock,
 ): ChatThreadState {
-  return maybeCapMessages(appendUserMessageLocal(state, text));
+  return maybeCapMessages(appendUserMessageLocal(state, text, now));
 }
 
 /**
@@ -193,13 +253,15 @@ export function markRequestResolved(
 export function applyEvent(
   state: ChatThreadState,
   event: ProviderRuntimeEvent,
+  now: Clock = defaultClock,
 ): ChatThreadState {
-  return maybeCapMessages(applyEventInner(state, event));
+  return maybeCapMessages(applyEventInner(state, event, now));
 }
 
 function applyEventInner(
   state: ChatThreadState,
   event: ProviderRuntimeEvent,
+  now: Clock,
 ): ChatThreadState {
   switch (event.type) {
     case "session_configured": {
@@ -227,11 +289,55 @@ function applyEventInner(
 
     case "content_delta": {
       const delta = event.delta;
+      if (delta.kind === "thinking") {
+        // Accumulate thinking deltas into a trailing reasoning block with
+        // the same tail-merge discipline as assistant text: continue the
+        // current block only while it is BOTH the tail AND streaming (and
+        // in this turn); anything else that landed means a fresh block.
+        const lastIndex = state.messages.length - 1;
+        const tail = state.messages[lastIndex];
+        if (
+          tail &&
+          tail.kind === "reasoning" &&
+          tail.streaming &&
+          (!tail.turn_id || tail.turn_id === event.turn_id)
+        ) {
+          const next: ReasoningItem = {
+            ...tail,
+            turn_id: event.turn_id,
+            text: tail.text + delta.text,
+            streaming: true,
+          };
+          return {
+            ...state,
+            streaming: true,
+            messages: replaceItem(state.messages, lastIndex, next),
+          };
+        }
+        const { seq, next: seqBumped } = takeSeq(state);
+        const newReasoning: ReasoningItem = {
+          kind: "reasoning",
+          id: nextId("reasoning"),
+          seq,
+          turn_id: event.turn_id,
+          text: delta.text,
+          streaming: true,
+          started_at: now(),
+        };
+        return {
+          ...seqBumped,
+          streaming: true,
+          messages: [...seqBumped.messages, newReasoning],
+        };
+      }
       if (delta.kind !== "text") {
-        // Thinking deltas and tool_input deltas are not rendered in
-        // Step 2's transcript.
+        // tool_input deltas are not rendered in the transcript.
         return state;
       }
+      // A text delta is a non-thinking boundary: seal any trailing
+      // streaming reasoning block so it stops shimmering before the
+      // assistant prose row is created/continued.
+      state = sealTrailingReasoning(state, now);
       // Only continue an existing assistant message when it's both
       // the CURRENT TAIL and still streaming. If anything else has
       // landed after the last assistant (tool call, permission
@@ -283,6 +389,8 @@ function applyEventInner(
       const item = event.item;
       switch (item.kind) {
         case "assistant_text": {
+          // Non-thinking boundary — seal any trailing streaming reasoning.
+          state = sealTrailingReasoning(state, now);
           const existing = findTrailingAssistant(state.messages, event.turn_id);
           if (existing && existing.item.streaming) {
             const next: AssistantMessageItem = {
@@ -311,10 +419,47 @@ function applyEventInner(
           };
         }
         case "assistant_thinking": {
-          // Not rendered in Step 2.
-          return state;
+          // Finalize the trailing reasoning block for this turn: replace
+          // the accumulated text with the authoritative final text, seal
+          // it, and record the thinking duration (first-delta → now).
+          const found = findTrailingReasoning(state.messages, event.turn_id);
+          if (found && found.item.streaming) {
+            const finalized: ReasoningItem = {
+              ...found.item,
+              turn_id: event.turn_id,
+              text: item.text,
+              streaming: false,
+              duration_ms:
+                found.item.started_at != null
+                  ? Math.max(0, now() - found.item.started_at)
+                  : found.item.duration_ms,
+            };
+            return {
+              ...state,
+              messages: replaceItem(state.messages, found.index, finalized),
+            };
+          }
+          // Completion carried no streamed deltas (or the block was
+          // already sealed by a boundary): materialise a fresh, sealed
+          // block so the final thinking text is never dropped. Without a
+          // first-delta timestamp there is no duration to report.
+          const { seq, next: seqBumped } = takeSeq(state);
+          const newReasoning: ReasoningItem = {
+            kind: "reasoning",
+            id: nextId("reasoning"),
+            seq,
+            turn_id: event.turn_id,
+            text: item.text,
+            streaming: false,
+          };
+          return {
+            ...seqBumped,
+            messages: [...seqBumped.messages, newReasoning],
+          };
         }
         case "tool_use": {
+          // Non-thinking boundary — seal any trailing streaming reasoning.
+          state = sealTrailingReasoning(state, now);
           // Specialized tools (ExitPlanMode, AskUserQuestion) drive
           // their own UI through a `permission_request` row — skipping
           // the ToolCallItem here prevents Stage 1's tool_use_id merge
@@ -365,6 +510,8 @@ function applyEventInner(
           return { ...seqBumped, messages: [...seqBumped.messages, newToolCall] };
         }
         case "tool_result": {
+          // Non-thinking boundary — seal any trailing streaming reasoning.
+          state = sealTrailingReasoning(state, now);
           const found = findToolCallByUseId(state.messages, item.tool_use_id);
           if (found) {
             const next: ToolCallItem = {
@@ -421,6 +568,9 @@ function applyEventInner(
     }
 
     case "turn_completed": {
+      // A completed turn is a hard boundary — seal any trailing streaming
+      // reasoning block alongside the assistant message.
+      state = sealTrailingReasoning(state, now);
       // Seal any still-streaming assistant message for this turn.
       let messages = state.messages;
       const existing = findTrailingAssistant(messages, event.turn_id);
@@ -455,6 +605,9 @@ function applyEventInner(
     }
 
     case "request_opened": {
+      // An approval prompt is a non-thinking boundary — seal any trailing
+      // streaming reasoning block before the request row lands.
+      state = sealTrailingReasoning(state, now);
       const existing = findPermissionRequest(state.messages, event.request_id);
       if (existing) return state;
       const { seq, next: seqBumped } = takeSeq(state);

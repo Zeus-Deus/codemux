@@ -335,8 +335,13 @@ export function MultiProviderModelPicker({
           disabled={disabled}
           data-testid="multi-provider-model-picker-trigger"
           className={cn(
-            "inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs",
-            "text-muted-foreground transition-colors hover:bg-muted hover:text-foreground",
+            // Composer footer pill: bordered card chip on the base
+            // surface (design's model/effort/permission pills), the
+            // leading ProviderLogo standing in for the design's tinted
+            // dot. Rounded-lg + border distinguishes these session-
+            // config pills from the rounded-full scope pills above.
+            "inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1 text-xs font-medium",
+            "text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground",
             "outline-none disabled:opacity-50",
           )}
         >

@@ -11,6 +11,21 @@ import type { ChatMode } from "@/stores/agent-chat-store";
 import type { ActivePillMode } from "@/components/chat/pickers/ModePill";
 
 /**
+ * Tone applied to a command-menu row's icon chip (redesigned `+`
+ * command menu). Maps to the app's token utilities in
+ * `ComposerCommandMenu` — never a raw colour. `muted` is the neutral
+ * default so rows that don't opt in stay quiet.
+ */
+export type CommandTone =
+  | "sky"
+  | "amber"
+  | "violet"
+  | "green"
+  | "red"
+  | "muted"
+  | "ember";
+
+/**
  * One row in the slash-command popup. The popup component renders these
  * generically — no hard-coded knowledge of modes — so Step 7 (skills)
  * can append its own items without touching the popup.
@@ -49,6 +64,10 @@ export interface SlashCommandItem {
    *  When present, the row's onSelect is suppressed because the
    *  trailing control owns the click target. */
   rightAdornment?: React.ReactNode;
+  /** Redesigned `+` command menu — tone of the row's 24px icon chip.
+   *  Optional; the menu falls back to `muted` when unset. Ignored by
+   *  the legacy `SlashCommandPopup` (slash / mention surfaces). */
+  tone?: CommandTone;
 }
 
 export interface SlashAnchor {
@@ -178,6 +197,37 @@ export function filterSlashItems(
     (item) =>
       item.command.toLowerCase().startsWith(`/${q}`) ||
       item.label.toLowerCase().includes(q),
+  );
+}
+
+/**
+ * Filter rows for the redesigned `+` command menu's search box.
+ *
+ * Unlike {@link filterSlashItems} (which only matches the leading
+ * command token), this searches across the label, description AND
+ * command tag so a row is findable by any of its visible text. A
+ * leading `/` scopes the match to the command tag only — so `/pl`
+ * resolves to Plan (tag `/plan`) without also matching prose that
+ * happens to contain "pl" in another row's description. Disabled rows
+ * are kept (they stay visible with their reason); the caller renders
+ * them non-selectable. Case-insensitive; empty query returns all.
+ */
+export function filterCommandMenuItems(
+  items: SlashCommandItem[],
+  query: string,
+): SlashCommandItem[] {
+  const raw = query.trim().toLowerCase();
+  if (!raw) return items;
+  if (raw.startsWith("/")) {
+    return items.filter((item) =>
+      item.command.toLowerCase().startsWith(raw),
+    );
+  }
+  return items.filter(
+    (item) =>
+      item.label.toLowerCase().includes(raw) ||
+      (item.description?.toLowerCase().includes(raw) ?? false) ||
+      item.command.toLowerCase().includes(raw),
   );
 }
 

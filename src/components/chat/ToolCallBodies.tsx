@@ -1,5 +1,6 @@
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
+import { DiffView } from "./DiffView";
 import { ToolCallBlock } from "./ToolCallBlock";
 
 const BASH_TAIL_LINES = 10;
@@ -230,37 +231,87 @@ function isSafeHttpUrl(raw: string): boolean {
 }
 
 export function EditToolBody({ item, input }: BodyProps) {
+  const diff = editDiffInput(item, input);
+  if (diff) {
+    // Real diff surface computed from the tool input (design D7).
+    return (
+      <DiffView
+        filename={diff.filename}
+        oldText={diff.oldText}
+        newText={diff.newText}
+        copyText={diff.copyText}
+      />
+    );
+  }
+
+  // Fallback: no diff-able input yet (e.g. running with only a path, or a
+  // result-only payload). Show the path and any raw result so nothing is
+  // dropped.
   const path = input
     ? stringField(input, "file_path") ?? stringField(input, "path")
     : null;
   const result = contentToString(item.result_content);
-  const stats = result ? parseEditStats(result) : null;
-
   return (
     <div className="space-y-1">
       {path && (
         <div className="font-mono text-[11.5px] text-foreground">{path}</div>
       )}
-      {stats && (
-        // Neutral inside the chat pane per the chat-ui skill: diffs
-        // here are status, not semantic colour. The +/− glyph alone
-        // carries the meaning; the dedicated diff viewer elsewhere
-        // in the app handles colour.
-        <p className="text-[11px] text-muted-foreground/80">
-          {stats.added > 0 && (
-            <span className="text-foreground/80">+{stats.added}</span>
-          )}
-          {stats.added > 0 && stats.removed > 0 && " "}
-          {stats.removed > 0 && (
-            <span className="text-muted-foreground">−{stats.removed}</span>
-          )}
-          {(stats.added > 0 || stats.removed > 0) && " line"}
-          {stats.added + stats.removed === 1 ? "" : "s"}
-        </p>
-      )}
-      {!stats && result && <ToolCallBlock content={result} />}
+      {result && <ToolCallBlock content={result} />}
     </div>
   );
+}
+
+interface EditDiffInput {
+  filename: string | null;
+  oldText: string;
+  newText: string;
+  copyText: string;
+}
+
+/** Extract the before/after text a diff card renders from an
+ *  Edit/MultiEdit/Write tool input. Returns `null` when the input carries
+ *  no diff-able fields (so the caller can fall back to path/result). */
+function editDiffInput(
+  item: ToolCallItem,
+  input: Record<string, unknown> | null,
+): EditDiffInput | null {
+  if (!input) return null;
+  const filename = stringField(input, "file_path") ?? stringField(input, "path");
+
+  switch (item.tool_name) {
+    case "Write": {
+      const content = strOrNull(input.content) ?? strOrNull(input.contents);
+      if (content == null) return null;
+      return { filename, oldText: "", newText: content, copyText: content };
+    }
+    case "MultiEdit": {
+      const edits = Array.isArray(input.edits) ? input.edits : [];
+      const olds: string[] = [];
+      const news: string[] = [];
+      for (const edit of edits) {
+        if (!isRecord(edit)) continue;
+        const o = strOrNull(edit.old_string);
+        const nw = strOrNull(edit.new_string);
+        if (o != null) olds.push(o);
+        if (nw != null) news.push(nw);
+      }
+      if (olds.length === 0 && news.length === 0) return null;
+      const newText = news.join("\n");
+      return { filename, oldText: olds.join("\n"), newText, copyText: newText };
+    }
+    default: {
+      // Edit (and any single-hunk variant).
+      const oldText = strOrNull(input.old_string);
+      const newText = strOrNull(input.new_string);
+      if (oldText == null && newText == null) return null;
+      return {
+        filename,
+        oldText: oldText ?? "",
+        newText: newText ?? "",
+        copyText: newText ?? "",
+      };
+    }
+  }
 }
 
 function GenericToolBody({ item }: { item: ToolCallItem }) {
@@ -285,6 +336,12 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 function stringField(obj: Record<string, unknown>, key: string): string | null {
   const v = obj[key];
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/** Like `stringField` but preserves empty strings (a legitimate
+ *  `old_string`/`new_string` for insert/delete-only diffs). */
+function strOrNull(v: unknown): string | null {
+  return typeof v === "string" ? v : null;
 }
 
 function numberField(obj: Record<string, unknown>, key: string): number | null {
@@ -402,17 +459,5 @@ function extractTitle(result: string): string | null {
   // sidecar didn't surface a parsed title field.
   if (firstLine.length > 120) return firstLine.slice(0, 119) + "…";
   return firstLine;
-}
-
-interface EditStats {
-  added: number;
-  removed: number;
-}
-
-function parseEditStats(result: string): EditStats | null {
-  const added = (result.match(/^\+(?!\+)/gm) ?? []).length;
-  const removed = (result.match(/^-(?!-)/gm) ?? []).length;
-  if (added === 0 && removed === 0) return null;
-  return { added, removed };
 }
 

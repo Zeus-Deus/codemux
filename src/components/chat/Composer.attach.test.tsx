@@ -218,7 +218,9 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     expect(issueRow.getAttribute("data-disabled")).toBe("true");
     expect(prRow.getAttribute("data-disabled")).toBe("true");
     expect(imageRow.getAttribute("data-disabled")).toBe("true");
-    expect(issueRow.className).toContain("opacity-50");
+    // Redesign: disabled rows dim to ~0.42 (design contract) rather
+    // than the legacy 0.5.
+    expect(issueRow.className).toContain("opacity-[0.42]");
   });
 
   it("clicking a disabled entry is a no-op (popup stays on main)", async () => {
@@ -296,10 +298,12 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     fireEvent.click(getByTestId("composer-attach-button"));
     fireEvent.click(getByTestId("slash-item-attach:folder"));
     await findByText("src/components/chat");
-    const textarea = document.querySelector(
-      'textarea',
-    ) as HTMLTextAreaElement;
-    fireEvent.keyDown(textarea, { key: "Escape" });
+    // The redesigned command menu owns a focused search input; Escape
+    // is handled there (not on the textarea) and bubbles to the menu's
+    // Escape handler.
+    fireEvent.keyDown(getByTestId("composer-command-search"), {
+      key: "Escape",
+    });
     // Back on main: File… visible, folder rows gone.
     expect(getByText("File…")).toBeInTheDocument();
     expect(queryByText("src/components/chat")).toBeNull();
@@ -309,10 +313,9 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     const { getByTestId, queryByText } = renderControlled({
     });
     fireEvent.click(getByTestId("composer-attach-button"));
-    const textarea = document.querySelector(
-      'textarea',
-    ) as HTMLTextAreaElement;
-    fireEvent.keyDown(textarea, { key: "Escape" });
+    fireEvent.keyDown(getByTestId("composer-command-search"), {
+      key: "Escape",
+    });
     expect(queryByText("File…")).toBeNull();
   });
 
@@ -375,6 +378,82 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     fireEvent.click(getByTestId("slash-item-attach:file"));
     const footer = getByTestId("slash-popup-footer");
     expect(footer.textContent).toContain("project");
+  });
+});
+
+describe("Composer command menu — search + structure (redesign)", () => {
+  it("renders the anchored command menu surface with a search box", () => {
+    const { getByTestId } = renderControlled();
+    fireEvent.click(getByTestId("composer-attach-button"));
+    expect(getByTestId("composer-command-menu")).toBeInTheDocument();
+    expect(getByTestId("composer-command-search")).toBeInTheDocument();
+  });
+
+  it("surfaces the MCP entry under its own INTEGRATIONS group", () => {
+    const { getByTestId, getByText } = renderControlled();
+    fireEvent.click(getByTestId("composer-attach-button"));
+    expect(getByText("INTEGRATIONS")).toBeInTheDocument();
+    expect(getByTestId("slash-item-attach:mcp")).toBeInTheDocument();
+  });
+
+  it("filters rows across groups as the user types in the search box", () => {
+    const { getByTestId, queryByTestId } = renderControlled();
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.change(getByTestId("composer-command-search"), {
+      target: { value: "debug" },
+    });
+    // Only the Debug mode row survives — other modes + attach rows are
+    // filtered out across every group.
+    expect(queryByTestId("slash-item-mode:debug")).not.toBeNull();
+    expect(queryByTestId("slash-item-mode:plan")).toBeNull();
+    expect(queryByTestId("slash-item-attach:file")).toBeNull();
+  });
+
+  it("matches a leading / against the mode tags (/pl → Plan)", () => {
+    const { getByTestId, queryByTestId } = renderControlled();
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.change(getByTestId("composer-command-search"), {
+      target: { value: "/pl" },
+    });
+    expect(queryByTestId("slash-item-mode:plan")).not.toBeNull();
+    expect(queryByTestId("slash-item-mode:ask")).toBeNull();
+    // Attach rows have no tag, so the slash-scoped match excludes them.
+    expect(queryByTestId("slash-item-attach:file")).toBeNull();
+  });
+
+  it("shows the empty state when the query matches nothing", () => {
+    const { getByTestId, getByText } = renderControlled();
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.change(getByTestId("composer-command-search"), {
+      target: { value: "zzzznope" },
+    });
+    expect(getByText(/No matches/i)).toBeInTheDocument();
+  });
+
+  it("keeps disabled rows VISIBLE with their reason (not hidden) + dimmed", () => {
+    // Contract: outside a GitHub repo the Issue / PR rows must NOT
+    // disappear — they render at reduced opacity, non-selectable, with
+    // the reason swapped into the description slot.
+    const { getByTestId } = renderControlled({ isGithubRepo: false });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const issue = getByTestId("slash-item-attach:issue");
+    expect(issue).toBeInTheDocument();
+    expect(issue.getAttribute("data-disabled")).toBe("true");
+    expect(issue.textContent).toContain("Not a GitHub repo");
+    expect(issue.className).toContain("opacity-[0.42]");
+    expect(issue.className).toContain("cursor-not-allowed");
+  });
+
+  it("Enter in the search box selects the first enabled row (cmdk nav)", () => {
+    // The menu's focused cmdk input owns keyboard nav; the first
+    // enabled row (Plan) is auto-highlighted, so Enter activates it.
+    const onModeActivate = vi.fn();
+    const { getByTestId } = renderControlled({ onModeActivate });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.keyDown(getByTestId("composer-command-search"), {
+      key: "Enter",
+    });
+    expect(onModeActivate).toHaveBeenCalledWith("plan");
   });
 });
 

@@ -157,28 +157,44 @@ describe("WebFetchToolBody", () => {
 });
 
 describe("EditToolBody", () => {
-  it("shows file path and add/remove summary parsed from a diff result", () => {
-    const diff = [
-      "--- a/src/foo.ts",
-      "+++ b/src/foo.ts",
-      "@@ -1,3 +1,4 @@",
-      " keep",
-      "-old line",
-      "+new line a",
-      "+new line b",
-    ].join("\n");
+  it("renders a diff card computed from the tool input (old_string/new_string)", () => {
     render(
       <ToolCallBody
         item={makeTool({
           tool_name: "Edit",
-          input: { file_path: "src/foo.ts" },
-          result_content: diff,
+          input: {
+            file_path: "src/foo.ts",
+            old_string: "old line",
+            new_string: "new line a\nnew line b",
+          },
         })}
       />,
     );
+    // Filename header.
     expect(screen.getByText("src/foo.ts")).toBeInTheDocument();
+    // +N/−N counts come from the computed diff, not the model's prose:
+    // one removed line, two added lines.
     expect(screen.getByText("+2")).toBeInTheDocument();
     expect(screen.getByText("−1")).toBeInTheDocument();
+    // The removed and added line text render in the body.
+    expect(screen.getByText("old line")).toBeInTheDocument();
+    expect(screen.getByText("new line a")).toBeInTheDocument();
+    expect(screen.getByText("new line b")).toBeInTheDocument();
+  });
+
+  it("renders an all-added diff for a Write (no old text)", () => {
+    render(
+      <ToolCallBody
+        item={makeTool({
+          tool_name: "Write",
+          input: { file_path: "src/new.ts", content: "export const a = 1;" },
+        })}
+      />,
+    );
+    expect(screen.getByText("src/new.ts")).toBeInTheDocument();
+    expect(screen.getByText("+1")).toBeInTheDocument();
+    expect(screen.getByText("−0")).toBeInTheDocument();
+    expect(screen.getByText("export const a = 1;")).toBeInTheDocument();
   });
 });
 

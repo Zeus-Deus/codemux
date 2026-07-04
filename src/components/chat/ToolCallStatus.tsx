@@ -1,20 +1,20 @@
-import { cn } from "@/lib/utils";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
 /**
- * Tier-2 status line: `verb + target + argument`. No background, no
- * border, no icon. Tight vertical rhythm.
+ * One-line tool summary for the single tool card (design D6): `verb +
+ * target + argument` in mono, args dimmed. Truncation is applied by the
+ * parent card wrapper.
  */
 export function ToolCallStatus({ item }: { item: ToolCallItem }) {
-  const { verb, target, targetMono, argument } = describeToolCall(item);
+  const { verb, target, argument } = describeToolCall(item);
 
   return (
-    <div className="py-0.5 text-xs leading-5 text-muted-foreground break-words">
+    <div className="font-mono text-[11.5px] leading-5 text-muted-foreground break-words">
       <span>{verb}</span>
       {target && (
         <>
           {" "}
-          <span className={cn(targetMono && "font-mono")}>{target}</span>
+          <span>{target}</span>
         </>
       )}
       {argument && (
@@ -27,7 +27,7 @@ export function ToolCallStatus({ item }: { item: ToolCallItem }) {
   );
 }
 
-interface ToolDescription {
+export interface ToolDescription {
   verb: string;
   target: string | null;
   targetMono: boolean;
@@ -51,7 +51,7 @@ const VERB_MAP: Record<string, string> = {
   NotebookEdit: "Edit",
 };
 
-function describeToolCall(item: ToolCallItem): ToolDescription {
+export function describeToolCall(item: ToolCallItem): ToolDescription {
   const verb = VERB_MAP[item.tool_name] ?? `Called ${item.tool_name}`;
   const inputRecord = isRecord(item.input) ? item.input : {};
   const toolName = item.tool_name;

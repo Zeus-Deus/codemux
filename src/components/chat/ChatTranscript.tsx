@@ -1,6 +1,7 @@
 import { shouldShowThinkingIndicator } from "@/lib/agent-chat/thinking";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
+import type { AgentChatProviderKind } from "@/tauri/types";
 
 import { MessageList } from "./MessageList";
 
@@ -8,8 +9,14 @@ interface Props {
   messages: ChatViewItem[];
   /** True while a turn is in flight — either the backend has
    *  acknowledged streaming OR the composer's optimistic flag is set.
-   *  Drives the transcript-tail "thinking" pulse. */
+   *  Drives the transcript-tail "working" marker. */
   streaming: boolean;
+  /** Optional session-created timestamp for the top session-start marker
+   *  (design D2). Forwarded to MessageList; Stage 3 wires the real value. */
+  sessionStartedAt?: number;
+  /** The session's chat provider. Forwarded to MessageList to brand the
+   *  assistant-turn avatar with the provider's official mark. */
+  provider?: AgentChatProviderKind | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -25,6 +32,8 @@ interface Props {
 export function ChatTranscript({
   messages,
   streaming,
+  sessionStartedAt,
+  provider,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -36,6 +45,8 @@ export function ChatTranscript({
       <MessageList
         messages={messages}
         showThinking={showThinking}
+        sessionStartedAt={sessionStartedAt}
+        provider={provider}
         onRespondToRequest={onRespondToRequest}
         onAcceptPlan={onAcceptPlan}
         onRejectPlan={onRejectPlan}

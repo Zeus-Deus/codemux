@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, ChevronDown, ShieldCheck } from "lucide-react";
+import { Check, ChevronDown, Lock } from "lucide-react";
 
 import {
   Command,
@@ -64,9 +64,9 @@ export function PermissionModePicker({
         <button
           type="button"
           disabled={disabled}
-          className="inline-flex items-center gap-1.5 rounded-full bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground outline-none disabled:opacity-50"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground outline-none disabled:opacity-50"
         >
-          <ShieldCheck className="h-3 w-3" />
+          <Lock className="h-3 w-3" />
           <span className="max-w-[140px] truncate">{label}</span>
           <ChevronDown className="h-2.5 w-2.5 opacity-40" />
         </button>

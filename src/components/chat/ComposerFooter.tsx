@@ -96,8 +96,15 @@ export function ComposerFooter({
               // the bold filled Send still reads as the primary
               // action on the right.
               "inline-flex h-7 w-7 items-center justify-center rounded-full",
+              // Transparent base border keeps the circle diameter fixed
+              // (border-box) so the open state can add an ember border
+              // without a 1px layout shift.
+              "border border-transparent",
               "bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground",
-              "data-[open=true]:bg-foreground/10 data-[open=true]:text-foreground",
+              // Open (command menu showing): the ember active treatment
+              // — ember-tinted fill, ember border, ember icon — matches
+              // the redesign so the trigger reads as "armed".
+              "data-[open=true]:border-accent-ember/45 data-[open=true]:bg-accent-ember/15 data-[open=true]:text-accent-ember data-[open=true]:hover:bg-accent-ember/15 data-[open=true]:hover:text-accent-ember",
               "disabled:opacity-40 disabled:pointer-events-none",
             )}
             aria-label="Attach"
@@ -175,8 +182,13 @@ export function ComposerFooter({
             type="button"
             onClick={onStop}
             className={cn(
+              // Streaming interrupt: a saturated red circle (design's
+              // `color-mix(red 85%, fg)`) so the stop affordance reads
+              // as the one destructive action in the row. Distinct from
+              // the neutral near-white Send so an in-flight turn is
+              // obvious at a glance.
               "inline-flex h-7 w-7 items-center justify-center rounded-full",
-              "bg-foreground text-background hover:bg-foreground/90",
+              "bg-destructive text-destructive-foreground hover:bg-destructive/90",
             )}
             aria-label="Stop"
             title="Stop"

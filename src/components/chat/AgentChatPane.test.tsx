@@ -61,12 +61,23 @@ vi.mock("./ChatHomeLanding", () => ({
 vi.mock("./ChatTranscript", () => ({
   ChatTranscript: ({
     messages,
+    sessionStartedAt,
     onAcceptPlan,
   }: {
     messages: unknown[];
+    sessionStartedAt?: number;
     onAcceptPlan: (requestId: string) => void;
   }) => (
-    <div data-testid="transcript" data-message-count={messages.length}>
+    <div
+      data-testid="transcript"
+      data-message-count={messages.length}
+      // Empty string encodes "no marker timestamp" (plain divider); a
+      // numeric string is the parsed session `created_at` the pane wired
+      // through for the D2 marker.
+      data-session-started-at={
+        sessionStartedAt == null ? "" : String(sessionStartedAt)
+      }
+    >
       <button
         data-testid="accept-plan"
         onClick={() => onAcceptPlan("req-1")}
@@ -233,6 +244,10 @@ vi.mock("@/tauri/commands", () => ({
   // with a truthy threadId — return an empty transcript so the effect
   // short-circuits without exercising the resume path in unit tests.
   agentChatListMessages: vi.fn().mockResolvedValue([]),
+  // The D2 session-start marker effect looks the active thread up in the
+  // persisted sessions list; default to empty so it clears to the plain
+  // divider unless a test seeds a record.
+  agentChatListSessions: vi.fn().mockResolvedValue([]),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),
   agentChatSetModel: vi.fn().mockResolvedValue(undefined),
@@ -398,6 +413,7 @@ vi.mock("@/stores/agent-chat-store", () => {
 import { AgentChatPane } from "./AgentChatPane";
 import {
   agentChatListMessages,
+  agentChatListSessions,
   agentChatSendTurn,
   agentChatSetPermissionMode,
   agentChatStartSession,
@@ -541,6 +557,89 @@ describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
       expect(vi.mocked(agentChatListMessages)).toHaveBeenCalled();
     });
     expect(hydrateThreadMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("AgentChatPane session-start marker wiring (D2)", () => {
+  // The pane resolves the active thread's `created_at` from the persisted
+  // sessions list and hands it to ChatTranscript as `sessionStartedAt`;
+  // the transcript stub echoes it into `data-session-started-at`.
+  function makeSessionRecord(overrides: {
+    thread_id: string;
+    created_at: string;
+  }) {
+    return {
+      thread_id: overrides.thread_id,
+      sdk_session_id: "sdk-1",
+      workspace_id: "ws-home",
+      cwd: "/home/user",
+      provider: "claude",
+      title: "Chat",
+      created_at: overrides.created_at,
+      last_active_at: overrides.created_at,
+    };
+  }
+
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    workspaceIdForPaneOverride = "ws-home";
+    // Reset the mount-time hydrate mock a sibling block left rejecting,
+    // so its caught-and-logged failure doesn't spam this block's stderr.
+    vi.mocked(agentChatListMessages).mockReset();
+    vi.mocked(agentChatListMessages).mockResolvedValue([]);
+    vi.mocked(agentChatListSessions).mockReset();
+    vi.mocked(agentChatListSessions).mockResolvedValue([]);
+  });
+
+  it("passes the matching session's parsed created_at through to the transcript", async () => {
+    const createdAt = "2026-07-03T14:52:00Z";
+    vi.mocked(agentChatListSessions).mockResolvedValue([
+      makeSessionRecord({ thread_id: "thread-x", created_at: createdAt }),
+    ]);
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatListSessions)).toHaveBeenCalledWith(
+        "ws-home",
+        "/home/user",
+      );
+    });
+    await waitFor(() => {
+      const transcript = container.querySelector('[data-testid="transcript"]');
+      expect(transcript?.getAttribute("data-session-started-at")).toBe(
+        String(Date.parse(createdAt)),
+      );
+    });
+  });
+
+  it("falls back to the plain divider (no timestamp) when no record matches the thread", async () => {
+    vi.mocked(agentChatListSessions).mockResolvedValue([
+      makeSessionRecord({
+        thread_id: "some-other-thread",
+        created_at: "2026-07-03T14:52:00Z",
+      }),
+    ]);
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatListSessions)).toHaveBeenCalled();
+    });
+    // No await-able change to observe, so assert the steady state: the
+    // stub kept its empty marker attribute.
+    const transcript = container.querySelector('[data-testid="transcript"]');
+    expect(transcript?.getAttribute("data-session-started-at")).toBe("");
+  });
+
+  it("ignores an unparseable created_at and renders the plain divider", async () => {
+    vi.mocked(agentChatListSessions).mockResolvedValue([
+      makeSessionRecord({ thread_id: "thread-x", created_at: "not-a-date" }),
+    ]);
+    const { container } = render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatListSessions)).toHaveBeenCalled();
+    });
+    const transcript = container.querySelector('[data-testid="transcript"]');
+    expect(transcript?.getAttribute("data-session-started-at")).toBe("");
   });
 });
 
@@ -691,6 +790,35 @@ describe("AgentChatPane Stage D — Zone 1 dispatch", () => {
     expect(stub).not.toBeNull();
     expect(stub!.dataset.projectPath).toBe("/projects/foo");
     expect(stub!.dataset.currentWorkspace).toBe("ws-foo");
+    expect(
+      container.querySelector('[data-testid="project-picker-stub"]'),
+    ).toBeNull();
+  });
+
+  it("hides the Zone 1 scope pills once the conversation has messages", () => {
+    mockAppState.appState = {
+      active_workspace_id: "ws-foo",
+      workspaces: [
+        {
+          workspace_id: "ws-foo",
+          workspace_type: "standard",
+          project_root: "/projects/foo",
+          cwd: "/projects/foo",
+        },
+      ],
+    };
+    workspaceIdForPaneOverride = "ws-foo";
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    const projectPane = {
+      ...pane,
+      pane_id: "pane-foo",
+      thread_id: "thread-x",
+      cwd: "/projects/foo",
+    };
+    const { container } = render(<AgentChatPane pane={projectPane} />);
+    expect(
+      container.querySelector('[data-testid="worktree-picker-stub"]'),
+    ).toBeNull();
     expect(
       container.querySelector('[data-testid="project-picker-stub"]'),
     ).toBeNull();

@@ -270,6 +270,70 @@ describe("replayPayloads", () => {
     }
   });
 
+  it("rebuilds a sealed reasoning block from thinking deltas + completion", () => {
+    const state = replayPayloads([
+      user("why?"),
+      event({
+        type: "content_delta",
+        thread_id: "t",
+        turn_id: "turn-1",
+        delta: { kind: "thinking", text: "Because " },
+      }),
+      event({
+        type: "content_delta",
+        thread_id: "t",
+        turn_id: "turn-1",
+        delta: { kind: "thinking", text: "of the cache." },
+      }),
+      event({
+        type: "item_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        item: { kind: "assistant_thinking", text: "Because of the cache." },
+      }),
+      event({
+        type: "item_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        item: { kind: "assistant_text", text: "It's the cache." },
+      }),
+    ]);
+    const reasoning = state.messages.find((m) => m.kind === "reasoning");
+    expect(reasoning).toBeDefined();
+    if (reasoning?.kind === "reasoning") {
+      expect(reasoning.text).toBe("Because of the cache.");
+      expect(reasoning.streaming).toBe(false);
+    }
+    // Reasoning precedes the assistant prose in the rebuilt transcript.
+    expect(state.messages.map((m) => m.kind)).toEqual([
+      "user_message",
+      "reasoning",
+      "assistant_message",
+    ]);
+  });
+
+  it("seals a reasoning block left streaming by a transcript truncated mid-thinking", () => {
+    // History cut off after thinking deltas but before the completion or
+    // any boundary item. The belt-and-braces pass must seal the block so a
+    // restored thread never renders a perpetual "Thinking…".
+    const state = replayPayloads([
+      event({
+        type: "content_delta",
+        thread_id: "t",
+        turn_id: "turn-1",
+        delta: { kind: "thinking", text: "half a thought" },
+      }),
+      // No completion. No boundary. No turn_completed.
+    ]);
+    const reasoning = state.messages.find((m) => m.kind === "reasoning");
+    expect(reasoning).toBeDefined();
+    if (reasoning?.kind === "reasoning") {
+      expect(reasoning.text).toBe("half a thought");
+      expect(reasoning.streaming).toBe(false);
+    }
+    expect(state.streaming).toBe(false);
+  });
+
   it("emits a turn_ended marker for an error-status turn_completed", () => {
     // Errors are surfaced inline so the resumed transcript matches
     // what the user saw originally — silently dropping them would

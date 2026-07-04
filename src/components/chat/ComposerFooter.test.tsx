@@ -129,6 +129,15 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     expect(screen.queryByRole("button", { name: "Send" })).toBeNull();
   });
 
+  it("the streaming Stop button uses the destructive (red) treatment", () => {
+    // Design D10: the interrupt is the one destructive action in the
+    // footer, so it reads red rather than the neutral Send fill.
+    renderFooter({ streaming: true });
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(stop.className).toContain("bg-destructive");
+    expect(stop.className).toContain("rounded-full");
+  });
+
   it("controlsDisabled disables the + button", () => {
     renderFooter({ controlsDisabled: true, onAttachClick: vi.fn() });
     const attach = screen.getByTestId("composer-attach-button");

@@ -37,6 +37,7 @@ import {
   MOCK_HOME_DIR,
   MOCK_USER,
   createSeedAppState,
+  richChatTurnEnvelopes,
 } from "./mock-fixtures";
 import type {
   AppStateSnapshot,
@@ -328,11 +329,28 @@ function mockChatTranscript(): string[] {
   const push = (envelope: unknown) => out.push(JSON.stringify(envelope));
   for (let i = 0; i < MOCK_CHAT_TURNS; i++) {
     const turnId = `seed-turn-${i + 1}`;
+    const isLast = i === MOCK_CHAT_TURNS - 1;
     push({
       type: "user_message",
       thread_id: T,
-      text: `Turn ${i + 1}: how does the virtualized transcript hold up at scale?`,
+      text: isLast
+        ? "Implement the fix for #57298."
+        : `Turn ${i + 1}: how does the virtualized transcript hold up at scale?`,
     });
+    if (isLast) {
+      // Final turn is a curated showcase: a reasoning block, a tool group
+      // card, a diff card and a task summary card, all landing at the tail
+      // so they're visible the moment the seeded thread opens (design QA).
+      for (const envelope of richChatTurnEnvelopes(T, turnId)) push(envelope);
+      push({
+        type: "turn_completed",
+        thread_id: T,
+        turn_id: turnId,
+        status: { kind: "success" },
+        usage: null,
+      });
+      continue;
+    }
     if (i % 5 === 4) {
       // Tool burst — 8 consecutive calls so the run-collapse toggle
       // ("Show 4 earlier tool calls") appears inside one virtual row.
@@ -368,7 +386,10 @@ function mockChatTranscript(): string[] {
       turn_id: turnId,
       item: {
         kind: "assistant_text",
-        text: `(${i + 1}/${MOCK_CHAT_TURNS}) ${ASSISTANT_BODIES[i % ASSISTANT_BODIES.length]}`,
+        // Counter prefix on its own paragraph — inlining it before a
+        // body that starts with a ``` fence would break the fence
+        // (CommonMark fences must start at the beginning of a line).
+        text: `(${i + 1}/${MOCK_CHAT_TURNS})\n\n${ASSISTANT_BODIES[i % ASSISTANT_BODIES.length]}`,
       },
     });
     push({
@@ -408,9 +429,42 @@ function streamMockChatReply(
     status: { status: "running", active_turn: turnId },
   });
 
+  // A short live thinking segment precedes the text tokens: thinking
+  // deltas stream first (Reasoning block header shimmers "Thinking…"),
+  // then an assistant_thinking completion seals the block before prose
+  // begins.
+  const THINKING_CHUNKS = [
+    "Let me look at what the user is asking ",
+    "and figure out the cleanest approach ",
+    "before I start writing any code.",
+  ];
+  let phase: "thinking" | "text" = "thinking";
+  let thinkIdx = 0;
+  let thinkingText = "";
   let emitted = 0;
   let fullText = "";
   const timer = window.setInterval(() => {
+    if (phase === "thinking") {
+      const chunk = THINKING_CHUNKS[thinkIdx];
+      thinkingText += chunk;
+      send({
+        type: "content_delta",
+        thread_id: threadId,
+        turn_id: turnId,
+        delta: { kind: "thinking", text: chunk },
+      });
+      thinkIdx += 1;
+      if (thinkIdx >= THINKING_CHUNKS.length) {
+        send({
+          type: "item_completed",
+          thread_id: threadId,
+          turn_id: turnId,
+          item: { kind: "assistant_thinking", text: thinkingText },
+        });
+        phase = "text";
+      }
+      return;
+    }
     emitted += 1;
     const chunk =
       emitted % 12 === 0
@@ -688,7 +742,22 @@ const handlers: Record<string, Handler> = {
     a.provider === "claude" ? CLAUDE_CAPABILITIES : EMPTY_CAPABILITIES,
   agent_chat_list_messages: (a) =>
     a.threadId === MOCK_CHAT_THREAD_ID ? mockChatTranscript() : [],
-  agent_chat_list_sessions: () => [],
+  // Return one record for the seeded thread so the pane can resolve the
+  // D2 session-start marker's `created_at` (and the SessionSelector
+  // dropdown has an entry). `created_at` is "now" so the marker reads
+  // "Today · HH:MM" like the design.
+  agent_chat_list_sessions: () => [
+    {
+      thread_id: MOCK_CHAT_THREAD_ID,
+      sdk_session_id: "sdk-mock-chat",
+      workspace_id: "ws-codemux-chat",
+      cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+      provider: "claude",
+      title: "agent-chat-demo",
+      created_at: new Date().toISOString(),
+      last_active_at: new Date().toISOString(),
+    },
+  ],
   agent_chat_start_session: (a) =>
     (a.input as { thread_id: string }).thread_id,
   agent_chat_send_turn: (a) =>

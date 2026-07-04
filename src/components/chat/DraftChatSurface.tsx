@@ -781,6 +781,39 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     activateWorkspace(wsId).catch(console.error);
   };
 
+  // D11 scope-pills row: worktree + branch pills (rounded-full) plus a
+  // hint spelling out what a first send will create. Only rendered on
+  // the draft surface (no live session yet) — a running chat graduates
+  // this into the workspace context bar. The `rise-in` animation is a
+  // one-shot entrance (globals.css) so the row settles in as the draft
+  // acquires a project scope.
+  const renderScopePills = (
+    projectPath: string,
+    draftTarget: ChatDraft["target"],
+  ) => (
+    <div className="rise-in flex flex-wrap items-center gap-2.5">
+      <WorktreePicker
+        mode="draft"
+        projectPath={projectPath}
+        draftTarget={draftTarget}
+        derivativeBranch={derivativeBranch}
+        onChangeDraftTarget={(target) =>
+          updateDraftTarget(draft.draftId, target)
+        }
+        onWorktreeCreated={handleWorktreeCreated}
+      />
+      <DerivativeBranchPicker
+        projectPath={projectPath}
+        value={derivativeBranch}
+        onChange={setDerivativeBranch}
+      />
+      <span className="text-[11.5px] text-muted-foreground">
+        {"→"} new worktree from{" "}
+        <span className="font-mono text-foreground/70">{derivativeBranch}</span>
+      </span>
+    </div>
+  );
+
   const zone1Override = (() => {
     if (draft.target.kind === "home") {
       return (
@@ -796,50 +829,15 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       );
     }
     if (draft.target.kind === "project") {
-      const projectPath = draft.target.projectPath;
-      return (
-        <div className="flex items-center gap-2">
-          <WorktreePicker
-            mode="draft"
-            projectPath={projectPath}
-            draftTarget={draft.target}
-            derivativeBranch={derivativeBranch}
-            onChangeDraftTarget={(target) =>
-              updateDraftTarget(draft.draftId, target)
-            }
-            onWorktreeCreated={handleWorktreeCreated}
-          />
-          <DerivativeBranchPicker
-            projectPath={projectPath}
-            value={derivativeBranch}
-            onChange={setDerivativeBranch}
-          />
-        </div>
-      );
+      return renderScopePills(draft.target.projectPath, draft.target);
     }
     if (draft.target.kind === "existing_workspace") {
-      if (!existingWorkspaceProjectRoot) return null;
-      return (
-        <div className="flex items-center gap-2">
-          <WorktreePicker
-            mode="draft"
-            projectPath={existingWorkspaceProjectRoot}
-            draftTarget={draft.target}
-            derivativeBranch={derivativeBranch}
-            onChangeDraftTarget={(target) =>
-              updateDraftTarget(draft.draftId, target)
-            }
-            onWorktreeCreated={handleWorktreeCreated}
-          />
-          <DerivativeBranchPicker
-            projectPath={existingWorkspaceProjectRoot}
-            value={derivativeBranch}
-            onChange={setDerivativeBranch}
-          />
-        </div>
-      );
+      // `undefined` → Composer's default cwd label as the fallback
+      // when the workspace has no resolvable project root.
+      if (!existingWorkspaceProjectRoot) return undefined;
+      return renderScopePills(existingWorkspaceProjectRoot, draft.target);
     }
-    return null;
+    return undefined;
   })();
 
   const composerEl = (
@@ -861,6 +859,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       // Drafts do not need a backend session to be considered ready —
       // Enter-to-send is always available as long as text is present.
       sessionReady={true}
+      // No live session yet — drives the draft-variant placeholder copy.
+      isDraft={true}
       showProviderPicker={true}
       showStopButton={false}
       errorMessage={draft.lastSendError}
@@ -911,7 +911,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
 function DraftSurfaceHeader() {
   return (
     <header
-      className="flex h-7 shrink-0 items-center gap-1 border-b border-border/30 bg-background px-1.5"
+      className="flex h-7 shrink-0 items-center gap-1 border-b border-border/50 bg-background px-1.5"
       data-testid="draft-surface-header"
     >
       <span className="px-1.5 text-xs text-muted-foreground">Agent Chat</span>

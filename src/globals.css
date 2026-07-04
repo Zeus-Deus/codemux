@@ -5,6 +5,13 @@
 @import "@fontsource-variable/dm-sans";
 @import "@xterm/xterm/css/xterm.css";
 
+/* Streamdown (streaming markdown renderer used by the agent-chat
+ * MessageResponse / ReasoningContent). Tailwind v4 only generates the
+ * classes it can see; the compiled Streamdown package emits its own
+ * utility classes, so its dist must be registered as a scan source.
+ * Path is relative to this file (src/globals.css → repo root). */
+@source "../node_modules/streamdown/dist/*.js";
+
 /* `@tailwindcss/typography` — drives the `prose` utility used by
  * `ChatMarkdown` to render assistant messages and plan proposals.
  * Tailwind v4 registers plugins via the `@plugin` at-rule instead
@@ -364,15 +371,6 @@ body.pane-resizing iframe {
   accent-color: var(--accent-ember);
 }
 
-/* Transcript-tail "thinking" indicator (see ThinkingIndicator.tsx).
- * Three dots with this same keyframe plus staggered animation-delay
- * produce a neutral wave. Opacity-only — no color change, no
- * transform — keeps the affordance quiet per the chat-ui skill. */
-@keyframes cm-thinking-wave {
-  0%, 80%, 100% { opacity: 0.2; }
-  40% { opacity: 0.9; }
-}
-
 /* Workspaces overview "pulse a row to draw attention" effect.
  *
  * Triggered when:
@@ -406,5 +404,58 @@ body.pane-resizing iframe {
   animation: cm-pulse-attention 800ms ease-out 2;
   /* Keep the rounding so the box-shadow tracks the row's corners. */
   border-radius: var(--radius, 0.625rem);
+}
+
+/* Agent-chat scope pills (worktree / branch) above the draft composer
+ * ease up into place when the draft surface mounts (design D11). Mirrors
+ * the mock's wsRise keyframe; apply via the `rise-in` class. */
+@keyframes cm-rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.rise-in {
+  animation: cm-rise-in 0.2s ease;
+}
+
+/* Live-status text shimmer for the agent-chat streaming marker
+ * ("Working…", "Running <tool>…") and the reasoning block header while
+ * thinking (design D9 / D5). A soft light band sweeps across the glyphs
+ * via a text-clipped gradient. Colours are theme tokens so it reads in
+ * both light and dark; the installed shadcn build does not ship a
+ * `shimmer` utility, so this is the local, token-driven equivalent of the
+ * design's wsShimmer. Honours reduced-motion. Apply via the `shimmer`
+ * class (optionally overriding font size/weight at the call site). */
+@keyframes cm-shimmer {
+  0% {
+    background-position: 200% 0;
+  }
+  100% {
+    background-position: -200% 0;
+  }
+}
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--muted-foreground) 20%,
+    var(--foreground) 48%,
+    var(--foreground) 52%,
+    var(--muted-foreground) 80%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: cm-shimmer 2.1s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .shimmer {
+    animation: none;
+  }
 }
 

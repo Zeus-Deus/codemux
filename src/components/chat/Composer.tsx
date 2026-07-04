@@ -22,6 +22,7 @@ import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import {
   buildModeCommands,
+  filterCommandMenuItems,
   filterSlashItems,
   findMentionAtCursor,
   findSlashAtCursor,
@@ -63,6 +64,7 @@ import type {
 } from "@/tauri/types";
 
 import { AttachmentChip } from "./AttachmentChip";
+import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { ComposerFooter } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { SlashCommandPopup } from "./SlashCommandPopup";
@@ -114,6 +116,12 @@ interface Props {
   streaming: boolean;
   sessionReady: boolean;
   showProviderPicker: boolean;
+  /** True on the pre-session draft surface (no live session yet). Only
+   *  affects the default-mode placeholder copy: draft reads "Describe
+   *  what you want the agent to do…", a live session reads "Reply or
+   *  steer the agent…" (design D10). Mode-specific placeholders
+   *  (plan/ask/debug) are unaffected. Defaults to false. */
+  isDraft?: boolean;
   /** Composer-level Cursor-style mode pill. Swaps the placeholder,
    *  hides the permission picker, and toggles the mode selector
    *  (dropdown → pill). */
@@ -127,8 +135,10 @@ interface Props {
   showStopButton?: boolean;
   /** Optional replacement for the Zone 1 strip (the cwd / "Home"
    *  label above the textarea). The draft surface uses this to thread
-   *  a project picker in when the draft target is Home. Pass `null`
-   *  (or omit) to keep the default cwd label. */
+   *  a project picker in when the draft target is Home. Omit
+   *  (`undefined`) to keep the default cwd label; pass `null` to
+   *  render nothing above the textarea (a running chat keeps its
+   *  scope in the workspace context bar instead). */
   zone1Override?: React.ReactNode;
   /** Step 8 Stage 1 — staged attachments rendered as a chip strip
    *  inside the composer card, above the textarea. Empty array hides
@@ -217,10 +227,11 @@ export function Composer({
   streaming,
   sessionReady,
   showProviderPicker,
+  isDraft = false,
   mode,
   errorMessage = null,
   showStopButton = true,
-  zone1Override = null,
+  zone1Override,
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
   onToggleExpandPr,
@@ -337,9 +348,12 @@ export function Composer({
   // slash + mention popups is enforced at the toggle point.
   const [attachOpen, setAttachOpen] = useState(false);
   const [attachSubmode, setAttachSubmode] = useState<AttachSubmode>("main");
-  const [attachHighlighted, setAttachHighlighted] = useState<string | null>(
-    null,
-  );
+  // Redesigned command menu — the search box is a real focused cmdk
+  // input, so keyboard nav (arrows / Enter) is owned by cmdk and the
+  // highlight is no longer parent-controlled. This holds the query the
+  // parent filters `attachPopupItems` against so the visible list and
+  // cmdk's navigable list stay identical.
+  const [attachQuery, setAttachQuery] = useState("");
   const [attachFileMatches, setAttachFileMatches] = useState<FileMatch[]>(
     EMPTY_FILE_MATCHES,
   );
@@ -610,7 +624,7 @@ export function Composer({
   const closeAttachPopup = useCallback(() => {
     setAttachOpen(false);
     setAttachSubmode("main");
-    setAttachHighlighted(null);
+    setAttachQuery("");
     // Keep the cached match arrays so reopening the popup is snappy;
     // the next open's effect re-fetches anyway when cwd / submode
     // changes invalidate them.
@@ -629,6 +643,7 @@ export function Composer({
       if (!target) return;
       if (
         target.closest('[data-testid="slash-command-popup"]') ||
+        target.closest('[data-testid="composer-command-menu"]') ||
         target.closest('[data-testid="composer-issue-picker"]') ||
         target.closest('[data-testid="composer-pr-picker"]') ||
         target.closest('[data-testid="composer-attach-button"]')
@@ -700,7 +715,7 @@ export function Composer({
     }
     setAttachOpen(true);
     setAttachSubmode("main");
-    setAttachHighlighted(null);
+    setAttachQuery("");
     if (slashAnchor) {
       setSlashAnchor(null);
       setSlashHighlighted(null);
@@ -904,12 +919,16 @@ export function Composer({
       // entries (Issue/PR/Image) stay for discoverability ahead of
       // Stages 4–6.
       return [
+        // MODES — design tones (sky / amber / violet) on the icon
+        // chips; the lucide icons stay in sync with MODE_CONFIG /
+        // ModePill so the picked mode's pill shows the same glyph.
         {
           id: "mode:plan",
           label: "Plan",
           description: "Plan and design before coding",
           command: "/plan",
           icon: ListTodo,
+          tone: "sky",
           group: "MODES",
           disabled: mode === "plan",
           onSelect: () => {},
@@ -920,6 +939,7 @@ export function Composer({
           description: "Add diagnostic logs to find bugs",
           command: "/debug",
           icon: Bug,
+          tone: "amber",
           group: "MODES",
           disabled: mode === "debug",
           onSelect: () => {},
@@ -930,6 +950,7 @@ export function Composer({
           description: "Read-only conversational mode",
           command: "/ask",
           icon: MessageCircleQuestion,
+          tone: "violet",
           group: "MODES",
           disabled: mode === "ask",
           onSelect: () => {},
@@ -940,6 +961,7 @@ export function Composer({
           description: "Pick a file from your project",
           command: "",
           icon: FileIcon,
+          tone: "muted",
           group: "ATTACH",
           onSelect: () => {},
         },
@@ -949,18 +971,36 @@ export function Composer({
           description: "Attach a directory tree",
           command: "",
           icon: FolderOpen,
+          tone: "muted",
           group: "ATTACH",
+          onSelect: () => {},
+        },
+        {
+          id: "attach:image",
+          label: "Image…",
+          // Stage 6 — capability gate. When `modelSupportsImages` is
+          // false the entry stays visible (so users discover that the
+          // affordance exists) but disabled with a model-specific hint.
+          description: modelSupportsImages
+            ? "Pick an image from disk"
+            : "Current model doesn't support images",
+          command: "",
+          icon: ImageIcon,
+          tone: "muted",
+          group: "ATTACH",
+          disabled: !modelSupportsImages,
           onSelect: () => {},
         },
         {
           id: "attach:issue",
           label: "GitHub Issue…",
           // Stage 4 — three flavours of disabled-state copy so the
-          // user knows whether the row is hidden because they're
+          // user knows whether the row is disabled because they're
           // off-GitHub, off-auth, or just waiting on the preflight.
-          // Once the preflight resolves to true + authenticated, the
-          // row enables and the description goes back to the active-
-          // affordance copy.
+          // The row stays VISIBLE and dimmed with its reason in the
+          // description; once the preflight resolves to true +
+          // authenticated it enables and the copy returns to the
+          // active-affordance line.
           description:
             isGithubRepo === false
               ? "Not a GitHub repo"
@@ -969,6 +1009,7 @@ export function Composer({
                 : "Pick an issue from this repo",
           command: "",
           icon: CircleDot,
+          tone: "muted",
           group: "ATTACH",
           disabled:
             isGithubRepo !== true || ghAuthenticated === false,
@@ -985,24 +1026,10 @@ export function Composer({
                 : "Pick a pull request from this repo",
           command: "",
           icon: GitPullRequest,
+          tone: "muted",
           group: "ATTACH",
           disabled:
             isGithubRepo !== true || ghAuthenticated === false,
-          onSelect: () => {},
-        },
-        {
-          id: "attach:image",
-          label: "Image…",
-          // Stage 6 — capability gate. When `modelSupportsImages` is
-          // false the entry stays visible (so users discover that the
-          // affordance exists) but disabled with a model-specific hint.
-          description: modelSupportsImages
-            ? "Pick an image from disk"
-            : "Current model doesn't support images",
-          command: "",
-          icon: ImageIcon,
-          group: "ATTACH",
-          disabled: !modelSupportsImages,
           onSelect: () => {},
         },
         {
@@ -1011,7 +1038,8 @@ export function Composer({
           description: "Toggle integrations the agent can call",
           command: "",
           icon: Server,
-          group: "ATTACH",
+          tone: "green",
+          group: "INTEGRATIONS",
           onSelect: () => {},
         },
       ];
@@ -1029,6 +1057,7 @@ export function Composer({
             : formatMcpRowStatus(runtime, isOff),
           command: "",
           icon: Server,
+          tone: "green",
           group: "MCP SERVERS",
           // The Switch in `rightAdornment` owns the click; the row's
           // own onSelect is intentionally a no-op so users don't
@@ -1050,6 +1079,7 @@ export function Composer({
         description: "View tools and manage servers",
         command: "",
         icon: Settings,
+        tone: "muted",
         group: "MCP SERVERS",
         onSelect: () => {},
       });
@@ -1061,6 +1091,7 @@ export function Composer({
         label: match.path,
         command: "",
         icon: FileIcon,
+        tone: "muted",
         group: "FILES",
         onSelect: () => {},
       }));
@@ -1074,6 +1105,7 @@ export function Composer({
       description: `${match.item_count} item${match.item_count === 1 ? "" : "s"}`,
       command: "",
       icon: FolderOpen,
+      tone: "muted",
       group: "FOLDERS",
       onSelect: () => {},
     }));
@@ -1122,16 +1154,30 @@ export function Composer({
     attachFolderMatches.length,
   ]);
 
-  // Initialise / sync the attach-popup highlight to the first
-  // enabled item whenever the visible item list shifts.
-  useEffect(() => {
-    if (!attachOpen) return;
-    const enabledIds = attachPopupItems
-      .filter((i) => !i.disabled)
-      .map((i) => i.id);
-    if (attachHighlighted && enabledIds.includes(attachHighlighted)) return;
-    setAttachHighlighted(enabledIds[0] ?? null);
-  }, [attachOpen, attachPopupItems, attachHighlighted]);
+  // Rows the command menu actually shows for the current query.
+  // Filtering here (rather than inside the menu) keeps the visible
+  // list identical to the one cmdk navigates. Disabled rows survive
+  // the filter so they stay visible with their reason; cmdk skips
+  // them during keyboard nav. `filterCommandMenuItems` also matches a
+  // leading `/` against the mode tags (so `/pl` finds Plan).
+  const visibleAttachItems = useMemo(
+    () => filterCommandMenuItems(attachPopupItems, attachQuery),
+    [attachPopupItems, attachQuery],
+  );
+
+  // Escape inside the command menu: a submode walks back to `main`
+  // (clearing the search); `main` closes the popup and restores focus
+  // to the textarea. Mirrors the prior macOS / Slack-style nested-menu
+  // UX, now that the menu's own focused search input receives the key.
+  const handleAttachEscape = useCallback(() => {
+    if (attachSubmode !== "main") {
+      setAttachSubmode("main");
+      setAttachQuery("");
+      return;
+    }
+    closeAttachPopup();
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [attachSubmode, closeAttachPopup]);
 
   const handleAttachPopupSelect = useCallback(
     (item: SlashCommandItem) => {
@@ -1139,27 +1185,27 @@ export function Composer({
       // Submode pivots
       if (item.id === "attach:file") {
         setAttachSubmode("file");
-        setAttachHighlighted(null);
+        setAttachQuery("");
         return;
       }
       if (item.id === "attach:folder") {
         setAttachSubmode("folder");
-        setAttachHighlighted(null);
+        setAttachQuery("");
         return;
       }
       if (item.id === "attach:issue") {
         setAttachSubmode("issue");
-        setAttachHighlighted(null);
+        setAttachQuery("");
         return;
       }
       if (item.id === "attach:pr") {
         setAttachSubmode("pr");
-        setAttachHighlighted(null);
+        setAttachQuery("");
         return;
       }
       if (item.id === "attach:mcp") {
         setAttachSubmode("mcp");
-        setAttachHighlighted(null);
+        setAttachQuery("");
         return;
       }
       if (item.id === "mcp:settings") {
@@ -1198,20 +1244,17 @@ export function Composer({
       // Mode picks — close the popup and activate the mode. The
       // mode pill renders in the chip strip above the textarea
       // (Stage 3 refactor); the footer no longer carries a mode
-      // selector after the `+ Mode` dropdown was retired.
-      if (item.id === "mode:plan") {
+      // selector after the `+ Mode` dropdown was retired. Focus
+      // returns to the textarea (it was on the menu's search input).
+      if (
+        item.id === "mode:plan" ||
+        item.id === "mode:debug" ||
+        item.id === "mode:ask"
+      ) {
+        const nextMode = item.id.slice("mode:".length) as ActivePillMode;
         closeAttachPopup();
-        onModeActivate("plan");
-        return;
-      }
-      if (item.id === "mode:debug") {
-        closeAttachPopup();
-        onModeActivate("debug");
-        return;
-      }
-      if (item.id === "mode:ask") {
-        closeAttachPopup();
-        onModeActivate("ask");
+        onModeActivate(nextMode);
+        requestAnimationFrame(() => textareaRef.current?.focus());
         return;
       }
       // File / folder picks: insert the inline token, dispatch the
@@ -1546,57 +1589,10 @@ export function Composer({
       }
     }
 
-    if (attachOpen) {
-      // Esc inside a submode walks back to main; Esc on main closes
-      // the popup. Mirrors the macOS / Slack-style nested-menu UX.
-      if (e.key === "Escape") {
-        e.preventDefault();
-        if (attachSubmode !== "main") {
-          setAttachSubmode("main");
-          setAttachHighlighted(null);
-        } else {
-          closeAttachPopup();
-        }
-        return;
-      }
-      // Arrow nav skips disabled rows entirely. Enter activates the
-      // currently highlighted (enabled) row via the same dispatch
-      // path the mouse-click would use.
-      const enabledIds = attachPopupItems
-        .filter((i) => !i.disabled)
-        .map((i) => i.id);
-      if (enabledIds.length > 0) {
-        if (e.key === "ArrowDown") {
-          e.preventDefault();
-          const idx = attachHighlighted
-            ? enabledIds.indexOf(attachHighlighted)
-            : -1;
-          const next = enabledIds[(idx + 1) % enabledIds.length];
-          if (next) setAttachHighlighted(next);
-          return;
-        }
-        if (e.key === "ArrowUp") {
-          e.preventDefault();
-          const idx = attachHighlighted
-            ? enabledIds.indexOf(attachHighlighted)
-            : 0;
-          const next =
-            enabledIds[(idx - 1 + enabledIds.length) % enabledIds.length];
-          if (next) setAttachHighlighted(next);
-          return;
-        }
-        if (e.key === "Enter" && !e.shiftKey) {
-          e.preventDefault();
-          const item = attachPopupItems.find(
-            (i) => i.id === attachHighlighted,
-          );
-          if (item) handleAttachPopupSelect(item);
-          return;
-        }
-      }
-      // Other keys (typing, etc.) pass through to the textarea so
-      // the user can keep editing prose while the popup is open.
-    }
+    // The redesigned command menu owns a real focused search input, so
+    // its keyboard nav (arrows / Enter / Escape) is handled by cmdk +
+    // the menu itself — not here on the textarea. When the menu is
+    // open the textarea isn't focused, so no attach branch is needed.
 
     if (mentionOpen) {
       // Esc closes the mention popup; falls through to the normal
@@ -1710,14 +1706,14 @@ export function Composer({
 
   return (
     <div className="w-full px-4 pb-3">
-      <div className="mx-auto w-full max-w-2xl">
-        {zone1Override !== null
-          ? <div className="pb-1">{zone1Override}</div>
-          : cwd && (
-              <div className="px-3 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
-                {cwd}
-              </div>
-            )}
+      <div className="mx-auto w-full max-w-[760px]">
+        {zone1Override !== null && zone1Override !== undefined ? (
+          <div className="pb-1">{zone1Override}</div>
+        ) : zone1Override === undefined && cwd ? (
+          <div className="px-3 pb-1 text-[11px] text-muted-foreground/70 truncate font-mono">
+            {cwd}
+          </div>
+        ) : null}
         <div
           data-testid="composer-wrapper"
           data-dragging={isDragging || undefined}
@@ -1727,20 +1723,26 @@ export function Composer({
           onDrop={handleDrop}
           className={cn(
             "relative",
-            "rounded-xl bg-muted/30 ring-1 ring-border/60 focus-within:ring-muted-foreground/60",
+            // Composer card (design D10): 15px radius, a real hairline
+            // border on the slightly-elevated surface, and a soft
+            // shadow so the card lifts off the pane background. Focus
+            // sharpens the border rather than stacking a ring.
+            "rounded-[15px] border border-border bg-muted/40 shadow-sm",
             // Composer is mounted for the entire chat session and re-
             // renders frequently as the draft / attachments change.
             // `transition-all` would animate every property change;
-            // scope to the two properties that actually transition
-            // here (drag-state ring colour + tinted background, plus
-            // focus-within ring colour shift) so the compositor only
-            // has work to do on those changes.
-            "transition-[box-shadow,background-color]",
+            // scope to the properties that actually transition here
+            // (drag-state border + tinted background, plus focus-within
+            // border shift) so the compositor only has work to do on
+            // those changes.
+            "transition-[box-shadow,border-color,background-color]",
+            "focus-within:border-muted-foreground/50",
             // Drag-over uses a neutral foreground-tinted ring instead
             // of the primary accent: the chat-ui skill reserves accent
             // for the app shell, and the brightness shift alone is
             // enough to confirm the drop target.
-            isDragging && "ring-2 ring-foreground/40 bg-foreground/[0.04]",
+            isDragging &&
+              "border-foreground/40 bg-foreground/[0.04] ring-1 ring-foreground/40",
           )}
         >
           {/* Step 8 Stage 6 — hidden image picker. The `+ → Image…`
@@ -1830,13 +1832,24 @@ export function Composer({
               />
             </div>
           ) : (
-            <SlashCommandPopup
-              items={attachPopupItems}
-              highlightedId={attachHighlighted}
-              onHighlightChange={setAttachHighlighted}
-              onSelect={handleAttachPopupSelect}
+            <ComposerCommandMenu
               open={attachOpen}
+              items={visibleAttachItems}
+              query={attachQuery}
+              onQueryChange={setAttachQuery}
+              onSelect={handleAttachPopupSelect}
+              onEscape={handleAttachEscape}
               footerNote={attachPopupFooter}
+              submode={attachSubmode}
+              placeholder={
+                attachSubmode === "file"
+                  ? "Filter files"
+                  : attachSubmode === "folder"
+                    ? "Filter folders"
+                    : attachSubmode === "mcp"
+                      ? "Filter servers"
+                      : "Search or type /"
+              }
             />
           )}
           {errorMessage && (
@@ -2082,7 +2095,9 @@ export function Composer({
                 }
               }}
               placeholder={
-                sessionReady ? placeholderForMode(mode) : "Starting session…"
+                sessionReady
+                  ? placeholderForMode(mode, isDraft)
+                  : "Starting session…"
               }
               rows={1}
               className={cn(
@@ -2157,7 +2172,7 @@ function formatMcpRowStatus(
   }
 }
 
-function placeholderForMode(mode: ChatMode): string {
+function placeholderForMode(mode: ChatMode, isDraft: boolean): string {
   switch (mode) {
     case "plan":
       return "Plan and design before coding…";
@@ -2166,6 +2181,10 @@ function placeholderForMode(mode: ChatMode): string {
     case "debug":
       return "Debug and troubleshoot issues…";
     case "default":
-      return "Message the agent…";
+      // Design D10: the empty draft surface invites a fresh task; a
+      // live session invites a follow-up / steer.
+      return isDraft
+        ? "Describe what you want the agent to do…"
+        : "Reply or steer the agent…";
   }
 }
