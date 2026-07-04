@@ -22,6 +22,7 @@ import type {
   ToolCallItem,
 } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
+import type { AgentChatProviderKind } from "@/tauri/types";
 
 import { AssistantAvatar } from "./AssistantAvatar";
 import { AssistantMessage } from "./AssistantMessage";
@@ -46,6 +47,10 @@ interface Props {
    *  (design D2). When absent a plain "Session started" divider renders.
    *  Stage 3 wires the real value through AgentChatPane. */
   sessionStartedAt?: number;
+  /** The session's chat provider. Drives the assistant-turn avatar's
+   *  official mark (Claude / Codex / OpenCode). Stable per session, so it
+   *  is safe to thread into the memoized rows. Absent → sparkle fallback. */
+  provider?: AgentChatProviderKind | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
@@ -69,6 +74,7 @@ export function MessageList({
   messages,
   showThinking = false,
   sessionStartedAt,
+  provider,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
@@ -186,11 +192,13 @@ export function MessageList({
                   <ToolGroupRowMemo
                     items={slot.body.items}
                     showAvatar={slot.showAvatar}
+                    provider={provider}
                   />
                 ) : (
                   <ItemRowMemo
                     item={slot.body.item}
                     showAvatar={slot.showAvatar}
+                    provider={provider}
                     approval={lookupApproval(slot.body.item, requestsById)}
                     onRespondToRequest={onRespondToRequest}
                     onAcceptPlan={onAcceptPlan}
@@ -284,14 +292,18 @@ function lookupApproval(
  *  their content aligns under the first row. */
 function AssistantGutter({
   showAvatar,
+  provider,
   children,
 }: {
   showAvatar: boolean;
+  provider?: AgentChatProviderKind | null;
   children: React.ReactNode;
 }) {
   return (
     <div className="flex gap-[13px]">
-      <div className="w-[29px] shrink-0">{showAvatar ? <AssistantAvatar /> : null}</div>
+      <div className="w-[29px] shrink-0">
+        {showAvatar ? <AssistantAvatar provider={provider} /> : null}
+      </div>
       <div className="min-w-0 flex-1">{children}</div>
     </div>
   );
@@ -300,6 +312,7 @@ function AssistantGutter({
 function ItemRow({
   item,
   showAvatar,
+  provider,
   approval,
   onRespondToRequest,
   onAcceptPlan,
@@ -307,6 +320,7 @@ function ItemRow({
 }: {
   item: ChatViewItem;
   showAvatar: boolean;
+  provider?: AgentChatProviderKind | null;
   approval: PermissionRequestItem | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
@@ -336,7 +350,7 @@ function ItemRow({
   }
 
   return (
-    <AssistantGutter showAvatar={showAvatar}>
+    <AssistantGutter showAvatar={showAvatar} provider={provider}>
       {renderAssistantBody(item, {
         approval,
         handleDecide,
@@ -414,12 +428,14 @@ function renderAssistantBody(
 function ToolGroupRow({
   items,
   showAvatar,
+  provider,
 }: {
   items: ToolCallItem[];
   showAvatar: boolean;
+  provider?: AgentChatProviderKind | null;
 }) {
   return (
-    <AssistantGutter showAvatar={showAvatar}>
+    <AssistantGutter showAvatar={showAvatar} provider={provider}>
       <ToolGroupCard items={items} />
     </AssistantGutter>
   );

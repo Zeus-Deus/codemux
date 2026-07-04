@@ -2017,6 +2017,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             messages={messages}
             streaming={streaming || isSending}
             sessionStartedAt={sessionStartedAt}
+            provider={provider}
             onRespondToRequest={handleRespond}
             onAcceptPlan={handleAcceptPlan}
             onRejectPlan={handleRejectPlan}

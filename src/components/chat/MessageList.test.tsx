@@ -10,6 +10,20 @@ import type {
 
 import { MessageList } from "./MessageList";
 
+// The assistant-turn avatar renders the provider's branded mark via
+// ProviderLogo, which imports the SVG assets at module load. vitest's
+// jsdom env doesn't serve `?import` URLs, so stub the marks for a
+// predictable path string (same pattern as provider-logo.test.tsx).
+vi.mock("@/assets/preset-icons/claude.svg", () => ({
+  default: "/mock/claude.svg",
+}));
+vi.mock("@/assets/preset-icons/codex.svg", () => ({
+  default: "/mock/codex.svg",
+}));
+vi.mock("@/assets/preset-icons/opencode.svg", () => ({
+  default: "/mock/opencode.svg",
+}));
+
 afterEach(() => cleanup());
 
 // The MessageScroller renders every row into the DOM (perf comes from
@@ -243,6 +257,39 @@ describe("MessageList tool group cards", () => {
     expect(screen.getByText("Searched the codebase")).toBeInTheDocument();
     expect(screen.getByText("Allow")).toBeInTheDocument();
     expect(screen.getByText("Deny")).toBeInTheDocument();
+  });
+});
+
+describe("MessageList provider avatar", () => {
+  const assistantTurn: ChatViewItem[] = [
+    {
+      kind: "assistant_message",
+      id: "am-1",
+      seq: 0,
+      turn_id: "t1",
+      text: "hello from the agent",
+      streaming: false,
+    },
+  ];
+
+  it("threads the provider through to the assistant-turn avatar mark", () => {
+    const { container } = render(
+      <MessageList messages={assistantTurn} provider="codex" {...noopHandlers} />,
+    );
+    const img = container.querySelector(
+      "img[data-provider]",
+    ) as HTMLImageElement;
+    expect(img).not.toBeNull();
+    expect(img.getAttribute("data-provider")).toBe("codex");
+    expect(img.getAttribute("src")).toContain("codex.svg");
+  });
+
+  it("falls back to the sparkle avatar when no provider is passed", () => {
+    const { container } = render(
+      <MessageList messages={assistantTurn} {...noopHandlers} />,
+    );
+    // No branded mark image; the ember sparkle (inline svg) shows instead.
+    expect(container.querySelector("img[data-provider]")).toBeNull();
   });
 });
 
