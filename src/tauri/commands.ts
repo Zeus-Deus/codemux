@@ -1102,6 +1102,29 @@ export const saveClipboardImageBytes = (
 export const pasteClipboardImageToFile = (): Promise<string> =>
   invoke<string>("paste_clipboard_image_to_file");
 
+/// Read the OS clipboard as an image, encode it as PNG, and return the
+/// encoded bytes + MIME directly (no temp file).
+///
+/// This is the agent-chat sibling of `pasteClipboardImageToFile`. The
+/// chat composer stages image bytes in memory rather than a filesystem
+/// path, so we ship the encoded PNG across IPC once (Rust→JS) instead
+/// of writing a temp file the composer would then have to read back and
+/// clean up. Throws when the clipboard holds no image (e.g. text-only),
+/// which the caller should treat as "let the default paste run".
+///
+/// WebKit hands the serialized `Vec<u8>` back as a `number[]`, so we
+/// rewrap it in a `Uint8Array` before returning.
+export interface ClipboardImagePayload {
+  bytes: Uint8Array;
+  mime: string;
+}
+export const pasteClipboardImage = async (): Promise<ClipboardImagePayload> => {
+  const raw = await invoke<{ bytes: number[]; mime: string }>(
+    "paste_clipboard_image",
+  );
+  return { bytes: new Uint8Array(raw.bytes), mime: raw.mime };
+};
+
 // ── Dialogs ──
 
 export const pickFolderDialog = (title: string) =>
