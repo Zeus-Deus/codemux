@@ -30,7 +30,10 @@ afterEach(() => cleanup());
 // `content-visibility:auto`, not row unmounting), so a plain render is
 // enough to assert on grouping / dispatch / marker DOM — no virtualizer
 // mock context is needed.
-function renderList(messages: ChatViewItem[], extra?: { showThinking?: boolean; sessionStartedAt?: number }) {
+function renderList(
+  messages: ChatViewItem[],
+  extra?: { showThinking?: boolean; streaming?: boolean; sessionStartedAt?: number },
+) {
   return render(
     <MessageList messages={messages} {...extra} {...noopHandlers} />,
   );
@@ -180,35 +183,60 @@ describe("MessageList dispatch", () => {
   });
 });
 
-describe("MessageList tool group cards", () => {
-  it("folds a run of ≥2 completed tool calls into one collapsible group card", () => {
+describe("MessageList activity blocks", () => {
+  it("folds a run of ≥2 completed tool calls into one settled activity block", () => {
     const messages: ChatViewItem[] = [
       readCall(0, "/a"),
       readCall(1, "/b"),
       readCall(2, "/c"),
     ];
     renderList(messages);
-    // One group card: derived title + meta. Individual commands stay
-    // hidden until expand.
-    expect(screen.getByText("Searched the codebase")).toBeInTheDocument();
-    expect(screen.getByText("3 commands")).toBeInTheDocument();
+    // Settled header: derived summary + step meta + Details toggle. Step
+    // rows stay hidden until expand.
+    expect(screen.getByText("Explored the codebase")).toBeInTheDocument();
+    expect(screen.getByText("3 steps")).toBeInTheDocument();
+    expect(screen.getByText("Details")).toBeInTheDocument();
     expect(screen.queryByText("/a")).toBeNull();
 
-    // Expand → per-call rows appear.
-    fireEvent.click(screen.getByText("Searched the codebase"));
+    // Expand → per-step rows appear; the toggle flips to "Hide".
+    fireEvent.click(screen.getByText("Explored the codebase"));
     expect(screen.getByText("/a")).toBeInTheDocument();
     expect(screen.getByText("/c")).toBeInTheDocument();
+    expect(screen.getByText("Hide")).toBeInTheDocument();
   });
 
-  it("renders a lone completed tool call as a single card, not a group", () => {
+  it("renders a lone completed tool call as a single card, not an activity block", () => {
     renderList([readCall(0, "/only")]);
-    expect(screen.queryByText(/commands/)).toBeNull();
+    expect(screen.queryByText(/steps/)).toBeNull();
+    expect(screen.queryByText("Details")).toBeNull();
     // Single card shows the mono summary via ToolCallStatus.
     expect(screen.getByText("Read")).toBeInTheDocument();
     expect(screen.getByText("/only")).toBeInTheDocument();
   });
 
-  it("a non-tool row breaks the run into two independent group cards", () => {
+  it("shows a WORKING header (live action + counter) for the streaming tail run", () => {
+    const messages: ChatViewItem[] = [
+      readCall(0, "/a"),
+      {
+        kind: "tool_call",
+        id: "tc-run",
+        seq: 1,
+        tool_use_id: "tu-run",
+        tool_name: "Bash",
+        input: { command: "cargo test" },
+        status: "running",
+        result_content: null,
+        approval_request_id: null,
+      },
+    ];
+    renderList(messages, { streaming: true, showThinking: false });
+    expect(screen.getByText("Working")).toBeInTheDocument();
+    // Live action = the running step; counter = 1 done · 1 running.
+    expect(screen.getByText("1 done · 1 running")).toBeInTheDocument();
+    expect(screen.getByText("run cargo test")).toBeInTheDocument();
+  });
+
+  it("a non-tool row breaks the run into two independent activity blocks", () => {
     const messages: ChatViewItem[] = [
       readCall(0, "/x0"),
       readCall(1, "/x1"),
@@ -224,11 +252,11 @@ describe("MessageList tool group cards", () => {
       readCall(4, "/y1"),
     ];
     renderList(messages);
-    expect(screen.getAllByText("Searched the codebase")).toHaveLength(2);
+    expect(screen.getAllByText("Explored the codebase")).toHaveLength(2);
     expect(screen.getByText("between bursts")).toBeInTheDocument();
   });
 
-  it("never swallows a pending-approval tool call into a group", () => {
+  it("never swallows a pending-approval tool call into an activity block", () => {
     const pending: ToolCallItem = {
       kind: "tool_call",
       id: "tc-guard",
@@ -252,9 +280,9 @@ describe("MessageList tool group cards", () => {
       resolution: { state: "pending" },
     };
     renderList([readCall(0, "/a"), readCall(1, "/b"), pending, approval]);
-    // Two completed reads fold into a group; the gated Bash call stays a
-    // standalone card with its approval footer visible.
-    expect(screen.getByText("Searched the codebase")).toBeInTheDocument();
+    // Two completed reads fold into an activity block; the gated Bash call
+    // stays a standalone card with its approval footer visible.
+    expect(screen.getByText("Explored the codebase")).toBeInTheDocument();
     expect(screen.getByText("Allow")).toBeInTheDocument();
     expect(screen.getByText("Deny")).toBeInTheDocument();
   });

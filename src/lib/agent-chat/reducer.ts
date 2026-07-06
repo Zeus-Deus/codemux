@@ -479,6 +479,10 @@ function applyEventInner(
               ...found.item,
               tool_name: item.tool_name,
               input: item.input,
+              // Result-first ordering already stamped `completed_at`; only
+              // fill `started_at` if this is genuinely the first time we
+              // observe the use landing.
+              started_at: found.item.started_at ?? now(),
             };
             return {
               ...state,
@@ -506,6 +510,7 @@ function applyEventInner(
             status: "running",
             result_content: null,
             approval_request_id: priorRequest?.request_id ?? null,
+            started_at: now(),
           };
           return { ...seqBumped, messages: [...seqBumped.messages, newToolCall] };
         }
@@ -518,6 +523,7 @@ function applyEventInner(
               ...found.item,
               status: item.is_error ? "error" : "done",
               result_content: item.content,
+              completed_at: now(),
             };
             return {
               ...state,
@@ -554,6 +560,7 @@ function applyEventInner(
             status: item.is_error ? "error" : "done",
             result_content: item.content,
             approval_request_id: null,
+            completed_at: now(),
           };
           return {
             ...seqBumped,
