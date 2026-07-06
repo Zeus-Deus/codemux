@@ -675,6 +675,91 @@ pub async fn paste_clipboard_image_to_file<R: tauri::Runtime>(
     .map_err(|e| format!("paste_clipboard_image_to_file task join failed: {e}"))?
 }
 
+/// Encoded clipboard image handed back to JS by `paste_clipboard_image`.
+///
+/// Unlike the dialog's file-path flow, the agent-chat composer stages
+/// image *bytes* in memory, so the encoded PNG has to cross the IPC
+/// boundary. `serde` serialises `Vec<u8>` as a JSON number array, which
+/// WebKit hands the frontend as a `number[]` (rewrapped in a `Uint8Array`
+/// by the TS wrapper).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClipboardImagePayload {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+}
+
+/// Encode a raw RGBA buffer as PNG and wrap it with its MIME, enforcing
+/// the same size ceiling the disk-write path applies.
+///
+/// Extracted from `paste_clipboard_image` so the encode + size-guard
+/// logic is unit-testable without an OS clipboard (mirrors how
+/// `encode_rgba_to_png` and `write_clipboard_image_to_disk` are split
+/// out). The `image/png` MIME is fixed because we always re-encode to
+/// PNG regardless of the clipboard's original format.
+fn build_clipboard_image_payload(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<ClipboardImagePayload, String> {
+    let png_bytes = encode_rgba_to_png(rgba, width, height)?;
+    if png_bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(format!(
+            "Clipboard image too large ({:.1} MB, limit is {} MB)",
+            png_bytes.len() as f64 / (1024.0 * 1024.0),
+            MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
+    Ok(ClipboardImagePayload {
+        bytes: png_bytes,
+        mime: "image/png".to_string(),
+    })
+}
+
+/// Read the OS clipboard as an image, encode it as PNG, and return the
+/// encoded bytes + MIME directly (no temp file).
+///
+/// This is the agent-chat sibling of `paste_clipboard_image_to_file`.
+/// The chat composer stages image bytes in memory rather than a
+/// filesystem path, so the bytes have to reach JS regardless. Shipping
+/// them across IPC once (Rust→JS) is cleaner than the alternative —
+/// writing a temp file and adding a second command to read it back
+/// would double the disk I/O and leak an orphan file the composer never
+/// deletes. The (unavoidable) single JSON-array hop is fine for a
+/// clipboard-sized screenshot.
+///
+/// Errors identically to `paste_clipboard_image_to_file` when the
+/// clipboard holds no image (text-only), so the frontend can fall back
+/// to the default paste behaviour.
+///
+/// `async fn` so the clipboard read, PNG encode, and size check all run
+/// on the blocking pool instead of the GTK main thread (see note at top
+/// of file).
+#[tauri::command]
+pub async fn paste_clipboard_image<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+) -> Result<ClipboardImagePayload, String> {
+    tokio::task::spawn_blocking(move || {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+
+        let img = app
+            .clipboard()
+            .read_image()
+            .map_err(|e| format!("clipboard read_image failed: {e}"))?;
+
+        let width = img.width();
+        let height = img.height();
+        let rgba = img.rgba();
+
+        if width == 0 || height == 0 || rgba.is_empty() {
+            return Err("Clipboard image is empty".into());
+        }
+
+        build_clipboard_image_payload(rgba, width, height)
+    })
+    .await
+    .map_err(|e| format!("paste_clipboard_image task join failed: {e}"))?
+}
+
 /// Count occurrences of `pattern` across `cwd` using ripgrep.
 ///
 /// `cwd` must be an absolute, existing directory. The pattern is passed
@@ -729,9 +814,9 @@ pub async fn grep_count_pattern(cwd: String, pattern: String) -> Result<usize, S
 #[cfg(test)]
 mod tests {
     use super::{
-        clipboard_image_extension, encode_rgba_to_png, grep_count_pattern, list_directory,
-        read_file, save_clipboard_image_bytes, search_in_files, write_file,
-        MAX_CLIPBOARD_IMAGE_BYTES,
+        build_clipboard_image_payload, clipboard_image_extension, encode_rgba_to_png,
+        grep_count_pattern, list_directory, read_file, save_clipboard_image_bytes,
+        search_in_files, write_file, MAX_CLIPBOARD_IMAGE_BYTES,
     };
     use std::fs;
 
@@ -1090,6 +1175,66 @@ mod tests {
         assert!(
             err.contains("overflow") || err.contains("does not match"),
             "expected overflow or mismatch error, got: {err}",
+        );
+    }
+
+    // ── build_clipboard_image_payload (agent-chat paste flow) ────
+    //
+    // Pure logic behind the `paste_clipboard_image` command: encode +
+    // size-guard, no OS clipboard required. The command itself only
+    // reads pixels off the clipboard and delegates here.
+
+    #[test]
+    fn build_clipboard_image_payload_returns_valid_png_and_mime() {
+        // 2×2 all-opaque blue. The payload's bytes must be a real PNG
+        // (magic header) so the File the composer builds decodes, and
+        // the MIME must be the fixed image/png we always re-encode to.
+        let rgba: Vec<u8> = vec![
+            0, 0, 255, 255, //
+            0, 0, 255, 255, //
+            0, 0, 255, 255, //
+            0, 0, 255, 255, //
+        ];
+        let payload =
+            build_clipboard_image_payload(&rgba, 2, 2).expect("encode should succeed");
+        assert_eq!(payload.mime, "image/png");
+        assert!(
+            payload.bytes.len() >= 8 && payload.bytes[..8] == PNG_MAGIC,
+            "payload bytes must be a real PNG, got first 8: {:?}",
+            &payload.bytes[..payload.bytes.len().min(8)],
+        );
+    }
+
+    #[test]
+    fn build_clipboard_image_payload_roundtrips_through_decoder() {
+        // Strongest correctness assertion: the returned bytes decode
+        // back to the exact input pixels via the same png crate.
+        let rgba: Vec<u8> = vec![
+            11, 22, 33, 255, //
+            44, 55, 66, 255, //
+        ];
+        let payload =
+            build_clipboard_image_payload(&rgba, 2, 1).expect("encode should succeed");
+        let decoder = png::Decoder::new(payload.bytes.as_slice());
+        let mut reader = decoder.read_info().expect("PNG should be parseable");
+        let mut decoded = vec![0u8; reader.output_buffer_size()];
+        let info = reader
+            .next_frame(&mut decoded)
+            .expect("PNG body should decode");
+        assert_eq!(info.width, 2);
+        assert_eq!(info.height, 1);
+        decoded.truncate(info.buffer_size());
+        assert_eq!(decoded, rgba, "decoded pixels must match the input RGBA");
+    }
+
+    #[test]
+    fn build_clipboard_image_payload_propagates_encode_errors() {
+        // A pixel/dimension mismatch must surface as an error (from
+        // encode_rgba_to_png) rather than panic or a bogus payload.
+        let err = build_clipboard_image_payload(&vec![0u8; 12], 2, 2).unwrap_err();
+        assert!(
+            err.contains("does not match"),
+            "expected length-mismatch error, got: {err}",
         );
     }
 

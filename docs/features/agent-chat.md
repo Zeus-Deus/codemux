@@ -103,6 +103,19 @@ The chat pane stack:
   images via paste / drop / picker. Inline chips, send-time injection,
   expand, caps, gif guard, chip tooltips. See
   `docs/plans/step-8-attachments.md`.
+  - **Ctrl+V image paste has a Linux clipboard fallback.** WebKit2GTK
+    strips image payloads from the JS `paste` event, so `Composer`'s
+    handler tries `e.clipboardData.items` first (works in the browser
+    dev mock / Chrome) and, when that yields no image, falls back to the
+    `paste_clipboard_image` Rust command (reads the OS clipboard
+    server-side, re-encodes PNG via the shared `encode_rgba_to_png`,
+    returns `{ bytes, mime }`). Composer wraps the bytes in a `File` and
+    hands them to the same `handleAttachImage` (`AgentChatPane`) the `+`
+    picker uses, so validation/staging are identical. This mirrors the
+    new-workspace dialog's `paste_clipboard_image_to_file`, but returns
+    bytes (not a temp-file path) because the chat stages bytes in
+    memory. A text-only clipboard rejects the command → default paste
+    runs untouched.
 - **Slash command popup** with cross-provider parsing.
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
   compat. Server-side sync (see `docs/features/skills-sync.md`).

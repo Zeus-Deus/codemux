@@ -1661,6 +1661,7 @@ pub fn run() {
             commands::write_file,
             commands::save_clipboard_image_bytes,
             commands::paste_clipboard_image_to_file,
+            commands::paste_clipboard_image,
             commands::grep_count_pattern,
             commands::reveal_in_file_manager,
             commands::start_oauth_flow,

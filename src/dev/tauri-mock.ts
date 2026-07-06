@@ -791,6 +791,16 @@ const handlers: Record<string, Handler> = {
   },
   grep_count_pattern: () => 0,
 
+  // Clipboard-image paste fallback (agent-chat composer). The real
+  // command reads the OS clipboard server-side; in the browser there's
+  // no such surface, so reject like the "no image on clipboard" case.
+  // The composer's clipboardData fast path handles real image pastes in
+  // the browser, and this rejection makes a text-only paste fall
+  // through to the default (plain-text) behaviour.
+  paste_clipboard_image: () => {
+    throw new Error("clipboard read_image failed: no image (dev mock)");
+  },
+
   // ── Agent chat per-thread event channel (issue #75) ──
   // Mirrors AgentChatChannelRegistry: newest attach wins, detach is
   // generation-guarded so a stale unmount can't tear down a newer
