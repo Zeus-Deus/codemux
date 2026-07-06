@@ -19,10 +19,20 @@ vi.mock("@/tauri/commands", async (importActual) => {
     listGithubIssuesByPath: vi.fn().mockResolvedValue([]),
     getGithubIssueByPath: vi.fn(),
     listSkills: vi.fn().mockResolvedValue([]),
+    // Default to the "no image on clipboard" outcome so the fallback
+    // stays inert for the clipboardData/fast-path and plain-text tests.
+    // The fallback-specific tests override this per call.
+    pasteClipboardImage: vi
+      .fn()
+      .mockRejectedValue(new Error("clipboard read_image failed")),
   };
 });
 
 import { Composer } from "./Composer";
+import { pasteClipboardImage } from "@/tauri/commands";
+
+const pasteClipboardImageMock =
+  pasteClipboardImage as unknown as ReturnType<typeof vi.fn>;
 
 type ComposerProps = ComponentProps<typeof Composer>;
 
@@ -240,6 +250,150 @@ describe("Composer image attach (Step 8 Stage 6)", () => {
       });
 
       expect(onAttachImage).toHaveBeenCalledWith(svg);
+    });
+
+    it("does NOT hit the Rust fallback when clipboardData has an image", async () => {
+      // The clipboardData fast path must short-circuit — reading the
+      // OS clipboard server-side is only for platforms that strip the
+      // image (Linux/WebKit2GTK).
+      pasteClipboardImageMock.mockClear();
+      const onAttachImage = vi.fn();
+      const { container } = renderControlled({ onAttachImage });
+      const textarea = container.querySelector(
+        "textarea",
+      ) as HTMLTextAreaElement;
+
+      const file = pngFile();
+      fireEvent.paste(textarea, {
+        clipboardData: {
+          items: [
+            {
+              kind: "file",
+              type: "image/png",
+              getAsFile: () => file,
+            } as unknown as DataTransferItem,
+          ],
+          files: [file],
+          types: ["Files"],
+          getData: () => "",
+        },
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(onAttachImage).toHaveBeenCalledWith(file);
+      expect(pasteClipboardImageMock).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Linux/WebKit2GTK fallback ─────────────────────────────────────
+  //
+  // WebKit2GTK strips image payloads from the JS paste event, so
+  // `clipboardData.items` is empty even when the OS clipboard holds a
+  // screenshot. When the fast path finds nothing, Composer reads the
+  // clipboard server-side via the `pasteClipboardImage` Rust command
+  // and wraps the returned PNG bytes in a File for onAttachImage —
+  // giving Ctrl+V the same end state as the "+" → Image… picker.
+  describe("paste handler — Rust clipboard fallback", () => {
+    function fireEmptyPaste(textarea: Element) {
+      // Mirrors WebKit2GTK: a real paste event fires but carries no
+      // image items. The Rust command does the actual clipboard read.
+      fireEvent.paste(textarea, {
+        clipboardData: {
+          items: [],
+          files: [],
+          types: [],
+          getData: () => "",
+        },
+      });
+    }
+
+    it("reads the OS clipboard and attaches a File with the PNG bytes", async () => {
+      pasteClipboardImageMock.mockClear();
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]);
+      pasteClipboardImageMock.mockResolvedValueOnce({
+        bytes,
+        mime: "image/png",
+      });
+
+      const onAttachImage = vi.fn();
+      const { container } = renderControlled({ onAttachImage });
+      const textarea = container.querySelector(
+        "textarea",
+      ) as HTMLTextAreaElement;
+
+      fireEmptyPaste(textarea);
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(pasteClipboardImageMock).toHaveBeenCalledTimes(1);
+      expect(onAttachImage).toHaveBeenCalledTimes(1);
+      const file = onAttachImage.mock.calls[0]?.[0] as File;
+      expect(file).toBeInstanceOf(File);
+      expect(file.type).toBe("image/png");
+      expect(file.name).toBe("pasted-image.png");
+      // size is derived from the blob parts, so it proves the File was
+      // constructed from exactly the fallback's PNG bytes. (We can't
+      // assert byte-for-byte content here: the suite's beforeEach stubs
+      // File.prototype.arrayBuffer — jsdom lacks a native one — to
+      // return an empty buffer, mirroring how the handleAttachImage
+      // tests exercise the read path.)
+      expect(file.size).toBe(bytes.length);
+    });
+
+    it("prevents default so the image bytes are not typed into the textarea", async () => {
+      pasteClipboardImageMock.mockClear();
+      pasteClipboardImageMock.mockResolvedValueOnce({
+        bytes: new Uint8Array([1, 2, 3, 4]),
+        mime: "image/png",
+      });
+
+      const onAttachImage = vi.fn();
+      const { container } = renderControlled({ onAttachImage });
+      const textarea = container.querySelector(
+        "textarea",
+      ) as HTMLTextAreaElement;
+
+      const event = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: { items: [], files: [], types: [], getData: () => "" },
+      });
+      textarea.dispatchEvent(event);
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(onAttachImage).toHaveBeenCalledTimes(1);
+      expect(event.defaultPrevented).toBe(true);
+    });
+
+    it("stays silent and does not preventDefault when the clipboard has no image", async () => {
+      // The Rust command rejects when the clipboard holds no image
+      // (text-only). The handler must treat that as "let the default
+      // paste run" — no attach, no preventDefault, plain text unharmed.
+      pasteClipboardImageMock.mockClear();
+      pasteClipboardImageMock.mockRejectedValueOnce(
+        new Error("clipboard read_image failed"),
+      );
+
+      const onAttachImage = vi.fn();
+      const { container } = renderControlled({ onAttachImage });
+      const textarea = container.querySelector(
+        "textarea",
+      ) as HTMLTextAreaElement;
+
+      const event = new Event("paste", { bubbles: true, cancelable: true });
+      Object.defineProperty(event, "clipboardData", {
+        value: {
+          items: [],
+          files: [],
+          types: ["text/plain"],
+          getData: () => "hello world",
+        },
+      });
+      textarea.dispatchEvent(event);
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(pasteClipboardImageMock).toHaveBeenCalledTimes(1);
+      expect(onAttachImage).not.toHaveBeenCalled();
+      // Not prevented → the browser's default plain-text paste proceeds.
+      expect(event.defaultPrevented).toBe(false);
     });
   });
 

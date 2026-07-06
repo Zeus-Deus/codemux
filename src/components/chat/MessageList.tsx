@@ -19,11 +19,11 @@ import {
 import type {
   ChatViewItem,
   PermissionRequestItem,
-  ToolCallItem,
 } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
+import { ActivityBlock } from "./ActivityBlock";
 import { AssistantAvatar } from "./AssistantAvatar";
 import { AssistantMessage } from "./AssistantMessage";
 import { MessageTrail } from "./MessageTrail";
@@ -34,9 +34,8 @@ import { StreamingMarker } from "./StreamingMarker";
 import { SubagentsCard } from "./SubagentsCard";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
-import { ToolGroupCard } from "./ToolGroupCard";
 import { UserMessage } from "./UserMessage";
-import { buildTranscriptSlots } from "./transcript-slots";
+import { buildTranscriptSlots, type ActivityStep } from "./transcript-slots";
 
 interface Props {
   messages: ChatViewItem[];
@@ -45,6 +44,11 @@ interface Props {
    *  upstream so it never shows while an approval is pending or a row is
    *  already streaming its own affordance. */
   showThinking?: boolean;
+  /** Thread-level streaming flag (turn in flight). Passed to the pure slot
+   *  builder so the tail mechanical-step run renders as the live "Working"
+   *  Activity block; also suppresses the separate StreamingMarker when a
+   *  working Activity block is already the tail (one live line). */
+  streaming?: boolean;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). When absent a plain "Session started" divider renders.
    *  Stage 3 wires the real value through AgentChatPane. */
@@ -79,6 +83,7 @@ interface Props {
 export function MessageList({
   messages,
   showThinking = false,
+  streaming = false,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -117,7 +122,18 @@ export function MessageList({
     return map;
   }, [ordered]);
 
-  const slots = useMemo(() => buildTranscriptSlots(ordered), [ordered]);
+  const slots = useMemo(
+    () => buildTranscriptSlots(ordered, streaming),
+    [ordered, streaming],
+  );
+
+  // A working Activity block already shows the single live line, so the
+  // separate shimmer marker is suppressed when one is the transcript tail
+  // (no double indicators). The marker still fills the gap before any step
+  // arrives (e.g. right after send), which is not a working Activity tail.
+  const tailBody = slots.length > 0 ? slots[slots.length - 1].body : null;
+  const tailIsWorkingActivity =
+    tailBody?.kind === "activity" && tailBody.working;
 
   // --- Tail snap ------------------------------------------------------
   // `content-visibility:auto` rows expose only ESTIMATED heights until
@@ -212,9 +228,10 @@ export function MessageList({
                 scrollAnchor={false}
                 className={slot.turnStart ? "mt-5" : "mt-[13px]"}
               >
-                {slot.body.kind === "toolGroup" ? (
-                  <ToolGroupRowMemo
+                {slot.body.kind === "activity" ? (
+                  <ActivityRowMemo
                     items={slot.body.items}
+                    working={slot.body.working}
                     showAvatar={slot.showAvatar}
                     provider={provider}
                   />
@@ -234,7 +251,7 @@ export function MessageList({
               </MessageScrollerItem>
             ))}
 
-            {showThinking && (
+            {showThinking && !tailIsWorkingActivity && (
               <div className="mt-[13px]">
                 <StreamingMarker messages={ordered} />
               </div>
@@ -488,18 +505,20 @@ function renderAssistantBody(
   }
 }
 
-function ToolGroupRow({
+function ActivityRow({
   items,
+  working,
   showAvatar,
   provider,
 }: {
-  items: ToolCallItem[];
+  items: ActivityStep[];
+  working: boolean;
   showAvatar: boolean;
   provider?: AgentChatProviderKind | null;
 }) {
   return (
     <AssistantGutter showAvatar={showAvatar} provider={provider}>
-      <ToolGroupCard items={items} />
+      <ActivityBlock items={items} working={working} />
     </AssistantGutter>
   );
 }
@@ -508,5 +527,7 @@ function ToolGroupRow({
 // stable `item` / `approval` references, so an untouched row keeps its
 // props identity and skips the whole ItemRow → leaf-component chain. One
 // streaming token mutates exactly one item → exactly one row re-renders.
+// (Activity rows rebuild their `items` array each pass, like the old tool
+// groups did; stable slot keys keep the scroller row from remounting.)
 const ItemRowMemo = memo(ItemRow);
-const ToolGroupRowMemo = memo(ToolGroupRow);
+const ActivityRowMemo = memo(ActivityRow);

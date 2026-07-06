@@ -389,6 +389,10 @@ function applyCompletedItemToList(
           ...found.item,
           tool_name: item.tool_name,
           input: item.input,
+          // Result-first ordering already stamped `completed_at`; only
+          // fill `started_at` if this is genuinely the first time we
+          // observe the use landing.
+          started_at: found.item.started_at ?? now(),
         };
         return {
           messages: replaceItem(messages, found.index, next),
@@ -411,6 +415,7 @@ function applyCompletedItemToList(
         status: "running",
         result_content: null,
         approval_request_id: priorRequest?.request_id ?? null,
+        started_at: now(),
       };
       return { messages: [...c2.messages, newToolCall], nextSeq: c2.nextSeq };
     }
@@ -422,6 +427,7 @@ function applyCompletedItemToList(
           ...found.item,
           status: item.is_error ? "error" : "done",
           result_content: item.content,
+          completed_at: now(),
         };
         return {
           messages: replaceItem(messages, found.index, next),
@@ -448,6 +454,7 @@ function applyCompletedItemToList(
         status: item.is_error ? "error" : "done",
         result_content: item.content,
         approval_request_id: null,
+        completed_at: now(),
       };
       return { messages: [...c2.messages, placeholder], nextSeq: c2.nextSeq };
     }

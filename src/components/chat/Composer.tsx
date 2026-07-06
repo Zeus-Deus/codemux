@@ -46,6 +46,7 @@ import {
   listProjectFolders,
   listPullRequests,
   MCP_CODEMUX_SELF_ID,
+  pasteClipboardImage,
   type McpServerConfig,
 } from "@/tauri/commands";
 import { Switch } from "@/components/ui/switch";
@@ -1450,20 +1451,58 @@ export function Composer({
   const handlePasteImage = useCallback(
     async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
       if (!onAttachImage) return;
+
+      // ── Fast path: clipboardData carries the image bytes ──────────
+      // Works in the browser dev mock (npm run dev / Chrome) and on
+      // platforms where the webview exposes image files on the paste
+      // event. Keep it FIRST so those paths never pay for the IPC
+      // round-trip below.
       const items = Array.from(e.clipboardData?.items ?? []);
       const imageItems = items.filter(
         (item) => item.kind === "file" && item.type.startsWith("image/"),
       );
-      if (imageItems.length === 0) return;
-      // Prevent the data-URL fallback the browser would otherwise
-      // dump into the textarea. We still let plain-text paste work
-      // because that branch only fires when the clipboard has no
-      // image files in it.
-      e.preventDefault();
-      for (const item of imageItems) {
-        const file = item.getAsFile();
-        if (file) await onAttachImage(file);
+      if (imageItems.length > 0) {
+        // Prevent the data-URL fallback the browser would otherwise
+        // dump into the textarea. We still let plain-text paste work
+        // because this branch only fires when the clipboard has image
+        // files in it.
+        e.preventDefault();
+        for (const item of imageItems) {
+          const file = item.getAsFile();
+          if (file) await onAttachImage(file);
+        }
+        return;
       }
+
+      // ── Fallback: Linux/WebKit2GTK strips image payloads from the JS
+      // paste event, so `clipboardData.items` never contains an image
+      // file. Read the OS clipboard server-side instead (mirrors the
+      // new-workspace dialog's `paste_clipboard_image_to_file`). The
+      // Rust command encodes a real PNG and returns the bytes; we wrap
+      // them in a File so the parent's onAttachImage runs the exact
+      // same MIME/size/animated-GIF validation + staging as the "+"
+      // picker. Composer stays display-only — the bytes flow straight
+      // through onAttachImage. ──
+      let payload: Awaited<ReturnType<typeof pasteClipboardImage>>;
+      try {
+        payload = await pasteClipboardImage();
+      } catch {
+        // No image on the OS clipboard (text-only) or plugin error.
+        // We did NOT preventDefault above, so the default paste has
+        // already run — plain text lands in the textarea normally.
+        return;
+      }
+      if (!payload.bytes.length) return;
+      // Defensive preventDefault to match the dialog. On WebKit an
+      // image-only clipboard pastes no text, so by the time this async
+      // call resolves there's nothing to clobber; on a text+image
+      // clipboard the text has already been pasted (acceptable — the
+      // user gets both the text and the attached image).
+      e.preventDefault();
+      const file = new File([payload.bytes], "pasted-image.png", {
+        type: payload.mime || "image/png",
+      });
+      await onAttachImage(file);
     },
     [onAttachImage],
   );

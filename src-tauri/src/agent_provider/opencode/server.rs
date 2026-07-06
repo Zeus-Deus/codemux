@@ -114,6 +114,13 @@ impl OpenCodeServer {
         let server_password =
             Alphanumeric.sample_string(&mut rand::thread_rng(), SERVER_PASSWORD_LEN);
 
+        // NOTE: this is a single long-lived server shared by every OpenCode
+        // chat session, so per-session workspace env (CODEMUX_WORKSPACE_ID,
+        // CODEMUX_PANE_ID, …) can NOT be injected here the way it is for the
+        // per-session Claude/Codex sidecars — one env would be wrong for all
+        // but one workspace. OpenCode agents therefore rely on the
+        // control-layer cwd fallback (`resolve_workspace_id_by_cwd` in
+        // control.rs) to route `codemux browser open` to the right workspace.
         let mut cmd = Command::new(binary_path);
         cmd.args(["serve", "--hostname=127.0.0.1", "--port=0"]);
         cmd.env("OPENCODE_SERVER_PASSWORD", &server_password);

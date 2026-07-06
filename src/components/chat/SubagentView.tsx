@@ -14,11 +14,11 @@ import type {
 } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
+import { ActivityBlock } from "./ActivityBlock";
 import { AssistantMessage } from "./AssistantMessage";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
-import { ToolGroupCard } from "./ToolGroupCard";
 import { UserMessage } from "./UserMessage";
 import { buildTranscriptSlots } from "./transcript-slots";
 
@@ -73,12 +73,15 @@ export function SubagentView({
         </span>
       </div>
 
-      {/* Sub-transcript through the existing renderers */}
+      {/* Sub-transcript through the existing renderers. Folded via the
+          shared slot builder with `streaming=false`, so contiguous
+          reasoning/tool runs roll up into a SETTLED Activity block (#124);
+          the drill-in's own live tail below handles the running indicator. */}
       <div className="flex flex-col">
         {slots.map((slot) => (
           <div key={slot.key} className={slot.turnStart ? "mt-4" : "mt-3"}>
-            {slot.body.kind === "toolGroup" ? (
-              <ToolGroupCard items={slot.body.items} />
+            {slot.body.kind === "activity" ? (
+              <ActivityBlock items={slot.body.items} working={slot.body.working} />
             ) : (
               <SubItem item={slot.body.item} />
             )}

@@ -28,7 +28,7 @@ use crate::agent_provider::{
 };
 use crate::database::{AgentChatCheckpointRecord, AgentChatSessionRecord, DatabaseStore};
 use crate::observability::ObservabilityStore;
-use crate::state::AppStateStore;
+use crate::state::{AppStateStore, PaneStatus};
 
 /// Event name used for the few provider events that are NOT scoped to
 /// a single thread (global `RuntimeWarning`s with no `thread_id`).
@@ -331,6 +331,12 @@ pub fn agent_chat_close_pane(
     // hand to `stop_session`. Without this the JSON-RPC sidecar and
     // its background tokio tasks live on after the pane disappears.
     let chat_thread = state.agent_chat_pane_thread(&pane_id);
+    // Drop any lingering status dot for this pane. The session tear-down
+    // below emits SessionStateChanged::Closed → Idle, but that races the
+    // tree mutation: once close_pane removes the node, the thread→pane
+    // walk can no longer resolve it, so clear by pane id here while the
+    // key is still meaningful.
+    state.set_pane_status(&pane_id, PaneStatus::Idle);
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
     let _ = state.close_pane(&pane_id);
@@ -383,6 +389,64 @@ pub fn dev_agent_chat_spawn_test_pane(
 // 4. Returns the result (serialized errors carry the full
 //    `SerializableProviderError` JSON so the UI can inspect subtype).
 
+/// Build the workspace-scoped environment overlay a chat agent's child
+/// processes need so `codemux browser open` — and any other `codemux` CLI
+/// the agent shells out to — routes to the agent's OWN workspace rather
+/// than whichever workspace the user happens to be viewing.
+///
+/// Terminal-spawned agents get this env at PTY spawn time (see
+/// `crate::terminal::spawn_pty_for_session_in_process`); the chat sidecar
+/// otherwise spawns with a bare env, so its `codemux browser open` calls
+/// reach the control layer with an empty `workspace_id` and fall through to
+/// the "active workspace" legacy path — the routing bug this overlay fixes.
+///
+/// Mirrors the `CODEMUX_*` surface a terminal PTY injects and reuses the
+/// exact [`crate::terminal::workspace_pty_env`] helper for the
+/// workspace-level vars (`CODEMUX_WORKSPACE_NAME`, `CODEMUX_AGENT_CONTEXT`,
+/// `CODEMUX_WORKSPACE_PATH`/`ROOT_PATH`/`BRANCH`/`PORT`) so the two surfaces
+/// stay in lockstep. `pane_id` is the chat pane the session runs in,
+/// surfaced as `CODEMUX_PANE_ID` for hook / browser routing.
+///
+/// Semantics:
+/// * `ws == None` (orphaned pane, no owning workspace) → returns `existing`
+///   untouched so no workspace context leaks in, matching the terminal
+///   path's behavior for sessions with no owning workspace.
+/// * entries already present in `existing` are never overwritten — an env
+///   value the caller explicitly supplied always wins over the workspace
+///   default.
+fn workspace_env_overlay(
+    ws: Option<&crate::state::WorkspaceSnapshot>,
+    pane_id: &str,
+    existing: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    let Some(ws) = ws else {
+        return existing;
+    };
+    let mut env = existing.unwrap_or_default();
+
+    // Session-level vars every Codemux surface advertises, followed by the
+    // workspace-level vars the terminal path injects. Collected into one
+    // list so the insert-if-absent pass below treats them uniformly.
+    let mut defaults: Vec<(String, String)> = vec![
+        ("CODEMUX".to_string(), "1".to_string()),
+        (
+            "CODEMUX_VERSION".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        ("CODEMUX_WORKSPACE_ID".to_string(), ws.workspace_id.0.clone()),
+        ("CODEMUX_PANE_ID".to_string(), pane_id.to_string()),
+        ("CODEMUX_BROWSER_CMD".to_string(), "codemux browser".to_string()),
+        ("BROWSER".to_string(), "codemux browser open".to_string()),
+    ];
+    defaults.extend(crate::terminal::workspace_pty_env(ws));
+
+    for (key, val) in defaults {
+        // Insert-if-absent so a caller-provided entry always wins.
+        env.entry(key).or_insert(val);
+    }
+    Some(env)
+}
+
 /// Start a new provider session for the given pane.
 ///
 /// The returned [`ThreadId`] is the identifier the provider itself
@@ -396,7 +460,7 @@ pub async fn agent_chat_start_session(
     app: AppHandle,
     pane_id: String,
     provider: ProviderKind,
-    input: StartSessionInput,
+    mut input: StartSessionInput,
 ) -> Result<ThreadId, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
@@ -457,6 +521,20 @@ pub async fn agent_chat_start_session(
                 MCP_PRIME_BUDGET.as_secs()
             ),
         }
+    }
+    // Overlay the chat pane's workspace env onto `input.env` BEFORE the
+    // provider consumes it, so the agent's browser/CLI subprocesses route to
+    // the agent's own workspace instead of the user's active one. Resolve the
+    // owning workspace from the pane; an orphaned pane (no workspace) injects
+    // nothing, matching the terminal path's behavior.
+    {
+        let state: State<'_, AppStateStore> = app.state();
+        let workspace_id = state.workspace_id_for_pane(&pane_id);
+        let snapshot = state.snapshot();
+        let ws = workspace_id
+            .as_ref()
+            .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
+        input.env = workspace_env_overlay(ws, &pane_id, input.env.take());
     }
     let session = impl_.start_session(input).await.map_err(provider_err)?;
     let state: State<'_, AppStateStore> = app.state();
@@ -1175,6 +1253,13 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             }
         }
     }
+    // Publish the chat session's lifecycle into the shared pane_statuses
+    // store so the sidebar rows, collapsed-rail aggregate, hover flyout,
+    // and PaneNode borders reflect chat agents exactly like terminal
+    // agents (whose status flows in through hooks.rs). This is the whole
+    // reason chat workspaces previously showed no status dot.
+    publish_pane_status(app, &event);
+
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
         // forwarded with an empty ThreadId so the frontend at least
@@ -1206,6 +1291,91 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
                 "[codemux::agent_chat] Failed to send event on thread channel {}: {error}",
                 thread_id.0
             );
+        }
+    }
+}
+
+/// Map a provider runtime event to the sidebar pane status it should
+/// drive, or `None` to leave the current status untouched.
+///
+/// The chat-side analogue of `hooks.rs::map_event_type` for terminal
+/// agents, so chat sessions publish the same working / needs-input /
+/// review vocabulary the sidebar already renders:
+///
+/// - streaming deltas / committed items / running session / a resolved
+///   request (the turn resumes) → `Working`
+/// - a user-facing request opened (tool approval, plan, AskUserQuestion)
+///   or the session parked on an approval → `Permission`
+/// - the turn finished → `Review` (the caller downgrades to `Idle` when
+///   the pane's workspace is already active, matching
+///   `handle_lifecycle_event`)
+/// - the session closed or errored → `Idle` (clear any stuck indicator)
+///
+/// Everything else leaves the indicator alone. In particular
+/// `SessionConfigured` and the `Starting` / `Ready` lifecycle phases map
+/// to `None`: a freshly-started session with no turn is idle, exactly
+/// like a freshly-spawned terminal shows no status until its first hook.
+fn map_event_to_pane_status(event: &ProviderRuntimeEvent) -> Option<PaneStatus> {
+    use crate::agent_provider::SessionStatus;
+    match event {
+        ProviderRuntimeEvent::ContentDelta { .. }
+        | ProviderRuntimeEvent::ItemCompleted { .. }
+        | ProviderRuntimeEvent::RequestResolved { .. } => Some(PaneStatus::Working),
+        ProviderRuntimeEvent::RequestOpened { .. } => Some(PaneStatus::Permission),
+        ProviderRuntimeEvent::TurnCompleted { .. } => Some(PaneStatus::Review),
+        ProviderRuntimeEvent::SessionStateChanged { status, .. } => match status {
+            SessionStatus::Running { .. } => Some(PaneStatus::Working),
+            SessionStatus::WaitingApproval { .. } => Some(PaneStatus::Permission),
+            SessionStatus::Closed | SessionStatus::Error { .. } => Some(PaneStatus::Idle),
+            SessionStatus::Starting | SessionStatus::Ready => None,
+        },
+        ProviderRuntimeEvent::SessionConfigured { .. }
+        | ProviderRuntimeEvent::ResumeCursorUpdated { .. }
+        // A subagent snapshot is card metadata (status / activity / tokens),
+        // not a parent-turn signal. Active subagent work already drives
+        // `Working` through its `ItemCompleted { subagent_id }` items, and
+        // `TurnCompleted` still owns the `Review` transition — so a snapshot
+        // (including the final completion one) must leave the indicator
+        // alone rather than resurrect `Working` after `Review`.
+        | ProviderRuntimeEvent::SubagentUpdated { .. }
+        | ProviderRuntimeEvent::RuntimeWarning { .. } => None,
+    }
+}
+
+/// Publish the pane status implied by `event` into the shared
+/// `pane_statuses` store and, when it actually changes, push a fresh
+/// app-state snapshot to the frontend so the sidebar re-renders.
+///
+/// The change-guard in
+/// [`set_pane_status_by_thread`](AppStateStore::set_pane_status_by_thread)
+/// means the `content_delta` token stream collapses to a single
+/// `Working` write per turn — so the direct emit here fires only on real
+/// transitions (~2–3 per turn), never per token. A direct
+/// `Emitter::emit` is used rather than the Wry-only
+/// `schedule_emit_app_state` debouncer because `forward_event` is generic
+/// over the Tauri runtime (the mock runtime drives the unit tests) and
+/// the transitions are already rate-limited by the guard.
+fn publish_pane_status<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEvent) {
+    let Some(mut status) = map_event_to_pane_status(event) else {
+        return;
+    };
+    let Some(thread_id) = thread_id_for_event(event) else {
+        return;
+    };
+    if thread_id.0.is_empty() {
+        return;
+    }
+    let state: State<'_, AppStateStore> = app.state();
+    // Mirror the terminal path: a turn that finishes in the workspace the
+    // user is already looking at clears to Idle instead of nagging with a
+    // review dot for output they can already see.
+    if status == PaneStatus::Review && state.is_thread_pane_in_active_workspace(&thread_id.0) {
+        status = PaneStatus::Idle;
+    }
+    if state.set_pane_status_by_thread(&thread_id.0, status) {
+        let snapshot = state.snapshot();
+        if let Err(error) = app.emit("app-state-changed", &snapshot) {
+            eprintln!("[codemux::agent_chat] failed to emit app state: {error}");
         }
     }
 }
@@ -1332,6 +1502,103 @@ mod tests {
         assert_eq!(extract_sdk_session_id(&json!({})), None);
         assert_eq!(extract_sdk_session_id(&json!("just-a-string")), None);
         assert_eq!(extract_sdk_session_id(&json!({"resume": 42})), None);
+    }
+
+    // ── workspace_env_overlay ──
+    //
+    // Guards the primary fix for the "chat agent's browser lands in the
+    // user's workspace" routing bug: the overlay must inject the workspace's
+    // CODEMUX_* surface, must never clobber a caller-provided entry, and must
+    // inject nothing for an orphaned pane.
+
+    fn test_workspace(id: &str) -> crate::state::WorkspaceSnapshot {
+        use crate::state::*;
+        WorkspaceSnapshot {
+            workspace_id: WorkspaceId(id.to_string()),
+            title: "my-feature".to_string(),
+            workspace_type: WorkspaceType::Standard,
+            cwd: "/home/user/projects/repo".to_string(),
+            git_branch: Some("feat/my-feature".to_string()),
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            notification_count: 0,
+            latest_agent_state: None,
+            worktree_path: None,
+            project_root: Some("/home/user/projects/repo".to_string()),
+            project_uid: None,
+            workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            tabs: Vec::new(),
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: Vec::new(),
+            host_id: None,
+            remote_cwd: None,
+            attach_only: false,
+        }
+    }
+
+    #[test]
+    fn workspace_env_overlay_injects_workspace_surface() {
+        let ws = test_workspace("ws-123");
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None)
+            .expect("a resolved workspace must yield an env map");
+
+        assert_eq!(env["CODEMUX"], "1");
+        assert_eq!(env["CODEMUX_WORKSPACE_ID"], "ws-123");
+        assert_eq!(env["CODEMUX_PANE_ID"], "pane-7");
+        assert_eq!(env["CODEMUX_BROWSER_CMD"], "codemux browser");
+        assert_eq!(env["BROWSER"], "codemux browser open");
+        assert_eq!(env["CODEMUX_VERSION"], env!("CARGO_PKG_VERSION"));
+        // Workspace-level vars threaded through `workspace_pty_env`.
+        assert_eq!(env["CODEMUX_WORKSPACE_NAME"], "my-feature");
+        assert_eq!(env["CODEMUX_WORKSPACE_PATH"], "/home/user/projects/repo");
+        assert_eq!(env["CODEMUX_ROOT_PATH"], "/home/user/projects/repo");
+        assert_eq!(env["CODEMUX_BRANCH"], "feat/my-feature");
+        assert!(env.contains_key("CODEMUX_PORT"));
+        assert!(env.contains_key("CODEMUX_AGENT_CONTEXT"));
+    }
+
+    #[test]
+    fn workspace_env_overlay_does_not_clobber_caller_entries() {
+        let ws = test_workspace("ws-123");
+        let mut existing = HashMap::new();
+        existing.insert("BROWSER".to_string(), "custom-browser".to_string());
+        existing.insert("MY_VAR".to_string(), "keep-me".to_string());
+
+        let env = workspace_env_overlay(Some(&ws), "pane-7", Some(existing))
+            .expect("a resolved workspace must yield an env map");
+
+        // Caller-provided entries win over the workspace defaults …
+        assert_eq!(env["BROWSER"], "custom-browser");
+        // … and unrelated caller entries survive.
+        assert_eq!(env["MY_VAR"], "keep-me");
+        // … while un-collided workspace vars are still injected.
+        assert_eq!(env["CODEMUX_WORKSPACE_ID"], "ws-123");
+    }
+
+    #[test]
+    fn workspace_env_overlay_no_workspace_injects_nothing() {
+        // Orphaned pane, no existing env → stays None (no injection).
+        assert!(workspace_env_overlay(None, "pane-7", None).is_none());
+
+        // Orphaned pane WITH a caller env → returned untouched.
+        let mut existing = HashMap::new();
+        existing.insert("MY_VAR".to_string(), "keep-me".to_string());
+        let env = workspace_env_overlay(None, "pane-7", Some(existing))
+            .expect("caller env must be preserved");
+        assert_eq!(env.len(), 1);
+        assert_eq!(env["MY_VAR"], "keep-me");
+        assert!(!env.contains_key("CODEMUX_WORKSPACE_ID"));
     }
 
     // ── should_persist_event policy ──
@@ -1611,6 +1878,126 @@ mod tests {
         assert!(
             b_captured.lock().unwrap().is_empty(),
             "no cross-thread leakage"
+        );
+    }
+
+    #[test]
+    fn map_event_to_pane_status_covers_the_lifecycle() {
+        use crate::state::PaneStatus;
+
+        // Working: a turn is producing output or resuming after approval.
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::ContentDelta {
+                thread_id: tid(),
+                turn_id: turn(),
+                delta: ContentDelta::Text { text: "hi".into() },
+                subagent_id: None,
+            }),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::ItemCompleted {
+                thread_id: tid(),
+                turn_id: turn(),
+                item: CompletedItem::AssistantText { text: "hi".into() },
+                subagent_id: None,
+            }),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::RequestResolved {
+                thread_id: tid(),
+                request_id: req(),
+                decision: ApprovalDecision::AllowForSession,
+            }),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Running { active_turn: turn() },
+            }),
+            Some(PaneStatus::Working)
+        );
+
+        // Permission: a user-facing request is open / session parked on one.
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::RequestOpened {
+                thread_id: tid(),
+                turn_id: turn(),
+                request_id: req(),
+                request_kind: "tool".into(),
+                payload: json!({}),
+                tool_use_id: None,
+                subagent_id: None,
+            }),
+            Some(PaneStatus::Permission)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::WaitingApproval { request_id: req() },
+            }),
+            Some(PaneStatus::Permission)
+        );
+
+        // Review: the turn finished (caller may downgrade to Idle if focused).
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::TurnCompleted {
+                thread_id: tid(),
+                turn_id: turn(),
+                status: TurnStatus::Success,
+                usage: None,
+            }),
+            Some(PaneStatus::Review)
+        );
+
+        // Idle: session torn down or broken — clear the indicator.
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Closed,
+            }),
+            Some(PaneStatus::Idle)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Error { message: "boom".into() },
+            }),
+            Some(PaneStatus::Idle)
+        );
+
+        // None: a fresh/ready session and configuration notices don't move
+        // the dot — parity with a freshly-spawned terminal showing nothing.
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Ready,
+            }),
+            None
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Starting,
+            }),
+            None
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionConfigured {
+                thread_id: tid(),
+                provider_session_id: ProviderSessionId("s".into()),
+            }),
+            None
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(tid()),
+                message: "warn".into(),
+                original_payload: None,
+            }),
+            None
         );
     }
 

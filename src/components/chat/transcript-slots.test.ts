@@ -3,6 +3,7 @@ import { describe, it, expect } from "vitest";
 import type {
   ChatViewItem,
   PermissionRequestItem,
+  ReasoningItem,
   ToolCallItem,
 } from "@/lib/agent-chat/types";
 
@@ -23,6 +24,18 @@ function assistantMsg(seq: number, text = "ok"): ChatViewItem {
   };
 }
 
+function reasoning(seq: number, overrides: Partial<ReasoningItem> = {}): ReasoningItem {
+  return {
+    kind: "reasoning",
+    id: `re-${seq}`,
+    seq,
+    turn_id: "t1",
+    text: "thinking about it",
+    streaming: false,
+    ...overrides,
+  };
+}
+
 function tool(seq: number, overrides: Partial<ToolCallItem> = {}): ToolCallItem {
   return {
     kind: "tool_call",
@@ -38,25 +51,105 @@ function tool(seq: number, overrides: Partial<ToolCallItem> = {}): ToolCallItem 
   };
 }
 
-describe("buildTranscriptSlots — grouping", () => {
-  it("folds a run of ≥2 completed tool calls into one toolGroup slot", () => {
+describe("buildTranscriptSlots — activity grouping", () => {
+  it("folds a run of ≥2 completed tool calls into one activity slot", () => {
     const slots = buildTranscriptSlots([tool(0), tool(1), tool(2)]);
     expect(slots).toHaveLength(1);
-    expect(slots[0].body.kind).toBe("toolGroup");
-    if (slots[0].body.kind === "toolGroup") {
+    expect(slots[0].body.kind).toBe("activity");
+    if (slots[0].body.kind === "activity") {
       expect(slots[0].body.items).toHaveLength(3);
+      expect(slots[0].body.working).toBe(false);
     }
-    // Group messageId is derived from the first member's id.
+    // Key is derived from the first step's id (stable as the run grows).
     expect(slots[0].messageId).toBe("run:tc-0");
   });
 
-  it("keeps a lone completed tool call as its own item slot", () => {
+  it("keeps a lone completed tool call as its own item slot (below GROUP_MIN)", () => {
     const slots = buildTranscriptSlots([tool(0)]);
     expect(slots).toHaveLength(1);
     expect(slots[0].body.kind).toBe("item");
   });
 
-  it("breaks a run at a non-tool item, yielding two groups", () => {
+  it("folds contiguous reasoning + tool calls into ONE activity block", () => {
+    const slots = buildTranscriptSlots([reasoning(0), tool(1), reasoning(2), tool(3)]);
+    expect(slots).toHaveLength(1);
+    expect(slots[0].body.kind).toBe("activity");
+    if (slots[0].body.kind === "activity") {
+      expect(slots[0].body.items.map((s) => s.kind)).toEqual([
+        "reasoning",
+        "tool_call",
+        "reasoning",
+        "tool_call",
+      ]);
+    }
+    // Keyed off the first step (a reasoning item here).
+    expect(slots[0].messageId).toBe("run:re-0");
+  });
+
+  it("keeps a lone reasoning run (no tools) as ReasoningBlock items, not an activity block", () => {
+    const slots = buildTranscriptSlots([reasoning(0), reasoning(1)]);
+    expect(slots.map((s) => s.body.kind)).toEqual(["item", "item"]);
+  });
+
+  it("folds running, errored and edit tool calls in as steps", () => {
+    const running = tool(1, { status: "running" });
+    const errored = tool(2, { status: "error" });
+    const edit = tool(3, {
+      tool_name: "Edit",
+      input: { file_path: "/a", old_string: "x", new_string: "y" },
+    });
+    const slots = buildTranscriptSlots([tool(0), running, errored, edit]);
+    expect(slots).toHaveLength(1);
+    expect(slots[0].body.kind).toBe("activity");
+    if (slots[0].body.kind === "activity") {
+      expect(slots[0].body.items).toHaveLength(4);
+    }
+  });
+
+  it("shows a single running tool as a WORKING activity block on the streaming tail (GROUP_MIN drops to 1)", () => {
+    const slots = buildTranscriptSlots([tool(0, { status: "running" })], true);
+    expect(slots).toHaveLength(1);
+    expect(slots[0].body.kind).toBe("activity");
+    if (slots[0].body.kind === "activity") {
+      expect(slots[0].body.working).toBe(true);
+      expect(slots[0].body.items).toHaveLength(1);
+    }
+  });
+
+  it("keeps a lone tool as a single card when settled (not streaming)", () => {
+    const slots = buildTranscriptSlots([tool(0, { status: "running" })], false);
+    expect(slots[0].body.kind).toBe("item");
+  });
+
+  it("marks working only on the tail run of an active turn; earlier runs settle", () => {
+    const slots = buildTranscriptSlots(
+      [tool(0), tool(1), assistantMsg(2), tool(3, { status: "running" })],
+      true,
+    );
+    expect(slots.map((s) => s.body.kind)).toEqual(["activity", "item", "activity"]);
+    if (slots[0].body.kind === "activity") expect(slots[0].body.working).toBe(false);
+    if (slots[2].body.kind === "activity") expect(slots[2].body.working).toBe(true);
+  });
+
+  it("never absorbs an approval-gated tool call — it stays standalone", () => {
+    const gated = tool(2, { status: "running", approval_request_id: "req-x" });
+    const slots = buildTranscriptSlots([tool(0), tool(1), gated]);
+    // Two reads fold into an activity; the gated tool is its own item.
+    expect(slots.map((s) => s.body.kind)).toEqual(["activity", "item"]);
+    expect(slots[1].messageId).toBe("tc-2");
+  });
+
+  it("never absorbs a TodoWrite / task-summary tool", () => {
+    const todo = tool(2, {
+      tool_name: "TodoWrite",
+      input: { todos: [{ content: "a", status: "pending" }] },
+    });
+    const slots = buildTranscriptSlots([tool(0), tool(1), todo]);
+    expect(slots.map((s) => s.body.kind)).toEqual(["activity", "item"]);
+    expect(slots[1].messageId).toBe("tc-2");
+  });
+
+  it("breaks a run at a non-step item, yielding two activity blocks", () => {
     const slots = buildTranscriptSlots([
       tool(0),
       tool(1),
@@ -64,63 +157,13 @@ describe("buildTranscriptSlots — grouping", () => {
       tool(3),
       tool(4),
     ]);
-    const kinds = slots.map((s) => s.body.kind);
-    expect(kinds).toEqual(["toolGroup", "item", "toolGroup"]);
-  });
-
-  it("excludes running, error, pending-approval, TodoWrite and diff calls from groups", () => {
-    const running = tool(1, { status: "running" });
-    const errored = tool(2, { status: "error" });
-    const gated = tool(3, { approval_request_id: "req-x" });
-    const todo = tool(4, {
-      tool_name: "TodoWrite",
-      input: { todos: [{ content: "a", status: "pending" }] },
-    });
-    const edit = tool(5, {
-      tool_name: "Edit",
-      input: { file_path: "/a", old_string: "x", new_string: "y" },
-    });
-    const slots = buildTranscriptSlots([
-      tool(0),
-      running,
-      errored,
-      gated,
-      todo,
-      edit,
-    ]);
-    // The lone completed tool(0) flushes as a single item (run of 1), then
-    // each non-groupable call is its own item — no group forms.
-    expect(slots.every((s) => s.body.kind === "item")).toBe(true);
-    expect(slots).toHaveLength(6);
-  });
-
-  it("keeps a diff tool between two read runs from swallowing the diff card", () => {
-    const edit = tool(2, {
-      tool_name: "Edit",
-      input: { file_path: "/a", old_string: "x", new_string: "y" },
-    });
-    const slots = buildTranscriptSlots([
-      tool(0),
-      tool(1),
-      edit,
-      tool(3),
-      tool(4),
-    ]);
-    // group(reads) · edit item · group(reads)
-    expect(slots.map((s) => s.body.kind)).toEqual([
-      "toolGroup",
-      "item",
-      "toolGroup",
-    ]);
+    expect(slots.map((s) => s.body.kind)).toEqual(["activity", "item", "activity"]);
   });
 });
 
 describe("buildTranscriptSlots — non-rendering rows", () => {
   it("drops a permission request already merged into a tool card footer", () => {
-    const gated = tool(0, {
-      status: "running",
-      approval_request_id: "req-1",
-    });
+    const gated = tool(0, { status: "running", approval_request_id: "req-1" });
     const merged: PermissionRequestItem = {
       kind: "permission_request",
       id: "req-1",
@@ -133,7 +176,7 @@ describe("buildTranscriptSlots — non-rendering rows", () => {
       resolution: { state: "pending" },
     };
     const slots = buildTranscriptSlots([gated, merged]);
-    // Only the tool card row survives — the merged request is not its own row.
+    // Only the gated tool card row survives (standalone item).
     expect(slots).toHaveLength(1);
     expect(slots[0].messageId).toBe("tc-0");
   });
@@ -187,7 +230,7 @@ describe("buildTranscriptSlots — subagent card", () => {
     expect(slots[0].scrollAnchor).toBe(false);
   });
 
-  it("breaks a tool run — the card never folds into a tool group", () => {
+  it("breaks a run — the card never folds into an activity block", () => {
     const slots = buildTranscriptSlots([
       tool(0),
       tool(1),
@@ -195,10 +238,13 @@ describe("buildTranscriptSlots — subagent card", () => {
       tool(3),
       tool(4),
     ]);
+    // The subagent_run is a standalone `item` slot that splits the two
+    // contiguous tool runs into separate Activity blocks (#124 renamed the
+    // folded slot kind `toolGroup` → `activity`).
     expect(slots.map((s) => s.body.kind)).toEqual([
-      "toolGroup",
+      "activity",
       "item",
-      "toolGroup",
+      "activity",
     ]);
   });
 });
@@ -219,12 +265,11 @@ describe("buildTranscriptSlots — turn boundaries", () => {
       assistantMsg(2),
       tool(3),
     ]);
-    // user, then the assistant run (message, message, single tool).
     const [u, a1, a2, t3] = slots;
     expect(u.showAvatar).toBe(false);
-    expect(a1.showAvatar).toBe(true); // first assistant row → avatar + turnStart
+    expect(a1.showAvatar).toBe(true);
     expect(a1.turnStart).toBe(true);
-    expect(a2.showAvatar).toBe(false); // continuation → gutter, no avatar
+    expect(a2.showAvatar).toBe(false);
     expect(a2.turnStart).toBe(false);
     expect(t3.showAvatar).toBe(false);
     expect(t3.scrollAnchor).toBe(false);

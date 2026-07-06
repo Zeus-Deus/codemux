@@ -80,6 +80,15 @@ export interface ToolCallItem {
    *  show an inline approval footer on the tool-call card. `null` in
    *  bypassPermissions mode or before the approval event lands. */
   approval_request_id: string | null;
+  /** Wall-clock ms (from the injected clock, default `Date.now`) when the
+   *  `tool_use` landed and the call went `running`. Optional so persisted /
+   *  hydrated transcripts written before this field existed still parse.
+   *  Feeds the Activity block's rolled-up duration. */
+  started_at?: number;
+  /** Wall-clock ms when the `tool_result` landed and the call settled
+   *  (`done` / `error`). Optional for the same backward-compat reason.
+   *  With `started_at`, bounds this call's contribution to run duration. */
+  completed_at?: number;
 }
 
 export interface PermissionRequestItem {

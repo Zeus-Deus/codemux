@@ -63,7 +63,9 @@ The chat pane stack:
   `ChatTranscript`, `MessageList` (shadcn MessageScroller shell),
   `transcript-slots.ts` (pure turn-grouping/tool-folding slot builder),
   `AssistantAvatar`, `ReasoningBlock` (collapsible thinking),
-  `ToolCallCard` + per-tool bodies, `ToolGroupCard` (folded runs),
+  `ToolCallCard` + per-tool bodies, `ActivityBlock` (one folded run of
+  reasoning + tool calls, working/settled — see "Activity block" below;
+  `activity-steps.ts` holds its pure step/summary/duration derivations),
   `DiffView` (red/green edit surface), `TaskSummaryCard` (TodoWrite
   checklist), `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
   (icon/tint mapping), `PlanProposalBlock`, `ComposerPendingInputPanel`
@@ -93,7 +95,8 @@ The chat pane stack:
   (per-tool body rendering), collapsible reasoning blocks (thinking
   deltas reduce into a `reasoning` ChatViewItem that seals on any
   non-thinking boundary and finalizes with a "Thought for Ns"
-  duration), tool-group cards, red/green diff cards for edits,
+  duration), **Activity blocks** (one folded run of reasoning + tool
+  calls — see "Activity block" below), red/green diff cards for edits,
   TodoWrite task checklists, plan proposals (`ExitPlanMode`),
   AskUserQuestion panels, shimmer streaming marker, debug-mode banner
   + exit dialog.
@@ -103,6 +106,19 @@ The chat pane stack:
   images via paste / drop / picker. Inline chips, send-time injection,
   expand, caps, gif guard, chip tooltips. See
   `docs/plans/step-8-attachments.md`.
+  - **Ctrl+V image paste has a Linux clipboard fallback.** WebKit2GTK
+    strips image payloads from the JS `paste` event, so `Composer`'s
+    handler tries `e.clipboardData.items` first (works in the browser
+    dev mock / Chrome) and, when that yields no image, falls back to the
+    `paste_clipboard_image` Rust command (reads the OS clipboard
+    server-side, re-encodes PNG via the shared `encode_rgba_to_png`,
+    returns `{ bytes, mime }`). Composer wraps the bytes in a `File` and
+    hands them to the same `handleAttachImage` (`AgentChatPane`) the `+`
+    picker uses, so validation/staging are identical. This mirrors the
+    new-workspace dialog's `paste_clipboard_image_to_file`, but returns
+    bytes (not a temp-file path) because the chat stages bytes in
+    memory. A text-only clipboard rejects the command → default paste
+    runs untouched.
 - **Slash command popup** with cross-provider parsing.
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
   compat. Server-side sync (see `docs/features/skills-sync.md`).
@@ -144,14 +160,18 @@ transcript; the reducer's 5,000-message cap bounds the worst case.
 
 Layout derivation lives in the pure `buildTranscriptSlots`
 (`transcript-slots.ts`): turn grouping (avatar once per assistant
-turn), tool-run folding into group cards, and per-slot identity.
+turn), Activity-run folding (reasoning + tool calls → one `activity`
+slot — see "Activity block" below), and per-slot identity.
 
 Contract preserved from the pre-redesign renderer:
 
 - **Stable keys + memo rows.** Per-slot keys are still `slot.item.id`
   / `run:<first-id>` (as `MessageScrollerItem messageId`), and rows
-  render through memoized leaves (`ItemRowMemo` / `ToolGroupRowMemo`)
-  — a streaming token mutates exactly one row.
+  render through memoized leaves (`ItemRowMemo` / `ActivityRowMemo`)
+  — a streaming token mutates exactly one row. (Activity rows rebuild
+  their `items` array each build, as the old tool-group rows did; the
+  stable `run:<first-id>` key keeps the scroller row from remounting as
+  the run grows and transitions working → settled.)
 - **Stick-to-bottom.** Pinned-ness is tracked from real scroll events
   (≤ 80 px from the bottom); after every transcript change (or
   streaming-marker toggle), if pinned, it snaps to the tail. Content
@@ -166,12 +186,64 @@ Contract preserved from the pre-redesign renderer:
   handling scrolls the viewport to a stale early anchor when new items
   register mid-stream, breaking the pin. Do not re-enable it without
   re-testing against the `agent-chat-demo` mock workspace.
-- **Variable heights.** Tool-group cards expand in place as a single
-  scroller row; the browser re-derives sizes as rows materialize.
+- **Variable heights.** Activity blocks expand in place as a single
+  scroller row (both the step list and per-step inline detail); the
+  browser re-derives sizes as rows materialize.
 - **Streaming marker** (shimmer status) renders as the last row inside
   the scroller content (not a footer) so the tail snap keeps it
   visible while streaming; the jump-to-latest pill is the restyled
-  `MessageScrollerButton` with a direct-DOM snap fallback.
+  `MessageScrollerButton` with a direct-DOM snap fallback. **A working
+  Activity block already shows the single live line, so the marker is
+  suppressed when one is the transcript tail** — `MessageList` passes
+  the thread `streaming` flag into `buildTranscriptSlots`, and the
+  marker only renders when the tail slot is not a working Activity block
+  (it still fills the gap right after send, before any step arrives).
+
+### Activity block (Activity Stream)
+
+`ActivityBlock.tsx` replaces the old per-tool "Thought / Thought /
+Ran…" spam with **one card per contiguous run of mechanical steps**
+(reasoning items + tool calls). `buildTranscriptSlots` folds a run of
+`reasoning` and groupable `tool_call` items into a single `activity`
+slot; `activity-steps.ts` holds the pure step/summary/counter/duration
+derivations (unit-tested in `activity-steps.test.ts`).
+
+- **Working vs settled is derived.** A run is *working* when the thread
+  is `streaming` and the run is the tail run of the active turn;
+  everything else *settles*. Working shows a collapsed row — amber
+  spinner (`status-working`), bold "Working", a shimmering mono live
+  action, a `N done · M running` counter, a rotating chevron. Settled
+  rolls up to a green circled check + a derived summary sentence
+  (`deriveActivitySummary`: read-heavy → "Explored the codebase",
+  command-heavy → "Ran commands", edit-heavy → "Edited files", mixed →
+  sensible) + a mono `N steps · 1m 12s` meta (duration from step
+  `started_at`/`completed_at`, omitted when < 1s / not derivable, e.g.
+  hydrated transcripts) + a Details/Hide toggle. On settle the block
+  re-renders collapsed (any mid-stream expansion resets).
+- **Shared step rows.** Both states expand to the same mono rows: a dim
+  short verb (`read`/`grep`/`edit`/`run`/`think`), a truncating summary
+  (from `describeToolCall` / the thought's first line), and a dim
+  right-aligned meta (`2 hits`, `+9 −1`, `ok`, `running`, `failed`).
+  Working dims completed steps (~0.6) and keeps the running one full
+  opacity; settled shows all green checks. Clicking a step row expands
+  its full detail inline (`ToolCallBody` / `DiffView` for tools, the
+  thought text for reasoning) — there is no side panel for tool output.
+- **What stays standalone (breaks the run).** Approval-gated tool calls
+  (`approval_request_id` set — the inline approval footer must render),
+  TodoWrite / task-summary tools (`TaskSummaryCard` stays a visible
+  checklist), `permission_request`/plan/AskUserQuestion rows, assistant
+  and user prose. Errored tool calls **do** fold in but stay
+  discoverable: a red ✕ step row, and the settled header appends a
+  subtle red `· N failed` to the meta. A lone reasoning run with no
+  tools keeps rendering as `ReasoningBlock`s (its live streaming text is
+  better served there); a lone settled tool call keeps rendering as a
+  single `ToolCallCard` (GROUP_MIN is 2 for settled runs, relaxed to 1
+  only for a single live working step). `ToolGroupCard` is retired.
+- **Timestamps.** `ToolCallItem` gained optional `started_at` /
+  `completed_at`, stamped by the pure reducer from its injectable
+  `Clock` (backward-compatible optionals so persisted transcripts still
+  parse); these plus `ReasoningItem`'s `started_at`/`duration_ms` feed
+  the settled duration.
 
 `ChatTranscript` is a thin shell that derives `showThinking`, forwards
 the optional `sessionStartedAt` (top session-start divider), and sizes
@@ -472,6 +544,25 @@ Rust side spawns the sidecar through
 helper the Codex adapter uses — so adding new methods is a matter of
 registering handlers in `buildMethods` in
 `sidecar/claude-agent/src/methods/index.ts` (dispatched from `main.ts`).
+
+**Workspace env injection.** `agent_chat_start_session` overlays the
+chat pane's workspace env onto `StartSessionInput.env` before the
+provider consumes it (`workspace_env_overlay` in
+`src-tauri/src/commands/agent_chat.rs`): `CODEMUX=1`,
+`CODEMUX_WORKSPACE_ID`, `CODEMUX_PANE_ID` (the chat pane),
+`CODEMUX_BROWSER_CMD`, `BROWSER`, plus the workspace-level vars from
+the terminal path's `workspace_pty_env` helper (reused `pub(crate)` so
+the two surfaces stay in lockstep). The Claude and Codex adapters pass
+`input.env` through to their per-session child spawns, so the agent's
+Bash subprocesses carry `CODEMUX_WORKSPACE_ID` and `codemux browser
+open` routes to the agent's own workspace instead of falling into the
+control layer's legacy active-workspace path (the pre-fix bug: with
+the beta on, browser panes landed in whatever workspace the user was
+viewing). Caller-provided env entries always win (insert-if-absent);
+an orphaned pane (no owning workspace) injects nothing. OpenCode's
+shared long-lived server cannot take per-session env — it relies on
+the control layer's cwd fallback (`resolve_workspace_id_by_cwd` in
+`src-tauri/src/control.rs`; see `docs/features/browser.md`).
 
 ## Claude Agent SDK integration
 
@@ -809,6 +900,28 @@ each consuming the provider's `event_stream()` and routing each
 event through `forward_event`. `broadcast::error::RecvError::Lagged`
 is already swallowed by each provider's event-stream helper, so slow
 subscribers never crash the loop — they just drop old events.
+
+## Sidebar status indicators
+
+Chat sessions publish into the same `pane_statuses` snapshot the left
+sidebar reads, so a chat workspace shows the working spinner / red
+needs-input pulse / green ready-for-review dot exactly like a terminal
+agent (previously chat panes showed nothing). `forward_event` in
+`commands/agent_chat.rs` maps each `ProviderRuntimeEvent` to a
+`PaneStatus` (`map_event_to_pane_status`) and writes it through
+`AppStateStore::set_pane_status_by_thread`, which resolves the
+`thread_id` to its `AgentChat` pane (`find_agent_chat_pane_id`) — the
+chat-side analogue of the terminal hooks path in `hooks.rs`. Mapping:
+streaming deltas / committed items / a running session / a resolved
+request → `Working`; an opened approval / plan / AskUserQuestion (or a
+session parked on approval) → `Permission`; `TurnCompleted` → `Review`
+(downgraded to `Idle` when the pane's workspace is already active,
+mirroring `handle_lifecycle_event`); session `Closed`/`Error` → cleared.
+A change-guard on `set_pane_status_by_thread` means the `content_delta`
+token stream collapses to a single write per turn rather than one per
+token. Because the write lands in `pane_statuses`, the sidebar rows,
+collapsed-rail aggregate dot, hover flyout, and `PaneNode` borders all
+update for free.
 
 ## Feature flag
 

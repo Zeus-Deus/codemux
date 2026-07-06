@@ -458,9 +458,56 @@ function streamMockChatReply(
     "and figure out the cleanest approach ",
     "before I start writing any code.",
   ];
-  let phase: "thinking" | "text" = "thinking";
+  // A run of reasoning + tool calls between thinking and prose: this is
+  // what folds into the live "Working" Activity block. Each step is
+  // emitted as a `tool_use` (goes `running`) then, on the next tick, a
+  // `tool_result` (settles) — so a single tool is briefly running and the
+  // block stays "Working" for the whole run. Kept out of the persisted
+  // seed so it only appears on an on-demand stream.
+  const TOOL_STEPS: Array<{
+    tool_name: string;
+    input: unknown;
+    content: string;
+  }> = [
+    {
+      tool_name: "Read",
+      input: { file_path: "src-tauri/src/terminal/mod.rs", offset: 1450, limit: 62 },
+      content:
+        "fn spawn_pty(&self) -> Result<Pty> {\n    let mut cmd = CommandBuilder::new(&shell);\n    cmd.envs(std::env::vars());\n    // ... env assembled from the process only\n}",
+    },
+    {
+      tool_name: "Grep",
+      input: { pattern: "fn workspace_pty_env", path: "src-tauri/src" },
+      content:
+        "src-tauri/src/workspace.rs:88:    pub fn workspace_pty_env(&self) -> Vec<(String, String)> {\n src-tauri/src/workspace.rs:140:    // exposed but never called at spawn time",
+    },
+    {
+      tool_name: "Read",
+      input: { file_path: "src-tauri/src/workspace.rs", offset: 88, limit: 52 },
+      content:
+        "pub fn workspace_pty_env(&self) -> Vec<(String, String)> {\n    self.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()\n}",
+    },
+    {
+      tool_name: "Edit",
+      input: {
+        file_path: "src-tauri/src/terminal/mod.rs",
+        old_string: "    cmd.envs(std::env::vars());",
+        new_string:
+          "    cmd.envs(std::env::vars());\n    cmd.envs(workspace.pty_env());",
+      },
+      content: "Applied edit to src-tauri/src/terminal/mod.rs",
+    },
+    {
+      tool_name: "Bash",
+      input: { command: "cargo check -p codemux" },
+      content: "    Checking codemux v0.10.0\n    Finished dev [unoptimized] target(s) in 4.12s",
+    },
+  ];
+  let phase: "thinking" | "tools" | "text" = "thinking";
   let thinkIdx = 0;
   let thinkingText = "";
+  let toolIdx = 0;
+  let toolSubphase: "use" | "result" = "use";
   let emitted = 0;
   let fullText = "";
   const timer = window.setInterval(() => {
@@ -481,8 +528,42 @@ function streamMockChatReply(
           turn_id: turnId,
           item: { kind: "assistant_thinking", text: thinkingText },
         });
-        phase = "text";
+        phase = "tools";
       }
+      return;
+    }
+    if (phase === "tools") {
+      const step = TOOL_STEPS[toolIdx];
+      const toolUseId = `${turnId}-tool-${toolIdx}`;
+      if (toolSubphase === "use") {
+        send({
+          type: "item_completed",
+          thread_id: threadId,
+          turn_id: turnId,
+          item: {
+            kind: "tool_use",
+            tool_name: step.tool_name,
+            tool_use_id: toolUseId,
+            input: step.input,
+          },
+        });
+        toolSubphase = "result";
+        return;
+      }
+      send({
+        type: "item_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        item: {
+          kind: "tool_result",
+          tool_use_id: toolUseId,
+          content: step.content,
+          is_error: false,
+        },
+      });
+      toolIdx += 1;
+      toolSubphase = "use";
+      if (toolIdx >= TOOL_STEPS.length) phase = "text";
       return;
     }
     emitted += 1;
@@ -944,6 +1025,16 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   grep_count_pattern: () => 0,
+
+  // Clipboard-image paste fallback (agent-chat composer). The real
+  // command reads the OS clipboard server-side; in the browser there's
+  // no such surface, so reject like the "no image on clipboard" case.
+  // The composer's clipboardData fast path handles real image pastes in
+  // the browser, and this rejection makes a text-only paste fall
+  // through to the default (plain-text) behaviour.
+  paste_clipboard_image: () => {
+    throw new Error("clipboard read_image failed: no image (dev mock)");
+  },
 
   // ── Agent chat per-thread event channel (issue #75) ──
   // Mirrors AgentChatChannelRegistry: newest attach wins, detach is

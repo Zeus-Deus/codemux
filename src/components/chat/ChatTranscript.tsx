@@ -48,6 +48,7 @@ export function ChatTranscript({
       <MessageList
         messages={messages}
         showThinking={showThinking}
+        streaming={streaming}
         sessionStartedAt={sessionStartedAt}
         provider={provider}
         onRespondToRequest={onRespondToRequest}
