@@ -159,6 +159,50 @@ describe("buildTranscriptSlots — non-rendering rows", () => {
   });
 });
 
+describe("buildTranscriptSlots — subagent card", () => {
+  function subagentRun(seq: number): ChatViewItem {
+    return {
+      kind: "subagent_run",
+      id: `run-${seq}`,
+      seq,
+      turn_id: "t1",
+      subagents: [
+        {
+          id: "a",
+          status: "running",
+          items: [],
+          toneIndex: 0,
+        },
+      ],
+    };
+  }
+
+  it("renders a subagent_run as its own standalone item slot", () => {
+    const slots = buildTranscriptSlots([subagentRun(0)]);
+    expect(slots).toHaveLength(1);
+    expect(slots[0].body.kind).toBe("item");
+    expect(slots[0].messageId).toBe("run-0");
+    // Assistant-side, but never a scroll anchor (not a user turn).
+    expect(slots[0].side).toBe("assistant");
+    expect(slots[0].scrollAnchor).toBe(false);
+  });
+
+  it("breaks a tool run — the card never folds into a tool group", () => {
+    const slots = buildTranscriptSlots([
+      tool(0),
+      tool(1),
+      subagentRun(2),
+      tool(3),
+      tool(4),
+    ]);
+    expect(slots.map((s) => s.body.kind)).toEqual([
+      "toolGroup",
+      "item",
+      "toolGroup",
+    ]);
+  });
+});
+
 describe("buildTranscriptSlots — turn boundaries", () => {
   it("marks user rows as scroll anchors on the user side", () => {
     const slots = buildTranscriptSlots([userMsg(0)]);

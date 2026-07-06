@@ -15,6 +15,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use super::protocol::{SessionInfo, SessionMessage};
+
 /// Configuration knobs for [`OpenCodeClient`]. Plain struct so callers
 /// can override fields one at a time; `Default` populates the values
 /// shared by every Stage 1 callsite.
@@ -133,6 +135,64 @@ impl OpenCodeClient {
             .await
             .map_err(|err| format!("parse_error: {err}"))?;
         Ok(flatten_provider_list(raw))
+    }
+
+    /// Cold-backfill a (sub)session's transcript.
+    ///
+    /// `GET /session/{id}/message?limit=N` returns the most recent
+    /// messages as `[{ info, parts }]` in the same shapes the live SSE
+    /// path decodes. Used only when Codemux attaches to a session
+    /// mid-flight and missed the start of a subagent's stream; the live
+    /// SSE channel is the primary source. `limit` caps how many
+    /// messages are pulled (`None` lets the server pick its default).
+    pub async fn get_session_messages(
+        &self,
+        session_id: &str,
+        limit: Option<u64>,
+    ) -> Result<Vec<SessionMessage>, String> {
+        let mut url = format!(
+            "{}/session/{}/message",
+            self.config.base_url,
+            urlencoding::encode(session_id)
+        );
+        if let Some(limit) = limit {
+            url.push_str(&format!("?limit={limit}"));
+        }
+        let request = self.attach_auth(self.http.get(&url));
+        let response = request.send().await.map_err(format_request_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("http_status_{}", status.as_u16()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|err| format!("parse_error: {err}"))
+    }
+
+    /// List a session's direct child (subagent) sessions.
+    ///
+    /// `GET /session/{id}/children` returns the child `Session` objects;
+    /// Codemux decodes them through the tolerant [`SessionInfo`] shape
+    /// (it only needs `id` / `parentID` / `title`). Used alongside
+    /// [`get_session_messages`](Self::get_session_messages) for cold
+    /// mid-session attach.
+    pub async fn list_children(&self, session_id: &str) -> Result<Vec<SessionInfo>, String> {
+        let url = format!(
+            "{}/session/{}/children",
+            self.config.base_url,
+            urlencoding::encode(session_id)
+        );
+        let request = self.attach_auth(self.http.get(&url));
+        let response = request.send().await.map_err(format_request_error)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(format!("http_status_{}", status.as_u16()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|err| format!("parse_error: {err}"))
     }
 
     fn url(&self, path: &str) -> String {
@@ -734,6 +794,83 @@ mod tests {
         assert!(entries.iter().find(|p| p.id == "p1").unwrap().connected);
         assert!(!entries.iter().find(|p| p.id == "p2").unwrap().connected);
         assert!(entries.iter().find(|p| p.id == "p3").unwrap().connected);
+    }
+
+    #[tokio::test]
+    async fn get_session_messages_decodes_info_and_parts() {
+        // Shape of `GET /session/{id}/message` — `[{ info, parts }]`.
+        let body = serde_json::json!([
+            {
+                "info": {
+                    "id": "msg_1",
+                    "sessionID": "ses_child",
+                    "role": "assistant",
+                    "time": { "created": 1, "completed": 2 }
+                },
+                "parts": [
+                    { "type": "text", "id": "p1", "sessionID": "ses_child", "messageID": "msg_1", "text": "hi" }
+                ]
+            }
+        ]);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/session/ses_child/message?limit=50")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&body).unwrap())
+            .create_async()
+            .await;
+        let cfg = OpenCodeClientConfig::new(server.url());
+        let client = OpenCodeClient::new(cfg).expect("client builds");
+        let msgs = client
+            .get_session_messages("ses_child", Some(50))
+            .await
+            .expect("decodes");
+        mock.assert_async().await;
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].info.session_id, "ses_child");
+        assert_eq!(msgs[0].parts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_session_messages_surfaces_http_error() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/session/ses_child/message")
+            .with_status(404)
+            .create_async()
+            .await;
+        let cfg = OpenCodeClientConfig::new(server.url());
+        let client = OpenCodeClient::new(cfg).expect("client builds");
+        let err = client
+            .get_session_messages("ses_child", None)
+            .await
+            .expect_err("404 surfaces");
+        mock.assert_async().await;
+        assert_eq!(err, "http_status_404");
+    }
+
+    #[tokio::test]
+    async fn list_children_decodes_child_sessions_with_parent_id() {
+        let body = serde_json::json!([
+            { "id": "ses_child", "parentID": "ses_root", "title": "child A" },
+            { "id": "ses_child2", "parentID": "ses_root", "title": "child B" }
+        ]);
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/session/ses_root/children")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::to_string(&body).unwrap())
+            .create_async()
+            .await;
+        let cfg = OpenCodeClientConfig::new(server.url());
+        let client = OpenCodeClient::new(cfg).expect("client builds");
+        let children = client.list_children("ses_root").await.expect("decodes");
+        mock.assert_async().await;
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].id, "ses_child");
+        assert_eq!(children[0].parent_id.as_deref(), Some("ses_root"));
     }
 
     #[tokio::test]

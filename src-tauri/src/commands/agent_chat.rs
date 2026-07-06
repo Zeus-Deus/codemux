@@ -1220,6 +1220,10 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             | ProviderRuntimeEvent::TurnCompleted { .. }
             | ProviderRuntimeEvent::RequestOpened { .. }
             | ProviderRuntimeEvent::RequestResolved { .. }
+            // Subagent snapshots persist so the orchestration card and
+            // child transcripts survive restart: DB hydrate replays them
+            // through the same reducer with zero schema migration.
+            | ProviderRuntimeEvent::SubagentUpdated { .. }
     )
 }
 
@@ -1250,6 +1254,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::RequestOpened { thread_id, .. }
         | ProviderRuntimeEvent::RequestResolved { thread_id, .. }
         | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. }
+        | ProviderRuntimeEvent::SubagentUpdated { thread_id, .. }
         | ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
@@ -1362,6 +1367,7 @@ mod tests {
             item: CompletedItem::AssistantText {
                 text: "hi".into(),
             },
+            subagent_id: None,
         };
         assert!(should_persist_event(&e));
     }
@@ -1376,6 +1382,7 @@ mod tests {
                 input: json!({"path": "/x"}),
                 tool_use_id: "tu-1".into(),
             },
+            subagent_id: None,
         };
         assert!(should_persist_event(&tool_use));
         let tool_result = ProviderRuntimeEvent::ItemCompleted {
@@ -1386,6 +1393,7 @@ mod tests {
                 content: json!("ok"),
                 is_error: false,
             },
+            subagent_id: None,
         };
         assert!(should_persist_event(&tool_result));
     }
@@ -1414,6 +1422,7 @@ mod tests {
             request_kind: "tool".into(),
             payload: json!({}),
             tool_use_id: None,
+            subagent_id: None,
         };
         assert!(should_persist_event(&opened));
         let resolved = ProviderRuntimeEvent::RequestResolved {
@@ -1432,6 +1441,7 @@ mod tests {
             thread_id: tid(),
             turn_id: turn(),
             delta: ContentDelta::Text { text: "hi".into() },
+            subagent_id: None,
         };
         assert!(!should_persist_event(&e));
     }
@@ -1499,6 +1509,7 @@ mod tests {
                 thread_id: ThreadId(thread.into()),
                 turn_id: turn(),
                 delta: ContentDelta::Text { text: text.into() },
+                subagent_id: None,
             },
         }
     }

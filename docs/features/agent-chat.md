@@ -229,6 +229,116 @@ already Beta-gated pane and simply hides on short threads.
   pin on hydrated transcripts. Unit tests cover the pure helpers
   (`message-trail.test.ts`) and the component (`MessageTrail.test.tsx`).
 
+## Subagent view (cross-provider)
+
+When a provider session delegates to subagents, the chat pane shows a
+**Subagents orchestration card** in the transcript and lets the user
+**enter** a subagent for a read-only, in-pane drill-in of its own stream.
+One canonical model drives all three providers. Design spec:
+`docs/plans/assets/Subagents.dc.html`; locked decisions:
+`docs/plans/subagent-view.md`.
+
+### Canonical event model (`agent_provider/events.rs`)
+
+Two additive, backward-compatible changes to `ProviderRuntimeEvent`
+(every new field is `#[serde(default)]`, so payloads persisted before
+subagents existed still deserialise, and the frontend merges non-null
+fields into per-subagent view state):
+
+- A new event `SubagentUpdated { thread_id, subagent }` carrying a
+  merge-able `SubagentSnapshot`. Serialised (snake_case) fields:
+  `subagent_id` (stable demux key, required), `parent_item_id?`,
+  `name?`, `agent_type?`, `model?`, `status`
+  (`pending|running|completed|failed|stopped`), `activity?`,
+  `result_text?`, `tool_use_count?`, `total_tokens?`, `duration_ms?`,
+  `provider_ref?`. All but `subagent_id` / `status` are optional because
+  providers dribble a subagent's identity out across many events.
+- A `subagent_id: Option<String>` tag on `ContentDelta`,
+  `ItemCompleted`, and `RequestOpened`. Non-null routes the (otherwise
+  unchanged) item / delta / approval into that subagent's sub-transcript
+  instead of the parent flow — so the drill-in reuses every existing
+  renderer, and a child's permission request still bubbles into the
+  parent view (labelled "from subagent X") rather than stalling the turn
+  invisibly.
+
+Subagent events are emitted thread-scoped under the **parent**
+`thread_id`; the `subagent_id` inside the payload is the demux key. They
+persist to `agent_chat_messages` under the parent thread as usual
+(`should_persist_event` also persists `SubagentUpdated`), so DB hydrate
+replays cards + child transcripts through the same reducer with **zero
+schema migration**. The TypeScript mirror lives in `src/tauri/events.ts`.
+
+### Per-provider keying + mapping
+
+- **Claude** (`claude/translate.rs`, keying = spawning
+  `parent_tool_use_id`): an assistant `tool_use` block named `Agent`
+  **or** `Task` spawns the row; every SDK message's top-level
+  `parent_tool_use_id` routes inner items into the sub-transcript; the
+  previously-dropped `task_started` / `task_progress` / `task_updated` /
+  `task_notification` system events become status + activity + usage
+  (mapped via a `task_id → tool_use_id` table), with the background
+  `async_launched` tool_result deferred to a later `task_notification`
+  for completion. The sidecar sets `agentProgressSummaries: true` (the
+  only sidecar change) so `task_progress.summary` feeds the activity line.
+- **Codex** (`codex/{protocol,translate,session}.rs`, keying = child
+  `threadId`): a persistent per-session demux routes wire events by
+  `params.threadId`; `collabAgentToolCall` / `subAgentActivity` map to
+  spawn/lifecycle + `agentsStates[..].message` activity (raw rendering
+  suppressed); child `thread/started` / `turn/*` update subagent status
+  and never the parent turn. `thread/started`, `turn/started`, and
+  `turn/completed` decode **both** the legacy flat and the v2 nested wire
+  shapes (custom `Deserialize`), and the success arm accepts both
+  `succeeded` and `completed`.
+- **OpenCode** (`opencode/{protocol,translate,sse,client}.rs`, keying =
+  child `sessionID`): an `SseRouter` grows a watched-session set (parent
+  ∪ transitive descendants via `SessionInfo.parentID`) instead of
+  dropping child-session events; the `task` tool part decodes
+  `state.metadata.{parentSessionId,sessionId,model}` (note the camelCase
+  lowercase-`d` keys) and `time.{start,end}`, emitting the row on the
+  first `running` update (`pending` carries no metadata) and stripping
+  the `<task_result>` / `<task_error>` envelope for `result_text`. Child
+  `permission.asked` bubbles as a `RequestOpened` and its reply is POSTed
+  to the **child** session's permissions endpoint. `question.asked`
+  remains a known gap (a different reply endpoint the current
+  `ApprovalDecision` model can't express — decoded as `Other`, no
+  regression).
+
+### Frontend (`src/lib/agent-chat/`, `src/components/chat/`)
+
+- `types.ts` adds `SubagentView` and a `SubagentRunItem`
+  (`kind: "subagent_run"`) `ChatViewItem`; `reducer.ts` merges snapshots
+  (non-null wins, status is monotonic and never regresses to pending) and
+  routes `subagent_id`-tagged events into the subagent's own `items` via
+  shared item-builders (one card per contiguous spawn group; a new turn
+  ⇒ a new card; per-subagent cap 500). Pure helpers live in
+  `subagents.ts`; `subagent_run` is a standalone unfoldable transcript
+  slot.
+- `SubagentsCard.tsx` — the orchestration card: aggregate header
+  ("N tasks · running in parallel" / "X done · Y active"), one row per
+  subagent (status spinner/check/x, name + mono model, shimmering
+  activity line while running / muted result when done, mono
+  `elapsed · N tools` meta, Enter button, chevron), an inline "Recent
+  activity" peek (last 3 child tool rows + "Enter subagent"), and the
+  footer note.
+- `SubagentView.tsx` + `SubagentBreadcrumb.tsx` — the read-only drill-in:
+  a `← Orchestrator › ⟨ordinal⟩ Name` breadcrumb with model chip and
+  right-aligned blinking status, a tone-tinted read-only banner, the
+  sub-transcript folded through `buildTranscriptSlots` + the existing
+  renderers, and a live shimmer tail while running.
+- `AgentChatPane.tsx` holds `viewMode` (orchestrator ↔ subagent) local
+  state; entering swaps the transcript body and the sub-header for the
+  breadcrumb, Esc / back returns, and the composer stays parent-bound
+  with the placeholder "Steering goes to the orchestrator…".
+  `AgentChatPaneHeader.tsx` shows an amber blinking "N subagents running"
+  pill while any subagent runs. All tones consume design-system tokens
+  (running = `status-working`, completed = `status-open`, failed =
+  `status-attention`); `.cm-blink` in `globals.css` honors
+  reduced-motion.
+
+The dev mock seeds one subagent turn in the demo transcript and exposes
+`window.__codemuxChatMock.streamSubagents()` for a live two-subagent
+lifecycle over the real per-thread Channel.
+
 ## Current Constraints
 
 - **Beta-gated.** The chat pane is hidden unless the user opts in via
@@ -441,12 +551,14 @@ from this list — `update-mcp-tools` wraps it.)
 
 ### Options construction
 
-Exactly 15 SDK `Options` fields are populated (`cwd`, `model`,
+Exactly 16 SDK `Options` fields are populated (`cwd`, `model`,
 `pathToClaudeCodeExecutable`, `settingSources: ["user","project","local"]`,
 `effort` (cast through `unknown` for forward-compat), `permissionMode`,
 `allowDangerouslySkipPermissions` (only with `bypassPermissions`),
 `settings` (when non-empty), `resume`, `sessionId`,
-`includePartialMessages: true`, `canUseTool`, `env: process.env`,
+`includePartialMessages: true`, `agentProgressSummaries: true` (so
+`task_progress` events carry a human-readable `summary` for the subagent
+card's activity line), `canUseTool`, `env: process.env`,
 `additionalDirectories` (when non-empty), `extraArgs` (when non-empty)).
 The other 30+ fields in the SDK's Options surface are intentionally
 left unset — they become features when the UI surfaces them.
@@ -754,7 +866,10 @@ the real reducer (`agent_chat_list_messages`), streams a simulated
 reply on `agent_chat_send_turn`, and exposes
 `window.__codemuxChatMock.streamReply()` for on-demand streaming —
 the standing harness for transcript-virtualization and scroll-pinning
-work.
+work. It also seeds one **subagent turn** (an "Implement" completed +
+"Verify" running orchestration card) and exposes
+`window.__codemuxChatMock.streamSubagents()` for a live two-subagent
+lifecycle over the real Channel — the harness for the subagent view.
 
 ## Step 9 — Cross-provider MCP server runtime (shipped)
 

@@ -40,7 +40,10 @@ const STANDALONE_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
 
 /** A completed, ungated, non-special tool call — safe to fold into a
  *  group. Running / pending-approval / error / TodoWrite / diff calls are
- *  excluded so they always render as their own, always-visible card. */
+ *  excluded so they always render as their own, always-visible card.
+ *  `subagent_run` orchestration cards are not tool calls, so they never
+ *  fold — each renders as its own standalone full-width slot (like a
+ *  diff), and it breaks any surrounding tool run. */
 function isGroupable(item: ChatViewItem): item is ToolCallItem {
   return (
     item.kind === "tool_call" &&

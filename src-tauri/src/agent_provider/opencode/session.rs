@@ -38,7 +38,7 @@ use super::manager::{OpenCodeServerHandle, OpenCodeServerManager};
 use super::protocol::{
     PermissionRespondRequest, SessionCreateRequest, SessionResponse,
 };
-use super::sse::{spawn_sse_listener, SsePeer};
+use super::sse::{spawn_sse_listener, SsePeer, SseRouter};
 use super::translate::{
     approval_decision_to_permission_reply, build_prompt_async_request, EventContext,
 };
@@ -62,6 +62,11 @@ pub struct OpenCodeSession {
     /// reads it on each event so updates land before the next
     /// `prompt_async` triggers a new burst of SSE traffic.
     event_ctx: Arc<Mutex<EventContext>>,
+    /// Subagent routing state shared with the SSE listener: the
+    /// watched-session set and the permission-id → session map. The
+    /// reply path reads the latter so a subagent's approval targets the
+    /// child session id rather than the root.
+    router: Arc<Mutex<SseRouter>>,
     sse_handle: Mutex<Option<JoinHandle<()>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
 }
@@ -130,9 +135,11 @@ impl OpenCodeSession {
             provider_session_id: provider_session_id.clone(),
         }));
 
+        let router = Arc::new(Mutex::new(SseRouter::new(session_resp.id.clone())));
         let peer = SsePeer {
             session_id: session_resp.id.clone(),
             event_ctx: event_ctx.clone(),
+            router: router.clone(),
         };
         let sse_handle = spawn_sse_listener(
             server_handle.base_url.clone(),
@@ -158,6 +165,7 @@ impl OpenCodeSession {
             server_handle,
             http,
             event_ctx,
+            router,
             sse_handle: Mutex::new(Some(sse_handle)),
             event_tx,
         }))
@@ -264,10 +272,20 @@ impl OpenCodeSession {
         let body = PermissionRespondRequest {
             response: approval_decision_to_permission_reply(&decision),
         };
+        // A subagent's permission request must be answered on the child
+        // session that raised it — the SSE listener recorded which
+        // session each permission id belongs to. Fall back to the root
+        // session for the ordinary (non-subagent) case.
+        let target_session = self
+            .router
+            .lock()
+            .await
+            .session_for_permission(&request_id.0)
+            .unwrap_or_else(|| self.provider_session_id.0.clone());
         let url = format!(
             "{}/session/{}/permissions/{}",
             self.server_handle.base_url.trim_end_matches('/'),
-            urlencoding::encode(&self.provider_session_id.0),
+            urlencoding::encode(&target_session),
             urlencoding::encode(&request_id.0),
         );
         let response = self
@@ -357,12 +375,13 @@ mod tests {
         }));
         let session = Arc::new(OpenCodeSession {
             thread_id: ThreadId("t1".into()),
-            provider_session_id,
+            provider_session_id: provider_session_id.clone(),
             current_model: Mutex::new(Some("openai/gpt-5".into())),
             current_variant: Mutex::new(None),
             server_handle: handle,
             http,
             event_ctx,
+            router: Arc::new(Mutex::new(SseRouter::new(provider_session_id.0.clone()))),
             sse_handle: Mutex::new(None),
             event_tx: tx.clone(),
         });
@@ -508,6 +527,40 @@ mod tests {
             )
             .await
             .expect("respond succeeds");
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn respond_to_request_targets_child_session_for_subagent_permission() {
+        // A subagent's approval must POST to the CHILD session id the
+        // SSE listener recorded for that permission, not the root.
+        let mut server = Server::new_async().await;
+        let mock = server
+            .mock("POST", "/session/ses_child/permissions/per_1")
+            .match_body(r#"{"response":"once"}"#)
+            .with_status(200)
+            .with_body("true")
+            .create_async()
+            .await;
+        let (session, _tx, _rx) =
+            mock_session(server.url(), "pw".into(), "sess_1").await;
+        // Simulate the SSE listener having recorded the child permission.
+        session
+            .router
+            .lock()
+            .await
+            .record_permission("per_1".into(), "ses_child".into());
+        session
+            .respond_to_request(
+                RequestId("per_1".into()),
+                ApprovalDecision::Allow {
+                    updated_input: None,
+                    updated_permissions: None,
+                },
+            )
+            .await
+            .expect("respond succeeds");
+        // The mock only matches the child-session URL.
         mock.assert_async().await;
     }
 

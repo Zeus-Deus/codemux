@@ -22,6 +22,7 @@
 //! final `RuntimeWarning` and exits — the provider can be restarted via
 //! [`super::OpenCodeServerManager::stop`] + a fresh `start_session`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use tokio::task::JoinHandle;
 
 use crate::agent_provider::events::ProviderRuntimeEvent;
 
-use super::protocol::OpenCodeEvent;
+use super::protocol::{KnownEvent, OpenCodeEvent, PartPayload, SessionInfo};
 use super::translate::{opencode_event_to_runtime, EventContext};
 
 /// Cap on consecutive reconnect attempts. Beyond this the listener
@@ -39,17 +40,98 @@ use super::translate::{opencode_event_to_runtime, EventContext};
 /// that must surface to the user.
 pub const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 
+/// Mutable subagent-routing state for one session's SSE stream.
+///
+/// OpenCode multiplexes **every** session onto one global `/event`
+/// channel, so the listener has to decide, per event, whether it
+/// belongs to the session Codemux owns (the root/parent), one of its
+/// subagents' child sessions, or an unrelated session that must be
+/// ignored. That decision is data-driven:
+///
+/// * `watched` starts as `{ root }` and grows every time a
+///   `session.created` arrives whose `parentID` is already watched
+///   (parent ∪ descendants, so nested subagents are picked up too).
+/// * `subagent_id_for` maps a watched session id to the demux key the
+///   frontend routes on: `None` for the root, `Some(child_id)` for a
+///   subagent.
+/// * `permission_sessions` remembers which session raised each
+///   permission request, so a reply can target the **child** session
+///   (`POST /session/{childID}/permissions/{permID}`) rather than the
+///   root — otherwise a subagent's approval never resolves and the turn
+///   stalls.
+///
+/// Shared (`Arc<Mutex<…>>`) between the SSE listener and the
+/// [`super::session::OpenCodeSession`] so the approval reply path can
+/// read `permission_sessions`.
+#[derive(Debug, Default)]
+pub struct SseRouter {
+    root_session_id: String,
+    watched: HashSet<String>,
+    permission_sessions: HashMap<String, String>,
+}
+
+impl SseRouter {
+    /// Seed the router with the root session (the one Codemux created);
+    /// it is watched from the start.
+    pub fn new(root_session_id: impl Into<String>) -> Self {
+        let root = root_session_id.into();
+        let mut watched = HashSet::new();
+        watched.insert(root.clone());
+        Self {
+            root_session_id: root,
+            watched,
+            permission_sessions: HashMap::new(),
+        }
+    }
+
+    /// Grow the watched set when a newly-created session's parent is
+    /// already watched. Returns `true` when a new session was added.
+    pub fn observe_session_created(&mut self, info: &SessionInfo) -> bool {
+        match &info.parent_id {
+            Some(parent) if self.watched.contains(parent) => self.watched.insert(info.id.clone()),
+            _ => false,
+        }
+    }
+
+    /// Whether events for `session_id` should reach the translator.
+    pub fn is_watched(&self, session_id: &str) -> bool {
+        self.watched.contains(session_id)
+    }
+
+    /// Demux key for an event on `session_id`: `None` for the root,
+    /// `Some(session_id)` for a subagent's child session.
+    pub fn subagent_id_for(&self, session_id: &str) -> Option<String> {
+        if session_id == self.root_session_id {
+            None
+        } else {
+            Some(session_id.to_string())
+        }
+    }
+
+    /// Remember which session a permission request belongs to.
+    pub fn record_permission(&mut self, permission_id: String, session_id: String) {
+        self.permission_sessions.insert(permission_id, session_id);
+    }
+
+    /// The session a permission reply must target, if known.
+    pub fn session_for_permission(&self, permission_id: &str) -> Option<String> {
+        self.permission_sessions.get(permission_id).cloned()
+    }
+}
+
 /// Snapshot of the routing state for a single live session. Cheap to
-/// clone (Arc-wrapped strings) so the listener can hand a clone to
+/// clone (Arc-wrapped) so the listener can hand a clone to
 /// [`opencode_event_to_runtime`] for each event without locking.
 ///
-/// The session id is the OpenCode-minted id (returned from
-/// `POST /session`); `EventContext` carries the Codemux-side
-/// thread/turn ids the user-facing event stream is keyed on.
+/// The session id is the OpenCode-minted root id (returned from
+/// `POST /session`); `event_ctx` carries the Codemux-side thread/turn
+/// ids the user-facing event stream is keyed on; `router` carries the
+/// mutable watched-session + permission-routing state.
 #[derive(Debug, Clone)]
 pub struct SsePeer {
     pub session_id: String,
     pub event_ctx: Arc<Mutex<EventContext>>,
+    pub router: Arc<Mutex<SseRouter>>,
 }
 
 /// Spawn the SSE listener task. Returns the join handle so the
@@ -91,7 +173,6 @@ async fn run_sse_listener(
 
     let mut attempt: u32 = 0;
     loop {
-        let session_filter = peer.session_id.clone();
         let connect = client
             .get(&url)
             .basic_auth("opencode", Some(&server_password))
@@ -126,7 +207,7 @@ async fn run_sse_listener(
             }
         };
 
-        consume_stream(response, &session_filter, &peer, &event_tx).await;
+        consume_stream(response, &peer, &event_tx).await;
 
         // The server closed the stream (or it ended cleanly). Try to
         // reconnect — the OpenCode server may still be live and a new
@@ -139,7 +220,6 @@ async fn run_sse_listener(
 
 async fn consume_stream(
     response: reqwest::Response,
-    session_filter: &str,
     peer: &SsePeer,
     event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
 ) {
@@ -164,14 +244,14 @@ async fn consume_stream(
         while let Some(end) = find_record_end(&buffer) {
             let record_bytes = buffer.drain(..end).collect::<Vec<u8>>();
             let record = String::from_utf8_lossy(&record_bytes).into_owned();
-            handle_record(&record, session_filter, peer, event_tx).await;
+            handle_record(&record, peer, event_tx).await;
         }
     }
     // Stream closed: drain any final record without a trailing blank
     // line (some upstream tooling forgets that suffix).
     if !buffer.is_empty() {
         let record = String::from_utf8_lossy(&buffer).into_owned();
-        handle_record(&record, session_filter, peer, event_tx).await;
+        handle_record(&record, peer, event_tx).await;
         buffer.clear();
     }
 }
@@ -225,7 +305,6 @@ pub fn parse_sse_record(record: &str) -> Option<String> {
 
 async fn handle_record(
     record: &str,
-    session_filter: &str,
     peer: &SsePeer,
     event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
 ) {
@@ -243,46 +322,87 @@ async fn handle_record(
         }
     };
 
-    if !event_matches_session(&event, session_filter) {
+    // Resolve routing against the watched-session set, growing it for
+    // newly-spawned subagents, before deciding whether the event is
+    // ours and how to tag it.
+    let Some(subagent_id) = resolve_routing(&event, &peer.router).await else {
         return;
-    }
+    };
 
     let ctx = peer.event_ctx.lock().await.clone();
-    for runtime in opencode_event_to_runtime(event, &ctx) {
+    for runtime in opencode_event_to_runtime(event, &ctx, subagent_id.as_deref()) {
         let _ = event_tx.send(runtime);
     }
 }
 
-/// Filter — only events whose `sessionID` (when present) matches the
-/// active session reach the translator. Events without a session id
-/// (e.g. `vcs.branch.updated`) fall through to the translator's
-/// catch-all.
-fn event_matches_session(event: &OpenCodeEvent, session_id: &str) -> bool {
-    use super::protocol::KnownEvent as K;
+/// Decide whether an event belongs to a watched session and, if so,
+/// return its subagent tag (`None` for the root, `Some(child)` for a
+/// subagent). Returns `None` (the outer `Option`) to signal "drop this
+/// event". Side effects: grows the watched set on `session.created` and
+/// records permission→session routing.
+async fn resolve_routing(
+    event: &OpenCodeEvent,
+    router: &Arc<Mutex<SseRouter>>,
+) -> Option<Option<String>> {
+    let mut router = router.lock().await;
+
+    // Grow the watched set first so a child's own `session.created`
+    // (which carries the parent id) is enough to start tracking it.
+    if let OpenCodeEvent::Known(KnownEvent::SessionCreated(env)) = event {
+        router.observe_session_created(&env.info);
+    }
+
+    // Unknown events are dropped at the SSE layer (as before) — the
+    // translator's `Other` warning arm is reserved for direct callers.
     let known = match event {
         OpenCodeEvent::Known(k) => k,
-        OpenCodeEvent::Other(_) => return false,
+        OpenCodeEvent::Other(_) => return None,
     };
+
+    // Record which session a permission belongs to so the reply can
+    // target the child session id later.
+    if let KnownEvent::PermissionAsked(p) = known {
+        router.record_permission(p.id.clone(), p.session_id.clone());
+    }
+
+    match event_session_id(known) {
+        Some(session_id) => {
+            if !router.is_watched(session_id) {
+                return None;
+            }
+            Some(router.subagent_id_for(session_id))
+        }
+        // A known, session-less event (e.g. `session.error` with no
+        // sessionID) is treated as root-scoped.
+        None => Some(None),
+    }
+}
+
+/// The session id an event belongs to, or `None` for a known event
+/// carrying no session id.
+fn event_session_id(known: &KnownEvent) -> Option<&str> {
+    use KnownEvent as K;
     match known {
         K::SessionCreated(env) | K::SessionUpdated(env) | K::SessionDeleted(env) => {
-            env.info.id == session_id
+            Some(env.info.id.as_str())
         }
-        K::SessionIdle(p) => p.session_id == session_id,
-        K::SessionStatus(p) => p.session_id == session_id,
-        K::SessionError(p) => p.session_id.as_deref().is_some_and(|s| s == session_id)
-            || p.session_id.is_none(),
-        K::MessageUpdated(env) => env.info.session_id == session_id,
-        K::MessageRemoved(p) => p.session_id == session_id,
+        K::SessionIdle(p) => Some(p.session_id.as_str()),
+        K::SessionStatus(p) => Some(p.session_id.as_str()),
+        K::SessionError(p) => p.session_id.as_deref(),
+        K::MessageUpdated(env) => Some(env.info.session_id.as_str()),
+        K::MessageRemoved(p) => Some(p.session_id.as_str()),
         K::MessagePartUpdated(p) => match &p.part {
-            super::protocol::PartPayload::Text(t) => t.session_id == session_id,
-            super::protocol::PartPayload::Reasoning(r) => r.session_id == session_id,
-            super::protocol::PartPayload::Tool(t) => t.session_id == session_id,
-            super::protocol::PartPayload::Other => false,
+            PartPayload::Text(t) => Some(t.session_id.as_str()),
+            PartPayload::Reasoning(r) => Some(r.session_id.as_str()),
+            PartPayload::Tool(t) => Some(t.session_id.as_str()),
+            PartPayload::Agent(a) => Some(a.session_id.as_str()),
+            PartPayload::Subtask(s) => Some(s.session_id.as_str()),
+            PartPayload::Other => None,
         },
-        K::MessagePartDelta(p) => p.session_id == session_id,
-        K::MessagePartRemoved(p) => p.session_id == session_id,
-        K::PermissionAsked(p) => p.session_id == session_id,
-        K::PermissionReplied(p) => p.session_id == session_id,
+        K::MessagePartDelta(p) => Some(p.session_id.as_str()),
+        K::MessagePartRemoved(p) => Some(p.session_id.as_str()),
+        K::PermissionAsked(p) => Some(p.session_id.as_str()),
+        K::PermissionReplied(p) => Some(p.session_id.as_str()),
     }
 }
 
@@ -330,6 +450,7 @@ mod tests {
                 turn_id: TurnId("turn1".into()),
                 provider_session_id: ProviderSessionId(session_id.to_string()),
             })),
+            router: Arc::new(Mutex::new(SseRouter::new(session_id))),
         }
     }
 
@@ -392,17 +513,96 @@ mod tests {
         assert_eq!(&buf[..end], b"data: foo\r\n\r\n");
     }
 
-    #[test]
-    fn event_matches_session_filters_by_session_id() {
-        let event = OpenCodeEvent::Known(KnownEvent::MessagePartDelta(super::super::protocol::MessagePartDelta {
-            session_id: "s1".into(),
+    fn delta_event(session_id: &str) -> OpenCodeEvent {
+        OpenCodeEvent::Known(KnownEvent::MessagePartDelta(super::super::protocol::MessagePartDelta {
+            session_id: session_id.into(),
             message_id: "m1".into(),
             part_id: "p1".into(),
             field: "text".into(),
             delta: "x".into(),
-        }));
-        assert!(event_matches_session(&event, "s1"));
-        assert!(!event_matches_session(&event, "s2"));
+        }))
+    }
+
+    fn child_created_event(child: &str, parent: &str) -> OpenCodeEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "session.created",
+            "properties": { "info": { "id": child, "parentID": parent, "title": "child" } }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_routing_passes_root_untagged_drops_unrelated() {
+        let router = Arc::new(Mutex::new(SseRouter::new("s1")));
+        // Root event → watched, untagged.
+        assert_eq!(
+            resolve_routing(&delta_event("s1"), &router).await,
+            Some(None)
+        );
+        // Unrelated session → dropped.
+        assert_eq!(resolve_routing(&delta_event("OTHER"), &router).await, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_routing_grows_watched_set_on_child_created_then_tags_child() {
+        let router = Arc::new(Mutex::new(SseRouter::new("s1")));
+        // Before the child is announced its events are dropped.
+        assert_eq!(resolve_routing(&delta_event("child"), &router).await, None);
+        // session.created with a watched parent adds the child; the
+        // creation event itself is a child-session event so it is
+        // already tagged with the child id.
+        assert_eq!(
+            resolve_routing(&child_created_event("child", "s1"), &router).await,
+            Some(Some("child".to_string()))
+        );
+        // Now child events pass, tagged with the child session id.
+        assert_eq!(
+            resolve_routing(&delta_event("child"), &router).await,
+            Some(Some("child".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_routing_ignores_child_whose_parent_is_unwatched() {
+        let router = Arc::new(Mutex::new(SseRouter::new("s1")));
+        // A session.created whose parent we don't track must NOT be added.
+        resolve_routing(&child_created_event("stranger", "someone_else"), &router).await;
+        assert_eq!(resolve_routing(&delta_event("stranger"), &router).await, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_routing_tracks_grandchildren_via_transitive_parents() {
+        let router = Arc::new(Mutex::new(SseRouter::new("s1")));
+        resolve_routing(&child_created_event("child", "s1"), &router).await;
+        // Grandchild's parent is `child`, which is now watched.
+        resolve_routing(&child_created_event("grand", "child"), &router).await;
+        assert_eq!(
+            resolve_routing(&delta_event("grand"), &router).await,
+            Some(Some("grand".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_routing_records_child_permission_session() {
+        let router = Arc::new(Mutex::new(SseRouter::new("s1")));
+        resolve_routing(&child_created_event("child", "s1"), &router).await;
+        let perm = serde_json::from_value::<OpenCodeEvent>(serde_json::json!({
+            "type": "permission.asked",
+            "properties": {
+                "id": "per_1", "sessionID": "child", "permission": "external_directory",
+                "patterns": ["/*"], "metadata": {}, "tool": { "messageID": "m", "callID": "c" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            resolve_routing(&perm, &router).await,
+            Some(Some("child".to_string()))
+        );
+        // The reply path can now recover the child session id.
+        assert_eq!(
+            router.lock().await.session_for_permission("per_1").as_deref(),
+            Some("child")
+        );
     }
 
     #[tokio::test]
@@ -410,11 +610,12 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(8);
         let peer = peer("s1");
         let record = "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"s1\",\"messageID\":\"m1\",\"partID\":\"p1\",\"field\":\"text\",\"delta\":\"hi\"}}\n\n";
-        handle_record(record, "s1", &peer, &tx).await;
+        handle_record(record, &peer, &tx).await;
         let event = rx.try_recv().expect("event published");
         match event {
-            ProviderRuntimeEvent::ContentDelta { delta, .. } => {
+            ProviderRuntimeEvent::ContentDelta { delta, subagent_id, .. } => {
                 use crate::agent_provider::events::ContentDelta;
+                assert!(subagent_id.is_none(), "root delta carries no subagent id");
                 match delta {
                     ContentDelta::Text { text } => assert_eq!(text, "hi"),
                     other => panic!("wrong delta: {other:?}"),
@@ -425,11 +626,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_record_routes_child_delta_with_subagent_id() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let peer = peer("s1");
+        // Announce the child so it becomes watched.
+        let created = "data: {\"type\":\"session.created\",\"properties\":{\"info\":{\"id\":\"child\",\"parentID\":\"s1\",\"title\":\"c\"}}}\n\n";
+        handle_record(created, &peer, &tx).await;
+        let record = "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"child\",\"messageID\":\"m1\",\"partID\":\"p1\",\"field\":\"text\",\"delta\":\"hi\"}}\n\n";
+        handle_record(record, &peer, &tx).await;
+        let event = rx.try_recv().expect("child event published");
+        match event {
+            ProviderRuntimeEvent::ContentDelta { subagent_id, .. } => {
+                assert_eq!(subagent_id.as_deref(), Some("child"));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn handle_record_filters_other_session() {
         let (tx, mut rx) = broadcast::channel(8);
         let peer = peer("s1");
         let record = "data: {\"type\":\"message.part.delta\",\"properties\":{\"sessionID\":\"OTHER\",\"messageID\":\"m1\",\"partID\":\"p1\",\"field\":\"text\",\"delta\":\"hi\"}}\n\n";
-        handle_record(record, "s1", &peer, &tx).await;
+        handle_record(record, &peer, &tx).await;
         // Filtered: nothing is published.
         assert!(rx.try_recv().is_err());
     }
@@ -439,7 +658,7 @@ mod tests {
         let (tx, mut rx) = broadcast::channel(8);
         let peer = peer("s1");
         let record = "data: { not json }\n\n";
-        handle_record(record, "s1", &peer, &tx).await;
+        handle_record(record, &peer, &tx).await;
         let event = rx.try_recv().expect("warning published");
         match event {
             ProviderRuntimeEvent::RuntimeWarning { message, .. } => {

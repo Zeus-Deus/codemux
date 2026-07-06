@@ -687,6 +687,147 @@ export function richChatTurnEnvelopes(
 }
 
 /**
+ * Runtime-event envelopes for a seeded subagents turn, mirroring the
+ * design fixture (`docs/plans/assets/Subagents.dc.html`): the orchestrator
+ * delegates to two subagents — "Implement" (completed) and "Verify" (still
+ * running). Replayed through the real reducer by `mockChatTranscript`, so
+ * the orchestration card, the running pill, and the drill-in all render
+ * from real `SubagentRunItem` state on open. Shapes mirror the Stage 1
+ * `subagent_updated` event + `subagent_id`-tagged `item_completed`.
+ */
+export function subagentTurnEnvelopes(
+  threadId: string,
+  turnId: string,
+): unknown[] {
+  const snap = (subagent: Record<string, unknown>) => ({
+    type: "subagent_updated",
+    thread_id: threadId,
+    subagent,
+  });
+  const sub = (subagentId: string, rest: Record<string, unknown>) => ({
+    thread_id: threadId,
+    turn_id: turnId,
+    subagent_id: subagentId,
+    ...rest,
+  });
+  const tool = (
+    subagentId: string,
+    id: string,
+    toolName: string,
+    input: Record<string, unknown>,
+    result: string | null,
+  ): unknown[] => {
+    const out: unknown[] = [
+      sub(subagentId, {
+        type: "item_completed",
+        item: { kind: "tool_use", tool_name: toolName, tool_use_id: id, input },
+      }),
+    ];
+    // A null result leaves the tool "running" (design shows Verify's
+    // `npm run verify` still in flight).
+    if (result !== null) {
+      out.push(
+        sub(subagentId, {
+          type: "item_completed",
+          item: { kind: "tool_result", tool_use_id: id, content: result, is_error: false },
+        }),
+      );
+    }
+    return out;
+  };
+
+  return [
+    // Orchestrator lead-in (parent flow).
+    {
+      thread_id: threadId,
+      turn_id: turnId,
+      type: "item_completed",
+      item: {
+        kind: "assistant_text",
+        text: "Root cause confirmed. I'll run this as a two-stage workflow and delegate to subagents so the work and the review happen independently.",
+      },
+    },
+    // Spawn "Implement" and stream its sub-transcript.
+    snap({
+      subagent_id: "impl",
+      name: "Implement",
+      agent_type: "implement",
+      model: "opus · xhigh",
+      status: "running",
+    }),
+    sub("impl", {
+      type: "item_completed",
+      item: {
+        kind: "assistant_text",
+        text: "Adding the Rust clipboard fallback to the composer paste handler. Keeping the fast clipboardData path and falling back through the existing handleAttachImage so mime validation still applies.",
+      },
+    }),
+    ...tool("impl", "impl-edit-1", "Edit", {
+      file_path: "src/components/chat/Composer.tsx",
+      old_string: "const x = 1;",
+      new_string: "const x = 1;\nconst y = 2;",
+    }, "Applied edit to src/components/chat/Composer.tsx"),
+    ...tool("impl", "impl-edit-2", "Edit", {
+      file_path: "src-tauri/src/clipboard.rs",
+      old_string: "",
+      new_string: "pub fn read_image() {}\n",
+    }, "Applied edit to src-tauri/src/clipboard.rs"),
+    ...tool("impl", "impl-run-1", "Bash", {
+      command: "cargo test clipboard_fallback",
+    }, "test result: ok. 1 passed"),
+    sub("impl", {
+      type: "item_completed",
+      item: {
+        kind: "assistant_text",
+        text: "Done — reported 6 changed files back to the orchestrator. npm run verify and cargo test both pass.",
+      },
+    }),
+    // Spawn "Verify" and stream its (still-running) sub-transcript.
+    snap({
+      subagent_id: "verify",
+      name: "Verify",
+      agent_type: "verify",
+      model: "opus · xhigh",
+      status: "running",
+      activity: "reading diff for async preventDefault timing regressions…",
+    }),
+    sub("verify", {
+      type: "item_completed",
+      item: {
+        kind: "assistant_text",
+        text: "Reviewing the diff produced by the Implement subagent. Hunting specifically for paste regressions, double-attach, and async timing bugs.",
+      },
+    }),
+    ...tool("verify", "verify-read-1", "Read", {
+      file_path: "src/components/chat/Composer.tsx:1420-1470",
+    }, "// Composer.tsx\n"),
+    ...tool("verify", "verify-grep-1", "Grep", {
+      pattern: "preventDefault",
+      path: "src/components/chat",
+    }, "4 matches"),
+    // Left running (no tool_result) — matches the design's "running".
+    ...tool("verify", "verify-run-1", "Bash", {
+      command: "npm run verify",
+    }, null),
+    // Implement finishes with final usage; Verify keeps working.
+    snap({
+      subagent_id: "impl",
+      status: "completed",
+      result_text: "Done · 6 files changed, npm run verify + cargo test passed",
+      tool_use_count: 28,
+      duration_ms: 161000,
+    }),
+    snap({
+      subagent_id: "verify",
+      status: "running",
+      activity: "checking async preventDefault timing on the paste handler…",
+      tool_use_count: 11,
+      duration_ms: 52000,
+    }),
+  ];
+}
+
+/**
  * Build a fresh, deep-ish-cloned `AppStateSnapshot`. The mock holds a
  * single mutable instance and re-emits it after mutating commands, so
  * we hand out a structuredClone to keep the canonical seed pristine

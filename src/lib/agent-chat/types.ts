@@ -1,8 +1,11 @@
 import type {
   ApprovalDecision,
   ProviderRuntimeEvent,
+  SubagentStatus,
   TurnStatus,
 } from "@/tauri/events";
+
+export type { SubagentStatus };
 
 export type ChatItemId = string;
 
@@ -92,6 +95,11 @@ export interface PermissionRequestItem {
    *  `null` for standalone requests (plan, unmatched, Codex
    *  server-initiated). */
   tool_use_id: string | null;
+  /** When a subagent raised this approval, its demux key. Lets the
+   *  parent flow label it "from subagent X" and the drill-in mirror
+   *  it into the sub-transcript. `null` for ordinary parent
+   *  requests. */
+  subagent_id?: string | null;
   resolution:
     | { state: "pending" }
     | { state: "responding"; decision: ApprovalDecision }
@@ -106,13 +114,60 @@ export interface TurnEndedItem {
   status: TurnStatus;
 }
 
+/**
+ * One subagent's live state + its own sub-transcript. The reducer merges
+ * `subagent_updated` snapshots into these (non-null fields win) and routes
+ * `subagent_id`-tagged content/item events into `items` using the same
+ * item-construction helpers as the main transcript. Camel-cased view
+ * shape — distinct from the snake_case wire `SubagentSnapshot`.
+ */
+export interface SubagentView {
+  /** Demux key (the wire `subagent_id`). Stable React key + lookup id. */
+  id: string;
+  name?: string;
+  agentType?: string;
+  model?: string;
+  status: SubagentStatus;
+  /** Provider-pushed "currently doing X" line, when supplied. */
+  activity?: string;
+  /** Final report first surfaced on completion. */
+  resultText?: string;
+  toolUseCount?: number;
+  totalTokens?: number;
+  durationMs?: number;
+  /** Wall-clock ms (injected clock) when the row was first observed —
+   *  drives the elapsed-time fallback when the provider sends no
+   *  `durationMs`. */
+  startedAt?: number;
+  /** The subagent's own transcript, built with the shared reducer
+   *  item-builders so every existing renderer works in the drill-in. */
+  items: ChatViewItem[];
+  /** Deterministic accent index (hash of `id`) for the design's tone
+   *  cycle; the visible status colour still derives from `status`. */
+  toneIndex: number;
+}
+
+/**
+ * One orchestration card per contiguous spawn group per turn (locked
+ * decision 5). Holds every subagent spawned back-to-back; a new turn or
+ * an interrupting parent item starts a fresh card.
+ */
+export interface SubagentRunItem {
+  kind: "subagent_run";
+  id: ChatItemId;
+  seq: number;
+  turn_id: string | null;
+  subagents: SubagentView[];
+}
+
 export type ChatViewItem =
   | UserMessageItem
   | AssistantMessageItem
   | ReasoningItem
   | ToolCallItem
   | PermissionRequestItem
-  | TurnEndedItem;
+  | TurnEndedItem
+  | SubagentRunItem;
 
 export interface ChatThreadState {
   messages: ChatViewItem[];

@@ -296,6 +296,7 @@ async fn registry_returns_none_when_provider_missing() {
 #[test]
 fn thread_id_for_event_extracts_bound_threads() {
     let delta = ProviderRuntimeEvent::ContentDelta {
+        subagent_id: None,
         thread_id: ThreadId("th-1".into()),
         turn_id: TurnId("tn-1".into()),
         delta: codemux_lib::agent_provider::ContentDelta::Text {
@@ -357,6 +358,7 @@ fn capture_channel() -> (
 
 fn text_delta(thread: &str, text: &str) -> ProviderRuntimeEvent {
     ProviderRuntimeEvent::ContentDelta {
+        subagent_id: None,
         thread_id: ThreadId(thread.into()),
         turn_id: TurnId("turn-1".into()),
         delta: codemux_lib::agent_provider::ContentDelta::Text { text: text.into() },
@@ -385,6 +387,7 @@ async fn event_bridge_routes_thread_events_to_attached_channel() {
     registry.attach("thread-bridge", channel);
 
     let event = ProviderRuntimeEvent::ItemCompleted {
+        subagent_id: None,
         thread_id: ThreadId("thread-bridge".into()),
         turn_id: TurnId("turn-1".into()),
         item: CompletedItem::AssistantText {
@@ -472,6 +475,7 @@ async fn event_bridge_persists_transcript_even_without_channel() {
     }
 
     let event = ProviderRuntimeEvent::ItemCompleted {
+        subagent_id: None,
         thread_id: ThreadId("thread-unattached".into()),
         turn_id: TurnId("turn-1".into()),
         item: CompletedItem::AssistantText {
@@ -554,6 +558,7 @@ async fn full_bridge_pipeline_streams_provider_events_per_thread() {
         provider.emit(text_delta("pipe-b", &format!("tok-b{i}")));
     }
     provider.emit(ProviderRuntimeEvent::ItemCompleted {
+        subagent_id: None,
         thread_id: ThreadId("pipe-a".into()),
         turn_id: TurnId("turn-1".into()),
         item: CompletedItem::AssistantText {

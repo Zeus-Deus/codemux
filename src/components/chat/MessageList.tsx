@@ -31,6 +31,7 @@ import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
 import { ReasoningBlock } from "./ReasoningBlock";
 import { StreamingMarker } from "./StreamingMarker";
+import { SubagentsCard } from "./SubagentsCard";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { ToolGroupCard } from "./ToolGroupCard";
@@ -55,6 +56,10 @@ interface Props {
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  /** Enter a subagent's read-only drill-in (design "Enter subagent").
+   *  Wired by AgentChatPane's viewMode state; absent → the card's Enter
+   *  affordance is inert. */
+  onEnterSubagent?: (subagentId: string) => void;
 }
 
 /**
@@ -79,6 +84,7 @@ export function MessageList({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onEnterSubagent,
 }: Props) {
   // Sort by seq so order is a property of the data, not of React
   // reconciliation or store-update timing (stable id tiebreak).
@@ -87,6 +93,19 @@ export function MessageList({
     copy.sort((a, b) => a.seq - b.seq || a.id.localeCompare(b.id));
     return copy;
   }, [messages]);
+
+  // Subagent-id → display name, for the "from subagent X" label on a
+  // bubbled approval request (locked decision 4).
+  const subagentNames = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const m of ordered) {
+      if (m.kind !== "subagent_run") continue;
+      for (const sub of m.subagents) {
+        map.set(sub.id, sub.name ?? sub.agentType ?? "subagent");
+      }
+    }
+    return map;
+  }, [ordered]);
 
   // Resolve tool-card approvals in O(1) from the request id the reducer
   // stamped onto the gated tool call.
@@ -205,9 +224,11 @@ export function MessageList({
                     showAvatar={slot.showAvatar}
                     provider={provider}
                     approval={lookupApproval(slot.body.item, requestsById)}
+                    subagentName={subagentNameFor(slot.body.item, subagentNames)}
                     onRespondToRequest={onRespondToRequest}
                     onAcceptPlan={onAcceptPlan}
                     onRejectPlan={onRejectPlan}
+                    onEnterSubagent={onEnterSubagent}
                   />
                 )}
               </MessageScrollerItem>
@@ -289,6 +310,16 @@ function lookupApproval(
   return null;
 }
 
+/** The originating subagent's display name for a bubbled approval request
+ *  (null for ordinary parent requests / non-request rows). */
+function subagentNameFor(
+  item: ChatViewItem,
+  subagentNames: Map<string, string>,
+): string | null {
+  if (item.kind !== "permission_request" || !item.subagent_id) return null;
+  return subagentNames.get(item.subagent_id) ?? "subagent";
+}
+
 // ---------------------------------------------------------------------------
 // Rows
 // ---------------------------------------------------------------------------
@@ -319,17 +350,21 @@ function ItemRow({
   showAvatar,
   provider,
   approval,
+  subagentName,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onEnterSubagent,
 }: {
   item: ChatViewItem;
   showAvatar: boolean;
   provider?: AgentChatProviderKind | null;
   approval: PermissionRequestItem | null;
+  subagentName: string | null;
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  onEnterSubagent?: (subagentId: string) => void;
 }) {
   const requestId =
     item.kind === "tool_call"
@@ -343,6 +378,10 @@ function ItemRow({
     },
     [requestId, onRespondToRequest],
   );
+  const handleEnterSubagent = useCallback(
+    (subagentId: string) => onEnterSubagent?.(subagentId),
+    [onEnterSubagent],
+  );
   const handleAcceptPlan = useCallback(() => {
     if (item.kind === "permission_request") return onAcceptPlan(item.request_id);
   }, [item, onAcceptPlan]);
@@ -354,10 +393,17 @@ function ItemRow({
     return <UserMessage item={item} />;
   }
 
+  // The orchestration card is a full-width standalone surface (no avatar
+  // gutter), matching the design.
+  if (item.kind === "subagent_run") {
+    return <SubagentsCard item={item} onEnter={handleEnterSubagent} />;
+  }
+
   return (
     <AssistantGutter showAvatar={showAvatar} provider={provider}>
       {renderAssistantBody(item, {
         approval,
+        subagentName,
         handleDecide,
         handleAcceptPlan,
         handleRejectPlan,
@@ -370,6 +416,7 @@ function renderAssistantBody(
   item: Exclude<ChatViewItem, { kind: "user_message" }>,
   handlers: {
     approval: PermissionRequestItem | null;
+    subagentName: string | null;
     handleDecide: (decision: ApprovalDecision) => void;
     handleAcceptPlan: () => void | Promise<void>;
     handleRejectPlan: () => void | Promise<void>;
@@ -416,7 +463,14 @@ function renderAssistantBody(
         }
         default:
           return (
-            <PermissionRequestBlock item={item} onDecide={handlers.handleDecide} />
+            <div className="space-y-1">
+              {handlers.subagentName && (
+                <div className="font-mono text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
+                  From subagent {handlers.subagentName}
+                </div>
+              )}
+              <PermissionRequestBlock item={item} onDecide={handlers.handleDecide} />
+            </div>
           );
       }
     case "turn_ended":
@@ -427,6 +481,10 @@ function renderAssistantBody(
           {item.status.message ? ` — ${item.status.message}` : ""}
         </div>
       );
+    case "subagent_run":
+      // Rendered full-width above (before the AssistantGutter wrap); this
+      // arm only keeps the switch exhaustive.
+      return null;
   }
 }
 
