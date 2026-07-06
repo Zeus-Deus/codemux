@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --sans:'DM Sans',ui-sans-serif,system-ui,sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,monospace;
+    --bg:oklch(0.163 0.004 59); --bg2:oklch(0.198 0.005 59); --card:oklch(0.230 0.005 59); --card-h:oklch(0.262 0.006 59);
+    --titlebar:oklch(0.142 0.004 59); --bd:oklch(0.303 0.006 59); --bd-soft:oklch(0.256 0.005 59);
+    --fg:oklch(0.972 0.003 70); --fg2:oklch(0.735 0.007 59); --fg3:oklch(0.578 0.008 59);
+    --primary:oklch(0.935 0.006 75); --primary-fg:oklch(0.205 0.01 60);
+    --ember:oklch(0.705 0.152 47);
+    --c-green:oklch(0.74 0.14 156); --c-amber:oklch(0.80 0.13 80); --c-red:oklch(0.685 0.17 22); --c-sky:oklch(0.74 0.10 232); --c-violet:oklch(0.72 0.13 290);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{font-family:var(--sans);background:#e8e6e1;}
+  @keyframes wsSpin{to{transform:rotate(360deg)}}
+  @keyframes wsShimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}
+  .wsShimmer{background:linear-gradient(90deg,var(--fg3) 20%,var(--fg) 48%,var(--fg) 52%,var(--fg3) 80%);background-size:200% 100%;-webkit-background-clip:text;background-clip:text;color:transparent;animation:wsShimmer 2.1s linear infinite;}
+  .wsSpin{animation:wsSpin 1s linear infinite}
+  .wsScroll::-webkit-scrollbar{width:9px}
+  .wsScroll::-webkit-scrollbar-thumb{background:color-mix(in oklch,var(--fg) 15%,transparent);border-radius:99px;border:2.5px solid transparent;background-clip:content-box}
+  .wsScroll::-webkit-scrollbar-track{background:transparent}
+</style>
+</helmet>
+
+<div style="width:1160px;padding:38px;background:#e8e6e1;font-family:var(--sans);">
+
+  <!-- state switch -->
+  <div style="position:fixed;top:16px;right:18px;z-index:400;display:flex;align-items:center;gap:8px;padding:7px;border-radius:13px;background:rgba(22,20,18,.9);backdrop-filter:blur(10px);box-shadow:0 10px 30px rgba(0,0,0,.4);border:1px solid rgba(255,255,255,.09);">
+    <span style="font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;color:rgba(255,255,255,.45);padding:0 4px 0 6px;">State</span>
+    <div style="display:flex;background:rgba(255,255,255,.07);border-radius:9px;padding:2px;">
+      <sc-for list="{{ tabs }}" as="t" hint-placeholder-count="3">
+        <button onClick="{{ t.onClick }}" style="border:none;cursor:pointer;font-family:var(--sans);font-size:11.5px;font-weight:600;padding:6px 12px;border-radius:7px;color:{{ t.col }};background:{{ t.bg }};">{{ t.label }}</button>
+      </sc-for>
+    </div>
+  </div>
+
+  <div style="max-width:1080px;margin:0 auto 18px;text-align:center;">
+    <h1 style="margin:0 0 7px;font-size:22px;font-weight:700;letter-spacing:-.02em;color:#1c1a17;">{{ heroTitle }}</h1>
+    <p style="margin:0 auto;max-width:700px;font-size:13.5px;line-height:1.6;color:#5b564e;">{{ heroDesc }}</p>
+  </div>
+
+  <!-- app window slice -->
+  <div style="max-width:1000px;margin:0 auto;border-radius:14px;overflow:hidden;box-shadow:0 20px 60px rgba(0,0,0,.26);border:1px solid rgba(0,0,0,.26);background:var(--bg);">
+    <div style="flex:none;display:flex;align-items:center;justify-content:space-between;gap:12px;height:38px;padding:0 15px;border-bottom:1px solid var(--bd-soft);background:var(--titlebar);">
+      <div style="display:flex;align-items:center;gap:7px;color:var(--fg);font-size:12.5px;font-weight:600;"><span>Wire workspace pty env into terminal</span><svg width="11" height="11" viewBox="0 0 12 12" fill="none" stroke="var(--fg3)" stroke-width="1.6"><path d="M3 4.5 6 7.5 9 4.5" stroke-linecap="round" stroke-linejoin="round"></path></svg></div>
+    </div>
+
+    <div class="wsScroll" style="height:512px;overflow-y:auto;background:var(--bg);">
+      <div style="max-width:730px;margin:0 auto;padding:22px 28px 30px;display:flex;flex-direction:column;gap:16px;">
+
+        <!-- user msg -->
+        <div style="align-self:flex-end;max-width:80%;background:var(--card);border:1px solid var(--bd-soft);border-radius:13px 13px 4px 13px;padding:10px 14px;font-size:13px;line-height:1.55;color:var(--fg);">Wire the workspace's env vars into the terminal PTY so agents inherit $CODEMUX_* automatically.</div>
+
+        <!-- assistant lead-in prose (always visible) -->
+        <div style="display:flex;gap:12px;">
+          <span style="flex:none;width:26px;height:26px;border-radius:7px;background:color-mix(in oklch,var(--ember) 18%,transparent);color:var(--ember);display:flex;align-items:center;justify-content:center;margin-top:1px;"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 2l1.5 3.8L13.4 7 9.5 8.2 8 12 6.5 8.2 2.6 7l3.9-1.2z" stroke-linejoin="round"></path></svg></span>
+          <p style="margin:0;font-size:13.5px;line-height:1.62;color:var(--fg2);flex:1;">I'll trace where the PTY is spawned and how env is currently assembled, then thread the workspace vars through.</p>
+        </div>
+
+        <!-- ============ ACTIVITY BLOCK ============ -->
+        <!-- WORKING: collapsed, shows live current action -->
+        <sc-if value="{{ isWorking }}" hint-placeholder-val="{{ true }}">
+          <div style="border-radius:12px;border:1px solid var(--bd);background:color-mix(in oklch,var(--fg) 2.5%,var(--bg));overflow:hidden;">
+            <div onClick="{{ toggle }}" style="display:flex;align-items:center;gap:11px;padding:11px 13px;cursor:pointer;" style-hover="background:color-mix(in oklch,var(--fg) 3%,transparent);">
+              <svg class="wsSpin" width="17" height="17" viewBox="0 0 16 16" fill="none" stroke="var(--c-amber)" stroke-width="1.9" style="flex:none;"><path d="M8 1.8a6.2 6.2 0 1 1-6 8" stroke-linecap="round"></path></svg>
+              <span style="font-size:12.5px;font-weight:700;color:var(--fg);flex:none;">Working</span>
+              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"><span class="wsShimmer" style="font-family:var(--mono);font-size:11.5px;">{{ liveAction }}</span></span>
+              <span style="flex:none;font-family:var(--mono);font-size:10.5px;color:var(--fg3);">{{ workingCount }}</span>
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="var(--fg3)" stroke-width="1.6" style="flex:none;transform:rotate({{ caret }}deg);transition:transform .15s;"><path d="M3 4.5 6 7.5 9 4.5" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            </div>
+            <sc-if value="{{ open }}" hint-placeholder-val="{{ false }}">
+              <div style="border-top:1px solid var(--bd-soft);padding:8px 13px 10px;display:flex;flex-direction:column;gap:1px;">
+                <sc-for list="{{ steps }}" as="s" hint-placeholder-count="5">
+                  <div style="display:flex;align-items:center;gap:9px;padding:4px 3px;font-family:var(--mono);font-size:11px;min-width:0;opacity:{{ s.op }};">
+                    <sc-if value="{{ s.spinning }}"><svg class="wsSpin" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="var(--c-amber)" stroke-width="2" style="flex:none;"><path d="M8 2a6 6 0 1 1-6 8" stroke-linecap="round"></path></svg></sc-if>
+                    <sc-if value="{{ s.check }}"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="var(--c-green)" stroke-width="2" style="flex:none;"><path d="M3.5 8.4 6.5 11.4 12.5 4.6" stroke-linecap="round" stroke-linejoin="round"></path></svg></sc-if>
+                    <span style="color:var(--fg3);flex:none;">{{ s.verb }}</span>
+                    <span style="flex:1;min-width:0;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ s.cmd }}</span>
+                    <span style="flex:none;color:var(--fg3);">{{ s.meta }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+          </div>
+        </sc-if>
+
+        <!-- SETTLED: rolled-up one-liner -->
+        <sc-if value="{{ isSettled }}" hint-placeholder-val="{{ false }}">
+          <div style="border-radius:12px;border:1px solid var(--bd-soft);background:var(--bg2);overflow:hidden;">
+            <div onClick="{{ toggle }}" style="display:flex;align-items:center;gap:11px;padding:10px 13px;cursor:pointer;" style-hover="background:color-mix(in oklch,var(--fg) 3%,transparent);">
+              <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="var(--c-green)" stroke-width="1.8" style="flex:none;"><circle cx="8" cy="8" r="6.4" stroke="color-mix(in oklch,var(--c-green) 40%,transparent)"></circle><path d="M5.2 8.2 7.1 10 10.8 5.9" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+              <span style="font-size:12.5px;font-weight:600;color:var(--fg2);flex:1;min-width:0;">{{ settledSummary }}</span>
+              <span style="flex:none;font-family:var(--mono);font-size:10.5px;color:var(--fg3);">{{ settledDuration }}</span>
+              <span style="flex:none;font-size:11.5px;font-weight:600;color:var(--fg3);display:inline-flex;align-items:center;gap:5px;">{{ expandLabel }}<svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" style="transform:rotate({{ caret }}deg);transition:transform .15s;"><path d="M3 4.5 6 7.5 9 4.5" stroke-linecap="round" stroke-linejoin="round"></path></svg></span>
+            </div>
+            <sc-if value="{{ open }}" hint-placeholder-val="{{ false }}">
+              <div style="border-top:1px solid var(--bd-soft);padding:8px 13px 10px;display:flex;flex-direction:column;gap:1px;">
+                <sc-for list="{{ steps }}" as="s" hint-placeholder-count="5">
+                  <div style="display:flex;align-items:center;gap:9px;padding:4px 3px;font-family:var(--mono);font-size:11px;min-width:0;">
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="var(--c-green)" stroke-width="2" style="flex:none;"><path d="M3.5 8.4 6.5 11.4 12.5 4.6" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+                    <span style="color:var(--fg3);flex:none;">{{ s.verb }}</span>
+                    <span style="flex:1;min-width:0;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">{{ s.cmd }}</span>
+                    <span style="flex:none;color:var(--fg3);">{{ s.meta }}</span>
+                  </div>
+                </sc-for>
+              </div>
+            </sc-if>
+          </div>
+          <!-- assistant conclusion prose (always visible) -->
+          <div style="display:flex;gap:12px;">
+            <span style="flex:none;width:26px;height:26px;border-radius:7px;background:color-mix(in oklch,var(--ember) 18%,transparent);color:var(--ember);display:flex;align-items:center;justify-content:center;margin-top:1px;"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 2l1.5 3.8L13.4 7 9.5 8.2 8 12 6.5 8.2 2.6 7l3.9-1.2z" stroke-linejoin="round"></path></svg></span>
+            <div style="flex:1;font-size:13.5px;line-height:1.62;color:var(--fg2);">
+              <p style="margin:0 0 10px;">Found it. The PTY is spawned in <span style="font-family:var(--mono);font-size:12px;background:color-mix(in oklch,var(--fg) 8%,transparent);padding:1px 5px;border-radius:4px;">terminal/mod.rs</span> and env was assembled from the process only. I threaded the workspace vars in:</p>
+              <div style="border-radius:11px;border:1px solid var(--bd-soft);background:var(--bg2);overflow:hidden;">
+                <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 12px;border-bottom:1px solid var(--bd-soft);"><span style="font-family:var(--mono);font-size:11px;color:var(--fg2);">terminal/mod.rs</span><span style="font-family:var(--mono);font-size:11px;"><span style="color:var(--c-green);">+9</span> <span style="color:var(--c-red);">−1</span></span></div>
+                <div style="font-family:var(--mono);font-size:11.5px;line-height:1.7;padding:7px 12px;">
+                  <div style="color:var(--c-green);background:color-mix(in oklch,var(--c-green) 9%,transparent);margin:0 -12px;padding:0 12px;">+ cmd.envs(workspace.pty_env());</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </sc-if>
+
+      </div>
+    </div>
+
+    <!-- composer -->
+    <div style="border-top:1px solid var(--bd-soft);padding:13px 0 14px;background:var(--bg);">
+      <div style="max-width:730px;margin:0 auto;padding:0 28px;">
+        <div style="border:1px solid var(--bd);border-radius:14px;background:var(--bg2);">
+          <div style="padding:12px 15px 6px;font-size:13px;color:var(--fg3);">Reply or steer the agent…</div>
+          <div style="display:flex;align-items:center;gap:8px;padding:7px 10px;">
+            <button aria-label="Attach" style="width:28px;height:28px;border-radius:99px;border:none;background:color-mix(in oklch,var(--fg) 8%,transparent);color:var(--fg3);cursor:pointer;display:flex;align-items:center;justify-content:center;flex:none;"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.1"><path d="M8 3.5v9M3.5 8h9" stroke-linecap="round"></path></svg></button>
+            <span style="display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border-radius:8px;border:1px solid var(--bd);background:var(--bg);color:var(--fg2);font-size:11.5px;font-weight:600;"><span style="width:10px;height:10px;border-radius:3px;background:color-mix(in oklch,var(--ember) 30%,transparent);"></span>Default</span>
+            <button aria-label="Send" style="margin-left:auto;width:30px;height:30px;border-radius:99px;border:none;background:var(--primary);color:var(--primary-fg);cursor:pointer;display:flex;align-items:center;justify-content:center;flex:none;"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2.1"><path d="M8 13V3.5M4 7l4-4 4 4" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- notes -->
+  <div style="max-width:1000px;margin:22px auto 0;display:flex;gap:16px;">
+    <sc-for list="{{ notes }}" as="n" hint-placeholder-count="3">
+      <div style="flex:1;padding:13px 15px;border-radius:11px;background:#dedbd4;border:1px solid #cfccc4;">
+        <div style="font-size:12px;font-weight:700;color:#1c1a17;margin-bottom:4px;">{{ n.t }}</div>
+        <div style="font-size:11.5px;line-height:1.5;color:#5b564e;">{{ n.b }}</div>
+      </div>
+    </sc-for>
+  </div>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1160,&quot;height&quot;:760}}">
+class Component extends DCLogic {
+  state = { view: 'working', open: false };
+
+  renderVals() {
+    const S = this.state;
+    const isWorking = S.view === 'working';
+    const isSettled = S.view === 'settled';
+    // "expanded" state = settled but forced open, for the third tab
+    const forceOpen = S.view === 'expanded';
+    const settledLike = isSettled || forceOpen;
+    const open = forceOpen ? true : S.open;
+
+    const tabs = [
+      { key:'working', label:'Working' },
+      { key:'settled', label:'Settled' },
+      { key:'expanded', label:'Expanded' },
+    ].map(t => ({
+      ...t,
+      onClick: () => this.setState({ view: t.key, open: false }),
+      bg: S.view===t.key ? 'rgba(255,255,255,.92)':'transparent',
+      col: S.view===t.key ? '#1a1a1e':'rgba(255,255,255,.6)',
+    }));
+
+    const rawSteps = [
+      { verb:'read', cmd:'src-tauri/src/terminal/mod.rs:1450-1512', meta:'' },
+      { verb:'think', cmd:'PTY spawn builds env from std::env::vars() only', meta:'' },
+      { verb:'grep', cmd:'-n "fn workspace_pty_env" -A 30 src-tauri/src', meta:'2 hits' },
+      { verb:'think', cmd:'workspace exposes pty_env() — not called at spawn', meta:'' },
+      { verb:'read', cmd:'src-tauri/src/workspace.rs:88-140', meta:'' },
+      { verb:'edit', cmd:'src-tauri/src/terminal/mod.rs', meta:'+9 −1' },
+      { verb:'run', cmd:'cargo check -p codemux', meta:'ok' },
+      { verb:'run', cmd:'cargo test terminal::env', meta:'running' },
+    ];
+    const steps = rawSteps.map((s, i) => {
+      const isLast = i === rawSteps.length - 1;
+      return {
+        ...s,
+        spinning: isWorking && isLast,
+        check: !(isWorking && isLast),
+        op: (isWorking && isLast) ? '1' : (isWorking ? '0.62' : '1'),
+        meta: (isWorking && isLast) ? 'running' : (s.meta || 'done'),
+      };
+    });
+
+    const notes = isWorking ? [
+      { t:'Only the live action shows', b:'While the agent works, the block stays one line — the shimmering current step — instead of 50 stacked rows. Expand to watch every step.' },
+      { t:'Thoughts fold in too', b:'Reasoning and tool calls share one Activity block, so "Thought / Thought / Ran…" never spams the transcript.' },
+      { t:'Auto-scroll stays calm', b:'The transcript no longer jumps on every tool call — the block updates in place.' },
+    ] : forceOpen ? [
+      { t:'Expandable on demand', b:'Click the block to reveal the full ordered list of tools + thoughts. Nothing is lost — it’s just tucked away.' },
+      { t:'Deep-link a step', b:'Each row can open the full tool output (diff, command result) in the side panel.' },
+      { t:'Same rows, always', b:'Working and Settled share the exact step list — the only difference is the header and default collapse.' },
+    ] : [
+      { t:'Collapses when done', b:'Once the step completes, the whole run rolls up to a green one-liner — "Explored 8 steps" — with duration.' },
+      { t:'Prose is never hidden', b:'The agent’s actual explanation and the diff stay fully visible below. Only mechanical noise collapses.' },
+      { t:'Scannable history', b:'A long session becomes a short column of summaries + conclusions you can actually read.' },
+    ];
+
+    return {
+      tabs, isWorking, isSettled: settledLike,
+      open, caret: open ? 180 : 0,
+      toggle: () => { if (!forceOpen) this.setState(s => ({ open: !s.open })); },
+      liveAction: 'cargo test terminal::env  —  compiling…',
+      workingCount: '7 done · 1 running',
+      settledSummary: 'Explored the terminal PTY spawn path',
+      settledDuration: '8 steps · 1m 12s',
+      expandLabel: open ? 'Hide' : 'Details',
+      steps,
+      heroTitle: isWorking ? 'While working: one live line, not fifty rows'
+        : forceOpen ? 'Expanded: every step, on demand'
+        : 'When done: rolled up to a summary',
+      heroDesc: isWorking ? 'Consecutive tool calls and thoughts collapse into a single Activity block. It shows the current action live and a running count — click to expand the full list. No more endless stacking while the agent churns.'
+        : forceOpen ? 'Expanding the block reveals the complete, ordered list of tools and thoughts. Everything is preserved — it’s just collapsed by default so the transcript stays readable.'
+        : 'The moment the run finishes, the whole block becomes a single green summary line with a duration. The agent’s prose and diffs stay visible; only the mechanical steps fold away.',
+      notes,
+    };
+  }
+}
+</script>
+</body>
+</html>

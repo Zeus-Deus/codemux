@@ -1,19 +1,28 @@
-import type { ChatViewItem, ToolCallItem } from "@/lib/agent-chat/types";
+import type {
+  ChatViewItem,
+  ReasoningItem,
+  ToolCallItem,
+} from "@/lib/agent-chat/types";
 
 import { isTaskSummaryTool } from "./TaskSummaryCard";
 
 /**
- * Pure transcript layout logic (design D2/D4/D6). Turns the ordered
- * `ChatViewItem[]` into render slots, folding contiguous runs of ≥2
- * completed tool calls into one tool-group slot and computing per-row
- * turn boundaries (avatar / top spacing). Kept side-effect-free and
- * exported so the grouping + turn-boundary rules can be unit-tested
- * directly (jsdom can't exercise real scrolling).
+ * Pure transcript layout logic (Activity Stream). Turns the ordered
+ * `ChatViewItem[]` into render slots, folding a contiguous run of
+ * mechanical steps — reasoning blocks AND tool calls (including running
+ * ones and Edit/MultiEdit/Write) — into ONE `activity` slot so the
+ * transcript never spams "Thought / Thought / Ran…". The assistant's
+ * prose and any standalone approval / plan / task-summary surface stays
+ * outside the block. Kept side-effect-free and exported so the grouping
+ * rules can be unit-tested directly (jsdom can't exercise real scrolling).
  */
+
+/** A mechanical step that folds into an Activity block. */
+export type ActivityStep = ReasoningItem | ToolCallItem;
 
 export type SlotBody =
   | { kind: "item"; item: ChatViewItem }
-  | { kind: "toolGroup"; items: ToolCallItem[] };
+  | { kind: "activity"; items: ActivityStep[]; working: boolean };
 
 export interface TranscriptSlot {
   /** Stable React key + MessageScroller `messageId`. */
@@ -31,28 +40,45 @@ export interface TranscriptSlot {
   body: SlotBody;
 }
 
-/** Minimum consecutive completed tool calls that fold into a group card. */
+/**
+ * Minimum steps a SETTLED run needs to roll up into an Activity block. A
+ * lone completed tool call (or a lone thought) keeps rendering as its own
+ * card so a single action never hides behind a summary header. While the
+ * run is the live WORKING tail this drops to 1 — a single running tool
+ * should still surface as the "Working" line.
+ */
 const GROUP_MIN = 2;
 
-/** Tools whose own card is a prominent standalone surface (a diff), so
- *  they never fold into a group where that surface would be hidden. */
-const STANDALONE_TOOLS = new Set(["Edit", "MultiEdit", "Write"]);
-
-/** A completed, ungated, non-special tool call — safe to fold into a
- *  group. Running / pending-approval / error / TodoWrite / diff calls are
- *  excluded so they always render as their own, always-visible card. */
-function isGroupable(item: ChatViewItem): item is ToolCallItem {
+/**
+ * A tool call that folds into an Activity block. Unlike the old
+ * tool-group folding this INCLUDES running, errored and Edit/MultiEdit/
+ * Write calls (their diff is reachable via the step-row inline
+ * expansion). It still excludes:
+ *  - approval-gated calls (`approval_request_id` set) — the inline
+ *    approval footer must render on a standalone `ToolCallCard`.
+ *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
+ *    checklist.
+ */
+function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
   return (
     item.kind === "tool_call" &&
-    item.status === "done" &&
     item.approval_request_id == null &&
-    !STANDALONE_TOOLS.has(item.tool_name) &&
     !isTaskSummaryTool(item)
   );
 }
 
+/** Reasoning blocks and groupable tool calls are the mechanical steps a
+ *  run absorbs. Everything else (assistant/user prose, permission
+ *  requests, turn-ended markers, gated / task-summary tools) breaks it. */
+function isActivityStep(item: ChatViewItem): item is ActivityStep {
+  return item.kind === "reasoning" || isGroupableTool(item);
+}
+
 export function buildTranscriptSlots(
   messages: ChatViewItem[],
+  /** Thread-level streaming flag (turn in flight). Only the tail run of an
+   *  active turn can be "working"; everything else settles. */
+  streaming = false,
 ): TranscriptSlot[] {
   // Permission requests already owned by a tool card's inline footer
   // (linked via approval_request_id) don't get their own row.
@@ -63,15 +89,24 @@ export function buildTranscriptSlots(
     }
   }
 
-  // Pass 1 — grouping.
+  // Pass 1 — fold contiguous mechanical-step runs into Activity blocks.
   const bodies: SlotBody[] = [];
-  let run: ToolCallItem[] = [];
-  const flush = () => {
+  let run: ActivityStep[] = [];
+  // `isTail` is true only for the terminal flush (no rendered item follows
+  // the run). Combined with `streaming`, it decides the working state and
+  // relaxes GROUP_MIN to 1 for a single live step.
+  const flush = (isTail: boolean) => {
     if (run.length === 0) return;
-    if (run.length >= GROUP_MIN) {
-      bodies.push({ kind: "toolGroup", items: run });
+    const working = streaming && isTail;
+    const hasTool = run.some((s) => s.kind === "tool_call");
+    // A pure-reasoning run never becomes an Activity block: a lone thought
+    // is not "Thought / Thought / Ran…" spam and its live streaming text is
+    // better served by ReasoningBlock. It folds in only when contiguous
+    // with a tool call.
+    if (hasTool && (working || run.length >= GROUP_MIN)) {
+      bodies.push({ kind: "activity", items: run, working });
     } else {
-      for (const t of run) bodies.push({ kind: "item", item: t });
+      for (const s of run) bodies.push({ kind: "item", item: s });
     }
     run = [];
   };
@@ -85,14 +120,15 @@ export function buildTranscriptSlots(
     }
     if (item.kind === "turn_ended" && item.status.kind !== "error") continue;
 
-    if (isGroupable(item)) {
+    if (isActivityStep(item)) {
       run.push(item);
       continue;
     }
-    flush();
+    // A rendered standalone item follows this run → it is not the tail.
+    flush(false);
     bodies.push({ kind: "item", item });
   }
-  flush();
+  flush(true);
 
   // Pass 2 — turn boundaries / avatar gutter.
   const slots: TranscriptSlot[] = [];
@@ -114,7 +150,10 @@ function slotIdentity(body: SlotBody): {
   messageId: string;
   scrollAnchor: boolean;
 } {
-  if (body.kind === "toolGroup") {
+  if (body.kind === "activity") {
+    // Key by the first step's id so the slot identity is stable as the run
+    // grows and as it transitions working → settled (a streaming token then
+    // mutates one memoized row and the scroller pin holds).
     const id = `run:${body.items[0].id}`;
     return { key: id, messageId: id, scrollAnchor: false };
   }

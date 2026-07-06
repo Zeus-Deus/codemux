@@ -163,6 +163,81 @@ describe("agent-chat reducer", () => {
     expect(tools[0].status).toBe("running");
   });
 
+  it("stamps started_at on tool_use and completed_at on tool_result from the injected clock", () => {
+    // Clock ticks 100 → 100 → 200: use lands at 100, result at 200.
+    const ticks = [100, 200];
+    let i = 0;
+    const clock: Clock = () => ticks[Math.min(i++, ticks.length - 1)];
+    const state = runEvents(
+      [
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_use_id: "tu-9",
+            tool_name: "Bash",
+            input: { command: "cargo test" },
+          },
+        },
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_result",
+            tool_use_id: "tu-9",
+            content: "ok",
+            is_error: false,
+          },
+        },
+      ],
+      createEmptyThreadState(),
+      clock,
+    );
+    const tool = state.messages.find(
+      (m): m is ToolCallItem => m.kind === "tool_call",
+    );
+    expect(tool?.started_at).toBe(100);
+    expect(tool?.completed_at).toBe(200);
+  });
+
+  it("stamps completed_at on a result-first placeholder and started_at when the use lands", () => {
+    const ticks = [500, 900];
+    let i = 0;
+    const clock: Clock = () => ticks[Math.min(i++, ticks.length - 1)];
+    const state = runEvents(
+      [
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: { kind: "tool_result", tool_use_id: "tu-r", content: "42", is_error: false },
+        },
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_use_id: "tu-r",
+            tool_name: "Bash",
+            input: { command: "echo 42" },
+          },
+        },
+      ],
+      createEmptyThreadState(),
+      clock,
+    );
+    const tool = state.messages.find(
+      (m): m is ToolCallItem => m.kind === "tool_call",
+    );
+    // Result landed first (500), then the use stamped its own start (900).
+    expect(tool?.completed_at).toBe(500);
+    expect(tool?.started_at).toBe(900);
+  });
+
   it("tracks permission-request lifecycle: append → resolve → collapse", () => {
     let state = runEvents([
       {

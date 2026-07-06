@@ -63,7 +63,9 @@ The chat pane stack:
   `ChatTranscript`, `MessageList` (shadcn MessageScroller shell),
   `transcript-slots.ts` (pure turn-grouping/tool-folding slot builder),
   `AssistantAvatar`, `ReasoningBlock` (collapsible thinking),
-  `ToolCallCard` + per-tool bodies, `ToolGroupCard` (folded runs),
+  `ToolCallCard` + per-tool bodies, `ActivityBlock` (one folded run of
+  reasoning + tool calls, working/settled — see "Activity block" below;
+  `activity-steps.ts` holds its pure step/summary/duration derivations),
   `DiffView` (red/green edit surface), `TaskSummaryCard` (TodoWrite
   checklist), `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
   (icon/tint mapping), `PlanProposalBlock`, `ComposerPendingInputPanel`
@@ -93,7 +95,8 @@ The chat pane stack:
   (per-tool body rendering), collapsible reasoning blocks (thinking
   deltas reduce into a `reasoning` ChatViewItem that seals on any
   non-thinking boundary and finalizes with a "Thought for Ns"
-  duration), tool-group cards, red/green diff cards for edits,
+  duration), **Activity blocks** (one folded run of reasoning + tool
+  calls — see "Activity block" below), red/green diff cards for edits,
   TodoWrite task checklists, plan proposals (`ExitPlanMode`),
   AskUserQuestion panels, shimmer streaming marker, debug-mode banner
   + exit dialog.
@@ -157,14 +160,18 @@ transcript; the reducer's 5,000-message cap bounds the worst case.
 
 Layout derivation lives in the pure `buildTranscriptSlots`
 (`transcript-slots.ts`): turn grouping (avatar once per assistant
-turn), tool-run folding into group cards, and per-slot identity.
+turn), Activity-run folding (reasoning + tool calls → one `activity`
+slot — see "Activity block" below), and per-slot identity.
 
 Contract preserved from the pre-redesign renderer:
 
 - **Stable keys + memo rows.** Per-slot keys are still `slot.item.id`
   / `run:<first-id>` (as `MessageScrollerItem messageId`), and rows
-  render through memoized leaves (`ItemRowMemo` / `ToolGroupRowMemo`)
-  — a streaming token mutates exactly one row.
+  render through memoized leaves (`ItemRowMemo` / `ActivityRowMemo`)
+  — a streaming token mutates exactly one row. (Activity rows rebuild
+  their `items` array each build, as the old tool-group rows did; the
+  stable `run:<first-id>` key keeps the scroller row from remounting as
+  the run grows and transitions working → settled.)
 - **Stick-to-bottom.** Pinned-ness is tracked from real scroll events
   (≤ 80 px from the bottom); after every transcript change (or
   streaming-marker toggle), if pinned, it snaps to the tail. Content
@@ -179,12 +186,64 @@ Contract preserved from the pre-redesign renderer:
   handling scrolls the viewport to a stale early anchor when new items
   register mid-stream, breaking the pin. Do not re-enable it without
   re-testing against the `agent-chat-demo` mock workspace.
-- **Variable heights.** Tool-group cards expand in place as a single
-  scroller row; the browser re-derives sizes as rows materialize.
+- **Variable heights.** Activity blocks expand in place as a single
+  scroller row (both the step list and per-step inline detail); the
+  browser re-derives sizes as rows materialize.
 - **Streaming marker** (shimmer status) renders as the last row inside
   the scroller content (not a footer) so the tail snap keeps it
   visible while streaming; the jump-to-latest pill is the restyled
-  `MessageScrollerButton` with a direct-DOM snap fallback.
+  `MessageScrollerButton` with a direct-DOM snap fallback. **A working
+  Activity block already shows the single live line, so the marker is
+  suppressed when one is the transcript tail** — `MessageList` passes
+  the thread `streaming` flag into `buildTranscriptSlots`, and the
+  marker only renders when the tail slot is not a working Activity block
+  (it still fills the gap right after send, before any step arrives).
+
+### Activity block (Activity Stream)
+
+`ActivityBlock.tsx` replaces the old per-tool "Thought / Thought /
+Ran…" spam with **one card per contiguous run of mechanical steps**
+(reasoning items + tool calls). `buildTranscriptSlots` folds a run of
+`reasoning` and groupable `tool_call` items into a single `activity`
+slot; `activity-steps.ts` holds the pure step/summary/counter/duration
+derivations (unit-tested in `activity-steps.test.ts`).
+
+- **Working vs settled is derived.** A run is *working* when the thread
+  is `streaming` and the run is the tail run of the active turn;
+  everything else *settles*. Working shows a collapsed row — amber
+  spinner (`status-working`), bold "Working", a shimmering mono live
+  action, a `N done · M running` counter, a rotating chevron. Settled
+  rolls up to a green circled check + a derived summary sentence
+  (`deriveActivitySummary`: read-heavy → "Explored the codebase",
+  command-heavy → "Ran commands", edit-heavy → "Edited files", mixed →
+  sensible) + a mono `N steps · 1m 12s` meta (duration from step
+  `started_at`/`completed_at`, omitted when < 1s / not derivable, e.g.
+  hydrated transcripts) + a Details/Hide toggle. On settle the block
+  re-renders collapsed (any mid-stream expansion resets).
+- **Shared step rows.** Both states expand to the same mono rows: a dim
+  short verb (`read`/`grep`/`edit`/`run`/`think`), a truncating summary
+  (from `describeToolCall` / the thought's first line), and a dim
+  right-aligned meta (`2 hits`, `+9 −1`, `ok`, `running`, `failed`).
+  Working dims completed steps (~0.6) and keeps the running one full
+  opacity; settled shows all green checks. Clicking a step row expands
+  its full detail inline (`ToolCallBody` / `DiffView` for tools, the
+  thought text for reasoning) — there is no side panel for tool output.
+- **What stays standalone (breaks the run).** Approval-gated tool calls
+  (`approval_request_id` set — the inline approval footer must render),
+  TodoWrite / task-summary tools (`TaskSummaryCard` stays a visible
+  checklist), `permission_request`/plan/AskUserQuestion rows, assistant
+  and user prose. Errored tool calls **do** fold in but stay
+  discoverable: a red ✕ step row, and the settled header appends a
+  subtle red `· N failed` to the meta. A lone reasoning run with no
+  tools keeps rendering as `ReasoningBlock`s (its live streaming text is
+  better served there); a lone settled tool call keeps rendering as a
+  single `ToolCallCard` (GROUP_MIN is 2 for settled runs, relaxed to 1
+  only for a single live working step). `ToolGroupCard` is retired.
+- **Timestamps.** `ToolCallItem` gained optional `started_at` /
+  `completed_at`, stamped by the pure reducer from its injectable
+  `Clock` (backward-compatible optionals so persisted transcripts still
+  parse); these plus `ReasoningItem`'s `started_at`/`duration_ms` feed
+  the settled duration.
 
 `ChatTranscript` is a thin shell that derives `showThinking`, forwards
 the optional `sessionStartedAt` (top session-start divider), and sizes
