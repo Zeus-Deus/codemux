@@ -920,11 +920,34 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         "browser_automation" => {
             let state: State<'_, AppStateStore> = app.state();
             let agent_browser: State<'_, crate::agent_browser::AgentBrowserManager> = app.state();
-            let workspace_id = request.params
+            let mut workspace_id = request.params
                 .get("workspace_id")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+
+            // Layer B fallback: when the caller sent no `workspace_id` (its
+            // `CODEMUX_WORKSPACE_ID` env was never injected — the agent-chat
+            // sidecar's Bash subprocesses, OpenCode's shared server, etc.)
+            // but did include a `cwd` hint, resolve the owning workspace by
+            // path so the pane lands in the *agent's* workspace instead of
+            // the "Legacy global path" below, which targets whatever
+            // workspace the user is currently viewing.
+            let mut cwd_resolved = false;
+            if workspace_id.is_empty() {
+                let cwd = request.params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !cwd.is_empty() {
+                    if let Some(resolved) =
+                        resolve_workspace_id_by_cwd(&state.snapshot().workspaces, cwd)
+                    {
+                        workspace_id = resolved;
+                        cwd_resolved = true;
+                    }
+                }
+            }
 
             let action_kind = request.params.get("action")
                 .and_then(|v| v.get("kind"))
@@ -933,7 +956,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 .to_string();
 
             eprintln!(
-                "[codemux::browser] handler received action={action_kind} workspace_id={workspace_id}"
+                "[codemux::browser] handler received action={action_kind} workspace_id={workspace_id} cwd_resolved={cwd_resolved}"
             );
 
             let params = request.params.get("action").cloned().unwrap_or(Value::Null);
@@ -1406,6 +1429,71 @@ fn filter_ports_by_workspace<'a>(
         .collect()
 }
 
+/// Resolve which workspace owns a given `cwd`, for browser routing when the
+/// caller sent an empty `workspace_id` (agent-chat Bash subprocesses,
+/// OpenCode's shared server, or any MCP/CLI caller whose
+/// `CODEMUX_WORKSPACE_ID` env is missing). Without this, such a caller
+/// takes the "Legacy global path" in the `browser_automation` handler and
+/// its browser pane lands on whatever workspace the *user* is viewing.
+///
+/// Matching is purely lexical — we deliberately do NOT `fs::canonicalize`,
+/// both because it would hit the filesystem on the control-socket hot path
+/// and because the unit tests use paths that don't exist on disk. Each
+/// workspace contributes two candidate roots: its `cwd` and its
+/// `worktree_path` (when set). A root matches when `cwd` equals it exactly
+/// or is a subdirectory of it at a path-component boundary — so
+/// `"/a/b"` matches cwd `"/a/b/src"` but NOT `"/a/bc"`. Trailing slashes on
+/// either side are ignored. The workspace with the *longest* matching root
+/// wins, so a nested worktree checked out under another workspace resolves
+/// to the deepest (most specific) match. Returns `None` when `cwd` is empty
+/// or nothing matches, in which case the handler keeps today's legacy path.
+fn resolve_workspace_id_by_cwd(
+    workspaces: &[crate::state::WorkspaceSnapshot],
+    cwd: &str,
+) -> Option<String> {
+    let cwd_n = cwd.trim_end_matches('/');
+    if cwd_n.is_empty() {
+        return None;
+    }
+
+    let mut best: Option<(usize, &str)> = None;
+    for ws in workspaces {
+        let candidate_roots = std::iter::once(ws.cwd.as_str())
+            .chain(ws.worktree_path.as_deref());
+        for root in candidate_roots {
+            let root_n = root.trim_end_matches('/');
+            if root_n.is_empty() {
+                continue;
+            }
+            if cwd_is_within(cwd_n, root_n) {
+                let root_len = root_n.len();
+                // Strict `>` so, on a length tie, the first workspace in the
+                // snapshot order wins deterministically.
+                if best.map_or(true, |(best_len, _)| root_len > best_len) {
+                    best = Some((root_len, ws.workspace_id.0.as_str()));
+                }
+            }
+        }
+    }
+
+    best.map(|(_, id)| id.to_string())
+}
+
+/// True when `cwd` is `root` itself or a subdirectory of `root`, comparing
+/// at path-component boundaries so `"/a/bc"` is not considered within
+/// `"/a/b"`. Both inputs are expected to be already trailing-slash-trimmed.
+fn cwd_is_within(cwd: &str, root: &str) -> bool {
+    if cwd == root {
+        return true;
+    }
+    // A strict subdirectory: `cwd` must start with `root` followed by a
+    // path separator, otherwise `"/a/b"` would spuriously match `"/a/bc"`.
+    // Both separators are accepted so Windows callers (whose
+    // `std::env::current_dir()` yields backslash paths) still match.
+    cwd.strip_prefix(root)
+        .is_some_and(|rest| rest.starts_with('/') || rest.starts_with('\\'))
+}
+
 /// Resolve the repo path for control socket commands.
 /// Checks `repo_path` param first, then falls back to active workspace's project_root/cwd.
 fn resolve_control_repo_path(
@@ -1502,6 +1590,160 @@ mod tests {
         ];
         let filtered = filter_ports_by_workspace(&ports, Some("ws-nonexistent"));
         assert!(filtered.is_empty());
+    }
+
+    // ─── resolve_workspace_id_by_cwd (browser routing fallback) ─────────
+    //
+    // Backs the Layer B cwd fallback in the `browser_automation` handler:
+    // when an env-less caller (agent-chat Bash subprocess, OpenCode's
+    // shared server, an MCP caller without `CODEMUX_WORKSPACE_ID`) sends an
+    // empty `workspace_id` plus a `cwd` hint, the browser pane must resolve
+    // to the *agent's* workspace, not whatever workspace the user is
+    // viewing. Matching is purely lexical (no `fs::canonicalize`), so these
+    // fixtures use paths that need not exist on disk.
+
+    /// Minimal `WorkspaceSnapshot` fixture varying only the fields the
+    /// resolver reads (`workspace_id`, `cwd`, `worktree_path`); mirrors the
+    /// pattern used by `workspaces_sync`'s `make_ws`.
+    fn ws(id: &str, cwd: &str, worktree_path: Option<&str>) -> crate::state::WorkspaceSnapshot {
+        use crate::state::*;
+        WorkspaceSnapshot {
+            workspace_id: WorkspaceId(id.to_string()),
+            title: id.to_string(),
+            workspace_type: WorkspaceType::Standard,
+            cwd: cwd.to_string(),
+            git_branch: None,
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            notification_count: 0,
+            latest_agent_state: None,
+            worktree_path: worktree_path.map(str::to_string),
+            project_root: None,
+            project_uid: None,
+            workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            tabs: Vec::new(),
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: Vec::new(),
+            host_id: None,
+            remote_cwd: None,
+            attach_only: false,
+        }
+    }
+
+    #[test]
+    fn resolve_cwd_exact_match() {
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a", None), ws("ws-b", "/home/user/proj-b", None)];
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&workspaces, "/home/user/proj-b"),
+            Some("ws-b".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_subdirectory_match() {
+        // A Bash subprocess spawned deep inside the workspace tree still
+        // resolves to the workspace root.
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a", None)];
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&workspaces, "/home/user/proj-a/src/nested/dir"),
+            Some("ws-a".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_component_safe_no_sibling_prefix_match() {
+        // "/a/b" must NOT match cwd "/a/bc" — the prefix has to land on a
+        // path-component boundary.
+        let workspaces = vec![ws("ws-a", "/a/b", None)];
+        assert_eq!(resolve_workspace_id_by_cwd(&workspaces, "/a/bc"), None);
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&workspaces, "/a/b/src"),
+            Some("ws-a".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_longest_root_wins_for_nested_workspaces() {
+        // A worktree checked out *under* another workspace must resolve to
+        // the deepest (most specific) root, regardless of snapshot order.
+        let outer = ws("ws-outer", "/home/user/repo", None);
+        let inner = ws("ws-inner", "/home/user/repo/worktrees/feature", None);
+        let cwd = "/home/user/repo/worktrees/feature/src";
+
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&[outer.clone(), inner.clone()], cwd),
+            Some("ws-inner".to_string())
+        );
+        // Order-independent: the deepest root still wins.
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&[inner, outer], cwd),
+            Some("ws-inner".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_matches_worktree_path() {
+        // The `worktree_path` is a second candidate root — a worktree
+        // whose live `cwd` differs from its checkout path still resolves.
+        let workspaces = vec![ws("ws-a", "/home/user/repo", Some("/home/user/.codemux/worktrees/repo/feat"))];
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&workspaces, "/home/user/.codemux/worktrees/repo/feat/pkg"),
+            Some("ws-a".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_trailing_slashes_ignored() {
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a/", None)];
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&workspaces, "/home/user/proj-a/"),
+            Some("ws-a".to_string())
+        );
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&workspaces, "/home/user/proj-a/src/"),
+            Some("ws-a".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_windows_backslash_subdirectory_match() {
+        // Windows callers send backslash paths from `std::env::current_dir()`;
+        // a subdir must still resolve (exact matches already work verbatim).
+        let workspaces = vec![ws("ws-a", r"C:\Users\dev\proj", None)];
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&workspaces, r"C:\Users\dev\proj\src"),
+            Some("ws-a".to_string())
+        );
+        // Component boundary still enforced.
+        assert_eq!(
+            resolve_workspace_id_by_cwd(&workspaces, r"C:\Users\dev\projx"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_cwd_no_match_returns_none() {
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a", None)];
+        assert_eq!(resolve_workspace_id_by_cwd(&workspaces, "/somewhere/else"), None);
+    }
+
+    #[test]
+    fn resolve_cwd_empty_returns_none() {
+        let workspaces = vec![ws("ws-a", "/home/user/proj-a", None)];
+        assert_eq!(resolve_workspace_id_by_cwd(&workspaces, ""), None);
+        // A cwd of only slashes normalizes to empty and must not match.
+        assert_eq!(resolve_workspace_id_by_cwd(&workspaces, "/"), None);
     }
 
     /// Tiny echo handler used by the round-trip tests: reads one line at a

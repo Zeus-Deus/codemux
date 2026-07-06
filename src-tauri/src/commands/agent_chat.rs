@@ -389,6 +389,64 @@ pub fn dev_agent_chat_spawn_test_pane(
 // 4. Returns the result (serialized errors carry the full
 //    `SerializableProviderError` JSON so the UI can inspect subtype).
 
+/// Build the workspace-scoped environment overlay a chat agent's child
+/// processes need so `codemux browser open` — and any other `codemux` CLI
+/// the agent shells out to — routes to the agent's OWN workspace rather
+/// than whichever workspace the user happens to be viewing.
+///
+/// Terminal-spawned agents get this env at PTY spawn time (see
+/// `crate::terminal::spawn_pty_for_session_in_process`); the chat sidecar
+/// otherwise spawns with a bare env, so its `codemux browser open` calls
+/// reach the control layer with an empty `workspace_id` and fall through to
+/// the "active workspace" legacy path — the routing bug this overlay fixes.
+///
+/// Mirrors the `CODEMUX_*` surface a terminal PTY injects and reuses the
+/// exact [`crate::terminal::workspace_pty_env`] helper for the
+/// workspace-level vars (`CODEMUX_WORKSPACE_NAME`, `CODEMUX_AGENT_CONTEXT`,
+/// `CODEMUX_WORKSPACE_PATH`/`ROOT_PATH`/`BRANCH`/`PORT`) so the two surfaces
+/// stay in lockstep. `pane_id` is the chat pane the session runs in,
+/// surfaced as `CODEMUX_PANE_ID` for hook / browser routing.
+///
+/// Semantics:
+/// * `ws == None` (orphaned pane, no owning workspace) → returns `existing`
+///   untouched so no workspace context leaks in, matching the terminal
+///   path's behavior for sessions with no owning workspace.
+/// * entries already present in `existing` are never overwritten — an env
+///   value the caller explicitly supplied always wins over the workspace
+///   default.
+fn workspace_env_overlay(
+    ws: Option<&crate::state::WorkspaceSnapshot>,
+    pane_id: &str,
+    existing: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    let Some(ws) = ws else {
+        return existing;
+    };
+    let mut env = existing.unwrap_or_default();
+
+    // Session-level vars every Codemux surface advertises, followed by the
+    // workspace-level vars the terminal path injects. Collected into one
+    // list so the insert-if-absent pass below treats them uniformly.
+    let mut defaults: Vec<(String, String)> = vec![
+        ("CODEMUX".to_string(), "1".to_string()),
+        (
+            "CODEMUX_VERSION".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        ("CODEMUX_WORKSPACE_ID".to_string(), ws.workspace_id.0.clone()),
+        ("CODEMUX_PANE_ID".to_string(), pane_id.to_string()),
+        ("CODEMUX_BROWSER_CMD".to_string(), "codemux browser".to_string()),
+        ("BROWSER".to_string(), "codemux browser open".to_string()),
+    ];
+    defaults.extend(crate::terminal::workspace_pty_env(ws));
+
+    for (key, val) in defaults {
+        // Insert-if-absent so a caller-provided entry always wins.
+        env.entry(key).or_insert(val);
+    }
+    Some(env)
+}
+
 /// Start a new provider session for the given pane.
 ///
 /// The returned [`ThreadId`] is the identifier the provider itself
@@ -402,7 +460,7 @@ pub async fn agent_chat_start_session(
     app: AppHandle,
     pane_id: String,
     provider: ProviderKind,
-    input: StartSessionInput,
+    mut input: StartSessionInput,
 ) -> Result<ThreadId, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
@@ -463,6 +521,20 @@ pub async fn agent_chat_start_session(
                 MCP_PRIME_BUDGET.as_secs()
             ),
         }
+    }
+    // Overlay the chat pane's workspace env onto `input.env` BEFORE the
+    // provider consumes it, so the agent's browser/CLI subprocesses route to
+    // the agent's own workspace instead of the user's active one. Resolve the
+    // owning workspace from the pane; an orphaned pane (no workspace) injects
+    // nothing, matching the terminal path's behavior.
+    {
+        let state: State<'_, AppStateStore> = app.state();
+        let workspace_id = state.workspace_id_for_pane(&pane_id);
+        let snapshot = state.snapshot();
+        let ws = workspace_id
+            .as_ref()
+            .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
+        input.env = workspace_env_overlay(ws, &pane_id, input.env.take());
     }
     let session = impl_.start_session(input).await.map_err(provider_err)?;
     let state: State<'_, AppStateStore> = app.state();
@@ -1418,6 +1490,103 @@ mod tests {
         assert_eq!(extract_sdk_session_id(&json!({})), None);
         assert_eq!(extract_sdk_session_id(&json!("just-a-string")), None);
         assert_eq!(extract_sdk_session_id(&json!({"resume": 42})), None);
+    }
+
+    // ── workspace_env_overlay ──
+    //
+    // Guards the primary fix for the "chat agent's browser lands in the
+    // user's workspace" routing bug: the overlay must inject the workspace's
+    // CODEMUX_* surface, must never clobber a caller-provided entry, and must
+    // inject nothing for an orphaned pane.
+
+    fn test_workspace(id: &str) -> crate::state::WorkspaceSnapshot {
+        use crate::state::*;
+        WorkspaceSnapshot {
+            workspace_id: WorkspaceId(id.to_string()),
+            title: "my-feature".to_string(),
+            workspace_type: WorkspaceType::Standard,
+            cwd: "/home/user/projects/repo".to_string(),
+            git_branch: Some("feat/my-feature".to_string()),
+            git_ahead: 0,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+            notification_count: 0,
+            latest_agent_state: None,
+            worktree_path: None,
+            project_root: Some("/home/user/projects/repo".to_string()),
+            project_uid: None,
+            workspace_kind: None,
+            protected: false,
+            divergent_copy: false,
+            pr_number: None,
+            pr_state: None,
+            pr_url: None,
+            linked_issue: None,
+            notifications_muted: false,
+            tabs: Vec::new(),
+            active_tab_id: String::new(),
+            active_surface_id: SurfaceId(String::new()),
+            surfaces: Vec::new(),
+            host_id: None,
+            remote_cwd: None,
+            attach_only: false,
+        }
+    }
+
+    #[test]
+    fn workspace_env_overlay_injects_workspace_surface() {
+        let ws = test_workspace("ws-123");
+        let env = workspace_env_overlay(Some(&ws), "pane-7", None)
+            .expect("a resolved workspace must yield an env map");
+
+        assert_eq!(env["CODEMUX"], "1");
+        assert_eq!(env["CODEMUX_WORKSPACE_ID"], "ws-123");
+        assert_eq!(env["CODEMUX_PANE_ID"], "pane-7");
+        assert_eq!(env["CODEMUX_BROWSER_CMD"], "codemux browser");
+        assert_eq!(env["BROWSER"], "codemux browser open");
+        assert_eq!(env["CODEMUX_VERSION"], env!("CARGO_PKG_VERSION"));
+        // Workspace-level vars threaded through `workspace_pty_env`.
+        assert_eq!(env["CODEMUX_WORKSPACE_NAME"], "my-feature");
+        assert_eq!(env["CODEMUX_WORKSPACE_PATH"], "/home/user/projects/repo");
+        assert_eq!(env["CODEMUX_ROOT_PATH"], "/home/user/projects/repo");
+        assert_eq!(env["CODEMUX_BRANCH"], "feat/my-feature");
+        assert!(env.contains_key("CODEMUX_PORT"));
+        assert!(env.contains_key("CODEMUX_AGENT_CONTEXT"));
+    }
+
+    #[test]
+    fn workspace_env_overlay_does_not_clobber_caller_entries() {
+        let ws = test_workspace("ws-123");
+        let mut existing = HashMap::new();
+        existing.insert("BROWSER".to_string(), "custom-browser".to_string());
+        existing.insert("MY_VAR".to_string(), "keep-me".to_string());
+
+        let env = workspace_env_overlay(Some(&ws), "pane-7", Some(existing))
+            .expect("a resolved workspace must yield an env map");
+
+        // Caller-provided entries win over the workspace defaults …
+        assert_eq!(env["BROWSER"], "custom-browser");
+        // … and unrelated caller entries survive.
+        assert_eq!(env["MY_VAR"], "keep-me");
+        // … while un-collided workspace vars are still injected.
+        assert_eq!(env["CODEMUX_WORKSPACE_ID"], "ws-123");
+    }
+
+    #[test]
+    fn workspace_env_overlay_no_workspace_injects_nothing() {
+        // Orphaned pane, no existing env → stays None (no injection).
+        assert!(workspace_env_overlay(None, "pane-7", None).is_none());
+
+        // Orphaned pane WITH a caller env → returned untouched.
+        let mut existing = HashMap::new();
+        existing.insert("MY_VAR".to_string(), "keep-me".to_string());
+        let env = workspace_env_overlay(None, "pane-7", Some(existing))
+            .expect("caller env must be preserved");
+        assert_eq!(env.len(), 1);
+        assert_eq!(env["MY_VAR"], "keep-me");
+        assert!(!env.contains_key("CODEMUX_WORKSPACE_ID"));
     }
 
     // ── should_persist_event policy ──

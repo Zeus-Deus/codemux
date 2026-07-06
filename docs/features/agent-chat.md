@@ -376,6 +376,25 @@ helper the Codex adapter uses — so adding new methods is a matter of
 registering handlers in `buildMethods` in
 `sidecar/claude-agent/src/methods/index.ts` (dispatched from `main.ts`).
 
+**Workspace env injection.** `agent_chat_start_session` overlays the
+chat pane's workspace env onto `StartSessionInput.env` before the
+provider consumes it (`workspace_env_overlay` in
+`src-tauri/src/commands/agent_chat.rs`): `CODEMUX=1`,
+`CODEMUX_WORKSPACE_ID`, `CODEMUX_PANE_ID` (the chat pane),
+`CODEMUX_BROWSER_CMD`, `BROWSER`, plus the workspace-level vars from
+the terminal path's `workspace_pty_env` helper (reused `pub(crate)` so
+the two surfaces stay in lockstep). The Claude and Codex adapters pass
+`input.env` through to their per-session child spawns, so the agent's
+Bash subprocesses carry `CODEMUX_WORKSPACE_ID` and `codemux browser
+open` routes to the agent's own workspace instead of falling into the
+control layer's legacy active-workspace path (the pre-fix bug: with
+the beta on, browser panes landed in whatever workspace the user was
+viewing). Caller-provided env entries always win (insert-if-absent);
+an orphaned pane (no owning workspace) injects nothing. OpenCode's
+shared long-lived server cannot take per-session env — it relies on
+the control layer's cwd fallback (`resolve_workspace_id_by_cwd` in
+`src-tauri/src/control.rs`; see `docs/features/browser.md`).
+
 ## Claude Agent SDK integration
 
 The sidecar (`sidecar/claude-agent/`) now hosts Anthropic's Claude
