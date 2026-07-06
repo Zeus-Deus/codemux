@@ -326,12 +326,15 @@ fn thread_id_for_event_extracts_bound_threads() {
 }
 
 /// Build a MockRuntime app with the managed state `forward_event`
-/// touches: an in-memory DatabaseStore (transcript persistence) and
-/// the per-thread channel registry (issue #75 routing).
+/// touches: an in-memory DatabaseStore (transcript persistence), the
+/// per-thread channel registry (issue #75 routing), and the
+/// AppStateStore (chat sessions publish their lifecycle into
+/// `pane_statuses` so the sidebar shows working/needs-input/review).
 fn mock_app_with_chat_state() -> tauri::App<tauri::test::MockRuntime> {
     let app = tauri::test::mock_app();
     app.manage(DatabaseStore::new_in_memory());
     app.manage(AgentChatChannelRegistry::default());
+    app.manage(AppStateStore::default());
     app
 }
 
@@ -524,6 +527,141 @@ async fn event_bridge_emits_threadless_warnings_on_event_bus() {
         }
         other => panic!("unexpected event variant: {other:?}"),
     }
+}
+
+/// Bind a chat pane to `thread` inside `state` and return its pane id.
+/// The pane must carry a thread id for the status walker to resolve it.
+fn bind_chat_pane(state: &AppStateStore, workspace_id: &str, thread: &str) -> String {
+    let pane = state
+        .create_agent_chat_pane(workspace_id, None, None, None)
+        .expect("create_agent_chat_pane");
+    state.set_agent_chat_thread_id(&pane.0, Some(thread.into()));
+    pane.0
+}
+
+#[tokio::test]
+async fn forward_event_publishes_status_into_pane_statuses() {
+    // A chat session's lifecycle must land in the shared pane_statuses
+    // store so the sidebar renders working/needs-input/review for chat
+    // workspaces, exactly like terminal agents.
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+    let state: State<'_, AppStateStore> = handle.state();
+
+    // Put the chat pane in a NON-active workspace so a completed turn
+    // resolves to Review (the active-workspace path downgrades to Idle,
+    // covered separately below).
+    let bg_ws = state
+        .create_workspace_with_layout(
+            std::path::PathBuf::from("/tmp/codemux-chat-status-bg"),
+            codemux_lib::state::WorkspacePresetLayout::Single,
+        )
+        .0;
+    let pane = bind_chat_pane(&state, &bg_ws, "thread-status");
+    // Foreground a different workspace so `bg_ws` is not active.
+    let fg_ws = state
+        .create_workspace_with_layout(
+            std::path::PathBuf::from("/tmp/codemux-chat-status-fg"),
+            codemux_lib::state::WorkspacePresetLayout::Single,
+        )
+        .0;
+    state.activate_workspace(&fg_ws);
+
+    let status_of = |pane: &str| state.snapshot().pane_statuses.get(pane).cloned();
+
+    // Streaming deltas → Working.
+    forward_event(&handle, text_delta("thread-status", "hello"));
+    assert_eq!(status_of(&pane), Some(codemux_lib::state::PaneStatus::Working));
+
+    // A pending approval → Permission.
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::RequestOpened {
+            thread_id: ThreadId("thread-status".into()),
+            turn_id: TurnId("turn-1".into()),
+            request_id: RequestId("req-1".into()),
+            request_kind: "tool".into(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+        },
+    );
+    assert_eq!(
+        status_of(&pane),
+        Some(codemux_lib::state::PaneStatus::Permission)
+    );
+
+    // Turn finishes while the workspace is NOT active → Review.
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId("thread-status".into()),
+            turn_id: TurnId("turn-1".into()),
+            status: codemux_lib::agent_provider::TurnStatus::Success,
+            usage: None,
+        },
+    );
+    assert_eq!(status_of(&pane), Some(codemux_lib::state::PaneStatus::Review));
+
+    // Session closes → entry cleared.
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ThreadId("thread-status".into()),
+            status: codemux_lib::agent_provider::SessionStatus::Closed,
+        },
+    );
+    assert_eq!(status_of(&pane), None, "closed session clears the indicator");
+}
+
+#[tokio::test]
+async fn forward_event_downgrades_review_to_idle_in_active_workspace() {
+    // Parity with the terminal path: a turn that finishes in the
+    // workspace the user is already looking at clears to Idle instead of
+    // nagging with a review dot.
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+    let state: State<'_, AppStateStore> = handle.state();
+
+    let active_ws = state.snapshot().active_workspace_id.0;
+    let pane = bind_chat_pane(&state, &active_ws, "thread-focused");
+    // create_agent_chat_pane keeps its workspace active; assert that.
+    assert!(state.is_thread_pane_in_active_workspace("thread-focused"));
+
+    forward_event(&handle, text_delta("thread-focused", "hi"));
+    assert_eq!(
+        state.snapshot().pane_statuses.get(&pane).cloned(),
+        Some(codemux_lib::state::PaneStatus::Working)
+    );
+
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId("thread-focused".into()),
+            turn_id: TurnId("turn-1".into()),
+            status: codemux_lib::agent_provider::TurnStatus::Success,
+            usage: None,
+        },
+    );
+    assert_eq!(
+        state.snapshot().pane_statuses.get(&pane).cloned(),
+        None,
+        "completed turn in the active workspace clears instead of Review"
+    );
+}
+
+#[tokio::test]
+async fn forward_event_ignores_status_for_unbound_threads() {
+    // An event for a thread with no resolvable chat pane must not create
+    // a spurious pane_statuses entry (and must not panic).
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+    let state: State<'_, AppStateStore> = handle.state();
+
+    forward_event(&handle, text_delta("no-such-thread", "hi"));
+    assert!(
+        state.snapshot().pane_statuses.is_empty(),
+        "unbound thread must not seed a status entry"
+    );
 }
 
 #[tokio::test]

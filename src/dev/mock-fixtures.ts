@@ -316,7 +316,11 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
     workspace_kind: "main",
     git_branch: "main",
   });
-  const { surface, tab } = chatSurface("Agent Chat", codemuxRoot);
+  const { pane, surface, tab } = chatSurface("Agent Chat", codemuxRoot);
+  // Chat sessions publish into pane_statuses just like terminal agents
+  // (backend `set_pane_status_by_thread`); seed a green "review" dot so
+  // the dev mock demonstrates a finished chat agent in the sidebar.
+  paneStatuses[pane.pane_id] = "review";
   return {
     ...ws,
     tabs: [tab],
@@ -418,7 +422,10 @@ const wsCodemuxChatLive = (() => {
     workspace_kind: "worktree",
     git_branch: "feature/75-chat-channel",
   });
-  const { surface, tab } = chatSurface("Agent Chat", cwd, null);
+  const { pane, surface, tab } = chatSurface("Agent Chat", cwd, null);
+  // Amber "working" dot: a chat agent mid-turn, mirroring how the backend
+  // maps streaming events → PaneStatus::Working into pane_statuses.
+  paneStatuses[pane.pane_id] = "working";
   return {
     ...ws,
     tabs: [tab],
