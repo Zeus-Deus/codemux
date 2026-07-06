@@ -28,7 +28,7 @@ use crate::agent_provider::{
 };
 use crate::database::{AgentChatCheckpointRecord, AgentChatSessionRecord, DatabaseStore};
 use crate::observability::ObservabilityStore;
-use crate::state::AppStateStore;
+use crate::state::{AppStateStore, PaneStatus};
 
 /// Event name used for the few provider events that are NOT scoped to
 /// a single thread (global `RuntimeWarning`s with no `thread_id`).
@@ -331,6 +331,12 @@ pub fn agent_chat_close_pane(
     // hand to `stop_session`. Without this the JSON-RPC sidecar and
     // its background tokio tasks live on after the pane disappears.
     let chat_thread = state.agent_chat_pane_thread(&pane_id);
+    // Drop any lingering status dot for this pane. The session tear-down
+    // below emits SessionStateChanged::Closed → Idle, but that races the
+    // tree mutation: once close_pane removes the node, the thread→pane
+    // walk can no longer resolve it, so clear by pane id here while the
+    // key is still meaningful.
+    state.set_pane_status(&pane_id, PaneStatus::Idle);
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
     let _ = state.close_pane(&pane_id);
@@ -1175,6 +1181,13 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             }
         }
     }
+    // Publish the chat session's lifecycle into the shared pane_statuses
+    // store so the sidebar rows, collapsed-rail aggregate, hover flyout,
+    // and PaneNode borders reflect chat agents exactly like terminal
+    // agents (whose status flows in through hooks.rs). This is the whole
+    // reason chat workspaces previously showed no status dot.
+    publish_pane_status(app, &event);
+
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
         // forwarded with an empty ThreadId so the frontend at least
@@ -1206,6 +1219,84 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
                 "[codemux::agent_chat] Failed to send event on thread channel {}: {error}",
                 thread_id.0
             );
+        }
+    }
+}
+
+/// Map a provider runtime event to the sidebar pane status it should
+/// drive, or `None` to leave the current status untouched.
+///
+/// The chat-side analogue of `hooks.rs::map_event_type` for terminal
+/// agents, so chat sessions publish the same working / needs-input /
+/// review vocabulary the sidebar already renders:
+///
+/// - streaming deltas / committed items / running session / a resolved
+///   request (the turn resumes) → `Working`
+/// - a user-facing request opened (tool approval, plan, AskUserQuestion)
+///   or the session parked on an approval → `Permission`
+/// - the turn finished → `Review` (the caller downgrades to `Idle` when
+///   the pane's workspace is already active, matching
+///   `handle_lifecycle_event`)
+/// - the session closed or errored → `Idle` (clear any stuck indicator)
+///
+/// Everything else leaves the indicator alone. In particular
+/// `SessionConfigured` and the `Starting` / `Ready` lifecycle phases map
+/// to `None`: a freshly-started session with no turn is idle, exactly
+/// like a freshly-spawned terminal shows no status until its first hook.
+fn map_event_to_pane_status(event: &ProviderRuntimeEvent) -> Option<PaneStatus> {
+    use crate::agent_provider::SessionStatus;
+    match event {
+        ProviderRuntimeEvent::ContentDelta { .. }
+        | ProviderRuntimeEvent::ItemCompleted { .. }
+        | ProviderRuntimeEvent::RequestResolved { .. } => Some(PaneStatus::Working),
+        ProviderRuntimeEvent::RequestOpened { .. } => Some(PaneStatus::Permission),
+        ProviderRuntimeEvent::TurnCompleted { .. } => Some(PaneStatus::Review),
+        ProviderRuntimeEvent::SessionStateChanged { status, .. } => match status {
+            SessionStatus::Running { .. } => Some(PaneStatus::Working),
+            SessionStatus::WaitingApproval { .. } => Some(PaneStatus::Permission),
+            SessionStatus::Closed | SessionStatus::Error { .. } => Some(PaneStatus::Idle),
+            SessionStatus::Starting | SessionStatus::Ready => None,
+        },
+        ProviderRuntimeEvent::SessionConfigured { .. }
+        | ProviderRuntimeEvent::ResumeCursorUpdated { .. }
+        | ProviderRuntimeEvent::RuntimeWarning { .. } => None,
+    }
+}
+
+/// Publish the pane status implied by `event` into the shared
+/// `pane_statuses` store and, when it actually changes, push a fresh
+/// app-state snapshot to the frontend so the sidebar re-renders.
+///
+/// The change-guard in
+/// [`set_pane_status_by_thread`](AppStateStore::set_pane_status_by_thread)
+/// means the `content_delta` token stream collapses to a single
+/// `Working` write per turn — so the direct emit here fires only on real
+/// transitions (~2–3 per turn), never per token. A direct
+/// `Emitter::emit` is used rather than the Wry-only
+/// `schedule_emit_app_state` debouncer because `forward_event` is generic
+/// over the Tauri runtime (the mock runtime drives the unit tests) and
+/// the transitions are already rate-limited by the guard.
+fn publish_pane_status<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEvent) {
+    let Some(mut status) = map_event_to_pane_status(event) else {
+        return;
+    };
+    let Some(thread_id) = thread_id_for_event(event) else {
+        return;
+    };
+    if thread_id.0.is_empty() {
+        return;
+    }
+    let state: State<'_, AppStateStore> = app.state();
+    // Mirror the terminal path: a turn that finishes in the workspace the
+    // user is already looking at clears to Idle instead of nagging with a
+    // review dot for output they can already see.
+    if status == PaneStatus::Review && state.is_thread_pane_in_active_workspace(&thread_id.0) {
+        status = PaneStatus::Idle;
+    }
+    if state.set_pane_status_by_thread(&thread_id.0, status) {
+        let snapshot = state.snapshot();
+        if let Err(error) = app.emit("app-state-changed", &snapshot) {
+            eprintln!("[codemux::agent_chat] failed to emit app state: {error}");
         }
     }
 }
@@ -1600,6 +1691,123 @@ mod tests {
         assert!(
             b_captured.lock().unwrap().is_empty(),
             "no cross-thread leakage"
+        );
+    }
+
+    #[test]
+    fn map_event_to_pane_status_covers_the_lifecycle() {
+        use crate::state::PaneStatus;
+
+        // Working: a turn is producing output or resuming after approval.
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::ContentDelta {
+                thread_id: tid(),
+                turn_id: turn(),
+                delta: ContentDelta::Text { text: "hi".into() },
+            }),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::ItemCompleted {
+                thread_id: tid(),
+                turn_id: turn(),
+                item: CompletedItem::AssistantText { text: "hi".into() },
+            }),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::RequestResolved {
+                thread_id: tid(),
+                request_id: req(),
+                decision: ApprovalDecision::AllowForSession,
+            }),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Running { active_turn: turn() },
+            }),
+            Some(PaneStatus::Working)
+        );
+
+        // Permission: a user-facing request is open / session parked on one.
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::RequestOpened {
+                thread_id: tid(),
+                turn_id: turn(),
+                request_id: req(),
+                request_kind: "tool".into(),
+                payload: json!({}),
+                tool_use_id: None,
+            }),
+            Some(PaneStatus::Permission)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::WaitingApproval { request_id: req() },
+            }),
+            Some(PaneStatus::Permission)
+        );
+
+        // Review: the turn finished (caller may downgrade to Idle if focused).
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::TurnCompleted {
+                thread_id: tid(),
+                turn_id: turn(),
+                status: TurnStatus::Success,
+                usage: None,
+            }),
+            Some(PaneStatus::Review)
+        );
+
+        // Idle: session torn down or broken — clear the indicator.
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Closed,
+            }),
+            Some(PaneStatus::Idle)
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Error { message: "boom".into() },
+            }),
+            Some(PaneStatus::Idle)
+        );
+
+        // None: a fresh/ready session and configuration notices don't move
+        // the dot — parity with a freshly-spawned terminal showing nothing.
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Ready,
+            }),
+            None
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Starting,
+            }),
+            None
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::SessionConfigured {
+                thread_id: tid(),
+                provider_session_id: ProviderSessionId("s".into()),
+            }),
+            None
+        );
+        assert_eq!(
+            map_event_to_pane_status(&ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(tid()),
+                message: "warn".into(),
+                original_payload: None,
+            }),
+            None
         );
     }
 

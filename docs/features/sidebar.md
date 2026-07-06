@@ -59,6 +59,11 @@ dot without a tooltip fighting the HoverCard), the `AsciiSpinner`
 - Two-state toggle (expanded ↔ icon rail) via title-bar button and `Ctrl+B`.
 - Rail shows nav icons, project avatars, and footer icons; never fully hides.
 - Live aggregate agent status + notification badges on collapsed project avatars.
+- Per-workspace agent status covers **both terminal and Agent Chat (Beta)
+  agents** — chat sessions publish into the same `pane_statuses` snapshot
+  via `set_pane_status_by_thread` (see `docs/features/agent-chat.md`
+  § "Sidebar status indicators"), so a chat workspace shows the same
+  working/needs-input/review indicator in every density mode.
 - Per-project hover flyout with live per-workspace status, notifications, switch, and
   new-workspace action.
 - Project avatar custom colors/images carry into the rail.

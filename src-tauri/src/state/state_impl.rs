@@ -2871,6 +2871,52 @@ impl AppStateStore {
         }
     }
 
+    /// Resolve a chat `thread_id` to its `AgentChat` pane and update the
+    /// pane status, the chat-pane analogue of
+    /// [`set_pane_status_by_session`]. The terminal resolver deliberately
+    /// skips `AgentChat` nodes (chat panes carry a `thread_id`, not a PTY
+    /// `session_id`), so chat sessions need their own thread→pane walk to
+    /// publish into the shared `pane_statuses` store the sidebar reads.
+    ///
+    /// Returns `true` only when the stored status actually changed, so the
+    /// high-frequency `content_delta` token stream can skip a redundant
+    /// frontend emit once the pane is already `Working`. `Idle` removes the
+    /// entry, mirroring the session-keyed variant.
+    pub fn set_pane_status_by_thread(&self, thread_id: &str, status: PaneStatus) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let pane_id = snapshot.workspaces.iter().find_map(|ws| {
+            ws.surfaces
+                .iter()
+                .find_map(|s| find_agent_chat_pane_id(&s.root, thread_id))
+        });
+        let Some(pane_id) = pane_id else {
+            return false;
+        };
+        if status == PaneStatus::Idle {
+            return snapshot.pane_statuses.remove(&pane_id.0).is_some();
+        }
+        if snapshot.pane_statuses.get(&pane_id.0) == Some(&status) {
+            return false;
+        }
+        snapshot.pane_statuses.insert(pane_id.0, status);
+        true
+    }
+
+    /// Whether the `AgentChat` pane bound to `thread_id` currently lives in
+    /// the active workspace. Mirrors `hooks.rs`'s `is_pane_active_for_session`
+    /// so a chat turn that finishes in the workspace the user is already
+    /// looking at clears to `Idle` instead of raising a review dot.
+    pub fn is_thread_pane_in_active_workspace(&self, thread_id: &str) -> bool {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().any(|ws| {
+            ws.workspace_id == snapshot.active_workspace_id
+                && ws
+                    .surfaces
+                    .iter()
+                    .any(|s| find_agent_chat_pane_id(&s.root, thread_id).is_some())
+        })
+    }
+
     /// Clear working/permission status for a session (on terminal exit).
     pub fn clear_transient_pane_status_by_session(&self, session_id: &str) {
         let mut snapshot = self.inner.lock().unwrap();
@@ -3961,6 +4007,26 @@ pub fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -
         PaneNodeSnapshot::Split { children, .. } => children
             .iter()
             .find_map(|child| find_terminal_pane_id(child, target_session_id)),
+        _ => None,
+    }
+}
+
+/// Resolve a chat `thread_id` to the `AgentChat` pane bound to it, if any.
+/// The chat-pane counterpart to [`find_terminal_pane_id`]: the terminal
+/// walker matches on the PTY `session_id` and skips `AgentChat` nodes, so
+/// chat status publishing needs this thread-keyed resolver instead. Only
+/// panes that have already been bound to a session (`thread_id.is_some()`)
+/// can match.
+pub fn find_agent_chat_pane_id(root: &PaneNodeSnapshot, target_thread_id: &str) -> Option<PaneId> {
+    match root {
+        PaneNodeSnapshot::AgentChat {
+            pane_id,
+            thread_id: Some(thread_id),
+            ..
+        } if thread_id == target_thread_id => Some(pane_id.clone()),
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter()
+            .find_map(|child| find_agent_chat_pane_id(child, target_thread_id)),
         _ => None,
     }
 }
@@ -6465,6 +6531,113 @@ mod tests {
 
         // Unknown pane id is a clean None, not a panic.
         assert_eq!(store.agent_chat_pane_thread("does-not-exist"), None);
+    }
+
+    #[test]
+    fn set_pane_status_by_thread_resolves_and_reports_changes() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+
+        // Unbound pane cannot be resolved by thread id yet.
+        assert!(!store.set_pane_status_by_thread("thread-1", PaneStatus::Working));
+        assert!(store.snapshot().pane_statuses.is_empty());
+
+        store.set_agent_chat_thread_id(&pane_id.0, Some("thread-1".into()));
+
+        // First transition writes and reports "changed".
+        assert!(store.set_pane_status_by_thread("thread-1", PaneStatus::Working));
+        assert_eq!(
+            store.snapshot().pane_statuses.get(&pane_id.0),
+            Some(&PaneStatus::Working)
+        );
+
+        // Re-writing the same status is a no-op (drives the change-guard
+        // that keeps the content_delta stream from spamming emits).
+        assert!(!store.set_pane_status_by_thread("thread-1", PaneStatus::Working));
+
+        // A real change writes again.
+        assert!(store.set_pane_status_by_thread("thread-1", PaneStatus::Review));
+        assert_eq!(
+            store.snapshot().pane_statuses.get(&pane_id.0),
+            Some(&PaneStatus::Review)
+        );
+
+        // Idle removes the entry (and reports the removal as a change).
+        assert!(store.set_pane_status_by_thread("thread-1", PaneStatus::Idle));
+        assert!(store.snapshot().pane_statuses.is_empty());
+        // Removing a missing entry is not a change.
+        assert!(!store.set_pane_status_by_thread("thread-1", PaneStatus::Idle));
+
+        // Unknown thread never resolves.
+        assert!(!store.set_pane_status_by_thread("does-not-exist", PaneStatus::Working));
+    }
+
+    #[test]
+    fn is_thread_pane_in_active_workspace_tracks_focus() {
+        let store = AppStateStore::default();
+        let active_ws = store.snapshot().active_workspace_id.clone();
+        let active_pane = store
+            .create_agent_chat_pane(&active_ws.0, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&active_pane.0, Some("thread-active".into()));
+
+        // A second workspace that is NOT the active one.
+        let other_ws = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux-thread-focus"),
+            WorkspacePresetLayout::Single,
+        );
+        let other_pane = store
+            .create_agent_chat_pane(&other_ws.0, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&other_pane.0, Some("thread-other".into()));
+
+        // create_agent_chat_pane activates the workspace it inserts into, so
+        // pin focus back to the first workspace for a deterministic check.
+        store.activate_workspace(&active_ws.0);
+
+        assert!(store.is_thread_pane_in_active_workspace("thread-active"));
+        assert!(!store.is_thread_pane_in_active_workspace("thread-other"));
+        assert!(!store.is_thread_pane_in_active_workspace("nope"));
+
+        store.activate_workspace(&other_ws.0);
+        assert!(!store.is_thread_pane_in_active_workspace("thread-active"));
+        assert!(store.is_thread_pane_in_active_workspace("thread-other"));
+    }
+
+    #[test]
+    fn find_agent_chat_pane_id_walks_splits_and_skips_unbound() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        // Two chat panes in the same surface (the second splits the first).
+        let pane_a = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        let pane_b = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&pane_a.0, Some("thread-a".into()));
+        store.set_agent_chat_thread_id(&pane_b.0, Some("thread-b".into()));
+
+        let snapshot = store.snapshot();
+        let workspace = workspace_by_id(&snapshot, &ws_id);
+        let root = &workspace.surfaces[0].root;
+
+        assert_eq!(find_agent_chat_pane_id(root, "thread-a"), Some(pane_a));
+        assert_eq!(find_agent_chat_pane_id(root, "thread-b"), Some(pane_b.clone()));
+        // Unbound / unknown thread ids never match.
+        assert_eq!(find_agent_chat_pane_id(root, "thread-c"), None);
+
+        // Clearing a binding drops it from the walk.
+        store.set_agent_chat_thread_id(&pane_b.0, None);
+        let cleared = store.snapshot();
+        let workspace = workspace_by_id(&cleared, &ws_id);
+        assert_eq!(
+            find_agent_chat_pane_id(&workspace.surfaces[0].root, "thread-b"),
+            None
+        );
     }
 
     #[test]

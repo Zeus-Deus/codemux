@@ -698,6 +698,28 @@ event through `forward_event`. `broadcast::error::RecvError::Lagged`
 is already swallowed by each provider's event-stream helper, so slow
 subscribers never crash the loop — they just drop old events.
 
+## Sidebar status indicators
+
+Chat sessions publish into the same `pane_statuses` snapshot the left
+sidebar reads, so a chat workspace shows the working spinner / red
+needs-input pulse / green ready-for-review dot exactly like a terminal
+agent (previously chat panes showed nothing). `forward_event` in
+`commands/agent_chat.rs` maps each `ProviderRuntimeEvent` to a
+`PaneStatus` (`map_event_to_pane_status`) and writes it through
+`AppStateStore::set_pane_status_by_thread`, which resolves the
+`thread_id` to its `AgentChat` pane (`find_agent_chat_pane_id`) — the
+chat-side analogue of the terminal hooks path in `hooks.rs`. Mapping:
+streaming deltas / committed items / a running session / a resolved
+request → `Working`; an opened approval / plan / AskUserQuestion (or a
+session parked on approval) → `Permission`; `TurnCompleted` → `Review`
+(downgraded to `Idle` when the pane's workspace is already active,
+mirroring `handle_lifecycle_event`); session `Closed`/`Error` → cleared.
+A change-guard on `set_pane_status_by_thread` means the `content_delta`
+token stream collapses to a single write per turn rather than one per
+token. Because the write lands in `pane_statuses`, the sidebar rows,
+collapsed-rail aggregate dot, hover flyout, and `PaneNode` borders all
+update for free.
+
 ## Feature flag
 
 The new flag `enable_agent_chat` lives on the existing `FeatureFlags`
