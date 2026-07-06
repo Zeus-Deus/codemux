@@ -115,10 +115,17 @@ impl CodexSession {
         permission_mode: Option<String>,
         effort: Option<String>,
         resume_cursor: Option<Value>,
+        caller_env: Option<HashMap<String, String>>,
         spawn: CodexSpawnConfig,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     ) -> Result<Arc<Self>, ProviderError> {
-        let mut env = HashMap::new();
+        // Start from the caller-supplied workspace env (CODEMUX_WORKSPACE_ID,
+        // CODEMUX_PANE_ID, BROWSER, …) so the agent's Bash subprocesses route
+        // `codemux browser open` at their OWN workspace. Provider-critical
+        // vars are overlaid AFTER so they win on conflict — CODEX_HOME must
+        // point at Codemux's managed config dir regardless of what the
+        // workspace env carries.
+        let mut env = caller_env.unwrap_or_default();
         if let Some(home) = spawn.codex_home.as_ref() {
             env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
         }

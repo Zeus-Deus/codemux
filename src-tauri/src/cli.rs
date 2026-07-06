@@ -370,6 +370,25 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
         }
         Some(CommandSet::Browser { command }) => {
             let ws_id = std::env::var("CODEMUX_WORKSPACE_ID").unwrap_or_default();
+            // Best-effort cwd so the control layer can resolve the owning
+            // workspace by path when `CODEMUX_WORKSPACE_ID` is absent — e.g.
+            // Bash subprocesses of the agent-chat sidecar (whose env we don't
+            // inject) or any other env-less caller. Empty string on error;
+            // the handler treats empty `cwd` as "no hint" and falls back to
+            // today's behaviour. See `resolve_workspace_id_by_cwd` in
+            // control.rs.
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+
+            // Build the shared params object for every `browser_automation`
+            // request: the env-injected `workspace_id` (may be empty), the
+            // `cwd` fallback hint, and the per-command `action`. Factored so
+            // the two routing params are added in exactly one place instead
+            // of being hand-copied across every command below.
+            let make_params = |action: Value| {
+                json!({ "workspace_id": &ws_id, "cwd": &cwd, "action": action })
+            };
 
             // Helper: surface the handler's error message instead of silently
             // returning `null` when `response.ok == false`. Without this, every
@@ -402,7 +421,7 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                 BrowserCommand::Open { url } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "open", "url": url } }),
+                        params: make_params(json!({ "kind": "open", "url": url })),
                     }).await?;
                     unwrap_response(response)
                 }
@@ -414,42 +433,42 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     };
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": action }),
+                        params: make_params(action),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::Click { selector, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "click", "selector": selector } }),
+                        params: make_params(json!({ "kind": "click", "selector": selector })),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::Fill { selector, value, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "fill", "selector": selector, "value": value } }),
+                        params: make_params(json!({ "kind": "fill", "selector": selector, "value": value })),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::Screenshot { browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "screenshot" } }),
+                        params: make_params(json!({ "kind": "screenshot" })),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::ConsoleLogs { browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "console" } }),
+                        params: make_params(json!({ "kind": "console" })),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::ClickAt { x, y, click_type, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "click_at", "x": x, "y": y, "click_type": click_type } }),
+                        params: make_params(json!({ "kind": "click_at", "x": x, "y": y, "click_type": click_type })),
                     }).await?;
                     unwrap_response(response)
                 }
@@ -459,35 +478,35 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     if let Some(yv) = y { action["y"] = json!(yv); }
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": action }),
+                        params: make_params(action),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::ScrollAt { x, y, direction, amount, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "scroll_at", "x": x, "y": y, "direction": direction, "amount": amount } }),
+                        params: make_params(json!({ "kind": "scroll_at", "x": x, "y": y, "direction": direction, "amount": amount })),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::KeyPress { key, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "key_press", "key": key } }),
+                        params: make_params(json!({ "kind": "key_press", "key": key })),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::Drag { start_x, start_y, end_x, end_y, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "drag", "start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y } }),
+                        params: make_params(json!({ "kind": "drag", "start_x": start_x, "start_y": start_y, "end_x": end_x, "end_y": end_y })),
                     }).await?;
                     unwrap_response(response)
                 }
                 BrowserCommand::ClickOs { x, y, browser_id: _ } => {
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": { "kind": "click_os", "x": x, "y": y } }),
+                        params: make_params(json!({ "kind": "click_os", "x": x, "y": y })),
                     }).await?;
                     unwrap_response(response)
                 }
@@ -497,7 +516,7 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     if let Some(yv) = y { action["y"] = json!(yv); }
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({ "workspace_id": &ws_id, "action": action }),
+                        params: make_params(action),
                     }).await?;
                     unwrap_response(response)
                 }
@@ -514,10 +533,7 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     let action = crate::browser_viewport::socket_action(resolved);
                     let response = send_control_request(ControlRequest {
                         command: "browser_automation".into(),
-                        params: json!({
-                            "workspace_id": &ws_id,
-                            "action": action,
-                        }),
+                        params: make_params(action),
                     }).await?;
                     let data = unwrap_response(response)?;
                     // Echo back what we applied — useful for agents

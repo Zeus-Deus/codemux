@@ -122,10 +122,17 @@ impl ClaudeSession {
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     ) -> Result<Arc<Self>, ProviderError> {
         // Spawn the sidecar.
+        //
+        // Overlay the caller-supplied workspace env (CODEMUX_WORKSPACE_ID,
+        // CODEMUX_PANE_ID, BROWSER, …) so the agent's Bash subprocesses route
+        // `codemux browser open` at their OWN workspace instead of whichever
+        // one the user is viewing. `JsonRpcChild` applies these as overlays on
+        // the inherited env, so an empty map (no workspace resolved) is a
+        // no-op and the sidecar inherits Codemux's env unchanged.
         let sidecar = JsonRpcChild::spawn(SpawnConfig {
             program: spawn.sidecar_binary,
             args: vec![],
-            env: HashMap::new(),
+            env: input.env.clone().unwrap_or_default(),
             cwd: Some(input.cwd.clone()),
             default_timeout: DEFAULT_RPC_TIMEOUT,
         })
