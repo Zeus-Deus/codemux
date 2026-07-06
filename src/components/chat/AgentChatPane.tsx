@@ -23,7 +23,14 @@ import {
   selectActiveSkills,
   useSkillsStore,
 } from "@/stores/skills-store";
-import type { ChatViewItem } from "@/lib/agent-chat/types";
+import type {
+  ChatViewItem,
+  PermissionRequestItem,
+} from "@/lib/agent-chat/types";
+import {
+  findSubagentView,
+  subagentOrdinal,
+} from "@/lib/agent-chat/subagents";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
@@ -80,6 +87,8 @@ import type {
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
+import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
+import { SubagentView } from "./SubagentView";
 import { DebugCleanupBanner } from "./DebugCleanupBanner";
 import { DebugExitDialog, type DebugExitChoice } from "./DebugExitDialog";
 import {
@@ -399,6 +408,52 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const draft = slice?.inputDraft ?? "";
   const messages = slice?.messages ?? EMPTY_MESSAGES;
   const streaming = slice?.streaming ?? false;
+
+  // Subagent drill-in view state (locked decision 3): the pane swaps its
+  // transcript body for a read-only sub-transcript and its sub-header for
+  // a breadcrumb, but the composer stays wired to the parent thread. Kept
+  // as local state; entering is triggered from the orchestration card, Esc
+  // returns.
+  const [enteredSubagentId, setEnteredSubagentId] = useState<string | null>(
+    null,
+  );
+  const enteredSubagent = useMemo(
+    () =>
+      enteredSubagentId ? findSubagentView(messages, enteredSubagentId) : null,
+    [messages, enteredSubagentId],
+  );
+  // The subagent vanished (thread switch / hydrate) — fall back to the
+  // orchestrator so we never render a dangling breadcrumb.
+  useEffect(() => {
+    if (enteredSubagentId && !enteredSubagent) setEnteredSubagentId(null);
+  }, [enteredSubagentId, enteredSubagent]);
+  // Approval requests that bubbled from the entered subagent, mirrored
+  // into the drill-in (locked decision 4).
+  const enteredSubagentRequests = useMemo<PermissionRequestItem[]>(() => {
+    if (!enteredSubagentId) return EMPTY_REQUESTS;
+    return messages.filter(
+      (m): m is PermissionRequestItem =>
+        m.kind === "permission_request" && m.subagent_id === enteredSubagentId,
+    );
+  }, [messages, enteredSubagentId]);
+  const handleEnterSubagent = useCallback((subagentId: string) => {
+    setEnteredSubagentId(subagentId);
+  }, []);
+  const handleExitSubagent = useCallback(() => {
+    setEnteredSubagentId(null);
+  }, []);
+  // Esc leaves the drill-in and returns to the orchestrator.
+  useEffect(() => {
+    if (!enteredSubagentId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setEnteredSubagentId(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [enteredSubagentId]);
   const activeTurnId = slice?.activeTurnId ?? null;
   const model = slice?.model ?? null;
   const permissionMode =
@@ -1955,6 +2010,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // An empty pane reads as a new chat: "Describe what you want the
       // agent to do…" until the first turn lands (design D10 copy).
       isDraft={messages.length === 0}
+      // In a subagent drill-in the composer stays parent-bound; only the
+      // placeholder changes to make that explicit (design copy).
+      placeholderOverride={
+        enteredSubagent ? "Steering goes to the orchestrator…" : undefined
+      }
       zone1Override={zone1Override}
       provider={provider}
       model={model}
@@ -2013,15 +2073,34 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         <ChatHomeLanding composer={composerEl} />
       ) : (
         <>
-          <ChatTranscript
-            messages={messages}
-            streaming={streaming || isSending}
-            sessionStartedAt={sessionStartedAt}
-            provider={provider}
-            onRespondToRequest={handleRespond}
-            onAcceptPlan={handleAcceptPlan}
-            onRejectPlan={handleRejectPlan}
-          />
+          {enteredSubagent ? (
+            // Drill-in: breadcrumb sub-header + read-only sub-transcript.
+            // The composer below stays wired to the parent thread.
+            <>
+              <SubagentBreadcrumb
+                subagent={enteredSubagent}
+                ordinal={subagentOrdinal(messages, enteredSubagent.id)}
+                onBack={handleExitSubagent}
+              />
+              <div className="flex-1 min-h-0 w-full overflow-y-auto">
+                <SubagentView
+                  subagent={enteredSubagent}
+                  requests={enteredSubagentRequests}
+                />
+              </div>
+            </>
+          ) : (
+            <ChatTranscript
+              messages={messages}
+              streaming={streaming || isSending}
+              sessionStartedAt={sessionStartedAt}
+              provider={provider}
+              onRespondToRequest={handleRespond}
+              onAcceptPlan={handleAcceptPlan}
+              onRejectPlan={handleRejectPlan}
+              onEnterSubagent={handleEnterSubagent}
+            />
+          )}
           {/* Composer region (design D10): a hairline lifts the whole
               composer column — AskUserQuestion panel, debug banner, and
               the composer card — off the scrolling transcript. */}
@@ -2041,4 +2120,5 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 }
 
 const EMPTY_MESSAGES: ChatViewItem[] = [];
+const EMPTY_REQUESTS: PermissionRequestItem[] = [];
 const EMPTY_ATTACHMENTS: Attachment[] = [];

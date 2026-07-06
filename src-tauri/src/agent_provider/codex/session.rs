@@ -28,7 +28,7 @@ use super::protocol::{
     ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
     RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
 };
-use super::translate::{translate_notification, translate_server_request};
+use super::translate::{translate_notification_with, translate_server_request, CodexSubagentDemux};
 
 /// Default per-request timeout, mirroring the upstream reference's
 /// `sendRequest(..., 20_000)` default.
@@ -619,6 +619,13 @@ fn spawn_notifications_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut notifications = child.notifications();
+        // One demux per session, rooted at the parent Codex thread id, so
+        // child-thread (sub-agent) registrations persist across messages.
+        let parent_codex_thread_id = {
+            let state = session.state.lock().await;
+            state.codex_thread_id.clone()
+        };
+        let mut demux = CodexSubagentDemux::new(parent_codex_thread_id);
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
@@ -629,7 +636,8 @@ fn spawn_notifications_task(
                             // Update local state for a few special
                             // notifications before broadcasting.
                             update_state_from_notification(&session, &msg).await;
-                            let events = translate_notification(&session.thread_id, msg);
+                            let events =
+                                translate_notification_with(&mut demux, &session.thread_id, msg);
                             for ev in events {
                                 if event_tx.send(ev).is_err() {
                                     // No subscribers — silently drop.
@@ -727,10 +735,19 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
     match msg {
         NotificationMessage::TurnStarted(p) => {
             let mut state = session.state.lock().await;
-            state.active_turn = Some(TurnId(p.turn_id.clone()));
+            // Only the parent thread drives the session's active turn;
+            // a sub-agent's turn must never touch parent turn state.
+            if p.thread_id == state.codex_thread_id {
+                state.active_turn = Some(TurnId(p.turn_id.clone()));
+            }
         }
         NotificationMessage::TurnCompleted(p) => {
             let mut state = session.state.lock().await;
+            // Sub-agent turn completions are handled as SubagentUpdated in
+            // the translator; leave the parent session state untouched.
+            if p.thread_id != state.codex_thread_id {
+                return;
+            }
             if state
                 .active_turn
                 .as_ref()
@@ -754,9 +771,18 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
         }
         NotificationMessage::Error(e) if !e.will_retry => {
             let mut state = session.state.lock().await;
-            state.status = SessionStatus::Error {
-                message: e.message.clone(),
-            };
+            // Scope a terminal error to the parent session only when it is
+            // unscoped or explicitly targets the parent thread; a
+            // sub-agent's error must not fail the whole session.
+            if e
+                .thread_id
+                .as_deref()
+                .map_or(true, |t| t == state.codex_thread_id)
+            {
+                state.status = SessionStatus::Error {
+                    message: e.message.clone(),
+                };
+            }
         }
         _ => {}
     }

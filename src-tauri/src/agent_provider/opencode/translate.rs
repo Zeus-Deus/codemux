@@ -16,7 +16,7 @@
 //! dropping them — adapter drift must be observable.
 
 use crate::agent_provider::events::{
-    CompletedItem, ContentDelta, ProviderRuntimeEvent, TurnStatus,
+    CompletedItem, ContentDelta, ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus, TurnStatus,
 };
 use crate::agent_provider::types::{
     ApprovalDecision, ProviderSessionId, RequestId, SessionStatus, ThreadId, TurnId,
@@ -24,7 +24,7 @@ use crate::agent_provider::types::{
 
 use super::protocol::{
     KnownEvent, ModelRef, OpenCodeApiError, OpenCodeEvent, PartInput, PartPayload,
-    PermissionReply, PromptAsyncRequest, ToolStateValue,
+    PermissionReply, PromptAsyncRequest, TaskMetadata, ToolStateValue,
 };
 
 // ── Outbound translation (Codemux → OpenCode wire) ──────────────────
@@ -129,15 +129,19 @@ pub struct EventContext {
 ///
 /// Returns an empty `Vec` when the event is irrelevant for the chat
 /// runtime (e.g. `session.created` for a session we did not initiate).
-/// The SSE listener is responsible for filtering events by session id
-/// before calling this; the context is only used for downstream
-/// labelling.
+/// The SSE listener is responsible for filtering events by the
+/// watched-session set before calling this, and for resolving
+/// `subagent_id`: `None` when the event belongs to the top-level
+/// (parent) session, `Some(child_session_id)` when it belongs to a
+/// subagent's child session. That id tags every child-scoped event so
+/// the frontend can route it into the subagent's own sub-transcript.
 pub fn opencode_event_to_runtime(
     event: OpenCodeEvent,
     ctx: &EventContext,
+    subagent_id: Option<&str>,
 ) -> Vec<ProviderRuntimeEvent> {
     match event {
-        OpenCodeEvent::Known(known) => translate_known(known, ctx),
+        OpenCodeEvent::Known(known) => translate_known(known, ctx, subagent_id),
         OpenCodeEvent::Other(payload) => {
             let event_type = payload
                 .get("type")
@@ -153,43 +157,59 @@ pub fn opencode_event_to_runtime(
     }
 }
 
-fn translate_known(event: KnownEvent, ctx: &EventContext) -> Vec<ProviderRuntimeEvent> {
+fn translate_known(
+    event: KnownEvent,
+    ctx: &EventContext,
+    subagent_id: Option<&str>,
+) -> Vec<ProviderRuntimeEvent> {
     match event {
-        KnownEvent::MessagePartDelta(delta) => translate_part_delta(delta, ctx),
-        KnownEvent::MessagePartUpdated(updated) => translate_part_updated(updated, ctx),
+        KnownEvent::MessagePartDelta(delta) => translate_part_delta(delta, ctx, subagent_id),
+        KnownEvent::MessagePartUpdated(updated) => {
+            translate_part_updated(updated, ctx, subagent_id)
+        }
         KnownEvent::MessagePartRemoved(_) => vec![],
-        KnownEvent::MessageUpdated(env) => translate_message_updated(env, ctx),
+        KnownEvent::MessageUpdated(env) => translate_message_updated(env, ctx, subagent_id),
         KnownEvent::MessageRemoved(_) => vec![],
-        KnownEvent::SessionIdle(_) => vec![ProviderRuntimeEvent::TurnCompleted {
-            thread_id: ctx.thread_id.clone(),
-            turn_id: ctx.turn_id.clone(),
-            status: TurnStatus::Success,
-            usage: None,
-        }],
-        KnownEvent::SessionStatus(status) => match status.status {
-            super::protocol::SessionStatusValue::Idle => {
-                vec![ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: ctx.thread_id.clone(),
-                    status: SessionStatus::Ready,
-                }]
+        KnownEvent::SessionIdle(_) => {
+            // A child session going idle fires *before* the parent's
+            // task tool part flips to `completed` — completing the
+            // parent turn here would end the turn while the subagent's
+            // result is still in flight. The task part drives subagent
+            // completion, so a child idle is a no-op; only the parent
+            // session's idle ends the user turn.
+            if subagent_id.is_some() {
+                return vec![];
             }
-            super::protocol::SessionStatusValue::Busy => {
-                vec![ProviderRuntimeEvent::SessionStateChanged {
-                    thread_id: ctx.thread_id.clone(),
-                    status: SessionStatus::Running {
-                        active_turn: ctx.turn_id.clone(),
+            vec![ProviderRuntimeEvent::TurnCompleted {
+                thread_id: ctx.thread_id.clone(),
+                turn_id: ctx.turn_id.clone(),
+                status: TurnStatus::Success,
+                usage: None,
+            }]
+        }
+        KnownEvent::SessionStatus(status) => translate_session_status(status, ctx, subagent_id),
+        KnownEvent::SessionError(err) => {
+            // A child session error marks that subagent failed; it must
+            // not complete the parent turn.
+            if let Some(id) = subagent_id {
+                let activity = err
+                    .error
+                    .as_ref()
+                    .map(|e| e.display_pair().1)
+                    .unwrap_or_else(|| "subagent session error".into());
+                return vec![subagent_event(
+                    ctx,
+                    SubagentSnapshot {
+                        subagent_id: id.to_string(),
+                        status: SubagentStatus::Failed,
+                        result_text: Some(activity),
+                        provider_ref: Some(id.to_string()),
+                        ..empty_snapshot(id)
                     },
-                }]
+                )];
             }
-            super::protocol::SessionStatusValue::Retry { message, .. } => {
-                vec![ProviderRuntimeEvent::RuntimeWarning {
-                    thread_id: Some(ctx.thread_id.clone()),
-                    message: format!("opencode_retry: {message}"),
-                    original_payload: None,
-                }]
-            }
-        },
-        KnownEvent::SessionError(err) => translate_session_error(err.error, ctx),
+            translate_session_error(err.error, ctx)
+        }
         KnownEvent::PermissionAsked(p) => {
             let payload = serde_json::json!({
                 "permission": p.permission,
@@ -197,6 +217,12 @@ fn translate_known(event: KnownEvent, ctx: &EventContext) -> Vec<ProviderRuntime
                 "metadata": p.metadata,
             });
             vec![ProviderRuntimeEvent::RequestOpened {
+                // Child (subagent) permission requests are tagged so the
+                // UI can label them "from subagent X" and surface them
+                // inside the drill-in. The reply still targets the child
+                // session id — resolved in `session::respond_to_request`
+                // from the id → session map the SSE listener records.
+                subagent_id: subagent_id.map(str::to_string),
                 thread_id: ctx.thread_id.clone(),
                 turn_id: ctx.turn_id.clone(),
                 request_id: RequestId(p.id),
@@ -231,11 +257,13 @@ fn translate_known(event: KnownEvent, ctx: &EventContext) -> Vec<ProviderRuntime
 fn translate_part_delta(
     delta: super::protocol::MessagePartDelta,
     ctx: &EventContext,
+    subagent_id: Option<&str>,
 ) -> Vec<ProviderRuntimeEvent> {
     if delta.field != "text" {
         return vec![];
     }
     vec![ProviderRuntimeEvent::ContentDelta {
+        subagent_id: subagent_id.map(str::to_string),
         thread_id: ctx.thread_id.clone(),
         turn_id: ctx.turn_id.clone(),
         delta: ContentDelta::Text { text: delta.delta },
@@ -245,7 +273,9 @@ fn translate_part_delta(
 fn translate_part_updated(
     updated: super::protocol::MessagePartUpdated,
     ctx: &EventContext,
+    subagent_id: Option<&str>,
 ) -> Vec<ProviderRuntimeEvent> {
+    let sid = || subagent_id.map(str::to_string);
     match updated.part {
         PartPayload::Text(text) => {
             // Synthetic parts are placeholders OpenCode inserts during
@@ -254,6 +284,7 @@ fn translate_part_updated(
                 return vec![];
             }
             vec![ProviderRuntimeEvent::ItemCompleted {
+                subagent_id: sid(),
                 thread_id: ctx.thread_id.clone(),
                 turn_id: ctx.turn_id.clone(),
                 item: CompletedItem::AssistantText { text: text.text },
@@ -264,6 +295,7 @@ fn translate_part_updated(
                 return vec![];
             }
             vec![ProviderRuntimeEvent::ItemCompleted {
+                subagent_id: sid(),
                 thread_id: ctx.thread_id.clone(),
                 turn_id: ctx.turn_id.clone(),
                 item: CompletedItem::AssistantThinking {
@@ -271,7 +303,16 @@ fn translate_part_updated(
                 },
             }]
         }
-        PartPayload::Tool(tool) => translate_tool_part(tool, ctx),
+        // The `task` tool spawns a subagent — it drives the subagent
+        // card, not a generic tool row, so it is routed away from
+        // `translate_tool_part` (whose generic card is suppressed for
+        // it) and into the SubagentUpdated lifecycle.
+        PartPayload::Tool(tool) if tool.tool == "task" => translate_task_part(tool, ctx),
+        PartPayload::Tool(tool) => translate_tool_part(tool, ctx, subagent_id),
+        // Decoded but inert: `@agent` mention chips and `subtask`
+        // markers produce no runtime event (the paired `task` tool part
+        // carries the real signal).
+        PartPayload::Agent(_) | PartPayload::Subtask(_) => vec![],
         PartPayload::Other => vec![],
     }
 }
@@ -279,11 +320,14 @@ fn translate_part_updated(
 fn translate_tool_part(
     tool: super::protocol::ToolPart,
     ctx: &EventContext,
+    subagent_id: Option<&str>,
 ) -> Vec<ProviderRuntimeEvent> {
+    let sid = || subagent_id.map(str::to_string);
     match tool.state {
         ToolStateValue::Pending { .. } | ToolStateValue::Running { .. } => vec![],
         ToolStateValue::Completed { input, output, .. } => vec![
             ProviderRuntimeEvent::ItemCompleted {
+                subagent_id: sid(),
                 thread_id: ctx.thread_id.clone(),
                 turn_id: ctx.turn_id.clone(),
                 item: CompletedItem::ToolUse {
@@ -293,6 +337,7 @@ fn translate_tool_part(
                 },
             },
             ProviderRuntimeEvent::ItemCompleted {
+                subagent_id: sid(),
                 thread_id: ctx.thread_id.clone(),
                 turn_id: ctx.turn_id.clone(),
                 item: CompletedItem::ToolResult {
@@ -302,8 +347,9 @@ fn translate_tool_part(
                 },
             },
         ],
-        ToolStateValue::Error { input, error } => vec![
+        ToolStateValue::Error { input, error, .. } => vec![
             ProviderRuntimeEvent::ItemCompleted {
+                subagent_id: sid(),
                 thread_id: ctx.thread_id.clone(),
                 turn_id: ctx.turn_id.clone(),
                 item: CompletedItem::ToolUse {
@@ -313,6 +359,7 @@ fn translate_tool_part(
                 },
             },
             ProviderRuntimeEvent::ItemCompleted {
+                subagent_id: sid(),
                 thread_id: ctx.thread_id.clone(),
                 turn_id: ctx.turn_id.clone(),
                 item: CompletedItem::ToolResult {
@@ -325,9 +372,249 @@ fn translate_tool_part(
     }
 }
 
+/// Translate a `task` tool part into the subagent lifecycle.
+///
+/// The `task` tool's lifecycle is: `pending` (no metadata yet — emits
+/// nothing) → `running` (first carries `state.metadata.sessionId`, the
+/// child session id / demux key, plus model, title, and the delegated
+/// input) → `completed` (output wrapped in a
+/// `<task …><task_result>…</task_result></task>` envelope; a
+/// `<task_error>` / `state="error"` envelope means the subagent failed)
+/// or `error` (the task tool itself failed).
+fn translate_task_part(
+    tool: super::protocol::ToolPart,
+    ctx: &EventContext,
+) -> Vec<ProviderRuntimeEvent> {
+    match tool.state {
+        // `pending` carries no metadata — we don't know the child
+        // session id yet, so there is nothing to key a row on.
+        ToolStateValue::Pending { .. } => vec![],
+        ToolStateValue::Running {
+            input,
+            title,
+            metadata,
+            ..
+        } => {
+            let md = TaskMetadata::from_value(&metadata);
+            let Some(child) = md.session_id.clone() else {
+                return vec![];
+            };
+            vec![subagent_event(
+                ctx,
+                SubagentSnapshot {
+                    subagent_id: child.clone(),
+                    parent_item_id: Some(tool.call_id),
+                    name: task_name(title.as_deref(), &input),
+                    agent_type: string_field(&input, "subagent_type"),
+                    model: md.model_id(),
+                    status: SubagentStatus::Running,
+                    provider_ref: Some(child),
+                    ..empty_snapshot("")
+                },
+            )]
+        }
+        ToolStateValue::Completed {
+            input,
+            output,
+            title,
+            metadata,
+            time,
+        } => {
+            let md = TaskMetadata::from_value(&metadata);
+            let Some(child) = md.session_id.clone() else {
+                return vec![];
+            };
+            let envelope = parse_task_envelope(&output);
+            let status = if envelope.is_error {
+                SubagentStatus::Failed
+            } else {
+                SubagentStatus::Completed
+            };
+            let duration_ms = time.as_ref().and_then(|t| match (t.start, t.end) {
+                (Some(start), Some(end)) if end >= start => Some(end - start),
+                _ => None,
+            });
+            vec![subagent_event(
+                ctx,
+                SubagentSnapshot {
+                    subagent_id: child.clone(),
+                    parent_item_id: Some(tool.call_id),
+                    name: task_name(title.as_deref(), &input),
+                    agent_type: string_field(&input, "subagent_type"),
+                    model: md.model_id(),
+                    status,
+                    result_text: Some(envelope.text),
+                    duration_ms,
+                    provider_ref: Some(child),
+                    ..empty_snapshot("")
+                },
+            )]
+        }
+        ToolStateValue::Error {
+            input,
+            error,
+            metadata,
+            time,
+        } => {
+            let md = TaskMetadata::from_value(&metadata);
+            // Without a child session id we cannot key the row. Fall
+            // back to the spawning tool call id so a failure is never
+            // silently swallowed.
+            let child = md.session_id.clone().unwrap_or_else(|| tool.call_id.clone());
+            let duration_ms = time.as_ref().and_then(|t| match (t.start, t.end) {
+                (Some(start), Some(end)) if end >= start => Some(end - start),
+                _ => None,
+            });
+            vec![subagent_event(
+                ctx,
+                SubagentSnapshot {
+                    subagent_id: child.clone(),
+                    parent_item_id: Some(tool.call_id),
+                    agent_type: string_field(&input, "subagent_type"),
+                    model: md.model_id(),
+                    status: SubagentStatus::Failed,
+                    result_text: Some(error),
+                    duration_ms,
+                    provider_ref: Some(child),
+                    ..empty_snapshot("")
+                },
+            )]
+        }
+    }
+}
+
+/// Result of stripping OpenCode's `<task …>` completion envelope.
+struct TaskEnvelope {
+    /// Inner report text (`<task_result>` body) or error text
+    /// (`<task_error>` body); the raw output when no envelope is found.
+    text: String,
+    /// `true` when the envelope carried `state="error"` or a
+    /// `<task_error>` body.
+    is_error: bool,
+}
+
+/// Parse the `<task id="…" state="…"><task_result>…</task_result></task>`
+/// completion envelope into its inner report + an error flag. Falls back
+/// to returning the whole string (as a success) when no envelope tags
+/// are present, so a future runtime that drops the wrapper still shows
+/// the subagent's report.
+fn parse_task_envelope(output: &str) -> TaskEnvelope {
+    let opening_is_error = output
+        .split_once('>')
+        .map(|(head, _)| head)
+        .unwrap_or("")
+        .contains("state=\"error\"");
+    if let Some(inner) = extract_between(output, "<task_error>", "</task_error>") {
+        return TaskEnvelope {
+            text: inner.trim().to_string(),
+            is_error: true,
+        };
+    }
+    if let Some(inner) = extract_between(output, "<task_result>", "</task_result>") {
+        return TaskEnvelope {
+            text: inner.trim().to_string(),
+            is_error: opening_is_error,
+        };
+    }
+    TaskEnvelope {
+        text: output.trim().to_string(),
+        is_error: opening_is_error,
+    }
+}
+
+fn extract_between<'a>(haystack: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = haystack.find(open)? + open.len();
+    let end = haystack[start..].find(close)? + start;
+    Some(&haystack[start..end])
+}
+
+/// Pick a display name for a subagent: the runtime-provided `title`
+/// falls back to the delegated `input.description`.
+fn task_name(title: Option<&str>, input: &serde_json::Value) -> Option<String> {
+    title
+        .map(str::to_string)
+        .or_else(|| string_field(input, "description"))
+}
+
+fn string_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|v| v.as_str()).map(str::to_string)
+}
+
+/// A `SubagentSnapshot` with every field at its "unknown" default
+/// except the id — the frontend merges non-`None` fields, so leaving
+/// fields `None` here never clobbers a value learned from an earlier
+/// snapshot.
+fn empty_snapshot(id: &str) -> SubagentSnapshot {
+    SubagentSnapshot {
+        subagent_id: id.to_string(),
+        parent_item_id: None,
+        name: None,
+        agent_type: None,
+        model: None,
+        status: SubagentStatus::Pending,
+        activity: None,
+        result_text: None,
+        tool_use_count: None,
+        total_tokens: None,
+        duration_ms: None,
+        provider_ref: None,
+    }
+}
+
+fn subagent_event(ctx: &EventContext, subagent: SubagentSnapshot) -> ProviderRuntimeEvent {
+    ProviderRuntimeEvent::SubagentUpdated {
+        thread_id: ctx.thread_id.clone(),
+        subagent,
+    }
+}
+
+fn translate_session_status(
+    status: super::protocol::SessionStatusEvent,
+    ctx: &EventContext,
+    subagent_id: Option<&str>,
+) -> Vec<ProviderRuntimeEvent> {
+    use super::protocol::SessionStatusValue as S;
+    // Child-session status changes are subagent status ticks — never
+    // the parent session's lifecycle. Completion is driven by the task
+    // tool part, so a child going idle/retry is a no-op here (avoid
+    // regressing a Running row); only `busy` bumps it to Running.
+    if let Some(id) = subagent_id {
+        return match status.status {
+            S::Busy => vec![subagent_event(
+                ctx,
+                SubagentSnapshot {
+                    subagent_id: id.to_string(),
+                    status: SubagentStatus::Running,
+                    provider_ref: Some(id.to_string()),
+                    ..empty_snapshot(id)
+                },
+            )],
+            S::Idle | S::Retry { .. } => vec![],
+        };
+    }
+    match status.status {
+        S::Idle => vec![ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ctx.thread_id.clone(),
+            status: SessionStatus::Ready,
+        }],
+        S::Busy => vec![ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ctx.thread_id.clone(),
+            status: SessionStatus::Running {
+                active_turn: ctx.turn_id.clone(),
+            },
+        }],
+        S::Retry { message, .. } => vec![ProviderRuntimeEvent::RuntimeWarning {
+            thread_id: Some(ctx.thread_id.clone()),
+            message: format!("opencode_retry: {message}"),
+            original_payload: None,
+        }],
+    }
+}
+
 fn translate_message_updated(
     env: super::protocol::MessageEnvelope,
     ctx: &EventContext,
+    subagent_id: Option<&str>,
 ) -> Vec<ProviderRuntimeEvent> {
     // Only assistant errors matter at this layer; all other content is
     // already covered by the per-part events.
@@ -335,6 +622,22 @@ fn translate_message_updated(
         return vec![];
     }
     if let Some(err) = env.info.error {
+        // A child assistant error marks the subagent failed — it must
+        // not complete the parent turn (the task part will also flip to
+        // a failed envelope; the reducer merges).
+        if let Some(id) = subagent_id {
+            let (_, message) = err.display_pair();
+            return vec![subagent_event(
+                ctx,
+                SubagentSnapshot {
+                    subagent_id: id.to_string(),
+                    status: SubagentStatus::Failed,
+                    result_text: Some(message),
+                    provider_ref: Some(id.to_string()),
+                    ..empty_snapshot(id)
+                },
+            )];
+        }
         return translate_assistant_error(err, ctx);
     }
     vec![]
@@ -492,7 +795,7 @@ mod tests {
         let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(super::super::protocol::SessionIdle {
             session_id: "s1".into(),
         }));
-        let out = opencode_event_to_runtime(event, &ctx());
+        let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
             ProviderRuntimeEvent::TurnCompleted { status, .. } => {
@@ -511,7 +814,7 @@ mod tests {
             field: "text".into(),
             delta: "hi".into(),
         }));
-        let out = opencode_event_to_runtime(event, &ctx());
+        let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
             ProviderRuntimeEvent::ContentDelta {
@@ -531,7 +834,7 @@ mod tests {
             field: "title".into(),
             delta: "filename.rs".into(),
         }));
-        let out = opencode_event_to_runtime(event, &ctx());
+        let out = opencode_event_to_runtime(event, &ctx(), None);
         assert!(out.is_empty());
     }
 
@@ -546,7 +849,7 @@ mod tests {
                 synthetic: None,
             }),
         }));
-        let out = opencode_event_to_runtime(event, &ctx());
+        let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
             ProviderRuntimeEvent::ItemCompleted {
@@ -568,7 +871,7 @@ mod tests {
                 synthetic: Some(true),
             }),
         }));
-        assert!(opencode_event_to_runtime(event, &ctx()).is_empty());
+        assert!(opencode_event_to_runtime(event, &ctx(), None).is_empty());
     }
 
     #[test]
@@ -584,10 +887,12 @@ mod tests {
                     input: serde_json::json!({ "path": "src/main.rs" }),
                     output: "fn main() {}".into(),
                     title: None,
+                    metadata: serde_json::Value::Null,
+                    time: None,
                 },
             }),
         }));
-        let out = opencode_event_to_runtime(event, &ctx());
+        let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 2, "expected ToolUse + ToolResult");
         match &out[0] {
             ProviderRuntimeEvent::ItemCompleted {
@@ -633,10 +938,12 @@ mod tests {
                 state: ToolStateValue::Error {
                     input: serde_json::json!({ "command": "exit 1" }),
                     error: "exit code 1".into(),
+                    metadata: serde_json::Value::Null,
+                    time: None,
                 },
             }),
         }));
-        let out = opencode_event_to_runtime(event, &ctx());
+        let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 2);
         match &out[1] {
             ProviderRuntimeEvent::ItemCompleted {
@@ -656,7 +963,7 @@ mod tests {
                 data: serde_json::json!({ "providerID": "openai", "message": "no key" }),
             }),
         }));
-        let out = opencode_event_to_runtime(event, &ctx());
+        let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
             ProviderRuntimeEvent::TurnCompleted { status, .. } => match status {
@@ -683,7 +990,7 @@ mod tests {
                 call_id: "call_x".into(),
             }),
         }));
-        let out = opencode_event_to_runtime(event, &ctx());
+        let out = opencode_event_to_runtime(event, &ctx(), None);
         assert_eq!(out.len(), 1);
         match &out[0] {
             ProviderRuntimeEvent::RequestOpened {
@@ -702,11 +1009,364 @@ mod tests {
 
     #[test]
     fn translate_unknown_event_emits_runtime_warning() {
-        let out = opencode_event_to_runtime(OpenCodeEvent::Other(serde_json::Value::Null), &ctx());
+        let out = opencode_event_to_runtime(OpenCodeEvent::Other(serde_json::Value::Null), &ctx(), None);
         assert_eq!(out.len(), 1);
         assert!(matches!(
             out[0],
             ProviderRuntimeEvent::RuntimeWarning { .. }
         ));
+    }
+
+    // ── Subagent (task tool) lifecycle ──────────────────────────────
+
+    /// Build a `message.part.updated` event carrying a `task` tool part
+    /// whose `state` is the supplied JSON, decoded through the real
+    /// wire path so the tests exercise deserialization too.
+    fn task_part_event(state: serde_json::Value) -> OpenCodeEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "prt_task",
+                    "sessionID": "ses_root",
+                    "messageID": "msg_1",
+                    "type": "tool",
+                    "callID": "call_task",
+                    "tool": "task",
+                    "state": state
+                }
+            }
+        }))
+        .expect("task event decodes")
+    }
+
+    #[test]
+    fn task_pending_emits_nothing_no_metadata_yet() {
+        // The pending→running gotcha: `pending` has no metadata, so no
+        // child session id — the row must NOT appear yet.
+        let event = task_part_event(serde_json::json!({
+            "status": "pending",
+            "input": {},
+            "raw": ""
+        }));
+        assert!(
+            opencode_event_to_runtime(event, &ctx(), None).is_empty(),
+            "pending task emits no subagent row"
+        );
+    }
+
+    #[test]
+    fn task_running_emits_running_subagent_from_metadata() {
+        let event = task_part_event(serde_json::json!({
+            "title": "List current directory files",
+            "metadata": {
+                "parentSessionId": "ses_root",
+                "sessionId": "ses_child",
+                "model": { "modelID": "big-pickle", "providerID": "opencode" }
+            },
+            "status": "running",
+            "input": {
+                "description": "List current directory files",
+                "prompt": "List all files.",
+                "subagent_type": "explore"
+            },
+            "time": { "start": 1000 }
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                assert_eq!(subagent.subagent_id, "ses_child");
+                assert_eq!(subagent.provider_ref.as_deref(), Some("ses_child"));
+                assert_eq!(subagent.parent_item_id.as_deref(), Some("call_task"));
+                assert_eq!(subagent.status, SubagentStatus::Running);
+                assert_eq!(subagent.name.as_deref(), Some("List current directory files"));
+                assert_eq!(subagent.agent_type.as_deref(), Some("explore"));
+                assert_eq!(subagent.model.as_deref(), Some("opencode/big-pickle"));
+                assert!(subagent.result_text.is_none());
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_running_falls_back_to_input_description_for_name() {
+        // No `title` on the running state → name falls back to
+        // `input.description`.
+        let event = task_part_event(serde_json::json!({
+            "metadata": { "sessionId": "ses_child" },
+            "status": "running",
+            "input": { "description": "Investigate the bug", "subagent_type": "explore" }
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), None);
+        match &out[0] {
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                assert_eq!(subagent.name.as_deref(), Some("Investigate the bug"));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_completed_parses_result_envelope_and_duration() {
+        let event = task_part_event(serde_json::json!({
+            "status": "completed",
+            "input": { "subagent_type": "explore" },
+            "output": "<task id=\"ses_child\" state=\"completed\">\n<task_result>\nDone: 19 entries.\n</task_result>\n</task>",
+            "metadata": {
+                "parentSessionId": "ses_root",
+                "sessionId": "ses_child",
+                "model": { "modelID": "big-pickle", "providerID": "opencode" }
+            },
+            "title": "List current directory files",
+            "time": { "start": 1000, "end": 4500 }
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), None);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                assert_eq!(subagent.subagent_id, "ses_child");
+                assert_eq!(subagent.status, SubagentStatus::Completed);
+                assert_eq!(subagent.result_text.as_deref(), Some("Done: 19 entries."));
+                assert_eq!(subagent.duration_ms, Some(3500));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_completed_with_error_envelope_marks_failed() {
+        let event = task_part_event(serde_json::json!({
+            "status": "completed",
+            "input": {},
+            "output": "<task id=\"ses_child\" state=\"error\">\n<task_error>\nSubagent hit a wall.\n</task_error>\n</task>",
+            "metadata": { "sessionId": "ses_child" },
+            "time": { "start": 1000, "end": 2000 }
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), None);
+        match &out[0] {
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                assert_eq!(subagent.status, SubagentStatus::Failed);
+                assert_eq!(subagent.result_text.as_deref(), Some("Subagent hit a wall."));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_error_state_marks_failed() {
+        let event = task_part_event(serde_json::json!({
+            "status": "error",
+            "input": { "subagent_type": "explore" },
+            "error": "spawn failed",
+            "metadata": { "sessionId": "ses_child" }
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), None);
+        match &out[0] {
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                assert_eq!(subagent.subagent_id, "ses_child");
+                assert_eq!(subagent.status, SubagentStatus::Failed);
+                assert_eq!(subagent.result_text.as_deref(), Some("spawn failed"));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_tool_never_emits_generic_tool_card() {
+        // Even on completion the `task` tool must not produce
+        // ToolUse/ToolResult items — only the subagent card.
+        let event = task_part_event(serde_json::json!({
+            "status": "completed",
+            "input": {},
+            "output": "<task id=\"ses_child\" state=\"completed\"><task_result>ok</task_result></task>",
+            "metadata": { "sessionId": "ses_child" },
+            "time": { "start": 1, "end": 2 }
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), None);
+        assert!(
+            out.iter().all(|e| matches!(e, ProviderRuntimeEvent::SubagentUpdated { .. })),
+            "task tool must not emit generic ItemCompleted cards"
+        );
+    }
+
+    #[test]
+    fn parse_task_envelope_extracts_result_and_error_bodies() {
+        let ok = parse_task_envelope(
+            "<task id=\"ses_x\" state=\"completed\">\n<task_result>\nhello\n</task_result>\n</task>",
+        );
+        assert_eq!(ok.text, "hello");
+        assert!(!ok.is_error);
+
+        let err = parse_task_envelope(
+            "<task id=\"ses_x\" state=\"error\">\n<task_error>\nboom\n</task_error>\n</task>",
+        );
+        assert_eq!(err.text, "boom");
+        assert!(err.is_error);
+
+        // No envelope → the whole string is the report, treated as success.
+        let bare = parse_task_envelope("just some text");
+        assert_eq!(bare.text, "just some text");
+        assert!(!bare.is_error);
+    }
+
+    // ── Child-session routing ───────────────────────────────────────
+
+    #[test]
+    fn child_text_part_routes_with_subagent_id() {
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(super::super::protocol::MessagePartUpdated {
+            part: PartPayload::Text(super::super::protocol::TextPart {
+                id: "p1".into(),
+                session_id: "ses_child".into(),
+                message_id: "m1".into(),
+                text: "child reply".into(),
+                synthetic: None,
+            }),
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ProviderRuntimeEvent::ItemCompleted {
+                subagent_id,
+                item: CompletedItem::AssistantText { text },
+                ..
+            } => {
+                assert_eq!(subagent_id.as_deref(), Some("ses_child"));
+                assert_eq!(text, "child reply");
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_delta_routes_with_subagent_id() {
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartDelta(super::super::protocol::MessagePartDelta {
+            session_id: "ses_child".into(),
+            message_id: "m1".into(),
+            part_id: "p1".into(),
+            field: "text".into(),
+            delta: "hi".into(),
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
+        match &out[0] {
+            ProviderRuntimeEvent::ContentDelta { subagent_id, .. } => {
+                assert_eq!(subagent_id.as_deref(), Some("ses_child"));
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_tool_part_routes_with_subagent_id() {
+        let event = task_child_tool_event();
+        let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
+        assert_eq!(out.len(), 2);
+        for e in &out {
+            match e {
+                ProviderRuntimeEvent::ItemCompleted { subagent_id, .. } => {
+                    assert_eq!(subagent_id.as_deref(), Some("ses_child"));
+                }
+                other => panic!("wrong event: {other:?}"),
+            }
+        }
+    }
+
+    fn task_child_tool_event() -> OpenCodeEvent {
+        serde_json::from_value(serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "tp", "sessionID": "ses_child", "messageID": "m1",
+                    "type": "tool", "callID": "call_read", "tool": "read",
+                    "state": { "status": "completed", "input": {}, "output": "contents" }
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn child_session_idle_does_not_complete_parent_turn() {
+        let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(super::super::protocol::SessionIdle {
+            session_id: "ses_child".into(),
+        }));
+        assert!(
+            opencode_event_to_runtime(event, &ctx(), Some("ses_child")).is_empty(),
+            "child idle must not emit TurnCompleted"
+        );
+    }
+
+    #[test]
+    fn parent_session_idle_completes_turn() {
+        let event = OpenCodeEvent::Known(KnownEvent::SessionIdle(super::super::protocol::SessionIdle {
+            session_id: "ses_root".into(),
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), None);
+        assert!(matches!(out[0], ProviderRuntimeEvent::TurnCompleted { .. }));
+    }
+
+    #[test]
+    fn child_session_status_busy_ticks_subagent_running() {
+        let event = OpenCodeEvent::Known(KnownEvent::SessionStatus(super::super::protocol::SessionStatusEvent {
+            session_id: "ses_child".into(),
+            status: super::super::protocol::SessionStatusValue::Busy,
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
+        match &out[0] {
+            ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                assert_eq!(subagent.subagent_id, "ses_child");
+                assert_eq!(subagent.status, SubagentStatus::Running);
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn child_session_status_idle_is_noop() {
+        let event = OpenCodeEvent::Known(KnownEvent::SessionStatus(super::super::protocol::SessionStatusEvent {
+            session_id: "ses_child".into(),
+            status: super::super::protocol::SessionStatusValue::Idle,
+        }));
+        assert!(opencode_event_to_runtime(event, &ctx(), Some("ses_child")).is_empty());
+    }
+
+    #[test]
+    fn child_permission_asked_tags_subagent_id() {
+        let event = OpenCodeEvent::Known(KnownEvent::PermissionAsked(super::super::protocol::PermissionAskedEvent {
+            id: "per_1".into(),
+            session_id: "ses_child".into(),
+            permission: "external_directory".into(),
+            patterns: vec!["/*".into()],
+            metadata: serde_json::json!({ "filepath": "/" }),
+            tool: Some(super::super::protocol::PermissionToolRef {
+                message_id: "m1".into(),
+                call_id: "call_y".into(),
+            }),
+        }));
+        let out = opencode_event_to_runtime(event, &ctx(), Some("ses_child"));
+        match &out[0] {
+            ProviderRuntimeEvent::RequestOpened {
+                subagent_id,
+                request_id,
+                ..
+            } => {
+                assert_eq!(subagent_id.as_deref(), Some("ses_child"));
+                assert_eq!(request_id.0, "per_1");
+            }
+            other => panic!("wrong event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_mention_part_is_inert() {
+        let event = OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(super::super::protocol::MessagePartUpdated {
+            part: PartPayload::Agent(super::super::protocol::AgentPart {
+                id: "p".into(),
+                session_id: "ses_root".into(),
+                message_id: "m1".into(),
+                name: Some("explore".into()),
+            }),
+        }));
+        assert!(opencode_event_to_runtime(event, &ctx(), None).is_empty());
     }
 }

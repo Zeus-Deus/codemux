@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 let currentMessages: unknown[] = [];
 // Overridable per-test: thread -> messages map so the new race-fix
@@ -63,10 +63,12 @@ vi.mock("./ChatTranscript", () => ({
     messages,
     sessionStartedAt,
     onAcceptPlan,
+    onEnterSubagent,
   }: {
     messages: unknown[];
     sessionStartedAt?: number;
     onAcceptPlan: (requestId: string) => void;
+    onEnterSubagent?: (subagentId: string) => void;
   }) => (
     <div
       data-testid="transcript"
@@ -81,6 +83,12 @@ vi.mock("./ChatTranscript", () => ({
       <button
         data-testid="accept-plan"
         onClick={() => onAcceptPlan("req-1")}
+      />
+      {/* Lets the viewMode-swap test trigger the pane's real
+          onEnterSubagent handler without mounting the full card. */}
+      <button
+        data-testid="enter-subagent"
+        onClick={() => onEnterSubagent?.("sub-1")}
       />
     </div>
   ),
@@ -462,6 +470,65 @@ describe("AgentChatPane empty-state branch", () => {
     expect(
       container.querySelector('[data-testid="home-landing"]'),
     ).toBeNull();
+  });
+});
+
+describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
+  const subagentMessage = {
+    kind: "subagent_run",
+    id: "run-1",
+    seq: 1,
+    turn_id: "turn-1",
+    subagents: [
+      {
+        id: "sub-1",
+        name: "Explore",
+        model: "opus · xhigh",
+        status: "running",
+        items: [],
+        toneIndex: 0,
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1", seq: 0 }, subagentMessage];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    workspaceIdForPaneOverride = "ws-home";
+    vi.mocked(agentChatListMessages).mockReset();
+    vi.mocked(agentChatListMessages).mockResolvedValue([]);
+  });
+
+  it("swaps the transcript for the breadcrumb + read-only drill-in on enter, and Esc returns", () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+
+    // Orchestrator mode: the (mocked) transcript is shown, no breadcrumb.
+    expect(container.querySelector('[data-testid="transcript"]')).not.toBeNull();
+
+    // Enter the subagent via the real onEnterSubagent handler.
+    fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
+
+    // Drill-in mode: transcript gone, breadcrumb + read-only banner shown.
+    expect(container.querySelector('[data-testid="transcript"]')).toBeNull();
+    expect(container.textContent).toContain("Orchestrator");
+    expect(container.textContent).toContain("Read-only view of the");
+    // The drill-in shows the subagent name in both the banner and breadcrumb.
+    expect(container.textContent).toContain("Explore");
+
+    // Esc returns to the orchestrator transcript.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(container.querySelector('[data-testid="transcript"]')).not.toBeNull();
+  });
+
+  it("keeps the parent-bound composer mounted while entered", () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+    expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
+    fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
+    // Drill-in swaps the transcript body but the composer stays parent-bound
+    // (design: "steering goes to the orchestrator").
+    expect(container.querySelector('[data-testid="transcript"]')).toBeNull();
+    expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
   });
 });
 

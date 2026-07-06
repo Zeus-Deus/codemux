@@ -20,6 +20,8 @@ interface Props {
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  /** Enter a subagent's read-only drill-in (design "Enter subagent"). */
+  onEnterSubagent?: (subagentId: string) => void;
 }
 
 /**
@@ -37,6 +39,7 @@ export function ChatTranscript({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onEnterSubagent,
 }: Props) {
   const showThinking = shouldShowThinkingIndicator(messages, streaming);
 
@@ -51,6 +54,7 @@ export function ChatTranscript({
         onRespondToRequest={onRespondToRequest}
         onAcceptPlan={onAcceptPlan}
         onRejectPlan={onRejectPlan}
+        onEnterSubagent={onEnterSubagent}
       />
     </div>
   );

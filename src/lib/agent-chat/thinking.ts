@@ -32,6 +32,14 @@ export function shouldShowThinkingIndicator(
       return last.status !== "running";
     case "permission_request":
       return last.resolution.state !== "pending";
+    case "subagent_run":
+      // The orchestration card renders its own live spinners while any
+      // subagent is working, so the tail pulse steps back; once every
+      // subagent finishes it's dead time again (waiting on the
+      // orchestrator to resume).
+      return last.subagents.every(
+        (s) => s.status !== "running" && s.status !== "pending",
+      );
     case "user_message":
     case "turn_ended":
       return true;

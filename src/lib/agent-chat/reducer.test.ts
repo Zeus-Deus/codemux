@@ -15,6 +15,7 @@ import type {
   ChatThreadState,
   PermissionRequestItem,
   ReasoningItem,
+  SubagentRunItem,
   ToolCallItem,
 } from "./types";
 
@@ -1155,5 +1156,200 @@ describe("agent-chat reducer", () => {
       // The head reasoning block was trimmed with the rest — no special-casing.
       expect(reasoningItems(state)).toHaveLength(0);
     });
+  });
+});
+
+describe("agent-chat reducer — subagents", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  function subagentUpdated(
+    subagent: Record<string, unknown>,
+  ): ProviderRuntimeEvent {
+    return {
+      type: "subagent_updated",
+      thread_id: "t1",
+      subagent: subagent as never,
+    } as ProviderRuntimeEvent;
+  }
+  function subItem(
+    subagentId: string,
+    item: Record<string, unknown>,
+  ): ProviderRuntimeEvent {
+    return {
+      type: "item_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      subagent_id: subagentId,
+      item: item as never,
+    } as ProviderRuntimeEvent;
+  }
+  function cards(state: ChatThreadState): SubagentRunItem[] {
+    return state.messages.filter(
+      (m): m is SubagentRunItem => m.kind === "subagent_run",
+    );
+  }
+
+  it("materialises a SubagentRunItem card on the first subagent_updated", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "Explore" }),
+    ]);
+    const all = cards(state);
+    expect(all).toHaveLength(1);
+    expect(all[0].subagents).toHaveLength(1);
+    expect(all[0].subagents[0]).toMatchObject({
+      id: "a",
+      name: "Explore",
+      status: "running",
+    });
+  });
+
+  it("joins a second subagent to the same contiguous card", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      subagentUpdated({ subagent_id: "b", status: "running", name: "B" }),
+    ]);
+    const all = cards(state);
+    expect(all).toHaveLength(1);
+    expect(all[0].subagents.map((s) => s.id)).toEqual(["a", "b"]);
+  });
+
+  it("opens a NEW card when a parent item interrupts the spawn group", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      // A parent-flow assistant message breaks contiguity.
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "assistant_text", text: "interlude" },
+      },
+      subagentUpdated({ subagent_id: "b", status: "running", name: "B" }),
+    ]);
+    expect(cards(state)).toHaveLength(2);
+  });
+
+  it("merges snapshots (non-null wins) and keeps status monotonic", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "Impl" }),
+      subagentUpdated({ subagent_id: "a", status: "running", model: "opus" }),
+      subagentUpdated({
+        subagent_id: "a",
+        status: "completed",
+        result_text: "All done",
+        tool_use_count: 28,
+      }),
+      // A stray default-pending update must not revive a finished row.
+      subagentUpdated({ subagent_id: "a", status: "pending" }),
+    ]);
+    const sub = cards(state)[0].subagents[0];
+    expect(sub).toMatchObject({
+      name: "Impl",
+      model: "opus",
+      status: "completed",
+      resultText: "All done",
+      toolUseCount: 28,
+    });
+  });
+
+  it("routes subagent_id-tagged items into the subagent's sub-transcript, not the parent flow", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      subItem("a", {
+        kind: "tool_use",
+        tool_name: "Read",
+        tool_use_id: "x",
+        input: { file_path: "/f" },
+      }),
+      subItem("a", { kind: "tool_result", tool_use_id: "x", content: "ok", is_error: false }),
+      subItem("a", { kind: "assistant_text", text: "child says hi" }),
+    ]);
+    // The parent transcript holds ONLY the card (no leaked child rows).
+    expect(state.messages).toHaveLength(1);
+    const sub = cards(state)[0].subagents[0];
+    const childTool = sub.items.find((i) => i.kind === "tool_call");
+    expect(childTool).toMatchObject({ tool_name: "Read", status: "done" });
+    expect(
+      sub.items.some(
+        (i) => i.kind === "assistant_message" && i.text === "child says hi",
+      ),
+    ).toBe(true);
+  });
+
+  it("streams subagent content_delta into the sub-transcript", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      {
+        type: "content_delta",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        subagent_id: "a",
+        delta: { kind: "text", text: "Hel" },
+      },
+      {
+        type: "content_delta",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        subagent_id: "a",
+        delta: { kind: "text", text: "lo" },
+      },
+    ]);
+    const sub = cards(state)[0].subagents[0];
+    const msg = sub.items.find((i) => i.kind === "assistant_message");
+    expect(msg).toMatchObject({ text: "Hello" });
+    // The parent thread's streaming flag is owned by session_state, not
+    // by child deltas.
+    expect(state.streaming).toBe(false);
+  });
+
+  it("tags a bubbled request_opened with its subagent_id", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      {
+        type: "request_opened",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        request_id: "req-1",
+        request_kind: "command",
+        payload: {},
+        tool_use_id: null,
+        subagent_id: "a",
+      },
+    ]);
+    const req = state.messages.find(
+      (m): m is PermissionRequestItem => m.kind === "permission_request",
+    );
+    expect(req?.subagent_id).toBe("a");
+    // Bubbles into the parent flow so the turn can't stall invisibly.
+    expect(state.pendingRequestIds).toContain("req-1");
+  });
+
+  it("caps a subagent's retained items", () => {
+    const events: ProviderRuntimeEvent[] = [
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+    ];
+    for (let i = 0; i < 600; i++) {
+      events.push(subItem("a", { kind: "assistant_text", text: `m${i}` }));
+    }
+    const state = runEvents(events);
+    const sub = cards(state)[0].subagents[0];
+    expect(sub.items.length).toBeLessThanOrEqual(500);
+  });
+
+  it("survives a persisted replay unchanged (old rows still deserialize)", () => {
+    // subagent_updated without a `type`-less payload — replay path uses
+    // applyEvent; here we just confirm the reducer is a pure function of
+    // the same events applied twice.
+    const events: ProviderRuntimeEvent[] = [
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      subItem("a", { kind: "assistant_text", text: "hi" }),
+    ];
+    const once = runEvents(events);
+    __resetReducerIdCounterForTests();
+    const twice = runEvents(events);
+    expect(cards(twice)[0].subagents[0].items.length).toBe(
+      cards(once)[0].subagents[0].items.length,
+    );
   });
 });

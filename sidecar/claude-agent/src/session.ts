@@ -173,6 +173,12 @@ function buildQueryOptions(
     pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
     settingSources: ["user", "project", "local"],
     includePartialMessages: true,
+    // Ask the SDK to emit human-readable `summary` fields on
+    // `task_progress` events so the subagent card's activity line can
+    // show "currently doing X" instead of only a tool name. Subagent
+    // view (Stage 1). Everything else in the subagent pipeline is
+    // Rust-side.
+    agentProgressSummaries: true,
     canUseTool,
     // `env: process.env` pass-through matches the research finding.
     // The SDK itself is responsible for reading the user's Claude

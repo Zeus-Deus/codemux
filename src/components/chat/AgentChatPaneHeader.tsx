@@ -15,6 +15,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { useAgentChatCheckpoint } from "@/hooks/use-agent-chat-checkpoint";
 import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
+import { countRunningSubagents } from "@/lib/agent-chat/subagents";
 import { toast } from "@/lib/toast";
 import { selectThread, useAgentChatStore } from "@/stores/agent-chat-store";
 import { findWorkspaceIdForPane, useAppStore } from "@/stores/app-store";
@@ -74,6 +75,13 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
   const turnActive = useAgentChatStore((s) => {
     const slice = pane.thread_id ? selectThread(pane.thread_id)(s) : null;
     return slice ? slice.activeTurnId != null || slice.streaming : false;
+  });
+  // Orchestrator-mode pane sub-header pill: how many subagents are live
+  // in this thread right now. Store-driven off the reduced transcript
+  // (backend-state-driven), so it reflects hydrate + live events alike.
+  const runningSubagents = useAgentChatStore((s) => {
+    const slice = pane.thread_id ? selectThread(pane.thread_id)(s) : null;
+    return slice ? countRunningSubagents(slice.messages) : 0;
   });
   const [confirmRestoreOpen, setConfirmRestoreOpen] = useState(false);
   const [restoring, setRestoring] = useState(false);
@@ -224,6 +232,20 @@ export function AgentChatPaneHeader({ pane, isActive, onPointerDown }: Props) {
           <span className="px-1.5 text-xs text-muted-foreground">Agent Chat</span>
         )}
       </div>
+      {/* "N subagents running" pill (design) — amber, blinking dot,
+          always visible while any subagent in this thread is live. */}
+      {runningSubagents > 0 && (
+        <span
+          className="mr-1 inline-flex shrink-0 items-center gap-1.5 text-[11px] font-semibold text-status-working"
+          data-testid="subagents-running-pill"
+        >
+          <span
+            className="cm-blink h-1.5 w-1.5 rounded-full bg-status-working"
+            aria-hidden
+          />
+          {runningSubagents} subagent{runningSubagents === 1 ? "" : "s"} running
+        </span>
+      )}
       {/* Match the muted-at-rest / lift-on-hover dialect the rest of
           the app's pane headers landed in c11a3fc + e96619e: 28px hit
           target, 14px glyph, drop close to destructive-foreground when
