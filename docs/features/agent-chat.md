@@ -134,6 +134,28 @@ The chat pane stack:
   session history selector; permission-mode mid-session restart;
   pane-scoped chats; new-tab preset launch; base-branch picker; stop-click
   restarts the session so the next turn works.
+- **Restart auto-resume + persisted picker config**: a chat pane reopened
+  after an app quit resumes transparently. The provider session map is
+  empty on every launch (no startup rehydration), so the backend
+  `ensure_live_session` choke point in `commands/agent_chat.rs` rebuilds a
+  dead session from its `agent_chat_sessions` row on the next
+  `agent_chat_send_turn` / `agent_chat_respond_to_request` — reusing the
+  SAME `thread_id` (keeping the attached Channel, pane snapshot, and store
+  slice valid) and passing `resume_cursor: {"resume": sdk_session_id}`
+  when the row carries one (falling back to a fresh session, whose
+  transcript still hydrates from the DB, when it does not or when the
+  resume-start fails). Each thread's picker config (`model`, `effort`,
+  `context_window`, `permission_mode`) is persisted on the session row —
+  written at `agent_chat_start_session`, updated fire-and-forget by the
+  picker handlers via `agent_chat_update_session_config`, always persisted
+  by `agent_chat_set_model` / `agent_chat_set_permission_mode` (which now
+  swallow a `SessionNotFound` from the dead-session apply into `Ok`, so
+  the value takes effect on the next auto-resume), and carried across
+  silent restarts by `migrate_agent_chat_session`. On pane mount the
+  frontend fetches `agent_chat_get_session(threadId)` and re-seeds the
+  pickers + resume cursor from the row, falling back to the provider
+  default model only when no row (or no persisted model) exists —
+  fixing the post-restart "reset to Opus" regression.
 - **Reusable JSON-RPC-over-stdio child-process helper** with timeout,
   graceful shutdown, bidirectional notifications, server-initiated
   requests, and child-exit cleanup.
@@ -795,10 +817,15 @@ lives in `ChatHomeLanding.tsx`.
 
 ## Tauri command surface
 
-All commands gated on the `enable_agent_chat` feature flag. Lifecycle
-commands return a `feature_disabled: ...` string when the flag is
-off; session commands also return a `provider_not_configured: ...`
-string when the target provider is missing from the registry.
+Session/lifecycle commands are gated on the `enable_agent_chat` feature
+flag and return a `feature_disabled: ...` string when the flag is off;
+session commands also return a `provider_not_configured: ...` string
+when the target provider is missing from the registry. The read-only /
+DB-only history commands (`agent_chat_list_sessions`,
+`agent_chat_get_session`, `agent_chat_update_session_config`,
+`agent_chat_get_checkpoint`, rename/delete) are intentionally NOT
+flag-gated, so a pane re-seeds or falls back to defaults rather than
+surfacing a `feature_disabled` string.
 
 | Command | Purpose |
 |---|---|
@@ -806,12 +833,14 @@ string when the target provider is missing from the registry.
 | `agent_chat_close_pane` | Close a chat pane. Idempotent — double-close is a no-op. |
 | `dev_agent_chat_spawn_test_pane` | Debug-only. Spawns a chat pane in the active workspace for manual QA from the browser devtools. |
 | `agent_chat_start_session` | Start a provider session, writing the returned thread id back onto the pane. |
-| `agent_chat_send_turn` | Queue a user turn on a thread. |
-| `agent_chat_interrupt_turn` | Halt the currently-running turn. |
-| `agent_chat_respond_to_request` | Resolve a pending approval / input request. |
-| `agent_chat_set_model` | Swap a thread's model mid-session. |
-| `agent_chat_set_permission_mode` | Swap a thread's permission mode mid-session. |
+| `agent_chat_send_turn` | Queue a user turn on a thread. Auto-resumes a dead session (rebuilt from its persisted row) before the turn, so a pane reopened after an app restart never sees `session_not_found`. |
+| `agent_chat_interrupt_turn` | Halt the currently-running turn. A `SessionNotFound` (nothing to interrupt on a dead session) is swallowed into `Ok`; does NOT auto-resume. |
+| `agent_chat_respond_to_request` | Resolve a pending approval / input request. Auto-resumes a dead session first (same choke point as `send_turn`). |
+| `agent_chat_set_model` | Swap a thread's model. Persist-always, apply-if-live: writes the model to the session row unconditionally, then applies to the live session if one exists; a `SessionNotFound` from the apply is swallowed into `Ok` (the value takes effect on the next auto-resume). |
+| `agent_chat_set_permission_mode` | Swap a thread's permission mode. Same persist-always, apply-if-live contract as `agent_chat_set_model`. |
 | `agent_chat_stop_session` | Gracefully close a session. Idempotent. |
+| `agent_chat_get_session` | Return a single persisted session row by thread id, INCLUDING rows whose `sdk_session_id` is still null (unlike `agent_chat_list_sessions`), with the per-thread config columns. Not flag-gated. Used by the pane's mount-seed to restore pickers + resume cursor after a restart. |
+| `agent_chat_update_session_config` | Persist a per-thread config patch (`model` / `effort` / `context_window` / `permission_mode`) to the session row. DB-only, no live-session requirement; only the provided fields overwrite (`COALESCE`). Not flag-gated. Fired fire-and-forget by the picker handlers. |
 | `agent_chat_get_checkpoint` | Return the run-start rollback checkpoint recorded for a thread (or null). Not flag-gated — renders as "no checkpoint" instead of an error. |
 | `agent_chat_restore_checkpoint` | Roll the workspace back to the thread's run-start checkpoint. Mutates the working tree; the UI confirms first. |
 

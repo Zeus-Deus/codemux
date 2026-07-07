@@ -296,6 +296,10 @@ impl AgentProvider for CodexAgentProvider {
         Ok(())
     }
 
+    async fn has_session(&self, thread_id: &ThreadId) -> bool {
+        self.sessions.read().await.contains_key(thread_id)
+    }
+
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {
         let sessions = self.collect_sessions().await;
         let mut out = Vec::with_capacity(sessions.len());

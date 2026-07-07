@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -26,7 +26,9 @@ use crate::agent_provider::{
     ProviderRuntimeEvent, RequestId, SendTurnInput, SerializableProviderError,
     StartSessionInput, ThreadId, TurnId,
 };
-use crate::database::{AgentChatCheckpointRecord, AgentChatSessionRecord, DatabaseStore};
+use crate::database::{
+    AgentChatCheckpointRecord, AgentChatSessionConfig, AgentChatSessionRecord, DatabaseStore,
+};
 use crate::observability::ObservabilityStore;
 use crate::state::{AppStateStore, PaneStatus};
 
@@ -474,6 +476,21 @@ pub async fn agent_chat_start_session(
         .to_str()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
+    // Snapshot the per-thread chat configuration BEFORE the provider
+    // consumes `input`, so it can be persisted onto the session row for
+    // restart-resume (re-seeding the pickers) and read back by
+    // `ensure_live_session` when it silently restarts a dead session.
+    // Session start writes the exact launch selection but never CLEARS a
+    // column it simply doesn't know about, so map each plain
+    // `Option<String>` through `keep_or_set` (`Some` → set, `None` →
+    // leave untouched) rather than treating a `None` as an explicit
+    // clear.
+    let config_for_persist = AgentChatSessionConfig {
+        model: AgentChatSessionConfig::keep_or_set(input.model.clone()),
+        effort: AgentChatSessionConfig::keep_or_set(input.effort.clone()),
+        context_window: AgentChatSessionConfig::keep_or_set(input.context_window.clone()),
+        permission_mode: AgentChatSessionConfig::keep_or_set(input.permission_mode.clone()),
+    };
     // Trace the resume wire so the dev console shows whether a
     // resume_cursor actually reached the provider, and with what
     // shape. Helps distinguish "frontend didn't send it" from
@@ -557,6 +574,17 @@ pub async fn agent_chat_start_session(
         ) {
             eprintln!(
                 "[codemux::agent_chat] failed to persist session record: {error}"
+            );
+        }
+        // Persist the per-thread chat config the session started with so
+        // a restart re-seeds the pickers and auto-resume rebuilds the SDK
+        // session with the same settings. Best-effort — a failed write
+        // just means the pane falls back to defaults after a restart.
+        if let Err(error) =
+            db.update_agent_chat_session_config(&session.thread_id.0, &config_for_persist)
+        {
+            eprintln!(
+                "[codemux::agent_chat] failed to persist session config: {error}"
             );
         }
         // Issue #80 — optional rollback checkpoint. Spawned AFTER the
@@ -788,6 +816,178 @@ pub async fn agent_chat_restore_checkpoint(
     .map_err(|e| format!("agent_chat_restore_checkpoint task join failed: {e}"))?
 }
 
+// ── Backend auto-resume ──────────────────────────────────────────────
+
+/// Per-`thread_id` async locks that serialize [`ensure_live_session`]'s
+/// check→rebuild sequence.
+///
+/// Every provider `start_session` is TOCTOU: it checks the session map
+/// under a read lock, releases it, spawns the sidecar, and only THEN
+/// takes the write lock to insert. So two concurrent auto-resuming
+/// commands on the same dead thread (e.g. an `agent_chat_send_turn`
+/// racing an `agent_chat_respond_to_request` on a replayed pending
+/// request after a restart) can both observe `has_session() == false`,
+/// both pass the `contains_key` guard, and both spawn a sidecar — the
+/// second insert then overwrites and drops the first session, orphaning
+/// one sidecar and resuming the same server-side session id twice.
+/// Holding a per-thread lock across the whole check→rebuild makes the
+/// resume idempotent.
+fn resume_locks() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fetch (or create) the resume lock for a single thread. The returned
+/// `Arc` is cloned out from under the map's std mutex so the short
+/// synchronous section never overlaps the `.await` on the async lock.
+fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut map = resume_locks().lock().unwrap();
+    map.entry(thread_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Ensure a live provider session is bound to `thread_id`, silently
+/// rebuilding it from the persisted `agent_chat_sessions` row when the
+/// provider's in-memory session map has no entry (the state after an app
+/// restart, where NO startup rehydration exists and the map starts
+/// empty).
+///
+/// This is the single choke point for backend auto-resume: every command
+/// that needs a live session (`agent_chat_send_turn`,
+/// `agent_chat_respond_to_request`) calls it first, so a user who reopens
+/// the app and immediately interacts with an existing chat pane gets
+/// their conversation transparently resumed instead of a
+/// `session_not_found` error.
+///
+/// Reuses the SAME `thread_id` on the rebuilt session — the map is empty
+/// after a restart so there is no collision, and keeping the id means the
+/// attached frontend `Channel`, the pane snapshot, and the store slice
+/// all stay valid with zero migration.
+///
+/// Resume strategy: pass `resume_cursor: {"resume": <sdk_session_id>}`
+/// when the row carries one (Claude reads `resume`/`sessionId`; codex /
+/// opencode consume their own cursor shapes best-effort). If the
+/// resume-start fails (e.g. the SDK rejects a stale session id), retry
+/// once as a FRESH session — the visible transcript already hydrates from
+/// the DB, so the user keeps their history even though the provider
+/// forgets its server-side context.
+///
+/// A no-op (returns `Ok`) when a session is already live, or when there
+/// is no persisted row to rebuild from — in the latter case the caller's
+/// own provider call surfaces the normal `SessionNotFound`.
+///
+/// Generic over the Tauri runtime so the integration tests can drive it
+/// on `tauri::test::mock_app`, mirroring `forward_event`.
+pub async fn ensure_live_session<R: Runtime>(
+    app: &AppHandle<R>,
+    provider_kind: ProviderKind,
+    thread_id: &ThreadId,
+) -> Result<(), String> {
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider_kind).await?;
+    // Fast path: a live session already exists, so no need to serialize
+    // — this is the common case (every send after the first).
+    if impl_.has_session(thread_id).await {
+        return Ok(());
+    }
+
+    // Serialize the check→rebuild across concurrent callers on the same
+    // thread so two auto-resumes can't each spawn a sidecar (see
+    // `resume_locks`). Held for the whole rebuild below.
+    let resume_lock = resume_lock_for(&thread_id.0);
+    let _resume_guard = resume_lock.lock().await;
+    // Re-check under the lock: another task may have rebuilt the session
+    // while we were waiting to acquire it.
+    if impl_.has_session(thread_id).await {
+        return Ok(());
+    }
+
+    // No live session — try to rebuild from the persisted row.
+    let record = {
+        let db: State<'_, DatabaseStore> = app.state();
+        db.get_agent_chat_session(&thread_id.0)
+    };
+    let Some(record) = record else {
+        // Nothing persisted; let the caller's provider call surface the
+        // normal SessionNotFound rather than inventing a fresh session
+        // with no history.
+        return Ok(());
+    };
+
+    let cwd = record
+        .cwd
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    // Rebuild the workspace env overlay so the resumed agent's
+    // browser / CLI subprocesses route to its OWN workspace, exactly
+    // like `agent_chat_start_session`. Resolve the pane from the thread;
+    // an orphaned thread (no pane) injects nothing.
+    let env = {
+        let state: State<'_, AppStateStore> = app.state();
+        match state.agent_chat_pane_id_for_thread(&thread_id.0) {
+            Some(pane_id) => {
+                let workspace_id = state.workspace_id_for_pane(&pane_id);
+                let snapshot = state.snapshot();
+                let ws = workspace_id
+                    .as_ref()
+                    .and_then(|id| snapshot.workspaces.iter().find(|w| &w.workspace_id.0 == id));
+                workspace_env_overlay(ws, &pane_id, None)
+            }
+            None => None,
+        }
+    };
+
+    let resume_cursor = record
+        .sdk_session_id
+        .as_ref()
+        .map(|id| serde_json::json!({ "resume": id }));
+
+    let build_input = |resume_cursor: Option<serde_json::Value>| StartSessionInput {
+        thread_id: thread_id.clone(),
+        cwd: cwd.clone(),
+        model: record.model.clone(),
+        resume_cursor,
+        permission_mode: record.permission_mode.clone(),
+        effort: record.effort.clone(),
+        context_window: record.context_window.clone(),
+        additional_directories: vec![],
+        env: env.clone(),
+        extra: serde_json::Value::Null,
+    };
+
+    eprintln!(
+        "[codemux::agent_chat] auto-resuming dead session thread={} provider={provider_kind:?} \
+         resume={} model={:?}",
+        thread_id.0,
+        resume_cursor.is_some(),
+        record.model,
+    );
+
+    match impl_.start_session(build_input(resume_cursor.clone())).await {
+        Ok(_) => Ok(()),
+        Err(err) if resume_cursor.is_some() => {
+            // Resume-start failed — retry once as a fresh session. The
+            // transcript already hydrates from the DB, so the user keeps
+            // their visible history.
+            eprintln!(
+                "[codemux::agent_chat] resume-start failed for thread={} ({err}); \
+                 retrying as a fresh session",
+                thread_id.0,
+            );
+            impl_
+                .start_session(build_input(None))
+                .await
+                .map_err(provider_err)?;
+            Ok(())
+        }
+        Err(err) => Err(provider_err(err)),
+    }
+}
+
 /// Queue a user turn on an existing session.
 #[tauri::command]
 pub async fn agent_chat_send_turn(
@@ -797,6 +997,11 @@ pub async fn agent_chat_send_turn(
 ) -> Result<TurnId, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // Auto-resume: if the provider's session map has no live session for
+    // this thread (e.g. the app was restarted), rebuild it from the
+    // persisted row before the turn so the user never sees a
+    // `session_not_found`. No-op when a session is already live.
+    ensure_live_session(&app, provider, &input.thread_id).await?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     // Capture the inputs we need for persistence before the provider
@@ -854,6 +1059,12 @@ fn first_line_title(text: &str) -> Option<String> {
 }
 
 /// Interrupt the currently running turn on a thread.
+///
+/// A `SessionNotFound` is swallowed into `Ok`: there is nothing to
+/// interrupt on a dead session (e.g. after a restart, before any turn
+/// has re-hydrated it), so a stale stop-click must not surface an error.
+/// Interrupt deliberately does NOT auto-resume — restarting a session
+/// just to immediately interrupt it would be pointless.
 #[tauri::command]
 pub async fn agent_chat_interrupt_turn(
     app: AppHandle,
@@ -865,10 +1076,11 @@ pub async fn agent_chat_interrupt_turn(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    impl_
-        .interrupt_turn(thread_id, turn_id)
-        .await
-        .map_err(provider_err)
+    match impl_.interrupt_turn(thread_id, turn_id).await {
+        Ok(()) => Ok(()),
+        Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+        Err(err) => Err(provider_err(err)),
+    }
 }
 
 /// Respond to a pending approval / tool / input request.
@@ -882,6 +1094,10 @@ pub async fn agent_chat_respond_to_request(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
+    // Auto-resume before responding: a pending approval a user acts on
+    // after a restart must land on a live session, not a
+    // `session_not_found`. No-op when a session is already live.
+    ensure_live_session(&app, provider, &thread_id).await?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     impl_
@@ -893,6 +1109,13 @@ pub async fn agent_chat_respond_to_request(
 /// Swap a session's active model. `model == None` is a validation
 /// error — the trait's `set_model` takes a `String`, and the
 /// resulting `ProviderError::ValidationError` is reflected here.
+///
+/// Persist-always, apply-if-live: the new model is written to the
+/// session's DB config unconditionally (so it survives a restart and is
+/// picked up by the next `ensure_live_session` auto-resume) and only
+/// THEN applied to the live session. A `SessionNotFound` from the live
+/// apply is swallowed into `Ok` — the value already took effect for the
+/// next resume.
 #[tauri::command]
 pub async fn agent_chat_set_model(
     app: AppHandle,
@@ -905,15 +1128,37 @@ pub async fn agent_chat_set_model(
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
     let model = model.ok_or_else(|| "validation_error: model required".to_string())?;
-    impl_
-        .set_model(thread_id, model)
-        .await
-        .map_err(provider_err)
+    // Persist first so a restart / next auto-resume uses the new model
+    // even if no live session exists to apply it to right now.
+    {
+        let db: State<'_, DatabaseStore> = app.state();
+        let config = AgentChatSessionConfig {
+            model: AgentChatSessionConfig::set(model.clone()),
+            ..AgentChatSessionConfig::default()
+        };
+        if let Err(error) = db.update_agent_chat_session_config(&thread_id.0, &config) {
+            eprintln!("[codemux::agent_chat] failed to persist model config: {error}");
+        }
+    }
+    match impl_.set_model(thread_id, model).await {
+        Ok(()) => Ok(()),
+        // A dead session is fine: the persisted value is applied on the
+        // next auto-resume.
+        Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+        Err(err) => Err(provider_err(err)),
+    }
 }
 
 /// Change a session's permission mode (accept-edits, bypass, plan,
 /// etc.). The mode is passed through as a string; providers reject
 /// unknown values via `ProviderError::ValidationError`.
+///
+/// Persist-always, apply-if-live (same contract as
+/// [`agent_chat_set_model`]): the mode is written to the DB config
+/// before the live apply, and a `SessionNotFound` from the apply is
+/// swallowed into `Ok` so a restart / next auto-resume adopts the mode.
+/// Non-`SessionNotFound` errors (e.g. a provider that rejects
+/// mid-session permission changes) still surface.
 #[tauri::command]
 pub async fn agent_chat_set_permission_mode(
     app: AppHandle,
@@ -925,10 +1170,24 @@ pub async fn agent_chat_set_permission_mode(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    impl_
-        .set_permission_mode(thread_id, mode)
-        .await
-        .map_err(provider_err)
+    // Persist first so the value survives a restart / next auto-resume.
+    {
+        let db: State<'_, DatabaseStore> = app.state();
+        let config = AgentChatSessionConfig {
+            permission_mode: AgentChatSessionConfig::set(mode.clone()),
+            ..AgentChatSessionConfig::default()
+        };
+        if let Err(error) = db.update_agent_chat_session_config(&thread_id.0, &config) {
+            eprintln!(
+                "[codemux::agent_chat] failed to persist permission_mode config: {error}"
+            );
+        }
+    }
+    match impl_.set_permission_mode(thread_id, mode).await {
+        Ok(()) => Ok(()),
+        Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+        Err(err) => Err(provider_err(err)),
+    }
 }
 
 /// Return the chat-side capabilities bundle for a provider.
@@ -1098,6 +1357,50 @@ pub async fn agent_chat_list_sessions(
 ) -> Result<Vec<AgentChatSessionRecord>, String> {
     let limit = limit.unwrap_or(50);
     Ok(db.list_agent_chat_sessions(&workspace_id, cwd.as_deref(), limit))
+}
+
+/// Fetch a single persisted chat session row by `thread_id`, including
+/// the per-thread config columns (`model`, `effort`, `context_window`,
+/// `permission_mode`).
+///
+/// Unlike [`agent_chat_list_sessions`], this returns the row EVEN when
+/// its `sdk_session_id` is still `NULL` — the frontend calls it on pane
+/// mount to re-seed the pickers (and the resume cursor) for a thread
+/// that may not yet have produced its first SDK message. Returns `None`
+/// when no row exists for the thread.
+///
+/// Not gated on the feature flag, consistent with the other DB-only
+/// history commands (`agent_chat_list_sessions`,
+/// `agent_chat_get_checkpoint`): the pane should fall back to defaults
+/// rather than surface a feature-flag error string when the flag is off.
+#[tauri::command]
+pub async fn agent_chat_get_session(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+) -> Result<Option<AgentChatSessionRecord>, String> {
+    Ok(db.get_agent_chat_session(&thread_id))
+}
+
+/// Persist a per-thread chat config change (model / effort /
+/// context-window / permission-mode) WITHOUT requiring a live session.
+///
+/// DB-only: the picker handlers call this fire-and-forget on every
+/// change so the selection survives a restart and is re-applied by the
+/// next `ensure_live_session` auto-resume. Each field is tri-state: an
+/// absent field leaves the stored column untouched, an explicit JSON
+/// `null` CLEARS it to NULL (used by the model-change compat reset), and
+/// a value overwrites it (see
+/// [`DatabaseStore::update_agent_chat_session_config`]).
+///
+/// Not gated on the feature flag, same rationale as
+/// [`agent_chat_get_session`].
+#[tauri::command]
+pub async fn agent_chat_update_session_config(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+    config: AgentChatSessionConfig,
+) -> Result<(), String> {
+    db.update_agent_chat_session_config(&thread_id, &config)
 }
 
 /// Rename a persisted chat session. Used by the dropdown's per-row

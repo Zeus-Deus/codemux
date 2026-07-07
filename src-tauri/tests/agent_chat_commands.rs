@@ -742,6 +742,256 @@ async fn full_bridge_pipeline_streams_provider_events_per_thread() {
     assert!(b.iter().all(|p| p.thread_id.0 == "pipe-b"));
 }
 
+// ── Backend auto-resume after a restart ──
+//
+// The bug: after the app is closed and reopened, the provider's live
+// session map is empty (no startup rehydration) but the persisted
+// `agent_chat_sessions` row survives. Every turn on the reopened pane
+// used to hit `session_not_found`. `ensure_live_session` must transparently
+// rebuild the session from that row — reusing the SAME thread_id, resuming
+// from the persisted `sdk_session_id`, with the persisted model — so the
+// turn goes through.
+//
+// Drives the REAL `ClaudeAgentProvider` against the `fake_claude_sidecar`
+// (script-driven, no SDK / Anthropic account) so we can assert on exactly
+// what `start-session` the auto-resume sent.
+
+mod auto_resume {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use codemux_lib::agent_provider::claude::{ClaudeAgentProvider, ClaudeProviderConfig};
+    use codemux_lib::agent_provider::{AgentProvider, ProviderKind, SendTurnInput, ThreadId};
+    use codemux_lib::commands::agent_chat::{ensure_live_session, ProviderRegistry};
+    use codemux_lib::database::{AgentChatSessionConfig, DatabaseStore};
+    use codemux_lib::state::AppStateStore;
+    use serde_json::Value;
+    use tauri::Manager;
+
+    fn fake_sidecar() -> PathBuf {
+        PathBuf::from(env!("CARGO_BIN_EXE_fake_claude_sidecar"))
+    }
+
+    /// Minimal POSIX shell escaper, mirroring the local module in
+    /// `claude_adapter.rs` (which is a test-local module, not a crate).
+    mod shell_escape {
+        pub fn escape<S: AsRef<str>>(s: S) -> String {
+            let s = s.as_ref();
+            if s.is_empty() {
+                return "''".into();
+            }
+            if s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-/=".contains(c))
+            {
+                return s.to_string();
+            }
+            let mut out = String::from("'");
+            for c in s.chars() {
+                if c == '\'' {
+                    out.push_str("'\\''");
+                } else {
+                    out.push(c);
+                }
+            }
+            out.push('\'');
+            out
+        }
+    }
+
+    /// Bash wrapper that exports `FAKE_CLAUDE_SIDECAR_CAPTURE=<path>` then
+    /// `exec`s the fake sidecar, so the sidecar records every received
+    /// `start-session`'s params to `capture` for later assertion. Mirrors
+    /// `claude_adapter.rs::wrapper_with_env`. Written into `dir` (a
+    /// caller-owned tempdir that must outlive the spawned session).
+    fn capture_wrapper(dir: &std::path::Path, capture: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("wrap.sh");
+        let body = format!(
+            "#!/usr/bin/env bash\nset -e\nexport FAKE_CLAUDE_SIDECAR_CAPTURE={}\nexec {} \"$@\"\n",
+            shell_escape::escape(capture.to_string_lossy()),
+            shell_escape::escape(fake_sidecar().to_string_lossy()),
+        );
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn claude_provider_with_capture(wrapper: PathBuf) -> Arc<ClaudeAgentProvider> {
+        Arc::new(
+            ClaudeAgentProvider::new(ClaudeProviderConfig {
+                sidecar_binary: Some(wrapper),
+                claude_binary: Some(PathBuf::from("/usr/bin/claude")),
+                event_channel_capacity: 1024,
+                mcp_registry: None,
+            })
+            .await
+            .expect("provider"),
+        )
+    }
+
+    fn read_capture(path: &std::path::Path) -> Vec<Value> {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).expect("valid capture json"))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_after_dead_session_auto_resumes_with_persisted_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let capture = tmp.path().join("start-session-capture.jsonl");
+        let cwd = tmp.path().join("workdir");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let wrapper = capture_wrapper(tmp.path(), &capture);
+
+        // Managed state the command path touches. A fresh provider whose
+        // session map is EMPTY models the post-restart process.
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle().clone();
+
+        let provider = claude_provider_with_capture(wrapper).await;
+        {
+            let registry: tauri::State<'_, ProviderRegistry> = handle.state();
+            registry.set_claude(provider.clone() as Arc<dyn AgentProvider>).await;
+        }
+
+        // Seed the persisted row exactly as it would survive a restart:
+        // a live sdk_session_id + a chosen model, but NO live session.
+        let thread = ThreadId("chat-pane-448-1783369893274".into());
+        {
+            let db: tauri::State<'_, DatabaseStore> = handle.state();
+            db.upsert_agent_chat_session(
+                &thread.0,
+                "ws-1",
+                Some(&cwd.to_string_lossy()),
+                "claude",
+            )
+            .unwrap();
+            db.set_agent_chat_sdk_session_id(&thread.0, "sdk-uuid-123")
+                .unwrap();
+            db.update_agent_chat_session_config(
+                &thread.0,
+                &AgentChatSessionConfig {
+                    model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                    ..AgentChatSessionConfig::default()
+                },
+            )
+            .unwrap();
+        }
+
+        // Precondition: the map is empty (the restart bug's starting point).
+        assert!(
+            !provider.has_session(&thread).await,
+            "no live session should exist before auto-resume"
+        );
+
+        // The choke point: rebuild the dead session from the DB row.
+        ensure_live_session(&handle, ProviderKind::Claude, &thread)
+            .await
+            .expect("auto-resume should succeed");
+
+        // The session is live again under the SAME thread_id.
+        assert!(
+            provider.has_session(&thread).await,
+            "auto-resume must rebind a live session to the same thread_id"
+        );
+
+        // The fake sidecar received a start-session carrying the persisted
+        // resume cursor and model.
+        let captured = read_capture(&capture);
+        assert_eq!(captured.len(), 1, "exactly one start-session was sent");
+        let params = &captured[0]["params"];
+        assert_eq!(
+            params["threadId"].as_str(),
+            Some(thread.0.as_str()),
+            "resumed session reuses the same thread_id"
+        );
+        assert_eq!(
+            params["resume"].as_str(),
+            Some("sdk-uuid-123"),
+            "resume cursor threaded through from the persisted sdk_session_id"
+        );
+        assert_eq!(
+            params["model"].as_str(),
+            Some("claude-opus-4-8"),
+            "persisted model threaded through to the SDK start-session"
+        );
+
+        // And a turn now goes through instead of session_not_found.
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: thread.clone(),
+                text: "still here after restart?".into(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+            })
+            .await
+            .expect("send_turn succeeds on the resumed session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ensure_live_session_is_a_noop_when_session_already_live() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let capture = tmp.path().join("capture.jsonl");
+        let cwd = tmp.path().join("workdir");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let wrapper = capture_wrapper(tmp.path(), &capture);
+
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle().clone();
+
+        let provider = claude_provider_with_capture(wrapper).await;
+        {
+            let registry: tauri::State<'_, ProviderRegistry> = handle.state();
+            registry.set_claude(provider.clone() as Arc<dyn AgentProvider>).await;
+        }
+
+        let thread = ThreadId("thread-live".into());
+        {
+            let db: tauri::State<'_, DatabaseStore> = handle.state();
+            db.upsert_agent_chat_session(&thread.0, "ws-1", Some(&cwd.to_string_lossy()), "claude")
+                .unwrap();
+        }
+
+        // Start a real session so the map has an entry.
+        provider
+            .start_session(codemux_lib::agent_provider::StartSessionInput {
+                thread_id: thread.clone(),
+                cwd: cwd.clone(),
+                model: None,
+                resume_cursor: None,
+                permission_mode: None,
+                effort: None,
+                context_window: None,
+                additional_directories: vec![],
+                env: None,
+                extra: Value::Null,
+            })
+            .await
+            .expect("start ok");
+        let captures_after_start = read_capture(&capture).len();
+
+        // ensure_live_session must NOT start a second session.
+        ensure_live_session(&handle, ProviderKind::Claude, &thread)
+            .await
+            .expect("no-op ok");
+        assert_eq!(
+            read_capture(&capture).len(),
+            captures_after_start,
+            "a live session must not be restarted by ensure_live_session"
+        );
+    }
+}
+
 // ── Run checkpoints (issue #80) ──
 //
 // End-to-end backend round trip through the same blocking helpers the

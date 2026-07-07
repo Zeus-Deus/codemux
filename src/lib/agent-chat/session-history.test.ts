@@ -20,6 +20,10 @@ function makeSession(
     title: null,
     created_at: "2026-04-24 12:00:00",
     last_active_at: "2026-04-24 12:00:00",
+    model: null,
+    effort: null,
+    context_window: null,
+    permission_mode: null,
     ...overrides,
   };
 }

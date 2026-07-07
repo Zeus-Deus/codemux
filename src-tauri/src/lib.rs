@@ -1523,6 +1523,8 @@ pub fn run() {
             commands::list_launch_gemini_models,
             commands::agent_chat_stop_session,
             commands::agent_chat_list_sessions,
+            commands::agent_chat_get_session,
+            commands::agent_chat_update_session_config,
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,

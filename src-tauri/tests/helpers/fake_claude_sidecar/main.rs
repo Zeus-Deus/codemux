@@ -55,6 +55,28 @@ struct ScriptEntry {
     params: Value,
 }
 
+/// Append the raw params of a received RPC to the capture file named by
+/// `FAKE_CLAUDE_SIDECAR_CAPTURE`, one JSON object per line. Lets a test
+/// assert on exactly what the adapter sent (e.g. that an auto-resume
+/// `start-session` carried the persisted `resume` cursor and model).
+/// A no-op when the env var is unset.
+fn capture_params(method: &str, params: &Value) {
+    let Ok(path) = std::env::var("FAKE_CLAUDE_SIDECAR_CAPTURE") else {
+        return;
+    };
+    let record = json!({ "method": method, "params": params });
+    let mut line = serde_json::to_string(&record).expect("serialize capture");
+    line.push('\n');
+    // Best-effort append; a capture failure must not perturb the RPC path.
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// Serialize and write one framed JSON line. Uses the stdout lock so
 /// writes from script threads interleave safely with the main loop.
 fn write_line(value: &Value) {
@@ -156,6 +178,7 @@ fn main() {
                 }
             }
             "start-session" => {
+                capture_params(method, &msg.params);
                 let thread_id = msg
                     .params
                     .get("threadId")
