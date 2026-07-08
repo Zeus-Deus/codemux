@@ -108,10 +108,24 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
     if (highest) tabStatusMap.set(tab.tab_id, highest);
   }
 
+  // Translate a vertical mouse-wheel delta into horizontal scrolling, same
+  // fix as the old PresetBar: `overflow-x: auto` only responds to native
+  // horizontal wheel/trackpad input on its own, not a plain vertical wheel
+  // (verified on the WebKit webview — a vertical wheel over the bar moved
+  // `scrollLeft` by 0). Lets tabs scroll with a normal mouse wheel once
+  // they overflow instead of only reacting to trackpad panning.
+  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    if (el.scrollWidth <= el.clientWidth || e.deltaY === 0) return;
+    el.scrollLeft += e.deltaY;
+  };
+
   return (
     <div
       className="flex min-w-0 items-center gap-1 overflow-x-auto"
       style={{ scrollbarWidth: "none" }}
+      onWheel={handleWheel}
+      data-testid="titlebar-tabs-scroll"
     >
       {workspace.tabs.map((tab) => {
         const surface = tab.surface_id
@@ -185,7 +199,7 @@ function TitleBarTab({
         title={tab.title}
       >
         <span className="shrink-0 opacity-90">{tabIcon(tab, isChat)}</span>
-        <span className="max-w-[140px] truncate">{tab.title}</span>
+        <span className="max-w-[130px] truncate">{tab.title}</span>
         {status && <StatusIndicator status={status} />}
       </button>
       <button
@@ -255,7 +269,7 @@ function ActiveChatTab({ workspace, tab, pane, status }: ActiveChatTabProps) {
               <span className="shrink-0 opacity-90">
                 <MessageSquare className="h-3 w-3" />
               </span>
-              <span className="max-w-[140px] truncate">{tab.title}</span>
+              <span className="max-w-[130px] truncate">{tab.title}</span>
               {status && <StatusIndicator status={status} />}
               <ChevronDown
                 className={cn(

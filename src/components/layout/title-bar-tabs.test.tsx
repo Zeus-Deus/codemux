@@ -179,6 +179,21 @@ describe("TitleBarTabs", () => {
     }
   });
 
+  it("translates a vertical wheel delta into horizontal scroll once tabs overflow", () => {
+    mocks.listSessions.mockResolvedValue([]);
+    render(<TitleBarTabs workspace={makeWorkspace(chatPane("thread-1"))} />);
+    const scroller = screen.getByTestId("titlebar-tabs-scroll");
+    // jsdom reports 0 for both by default; stub an overflowing layout so
+    // the guard (`scrollWidth <= clientWidth`) doesn't short-circuit —
+    // mirrors the WebKit-webview quirk noted in the handler: a plain
+    // vertical wheel doesn't natively scroll an `overflow-x: auto` box.
+    Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+    Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+    Object.defineProperty(scroller, "scrollLeft", { value: 0, writable: true, configurable: true });
+    fireEvent.wheel(scroller, { deltaY: 120 });
+    expect(scroller.scrollLeft).toBe(120);
+  });
+
   it("activates an inactive tab on click", () => {
     mocks.listSessions.mockResolvedValue([]);
     const ws = makeWorkspace(chatPane("thread-1"), {

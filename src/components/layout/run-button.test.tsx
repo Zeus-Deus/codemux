@@ -61,6 +61,14 @@ function renderRunButton(workspaceId = "ws-1") {
   );
 }
 
+function renderSplitRunButton(workspaceId = "ws-1") {
+  return render(
+    <TooltipProvider>
+      <RunButton workspaceId={workspaceId} variant="split" />
+    </TooltipProvider>,
+  );
+}
+
 beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -144,6 +152,21 @@ describe("RunButton", () => {
     expect(screen.getByText("Ctrl+Shift+G")).toBeInTheDocument();
   });
 
+  it("legacy default renders the standalone gear button that opens configure", async () => {
+    const { container } = renderRunButton();
+    await flushPromises();
+    // Original shape: ghost Run/Set Run button + a second, standalone gear
+    // Button (no aria-label — pre-change markup, kept byte-identical).
+    const buttons = container.querySelectorAll("button");
+    expect(buttons).toHaveLength(2);
+    // No split-caret in legacy mode.
+    expect(
+      screen.queryByRole("button", { name: "Configure run command" }),
+    ).toBeNull();
+    await userEvent.click(buttons[1]);
+    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
+  });
+
   it('falls back to "Set Run" when no project root', async () => {
     mockActiveWorkspace = {
       workspace_id: "ws-1",
@@ -163,5 +186,60 @@ describe("RunButton", () => {
     renderRunButton();
     await flushPromises();
     expect(screen.getByText("Set Run")).toBeInTheDocument();
+  });
+});
+
+// GUI-chrome shape (`variant="split"`, passed only by title-bar.tsx).
+// The legacy default above stays byte-identical for the flag-off PresetBar.
+describe("RunButton — split variant", () => {
+  it('main segment shows "Set Run" and opens configure when unconfigured', async () => {
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Set Run"));
+    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
+    expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
+  });
+
+  it('main segment shows "Run" and runs the dev command when configured', async () => {
+    mockGetProjectScripts.mockResolvedValue({
+      setup: [],
+      teardown: [],
+      run: "npm run dev",
+    });
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(screen.getByText("Run"));
+    expect(mockRunProjectDevCommand).toHaveBeenCalledWith("ws-1");
+  });
+
+  it("caret segment opens configure regardless of configured state", async () => {
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Configure run command" }),
+    );
+    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
+  });
+
+  it("caret segment opens configure even when a run command is set", async () => {
+    mockGetProjectScripts.mockResolvedValue({
+      setup: [],
+      teardown: [],
+      run: "npm run dev",
+    });
+    renderSplitRunButton();
+    await flushPromises();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Configure run command" }),
+    );
+    expect(mockSetShowSettings).toHaveBeenCalledWith(true, "projects");
+    // Caret never runs the command — only the main segment does.
+    expect(mockRunProjectDevCommand).not.toHaveBeenCalled();
+  });
+
+  it("keeps the shortcut badge in the main segment", async () => {
+    renderSplitRunButton();
+    await flushPromises();
+    expect(screen.getByText("Ctrl+Shift+G")).toBeInTheDocument();
   });
 });

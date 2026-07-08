@@ -26,7 +26,15 @@ null && workspace_type != null && workspace_type !== "open_flow"`. When false
 it returns the byte-identical legacy `h-9` bar; when true it composes discrete
 slots left-to-right:
 
-`[sidebar toggle] [tabs] [+ launcher] [chat favorite] …drag spacer… [right-panel toggle] [RunButton] [ResourceMonitor] [IdeLauncher] [sep] [WindowControls]`
+`[sidebar-width cluster: sidebar toggle] | [tabs] [+ launcher] | [pinned preset tiles] …drag spacer… [right-panel toggle] [RunButton split] [ResourceMonitor] [IdeLauncher compact] [sep] [WindowControls]`
+
+The far-left cluster contains **only the sidebar toggle** and is sized to the
+live sidebar width (`useSidebarGapWidth()` in
+`src/hooks/use-sidebar-gap-width.ts` — measures the sidebar's
+`[data-slot="sidebar-gap"]` box via ResizeObserver, since the titlebar
+renders outside `SidebarProvider`), with a hairline `border-r` at the
+sidebar boundary so tabs start where the content pane starts (design:
+`.design/top-bar.dc.html`).
 
 - **`TitleBarTabs`** (`src/components/layout/title-bar-tabs.tsx`) — the
   workspace's backend-owned tabs as compact pills (h-7, rounded-lg) with a
@@ -35,7 +43,9 @@ slots left-to-right:
   The **active chat tab** grows a chevron opening the session-history dropdown
   and renders the live "N subagents running" pill inline beside it.
   Activation/close route through the existing `activateTab` / `closeTab`
-  commands.
+  commands. Pills cap at `max-w-[130px]` and the strip scrolls
+  horizontally (wheel → horizontal translation, hidden scrollbar) instead
+  of shrinking when tabs overflow.
 - **`AgentLauncher`** (`src/components/layout/agent-launcher.tsx`) — the `+`
   popover, a cmdk `Command` with sections **GUI** (`chat_agent` presets,
   `PINNED` tag → `agentChatCreatePane`), **CLI agents** (pinned first, `↗
@@ -43,11 +53,20 @@ slots left-to-right:
   `createTab`, Browser → `createBrowserPane`), and a **Manage presets…** footer
   (`setShowSettings(true, "presets")`). Preset data comes from the live
   `usePresetStore()` snapshot (`src/hooks/use-preset-store.ts`).
-- **`PinnedChatFavorite`** — one ember-tinted (`accent-ember` tokens) inline
-  button per `chat_agent` preset; click launches a new chat tab.
+- **`PinnedPresetTiles`** — 27px glyph tiles right of the `+` launcher
+  (after a 1px divider): ember-tinted (`accent-ember`) tiles for
+  `chat_agent` presets and neutral tiles for pinned `cli` presets, each
+  with a hover Tooltip naming the preset. Click semantics mirror the
+  launcher (chat = new chat tab; CLI = new tab, Shift-click = split via
+  `applyPreset`).
 - **Rehomed controls** — the right-panel toggle (`FileDiff`, drives
   `rightPanelTabs`) and `RunButton` move from `TabBar`/`PresetBar` into the
-  titlebar right cluster.
+  titlebar right cluster. In GUI chrome the `RunButton` renders its
+  `variant="split"` form (main segment = green play + Run/Set Run, caret
+  segment = configure; no standalone gear) and `IdeLauncher` renders
+  `compact` (icon square + caret, combined tooltip). Both components keep
+  their legacy default rendering for the flag-off `PresetBar`, preserving
+  the byte-identical contract.
 - **Row suppression** — `WorkspaceMain` (`workspace-main.tsx`) drops `TabBar`
   and `PresetBar` when the flag is on; `PaneNode` (`isSurfaceRoot` +
   `enableAgentChat`) suppresses `AgentChatPaneHeader` for a **sole-root**

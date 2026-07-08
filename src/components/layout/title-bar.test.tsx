@@ -1,9 +1,11 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 import type {
   PresetStoreSnapshot,
+  TerminalPreset,
   WorkspaceSnapshot,
   WorkspaceType,
 } from "@/tauri/types";
@@ -33,30 +35,50 @@ vi.mock("./window-chrome", () => ({
   WindowControls: () => <div data-testid="window-controls" />,
 }));
 
+const chatPreset: TerminalPreset = {
+  id: "builtin-chat-agent",
+  name: "Chat Agent",
+  description: null,
+  commands: [],
+  working_directory: null,
+  launch_mode: "new_tab",
+  icon: "chat-agent",
+  pinned: true,
+  is_builtin: true,
+  auto_run_on_workspace: false,
+  auto_run_on_new_tab: false,
+  kind: "chat_agent",
+  launch_config: null,
+};
+
+const pinnedCliPreset: TerminalPreset = {
+  id: "cli-claude",
+  name: "Claude Code",
+  description: null,
+  commands: ["claude"],
+  working_directory: null,
+  launch_mode: "new_tab",
+  icon: "claude",
+  pinned: true,
+  is_builtin: true,
+  auto_run_on_workspace: false,
+  auto_run_on_new_tab: false,
+  kind: "cli",
+  launch_config: null,
+};
+
 const chatPresetSnapshot: PresetStoreSnapshot = {
   bar_visible: true,
   default_preset_id: null,
-  presets: [
-    {
-      id: "builtin-chat-agent",
-      name: "Chat Agent",
-      description: null,
-      commands: [],
-      working_directory: null,
-      launch_mode: "new_tab",
-      icon: "chat-agent",
-      pinned: true,
-      is_builtin: true,
-      auto_run_on_workspace: false,
-      auto_run_on_new_tab: false,
-      kind: "chat_agent",
-      launch_config: null,
-    },
-  ],
+  presets: [chatPreset],
 };
 
+// Mutable so individual tests can swap in a pinned CLI preset alongside the
+// chat favorite without affecting the other describe blocks.
+let presetSnapshot: PresetStoreSnapshot = chatPresetSnapshot;
+
 vi.mock("@/hooks/use-preset-store", () => ({
-  usePresetStore: () => chatPresetSnapshot,
+  usePresetStore: () => presetSnapshot,
 }));
 
 vi.mock("@/stores/app-store", () => ({
@@ -116,6 +138,7 @@ vi.mock("@/tauri/commands", () => ({
   detectEditors: vi.fn().mockResolvedValue([]),
   openInEditor: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
+  applyPreset: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/lib/toast", () => ({
@@ -151,11 +174,15 @@ function makeWorkspace(): WorkspaceSnapshot {
 }
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { agentChatCreatePane, applyPreset } from "@/tauri/commands";
 import { TitleBar } from "./title-bar";
 
 function renderBar() {
   return render(
-    <TooltipProvider>
+    // `delayDuration={0}` short-circuits Radix's default hover delay so
+    // `userEvent.hover` + `findByText` can settle within the test timeout
+    // (same pattern used in preset-bar.test.tsx).
+    <TooltipProvider delayDuration={0}>
       <TitleBar sidebarOpen onToggleSidebar={() => {}} />
     </TooltipProvider>,
   );
@@ -167,6 +194,9 @@ beforeEach(() => {
   state.activeDraftId = null;
   state.workspaceId = "ws-1";
   state.workspaceType = "standard";
+  presetSnapshot = chatPresetSnapshot;
+  vi.mocked(agentChatCreatePane).mockClear();
+  vi.mocked(applyPreset).mockClear();
 });
 
 afterEach(cleanup);
@@ -204,5 +234,92 @@ describe("TitleBar chrome gating", () => {
     state.activeDraftId = "draft-1";
     const { queryByTestId } = renderBar();
     expect(queryByTestId("titlebar-tabs")).toBeNull();
+  });
+});
+
+describe("TitleBar GUI chrome — left cluster sized to the sidebar", () => {
+  it("renders the sidebar-toggle cluster with an explicit pixel width and a boundary border", () => {
+    state.enableAgentChat = true;
+    const { getByTestId } = renderBar();
+    const cluster = getByTestId("titlebar-sidebar-cluster");
+    // jsdom has no real `SidebarProvider` DOM to measure (no
+    // `[data-slot="sidebar-gap"]` node exists in this test tree), so
+    // `useSidebarGapWidth` stays on its fallback — which matches
+    // `SidebarProvider`'s own default width (256px) for exactly that
+    // reason. The point under test is the mechanism (an explicit,
+    // sidebar-derived pixel width + boundary border), not a live resize,
+    // which isn't observable under jsdom's no-op ResizeObserver stub.
+    expect(cluster.style.width).toBe("256px");
+    expect(cluster.className).toContain("border-r");
+  });
+});
+
+describe("TitleBar GUI chrome — pinned preset tiles", () => {
+  beforeEach(() => {
+    state.enableAgentChat = true;
+    presetSnapshot = {
+      ...chatPresetSnapshot,
+      presets: [chatPreset, pinnedCliPreset],
+    };
+  });
+
+  it("renders the ember chat favorite tile and launches a new chat tab on click", async () => {
+    const { getByTestId } = renderBar();
+    await userEvent.click(getByTestId("titlebar-favorite-builtin-chat-agent"));
+    expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
+      "ws-1",
+      "claude",
+      null,
+      "new_tab",
+    );
+  });
+
+  it("renders a neutral tile for a pinned CLI preset, right of a divider", () => {
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-pin-cli-claude")).toBeInTheDocument();
+  });
+
+  it("does not render a pinned CLI tile for an unpinned CLI preset", () => {
+    presetSnapshot = {
+      ...chatPresetSnapshot,
+      presets: [chatPreset, { ...pinnedCliPreset, pinned: false }],
+    };
+    const { queryByTestId } = renderBar();
+    expect(queryByTestId("titlebar-pin-cli-claude")).toBeNull();
+  });
+
+  it("launches a pinned CLI preset in a new tab on plain click", async () => {
+    const { getByTestId } = renderBar();
+    await userEvent.click(getByTestId("titlebar-pin-cli-claude"));
+    expect(vi.mocked(applyPreset)).toHaveBeenCalledWith(
+      "ws-1",
+      "cli-claude",
+      "new_tab",
+      null,
+      null,
+    );
+  });
+
+  it("splits a pinned CLI preset on Shift-click", () => {
+    const { getByTestId } = renderBar();
+    // userEvent v14's shift-modifier syntax doesn't reliably set
+    // `MouseEvent.shiftKey` on the synthetic click; use `fireEvent.click`
+    // with an explicit init, matching the pattern in preset-bar.test.tsx.
+    fireEvent.click(getByTestId("titlebar-pin-cli-claude"), { shiftKey: true });
+    expect(vi.mocked(applyPreset)).toHaveBeenCalledWith(
+      "ws-1",
+      "cli-claude",
+      "split_pane",
+      null,
+      null,
+    );
+  });
+
+  it("shows the preset name in a hover tooltip for a pinned tile", async () => {
+    renderBar();
+    await userEvent.hover(screen.getByTestId("titlebar-pin-cli-claude"));
+    await waitFor(() =>
+      expect(screen.getAllByText("Claude Code").length).toBeGreaterThan(0),
+    );
   });
 });
