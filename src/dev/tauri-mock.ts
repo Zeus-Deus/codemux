@@ -991,8 +991,36 @@ const handlers: Record<string, Handler> = {
       title: "agent-chat-demo",
       created_at: new Date().toISOString(),
       last_active_at: new Date().toISOString(),
+      model: "claude-opus-4-8",
+      effort: null,
+      context_window: null,
+      permission_mode: "bypassPermissions",
     },
   ],
+  // Restart-resume seed (design F): the pane's mount-seed effect fetches
+  // this to restore picker config + resume cursor. Return a plausible
+  // record for the seeded thread so `npm run dev` rehydrates the pickers;
+  // any other thread has no persisted row yet.
+  agent_chat_get_session: (a) =>
+    a.threadId === MOCK_CHAT_THREAD_ID
+      ? {
+          thread_id: MOCK_CHAT_THREAD_ID,
+          sdk_session_id: "sdk-mock-chat",
+          workspace_id: "ws-codemux-chat",
+          cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+          provider: "claude",
+          title: "agent-chat-demo",
+          created_at: new Date().toISOString(),
+          last_active_at: new Date().toISOString(),
+          model: "claude-opus-4-8",
+          effort: null,
+          context_window: null,
+          permission_mode: "bypassPermissions",
+        }
+      : null,
+  // DB-only config persist (design G). The mock has no SQLite, so this
+  // is a no-op — the demo pane keeps its in-memory slice values.
+  agent_chat_update_session_config: () => undefined,
   agent_chat_start_session: (a) =>
     (a.input as { thread_id: string }).thread_id,
   agent_chat_send_turn: (a) =>

@@ -2902,6 +2902,21 @@ impl AppStateStore {
         true
     }
 
+    /// Resolve a chat `thread_id` to the id of the `AgentChat` pane it is
+    /// bound to, walking every workspace surface. Returns `None` when no
+    /// pane currently carries the thread (e.g. the pane was closed). Used
+    /// by the backend auto-resume path to rebuild the workspace env
+    /// overlay for a session it is silently restarting.
+    pub fn agent_chat_pane_id_for_thread(&self, thread_id: &str) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().find_map(|ws| {
+            ws.surfaces
+                .iter()
+                .find_map(|s| find_agent_chat_pane_id(&s.root, thread_id))
+                .map(|pane_id| pane_id.0)
+        })
+    }
+
     /// Whether the `AgentChat` pane bound to `thread_id` currently lives in
     /// the active workspace. Mirrors `hooks.rs`'s `is_pane_active_for_session`
     /// so a chat turn that finishes in the workspace the user is already

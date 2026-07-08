@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -44,6 +44,82 @@ pub struct AgentChatSessionRecord {
     pub title: Option<String>,
     pub created_at: String,
     pub last_active_at: String,
+    /// Per-thread model id the pane was last configured with. Persisted
+    /// so a pane reopened after an app restart re-seeds the user's chosen
+    /// model instead of falling back to the provider default, and so the
+    /// backend auto-resume path (`ensure_live_session`) restarts the SDK
+    /// session with the same model. `None` for legacy rows created before
+    /// this column existed.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-thread reasoning / effort level (Claude: session-scoped).
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Per-thread context-window selection (Claude `"1m"` etc.).
+    #[serde(default)]
+    pub context_window: Option<String>,
+    /// Per-thread permission mode (`default` / `acceptEdits` / …).
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+}
+
+/// Per-thread chat configuration written alongside an
+/// `agent_chat_sessions` row. Every field is a tri-state so callers
+/// (session start, the picker-driven update command, auto-resume) can
+/// express three distinct intents per column:
+///
+/// - `None` (outer) — field absent: leave the stored value untouched.
+/// - `Some(None)` — explicit clear: set the column to `NULL`.
+/// - `Some(Some(v))` — set the column to `v`.
+///
+/// The tri-state matters for the model-change compat reset: switching
+/// to a model that has no effort levels / no 1m context must be able to
+/// CLEAR `effort` / `context_window` back to `NULL`, otherwise the stale
+/// value is resurrected on the next restart (it would be paired with a
+/// model that doesn't support it). A plain `Option<String>` can't
+/// express "clear" — a JSON `null` and an absent field both deserialize
+/// to `None` — so the fields are `Option<Option<String>>` with a
+/// custom deserializer that maps an explicit `null` to `Some(None)`.
+/// See [`DatabaseStore::update_agent_chat_session_config`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentChatSessionConfig {
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    pub model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    pub effort: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    pub context_window: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_tristate")]
+    pub permission_mode: Option<Option<String>>,
+}
+
+/// Deserialize a present field (whether `null` or a value) into the
+/// inner `Some(..)` of an [`AgentChatSessionConfig`] tri-state, so an
+/// explicit JSON `null` becomes `Some(None)` (clear) rather than being
+/// indistinguishable from an absent field. Absent fields fall through
+/// to `#[serde(default)]` = `None` (leave untouched).
+fn deserialize_tristate<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<String>::deserialize(deserializer)?))
+}
+
+impl AgentChatSessionConfig {
+    /// Build a config that overwrites a column with a concrete value.
+    /// Convenience for callers that always set (never clear) a field.
+    pub fn set(value: impl Into<String>) -> Option<Option<String>> {
+        Some(Some(value.into()))
+    }
+
+    /// Map a plain `Option<String>` (the shape most internal callers
+    /// hold) into the tri-state with "leave untouched on `None`"
+    /// semantics: `Some(v)` → set to `v`, `None` → leave the column
+    /// unchanged. Use for session-start / auto-resume snapshots that
+    /// should never clear a column they simply don't know about.
+    pub fn keep_or_set(value: Option<String>) -> Option<Option<String>> {
+        value.map(Some)
+    }
 }
 
 /// Persisted bookkeeping for the run-start rollback checkpoint
@@ -162,7 +238,16 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             provider TEXT NOT NULL,
             title TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            last_active_at TEXT NOT NULL DEFAULT (datetime('now'))
+            last_active_at TEXT NOT NULL DEFAULT (datetime('now')),
+            -- Per-thread chat configuration so a pane reopened after an
+            -- app restart re-seeds the user's chosen model / effort /
+            -- context-window / permission-mode instead of the provider
+            -- default, and so backend auto-resume restarts the SDK
+            -- session with the same settings. Nullable for legacy rows.
+            model TEXT,
+            effort TEXT,
+            context_window TEXT,
+            permission_mode TEXT
         );
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_workspace
@@ -421,6 +506,15 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // server-schema change. Lets a pull land a repo ROOT on the right
         // branch and protect it even when `git_branch` is null.
         "ALTER TABLE workspaces_sync ADD COLUMN default_branch TEXT",
+        // Per-thread chat configuration (restart-resume follow-up).
+        // Existing databases predate these columns; add them so a pane
+        // reopened after a restart re-seeds the user's model / effort /
+        // context-window / permission-mode and the auto-resume path can
+        // rebuild the SDK session with the same settings.
+        "ALTER TABLE agent_chat_sessions ADD COLUMN model TEXT",
+        "ALTER TABLE agent_chat_sessions ADD COLUMN effort TEXT",
+        "ALTER TABLE agent_chat_sessions ADD COLUMN context_window TEXT",
+        "ALTER TABLE agent_chat_sessions ADD COLUMN permission_mode TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -2310,6 +2404,22 @@ impl DatabaseStore {
                  created_at = COALESCE(
                      (SELECT created_at FROM agent_chat_sessions WHERE thread_id = ?1),
                      created_at
+                 ),
+                 model = COALESCE(
+                     (SELECT model FROM agent_chat_sessions WHERE thread_id = ?1),
+                     model
+                 ),
+                 effort = COALESCE(
+                     (SELECT effort FROM agent_chat_sessions WHERE thread_id = ?1),
+                     effort
+                 ),
+                 context_window = COALESCE(
+                     (SELECT context_window FROM agent_chat_sessions WHERE thread_id = ?1),
+                     context_window
+                 ),
+                 permission_mode = COALESCE(
+                     (SELECT permission_mode FROM agent_chat_sessions WHERE thread_id = ?1),
+                     permission_mode
                  )
              WHERE thread_id = ?2",
             params![old_thread_id, new_thread_id],
@@ -2348,6 +2458,71 @@ impl DatabaseStore {
             params![thread_id, sdk_session_id],
         )
         .map_err(|e| format!("Failed to set sdk_session_id: {e}"))?;
+        Ok(())
+    }
+
+    /// Overwrite the per-thread chat configuration, honouring the
+    /// tri-state of each [`AgentChatSessionConfig`] field:
+    ///
+    /// - `None` (outer) — the column is omitted from the UPDATE (left
+    ///   untouched).
+    /// - `Some(None)` — the column is set to `NULL` (explicit clear).
+    /// - `Some(Some(v))` — the column is set to `v`.
+    ///
+    /// The SET clause is built dynamically so an explicit clear can
+    /// actually write `NULL`; a static `COALESCE(?, col)` could only
+    /// ever leave-or-set and would silently drop a clear (that bug let a
+    /// model-incompatible effort/context survive a restart). Called at
+    /// session start with the `StartSessionInput` selection and again
+    /// from the `agent_chat_update_session_config` command every time
+    /// the user changes a picker — DB-only, no live-session requirement,
+    /// so the value survives a restart even if it was never applied to a
+    /// live SDK session.
+    ///
+    /// A no-op when no field is supplied, and when no row exists for
+    /// `thread_id` (the UPDATE matches zero rows); callers persist the
+    /// session row first.
+    pub fn update_agent_chat_session_config(
+        &self,
+        thread_id: &str,
+        config: &AgentChatSessionConfig,
+    ) -> Result<(), String> {
+        use rusqlite::types::Value;
+        // Turn a tri-state field into a NULL-able bind value, or `None`
+        // when the caller left the field absent (so it's skipped).
+        fn bind(field: &Option<Option<String>>) -> Option<Value> {
+            field.as_ref().map(|inner| match inner {
+                Some(s) => Value::Text(s.clone()),
+                None => Value::Null,
+            })
+        }
+        let columns = [
+            ("model", bind(&config.model)),
+            ("effort", bind(&config.effort)),
+            ("context_window", bind(&config.context_window)),
+            ("permission_mode", bind(&config.permission_mode)),
+        ];
+        let mut set_clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<Value> = Vec::new();
+        for (name, value) in columns {
+            if let Some(value) = value {
+                binds.push(value);
+                set_clauses.push(format!("{name} = ?{}", binds.len()));
+            }
+        }
+        if set_clauses.is_empty() {
+            // Nothing to write — every field was left untouched.
+            return Ok(());
+        }
+        binds.push(Value::Text(thread_id.to_string()));
+        let sql = format!(
+            "UPDATE agent_chat_sessions SET {} WHERE thread_id = ?{}",
+            set_clauses.join(", "),
+            binds.len(),
+        );
+        let conn = self.conn.lock().unwrap();
+        conn.execute(&sql, rusqlite::params_from_iter(binds))
+            .map_err(|e| format!("Failed to update agent_chat_session config: {e}"))?;
         Ok(())
     }
 
@@ -2419,6 +2594,10 @@ impl DatabaseStore {
                 title: row.get(5)?,
                 created_at: row.get(6)?,
                 last_active_at: row.get(7)?,
+                model: row.get(8)?,
+                effort: row.get(9)?,
+                context_window: row.get(10)?,
+                permission_mode: row.get(11)?,
             })
         };
         // Only surface rows that actually have an sdk_session_id —
@@ -2430,7 +2609,7 @@ impl DatabaseStore {
         // silent restarts that never got interacted with.
         if let Some(cwd) = cwd {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND cwd = ?2 AND sdk_session_id IS NOT NULL
                  ORDER BY last_active_at DESC LIMIT ?3",
@@ -2443,7 +2622,7 @@ impl DatabaseStore {
                 .unwrap_or_default()
         } else {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND sdk_session_id IS NOT NULL
                  ORDER BY last_active_at DESC LIMIT ?2",
@@ -2483,8 +2662,17 @@ impl DatabaseStore {
         let Some(survivor) = survivor else {
             return Ok(());
         };
-        // Merge identity fields: keep the earliest created_at and
-        // any non-null title across the whole set onto the survivor.
+        // Merge identity + config fields onto the survivor: keep the
+        // earliest created_at, and carry forward any non-null title /
+        // per-thread config (model / effort / context_window /
+        // permission_mode) across the whole set. The survivor is the
+        // most-recently-active row — for a resume that's the freshly
+        // minted thread whose config columns are still NULL — so
+        // without this backfill the user's persisted per-thread model /
+        // effort / context / permission-mode selection would be lost
+        // when the original row is DELETEd below. Each config column
+        // prefers the survivor's own non-null value, then the
+        // most-recently-active non-null value across the group.
         conn.execute(
             "UPDATE agent_chat_sessions
                  SET created_at = COALESCE(
@@ -2496,6 +2684,30 @@ impl DatabaseStore {
                      title,
                      (SELECT title FROM agent_chat_sessions
                       WHERE sdk_session_id = ?1 AND title IS NOT NULL
+                      ORDER BY last_active_at DESC LIMIT 1)
+                 ),
+                 model = COALESCE(
+                     model,
+                     (SELECT model FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND model IS NOT NULL
+                      ORDER BY last_active_at DESC LIMIT 1)
+                 ),
+                 effort = COALESCE(
+                     effort,
+                     (SELECT effort FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND effort IS NOT NULL
+                      ORDER BY last_active_at DESC LIMIT 1)
+                 ),
+                 context_window = COALESCE(
+                     context_window,
+                     (SELECT context_window FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND context_window IS NOT NULL
+                      ORDER BY last_active_at DESC LIMIT 1)
+                 ),
+                 permission_mode = COALESCE(
+                     permission_mode,
+                     (SELECT permission_mode FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND permission_mode IS NOT NULL
                       ORDER BY last_active_at DESC LIMIT 1)
                  )
              WHERE thread_id = ?2",
@@ -2544,7 +2756,7 @@ impl DatabaseStore {
     ) -> Option<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode
              FROM agent_chat_sessions WHERE thread_id = ?1",
             params![thread_id],
             |row| {
@@ -2557,6 +2769,10 @@ impl DatabaseStore {
                     title: row.get(5)?,
                     created_at: row.get(6)?,
                     last_active_at: row.get(7)?,
+                    model: row.get(8)?,
+                    effort: row.get(9)?,
+                    context_window: row.get(10)?,
+                    permission_mode: row.get(11)?,
                 })
             },
         )
@@ -3747,6 +3963,50 @@ mod tests {
     }
 
     #[test]
+    fn collapse_duplicate_agent_chat_sessions_carries_forward_config() {
+        // Regression: reopening a session from the history dropdown
+        // starts a fresh (most-recently-active) resume row with NULL
+        // config, which becomes the survivor. The merge must carry the
+        // original row's per-thread model / effort / context /
+        // permission-mode onto the survivor before the original is
+        // DELETEd, or the user's saved selection is silently lost.
+        let db = init_test_database();
+        {
+            let conn = db.conn.lock().unwrap();
+            // Original row (older) carries the user's real config.
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at,
+                      model, effort, context_window, permission_mode)
+                 VALUES ('original', 'sdk-xyz', 'ws', 'claude', '2025-01-01', '2025-01-01',
+                         'claude-opus-4-8', 'high', '1m', 'acceptEdits')",
+                [],
+            )
+            .unwrap();
+            // Freshly-minted resume row (more recent) with NULL config.
+            conn.execute(
+                "INSERT INTO agent_chat_sessions
+                     (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at)
+                 VALUES ('resume', 'sdk-xyz', 'ws', 'claude', '2025-02-01', '2025-02-01')",
+                [],
+            )
+            .unwrap();
+        }
+
+        db.collapse_duplicate_agent_chat_sessions("sdk-xyz")
+            .unwrap();
+
+        // The resume row survives, but the original's config is
+        // backfilled onto it.
+        assert!(db.get_agent_chat_session("original").is_none());
+        let survivor = db.get_agent_chat_session("resume").unwrap();
+        assert_eq!(survivor.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(survivor.effort.as_deref(), Some("high"));
+        assert_eq!(survivor.context_window.as_deref(), Some("1m"));
+        assert_eq!(survivor.permission_mode.as_deref(), Some("acceptEdits"));
+    }
+
+    #[test]
     fn collapse_duplicate_agent_chat_sessions_is_noop_when_no_match() {
         let db = init_test_database();
         db.upsert_agent_chat_session("t", "ws", None, "claude")
@@ -3854,6 +4114,240 @@ mod tests {
         let rec = db.get_agent_chat_session("new").unwrap();
         assert_eq!(rec.title.as_deref(), Some("My chat"));
         assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-uuid"));
+    }
+
+    // ── Per-thread chat config (restart-resume follow-up) ──
+
+    #[test]
+    fn agent_chat_session_config_defaults_null_on_fresh_row() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
+            .unwrap();
+        let rec = db.get_agent_chat_session("t").expect("row exists");
+        // A brand-new row has no config yet — all four columns are NULL.
+        assert_eq!(rec.model, None);
+        assert_eq!(rec.effort, None);
+        assert_eq!(rec.context_window, None);
+        assert_eq!(rec.permission_mode, None);
+    }
+
+    #[test]
+    fn agent_chat_session_config_roundtrip_and_get_null_sdk_row() {
+        let db = init_test_database();
+        // No sdk_session_id set — this is exactly the post-restart state
+        // `agent_chat_get_session` must still return (unlike the history
+        // list, which filters NULL-sdk rows out).
+        db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                effort: AgentChatSessionConfig::set("high"),
+                context_window: AgentChatSessionConfig::set("1m"),
+                permission_mode: AgentChatSessionConfig::set("acceptEdits"),
+            },
+        )
+        .unwrap();
+
+        let rec = db
+            .get_agent_chat_session("t")
+            .expect("get returns the row even with a NULL sdk_session_id");
+        assert_eq!(rec.sdk_session_id, None);
+        assert_eq!(rec.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(rec.effort.as_deref(), Some("high"));
+        assert_eq!(rec.context_window.as_deref(), Some("1m"));
+        assert_eq!(rec.permission_mode.as_deref(), Some("acceptEdits"));
+    }
+
+    #[test]
+    fn agent_chat_update_session_config_only_overwrites_provided_fields() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                effort: AgentChatSessionConfig::set("high"),
+                context_window: AgentChatSessionConfig::set("1m"),
+                permission_mode: AgentChatSessionConfig::set("default"),
+            },
+        )
+        .unwrap();
+
+        // A partial update (only model) must leave the other columns
+        // untouched — an absent (`None`) field is omitted from the UPDATE.
+        db.update_agent_chat_session_config(
+            "t",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-sonnet-4-5"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
+
+        let rec = db.get_agent_chat_session("t").unwrap();
+        assert_eq!(rec.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(rec.effort.as_deref(), Some("high"), "effort preserved");
+        assert_eq!(
+            rec.context_window.as_deref(),
+            Some("1m"),
+            "context_window preserved"
+        );
+        assert_eq!(
+            rec.permission_mode.as_deref(),
+            Some("default"),
+            "permission_mode preserved"
+        );
+    }
+
+    #[test]
+    fn agent_chat_update_session_config_explicit_null_clears_column() {
+        // Regression: the model-change compat reset sends an explicit
+        // `null` for effort / context_window when the new model no longer
+        // supports them. That must CLEAR the column (`Some(None)`), not be
+        // dropped as "leave untouched" — otherwise a model-incompatible
+        // effort/context survives a restart and gets re-applied.
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                effort: AgentChatSessionConfig::set("high"),
+                context_window: AgentChatSessionConfig::set("1m"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
+
+        // Switch to a model with no effort levels / no 1m context: the
+        // patch keeps `model`, but clears effort + context to NULL while
+        // leaving permission_mode (absent) untouched.
+        db.update_agent_chat_session_config(
+            "t",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-haiku-4-5"),
+                effort: Some(None),
+                context_window: Some(None),
+                permission_mode: None,
+            },
+        )
+        .unwrap();
+
+        let rec = db.get_agent_chat_session("t").unwrap();
+        assert_eq!(rec.model.as_deref(), Some("claude-haiku-4-5"));
+        assert_eq!(rec.effort, None, "explicit null cleared effort");
+        assert_eq!(
+            rec.context_window, None,
+            "explicit null cleared context_window"
+        );
+    }
+
+    #[test]
+    fn agent_chat_update_session_config_null_deserializes_to_clear() {
+        // The tri-state must survive the JSON wire: an explicit `null`
+        // from the frontend patch deserializes to `Some(None)` (clear),
+        // while an absent field stays `None` (leave untouched).
+        let cfg: AgentChatSessionConfig = serde_json::from_str(
+            r#"{ "model": "claude-haiku-4-5", "effort": null, "context_window": null }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.model, Some(Some("claude-haiku-4-5".to_string())));
+        assert_eq!(cfg.effort, Some(None), "explicit null → clear");
+        assert_eq!(cfg.context_window, Some(None), "explicit null → clear");
+        assert_eq!(cfg.permission_mode, None, "absent field → untouched");
+    }
+
+    #[test]
+    fn upsert_preserves_config_on_conflict() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
+        // A later upsert (e.g. a silent restart bumping last_active_at)
+        // must not clobber the persisted config.
+        db.upsert_agent_chat_session("t", "ws", Some("/p2"), "claude")
+            .unwrap();
+        let rec = db.get_agent_chat_session("t").unwrap();
+        assert_eq!(rec.cwd.as_deref(), Some("/p2"), "cwd refreshed by upsert");
+        assert_eq!(
+            rec.model.as_deref(),
+            Some("claude-opus-4-8"),
+            "config survives the upsert"
+        );
+    }
+
+    #[test]
+    fn agent_chat_sessions_migrate_carries_forward_config() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("old", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "old",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                effort: AgentChatSessionConfig::set("xhigh"),
+                context_window: AgentChatSessionConfig::set("1m"),
+                permission_mode: AgentChatSessionConfig::set("bypassPermissions"),
+            },
+        )
+        .unwrap();
+
+        db.upsert_agent_chat_session("new", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.migrate_agent_chat_session("old", "new").unwrap();
+
+        let rec = db.get_agent_chat_session("new").expect("migrated row");
+        assert_eq!(rec.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(rec.effort.as_deref(), Some("xhigh"));
+        assert_eq!(rec.context_window.as_deref(), Some("1m"));
+        assert_eq!(rec.permission_mode.as_deref(), Some("bypassPermissions"));
+    }
+
+    #[test]
+    fn list_agent_chat_sessions_returns_config_columns() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("t", "sdk-1").unwrap();
+        db.update_agent_chat_session_config(
+            "t",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                effort: AgentChatSessionConfig::set("high"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
+        let rows = db.list_agent_chat_sessions("ws", None, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(rows[0].effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn update_config_on_missing_row_is_noop() {
+        let db = init_test_database();
+        // No row for "ghost" — the UPDATE matches zero rows and returns Ok.
+        db.update_agent_chat_session_config(
+            "ghost",
+            &AgentChatSessionConfig {
+                model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .expect("update on missing row is a no-op, not an error");
+        assert!(db.get_agent_chat_session("ghost").is_none());
     }
 
     #[test]

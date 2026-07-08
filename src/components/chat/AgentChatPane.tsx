@@ -54,6 +54,7 @@ import {
 } from "@/stores/provider-capabilities-store";
 import {
   activateWorkspace,
+  agentChatGetSession,
   agentChatInterruptTurn,
   agentChatListMessages,
   agentChatListSessions,
@@ -63,6 +64,7 @@ import {
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
+  agentChatUpdateSessionConfig,
   checkGhStatus,
   checkGithubRepo,
   getGithubIssueByPath,
@@ -71,6 +73,8 @@ import {
   grepCountPattern,
   readFileForAttachment,
   readFolderForAttachment,
+  type AgentChatSessionConfigUpdate,
+  type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
@@ -368,6 +372,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const setStoreEffort = useAgentChatStore((s) => s.setEffort);
   const setStoreContextWindow = useAgentChatStore((s) => s.setContextWindow);
+  const setStoreResumeCursor = useAgentChatStore((s) => s.setResumeCursor);
   const setStoreMode = useAgentChatStore((s) => s.setMode);
   const setStoreModePriorPermissionMode = useAgentChatStore(
     (s) => s.setModePriorPermissionMode,
@@ -489,27 +494,123 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
   }, [threadId, capabilities, permissionMode, setStorePermissionMode]);
 
-  // Seed slice.model with the provider's default whenever the slice
-  // exists (threadId set) but has no model yet. Three paths land in
-  // this state:
+  // Seed the slice's picker config from the persisted session row
+  // whenever the slice exists (threadId set) but has no model yet.
+  // Three paths land in this state:
   //   (a) app restart — the pane snapshot still carries a thread_id,
   //       but the in-memory store was wiped, so `ensureThread` below
-  //       creates a fresh empty slice
+  //       creates a fresh empty slice. THIS is the restart bug: the
+  //       DB row holds the user's chosen model / effort / context /
+  //       permission mode + the durable `sdk_session_id`, none of
+  //       which live in the wiped store.
   //   (b) resume from session history — `hydrateThread` rebuilds the
   //       transcript from persisted events, none of which carry the
-  //       chosen model
+  //       chosen model.
   //   (c) any future flow that pre-creates a slice without seeding
   //       the model (e.g. silent restart on a thread that never got
-  //       a model assigned)
-  // Without this seed, ReasoningPicker (which short-circuits on
-  // `!model`) renders nothing and the user loses the effort /
-  // context-window picker. Idempotent — bails the moment a model is
-  // present.
+  //       a model assigned).
+  //
+  // We fetch `agent_chat_get_session(threadId)` (which — unlike the
+  // history list — returns rows whose `sdk_session_id` is still null)
+  // and seed model/effort/contextWindow/permissionMode from it,
+  // falling back to the provider default only when the row (or its
+  // model column) is absent. Fetching FIRST and seeding once avoids
+  // flashing the Opus default and then swapping to the persisted
+  // model. `resumeCursor` is restored from `sdk_session_id` so a
+  // picker-triggered silent restart resumes the SDK session instead
+  // of starting fresh.
+  //
+  // Race safety: gated on `model === null`, and we re-check the live
+  // slice after the async fetch so a selection the user made while the
+  // fetch was in flight is never clobbered. `seedAttemptedRef` (keyed
+  // by thread id, released on teardown like the hydrate effect) keeps
+  // StrictMode's double-mount from firing two fetches. Without this
+  // seed, ReasoningPicker (which short-circuits on `!model`) renders
+  // nothing and the user loses the effort / context-window picker.
+  const seedAttemptedRef = useRef<string | null>(null);
   useEffect(() => {
     if (!threadId) return;
     if (model !== null) return;
-    setStoreModel(threadId, defaultModelForProvider(provider));
-  }, [threadId, model, provider, setStoreModel]);
+    if (seedAttemptedRef.current === threadId) return;
+    seedAttemptedRef.current = threadId;
+    const seedThreadId = threadId;
+    const seedProvider = provider;
+    let cancelled = false;
+    void (async () => {
+      let record: AgentChatSessionRecord | null = null;
+      try {
+        record = await agentChatGetSession(seedThreadId);
+      } catch (err) {
+        // Soft-fail: fall through to the provider default so the
+        // pickers still render. Log so it's debuggable.
+        console.warn("[agent-chat] get-session on mount failed:", err);
+      }
+      if (cancelled) return;
+      // Never overwrite a value the user picked while the fetch was in
+      // flight — the picker handlers write straight to the slice. The
+      // guard is PER FIELD (not a single `model`-only bail): a user can
+      // change permission-mode / effort / context — or nothing but the
+      // model — during the in-flight window, and each field must be
+      // protected independently. A field is only seeded when the live
+      // slice still holds its unseeded sentinel (the `emptySlice`
+      // default), i.e. the user hasn't touched it. `!current` means the
+      // slice doesn't exist yet, so seeding is unconditionally safe.
+      const current = useAgentChatStore.getState().threads[seedThreadId];
+      // A model pick runs the compat planner, which OWNS effort/context
+      // for the new model — so if the user picked a model mid-flight we
+      // must not re-seed model/effort/context from the (now stale) row.
+      const modelUntouched = !current || current.model === null;
+      if (modelUntouched) {
+        setStoreModel(
+          seedThreadId,
+          record?.model ?? defaultModelForProvider(seedProvider),
+        );
+      }
+      if (record) {
+        if (modelUntouched) {
+          if (record.effort != null && (!current || current.effort === null))
+            setStoreEffort(seedThreadId, record.effort);
+          if (
+            record.context_window != null &&
+            (!current || current.contextWindow === null)
+          )
+            setStoreContextWindow(seedThreadId, record.context_window);
+        }
+        if (
+          record.permission_mode != null &&
+          (!current ||
+            current.permissionMode === DEFAULT_THREAD_PERMISSION_MODE)
+        )
+          setStorePermissionMode(seedThreadId, record.permission_mode);
+        // Resume cursor is independent of the model pick, so seed it even
+        // when the user changed the model mid-flight — otherwise a later
+        // picker-triggered restart would start fresh instead of resuming.
+        if (!current || current.resumeCursor == null)
+          setStoreResumeCursor(
+            seedThreadId,
+            record.sdk_session_id ? { resume: record.sdk_session_id } : null,
+          );
+      }
+    })();
+    return () => {
+      cancelled = true;
+      // Release the attempt marker on teardown so StrictMode's
+      // mount→unmount→remount cycle re-seeds on the real mount instead
+      // of bailing on a stale marker (mirrors hydrateAttemptedRef).
+      if (seedAttemptedRef.current === threadId) {
+        seedAttemptedRef.current = null;
+      }
+    };
+  }, [
+    threadId,
+    model,
+    provider,
+    setStoreModel,
+    setStoreEffort,
+    setStoreContextWindow,
+    setStorePermissionMode,
+    setStoreResumeCursor,
+  ]);
 
   // Resolve the session-start timestamp for the D2 transcript marker.
   // The persisted sessions list is the only place a chat's wall-clock
@@ -1616,6 +1717,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setStorePermissionMode(threadId, "plan");
         setSessionLaunchMode(threadId, "plan");
         setStoreMode(threadId, newMode);
+        // The Plan/Ask pill is a TRANSIENT, session-live override that
+        // lives only in the in-memory slice (`mode` +
+        // `modePriorPermissionMode`) — neither is persisted. But
+        // `agent_chat_set_permission_mode` just wrote "plan" to the DB
+        // row, so a restart would auto-resume a read-only "plan" session
+        // with the pill gone and the prior mode unrecoverable. Re-persist
+        // the user's DURABLE permission choice so the DB reflects the
+        // real per-thread mode and a restart resumes in it (pill off),
+        // instead of a stale, pill-less read-only lock.
+        agentChatUpdateSessionConfig(threadId, {
+          permission_mode: priorMode,
+        }).catch((err) => {
+          console.warn(
+            "[agent-chat] failed to re-persist durable permission mode",
+            err,
+          );
+        });
       } else {
         setStoreMode(threadId, newMode);
       }
@@ -1743,6 +1861,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     triggerDebugCleanup,
   ]);
 
+  // Design G: mirror every picker change into the persisted session
+  // row so the user's choice survives an app restart even when no live
+  // session exists (the backend `set_model` / `set_permission_mode`
+  // paths persist too, but the effort / context-window pickers restart
+  // the session rather than calling a setter, and a mode already live
+  // on the session early-returns before any restart). Fire-and-forget:
+  // the DB write is best-effort and a failure only costs the
+  // restart-time restore of one field, so we log at console level
+  // rather than toasting.
+  const persistSessionConfig = useCallback(
+    (config: AgentChatSessionConfigUpdate) => {
+      if (!threadId) return;
+      agentChatUpdateSessionConfig(threadId, config).catch((err) => {
+        console.warn("[agent-chat] persist session config failed:", err);
+      });
+    },
+    [threadId],
+  );
+
   const handleModelChange = useCallback(
     (next: string) => {
       if (!threadId) return;
@@ -1758,12 +1895,19 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         currentEffort: effort,
         currentContextWindow: contextWindow,
       });
+      // Fold the model change and any compat-driven effort/context
+      // resets into a single persisted patch so a restart doesn't
+      // restore a stale effort that the new model no longer supports.
+      const configPatch: AgentChatSessionConfigUpdate = { model: next };
       if (plan.resetEffort !== undefined) {
         setStoreEffort(threadId, plan.resetEffort);
+        configPatch.effort = plan.resetEffort;
       }
       if (plan.resetContextWindow !== undefined) {
         setStoreContextWindow(threadId, plan.resetContextWindow);
+        configPatch.context_window = plan.resetContextWindow;
       }
+      persistSessionConfig(configPatch);
       agentChatSetModel(provider, threadId, next).catch((err) => {
         toast.error(`Failed to set model: ${err}`);
       });
@@ -1777,6 +1921,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       setStoreModel,
       setStoreEffort,
       setStoreContextWindow,
+      persistSessionConfig,
     ],
   );
 
@@ -1795,6 +1940,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       });
       if (!plan) return;
       setStorePermissionMode(threadId, plan.setPermissionMode);
+      // Persist the mode BEFORE the early return below: when the mode
+      // is already live we skip the restart, so the DB write is the
+      // only thing that carries this choice across a restart.
+      persistSessionConfig({ permission_mode: plan.setPermissionMode });
       // Skip the restart when the same mode is already live on the
       // current session — avoids a no-op session teardown.
       if (currentSlice.sessionLaunchMode === plan.setPermissionMode) return;
@@ -1804,7 +1953,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // PerTurn providers: the mode is already persisted; the next
       // `sendTurn` picks it up via `permission_mode_override`.
     },
-    [threadId, capabilities, setStorePermissionMode, restartSessionWith],
+    [
+      threadId,
+      capabilities,
+      setStorePermissionMode,
+      restartSessionWith,
+      persistSessionConfig,
+    ],
   );
 
   /**
@@ -1828,6 +1983,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       if (plan.setEffort !== null) {
         setStoreEffort(threadId, plan.setEffort);
+        persistSessionConfig({ effort: plan.setEffort });
       }
       if (plan.restart) {
         restartSessionWith({ effort: plan.setEffort });
@@ -1841,6 +1997,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       setInputDraft,
       setStoreEffort,
       restartSessionWith,
+      persistSessionConfig,
     ],
   );
 
@@ -1848,6 +2005,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (next: string) => {
       if (!threadId) return;
       setStoreContextWindow(threadId, next);
+      persistSessionConfig({ context_window: next });
       // Context window on Claude is encoded into the model id (e.g.
       // `claude-opus-4-7[1m]`), which is a session-init parameter.
       // Mid-session change → restart.
@@ -1855,7 +2013,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         restartSessionWith({ contextWindow: next });
       }
     },
-    [threadId, provider, setStoreContextWindow, restartSessionWith],
+    [
+      threadId,
+      provider,
+      setStoreContextWindow,
+      restartSessionWith,
+      persistSessionConfig,
+    ],
   );
 
   const handleProviderChange = useCallback(
