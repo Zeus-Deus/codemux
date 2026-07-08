@@ -832,6 +832,22 @@ multi-provider model picker. The empty-state composer (before a session
 exists) lives in `DraftChatSurface.tsx`; the "no panes" home landing
 lives in `ChatHomeLanding.tsx`.
 
+**GUI chrome suppression.** When the Beta flag is on and the chat pane is
+the **sole root** of its surface (not a split), `AgentChatPaneHeader` does
+NOT render — the title bar absorbs the tab, its session-history dropdown,
+close, "Restore checkpoint", and the "N subagents running" pill (`PaneNode`
+gates on `isSurfaceRoot`). In split layouts the per-pane header still
+renders, so split/close/drag keep working. The session-switch orchestration
+(stop → hydrate → resume), the checkpoint-restore state, and the grouped
+session list were extracted into shared pieces so the legacy per-pane header
+and the titlebar tab drive one implementation, not a fork:
+`src/hooks/use-agent-chat-session-actions.ts`,
+`src/hooks/use-agent-chat-checkpoint-restore.ts` +
+`src/components/chat/restore-checkpoint-dialog.tsx`, and
+`src/components/chat/session-history-menu.tsx` (`SessionHistoryList` +
+`useSessionHistory`, now consumed by both `SessionSelector` and the
+title-bar chat tab). See `docs/features/gui-chrome.md`.
+
 ## Tauri command surface
 
 Session/lifecycle commands are gated on the `enable_agent_chat` feature

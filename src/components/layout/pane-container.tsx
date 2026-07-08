@@ -21,6 +21,7 @@ export function PaneContainer({ workspace }: Props) {
         node={activeSurface.root}
         activePaneId={activeSurface.active_pane_id}
         visible
+        isSurfaceRoot
       />
     </div>
   );

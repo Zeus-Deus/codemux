@@ -80,6 +80,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - IDE integration: `docs/features/ide-integration.md`
 - Left sidebar (two-state expanded ↔ icon rail, with aggregate agent-status dots on collapsed project avatars + per-project hover flyout — Superset-adapted): `docs/features/sidebar.md`
 - Workspace context bar (bottom status strip under the work surface: branch · kind · ↑↓ · diff · PR/issue chips · device for the active workspace — the detail home for the clean sidebar appearance): `docs/features/workspace-context-bar.md`
+- GUI chrome (Agent Chat Beta on: the four chrome rows collapse to a single `h-10` title bar with in-titlebar tabs + `+` agent launcher + inline chat favorite + rehomed right-panel/Run controls; legacy chrome byte-identical when the flag is off): `docs/features/gui-chrome.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`
 - Windows cross-platform work: `docs/plans/windows-support.md`
