@@ -48,7 +48,7 @@ pub enum SubagentStatus {
 /// Serde is additive — every optional field carries `#[serde(default)]`
 /// so a snapshot persisted by an older build (missing fields added
 /// later) still deserialises.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SubagentSnapshot {
     /// Stable demux key. Provider-specific: Claude uses the spawning
     /// `parent_tool_use_id`, Codex the child `threadId`, OpenCode the

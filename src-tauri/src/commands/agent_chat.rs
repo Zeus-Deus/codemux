@@ -339,6 +339,16 @@ pub fn agent_chat_close_pane(
     // walk can no longer resolve it, so clear by pane id here while the
     // key is still meaningful.
     state.set_pane_status(&pane_id, PaneStatus::Idle);
+    // Forget any running-subagent tracking for this thread. The
+    // SessionStateChanged::Closed event below also clears it, but that
+    // races the tear-down (and may be dropped if no channel is attached),
+    // so clear eagerly by thread id while it is still resolvable —
+    // otherwise a subagent whose terminal status is never observed could
+    // pin a stuck "working" spinner forever.
+    if let Some((_, thread_id)) = &chat_thread {
+        let tracker: State<'_, SubagentTracker> = app.state();
+        tracker.clear_thread(thread_id);
+    }
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
     let _ = state.close_pane(&pane_id);
@@ -1009,6 +1019,20 @@ pub async fn agent_chat_send_turn(
     let thread_id_for_persist = input.thread_id.0.clone();
     let user_text_for_persist = input.text.clone();
     let first_line = first_line_title(&input.text);
+    // A genuine new user turn is the authoritative, provider-agnostic
+    // anchor for resetting subagent tracking. Clear the thread's tracker
+    // entry here so a subagent left non-terminal by the previous turn
+    // (e.g. Claude's background `async_launched` task that never emits a
+    // terminal `task_notification`) cannot pin `review_pending`/`running`
+    // and suppress `Review` for this turn and every one after (Finding 1).
+    // A genuinely-still-alive background subagent re-inserts itself via its
+    // next `Running` snapshot (Claude re-emits these through `task_progress`
+    // ticks). Unlike `SessionStateChanged::Running`, which Claude does not
+    // fire per user turn, this fires on every turn for all three providers.
+    {
+        let tracker: State<'_, SubagentTracker> = app.state();
+        tracker.clear_thread(&thread_id_for_persist);
+    }
     let turn = impl_.send_turn(input).await.map_err(provider_err)?;
 
     // Best-effort: bump last_active_at so the session floats to the
@@ -1561,7 +1585,8 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     // and PaneNode borders reflect chat agents exactly like terminal
     // agents (whose status flows in through hooks.rs). This is the whole
     // reason chat workspaces previously showed no status dot.
-    publish_pane_status(app, &event);
+    let tracker: State<'_, SubagentTracker> = app.state();
+    publish_pane_status(app, &tracker, &event);
 
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
@@ -1598,8 +1623,81 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     }
 }
 
+// ── Per-thread running-subagent tracking ─────────────────────────────
+
+/// Per-thread bookkeeping that keeps the sidebar "working" spinner alive
+/// while subagents outlive the parent chat turn.
+///
+/// The primary chat turn can finish (`TurnCompleted`) while subagents it
+/// spawned are still running. The old stateless mapper published `Review`
+/// at that point, dropping the spinner even though work continued in the
+/// child transcripts. This struct remembers which subagents are still
+/// running/pending per thread, plus whether a `Review` transition is
+/// *owed* — i.e. the turn completed while subagents were still live and
+/// the sidebar should flip to `Review` only once the last one finishes.
+///
+/// All decision logic lives in [`map_event_to_pane_status`], a pure
+/// function over `(event, &mut ThreadSubagentState)` with no `AppHandle`,
+/// so it is directly unit-testable.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ThreadSubagentState {
+    /// `subagent_id`s currently `Pending` or `Running`.
+    running: std::collections::BTreeSet<String>,
+    /// A turn finished while `running` was non-empty, so the `Review`
+    /// transition is owed once the last tracked subagent goes terminal.
+    review_pending: bool,
+}
+
+impl ThreadSubagentState {
+    /// Whether this thread tracks no live subagents and owes no `Review`
+    /// — the entry can be dropped from [`SubagentTracker`] so the map
+    /// never grows unbounded.
+    fn is_clear(&self) -> bool {
+        self.running.is_empty() && !self.review_pending
+    }
+}
+
+/// Tauri-managed, per-thread running-subagent tracker.
+///
+/// Shared across the single event-forwarding path ([`forward_event`] →
+/// [`publish_pane_status`]). Analogous to [`AgentChatChannelRegistry`]:
+/// a `Mutex<HashMap<thread_id, _>>` guarded by a single lock, held only
+/// for the duration of one event's decision. Only *live* provider events
+/// reach it — transcript hydration/resume replays persisted events on the
+/// frontend (`agent_chat_list_messages` + `hydrateThread`), never through
+/// `forward_event` — so no replay guard is needed here (see module notes
+/// on `should_persist_event`).
+#[derive(Default)]
+pub struct SubagentTracker {
+    threads: Mutex<HashMap<String, ThreadSubagentState>>,
+}
+
+impl SubagentTracker {
+    /// Run the pane-status decision for `event` against `thread_id`'s
+    /// tracked subagent state, mutating it in place. Drops the entry once
+    /// it returns to the clear state so the map stays bounded.
+    fn decide(&self, thread_id: &str, event: &ProviderRuntimeEvent) -> Option<PaneStatus> {
+        let mut threads = self.threads.lock().expect("subagent tracker poisoned");
+        let state = threads.entry(thread_id.to_string()).or_default();
+        let status = map_event_to_pane_status(event, state);
+        if state.is_clear() {
+            threads.remove(thread_id);
+        }
+        status
+    }
+
+    /// Forget all subagent tracking for `thread_id`. Called on explicit
+    /// pane close so a subagent whose terminal status is never observed
+    /// cannot pin the spinner after the session is gone. Idempotent.
+    pub fn clear_thread(&self, thread_id: &str) {
+        let mut threads = self.threads.lock().expect("subagent tracker poisoned");
+        threads.remove(thread_id);
+    }
+}
+
 /// Map a provider runtime event to the sidebar pane status it should
-/// drive, or `None` to leave the current status untouched.
+/// drive, or `None` to leave the current status untouched, updating the
+/// thread's [`ThreadSubagentState`] as a side effect.
 ///
 /// The chat-side analogue of `hooks.rs::map_event_type` for terminal
 /// agents, so chat sessions publish the same working / needs-input /
@@ -1611,36 +1709,120 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
 ///   or the session parked on an approval → `Permission`
 /// - the turn finished → `Review` (the caller downgrades to `Idle` when
 ///   the pane's workspace is already active, matching
-///   `handle_lifecycle_event`)
-/// - the session closed or errored → `Idle` (clear any stuck indicator)
+///   `handle_lifecycle_event`) — **but** if subagents are still running,
+///   hold `Working` and defer `Review` until the last one finishes.
+/// - the session closed or errored → `Idle` (clear any stuck indicator),
+///   and forget this thread's subagent tracking.
+///
+/// Subagent semantics (the reason this is stateful):
+/// - `SubagentUpdated` with `Running`/`Pending` records the subagent as
+///   live. It only *restores* `Working` when a `Review` was already owed
+///   (a running snapshot arriving after the parent turn finished); during
+///   an in-flight turn the parent already owns `Working`, so it returns
+///   `None` rather than resurrecting the spinner out of nowhere.
+/// - `SubagentUpdated` with a terminal status (`Completed`/`Failed`/
+///   `Stopped`) drops the subagent; when the last one clears and a
+///   `Review` was owed, it finally publishes `Review`.
+///
+/// A genuine **new user turn** resets the thread's tracker (both
+/// `running` and `review_pending`). The authoritative, provider-agnostic
+/// anchor is the send-message command path
+/// ([`agent_chat_send_turn`] calls [`SubagentTracker::clear_thread`]);
+/// `SessionStateChanged::Running` also resets here (reliably per-turn for
+/// Codex/OpenCode). `review_pending` is therefore cleared only by:
+/// publishing the owed/normal `Review`, a new-turn reset, session
+/// `Closed`/`Error`, or `agent_chat_close_pane` — never by a stray
+/// streaming delta.
 ///
 /// Everything else leaves the indicator alone. In particular
 /// `SessionConfigured` and the `Starting` / `Ready` lifecycle phases map
 /// to `None`: a freshly-started session with no turn is idle, exactly
 /// like a freshly-spawned terminal shows no status until its first hook.
-fn map_event_to_pane_status(event: &ProviderRuntimeEvent) -> Option<PaneStatus> {
-    use crate::agent_provider::SessionStatus;
+fn map_event_to_pane_status(
+    event: &ProviderRuntimeEvent,
+    state: &mut ThreadSubagentState,
+) -> Option<PaneStatus> {
+    use crate::agent_provider::{SessionStatus, SubagentStatus};
     match event {
+        // Streaming output keeps the spinner alive but must NOT touch
+        // `review_pending`. Parent-scoped output (`subagent_id == None`)
+        // can still trickle in *after* a deferred `TurnCompleted` (e.g. a
+        // final result item) while subagents keep running; clearing the
+        // owed `Review` here would silently drop it and strand the pane at
+        // `Working`. A genuine new turn is what resets `review_pending` —
+        // via the send-message command clear (authoritative,
+        // provider-agnostic) or a `SessionStateChanged::Running` snapshot
+        // — never a stray delta.
         ProviderRuntimeEvent::ContentDelta { .. }
         | ProviderRuntimeEvent::ItemCompleted { .. }
         | ProviderRuntimeEvent::RequestResolved { .. } => Some(PaneStatus::Working),
         ProviderRuntimeEvent::RequestOpened { .. } => Some(PaneStatus::Permission),
-        ProviderRuntimeEvent::TurnCompleted { .. } => Some(PaneStatus::Review),
+        ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => match subagent.status {
+            SubagentStatus::Pending | SubagentStatus::Running => {
+                if !subagent.subagent_id.is_empty() {
+                    state.running.insert(subagent.subagent_id.clone());
+                }
+                // Keep/restore the spinner only when a `Review` was owed;
+                // otherwise the parent turn owns `Working` and a snapshot
+                // (metadata: activity / tokens) must not move the dot.
+                if state.review_pending {
+                    Some(PaneStatus::Working)
+                } else {
+                    None
+                }
+            }
+            SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Stopped => {
+                state.running.remove(&subagent.subagent_id);
+                if state.running.is_empty() && state.review_pending {
+                    state.review_pending = false;
+                    Some(PaneStatus::Review)
+                } else {
+                    None
+                }
+            }
+        },
+        ProviderRuntimeEvent::TurnCompleted { .. } => {
+            if state.running.is_empty() {
+                Some(PaneStatus::Review)
+            } else {
+                // Subagents outlive the parent turn: hold the spinner and
+                // owe a `Review` for when the last of them finishes.
+                state.review_pending = true;
+                Some(PaneStatus::Working)
+            }
+        }
         ProviderRuntimeEvent::SessionStateChanged { status, .. } => match status {
-            SessionStatus::Running { .. } => Some(PaneStatus::Working),
+            SessionStatus::Running { .. } => {
+                // A fresh turn started: reset the whole tracker. Both the
+                // owed `Review` *and* any still-`running` set from the
+                // previous turn are stale — a leftover id would otherwise
+                // hold `Working` and suppress `Review` for every future
+                // turn until session close (Finding 1). A genuinely-alive
+                // background subagent re-inserts itself on its next
+                // `Running` snapshot (Claude re-emits these via
+                // `task_progress` ticks), so clearing here is safe.
+                // Reliable per-turn for Codex (`turn/started`) and OpenCode
+                // (`session.status = busy`); Claude's authoritative reset
+                // is the send-message command clear (see
+                // `agent_chat_send_turn`).
+                state.running.clear();
+                state.review_pending = false;
+                Some(PaneStatus::Working)
+            }
             SessionStatus::WaitingApproval { .. } => Some(PaneStatus::Permission),
-            SessionStatus::Closed | SessionStatus::Error { .. } => Some(PaneStatus::Idle),
+            SessionStatus::Closed | SessionStatus::Error { .. } => {
+                // Tear-down: drop all tracking so a subagent whose
+                // terminal status is never observed (e.g. Claude's
+                // background `async_launched` task that never emits a
+                // later `task_notification`) cannot pin the spinner.
+                state.running.clear();
+                state.review_pending = false;
+                Some(PaneStatus::Idle)
+            }
             SessionStatus::Starting | SessionStatus::Ready => None,
         },
         ProviderRuntimeEvent::SessionConfigured { .. }
         | ProviderRuntimeEvent::ResumeCursorUpdated { .. }
-        // A subagent snapshot is card metadata (status / activity / tokens),
-        // not a parent-turn signal. Active subagent work already drives
-        // `Working` through its `ItemCompleted { subagent_id }` items, and
-        // `TurnCompleted` still owns the `Review` transition — so a snapshot
-        // (including the final completion one) must leave the indicator
-        // alone rather than resurrect `Working` after `Review`.
-        | ProviderRuntimeEvent::SubagentUpdated { .. }
         | ProviderRuntimeEvent::RuntimeWarning { .. } => None,
     }
 }
@@ -1658,16 +1840,23 @@ fn map_event_to_pane_status(event: &ProviderRuntimeEvent) -> Option<PaneStatus> 
 /// `schedule_emit_app_state` debouncer because `forward_event` is generic
 /// over the Tauri runtime (the mock runtime drives the unit tests) and
 /// the transitions are already rate-limited by the guard.
-fn publish_pane_status<R: Runtime>(app: &AppHandle<R>, event: &ProviderRuntimeEvent) {
-    let Some(mut status) = map_event_to_pane_status(event) else {
-        return;
-    };
+fn publish_pane_status<R: Runtime>(
+    app: &AppHandle<R>,
+    tracker: &SubagentTracker,
+    event: &ProviderRuntimeEvent,
+) {
     let Some(thread_id) = thread_id_for_event(event) else {
         return;
     };
     if thread_id.0.is_empty() {
         return;
     }
+    // The status decision is per-thread and stateful (subagents can
+    // outlive the parent turn), so resolve the thread first and route the
+    // event through that thread's tracker.
+    let Some(mut status) = tracker.decide(&thread_id.0, event) else {
+        return;
+    };
     let state: State<'_, AppStateStore> = app.state();
     // Mirror the terminal path: a turn that finishes in the workspace the
     // user is already looking at clears to Idle instead of nagging with a
@@ -1913,7 +2102,7 @@ mod tests {
     // means adding a `not persisted` row.
 
     use crate::agent_provider::events::{
-        CompletedItem, ContentDelta, TurnStatus, TurnUsage,
+        CompletedItem, ContentDelta, SubagentSnapshot, SubagentStatus, TurnStatus, TurnUsage,
     };
     use crate::agent_provider::types::{
         ApprovalDecision, ProviderSessionId, RequestId, SessionStatus,
@@ -2184,124 +2373,460 @@ mod tests {
         );
     }
 
+    /// Build a `SubagentUpdated` event carrying just an id + status.
+    fn subagent_event(id: &str, status: SubagentStatus) -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::SubagentUpdated {
+            thread_id: tid(),
+            subagent: SubagentSnapshot {
+                subagent_id: id.into(),
+                status,
+                ..Default::default()
+            },
+        }
+    }
+
+    fn turn_completed() -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::TurnCompleted {
+            thread_id: tid(),
+            turn_id: turn(),
+            status: TurnStatus::Success,
+            usage: None,
+        }
+    }
+
     #[test]
     fn map_event_to_pane_status_covers_the_lifecycle() {
         use crate::state::PaneStatus;
 
+        // The mapper is now stateful; each stand-alone assertion below
+        // uses a fresh, empty tracker state so it exercises the base
+        // vocabulary in isolation (no subagents in flight).
+        let mut st = ThreadSubagentState::default();
+
         // Working: a turn is producing output or resuming after approval.
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::ContentDelta {
-                thread_id: tid(),
-                turn_id: turn(),
-                delta: ContentDelta::Text { text: "hi".into() },
-                subagent_id: None,
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::ContentDelta {
+                    thread_id: tid(),
+                    turn_id: turn(),
+                    delta: ContentDelta::Text { text: "hi".into() },
+                    subagent_id: None,
+                },
+                &mut st
+            ),
             Some(PaneStatus::Working)
         );
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::ItemCompleted {
-                thread_id: tid(),
-                turn_id: turn(),
-                item: CompletedItem::AssistantText { text: "hi".into() },
-                subagent_id: None,
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::ItemCompleted {
+                    thread_id: tid(),
+                    turn_id: turn(),
+                    item: CompletedItem::AssistantText { text: "hi".into() },
+                    subagent_id: None,
+                },
+                &mut st
+            ),
             Some(PaneStatus::Working)
         );
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::RequestResolved {
-                thread_id: tid(),
-                request_id: req(),
-                decision: ApprovalDecision::AllowForSession,
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::RequestResolved {
+                    thread_id: tid(),
+                    request_id: req(),
+                    decision: ApprovalDecision::AllowForSession,
+                },
+                &mut st
+            ),
             Some(PaneStatus::Working)
         );
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: tid(),
-                status: SessionStatus::Running { active_turn: turn() },
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Running { active_turn: turn() },
+                },
+                &mut st
+            ),
             Some(PaneStatus::Working)
         );
 
         // Permission: a user-facing request is open / session parked on one.
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::RequestOpened {
-                thread_id: tid(),
-                turn_id: turn(),
-                request_id: req(),
-                request_kind: "tool".into(),
-                payload: json!({}),
-                tool_use_id: None,
-                subagent_id: None,
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::RequestOpened {
+                    thread_id: tid(),
+                    turn_id: turn(),
+                    request_id: req(),
+                    request_kind: "tool".into(),
+                    payload: json!({}),
+                    tool_use_id: None,
+                    subagent_id: None,
+                },
+                &mut st
+            ),
             Some(PaneStatus::Permission)
         );
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: tid(),
-                status: SessionStatus::WaitingApproval { request_id: req() },
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::WaitingApproval { request_id: req() },
+                },
+                &mut st
+            ),
             Some(PaneStatus::Permission)
         );
 
-        // Review: the turn finished (caller may downgrade to Idle if focused).
+        // Review: the turn finished with no subagents in flight (caller
+        // may downgrade to Idle if focused).
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::TurnCompleted {
-                thread_id: tid(),
-                turn_id: turn(),
-                status: TurnStatus::Success,
-                usage: None,
-            }),
+            map_event_to_pane_status(&turn_completed(), &mut st),
             Some(PaneStatus::Review)
         );
 
         // Idle: session torn down or broken — clear the indicator.
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: tid(),
-                status: SessionStatus::Closed,
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Closed,
+                },
+                &mut st
+            ),
             Some(PaneStatus::Idle)
         );
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: tid(),
-                status: SessionStatus::Error { message: "boom".into() },
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Error { message: "boom".into() },
+                },
+                &mut st
+            ),
             Some(PaneStatus::Idle)
         );
 
         // None: a fresh/ready session and configuration notices don't move
         // the dot — parity with a freshly-spawned terminal showing nothing.
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: tid(),
-                status: SessionStatus::Ready,
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Ready,
+                },
+                &mut st
+            ),
             None
         );
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::SessionStateChanged {
-                thread_id: tid(),
-                status: SessionStatus::Starting,
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Starting,
+                },
+                &mut st
+            ),
             None
         );
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::SessionConfigured {
-                thread_id: tid(),
-                provider_session_id: ProviderSessionId("s".into()),
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionConfigured {
+                    thread_id: tid(),
+                    provider_session_id: ProviderSessionId("s".into()),
+                },
+                &mut st
+            ),
             None
         );
         assert_eq!(
-            map_event_to_pane_status(&ProviderRuntimeEvent::RuntimeWarning {
-                thread_id: Some(tid()),
-                message: "warn".into(),
-                original_payload: None,
-            }),
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::RuntimeWarning {
+                    thread_id: Some(tid()),
+                    message: "warn".into(),
+                    original_payload: None,
+                },
+                &mut st
+            ),
             None
         );
+    }
+
+    // (a) TurnCompleted while a subagent is still running holds Working
+    //     instead of flipping to Review.
+    #[test]
+    fn turn_completed_with_running_subagent_stays_working() {
+        let mut st = ThreadSubagentState::default();
+        // Subagent spawns mid-turn.
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st),
+            None,
+            "a running snapshot during an in-flight turn doesn't move the dot"
+        );
+        // Parent turn finishes but the subagent is still running.
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Working),
+            "spinner holds while the subagent runs"
+        );
+        assert!(st.review_pending, "a Review is now owed");
+        assert!(st.running.contains("s1"));
+    }
+
+    // (b) The last subagent going terminal after TurnCompleted publishes
+    //     the deferred Review.
+    #[test]
+    fn last_subagent_terminal_after_turn_completed_publishes_review() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&subagent_event("s2", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+
+        // First subagent finishes — still one running, no Review yet.
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Completed), &mut st),
+            None
+        );
+        assert!(st.review_pending);
+        // Last subagent finishes — the deferred Review fires.
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("s2", SubagentStatus::Failed), &mut st),
+            Some(PaneStatus::Review)
+        );
+        assert!(st.is_clear(), "tracker returns to the clear state");
+    }
+
+    // (c) No subagents: TurnCompleted → Review, unchanged from before.
+    #[test]
+    fn turn_completed_without_subagents_reviews() {
+        let mut st = ThreadSubagentState::default();
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Review)
+        );
+        assert!(st.is_clear());
+    }
+
+    // (d) Session Closed / Error clears tracking so a never-terminating
+    //     subagent can't pin the spinner.
+    #[test]
+    fn session_close_clears_subagent_tracking() {
+        use crate::state::PaneStatus;
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert!(!st.is_clear());
+
+        assert_eq!(
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Closed,
+                },
+                &mut st
+            ),
+            Some(PaneStatus::Idle)
+        );
+        assert!(st.is_clear(), "close forgets the stuck subagent");
+
+        // Same for Error.
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Error { message: "boom".into() },
+                },
+                &mut st
+            ),
+            Some(PaneStatus::Idle)
+        );
+        assert!(st.is_clear());
+    }
+
+    // (e) Subagent completes BEFORE the parent turn finishes → normal
+    //     Review, no deferral.
+    #[test]
+    fn subagent_completes_before_turn_completed_reviews() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        // Subagent finishes while the parent turn is still going.
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Completed), &mut st),
+            None,
+            "no Review owed yet, so a terminal subagent is silent"
+        );
+        assert!(st.is_clear());
+        // Parent turn then completes with nothing outstanding.
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Review)
+        );
+    }
+
+    // A running snapshot arriving AFTER a Review is owed restores Working
+    // (the resurrection guard only blocks snapshots during a live turn).
+    #[test]
+    fn running_snapshot_after_review_owed_restores_working() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st),
+            Some(PaneStatus::Working),
+            "a live running snapshot keeps the spinner while Review is owed"
+        );
+    }
+
+    // (f) The tracker drops the thread entry once it returns to clear, so
+    //     a later replayed/stray terminal snapshot can't underflow or
+    //     resurrect anything — it maps to None against a fresh state.
+    #[test]
+    fn tracker_drops_cleared_threads_and_ignores_stray_terminals() {
+        let tracker = SubagentTracker::default();
+        // Live turn with a subagent that outlives it.
+        assert_eq!(
+            tracker.decide("t", &subagent_event("s1", SubagentStatus::Running)),
+            None
+        );
+        assert_eq!(
+            tracker.decide("t", &turn_completed()),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed)),
+            Some(PaneStatus::Review)
+        );
+        // Entry is dropped; a stray duplicate terminal is a harmless None.
+        assert_eq!(
+            tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed)),
+            None
+        );
+        // clear_thread is idempotent on an already-gone thread.
+        tracker.clear_thread("t");
+        tracker.clear_thread("does-not-exist");
+    }
+
+    fn session_running() -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: tid(),
+            status: SessionStatus::Running { active_turn: turn() },
+        }
+    }
+
+    // Finding 1 (regression): a subagent left non-terminal by a prior turn
+    // must NOT suppress `Review` on every later turn. The new-turn reset
+    // (here modelled by `SessionStateChanged::Running`, the provider-level
+    // per-turn anchor) drains the stale `running` id so the next
+    // `TurnCompleted` flips to `Review`. Would fail before the fix, when
+    // `Running` cleared only `review_pending` and left `running` intact.
+    #[test]
+    fn stale_running_subagent_does_not_suppress_review_across_turns() {
+        let mut st = ThreadSubagentState::default();
+        // Turn 1: a background subagent spawns and never goes terminal.
+        map_event_to_pane_status(&subagent_event("bg", SubagentStatus::Running), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Working),
+            "turn 1 defers Review while the background subagent runs"
+        );
+        assert!(st.review_pending);
+        assert!(st.running.contains("bg"));
+
+        // Turn 2 starts: the new-turn reset drains the stale tracking.
+        assert_eq!(
+            map_event_to_pane_status(&session_running(), &mut st),
+            Some(PaneStatus::Working)
+        );
+        assert!(st.is_clear(), "new turn resets both running and review_pending");
+
+        // Turn 2 finishes with nothing tracked → Review fires normally.
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Review),
+            "no stale id suppresses the second turn's Review"
+        );
+    }
+
+    // Same regression via the authoritative anchor: the send-message
+    // command path clears the tracker entry. Model it with
+    // `SubagentTracker::clear_thread` between the two turns.
+    #[test]
+    fn send_command_clear_resets_tracking_across_turns() {
+        let tracker = SubagentTracker::default();
+        // Turn 1: subagent outlives the turn, Review deferred.
+        tracker.decide("t", &subagent_event("bg", SubagentStatus::Running));
+        assert_eq!(tracker.decide("t", &turn_completed()), Some(PaneStatus::Working));
+
+        // agent_chat_send_turn clears the thread's tracker before turn 2.
+        tracker.clear_thread("t");
+
+        // Turn 2 completes clean → Review, not a stuck Working.
+        assert_eq!(tracker.decide("t", &turn_completed()), Some(PaneStatus::Review));
+    }
+
+    // Finding 2: a deferred Review must survive parent-scoped output that
+    // trickles in after `TurnCompleted` while subagents still run. The
+    // parent-scoped `ItemCompleted` maps `Working` but must NOT clear the
+    // owed `review_pending`, so the later terminal subagent still fires
+    // `Review`. Would fail before the fix, when parent-scoped output with
+    // `subagent_id == None` cleared `review_pending`.
+    #[test]
+    fn deferred_review_survives_parent_scoped_output() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Working),
+            "Review deferred while the subagent runs"
+        );
+        assert!(st.review_pending);
+
+        // A late parent-scoped item (subagent_id == None) arrives after the
+        // deferred TurnCompleted. It keeps Working but leaves the owed
+        // Review intact.
+        assert_eq!(
+            map_event_to_pane_status(
+                &ProviderRuntimeEvent::ItemCompleted {
+                    thread_id: tid(),
+                    turn_id: turn(),
+                    item: CompletedItem::AssistantText { text: "final".into() },
+                    subagent_id: None,
+                },
+                &mut st
+            ),
+            Some(PaneStatus::Working)
+        );
+        assert!(st.review_pending, "parent-scoped output must not drop the owed Review");
+
+        // The last subagent goes terminal → the owed Review finally fires.
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Completed), &mut st),
+            Some(PaneStatus::Review)
+        );
+        assert!(st.is_clear());
+    }
+
+    // After a new-turn reset drained the stale tracking, a late terminal
+    // snapshot for the forgotten subagent is a harmless no-op — it doesn't
+    // underflow `running`, resurrect a Review, or move the dot.
+    #[test]
+    fn stale_terminal_after_new_turn_reset_is_noop() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("bg", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        // New turn resets tracking.
+        map_event_to_pane_status(&session_running(), &mut st);
+        assert!(st.is_clear());
+
+        // The old subagent's terminal snapshot finally arrives — no-op.
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("bg", SubagentStatus::Completed), &mut st),
+            None,
+            "a terminal for an already-forgotten subagent moves nothing"
+        );
+        assert!(st.is_clear());
     }
 
     #[test]
