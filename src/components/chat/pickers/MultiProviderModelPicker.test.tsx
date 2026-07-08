@@ -45,7 +45,14 @@ function makeCaps(models: ChatModelInfo[]): ProviderChatCapabilities {
 }
 
 const CLAUDE_CAPS = makeCaps([
-  makeModel({ id: "claude-opus-4-7", label: "Claude Opus 4.7" }),
+  // Opus carries the resolved-version + blurb the backend now serves
+  // for Claude rows; Haiku keeps `description: null` so we still cover
+  // the unchanged (subtitle == driver label) rendering.
+  makeModel({
+    id: "claude-opus-4-7",
+    label: "Claude Opus 4.7",
+    description: "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+  }),
   makeModel({ id: "claude-haiku-4-5", label: "Claude Haiku 4.5" }),
 ]);
 
@@ -170,6 +177,68 @@ describe("MultiProviderModelPicker — trigger", () => {
     expect(
       screen.queryByPlaceholderText("Search models..."),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe("MultiProviderModelPicker — model descriptions", () => {
+  it("appends the description to the row subtitle after the driver label", async () => {
+    const user = userEvent.setup();
+    renderPicker({ provider: "claude", model: "claude-opus-4-7" });
+    await openPicker(user);
+
+    const rows = screen.getAllByTestId("multi-provider-model-row");
+    const opusRow = rows.find((r) =>
+      r.textContent?.includes("Claude Opus 4.7"),
+    );
+    expect(opusRow).toBeDefined();
+    // Subtitle reads "Claude · <description>" on a single line, with
+    // the full text mirrored into the title tooltip.
+    const subtitle = opusRow!.querySelector(
+      "span[title]",
+    ) as HTMLElement | null;
+    expect(subtitle).not.toBeNull();
+    expect(subtitle!.textContent).toBe(
+      "Claude · Opus 4.8 with 1M context · Best for everyday, complex tasks",
+    );
+    expect(subtitle!).toHaveAttribute(
+      "title",
+      "Claude · Opus 4.8 with 1M context · Best for everyday, complex tasks",
+    );
+  });
+
+  it("leaves the subtitle as the driver label when description is null", async () => {
+    const user = userEvent.setup();
+    renderPicker({ provider: "claude", model: "claude-opus-4-7" });
+    await openPicker(user);
+
+    const rows = screen.getAllByTestId("multi-provider-model-row");
+    const haikuRow = rows.find((r) =>
+      r.textContent?.includes("Claude Haiku 4.5"),
+    );
+    expect(haikuRow).toBeDefined();
+    const subtitle = haikuRow!.querySelector(
+      "span[title]",
+    ) as HTMLElement | null;
+    expect(subtitle).not.toBeNull();
+    expect(subtitle!.textContent).toBe("Claude");
+    expect(subtitle!).toHaveAttribute("title", "Claude");
+  });
+
+  it("surfaces the active model's description in the trigger tooltip", () => {
+    renderPicker({ provider: "claude", model: "claude-opus-4-7" });
+    expect(
+      screen.getByTestId("multi-provider-model-picker-trigger"),
+    ).toHaveAttribute(
+      "title",
+      "Claude Opus 4.7 · Opus 4.8 with 1M context · Best for everyday, complex tasks",
+    );
+  });
+
+  it("trigger tooltip is just the label when the active model has no description", () => {
+    renderPicker({ provider: "claude", model: "claude-haiku-4-5" });
+    expect(
+      screen.getByTestId("multi-provider-model-picker-trigger"),
+    ).toHaveAttribute("title", "Claude Haiku 4.5");
   });
 });
 

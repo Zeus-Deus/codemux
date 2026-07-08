@@ -91,6 +91,20 @@ The chat pane stack:
     child (`kill_on_drop`, generated `OPENCODE_SERVER_PASSWORD`).
   - All three render in a single 2-column picker (provider rail + searchable
     model list); favorites persist via zustand + `localStorage`.
+  - **Model rows show the resolved version + blurb** (like the terminal
+    `/model` picker): when `ChatModelInfo.description` is present the row
+    subtitle renders `<driver> · <description>` (truncated, full text in a
+    `title` tooltip), e.g. `Claude · Opus 4.8 with 1M context · Best for
+    everyday, complex tasks`; the trigger pill mirrors label + description
+    into its tooltip. Backend guarantees every Claude row carries a
+    description: SDK-provided string verbatim when the CLI supplies one →
+    maintained blurb for known full ids (blurb-only; the label already
+    carries the version) → alias backfill (`ALIAS_CANONICAL_IDS` in
+    `src-tauri/src/agent_provider/claude/capabilities.rs` maps
+    `default`/`opus`/`fable`/`sonnet`/`haiku` to canonical maintained ids and
+    synthesizes `<Version>[ with 1M context] · <blurb>`). Model *selection*
+    itself passes the picked id through unchanged; alias ids are resolved to
+    the latest concrete model by the Claude CLI/SDK, not by Codemux.
 - **Streaming chat UX**: Streamdown-rendered messages, tool approvals
   (per-tool body rendering), collapsible reasoning blocks (thinking
   deltas reduce into a `reasoning` ChatViewItem that seals on any
