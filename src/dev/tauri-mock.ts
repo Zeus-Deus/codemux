@@ -38,6 +38,7 @@ import {
   MOCK_USER,
   createSeedAppState,
   richChatTurnEnvelopes,
+  subagentTurnEnvelopes,
 } from "./mock-fixtures";
 import type {
   AppStateSnapshot,
@@ -268,7 +269,10 @@ const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
 const MOCK_CHAT_MODEL: ChatModelInfo = {
   id: "mock-sonnet",
   label: "Mock Sonnet",
-  description: "Simulated model served by the dev mock",
+  // Mirrors the resolved-version + blurb the real backend now serves
+  // for Claude rows so `npm run dev` visually exercises the picker's
+  // description subtitle.
+  description: "Sonnet 5 with 1M context · Efficient for routine tasks",
   effort_levels: [],
   default_effort: null,
   prompt_injected_effort_levels: [],
@@ -400,6 +404,25 @@ function mockChatTranscript(): string[] {
       usage: null,
     });
   }
+  // Final showcase turn: the subagents orchestration card (design
+  // fixture) — one completed subagent, one still running — so the card,
+  // the "1 subagent running" pane pill, and the drill-in all render on
+  // open. Landing last keeps it visible the moment the thread hydrates.
+  const subTurnId = "seed-subagents";
+  push({
+    type: "user_message",
+    thread_id: T,
+    text: "Implement clipboard-paste fallback",
+  });
+  for (const envelope of subagentTurnEnvelopes(T, subTurnId)) push(envelope);
+  push({
+    type: "turn_completed",
+    thread_id: T,
+    turn_id: subTurnId,
+    status: { kind: "success" },
+    usage: null,
+  });
+
   mockChatTranscriptCache = out;
   return out;
 }
@@ -615,17 +638,151 @@ function streamMockChatReply(
   return turnId;
 }
 
-// Expose the stream trigger for browser-console / automation use.
+/** Live-stream a full two-subagent lifecycle over the real per-thread
+ *  Channel for visual dev: the orchestrator spawns "Explore" and
+ *  "Implement", both work through a few tool calls, then finish. Drives
+ *  the orchestration card, the running pill, the shimmer activity lines,
+ *  and (if entered) the drill-in — all from live `subagent_updated` +
+ *  `subagent_id`-tagged events, exactly like the real adapter.
+ *
+ *  `window.__codemuxChatMock.streamSubagents()` triggers it on demand. */
+function streamMockSubagents(
+  threadId: string,
+  opts: { intervalMs?: number } = {},
+): string {
+  const turnId = `live-subagents-${++mockChatTurnSeq}`;
+  const intervalMs = Math.max(60, opts.intervalMs ?? 550);
+  const send = (event: unknown) => emitChatEvent(threadId, event);
+  const snap = (subagent: Record<string, unknown>) =>
+    send({ type: "subagent_updated", thread_id: threadId, subagent });
+  const item = (subagentId: string, it: Record<string, unknown>) =>
+    send({
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      subagent_id: subagentId,
+      item: it,
+    });
+  const toolUse = (
+    subagentId: string,
+    id: string,
+    toolName: string,
+    input: Record<string, unknown>,
+  ) => item(subagentId, { kind: "tool_use", tool_name: toolName, tool_use_id: id, input });
+  const toolResult = (subagentId: string, id: string, content: string) =>
+    item(subagentId, { kind: "tool_result", tool_use_id: id, content, is_error: false });
+
+  // Scripted timeline — one frame per tick so the lifecycle is watchable.
+  const frames: Array<() => void> = [
+    () =>
+      send({
+        type: "session_state_changed",
+        thread_id: threadId,
+        status: { status: "running", active_turn: turnId },
+      }),
+    () =>
+      send({
+        type: "item_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        item: {
+          kind: "assistant_text",
+          text: "Delegating to two subagents so exploration and implementation run in parallel.",
+        },
+      }),
+    () =>
+      snap({
+        subagent_id: "explore",
+        name: "Explore",
+        agent_type: "explore",
+        model: "sonnet · high",
+        status: "running",
+      }),
+    () =>
+      snap({
+        subagent_id: "build",
+        name: "Implement",
+        agent_type: "implement",
+        model: "opus · xhigh",
+        status: "running",
+      }),
+    () => toolUse("explore", "ex-1", "Grep", { pattern: "handlePaste", path: "src" }),
+    () => toolResult("explore", "ex-1", "7 matches"),
+    () => snap({ subagent_id: "explore", activity: "mapping the paste handler call graph…" }),
+    () => toolUse("build", "b-1", "Edit", {
+      file_path: "src-tauri/src/clipboard.rs",
+      old_string: "",
+      new_string: "pub fn read_image() {}\n",
+    }),
+    () => toolResult("build", "b-1", "Applied edit"),
+    () => toolUse("explore", "ex-2", "Read", { file_path: "src/components/chat/Composer.tsx" }),
+    () => toolResult("explore", "ex-2", "// Composer.tsx\n"),
+    () =>
+      snap({
+        subagent_id: "explore",
+        status: "completed",
+        result_text: "Mapped the paste path · 2 files inspected",
+        tool_use_count: 2,
+        duration_ms: 12000,
+      }),
+    () => toolUse("build", "b-2", "Bash", { command: "cargo test clipboard_fallback" }),
+    () => toolResult("build", "b-2", "test result: ok. 1 passed"),
+    () =>
+      snap({
+        subagent_id: "build",
+        status: "completed",
+        result_text: "Done · clipboard fallback landed, tests pass",
+        tool_use_count: 4,
+        duration_ms: 21000,
+      }),
+    () =>
+      send({
+        type: "item_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        item: {
+          kind: "assistant_text",
+          text: "Both subagents reported back — clipboard paste fallback is implemented and verified.",
+        },
+      }),
+    () =>
+      send({
+        type: "turn_completed",
+        thread_id: threadId,
+        turn_id: turnId,
+        status: { kind: "success" },
+        usage: null,
+      }),
+    () =>
+      send({
+        type: "session_state_changed",
+        thread_id: threadId,
+        status: { status: "ready" },
+      }),
+  ];
+
+  let i = 0;
+  const timer = window.setInterval(() => {
+    const frame = frames[i++];
+    if (frame) frame();
+    if (i >= frames.length) window.clearInterval(timer);
+  }, intervalMs);
+  return turnId;
+}
+
+// Expose the stream triggers for browser-console / automation use.
 (
   window as unknown as {
     __codemuxChatMock: {
       threadId: string;
       streamReply: typeof streamMockChatReply;
+      streamSubagents: typeof streamMockSubagents;
     };
   }
 ).__codemuxChatMock = {
   threadId: MOCK_CHAT_THREAD_ID,
   streamReply: streamMockChatReply,
+  streamSubagents: streamMockSubagents,
 };
 
 // A small, mutable preset store so the preset bar + structured editor are
@@ -869,8 +1026,36 @@ const handlers: Record<string, Handler> = {
       title: "agent-chat-demo",
       created_at: new Date().toISOString(),
       last_active_at: new Date().toISOString(),
+      model: "claude-opus-4-8",
+      effort: null,
+      context_window: null,
+      permission_mode: "bypassPermissions",
     },
   ],
+  // Restart-resume seed (design F): the pane's mount-seed effect fetches
+  // this to restore picker config + resume cursor. Return a plausible
+  // record for the seeded thread so `npm run dev` rehydrates the pickers;
+  // any other thread has no persisted row yet.
+  agent_chat_get_session: (a) =>
+    a.threadId === MOCK_CHAT_THREAD_ID
+      ? {
+          thread_id: MOCK_CHAT_THREAD_ID,
+          sdk_session_id: "sdk-mock-chat",
+          workspace_id: "ws-codemux-chat",
+          cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+          provider: "claude",
+          title: "agent-chat-demo",
+          created_at: new Date().toISOString(),
+          last_active_at: new Date().toISOString(),
+          model: "claude-opus-4-8",
+          effort: null,
+          context_window: null,
+          permission_mode: "bypassPermissions",
+        }
+      : null,
+  // DB-only config persist (design G). The mock has no SQLite, so this
+  // is a no-op — the demo pane keeps its in-memory slice values.
+  agent_chat_update_session_config: () => undefined,
   agent_chat_start_session: (a) =>
     (a.input as { thread_id: string }).thread_id,
   agent_chat_send_turn: (a) => {

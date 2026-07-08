@@ -58,6 +58,9 @@ const GROUP_MIN = 2;
  *    approval footer must render on a standalone `ToolCallCard`.
  *  - TodoWrite / task-summary calls — `TaskSummaryCard` stays a visible
  *    checklist.
+ * (`subagent_run` orchestration cards are `kind: "subagent_run"`, not
+ * `tool_call`, so they never satisfy this predicate — each renders as its
+ * own standalone full-width slot and breaks any surrounding run.)
  */
 function isGroupableTool(item: ChatViewItem): item is ToolCallItem {
   return (

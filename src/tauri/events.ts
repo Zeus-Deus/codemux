@@ -157,6 +157,46 @@ export type CompletedItem =
       is_error: boolean;
     };
 
+// ── Subagents (cross-provider) ──
+//
+// Mirror of src-tauri/src/agent_provider/events.rs:SubagentSnapshot /
+// SubagentStatus (Stage 1). Field names are the SERIALIZED snake_case
+// wire names. Every field except `subagent_id` / `status` is optional
+// and `#[serde(default)]` on the Rust side, so old persisted rows (and
+// providers that only dribble identity out over several events) decode
+// cleanly. The frontend reducer merges non-null fields into its
+// per-subagent view state.
+
+export type SubagentStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped";
+
+export interface SubagentSnapshot {
+  /** Stable demux key (Claude parent_tool_use_id, Codex child threadId,
+   *  OpenCode child sessionID). Required. */
+  subagent_id: string;
+  /** tool_use / call id of the block that spawned this subagent. */
+  parent_item_id?: string | null;
+  /** Display name — "Explore", nickname, or agent name. */
+  name?: string | null;
+  /** subagent_type / role / agent. */
+  agent_type?: string | null;
+  model?: string | null;
+  status: SubagentStatus;
+  /** Live "currently doing X" line pushed by the provider. */
+  activity?: string | null;
+  /** Final report text, on completion. */
+  result_text?: string | null;
+  tool_use_count?: number | null;
+  total_tokens?: number | null;
+  duration_ms?: number | null;
+  /** Provider-native id (codex threadId, opencode sessionID, claude agentId). */
+  provider_ref?: string | null;
+}
+
 export type TurnStatus =
   | { kind: "success" }
   | { kind: "error"; subtype: string; message: string }
@@ -180,12 +220,25 @@ export type ProviderRuntimeEvent =
       thread_id: string;
       turn_id: string;
       delta: ContentDelta;
+      /** When set, this delta belongs to the sub-transcript of the
+       *  identified subagent (Claude `parent_tool_use_id`, Codex child
+       *  threadId). `#[serde(default)]` on the Rust side, so absent /
+       *  `null` for ordinary parent-thread streaming. */
+      subagent_id?: string | null;
     }
   | {
       type: "item_completed";
       thread_id: string;
       turn_id: string;
       item: CompletedItem;
+      /** When set, this completed item belongs to the identified
+       *  subagent's sub-transcript rather than the parent flow. */
+      subagent_id?: string | null;
+    }
+  | {
+      type: "subagent_updated";
+      thread_id: string;
+      subagent: SubagentSnapshot;
     }
   | {
       type: "turn_completed";
@@ -207,6 +260,10 @@ export type ProviderRuntimeEvent =
        *  requests (plan, Codex server-initiated, or when the provider
        *  didn't supply one). */
       tool_use_id: string | null;
+      /** When a subagent raised this approval, its demux key — lets the
+       *  UI label the request "from subagent X" in the parent flow and
+       *  mirror it into the drill-in. `#[serde(default)]`. */
+      subagent_id?: string | null;
     }
   | {
       type: "request_resolved";

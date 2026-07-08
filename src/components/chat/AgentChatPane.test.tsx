@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
-import { cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 let currentMessages: unknown[] = [];
 // Overridable per-test: thread -> messages map so the new race-fix
@@ -46,6 +46,11 @@ const setPermissionModeMock = vi.fn();
 const markRequestResolvedMock = vi.fn();
 const setHasDebugActivityMock = vi.fn();
 const setDebugActivityResolvedMock = vi.fn();
+// Hoisted so the mount-seed effect tests (design F) can assert which
+// picker fields the pane restored from the persisted session row.
+const setEffortMock = vi.fn();
+const setContextWindowMock = vi.fn();
+const setResumeCursorMock = vi.fn();
 // Hoisted mock for the bug/chat-agent-empty regression test (an
 // unmount/remount that lands on an existing thread should pull the
 // persisted transcript and overlay it onto the in-memory slice when
@@ -63,10 +68,12 @@ vi.mock("./ChatTranscript", () => ({
     messages,
     sessionStartedAt,
     onAcceptPlan,
+    onEnterSubagent,
   }: {
     messages: unknown[];
     sessionStartedAt?: number;
     onAcceptPlan: (requestId: string) => void;
+    onEnterSubagent?: (subagentId: string) => void;
   }) => (
     <div
       data-testid="transcript"
@@ -81,6 +88,12 @@ vi.mock("./ChatTranscript", () => ({
       <button
         data-testid="accept-plan"
         onClick={() => onAcceptPlan("req-1")}
+      />
+      {/* Lets the viewMode-swap test trigger the pane's real
+          onEnterSubagent handler without mounting the full card. */}
+      <button
+        data-testid="enter-subagent"
+        onClick={() => onEnterSubagent?.("sub-1")}
       />
     </div>
   ),
@@ -140,10 +153,14 @@ vi.mock("./Composer", () => ({
     zone1Override,
     onModeRemove,
     onModeActivate,
+    onModelChange,
+    onContextWindowChange,
   }: {
     zone1Override?: React.ReactNode;
     onModeRemove: () => void;
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
+    onModelChange: (model: string) => void;
+    onContextWindowChange: (contextWindow: string) => void;
   }) => (
     <div data-testid="composer">
       <div data-testid="zone1">{zone1Override}</div>
@@ -159,6 +176,17 @@ vi.mock("./Composer", () => ({
       <button
         data-testid="mode-activate-debug"
         onClick={() => onModeActivate("debug")}
+      />
+      {/* Design G persist coverage: exercise the pane's real picker
+          handlers so the test can assert the fire-and-forget
+          `agentChatUpdateSessionConfig` write. */}
+      <button
+        data-testid="model-change"
+        onClick={() => onModelChange("claude-sonnet-4-6")}
+      />
+      <button
+        data-testid="context-window-change"
+        onClick={() => onContextWindowChange("1m")}
       />
     </div>
   ),
@@ -239,6 +267,11 @@ vi.mock("@/hooks/use-agent-chat-events", () => ({
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
+  // The pane's mount-seed effect (design F) fetches the persisted
+  // session row to restore picker config + resume cursor. Default to
+  // `null` (no persisted row) so tests that don't seed a record fall
+  // back to the provider default; the seed tests override per-case.
+  agentChatGetSession: vi.fn().mockResolvedValue(null),
   agentChatInterruptTurn: vi.fn().mockResolvedValue(undefined),
   // The pane's mount-time hydrate effect calls this whenever it lands
   // with a truthy threadId — return an empty transcript so the effect
@@ -254,6 +287,9 @@ vi.mock("@/tauri/commands", () => ({
   agentChatSetPermissionMode: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
+  // Picker handlers (design G) mirror every change into this DB-only
+  // persist command, fire-and-forget. Default no-op.
+  agentChatUpdateSessionConfig: vi.fn().mockResolvedValue(undefined),
   grepCountPattern: vi.fn().mockResolvedValue(0),
 }));
 
@@ -375,8 +411,9 @@ vi.mock("@/stores/agent-chat-store", () => {
         setModel: setModelMock,
         setPermissionMode: setPermissionModeMock,
         setSessionLaunchMode: vi.fn(),
-        setEffort: vi.fn(),
-        setContextWindow: vi.fn(),
+        setEffort: setEffortMock,
+        setContextWindow: setContextWindowMock,
+        setResumeCursor: setResumeCursorMock,
         setMode: setModeMock,
         setModePriorPermissionMode: setModePriorMock,
         setHasDebugActivity: setHasDebugActivityMock,
@@ -412,13 +449,16 @@ vi.mock("@/stores/agent-chat-store", () => {
 
 import { AgentChatPane } from "./AgentChatPane";
 import {
+  agentChatGetSession,
   agentChatListMessages,
   agentChatListSessions,
   agentChatSendTurn,
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
+  agentChatUpdateSessionConfig,
   grepCountPattern,
+  type AgentChatSessionRecord,
 } from "@/tauri/commands";
 
 const pane = {
@@ -462,6 +502,65 @@ describe("AgentChatPane empty-state branch", () => {
     expect(
       container.querySelector('[data-testid="home-landing"]'),
     ).toBeNull();
+  });
+});
+
+describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
+  const subagentMessage = {
+    kind: "subagent_run",
+    id: "run-1",
+    seq: 1,
+    turn_id: "turn-1",
+    subagents: [
+      {
+        id: "sub-1",
+        name: "Explore",
+        model: "opus · xhigh",
+        status: "running",
+        items: [],
+        toneIndex: 0,
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1", seq: 0 }, subagentMessage];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    workspaceIdForPaneOverride = "ws-home";
+    vi.mocked(agentChatListMessages).mockReset();
+    vi.mocked(agentChatListMessages).mockResolvedValue([]);
+  });
+
+  it("swaps the transcript for the breadcrumb + read-only drill-in on enter, and Esc returns", () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+
+    // Orchestrator mode: the (mocked) transcript is shown, no breadcrumb.
+    expect(container.querySelector('[data-testid="transcript"]')).not.toBeNull();
+
+    // Enter the subagent via the real onEnterSubagent handler.
+    fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
+
+    // Drill-in mode: transcript gone, breadcrumb + read-only banner shown.
+    expect(container.querySelector('[data-testid="transcript"]')).toBeNull();
+    expect(container.textContent).toContain("Orchestrator");
+    expect(container.textContent).toContain("Read-only view of the");
+    // The drill-in shows the subagent name in both the banner and breadcrumb.
+    expect(container.textContent).toContain("Explore");
+
+    // Esc returns to the orchestrator transcript.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(container.querySelector('[data-testid="transcript"]')).not.toBeNull();
+  });
+
+  it("keeps the parent-bound composer mounted while entered", () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+    expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
+    fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
+    // Drill-in swaps the transcript body but the composer stays parent-bound
+    // (design: "steering goes to the orchestrator").
+    expect(container.querySelector('[data-testid="transcript"]')).toBeNull();
+    expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
   });
 });
 
@@ -577,6 +676,10 @@ describe("AgentChatPane session-start marker wiring (D2)", () => {
       title: "Chat",
       created_at: overrides.created_at,
       last_active_at: overrides.created_at,
+      model: null,
+      effort: null,
+      context_window: null,
+      permission_mode: null,
     };
   }
 
@@ -1112,14 +1215,40 @@ describe("AgentChatPane Stage D — Zone 1 dispatch", () => {
 // a separate seed effect the slice's model would stay null and
 // ReasoningPicker (`if (!model) return null`) would render nothing.
 
-describe("AgentChatPane default-model seed effect", () => {
+describe("AgentChatPane mount-seed effect (design F)", () => {
+  function makeRecord(
+    overrides: Partial<AgentChatSessionRecord> = {},
+  ): AgentChatSessionRecord {
+    return {
+      thread_id: "thread-x",
+      sdk_session_id: null,
+      workspace_id: "ws-home",
+      cwd: "/home/user",
+      provider: "claude",
+      title: "Chat",
+      created_at: "2026-07-03T14:52:00Z",
+      last_active_at: "2026-07-03T14:52:00Z",
+      model: null,
+      effort: null,
+      context_window: null,
+      permission_mode: null,
+      ...overrides,
+    };
+  }
+
   beforeEach(() => {
     currentMessages = [];
     currentThreadsMap = {};
     currentDraftsById = {};
+    currentSliceOverrides = {};
     workspaceIdForPaneOverride = "ws-home";
     setModelMock.mockClear();
+    setEffortMock.mockClear();
+    setContextWindowMock.mockClear();
+    setResumeCursorMock.mockClear();
+    setPermissionModeMock.mockClear();
     vi.mocked(agentChatStartSession).mockClear();
+    vi.mocked(agentChatGetSession).mockReset().mockResolvedValue(null);
     mockAppState.appState = HOME_APP_STATE.appState;
   });
   afterEach(() => {
@@ -1131,18 +1260,17 @@ describe("AgentChatPane default-model seed effect", () => {
     cleanup();
   });
 
-  it("seeds slice.model with the provider default when slice.model is null on mount", () => {
+  it("falls back to the provider default when no persisted row exists", async () => {
     // Pane already has a thread_id (existing pane reopened, or app
     // restart hydrated the pane snapshot but the in-memory store is
     // empty). Slice exists with model: null. The mount effect that
-    // starts a session short-circuits in this branch, so the new
-    // seed effect must compensate.
-    const existingPane = {
-      ...pane,
-      thread_id: "thread-x",
-    };
+    // starts a session short-circuits in this branch, so the seed
+    // effect must compensate. `agentChatGetSession` resolves null →
+    // provider default.
+    const existingPane = { ...pane, thread_id: "thread-x" };
     render(<AgentChatPane pane={existingPane} />);
-    expect(setModelMock).toHaveBeenCalled();
+    await waitFor(() => expect(setModelMock).toHaveBeenCalled());
+    expect(agentChatGetSession).toHaveBeenCalledWith("thread-x");
     const [threadId, model] = setModelMock.mock.calls[0];
     expect(threadId).toBe("thread-x");
     // defaultModelForProvider("claude") falls back to "claude-opus-4-8"
@@ -1150,19 +1278,103 @@ describe("AgentChatPane default-model seed effect", () => {
     expect(model).toBe("claude-opus-4-8");
   });
 
-  it("does not call setModel when there is no thread_id yet", () => {
+  it("seeds the persisted model over the Opus default", async () => {
+    // Bug #2: after restart the picker must show the user's chosen
+    // model, not the Opus default. The persisted row wins.
+    vi.mocked(agentChatGetSession).mockResolvedValue(
+      makeRecord({ model: "claude-sonnet-4-6" }),
+    );
+    const existingPane = { ...pane, thread_id: "thread-x" };
+    render(<AgentChatPane pane={existingPane} />);
+    await waitFor(() => expect(setModelMock).toHaveBeenCalled());
+    const [, model] = setModelMock.mock.calls[0];
+    expect(model).toBe("claude-sonnet-4-6");
+  });
+
+  it("seeds effort / contextWindow / permissionMode from the record", async () => {
+    vi.mocked(agentChatGetSession).mockResolvedValue(
+      makeRecord({
+        model: "claude-sonnet-4-6",
+        effort: "high",
+        context_window: "1m",
+        permission_mode: "plan",
+      }),
+    );
+    const existingPane = { ...pane, thread_id: "thread-x" };
+    render(<AgentChatPane pane={existingPane} />);
+    await waitFor(() =>
+      expect(setEffortMock).toHaveBeenCalledWith("thread-x", "high"),
+    );
+    expect(setContextWindowMock).toHaveBeenCalledWith("thread-x", "1m");
+    expect(setPermissionModeMock).toHaveBeenCalledWith("thread-x", "plan");
+  });
+
+  it("does not clobber a permission-mode change the user made during the in-flight fetch", async () => {
+    // Finding 2: the post-fetch re-check must guard EACH field, not just
+    // `model`. Here the slice's model is still null (so the effect
+    // proceeds and seeds the model), but the user changed permission mode
+    // to "acceptEdits" while `agent_chat_get_session` was in flight. The
+    // stale persisted "plan" must NOT be written back over it.
+    currentSliceOverrides = { "thread-x": { permissionMode: "acceptEdits" } };
+    vi.mocked(agentChatGetSession).mockResolvedValue(
+      makeRecord({ model: "claude-sonnet-4-6", permission_mode: "plan" }),
+    );
+    const existingPane = { ...pane, thread_id: "thread-x" };
+    render(<AgentChatPane pane={existingPane} />);
+    // The model still seeds (the user didn't touch it).
+    await waitFor(() =>
+      expect(setModelMock).toHaveBeenCalledWith(
+        "thread-x",
+        "claude-sonnet-4-6",
+      ),
+    );
+    // ...but the user's in-flight permission-mode pick is preserved.
+    expect(setPermissionModeMock).not.toHaveBeenCalledWith("thread-x", "plan");
+  });
+
+  it("restores resumeCursor from the persisted sdk_session_id", async () => {
+    // Bug #1 support: a picker-triggered silent restart must resume the
+    // durable SDK session rather than start fresh, so the mount seed
+    // rebuilds { resume: sdk_session_id } into the slice.
+    vi.mocked(agentChatGetSession).mockResolvedValue(
+      makeRecord({ model: "claude-sonnet-4-6", sdk_session_id: "sdk-abc" }),
+    );
+    const existingPane = { ...pane, thread_id: "thread-x" };
+    render(<AgentChatPane pane={existingPane} />);
+    await waitFor(() => expect(setResumeCursorMock).toHaveBeenCalled());
+    expect(setResumeCursorMock).toHaveBeenCalledWith("thread-x", {
+      resume: "sdk-abc",
+    });
+  });
+
+  it("seeds resumeCursor null when the row has no sdk_session_id", async () => {
+    vi.mocked(agentChatGetSession).mockResolvedValue(
+      makeRecord({ model: "claude-sonnet-4-6", sdk_session_id: null }),
+    );
+    const existingPane = { ...pane, thread_id: "thread-x" };
+    render(<AgentChatPane pane={existingPane} />);
+    await waitFor(() => expect(setResumeCursorMock).toHaveBeenCalled());
+    expect(setResumeCursorMock).toHaveBeenCalledWith("thread-x", null);
+  });
+
+  it("does not fetch the session row when there is no thread_id yet", () => {
     // The "new pane" mount path takes a different branch — it starts
-    // a session and the .then() handler seeds the model. This effect
-    // must not fire pre-thread, otherwise we'd write to the wrong key.
+    // a session and the .then() handler seeds the model. The seed
+    // effect must not fire its fetch pre-thread, otherwise we'd read
+    // (and later write) the wrong key. Assert synchronously: the seed
+    // effect calls `agentChatGetSession` before its first await, so a
+    // guard failure surfaces without yielding — and yielding here would
+    // race the null-thread start path, which legitimately seeds a model
+    // once its own session resolves.
     const draftlessPane = {
       ...pane,
       thread_id: null as unknown as string,
     };
     render(<AgentChatPane pane={draftlessPane} />);
-    expect(setModelMock).not.toHaveBeenCalled();
+    expect(agentChatGetSession).not.toHaveBeenCalled();
   });
 
-  it("uses codex default when the pane is on the codex provider", () => {
+  it("uses codex default when the pane is on the codex provider", async () => {
     // The fallback table maps each provider to its own default. A
     // pane on codex must not get seeded with the claude default.
     const codexPane = {
@@ -1171,9 +1383,53 @@ describe("AgentChatPane default-model seed effect", () => {
       provider: "codex" as const,
     };
     render(<AgentChatPane pane={codexPane} />);
-    expect(setModelMock).toHaveBeenCalled();
+    await waitFor(() => expect(setModelMock).toHaveBeenCalled());
     const [, model] = setModelMock.mock.calls[0];
     expect(model).toBe("gpt-5.4");
+  });
+});
+
+describe("AgentChatPane picker-config persistence (design G)", () => {
+  beforeEach(() => {
+    currentMessages = [];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {};
+    workspaceIdForPaneOverride = "ws-home";
+    vi.mocked(agentChatGetSession).mockReset().mockResolvedValue(null);
+    vi.mocked(agentChatUpdateSessionConfig).mockClear();
+    mockAppState.appState = HOME_APP_STATE.appState;
+  });
+  afterEach(() => cleanup());
+
+  it("persists the model on a picker change (fire-and-forget)", async () => {
+    const existingPane = { ...pane, thread_id: "thread-x" };
+    const { container } = render(<AgentChatPane pane={existingPane} />);
+    const btn = container.querySelector(
+      '[data-testid="model-change"]',
+    ) as HTMLButtonElement;
+    btn.click();
+    await waitFor(() =>
+      expect(agentChatUpdateSessionConfig).toHaveBeenCalled(),
+    );
+    const [threadId, config] = vi.mocked(agentChatUpdateSessionConfig).mock
+      .calls[0];
+    expect(threadId).toBe("thread-x");
+    expect(config).toMatchObject({ model: "claude-sonnet-4-6" });
+  });
+
+  it("persists the context window on a picker change", async () => {
+    const existingPane = { ...pane, thread_id: "thread-x" };
+    const { container } = render(<AgentChatPane pane={existingPane} />);
+    const btn = container.querySelector(
+      '[data-testid="context-window-change"]',
+    ) as HTMLButtonElement;
+    btn.click();
+    await waitFor(() =>
+      expect(agentChatUpdateSessionConfig).toHaveBeenCalledWith("thread-x", {
+        context_window: "1m",
+      }),
+    );
   });
 });
 
@@ -1283,6 +1539,37 @@ describe("AgentChatPane handleModeRemove silent-restart", () => {
     expect(setPermissionModeMock).not.toHaveBeenCalledWith(
       "thread-x",
       "plan",
+    );
+  });
+
+  it("activating the Plan pill re-persists the durable permission mode so a restart isn't left plan-locked (finding 6)", async () => {
+    // The pill flips the LIVE session to read-only "plan" (in-memory
+    // only), but `agent_chat_set_permission_mode` just wrote "plan" to
+    // the DB row. Without the re-persist, a restart auto-resumes a
+    // read-only "plan" session with the pill gone and the prior mode
+    // unrecoverable. The handler must write the user's DURABLE mode back
+    // to the DB.
+    vi.mocked(agentChatUpdateSessionConfig).mockClear().mockResolvedValue(
+      undefined,
+    );
+    currentSliceOverrides = { "thread-x": { permissionMode: "acceptEdits" } };
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const activateBtn = container.querySelector(
+      '[data-testid="mode-activate-plan"]',
+    ) as HTMLButtonElement;
+    activateBtn.click();
+
+    await waitFor(() =>
+      expect(agentChatSetPermissionMode).toHaveBeenCalledWith(
+        "claude",
+        "thread-x",
+        "plan",
+      ),
+    );
+    await waitFor(() =>
+      expect(agentChatUpdateSessionConfig).toHaveBeenCalledWith("thread-x", {
+        permission_mode: "acceptEdits",
+      }),
     );
   });
 

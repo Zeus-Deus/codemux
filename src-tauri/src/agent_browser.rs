@@ -2830,14 +2830,15 @@ Active Connections
     /// reliable ECONNREFUSED.
     #[test]
     fn probe_stream_port_fails_when_nothing_is_listening() {
-        // Bind a listener, capture the port, drop it. The OS won't
-        // hand the port to anyone immediately — TIME_WAIT-ish — so
-        // probing it returns false. This is more robust than guessing
-        // a free port.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        assert!(!probe_stream_port(port, 2, Duration::from_millis(10)));
+        // Probe port 1 (IANA-reserved tcpmux, root-only to bind on Unix
+        // and unused in CI containers) for a reliable ECONNREFUSED. The
+        // earlier bind-an-ephemeral-port-then-drop-it approach was flaky
+        // under parallel test load: a merely-bound-then-dropped listener
+        // has no TIME_WAIT, so the OS could immediately hand the freed
+        // port to a concurrent test binding `127.0.0.1:0`, making the
+        // probe connect and this assertion fail. Port 1 is never bound
+        // by any test, so nothing races us.
+        assert!(!probe_stream_port(1, 2, Duration::from_millis(10)));
     }
 
     /// `allocate_port` must reject a port that something else is

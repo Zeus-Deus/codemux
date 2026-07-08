@@ -459,3 +459,24 @@ body.pane-resizing iframe {
   }
 }
 
+/* Blinking status dot for the "N subagents running" pill and the
+ * subagent breadcrumb (design wsBlink). Opacity pulse only, so it reads
+ * over any tint; honours reduced-motion. Apply via `cm-blink`. */
+@keyframes cm-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+.cm-blink {
+  animation: cm-blink 1.3s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cm-blink {
+    animation: none;
+  }
+}
+

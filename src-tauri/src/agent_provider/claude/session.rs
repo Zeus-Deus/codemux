@@ -38,7 +38,7 @@ use super::protocol::{
 };
 use crate::agent_provider::ImageInput;
 use base64::Engine;
-use super::translate::translate_notification;
+use super::translate::{translate_notification_with, SubagentDemux};
 
 /// Default per-RPC timeout for the sidecar. Matches the value
 /// production integrations use.
@@ -801,6 +801,11 @@ fn spawn_notifications_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut notifications = sidecar.notifications();
+        // Per-session subagent demux state. Owned by this single
+        // notification task and passed by `&mut` into the translator so
+        // subagent launch → inner routing → progress → completion spans
+        // multiple messages. Task-local: no lock, no cross-task sharing.
+        let mut demux = SubagentDemux::default();
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
@@ -818,9 +823,10 @@ fn spawn_notifications_task(
                             // a bug can't kill this task.
                             let events = std::panic::catch_unwind(
                                 std::panic::AssertUnwindSafe(|| {
-                                    translate_notification(
+                                    translate_notification_with(
                                         &session.thread_id,
                                         structured,
+                                        &mut demux,
                                     )
                                 }),
                             )

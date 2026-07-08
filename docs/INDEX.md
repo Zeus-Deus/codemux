@@ -35,6 +35,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Settings panel: `docs/features/settings.md`
 - Settings sync: `docs/features/settings-sync.md`
 - Agent Chat (Beta-gated chat pane, providers, sidecar, attachments): `docs/features/agent-chat.md`
+- Subagent view (cross-provider Subagents orchestration card + read-only drill-in — Claude / Codex / OpenCode; PR #125, unreleased): `docs/features/agent-chat.md` (§ Subagent view (cross-provider)); locked plan + implementation record at `docs/plans/subagent-view.md`
 - Agent run checkpoints (issue #80 — opt-in background rollback snapshot at run start + restore): `docs/features/agent-chat.md` (§ Run checkpoints); design note at `docs/plans/agent-run-checkpoint.md`
 - Multi-provider chat (Step 12): `docs/features/multi-provider-chat.md`; plan + final-state summary at `docs/plans/step-12-opencode-implementation-plan.md`; research at `docs/plans/step-12-opencode-research.md`; operator UI smoke at `docs/plans/step-12-ui-smoke-checklist.md`
 - Skills sync (server-side, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/plans/step-10-skills-sync.md`; research at `docs/plans/step-10-skills-sync-research.md`; operator UI smoke at `docs/plans/step-10-ui-smoke-checklist.md`
@@ -79,6 +80,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - IDE integration: `docs/features/ide-integration.md`
 - Left sidebar (two-state expanded ↔ icon rail, with aggregate agent-status dots on collapsed project avatars + per-project hover flyout — Superset-adapted): `docs/features/sidebar.md`
 - Workspace context bar (bottom status strip under the work surface: branch · kind · ↑↓ · diff · PR/issue chips · device for the active workspace — the detail home for the clean sidebar appearance): `docs/features/workspace-context-bar.md`
+- GUI chrome (Agent Chat Beta on: the four chrome rows collapse to a single `h-10` title bar with in-titlebar tabs + `+` agent launcher + inline chat favorite + rehomed right-panel/Run controls; legacy chrome byte-identical when the flag is off): `docs/features/gui-chrome.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`
 - Windows cross-platform work: `docs/plans/windows-support.md`

@@ -1313,6 +1313,26 @@ export interface AgentChatSessionRecord {
   title: string | null;
   created_at: string;
   last_active_at: string;
+  /** Persisted per-thread picker config (nullable). Written from
+   *  `agent_chat_start_session` + `agent_chat_update_session_config`
+   *  and carried across silent restarts so the pane rehydrates the
+   *  user's chosen model / reasoning / context / permission mode after
+   *  an app restart instead of falling back to the provider default. */
+  model: string | null;
+  effort: string | null;
+  context_window: string | null;
+  permission_mode: string | null;
+}
+
+/** Partial per-thread config patch for
+ *  `agent_chat_update_session_config`. Only the fields present are
+ *  overwritten in the DB row (snake_case to match the Rust struct /
+ *  DB columns). This is DB-only — it never requires a live session. */
+export interface AgentChatSessionConfigUpdate {
+  model?: string | null;
+  effort?: string | null;
+  context_window?: string | null;
+  permission_mode?: string | null;
 }
 
 export const agentChatListSessions = (
@@ -1331,6 +1351,26 @@ export const agentChatRenameSession = (threadId: string, title: string) =>
 
 export const agentChatDeleteSession = (threadId: string) =>
   invoke<void>("agent_chat_delete_session", { threadId });
+
+/** Fetch a single persisted session row by thread id, INCLUDING rows
+ *  whose `sdk_session_id` is still null (unlike `agentChatListSessions`,
+ *  which filters those out). Returns `null` when no row exists. Used by
+ *  the pane's mount-seed effect to restore picker config + resume
+ *  cursor after an app restart. */
+export const agentChatGetSession = (threadId: string) =>
+  invoke<AgentChatSessionRecord | null>("agent_chat_get_session", {
+    threadId,
+  });
+
+/** Persist per-thread picker config to the session row without touching
+ *  the live provider session. Only the provided fields are overwritten.
+ *  Fired fire-and-forget from the picker handlers so a value the user
+ *  picks survives an app restart even when no live session exists. */
+export const agentChatUpdateSessionConfig = (
+  threadId: string,
+  config: AgentChatSessionConfigUpdate,
+) =>
+  invoke<void>("agent_chat_update_session_config", { threadId, config });
 
 /**
  * Return the persisted message envelopes for a thread, in original

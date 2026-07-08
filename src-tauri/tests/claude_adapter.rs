@@ -32,7 +32,7 @@ use codemux_lib::agent_provider::claude::{
 };
 use codemux_lib::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderError, ProviderRuntimeEvent, RequestId,
-    SendTurnInput, SessionStatus, StartSessionInput, ThreadId, TurnId, TurnStatus,
+    SendTurnInput, SessionStatus, StartSessionInput, SubagentStatus, ThreadId, TurnId, TurnStatus,
 };
 
 fn fake_sidecar() -> PathBuf {
@@ -1547,6 +1547,169 @@ async fn event_ordering_across_rapid_bursts() {
         assert_eq!(t, &format!("{i}"));
     }
     provider.stop_session(ThreadId("t-burst".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_lifecycle_launch_progress_completion_flows_through_adapter() {
+    // Full Claude subagent lifecycle driven through the real notification
+    // task (so the per-session SubagentDemux persists across messages):
+    // launch (Agent tool_use) → task_progress → foreground completion via
+    // tool_result + structured tool_use_result AgentOutput.
+    let script = write_script(json!([
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-sub",
+                "message": {
+                    "type": "assistant",
+                    "parent_tool_use_id": null,
+                    "turn_id": "sdk-turn-1",
+                    "message": { "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_sub",
+                        "name": "Agent",
+                        "input": {
+                            "subagent_type": "Explore",
+                            "model": "claude-sonnet-4",
+                            "description": "explore",
+                            "prompt": "look"
+                        }
+                    }]}
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 10, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-sub",
+                "message": {
+                    "type": "system",
+                    "subtype": "task_progress",
+                    "task_id": "task_1",
+                    "tool_use_id": "toolu_sub",
+                    "usage": {"total_tokens": 800, "tool_uses": 2, "duration_ms": 1500},
+                    "summary": "Reading files"
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 15, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-sub",
+                "message": {
+                    "type": "user",
+                    "parent_tool_use_id": null,
+                    "turn_id": "sdk-turn-1",
+                    "message": { "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_sub",
+                        "content": "done",
+                        "is_error": false
+                    }]},
+                    "tool_use_result": {
+                        "status": "completed",
+                        "agentId": "agent_final",
+                        "agentType": "Explore",
+                        "totalToolUseCount": 5,
+                        "totalDurationMs": 9000,
+                        "totalTokens": 4200,
+                        "content": [{"type": "text", "text": "Explored the tree"}],
+                        "prompt": "look"
+                    }
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 20, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-sub",
+                "message": {
+                    "type": "result",
+                    "subtype": "success",
+                    "turn_id": "sdk-turn-1",
+                    "duration_ms": 30,
+                    "num_turns": 1
+                }
+            }
+        }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input("t-sub")).await.unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-sub".into()),
+            text: "spawn a subagent".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+
+    let mut saw_running = false;
+    let mut saw_progress_tokens = false;
+    let mut saw_completed = false;
+    let mut leaked_generic_item = false;
+    let _ = timeout(Duration::from_secs(5), async {
+        while let Some(ev) = stream.next().await {
+            match &ev {
+                ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                    assert_eq!(subagent.subagent_id, "toolu_sub");
+                    match subagent.status {
+                        SubagentStatus::Running => {
+                            saw_running = true;
+                            if subagent.total_tokens == Some(800) {
+                                saw_progress_tokens = true;
+                            }
+                        }
+                        SubagentStatus::Completed => {
+                            saw_completed = true;
+                            assert_eq!(subagent.provider_ref.as_deref(), Some("agent_final"));
+                            assert_eq!(subagent.total_tokens, Some(4200));
+                            assert_eq!(subagent.tool_use_count, Some(5));
+                            assert_eq!(
+                                subagent.result_text.as_deref(),
+                                Some("Explored the tree")
+                            );
+                        }
+                        other => panic!("unexpected subagent status {other:?}"),
+                    }
+                }
+                // The Agent launch tool_use and its tool_result must be
+                // suppressed — never surfaced as generic items.
+                ProviderRuntimeEvent::ItemCompleted {
+                    subagent_id: None, ..
+                } => {
+                    leaked_generic_item = true;
+                }
+                _ => {}
+            }
+            if saw_completed {
+                break;
+            }
+        }
+    })
+    .await;
+
+    assert!(saw_running, "expected a Running SubagentUpdated on launch");
+    assert!(saw_progress_tokens, "expected task_progress usage to flow");
+    assert!(saw_completed, "expected a Completed SubagentUpdated");
+    assert!(
+        !leaked_generic_item,
+        "Agent tool_use / tool_result must be suppressed, not surfaced as generic items"
+    );
+    provider.stop_session(ThreadId("t-sub".into())).await.ok();
 }
 
 // --------------------------------------------------------------------------

@@ -205,6 +205,12 @@ interface AgentChatStore {
   hydrateThread: (threadId: string, payloads: string[]) => void;
   /** Clear a thread entirely (e.g. on session stop). */
   resetThread: (threadId: string) => void;
+  /** Seed / update the thread's resume cursor. Normally set by the
+   *  `ResumeCursorUpdated` event, but the mount-seed effect also uses
+   *  this to restore `{ resume: sdk_session_id }` from the persisted
+   *  session row after an app restart so a picker-triggered silent
+   *  restart resumes the SDK session instead of starting fresh. */
+  setResumeCursor: (threadId: string, resumeCursor: unknown | null) => void;
   /** Set the thread's reasoning/effort level. `null` clears to default. */
   setEffort: (threadId: string, effort: string | null) => void;
   /** Set the thread's context-window selection. `null` clears. */
@@ -431,6 +437,15 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       }
       return { threads: rest };
     }),
+
+  setResumeCursor: (threadId, resumeCursor) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.resumeCursor === resumeCursor
+          ? slice
+          : { ...slice, resumeCursor },
+      ),
+    ),
 
   setEffort: (threadId, effort) =>
     set((state) =>

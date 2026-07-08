@@ -97,6 +97,17 @@ pub trait AgentProvider: Send + Sync {
     /// Enumerate every currently live session the provider is tracking.
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError>;
 
+    /// Whether a live session is currently bound to `thread_id`.
+    ///
+    /// Cheap containment check against the provider's in-memory session
+    /// registry — it does not touch the subprocess. The backend
+    /// auto-resume choke point
+    /// (`commands::agent_chat::ensure_live_session`) uses this to decide
+    /// whether a turn needs a session rebuilt from the persisted DB row
+    /// (e.g. after an app restart, when the map is empty) before the
+    /// operation can proceed.
+    async fn has_session(&self, thread_id: &ThreadId) -> bool;
+
     /// Subscribe to the canonical runtime event stream.
     ///
     /// Each call typically returns a fresh subscription; implementations are

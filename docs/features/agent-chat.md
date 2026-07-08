@@ -91,6 +91,20 @@ The chat pane stack:
     child (`kill_on_drop`, generated `OPENCODE_SERVER_PASSWORD`).
   - All three render in a single 2-column picker (provider rail + searchable
     model list); favorites persist via zustand + `localStorage`.
+  - **Model rows show the resolved version + blurb** (like the terminal
+    `/model` picker): when `ChatModelInfo.description` is present the row
+    subtitle renders `<driver> · <description>` (truncated, full text in a
+    `title` tooltip), e.g. `Claude · Opus 4.8 with 1M context · Best for
+    everyday, complex tasks`; the trigger pill mirrors label + description
+    into its tooltip. Backend guarantees every Claude row carries a
+    description: SDK-provided string verbatim when the CLI supplies one →
+    maintained blurb for known full ids (blurb-only; the label already
+    carries the version) → alias backfill (`ALIAS_CANONICAL_IDS` in
+    `src-tauri/src/agent_provider/claude/capabilities.rs` maps
+    `default`/`opus`/`fable`/`sonnet`/`haiku` to canonical maintained ids and
+    synthesizes `<Version>[ with 1M context] · <blurb>`). Model *selection*
+    itself passes the picked id through unchanged; alias ids are resolved to
+    the latest concrete model by the Claude CLI/SDK, not by Codemux.
 - **Streaming chat UX**: Streamdown-rendered messages, tool approvals
   (per-tool body rendering), collapsible reasoning blocks (thinking
   deltas reduce into a `reasoning` ChatViewItem that seals on any
@@ -134,6 +148,28 @@ The chat pane stack:
   session history selector; permission-mode mid-session restart;
   pane-scoped chats; new-tab preset launch; base-branch picker; stop-click
   restarts the session so the next turn works.
+- **Restart auto-resume + persisted picker config**: a chat pane reopened
+  after an app quit resumes transparently. The provider session map is
+  empty on every launch (no startup rehydration), so the backend
+  `ensure_live_session` choke point in `commands/agent_chat.rs` rebuilds a
+  dead session from its `agent_chat_sessions` row on the next
+  `agent_chat_send_turn` / `agent_chat_respond_to_request` — reusing the
+  SAME `thread_id` (keeping the attached Channel, pane snapshot, and store
+  slice valid) and passing `resume_cursor: {"resume": sdk_session_id}`
+  when the row carries one (falling back to a fresh session, whose
+  transcript still hydrates from the DB, when it does not or when the
+  resume-start fails). Each thread's picker config (`model`, `effort`,
+  `context_window`, `permission_mode`) is persisted on the session row —
+  written at `agent_chat_start_session`, updated fire-and-forget by the
+  picker handlers via `agent_chat_update_session_config`, always persisted
+  by `agent_chat_set_model` / `agent_chat_set_permission_mode` (which now
+  swallow a `SessionNotFound` from the dead-session apply into `Ok`, so
+  the value takes effect on the next auto-resume), and carried across
+  silent restarts by `migrate_agent_chat_session`. On pane mount the
+  frontend fetches `agent_chat_get_session(threadId)` and re-seeds the
+  pickers + resume cursor from the row, falling back to the provider
+  default model only when no row (or no persisted model) exists —
+  fixing the post-restart "reset to Opus" regression.
 - **Reusable JSON-RPC-over-stdio child-process helper** with timeout,
   graceful shutdown, bidirectional notifications, server-initiated
   requests, and child-exit cleanup.
@@ -300,6 +336,119 @@ already Beta-gated pane and simply hides on short threads.
   re-enabling the engine anchor handling that breaks the stick-to-bottom
   pin on hydrated transcripts. Unit tests cover the pure helpers
   (`message-trail.test.ts`) and the component (`MessageTrail.test.tsx`).
+
+## Subagent view (cross-provider)
+
+When a provider session delegates to subagents, the chat pane shows a
+**Subagents orchestration card** in the transcript and lets the user
+**enter** a subagent for a read-only, in-pane drill-in of its own stream.
+One canonical model drives all three providers. Design spec:
+`docs/plans/assets/Subagents.dc.html`; locked decisions:
+`docs/plans/subagent-view.md`.
+
+### Canonical event model (`agent_provider/events.rs`)
+
+Two additive, backward-compatible changes to `ProviderRuntimeEvent`
+(every new field is `#[serde(default)]`, so payloads persisted before
+subagents existed still deserialise, and the frontend merges non-null
+fields into per-subagent view state):
+
+- A new event `SubagentUpdated { thread_id, subagent }` carrying a
+  merge-able `SubagentSnapshot`. Serialised (snake_case) fields:
+  `subagent_id` (stable demux key, required), `parent_item_id?`,
+  `name?`, `agent_type?`, `model?`, `status`
+  (`pending|running|completed|failed|stopped`), `activity?`,
+  `result_text?`, `tool_use_count?`, `total_tokens?`, `duration_ms?`,
+  `provider_ref?`. All but `subagent_id` / `status` are optional because
+  providers dribble a subagent's identity out across many events.
+- A `subagent_id: Option<String>` tag on `ContentDelta`,
+  `ItemCompleted`, and `RequestOpened`. Non-null routes the (otherwise
+  unchanged) item / delta / approval into that subagent's sub-transcript
+  instead of the parent flow — so the drill-in reuses every existing
+  renderer, and a child's permission request still bubbles into the
+  parent view (labelled "from subagent X") rather than stalling the turn
+  invisibly.
+
+Subagent events are emitted thread-scoped under the **parent**
+`thread_id`; the `subagent_id` inside the payload is the demux key. They
+persist to `agent_chat_messages` under the parent thread as usual
+(`should_persist_event` also persists `SubagentUpdated`), so DB hydrate
+replays cards + child transcripts through the same reducer with **zero
+schema migration**. The TypeScript mirror lives in `src/tauri/events.ts`.
+The backend also consumes these `SubagentUpdated` statuses to keep the
+left-sidebar working spinner alive while subagents outlive the parent
+turn — see [Sidebar status indicators](#sidebar-status-indicators).
+
+### Per-provider keying + mapping
+
+- **Claude** (`claude/translate.rs`, keying = spawning
+  `parent_tool_use_id`): an assistant `tool_use` block named `Agent`
+  **or** `Task` spawns the row; every SDK message's top-level
+  `parent_tool_use_id` routes inner items into the sub-transcript; the
+  previously-dropped `task_started` / `task_progress` / `task_updated` /
+  `task_notification` system events become status + activity + usage
+  (mapped via a `task_id → tool_use_id` table), with the background
+  `async_launched` tool_result deferred to a later `task_notification`
+  for completion. The sidecar sets `agentProgressSummaries: true` (the
+  only sidecar change) so `task_progress.summary` feeds the activity line.
+- **Codex** (`codex/{protocol,translate,session}.rs`, keying = child
+  `threadId`): a persistent per-session demux routes wire events by
+  `params.threadId`; `collabAgentToolCall` / `subAgentActivity` map to
+  spawn/lifecycle + `agentsStates[..].message` activity (raw rendering
+  suppressed); child `thread/started` / `turn/*` update subagent status
+  and never the parent turn. `thread/started`, `turn/started`, and
+  `turn/completed` decode **both** the legacy flat and the v2 nested wire
+  shapes (custom `Deserialize`), and the success arm accepts both
+  `succeeded` and `completed`.
+- **OpenCode** (`opencode/{protocol,translate,sse,client}.rs`, keying =
+  child `sessionID`): an `SseRouter` grows a watched-session set (parent
+  ∪ transitive descendants via `SessionInfo.parentID`) instead of
+  dropping child-session events; the `task` tool part decodes
+  `state.metadata.{parentSessionId,sessionId,model}` (note the camelCase
+  lowercase-`d` keys) and `time.{start,end}`, emitting the row on the
+  first `running` update (`pending` carries no metadata) and stripping
+  the `<task_result>` / `<task_error>` envelope for `result_text`. Child
+  `permission.asked` bubbles as a `RequestOpened` and its reply is POSTed
+  to the **child** session's permissions endpoint. `question.asked`
+  remains a known gap (a different reply endpoint the current
+  `ApprovalDecision` model can't express — decoded as `Other`, no
+  regression).
+
+### Frontend (`src/lib/agent-chat/`, `src/components/chat/`)
+
+- `types.ts` adds `SubagentView` and a `SubagentRunItem`
+  (`kind: "subagent_run"`) `ChatViewItem`; `reducer.ts` merges snapshots
+  (non-null wins, status is monotonic and never regresses to pending) and
+  routes `subagent_id`-tagged events into the subagent's own `items` via
+  shared item-builders (one card per contiguous spawn group; a new turn
+  ⇒ a new card; per-subagent cap 500). Pure helpers live in
+  `subagents.ts`; `subagent_run` is a standalone unfoldable transcript
+  slot.
+- `SubagentsCard.tsx` — the orchestration card: aggregate header
+  ("N tasks · running in parallel" / "X done · Y active"), one row per
+  subagent (status spinner/check/x, name + mono model, shimmering
+  activity line while running / muted result when done, mono
+  `elapsed · N tools` meta, Enter button, chevron), an inline "Recent
+  activity" peek (last 3 child tool rows + "Enter subagent"), and the
+  footer note.
+- `SubagentView.tsx` + `SubagentBreadcrumb.tsx` — the read-only drill-in:
+  a `← Orchestrator › ⟨ordinal⟩ Name` breadcrumb with model chip and
+  right-aligned blinking status, a tone-tinted read-only banner, the
+  sub-transcript folded through `buildTranscriptSlots` + the existing
+  renderers, and a live shimmer tail while running.
+- `AgentChatPane.tsx` holds `viewMode` (orchestrator ↔ subagent) local
+  state; entering swaps the transcript body and the sub-header for the
+  breadcrumb, Esc / back returns, and the composer stays parent-bound
+  with the placeholder "Steering goes to the orchestrator…".
+  `AgentChatPaneHeader.tsx` shows an amber blinking "N subagents running"
+  pill while any subagent runs. All tones consume design-system tokens
+  (running = `status-working`, completed = `status-open`, failed =
+  `status-attention`); `.cm-blink` in `globals.css` honors
+  reduced-motion.
+
+The dev mock seeds one subagent turn in the demo transcript and exposes
+`window.__codemuxChatMock.streamSubagents()` for a live two-subagent
+lifecycle over the real per-thread Channel.
 
 ## Current Constraints
 
@@ -532,12 +681,14 @@ from this list — `update-mcp-tools` wraps it.)
 
 ### Options construction
 
-Exactly 15 SDK `Options` fields are populated (`cwd`, `model`,
+Exactly 16 SDK `Options` fields are populated (`cwd`, `model`,
 `pathToClaudeCodeExecutable`, `settingSources: ["user","project","local"]`,
 `effort` (cast through `unknown` for forward-compat), `permissionMode`,
 `allowDangerouslySkipPermissions` (only with `bypassPermissions`),
 `settings` (when non-empty), `resume`, `sessionId`,
-`includePartialMessages: true`, `canUseTool`, `env: process.env`,
+`includePartialMessages: true`, `agentProgressSummaries: true` (so
+`task_progress` events carry a human-readable `summary` for the subagent
+card's activity line), `canUseTool`, `env: process.env`,
 `additionalDirectories` (when non-empty), `extraArgs` (when non-empty)).
 The other 30+ fields in the SDK's Options surface are intentionally
 left unset — they become features when the UI surfaces them.
@@ -681,12 +832,33 @@ multi-provider model picker. The empty-state composer (before a session
 exists) lives in `DraftChatSurface.tsx`; the "no panes" home landing
 lives in `ChatHomeLanding.tsx`.
 
+**GUI chrome suppression.** When the Beta flag is on and the chat pane is
+the **sole root** of its surface (not a split), `AgentChatPaneHeader` does
+NOT render — the title bar absorbs the tab, its session-history dropdown,
+close, "Restore checkpoint", and the "N subagents running" pill (`PaneNode`
+gates on `isSurfaceRoot`). In split layouts the per-pane header still
+renders, so split/close/drag keep working. The session-switch orchestration
+(stop → hydrate → resume), the checkpoint-restore state, and the grouped
+session list were extracted into shared pieces so the legacy per-pane header
+and the titlebar tab drive one implementation, not a fork:
+`src/hooks/use-agent-chat-session-actions.ts`,
+`src/hooks/use-agent-chat-checkpoint-restore.ts` +
+`src/components/chat/restore-checkpoint-dialog.tsx`, and
+`src/components/chat/session-history-menu.tsx` (`SessionHistoryList` +
+`useSessionHistory`, now consumed by both `SessionSelector` and the
+title-bar chat tab). See `docs/features/gui-chrome.md`.
+
 ## Tauri command surface
 
-All commands gated on the `enable_agent_chat` feature flag. Lifecycle
-commands return a `feature_disabled: ...` string when the flag is
-off; session commands also return a `provider_not_configured: ...`
-string when the target provider is missing from the registry.
+Session/lifecycle commands are gated on the `enable_agent_chat` feature
+flag and return a `feature_disabled: ...` string when the flag is off;
+session commands also return a `provider_not_configured: ...` string
+when the target provider is missing from the registry. The read-only /
+DB-only history commands (`agent_chat_list_sessions`,
+`agent_chat_get_session`, `agent_chat_update_session_config`,
+`agent_chat_get_checkpoint`, rename/delete) are intentionally NOT
+flag-gated, so a pane re-seeds or falls back to defaults rather than
+surfacing a `feature_disabled` string.
 
 | Command | Purpose |
 |---|---|
@@ -694,12 +866,14 @@ string when the target provider is missing from the registry.
 | `agent_chat_close_pane` | Close a chat pane. Idempotent — double-close is a no-op. |
 | `dev_agent_chat_spawn_test_pane` | Debug-only. Spawns a chat pane in the active workspace for manual QA from the browser devtools. |
 | `agent_chat_start_session` | Start a provider session, writing the returned thread id back onto the pane. |
-| `agent_chat_send_turn` | Queue a user turn on a thread. |
-| `agent_chat_interrupt_turn` | Halt the currently-running turn. |
-| `agent_chat_respond_to_request` | Resolve a pending approval / input request. |
-| `agent_chat_set_model` | Swap a thread's model mid-session. |
-| `agent_chat_set_permission_mode` | Swap a thread's permission mode mid-session. |
+| `agent_chat_send_turn` | Queue a user turn on a thread. Auto-resumes a dead session (rebuilt from its persisted row) before the turn, so a pane reopened after an app restart never sees `session_not_found`. |
+| `agent_chat_interrupt_turn` | Halt the currently-running turn. A `SessionNotFound` (nothing to interrupt on a dead session) is swallowed into `Ok`; does NOT auto-resume. |
+| `agent_chat_respond_to_request` | Resolve a pending approval / input request. Auto-resumes a dead session first (same choke point as `send_turn`). |
+| `agent_chat_set_model` | Swap a thread's model. Persist-always, apply-if-live: writes the model to the session row unconditionally, then applies to the live session if one exists; a `SessionNotFound` from the apply is swallowed into `Ok` (the value takes effect on the next auto-resume). |
+| `agent_chat_set_permission_mode` | Swap a thread's permission mode. Same persist-always, apply-if-live contract as `agent_chat_set_model`. |
 | `agent_chat_stop_session` | Gracefully close a session. Idempotent. |
+| `agent_chat_get_session` | Return a single persisted session row by thread id, INCLUDING rows whose `sdk_session_id` is still null (unlike `agent_chat_list_sessions`), with the per-thread config columns. Not flag-gated. Used by the pane's mount-seed to restore pickers + resume cursor after a restart. |
+| `agent_chat_update_session_config` | Persist a per-thread config patch (`model` / `effort` / `context_window` / `permission_mode`) to the session row. DB-only, no live-session requirement; only the provided fields overwrite (`COALESCE`). Not flag-gated. Fired fire-and-forget by the picker handlers. |
 | `agent_chat_get_checkpoint` | Return the run-start rollback checkpoint recorded for a thread (or null). Not flag-gated — renders as "no checkpoint" instead of an error. |
 | `agent_chat_restore_checkpoint` | Roll the workspace back to the thread's run-start checkpoint. Mutates the working tree; the UI confirms first. |
 
@@ -810,6 +984,50 @@ token stream collapses to a single write per turn rather than one per
 token. Because the write lands in `pane_statuses`, the sidebar rows,
 collapsed-rail aggregate dot, hover flyout, and `PaneNode` borders all
 update for free.
+
+**Subagents keep the spinner alive past `TurnCompleted`.** The primary
+chat turn can finish while subagents it spawned are still running, so the
+mapping is stateful: `map_event_to_pane_status` takes the event *plus* a
+per-thread `ThreadSubagentState` (running `subagent_id`s + a
+`review_pending` flag), held in the Tauri-managed `SubagentTracker`
+(`Mutex<HashMap<thread_id, _>>`, one lock per decision, registered in
+`lib.rs` alongside `AgentChatChannelRegistry`). `SubagentUpdated` with a
+`running`/`pending` status records the subagent; a terminal status
+(`completed`/`failed`/`stopped`) drops it. `TurnCompleted` publishes
+`Review` only when no subagents are tracked — otherwise it *holds
+`Working`* and marks `review_pending`, and the deferred `Review` fires
+when the last subagent goes terminal. The working indicator therefore
+persists until the turn **and** all tracked subagents finish, matching the
+still-running `SubagentsCard` in the drill-in.
+
+**A new user turn resets the thread's tracker** (both `running` and
+`review_pending`). The authoritative, provider-agnostic anchor is the
+send-message command path: `agent_chat_send_turn` calls
+`SubagentTracker::clear_thread` before dispatching the turn. This matters
+because a provider can leave a subagent non-terminal — Claude's background
+`async_launched` task stays `Running` until a later `task_notification`
+that may never arrive — and without the reset that stale `running` id
+would hold `Working` and suppress `Review` for *every* later turn until
+session close. `SessionStateChanged::Running` also resets the tracker
+(reliably per-turn for Codex's `turn/started` and OpenCode's
+`session.status = busy`; Claude does not fire it per user turn, hence the
+command-path clear). A genuinely-still-alive background subagent
+re-inserts itself on its next `Running` snapshot — Claude re-emits these
+via `task_progress` ticks — so clearing at turn start is safe. Crucially,
+parent-scoped `content_delta`/`item_completed` (`subagent_id == None`) do
+**not** clear `review_pending`: such output can trickle in after a deferred
+`TurnCompleted`, and dropping the owed `Review` there would strand the
+pane at `Working`. `review_pending` is cleared only by publishing the
+owed/normal `Review`, a new-turn reset, session `Closed`/`Error`, or
+`agent_chat_close_pane`.
+
+Only *live* provider events reach the tracker: transcript hydration/resume
+replays persisted events through the frontend reducer
+(`agent_chat_list_messages` + `hydrateThread`), never through
+`forward_event`, so there is no backend replay to guard against. Session
+`Closed`/`Error` and explicit `agent_chat_close_pane` also clear the
+thread's tracking so a stuck subagent can never pin the spinner after the
+session is gone.
 
 ## Follow-up queueing
 
@@ -943,7 +1161,10 @@ the real reducer (`agent_chat_list_messages`), streams a simulated
 reply on `agent_chat_send_turn`, and exposes
 `window.__codemuxChatMock.streamReply()` for on-demand streaming —
 the standing harness for transcript-virtualization and scroll-pinning
-work.
+work. It also seeds one **subagent turn** (an "Implement" completed +
+"Verify" running orchestration card) and exposes
+`window.__codemuxChatMock.streamSubagents()` for a live two-subagent
+lifecycle over the real Channel — the harness for the subagent view.
 
 ## Step 9 — Cross-provider MCP server runtime (shipped)
 

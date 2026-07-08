@@ -327,6 +327,22 @@ export function MultiProviderModelPicker({
     return caps?.models.find((m) => m.id === model)?.sub_provider ?? null;
   }, [provider, model, claudeCaps, codexCaps, opencodeCaps]);
 
+  // The active model's resolved-version blurb, surfaced only in the
+  // trigger's tooltip so the pill itself stays compact. Combines the
+  // visible label with the description (e.g.
+  // "Opus · Opus 4.8 with 1M context · Best for everyday, complex tasks").
+  const triggerTitle = useMemo(() => {
+    const caps =
+      provider === "claude"
+        ? claudeCaps
+        : provider === "codex"
+        ? codexCaps
+        : opencodeCaps;
+    const description =
+      caps?.models.find((m) => m.id === model)?.description ?? null;
+    return description ? `${triggerLabel} · ${description}` : triggerLabel;
+  }, [provider, model, claudeCaps, codexCaps, opencodeCaps, triggerLabel]);
+
   return (
     <Popover open={open} onOpenChange={(v) => !disabled && setOpen(v)}>
       <PopoverTrigger asChild>
@@ -334,6 +350,7 @@ export function MultiProviderModelPicker({
           type="button"
           disabled={disabled}
           data-testid="multi-provider-model-picker-trigger"
+          title={triggerTitle}
           className={cn(
             // Composer footer pill: bordered card chip on the base
             // surface (design's model/effort/permission pills), the
@@ -640,9 +657,19 @@ function ModelRow({
 }) {
   const { model, provider } = row;
   const driverLabel = providerDisplayLabel(provider);
-  const subtitle = model.sub_provider
+  // Base subtitle: driver label, plus the federated `sub_provider`
+  // hint for OpenCode rows. When the backend supplies a resolved
+  // `description` (e.g. Claude alias rows carry
+  // "Opus 4.8 with 1M context · Best for everyday, complex tasks"),
+  // append it after another dot so the row reads
+  // "Claude · Opus 4.8 with 1M context · Best…" — single line,
+  // truncated, with the full text in the `title` tooltip.
+  const subtitleBase = model.sub_provider
     ? `${driverLabel} · ${model.sub_provider}`
     : driverLabel;
+  const subtitle = model.description
+    ? `${subtitleBase} · ${model.description}`
+    : subtitleBase;
   return (
     <CommandItem
       value={`${provider}::${model.id}`}
@@ -664,7 +691,9 @@ function ModelRow({
             provider={provider}
             className="h-2.5 w-2.5 shrink-0"
           />
-          <span className="truncate">{subtitle}</span>
+          <span className="truncate" title={subtitle}>
+            {subtitle}
+          </span>
         </div>
       </div>
       {model.is_free ? (

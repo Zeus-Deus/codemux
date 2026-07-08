@@ -127,6 +127,10 @@ interface Props {
    *  steer the agent…" (design D10). Mode-specific placeholders
    *  (plan/ask/debug) are unaffected. Defaults to false. */
   isDraft?: boolean;
+  /** When set, overrides the computed textarea placeholder entirely.
+   *  Used by the subagent drill-in to swap in "Steering goes to the
+   *  orchestrator…" while the composer stays parent-bound. */
+  placeholderOverride?: string;
   /** Composer-level Cursor-style mode pill. Swaps the placeholder,
    *  hides the permission picker, and toggles the mode selector
    *  (dropdown → pill). */
@@ -234,6 +238,7 @@ export function Composer({
   sessionReady,
   showProviderPicker,
   isDraft = false,
+  placeholderOverride,
   mode,
   errorMessage = null,
   showStopButton = true,
@@ -2149,7 +2154,7 @@ export function Composer({
               }}
               placeholder={
                 sessionReady
-                  ? placeholderForMode(mode, isDraft)
+                  ? (placeholderOverride ?? placeholderForMode(mode, isDraft))
                   : "Starting session…"
               }
               rows={1}

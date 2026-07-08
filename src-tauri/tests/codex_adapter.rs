@@ -31,8 +31,9 @@ use codemux_lib::agent_provider::codex::auth::{
 use codemux_lib::agent_provider::codex::protocol::ClientInfo;
 use codemux_lib::agent_provider::codex::{CodexAgentProvider, CodexProviderConfig};
 use codemux_lib::agent_provider::{
-    AgentProvider, ApprovalDecision, ContentDelta, ProviderError, ProviderRuntimeEvent,
-    RequestId, SendTurnInput, SessionStatus, StartSessionInput, ThreadId, TurnId,
+    AgentProvider, ApprovalDecision, CompletedItem, ContentDelta, ProviderError,
+    ProviderRuntimeEvent, RequestId, SendTurnInput, SessionStatus, StartSessionInput,
+    SubagentStatus, ThreadId, TurnId,
 };
 
 // ---------------------------------------------------------------------------
@@ -1020,6 +1021,197 @@ async fn classify_auth_output_pure_function() {
         classify_auth_output(""),
         AuthStatus::Unknown { .. }
     ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter() {
+    // A full Codex multi-agent lifecycle, exercised end-to-end through the
+    // real adapter + fake app-server:
+    //   1. parent turn/started
+    //   2. collabAgentToolCall spawnAgent (inProgress) → child registered,
+    //      SubagentUpdated (Pending/Running)
+    //   3. collabAgentToolCall spawnAgent (completed) with agentsStates
+    //      running + activity message → SubagentUpdated Running
+    //   4. child thread/started (v2 nested) with nickname/role → identity
+    //   5. child turn/started (v2 nested) → SubagentUpdated Running
+    //   6. child agentMessage item/completed → ItemCompleted tagged with
+    //      subagent_id (the drill-in transcript)
+    //   7. subAgentActivity (interacted) → status tick, suppressed raw
+    //   8. child turn/completed (v2 nested, durationMs) → SubagentUpdated
+    //      Completed with duration
+    //   9. collabAgentToolCall wait (completed) agentsStates completed →
+    //      SubagentUpdated Completed
+    //  10. parent turn/completed → parent turn succeeds
+    let script = write_script(json!([
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
+         "params":{"threadId":"c-1","turnId":"pt-1"}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","item":{
+            "type":"collabAgentToolCall","id":"call-1","tool":"spawnAgent","status":"inProgress",
+            "senderThreadId":"c-1","receiverThreadIds":["c-child"],"model":"gpt-5.4",
+            "prompt":"explore the repo","agentsStates":{"c-child":{"status":"pendingInit"}}}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","item":{
+            "type":"collabAgentToolCall","id":"call-1","tool":"spawnAgent","status":"completed",
+            "senderThreadId":"c-1","receiverThreadIds":["c-child"],"model":"gpt-5.4",
+            "prompt":"explore the repo",
+            "agentsStates":{"c-child":{"status":"running","message":"reading files"}}}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"thread/started",
+         "params":{"thread":{"id":"c-child","parentThreadId":"c-1","agentNickname":"Explore",
+            "agentRole":"explore","cwd":"/tmp","status":"running","turns":[]}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
+         "params":{"threadId":"c-child","turn":{"id":"ct-1","status":"inProgress","items":[]}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-child","turnId":"ct-1","item":{
+            "type":"agentMessage","id":"cm-1","text":"child found the answer"}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","item":{
+            "type":"subAgentActivity","id":"sa-1","agentThreadId":"c-child",
+            "agentPath":"root/explore","kind":"interacted"}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/completed",
+         "params":{"threadId":"c-child","turn":{"id":"ct-1","status":"completed",
+            "durationMs":4321,"items":[]}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","item":{
+            "type":"collabAgentToolCall","id":"call-2","tool":"wait","status":"completed",
+            "senderThreadId":"c-1","receiverThreadIds":["c-child"],
+            "agentsStates":{"c-child":{"status":"completed","message":"done"}}}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","status":"succeeded"}}
+    ]));
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-sub")).await.unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-sub".into()),
+            text: "delegate".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+
+    let mut saw_child_running = false;
+    let mut saw_child_model = false;
+    let mut saw_child_name = false;
+    let mut saw_child_activity = false;
+    let mut saw_child_completed_with_duration = false;
+    let mut saw_child_transcript_text = false;
+    let mut saw_parent_turn_completed = false;
+    // Suppression / isolation invariants:
+    let mut saw_collab_tool_render = false; // no ToolUse/ToolResult for collab item
+    let mut saw_parent_tagged_delta = false; // parent transcript must stay untagged
+    let mut collab_warning = false; // collab/subAgentActivity must not warn
+
+    let collected = timeout(Duration::from_secs(6), async {
+        while let Some(ev) = stream.next().await {
+            match &ev {
+                ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                    assert_eq!(subagent.subagent_id, "c-child");
+                    assert_eq!(subagent.provider_ref.as_deref(), Some("c-child"));
+                    if subagent.status == SubagentStatus::Running {
+                        saw_child_running = true;
+                    }
+                    if subagent.model.as_deref() == Some("gpt-5.4") {
+                        saw_child_model = true;
+                    }
+                    if subagent.name.as_deref() == Some("Explore") {
+                        saw_child_name = true;
+                    }
+                    if subagent.activity.as_deref() == Some("reading files") {
+                        saw_child_activity = true;
+                    }
+                    if subagent.status == SubagentStatus::Completed
+                        && subagent.duration_ms == Some(4321)
+                    {
+                        saw_child_completed_with_duration = true;
+                    }
+                }
+                ProviderRuntimeEvent::ItemCompleted {
+                    item,
+                    subagent_id,
+                    ..
+                } => match item {
+                    CompletedItem::AssistantText { text }
+                        if text == "child found the answer" =>
+                    {
+                        assert_eq!(
+                            subagent_id.as_deref(),
+                            Some("c-child"),
+                            "child transcript item must be tagged with its subagent_id"
+                        );
+                        saw_child_transcript_text = true;
+                    }
+                    // This scenario emits no ordinary tools; any ToolUse /
+                    // ToolResult here would mean a collabAgentToolCall or
+                    // subAgentActivity item leaked instead of being suppressed.
+                    CompletedItem::ToolUse { .. } | CompletedItem::ToolResult { .. } => {
+                        saw_collab_tool_render = true;
+                    }
+                    _ => {}
+                },
+                ProviderRuntimeEvent::ContentDelta { subagent_id, .. } => {
+                    if subagent_id.is_some() {
+                        saw_parent_tagged_delta = true;
+                    }
+                }
+                ProviderRuntimeEvent::TurnCompleted { .. } => {
+                    saw_parent_turn_completed = true;
+                }
+                ProviderRuntimeEvent::RuntimeWarning { message, .. } => {
+                    if message.contains("collabAgentToolCall")
+                        || message.contains("subAgentActivity")
+                    {
+                        collab_warning = true;
+                    }
+                }
+                _ => {}
+            }
+            if saw_child_running
+                && saw_child_model
+                && saw_child_name
+                && saw_child_activity
+                && saw_child_completed_with_duration
+                && saw_child_transcript_text
+                && saw_parent_turn_completed
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(collected.is_ok(), "timed out waiting for subagent lifecycle events");
+    assert!(saw_child_running, "missing Running SubagentUpdated");
+    assert!(saw_child_model, "missing model gpt-5.4 on a subagent snapshot");
+    assert!(saw_child_name, "missing nickname Explore from child thread/started");
+    assert!(saw_child_activity, "missing agentsStates activity line");
+    assert!(
+        saw_child_completed_with_duration,
+        "missing Completed SubagentUpdated with durationMs 4321"
+    );
+    assert!(
+        saw_child_transcript_text,
+        "missing child agentMessage routed into the drill-in transcript"
+    );
+    assert!(saw_parent_turn_completed, "missing parent TurnCompleted");
+    assert!(
+        !saw_collab_tool_render,
+        "collabAgentToolCall / subAgentActivity items must be suppressed, not rendered as tools"
+    );
+    assert!(
+        !saw_parent_tagged_delta,
+        "parent transcript deltas must never be tagged with a subagent_id"
+    );
+    assert!(
+        !collab_warning,
+        "collab / subAgentActivity items must not fall through to RuntimeWarning"
+    );
+    provider.stop_session(ThreadId("t-sub".into())).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

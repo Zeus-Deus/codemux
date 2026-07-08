@@ -199,6 +199,14 @@ pub struct SessionInfo {
     pub id: String,
     #[serde(default)]
     pub title: Option<String>,
+    /// Parent session id when this session is a subagent's child
+    /// session. Present on `session.created` for every subagent the
+    /// runtime spawns (`properties.info.parentID`). The SSE listener
+    /// grows its watched-session set when this points at a session it
+    /// already tracks. `None` for the top-level (user-initiated)
+    /// session.
+    #[serde(default, rename = "parentID")]
+    pub parent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -270,6 +278,18 @@ pub struct MessageEnvelope {
     pub info: MessageInfo,
 }
 
+/// One element of `GET /session/{id}/message` — a stored message plus
+/// its parts. Used by [`super::client::OpenCodeClient::get_session_messages`]
+/// to cold-backfill a subagent transcript on mid-session attach (the
+/// live SSE stream is the primary path). Reuses the same [`MessageInfo`]
+/// / [`PartPayload`] decoders the streaming path uses.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionMessage {
+    pub info: MessageInfo,
+    #[serde(default)]
+    pub parts: Vec<PartPayload>,
+}
+
 /// Trimmed projection of `Message` — Codemux only needs the routing
 /// fields (`sessionID`, `id`, `role`) plus the optional `error` to
 /// detect mid-turn assistant failures.
@@ -319,9 +339,21 @@ pub enum PartPayload {
     Reasoning(ReasoningPart),
     #[serde(rename = "tool")]
     Tool(ToolPart),
+    /// An `@agent` mention chip inside a message (the runtime records
+    /// which subagent the turn addressed). Decoded so it does not fall
+    /// to `Other`; the chat backend treats it as inert — no runtime
+    /// event — while the frontend can render it as a chip.
+    #[serde(rename = "agent")]
+    Agent(AgentPart),
+    /// A `subtask` marker part. The runtime always also materializes a
+    /// `task` tool part (which drives the subagent card), so this part
+    /// needs no special handling; decoding it just keeps it off the
+    /// `Other` warning path.
+    #[serde(rename = "subtask")]
+    Subtask(SubtaskPart),
     /// Catch-all for `step-start`, `step-finish`, `snapshot`, `patch`,
-    /// `agent`, `retry`, `compaction`, `subtask`, `file` — none of
-    /// which the chat UI renders.
+    /// `retry`, `compaction`, `file` — none of which the chat UI
+    /// renders.
     #[serde(other)]
     Other,
 }
@@ -363,9 +395,17 @@ pub struct ToolPart {
     pub state: ToolStateValue,
 }
 
-/// Mirrors `ToolState` from the SDK — we only act on `completed` and
-/// `error` (the terminal states); `pending` and `running` are
-/// in-flight markers Codemux ignores at item-level.
+/// Mirrors `ToolState` from the SDK. For ordinary tools Codemux acts on
+/// `completed` and `error` (the terminal states) at item-level; the
+/// `task` tool is special-cased in [`super::translate`] and reads
+/// `metadata` / `time` off every non-`pending` state to drive the
+/// subagent card (`pending` carries no metadata — verified live).
+///
+/// `metadata` is decoded as a raw [`serde_json::Value`] because its
+/// shape is per-tool (`read` reports `{ preview, truncated, … }`, the
+/// `task` tool reports `{ parentSessionId, sessionId, model }` — see
+/// [`TaskMetadata`]). Keeping it untyped here means one weird-shaped
+/// tool cannot break the decode of the whole event.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "status", rename_all = "lowercase")]
 pub enum ToolStateValue {
@@ -378,6 +418,10 @@ pub enum ToolStateValue {
         input: serde_json::Value,
         #[serde(default)]
         title: Option<String>,
+        #[serde(default)]
+        metadata: serde_json::Value,
+        #[serde(default)]
+        time: Option<ToolTime>,
     },
     Completed {
         #[serde(default)]
@@ -386,13 +430,118 @@ pub enum ToolStateValue {
         output: String,
         #[serde(default)]
         title: Option<String>,
+        #[serde(default)]
+        metadata: serde_json::Value,
+        #[serde(default)]
+        time: Option<ToolTime>,
     },
     Error {
         #[serde(default)]
         input: serde_json::Value,
         #[serde(default)]
         error: String,
+        #[serde(default)]
+        metadata: serde_json::Value,
+        #[serde(default)]
+        time: Option<ToolTime>,
     },
+}
+
+/// Wall-clock window a tool state carries (`state.time.{start,end}`,
+/// epoch milliseconds). The `task` tool populates both on completion so
+/// the subagent card can show an elapsed duration.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ToolTime {
+    #[serde(default)]
+    pub start: Option<u64>,
+    #[serde(default)]
+    pub end: Option<u64>,
+}
+
+/// Typed projection of the `task` tool's `state.metadata`.
+///
+/// The keys are camelCase with a **lowercase `d`** (`sessionId`, not
+/// `sessionID`) — a deliberate quirk of the task runtime that differs
+/// from the `sessionID` casing used everywhere else on the wire, so the
+/// rename annotations here are load-bearing. `sessionId` is the child
+/// (subagent) session id and doubles as the subagent demux key.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TaskMetadata {
+    #[serde(default, rename = "parentSessionId")]
+    pub parent_session_id: Option<String>,
+    #[serde(default, rename = "sessionId")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<TaskModelRef>,
+}
+
+impl TaskMetadata {
+    /// Parse the raw `state.metadata` value into the typed task shape.
+    /// Non-object / non-task metadata (e.g. the `read` tool's
+    /// `{ preview, … }`) decodes to an all-`None` [`TaskMetadata`]
+    /// because every field defaults — the caller treats that as "no
+    /// subagent identity yet".
+    pub fn from_value(value: &serde_json::Value) -> Self {
+        serde_json::from_value(value.clone()).unwrap_or_default()
+    }
+
+    /// Render the `{ providerID, modelID }` pair as a Codemux model id
+    /// (`providerID/modelID`, matching [`super::translate::split_model_id`]).
+    pub fn model_id(&self) -> Option<String> {
+        self.model.as_ref().map(|m| m.as_model_id())
+    }
+}
+
+/// The `{ providerID, modelID }` object nested inside task metadata.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TaskModelRef {
+    #[serde(default, rename = "providerID")]
+    pub provider_id: String,
+    #[serde(default, rename = "modelID")]
+    pub model_id: String,
+}
+
+impl TaskModelRef {
+    /// `providerID/modelID` — the id form the rest of Codemux uses.
+    pub fn as_model_id(&self) -> String {
+        format!("{}/{}", self.provider_id, self.model_id)
+    }
+}
+
+/// An `@agent` mention part (`type: "agent"`). Verified live —
+/// `{ type, name, messageID, sessionID, id }` with an optional
+/// `source` span the mention was typed at.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentPart {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    /// The mentioned agent slug, e.g. `"explore"`.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// A `subtask` marker part (`type: "subtask"`). Mirrors the SDK's
+/// `SubtaskPart` — carries the delegated prompt/description plus the
+/// target agent + model. Decoded for completeness; the paired `task`
+/// tool part is what actually drives the subagent card.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubtaskPart {
+    pub id: String,
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub model: Option<TaskModelRef>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -678,6 +827,257 @@ mod tests {
             }
             other => panic!("expected Other, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_info_decodes_parent_id_for_child_session() {
+        // Real `session.created` child payload from the live capture —
+        // the child carries `parentID` pointing at the root session.
+        let raw = serde_json::json!({
+            "type": "session.created",
+            "properties": {
+                "sessionID": "ses_child",
+                "info": {
+                    "id": "ses_child",
+                    "parentID": "ses_root",
+                    "title": "List current directory files (@explore subagent)"
+                }
+            }
+        });
+        let event: OpenCodeEvent = serde_json::from_value(raw).unwrap();
+        match event {
+            OpenCodeEvent::Known(KnownEvent::SessionCreated(env)) => {
+                assert_eq!(env.info.id, "ses_child");
+                assert_eq!(env.info.parent_id.as_deref(), Some("ses_root"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_info_parent_id_absent_on_root_session() {
+        let raw = serde_json::json!({
+            "type": "session.created",
+            "properties": { "info": { "id": "ses_root", "title": "root" } }
+        });
+        let event: OpenCodeEvent = serde_json::from_value(raw).unwrap();
+        match event {
+            OpenCodeEvent::Known(KnownEvent::SessionCreated(env)) => {
+                assert!(env.info.parent_id.is_none());
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_tool_running_decodes_metadata_and_input() {
+        // The exact `running` state.metadata shape from the live SSE
+        // capture — note the camelCase-with-lowercase-`d` keys
+        // (`sessionId`, `parentSessionId`) that differ from the
+        // `sessionID` casing used elsewhere.
+        let raw = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "prt_1",
+                    "sessionID": "ses_root",
+                    "messageID": "msg_1",
+                    "type": "tool",
+                    "callID": "call_task",
+                    "tool": "task",
+                    "state": {
+                        "title": "List current directory files",
+                        "metadata": {
+                            "parentSessionId": "ses_root",
+                            "sessionId": "ses_child",
+                            "model": { "modelID": "big-pickle", "providerID": "opencode" }
+                        },
+                        "status": "running",
+                        "input": {
+                            "description": "List current directory files",
+                            "prompt": "List all files in the current directory (/).",
+                            "subagent_type": "explore"
+                        },
+                        "time": { "start": 1783362470235u64 }
+                    }
+                }
+            }
+        });
+        let event: OpenCodeEvent = serde_json::from_value(raw).unwrap();
+        let OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(MessagePartUpdated {
+            part: PartPayload::Tool(tool),
+        })) = event
+        else {
+            panic!("expected tool part");
+        };
+        assert_eq!(tool.tool, "task");
+        match tool.state {
+            ToolStateValue::Running {
+                title,
+                metadata,
+                time,
+                input,
+            } => {
+                assert_eq!(title.as_deref(), Some("List current directory files"));
+                let md = TaskMetadata::from_value(&metadata);
+                assert_eq!(md.session_id.as_deref(), Some("ses_child"));
+                assert_eq!(md.parent_session_id.as_deref(), Some("ses_root"));
+                assert_eq!(md.model_id().as_deref(), Some("opencode/big-pickle"));
+                assert_eq!(time.unwrap().start, Some(1783362470235));
+                assert_eq!(input["subagent_type"], "explore");
+            }
+            other => panic!("wrong state: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_tool_completed_decodes_envelope_output_and_time() {
+        let raw = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "prt_1",
+                    "sessionID": "ses_root",
+                    "messageID": "msg_1",
+                    "type": "tool",
+                    "callID": "call_task",
+                    "tool": "task",
+                    "state": {
+                        "status": "completed",
+                        "input": { "subagent_type": "explore" },
+                        "output": "<task id=\"ses_child\" state=\"completed\">\n<task_result>\nDone.\n</task_result>\n</task>",
+                        "metadata": {
+                            "parentSessionId": "ses_root",
+                            "sessionId": "ses_child",
+                            "model": { "modelID": "big-pickle", "providerID": "opencode" },
+                            "truncated": false
+                        },
+                        "title": "List current directory files",
+                        "time": { "start": 1783362470235u64, "end": 1783362691634u64 }
+                    }
+                }
+            }
+        });
+        let event: OpenCodeEvent = serde_json::from_value(raw).unwrap();
+        let OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(MessagePartUpdated {
+            part: PartPayload::Tool(tool),
+        })) = event
+        else {
+            panic!("expected tool part");
+        };
+        match tool.state {
+            ToolStateValue::Completed {
+                output,
+                metadata,
+                time,
+                ..
+            } => {
+                assert!(output.contains("<task_result>"));
+                let md = TaskMetadata::from_value(&metadata);
+                assert_eq!(md.session_id.as_deref(), Some("ses_child"));
+                let t = time.unwrap();
+                assert_eq!(t.start, Some(1783362470235));
+                assert_eq!(t.end, Some(1783362691634));
+            }
+            other => panic!("wrong state: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_metadata_from_non_task_tool_metadata_is_all_none() {
+        // The `read` tool's metadata (`{ preview, truncated, loaded }`)
+        // must decode to an empty TaskMetadata rather than erroring.
+        let md = TaskMetadata::from_value(&serde_json::json!({
+            "preview": "a\nb\nc",
+            "truncated": false,
+            "loaded": []
+        }));
+        assert!(md.session_id.is_none());
+        assert!(md.parent_session_id.is_none());
+        assert!(md.model_id().is_none());
+    }
+
+    #[test]
+    fn agent_part_decodes_as_agent_variant() {
+        // Real `agent` part payload from the capture — must decode to
+        // the Agent variant, not fall through to Other.
+        let raw = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "type": "agent",
+                    "name": "explore",
+                    "messageID": "msg_1",
+                    "sessionID": "ses_root",
+                    "id": "prt_agent"
+                }
+            }
+        });
+        let event: OpenCodeEvent = serde_json::from_value(raw).unwrap();
+        match event {
+            OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(MessagePartUpdated {
+                part: PartPayload::Agent(agent),
+            })) => {
+                assert_eq!(agent.name.as_deref(), Some("explore"));
+                assert_eq!(agent.session_id, "ses_root");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtask_part_decodes_as_subtask_variant() {
+        let raw = serde_json::json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "type": "subtask",
+                    "id": "prt_sub",
+                    "sessionID": "ses_root",
+                    "messageID": "msg_1",
+                    "prompt": "do the thing",
+                    "description": "a thing",
+                    "agent": "explore",
+                    "model": { "providerID": "opencode", "modelID": "big-pickle" }
+                }
+            }
+        });
+        let event: OpenCodeEvent = serde_json::from_value(raw).unwrap();
+        match event {
+            OpenCodeEvent::Known(KnownEvent::MessagePartUpdated(MessagePartUpdated {
+                part: PartPayload::Subtask(sub),
+            })) => {
+                assert_eq!(sub.agent.as_deref(), Some("explore"));
+                assert_eq!(sub.model.unwrap().as_model_id(), "opencode/big-pickle");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_message_decodes_info_and_parts_for_backfill() {
+        // Shape returned by `GET /session/{id}/message` — a list of
+        // `{ info, parts }`; used for cold backfill.
+        let raw = serde_json::json!([
+            {
+                "info": {
+                    "id": "msg_1",
+                    "sessionID": "ses_child",
+                    "role": "assistant",
+                    "time": { "created": 1, "completed": 2 }
+                },
+                "parts": [
+                    { "type": "text", "id": "p1", "sessionID": "ses_child", "messageID": "msg_1", "text": "hi" },
+                    { "type": "step-start", "id": "p2" }
+                ]
+            }
+        ]);
+        let msgs: Vec<SessionMessage> = serde_json::from_value(raw).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].info.session_id, "ses_child");
+        assert_eq!(msgs[0].parts.len(), 2);
+        assert!(matches!(msgs[0].parts[0], PartPayload::Text(_)));
+        assert!(matches!(msgs[0].parts[1], PartPayload::Other));
     }
 
     #[test]

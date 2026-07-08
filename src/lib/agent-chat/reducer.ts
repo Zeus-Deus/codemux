@@ -1,5 +1,12 @@
-import type { ApprovalDecision, ProviderRuntimeEvent } from "@/tauri/events";
+import type {
+  ApprovalDecision,
+  CompletedItem,
+  ContentDelta,
+  ProviderRuntimeEvent,
+  SubagentSnapshot,
+} from "@/tauri/events";
 
+import { mergeSnapshot, newSubagentView } from "./subagents";
 import {
   emptyThreadState,
   type AssistantMessageItem,
@@ -7,6 +14,8 @@ import {
   type ChatViewItem,
   type PermissionRequestItem,
   type ReasoningItem,
+  type SubagentRunItem,
+  type SubagentView,
   type ToolCallItem,
   type UserMessageItem,
 } from "./types";
@@ -170,13 +179,13 @@ function findTrailingReasoning(
  * is not a streaming reasoning item, so it is cheap to call unconditionally
  * at boundary sites. Computes `duration_ms` from `started_at` when known.
  */
-function sealTrailingReasoning(
-  state: ChatThreadState,
+function sealTrailingReasoningList(
+  messages: ChatViewItem[],
   now: Clock,
-): ChatThreadState {
-  const lastIndex = state.messages.length - 1;
-  const tail = state.messages[lastIndex];
-  if (!tail || tail.kind !== "reasoning" || !tail.streaming) return state;
+): ChatViewItem[] {
+  const lastIndex = messages.length - 1;
+  const tail = messages[lastIndex];
+  if (!tail || tail.kind !== "reasoning" || !tail.streaming) return messages;
   const sealed: ReasoningItem = {
     ...tail,
     streaming: false,
@@ -185,7 +194,439 @@ function sealTrailingReasoning(
         ? Math.max(0, now() - tail.started_at)
         : tail.duration_ms,
   };
-  return { ...state, messages: replaceItem(state.messages, lastIndex, sealed) };
+  return replaceItem(messages, lastIndex, sealed);
+}
+
+function sealTrailingReasoning(
+  state: ChatThreadState,
+  now: Clock,
+): ChatThreadState {
+  const sealed = sealTrailingReasoningList(state.messages, now);
+  if (sealed === state.messages) return state;
+  return { ...state, messages: sealed };
+}
+
+// ---------------------------------------------------------------------------
+// Shared item-construction helpers
+//
+// These operate on a bare `(messages, nextSeq)` context so the main
+// transcript AND a subagent's sub-transcript build items through the exact
+// same tail-merge / sealing discipline (locked decision: the drill-in
+// reuses every existing renderer, so its items must be built identically).
+// Thread-level side effects (streaming flag, pendingRequestIds) stay in the
+// event handlers that call these.
+// ---------------------------------------------------------------------------
+
+interface ListCtx {
+  messages: ChatViewItem[];
+  nextSeq: number;
+}
+
+function takeSeqList(ctx: ListCtx): { seq: number; ctx: ListCtx } {
+  return {
+    seq: ctx.nextSeq,
+    ctx: { messages: ctx.messages, nextSeq: ctx.nextSeq + 1 },
+  };
+}
+
+/** Append a thinking delta with the reasoning tail-merge rule. */
+function appendThinkingDelta(
+  ctx: ListCtx,
+  text: string,
+  turnId: string,
+  now: Clock,
+): ListCtx {
+  const lastIndex = ctx.messages.length - 1;
+  const tail = ctx.messages[lastIndex];
+  if (
+    tail &&
+    tail.kind === "reasoning" &&
+    tail.streaming &&
+    (!tail.turn_id || tail.turn_id === turnId)
+  ) {
+    const next: ReasoningItem = {
+      ...tail,
+      turn_id: turnId,
+      text: tail.text + text,
+      streaming: true,
+    };
+    return {
+      messages: replaceItem(ctx.messages, lastIndex, next),
+      nextSeq: ctx.nextSeq,
+    };
+  }
+  const { seq, ctx: c2 } = takeSeqList(ctx);
+  const newReasoning: ReasoningItem = {
+    kind: "reasoning",
+    id: nextId("reasoning"),
+    seq,
+    turn_id: turnId,
+    text,
+    streaming: true,
+    started_at: now(),
+  };
+  return { messages: [...c2.messages, newReasoning], nextSeq: c2.nextSeq };
+}
+
+/** Append a text delta: seal any trailing reasoning, then tail-merge into
+ *  the streaming assistant message (or start a fresh one). */
+function appendTextDelta(
+  ctx: ListCtx,
+  text: string,
+  turnId: string,
+  now: Clock,
+): ListCtx {
+  const messages = sealTrailingReasoningList(ctx.messages, now);
+  const tail = messages[messages.length - 1];
+  if (
+    tail &&
+    tail.kind === "assistant_message" &&
+    tail.streaming &&
+    (!tail.turn_id || tail.turn_id === turnId)
+  ) {
+    const next: AssistantMessageItem = {
+      ...tail,
+      turn_id: turnId,
+      text: tail.text + text,
+      streaming: true,
+    };
+    return {
+      messages: replaceItem(messages, messages.length - 1, next),
+      nextSeq: ctx.nextSeq,
+    };
+  }
+  const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
+  const newAssistant: AssistantMessageItem = {
+    kind: "assistant_message",
+    id: nextId("assistant"),
+    seq,
+    turn_id: turnId,
+    text,
+    streaming: true,
+  };
+  return { messages: [...c2.messages, newAssistant], nextSeq: c2.nextSeq };
+}
+
+/** Apply a `content_delta` (text / thinking; tool_input is a no-op) to a
+ *  message list. Returns the same ctx reference-equal messages when
+ *  nothing rendered. */
+function applyContentDeltaToList(
+  ctx: ListCtx,
+  delta: ContentDelta,
+  turnId: string,
+  now: Clock,
+): ListCtx {
+  if (delta.kind === "thinking") {
+    return appendThinkingDelta(ctx, delta.text, turnId, now);
+  }
+  if (delta.kind === "text") {
+    return appendTextDelta(ctx, delta.text, turnId, now);
+  }
+  return ctx;
+}
+
+/** Apply a completed item to a message list with the same discipline the
+ *  main transcript uses (seal reasoning at non-thinking boundaries,
+ *  tail-merge streaming assistant/reasoning, attach tool results). */
+function applyCompletedItemToList(
+  ctx: ListCtx,
+  item: CompletedItem,
+  turnId: string,
+  now: Clock,
+): ListCtx {
+  switch (item.kind) {
+    case "assistant_text": {
+      const messages = sealTrailingReasoningList(ctx.messages, now);
+      const existing = findTrailingAssistant(messages, turnId);
+      if (existing && existing.item.streaming) {
+        const next: AssistantMessageItem = {
+          ...existing.item,
+          turn_id: turnId,
+          text: item.text,
+          streaming: false,
+        };
+        return {
+          messages: replaceItem(messages, existing.index, next),
+          nextSeq: ctx.nextSeq,
+        };
+      }
+      const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
+      const newAssistant: AssistantMessageItem = {
+        kind: "assistant_message",
+        id: nextId("assistant"),
+        seq,
+        turn_id: turnId,
+        text: item.text,
+        streaming: false,
+      };
+      return { messages: [...c2.messages, newAssistant], nextSeq: c2.nextSeq };
+    }
+    case "assistant_thinking": {
+      const found = findTrailingReasoning(ctx.messages, turnId);
+      if (found && found.item.streaming) {
+        const finalized: ReasoningItem = {
+          ...found.item,
+          turn_id: turnId,
+          text: item.text,
+          streaming: false,
+          duration_ms:
+            found.item.started_at != null
+              ? Math.max(0, now() - found.item.started_at)
+              : found.item.duration_ms,
+        };
+        return {
+          messages: replaceItem(ctx.messages, found.index, finalized),
+          nextSeq: ctx.nextSeq,
+        };
+      }
+      const { seq, ctx: c2 } = takeSeqList(ctx);
+      const newReasoning: ReasoningItem = {
+        kind: "reasoning",
+        id: nextId("reasoning"),
+        seq,
+        turn_id: turnId,
+        text: item.text,
+        streaming: false,
+      };
+      return { messages: [...c2.messages, newReasoning], nextSeq: c2.nextSeq };
+    }
+    case "tool_use": {
+      const messages = sealTrailingReasoningList(ctx.messages, now);
+      if (SPECIALIZED_TOOLS.has(item.tool_name)) {
+        return { messages, nextSeq: ctx.nextSeq };
+      }
+      const found = findToolCallByUseId(messages, item.tool_use_id);
+      if (found) {
+        const next: ToolCallItem = {
+          ...found.item,
+          tool_name: item.tool_name,
+          input: item.input,
+          // Result-first ordering already stamped `completed_at`; only
+          // fill `started_at` if this is genuinely the first time we
+          // observe the use landing.
+          started_at: found.item.started_at ?? now(),
+        };
+        return {
+          messages: replaceItem(messages, found.index, next),
+          nextSeq: ctx.nextSeq,
+        };
+      }
+      const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
+      const priorRequest = c2.messages.find(
+        (m): m is PermissionRequestItem =>
+          m.kind === "permission_request" &&
+          m.tool_use_id === item.tool_use_id,
+      );
+      const newToolCall: ToolCallItem = {
+        kind: "tool_call",
+        id: nextId("tool"),
+        seq,
+        tool_use_id: item.tool_use_id,
+        tool_name: item.tool_name,
+        input: item.input,
+        status: "running",
+        result_content: null,
+        approval_request_id: priorRequest?.request_id ?? null,
+        started_at: now(),
+      };
+      return { messages: [...c2.messages, newToolCall], nextSeq: c2.nextSeq };
+    }
+    case "tool_result": {
+      const messages = sealTrailingReasoningList(ctx.messages, now);
+      const found = findToolCallByUseId(messages, item.tool_use_id);
+      if (found) {
+        const next: ToolCallItem = {
+          ...found.item,
+          status: item.is_error ? "error" : "done",
+          result_content: item.content,
+          completed_at: now(),
+        };
+        return {
+          messages: replaceItem(messages, found.index, next),
+          nextSeq: ctx.nextSeq,
+        };
+      }
+      const specializedPending = messages.find(
+        (m): m is PermissionRequestItem =>
+          m.kind === "permission_request" &&
+          m.tool_use_id === item.tool_use_id &&
+          SPECIALIZED_REQUEST_KINDS.has(m.request_kind),
+      );
+      if (specializedPending) {
+        return { messages, nextSeq: ctx.nextSeq };
+      }
+      const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
+      const placeholder: ToolCallItem = {
+        kind: "tool_call",
+        id: nextId("tool"),
+        seq,
+        tool_use_id: item.tool_use_id,
+        tool_name: "(pending)",
+        input: null,
+        status: item.is_error ? "error" : "done",
+        result_content: item.content,
+        approval_request_id: null,
+        completed_at: now(),
+      };
+      return { messages: [...c2.messages, placeholder], nextSeq: c2.nextSeq };
+    }
+    default: {
+      warnOnce(
+        `item_completed/${(item as { kind: string }).kind}`,
+        item,
+      );
+      return ctx;
+    }
+  }
+}
+
+/** Hard cap on retained items inside a single subagent's sub-transcript,
+ *  mirroring the main transcript cap. */
+const MAX_SUBAGENT_ITEMS = 500;
+const TRIM_TARGET_SUBAGENT_ITEMS = 400;
+
+function capSubagentItems(items: ChatViewItem[]): ChatViewItem[] {
+  if (items.length <= MAX_SUBAGENT_ITEMS) return items;
+  return items.slice(items.length - TRIM_TARGET_SUBAGENT_ITEMS);
+}
+
+/**
+ * Locate a subagent view by id, or create it. New subagents join the
+ * trailing `subagent_run` card when it is the transcript tail (one card
+ * per contiguous spawn group per turn); otherwise a fresh card is opened.
+ * Returns the (possibly new) messages array plus the card / sub indices.
+ */
+function locateOrCreateSubagent(
+  state: ChatThreadState,
+  subagentId: string,
+  turnId: string | null,
+  now: Clock,
+): {
+  messages: ChatViewItem[];
+  nextSeq: number;
+  cardIndex: number;
+  subIndex: number;
+} {
+  for (let i = state.messages.length - 1; i >= 0; i--) {
+    const card = state.messages[i];
+    if (card.kind !== "subagent_run") continue;
+    const subIndex = card.subagents.findIndex((s) => s.id === subagentId);
+    if (subIndex >= 0) {
+      return {
+        messages: state.messages,
+        nextSeq: state.nextSeq,
+        cardIndex: i,
+        subIndex,
+      };
+    }
+  }
+
+  // A new subagent — seal any trailing reasoning, then join the tail card
+  // or open a new one.
+  const sealed = sealTrailingReasoningList(state.messages, now);
+  const tailIndex = sealed.length - 1;
+  const tail = sealed[tailIndex];
+  const view = newSubagentView(subagentId, now());
+  if (tail && tail.kind === "subagent_run") {
+    const nextCard: SubagentRunItem = {
+      ...tail,
+      subagents: [...tail.subagents, view],
+    };
+    return {
+      messages: replaceItem(sealed, tailIndex, nextCard),
+      nextSeq: state.nextSeq,
+      cardIndex: tailIndex,
+      subIndex: nextCard.subagents.length - 1,
+    };
+  }
+  const newCard: SubagentRunItem = {
+    kind: "subagent_run",
+    id: nextId("subrun"),
+    seq: state.nextSeq,
+    turn_id: turnId,
+    subagents: [view],
+  };
+  return {
+    messages: [...sealed, newCard],
+    nextSeq: state.nextSeq + 1,
+    cardIndex: sealed.length,
+    subIndex: 0,
+  };
+}
+
+/** Write a mutated subagent view back into its card. */
+function replaceSubagent(
+  messages: ChatViewItem[],
+  cardIndex: number,
+  subIndex: number,
+  nextView: SubagentView,
+): ChatViewItem[] {
+  const card = messages[cardIndex];
+  if (card.kind !== "subagent_run") return messages;
+  const subs = card.subagents.slice();
+  subs[subIndex] = nextView;
+  return replaceItem(messages, cardIndex, { ...card, subagents: subs });
+}
+
+/** Route a `subagent_id`-tagged content/item event into its subagent's
+ *  sub-transcript using the shared item-builders. */
+function routeSubagentItem(
+  state: ChatThreadState,
+  subagentId: string,
+  turnId: string,
+  build: (ctx: ListCtx) => ListCtx,
+  now: Clock,
+): ChatThreadState {
+  const loc = locateOrCreateSubagent(state, subagentId, turnId, now);
+  const card = loc.messages[loc.cardIndex];
+  if (card.kind !== "subagent_run") return state;
+  const sub = card.subagents[loc.subIndex];
+  const ctx = build({ messages: sub.items, nextSeq: loc.nextSeq });
+  if (ctx.messages === sub.items && ctx.nextSeq === loc.nextSeq) {
+    // Nothing changed inside the sub-transcript; still commit any new
+    // card that `locateOrCreate` may have appended.
+    if (loc.messages === state.messages) return state;
+    return { ...state, messages: loc.messages, nextSeq: loc.nextSeq };
+  }
+  const nextView: SubagentView = {
+    ...sub,
+    items: capSubagentItems(ctx.messages),
+  };
+  return {
+    ...state,
+    nextSeq: ctx.nextSeq,
+    messages: replaceSubagent(loc.messages, loc.cardIndex, loc.subIndex, nextView),
+  };
+}
+
+/** Best-effort current turn id from the trailing turn-bearing item, so a
+ *  freshly-opened card records which turn spawned it. */
+function trailingTurnId(messages: ChatViewItem[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if ("turn_id" in m && m.turn_id) return m.turn_id;
+  }
+  return null;
+}
+
+/** Merge a `subagent_updated` snapshot into its view (non-null fields win,
+ *  status stays monotonic), creating the card / view when first seen. */
+function applySubagentUpdated(
+  state: ChatThreadState,
+  snap: SubagentSnapshot,
+  now: Clock,
+): ChatThreadState {
+  const turnId = trailingTurnId(state.messages);
+  const loc = locateOrCreateSubagent(state, snap.subagent_id, turnId, now);
+  const card = loc.messages[loc.cardIndex];
+  if (card.kind !== "subagent_run") return state;
+  const sub = card.subagents[loc.subIndex];
+  const nextView = mergeSnapshot(sub, snap);
+  return {
+    ...state,
+    nextSeq: loc.nextSeq,
+    messages: replaceSubagent(loc.messages, loc.cardIndex, loc.subIndex, nextView),
+  };
 }
 
 function appendUserMessageLocal(
@@ -333,289 +774,68 @@ function applyEventInner(
 
     case "content_delta": {
       const delta = event.delta;
-      if (delta.kind === "thinking") {
-        // Accumulate thinking deltas into a trailing reasoning block with
-        // the same tail-merge discipline as assistant text: continue the
-        // current block only while it is BOTH the tail AND streaming (and
-        // in this turn); anything else that landed means a fresh block.
-        const lastIndex = state.messages.length - 1;
-        const tail = state.messages[lastIndex];
-        if (
-          tail &&
-          tail.kind === "reasoning" &&
-          tail.streaming &&
-          (!tail.turn_id || tail.turn_id === event.turn_id)
-        ) {
-          const next: ReasoningItem = {
-            ...tail,
-            turn_id: event.turn_id,
-            text: tail.text + delta.text,
-            streaming: true,
-          };
-          return {
-            ...state,
-            streaming: true,
-            messages: replaceItem(state.messages, lastIndex, next),
-          };
-        }
-        const { seq, next: seqBumped } = takeSeq(state);
-        const newReasoning: ReasoningItem = {
-          kind: "reasoning",
-          id: nextId("reasoning"),
-          seq,
-          turn_id: event.turn_id,
-          text: delta.text,
-          streaming: true,
-          started_at: now(),
-        };
-        return {
-          ...seqBumped,
-          streaming: true,
-          messages: [...seqBumped.messages, newReasoning],
-        };
+      // Subagent-tagged deltas stream into that subagent's own
+      // sub-transcript (built with the shared item-builders), never the
+      // parent flow. The parent streaming flag is owned by
+      // session_state_changed, so it isn't touched here.
+      if (event.subagent_id) {
+        return routeSubagentItem(
+          state,
+          event.subagent_id,
+          event.turn_id,
+          (ctx) => applyContentDeltaToList(ctx, delta, event.turn_id, now),
+          now,
+        );
       }
-      if (delta.kind !== "text") {
+      if (delta.kind === "tool_input") {
         // tool_input deltas are not rendered in the transcript.
         return state;
       }
-      // A text delta is a non-thinking boundary: seal any trailing
-      // streaming reasoning block so it stops shimmering before the
-      // assistant prose row is created/continued.
-      state = sealTrailingReasoning(state, now);
-      // Only continue an existing assistant message when it's both
-      // the CURRENT TAIL and still streaming. If anything else has
-      // landed after the last assistant (tool call, permission
-      // request, turn-ended marker, …), those events mark the
-      // boundary between two content blocks — the incoming deltas
-      // belong to a FRESH assistant message at a new seq, otherwise
-      // they'd render at the sealed block's (now stale) position and
-      // visually leapfrog over the intervening items. This is the
-      // AskUserQuestion "Answered appears above older tool calls"
-      // bug: after the user's answer, the next text deltas would
-      // back-merge onto the turn's first assistant.
-      const tail = state.messages[state.messages.length - 1];
-      if (
-        tail &&
-        tail.kind === "assistant_message" &&
-        tail.streaming &&
-        (!tail.turn_id || tail.turn_id === event.turn_id)
-      ) {
-        const lastIndex = state.messages.length - 1;
-        const next: AssistantMessageItem = {
-          ...tail,
-          turn_id: event.turn_id,
-          text: tail.text + delta.text,
-          streaming: true,
-        };
-        return {
-          ...state,
-          streaming: true,
-          messages: replaceItem(state.messages, lastIndex, next),
-        };
-      }
-      const { seq, next: seqBumped } = takeSeq(state);
-      const newAssistant: AssistantMessageItem = {
-        kind: "assistant_message",
-        id: nextId("assistant"),
-        seq,
-        turn_id: event.turn_id,
-        text: delta.text,
-        streaming: true,
-      };
+      // text / thinking deltas render into the parent transcript through
+      // the shared builder (seal-on-boundary + tail-merge discipline);
+      // both mark the turn as streaming.
+      const ctx = applyContentDeltaToList(
+        { messages: state.messages, nextSeq: state.nextSeq },
+        delta,
+        event.turn_id,
+        now,
+      );
       return {
-        ...seqBumped,
+        ...state,
         streaming: true,
-        messages: [...seqBumped.messages, newAssistant],
+        messages: ctx.messages,
+        nextSeq: ctx.nextSeq,
       };
     }
 
     case "item_completed": {
       const item = event.item;
-      switch (item.kind) {
-        case "assistant_text": {
-          // Non-thinking boundary — seal any trailing streaming reasoning.
-          state = sealTrailingReasoning(state, now);
-          const existing = findTrailingAssistant(state.messages, event.turn_id);
-          if (existing && existing.item.streaming) {
-            const next: AssistantMessageItem = {
-              ...existing.item,
-              turn_id: event.turn_id,
-              text: item.text,
-              streaming: false,
-            };
-            return {
-              ...state,
-              messages: replaceItem(state.messages, existing.index, next),
-            };
-          }
-          const { seq, next: seqBumped } = takeSeq(state);
-          const newAssistant: AssistantMessageItem = {
-            kind: "assistant_message",
-            id: nextId("assistant"),
-            seq,
-            turn_id: event.turn_id,
-            text: item.text,
-            streaming: false,
-          };
-          return {
-            ...seqBumped,
-            messages: [...seqBumped.messages, newAssistant],
-          };
-        }
-        case "assistant_thinking": {
-          // Finalize the trailing reasoning block for this turn: replace
-          // the accumulated text with the authoritative final text, seal
-          // it, and record the thinking duration (first-delta → now).
-          const found = findTrailingReasoning(state.messages, event.turn_id);
-          if (found && found.item.streaming) {
-            const finalized: ReasoningItem = {
-              ...found.item,
-              turn_id: event.turn_id,
-              text: item.text,
-              streaming: false,
-              duration_ms:
-                found.item.started_at != null
-                  ? Math.max(0, now() - found.item.started_at)
-                  : found.item.duration_ms,
-            };
-            return {
-              ...state,
-              messages: replaceItem(state.messages, found.index, finalized),
-            };
-          }
-          // Completion carried no streamed deltas (or the block was
-          // already sealed by a boundary): materialise a fresh, sealed
-          // block so the final thinking text is never dropped. Without a
-          // first-delta timestamp there is no duration to report.
-          const { seq, next: seqBumped } = takeSeq(state);
-          const newReasoning: ReasoningItem = {
-            kind: "reasoning",
-            id: nextId("reasoning"),
-            seq,
-            turn_id: event.turn_id,
-            text: item.text,
-            streaming: false,
-          };
-          return {
-            ...seqBumped,
-            messages: [...seqBumped.messages, newReasoning],
-          };
-        }
-        case "tool_use": {
-          // Non-thinking boundary — seal any trailing streaming reasoning.
-          state = sealTrailingReasoning(state, now);
-          // Specialized tools (ExitPlanMode, AskUserQuestion) drive
-          // their own UI through a `permission_request` row — skipping
-          // the ToolCallItem here prevents Stage 1's tool_use_id merge
-          // from stamping `approval_request_id` on an otherwise-unused
-          // tool card and suppressing the specialized renderer in
-          // MessageList.
-          if (SPECIALIZED_TOOLS.has(item.tool_name)) {
-            return state;
-          }
-          // Tool input may have streamed in via content_delta tool_input;
-          // we ignore those deltas in Step 2 and attach the finalised
-          // tool_use here. If the same tool_use_id already exists (e.g.
-          // a tool_result came first), attach to it.
-          const found = findToolCallByUseId(state.messages, item.tool_use_id);
-          if (found) {
-            const next: ToolCallItem = {
-              ...found.item,
-              tool_name: item.tool_name,
-              input: item.input,
-              // Result-first ordering already stamped `completed_at`; only
-              // fill `started_at` if this is genuinely the first time we
-              // observe the use landing.
-              started_at: found.item.started_at ?? now(),
-            };
-            return {
-              ...state,
-              messages: replaceItem(state.messages, found.index, next),
-            };
-          }
-          const { seq, next: seqBumped } = takeSeq(state);
-          // Defensive association: if a permission_request with a
-          // matching tool_use_id already exists (request_opened
-          // landed before the assistant tool_use — unusual but
-          // possible depending on SDK ordering), link the new tool
-          // call to it up front.
-          const priorRequest = seqBumped.messages.find(
-            (m): m is PermissionRequestItem =>
-              m.kind === "permission_request" &&
-              m.tool_use_id === item.tool_use_id,
-          );
-          const newToolCall: ToolCallItem = {
-            kind: "tool_call",
-            id: nextId("tool"),
-            seq,
-            tool_use_id: item.tool_use_id,
-            tool_name: item.tool_name,
-            input: item.input,
-            status: "running",
-            result_content: null,
-            approval_request_id: priorRequest?.request_id ?? null,
-            started_at: now(),
-          };
-          return { ...seqBumped, messages: [...seqBumped.messages, newToolCall] };
-        }
-        case "tool_result": {
-          // Non-thinking boundary — seal any trailing streaming reasoning.
-          state = sealTrailingReasoning(state, now);
-          const found = findToolCallByUseId(state.messages, item.tool_use_id);
-          if (found) {
-            const next: ToolCallItem = {
-              ...found.item,
-              status: item.is_error ? "error" : "done",
-              result_content: item.content,
-              completed_at: now(),
-            };
-            return {
-              ...state,
-              messages: replaceItem(state.messages, found.index, next),
-            };
-          }
-          // Specialized tools never emit a tool_result in practice
-          // (ExitPlanMode is denied by the sidecar, AskUserQuestion's
-          // "result" is the user's answer routed back through
-          // `respond-to-request`). Guard defensively: if the
-          // tool_use_id matches a pending specialized request, don't
-          // create a ghost "(pending)" placeholder that would
-          // resurrect the very card the tool_use guard prevented.
-          const specializedPending = state.messages.find(
-            (m): m is PermissionRequestItem =>
-              m.kind === "permission_request" &&
-              m.tool_use_id === item.tool_use_id &&
-              SPECIALIZED_REQUEST_KINDS.has(m.request_kind),
-          );
-          if (specializedPending) {
-            return state;
-          }
-          // Result arrived before we saw the tool_use. Create a placeholder
-          // carrying the result so nothing is lost; the tool_use item
-          // handler will attach when the use shows up.
-          const { seq, next: seqBumped } = takeSeq(state);
-          const placeholder: ToolCallItem = {
-            kind: "tool_call",
-            id: nextId("tool"),
-            seq,
-            tool_use_id: item.tool_use_id,
-            tool_name: "(pending)",
-            input: null,
-            status: item.is_error ? "error" : "done",
-            result_content: item.content,
-            approval_request_id: null,
-            completed_at: now(),
-          };
-          return {
-            ...seqBumped,
-            messages: [...seqBumped.messages, placeholder],
-          };
-        }
-        default: {
-          warnOnce(`item_completed/${(item as { kind: string }).kind}`, item);
-          return state;
-        }
+      // Subagent-tagged items reuse CompletedItem unchanged and route into
+      // that subagent's sub-transcript, so the drill-in renders through
+      // every existing renderer (locked decision 1).
+      if (event.subagent_id) {
+        return routeSubagentItem(
+          state,
+          event.subagent_id,
+          event.turn_id,
+          (ctx) => applyCompletedItemToList(ctx, item, event.turn_id, now),
+          now,
+        );
       }
+      const ctx = applyCompletedItemToList(
+        { messages: state.messages, nextSeq: state.nextSeq },
+        item,
+        event.turn_id,
+        now,
+      );
+      if (ctx.messages === state.messages && ctx.nextSeq === state.nextSeq) {
+        return state;
+      }
+      return { ...state, messages: ctx.messages, nextSeq: ctx.nextSeq };
+    }
+
+    case "subagent_updated": {
+      return applySubagentUpdated(state, event.subagent, now);
     }
 
     case "turn_completed": {
@@ -671,6 +891,10 @@ function applyEventInner(
         request_kind: event.request_kind,
         payload: event.payload,
         tool_use_id: event.tool_use_id,
+        // A subagent's approval bubbles into the parent flow (locked
+        // decision 4) tagged with its demux key so the UI can label it
+        // "from subagent X" and the drill-in can mirror it.
+        subagent_id: event.subagent_id ?? null,
         resolution: { state: "pending" },
       };
       // When the request is tied to an in-flight tool_use, link the

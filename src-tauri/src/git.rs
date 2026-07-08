@@ -560,8 +560,14 @@ pub fn git_checkpoint_create(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // Per-call monotonic suffix so two concurrent checkpoint operations
+    // in the same process never share a temp-index path (and thus never
+    // collide on its `.lock`). `nanos` alone is insufficient under a
+    // coarse/contended clock — two threads can read the same value.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp_index = std::env::temp_dir().join(format!(
-        "codemux-checkpoint-index-{}-{nanos}",
+        "codemux-checkpoint-index-{}-{nanos}-{seq}",
         std::process::id()
     ));
 

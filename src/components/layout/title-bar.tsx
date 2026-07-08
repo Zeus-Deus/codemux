@@ -3,9 +3,13 @@ import {
   PanelLeft,
   ChevronDown,
   ExternalLink,
+  FileDiff,
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
 import { ResourceMonitor } from "./resource-monitor";
+import { TitleBarTabs } from "./title-bar-tabs";
+import { AgentLauncher } from "./agent-launcher";
+import { RunButton } from "./run-button";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,12 +27,26 @@ import {
 } from "@/components/ui/tooltip";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
-import { useAppStore } from "@/stores/app-store";
-import { detectEditors, openInEditor } from "@/tauri/commands";
+import {
+  useActiveWorkspace,
+  useActiveWorkspaceId,
+  useAppStore,
+} from "@/stores/app-store";
+import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
+import { usePresetStore } from "@/hooks/use-preset-store";
+import { useUIStore } from "@/stores/ui-store";
+import { toast } from "@/lib/toast";
+import {
+  agentChatCreatePane,
+  detectEditors,
+  openInEditor,
+} from "@/tauri/commands";
 import { cn } from "@/lib/utils";
 import { EditorIcon } from "@/components/icons/editor-icon";
+import { PresetIcon } from "@/components/icons/preset-icon";
 import { useSyncedSettingsStore, selectDefaultEditor } from "@/stores/synced-settings-store";
-import type { EditorInfo } from "@/tauri/types";
+import type { EditorInfo, WorkspaceSnapshot } from "@/tauri/types";
 
 // ── IDE Launcher ──
 
@@ -181,6 +199,112 @@ function SidebarToggleButton({
   );
 }
 
+// ── Right-panel toggle (rehomed from TabBar for GUI chrome) ──
+
+function RightPanelToggle({ workspaceId }: { workspaceId: string }) {
+  const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
+  const rightPanelTab = useUIStore(
+    (s) => s.rightPanelTabs[workspaceId] ?? null,
+  );
+
+  // True toggle: any open tab closes the panel; closed opens to Files.
+  const togglePanel = () => {
+    setRightPanelTab(workspaceId, rightPanelTab == null ? "files" : null);
+  };
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          className={cn(
+            "shrink-0",
+            rightPanelTab
+              ? "bg-card text-foreground"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+          onClick={togglePanel}
+          aria-pressed={rightPanelTab != null}
+          aria-label={rightPanelTab ? "Close panel" : "Open panel"}
+        >
+          <FileDiff className="h-3.5 w-3.5" />
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom" sideOffset={4}>
+        {rightPanelTab ? "Close panel" : "Open panel"}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+// ── Pinned chat favorite (GUI chrome) ──
+
+function PinnedChatFavorite({ workspace }: { workspace: WorkspaceSnapshot }) {
+  const presetStore = usePresetStore();
+  const chatPresets = (presetStore?.presets ?? []).filter(
+    (p) => p.kind === "chat_agent",
+  );
+
+  const launch = () => {
+    agentChatCreatePane(workspace.workspace_id, "claude", null, "new_tab").catch(
+      (err) => {
+        const message =
+          typeof err === "string"
+            ? err
+            : err instanceof Error
+              ? err.message
+              : String(err);
+        toast.error(`Chat Agent: ${message}`);
+        console.error("[title-bar] chat favorite launch failed:", err);
+      },
+    );
+  };
+
+  if (chatPresets.length === 0) return null;
+
+  return (
+    <>
+      {chatPresets.map((preset) => (
+        <button
+          key={preset.id}
+          type="button"
+          onClick={launch}
+          title={`New ${preset.name}`}
+          data-testid={`titlebar-favorite-${preset.id}`}
+          className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md border border-accent-ember/35 bg-accent-ember/12 px-2.5 text-xs font-semibold text-foreground transition-colors hover:bg-accent-ember/20"
+        >
+          <span className="flex h-3.5 w-3.5 items-center justify-center rounded bg-accent-ember/25 text-accent-ember">
+            <PresetIcon icon={preset.icon} className="h-2.5 w-2.5" />
+          </span>
+          {preset.name}
+        </button>
+      ))}
+    </>
+  );
+}
+
+// ── Workspace slots (GUI chrome) ──
+//
+// Self-subscribes to the active workspace so its per-tick re-render
+// (fresh snapshot ref every backend emit) stays isolated to the tab
+// strip + launcher + favorite, never churning the window controls /
+// resource monitor sitting in the sibling right cluster.
+function TitleBarWorkspaceSlots() {
+  const workspace = useActiveWorkspace();
+  if (!workspace) return null;
+  return (
+    <div
+      className="flex min-w-0 items-center gap-1"
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      <TitleBarTabs workspace={workspace} />
+      <AgentLauncher workspace={workspace} />
+      <PinnedChatFavorite workspace={workspace} />
+    </div>
+  );
+}
+
 // ── Title Bar ──
 
 interface TitleBarProps {
@@ -189,26 +313,96 @@ interface TitleBarProps {
 }
 
 export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
+  const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
+  const activeWorkspaceId = useActiveWorkspaceId();
+  // Primitive selector — stays stable across backend ticks so the whole
+  // title bar doesn't re-render on every snapshot emit.
+  const activeWorkspaceType = useAppStore((s) => {
+    const id = s.appState?.active_workspace_id;
+    if (!id) return null;
+    return (
+      s.appState!.workspaces.find((w) => w.workspace_id === id)
+        ?.workspace_type ?? null
+    );
+  });
+
+  // GUI chrome renders for a real, non-OpenFlow workspace when the Agent
+  // Chat Beta is on. A live lazy-creation draft (no workspace yet) keeps
+  // the legacy bar so the draft surface's own PresetBar stays coherent;
+  // OpenFlow keeps its dedicated chrome untouched.
+  const lazyDraftActive = lazyEnabled && activeDraftId !== null;
+  const guiChrome =
+    enableAgentChat &&
+    !lazyDraftActive &&
+    activeWorkspaceId != null &&
+    activeWorkspaceType != null &&
+    activeWorkspaceType !== "open_flow";
+
+  if (!guiChrome) {
+    return (
+      <div
+        data-tauri-drag-region
+        className="relative flex h-9 w-full shrink-0 items-center justify-between border-b border-border bg-card"
+      >
+        {/* Left */}
+        <div className="flex items-center gap-1 pl-2">
+          <SidebarToggleButton open={sidebarOpen} onToggle={onToggleSidebar} />
+        </div>
+
+        {/* Center — left intentionally empty so the title bar reads as
+            a calm drag region. Command palette is reachable from the
+            sidebar footer + its keyboard shortcut. */}
+
+        {/* Right */}
+        <div className="flex items-center gap-1.5 pr-0.5">
+          {/* Resource monitor — CPU/memory usage of Codemux + every
+              terminal process tree. Self-gates on the
+              appearance.show_resource_monitor setting and renders null
+              when disabled. */}
+          <ResourceMonitor />
+          <IdeLauncher />
+          <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
+          <WindowControls />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       data-tauri-drag-region
-      className="relative flex h-9 w-full shrink-0 items-center justify-between border-b border-border bg-card"
+      className="relative flex h-10 w-full shrink-0 items-center border-b border-border bg-card"
     >
-      {/* Left */}
-      <div className="flex items-center gap-1 pl-2">
+      {/* Left — sidebar toggle */}
+      <div
+        className="flex shrink-0 items-center gap-1 pl-2 pr-1"
+        onPointerDown={(e) => e.stopPropagation()}
+      >
         <SidebarToggleButton open={sidebarOpen} onToggle={onToggleSidebar} />
       </div>
 
-      {/* Center — left intentionally empty so the title bar reads as
-          a calm drag region. Command palette is reachable from the
-          sidebar footer + its keyboard shortcut. */}
+      {/* Workspace slots — tabs + launcher + favorite */}
+      <TitleBarWorkspaceSlots />
 
-      {/* Right */}
-      <div className="flex items-center gap-1.5 pr-0.5">
-        {/* Resource monitor — CPU/memory usage of Codemux + every
-            terminal process tree. Self-gates on the
-            appearance.show_resource_monitor setting and renders null
-            when disabled. */}
+      {/* Draggable spacer — the calm middle stays a window drag region.
+          Tauri v2's injected mousedown handler only checks the direct
+          target for `data-tauri-drag-region` (no ancestor walk), so this
+          covering spacer must carry the attribute itself even though the
+          root does — otherwise the middle isn't draggable on Windows/macOS.
+          Discrete slots (tabs / launcher / favorite / spacer / right
+          cluster) leave room for a future inline workflow-status pill. */}
+      <div data-tauri-drag-region className="flex-1 self-stretch" />
+
+      {/* Right cluster — rehomed right-panel toggle + Run, then the
+          standard monitor / IDE / window controls */}
+      <div
+        className="flex shrink-0 items-center gap-1.5 pr-0.5"
+        onPointerDown={(e) => e.stopPropagation()}
+      >
+        {activeWorkspaceId && <RightPanelToggle workspaceId={activeWorkspaceId} />}
+        {activeWorkspaceId && <RunButton workspaceId={activeWorkspaceId} />}
         <ResourceMonitor />
         <IdeLauncher />
         <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
