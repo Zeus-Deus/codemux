@@ -4,8 +4,9 @@
   Agent Chat — see when subagents launch / work / finish, and enter one to
   watch its own transcript.
 - Audience: Implementation agents and anyone changing agent-chat internals.
-- Authority: Landed work plan (all stages shipped on the `subagent-view`
-  branch — see "Already Landed" below). Canonical current truth now lives in
+- Authority: Landed work plan (all stages shipped via the `subagent-view`
+  branch, merged to `main` in PR #125 — see "Already Landed" below).
+  Canonical current truth now lives in
   `docs/features/agent-chat.md` § "Subagent view (cross-provider)"; this doc
   is retained for the locked decisions and the implementation record.
   Protocol facts below were research-verified (July 2026) against SDK type
