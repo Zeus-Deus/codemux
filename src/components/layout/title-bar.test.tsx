@@ -175,6 +175,7 @@ function makeWorkspace(): WorkspaceSnapshot {
 
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { agentChatCreatePane, applyPreset } from "@/tauri/commands";
+import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { TitleBar } from "./title-bar";
 
 function renderBar() {
@@ -197,9 +198,18 @@ beforeEach(() => {
   presetSnapshot = chatPresetSnapshot;
   vi.mocked(agentChatCreatePane).mockClear();
   vi.mocked(applyPreset).mockClear();
+  // Titlebar tile pins are opt-in and persisted (localStorage) — reset to
+  // the real default (empty) before every test so tests don't leak into
+  // each other or depend on ordering.
+  localStorage.clear();
+  useTitlebarPinsStore.setState({ pinnedIds: [] });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+  useTitlebarPinsStore.setState({ pinnedIds: [] });
+});
 
 describe("TitleBar chrome gating", () => {
   it("renders the legacy bar (no tabs/launcher) when the Beta is OFF", () => {
@@ -212,12 +222,16 @@ describe("TitleBar chrome gating", () => {
 
   it("merges tabs + launcher into the bar when the Beta is ON", () => {
     state.enableAgentChat = true;
-    const { getByTestId } = renderBar();
+    const { getByTestId, queryByTestId } = renderBar();
     expect(getByTestId("titlebar-tabs")).toBeInTheDocument();
     expect(getByTestId("agent-launcher")).toBeInTheDocument();
     // Rehomed right cluster.
     expect(getByTestId("run-button")).toBeInTheDocument();
-    expect(getByTestId("titlebar-favorite-builtin-chat-agent")).toBeInTheDocument();
+    // Pinned tiles are opt-in (see the dedicated describe blocks below) —
+    // the titlebar-pins store defaults empty, so no tile renders here even
+    // though the fixture's chat preset has `pinned: true` (that flag is
+    // the unrelated legacy-PresetBar concept).
+    expect(queryByTestId("titlebar-favorite-builtin-chat-agent")).toBeNull();
   });
 
   it("keeps the legacy bar for OpenFlow workspaces even with the Beta ON", () => {
@@ -252,6 +266,34 @@ describe("TitleBar GUI chrome — left cluster sized to the sidebar", () => {
     expect(cluster.style.width).toBe("256px");
     expect(cluster.className).toContain("border-r");
   });
+
+  it("left-aligns the sidebar toggle within its cluster (not centered)", () => {
+    // Regression coverage: the cluster used to be `justify-center`, which
+    // visually floated the toggle away from the mock's left-aligned
+    // `padding:0 10px` layout.
+    state.enableAgentChat = true;
+    const { getByTestId } = renderBar();
+    const cluster = getByTestId("titlebar-sidebar-cluster");
+    expect(cluster.className).toContain("justify-start");
+    expect(cluster.className).not.toContain("justify-center");
+  });
+});
+
+describe("TitleBar GUI chrome — pinned preset tiles default to none", () => {
+  it("renders no tiles and no divider when the titlebar-pins store is empty, even though every preset has preset.pinned=true", () => {
+    // Regression coverage: `preset.pinned` means "show in the legacy
+    // PresetBar" (src-tauri/src/presets.rs ships that true on nearly
+    // every built-in). Tiles here must be gated on the separate,
+    // user-controlled `useTitlebarPinsStore`, which defaults to empty.
+    state.enableAgentChat = true;
+    presetSnapshot = {
+      ...chatPresetSnapshot,
+      presets: [chatPreset, pinnedCliPreset],
+    };
+    const { queryByTestId } = renderBar();
+    expect(queryByTestId("titlebar-favorite-builtin-chat-agent")).toBeNull();
+    expect(queryByTestId("titlebar-pin-cli-claude")).toBeNull();
+  });
 });
 
 describe("TitleBar GUI chrome — pinned preset tiles", () => {
@@ -261,6 +303,11 @@ describe("TitleBar GUI chrome — pinned preset tiles", () => {
       ...chatPresetSnapshot,
       presets: [chatPreset, pinnedCliPreset],
     };
+    // Opt both builtins into the titlebar-pin store so this describe block
+    // still exercises tile rendering/launch behavior end to end.
+    useTitlebarPinsStore.setState({
+      pinnedIds: ["builtin-chat-agent", "cli-claude"],
+    });
   });
 
   it("renders the ember chat favorite tile and launches a new chat tab on click", async () => {
@@ -279,11 +326,19 @@ describe("TitleBar GUI chrome — pinned preset tiles", () => {
     expect(getByTestId("titlebar-pin-cli-claude")).toBeInTheDocument();
   });
 
-  it("does not render a pinned CLI tile for an unpinned CLI preset", () => {
+  it("still renders the tile for a CLI preset with preset.pinned=false, as long as its id is in the titlebar-pins store", () => {
+    // `preset.pinned` is the unrelated legacy-PresetBar flag — the tile
+    // here is gated purely on titlebar-pin store membership.
     presetSnapshot = {
       ...chatPresetSnapshot,
       presets: [chatPreset, { ...pinnedCliPreset, pinned: false }],
     };
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-pin-cli-claude")).toBeInTheDocument();
+  });
+
+  it("does not render a tile for a preset.pinned=true CLI preset whose id isn't in the titlebar-pins store", () => {
+    useTitlebarPinsStore.setState({ pinnedIds: ["builtin-chat-agent"] });
     const { queryByTestId } = renderBar();
     expect(queryByTestId("titlebar-pin-cli-claude")).toBeNull();
   });

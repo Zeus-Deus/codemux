@@ -36,6 +36,7 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
+import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useUIStore } from "@/stores/ui-store";
 import { toast } from "@/lib/toast";
 import {
@@ -116,8 +117,15 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             onClick={() => defaultEditor && handleOpen(defaultEditor.id)}
             disabled={isLoading || !defaultEditor}
             className={cn(
-              "flex items-center gap-1 h-6 rounded-l-md border border-r-0 border-border/60 bg-secondary/50 text-xs font-medium",
-              compact ? "w-6 justify-center px-0" : "px-2",
+              "flex items-center gap-1 border border-r-0 bg-secondary/50 text-xs font-medium",
+              // `compact` (GUI-chrome only) is sized to match the Run
+              // split button's 28px bordered-chip shape (h-7, rounded-[7px],
+              // full-opacity border-border) so the two titlebar chips read
+              // as one family, per the mock. Non-compact (legacy bar) stays
+              // byte-identical to before.
+              compact
+                ? "h-7 w-7 justify-center rounded-l-[7px] border-border px-0"
+                : "h-6 rounded-l-md border-border/60 px-2",
               "transition-colors duration-150",
               "hover:bg-secondary hover:border-border",
               isLoading && "opacity-50 pointer-events-none",
@@ -145,7 +153,10 @@ function IdeLauncher({ compact = false }: IdeLauncherProps) {
             type="button"
             disabled={isLoading}
             className={cn(
-              "flex items-center justify-center h-6 w-5 rounded-r-md border border-border/60 bg-secondary/50 text-muted-foreground",
+              "flex items-center justify-center border bg-secondary/50 text-muted-foreground",
+              compact
+                ? "h-7 w-6 rounded-r-[7px] border-border"
+                : "h-6 w-5 rounded-r-md border-border/60",
               "transition-colors duration-150",
               "hover:bg-secondary hover:border-border hover:text-foreground",
               isLoading && "opacity-50 pointer-events-none",
@@ -261,11 +272,16 @@ function RightPanelToggle({ workspaceId }: { workspaceId: string }) {
 
 // ── Pinned preset tiles (GUI chrome) ──
 //
-// One 27px icon tile per chat_agent preset (ember-tinted "favorite", as
-// before) plus one per pinned CLI preset (neutral tile) — they sit right of
-// the `+` launcher, in launcher priority order. Click launches exactly like
-// the launcher row for that preset kind; Shift-click still splits for CLI
-// presets. `+` remains the only way to reach everything else.
+// One 27px icon tile per preset the user has opted into via the title-bar
+// pin toggle in the `+` launcher (`useTitlebarPinsStore` —
+// src/stores/titlebar-pins-store.ts), NOT `preset.pinned` (that flag means
+// "show in the legacy PresetBar" and is unrelated — nearly every built-in
+// preset ships `pinned: true` for that bar, which is what used to flood
+// this row with tiles by default). Default is an empty store: no tiles,
+// no divider. chat_agent presets get the ember-tinted tile, cli presets
+// get the neutral tile. Click launches exactly like the launcher row for
+// that preset kind; Shift-click still splits for CLI presets. `+` remains
+// the only way to reach everything else (and the only way to pin/unpin).
 
 function errorMessage(err: unknown): string {
   return typeof err === "string"
@@ -313,10 +329,13 @@ function PinnedPresetTile({
 
 function PinnedPresetTiles({ workspace }: { workspace: WorkspaceSnapshot }) {
   const presetStore = usePresetStore();
+  const pinnedIds = useTitlebarPinsStore((s) => s.pinnedIds);
   const presets = presetStore?.presets ?? [];
-  const chatPresets = presets.filter((p) => p.kind === "chat_agent");
+  const chatPresets = presets.filter(
+    (p) => p.kind === "chat_agent" && pinnedIds.includes(p.id),
+  );
   const pinnedCliPresets = presets.filter(
-    (p) => p.kind === "cli" && p.pinned,
+    (p) => p.kind === "cli" && pinnedIds.includes(p.id),
   );
   const workspaceId = workspace.workspace_id;
 
@@ -474,7 +493,7 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           `useSidebarGapWidth` for how the live width is mirrored instead. */}
       <div
         data-testid="titlebar-sidebar-cluster"
-        className="flex h-full shrink-0 items-center justify-center border-r border-border"
+        className="flex h-full shrink-0 items-center justify-start border-r border-border px-2.5"
         style={{ width: `${sidebarGapWidth}px` }}
         onPointerDown={(e) => e.stopPropagation()}
       >

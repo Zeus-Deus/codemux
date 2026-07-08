@@ -106,6 +106,18 @@ describe("RightPanel Orchestration tab", () => {
     expect(screen.queryByTestId("orchestration-tab")).toBeNull();
   });
 
+  it("hides the Orchestration tab while the run is pending approval", () => {
+    // The in-thread approval card owns the pending_approval state; the
+    // panel only appears once the run is approved (design mock: the
+    // approval state renders no side panel).
+    mocks.workflow = {
+      run: makeRun({ status: "pending_approval", approvalRequestId: "req-1" }),
+      threadId: "thread-1",
+    };
+    render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);
+    expect(screen.queryByTestId("orchestration-tab")).toBeNull();
+  });
+
   it("shows the Orchestration tab with a pulsing dot while the run is active", () => {
     mocks.workflow = { run: makeRun({ status: "running" }), threadId: "thread-1" };
     render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);

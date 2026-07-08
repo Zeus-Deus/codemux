@@ -93,7 +93,16 @@ const TAB_TRIGGER_CLS = cn(
 
 export function RightPanel({ workspace, activeTab }: Props) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
-  const { run: workflowRun, threadId: workflowThreadId } = useWorkspaceWorkflow(workspace);
+  const workspaceWorkflow = useWorkspaceWorkflow(workspace);
+  // The Orchestration tab appears only once a run is approved (design:
+  // the approval card in the thread owns the pending_approval state; the
+  // panel would just duplicate the planned phases as "queued").
+  const workflowRun =
+    workspaceWorkflow.run != null &&
+    workspaceWorkflow.run.status !== "pending_approval"
+      ? workspaceWorkflow.run
+      : null;
+  const workflowThreadId = workflowRun != null ? workspaceWorkflow.threadId : null;
 
   const handleTabChange = (value: string) => {
     setRightPanelTab(workspace.workspace_id, value as RightPanelTab);

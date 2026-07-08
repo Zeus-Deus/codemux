@@ -95,9 +95,14 @@ export function WorkspaceMain() {
   // closed) with no run left to show. Coerce the RENDERED tab back to
   // Files without touching the persisted store value — a pure fallback,
   // not a `setRightPanelTab` call, so there's nothing to loop on.
+  // `pending_approval` runs don't surface the tab either (the in-thread
+  // approval card owns that state), so they coerce away too — keep this
+  // predicate in sync with RightPanel's tab gate.
   const { run: activeWorkflowRun } = useWorkspaceWorkflow(activeWorkspace);
+  const showableWorkflowRun =
+    activeWorkflowRun != null && activeWorkflowRun.status !== "pending_approval";
   const rightPanelTab =
-    rightPanelTabRaw === "orchestration" && !activeWorkflowRun
+    rightPanelTabRaw === "orchestration" && !showableWorkflowRun
       ? "files"
       : rightPanelTabRaw;
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);

@@ -88,29 +88,40 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
     // opens configure. The old standalone gear affordance is gone here —
     // configure lives only behind the caret, matching the IDE launcher's
     // [icon][caret] shape.
+    //
+    // Mock-faithful restyle (`.design/top-bar.dc.html`, "Set Run split
+    // icon button"): ONE bordered/backgrounded container (border-border +
+    // bg-secondary/50, the same chip tokens the compact IDE launcher chip
+    // already uses in this bar) with the two segments transparent inside
+    // it, rather than two independently-bordered halves. The inline
+    // keyboard-shortcut badge is gone — the shortcut now lives in the
+    // main segment's tooltip instead of eating horizontal space.
+    const mainTooltip = isConfigured
+      ? `${runCommand} · Ctrl+Shift+G`
+      : "Set Run · Ctrl+Shift+G";
     return (
-      <div className="flex items-center shrink-0">
+      <div className="flex h-7 shrink-0 items-center overflow-hidden rounded-[7px] border border-border bg-secondary/50">
         <Tooltip>
           <TooltipTrigger asChild>
             <button
               type="button"
               onClick={isConfigured ? handleRun : handleConfigure}
               className={cn(
-                "flex items-center gap-1 h-6 px-2 rounded-l-md border border-r-0 border-border/60 bg-secondary/50 text-xs font-medium",
-                "transition-colors duration-150",
-                "hover:bg-secondary hover:border-border",
+                "flex h-full items-center gap-1.5 px-[9px] text-[11.5px] font-semibold text-foreground",
+                "transition-colors duration-150 hover:bg-secondary",
                 !isConfigured && "text-muted-foreground",
               )}
             >
-              <Play className="size-3.5 shrink-0 text-status-open" fill="currentColor" />
+              <Play className="h-[11px] w-[11px] shrink-0 text-status-open" fill="currentColor" />
               <span>{isConfigured ? "Run" : "Set Run"}</span>
-              {shortcutBadge}
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4}>
-            {isConfigured ? runCommand : "Configure run command"}
+            {mainTooltip}
           </TooltipContent>
         </Tooltip>
+
+        <div className="h-4 w-px shrink-0 bg-border" aria-hidden />
 
         <Tooltip>
           <TooltipTrigger asChild>
@@ -119,9 +130,8 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
               onClick={handleConfigure}
               aria-label="Configure run command"
               className={cn(
-                "flex items-center justify-center h-6 w-5 rounded-r-md border border-border/60 bg-secondary/50 text-muted-foreground",
-                "transition-colors duration-150",
-                "hover:bg-secondary hover:border-border hover:text-foreground",
+                "flex h-full w-6 items-center justify-center text-muted-foreground",
+                "transition-colors duration-150 hover:bg-secondary hover:text-foreground",
               )}
             >
               <ChevronDown className="h-3 w-3" />

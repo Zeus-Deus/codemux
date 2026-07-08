@@ -110,10 +110,14 @@ suppressed in the transcript — `WorkflowRunCard` owns it.
 tab **conditionally** — only when `useWorkspaceWorkflow(workspace)`
 (`src/components/workflow/use-workspace-workflow.ts`, which scans every
 `agent_chat` pane's thread across the workspace's surfaces for an active
-or latest workflow run) finds one — with a pulsing status-working dot
-while running. This is the first conditionally-rendered right-panel tab.
-`workspace-main.tsx` has a stale-tab guard that coerces a persisted
-`"orchestration"` selection back to `"files"` when no run exists.
+or latest workflow run) finds one **that is past approval** — a
+`pending_approval` run does not surface the tab (the in-thread approval
+card owns that state; the panel would only duplicate the planned phases
+as "queued") — with a pulsing status-working dot while running. This is
+the first conditionally-rendered right-panel tab. `workspace-main.tsx`
+has a stale-tab guard (same predicate) that coerces a persisted
+`"orchestration"` selection back to `"files"` when no showable run
+exists.
 
 The panel body (`src/components/workflow/orchestration-panel.tsx` +
 `workflow-phase-list.tsx`, `workflow-agent-detail.tsx`,

@@ -39,6 +39,7 @@ vi.mock("@/stores/ui-store", () => ({
   }),
 }));
 
+import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { AgentLauncher } from "./agent-launcher";
 
 function mkPreset(p: Partial<TerminalPreset> & { id: string; name: string }): TerminalPreset {
@@ -121,9 +122,15 @@ beforeEach(() => {
   mocks.applyPreset.mockClear();
   mocks.createTab.mockClear();
   mocks.createBrowserPane.mockClear();
+  localStorage.clear();
+  useTitlebarPinsStore.setState({ pinnedIds: [] });
 });
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  localStorage.clear();
+  useTitlebarPinsStore.setState({ pinnedIds: [] });
+});
 
 describe("AgentLauncher", () => {
   it("lists GUI + CLI sections from the preset snapshot", () => {
@@ -196,5 +203,66 @@ describe("AgentLauncher", () => {
       fireEvent.click(screen.getByText("Terminal"));
     });
     expect(mocks.createTab).toHaveBeenCalledWith("ws-1", "terminal");
+  });
+});
+
+// Issue 2 fix — pinned title-bar tiles are opt-in via a hover-revealed pin
+// toggle on each GUI/CLI row, backed by `useTitlebarPinsStore` (separate
+// from `preset.pinned`, the legacy-PresetBar flag). The toggle must never
+// launch the row.
+describe("AgentLauncher — titlebar pin toggle", () => {
+  it("toggles the titlebar-pins store for a GUI row without launching it", () => {
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    expect(useTitlebarPinsStore.getState().isTitlebarPinned("builtin-chat-agent")).toBe(false);
+    act(() => {
+      fireEvent.click(screen.getByTestId("launcher-pin-toggle-builtin-chat-agent"));
+    });
+    expect(useTitlebarPinsStore.getState().isTitlebarPinned("builtin-chat-agent")).toBe(true);
+    expect(mocks.agentChatCreatePane).not.toHaveBeenCalled();
+  });
+
+  it("toggles the titlebar-pins store for a CLI row without launching it", () => {
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    expect(useTitlebarPinsStore.getState().isTitlebarPinned("builtin-claude")).toBe(false);
+    act(() => {
+      fireEvent.click(screen.getByTestId("launcher-pin-toggle-builtin-claude"));
+    });
+    expect(useTitlebarPinsStore.getState().isTitlebarPinned("builtin-claude")).toBe(true);
+    expect(mocks.applyPreset).not.toHaveBeenCalled();
+  });
+
+  it("unpins on a second click, still without launching", () => {
+    useTitlebarPinsStore.setState({ pinnedIds: ["builtin-claude"] });
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    act(() => {
+      fireEvent.click(screen.getByTestId("launcher-pin-toggle-builtin-claude"));
+    });
+    expect(useTitlebarPinsStore.getState().isTitlebarPinned("builtin-claude")).toBe(false);
+    expect(mocks.applyPreset).not.toHaveBeenCalled();
+  });
+
+  it("shows the pinned aria-label/title once a preset is pinned", () => {
+    useTitlebarPinsStore.setState({ pinnedIds: ["builtin-claude"] });
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    const toggle = screen.getByTestId("launcher-pin-toggle-builtin-claude");
+    expect(toggle).toHaveAttribute("aria-label", "Unpin from title bar");
+    const unpinned = screen.getByTestId("launcher-pin-toggle-builtin-codex");
+    expect(unpinned).toHaveAttribute("aria-label", "Pin to title bar");
+  });
+
+  it("does not select the row when Shift-clicking the pin toggle on a CLI row", () => {
+    render(<AgentLauncher workspace={makeWorkspace()} />);
+    openLauncher();
+    const toggle = screen.getByTestId("launcher-pin-toggle-builtin-claude");
+    act(() => {
+      fireEvent.mouseDown(toggle, { shiftKey: true });
+      fireEvent.click(toggle);
+    });
+    expect(mocks.applyPreset).not.toHaveBeenCalled();
+    expect(useTitlebarPinsStore.getState().isTitlebarPinned("builtin-claude")).toBe(true);
   });
 });

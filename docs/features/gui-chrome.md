@@ -54,11 +54,14 @@ sidebar boundary so tabs start where the content pane starts (design:
   (`setShowSettings(true, "presets")`). Preset data comes from the live
   `usePresetStore()` snapshot (`src/hooks/use-preset-store.ts`).
 - **`PinnedPresetTiles`** — 27px glyph tiles right of the `+` launcher
-  (after a 1px divider): ember-tinted (`accent-ember`) tiles for
-  `chat_agent` presets and neutral tiles for pinned `cli` presets, each
-  with a hover Tooltip naming the preset. Click semantics mirror the
-  launcher (chat = new chat tab; CLI = new tab, Shift-click = split via
-  `applyPreset`).
+  (after a 1px divider), **opt-in and empty by default**: only presets the
+  user pinned to the title bar render (ember-tinted `accent-ember` tiles
+  for `chat_agent`, neutral for `cli`), each with a hover Tooltip naming
+  the preset. The pin set lives in `src/stores/titlebar-pins-store.ts`
+  (zustand persist, separate from the legacy `preset.pinned` flag that
+  drives the flag-off PresetBar) and is toggled from a hover pin button on
+  each launcher row. Click semantics mirror the launcher (chat = new chat
+  tab; CLI = new tab, Shift-click = split via `applyPreset`).
 - **Rehomed controls** — the right-panel toggle (`FileDiff`, drives
   `rightPanelTabs`) and `RunButton` move from `TabBar`/`PresetBar` into the
   titlebar right cluster. In GUI chrome the `RunButton` renders its
@@ -88,6 +91,13 @@ titlebar tab share one implementation (see "Important Touch Points").
   Terminal/Browser panes, and Manage presets.
 - Inline ember chat favorite; rehomed right-panel toggle + RunButton; the "N
   subagents running" status pill kept alive next to the active chat tab.
+- Tab drag-reorder via a pointer-based drag (pointerdown on a pill body +
+  ~5px movement threshold → drag mode, drop index computed from tab
+  midpoints, same `reorder_tabs` backend command and insertion-indicator
+  styling as the legacy `TabBar`). Pointer events avoid the titlebar's
+  `data-tauri-drag-region`, unlike HTML5 DnD; a completed drag suppresses
+  the trailing click so it never activates a tab or pops the chat-tab
+  history dropdown.
 - The empty titlebar center stays an OS drag region.
 
 ## Current Constraints
@@ -97,9 +107,6 @@ titlebar tab share one implementation (see "Important Touch Points").
   own PresetBar stays coherent; GUI chrome is gated off while a draft is
   active.
 - **OpenFlow workspaces are untouched** — they keep their dedicated chrome.
-- **No tab drag-reorder in GUI chrome.** Reusing `TabBar`'s HTML5-drag logic
-  inside a `data-tauri-drag-region` parent is not clean; reorder stays a
-  legacy-only affordance (flag off) and is a follow-up.
 - **A sole-root chat pane loses its per-pane split/close buttons** (the
   suppressed `AgentChatPaneHeader`); splitting is done from the launcher
   (Shift on a CLI agent) instead, and split layouts restore the per-pane
