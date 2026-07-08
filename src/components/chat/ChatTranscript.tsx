@@ -22,6 +22,9 @@ interface Props {
   onRejectPlan: (requestId: string) => void | Promise<void>;
   /** Enter a subagent's read-only drill-in (design "Enter subagent"). */
   onEnterSubagent?: (subagentId: string) => void;
+  /** Active workspace id, forwarded to MessageList for the
+   *  WorkflowRunCard "Open panel" affordance. */
+  workspaceId?: string | null;
 }
 
 /**
@@ -40,6 +43,7 @@ export function ChatTranscript({
   onAcceptPlan,
   onRejectPlan,
   onEnterSubagent,
+  workspaceId,
 }: Props) {
   const showThinking = shouldShowThinkingIndicator(messages, streaming);
 
@@ -55,6 +59,7 @@ export function ChatTranscript({
         onAcceptPlan={onAcceptPlan}
         onRejectPlan={onRejectPlan}
         onEnterSubagent={onEnterSubagent}
+        workspaceId={workspaceId}
       />
     </div>
   );

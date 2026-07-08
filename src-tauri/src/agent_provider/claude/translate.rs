@@ -21,10 +21,14 @@
 //! kill the notification task.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
+
+use regex::Regex;
 
 use crate::agent_provider::{
     CompletedItem, ContentDelta, ProviderRuntimeEvent, ProviderSessionId, RequestId,
     SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus, TurnUsage,
+    WorkflowPhaseSnapshot, WorkflowSnapshot,
 };
 
 use super::protocol::{SidecarError, SidecarNotification};
@@ -54,6 +58,12 @@ pub struct SubagentDemux {
     /// grandchildren map to their ancestor so v1 flattens nested
     /// subagents into the child's stream (no recursive drill-in yet).
     root_of: HashMap<String, String>,
+    /// The `tool_use_id` (== `workflow_id`) of the currently in-flight
+    /// top-level `Workflow` tool call, when one is active. `None` when no
+    /// workflow is running. While `Some`, every top-level subagent
+    /// snapshot is stamped with this id (see [`stamp_workflow_attribution`])
+    /// so the frontend can route it into the workflow's phase view.
+    active_workflow: Option<String>,
 }
 
 impl SubagentDemux {
@@ -127,6 +137,12 @@ fn parent_tool_use_id(msg: &serde_json::Value) -> Option<String> {
 /// `system:init.tools` still lists `Task`; match both.
 fn is_agent_tool(name: &str) -> bool {
     name == "Agent" || name == "Task"
+}
+
+/// The dynamic-workflow orchestration tool. A top-level `tool_use` block
+/// naming it launches a `Workflow` run (see [`translate_assistant`]).
+fn is_workflow_tool(name: &str) -> bool {
+    name == "Workflow"
 }
 
 // ---------------------------------------------------------------------------
@@ -442,15 +458,30 @@ fn translate_assistant(
                         .unwrap_or_default()
                         .to_string();
                     let input = block.get("input").cloned().unwrap_or_default();
+                    // A top-level `Workflow` launch becomes a
+                    // WorkflowUpdated card and suppresses the generic
+                    // ToolUse, exactly like a top-level Agent launch does
+                    // for subagents. Nested (subagent-spawned) Workflow
+                    // calls are not expected and fall through unchanged.
+                    if is_workflow_tool(&tool_name) && subagent_id.is_none() {
+                        demux.active_workflow = Some(tool_use_id.clone());
+                        out.push(ProviderRuntimeEvent::WorkflowUpdated {
+                            thread_id: thread_id.clone(),
+                            workflow: workflow_snapshot_from_launch(&tool_use_id, &input),
+                        });
+                        continue;
+                    }
                     if is_agent_tool(&tool_name) {
                         match subagent_id.as_ref() {
                             // Top-level launch: emit the card, suppress the
                             // generic ToolUse (the card replaces it).
                             None => {
                                 demux.register_top_level_launch(&tool_use_id);
+                                let mut snap = snapshot_from_launch(&tool_use_id, &input);
+                                stamp_workflow_attribution(&mut snap, demux);
                                 out.push(ProviderRuntimeEvent::SubagentUpdated {
                                     thread_id: thread_id.clone(),
-                                    subagent: snapshot_from_launch(&tool_use_id, &input),
+                                    subagent: snap,
                                 });
                                 continue;
                             }
@@ -511,6 +542,190 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         total_tokens: None,
         duration_ms: None,
         provider_ref: None,
+        workflow_id: None,
+        phase: None,
+    }
+}
+
+/// Build the initial [`WorkflowSnapshot`] from a top-level `Workflow`
+/// tool_use block's `input`. `input.script` carries the workflow's JS
+/// source, which opens with an `export const meta = { name, description,
+/// phases: [{ title, detail }, ...] }` literal; [`parse_workflow_meta`]
+/// best-effort extracts it. `input.name` (a saved workflow's name) is the
+/// fallback when the script has no `meta.name`.
+fn workflow_snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> WorkflowSnapshot {
+    let script = input.get("script").and_then(|v| v.as_str()).unwrap_or("");
+    let meta = parse_workflow_meta(script);
+    let input_name = input
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    WorkflowSnapshot {
+        workflow_id: tool_use_id.to_string(),
+        status: "running".to_string(),
+        name: meta.name.or(input_name),
+        description: meta.description,
+        script: if script.is_empty() {
+            None
+        } else {
+            Some(script.to_string())
+        },
+        phases: meta.phases,
+        result_text: None,
+        total_tokens: None,
+        agent_count: None,
+        duration_ms: None,
+    }
+}
+
+/// Best-effort fields extracted from a workflow script's
+/// `export const meta = { ... }` literal.
+#[derive(Debug, Default)]
+struct ParsedWorkflowMeta {
+    name: Option<String>,
+    description: Option<String>,
+    phases: Option<Vec<WorkflowPhaseSnapshot>>,
+}
+
+static META_DECL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"export\s+const\s+meta\s*=\s*\{").unwrap());
+static META_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"name\s*:\s*['"]([^'"]*)['"]"#).unwrap());
+static META_DESCRIPTION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"description\s*:\s*['"]([^'"]*)['"]"#).unwrap());
+static META_PHASE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\{\s*title\s*:\s*['"]([^'"]*)['"](?:\s*,\s*detail\s*:\s*['"]([^'"]*)['"])?[^{}]*\}"#)
+        .unwrap()
+});
+
+/// Scan `text` starting at `open_idx` (the index of an opening `open`
+/// delimiter) and return the slice up to and including its matching
+/// `close`, tracking nesting depth. `None` if the delimiter never closes
+/// (malformed / truncated script — never panics on bad input).
+fn extract_delimited(text: &str, open_idx: usize, open: char, close: char) -> Option<&str> {
+    let mut depth = 0i32;
+    for (i, ch) in text[open_idx..].char_indices() {
+        if ch == open {
+            depth += 1;
+        } else if ch == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&text[open_idx..open_idx + i + ch.len_utf8()]);
+            }
+        }
+    }
+    None
+}
+
+/// Tolerant, regex-based extraction of `name` / `description` / `phases`
+/// out of a workflow script's `meta` literal. Never panics — any parse
+/// failure just leaves the corresponding field `None` so the launch still
+/// gets a card (with the raw script text always preserved separately).
+fn parse_workflow_meta(script: &str) -> ParsedWorkflowMeta {
+    let mut out = ParsedWorkflowMeta::default();
+    let Some(decl) = META_DECL_RE.find(script) else {
+        return out;
+    };
+    // `decl` matches up to and including the opening `{`.
+    let brace_idx = decl.end() - 1;
+    let Some(block) = extract_delimited(script, brace_idx, '{', '}') else {
+        return out;
+    };
+    out.name = META_NAME_RE
+        .captures(block)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string());
+    out.description = META_DESCRIPTION_RE
+        .captures(block)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string());
+    if let Some(phases_key) = block.find("phases") {
+        if let Some(bracket_rel) = block[phases_key..].find('[') {
+            let bracket_idx = phases_key + bracket_rel;
+            if let Some(array_text) = extract_delimited(block, bracket_idx, '[', ']') {
+                let phases: Vec<WorkflowPhaseSnapshot> = META_PHASE_RE
+                    .captures_iter(array_text)
+                    .filter_map(|c| {
+                        let title = c.get(1)?.as_str().to_string();
+                        let detail = c.get(2).map(|m| m.as_str().to_string());
+                        Some(WorkflowPhaseSnapshot { title, detail })
+                    })
+                    .collect();
+                if !phases.is_empty() {
+                    out.phases = Some(phases);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `phase:X` hint scanner, applied to a subagent's activity / result text
+/// while a workflow is active. Case-insensitive; the value runs to the
+/// next whitespace or closing bracket/paren/comma. `None` when no hint is
+/// present — the frontend falls back to the workflow's last planned phase.
+static PHASE_HINT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)phase\s*:\s*([^\s\]\),]+)").unwrap());
+
+fn extract_phase_hint(text: &str) -> Option<String> {
+    PHASE_HINT_RE
+        .captures(text)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// While a `Workflow` run is active, stamp its id (and a best-effort
+/// phase hint derived from the snapshot's own activity/result text) onto
+/// a top-level subagent snapshot. No-op when no workflow is active, so
+/// existing subagent behavior is byte-identical outside a workflow run.
+fn stamp_workflow_attribution(snap: &mut SubagentSnapshot, demux: &SubagentDemux) {
+    let Some(workflow_id) = demux.active_workflow.clone() else {
+        return;
+    };
+    snap.workflow_id = Some(workflow_id);
+    snap.phase = snap
+        .activity
+        .as_deref()
+        .and_then(extract_phase_hint)
+        .or_else(|| snap.result_text.as_deref().and_then(extract_phase_hint));
+}
+
+/// Join / stringify a `tool_result` content payload for the workflow's
+/// `result_text`, truncated to `max_chars` (character count, not bytes)
+/// so a runaway report can't bloat the transcript. `None` for empty
+/// content.
+fn stringify_content_truncated(content: &serde_json::Value, max_chars: usize) -> Option<String> {
+    let text = match content {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => {
+            let mut joined = String::new();
+            for block in arr {
+                if let Some(t) = block.get("text").and_then(|v| v.as_str()) {
+                    if !joined.is_empty() {
+                        joined.push('\n');
+                    }
+                    joined.push_str(t);
+                }
+            }
+            if joined.is_empty() {
+                content.to_string()
+            } else {
+                joined
+            }
+        }
+        other => other.to_string(),
+    };
+    if text.is_empty() {
+        return None;
+    }
+    if text.chars().count() > max_chars {
+        let truncated: String = text.chars().take(max_chars).collect();
+        Some(format!("{truncated}…"))
+    } else {
+        Some(text)
     }
 }
 
@@ -531,6 +746,8 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         total_tokens: None,
         duration_ms: None,
         provider_ref: None,
+        workflow_id: None,
+        phase: None,
     }
 }
 
@@ -585,10 +802,27 @@ fn translate_user(
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            // Parent-level completion of the active Workflow tool run.
+            if parent.is_none() && demux.active_workflow.as_deref() == Some(tool_use_id.as_str())
+            {
+                let result_text = stringify_content_truncated(&content, 4000);
+                out.push(ProviderRuntimeEvent::WorkflowUpdated {
+                    thread_id: thread_id.clone(),
+                    workflow: WorkflowSnapshot {
+                        workflow_id: tool_use_id.clone(),
+                        status: if is_error { "failed" } else { "completed" }.to_string(),
+                        result_text,
+                        ..Default::default()
+                    },
+                });
+                demux.active_workflow = None;
+                // Suppress the raw ToolResult item.
+                continue;
+            }
             // Parent-level completion of a top-level subagent.
             if parent.is_none() && demux.is_top_level_launch(&tool_use_id) {
                 let tur = msg.get("tool_use_result");
-                match completion_from_agent_output(&tool_use_id, tur, is_error) {
+                match completion_from_agent_output(&tool_use_id, tur, is_error, demux) {
                     // Background launch: do not mark done; card stays
                     // Running until task_notification arrives.
                     CompletionOutcome::Pending => {}
@@ -655,6 +889,7 @@ fn completion_from_agent_output(
     tool_use_id: &str,
     tur: Option<&serde_json::Value>,
     is_error: bool,
+    demux: &SubagentDemux,
 ) -> CompletionOutcome {
     let Some(tur) = tur else {
         // No structured output — mark done from the tool_result flag.
@@ -664,6 +899,7 @@ fn completion_from_agent_output(
         } else {
             SubagentStatus::Completed
         };
+        stamp_workflow_attribution(&mut snap, demux);
         return CompletionOutcome::Done(snap);
     };
     let status = tur.get("status").and_then(|v| v.as_str());
@@ -688,6 +924,7 @@ fn completion_from_agent_output(
     snap.total_tokens = tur.get("totalTokens").and_then(|v| v.as_u64());
     snap.duration_ms = tur.get("totalDurationMs").and_then(|v| v.as_u64());
     snap.result_text = agent_output_text(tur);
+    stamp_workflow_attribution(&mut snap, demux);
     CompletionOutcome::Done(snap)
 }
 
@@ -869,6 +1106,7 @@ fn translate_task_started(
     if !description.is_empty() {
         snap.activity = Some(description);
     }
+    stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
         subagent: snap,
@@ -894,6 +1132,7 @@ fn translate_task_progress(
     snap.status = SubagentStatus::Running;
     snap.activity = opt_str_field(msg, "summary").or_else(|| opt_str_field(msg, "last_tool_name"));
     apply_task_usage(&mut snap, msg.get("usage"));
+    stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
         subagent: snap,
@@ -941,6 +1180,7 @@ fn translate_task_updated(
     if !changed {
         return Vec::new();
     }
+    stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
         subagent: snap,
@@ -972,6 +1212,7 @@ fn translate_task_notification(
         snap.result_text = Some(summary);
     }
     apply_task_usage(&mut snap, msg.get("usage"));
+    stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
         subagent: snap,
@@ -2355,5 +2596,243 @@ mod tests {
         });
         let snap = only_subagent(&translate_sdk_message_with(&tid(), &done, &mut demux)).clone();
         assert_eq!(snap.status, SubagentStatus::Failed);
+    }
+
+    // =======================================================================
+    // Workflow tool mapping
+    // =======================================================================
+
+    fn only_workflow(events: &[ProviderRuntimeEvent]) -> &WorkflowSnapshot {
+        assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
+        match &events[0] {
+            ProviderRuntimeEvent::WorkflowUpdated { workflow, .. } => workflow,
+            other => panic!("expected WorkflowUpdated, got {other:?}"),
+        }
+    }
+
+    fn workflow_launch_msg(tool_use_id: &str, input: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "assistant",
+            "parent_tool_use_id": null,
+            "turn_id": "turn-1",
+            "message": { "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "Workflow",
+                "input": input
+            }]}
+        })
+    }
+
+    const SAMPLE_WORKFLOW_SCRIPT: &str = r#"
+export const meta = {
+  name: 'Bug Hunt',
+  description: 'Find and fix bugs across the repo',
+  phases: [
+    { title: 'Explore', detail: 'scan the code for suspects' },
+    { title: 'Fix', detail: 'apply the fixes' },
+  ],
+};
+
+async function run() {
+  // ... orchestration body ...
+}
+"#;
+
+    #[test]
+    fn workflow_launch_parses_meta_and_emits_running_snapshot_suppressing_tool_use() {
+        let mut demux = SubagentDemux::default();
+        let msg = workflow_launch_msg(
+            "toolu_wf1",
+            json!({"script": SAMPLE_WORKFLOW_SCRIPT}),
+        );
+        let events = translate_sdk_message_with(&tid(), &msg, &mut demux);
+        // No generic ToolUse item — the workflow card replaces it.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })),
+            "generic ToolUse must be suppressed for a Workflow launch"
+        );
+        let wf = only_workflow(&events);
+        assert_eq!(wf.workflow_id, "toolu_wf1");
+        assert_eq!(wf.status, "running");
+        assert_eq!(wf.name.as_deref(), Some("Bug Hunt"));
+        assert_eq!(
+            wf.description.as_deref(),
+            Some("Find and fix bugs across the repo")
+        );
+        assert_eq!(wf.script.as_deref(), Some(SAMPLE_WORKFLOW_SCRIPT));
+        let phases = wf.phases.as_ref().expect("phases parsed");
+        assert_eq!(phases.len(), 2);
+        assert_eq!(phases[0].title, "Explore");
+        assert_eq!(phases[0].detail.as_deref(), Some("scan the code for suspects"));
+        assert_eq!(phases[1].title, "Fix");
+        assert_eq!(phases[1].detail.as_deref(), Some("apply the fixes"));
+        // The demux now tracks this workflow as active.
+        assert_eq!(demux.active_workflow.as_deref(), Some("toolu_wf1"));
+    }
+
+    #[test]
+    fn workflow_launch_falls_back_to_input_name_when_meta_missing() {
+        let mut demux = SubagentDemux::default();
+        let msg = workflow_launch_msg(
+            "toolu_wf2",
+            json!({"script": "console.log('no meta here')", "name": "Saved Workflow"}),
+        );
+        let wf = only_workflow(&translate_sdk_message_with(&tid(), &msg, &mut demux)).clone();
+        assert_eq!(wf.name.as_deref(), Some("Saved Workflow"));
+        assert!(wf.phases.is_none());
+        assert!(wf.description.is_none());
+    }
+
+    #[test]
+    fn workflow_tool_result_completes_workflow_and_suppresses_tool_result() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &workflow_launch_msg("toolu_wf1", json!({"script": SAMPLE_WORKFLOW_SCRIPT})),
+            &mut demux,
+        );
+        let done = json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": { "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_wf1",
+                "content": "All phases completed successfully.",
+                "is_error": false
+            }]}
+        });
+        let events = translate_sdk_message_with(&tid(), &done, &mut demux);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })),
+            "raw ToolResult must be suppressed for a workflow completion"
+        );
+        let wf = only_workflow(&events);
+        assert_eq!(wf.workflow_id, "toolu_wf1");
+        assert_eq!(wf.status, "completed");
+        assert_eq!(
+            wf.result_text.as_deref(),
+            Some("All phases completed successfully.")
+        );
+        // The demux clears the active workflow on completion.
+        assert!(demux.active_workflow.is_none());
+    }
+
+    #[test]
+    fn workflow_tool_result_error_marks_failed() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &workflow_launch_msg("toolu_wf1", json!({"script": SAMPLE_WORKFLOW_SCRIPT})),
+            &mut demux,
+        );
+        let failed = json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": { "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_wf1",
+                "content": "boom",
+                "is_error": true
+            }]}
+        });
+        let wf = only_workflow(&translate_sdk_message_with(&tid(), &failed, &mut demux)).clone();
+        assert_eq!(wf.status, "failed");
+        assert_eq!(wf.result_text.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn workflow_result_text_is_truncated_to_4000_chars() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &workflow_launch_msg("toolu_wf1", json!({"script": SAMPLE_WORKFLOW_SCRIPT})),
+            &mut demux,
+        );
+        let long_text = "x".repeat(5000);
+        let done = json!({
+            "type": "user",
+            "parent_tool_use_id": null,
+            "message": { "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_wf1",
+                "content": long_text,
+                "is_error": false
+            }]}
+        });
+        let wf = only_workflow(&translate_sdk_message_with(&tid(), &done, &mut demux)).clone();
+        let result = wf.result_text.expect("result text present");
+        // 4000 chars + the truncation ellipsis marker.
+        assert_eq!(result.chars().count(), 4001);
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn subagent_task_progress_during_active_workflow_gets_workflow_id_and_phase() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &workflow_launch_msg("toolu_wf1", json!({"script": SAMPLE_WORKFLOW_SCRIPT})),
+            &mut demux,
+        );
+        translate_sdk_message_with(
+            &tid(),
+            &launch_msg("Agent", "toolu_root", json!({"subagent_type": "Explore"})),
+            &mut demux,
+        );
+        let progress = json!({
+            "type": "system", "subtype": "task_progress",
+            "task_id": "task_1", "tool_use_id": "toolu_root",
+            "usage": {"total_tokens": 10, "tool_uses": 1, "duration_ms": 20},
+            "summary": "scanning [phase:Explore] for bugs"
+        });
+        let snap = only_subagent(&translate_sdk_message_with(&tid(), &progress, &mut demux)).clone();
+        assert_eq!(snap.workflow_id.as_deref(), Some("toolu_wf1"));
+        assert_eq!(snap.phase.as_deref(), Some("Explore"));
+    }
+
+    #[test]
+    fn subagent_events_without_active_workflow_have_no_workflow_attribution() {
+        // Regression guard: outside a workflow run, subagent snapshots
+        // must be byte-identical to pre-workflow behavior (no
+        // `workflow_id` / `phase` stamped).
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &launch_msg("Agent", "toolu_root", json!({"subagent_type": "Explore"})),
+            &mut demux,
+        );
+        let progress = json!({
+            "type": "system", "subtype": "task_progress",
+            "task_id": "task_1", "tool_use_id": "toolu_root",
+            "usage": {"total_tokens": 10, "tool_uses": 1, "duration_ms": 20},
+            "summary": "scanning phase:Explore for bugs"
+        });
+        let snap = only_subagent(&translate_sdk_message_with(&tid(), &progress, &mut demux)).clone();
+        assert!(snap.workflow_id.is_none());
+        assert!(snap.phase.is_none());
+    }
+
+    #[test]
+    fn workflow_launch_top_level_agent_gets_workflow_id_immediately() {
+        // The initial Agent-launch snapshot (before any task_* event)
+        // should already carry the active workflow's id.
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &workflow_launch_msg("toolu_wf1", json!({"script": SAMPLE_WORKFLOW_SCRIPT})),
+            &mut demux,
+        );
+        let snap = only_subagent(&translate_sdk_message_with(
+            &tid(),
+            &launch_msg("Agent", "toolu_root", json!({"subagent_type": "Explore"})),
+            &mut demux,
+        ))
+        .clone();
+        assert_eq!(snap.workflow_id.as_deref(), Some("toolu_wf1"));
     }
 }

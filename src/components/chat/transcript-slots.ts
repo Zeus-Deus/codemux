@@ -84,11 +84,15 @@ export function buildTranscriptSlots(
   streaming = false,
 ): TranscriptSlot[] {
   // Permission requests already owned by a tool card's inline footer
-  // (linked via approval_request_id) don't get their own row.
+  // (linked via approval_request_id), or by a WorkflowRunCard's approval
+  // header (linked via approvalRequestId), don't get their own row.
   const mergedRequestIds = new Set<string>();
   for (const m of messages) {
     if (m.kind === "tool_call" && m.approval_request_id) {
       mergedRequestIds.add(m.approval_request_id);
+    }
+    if (m.kind === "workflow_run" && m.approvalRequestId) {
+      mergedRequestIds.add(m.approvalRequestId);
     }
   }
 

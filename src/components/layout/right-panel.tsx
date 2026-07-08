@@ -5,6 +5,8 @@ import { useUIStore, type RightPanelTab } from "@/stores/ui-store";
 import { ChangesPanel } from "@/components/workspace/changes-panel";
 import { FileTreePanel } from "@/components/workspace/file-tree-panel";
 import { ReviewPanel } from "@/components/workspace/review-panel";
+import { OrchestrationPanel } from "@/components/workflow/orchestration-panel";
+import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 import type {
   WorkspaceSnapshot,
   CheckInfo,
@@ -91,6 +93,7 @@ const TAB_TRIGGER_CLS = cn(
 
 export function RightPanel({ workspace, activeTab }: Props) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
+  const { run: workflowRun, threadId: workflowThreadId } = useWorkspaceWorkflow(workspace);
 
   const handleTabChange = (value: string) => {
     setRightPanelTab(workspace.workspace_id, value as RightPanelTab);
@@ -125,6 +128,21 @@ export function RightPanel({ workspace, activeTab }: Props) {
                 />
               )}
             </TabsTrigger>
+            {workflowRun != null && (
+              <TabsTrigger
+                value="orchestration"
+                className={TAB_TRIGGER_CLS}
+                data-testid="orchestration-tab"
+              >
+                Orchestration
+                {workflowRun.status === "running" && (
+                  <span
+                    className="cm-blink ml-1.5 h-1.5 w-1.5 rounded-full bg-status-working"
+                    aria-hidden
+                  />
+                )}
+              </TabsTrigger>
+            )}
           </TabsList>
         </div>
         <TabsContent value="files" className="flex-1 overflow-hidden">
@@ -136,6 +154,15 @@ export function RightPanel({ workspace, activeTab }: Props) {
         <TabsContent value="review" className="flex-1 overflow-hidden">
           <ReviewPanel workspace={workspace} />
         </TabsContent>
+        {workflowRun != null && (
+          <TabsContent value="orchestration" className="flex-1 overflow-hidden">
+            <OrchestrationPanel
+              workspace={workspace}
+              run={workflowRun}
+              threadId={workflowThreadId}
+            />
+          </TabsContent>
+        )}
       </Tabs>
     </div>
   );

@@ -358,3 +358,81 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
     expect(getTextarea(container).selectionEnd).toBe("/omarchy ".length);
   });
 });
+
+describe("Composer · /workflow slash entry (Claude-gated)", () => {
+  beforeEach(() => {
+    resetSkillsStore();
+    listSkillsMock.mockReset();
+    listSkillsMock.mockResolvedValue([]);
+  });
+
+  afterEach(() => cleanup());
+
+  it("shows /workflow enabled with the orchestration hint when the Claude provider is active", async () => {
+    const { container, queryByTestId, getByText } = renderComposer({
+      provider: "claude",
+    });
+    type(getTextarea(container), "/");
+
+    await waitFor(() => {
+      expect(queryByTestId("slash-item-workflow")).not.toBeNull();
+    });
+    const row = queryByTestId("slash-item-workflow")!;
+    // cmdk emits `data-disabled="false"` for enabled items; either a
+    // missing attribute or "false" both mean "enabled" (see the same
+    // precedent in Composer.attach.test.tsx).
+    const attr = row.getAttribute("data-disabled");
+    expect(attr === null || attr === "false").toBe(true);
+    expect(getByText("Orchestrate this task with many subagents")).toBeInTheDocument();
+  });
+
+  it("clicking /workflow (Claude) expands the typed query into a literal /workflow token", async () => {
+    const onDraftChange = vi.fn();
+    const { container, queryByTestId, getByTestId } = renderComposer({
+      provider: "claude",
+      onDraftChange,
+    });
+    type(getTextarea(container), "/");
+
+    await waitFor(() => {
+      expect(queryByTestId("slash-item-workflow")).not.toBeNull();
+    });
+
+    fireEvent.click(getByTestId("slash-item-workflow"));
+
+    await waitFor(() => {
+      expect(onDraftChange).toHaveBeenCalled();
+    });
+    const calls = onDraftChange.mock.calls;
+    const finalText = calls[calls.length - 1]?.[0];
+    expect(finalText).toBe("/workflow ");
+    expect(queryByTestId("slash-command-popup")).toBeNull();
+  });
+
+  it.each(["codex", "opencode"] as const)(
+    "shows /workflow disabled with a reason for the %s provider, and clicking is a no-op",
+    async (provider) => {
+      const onDraftChange = vi.fn();
+      const { container, queryByTestId, getByTestId, getByText } = renderComposer({
+        provider,
+        onDraftChange,
+      });
+      type(getTextarea(container), "/");
+
+      await waitFor(() => {
+        expect(queryByTestId("slash-item-workflow")).not.toBeNull();
+      });
+      const row = getByTestId("slash-item-workflow");
+      expect(row.getAttribute("data-disabled")).toBe("true");
+      expect(getByText("Only available with Claude models")).toBeInTheDocument();
+
+      // Typing "/" itself already reports the draft once; only assert
+      // no *additional* calls come from clicking the disabled row.
+      const callsBeforeClick = onDraftChange.mock.calls.length;
+      fireEvent.click(row);
+      expect(onDraftChange.mock.calls.length).toBe(callsBeforeClick);
+      // Popup stays open — a disabled row click is a no-op, not a select.
+      expect(queryByTestId("slash-command-popup")).not.toBeNull();
+    },
+  );
+});

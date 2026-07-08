@@ -17,6 +17,7 @@ import type {
   ReasoningItem,
   SubagentRunItem,
   ToolCallItem,
+  WorkflowRunItem,
 } from "./types";
 
 function runEvents(
@@ -1351,5 +1352,258 @@ describe("agent-chat reducer — subagents", () => {
     expect(cards(twice)[0].subagents[0].items.length).toBe(
       cards(once)[0].subagents[0].items.length,
     );
+  });
+});
+
+describe("agent-chat reducer — workflows", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  function workflowUpdated(workflow: Record<string, unknown>): ProviderRuntimeEvent {
+    return {
+      type: "workflow_updated",
+      thread_id: "t1",
+      workflow: workflow as never,
+    } as ProviderRuntimeEvent;
+  }
+  function workflowSubagentUpdated(
+    subagent: Record<string, unknown>,
+  ): ProviderRuntimeEvent {
+    return {
+      type: "subagent_updated",
+      thread_id: "t1",
+      subagent: subagent as never,
+    } as ProviderRuntimeEvent;
+  }
+  function workflowSubItem(
+    subagentId: string,
+    item: Record<string, unknown>,
+  ): ProviderRuntimeEvent {
+    return {
+      type: "item_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      subagent_id: subagentId,
+      item: item as never,
+    } as ProviderRuntimeEvent;
+  }
+  function workflows(state: ChatThreadState): WorkflowRunItem[] {
+    return state.messages.filter(
+      (m): m is WorkflowRunItem => m.kind === "workflow_run",
+    );
+  }
+
+  const samplePhases = [
+    { title: "Explore", detail: "scan for suspects" },
+    { title: "Fix", detail: "apply the fixes" },
+  ];
+
+  it("materialises a WorkflowRunItem on the first workflow_updated", () => {
+    const state = runEvents([
+      workflowUpdated({
+        workflow_id: "wf1",
+        status: "running",
+        name: "Bug Hunt",
+        description: "Find and fix bugs",
+        phases: samplePhases,
+      }),
+    ]);
+    const all = workflows(state);
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({
+      workflowId: "wf1",
+      status: "running",
+      name: "Bug Hunt",
+      description: "Find and fix bugs",
+    });
+    expect(all[0].plannedPhases).toEqual(samplePhases);
+    expect(all[0].phases.map((p) => p.title)).toEqual(["Explore", "Fix"]);
+    expect(all[0].phases.every((p) => p.agents.length === 0)).toBe(true);
+  });
+
+  it("merges workflow snapshots (non-null wins) and keeps status monotonic", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", name: "Bug Hunt" }),
+      workflowUpdated({ workflow_id: "wf1", status: "completed", result_text: "done", total_tokens: 500 }),
+      // A stray duplicate "running" snapshot must not revive a finished run.
+      workflowUpdated({ workflow_id: "wf1", status: "running" }),
+    ]);
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("completed");
+    expect(wf.resultText).toBe("done");
+    expect(wf.totalTokens).toBe(500);
+    expect(wf.name).toBe("Bug Hunt");
+  });
+
+  it("routes a workflow_id-tagged subagent_updated into the matching phase, not a subagent_run card", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        name: "Explorer",
+        workflow_id: "wf1",
+        phase: "Explore",
+      }),
+    ]);
+    // No generic subagent_run card — the agent lives inside the workflow.
+    expect(state.messages.filter((m) => m.kind === "subagent_run")).toHaveLength(0);
+    const wf = workflows(state)[0];
+    const explorePhase = wf.phases.find((p) => p.title === "Explore")!;
+    expect(explorePhase.agents).toHaveLength(1);
+    expect(explorePhase.agents[0]).toMatchObject({ id: "sub-a", name: "Explorer", status: "running" });
+  });
+
+  it("falls back to the last planned phase title when the subagent has no phase hint", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({ subagent_id: "sub-a", status: "running", workflow_id: "wf1" }),
+    ]);
+    const wf = workflows(state)[0];
+    const fixPhase = wf.phases.find((p) => p.title === "Fix")!;
+    expect(fixPhase.agents.map((a) => a.id)).toEqual(["sub-a"]);
+  });
+
+  it("synthesizes a 'Run' phase bucket when there are no planned phases and no phase hint", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running" }),
+      workflowSubagentUpdated({ subagent_id: "sub-a", status: "running", workflow_id: "wf1" }),
+    ]);
+    const wf = workflows(state)[0];
+    expect(wf.phases.map((p) => p.title)).toEqual(["Run"]);
+    expect(wf.phases[0].agents.map((a) => a.id)).toEqual(["sub-a"]);
+  });
+
+  it("routes subagent_id-tagged items into the workflow phase's sub-transcript", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        workflow_id: "wf1",
+        phase: "Explore",
+      }),
+      workflowSubItem("sub-a", { kind: "assistant_text", text: "child says hi" }),
+    ]);
+    const wf = workflows(state)[0];
+    const explorePhase = wf.phases.find((p) => p.title === "Explore")!;
+    expect(
+      explorePhase.agents[0].items.some(
+        (i) => i.kind === "assistant_message" && i.text === "child says hi",
+      ),
+    ).toBe(true);
+    // The parent transcript holds only the workflow item — no leaked rows.
+    expect(state.messages).toHaveLength(1);
+  });
+
+  it("merges a subagent snapshot arriving before the workflow item via the generic fallback", () => {
+    // Out-of-order defensive path: the update is never dropped even
+    // though the workflow item hasn't been seen yet.
+    const state = runEvents([
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        workflow_id: "wf-not-seen-yet",
+      }),
+    ]);
+    expect(workflows(state)).toHaveLength(0);
+    const cards = state.messages.filter(
+      (m): m is SubagentRunItem => m.kind === "subagent_run",
+    );
+    expect(cards).toHaveLength(1);
+    expect(cards[0].subagents[0].id).toBe("sub-a");
+  });
+
+  it("links a workflow to a pending approval request via tool_use_id and flips to pending_approval", () => {
+    let state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running" }),
+    ]);
+    state = applyEvent(state, {
+      type: "request_opened",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      request_id: "req-wf",
+      request_kind: "other",
+      payload: {},
+      tool_use_id: "wf1",
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("pending_approval");
+    expect(wf.approvalRequestId).toBe("req-wf");
+  });
+
+  it("resumes to running when the gating approval is allowed", () => {
+    let state = runEvents([workflowUpdated({ workflow_id: "wf1", status: "running" })]);
+    state = applyEvent(state, {
+      type: "request_opened",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      request_id: "req-wf",
+      request_kind: "other",
+      payload: {},
+      tool_use_id: "wf1",
+    });
+    state = applyEvent(state, {
+      type: "request_resolved",
+      thread_id: "t1",
+      request_id: "req-wf",
+      decision: { decision: "allow" },
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("running");
+    // Stays linked after resolution so transcript-slots keeps suppressing
+    // the standalone resolved permission block (no stray "Allowed" row).
+    expect(wf.approvalRequestId).toBe("req-wf");
+  });
+
+  it("stops the workflow when the gating approval is denied", () => {
+    let state = runEvents([workflowUpdated({ workflow_id: "wf1", status: "running" })]);
+    state = applyEvent(state, {
+      type: "request_opened",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      request_id: "req-wf",
+      request_kind: "other",
+      payload: {},
+      tool_use_id: "wf1",
+    });
+    state = applyEvent(state, {
+      type: "request_resolved",
+      thread_id: "t1",
+      request_id: "req-wf",
+      decision: { decision: "deny", message: "no" },
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("stopped");
+  });
+
+  it("stops a still-running workflow when its turn ends in error", () => {
+    let state = runEvents([workflowUpdated({ workflow_id: "wf1", status: "running" })]);
+    state = applyEvent(state, {
+      type: "turn_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      status: { kind: "error", subtype: "interrupted", message: "session interrupted" },
+      usage: null,
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("stopped");
+  });
+
+  it("leaves a completed workflow's status alone when the turn later errors", () => {
+    let state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running" }),
+      workflowUpdated({ workflow_id: "wf1", status: "completed" }),
+    ]);
+    state = applyEvent(state, {
+      type: "turn_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      status: { kind: "error", subtype: "interrupted", message: "session interrupted" },
+      usage: null,
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("completed");
   });
 });

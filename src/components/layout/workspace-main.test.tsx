@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 
+import type { WorkflowRunItem } from "@/lib/agent-chat/types";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 // ── Mutable mock state ──
@@ -10,7 +11,13 @@ const state = {
   enableAgentChat: false,
   enableLazy: false,
   activeDraftId: null as string | null,
+  workflowRun: null as WorkflowRunItem | null,
+  rightPanelTabs: {} as Record<string, string | null>,
 };
+
+vi.mock("@/components/workflow/use-workspace-workflow", () => ({
+  useWorkspaceWorkflow: () => ({ run: state.workflowRun, threadId: null }),
+}));
 
 // Child rows → sentinels so we can assert which chrome rendered.
 vi.mock("./tab-bar", () => ({
@@ -23,7 +30,9 @@ vi.mock("./pane-container", () => ({
   PaneContainer: () => <div data-testid="pane-container" />,
 }));
 vi.mock("./right-panel", () => ({
-  RightPanel: () => <div data-testid="right-panel" />,
+  RightPanel: ({ activeTab }: { activeTab: string | null }) => (
+    <div data-testid="right-panel" data-active-tab={activeTab ?? ""} />
+  ),
 }));
 vi.mock("@/components/diff/DiffPane", () => ({
   DiffPane: () => <div data-testid="diff-pane" />,
@@ -74,7 +83,7 @@ vi.mock("@/stores/ui-store", () => ({
       sel({
         onboardingProjectDir: null,
         setOnboardingProjectDir: vi.fn(),
-        rightPanelTabs: {},
+        rightPanelTabs: state.rightPanelTabs,
         rightPanelWidth: 320,
       }),
     ),
@@ -141,6 +150,8 @@ beforeEach(() => {
   state.enableAgentChat = false;
   state.enableLazy = false;
   state.activeDraftId = null;
+  state.workflowRun = null;
+  state.rightPanelTabs = {};
 });
 
 afterEach(cleanup);
@@ -161,5 +172,45 @@ describe("WorkspaceMain chrome rows", () => {
     expect(queryByTestId("preset-bar")).toBeNull();
     // Pane content still renders — only the stacked chrome rows drop.
     expect(getByTestId("pane-container")).toBeInTheDocument();
+  });
+});
+
+describe("WorkspaceMain right-panel stale-tab guard", () => {
+  it("coerces a persisted 'orchestration' tab to 'files' when no workflow run exists", () => {
+    state.rightPanelTabs = { "ws-1": "orchestration" };
+    state.workflowRun = null;
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("right-panel").dataset.activeTab).toBe("files");
+  });
+
+  it("keeps 'orchestration' active when a workflow run exists", () => {
+    state.rightPanelTabs = { "ws-1": "orchestration" };
+    state.workflowRun = {
+      kind: "workflow_run",
+      id: "wf-item-1",
+      seq: 0,
+      workflowId: "wf-1",
+      status: "running",
+      name: null,
+      description: null,
+      script: null,
+      plannedPhases: [],
+      phases: [],
+      resultText: null,
+      totalTokens: null,
+      agentCount: null,
+      startedAt: 0,
+      durationMs: null,
+      approvalRequestId: null,
+    };
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("right-panel").dataset.activeTab).toBe("orchestration");
+  });
+
+  it("leaves a non-orchestration persisted tab untouched", () => {
+    state.rightPanelTabs = { "ws-1": "changes" };
+    state.workflowRun = null;
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("right-panel").dataset.activeTab).toBe("changes");
   });
 });

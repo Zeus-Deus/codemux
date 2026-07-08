@@ -600,6 +600,12 @@ describe("Composer", () => {
         "data-selected",
         "true",
       );
+      // The WORKFLOWS group's single `/workflow` row follows MODES.
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      expect(getByTestId("slash-item-workflow")).toHaveAttribute(
+        "data-selected",
+        "true",
+      );
       fireEvent.keyDown(textarea, { key: "ArrowDown" });
       // Wraps around to the top.
       expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
@@ -607,8 +613,8 @@ describe("Composer", () => {
         "true",
       );
       fireEvent.keyDown(textarea, { key: "ArrowUp" });
-      // Wraps from top to bottom.
-      expect(getByTestId("slash-item-mode:debug")).toHaveAttribute(
+      // Wraps from top to bottom, landing on the last item (/workflow).
+      expect(getByTestId("slash-item-workflow")).toHaveAttribute(
         "data-selected",
         "true",
       );

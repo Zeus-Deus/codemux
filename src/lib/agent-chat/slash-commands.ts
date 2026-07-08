@@ -4,6 +4,7 @@ import {
   Bug,
   ListTodo,
   MessageCircleQuestion,
+  Workflow,
   type LucideIcon,
 } from "lucide-react";
 
@@ -279,6 +280,40 @@ export function buildModeCommands({
     },
   ];
   return all.filter((item) => item.id !== `mode:${activeMode}`);
+}
+
+interface BuildWorkflowCommandArgs {
+  /** True when the active model is a Claude model. `/workflow` only
+   *  runs through the Claude Code runtime's server-side orchestration
+   *  (it fans a task out to many subagents), so other providers keep
+   *  the row visible but disabled with a reason rather than hiding it
+   *  outright — mirrors the `attach:image` capability-gate pattern. */
+  isClaude: boolean;
+}
+
+/**
+ * Build the single `/workflow` row shared by both command surfaces
+ * (the typed `/` popup and the `+` menu). Selecting it only ever
+ * inserts the literal text `/workflow ` into the draft — the runtime
+ * parses that prefix server-side and drives the orchestration; there
+ * is no frontend workflow-start logic here.
+ */
+export function buildWorkflowCommand({
+  isClaude,
+}: BuildWorkflowCommandArgs): SlashCommandItem {
+  return {
+    id: "workflow",
+    label: "Workflow",
+    description: isClaude
+      ? "Orchestrate this task with many subagents"
+      : "Only available with Claude models",
+    command: "/workflow",
+    icon: Workflow,
+    tone: "ember",
+    group: "WORKFLOWS",
+    disabled: !isClaude,
+    onSelect: () => {},
+  };
 }
 
 /** Cycle order for Shift+Tab: default → plan → ask → debug → default. */

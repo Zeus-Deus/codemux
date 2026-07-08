@@ -6,6 +6,7 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
   ToolCallItem,
+  WorkflowRunItem,
 } from "@/lib/agent-chat/types";
 
 import { MessageList } from "./MessageList";
@@ -110,6 +111,28 @@ function readCall(seq: number, path: string): ToolCallItem {
     status: "done",
     result_content: null,
     approval_request_id: null,
+  };
+}
+
+function workflowRunItem(overrides: Partial<WorkflowRunItem> = {}): WorkflowRunItem {
+  return {
+    kind: "workflow_run",
+    id: "wf-1",
+    seq: 0,
+    workflowId: "wf-1",
+    status: "pending_approval",
+    name: "Audit route auth",
+    description: null,
+    script: null,
+    plannedPhases: [{ title: "Discover route files", detail: null }],
+    phases: [{ title: "Discover route files", detail: null, agents: [] }],
+    resultText: null,
+    totalTokens: null,
+    agentCount: null,
+    startedAt: Date.now(),
+    durationMs: null,
+    approvalRequestId: "req-wf",
+    ...overrides,
   };
 }
 
@@ -359,5 +382,62 @@ describe("MessageList chrome", () => {
   it("does not render the streaming marker when showThinking is unset", () => {
     renderList([readCall(0, "/a")]);
     expect(screen.queryByRole("status", { name: "Agent is working" })).toBeNull();
+  });
+});
+
+describe("MessageList workflow_run dispatch", () => {
+  it("renders the approval card full-width and suppresses the generic permission_request row it owns", () => {
+    const req: PermissionRequestItem = {
+      kind: "permission_request",
+      id: "req-wf",
+      seq: 1,
+      request_id: "req-wf",
+      turn_id: "t1",
+      request_kind: "workflow",
+      payload: {},
+      tool_use_id: null,
+      resolution: { state: "pending" },
+    };
+    renderList([workflowRunItem(), req]);
+    expect(screen.getByTestId("workflow-approval-card")).toBeInTheDocument();
+    expect(screen.getByText("Run as a workflow?")).toBeInTheDocument();
+    // The generic PermissionRequestBlock fallback ("Approval requested…")
+    // must not also render for the request the workflow card owns.
+    expect(screen.queryByText(/Approval requested/)).toBeNull();
+  });
+
+  it("still renders an unrelated permission_request normally alongside a workflow card", () => {
+    const unrelated: PermissionRequestItem = {
+      kind: "permission_request",
+      id: "req-other",
+      seq: 1,
+      request_id: "req-other",
+      turn_id: "t1",
+      request_kind: "mcp-tool-use",
+      payload: { tool_name: "SomeTool" },
+      tool_use_id: null,
+      resolution: { state: "pending" },
+    };
+    renderList([workflowRunItem(), unrelated]);
+    expect(screen.getByTestId("workflow-approval-card")).toBeInTheDocument();
+    expect(screen.getByText(/Approval requested/)).toBeInTheDocument();
+  });
+
+  it("routes a running workflow to the inline progress row", () => {
+    renderList([workflowRunItem({ status: "running", approvalRequestId: null })]);
+    expect(screen.getByTestId("workflow-run-card")).toBeInTheDocument();
+    expect(screen.getByText("Workflow running")).toBeInTheDocument();
+  });
+
+  it("routes a completed workflow to the summary row", () => {
+    renderList([
+      workflowRunItem({
+        status: "completed",
+        approvalRequestId: null,
+        agentCount: 3,
+        durationMs: 5000,
+      }),
+    ]);
+    expect(screen.getByText(/Workflow complete/)).toBeInTheDocument();
   });
 });

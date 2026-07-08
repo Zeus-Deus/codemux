@@ -92,6 +92,67 @@ pub struct SubagentSnapshot {
     /// providers only learn it on completion.
     #[serde(default)]
     pub provider_ref: Option<String>,
+    /// When this subagent was spawned while a `Workflow` tool run was
+    /// active, the workflow's `workflow_id` (its spawning tool_use id).
+    /// Lets the frontend route the snapshot into the workflow's phase
+    /// view instead of the generic subagent-run card. `None` for
+    /// subagents spawned outside a workflow.
+    #[serde(default)]
+    pub workflow_id: Option<String>,
+    /// Best-effort phase label for this subagent within its workflow,
+    /// when the provider's task label carries a `phase:X` hint. `None`
+    /// when no hint was found (the frontend falls back to the workflow's
+    /// last planned phase title).
+    #[serde(default)]
+    pub phase: Option<String>,
+}
+
+/// One planned phase of a `Workflow` run, parsed best-effort out of the
+/// script's `export const meta = { phases: [...] }` literal.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkflowPhaseSnapshot {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// A merge-able state snapshot for one `Workflow` tool run.
+///
+/// Mirrors [`SubagentSnapshot`]'s additive-serde discipline: every field
+/// but `workflow_id` carries `#[serde(default)]` so old/partial payloads
+/// still deserialise, and the frontend merges non-`None` fields into its
+/// per-workflow view state.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WorkflowSnapshot {
+    /// Stable key — the `tool_use_id` of the `Workflow` tool call.
+    #[serde(default)]
+    pub workflow_id: String,
+    /// `"pending_approval" | "running" | "completed" | "failed" | "stopped"`.
+    #[serde(default)]
+    pub status: String,
+    /// Workflow name — parsed from `meta.name`, falling back to a saved
+    /// workflow's `input.name` when the script doesn't carry one.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `meta.description`, when present.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The raw script text (`input.script`), for the "view source" affordance.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Planned phases parsed from `meta.phases`, in script order.
+    #[serde(default)]
+    pub phases: Option<Vec<WorkflowPhaseSnapshot>>,
+    /// Final result text on completion/failure, truncated to a sane length.
+    #[serde(default)]
+    pub result_text: Option<String>,
+    #[serde(default)]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub agent_count: Option<u32>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 /// A streamed fragment produced mid-turn.
@@ -203,6 +264,14 @@ pub enum ProviderRuntimeEvent {
     SubagentUpdated {
         thread_id: ThreadId,
         subagent: SubagentSnapshot,
+    },
+    /// A `Workflow` tool run's merge-able state snapshot changed
+    /// (launched, or terminated). Emitted thread-scoped under the parent
+    /// `thread_id`; `workflow.workflow_id` inside is the demux key (the
+    /// `Workflow` tool call's `tool_use_id`).
+    WorkflowUpdated {
+        thread_id: ThreadId,
+        workflow: WorkflowSnapshot,
     },
     /// The turn finished — either successfully or with a terminal error.
     TurnCompleted {
@@ -317,6 +386,8 @@ mod tests {
             total_tokens: Some(1200),
             duration_ms: Some(5000),
             provider_ref: None,
+            workflow_id: None,
+            phase: None,
         }
     }
 

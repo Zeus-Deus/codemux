@@ -2263,6 +2263,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               onAcceptPlan={handleAcceptPlan}
               onRejectPlan={handleRejectPlan}
               onEnterSubagent={handleEnterSubagent}
+              workspaceId={workspaceIdForPane}
             />
           )}
           {/* Composer region (design D10): a hairline lifts the whole

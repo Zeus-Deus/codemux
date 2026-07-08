@@ -35,6 +35,7 @@ import { SubagentsCard } from "./SubagentsCard";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
+import { WorkflowRunCard } from "./WorkflowRunCard";
 import { buildTranscriptSlots, type ActivityStep } from "./transcript-slots";
 
 interface Props {
@@ -64,6 +65,12 @@ interface Props {
    *  Wired by AgentChatPane's viewMode state; absent → the card's Enter
    *  affordance is inert. */
   onEnterSubagent?: (subagentId: string) => void;
+  /** Active workspace id, threaded down to `WorkflowRunCard` so its
+   *  "Open panel" affordance can flip the right panel to the
+   *  Orchestration tab. Sourced the same way AgentChatPane resolves it
+   *  for everything else (`findWorkspaceIdForPane`); absent → the
+   *  affordance is inert rather than throwing. */
+  workspaceId?: string | null;
 }
 
 /**
@@ -90,6 +97,7 @@ export function MessageList({
   onAcceptPlan,
   onRejectPlan,
   onEnterSubagent,
+  workspaceId,
 }: Props) {
   // Sort by seq so order is a property of the data, not of React
   // reconciliation or store-update timing (stable id tiebreak).
@@ -246,6 +254,7 @@ export function MessageList({
                     onAcceptPlan={onAcceptPlan}
                     onRejectPlan={onRejectPlan}
                     onEnterSubagent={onEnterSubagent}
+                    workspaceId={workspaceId}
                   />
                 )}
               </MessageScrollerItem>
@@ -324,6 +333,9 @@ function lookupApproval(
   if (item.kind === "tool_call" && item.approval_request_id != null) {
     return requestsById.get(item.approval_request_id) ?? null;
   }
+  if (item.kind === "workflow_run" && item.approvalRequestId != null) {
+    return requestsById.get(item.approvalRequestId) ?? null;
+  }
   return null;
 }
 
@@ -372,6 +384,7 @@ function ItemRow({
   onAcceptPlan,
   onRejectPlan,
   onEnterSubagent,
+  workspaceId,
 }: {
   item: ChatViewItem;
   showAvatar: boolean;
@@ -382,13 +395,16 @@ function ItemRow({
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onEnterSubagent?: (subagentId: string) => void;
+  workspaceId?: string | null;
 }) {
   const requestId =
     item.kind === "tool_call"
       ? item.approval_request_id
       : item.kind === "permission_request"
         ? item.request_id
-        : null;
+        : item.kind === "workflow_run"
+          ? item.approvalRequestId
+          : null;
   const handleDecide = useCallback(
     (decision: ApprovalDecision) => {
       if (requestId) onRespondToRequest(requestId, decision);
@@ -414,6 +430,18 @@ function ItemRow({
   // gutter), matching the design.
   if (item.kind === "subagent_run") {
     return <SubagentsCard item={item} onEnter={handleEnterSubagent} />;
+  }
+
+  // Same full-width, no-gutter treatment for a Workflow tool run.
+  if (item.kind === "workflow_run") {
+    return (
+      <WorkflowRunCard
+        item={item}
+        approval={approval}
+        onDecide={handleDecide}
+        workspaceId={workspaceId}
+      />
+    );
   }
 
   return (
@@ -499,6 +527,7 @@ function renderAssistantBody(
         </div>
       );
     case "subagent_run":
+    case "workflow_run":
       // Rendered full-width above (before the AssistantGutter wrap); this
       // arm only keeps the switch exhaustive.
       return null;

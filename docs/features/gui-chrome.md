@@ -8,7 +8,7 @@
 - Update when: The titlebar composition, the launcher, or the legacy/GUI gate
   changes.
 - Read next: `docs/features/agent-chat.md`, `docs/features/presets.md`,
-  `docs/features/sidebar.md`
+  `docs/features/sidebar.md`, `docs/features/workflow-orchestration.md`
 
 ## What This Feature Is
 
@@ -86,12 +86,16 @@ titlebar tab share one implementation (see "Important Touch Points").
   (Shift on a CLI agent) instead, and split layouts restore the per-pane
   header.
 
-## Design intent (not shipped)
+## Workflow orchestration integration
 
 The titlebar is deliberately slot-composed and the `RightPanel` + resizer +
-`rightPanelTabs` infra is preserved (hence rehoming the toggle) so a planned
-inline **workflow-orchestration status pill** and an **Orchestration** right
-side panel can land without restructuring the chrome. Neither is built.
+`rightPanelTabs` infra is preserved (hence rehoming the toggle), which let
+the **Orchestration** right-panel tab for Claude workflow runs land without
+restructuring this chrome — `RightPanelTab` gained an `"orchestration"`
+variant that `right-panel.tsx` renders conditionally, only when the active
+workspace has a workflow run. See `docs/features/workflow-orchestration.md`
+for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
+`WorkflowRunCard`, and the panel body).
 
 ## Important Touch Points
 

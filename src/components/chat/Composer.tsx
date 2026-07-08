@@ -22,6 +22,7 @@ import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import {
   buildModeCommands,
+  buildWorkflowCommand,
   filterCommandMenuItems,
   filterSlashItems,
   findMentionAtCursor,
@@ -387,6 +388,14 @@ export function Composer({
     [mode, onModeActivate],
   );
 
+  // `/workflow` — gated to the Claude provider (server-side runtime
+  // support only exists there). Shared between the typed `/` popup and
+  // the `+` menu so the gating logic lives in one place.
+  const workflowCommand = useMemo(
+    () => buildWorkflowCommand({ isClaude: provider === "claude" }),
+    [provider],
+  );
+
   // ─── Skills (Cursor-style inline tokens) ─────────────────────────
   // Lazy-load on first popup open. Picking a skill expands the typed
   // `/<query>` to the full `/<skill-name>` in the textarea — the slash
@@ -422,8 +431,8 @@ export function Composer({
   );
 
   const allSlashItems = useMemo(
-    () => [...modeCommands, ...skillItems],
-    [modeCommands, skillItems],
+    () => [...modeCommands, workflowCommand, ...skillItems],
+    [modeCommands, workflowCommand, skillItems],
   );
 
   // Surface skill-loading + skill-error in the popup footer so the user
@@ -961,6 +970,11 @@ export function Composer({
           disabled: mode === "ask",
           onSelect: () => {},
         },
+        // WORKFLOWS — single row, gated to the Claude provider. Kept
+        // visible-but-disabled for other providers (design D-parity
+        // with the `attach:image` capability gate) so the affordance
+        // stays discoverable rather than vanishing.
+        workflowCommand,
         {
           id: "attach:file",
           label: "File…",
@@ -1127,6 +1141,7 @@ export function Composer({
     isGithubRepo,
     ghAuthenticated,
     modelSupportsImages,
+    workflowCommand,
   ]);
 
   const attachPopupFooter = useMemo(() => {
@@ -1263,6 +1278,15 @@ export function Composer({
         requestAnimationFrame(() => textareaRef.current?.focus());
         return;
       }
+      // `/workflow` — insert the literal command text at the cursor so
+      // the user types their task after it and sends it as a normal
+      // message; the Claude runtime parses the prefix and drives the
+      // orchestration server-side (no frontend workflow logic here).
+      if (item.id === "workflow") {
+        insertAtCursor("/workflow ");
+        closeAttachPopup();
+        return;
+      }
       // File / folder picks: insert the inline token, dispatch the
       // resolve callback to the parent, close the popup.
       if (item.id.startsWith("attach-file:")) {
@@ -1298,6 +1322,7 @@ export function Composer({
       attachFileMatches,
       attachFolderMatches,
       insertInlineToken,
+      insertAtCursor,
       closeAttachPopup,
       onAttachFile,
       onAttachFolder,
@@ -1404,19 +1429,25 @@ export function Composer({
   );
 
   const handleSlashSelect = (item: SlashCommandItem) => {
+    // Mirrors the `+` menu's `handleAttachPopupSelect` guard — Enter on
+    // a highlighted-but-disabled row (e.g. `/workflow` on a non-Claude
+    // provider) must no-op rather than expand/activate it. Mouse clicks
+    // are already double-guarded inside SlashCommandPopup itself.
+    if (item.disabled) return;
     if (slashAnchor) {
       const consumedLength = 1 + slashAnchor.query.length;
       const before = draft.slice(0, slashAnchor.start);
       const after = draft.slice(slashAnchor.start + consumedLength);
 
-      if (item.id.startsWith("skill:")) {
+      if (item.id.startsWith("skill:") || item.id === "workflow") {
         // Cursor-style inline expansion. Replace the typed `/<query>`
-        // with the full `/<skill-name> ` (trailing space so the user can
-        // keep typing context after the token without an extra
-        // keystroke). The mirror overlay highlights it; send-time
-        // parsing resolves it to the skill body.
-        const skillName = item.command.replace(/^\//, "");
-        const insertion = `/${skillName}${after.startsWith(" ") ? "" : " "}`;
+        // with the full `/<skill-name> ` or `/workflow ` (trailing
+        // space so the user can keep typing context after the token
+        // without an extra keystroke). The mirror overlay highlights
+        // skill tokens; `/workflow` is handled server-side by the
+        // Claude runtime — this composer only ever inserts the text.
+        const tokenName = item.command.replace(/^\//, "");
+        const insertion = `/${tokenName}${after.startsWith(" ") ? "" : " "}`;
         const next = before + insertion + after;
         onDraftChange(next);
         // Cursor lands right after the inserted token (and the space we

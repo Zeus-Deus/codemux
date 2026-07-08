@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { ModelSelection, PendingWorkspace } from "@/tauri/types";
 
-export type RightPanelTab = "changes" | "files" | "review";
+export type RightPanelTab = "changes" | "files" | "review" | "orchestration";
 
 interface UIStore {
   rightPanelTabs: Record<string, RightPanelTab | null>;

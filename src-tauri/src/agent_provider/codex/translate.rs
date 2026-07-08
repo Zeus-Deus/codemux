@@ -346,6 +346,8 @@ fn subagent_snapshot(subagent_id: &str, status: SubagentStatus) -> SubagentSnaps
         total_tokens: None,
         duration_ms: None,
         provider_ref: Some(subagent_id.to_string()),
+        workflow_id: None,
+        phase: None,
     }
 }
 
