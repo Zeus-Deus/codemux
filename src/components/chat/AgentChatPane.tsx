@@ -54,6 +54,7 @@ import {
 } from "@/stores/provider-capabilities-store";
 import {
   activateWorkspace,
+  agentChatCancelQueuedTurn,
   agentChatGetSession,
   agentChatInterruptTurn,
   agentChatListMessages,
@@ -393,6 +394,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const skillsRegistry = useSkillsStore(selectActiveSkills);
   const migrateThreadId = useAgentChatStore((s) => s.migrateThreadId);
   const appendUserMessage = useAgentChatStore((s) => s.appendUserMessage);
+  const removeUserMessageByNonce = useAgentChatStore(
+    (s) => s.removeUserMessageByNonce,
+  );
   const markRequestResponding = useAgentChatStore(
     (s) => s.markRequestResponding,
   );
@@ -993,7 +997,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         skillBodies,
         attachmentBlock,
       );
-      appendUserMessage(threadId, plan.text);
+      // Optimistic append carries a client nonce so a `turn_queued`
+      // event can reconcile THIS exact bubble (grey it out) instead of
+      // duplicating it, and so an outright RPC failure can roll it back
+      // (fixes the pre-queue orphan-bubble bug).
+      const clientNonce =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      appendUserMessage(threadId, plan.text, clientNonce);
       // Clear chips per-turn (matches the inputDraft = "" reset that
       // appendUserMessage already does for the textarea).
       clearStagedAttachments(threadId);
@@ -1003,10 +1015,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         images: imagePayloads,
         model_override: null,
         effort_override: plan.effortOverride,
+        client_nonce: clientNonce,
       };
       try {
+        // Backend is authoritative: if a turn was already in flight the
+        // send is QUEUED (result.queued_id set) rather than rejected. In
+        // that case the `turn_queued` event greys the optimistic bubble;
+        // we do nothing extra here. An immediate start keeps the bubble
+        // as a normal user message.
         await agentChatSendTurn(provider, input);
       } catch (err) {
+        // Genuine failure — roll back the optimistic bubble so no orphan
+        // is left, and restore the text into the composer so the user
+        // doesn't lose it.
+        removeUserMessageByNonce(threadId, clientNonce);
+        setInputDraft(threadId, rawText);
         toast.error(`Failed to send turn: ${err}`);
         sendInFlightRef.current = false;
         setIsSending(false);
@@ -1021,6 +1044,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     cwd,
     skillsRegistry,
     appendUserMessage,
+    removeUserMessageByNonce,
+    setInputDraft,
     clearStagedAttachments,
     updateStagedAttachment,
   ]);
@@ -1522,6 +1547,29 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     migrateThreadId,
     setSessionLaunchMode,
   ]);
+
+  // Follow-up queueing: cancel a queued (not-yet-dispatched) turn. The
+  // backend emits `queued_turn_cancelled`, which the reducer uses to
+  // remove the greyed bubble — so we don't optimistically remove here.
+  // On success we restore the cancelled text into the composer draft so
+  // the user can edit and resend (prepended if the composer already has
+  // content, to avoid clobbering an in-progress draft).
+  const handleCancelQueued = useCallback(
+    (queuedId: string, text: string) => {
+      if (!threadId) return;
+      const tid = threadId;
+      void (async () => {
+        try {
+          await agentChatCancelQueuedTurn(provider, tid, queuedId);
+          const current = useAgentChatStore.getState().threads[tid]?.inputDraft ?? "";
+          setInputDraft(tid, current.trim().length > 0 ? `${text}\n${current}` : text);
+        } catch (err) {
+          toast.error(`Failed to cancel queued message: ${err}`);
+        }
+      })();
+    },
+    [threadId, provider, setInputDraft],
+  );
 
   const handleRespond = useCallback(
     (requestId: string, decision: ApprovalDecision) => {
@@ -2189,7 +2237,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
       ultrathinkInBodyText={ultrathinkInBodyText}
-      streaming={streaming || isSending}
+      // Real streaming only — a follow-up sent while this is true gets
+      // QUEUED, not blocked. `sending` blocks re-submit during the send
+      // RPC ack-lag without blocking queueing.
+      streaming={streaming}
+      sending={isSending}
       sessionReady={sessionReady}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}
@@ -2262,6 +2314,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               onRespondToRequest={handleRespond}
               onAcceptPlan={handleAcceptPlan}
               onRejectPlan={handleRejectPlan}
+              onCancelQueued={handleCancelQueued}
               onEnterSubagent={handleEnterSubagent}
               workspaceId={workspaceIdForPane}
             />

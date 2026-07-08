@@ -8,6 +8,7 @@ import {
   appendUserMessage,
   createEmptyThreadState,
   markRequestResponding,
+  removeUserMessageByNonce,
   type Clock,
 } from "./reducer";
 import type {
@@ -17,6 +18,7 @@ import type {
   ReasoningItem,
   SubagentRunItem,
   ToolCallItem,
+  UserMessageItem,
   WorkflowRunItem,
 } from "./types";
 
@@ -1157,6 +1159,162 @@ describe("agent-chat reducer", () => {
       // The head reasoning block was trimmed with the rest — no special-casing.
       expect(reasoningItems(state)).toHaveLength(0);
     });
+  });
+});
+
+describe("agent-chat reducer — follow-up queueing", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  const users = (s: ChatThreadState): UserMessageItem[] =>
+    s.messages.filter((m): m is UserMessageItem => m.kind === "user_message");
+
+  it("turn_queued reconciles the optimistic bubble by client nonce (no duplicate)", () => {
+    // Composer optimistically appended a bubble carrying a nonce.
+    let state = appendUserMessage(
+      createEmptyThreadState(),
+      "second message",
+      undefined,
+      "nonce-x",
+    );
+    expect(users(state)).toHaveLength(1);
+    expect(users(state)[0].queued).toBeUndefined();
+
+    state = applyEvent(state, {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-1",
+      client_nonce: "nonce-x",
+      text: "second message",
+    });
+
+    const list = users(state);
+    expect(list).toHaveLength(1); // reconciled, not duplicated
+    expect(list[0].queued).toEqual({ queuedId: "q-1" });
+    expect(list[0].text).toBe("second message");
+  });
+
+  it("turn_queued without a matching bubble appends a greyed item (remount case)", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-2",
+      client_nonce: null,
+      text: "reconstructed",
+    });
+    const list = users(state);
+    expect(list).toHaveLength(1);
+    expect(list[0].queued).toEqual({ queuedId: "q-2" });
+    expect(list[0].text).toBe("reconstructed");
+  });
+
+  it("queued items sort to the very bottom, below later streaming content", () => {
+    let state = appendUserMessage(
+      createEmptyThreadState(),
+      "queued one",
+      undefined,
+      "n1",
+    );
+    state = applyEvent(state, {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-1",
+      client_nonce: "n1",
+      text: "queued one",
+    });
+    // An assistant message streams in AFTER the enqueue.
+    state = applyEvent(state, {
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "text", text: "assistant reply" },
+    });
+    const queued = users(state)[0];
+    const assistant = state.messages.find(
+      (m): m is AssistantMessageItem => m.kind === "assistant_message",
+    );
+    expect(queued.seq).toBeGreaterThan(assistant!.seq);
+  });
+
+  it("queued_turn_dispatched promotes the bubble and re-seqs it to the tail", () => {
+    let state = appendUserMessage(
+      createEmptyThreadState(),
+      "hello",
+      undefined,
+      "n1",
+    );
+    state = applyEvent(state, {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-1",
+      client_nonce: "n1",
+      text: "hello",
+    });
+    const queuedSeq = users(state)[0].seq;
+    state = applyEvent(state, {
+      type: "queued_turn_dispatched",
+      thread_id: "t1",
+      queued_id: "q-1",
+      turn_id: "turn-9",
+      text: "hello",
+    });
+    const list = users(state);
+    expect(list).toHaveLength(1);
+    expect(list[0].queued).toBeUndefined(); // promoted to normal
+    expect(list[0].seq).toBeLessThan(queuedSeq); // re-seq'd out of the queued band
+    expect(list[0].text).toBe("hello");
+  });
+
+  it("queued_turn_cancelled removes the greyed bubble", () => {
+    let state = applyEvent(createEmptyThreadState(), {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-3",
+      client_nonce: null,
+      text: "bye",
+    });
+    expect(users(state)).toHaveLength(1);
+    state = applyEvent(state, {
+      type: "queued_turn_cancelled",
+      thread_id: "t1",
+      queued_id: "q-3",
+    });
+    expect(users(state)).toHaveLength(0);
+  });
+
+  it("dispatch/cancel for an unknown queued id are safe no-ops", () => {
+    const base = appendUserMessage(createEmptyThreadState(), "x", undefined, "n");
+    const afterDispatch = applyEvent(base, {
+      type: "queued_turn_dispatched",
+      thread_id: "t1",
+      queued_id: "missing",
+      turn_id: "t",
+      text: "x",
+    });
+    expect(afterDispatch.messages).toEqual(base.messages);
+    const afterCancel = applyEvent(base, {
+      type: "queued_turn_cancelled",
+      thread_id: "t1",
+      queued_id: "missing",
+    });
+    expect(afterCancel.messages).toEqual(base.messages);
+  });
+
+  it("removeUserMessageByNonce rolls back an optimistic bubble", () => {
+    const state = appendUserMessage(
+      createEmptyThreadState(),
+      "oops",
+      undefined,
+      "nonce-err",
+    );
+    expect(users(state)).toHaveLength(1);
+    const rolledBack = removeUserMessageByNonce(state, "nonce-err");
+    expect(users(rolledBack)).toHaveLength(0);
+    // Unknown nonce is a no-op.
+    expect(removeUserMessageByNonce(state, "other").messages).toEqual(
+      state.messages,
+    );
   });
 });
 

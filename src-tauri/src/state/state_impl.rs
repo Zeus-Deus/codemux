@@ -2581,6 +2581,49 @@ impl AppStateStore {
         Ok(())
     }
 
+    /// Mark an agent browser session as live/active without attaching it to
+    /// a pane. Used by the GUI-mode background-browsing gate in
+    /// `control.rs`'s `browser_automation` handler: when pane creation is
+    /// suppressed (Agent Chat GUI beta on, non-OpenFlow workspace), the
+    /// session would otherwise never flip `is_active` (only
+    /// `attach_agent_browser_to_pane` does that), so the frontend's
+    /// "background session is live" chip/indicator would never see it.
+    /// Returns `false` when no session exists yet for the workspace.
+    pub fn mark_agent_browser_active(&self, workspace_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        session.is_active = true;
+        true
+    }
+
+    /// Mark an agent browser session as no longer live. Mirror of
+    /// [`mark_agent_browser_active`](Self::mark_agent_browser_active): the
+    /// `browser_automation` handler calls this when a `close` action
+    /// completes successfully, so the GUI-mode background chip /
+    /// context-bar indicator / peek overlay (which key off `is_active`)
+    /// stop presenting the session as live. The session itself is kept
+    /// (URL, cli_session_name) for a later reopen — this only flips the
+    /// liveness flag. Returns `false` when no session exists for the
+    /// workspace.
+    pub fn mark_agent_browser_inactive(&self, workspace_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        session.is_active = false;
+        true
+    }
+
     /// Update the current URL on the agent browser session for a workspace.
     pub fn update_agent_browser_url(
         &self,
@@ -6050,6 +6093,63 @@ mod tests {
         // Session still exists and is_active stays true (process still running)
         let snap = store.snapshot();
         assert_eq!(snap.agent_browser_sessions.len(), 1);
+    }
+
+    #[test]
+    fn mark_agent_browser_active_flips_is_active_without_attaching_pane() {
+        // Backs the GUI-mode background-browsing gate: control.rs suppresses
+        // pane creation but must still be able to mark the detached session
+        // live so the frontend's background chip/indicator can render it.
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+        assert!(!session.is_active);
+
+        let found = store.mark_agent_browser_active(&ws_id.0);
+        assert!(found);
+
+        let snap = store.snapshot();
+        let updated = &snap.agent_browser_sessions[0];
+        assert!(updated.is_active);
+        assert!(updated.pane_id.is_none());
+        assert!(updated.browser_id.is_none());
+    }
+
+    #[test]
+    fn mark_agent_browser_active_returns_false_when_no_session() {
+        let store = AppStateStore::default();
+        assert!(!store.mark_agent_browser_active("no-such-workspace"));
+    }
+
+    #[test]
+    fn mark_agent_browser_inactive_clears_is_active_but_keeps_session() {
+        // Backs the `close`-action wiring in control.rs: a successful
+        // browser close must drop `is_active` so the GUI-mode background
+        // chip/indicator/peek stop showing LIVE — while the session itself
+        // (URL, cli_session_name) survives for a later reopen.
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        store.mark_agent_browser_active(&ws_id.0);
+        store
+            .update_agent_browser_url(&ws_id.0, "https://example.com".into())
+            .unwrap();
+        assert!(store.snapshot().agent_browser_sessions[0].is_active);
+
+        let found = store.mark_agent_browser_inactive(&ws_id.0);
+        assert!(found);
+
+        let snap = store.snapshot();
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+        let updated = &snap.agent_browser_sessions[0];
+        assert!(!updated.is_active);
+        assert_eq!(updated.current_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn mark_agent_browser_inactive_returns_false_when_no_session() {
+        let store = AppStateStore::default();
+        assert!(!store.mark_agent_browser_inactive("no-such-workspace"));
     }
 
     #[test]

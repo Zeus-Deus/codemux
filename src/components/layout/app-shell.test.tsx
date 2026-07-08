@@ -32,6 +32,11 @@ vi.mock("./workspace-main", () => ({
 vi.mock("./workspace-context-bar", () => ({
   WorkspaceContextBar: () => <div data-testid="workspace-context-bar" />,
 }));
+// The peek overlay has its own dedicated test file
+// (BrowserPeekOverlay.test.tsx); here it's just a shell child.
+vi.mock("@/components/browser/BrowserPeekOverlay", () => ({
+  BrowserPeekOverlay: () => <div data-testid="browser-peek-overlay" />,
+}));
 vi.mock("./empty-state", () => ({
   EmptyState: () => <div data-testid="empty-state" />,
 }));

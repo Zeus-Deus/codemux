@@ -1624,7 +1624,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
     lastDebugExitOpen = false;
     lastDebugExitOnChoose = null;
     vi.mocked(grepCountPattern).mockClear().mockResolvedValue(0);
-    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue("turn-1");
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({ turn_id: "turn-1", queued_id: null });
   });
   afterEach(() => cleanup());
 
@@ -1823,12 +1823,14 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
     };
     // Slow-walk the send-turn promise so the second click definitely
     // lands while the first is still in flight.
-    const sendDeferred: { resolve: ((v: string) => void) | null } = {
+    const sendDeferred: {
+      resolve: ((v: { turn_id: string; queued_id: string | null }) => void) | null;
+    } = {
       resolve: null,
     };
     vi.mocked(agentChatSendTurn).mockImplementation(
       () =>
-        new Promise<string>((resolve) => {
+        new Promise<{ turn_id: string; queued_id: string | null }>((resolve) => {
           sendDeferred.resolve = resolve;
         }),
     );
@@ -1842,7 +1844,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
     banner.click();
     banner.click();
     expect(agentChatSendTurn).toHaveBeenCalledTimes(1);
-    sendDeferred.resolve?.("turn-done");
+    sendDeferred.resolve?.({ turn_id: "turn-done", queued_id: null });
   });
 
   it("cleanup ordering: setMode('default') is called BEFORE agentChatSendTurn so the wrapper does not re-instruct", async () => {
@@ -1859,7 +1861,7 @@ describe("AgentChatPane Stage 6 — Debug-mode cleanup", () => {
     });
     vi.mocked(agentChatSendTurn).mockImplementation(async () => {
       callOrder.push("agentChatSendTurn");
-      return "turn-1";
+      return { turn_id: "turn-1", queued_id: null };
     });
 
     const { container } = render(<AgentChatPane pane={pane} />);

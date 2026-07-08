@@ -116,6 +116,10 @@ interface Props {
   permissionModes: PermissionModeOption[] | null;
   ultrathinkInBodyText: boolean;
   streaming: boolean;
+  /** True while THIS composer's send RPC is in flight (before the
+   *  backend acks). Blocks submit to avoid a double-send, but — unlike
+   *  `streaming` — does not block queueing a follow-up. Defaults false. */
+  sending?: boolean;
   sessionReady: boolean;
   showProviderPicker: boolean;
   /** True on the pre-session draft surface (no live session yet). Only
@@ -231,6 +235,7 @@ export function Composer({
   permissionModes,
   ultrathinkInBodyText,
   streaming,
+  sending = false,
   sessionReady,
   showProviderPicker,
   isDraft = false,
@@ -1609,7 +1614,16 @@ export function Composer({
   const [dragDepth, setDragDepth] = useState(0);
   const isDragging = dragDepth > 0;
 
-  const canSubmit = sessionReady && !streaming && draft.trim().length > 0;
+  // Follow-up queueing: submit is allowed WHILE a turn streams (the send
+  // is queued, not rejected). It is still blocked while this composer's
+  // own send RPC is in flight (`sending`) to avoid a double-send. The
+  // Stop button stays visible whenever a turn is active or a send is
+  // mid-flight (`busy`).
+  const busy = streaming || sending;
+  const canSubmit = sessionReady && !sending && draft.trim().length > 0;
+  // Subtle affordance so the user knows Enter will queue rather than
+  // interrupt, shown only while a turn streams and there's text to send.
+  const showQueueHint = streaming && draft.trim().length > 0;
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Shift+Tab cycles modes regardless of popup state. preventDefault
@@ -2186,6 +2200,11 @@ export function Composer({
               style={{ maxHeight: `${MAX_ROWS_APPROX_PX}px` }}
             />
           </div>
+          {showQueueHint ? (
+            <div className="px-3 pb-1 text-[11px] leading-none text-muted-foreground/70">
+              Enter to queue
+            </div>
+          ) : null}
           <ComposerFooter
             provider={provider}
             model={model}
@@ -2196,7 +2215,7 @@ export function Composer({
             effortLabelMap={effortLabelMap}
             permissionModes={permissionModes}
             ultrathinkInBodyText={ultrathinkInBodyText}
-            streaming={streaming}
+            streaming={busy}
             canSubmit={canSubmit}
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}

@@ -25,6 +25,16 @@ export interface UserMessageItem {
   id: ChatItemId;
   seq: number;
   text: string;
+  /** Follow-up queueing: present while this message is parked behind an
+   *  active turn (rendered greyed-out with a "Queued" pill + cancel X).
+   *  Removed when the turn dispatches (`queued_turn_dispatched`) and the
+   *  bubble promotes to a normal user message. */
+  queued?: { queuedId: string };
+  /** Optimistic-send correlation token. Set when the bubble was
+   *  optimistically appended by the composer; lets the `turn_queued`
+   *  event reconcile against this exact item instead of appending a
+   *  duplicate. Absent for hydrated / backend-reconstructed items. */
+  clientNonce?: string;
 }
 
 export interface AssistantMessageItem {

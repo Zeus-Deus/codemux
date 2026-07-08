@@ -22,9 +22,13 @@ legacy chrome unchanged.
 
 `TitleBar` (`src/components/layout/title-bar.tsx`) branches on a computed
 `guiChrome` flag: `enableAgentChat && !lazyDraftActive && activeWorkspaceId !=
-null && workspace_type != null && workspace_type !== "open_flow"`. When false
-it returns the byte-identical legacy `h-9` bar; when true it composes discrete
-slots left-to-right:
+null && workspace_type != null && workspace_type !== "open_flow"`. This
+predicate lives in the shared `useGuiChrome()` hook
+(`src/hooks/use-gui-chrome.ts`) so other GUI-mode-only surfaces gate on the
+identical rule — currently the background-browser inline chip, context-bar
+indicator, and peek overlay (`docs/features/browser.md` § "Background
+browser in GUI mode"). When false it returns the byte-identical legacy
+`h-9` bar; when true it composes discrete slots left-to-right:
 
 `[sidebar-width cluster: sidebar toggle] | [tabs] [+ launcher] | [pinned preset tiles] …drag spacer… [right-panel toggle] [RunButton split] [ResourceMonitor] [IdeLauncher compact] [sep] [WindowControls]`
 
@@ -125,8 +129,10 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
 
 ## Important Touch Points
 
-- `src/components/layout/title-bar.tsx` — the `guiChrome` gate + slot
-  composition, `RightPanelToggle`, `PinnedChatFavorite`,
+- `src/hooks/use-gui-chrome.ts` — the shared `guiChrome` predicate (single
+  source of truth, extracted from `title-bar.tsx`).
+- `src/components/layout/title-bar.tsx` — consumes `useGuiChrome()` for the
+  slot-composition branch, `RightPanelToggle`, `PinnedChatFavorite`,
   `TitleBarWorkspaceSlots`.
 - `src/components/layout/title-bar-tabs.tsx` — pill tab strip + active chat tab
   (chevron dropdown, subagents pill, checkpoint dialog).

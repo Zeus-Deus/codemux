@@ -20,12 +20,15 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
+import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 import { ActivityBlock } from "./ActivityBlock";
 import { AssistantAvatar } from "./AssistantAvatar";
 import { AssistantMessage } from "./AssistantMessage";
+import { BackgroundBrowserChip } from "./BackgroundBrowserChip";
 import { MessageTrail } from "./MessageTrail";
 import { PermissionRequestBlock } from "./PermissionRequestBlock";
 import { PlanProposalBlock } from "./PlanProposalBlock";
@@ -61,15 +64,21 @@ interface Props {
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  /** Follow-up queueing: cancel a queued user turn. `text` is passed
+   *  back so the caller can restore it into the composer. */
+  onCancelQueued?: (queuedId: string, text: string) => void;
   /** Enter a subagent's read-only drill-in (design "Enter subagent").
    *  Wired by AgentChatPane's viewMode state; absent → the card's Enter
    *  affordance is inert. */
   onEnterSubagent?: (subagentId: string) => void;
-  /** Active workspace id, threaded down to `WorkflowRunCard` so its
+  /** This pane's workspace id (sourced via `findWorkspaceIdForPane`).
+   *  Two consumers: (a) threaded down to `WorkflowRunCard` so its
    *  "Open panel" affordance can flip the right panel to the
-   *  Orchestration tab. Sourced the same way AgentChatPane resolves it
-   *  for everything else (`findWorkspaceIdForPane`); absent → the
-   *  affordance is inert rather than throwing. */
+   *  Orchestration tab; (b) the GUI-mode background-browser session
+   *  lookup for the inline chip (docs/features/browser.md "Background
+   *  browser in GUI mode"). Absent → both affordances are inert
+   *  (legacy / non-workspace-scoped callers keep byte-identical
+   *  output) rather than throwing. */
   workspaceId?: string | null;
 }
 
@@ -96,9 +105,38 @@ export function MessageList({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onCancelQueued,
   onEnterSubagent,
   workspaceId,
 }: Props) {
+  // GUI-mode background browser session for this pane's workspace (see
+  // docs/features/browser.md "Background browser in GUI mode"). Gated on
+  // the same predicate the backend's `browser_automation` handler uses to
+  // suppress pane creation: Agent Chat beta on, workspace not OpenFlow.
+  // `workspaceId` is absent for legacy/non-workspace-scoped callers, so
+  // the chip never renders there — byte-identical output preserved.
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+  const workspaceType = useAppStore((s) => {
+    if (!workspaceId) return null;
+    return (
+      s.appState?.workspaces.find((w) => w.workspace_id === workspaceId)
+        ?.workspace_type ?? null
+    );
+  });
+  const backgroundBrowserSession = useAppStore((s) => {
+    if (!workspaceId) return null;
+    const session = s.appState?.agent_browser_sessions?.find(
+      (abs) => abs.workspace_id === workspaceId,
+    );
+    if (!session || !session.is_active || session.pane_id) return null;
+    return session;
+  });
+  const showBrowserChip =
+    !!workspaceId &&
+    enableAgentChat &&
+    workspaceType !== "open_flow" &&
+    !!backgroundBrowserSession;
+
   // Sort by seq so order is a property of the data, not of React
   // reconciliation or store-update timing (stable id tiebreak).
   const ordered = useMemo(() => {
@@ -253,12 +291,22 @@ export function MessageList({
                     onRespondToRequest={onRespondToRequest}
                     onAcceptPlan={onAcceptPlan}
                     onRejectPlan={onRejectPlan}
+                    onCancelQueued={onCancelQueued}
                     onEnterSubagent={onEnterSubagent}
                     workspaceId={workspaceId}
                   />
                 )}
               </MessageScrollerItem>
             ))}
+
+            {showBrowserChip && backgroundBrowserSession && workspaceId && (
+              <div className="mt-[13px]">
+                <BackgroundBrowserChip
+                  session={backgroundBrowserSession}
+                  workspaceId={workspaceId}
+                />
+              </div>
+            )}
 
             {showThinking && !tailIsWorkingActivity && (
               <div className="mt-[13px]">
@@ -383,6 +431,7 @@ function ItemRow({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onCancelQueued,
   onEnterSubagent,
   workspaceId,
 }: {
@@ -394,6 +443,7 @@ function ItemRow({
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  onCancelQueued?: (queuedId: string, text: string) => void;
   onEnterSubagent?: (subagentId: string) => void;
   workspaceId?: string | null;
 }) {
@@ -423,7 +473,7 @@ function ItemRow({
   }, [item, onRejectPlan]);
 
   if (item.kind === "user_message") {
-    return <UserMessage item={item} />;
+    return <UserMessage item={item} onCancelQueued={onCancelQueued} />;
   }
 
   // The orchestration card is a full-width standalone surface (no avatar

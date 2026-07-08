@@ -1,7 +1,8 @@
-import { Cloud, Folder, GitBranch, Laptop } from "lucide-react";
+import { Cloud, Folder, GitBranch, Globe, Laptop } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
-import { useActiveWorkspace } from "@/stores/app-store";
+import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useHosts } from "@/stores/hosts-store";
@@ -52,9 +53,24 @@ export function WorkspaceContextBar() {
   // markdown-reparse cascades the primitive selectors exist to avoid.
   const workspace = useActiveWorkspace();
   const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const hasActiveDraft = useChatDraftStore((s) => s.activeDraftId !== null);
   const onboardingProjectDir = useUIStore((s) => s.onboardingProjectDir);
   const hosts = useHosts();
+  // GUI-mode background browser session for the active workspace (see
+  // docs/features/browser.md "Background browser in GUI mode") — a
+  // detached agent browser session that is live (`is_active`) but not
+  // attached to a pane (`pane_id === null`).
+  const backgroundBrowserSession = useAppStore((s) => {
+    const wsId = workspace?.workspace_id;
+    if (!wsId) return null;
+    const session = s.appState?.agent_browser_sessions?.find(
+      (abs) => abs.workspace_id === wsId,
+    );
+    if (!session || !session.is_active || session.pane_id) return null;
+    return session;
+  });
+  const openPeek = useBrowserPeekStore((s) => s.open);
 
   // Brand-new chat draft: the workspace scope isn't locked in yet, so
   // there is nothing to report (mirrors WorkspaceMain's draft branch).
@@ -71,8 +87,15 @@ export function WorkspaceContextBar() {
   const prState = normalizePrState(workspace.pr_state);
   const hasGit = !!workspace.git_branch;
 
+  const showBrowserIndicator =
+    enableAgentChat &&
+    workspace.workspace_type !== "open_flow" &&
+    !!backgroundBrowserSession;
+
   // Nothing to report at all (e.g. a home-directory workspace).
-  if (!hasGit && !prState && !workspace.linked_issue) return null;
+  if (!hasGit && !prState && !workspace.linked_issue && !showBrowserIndicator) {
+    return null;
+  }
 
   const isWorktree = workspace.workspace_kind
     ? workspace.workspace_kind === "worktree"
@@ -152,6 +175,23 @@ export function WorkspaceContextBar() {
       )}
 
       <div className="ml-auto flex shrink-0 items-center gap-2">
+        {/* GUI-mode background browser indicator — opens the peek overlay */}
+        {showBrowserIndicator && (
+          <button
+            type="button"
+            onClick={() => openPeek(workspace.workspace_id)}
+            aria-label="Browser running in background — view"
+            className="inline-flex h-[26px] items-center gap-1.5 rounded-md border border-status-remote/30 bg-status-remote/10 px-2.5 text-[11px] font-semibold text-status-remote transition-colors hover:bg-status-remote/16 hover:text-foreground"
+          >
+            <Globe className="h-3 w-3" aria-hidden />
+            Browser
+            <span
+              className="cm-blink h-1.5 w-1.5 rounded-full bg-status-working"
+              aria-hidden
+            />
+          </button>
+        )}
+
         {/* PR chip — opens the PR on GitHub */}
         {prState && (
           <button

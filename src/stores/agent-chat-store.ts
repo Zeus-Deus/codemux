@@ -7,6 +7,7 @@ import {
   createEmptyThreadState,
   markRequestResolved,
   markRequestResponding,
+  removeUserMessageByNonce,
 } from "@/lib/agent-chat/reducer";
 import type { ChatThreadState, ChatViewItem } from "@/lib/agent-chat/types";
 import type { AgentChatCheckpointRecord } from "@/tauri/commands";
@@ -158,7 +159,14 @@ interface AgentChatStore {
   /** Apply a canonical provider event to the matching slice. */
   applyEvent: (threadId: string, event: ProviderRuntimeEvent) => void;
   /** Append a user message optimistically (no provider echo). */
-  appendUserMessage: (threadId: string, text: string) => void;
+  appendUserMessage: (
+    threadId: string,
+    text: string,
+    clientNonce?: string,
+  ) => void;
+  /** Roll back an optimistic user bubble by its client nonce (send RPC
+   *  failed). No-op when not found. */
+  removeUserMessageByNonce: (threadId: string, clientNonce: string) => void;
   /** Flag a permission request as in-flight while the invoke runs. */
   markRequestResponding: (
     threadId: string,
@@ -305,12 +313,20 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       }),
     ),
 
-  appendUserMessage: (threadId, text) =>
+  appendUserMessage: (threadId, text, clientNonce) =>
     set((state) =>
       updateSlice(state, threadId, (slice) => ({
         ...slice,
-        ...appendUserMessage(slice, text),
+        ...appendUserMessage(slice, text, undefined, clientNonce),
         inputDraft: "",
+      })),
+    ),
+
+  removeUserMessageByNonce: (threadId, clientNonce) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) => ({
+        ...slice,
+        ...removeUserMessageByNonce(slice, clientNonce),
       })),
     ),
 
