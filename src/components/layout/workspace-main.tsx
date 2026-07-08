@@ -125,6 +125,10 @@ export function WorkspaceMain() {
   // present on both drafts and real workspaces — a preset click on a
   // draft materialises the workspace via `materializeWithPreset`.
   const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
+  // GUI chrome (Agent Chat Beta): the title bar absorbs the tab strip +
+  // preset launcher, so those stacked rows drop here. Off ⇒ legacy chrome
+  // renders byte-identical.
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
   const activeDraft = useChatDraftStore((s) =>
     s.activeDraftId ? s.draftsById[s.activeDraftId] ?? null : null,
@@ -182,10 +186,13 @@ export function WorkspaceMain() {
 
   return (
     <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
-      {/* Left: tab bar + preset bar + pane content */}
+      {/* Left: tab bar + preset bar + pane content. In GUI chrome the
+          title bar hosts the tabs + launcher, so both rows are dropped. */}
       <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
-        <TabBar workspace={activeWorkspace} />
-        <PresetBar workspaceId={activeWorkspace.workspace_id} />
+        {!enableAgentChat && <TabBar workspace={activeWorkspace} />}
+        {!enableAgentChat && (
+          <PresetBar workspaceId={activeWorkspace.workspace_id} />
+        )}
         <div className="flex-1 min-h-0 overflow-hidden">
           {activeTab?.kind === "diff" ? (
             <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />
