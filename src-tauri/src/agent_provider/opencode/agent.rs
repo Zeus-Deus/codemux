@@ -178,7 +178,12 @@ impl AgentProvider for OpenCodeAgentProvider {
                 input.effort_override,
             )
             .await?;
-        Ok(TurnStartResult { turn_id })
+        // OpenCode has no busy guard and no follow-up queue yet — every
+        // send starts immediately, so `queued_id` is always `None`.
+        Ok(TurnStartResult {
+            turn_id,
+            queued_id: None,
+        })
     }
 
     async fn interrupt_turn(

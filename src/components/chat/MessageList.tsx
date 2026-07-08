@@ -59,6 +59,9 @@ interface Props {
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  /** Follow-up queueing: cancel a queued user turn. `text` is passed
+   *  back so the caller can restore it into the composer. */
+  onCancelQueued?: (queuedId: string, text: string) => void;
 }
 
 /**
@@ -84,6 +87,7 @@ export function MessageList({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onCancelQueued,
 }: Props) {
   // Sort by seq so order is a property of the data, not of React
   // reconciliation or store-update timing (stable id tiebreak).
@@ -225,6 +229,7 @@ export function MessageList({
                     onRespondToRequest={onRespondToRequest}
                     onAcceptPlan={onAcceptPlan}
                     onRejectPlan={onRejectPlan}
+                    onCancelQueued={onCancelQueued}
                   />
                 )}
               </MessageScrollerItem>
@@ -339,6 +344,7 @@ function ItemRow({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onCancelQueued,
 }: {
   item: ChatViewItem;
   showAvatar: boolean;
@@ -347,6 +353,7 @@ function ItemRow({
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  onCancelQueued?: (queuedId: string, text: string) => void;
 }) {
   const requestId =
     item.kind === "tool_call"
@@ -368,7 +375,7 @@ function ItemRow({
   }, [item, onRejectPlan]);
 
   if (item.kind === "user_message") {
-    return <UserMessage item={item} />;
+    return <UserMessage item={item} onCancelQueued={onCancelQueued} />;
   }
 
   return (

@@ -20,6 +20,9 @@ interface Props {
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  /** Follow-up queueing: cancel a queued turn (X on the greyed bubble).
+   *  `text` is passed back so the caller can restore it to the composer. */
+  onCancelQueued?: (queuedId: string, text: string) => void;
 }
 
 /**
@@ -37,6 +40,7 @@ export function ChatTranscript({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onCancelQueued,
 }: Props) {
   const showThinking = shouldShowThinkingIndicator(messages, streaming);
 
@@ -51,6 +55,7 @@ export function ChatTranscript({
         onRespondToRequest={onRespondToRequest}
         onAcceptPlan={onAcceptPlan}
         onRejectPlan={onRejectPlan}
+        onCancelQueued={onCancelQueued}
       />
     </div>
   );

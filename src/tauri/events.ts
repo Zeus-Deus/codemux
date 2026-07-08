@@ -229,6 +229,31 @@ export type ProviderRuntimeEvent =
       type: "resume_cursor_updated";
       thread_id: string;
       resume_cursor: unknown;
+    }
+  // Follow-up queueing (mirrors `ProviderRuntimeEvent` in
+  // src-tauri/src/agent_provider/events.rs). A send that arrives while a
+  // turn is in flight is queued instead of rejected.
+  | {
+      type: "turn_queued";
+      thread_id: string;
+      queued_id: string;
+      /** Echoes the optimistic-send correlation token so the reducer can
+       *  grey out the already-appended bubble instead of duplicating it.
+       *  `null` for older callers / a remounted pane. */
+      client_nonce: string | null;
+      text: string;
+    }
+  | {
+      type: "queued_turn_dispatched";
+      thread_id: string;
+      queued_id: string;
+      turn_id: string;
+      text: string;
+    }
+  | {
+      type: "queued_turn_cancelled";
+      thread_id: string;
+      queued_id: string;
     };
 
 /** Canonical provider event payload as delivered to the frontend —

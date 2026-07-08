@@ -115,6 +115,7 @@ impl AgentProvider for MockAgentProvider {
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
         Ok(TurnStartResult {
             turn_id: TurnId("mock-turn".into()),
+            queued_id: None,
         })
     }
 

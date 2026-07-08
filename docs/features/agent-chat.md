@@ -811,6 +811,82 @@ token. Because the write lands in `pane_statuses`, the sidebar rows,
 collapsed-rail aggregate dot, hover flyout, and `PaneNode` borders all
 update for free.
 
+## Follow-up queueing
+
+Sending a chat message while the agent is mid-turn **queues** it instead
+of rejecting it. Previously the frontend optimistically appended the user
+bubble and then `agent_chat_send_turn` failed with
+`ProviderError::ValidationError("session has an active turn …")`, leaving
+an orphaned bubble + a toast + a message that never got answered. Now the
+send is queued and auto-dispatched as the next turn.
+
+**Backend-authoritative queue.** The queue lives in Rust session state
+(`queued_turns: VecDeque<QueuedTurn>` on both `claude/session.rs` and
+`codex/session.rs`), so it survives pane unmount/remount. The busy branch
+of `send_turn` enqueues rather than erroring (`enqueue_or_send`); the
+busy check re-runs under the state lock, so there is no TOCTOU with a
+turn that finished between the frontend send and the backend enqueue.
+`TurnStartResult` gained an optional `queued_id` — set when the send was
+queued (its `turn_id` is then an empty placeholder). OpenCode has no busy
+guard and no queue; `cancel_queued_turn` is a trait-default no-op there.
+
+**Draining.** On the turn-completion transition (Claude: the SDK `result`
+message → Ready; Codex: `turn/completed` → Ready), and after
+interrupt/abort, the session pops the next queued turn (FIFO) and
+dispatches it through the same internal send path
+(`drain_queue`). Dispatch happens **after** the completion handler
+releases the session lock, so `do_send` can re-acquire it without
+deadlocking. Draining only fires when the session is truly idle (Ready,
+no active turn, no pending approval). On session error/close the whole
+queue is cancelled (`cancel_all_queued`). A failed dispatch cancels that
+item and continues — the queue never wedges.
+
+**Events** (`ProviderRuntimeEvent`, forwarded through `forward_event`):
+
+- `TurnQueued { thread_id, queued_id, client_nonce, text }` — a send was
+  parked. `client_nonce` echoes the optimistic-send correlation token so
+  the reducer greys the already-appended bubble instead of duplicating
+  it; `text` lets a remounted pane reconstruct the bubble.
+- `QueuedTurnDispatched { thread_id, queued_id, turn_id, text }` — the
+  queued turn is now active. `forward_event` persists the user-message
+  envelope **here** (not at enqueue time) so chat history reflects real
+  turn order. The reducer promotes the greyed bubble to a normal user
+  message and re-seqs it to the dispatch-time tail.
+- `QueuedTurnCancelled { thread_id, queued_id }` — the queued turn was
+  cancelled (by the user or by session close/error). The reducer removes
+  the greyed bubble.
+
+**Command.** `agent_chat_cancel_queued_turn(provider, thread_id,
+queued_id)` cancels a queued turn (idempotent). Wrapper:
+`agentChatCancelQueuedTurn` in `src/tauri/commands.ts`.
+
+**Frontend.** `UserMessageItem` gained `queued?: { queuedId }` (greyed
+render + "Queued" pill + hover-X) and `clientNonce?` (reconciliation +
+error rollback). Queued items sort to the very bottom via a `QUEUED_SEQ_BASE`
+offset so they stay below the streaming turn. The composer's `handleSubmit`
+attaches a `client_nonce`, treats a queued result as success (the
+`turn_queued` event greys the bubble), and on a genuine RPC failure rolls
+the optimistic bubble back and restores the draft (fixes the orphan bug).
+The Composer allows Enter-to-queue while streaming (blocked only during
+the in-flight send RPC) and shows a subtle "Enter to queue" hint;
+cancelling a queued item restores its text into the composer draft.
+
+**Persistence/hydrate note.** The queue is in-memory session state; there
+is no "get session status" command that carries a queued-turns snapshot,
+so a pane that remounts mid-queue does NOT re-render the still-pending
+queued items until they dispatch (they still drain correctly
+backend-side). Adding the snapshot to a status command is a possible
+follow-up.
+
+**Out of scope (TODO):**
+
+- **Steering / inject-into-live-turn** (Cmd+Enter "send now" that injects
+  into the running turn rather than queuing behind it).
+- **Editing a queued message in place** (cancel-restores-to-composer
+  covers the common case).
+- **Persisting the queue across app restart.**
+- **OpenCode queue parity.**
+
 ## Feature flag
 
 The new flag `enable_agent_chat` lives on the existing `FeatureFlags`

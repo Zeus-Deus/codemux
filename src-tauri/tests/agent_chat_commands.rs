@@ -225,6 +225,7 @@ async fn send_turn_forwards_to_selected_provider() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();

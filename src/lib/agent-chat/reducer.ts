@@ -8,7 +8,19 @@ import {
   type PermissionRequestItem,
   type ReasoningItem,
   type ToolCallItem,
+  type UserMessageItem,
 } from "./types";
+
+/**
+ * Seq offset for QUEUED user messages so they always sort to the very
+ * bottom of the transcript (below the streaming assistant turn they're
+ * parked behind), regardless of how many items stream in after they were
+ * enqueued. The 5,000-item cap keeps real seqs far below this; among
+ * themselves queued items keep FIFO order via the monotonic `nextSeq`
+ * they add on top. Cleared (re-seq'd to a normal tail seq) when a queued
+ * turn dispatches.
+ */
+const QUEUED_SEQ_BASE = 1_000_000_000;
 
 /**
  * Wall-clock source for reasoning-block timing. Injectable so tests can
@@ -180,14 +192,16 @@ function appendUserMessageLocal(
   state: ChatThreadState,
   text: string,
   now: Clock,
+  clientNonce?: string,
 ): ChatThreadState {
   const sealed = sealTrailingReasoning(state, now);
   const { seq, next } = takeSeq(sealed);
-  const item: ChatViewItem = {
+  const item: UserMessageItem = {
     kind: "user_message",
     id: nextId("user"),
     seq,
     text,
+    ...(clientNonce ? { clientNonce } : {}),
   };
   return { ...next, messages: [...next.messages, item] };
 }
@@ -195,14 +209,44 @@ function appendUserMessageLocal(
 /**
  * Local-only action: append a user turn the composer just submitted.
  * Providers do not echo user messages back in the event stream, so the
- * UI inserts them optimistically.
+ * UI inserts them optimistically. `clientNonce` (when provided) lets a
+ * later `turn_queued` event reconcile this exact bubble instead of
+ * duplicating it, and lets an error path roll it back
+ * (`removeUserMessageByNonce`).
  */
 export function appendUserMessage(
   state: ChatThreadState,
   text: string,
   now: Clock = defaultClock,
+  clientNonce?: string,
 ): ChatThreadState {
-  return maybeCapMessages(appendUserMessageLocal(state, text, now));
+  return maybeCapMessages(appendUserMessageLocal(state, text, now, clientNonce));
+}
+
+/**
+ * Local-only action: roll back an optimistic user bubble by its client
+ * nonce. Used when the send RPC fails outright so no orphan bubble is
+ * left behind (fixes the pre-queue orphan bug). No-op when not found.
+ */
+export function removeUserMessageByNonce(
+  state: ChatThreadState,
+  clientNonce: string,
+): ChatThreadState {
+  const idx = state.messages.findIndex(
+    (m) => m.kind === "user_message" && m.clientNonce === clientNonce,
+  );
+  if (idx < 0) return state;
+  return { ...state, messages: state.messages.filter((_, i) => i !== idx) };
+}
+
+/** Find a queued user bubble by its backend queued id. */
+function findQueuedUserMessage(
+  messages: ChatViewItem[],
+  queuedId: string,
+): number {
+  return messages.findIndex(
+    (m) => m.kind === "user_message" && m.queued?.queuedId === queuedId,
+  );
 }
 
 /**
@@ -683,6 +727,65 @@ function applyEventInner(
       // Transcript-level no-op: the store slice tracks resume_cursor
       // outside of ChatThreadState so the reducer stays pure.
       return state;
+    }
+
+    case "turn_queued": {
+      // A follow-up send parked behind the active turn. Prefer to
+      // reconcile with the optimistic bubble the composer already
+      // appended (matched on client_nonce) so we don't duplicate it;
+      // re-seq it into the QUEUED band so it pins to the bottom below
+      // the streaming turn.
+      const nonce = event.client_nonce;
+      const existingIdx =
+        nonce != null
+          ? state.messages.findIndex(
+              (m) => m.kind === "user_message" && m.clientNonce === nonce,
+            )
+          : -1;
+      if (existingIdx >= 0) {
+        const existing = state.messages[existingIdx] as UserMessageItem;
+        const { seq, next } = takeSeq(state);
+        const updated: UserMessageItem = {
+          ...existing,
+          queued: { queuedId: event.queued_id },
+          seq: QUEUED_SEQ_BASE + seq,
+        };
+        return { ...next, messages: replaceItem(next.messages, existingIdx, updated) };
+      }
+      // No optimistic bubble (e.g. a remounted pane that never saw the
+      // send) — reconstruct the greyed item straight from the event.
+      const { seq, next } = takeSeq(state);
+      const item: UserMessageItem = {
+        kind: "user_message",
+        id: nextId("queued"),
+        seq: QUEUED_SEQ_BASE + seq,
+        text: event.text,
+        queued: { queuedId: event.queued_id },
+        ...(nonce != null ? { clientNonce: nonce } : {}),
+      };
+      return { ...next, messages: [...next.messages, item] };
+    }
+
+    case "queued_turn_dispatched": {
+      // The queued turn is now the active turn — promote its bubble to a
+      // normal user message and re-seq it to the tail so it renders at
+      // its real dispatch position (after everything the prior turn
+      // produced), not where it was typed.
+      const idx = findQueuedUserMessage(state.messages, event.queued_id);
+      if (idx < 0) return state;
+      const existing = state.messages[idx] as UserMessageItem;
+      const { seq, next } = takeSeq(state);
+      const { queued: _dropped, ...rest } = existing;
+      const promoted: UserMessageItem = { ...rest, seq };
+      return { ...next, messages: replaceItem(next.messages, idx, promoted) };
+    }
+
+    case "queued_turn_cancelled": {
+      // The queued turn was cancelled (by the user, or by session
+      // close/error) — remove its greyed bubble.
+      const idx = findQueuedUserMessage(state.messages, event.queued_id);
+      if (idx < 0) return state;
+      return { ...state, messages: state.messages.filter((_, i) => i !== idx) };
     }
 
     default: {

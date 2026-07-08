@@ -789,12 +789,20 @@ pub async fn agent_chat_restore_checkpoint(
 }
 
 /// Queue a user turn on an existing session.
+///
+/// Returns a [`TurnStartResult`]: when the session was busy the turn is
+/// **queued** (`queued_id` set) rather than rejected, and dispatches
+/// automatically when the current turn finishes. The user-message
+/// envelope is persisted here only for an immediate start; a queued
+/// turn's envelope is written when it actually DISPATCHES (see
+/// [`forward_event`]'s `QueuedTurnDispatched` handling) so chat history
+/// reflects real turn order.
 #[tauri::command]
 pub async fn agent_chat_send_turn(
     app: AppHandle,
     provider: ProviderKind,
     input: SendTurnInput,
-) -> Result<TurnId, String> {
+) -> Result<crate::agent_provider::TurnStartResult, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
@@ -804,7 +812,7 @@ pub async fn agent_chat_send_turn(
     let thread_id_for_persist = input.thread_id.0.clone();
     let user_text_for_persist = input.text.clone();
     let first_line = first_line_title(&input.text);
-    let turn = impl_.send_turn(input).await.map_err(provider_err)?;
+    let result = impl_.send_turn(input).await.map_err(provider_err)?;
 
     // Best-effort: bump last_active_at so the session floats to the
     // top of the dropdown, and set an auto-title from the first user
@@ -817,20 +825,51 @@ pub async fn agent_chat_send_turn(
             let _ = db.set_agent_chat_title(&thread_id_for_persist, &title);
         }
     }
-    // Persist the user message envelope. User messages never come
-    // back through the provider event stream, so this is the one
-    // chance to record them. Best-effort: a failed write means
-    // resume will skip this user turn but the live conversation is
+    // Persist the user message envelope — but ONLY for an immediate
+    // start. A queued turn is persisted when it dispatches, so the
+    // transcript records real turn order rather than type order. User
+    // messages never come back through the provider event stream, so
+    // this is the one chance to record them. Best-effort: a failed write
+    // means resume will skip this user turn but the live conversation is
     // unaffected.
+    if result.queued_id.is_none() {
+        persist_user_message(&db, &thread_id_for_persist, &user_text_for_persist);
+    }
+    Ok(result)
+}
+
+/// Cancel a queued (not-yet-dispatched) follow-up turn. Idempotent — an
+/// unknown or already-dispatched id is a silent success. On success the
+/// provider emits a `QueuedTurnCancelled` event so the UI removes the
+/// greyed bubble.
+#[tauri::command]
+pub async fn agent_chat_cancel_queued_turn(
+    app: AppHandle,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    queued_id: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    impl_
+        .cancel_queued_turn(thread_id, queued_id)
+        .await
+        .map_err(provider_err)
+}
+
+/// Append the synthetic `{"type":"user_message"}` transcript envelope.
+/// Best-effort — a failed write only means resume skips this user turn.
+fn persist_user_message(db: &DatabaseStore, thread_id: &str, text: &str) {
     let user_msg = serde_json::json!({
         "type": "user_message",
-        "thread_id": thread_id_for_persist,
-        "text": user_text_for_persist,
+        "thread_id": thread_id,
+        "text": text,
     });
     if let Ok(payload) = serde_json::to_string(&user_msg) {
-        let _ = db.append_agent_chat_message(&thread_id_for_persist, &payload);
+        let _ = db.append_agent_chat_message(thread_id, &payload);
     }
-    Ok(turn.turn_id)
 }
 
 /// Derive a short dropdown title from the first user turn's text.
@@ -1229,6 +1268,20 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             }
         }
     }
+    // A queued follow-up turn just dispatched — NOW persist its
+    // user-message envelope, at real turn order (it was intentionally
+    // skipped at enqueue time in `agent_chat_send_turn`). The queue lives
+    // in provider memory, so this event is the one moment the command
+    // layer can record the turn.
+    if let ProviderRuntimeEvent::QueuedTurnDispatched {
+        thread_id, text, ..
+    } = &event
+    {
+        if !thread_id.0.is_empty() {
+            let db: State<'_, DatabaseStore> = app.state();
+            persist_user_message(&db, &thread_id.0, text);
+        }
+    }
     // Best-effort transcript persistence so the SessionSelector resume
     // path can replay the visible conversation. We only persist events
     // that mutate the rendered transcript; partial deltas, lifecycle
@@ -1331,7 +1384,14 @@ fn map_event_to_pane_status(event: &ProviderRuntimeEvent) -> Option<PaneStatus> 
         },
         ProviderRuntimeEvent::SessionConfigured { .. }
         | ProviderRuntimeEvent::ResumeCursorUpdated { .. }
-        | ProviderRuntimeEvent::RuntimeWarning { .. } => None,
+        | ProviderRuntimeEvent::RuntimeWarning { .. }
+        // Follow-up queue transitions don't drive the sidebar dot on
+        // their own: a dispatched turn's own `SessionStateChanged {
+        // Running }` sets Working, and enqueue / cancel leave the current
+        // indicator untouched.
+        | ProviderRuntimeEvent::TurnQueued { .. }
+        | ProviderRuntimeEvent::QueuedTurnDispatched { .. }
+        | ProviderRuntimeEvent::QueuedTurnCancelled { .. } => None,
     }
 }
 
@@ -1413,7 +1473,10 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::RequestOpened { thread_id, .. }
         | ProviderRuntimeEvent::RequestResolved { thread_id, .. }
         | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. }
-        | ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, .. } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, .. }
+        | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
+        | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
+        | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }

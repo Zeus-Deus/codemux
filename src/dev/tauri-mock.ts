@@ -405,6 +405,34 @@ function mockChatTranscript(): string[] {
 }
 
 let mockChatTurnSeq = 0;
+let mockQueuedSeq = 0;
+
+// Follow-up queueing: track which threads have a turn in flight and the
+// FIFO follow-up queue behind each, so `agent_chat_send_turn` can mirror
+// the real backend (queue-while-busy) and drain on completion.
+const chatActiveTurns = new Set<string>();
+interface MockQueuedTurn {
+  queuedId: string;
+  text: string;
+  clientNonce: string | null;
+}
+const chatQueues = new Map<string, MockQueuedTurn[]>();
+
+/** Pop the next queued follow-up (if any) and dispatch it, mirroring the
+ *  provider's drain-on-completion. */
+function drainChatQueue(threadId: string): void {
+  const q = chatQueues.get(threadId);
+  if (!q || q.length === 0) return;
+  const next = q.shift() as MockQueuedTurn;
+  const turnId = streamMockChatReply(threadId);
+  emitChatEvent(threadId, {
+    type: "queued_turn_dispatched",
+    thread_id: threadId,
+    queued_id: next.queuedId,
+    turn_id: turnId,
+    text: next.text,
+  });
+}
 
 /** Simulate a streaming assistant reply on the real event channel.
  *  Returns the turn id immediately; deltas tick on an interval so
@@ -423,6 +451,7 @@ function streamMockChatReply(
   const intervalMs = Math.max(5, opts.intervalMs ?? 40);
   const send = (event: unknown) => emitChatEvent(threadId, event);
 
+  chatActiveTurns.add(threadId);
   send({
     type: "session_state_changed",
     thread_id: threadId,
@@ -578,6 +607,9 @@ function streamMockChatReply(
         thread_id: threadId,
         status: { status: "ready" },
       });
+      // Turn done — drain the next queued follow-up (FIFO).
+      chatActiveTurns.delete(threadId);
+      drainChatQueue(threadId);
     }
   }, intervalMs);
   return turnId;
@@ -841,8 +873,55 @@ const handlers: Record<string, Handler> = {
   ],
   agent_chat_start_session: (a) =>
     (a.input as { thread_id: string }).thread_id,
-  agent_chat_send_turn: (a) =>
-    streamMockChatReply((a.input as { thread_id: string }).thread_id),
+  agent_chat_send_turn: (a) => {
+    const input = a.input as {
+      thread_id: string;
+      text: string;
+      client_nonce?: string | null;
+    };
+    const threadId = input.thread_id;
+    // Queue-while-busy, mirroring the real provider: a send during an
+    // active turn parks in the FIFO queue and renders greyed-out.
+    if (chatActiveTurns.has(threadId)) {
+      const queuedId = `mock-queued-${++mockQueuedSeq}`;
+      const q = chatQueues.get(threadId) ?? [];
+      q.push({
+        queuedId,
+        text: input.text,
+        clientNonce: input.client_nonce ?? null,
+      });
+      chatQueues.set(threadId, q);
+      emitChatEvent(threadId, {
+        type: "turn_queued",
+        thread_id: threadId,
+        queued_id: queuedId,
+        client_nonce: input.client_nonce ?? null,
+        text: input.text,
+      });
+      return { turn_id: "", queued_id: queuedId };
+    }
+    const turnId = streamMockChatReply(threadId);
+    return { turn_id: turnId, queued_id: null };
+  },
+  agent_chat_cancel_queued_turn: (a) => {
+    const { threadId, queuedId } = a as {
+      threadId: string;
+      queuedId: string;
+    };
+    const q = chatQueues.get(threadId);
+    if (q) {
+      const idx = q.findIndex((e) => e.queuedId === queuedId);
+      if (idx >= 0) {
+        q.splice(idx, 1);
+        emitChatEvent(threadId, {
+          type: "queued_turn_cancelled",
+          thread_id: threadId,
+          queued_id: queuedId,
+        });
+      }
+    }
+    return undefined;
+  },
   agent_chat_interrupt_turn: () => undefined,
   agent_chat_respond_to_request: () => undefined,
   agent_chat_set_model: () => undefined,

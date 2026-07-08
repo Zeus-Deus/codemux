@@ -1200,6 +1200,19 @@ export interface AgentChatSendTurnInput {
    *  `sandboxPolicy` on `turn/start`. Wired in the backend struct;
    *  MVP Codex UI still round-trips mode via session restart. */
   permission_mode_override?: string | null;
+  /** Follow-up queueing — optimistic-send correlation token. When the
+   *  turn is queued behind an active turn the backend echoes this on the
+   *  `turn_queued` event so the reducer reconciles the greyed bubble
+   *  instead of duplicating it. */
+  client_nonce?: string | null;
+}
+
+/** Result of `agent_chat_send_turn`. When `queued_id` is set the turn
+ *  was queued behind an active turn (rendered greyed-out) instead of
+ *  starting immediately; `turn_id` is an empty placeholder in that case. */
+export interface TurnStartResult {
+  turn_id: string;
+  queued_id: string | null;
 }
 
 export const getHomeDir = () => invoke<string>("get_home_dir");
@@ -1227,7 +1240,7 @@ export const agentChatStartSession = (
 export const agentChatSendTurn = (
   provider: AgentChatProviderKind,
   input: AgentChatSendTurnInput,
-) => invoke<string>("agent_chat_send_turn", { provider, input });
+) => invoke<TurnStartResult>("agent_chat_send_turn", { provider, input });
 
 export const agentChatInterruptTurn = (
   provider: AgentChatProviderKind,
@@ -1238,6 +1251,20 @@ export const agentChatInterruptTurn = (
     provider,
     threadId,
     turnId,
+  });
+
+/** Cancel a queued (not-yet-dispatched) follow-up turn. On success the
+ *  provider emits a `queued_turn_cancelled` event so the UI removes the
+ *  greyed bubble. */
+export const agentChatCancelQueuedTurn = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  queuedId: string,
+) =>
+  invoke<void>("agent_chat_cancel_queued_turn", {
+    provider,
+    threadId,
+    queuedId,
   });
 
 export const agentChatRespondToRequest = (

@@ -218,10 +218,18 @@ impl AgentProvider for ClaudeAgentProvider {
         let session = session.ok_or_else(|| ProviderError::SessionNotFound {
             thread_id: input.thread_id.clone(),
         })?;
-        let turn_id = session
-            .send_turn(input.text, input.images, input.model_override)
-            .await?;
-        Ok(TurnStartResult { turn_id })
+        Ok(match session.enqueue_or_send(input).await? {
+            crate::agent_provider::SendOutcome::Started(turn_id) => TurnStartResult {
+                turn_id,
+                queued_id: None,
+            },
+            crate::agent_provider::SendOutcome::Queued(queued_id) => TurnStartResult {
+                // No live turn yet — the real id arrives on
+                // QueuedTurnDispatched. Empty placeholder keeps the shape.
+                turn_id: TurnId(String::new()),
+                queued_id: Some(queued_id),
+            },
+        })
     }
 
     async fn interrupt_turn(
@@ -235,6 +243,22 @@ impl AgentProvider for ClaudeAgentProvider {
         };
         let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
         session.interrupt(turn_id).await
+    }
+
+    async fn cancel_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<(), ProviderError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&thread_id).cloned()
+        };
+        // A missing session means nothing is queued — treat as a no-op.
+        let Some(session) = session else {
+            return Ok(());
+        };
+        session.cancel_queued(&queued_id).await
     }
 
     async fn respond_to_request(
