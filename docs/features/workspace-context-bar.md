@@ -35,6 +35,13 @@ Left → right:
   (`side="top"`).
 - **Device** — laptop icon + "This device", or cloud icon + host name
   (resolved from `useHosts()` by `host_id`) for remote workspaces.
+- **Background browser indicator** (GUI mode only — `docs/features/browser.md`
+  § "Background browser in GUI mode") — a sky-tinted pill with a blinking
+  amber dot, shown while the active workspace has a live, pane-less
+  `agent_browser_sessions` entry (an agent opened a browser and the Agent
+  Chat GUI Beta kept it detached instead of splitting a pane). Click opens
+  the floating peek overlay (`BrowserPeekOverlay`). Gated on `enableAgentChat
+  && workspace.workspace_type !== "open_flow"`, mirroring `useGuiChrome()`.
 
 The sidebar's expanded footer row (`sidebar-footer-bar.tsx`) is
 height-matched to the bar (42px, border-top instead of a separator +
@@ -50,8 +57,8 @@ new data plumbing.
 - no active workspace;
 - a lazy-creation chat draft is active (unscoped new chat);
 - the onboarding wizard covers the active workspace;
-- the workspace has no git branch, no PR, and no linked issue
-  (e.g. a home-directory workspace).
+- the workspace has no git branch, no PR, no linked issue, and no live
+  background browser session (e.g. a home-directory workspace).
 
 ## What Works Today
 
@@ -77,8 +84,9 @@ new data plumbing.
 - `src/components/layout/app-shell.tsx` — mounted after `WorkspaceMain` in `SidebarInset`
 - `src/components/github/pr-status-icon.tsx` — PR state icon + humanized label
 - `src/components/github/issue-detail-popover.tsx` — `variant="chip"`, `side`/`align` props
-- `src/stores/app-store.ts` — `useActiveWorkspace()`
+- `src/stores/app-store.ts` — `useActiveWorkspace()`, `useAppStore()` (background-browser session lookup)
 - `src/stores/hosts-store.ts` — `useHosts()` host-name lookup
+- `src/stores/browser-peek-store.ts` — the indicator's click target (opens the peek)
 - `src/dev/tauri-mock.ts` — `get_github_issue` mock for the popover
 - `src/components/layout/workspace-context-bar.test.tsx` — unit tests
 

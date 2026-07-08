@@ -32,8 +32,7 @@ import {
   useActiveWorkspaceId,
   useAppStore,
 } from "@/stores/app-store";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
-import { useFeatureFlags } from "@/stores/feature-flags";
+import { useGuiChrome } from "@/hooks/use-gui-chrome";
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { useUIStore } from "@/stores/ui-store";
 import { toast } from "@/lib/toast";
@@ -313,32 +312,14 @@ interface TitleBarProps {
 }
 
 export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
-  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
-  const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
-  const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
   const activeWorkspaceId = useActiveWorkspaceId();
-  // Primitive selector — stays stable across backend ticks so the whole
-  // title bar doesn't re-render on every snapshot emit.
-  const activeWorkspaceType = useAppStore((s) => {
-    const id = s.appState?.active_workspace_id;
-    if (!id) return null;
-    return (
-      s.appState!.workspaces.find((w) => w.workspace_id === id)
-        ?.workspace_type ?? null
-    );
-  });
 
   // GUI chrome renders for a real, non-OpenFlow workspace when the Agent
   // Chat Beta is on. A live lazy-creation draft (no workspace yet) keeps
   // the legacy bar so the draft surface's own PresetBar stays coherent;
-  // OpenFlow keeps its dedicated chrome untouched.
-  const lazyDraftActive = lazyEnabled && activeDraftId !== null;
-  const guiChrome =
-    enableAgentChat &&
-    !lazyDraftActive &&
-    activeWorkspaceId != null &&
-    activeWorkspaceType != null &&
-    activeWorkspaceType !== "open_flow";
+  // OpenFlow keeps its dedicated chrome untouched. Shared with other
+  // GUI-mode-only surfaces via `useGuiChrome` (see hook doc comment).
+  const guiChrome = useGuiChrome();
 
   if (!guiChrome) {
     return (

@@ -920,6 +920,7 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
         "browser_automation" => {
             let state: State<'_, AppStateStore> = app.state();
             let agent_browser: State<'_, crate::agent_browser::AgentBrowserManager> = app.state();
+            let observability: State<'_, crate::observability::ObservabilityStore> = app.state();
             let mut workspace_id = request.params
                 .get("workspace_id")
                 .and_then(Value::as_str)
@@ -1008,8 +1009,41 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                     stream_port,
                 );
 
-                // Auto-create a browser pane if no pane is attached and user hasn't dismissed it.
-                let should_create = agent_session.pane_id.is_none() && !agent_session.user_dismissed;
+                // GUI-mode background browsing (docs/features/browser.md
+                // "Background browser in GUI mode"): when the Agent Chat
+                // GUI beta is on and this isn't an OpenFlow workspace, the
+                // agent's browser session must stay detached — the
+                // frontend renders it as an inline chip + context-bar
+                // indicator instead of splitting the chat into a pane.
+                // OpenFlow workspaces and the flag-off path keep today's
+                // split-pane behavior unchanged.
+                let workspace_type = state
+                    .snapshot()
+                    .workspaces
+                    .iter()
+                    .find(|w| w.workspace_id.0 == workspace_id)
+                    .map(|w| w.workspace_type);
+                let gui_background_mode = observability.agent_chat_enabled()
+                    && workspace_type != Some(crate::state::WorkspaceType::OpenFlow);
+
+                // Auto-create a browser pane if no pane is attached and user hasn't dismissed it
+                // — unless GUI-mode background browsing suppresses it (see above).
+                let should_create = should_create_browser_pane(
+                    agent_session.pane_id.is_some(),
+                    agent_session.user_dismissed,
+                    gui_background_mode,
+                );
+
+                if gui_background_mode {
+                    // Mark the session live even though no pane will be
+                    // attached, so the frontend's "background session is
+                    // live" chip/indicator can key off `is_active` the
+                    // same way an attached session does. Emit immediately
+                    // so the chip/indicator appear without waiting for a
+                    // later `open` action to trigger the next emit.
+                    state.mark_agent_browser_active(&workspace_id);
+                    crate::state::emit_app_state(&app);
+                }
 
                 if should_create {
                     let target_pane_id = {
@@ -1071,7 +1105,22 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 agent_session.cli_session_name
             } else {
                 // Legacy global path: no workspace context (backward compat).
-                if state.snapshot().browser_sessions.is_empty() {
+                //
+                // The GUI-mode background-browsing gate deliberately does
+                // NOT apply here. This path has no resolved `workspace_id`,
+                // so no `AgentBrowserSession` exists to mark active — the
+                // background chip / context-bar indicator / peek overlay
+                // all key off a workspace's `agent_browser_sessions` entry
+                // and could never surface this browser. Suppressing the
+                // pane would therefore leave the browser running completely
+                // invisibly (no pane, no chip, no way to view or promote);
+                // a visible pane is the only safe behavior. See
+                // `should_create_legacy_browser_pane` for the unit-tested
+                // decision.
+                if should_create_legacy_browser_pane(
+                    state.snapshot().browser_sessions.is_empty(),
+                    observability.agent_chat_enabled(),
+                ) {
                     let active_pane_id = {
                         let snap = state.snapshot();
                         snap.workspaces.iter()
@@ -1119,6 +1168,21 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                         .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
                 }
             };
+
+            // A successful `close` ends the browser session — mirror that
+            // into the workspace's `AgentBrowserSession` so the GUI-mode
+            // background chip / context-bar indicator / peek overlay (which
+            // key off `is_active`) stop showing LIVE. Without this the
+            // session stayed `is_active: true` forever, since only
+            // `attach_agent_browser_to_pane` / `mark_agent_browser_active`
+            // ever touched the flag. Scoped to the workspace path — the
+            // legacy no-workspace path has no `AgentBrowserSession`.
+            if action_kind == "close" && result.is_ok() && !workspace_id.is_empty() {
+                if state.mark_agent_browser_inactive(&workspace_id) {
+                    crate::state::emit_app_state(&app);
+                }
+            }
+
             result
         }
         "get_project_memory" => memory::get_project_memory(
@@ -1429,6 +1493,45 @@ fn filter_ports_by_workspace<'a>(
         .collect()
 }
 
+/// Decide whether `browser_automation` should auto-create (or reconnect) a
+/// split browser pane for the agent's browser session.
+///
+/// Extracted as a small pure function so the GUI-mode background-browsing
+/// gate (docs/features/browser.md "Background browser in GUI mode") is
+/// unit-testable without standing up `AppStateStore`/`ObservabilityStore`.
+/// `pane_attached` and `user_dismissed` mirror the existing pre-GUI-mode
+/// rule; `gui_background_mode` is `true` when the Agent Chat GUI beta is on
+/// for a non-OpenFlow workspace, in which case the session must stay
+/// detached even though it would otherwise qualify for a new pane.
+fn should_create_browser_pane(
+    pane_attached: bool,
+    user_dismissed: bool,
+    gui_background_mode: bool,
+) -> bool {
+    !pane_attached && !user_dismissed && !gui_background_mode
+}
+
+/// Pane-creation decision for the **legacy no-workspace-context fallback**
+/// in the `browser_automation` handler.
+///
+/// Unlike [`should_create_browser_pane`], the Agent Chat GUI beta
+/// (`agent_chat_enabled`) is accepted but deliberately **ignored**: with no
+/// resolved `workspace_id` there is no `AgentBrowserSession` to mark
+/// active, so GUI-mode background browsing cannot be represented — the
+/// inline chip, context-bar indicator, and peek overlay all key off a
+/// workspace's `agent_browser_sessions` entry and would never surface this
+/// browser. Suppressing the pane here would leave the browser running
+/// completely invisibly (no pane, no chip, no way to view or promote), so
+/// the visible pane stays the behavior in both modes. The parameter exists
+/// (rather than not being taken at all) so this invariant is explicit and
+/// regression-tested.
+fn should_create_legacy_browser_pane(
+    browser_sessions_empty: bool,
+    _agent_chat_enabled_ignored: bool,
+) -> bool {
+    browser_sessions_empty
+}
+
 /// Resolve which workspace owns a given `cwd`, for browser routing when the
 /// caller sent an empty `workspace_id` (agent-chat Bash subprocesses,
 /// OpenCode's shared server, or any MCP/CLI caller whose
@@ -1590,6 +1693,57 @@ mod tests {
         ];
         let filtered = filter_ports_by_workspace(&ports, Some("ws-nonexistent"));
         assert!(filtered.is_empty());
+    }
+
+    // ─── should_create_browser_pane (GUI-mode background browsing gate) ─
+
+    #[test]
+    fn should_create_pane_when_detached_and_not_dismissed_and_not_gui_mode() {
+        // Today's exact behavior: flag off (or OpenFlow) always creates.
+        assert!(should_create_browser_pane(false, false, false));
+    }
+
+    #[test]
+    fn should_not_create_pane_when_already_attached() {
+        assert!(!should_create_browser_pane(true, false, false));
+    }
+
+    #[test]
+    fn should_not_create_pane_when_user_dismissed() {
+        assert!(!should_create_browser_pane(false, true, false));
+    }
+
+    #[test]
+    fn should_not_create_pane_in_gui_background_mode_even_if_otherwise_eligible() {
+        // The core GUI-mode gate: an otherwise-eligible detached,
+        // non-dismissed session must NOT get a pane when GUI background
+        // mode applies (Agent Chat beta on, non-OpenFlow workspace).
+        assert!(!should_create_browser_pane(false, false, true));
+    }
+
+    #[test]
+    fn gui_background_mode_does_not_override_already_attached_or_dismissed() {
+        assert!(!should_create_browser_pane(true, false, true));
+        assert!(!should_create_browser_pane(false, true, true));
+    }
+
+    #[test]
+    fn legacy_fallback_always_creates_pane_regardless_of_gui_flag() {
+        // The no-workspace-context fallback has no AgentBrowserSession to
+        // surface a background browser through (no chip / indicator /
+        // peek), so GUI background mode must NOT suppress the pane there —
+        // a visible pane is the only safe behavior. Regression guard
+        // against re-adding the gate on this path.
+        assert!(should_create_legacy_browser_pane(true, false));
+        assert!(should_create_legacy_browser_pane(true, true));
+    }
+
+    #[test]
+    fn legacy_fallback_skips_creation_when_a_browser_session_already_exists() {
+        // Pre-existing behavior, unchanged in both modes: the legacy path
+        // only bootstraps a pane when no browser session exists yet.
+        assert!(!should_create_legacy_browser_pane(false, false));
+        assert!(!should_create_legacy_browser_pane(false, true));
     }
 
     // ─── resolve_workspace_id_by_cwd (browser routing fallback) ─────────

@@ -7,6 +7,9 @@ import type {
   PermissionRequestItem,
   ToolCallItem,
 } from "@/lib/agent-chat/types";
+import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
+import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
 import { MessageList } from "./MessageList";
 
@@ -359,5 +362,172 @@ describe("MessageList chrome", () => {
   it("does not render the streaming marker when showThinking is unset", () => {
     renderList([readCall(0, "/a")]);
     expect(screen.queryByRole("status", { name: "Agent is working" })).toBeNull();
+  });
+});
+
+// ── GUI-mode background browser chip ──
+// (docs/features/browser.md "Background browser in GUI mode")
+
+function makeWorkspace(overrides: Partial<WorkspaceSnapshot> = {}): WorkspaceSnapshot {
+  return {
+    workspace_id: "ws-1",
+    title: "Test",
+    workspace_type: "standard",
+    cwd: "/path/to/project",
+    git_branch: "main",
+    git_ahead: 0,
+    git_behind: 0,
+    git_additions: 0,
+    git_deletions: 0,
+    git_changed_files: 0,
+    notification_count: 0,
+    notifications_muted: false,
+    latest_agent_state: null,
+    worktree_path: null,
+    project_root: null,
+    pr_number: null,
+    pr_state: null,
+    pr_url: null,
+    linked_issue: null,
+    tabs: [],
+    active_tab_id: "",
+    active_surface_id: "",
+    surfaces: [],
+    ...overrides,
+  };
+}
+
+function makeBackgroundSession(
+  overrides: Partial<AgentBrowserSession> = {},
+): AgentBrowserSession {
+  return {
+    session_id: "abs-1",
+    workspace_id: "ws-1",
+    cli_session_name: "ws-abc123",
+    stream_url: "ws://localhost:9223",
+    current_url: "https://example.com/dashboard",
+    is_active: true,
+    pane_id: null,
+    browser_id: null,
+    user_dismissed: false,
+    ...overrides,
+  };
+}
+
+function setAppStateForBrowserChip(
+  workspaceOverrides: Partial<WorkspaceSnapshot> = {},
+  sessions: AgentBrowserSession[] = [],
+) {
+  const ws = makeWorkspace(workspaceOverrides);
+  useAppStore.setState({
+    appState: {
+      schema_version: 1,
+      active_workspace_id: ws.workspace_id,
+      workspaces: [ws],
+      terminal_sessions: [],
+      browser_sessions: [],
+      agent_browser_sessions: sessions,
+      notifications: [],
+      detected_ports: [],
+      pane_statuses: {},
+      persistence: {
+        schema_version: 1,
+        stores_layout_metadata: true,
+        stores_terminal_metadata: true,
+        stores_live_process_state: false,
+      },
+      config: {} as AppStateSnapshot["config"],
+    },
+  });
+}
+
+describe("MessageList background browser chip", () => {
+  afterEach(() => {
+    useAppStore.setState({ appState: null });
+    useFeatureFlags.setState({ enableAgentChat: false });
+  });
+
+  it("renders the inline chip with the LIVE badge and current URL when the workspace has a live background session (GUI mode on)", () => {
+    useFeatureFlags.setState({ enableAgentChat: true });
+    setAppStateForBrowserChip({}, [makeBackgroundSession()]);
+    render(
+      <MessageList
+        messages={[readCall(0, "/a")]}
+        workspaceId="ws-1"
+        {...noopHandlers}
+      />,
+    );
+    expect(screen.getByText("Browser opened in background")).toBeInTheDocument();
+    expect(screen.getByText("Live")).toBeInTheDocument();
+    expect(
+      screen.getByText(/https:\/\/example\.com\/dashboard/),
+    ).toBeInTheDocument();
+  });
+
+  it("does not render the chip when the Agent Chat beta flag is off (flag-off byte-identical path)", () => {
+    useFeatureFlags.setState({ enableAgentChat: false });
+    setAppStateForBrowserChip({}, [makeBackgroundSession()]);
+    render(
+      <MessageList
+        messages={[readCall(0, "/a")]}
+        workspaceId="ws-1"
+        {...noopHandlers}
+      />,
+    );
+    expect(screen.queryByText("Browser opened in background")).toBeNull();
+  });
+
+  it("does not render the chip for an OpenFlow workspace even with the flag on", () => {
+    useFeatureFlags.setState({ enableAgentChat: true });
+    setAppStateForBrowserChip({ workspace_type: "open_flow" }, [
+      makeBackgroundSession(),
+    ]);
+    render(
+      <MessageList
+        messages={[readCall(0, "/a")]}
+        workspaceId="ws-1"
+        {...noopHandlers}
+      />,
+    );
+    expect(screen.queryByText("Browser opened in background")).toBeNull();
+  });
+
+  it("does not render the chip once the session is attached to a pane (promoted, no longer background)", () => {
+    useFeatureFlags.setState({ enableAgentChat: true });
+    setAppStateForBrowserChip({}, [
+      makeBackgroundSession({ pane_id: "pane-1", browser_id: "browser-1" }),
+    ]);
+    render(
+      <MessageList
+        messages={[readCall(0, "/a")]}
+        workspaceId="ws-1"
+        {...noopHandlers}
+      />,
+    );
+    expect(screen.queryByText("Browser opened in background")).toBeNull();
+  });
+
+  it("does not render the chip without a workspaceId prop, even with a matching session in state", () => {
+    useFeatureFlags.setState({ enableAgentChat: true });
+    setAppStateForBrowserChip({}, [makeBackgroundSession()]);
+    render(<MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />);
+    expect(screen.queryByText("Browser opened in background")).toBeNull();
+  });
+
+  it("does not render the chip once the session is inactive (browser closed — is_active false)", () => {
+    // Backs the close-action wiring: control.rs flips `is_active` to false
+    // on a successful `close`, and the chip must stop showing entirely
+    // (LIVE badge included) instead of blinking forever.
+    useFeatureFlags.setState({ enableAgentChat: true });
+    setAppStateForBrowserChip({}, [makeBackgroundSession({ is_active: false })]);
+    render(
+      <MessageList
+        messages={[readCall(0, "/a")]}
+        workspaceId="ws-1"
+        {...noopHandlers}
+      />,
+    );
+    expect(screen.queryByText("Browser opened in background")).toBeNull();
+    expect(screen.queryByText("Live")).toBeNull();
   });
 });

@@ -31,6 +31,104 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 - workspace-correct routing for env-less callers: `browser_automation` requests carry both the caller's `CODEMUX_WORKSPACE_ID` (injected into terminal PTYs and, since the agent-chat fix, into Claude/Codex chat sidecars) and a best-effort `cwd` hint. When `workspace_id` is empty, `resolve_workspace_id_by_cwd` in `src-tauri/src/control.rs` resolves the owning workspace lexically from the cwd (exact or component-safe subdirectory match against each workspace's `cwd`/`worktree_path`, longest root wins for nested worktrees) before falling back to the legacy active-workspace path — so agent-chat sessions (and OpenCode's shared server, which can't take per-session env) open their browser pane in the agent's own workspace, not whichever one the user is viewing
 - hang-proof external calls (issue #96): every `agent-browser` CLI / process-control invocation runs through hard-timeout wrappers (`output_capture_with_timeout` / `launch_status_with_timeout`) that kill the child — and, on Unix, its whole process group — on overrun, so a wedged daemon can never block `close()` / `start_stream()` / automation forever. The async callers also push the blocking work onto `tokio::task::spawn_blocking` so a slow CLI can't stall the runtime's worker threads. Default ceilings: ~5s process control, ~10s `close`, ~30s DOM actions, ~60s `open`/`wait`. Replaces the unbounded `std::process::Command::output()` calls that hung `cargo test` to the 30-minute job timeout on the Windows CI image.
 
+## Background browser in GUI mode
+
+When the Agent Chat GUI Beta (`enable_agent_chat`) is on for a real,
+non-OpenFlow workspace (the same gate as `docs/features/gui-chrome.md`'s
+`useGuiChrome`), an agent-opened browser (`codemux browser open` /
+`browser_automation`) no longer splits the chat pane into a browser pane.
+The daemon-level session, streaming, and automation handling are
+**unchanged** — this is purely a rendering decision. The `AgentBrowserSession`
+that would normally get `attach_agent_browser_to_pane`d instead stays
+detached (`pane_id: None`), same as it already does after the user manually
+closes a browser pane; the only difference is the session is marked
+`is_active` immediately (`AppStateStore::mark_agent_browser_active`) instead
+of waiting for a pane attach that will never come, and `emit_app_state`
+fires right away so the frontend picks it up without delay.
+
+**Backend gate** (`src-tauri/src/control.rs`, `browser_automation` handler):
+the existing auto-pane-creation decision (previously inline: `let
+should_create = agent_session.pane_id.is_none() && !agent_session
+.user_dismissed;`) is now behind a small pure function,
+`should_create_browser_pane(pane_attached, user_dismissed,
+gui_background_mode)`, unit-tested directly. `gui_background_mode` is
+`observability.agent_chat_enabled() && workspace_type !=
+Some(WorkspaceType::OpenFlow)`, applied on the workspace-scoped path only.
+Flag off, or an OpenFlow workspace, produces byte-identical behavior to
+before this feature — a pane is always created.
+
+The **legacy no-`workspace_id` fallback** (empty `workspace_id` and no cwd
+resolution) deliberately ignores the GUI flag and always creates the pane
+(`should_create_legacy_browser_pane`, also unit-tested): that path has no
+resolved workspace, so no `AgentBrowserSession` exists to mark active — the
+chip / indicator / peek could never surface the browser, and suppressing the
+pane would leave it running completely invisibly. A visible pane is the only
+safe behavior there.
+
+**Close wiring**: when a `browser_automation` `close` action completes
+successfully on the workspace-scoped path, the handler calls
+`AppStateStore::mark_agent_browser_inactive` (mirror of
+`mark_agent_browser_active` — flips `is_active` to false, keeps the session's
+URL / `cli_session_name` for a later reopen) and emits app state, so the
+chip, indicator, and peek stop presenting the session as live the moment the
+browser closes. Daemon-death detection (a browser dying without a `close`)
+is out of scope — only the explicit close path is wired.
+
+**Frontend surfaces**, all gated on the shared `useGuiChrome()` hook
+(`src/hooks/use-gui-chrome.ts`, extracted from `title-bar.tsx`'s inline
+predicate — see `docs/features/gui-chrome.md`) or the equivalent per-workspace
+flag+type check where a specific (possibly non-active) workspace id is
+already in hand:
+
+- **Inline conversation chip** (`src/components/chat/BackgroundBrowserChip.tsx`)
+  — `MessageList` cross-references `agent_browser_sessions` for the pane's
+  workspace (a session that `is_active` and has no `pane_id`) and appends
+  the chip as a derived row after the transcript (not a reducer
+  `ChatViewItem`). Globe icon chip with a blinking amber dot, "Browser
+  opened in background" + `LIVE` badge while active, the current URL
+  (`agent_browser_sessions[].current_url`, already tracked — no new field
+  needed), and a "View" affordance. Click opens the peek overlay.
+- **Context-bar indicator** (`src/components/layout/workspace-context-bar.tsx`)
+  — a sky-tinted pill with a blinking amber dot in the right-aligned
+  cluster, shown while the active workspace has a live background session.
+  The bar's "nothing to report" early-return now also checks this, so the
+  bar renders for the indicator alone even with no git/PR/issue. See
+  `docs/features/workspace-context-bar.md`.
+- **Peek overlay** (`src/components/browser/BrowserPeekOverlay.tsx`) — a
+  440×300 floating panel, absolutely positioned top-right inside the
+  already-`position: relative` `SidebarInset` (mounted once in
+  `app-shell.tsx`) so it overlays the chat surface without resizing it.
+  Escape, click-outside, and switching the active workspace all close it —
+  the peek is a transient "look at this now" affordance, so returning to a
+  workspace never pops it open unprompted. Header: green status dot, mono
+  URL readout, "Open as pane" (promote) and close buttons. Body: a live
+  `BrowserPane`. Peek open/closed state is a single `openWorkspaceId` in a
+  small zustand store, `src/stores/browser-peek-store.ts` (at most one peek
+  can be open app-wide).
+- **Promote to pane** — "Open as pane" calls the same `create_browser_pane`
+  Tauri command the `+` launcher's Panes → Browser item uses
+  (`agent-launcher.tsx`); `create_browser_pane_impl`
+  (`src-tauri/src/commands/browser.rs`) already finds and reconnects a
+  workspace's detached agent session, so no new backend command was
+  needed. The peek closes on promote; the chip/indicator stop showing
+  `LIVE`/the blink once the session is pane-attached (no longer
+  "background") since the chip/indicator lookups filter on `pane_id ===
+  null`.
+
+**`BrowserPane` plumbing note**: a detached/background session has no
+`browser_id` (that's only assigned once a pane exists), but `BrowserPane`
+resolved its `agentSession` strictly by `browser_id`. It now accepts an
+optional `workspaceId` prop; when set, the `agent_browser_sessions` lookup
+falls back to matching on `workspace_id` when the `browser_id` match misses.
+The peek overlay passes the session's own `cli_session_name` as `browserId`
+(so the stream daemon starts against the right session — the pane-attached
+path's existing `agent_session_name` fallback wasn't populated in the
+detached case) plus `workspaceId`. A new `hideToolbar` prop suppresses
+`BrowserPane`'s embedded address-bar toolbar for the peek, which renders its
+own compact header instead. Both props are additive and default to today's
+pane behavior (`workspaceId` unset falls through to the exact prior
+`browser_id`-only lookup; `hideToolbar` defaults to showing the toolbar).
+
 ## Expected Operating Model
 
 - agents control the browser programmatically
@@ -62,5 +160,10 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 - `src/components/browser/BrowserPane.tsx` — screenshot rendering, toolbar, address bar, reactive `stream_url` reconnect on URL change, auto-syncs viewport on pane resize via legacy `width`/`height` payload (which the new socket handler accepts unchanged); pointer-capture input forwarding (drag selection, hover, click-count chaining, right/middle click), cursor probe, host-clipboard bridge, probe-based liveness + corner reconnect pill
 - `src/components/browser/stream-protocol.ts` — pure helpers for the stream-input protocol (button mapping, click-count chaining, coordinate mapping, cursor sanitization) and the daemon HTTP endpoints (`/api/status` liveness probe, `/api/command` evals; page scripts minified for the single-segment HTTP constraint). Unit-tested in `stream-protocol.test.ts`
 - `src/components/browser/InspectorPanel.tsx` — browser inspector/DevTools panel
+- `src/components/browser/BrowserPeekOverlay.tsx` — GUI-mode background-browser floating peek (see "Background browser in GUI mode" above)
+- `src/components/chat/BackgroundBrowserChip.tsx` — the inline conversation chip for a background session
+- `src/hooks/use-gui-chrome.ts` — the shared `useGuiChrome()` gate the chip/indicator/peek key off
+- `src/stores/browser-peek-store.ts` — peek open/closed state (single `openWorkspaceId`; cleared on workspace switch)
+- `src-tauri/src/state/state_impl.rs` — `AgentBrowserSession` (`is_active`, `pane_id`, `current_url`), `mark_agent_browser_active` / `mark_agent_browser_inactive`, `attach_agent_browser_to_pane`, `detach_agent_browser_from_pane`, `find_detached_agent_browser`
 - `docs/reference/BROWSER-AGENT-COMMANDS.md` — CLI and socket command reference
 - `docs/archive/browser-stream-fix.md` — landed cross-platform stream-stability plan (PID tracking, single canonical key, atomic teardown, symmetric bind probe, reactive frontend reconnect)

@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { WorkspaceSnapshot } from "@/tauri/types";
+import type { AgentBrowserSession, WorkspaceSnapshot } from "@/tauri/types";
 
 // ── Mocks ──
 //
@@ -11,18 +11,27 @@ import type { WorkspaceSnapshot } from "@/tauri/types";
 const mocks = vi.hoisted(() => ({
   workspace: null as WorkspaceSnapshot | null,
   lazyEnabled: false,
+  enableAgentChat: false,
   activeDraftId: null as string | null,
   onboardingProjectDir: null as string | null,
   hosts: [] as Array<{ id: number; name: string }>,
   openUrl: vi.fn().mockResolvedValue(undefined),
+  agentBrowserSessions: [] as AgentBrowserSession[],
 }));
 
 vi.mock("@/stores/app-store", () => ({
   useActiveWorkspace: () => mocks.workspace,
+  useAppStore: (sel: (s: Record<string, unknown>) => unknown) =>
+    sel({
+      appState: { agent_browser_sessions: mocks.agentBrowserSessions },
+    }),
 }));
 vi.mock("@/stores/feature-flags", () => ({
   useFeatureFlags: (sel: (s: Record<string, unknown>) => unknown) =>
-    sel({ enableLazyWorkspaceCreation: mocks.lazyEnabled }),
+    sel({
+      enableLazyWorkspaceCreation: mocks.lazyEnabled,
+      enableAgentChat: mocks.enableAgentChat,
+    }),
 }));
 vi.mock("@/stores/chat-draft-store", () => ({
   useChatDraftStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -46,6 +55,7 @@ vi.mock("@/tauri/commands", () => ({
 
 // Late import so the mocks above apply.
 import { WorkspaceContextBar } from "./workspace-context-bar";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -78,13 +88,33 @@ function makeWorkspace(
   };
 }
 
+function makeBackgroundSession(
+  overrides: Partial<AgentBrowserSession> = {},
+): AgentBrowserSession {
+  return {
+    session_id: "abs-1",
+    workspace_id: "ws-1",
+    cli_session_name: "ws-abc123",
+    stream_url: "ws://localhost:9223",
+    current_url: "https://example.com",
+    is_active: true,
+    pane_id: null,
+    browser_id: null,
+    user_dismissed: false,
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   mocks.workspace = null;
   mocks.lazyEnabled = false;
+  mocks.enableAgentChat = false;
   mocks.activeDraftId = null;
   mocks.onboardingProjectDir = null;
   mocks.hosts = [];
   mocks.openUrl.mockClear();
+  mocks.agentBrowserSessions = [];
+  useBrowserPeekStore.setState({ openWorkspaceId: null });
 });
 
 afterEach(cleanup);
@@ -214,5 +244,67 @@ describe("WorkspaceContextBar", () => {
     render(<WorkspaceContextBar />);
     expect(screen.getByText("pandora")).toBeInTheDocument();
     expect(screen.queryByText("This device")).not.toBeInTheDocument();
+  });
+
+  // ── GUI-mode background browser indicator ──
+  // (docs/features/browser.md "Background browser in GUI mode")
+
+  it("shows the background-browser indicator in GUI mode with a live background session, and opens the peek on click", async () => {
+    mocks.workspace = makeWorkspace();
+    mocks.enableAgentChat = true;
+    mocks.agentBrowserSessions = [makeBackgroundSession()];
+    render(<WorkspaceContextBar />);
+    const indicator = screen.getByRole("button", { name: /Browser running in background/ });
+    expect(indicator).toBeInTheDocument();
+    expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
+    await userEvent.click(indicator);
+    expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);
+  });
+
+  it("hides the background-browser indicator when the Agent Chat beta flag is off (flag-off byte-identical path)", () => {
+    mocks.workspace = makeWorkspace();
+    mocks.enableAgentChat = false;
+    mocks.agentBrowserSessions = [makeBackgroundSession()];
+    render(<WorkspaceContextBar />);
+    expect(
+      screen.queryByRole("button", { name: /Browser running in background/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the background-browser indicator for an OpenFlow workspace even with the flag on", () => {
+    mocks.workspace = makeWorkspace({ workspace_type: "open_flow" });
+    mocks.enableAgentChat = true;
+    mocks.agentBrowserSessions = [makeBackgroundSession()];
+    render(<WorkspaceContextBar />);
+    expect(
+      screen.queryByRole("button", { name: /Browser running in background/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the background-browser indicator once the session is attached to a pane (no longer background)", () => {
+    mocks.workspace = makeWorkspace();
+    mocks.enableAgentChat = true;
+    mocks.agentBrowserSessions = [
+      makeBackgroundSession({ pane_id: "pane-1", browser_id: "browser-1" }),
+    ];
+    render(<WorkspaceContextBar />);
+    expect(
+      screen.queryByRole("button", { name: /Browser running in background/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders the bar for the browser indicator alone even with no git/PR/issue to report", () => {
+    mocks.workspace = makeWorkspace({
+      git_branch: null,
+      pr_state: null,
+      linked_issue: null,
+    });
+    mocks.enableAgentChat = true;
+    mocks.agentBrowserSessions = [makeBackgroundSession()];
+    const { container } = render(<WorkspaceContextBar />);
+    expect(container).not.toBeEmptyDOMElement();
+    expect(
+      screen.getByRole("button", { name: /Browser running in background/ }),
+    ).toBeInTheDocument();
   });
 });
