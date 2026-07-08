@@ -375,6 +375,9 @@ persist to `agent_chat_messages` under the parent thread as usual
 (`should_persist_event` also persists `SubagentUpdated`), so DB hydrate
 replays cards + child transcripts through the same reducer with **zero
 schema migration**. The TypeScript mirror lives in `src/tauri/events.ts`.
+The backend also consumes these `SubagentUpdated` statuses to keep the
+left-sidebar working spinner alive while subagents outlive the parent
+turn — see [Sidebar status indicators](#sidebar-status-indicators).
 
 ### Per-provider keying + mapping
 
@@ -965,6 +968,50 @@ token stream collapses to a single write per turn rather than one per
 token. Because the write lands in `pane_statuses`, the sidebar rows,
 collapsed-rail aggregate dot, hover flyout, and `PaneNode` borders all
 update for free.
+
+**Subagents keep the spinner alive past `TurnCompleted`.** The primary
+chat turn can finish while subagents it spawned are still running, so the
+mapping is stateful: `map_event_to_pane_status` takes the event *plus* a
+per-thread `ThreadSubagentState` (running `subagent_id`s + a
+`review_pending` flag), held in the Tauri-managed `SubagentTracker`
+(`Mutex<HashMap<thread_id, _>>`, one lock per decision, registered in
+`lib.rs` alongside `AgentChatChannelRegistry`). `SubagentUpdated` with a
+`running`/`pending` status records the subagent; a terminal status
+(`completed`/`failed`/`stopped`) drops it. `TurnCompleted` publishes
+`Review` only when no subagents are tracked — otherwise it *holds
+`Working`* and marks `review_pending`, and the deferred `Review` fires
+when the last subagent goes terminal. The working indicator therefore
+persists until the turn **and** all tracked subagents finish, matching the
+still-running `SubagentsCard` in the drill-in.
+
+**A new user turn resets the thread's tracker** (both `running` and
+`review_pending`). The authoritative, provider-agnostic anchor is the
+send-message command path: `agent_chat_send_turn` calls
+`SubagentTracker::clear_thread` before dispatching the turn. This matters
+because a provider can leave a subagent non-terminal — Claude's background
+`async_launched` task stays `Running` until a later `task_notification`
+that may never arrive — and without the reset that stale `running` id
+would hold `Working` and suppress `Review` for *every* later turn until
+session close. `SessionStateChanged::Running` also resets the tracker
+(reliably per-turn for Codex's `turn/started` and OpenCode's
+`session.status = busy`; Claude does not fire it per user turn, hence the
+command-path clear). A genuinely-still-alive background subagent
+re-inserts itself on its next `Running` snapshot — Claude re-emits these
+via `task_progress` ticks — so clearing at turn start is safe. Crucially,
+parent-scoped `content_delta`/`item_completed` (`subagent_id == None`) do
+**not** clear `review_pending`: such output can trickle in after a deferred
+`TurnCompleted`, and dropping the owed `Review` there would strand the
+pane at `Working`. `review_pending` is cleared only by publishing the
+owed/normal `Review`, a new-turn reset, session `Closed`/`Error`, or
+`agent_chat_close_pane`.
+
+Only *live* provider events reach the tracker: transcript hydration/resume
+replays persisted events through the frontend reducer
+(`agent_chat_list_messages` + `hydrateThread`), never through
+`forward_event`, so there is no backend replay to guard against. Session
+`Closed`/`Error` and explicit `agent_chat_close_pane` also clear the
+thread's tracking so a stuck subagent can never pin the spinner after the
+session is gone.
 
 ## Feature flag
 

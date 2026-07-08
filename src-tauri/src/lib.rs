@@ -194,6 +194,11 @@ pub fn run() {
         // events (incl. the content_delta token stream) to it instead
         // of broadcasting on the global event bus. See issue #75.
         .manage(commands::agent_chat::AgentChatChannelRegistry::default())
+        // Per-thread running-subagent tracker: keeps the sidebar
+        // "working" spinner alive when the parent chat turn finishes
+        // while subagents it spawned are still running. Consulted by
+        // forward_event → publish_pane_status. See agent_chat.rs.
+        .manage(commands::agent_chat::SubagentTracker::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
