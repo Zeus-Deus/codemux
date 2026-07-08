@@ -42,17 +42,27 @@ export function defaultModelId(provider: AgentChatProviderKind): string {
   return caps?.models[0]?.id ?? FALLBACK_DEFAULT_MODEL_BY_PROVIDER[provider];
 }
 
-/** List the provider's models as `{ id, label }` for picker rendering.
- *  Returns `[]` when capabilities aren't hydrated — the picker
- *  renders its CommandEmpty state in that case. */
+/** List the provider's models as `{ id, label, description }` for
+ *  picker rendering. `description` carries the backend's resolved
+ *  version + blurb (e.g. Claude's
+ *  "Opus 4.8 with 1M context · Best for everyday, complex tasks"),
+ *  `null` when none was supplied. Returns `[]` when capabilities
+ *  aren't hydrated — the picker renders its CommandEmpty state in
+ *  that case. */
 export function modelsForProvider(
   provider: AgentChatProviderKind,
-): Array<{ id: string; label: string }> {
+): Array<{ id: string; label: string; description: string | null }> {
   const caps = selectCapabilities(
     useProviderCapabilities.getState(),
     provider,
   );
-  return caps?.models.map((m) => ({ id: m.id, label: m.label })) ?? [];
+  return (
+    caps?.models.map((m) => ({
+      id: m.id,
+      label: m.label,
+      description: m.description,
+    })) ?? []
+  );
 }
 
 /** Look up a model's display label by id. Falls back to the raw id

@@ -17,10 +17,24 @@ vi.mock("@/assets/preset-icons/codex.svg", () => ({
 // minimal payload that mirrors the Rust `capabilities.rs` data the
 // real store would return, so the test's label assertions keep
 // matching reality.
-const CLAUDE_MODELS_STUB = [
-  { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
-  { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
-  { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
+const CLAUDE_MODELS_STUB: Array<{
+  id: string;
+  label: string;
+  description: string | null;
+}> = [
+  {
+    id: "claude-opus-4-7",
+    label: "Claude Opus 4.7",
+    description: "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+  },
+  {
+    id: "claude-sonnet-4-6",
+    label: "Claude Sonnet 4.6",
+    description: "Sonnet 5 · Efficient for routine tasks",
+  },
+  // Kept without a description so the "no subtitle" rendering path
+  // stays covered.
+  { id: "claude-haiku-4-5", label: "Claude Haiku 4.5", description: null },
 ];
 const CODEX_MODELS_STUB = [
   { id: "gpt-5.4", label: "GPT-5.4 (Codex)" },
@@ -32,7 +46,7 @@ const capsState = {
     models: CLAUDE_MODELS_STUB.map((m) => ({
       id: m.id,
       label: m.label,
-      description: null,
+      description: m.description,
       effort_levels: [],
       default_effort: null,
       prompt_injected_effort_levels: [],
@@ -187,6 +201,47 @@ describe("ModelPicker — interaction", () => {
       expect(img).not.toBeNull();
       expect(img!.getAttribute("data-provider")).toBe("claude");
     }
+  });
+
+  it("renders the model description as a row subtitle when present", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <TooltipProvider>
+        <ModelPicker provider="claude" value={null} onChange={vi.fn()} />
+      </TooltipProvider>,
+    );
+    await user.click(container.querySelector("button") as HTMLElement);
+    const options = await screen.findAllByRole("option");
+    const opus = options.find((o) =>
+      o.textContent?.includes("Claude Opus 4.7"),
+    );
+    expect(opus).toBeDefined();
+    const subtitle = opus!.querySelector("[title]") as HTMLElement | null;
+    expect(subtitle).not.toBeNull();
+    expect(subtitle!.textContent).toBe(
+      "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+    );
+    expect(subtitle!).toHaveAttribute(
+      "title",
+      "Opus 4.8 with 1M context · Best for everyday, complex tasks",
+    );
+  });
+
+  it("omits the subtitle for a model without a description", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <TooltipProvider>
+        <ModelPicker provider="claude" value={null} onChange={vi.fn()} />
+      </TooltipProvider>,
+    );
+    await user.click(container.querySelector("button") as HTMLElement);
+    const options = await screen.findAllByRole("option");
+    const haiku = options.find((o) =>
+      o.textContent?.includes("Claude Haiku 4.5"),
+    );
+    expect(haiku).toBeDefined();
+    // No description → no subtitle element carrying a `title`.
+    expect(haiku!.querySelector("[title]")).toBeNull();
   });
 
   it("clicking a row calls onChange with that model id", async () => {

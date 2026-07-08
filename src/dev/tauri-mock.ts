@@ -269,7 +269,10 @@ const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
 const MOCK_CHAT_MODEL: ChatModelInfo = {
   id: "mock-sonnet",
   label: "Mock Sonnet",
-  description: "Simulated model served by the dev mock",
+  // Mirrors the resolved-version + blurb the real backend now serves
+  // for Claude rows so `npm run dev` visually exercises the picker's
+  // description subtitle.
+  description: "Sonnet 5 with 1M context · Efficient for routine tasks",
   effort_levels: [],
   default_effort: null,
   prompt_injected_effort_levels: [],

@@ -80,16 +80,20 @@ describe("capability-defaults", () => {
   });
 
   describe("modelsForProvider", () => {
-    it("returns a [{id, label}] projection of the capabilities list", () => {
+    it("returns a [{id, label, description}] projection of the capabilities list", () => {
       useProviderCapabilities.setState({
         claude: makeClaudeCaps([
           makeModel({ id: "a", label: "Alpha" }),
-          makeModel({ id: "b", label: "Beta" }),
+          makeModel({
+            id: "b",
+            label: "Beta",
+            description: "Beta 2 · Fast and capable",
+          }),
         ]),
       });
       expect(modelsForProvider("claude")).toEqual([
-        { id: "a", label: "Alpha" },
-        { id: "b", label: "Beta" },
+        { id: "a", label: "Alpha", description: null },
+        { id: "b", label: "Beta", description: "Beta 2 · Fast and capable" },
       ]);
     });
 

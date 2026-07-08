@@ -122,7 +122,7 @@ fn models() -> Vec<ChatModelInfo> {
         ChatModelInfo {
             id: "claude-opus-4-7".into(),
             label: "Claude Opus 4.7".into(),
-            description: None,
+            description: Some("Previous Opus generation".into()),
             effort_levels: vec![
                 "low".into(),
                 "medium".into(),
@@ -144,7 +144,7 @@ fn models() -> Vec<ChatModelInfo> {
         ChatModelInfo {
             id: "claude-opus-4-6".into(),
             label: "Claude Opus 4.6".into(),
-            description: None,
+            description: Some("Previous Opus generation".into()),
             effort_levels: vec![
                 "low".into(),
                 "medium".into(),
@@ -165,7 +165,7 @@ fn models() -> Vec<ChatModelInfo> {
         ChatModelInfo {
             id: "claude-opus-4-5".into(),
             label: "Claude Opus 4.5".into(),
-            description: None,
+            description: Some("Previous Opus generation".into()),
             effort_levels: vec![
                 "low".into(),
                 "medium".into(),
@@ -766,6 +766,64 @@ fn build_capabilities_from_sdk(
     }
 }
 
+/// The deployed CLI's `supportedModels()` reports its curated roster
+/// under short *alias* ids (`default`, `opus`, `fable`, `sonnet`,
+/// `haiku`) rather than the full versioned id, and some deployed CLIs
+/// give those alias rows no `description`. This table maps each alias to
+/// the canonical full id in the maintained [`models`] table so an alias
+/// row can borrow the canonical entry's resolved version + blurb when
+/// the SDK reports no description of its own. `default` is the CLI's
+/// recommended default and resolves like `opus`. Keeping the mapping in
+/// one place means a future model bump is a one-line edit.
+const ALIAS_CANONICAL_IDS: &[(&str, &str)] = &[
+    ("default", "claude-opus-4-8"),
+    ("opus", "claude-opus-4-8"),
+    ("fable", "claude-fable-5"),
+    ("sonnet", "claude-sonnet-4-6"),
+    ("haiku", "claude-haiku-4-5"),
+];
+
+/// Resolve an alias id (`default` / `opus` / `fable` / `sonnet` /
+/// `haiku`) to its canonical full id. Case-insensitive; returns `None`
+/// for a full id or an unknown id (both fall through to the normal
+/// lookup / inference path).
+fn canonical_id_for_alias(id: &str) -> Option<&'static str> {
+    let lower = id.to_ascii_lowercase();
+    ALIAS_CANONICAL_IDS
+        .iter()
+        .find(|(alias, _)| *alias == lower)
+        .map(|(_, canonical)| *canonical)
+}
+
+/// Build a version-bearing description for an alias row from its
+/// canonical maintained entry, per the picker contract:
+/// `"<Version>[ with 1M context] · <blurb>"` — e.g.
+/// `"Opus 4.8 with 1M context · Best for everyday, complex tasks"`.
+///
+/// The version is the canonical label with the leading `"Claude "`
+/// stripped (`"Claude Opus 4.8"` → `"Opus 4.8"`); `" with 1M context"`
+/// is appended only when the canonical model *defaults* to a 1M context
+/// window; the blurb is the canonical entry's own description. Returns
+/// `None` when the canonical entry carries no blurb, so nothing empty is
+/// ever synthesized.
+fn alias_description_from_canonical(canonical: &ChatModelInfo) -> Option<String> {
+    let blurb = canonical.description.as_deref()?;
+    let version = canonical
+        .label
+        .strip_prefix("Claude ")
+        .unwrap_or(canonical.label.as_str());
+    let defaults_to_1m = canonical
+        .context_window_options
+        .iter()
+        .any(|o| o.is_default && o.value == "1m");
+    let prefix = if defaults_to_1m {
+        format!("{version} with 1M context")
+    } else {
+        version.to_string()
+    };
+    Some(format!("{prefix} · {blurb}"))
+}
+
 /// Merge a single SDK model record with hand-maintained metadata. The
 /// SDK is authoritative for the live model id, display name, and
 /// effort vocabulary (since the deployed CLI is sometimes ahead of
@@ -835,10 +893,25 @@ fn merge_sdk_with_maintained(
     } else {
         sdk.display_name
     };
-    let description = if sdk.description.trim().is_empty() {
-        known.as_ref().and_then(|k| k.description.clone())
-    } else {
+    // Description precedence:
+    //   1. SDK verbatim — the deployed CLI packs the resolved version +
+    //      blurb into `description` (exactly what the terminal `/model`
+    //      picker renders), so prefer it untouched.
+    //   2. Maintained blurb for a known full id — the row's label already
+    //      carries the version (e.g. "Claude Opus 4.8"), so the blurb
+    //      stands alone with no version duplication.
+    //   3. Alias backfill — an alias row (default/opus/fable/sonnet/haiku)
+    //      the SDK gave no description for gets a version-bearing
+    //      description synthesized from its canonical maintained entry, so
+    //      the picker still shows what the alias actually resolves to.
+    let description = if !sdk.description.trim().is_empty() {
         Some(sdk.description)
+    } else if let Some(known_desc) = known.as_ref().and_then(|k| k.description.clone()) {
+        Some(known_desc)
+    } else {
+        canonical_id_for_alias(&base_id)
+            .and_then(|cid| maintained.get(cid))
+            .and_then(alias_description_from_canonical)
     };
 
     ChatModelInfo {
@@ -1228,11 +1301,10 @@ mod tests {
 
     #[test]
     fn merge_uses_maintained_metadata_for_known_ids() {
-        // The maintained Opus 4.7 entry has `description: None` (demoted
-        // from flagship). An inferred Opus would carry no description
-        // either, so we discriminate by the precise label — maintained
-        // is "Claude Opus 4.7", and the api `display_name` we feed is
-        // deliberately different to prove maintained wins.
+        // Discriminate maintained-vs-inferred by the precise label: the
+        // maintained entry is "Claude Opus 4.7", and the api
+        // `display_name` we feed is deliberately different to prove
+        // maintained metadata wins over the live payload.
         let live = vec![ApiModel {
             id: "claude-opus-4-7".into(),
             display_name: "DIFFERENT NAME".into(),
@@ -1568,5 +1640,159 @@ mod tests {
             caps.default_permission_mode.as_deref(),
             Some("bypassPermissions")
         );
+    }
+
+    // ── Description backfill (resolved-version blurbs) ────────────────
+
+    #[test]
+    fn every_maintained_model_has_a_description() {
+        // Contract: no current Claude model may serve `description: None`
+        // to the picker — the frontend renders it in the row subtitle.
+        for model in models() {
+            assert!(
+                model.description.as_deref().is_some_and(|d| !d.trim().is_empty()),
+                "{} must carry a non-empty description",
+                model.id
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_merge_alias_rows_backfill_version_bearing_description() {
+        // The deployed CLI reports its roster under alias ids with short
+        // display names and — on some builds — no `description`. Each
+        // alias row must backfill a resolved-version + blurb description
+        // from its canonical maintained entry so the picker shows what
+        // the alias actually runs. `default` resolves like `opus`.
+        let live = vec![
+            sdk_model(
+                "default",
+                "Default (recommended)",
+                &["low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                Some(true),
+            ),
+            sdk_model(
+                "opus",
+                "Opus",
+                &["low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                None,
+            ),
+            sdk_model(
+                "fable",
+                "Fable",
+                &["low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                None,
+            ),
+            sdk_model("sonnet", "Sonnet", &["low", "medium", "high"], Some(true), None),
+            sdk_model("haiku", "Haiku", &[], None, None),
+        ];
+        let caps = build_capabilities_from_sdk(live);
+        let desc = |id: &str| {
+            caps.models
+                .iter()
+                .find(|m| m.id == id)
+                .unwrap_or_else(|| panic!("{id} row must exist"))
+                .description
+                .clone()
+                .unwrap_or_else(|| panic!("{id} row must carry a description"))
+        };
+        // `default` and `opus` both resolve to Opus 4.8, which defaults to
+        // the 1M context window → the "with 1M context" qualifier.
+        assert_eq!(
+            desc("default"),
+            "Opus 4.8 with 1M context · Best for everyday, complex tasks"
+        );
+        assert_eq!(
+            desc("opus"),
+            "Opus 4.8 with 1M context · Best for everyday, complex tasks"
+        );
+        // Fable/Sonnet also default to the 1M window in the maintained
+        // table, so they carry the qualifier too.
+        assert_eq!(
+            desc("fable"),
+            "Fable 5 with 1M context · Most capable for the hardest, longest-running tasks"
+        );
+        assert_eq!(desc("sonnet"), "Sonnet 4.6 with 1M context · Fast and capable");
+        // Haiku has no context-window options → no qualifier, blurb only.
+        assert_eq!(desc("haiku"), "Haiku 4.5 · Fastest and cheapest");
+    }
+
+    #[test]
+    fn sdk_merge_full_id_rows_keep_blurb_only_description() {
+        // A full-id row's label already carries the version
+        // ("Claude Opus 4.8"), so its description must stay the bare
+        // blurb — no version duplication.
+        let live = vec![
+            sdk_model(
+                "claude-opus-4-8",
+                "Claude Opus 4.8",
+                &["low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                None,
+            ),
+            sdk_model(
+                "claude-opus-4-7",
+                "Claude Opus 4.7",
+                &["low", "medium", "high", "xhigh", "max"],
+                Some(true),
+                None,
+            ),
+        ];
+        let caps = build_capabilities_from_sdk(live);
+        let opus48 = caps.models.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
+        assert_eq!(
+            opus48.description.as_deref(),
+            Some("Best for everyday, complex tasks")
+        );
+        let opus47 = caps.models.iter().find(|m| m.id == "claude-opus-4-7").unwrap();
+        assert_eq!(opus47.description.as_deref(), Some("Previous Opus generation"));
+    }
+
+    #[test]
+    fn sdk_description_wins_verbatim_over_backfill() {
+        // When the deployed CLI supplies its own description (the common
+        // case — it packs the resolved version + blurb in there), that
+        // string wins verbatim over any maintained / alias backfill.
+        let sdk = SdkModelInfo {
+            value: "opus".into(),
+            display_name: "Opus".into(),
+            description: "Opus 4.9 with 1M context · Freshest blurb from the CLI".into(),
+            supported_effort_levels: vec!["low".into(), "high".into()],
+            supports_adaptive_thinking: Some(true),
+            supports_fast_mode: None,
+        };
+        let caps = build_capabilities_from_sdk(vec![sdk]);
+        let opus = caps.models.iter().find(|m| m.id == "opus").unwrap();
+        assert_eq!(
+            opus.description.as_deref(),
+            Some("Opus 4.9 with 1M context · Freshest blurb from the CLI")
+        );
+    }
+
+    #[test]
+    fn canonical_id_for_alias_maps_every_alias_and_ignores_full_ids() {
+        assert_eq!(canonical_id_for_alias("default"), Some("claude-opus-4-8"));
+        assert_eq!(canonical_id_for_alias("opus"), Some("claude-opus-4-8"));
+        assert_eq!(canonical_id_for_alias("fable"), Some("claude-fable-5"));
+        assert_eq!(canonical_id_for_alias("sonnet"), Some("claude-sonnet-4-6"));
+        assert_eq!(canonical_id_for_alias("haiku"), Some("claude-haiku-4-5"));
+        // Case-insensitive.
+        assert_eq!(canonical_id_for_alias("OPUS"), Some("claude-opus-4-8"));
+        // Full ids and unknown ids are not aliases.
+        assert_eq!(canonical_id_for_alias("claude-opus-4-8"), None);
+        assert_eq!(canonical_id_for_alias("mystery"), None);
+        // Every alias must resolve to an id that exists in the maintained
+        // table, so backfill can never point at a missing entry.
+        let maintained: std::collections::HashSet<String> =
+            models().into_iter().map(|m| m.id).collect();
+        for (alias, canonical) in ALIAS_CANONICAL_IDS {
+            assert!(
+                maintained.contains(*canonical),
+                "alias {alias} maps to unknown canonical id {canonical}",
+            );
+        }
     }
 }
