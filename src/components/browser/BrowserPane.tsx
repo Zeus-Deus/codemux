@@ -36,6 +36,20 @@ interface Props {
   browserId: string;
   focused: boolean;
   visible: boolean;
+  /** When set, resolves the agent browser session by workspace instead of
+   *  strictly by `browser_id`. A detached/background agent session
+   *  (GUI-mode background browsing, docs/features/browser.md) has no
+   *  `browser_id` until it's promoted to a pane, so the peek overlay
+   *  passes the session's own `cli_session_name` as `browserId` (so the
+   *  stream daemon starts against the right session) plus `workspaceId`
+   *  so the `agent_browser_sessions` lookup still finds it. No-op for the
+   *  normal pane-attached case, where `browser_id` alone always resolves. */
+  workspaceId?: string;
+  /** Suppresses the embedded address-bar toolbar. Used by the peek
+   *  overlay, which renders its own compact header with a URL readout and
+   *  promote/close actions instead. Defaults to showing the toolbar
+   *  (today's pane behavior, unchanged). */
+  hideToolbar?: boolean;
 }
 
 // Move-forwarding cadence (ms). Drags run tight for smooth text
@@ -61,7 +75,7 @@ interface PendingMove {
   modifiers: number;
 }
 
-export function BrowserPane({ browserId, focused, visible }: Props) {
+export function BrowserPane({ browserId, focused, visible, workspaceId, hideToolbar }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -90,10 +104,21 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const browserSession = useAppStore(
     (s) => s.appState?.browser_sessions.find((b) => b.browser_id === browserId),
   );
-  // Check if this browser pane is backed by an agent browser session (for reconnection)
-  const agentSession = useAppStore(
-    (s) => s.appState?.agent_browser_sessions?.find((abs) => abs.browser_id === browserId),
-  );
+  // Check if this browser pane is backed by an agent browser session (for
+  // reconnection). Pane-attached sessions resolve by `browser_id`; a
+  // detached/background session (GUI-mode background browsing) has no
+  // `browser_id`, so when the caller passes `workspaceId` (the peek
+  // overlay), fall back to matching on that instead.
+  const agentSession = useAppStore((s) => {
+    const sessions = s.appState?.agent_browser_sessions;
+    if (!sessions) return undefined;
+    const byBrowserId = sessions.find((abs) => abs.browser_id === browserId);
+    if (byBrowserId) return byBrowserId;
+    if (workspaceId) {
+      return sessions.find((abs) => abs.workspace_id === workspaceId);
+    }
+    return undefined;
+  });
   const agentSessionRef = useRef(agentSession);
   agentSessionRef.current = agentSession;
 
@@ -813,15 +838,17 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
   return (
     <div className="flex h-full w-full flex-col bg-card">
-      <BrowserToolbar
-        browserId={browserId}
-        sessionId={effectiveSessionId}
-        currentUrl={currentUrl}
-        onUrlChange={setCurrentUrl}
-        loading={status === "starting" || status === "connecting"}
-        inspectorActive={inspectorActive}
-        onInspectorToggle={toggleInspector}
-      />
+      {!hideToolbar && (
+        <BrowserToolbar
+          browserId={browserId}
+          sessionId={effectiveSessionId}
+          currentUrl={currentUrl}
+          onUrlChange={setCurrentUrl}
+          loading={status === "starting" || status === "connecting"}
+          inspectorActive={inspectorActive}
+          onInspectorToggle={toggleInspector}
+        />
+      )}
       {selectedElement && (
         <InspectorPanel
           element={selectedElement}

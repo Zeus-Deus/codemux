@@ -23,6 +23,7 @@
  *   - a workspace with a non-zero `notification_count`
  */
 import type {
+  AgentBrowserSession,
   AppStateSnapshot,
   AuthUser,
   CodemuxConfigSnapshot,
@@ -329,6 +330,25 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
     surfaces: [surface],
   };
 })();
+
+/** Detached (pane-less) agent browser session for `wsCodemuxChat` —
+ *  drives the "Background browser in GUI mode" chrome (issue: browser
+ *  chip + context-bar indicator + peek overlay, `docs/features/browser.md`):
+ *  the agent opened a browser mid-chat but it stayed off to the side
+ *  instead of splitting the chat into a pane. `pane_id: null` + `is_active:
+ *  true` is exactly the predicate `MessageList`, `WorkspaceContextBar`, and
+ *  `BrowserPeekOverlay` all key off of. */
+const MOCK_AGENT_BROWSER_SESSION: AgentBrowserSession = {
+  session_id: "agent-browser-mock-chat",
+  workspace_id: wsCodemuxChat.workspace_id,
+  cli_session_name: "devmock",
+  stream_url: "ws://127.0.0.1:9777",
+  current_url: "http://localhost:1420",
+  is_active: true,
+  pane_id: null,
+  browser_id: null,
+  user_dismissed: false,
+};
 
 /** Browser-pane workspace: a single `browser` pane streaming from the
  *  dev stream port — lets browser-pane UI work be exercised end-to-end
@@ -847,7 +867,7 @@ export function createSeedAppState(): AppStateSnapshot {
     workspaces: ALL_WORKSPACES,
     terminal_sessions: terminalSessions,
     browser_sessions: [],
-    agent_browser_sessions: [],
+    agent_browser_sessions: [MOCK_AGENT_BROWSER_SESSION],
     notifications: [],
     detected_ports: [
       {

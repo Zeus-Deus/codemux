@@ -25,6 +25,9 @@ interface Props {
   onCancelQueued?: (queuedId: string, text: string) => void;
   /** Enter a subagent's read-only drill-in (design "Enter subagent"). */
   onEnterSubagent?: (subagentId: string) => void;
+  /** Forwarded to MessageList for the GUI-mode background-browser chip
+   *  lookup (docs/features/browser.md). */
+  workspaceId?: string | null;
 }
 
 /**
@@ -44,6 +47,7 @@ export function ChatTranscript({
   onRejectPlan,
   onCancelQueued,
   onEnterSubagent,
+  workspaceId,
 }: Props) {
   const showThinking = shouldShowThinkingIndicator(messages, streaming);
 
@@ -60,6 +64,7 @@ export function ChatTranscript({
         onRejectPlan={onRejectPlan}
         onCancelQueued={onCancelQueued}
         onEnterSubagent={onEnterSubagent}
+        workspaceId={workspaceId}
       />
     </div>
   );
