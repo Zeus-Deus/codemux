@@ -38,6 +38,7 @@ import { SubagentsCard } from "./SubagentsCard";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
+import { WorkflowRunCard } from "./WorkflowRunCard";
 import { buildTranscriptSlots, type ActivityStep } from "./transcript-slots";
 
 interface Props {
@@ -70,10 +71,14 @@ interface Props {
    *  Wired by AgentChatPane's viewMode state; absent → the card's Enter
    *  affordance is inert. */
   onEnterSubagent?: (subagentId: string) => void;
-  /** This pane's workspace id. Used only to look up a GUI-mode background
-   *  browser session (docs/features/browser.md "Background browser in GUI
-   *  mode") for the inline chip — absent → chip never renders (legacy /
-   *  non-workspace-scoped callers keep byte-identical output). */
+  /** This pane's workspace id (sourced via `findWorkspaceIdForPane`).
+   *  Two consumers: (a) threaded down to `WorkflowRunCard` so its
+   *  "Open panel" affordance can flip the right panel to the
+   *  Orchestration tab; (b) the GUI-mode background-browser session
+   *  lookup for the inline chip (docs/features/browser.md "Background
+   *  browser in GUI mode"). Absent → both affordances are inert
+   *  (legacy / non-workspace-scoped callers keep byte-identical
+   *  output) rather than throwing. */
   workspaceId?: string | null;
 }
 
@@ -288,6 +293,7 @@ export function MessageList({
                     onRejectPlan={onRejectPlan}
                     onCancelQueued={onCancelQueued}
                     onEnterSubagent={onEnterSubagent}
+                    workspaceId={workspaceId}
                   />
                 )}
               </MessageScrollerItem>
@@ -375,6 +381,9 @@ function lookupApproval(
   if (item.kind === "tool_call" && item.approval_request_id != null) {
     return requestsById.get(item.approval_request_id) ?? null;
   }
+  if (item.kind === "workflow_run" && item.approvalRequestId != null) {
+    return requestsById.get(item.approvalRequestId) ?? null;
+  }
   return null;
 }
 
@@ -424,6 +433,7 @@ function ItemRow({
   onRejectPlan,
   onCancelQueued,
   onEnterSubagent,
+  workspaceId,
 }: {
   item: ChatViewItem;
   showAvatar: boolean;
@@ -435,13 +445,16 @@ function ItemRow({
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
   onEnterSubagent?: (subagentId: string) => void;
+  workspaceId?: string | null;
 }) {
   const requestId =
     item.kind === "tool_call"
       ? item.approval_request_id
       : item.kind === "permission_request"
         ? item.request_id
-        : null;
+        : item.kind === "workflow_run"
+          ? item.approvalRequestId
+          : null;
   const handleDecide = useCallback(
     (decision: ApprovalDecision) => {
       if (requestId) onRespondToRequest(requestId, decision);
@@ -467,6 +480,18 @@ function ItemRow({
   // gutter), matching the design.
   if (item.kind === "subagent_run") {
     return <SubagentsCard item={item} onEnter={handleEnterSubagent} />;
+  }
+
+  // Same full-width, no-gutter treatment for a Workflow tool run.
+  if (item.kind === "workflow_run") {
+    return (
+      <WorkflowRunCard
+        item={item}
+        approval={approval}
+        onDecide={handleDecide}
+        workspaceId={workspaceId}
+      />
+    );
   }
 
   return (
@@ -552,6 +577,7 @@ function renderAssistantBody(
         </div>
       );
     case "subagent_run":
+    case "workflow_run":
       // Rendered full-width above (before the AssistantGutter wrap); this
       // arm only keeps the switch exhaustive.
       return null;

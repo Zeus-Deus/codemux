@@ -4,6 +4,7 @@ import type {
   ContentDelta,
   ProviderRuntimeEvent,
   SubagentSnapshot,
+  WorkflowSnapshot,
 } from "@/tauri/events";
 
 import { mergeSnapshot, newSubagentView } from "./subagents";
@@ -18,7 +19,9 @@ import {
   type SubagentView,
   type ToolCallItem,
   type UserMessageItem,
+  type WorkflowRunItem,
 } from "./types";
+import { mergeWorkflowSnapshot, newWorkflowRunItem } from "./workflows";
 
 /**
  * Seq offset for QUEUED user messages so they always sort to the very
@@ -568,8 +571,167 @@ function replaceSubagent(
   return replaceItem(messages, cardIndex, { ...card, subagents: subs });
 }
 
+// ---------------------------------------------------------------------------
+// Workflow routing
+//
+// A `Workflow` tool run gets its own top-level `WorkflowRunItem` (not a
+// card of many — one per launch) and every subagent it spawns is routed
+// into that item's phases instead of the generic `subagent_run` card.
+// Attribution rides on `SubagentSnapshot.workflow_id` / `.phase`, set
+// server-side (translate.rs) only while a workflow is active, so a
+// subagent spawned outside a workflow is byte-identical to pre-workflow
+// behavior — it never reaches this code path.
+// ---------------------------------------------------------------------------
+
+function findWorkflow(
+  messages: ChatViewItem[],
+  workflowId: string,
+): { index: number; item: WorkflowRunItem } | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const item = messages[i];
+    if (item.kind === "workflow_run" && item.workflowId === workflowId) {
+      return { index: i, item };
+    }
+  }
+  return null;
+}
+
+function findWorkflowByApprovalRequestId(
+  messages: ChatViewItem[],
+  requestId: string,
+): { index: number; item: WorkflowRunItem } | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const item = messages[i];
+    if (item.kind === "workflow_run" && item.approvalRequestId === requestId) {
+      return { index: i, item };
+    }
+  }
+  return null;
+}
+
+/** Locate a subagent living inside any workflow's phases (searched
+ *  separately from `subagent_run` cards since the two containers have
+ *  different shapes). */
+function findSubagentInWorkflows(
+  messages: ChatViewItem[],
+  subagentId: string,
+): { itemIndex: number; phaseIndex: number; subIndex: number } | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const item = messages[i];
+    if (item.kind !== "workflow_run") continue;
+    for (let p = 0; p < item.phases.length; p++) {
+      const subIndex = item.phases[p].agents.findIndex((a) => a.id === subagentId);
+      if (subIndex >= 0) return { itemIndex: i, phaseIndex: p, subIndex };
+    }
+  }
+  return null;
+}
+
+/** Phase key a subagent attributes to: its own `phase` hint, else the
+ *  workflow's last planned phase title, else a catch-all "Run" bucket. */
+function workflowPhaseKeyFor(item: WorkflowRunItem, hint: string | null | undefined): string {
+  if (hint) return hint;
+  const last = item.plannedPhases[item.plannedPhases.length - 1];
+  return last?.title ?? "Run";
+}
+
+/** Write a mutated subagent view back into its workflow phase. */
+function replaceWorkflowSubagent(
+  messages: ChatViewItem[],
+  itemIndex: number,
+  phaseIndex: number,
+  subIndex: number,
+  nextView: SubagentView,
+): ChatViewItem[] {
+  const item = messages[itemIndex];
+  if (item.kind !== "workflow_run") return messages;
+  const phase = item.phases[phaseIndex];
+  const agents = phase.agents.slice();
+  agents[subIndex] = nextView;
+  const phases = item.phases.slice();
+  phases[phaseIndex] = { ...phase, agents };
+  return replaceItem(messages, itemIndex, { ...item, phases });
+}
+
+/** Merge a workflow-attributed `subagent_updated` snapshot into the
+ *  matching `WorkflowRunItem`'s phases, creating both the phase bucket
+ *  and the subagent view on first sight. Falls back to the generic
+ *  `subagent_run` routing when the workflow item hasn't landed yet (an
+ *  out-of-order snapshot) so the update is never dropped. */
+function applyWorkflowSubagentUpdated(
+  state: ChatThreadState,
+  snap: SubagentSnapshot,
+  now: Clock,
+): ChatThreadState {
+  const workflowId = snap.workflow_id;
+  if (!workflowId) return applyGenericSubagentUpdated(state, snap, now);
+  const found = findWorkflow(state.messages, workflowId);
+  if (!found) return applyGenericSubagentUpdated(state, snap, now);
+  const existing = findSubagentInWorkflows(state.messages, snap.subagent_id);
+  if (existing) {
+    const item = state.messages[existing.itemIndex];
+    if (item.kind !== "workflow_run") return state;
+    const sub = item.phases[existing.phaseIndex].agents[existing.subIndex];
+    const nextView = mergeSnapshot(sub, snap);
+    return {
+      ...state,
+      messages: replaceWorkflowSubagent(
+        state.messages,
+        existing.itemIndex,
+        existing.phaseIndex,
+        existing.subIndex,
+        nextView,
+      ),
+    };
+  }
+  const phaseKey = workflowPhaseKeyFor(found.item, snap.phase);
+  const view = mergeSnapshot(newSubagentView(snap.subagent_id, now()), snap);
+  const phaseIndex = found.item.phases.findIndex((p) => p.title === phaseKey);
+  const phases =
+    phaseIndex >= 0
+      ? found.item.phases.map((p, i) =>
+          i === phaseIndex ? { ...p, agents: [...p.agents, view] } : p,
+        )
+      : [...found.item.phases, { title: phaseKey, detail: null, agents: [view] }];
+  return {
+    ...state,
+    messages: replaceItem(state.messages, found.index, { ...found.item, phases }),
+  };
+}
+
+/** Stop every workflow still `running`/`pending_approval` — used when
+ *  the thread's turn dies with no other terminal signal coming for it. */
+function stopRunningWorkflows(messages: ChatViewItem[]): ChatViewItem[] {
+  return messages.map((m) => {
+    if (m.kind !== "workflow_run") return m;
+    if (m.status !== "running" && m.status !== "pending_approval") return m;
+    return { ...m, status: "stopped" };
+  });
+}
+
+/** Merge a `workflow_updated` snapshot into its item (non-null fields
+ *  win, status stays monotonic), creating the item on first sight. */
+function applyWorkflowUpdated(
+  state: ChatThreadState,
+  snap: WorkflowSnapshot,
+  now: Clock,
+): ChatThreadState {
+  const sealed = sealTrailingReasoning(state, now);
+  const found = findWorkflow(sealed.messages, snap.workflow_id);
+  if (found) {
+    const next = mergeWorkflowSnapshot(found.item, snap);
+    return { ...sealed, messages: replaceItem(sealed.messages, found.index, next) };
+  }
+  const { seq, next: seqBumped } = takeSeq(sealed);
+  const item = newWorkflowRunItem(nextId("workflow"), seq, now(), snap);
+  return { ...seqBumped, messages: [...seqBumped.messages, item] };
+}
+
 /** Route a `subagent_id`-tagged content/item event into its subagent's
- *  sub-transcript using the shared item-builders. */
+ *  sub-transcript using the shared item-builders. Checks workflow phases
+ *  first (a workflow-attributed subagent's own snapshot always lands
+ *  before its content), falling back to the generic `subagent_run` card
+ *  path unchanged. */
 function routeSubagentItem(
   state: ChatThreadState,
   subagentId: string,
@@ -577,6 +739,26 @@ function routeSubagentItem(
   build: (ctx: ListCtx) => ListCtx,
   now: Clock,
 ): ChatThreadState {
+  const wfLoc = findSubagentInWorkflows(state.messages, subagentId);
+  if (wfLoc) {
+    const item = state.messages[wfLoc.itemIndex];
+    if (item.kind !== "workflow_run") return state;
+    const sub = item.phases[wfLoc.phaseIndex].agents[wfLoc.subIndex];
+    const ctx = build({ messages: sub.items, nextSeq: state.nextSeq });
+    if (ctx.messages === sub.items && ctx.nextSeq === state.nextSeq) return state;
+    const nextView: SubagentView = { ...sub, items: capSubagentItems(ctx.messages) };
+    return {
+      ...state,
+      nextSeq: ctx.nextSeq,
+      messages: replaceWorkflowSubagent(
+        state.messages,
+        wfLoc.itemIndex,
+        wfLoc.phaseIndex,
+        wfLoc.subIndex,
+        nextView,
+      ),
+    };
+  }
   const loc = locateOrCreateSubagent(state, subagentId, turnId, now);
   const card = loc.messages[loc.cardIndex];
   if (card.kind !== "subagent_run") return state;
@@ -610,8 +792,21 @@ function trailingTurnId(messages: ChatViewItem[]): string | null {
 }
 
 /** Merge a `subagent_updated` snapshot into its view (non-null fields win,
- *  status stays monotonic), creating the card / view when first seen. */
+ *  status stays monotonic), creating the card / view when first seen.
+ *  Snapshots carrying `workflow_id` (stamped server-side only while a
+ *  workflow is active) route into that workflow's phases instead. */
 function applySubagentUpdated(
+  state: ChatThreadState,
+  snap: SubagentSnapshot,
+  now: Clock,
+): ChatThreadState {
+  if (snap.workflow_id) {
+    return applyWorkflowSubagentUpdated(state, snap, now);
+  }
+  return applyGenericSubagentUpdated(state, snap, now);
+}
+
+function applyGenericSubagentUpdated(
   state: ChatThreadState,
   snap: SubagentSnapshot,
   now: Clock,
@@ -838,6 +1033,10 @@ function applyEventInner(
       return applySubagentUpdated(state, event.subagent, now);
     }
 
+    case "workflow_updated": {
+      return applyWorkflowUpdated(state, event.workflow, now);
+    }
+
     case "turn_completed": {
       // A completed turn is a hard boundary — seal any trailing streaming
       // reasoning block alongside the assistant message.
@@ -856,6 +1055,10 @@ function applyEventInner(
       // sees the failure in-flow. Success/max_turns/max_budget are
       // silent — the absent streaming + completed content is enough.
       if (event.status.kind === "error") {
+        // A workflow still running/pending-approval when its turn dies
+        // has no other terminal signal coming (the sidecar tears the
+        // session down) — stop it here so it doesn't spin forever.
+        messages = stopRunningWorkflows(messages);
         const { seq, next: seqBumped } = takeSeq({ ...state, messages });
         return {
           ...seqBumped,
@@ -914,6 +1117,19 @@ function applyEventInner(
           };
           messages = replaceItem(messages, toolMatch.index, patched);
         }
+        // A `Workflow` tool call gated on approval: link the request and
+        // flip the run card to `pending_approval` so the UI can render
+        // the gate inline instead of (or alongside) the standalone
+        // permission row.
+        const wfMatch = findWorkflow(messages, event.tool_use_id);
+        if (wfMatch) {
+          const patchedWf: WorkflowRunItem = {
+            ...wfMatch.item,
+            approvalRequestId: event.request_id,
+            status: "pending_approval",
+          };
+          messages = replaceItem(messages, wfMatch.index, patchedWf);
+        }
       }
       return {
         ...seqBumped,
@@ -926,14 +1142,38 @@ function applyEventInner(
 
     case "request_resolved": {
       const found = findPermissionRequest(state.messages, event.request_id);
-      if (!found) return state;
-      const next: PermissionRequestItem = {
-        ...found.item,
-        resolution: { state: "resolved", decision: event.decision },
-      };
+      let messages = state.messages;
+      if (found) {
+        const next: PermissionRequestItem = {
+          ...found.item,
+          resolution: { state: "resolved", decision: event.decision },
+        };
+        messages = replaceItem(messages, found.index, next);
+      }
+      // A workflow gated on this request resumes (`running`) on allow,
+      // or is considered abandoned (`stopped`) on deny/cancel — the
+      // sidecar never restarts a denied Workflow tool call.
+      const wfMatch = findWorkflowByApprovalRequestId(messages, event.request_id);
+      if (wfMatch) {
+        const decision = event.decision.decision;
+        const nextStatus = decision === "allow" || decision === "allow_for_session"
+          ? "running"
+          : "stopped";
+        // Keep `approvalRequestId` linked after resolution: the workflow
+        // card owns this request's row for good (transcript-slots keeps
+        // suppressing the standalone resolved block — otherwise a stray
+        // "Allowed" line would reappear under the card). The approval UI
+        // itself only renders while status === "pending_approval".
+        const patchedWf: WorkflowRunItem = {
+          ...wfMatch.item,
+          status: nextStatus,
+        };
+        messages = replaceItem(messages, wfMatch.index, patchedWf);
+      }
+      if (!found && !wfMatch) return state;
       return {
         ...state,
-        messages: replaceItem(state.messages, found.index, next),
+        messages,
         pendingRequestIds: state.pendingRequestIds.filter(
           (id) => id !== event.request_id,
         ),

@@ -25,8 +25,9 @@ interface Props {
   onCancelQueued?: (queuedId: string, text: string) => void;
   /** Enter a subagent's read-only drill-in (design "Enter subagent"). */
   onEnterSubagent?: (subagentId: string) => void;
-  /** Forwarded to MessageList for the GUI-mode background-browser chip
-   *  lookup (docs/features/browser.md). */
+  /** Forwarded to MessageList for the WorkflowRunCard "Open panel"
+   *  affordance and the GUI-mode background-browser chip lookup
+   *  (docs/features/browser.md). */
   workspaceId?: string | null;
 }
 

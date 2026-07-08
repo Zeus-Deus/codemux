@@ -18,7 +18,7 @@ pub mod types;
 pub use errors::{ProviderError, SerializableProviderError};
 pub use events::{
     CompletedItem, ContentDelta, ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus,
-    TurnStatus, TurnUsage,
+    TurnStatus, TurnUsage, WorkflowPhaseSnapshot, WorkflowSnapshot,
 };
 pub use instance::ProviderInstanceId;
 pub use provider::{AgentProvider, ProviderEventStream};

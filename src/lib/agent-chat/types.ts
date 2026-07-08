@@ -179,6 +179,74 @@ export interface SubagentRunItem {
   subagents: SubagentView[];
 }
 
+/**
+ * Lifecycle status of a `Workflow` tool run, as merged into the frontend's
+ * per-workflow view state. Mirrors the wire `WorkflowSnapshot.status`
+ * string (not a Rust enum on the wire, so this is the view-side
+ * narrowing of it).
+ */
+export type WorkflowRunStatus =
+  | "pending_approval"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped";
+
+/**
+ * One planned phase of a workflow run, carrying the subagents the
+ * reducer has routed into it (via `SubagentSnapshot.phase`). Status and
+ * rollups (tokens, elapsed, counts) are derived on read by
+ * `workflows.ts` helpers rather than stored, so there is a single source
+ * of truth (the `agents` list) for them.
+ */
+export interface WorkflowPhaseView {
+  title: string;
+  detail: string | null;
+  agents: SubagentView[];
+}
+
+/**
+ * One `Workflow` tool run's live state + its phases. The reducer merges
+ * `workflow_updated` snapshots into these (non-null fields win, status
+ * stays monotonic once terminal) and routes `workflow_id`-tagged
+ * `subagent_updated` snapshots into the matching phase's `agents` list
+ * instead of the generic `subagent_run` card.
+ */
+export interface WorkflowRunItem {
+  kind: "workflow_run";
+  id: ChatItemId;
+  seq: number;
+  /** Demux key — the wire `workflow_id` (the `Workflow` tool call's
+   *  `tool_use_id`). */
+  workflowId: string;
+  status: WorkflowRunStatus;
+  name: string | null;
+  description: string | null;
+  /** Raw script text, for a "view source" affordance. */
+  script: string | null;
+  /** Phases as originally planned by the script's `meta.phases`, before
+   *  any subagents have been attributed to them. `workflowPhaseStats`
+   *  callers should prefer `phases` (which carries the live agents);
+   *  this is kept so a phase with zero subagents-so-far still renders
+   *  its title/detail. */
+  plannedPhases: { title: string; detail: string | null }[];
+  /** Live phases — one per planned phase (by title), each carrying the
+   *  subagents the reducer has routed into it. A subagent whose `phase`
+   *  hint doesn't match any planned title lands in a synthesized
+   *  trailing "Run" phase. */
+  phases: WorkflowPhaseView[];
+  resultText: string | null;
+  totalTokens: number | null;
+  agentCount: number | null;
+  /** Wall-clock ms (injected clock) when the launch was first observed. */
+  startedAt: number;
+  durationMs: number | null;
+  /** When a permission request gates this workflow's launch (e.g. an
+   *  approval-required workflow), the request's id. `null` once
+   *  resolved or when no gate applies. */
+  approvalRequestId: string | null;
+}
+
 export type ChatViewItem =
   | UserMessageItem
   | AssistantMessageItem
@@ -186,7 +254,8 @@ export type ChatViewItem =
   | ToolCallItem
   | PermissionRequestItem
   | TurnEndedItem
-  | SubagentRunItem;
+  | SubagentRunItem
+  | WorkflowRunItem;
 
 export interface ChatThreadState {
   messages: ChatViewItem[];

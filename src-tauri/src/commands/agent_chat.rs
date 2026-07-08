@@ -1890,6 +1890,11 @@ fn map_event_to_pane_status(
         | ProviderRuntimeEvent::TurnQueued { .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { .. } => None,
+        // A workflow launching/completing doesn't itself imply a pane
+        // status transition — the subagents it spawns and the turn it
+        // runs within already drive `Working`/`Review` via their own
+        // events above.
+        ProviderRuntimeEvent::WorkflowUpdated { .. } => None,
     }
 }
 
@@ -1952,6 +1957,10 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             // child transcripts survive restart: DB hydrate replays them
             // through the same reducer with zero schema migration.
             | ProviderRuntimeEvent::SubagentUpdated { .. }
+            // Workflow snapshots persist for the same reason — the
+            // workflow run card and its phase attribution must survive a
+            // restart via hydrate-replay, not a bespoke schema.
+            | ProviderRuntimeEvent::WorkflowUpdated { .. }
     )
 }
 
@@ -1983,6 +1992,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::RequestResolved { thread_id, .. }
         | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. }
         | ProviderRuntimeEvent::SubagentUpdated { thread_id, .. }
+        | ProviderRuntimeEvent::WorkflowUpdated { thread_id, .. }
         | ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, .. }
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }

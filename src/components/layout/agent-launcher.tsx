@@ -1,5 +1,5 @@
 import { useRef, useState } from "react";
-import { Plus, Terminal, Globe, Settings, ExternalLink } from "lucide-react";
+import { Pin, PinOff, Plus, Terminal, Globe, Settings, ExternalLink } from "lucide-react";
 
 import {
   Command,
@@ -19,6 +19,7 @@ import { PresetIcon } from "@/components/icons/preset-icon";
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
+import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useUIStore } from "@/stores/ui-store";
 import {
   agentChatCreatePane,
@@ -27,6 +28,51 @@ import {
   createTab,
 } from "@/tauri/commands";
 import type { TerminalPreset, WorkspaceSnapshot } from "@/tauri/types";
+
+/**
+ * Hover-revealed pin toggle rendered inside a GUI/CLI preset row in the
+ * launcher. Opts a preset id into `useTitlebarPinsStore` — the separate,
+ * user-controlled set that drives `PinnedPresetTiles` in title-bar.tsx
+ * (default empty; unrelated to `preset.pinned`, which only affects the
+ * legacy PresetBar). Must never launch the row: every pointer handler
+ * stops propagation so cmdk's `CommandItem` never sees the click and
+ * fires `onSelect`.
+ */
+function TitlebarPinToggle({ presetId }: { presetId: string }) {
+  const pinned = useTitlebarPinsStore((s) => s.pinnedIds.includes(presetId));
+
+  const stop = (e: React.SyntheticEvent) => {
+    e.stopPropagation();
+  };
+
+  return (
+    <button
+      type="button"
+      aria-label={pinned ? "Unpin from title bar" : "Pin to title bar"}
+      title={pinned ? "Unpin from title bar" : "Pin to title bar"}
+      data-testid={`launcher-pin-toggle-${presetId}`}
+      onPointerDown={stop}
+      onMouseDown={stop}
+      onClick={(e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        useTitlebarPinsStore.getState().toggleTitlebarPin(presetId);
+      }}
+      className={cn(
+        "ml-1 flex h-5 w-5 shrink-0 items-center justify-center rounded transition-colors",
+        pinned
+          ? "text-accent-ember opacity-100 hover:text-accent-ember/80"
+          : "text-muted-foreground opacity-0 group-hover/command-item:opacity-100 hover:text-foreground",
+      )}
+    >
+      {pinned ? (
+        <PinOff className="size-3.5" />
+      ) : (
+        <Pin className="size-3.5" />
+      )}
+    </button>
+  );
+}
 
 interface AgentLauncherProps {
   workspace: WorkspaceSnapshot;
@@ -170,6 +216,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                         PINNED
                       </span>
                     )}
+                    <TitlebarPinToggle presetId={preset.id} />
                   </CommandItem>
                 ))}
               </CommandGroup>
@@ -191,6 +238,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                     <span className="font-mono text-[10px] text-muted-foreground/70">
                       ↗ terminal
                     </span>
+                    <TitlebarPinToggle presetId={preset.id} />
                   </CommandItem>
                 ))}
               </CommandGroup>

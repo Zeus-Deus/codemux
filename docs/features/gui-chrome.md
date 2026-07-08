@@ -8,7 +8,7 @@
 - Update when: The titlebar composition, the launcher, or the legacy/GUI gate
   changes.
 - Read next: `docs/features/agent-chat.md`, `docs/features/presets.md`,
-  `docs/features/sidebar.md`
+  `docs/features/sidebar.md`, `docs/features/workflow-orchestration.md`
 
 ## What This Feature Is
 
@@ -30,7 +30,15 @@ indicator, and peek overlay (`docs/features/browser.md` § "Background
 browser in GUI mode"). When false it returns the byte-identical legacy
 `h-9` bar; when true it composes discrete slots left-to-right:
 
-`[sidebar toggle] [tabs] [+ launcher] [chat favorite] …drag spacer… [right-panel toggle] [RunButton] [ResourceMonitor] [IdeLauncher] [sep] [WindowControls]`
+`[sidebar-width cluster: sidebar toggle] | [tabs] [+ launcher] | [pinned preset tiles] …drag spacer… [right-panel toggle] [RunButton split] [ResourceMonitor] [IdeLauncher compact] [sep] [WindowControls]`
+
+The far-left cluster contains **only the sidebar toggle** and is sized to the
+live sidebar width (`useSidebarGapWidth()` in
+`src/hooks/use-sidebar-gap-width.ts` — measures the sidebar's
+`[data-slot="sidebar-gap"]` box via ResizeObserver, since the titlebar
+renders outside `SidebarProvider`), with a hairline `border-r` at the
+sidebar boundary so tabs start where the content pane starts (design:
+`.design/top-bar.dc.html`).
 
 - **`TitleBarTabs`** (`src/components/layout/title-bar-tabs.tsx`) — the
   workspace's backend-owned tabs as compact pills (h-7, rounded-lg) with a
@@ -39,7 +47,9 @@ browser in GUI mode"). When false it returns the byte-identical legacy
   The **active chat tab** grows a chevron opening the session-history dropdown
   and renders the live "N subagents running" pill inline beside it.
   Activation/close route through the existing `activateTab` / `closeTab`
-  commands.
+  commands. Pills cap at `max-w-[130px]` and the strip scrolls
+  horizontally (wheel → horizontal translation, hidden scrollbar) instead
+  of shrinking when tabs overflow.
 - **`AgentLauncher`** (`src/components/layout/agent-launcher.tsx`) — the `+`
   popover, a cmdk `Command` with sections **GUI** (`chat_agent` presets,
   `PINNED` tag → `agentChatCreatePane`), **CLI agents** (pinned first, `↗
@@ -47,11 +57,23 @@ browser in GUI mode"). When false it returns the byte-identical legacy
   `createTab`, Browser → `createBrowserPane`), and a **Manage presets…** footer
   (`setShowSettings(true, "presets")`). Preset data comes from the live
   `usePresetStore()` snapshot (`src/hooks/use-preset-store.ts`).
-- **`PinnedChatFavorite`** — one ember-tinted (`accent-ember` tokens) inline
-  button per `chat_agent` preset; click launches a new chat tab.
+- **`PinnedPresetTiles`** — 27px glyph tiles right of the `+` launcher
+  (after a 1px divider), **opt-in and empty by default**: only presets the
+  user pinned to the title bar render (ember-tinted `accent-ember` tiles
+  for `chat_agent`, neutral for `cli`), each with a hover Tooltip naming
+  the preset. The pin set lives in `src/stores/titlebar-pins-store.ts`
+  (zustand persist, separate from the legacy `preset.pinned` flag that
+  drives the flag-off PresetBar) and is toggled from a hover pin button on
+  each launcher row. Click semantics mirror the launcher (chat = new chat
+  tab; CLI = new tab, Shift-click = split via `applyPreset`).
 - **Rehomed controls** — the right-panel toggle (`FileDiff`, drives
   `rightPanelTabs`) and `RunButton` move from `TabBar`/`PresetBar` into the
-  titlebar right cluster.
+  titlebar right cluster. In GUI chrome the `RunButton` renders its
+  `variant="split"` form (main segment = green play + Run/Set Run, caret
+  segment = configure; no standalone gear) and `IdeLauncher` renders
+  `compact` (icon square + caret, combined tooltip). Both components keep
+  their legacy default rendering for the flag-off `PresetBar`, preserving
+  the byte-identical contract.
 - **Row suppression** — `WorkspaceMain` (`workspace-main.tsx`) drops `TabBar`
   and `PresetBar` when the flag is on; `PaneNode` (`isSurfaceRoot` +
   `enableAgentChat`) suppresses `AgentChatPaneHeader` for a **sole-root**
@@ -73,6 +95,13 @@ titlebar tab share one implementation (see "Important Touch Points").
   Terminal/Browser panes, and Manage presets.
 - Inline ember chat favorite; rehomed right-panel toggle + RunButton; the "N
   subagents running" status pill kept alive next to the active chat tab.
+- Tab drag-reorder via a pointer-based drag (pointerdown on a pill body +
+  ~5px movement threshold → drag mode, drop index computed from tab
+  midpoints, same `reorder_tabs` backend command and insertion-indicator
+  styling as the legacy `TabBar`). Pointer events avoid the titlebar's
+  `data-tauri-drag-region`, unlike HTML5 DnD; a completed drag suppresses
+  the trailing click so it never activates a tab or pops the chat-tab
+  history dropdown.
 - The empty titlebar center stays an OS drag region.
 
 ## Current Constraints
@@ -82,20 +111,21 @@ titlebar tab share one implementation (see "Important Touch Points").
   own PresetBar stays coherent; GUI chrome is gated off while a draft is
   active.
 - **OpenFlow workspaces are untouched** — they keep their dedicated chrome.
-- **No tab drag-reorder in GUI chrome.** Reusing `TabBar`'s HTML5-drag logic
-  inside a `data-tauri-drag-region` parent is not clean; reorder stays a
-  legacy-only affordance (flag off) and is a follow-up.
 - **A sole-root chat pane loses its per-pane split/close buttons** (the
   suppressed `AgentChatPaneHeader`); splitting is done from the launcher
   (Shift on a CLI agent) instead, and split layouts restore the per-pane
   header.
 
-## Design intent (not shipped)
+## Workflow orchestration integration
 
 The titlebar is deliberately slot-composed and the `RightPanel` + resizer +
-`rightPanelTabs` infra is preserved (hence rehoming the toggle) so a planned
-inline **workflow-orchestration status pill** and an **Orchestration** right
-side panel can land without restructuring the chrome. Neither is built.
+`rightPanelTabs` infra is preserved (hence rehoming the toggle), which let
+the **Orchestration** right-panel tab for Claude workflow runs land without
+restructuring this chrome — `RightPanelTab` gained an `"orchestration"`
+variant that `right-panel.tsx` renders conditionally, only when the active
+workspace has a workflow run. See `docs/features/workflow-orchestration.md`
+for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
+`WorkflowRunCard`, and the panel body).
 
 ## Important Touch Points
 

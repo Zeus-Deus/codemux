@@ -36,9 +36,15 @@ import {
   MOCK_CHAT_THREAD_ID,
   MOCK_HOME_DIR,
   MOCK_USER,
+  MOCK_WORKFLOW_APPROVAL_THREAD_ID,
+  MOCK_WORKFLOW_COMPLETE_THREAD_ID,
+  MOCK_WORKFLOW_RUNNING_THREAD_ID,
   createSeedAppState,
   richChatTurnEnvelopes,
   subagentTurnEnvelopes,
+  workflowApprovalEnvelopes,
+  workflowCompleteEnvelopes,
+  workflowRunningEnvelopes,
 } from "./mock-fixtures";
 import type {
   AppStateSnapshot,
@@ -425,6 +431,77 @@ function mockChatTranscript(): string[] {
 
   mockChatTranscriptCache = out;
   return out;
+}
+
+// ── /workflow orchestration demo threads ────────────────────────────
+//
+// Three separate seeded threads — one per lifecycle stage of the
+// "Audit route auth" `/workflow` run (design fixture
+// `.design/workflow-orchestration.dc.html`) — so pending-approval,
+// mid-run, and finished are each directly reachable from their own
+// workspace instead of requiring a live interaction to advance between
+// states. `agent_chat_list_messages` replays the same persisted-payload
+// path as the main seeded thread (`mockChatTranscript` above): JSON
+// envelopes through the real reducer via `replayPayloads`.
+const WORKFLOW_THREAD_BUILDERS: Record<string, () => unknown[]> = {
+  [MOCK_WORKFLOW_APPROVAL_THREAD_ID]: () =>
+    workflowApprovalEnvelopes(MOCK_WORKFLOW_APPROVAL_THREAD_ID),
+  [MOCK_WORKFLOW_RUNNING_THREAD_ID]: () =>
+    workflowRunningEnvelopes(MOCK_WORKFLOW_RUNNING_THREAD_ID),
+  [MOCK_WORKFLOW_COMPLETE_THREAD_ID]: () =>
+    workflowCompleteEnvelopes(MOCK_WORKFLOW_COMPLETE_THREAD_ID),
+};
+
+const workflowTranscriptCache = new Map<string, string[]>();
+
+/** `agent_chat_list_messages` payload for a workflow-demo thread, or
+ *  `null` when `threadId` isn't one of the three seeded above. */
+function mockWorkflowTranscript(threadId: string): string[] | null {
+  const builder = WORKFLOW_THREAD_BUILDERS[threadId];
+  if (!builder) return null;
+  let cached = workflowTranscriptCache.get(threadId);
+  if (!cached) {
+    cached = builder().map((e) => JSON.stringify(e));
+    workflowTranscriptCache.set(threadId, cached);
+  }
+  return cached;
+}
+
+/** `workspace_id` + `cwd` for each workflow-demo thread — keeps
+ *  `agent_chat_list_sessions` / `agent_chat_get_session` in sync with
+ *  the panes/worktree paths seeded in `mock-fixtures.ts`. */
+const WORKFLOW_THREAD_WORKSPACE: Record<string, { workspaceId: string; cwd: string }> = {
+  [MOCK_WORKFLOW_APPROVAL_THREAD_ID]: {
+    workspaceId: "ws-codemux-workflow-approval",
+    cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-workflow-approval`,
+  },
+  [MOCK_WORKFLOW_RUNNING_THREAD_ID]: {
+    workspaceId: "ws-codemux-workflow-running",
+    cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-workflow-running`,
+  },
+  [MOCK_WORKFLOW_COMPLETE_THREAD_ID]: {
+    workspaceId: "ws-codemux-workflow-complete",
+    cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-workflow-complete`,
+  },
+};
+
+function mockWorkflowSessionRecord(threadId: string): unknown | null {
+  const loc = WORKFLOW_THREAD_WORKSPACE[threadId];
+  if (!loc) return null;
+  return {
+    thread_id: threadId,
+    sdk_session_id: `sdk-${threadId}`,
+    workspace_id: loc.workspaceId,
+    cwd: loc.cwd,
+    provider: "claude",
+    title: "Audit route auth",
+    created_at: new Date().toISOString(),
+    last_active_at: new Date().toISOString(),
+    model: "claude-opus-4-8",
+    effort: null,
+    context_window: null,
+    permission_mode: "bypassPermissions",
+  };
 }
 
 let mockChatTurnSeq = 0;
@@ -1010,49 +1087,66 @@ const handlers: Record<string, Handler> = {
   // send_turn answers with the channel-streamed mock reply.
   list_chat_provider_capabilities: (a) =>
     a.provider === "claude" ? CLAUDE_CAPABILITIES : EMPTY_CAPABILITIES,
-  agent_chat_list_messages: (a) =>
-    a.threadId === MOCK_CHAT_THREAD_ID ? mockChatTranscript() : [],
+  agent_chat_list_messages: (a) => {
+    const threadId = a.threadId as string;
+    if (threadId === MOCK_CHAT_THREAD_ID) return mockChatTranscript();
+    return mockWorkflowTranscript(threadId) ?? [];
+  },
   // Return one record for the seeded thread so the pane can resolve the
   // D2 session-start marker's `created_at` (and the SessionSelector
   // dropdown has an entry). `created_at` is "now" so the marker reads
-  // "Today · HH:MM" like the design.
-  agent_chat_list_sessions: () => [
-    {
-      thread_id: MOCK_CHAT_THREAD_ID,
-      sdk_session_id: "sdk-mock-chat",
-      workspace_id: "ws-codemux-chat",
-      cwd: `${MOCK_HOME_DIR}/projects/codemux`,
-      provider: "claude",
-      title: "agent-chat-demo",
-      created_at: new Date().toISOString(),
-      last_active_at: new Date().toISOString(),
-      model: "claude-opus-4-8",
-      effort: null,
-      context_window: null,
-      permission_mode: "bypassPermissions",
-    },
-  ],
+  // "Today · HH:MM" like the design. Also covers the three `/workflow`
+  // demo threads, keyed by the requesting workspace id.
+  agent_chat_list_sessions: (a) => {
+    const workspaceId = a.workspaceId as string | undefined;
+    const workflowEntry = Object.entries(WORKFLOW_THREAD_WORKSPACE).find(
+      ([, loc]) => loc.workspaceId === workspaceId,
+    );
+    if (workflowEntry) {
+      const record = mockWorkflowSessionRecord(workflowEntry[0]);
+      return record ? [record] : [];
+    }
+    return [
+      {
+        thread_id: MOCK_CHAT_THREAD_ID,
+        sdk_session_id: "sdk-mock-chat",
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider: "claude",
+        title: "agent-chat-demo",
+        created_at: new Date().toISOString(),
+        last_active_at: new Date().toISOString(),
+        model: "claude-opus-4-8",
+        effort: null,
+        context_window: null,
+        permission_mode: "bypassPermissions",
+      },
+    ];
+  },
   // Restart-resume seed (design F): the pane's mount-seed effect fetches
   // this to restore picker config + resume cursor. Return a plausible
   // record for the seeded thread so `npm run dev` rehydrates the pickers;
   // any other thread has no persisted row yet.
-  agent_chat_get_session: (a) =>
-    a.threadId === MOCK_CHAT_THREAD_ID
-      ? {
-          thread_id: MOCK_CHAT_THREAD_ID,
-          sdk_session_id: "sdk-mock-chat",
-          workspace_id: "ws-codemux-chat",
-          cwd: `${MOCK_HOME_DIR}/projects/codemux`,
-          provider: "claude",
-          title: "agent-chat-demo",
-          created_at: new Date().toISOString(),
-          last_active_at: new Date().toISOString(),
-          model: "claude-opus-4-8",
-          effort: null,
-          context_window: null,
-          permission_mode: "bypassPermissions",
-        }
-      : null,
+  agent_chat_get_session: (a) => {
+    const threadId = a.threadId as string;
+    if (threadId === MOCK_CHAT_THREAD_ID) {
+      return {
+        thread_id: MOCK_CHAT_THREAD_ID,
+        sdk_session_id: "sdk-mock-chat",
+        workspace_id: "ws-codemux-chat",
+        cwd: `${MOCK_HOME_DIR}/projects/codemux`,
+        provider: "claude",
+        title: "agent-chat-demo",
+        created_at: new Date().toISOString(),
+        last_active_at: new Date().toISOString(),
+        model: "claude-opus-4-8",
+        effort: null,
+        context_window: null,
+        permission_mode: "bypassPermissions",
+      };
+    }
+    return mockWorkflowSessionRecord(threadId);
+  },
   // DB-only config persist (design G). The mock has no SQLite, so this
   // is a no-op — the demo pane keeps its in-memory slice values.
   agent_chat_update_session_config: () => undefined,

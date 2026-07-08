@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   buildModeCommands,
+  buildWorkflowCommand,
   filterSlashItems,
   findMentionAtCursor,
   findSlashAtCursor,
@@ -167,6 +168,24 @@ describe("buildModeCommands", () => {
       onActivate: vi.fn(),
     });
     expect(items.map((i) => i.id)).toEqual(["mode:plan", "mode:debug"]);
+  });
+});
+
+describe("buildWorkflowCommand", () => {
+  it("is enabled with the orchestration description when isClaude is true", () => {
+    const item = buildWorkflowCommand({ isClaude: true });
+    expect(item.id).toBe("workflow");
+    expect(item.command).toBe("/workflow");
+    expect(item.disabled).toBe(false);
+    expect(item.description).toBe(
+      "Orchestrate this task with many subagents",
+    );
+  });
+
+  it("is disabled with a reason when isClaude is false", () => {
+    const item = buildWorkflowCommand({ isClaude: false });
+    expect(item.disabled).toBe(true);
+    expect(item.description).toBe("Only available with Claude models");
   });
 });
 

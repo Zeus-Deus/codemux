@@ -195,6 +195,53 @@ export interface SubagentSnapshot {
   duration_ms?: number | null;
   /** Provider-native id (codex threadId, opencode sessionID, claude agentId). */
   provider_ref?: string | null;
+  /** When this subagent was spawned while a `Workflow` tool run was
+   *  active, that workflow's `workflow_id`. Lets the reducer route the
+   *  snapshot into the workflow's phase view instead of the generic
+   *  subagent-run card. `null` outside a workflow run. */
+  workflow_id?: string | null;
+  /** Best-effort phase label parsed from a `phase:X` hint in the
+   *  provider's task label. `null` when no hint was found — the reducer
+   *  falls back to the workflow's last planned phase title. */
+  phase?: string | null;
+}
+
+// ── Workflows (Claude dynamic-workflow orchestration) ──
+//
+// Mirror of src-tauri/src/agent_provider/events.rs:WorkflowSnapshot /
+// WorkflowPhaseSnapshot. Same additive-serde discipline as
+// SubagentSnapshot: every field but `workflow_id` is optional and
+// `#[serde(default)]` on the Rust side.
+
+export type WorkflowRunWireStatus =
+  | "pending_approval"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped";
+
+export interface WorkflowPhaseSnapshot {
+  title: string;
+  detail?: string | null;
+}
+
+export interface WorkflowSnapshot {
+  /** Stable key — the `tool_use_id` of the `Workflow` tool call. */
+  workflow_id: string;
+  status: string;
+  /** Workflow name — `meta.name`, falling back to a saved workflow's
+   *  `input.name`. */
+  name?: string | null;
+  description?: string | null;
+  /** Raw script text (`input.script`), for a "view source" affordance. */
+  script?: string | null;
+  /** Planned phases parsed from `meta.phases`, in script order. */
+  phases?: WorkflowPhaseSnapshot[] | null;
+  /** Final result text on completion/failure, truncated server-side. */
+  result_text?: string | null;
+  total_tokens?: number | null;
+  agent_count?: number | null;
+  duration_ms?: number | null;
 }
 
 export type TurnStatus =
@@ -239,6 +286,11 @@ export type ProviderRuntimeEvent =
       type: "subagent_updated";
       thread_id: string;
       subagent: SubagentSnapshot;
+    }
+  | {
+      type: "workflow_updated";
+      thread_id: string;
+      workflow: WorkflowSnapshot;
     }
   | {
       type: "turn_completed";

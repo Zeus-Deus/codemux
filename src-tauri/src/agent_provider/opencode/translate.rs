@@ -558,6 +558,8 @@ fn empty_snapshot(id: &str) -> SubagentSnapshot {
         total_tokens: None,
         duration_ms: None,
         provider_ref: None,
+        workflow_id: None,
+        phase: None,
     }
 }
 

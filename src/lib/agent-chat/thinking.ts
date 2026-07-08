@@ -40,6 +40,13 @@ export function shouldShowThinkingIndicator(
       return last.subagents.every(
         (s) => s.status !== "running" && s.status !== "pending",
       );
+    case "workflow_run":
+      // The workflow card shows its own spinner/progress bar while the
+      // run is live (and the approval card while pending), so the tail
+      // pulse steps back until the run reaches a terminal state.
+      return (
+        last.status !== "running" && last.status !== "pending_approval"
+      );
     case "user_message":
     case "turn_ended":
       return true;

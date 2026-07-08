@@ -472,6 +472,107 @@ const wsCodemuxPorts = makeWorkspace({
   git_changed_files: 2,
 });
 
+/** Thread ids for the three `/workflow` orchestration demo panes below
+ *  (design fixture `.design/workflow-orchestration.dc.html`, "Audit
+ *  route auth"). Each gets its OWN workspace + thread so every stage of
+ *  the workflow lifecycle — gated on approval, mid-run, and finished —
+ *  is directly reachable in the sidebar rather than requiring a live
+ *  interaction to walk between states. */
+export const MOCK_WORKFLOW_APPROVAL_THREAD_ID = "thread-mock-workflow-approval";
+export const MOCK_WORKFLOW_RUNNING_THREAD_ID = "thread-mock-workflow-running";
+export const MOCK_WORKFLOW_COMPLETE_THREAD_ID = "thread-mock-workflow-complete";
+
+/** Approval-gated workflow: `/workflow` turn lands, Claude proposes the
+ *  script, and the run sits in `pending_approval` waiting on the linked
+ *  permission request. */
+const wsCodemuxWorkflowApproval = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/demo-workflow-approval`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-workflow-approval",
+    title: "workflow-approval",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "demo/workflow-approval",
+  });
+  const { pane, surface, tab } = chatSurface(
+    "Agent Chat",
+    cwd,
+    MOCK_WORKFLOW_APPROVAL_THREAD_ID,
+  );
+  // Red "permission" dot: the run is gated on the user's decision.
+  paneStatuses[pane.pane_id] = "permission";
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
+/** Running workflow: approved and mid-phase-2, with a mix of done /
+ *  running / queued subagents auditing route files. */
+const wsCodemuxWorkflowRunning = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/demo-workflow-running`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-workflow-running",
+    title: "workflow-running",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "demo/workflow-running",
+  });
+  const { pane, surface, tab } = chatSurface(
+    "Agent Chat",
+    cwd,
+    MOCK_WORKFLOW_RUNNING_THREAD_ID,
+  );
+  // Amber "working" dot: the workflow is actively spawning/running agents.
+  paneStatuses[pane.pane_id] = "working";
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
+/** Completed workflow: the full run finished with a findings summary and
+ *  a trailing assistant report message. */
+const wsCodemuxWorkflowComplete = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/demo-workflow-complete`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-workflow-complete",
+    title: "workflow-complete",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "demo/workflow-complete",
+  });
+  const { pane, surface, tab } = chatSurface(
+    "Agent Chat",
+    cwd,
+    MOCK_WORKFLOW_COMPLETE_THREAD_ID,
+  );
+  // Green "review" dot: the run finished and is ready to look at.
+  paneStatuses[pane.pane_id] = "review";
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
 // Project 2 — vexis: 1 primary + 3 worktrees (one in `permission`).
 
 const vexisRoot = `${PROJECTS}/vexis`;
@@ -575,6 +676,9 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxMock,
   wsCodemuxChatLive,
   wsCodemuxPorts,
+  wsCodemuxWorkflowApproval,
+  wsCodemuxWorkflowRunning,
+  wsCodemuxWorkflowComplete,
   wsVexisMain,
   wsVexisCuda,
   wsVexisBench,
@@ -851,6 +955,618 @@ export function subagentTurnEnvelopes(
       tool_use_count: 11,
       duration_ms: 52000,
     }),
+  ];
+}
+
+// ── /workflow orchestration demo (Claude dynamic-workflow feature) ────
+//
+// Mirrors the design fixture `.design/workflow-orchestration.dc.html`
+// ("Audit route auth"): a `/workflow` turn that audits every route
+// handler under `src/routes/` for missing auth checks. The three
+// lifecycle stages — gated on approval, mid-run, and finished — are
+// seeded as three SEPARATE threads (see `wsCodemuxWorkflowApproval` /
+// `Running` / `Complete` above) so each is directly reachable rather
+// than requiring a live interaction to advance between states.
+
+const WORKFLOW_NAME = "Audit route auth";
+const WORKFLOW_DESCRIPTION =
+  "Audit every route handler under src/routes/ for missing auth checks, and adversarially verify each finding.";
+/** The `/workflow` slash-command turn, verbatim from the design's
+ *  conversation bubble. */
+const WORKFLOW_USER_TEXT = `/workflow\n${WORKFLOW_DESCRIPTION}`;
+
+/** Planned phases parsed from the script's `meta.phases` — titles are
+ *  the routing key subagents attribute to via `SubagentSnapshot.phase`,
+ *  so they must match exactly what the phase-tagged snapshots below use.
+ *  `detail` carries the design's "~N agents" estimate. */
+const WORKFLOW_PLANNED_PHASES = [
+  { title: "Discover route files", detail: "~1 agent" },
+  { title: "Audit each file for missing auth", detail: "~42 agents" },
+  { title: "Adversarially verify findings", detail: "~1 per finding" },
+];
+
+const WORKFLOW_PHASE_DISCOVER = WORKFLOW_PLANNED_PHASES[0].title;
+const WORKFLOW_PHASE_AUDIT = WORKFLOW_PLANNED_PHASES[1].title;
+const WORKFLOW_PHASE_VERIFY = WORKFLOW_PLANNED_PHASES[2].title;
+
+/** Small, realistic workflow script — the "View script" affordance on
+ *  the approval card reads this back. */
+const WORKFLOW_SCRIPT = `export const meta = {
+  name: "Audit route auth",
+  description:
+    "Audit every route handler under src/routes/ for missing auth checks, and adversarially verify each finding.",
+  phases: [
+    { title: "Discover route files", detail: "~1 agent" },
+    { title: "Audit each file for missing auth", detail: "~42 agents" },
+    { title: "Adversarially verify findings", detail: "~1 per finding" },
+  ],
+};
+
+export async function run({ glob, agent, phase }) {
+  const files = await phase("Discover route files", () =>
+    glob("src/routes/**/*.ts"),
+  );
+
+  const findings = await phase("Audit each file for missing auth", () =>
+    Promise.all(
+      files.map((file) =>
+        agent({
+          prompt:
+            "Audit " + file + " for endpoints missing the requireAuth " +
+            "middleware. Report each unprotected route with its method and path.",
+        }),
+      ),
+    ),
+  );
+
+  await phase("Adversarially verify findings", () =>
+    Promise.all(
+      findings
+        .filter((f) => f.issues.length > 0)
+        .map((f) =>
+          agent({ prompt: "Independently confirm: " + JSON.stringify(f) }),
+        ),
+    ),
+  );
+}
+`;
+
+/** JSON \`resultText\` shapes: an empty \`issues\` array parses to the
+ *  green "clean" badge, a non-empty one to the red "N issues" badge —
+ *  see \`subagentFindingBadge\` in \`lib/agent-chat/workflows.ts\`. */
+function auditClean(file: string): string {
+  return JSON.stringify({ file, issues: [] });
+}
+function auditIssues(
+  file: string,
+  issues: Array<{ method: string; path: string; note?: string }>,
+): string {
+  return JSON.stringify({ file, issues });
+}
+
+/**
+ * Envelopes for the approval-gated thread: the `/workflow` turn lands,
+ * Claude proposes the script (`workflow_updated` in `pending_approval`
+ * with the planned phases + script), and a linked `request_opened`
+ * (`tool_use_id` == `workflow_id`) gates the run — exactly the "Run as a
+ * workflow?" approval card in the design.
+ */
+export function workflowApprovalEnvelopes(threadId: string): unknown[] {
+  const workflowId = "wf-audit-route-auth-approval";
+  return [
+    { type: "user_message", thread_id: threadId, text: WORKFLOW_USER_TEXT },
+    {
+      type: "workflow_updated",
+      thread_id: threadId,
+      workflow: {
+        workflow_id: workflowId,
+        status: "pending_approval",
+        name: WORKFLOW_NAME,
+        description: WORKFLOW_DESCRIPTION,
+        script: WORKFLOW_SCRIPT,
+        phases: WORKFLOW_PLANNED_PHASES,
+      },
+    },
+    {
+      type: "request_opened",
+      thread_id: threadId,
+      turn_id: "turn-workflow-approval",
+      request_id: "req-workflow-approval",
+      // Mirrors the reducer's own workflow-gate tests (reducer.test.ts):
+      // the workflow card renders its own approval UI keyed off
+      // `tool_use_id`, so the standalone request doesn't need a
+      // specialized `request_kind`.
+      request_kind: "other",
+      payload: { workflow_id: workflowId, name: WORKFLOW_NAME },
+      tool_use_id: workflowId,
+    },
+  ];
+}
+
+/**
+ * Envelopes for the running thread: approved and mid-phase-2. Phase 1
+ * (Discover) is already done; phase 2 (Audit) has 8 subagents in mixed
+ * states mirroring the design's agent list exactly (routes/auth.ts done
+ * clean, routes/billing.ts done with 2 issues + a short read/grep
+ * sub-transcript, routes/users.ts done clean, routes/webhooks.ts done 1
+ * issue, routes/orders.ts + routes/reports.ts running, routes/admin.ts +
+ * routes/search.ts still queued); phase 3 (Verify) stays planned/pending
+ * — no subagents attributed to it yet.
+ */
+export function workflowRunningEnvelopes(threadId: string): unknown[] {
+  const workflowId = "wf-audit-route-auth-running";
+  const turnId = "turn-workflow-running";
+  const requestId = "req-workflow-running";
+
+  const snap = (subagent: Record<string, unknown>) => ({
+    type: "subagent_updated",
+    thread_id: threadId,
+    subagent,
+  });
+  const subItem = (subagentId: string, item: Record<string, unknown>) => ({
+    type: "item_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    subagent_id: subagentId,
+    item,
+  });
+  const tool = (
+    subagentId: string,
+    id: string,
+    toolName: string,
+    input: Record<string, unknown>,
+    result: string,
+  ): unknown[] => [
+    subItem(subagentId, {
+      kind: "tool_use",
+      tool_name: toolName,
+      tool_use_id: id,
+      input,
+    }),
+    subItem(subagentId, {
+      kind: "tool_result",
+      tool_use_id: id,
+      content: result,
+      is_error: false,
+    }),
+  ];
+
+  return [
+    { type: "user_message", thread_id: threadId, text: WORKFLOW_USER_TEXT },
+    {
+      type: "workflow_updated",
+      thread_id: threadId,
+      workflow: {
+        workflow_id: workflowId,
+        status: "pending_approval",
+        name: WORKFLOW_NAME,
+        description: WORKFLOW_DESCRIPTION,
+        script: WORKFLOW_SCRIPT,
+        phases: WORKFLOW_PLANNED_PHASES,
+      },
+    },
+    {
+      type: "request_opened",
+      thread_id: threadId,
+      turn_id: turnId,
+      request_id: requestId,
+      request_kind: "other",
+      payload: { workflow_id: workflowId, name: WORKFLOW_NAME },
+      tool_use_id: workflowId,
+    },
+    {
+      type: "request_resolved",
+      thread_id: threadId,
+      request_id: requestId,
+      decision: { decision: "allow" },
+    },
+
+    // Phase 1 — Discover: spawned then finished small.
+    snap({
+      subagent_id: "discover",
+      name: "Discover",
+      agent_type: "explore",
+      model: "sonnet",
+      status: "running",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_DISCOVER,
+    }),
+    snap({
+      subagent_id: "discover",
+      status: "completed",
+      workflow_id: workflowId,
+      result_text: "Found 42 route handler files under src/routes/.",
+      tool_use_count: 3,
+      total_tokens: 12_000,
+      duration_ms: 9_000,
+    }),
+
+    // Phase 2 — Audit: 8 of the ~42 files, mirroring the design's list.
+    snap({
+      subagent_id: "audit-auth",
+      name: "routes/auth.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "running",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+    }),
+    snap({
+      subagent_id: "audit-auth",
+      status: "completed",
+      workflow_id: workflowId,
+      result_text: auditClean("src/routes/auth.ts"),
+      tool_use_count: 4,
+      total_tokens: 21_000,
+      duration_ms: 26_000,
+    }),
+
+    snap({
+      subagent_id: "audit-billing",
+      name: "routes/billing.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "running",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+    }),
+    ...tool(
+      "audit-billing",
+      "billing-read-1",
+      "Read",
+      { file_path: "src/routes/billing.ts" },
+      "// src/routes/billing.ts — 214 ln\n",
+    ),
+    ...tool(
+      "audit-billing",
+      "billing-grep-1",
+      "Grep",
+      { pattern: "requireAuth", path: "src/routes/billing.ts" },
+      "3 hits",
+    ),
+    ...tool(
+      "audit-billing",
+      "billing-grep-2",
+      "Grep",
+      { pattern: "router.post", path: "src/routes/billing.ts" },
+      "5 hits",
+    ),
+    snap({
+      subagent_id: "audit-billing",
+      status: "completed",
+      workflow_id: workflowId,
+      result_text: auditIssues("src/routes/billing.ts", [
+        { method: "POST", path: "/refund" },
+        { method: "POST", path: "/credit" },
+      ]),
+      tool_use_count: 6,
+      total_tokens: 24_000,
+      duration_ms: 31_000,
+    }),
+
+    snap({
+      subagent_id: "audit-users",
+      name: "routes/users.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "running",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+    }),
+    snap({
+      subagent_id: "audit-users",
+      status: "completed",
+      workflow_id: workflowId,
+      result_text: auditClean("src/routes/users.ts"),
+      tool_use_count: 4,
+      total_tokens: 19_000,
+      duration_ms: 24_000,
+    }),
+
+    snap({
+      subagent_id: "audit-webhooks",
+      name: "routes/webhooks.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "running",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+    }),
+    snap({
+      subagent_id: "audit-webhooks",
+      status: "completed",
+      workflow_id: workflowId,
+      result_text: auditIssues("src/routes/webhooks.ts", [
+        { method: "POST", path: "/stripe", note: "no signature check" },
+      ]),
+      tool_use_count: 5,
+      total_tokens: 22_000,
+      duration_ms: 28_000,
+    }),
+
+    snap({
+      subagent_id: "audit-orders",
+      name: "routes/orders.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "running",
+      activity: "auditing src/routes/orders.ts for requireAuth coverage…",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+    }),
+    snap({
+      subagent_id: "audit-reports",
+      name: "routes/reports.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "running",
+      activity: "auditing src/routes/reports.ts for requireAuth coverage…",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+    }),
+    snap({
+      subagent_id: "audit-admin",
+      name: "routes/admin.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "pending",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+    }),
+    snap({
+      subagent_id: "audit-search",
+      name: "routes/search.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "pending",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+    }),
+    // Phase 3 (Verify) intentionally has no subagents yet — it renders
+    // "pending" purely from the workflow still being `running` with an
+    // empty agents list (see `workflowPhaseStatus`).
+  ];
+}
+
+/**
+ * Envelopes for the finished thread: all three phases complete, a
+ * roll-up (`44 agents · 3 phases · ~2.9M tokens · 4m 51s`) on the final
+ * `workflow_updated`, and a trailing assistant report matching the
+ * design's completion copy verbatim.
+ */
+export function workflowCompleteEnvelopes(threadId: string): unknown[] {
+  const workflowId = "wf-audit-route-auth-complete";
+  const turnId = "turn-workflow-complete";
+  const requestId = "req-workflow-complete";
+
+  const snap = (subagent: Record<string, unknown>) => ({
+    type: "subagent_updated",
+    thread_id: threadId,
+    subagent,
+  });
+
+  const REPORT =
+    "Audit complete. **3 endpoints** are missing auth checks — each was " +
+    "independently confirmed by a second agent:\n\n" +
+    "- routes/billing.ts — POST /refund, POST /credit\n" +
+    "- routes/webhooks.ts — POST /stripe (no signature check)";
+
+  return [
+    { type: "user_message", thread_id: threadId, text: WORKFLOW_USER_TEXT },
+    {
+      type: "workflow_updated",
+      thread_id: threadId,
+      workflow: {
+        workflow_id: workflowId,
+        status: "pending_approval",
+        name: WORKFLOW_NAME,
+        description: WORKFLOW_DESCRIPTION,
+        script: WORKFLOW_SCRIPT,
+        phases: WORKFLOW_PLANNED_PHASES,
+      },
+    },
+    {
+      type: "request_opened",
+      thread_id: threadId,
+      turn_id: turnId,
+      request_id: requestId,
+      request_kind: "other",
+      payload: { workflow_id: workflowId, name: WORKFLOW_NAME },
+      tool_use_id: workflowId,
+    },
+    {
+      type: "request_resolved",
+      thread_id: threadId,
+      request_id: requestId,
+      decision: { decision: "allow" },
+    },
+
+    snap({
+      subagent_id: "discover",
+      name: "Discover",
+      agent_type: "explore",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_DISCOVER,
+      result_text: "Found 42 route handler files under src/routes/.",
+      tool_use_count: 3,
+      total_tokens: 12_000,
+      duration_ms: 9_000,
+    }),
+
+    snap({
+      subagent_id: "audit-auth",
+      name: "routes/auth.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+      result_text: auditClean("src/routes/auth.ts"),
+      tool_use_count: 4,
+      total_tokens: 21_000,
+      duration_ms: 26_000,
+    }),
+    snap({
+      subagent_id: "audit-billing",
+      name: "routes/billing.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+      result_text: auditIssues("src/routes/billing.ts", [
+        { method: "POST", path: "/refund" },
+        { method: "POST", path: "/credit" },
+      ]),
+      tool_use_count: 6,
+      total_tokens: 24_000,
+      duration_ms: 31_000,
+    }),
+    snap({
+      subagent_id: "audit-users",
+      name: "routes/users.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+      result_text: auditClean("src/routes/users.ts"),
+      tool_use_count: 4,
+      total_tokens: 19_000,
+      duration_ms: 24_000,
+    }),
+    snap({
+      subagent_id: "audit-webhooks",
+      name: "routes/webhooks.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+      result_text: auditIssues("src/routes/webhooks.ts", [
+        { method: "POST", path: "/stripe", note: "no signature check" },
+      ]),
+      tool_use_count: 5,
+      total_tokens: 22_000,
+      duration_ms: 28_000,
+    }),
+    snap({
+      subagent_id: "audit-orders",
+      name: "routes/orders.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+      result_text: auditClean("src/routes/orders.ts"),
+      tool_use_count: 4,
+      total_tokens: 20_000,
+      duration_ms: 25_000,
+    }),
+    snap({
+      subagent_id: "audit-reports",
+      name: "routes/reports.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+      result_text: auditClean("src/routes/reports.ts"),
+      tool_use_count: 4,
+      total_tokens: 20_000,
+      duration_ms: 25_000,
+    }),
+    snap({
+      subagent_id: "audit-admin",
+      name: "routes/admin.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+      result_text: auditClean("src/routes/admin.ts"),
+      tool_use_count: 4,
+      total_tokens: 20_000,
+      duration_ms: 25_000,
+    }),
+    snap({
+      subagent_id: "audit-search",
+      name: "routes/search.ts",
+      agent_type: "audit",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_AUDIT,
+      result_text: auditClean("src/routes/search.ts"),
+      tool_use_count: 4,
+      total_tokens: 20_000,
+      duration_ms: 25_000,
+    }),
+
+    // Phase 3 — Verify: one verifier per flagged file, confirming the
+    // finding independently (design copy: "each was independently
+    // confirmed by a second agent").
+    snap({
+      subagent_id: "verify-billing",
+      name: "Verify routes/billing.ts",
+      agent_type: "verify",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_VERIFY,
+      result_text:
+        "Confirmed: POST /refund and POST /credit call the handler " +
+        "directly without requireAuth.",
+      tool_use_count: 3,
+      total_tokens: 15_000,
+      duration_ms: 18_000,
+    }),
+    snap({
+      subagent_id: "verify-webhooks",
+      name: "Verify routes/webhooks.ts",
+      agent_type: "verify",
+      model: "sonnet",
+      status: "completed",
+      workflow_id: workflowId,
+      phase: WORKFLOW_PHASE_VERIFY,
+      result_text:
+        "Confirmed: POST /stripe has no signature verification before " +
+        "handling the webhook payload.",
+      tool_use_count: 3,
+      total_tokens: 14_000,
+      duration_ms: 17_000,
+    }),
+
+    // Final roll-up snapshot: seals the run and carries the aggregate
+    // figures the design's completion pill shows.
+    {
+      type: "workflow_updated",
+      thread_id: threadId,
+      workflow: {
+        workflow_id: workflowId,
+        status: "completed",
+        result_text:
+          "3 endpoints missing auth checks across 2 files (billing.ts, webhooks.ts).",
+        total_tokens: 2_900_000,
+        agent_count: 44,
+        duration_ms: 291_000, // 4m 51s
+      },
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: { kind: "assistant_text", text: REPORT },
+    },
+    {
+      type: "turn_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      status: { kind: "success" },
+      usage: null,
+    },
   ];
 }
 

@@ -8,6 +8,7 @@
   change.
 - Read next: `docs/features/multi-provider-chat.md`,
   `docs/features/skills-sync.md`, `docs/features/mcp-server.md`,
+  `docs/features/workflow-orchestration.md`,
   `docs/plans/step-8-attachments.md`,
   `docs/plans/step-13-beta-toggle-research.md`.
 
@@ -449,6 +450,19 @@ turn — see [Sidebar status indicators](#sidebar-status-indicators).
 The dev mock seeds one subagent turn in the demo transcript and exposes
 `window.__codemuxChatMock.streamSubagents()` for a live two-subagent
 lifecycle over the real per-thread Channel.
+
+**Workflow runs are a Claude-only relative of this system.** When a
+Claude session runs a top-level `Workflow` tool_use (a script that
+coordinates many subagents across named phases), the same translate
+layer emits a separate `workflow_updated` event instead of treating it
+as an ordinary subagent, and top-level subagents spawned while that
+workflow is active get stamped with a `workflow_id`/`phase` so they
+route into the workflow's phases rather than the generic Subagents card.
+The chat pane renders this as a `WorkflowRunCard` (approval / running /
+summary) and a conditional **Orchestration** right-panel tab instead of
+the inline Subagents card + drill-in described above. See
+`docs/features/workflow-orchestration.md` for the full model; this file
+does not duplicate it.
 
 ## Current Constraints
 
