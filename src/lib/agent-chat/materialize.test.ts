@@ -8,7 +8,7 @@ import type { TerminalPreset } from "@/tauri/types";
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
-  agentChatSendTurn: vi.fn().mockResolvedValue("turn-1"),
+  agentChatSendTurn: vi.fn().mockResolvedValue({ turn_id: "turn-1", queued_id: null }),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echoed"),
   applyPreset: vi.fn().mockResolvedValue(undefined),
   // `createEmptyWorkspace` is called with either `/home/user` (home
@@ -84,7 +84,7 @@ describe("materializeAndSend", () => {
   beforeEach(() => {
     vi.mocked(activateWorkspace).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatCreatePane).mockClear().mockResolvedValue("pane-new");
-    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue("turn-1");
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({ turn_id: "turn-1", queued_id: null });
     vi.mocked(agentChatStartSession)
       .mockClear()
       .mockResolvedValue("thread-echoed");
@@ -581,7 +581,7 @@ describe("materializeWithPreset", () => {
   beforeEach(() => {
     vi.mocked(activateWorkspace).mockClear().mockResolvedValue(undefined);
     vi.mocked(agentChatCreatePane).mockClear().mockResolvedValue("pane-new");
-    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue("turn-1");
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({ turn_id: "turn-1", queued_id: null });
     vi.mocked(agentChatStartSession)
       .mockClear()
       .mockResolvedValue("thread-echoed");

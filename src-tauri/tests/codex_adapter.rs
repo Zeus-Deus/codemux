@@ -245,6 +245,7 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -337,6 +338,7 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -383,6 +385,7 @@ async fn command_approval_request_roundtrip() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -439,6 +442,7 @@ async fn command_approval_deny_roundtrip() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -486,6 +490,7 @@ async fn interrupt_turn_sends_turn_interrupt() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -520,6 +525,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -563,6 +569,7 @@ async fn set_model_updates_session_state() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -604,6 +611,7 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap_err();
@@ -636,6 +644,7 @@ async fn child_process_crash_emits_error_state() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await;
 
@@ -658,7 +667,10 @@ async fn child_process_crash_emits_error_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_send_turn_returns_validation_error() {
+async fn concurrent_send_turn_queues_instead_of_erroring() {
+    // Follow-up queueing: a second send while the first turn is active is
+    // now QUEUED (not rejected). The fixture emits only turn/started, so
+    // the first turn stays active and the second parks in the queue.
     let script = write_script(json!([
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
          "params":{"threadId":"c-1","turnId":"t-busy"}}
@@ -668,7 +680,8 @@ async fn concurrent_send_turn_returns_validation_error() {
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
     start_session_resilient(&provider, start_input("t-busy")).await.unwrap();
-    provider
+    let mut stream = provider.event_stream();
+    let first = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-busy".into()),
             text: "first".into(),
@@ -676,11 +689,13 @@ async fn concurrent_send_turn_returns_validation_error() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
+    assert!(first.queued_id.is_none(), "first send starts immediately");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let err = provider
+    let second = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-busy".into()),
             text: "second".into(),
@@ -688,11 +703,97 @@ async fn concurrent_send_turn_returns_validation_error() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: Some("nonce-2".into()),
         })
         .await
-        .unwrap_err();
-    assert!(matches!(err, ProviderError::ValidationError { .. }));
+        .unwrap();
+    let queued_id = second
+        .queued_id
+        .expect("second send should be queued behind the active turn");
+
+    let saw = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::TurnQueued {
+                queued_id: qid,
+                client_nonce,
+                text,
+                ..
+            } = ev
+            {
+                assert_eq!(qid, queued_id);
+                assert_eq!(client_nonce.as_deref(), Some("nonce-2"));
+                assert_eq!(text, "second");
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(saw, "expected a TurnQueued event");
     provider.stop_session(ThreadId("t-busy".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_queued_turn_removes_it_codex() {
+    let script = write_script(json!([
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
+         "params":{"threadId":"c-1","turnId":"t-cq"}}
+    ]));
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-cq"))
+        .await
+        .unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-cq".into()),
+            text: "first".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let queued = provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-cq".into()),
+            text: "second".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap()
+        .queued_id
+        .expect("second send queued");
+
+    provider
+        .cancel_queued_turn(ThreadId("t-cq".into()), queued.clone())
+        .await
+        .unwrap();
+
+    let cancelled = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } = ev {
+                return Some(queued_id);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    assert_eq!(cancelled.as_deref(), Some(queued.as_str()));
+    provider.stop_session(ThreadId("t-cq".into())).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -766,6 +867,7 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -882,6 +984,7 @@ async fn bogus_response_to_unknown_jsonrpc_id_does_not_crash_adapter() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -988,6 +1091,7 @@ async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter(
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -1133,6 +1237,7 @@ async fn shutdown_during_event_streaming_does_not_panic() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();

@@ -149,6 +149,14 @@ pub struct SendTurnInput {
     /// permission mode is session-scoped and changes require restart.
     #[serde(default)]
     pub permission_mode_override: Option<String>,
+    /// Optional client-generated correlation token for the follow-up
+    /// queue. The frontend attaches this when it optimistically appends
+    /// a user bubble; if the send is queued behind an active turn the
+    /// backend echoes it on [`ProviderRuntimeEvent::TurnQueued`] so the
+    /// reducer can grey out the existing bubble rather than duplicate it.
+    /// `None` for non-queued sends and older callers.
+    #[serde(default)]
+    pub client_nonce: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -292,8 +300,28 @@ pub struct ProviderChatCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnStartResult {
     /// Provider-assigned turn identifier. Subsequent events for this turn
-    /// reference it.
+    /// reference it. For a **queued** send (see `queued_id`) this is an
+    /// empty placeholder — no live turn exists yet; the real turn id
+    /// arrives later on the [`ProviderRuntimeEvent::QueuedTurnDispatched`]
+    /// event.
     pub turn_id: TurnId,
+    /// Set when the send was **queued** behind an in-flight turn instead
+    /// of starting immediately. Identifies the queued item so the UI can
+    /// render it greyed-out and cancel it. The turn dispatches (emitting
+    /// `QueuedTurnDispatched` then the normal turn-start events) once the
+    /// session next goes idle. `None` for a normal immediate start.
+    #[serde(default)]
+    pub queued_id: Option<String>,
+}
+
+/// Outcome of an internal session-level send: either the turn started
+/// immediately or it was queued behind the active turn.
+#[derive(Debug, Clone)]
+pub enum SendOutcome {
+    /// The turn started immediately; carries its freshly-minted id.
+    Started(TurnId),
+    /// The turn was queued behind the active turn; carries the queued id.
+    Queued(String),
 }
 
 /// Decision the runtime ships back to the provider when a user finishes

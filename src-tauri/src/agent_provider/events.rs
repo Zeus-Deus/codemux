@@ -263,6 +263,41 @@ pub enum ProviderRuntimeEvent {
         thread_id: ThreadId,
         resume_cursor: serde_json::Value,
     },
+    /// A user turn arrived while a turn was already in flight, so it was
+    /// **queued** instead of rejected. The UI renders it greyed-out in
+    /// the transcript until it dispatches or is cancelled.
+    ///
+    /// `client_nonce` echoes the optimistic-send correlation token the
+    /// frontend attached to [`SendTurnInput`](super::types::SendTurnInput),
+    /// so the reducer can reconcile this event with the already-appended
+    /// optimistic bubble instead of duplicating it. `text` is the raw
+    /// turn text so a remounted pane (which never saw the optimistic
+    /// append) can still reconstruct the queued bubble.
+    TurnQueued {
+        thread_id: ThreadId,
+        queued_id: String,
+        #[serde(default)]
+        client_nonce: Option<String>,
+        text: String,
+    },
+    /// A previously-queued turn has now been dispatched as the active
+    /// turn. Carries the freshly-minted `turn_id` and the original
+    /// `text` so the command layer can persist the user-message envelope
+    /// at real turn order (queued turns are NOT persisted at enqueue
+    /// time). The UI promotes the greyed bubble to a normal user message.
+    QueuedTurnDispatched {
+        thread_id: ThreadId,
+        queued_id: String,
+        turn_id: TurnId,
+        text: String,
+    },
+    /// A queued turn was cancelled — either by the user (X button) or
+    /// because the session closed / errored with items still queued. The
+    /// UI removes the greyed bubble.
+    QueuedTurnCancelled {
+        thread_id: ThreadId,
+        queued_id: String,
+    },
 }
 
 #[cfg(test)]

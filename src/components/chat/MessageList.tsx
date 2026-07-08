@@ -60,6 +60,9 @@ interface Props {
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  /** Follow-up queueing: cancel a queued user turn. `text` is passed
+   *  back so the caller can restore it into the composer. */
+  onCancelQueued?: (queuedId: string, text: string) => void;
   /** Enter a subagent's read-only drill-in (design "Enter subagent").
    *  Wired by AgentChatPane's viewMode state; absent → the card's Enter
    *  affordance is inert. */
@@ -89,6 +92,7 @@ export function MessageList({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onCancelQueued,
   onEnterSubagent,
 }: Props) {
   // Sort by seq so order is a property of the data, not of React
@@ -245,6 +249,7 @@ export function MessageList({
                     onRespondToRequest={onRespondToRequest}
                     onAcceptPlan={onAcceptPlan}
                     onRejectPlan={onRejectPlan}
+                    onCancelQueued={onCancelQueued}
                     onEnterSubagent={onEnterSubagent}
                   />
                 )}
@@ -371,6 +376,7 @@ function ItemRow({
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onCancelQueued,
   onEnterSubagent,
 }: {
   item: ChatViewItem;
@@ -381,6 +387,7 @@ function ItemRow({
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  onCancelQueued?: (queuedId: string, text: string) => void;
   onEnterSubagent?: (subagentId: string) => void;
 }) {
   const requestId =
@@ -407,7 +414,7 @@ function ItemRow({
   }, [item, onRejectPlan]);
 
   if (item.kind === "user_message") {
-    return <UserMessage item={item} />;
+    return <UserMessage item={item} onCancelQueued={onCancelQueued} />;
   }
 
   // The orchestration card is a full-width standalone surface (no avatar
