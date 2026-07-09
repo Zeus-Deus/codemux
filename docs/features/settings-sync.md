@@ -47,6 +47,9 @@ UserSettings
     enabled: boolean           (default: true)
     scrollback_lines: number   (default: 10000)
     max_total_mb: number       (default: 100)
+  agent_chat
+    checkpoints_enabled: boolean                 (default: false, run-start rollback checkpoint — issue #80)
+    background_browser_desktop_viewport: boolean (default: false, pin GUI-mode background-browser peek to 1280×800 — docs/features/browser.md)
 ```
 
 ### Offline Cache

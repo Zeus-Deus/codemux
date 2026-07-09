@@ -248,7 +248,7 @@ const SYNCED_SETTINGS: UserSettings = {
   },
   // Checkpoints ON in the mock so the seeded chat pane exercises the
   // restore affordance (issue #80) without a real backend.
-  agent_chat: { checkpoints_enabled: true },
+  agent_chat: { checkpoints_enabled: true, background_browser_desktop_viewport: false },
 };
 
 const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
