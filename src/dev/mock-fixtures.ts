@@ -316,6 +316,16 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
     project_uid: codemuxUid,
     workspace_kind: "main",
     git_branch: "main",
+    // Git counters + PR so the below-composer Context Row (behind chip,
+    // PR chip, workspace-details popover) is fully populated in the mock.
+    pr_number: 172,
+    pr_state: "open",
+    pr_url: "https://github.com/example/codemux/pull/172",
+    git_ahead: 2,
+    git_behind: 5,
+    git_additions: 9,
+    git_deletions: 1,
+    git_changed_files: 1,
   });
   const { pane, surface, tab } = chatSurface("Agent Chat", codemuxRoot);
   // Chat sessions publish into pane_statuses just like terminal agents

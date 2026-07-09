@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   Check,
   ChevronDown,
@@ -113,6 +113,12 @@ export interface ThreadScopeRowProps {
   onChangeCheckoutMode: (mode: "current" | "worktree") => void;
   onChangeWorktreeName: (name: string) => void;
   onChangeBaseBranch: (branch: string) => void;
+  /** Rendered after `BranchControl`, right-aligned — `AgentChatPane`
+   *  passes `<WorkspaceStatusCluster />` here so the empty-thread row
+   *  carries the same passive git/PR status as the running-thread
+   *  Context Row (`docs/features/agent-chat.md` "Context Row"). Omitted
+   *  by `DraftChatSurface`, which has no real workspace yet. */
+  trailing?: ReactNode;
 }
 
 /**
@@ -137,6 +143,7 @@ export function ThreadScopeRow({
   onChangeCheckoutMode,
   onChangeWorktreeName,
   onChangeBaseBranch,
+  trailing,
 }: ThreadScopeRowProps) {
   const isHome =
     location.kind === "draft"
@@ -176,15 +183,20 @@ export function ThreadScopeRow({
             </>
           )}
         </div>
-        {showProjectControls && projectPath && (
-          <BranchControl
-            projectPath={projectPath}
-            checkoutMode={checkoutMode}
-            baseBranch={baseBranch}
-            disabled={disabled}
-            onChangeCheckoutMode={onChangeCheckoutMode}
-            onChangeBaseBranch={onChangeBaseBranch}
-          />
+        {(showProjectControls || trailing) && (
+          <div className="flex shrink-0 items-center gap-1.5">
+            {showProjectControls && projectPath && (
+              <BranchControl
+                projectPath={projectPath}
+                checkoutMode={checkoutMode}
+                baseBranch={baseBranch}
+                disabled={disabled}
+                onChangeCheckoutMode={onChangeCheckoutMode}
+                onChangeBaseBranch={onChangeBaseBranch}
+              />
+            )}
+            {trailing}
+          </div>
         )}
       </div>
       {scopeHint && (

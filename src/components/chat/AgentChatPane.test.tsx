@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 let currentMessages: unknown[] = [];
 // Overridable per-test: thread -> messages map so the new race-fix
@@ -246,6 +246,15 @@ vi.mock("./pickers/ThreadScopeRow", () => ({
       />
     );
   },
+}));
+
+// Status cluster — its own store subscriptions / Tauri round-trips are
+// covered by WorkspaceStatusCluster.test.tsx; these tests only need to
+// see WHERE it's rendered (Context Row vs. the empty-state scope row).
+vi.mock("./WorkspaceStatusCluster", () => ({
+  WorkspaceStatusCluster: () => (
+    <div data-testid="workspace-status-cluster-stub" />
+  ),
 }));
 
 vi.mock("@/stores/ui-store", () => ({
@@ -976,7 +985,7 @@ describe("AgentChatPane Thread Scope — empty-state scope row", () => {
     expect(stub!.dataset.baseBranch).toBe("feat/login");
   });
 
-  it("hides the scope row once the conversation has messages", () => {
+  it("replaces the scope row with the read-only Context Row once the conversation has messages", () => {
     mockAppState.appState = {
       active_workspace_id: "ws-foo",
       workspaces: [
@@ -985,6 +994,7 @@ describe("AgentChatPane Thread Scope — empty-state scope row", () => {
           workspace_type: "standard",
           project_root: "/projects/foo",
           cwd: "/projects/foo",
+          git_branch: "feat/login",
         },
       ],
     };
@@ -996,14 +1006,50 @@ describe("AgentChatPane Thread Scope — empty-state scope row", () => {
       thread_id: "thread-x",
       cwd: "/projects/foo",
     };
+    // This describe block doesn't call `afterEach(cleanup)`, so prior
+    // tests' DOM trees can still be mounted in `document.body` —
+    // `within(container)` (not the bare `getByText` RTL normally
+    // returns, which is bound to `baseElement`/`document.body`) keeps
+    // these assertions scoped to THIS render.
     const { container } = render(<AgentChatPane pane={projectPane} />);
+    const scoped = within(container);
+    // The interactive empty-state scope row is gone...
     expect(
       container.querySelector('[data-testid="thread-scope-row-stub"]'),
     ).toBeNull();
-    // Zone 1 stays empty too — running-chat scope lives in the
-    // workspace context bar.
+    // Zone 1 stays empty — scope now lives below the composer.
     const zone1 = container.querySelector('[data-testid="zone1"]');
     expect(zone1!.childElementCount).toBe(0);
+    // ...replaced by the read-only Context Row: static project/branch
+    // labels plus the same status cluster the scope row's `trailing`
+    // slot carries.
+    expect(scoped.getByText("foo")).toBeInTheDocument();
+    expect(scoped.getByText("feat/login")).toBeInTheDocument();
+    const below = container.querySelector('[data-testid="below-composer"]');
+    expect(
+      below!.querySelector('[data-testid="workspace-status-cluster-stub"]'),
+    ).not.toBeNull();
+  });
+
+  it("Context Row omits the branch span when the workspace has no git branch (e.g. a home pane)", () => {
+    mockAppState.appState = {
+      active_workspace_id: "ws-home",
+      workspaces: [
+        {
+          workspace_id: "ws-home",
+          workspace_type: "standard",
+          project_root: "/home/user",
+          cwd: "/home/user",
+          git_branch: null,
+        },
+      ],
+    };
+    workspaceIdForPaneOverride = "ws-home";
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const scoped = within(container);
+    expect(scoped.getByText("Home")).toBeInTheDocument();
+    expect(scoped.queryByText("·")).not.toBeInTheDocument();
   });
 
   it("onSelectProject activates the first workspace of the picked project (old ProjectPicker behavior)", async () => {

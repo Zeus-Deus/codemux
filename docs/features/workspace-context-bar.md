@@ -42,6 +42,13 @@ Left → right:
   Chat GUI Beta kept it detached instead of splitting a pane). Click opens
   the floating peek overlay (`BrowserPeekOverlay`). Gated on `enableAgentChat
   && workspace.workspace_type !== "open_flow"`, mirroring `useGuiChrome()`.
+  The pill + session lookup now live in the shared
+  `BackgroundBrowserIndicator` / `useBackgroundBrowserSession` pair
+  (`src/components/browser/background-browser-indicator.tsx`), consumed
+  by both this bar and the Context Row's `WorkspaceStatusCluster` —
+  when the bar hides for an active agent-chat pane (below), the same
+  indicator renders in the Context Row instead, so the peek toggle is
+  never lost.
 
 The sidebar's expanded footer row (`sidebar-footer-bar.tsx`) is
 height-matched to the bar (42px, border-top instead of a separator +
@@ -58,7 +65,19 @@ new data plumbing.
 - a lazy-creation chat draft is active (unscoped new chat);
 - the onboarding wizard covers the active workspace;
 - the workspace has no git branch, no PR, no linked issue, and no live
-  background browser session (e.g. a home-directory workspace).
+  background browser session (e.g. a home-directory workspace);
+- **GUI chrome + an active Agent Chat pane** — `useAgentChatPaneActive()`
+  (`src/hooks/use-gui-chrome.ts`) is true when GUI chrome is active AND
+  the active pane of the active workspace's active surface is an
+  `agent_chat` pane. In that case the pane's own **Context Row**, under
+  its composer, now carries this same git/PR detail — and the
+  background-browser indicator — inline (see
+  `docs/features/agent-chat.md` § "Context Row (running-thread
+  status)") — showing both would duplicate the same numbers twice on
+  screen, so the permanent strip steps aside. A terminal (or other)
+  pane active in GUI mode keeps the bar; legacy chrome (Beta flag off)
+  is untouched, since `useGuiChrome()` — which the predicate is built
+  on — always resolves `false` there.
 
 ## What Works Today
 
@@ -82,13 +101,16 @@ new data plumbing.
 
 - `src/components/layout/workspace-context-bar.tsx` — the bar
 - `src/components/layout/app-shell.tsx` — mounted after `WorkspaceMain` in `SidebarInset`
-- `src/components/github/pr-status-icon.tsx` — PR state icon + humanized label
+- `src/hooks/use-gui-chrome.ts` — `useAgentChatPaneActive()`, the bar's hide-for-Context-Row gate
+- `src/components/github/pr-status-icon.tsx` — PR state icon + humanized label + `PR_CHIP_TONE` (shared with the Context Row's status cluster)
 - `src/components/github/issue-detail-popover.tsx` — `variant="chip"`, `side`/`align` props
-- `src/stores/app-store.ts` — `useActiveWorkspace()`, `useAppStore()` (background-browser session lookup)
+- `src/stores/app-store.ts` — `useActiveWorkspace()`
+- `src/components/browser/background-browser-indicator.tsx` — shared `BackgroundBrowserIndicator` pill + `useBackgroundBrowserSession` lookup (bar + Context Row cluster)
 - `src/stores/hosts-store.ts` — `useHosts()` host-name lookup
 - `src/stores/browser-peek-store.ts` — the indicator's click target (opens the peek)
 - `src/dev/tauri-mock.ts` — `get_github_issue` mock for the popover
 - `src/components/layout/workspace-context-bar.test.tsx` — unit tests
+- `src/components/chat/WorkspaceStatusCluster.tsx` — the Context Row's relocated version of this bar's git/PR detail + browser indicator (see `docs/features/agent-chat.md`)
 
 ## Notes
 
@@ -96,3 +118,7 @@ new data plumbing.
 - Adapted from the "workspace context bar" in the CodeMux UI-refresh design
   handoff (main workspace screen): passive status under the terminal / live
   chat, hidden when there is nothing to report.
+- The Context Row redesign (`.design-import/Context Row.dc.html`) relocated
+  this bar's content into the Agent Chat composer's scope row instead of
+  deleting anything — this bar still owns the detail for every non-agent-chat
+  active pane (terminal, browser, …) and for legacy chrome.

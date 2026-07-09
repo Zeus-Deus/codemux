@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Folder, GitBranch, Home } from "lucide-react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import {
@@ -105,6 +106,7 @@ import {
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
+import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
 import { useUIStore } from "@/stores/ui-store";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
@@ -2234,11 +2236,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setBaseBranch((prev) => (prev === "" ? paneWorkspaceBranch : prev));
   }, [paneWorkspaceBranch]);
 
-  // Zone 1 — nothing renders above the composer anymore: the Thread
-  // Scope row lives BELOW it (`belowComposerSlot`) while the thread is
-  // empty, and a running conversation keeps its scope in the workspace
-  // context bar. `undefined` (no resolvable project root) keeps the
-  // Composer's default cwd label as before.
+  // Zone 1 — nothing renders above the composer anymore: the scope
+  // lives BELOW it (`belowComposerSlot`) — `ThreadScopeRow` while the
+  // thread is empty, the Context Row once it has messages (see below).
+  // `undefined` (no resolvable project root) keeps the Composer's
+  // default cwd label as before.
   const zone1Override = workspaceProjectRoot ? null : undefined;
 
   // Old ProjectPicker onChange behavior, verbatim: clear any active
@@ -2290,7 +2292,52 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         onChangeCheckoutMode={setCheckoutMode}
         onChangeWorktreeName={setWorktreeName}
         onChangeBaseBranch={setBaseBranch}
+        // Real workspace on this surface — the status cluster has a
+        // git branch to report from its first render, unlike
+        // `DraftChatSurface`, which has no workspace yet and doesn't
+        // pass this.
+        trailing={<WorkspaceStatusCluster />}
       />
+    ) : messages.length > 0 && workspaceProjectRoot ? (
+      // Context Row (design: `.design-import/Context Row.dc.html`) —
+      // once the thread has messages, scope is committed (the first
+      // send locked it in), so this half turns read-only: static
+      // project/branch labels on the left, the same passive git/PR
+      // status cluster on the right that the old bottom
+      // `WorkspaceContextBar` used to show (now hidden for this pane —
+      // see `useAgentChatPaneActive`).
+      <div className="flex w-full items-center justify-between gap-2.5 px-1">
+        <div className="flex min-w-0 items-center gap-0.5 text-xs font-semibold text-foreground/90">
+          <span
+            className="inline-flex h-[27px] shrink-0 items-center gap-1.5 rounded-md px-2"
+            title={workspaceProjectRoot}
+          >
+            {isHomeWorkspace ? (
+              <Home className="size-3.5 text-status-remote" />
+            ) : (
+              <Folder className="size-3.5 text-muted-foreground" />
+            )}
+            <span className="max-w-[140px] truncate">
+              {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
+            </span>
+          </span>
+          {paneWorkspaceBranch && (
+            <>
+              <span className="select-none text-muted-foreground/50">·</span>
+              <span
+                className="inline-flex h-[27px] shrink-0 items-center gap-1.5 rounded-md px-2 font-mono"
+                title={`Branch: ${paneWorkspaceBranch}`}
+              >
+                <GitBranch className="size-3 text-muted-foreground" />
+                <span className="max-w-[160px] truncate">
+                  {paneWorkspaceBranch}
+                </span>
+              </span>
+            </>
+          )}
+        </div>
+        <WorkspaceStatusCluster />
+      </div>
     ) : undefined;
 
   /** Thread Scope deferred-worktree first send. Replaces `handleSubmit`
