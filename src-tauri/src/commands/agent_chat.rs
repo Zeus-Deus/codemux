@@ -1935,12 +1935,39 @@ fn publish_pane_status<R: Runtime>(
     if status == PaneStatus::Review && state.is_thread_pane_in_active_workspace(&thread_id.0) {
         status = PaneStatus::Idle;
     }
-    if state.set_pane_status_by_thread(&thread_id.0, status) {
+    let status_changed = state.set_pane_status_by_thread(&thread_id.0, status.clone());
+    // A finished run (turn complete and settled to `Review`/`Idle`, or the
+    // session closed/errored into `Idle`) releases the workspace's
+    // background agent browser session, if any, so the GUI-mode chip /
+    // context-bar indicator stop showing "LIVE" once the agent has nothing
+    // left to do. `Working`/`Permission` must NOT release — the tracker
+    // already defers `Review` while subagents are still running, so by the
+    // time we see a terminal status here the run really is over.
+    let released = run_finished(status)
+        && state
+            .agent_chat_pane_id_for_thread(&thread_id.0)
+            .and_then(|pane_id| state.workspace_id_for_pane(&pane_id))
+            .map(|workspace_id| state.release_detached_agent_browser(&workspace_id))
+            .unwrap_or(false);
+    // Compute both booleans above (not short-circuited via `||`) so the
+    // release call always runs even when the pane status itself didn't
+    // change (e.g. the thread was already Idle when the session closed).
+    if status_changed || released {
         let snapshot = state.snapshot();
         if let Err(error) = app.emit("app-state-changed", &snapshot) {
             eprintln!("[codemux::agent_chat] failed to emit app state: {error}");
         }
     }
+}
+
+/// Whether `status` represents the agent-chat run being over — a turn
+/// settled to `Review`/`Idle`, or the underlying session closing/erroring
+/// into `Idle`. Extracted from [`publish_pane_status`] so the "should we
+/// release the background browser session" policy is unit-testable
+/// without an `AppHandle`/`AppStateStore`. `Working` and `Permission` are
+/// mid-run and must return `false`.
+fn run_finished(status: PaneStatus) -> bool {
+    matches!(status, PaneStatus::Review | PaneStatus::Idle)
 }
 
 /// Whether a canonical provider event should be written to
@@ -2628,6 +2655,20 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn run_finished_only_for_review_and_idle() {
+        // Backs the background-agent-browser release wiring in
+        // `publish_pane_status`: a run is only "over" once the tracker
+        // settles to Review (turn done, nothing left in flight) or Idle
+        // (turn done and already seen, or session closed/errored). A
+        // mid-run Working or an approval prompt must never release the
+        // chip out from under a still-live agent.
+        assert!(run_finished(PaneStatus::Review));
+        assert!(run_finished(PaneStatus::Idle));
+        assert!(!run_finished(PaneStatus::Working));
+        assert!(!run_finished(PaneStatus::Permission));
     }
 
     // (a) TurnCompleted while a subagent is still running holds Working
