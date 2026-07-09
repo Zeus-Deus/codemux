@@ -49,7 +49,7 @@
 1. Harden OpenFlow reliability and intervention flow (the largest remaining stability gap)
 2. Re-enable OpenFlow on Windows by rewriting the bash wrapper scripts in `openflow::prompts`
 3. Move the agent-chat surface from Beta-gated to default-on once dogfooding settles
-4. Re-wire a UI entry point for the AI merge resolver — the backend, commands, store, and settings row all still work, but the refined-minimal UI pass (`92965c9`) removed both buttons that started a resolution, so the feature is currently unreachable (see `docs/features/merge-resolver.md`)
+4. Repair the Changes-panel regression from the refined-minimal UI pass (`92965c9`). Backends, Tauri commands, wrappers, and settings rows are all intact; only the UI callers were dropped. Restore, in rough value order: the AI merge resolver entry point (`ai-merge-store.ts` has zero importers), per-file Ours/Theirs (`resolveConflictOurs`/`Theirs`), "Merge [base] into current" (`mergeBranch`), "Merge into [base]" (`mergeIntoBase`), the Recent Commits section (`gitLogEntries`), the "Against base" compare section, and Alt+Click inline diff. See `docs/features/changes-panel.md` § "Removed by the slim-panel pass" and `docs/features/merge-resolver.md`. Public docs for these were removed from the website in the meantime; restore them from git history when the buttons come back.
 5. Add memory drawer UI
 6. Add context menus on pane headers (workspace rows, section groups, tabs, and the changes/ports sidebar panels already have them)
 7. Windows Authenticode code signing — pick OV vs EV certificate once SmartScreen friction starts showing up in user reports

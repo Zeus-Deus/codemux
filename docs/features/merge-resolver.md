@@ -55,12 +55,11 @@ idle → creating_branch → resolving → review → applying → idle
 
 ### Configuration
 
-The resolver is always available — there is no enable toggle. It only fires when the user explicitly clicks "Resolve with AI" on a real conflict, and even then runs on a temp branch with mandatory user review before apply, so gating it behind a setting was unnecessary friction.
+The resolver has no enable toggle rendered in the UI. (`ai_resolver_enabled` exists as a stored settings key, defaulting to `"false"`, but `setAiResolverEnabled` has no caller in `src/components/`.) The design intent was that it only fires when the user explicitly clicks "Resolve with AI" on a real conflict, and even then runs on a temp branch with mandatory user review before apply, so gating it behind a setting was unnecessary friction.
 
-Resolver settings are in Settings > Editor & Workflow > Agent:
-- CLI tool selector (Claude Code, Codex, OpenCode)
-- Model selector
-- Default merge strategy (Smart merge / Keep both / Prefer mine / Prefer theirs) — can also be overridden per-conflict from the resolver banner
+Resolver settings are in Settings > Git > Merge Conflict Resolver (a `SectionGroup` under the Git section, sibling to `AI Tools`):
+- Agent + model picker (Claude Code, Codex, OpenCode — the shared `MultiProviderModelPicker`)
+- Default merge strategy (Smart merge / Keep both / Prefer mine / Prefer theirs)
 
 ## What Works Today
 
@@ -73,7 +72,7 @@ Present and wired to each other, but not reachable by a user:
 - Frontend state machine tracking full resolver lifecycle (`ai-merge-store.ts`, no importers)
 - Backend Tauri commands, all registered in `lib.rs`: `create_resolver_branch`, `resolve_conflicts_with_agent`, `apply_resolution`, `abort_resolution`, `get_resolution_diff`
 - Frontend wrappers in `src/tauri/commands.ts` for all five
-- Settings → Editor & Workflow → Agent → "Merge Conflict Resolver" (CLI + model picker, default strategy)
+- Settings → Git → "Merge Conflict Resolver" (agent + model picker, default strategy). Note `ai_resolver_enabled` exists as a stored settings key but `setAiResolverEnabled` has no caller in the UI — there is no enable toggle rendered.
 
 ## Current Constraints
 
