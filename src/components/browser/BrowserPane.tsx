@@ -50,6 +50,15 @@ interface Props {
    *  promote/close actions instead. Defaults to showing the toolbar
    *  (today's pane behavior, unchanged). */
   hideToolbar?: boolean;
+  /** Pins the browser's CDP viewport to a fixed size instead of syncing
+   *  it to the container. The canvas element still tracks the container's
+   *  pixel size — the frame-draw letterbox scales the (larger) frame down
+   *  to fit, and `mapToViewport` already maps input through the draw
+   *  rect, so clicks stay accurate. Used by the peek overlay's
+   *  "Desktop-size background browser" setting so the tiny popover
+   *  doesn't force the agent's page to reflow at popover dimensions.
+   *  Absent = today's container-sync behavior, unchanged. */
+  fixedViewport?: { width: number; height: number };
 }
 
 // Move-forwarding cadence (ms). Drags run tight for smooth text
@@ -75,11 +84,17 @@ interface PendingMove {
   modifiers: number;
 }
 
-export function BrowserPane({ browserId, focused, visible, workspaceId, hideToolbar }: Props) {
+export function BrowserPane({ browserId, focused, visible, workspaceId, hideToolbar, fixedViewport }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const viewportRef = useRef<ViewportInfo>({ width: 1280, height: 720 });
+  // Ref-mirror of the `fixedViewport` prop so the WebSocket and
+  // ResizeObserver effects can read it without listing it in their
+  // dependency arrays (an inline object literal from the caller would
+  // otherwise reconnect the stream every render).
+  const fixedViewportRef = useRef(fixedViewport);
+  fixedViewportRef.current = fixedViewport;
   const [status, setStatus] = useState<"starting" | "connecting" | "waiting" | "live" | "error">("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [hasFrame, setHasFrame] = useState(false);
@@ -282,6 +297,16 @@ export function BrowserPane({ browserId, focused, visible, workspaceId, hideTool
         ws.onopen = () => {
           if (!active) return;
           setStatus("waiting");
+
+          // Pinned viewport: ignore container dimensions entirely — the
+          // popover canvas letterboxes the larger frame down to fit.
+          const fixed = fixedViewportRef.current;
+          if (fixed && fixed.width > 10 && fixed.height > 10) {
+            viewportRef.current = { width: fixed.width, height: fixed.height };
+            agentBrowserRun(effectiveSessionId, "viewport", { width: fixed.width, height: fixed.height }).catch(() => {});
+            sendInput({ type: "resize", width: fixed.width, height: fixed.height });
+            return;
+          }
 
           // Set initial viewport to match container dimensions
           const container = containerRef.current;
@@ -815,6 +840,10 @@ export function BrowserPane({ browserId, focused, visible, workspaceId, hideTool
         canvas.width = cw;
         canvas.height = ch;
       }
+      // Pinned viewport: the canvas tracks the container (above) but the
+      // browser's viewport stays fixed — never re-send it or overwrite
+      // viewportRef with container dims.
+      if (fixedViewportRef.current) return;
       // Debounced: tell browser to resize viewport to match
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {

@@ -2624,6 +2624,35 @@ impl AppStateStore {
         true
     }
 
+    /// Release a workspace's *background/detached* agent browser session
+    /// when the agent-chat run that was driving it finishes. Backs the
+    /// run-lifecycle wiring in `agent_chat.rs`'s `publish_pane_status`:
+    /// agents rarely call `browser close` themselves, so without this the
+    /// GUI-mode background chip / context-bar indicator (which key off
+    /// `is_active`) would show "LIVE" forever after the turn is long done.
+    /// Only flips the flag — and only returns `true` — when the session
+    /// exists, is currently active, AND has no `pane_id` (i.e. it is in
+    /// background/detached mode, not the legacy split-pane flow). A
+    /// pane-attached session has its own lifecycle (explicit user close /
+    /// pane close) and must be left untouched here. The session itself
+    /// (URL, cli_session_name) is kept so a later browser action from the
+    /// agent simply re-marks it active and the chip returns.
+    pub fn release_detached_agent_browser(&self, workspace_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        if !session.is_active || session.pane_id.is_some() {
+            return false;
+        }
+        session.is_active = false;
+        true
+    }
+
     /// Update the current URL on the agent browser session for a workspace.
     pub fn update_agent_browser_url(
         &self,
@@ -6150,6 +6179,62 @@ mod tests {
     fn mark_agent_browser_inactive_returns_false_when_no_session() {
         let store = AppStateStore::default();
         assert!(!store.mark_agent_browser_inactive("no-such-workspace"));
+    }
+
+    #[test]
+    fn release_detached_agent_browser_flips_paneless_active_session() {
+        // Backs the run-finished release in `agent_chat.rs`'s
+        // `publish_pane_status`: a background (pane-less) session that is
+        // active should flip inactive so the GUI chip stops showing LIVE.
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        store.mark_agent_browser_active(&ws_id.0);
+        assert!(store.snapshot().agent_browser_sessions[0].is_active);
+
+        let released = store.release_detached_agent_browser(&ws_id.0);
+        assert!(released);
+
+        let snap = store.snapshot();
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+        assert!(!snap.agent_browser_sessions[0].is_active);
+    }
+
+    #[test]
+    fn release_detached_agent_browser_leaves_pane_attached_session_untouched() {
+        // A pane-attached session (legacy split-pane mode) has its own
+        // close lifecycle; the run-finished release must not touch it.
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+        assert!(store.snapshot().agent_browser_sessions[0].is_active);
+
+        let released = store.release_detached_agent_browser(&ws_id.0);
+        assert!(!released);
+
+        let snap = store.snapshot();
+        assert!(snap.agent_browser_sessions[0].is_active);
+        assert!(snap.agent_browser_sessions[0].pane_id.is_some());
+    }
+
+    #[test]
+    fn release_detached_agent_browser_returns_false_when_no_session_or_inactive() {
+        let store = AppStateStore::default();
+        assert!(!store.release_detached_agent_browser("no-such-workspace"));
+
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        // Freshly resolved session starts inactive.
+        assert!(!store.release_detached_agent_browser(&ws_id.0));
     }
 
     #[test]

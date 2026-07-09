@@ -74,6 +74,32 @@ chip, indicator, and peek stop presenting the session as live the moment the
 browser closes. Daemon-death detection (a browser dying without a `close`)
 is out of scope — only the explicit close path is wired.
 
+**Run-finished release**: agents rarely call `browser close` themselves, so
+the explicit-close path above almost never fires in practice and the chip
+would otherwise show `LIVE · agent is navigating…` forever after the turn
+ends. `agent_chat.rs`'s `publish_pane_status` (the same function that drives
+the sidebar status dot) now also releases the background session: once the
+per-thread `SubagentTracker` settles a turn to `PaneStatus::Review` or
+`PaneStatus::Idle` — turn complete with no subagents still in flight, or the
+session closing/erroring into `Idle` — it resolves the thread's pane
+(`agent_chat_pane_id_for_thread`) and workspace (`workspace_id_for_pane`)
+and calls `AppStateStore::release_detached_agent_browser`. That method only
+flips `is_active` (and only returns `true`) for a session that is currently
+active *and* pane-less (`pane_id.is_none()`); a session already attached to
+a legacy split-pane is left alone since that flow has its own close
+lifecycle. `PaneStatus::Working`/`Permission` never release — the tracker
+already defers `Review` while a subagent is still running, so by the time a
+terminal status reaches this check the run really is over. As with the
+explicit-close path, the session's URL and `cli_session_name` are kept, so
+the agent's next browser action simply re-marks it active and the chip
+returns. Daemon-death detection remains out of scope either way.
+
+Known accepted edge case: if two chat threads are both driving browser
+activity in the *same* workspace, one thread finishing its run releases the
+chip even while the other thread is still mid-run. This self-heals — the
+still-running thread's next browser action immediately re-marks the shared
+session active.
+
 **Frontend surfaces**, all gated on the shared `useGuiChrome()` hook
 (`src/hooks/use-gui-chrome.ts`, extracted from `title-bar.tsx`'s inline
 predicate — see `docs/features/gui-chrome.md`) or the equivalent per-workspace
@@ -129,6 +155,23 @@ own compact header instead. Both props are additive and default to today's
 pane behavior (`workspaceId` unset falls through to the exact prior
 `browser_id`-only lookup; `hideToolbar` defaults to showing the toolbar).
 
+**Desktop-size peek viewport (opt-in)**: by default, `BrowserPane` syncs the
+browser's real CDP viewport to its container — inside the 440×300 peek that
+means pages reflow at popover dimensions and agents end up re-sending
+`viewport` every turn. Settings → Agent → "Desktop-size background browser"
+(`UserSettings.agent_chat.background_browser_desktop_viewport`, synced
+settings, default OFF) instead pins the peek's viewport to 1280×800 —
+matching the `desktop` preset / `RESET_SPEC` in
+`src-tauri/src/browser_viewport.rs` — via a new optional `BrowserPane`
+`fixedViewport` prop. When set, the WebSocket-open handshake sends the fixed
+size instead of container dims, and the `ResizeObserver` keeps syncing the
+canvas element to the container but skips the viewport re-send, so the
+existing frame-draw letterbox scales the full-size frame down to fit. Input
+mapping needs no changes — `mapToViewport` already routes clicks through the
+canvas rect + draw rect into viewport coordinates. Applies only to the peek
+overlay; normal browser panes (and the peek with the setting off) keep the
+container-sync behavior unchanged.
+
 ## Expected Operating Model
 
 - agents control the browser programmatically
@@ -164,6 +207,7 @@ pane behavior (`workspaceId` unset falls through to the exact prior
 - `src/components/chat/BackgroundBrowserChip.tsx` — the inline conversation chip for a background session
 - `src/hooks/use-gui-chrome.ts` — the shared `useGuiChrome()` gate the chip/indicator/peek key off
 - `src/stores/browser-peek-store.ts` — peek open/closed state (single `openWorkspaceId`; cleared on workspace switch)
-- `src-tauri/src/state/state_impl.rs` — `AgentBrowserSession` (`is_active`, `pane_id`, `current_url`), `mark_agent_browser_active` / `mark_agent_browser_inactive`, `attach_agent_browser_to_pane`, `detach_agent_browser_from_pane`, `find_detached_agent_browser`
+- `src-tauri/src/state/state_impl.rs` — `AgentBrowserSession` (`is_active`, `pane_id`, `current_url`), `mark_agent_browser_active` / `mark_agent_browser_inactive` / `release_detached_agent_browser`, `attach_agent_browser_to_pane`, `detach_agent_browser_from_pane`, `find_detached_agent_browser`
+- `src-tauri/src/commands/agent_chat.rs` — `publish_pane_status` calls `release_detached_agent_browser` once a run settles to `Review`/`Idle` (see "Run-finished release" above)
 - `docs/reference/BROWSER-AGENT-COMMANDS.md` — CLI and socket command reference
 - `docs/archive/browser-stream-fix.md` — landed cross-platform stream-stability plan (PID tracking, single canonical key, atomic teardown, symmetric bind probe, reactive frontend reconnect)

@@ -11,7 +11,18 @@ import { useGuiChrome } from "@/hooks/use-gui-chrome";
 import { cn } from "@/lib/utils";
 import { useActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
+import {
+  selectBackgroundBrowserDesktopViewport,
+  useSyncedSettingsStore,
+} from "@/stores/synced-settings-store";
 import { createBrowserPane } from "@/tauri/commands";
+
+/** Pinned viewport for the "Desktop-size background browser" setting.
+ *  Matches the `desktop` preset / `RESET_SPEC` in
+ *  `src-tauri/src/browser_viewport.rs` (1280×800 @ 1× DPR), so the peek
+ *  shows pages at the same baseline agents get from
+ *  `codemux browser viewport reset`. */
+const DESKTOP_PEEK_VIEWPORT = { width: 1280, height: 800 };
 
 /**
  * Floating "peek" overlay for a GUI-mode background browser session
@@ -46,6 +57,9 @@ export function BrowserPeekOverlay() {
     if (!found || !found.is_active || found.pane_id) return null;
     return found;
   });
+  const desktopViewport = useSyncedSettingsStore(
+    selectBackgroundBrowserDesktopViewport,
+  );
   const panelRef = useRef<HTMLDivElement>(null);
 
   const open = guiChrome && isOpen && !!session && !!activeWorkspaceId;
@@ -157,6 +171,7 @@ export function BrowserPeekOverlay() {
           focused={false}
           visible={open}
           hideToolbar
+          fixedViewport={desktopViewport ? DESKTOP_PEEK_VIEWPORT : undefined}
         />
       </div>
     </div>
