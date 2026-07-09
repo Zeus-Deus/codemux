@@ -51,7 +51,10 @@ import type {
   ChatModelInfo,
   CliToolInfo,
   FeatureFlags,
+  PaneNodeSnapshot,
   PresetStoreSnapshot,
+  SurfaceSnapshot,
+  TabSnapshot,
   TerminalPreset,
   ProviderChatCapabilities,
   ResourceMetricsSnapshot,
@@ -1555,6 +1558,51 @@ const handlers: Record<string, Handler> = {
   save_terminal_scrollback: () => undefined,
   flush_scrollback_cache: () => 0,
 
+  // ── Deferred worktree first-send (Thread Scope) ──
+  //
+  // Faithfully reproduces the async race the fix targets: the new
+  // worktree workspace is RETURNED synchronously from the invoke, but
+  // only reaches the app-store via an ASYNCHRONOUS `app-state-changed`
+  // emit (a macrotask later) — so a synchronous store read-back right
+  // after the invoke resolves misses, exactly like the real Tauri
+  // runtime. The workspace carries a DISTINCT cwd (the sibling worktree
+  // path, not the repo root) so root-vs-worktree is observable in dev.
+  generate_branch_name: (a) => {
+    const slug = String(a.prompt ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .split("-")
+      .slice(0, 4)
+      .join("-");
+    return slug || "mock-branch";
+  },
+  generate_random_branch_name: () =>
+    `mock-worktree-${Math.random().toString(36).slice(2, 8)}`,
+  create_worktree_workspace: (a) => {
+    const ws = buildWorktreeWorkspace(
+      String(a.repoPath ?? `${MOCK_HOME_DIR}/projects/codemux`),
+      String(a.branch ?? "mock-branch"),
+    );
+    // ASYNC emit — the workspace lands in the store only AFTER this
+    // invoke's promise has already resolved (macrotask), mirroring the
+    // real runtime's event ordering that the bug depended on.
+    setTimeout(() => {
+      appState = { ...appState, workspaces: [...appState.workspaces, ws] };
+      emitAppState();
+    }, 0);
+    return ws.workspace_id;
+  },
+  agent_chat_create_pane: (a) => {
+    // The deferred worktree workspace already carries a fresh
+    // agent_chat pane (empty thread); bind the session to it. Falls
+    // back to a synthetic id for any other workspace.
+    const ws = findWorkspace(a.workspaceId);
+    const root = ws?.surfaces?.[0]?.root;
+    if (root && root.kind === "agent_chat") return root.pane_id;
+    return `pane-mock-${Date.now()}`;
+  },
+
   // ── Mutators: patch in-memory state + re-emit ──
   activate_workspace: (a) => {
     if (findWorkspace(a.workspaceId)) {
@@ -1582,6 +1630,83 @@ const handlers: Record<string, Handler> = {
   close_workspace: (a) => removeWorkspace(a.workspaceId),
   close_workspace_with_worktree: (a) => removeWorkspace(a.workspaceId),
 };
+
+/** Build a `worktree`-kind workspace with a fresh (thread-less)
+ *  agent_chat pane and a DISTINCT sibling-worktree cwd, mirroring the
+ *  real `create_worktree_workspace` with the `"empty"` layout. Kept
+ *  self-contained (mock-fixtures' builders aren't exported) so the
+ *  deferred-worktree first-send path is exercisable end-to-end in
+ *  `npm run dev`. */
+let deferredWorktreeSeq = 0;
+function buildWorktreeWorkspace(
+  repoPath: string,
+  branch: string,
+): WorkspaceSnapshot {
+  const n = ++deferredWorktreeSeq;
+  const repoName = repoPath.split("/").filter(Boolean).pop() ?? "repo";
+  // Sibling worktree path — NOT the repo root — so a caller can tell the
+  // worktree cwd apart from the parent checkout.
+  const cwd = `${MOCK_HOME_DIR}/.codemux/worktrees/${repoName}/${branch}`;
+  const paneId = `pane-deferred-wt-${n}`;
+  const surfaceId = `surface-deferred-wt-${n}`;
+  const tabId = `tab-deferred-wt-${n}`;
+
+  const pane: PaneNodeSnapshot = {
+    kind: "agent_chat",
+    pane_id: paneId,
+    title: branch,
+    thread_id: null,
+    provider: "claude",
+    cwd,
+  };
+  const surface: SurfaceSnapshot = {
+    surface_id: surfaceId,
+    title: branch,
+    root: pane,
+    active_pane_id: paneId,
+  };
+  const tab: TabSnapshot = {
+    tab_id: tabId,
+    kind: "terminal",
+    title: branch,
+    surface_id: surfaceId,
+    browser_id: null,
+    icon: null,
+  };
+
+  return {
+    workspace_id: `ws-deferred-worktree-${n}`,
+    title: branch,
+    workspace_type: "standard",
+    cwd,
+    git_branch: branch,
+    git_ahead: 0,
+    git_behind: 0,
+    git_additions: 0,
+    git_deletions: 0,
+    git_changed_files: 0,
+    notification_count: 0,
+    latest_agent_state: null,
+    worktree_path: cwd,
+    project_root: repoPath,
+    project_uid: null,
+    workspace_kind: "worktree",
+    protected: false,
+    divergent_copy: false,
+    pr_number: null,
+    pr_state: null,
+    pr_url: null,
+    linked_issue: null,
+    notifications_muted: false,
+    tabs: [tab],
+    active_tab_id: tabId,
+    active_surface_id: surfaceId,
+    surfaces: [surface],
+    host_id: null,
+    remote_cwd: null,
+    attach_only: false,
+  };
+}
 
 /** Drop a workspace from the in-memory snapshot, reassigning the active
  *  workspace if it was the one closed, then re-emit. */

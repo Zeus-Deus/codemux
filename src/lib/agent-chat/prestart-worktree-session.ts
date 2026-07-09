@@ -3,11 +3,12 @@ import {
   useAgentChatStore,
   type ChatMode,
 } from "@/stores/agent-chat-store";
-import { useAppStore } from "@/stores/app-store";
 import {
   agentChatCreatePane,
   agentChatStartSession,
 } from "@/tauri/commands";
+
+import { waitForWorkspaceCwd } from "./wait-for-workspace-cwd";
 
 /** Optional session config carried from the surface that triggered the
  *  prestart (Thread Scope deferred-worktree submit) so the new
@@ -62,27 +63,27 @@ export interface PrestartedWorktreeSession {
  * ## CWD resolution
  *
  * The worktree path is only known to the backend after
- * `git_create_worktree` runs. We read it from the app-store after
- * `create_worktree_workspace` returns — `emit_app_state` fires
- * synchronously inside that Tauri command before the `Ok()` return,
- * so the event is on the frontend's IPC queue ahead of the invoke
- * response. In the degenerate case where the workspace still isn't
- * in the store (e.g. event delivery reordering), we skip the
- * pre-start entirely and fall back to the mount-effect path — not
- * ideal, but strictly no worse than today's buggy behavior.
+ * `git_create_worktree` runs, and the new workspace reaches the
+ * app-store only via the async `app-state-changed` event — which has
+ * essentially never been processed by the time `create_worktree_workspace`
+ * resolves (the PR #142 deferred-worktree cwd regression). Rather than
+ * a single synchronous read-back
+ * (which ~always missed and returned null on first send), we
+ * `waitForWorkspaceCwd` — awaiting the store landing the workspace,
+ * racing the event against a direct `get_app_state` fetch. Only a
+ * genuine timeout returns `null`, at which point we fall back to the
+ * AgentChatPane mount-effect path — strictly no worse than the pre-fix
+ * behavior, but now rare instead of routine.
  */
 export async function prestartWorktreeSession(
   workspaceId: string,
   config: PrestartSessionConfig = {},
 ): Promise<PrestartedWorktreeSession | null> {
-  const ws = useAppStore
-    .getState()
-    .appState?.workspaces.find((w) => w.workspace_id === workspaceId);
-  const cwd = ws?.cwd;
+  const cwd = await waitForWorkspaceCwd(workspaceId);
   if (!cwd) {
     console.warn(
-      "[prestart-worktree-session] workspace not yet in store; deferring " +
-        "session start to AgentChatPane mount-effect",
+      "[prestart-worktree-session] workspace cwd never reached the store; " +
+        "deferring session start to AgentChatPane mount-effect",
       { workspaceId },
     );
     return null;

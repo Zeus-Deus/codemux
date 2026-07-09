@@ -284,6 +284,17 @@ const ISSUE_MOCK: LinkedIssue = {
   labels: ["enhancement"],
 };
 
+/** Linked to the agent-chat-demo workspace so the Context Row's
+ *  linked-issue chip (relocated from the old bottom bar) is visible and
+ *  clickable under `npm run dev` — the mock's `get_github_issue`
+ *  expands this into a full issue for the popover. */
+const ISSUE_CHAT: LinkedIssue = {
+  number: 146,
+  title: "Context Row loses the linked-issue chip on agent-chat surfaces",
+  state: "Open",
+  labels: ["bug", "regression"],
+};
+
 // ── Workspaces ──────────────────────────────────────────────────────
 //
 // Project 1 — codemux: 1 primary (repo root) + 4 worktrees, covering
@@ -321,6 +332,9 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
     pr_number: 172,
     pr_state: "open",
     pr_url: "https://github.com/example/codemux/pull/172",
+    // Linked issue so the Context Row's relocated linked-issue chip
+    // (PR #144 dropped it from agent-chat surfaces) is demoable here.
+    linked_issue: ISSUE_CHAT,
     git_ahead: 2,
     git_behind: 5,
     git_additions: 9,
