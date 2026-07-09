@@ -976,8 +976,12 @@ sends the first message. The shared naming/creation helper is
 `createDeferredWorktree` (exported from
 `src/lib/agent-chat/materialize.ts`): name precedence is trimmed
 `worktreeName` verbatim → `generateBranchName(firstMessage,
-projectPath)` (the CLI's AI first-message naming) →
-`generateRandomBranchName(projectPath)` on error/empty, then
+projectPath)` (the CLI's AI first-message naming, backed by
+`branch_name.rs::generate_ai_name`; the underlying `claude --print` call
+is bounded by a 30s timeout, and any failure — spawn error, timeout,
+non-zero exit, empty output — is logged via `log::warn!` to the native
+log instead of failing silently) → `generateRandomBranchName(projectPath)`
+on error/empty, then
 `createWorktreeWorkspace` off the row's `baseBranch` with the `"empty"`
 layout. The two surfaces route it differently:
 
