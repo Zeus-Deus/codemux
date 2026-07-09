@@ -963,8 +963,11 @@ discriminated `location` prop so one component serves both surfaces:
 `baseBranch` from the workspace snapshot's `git_branch` — the real
 checked-out branch — falling back to the heuristic only when the
 snapshot has none. The row renders only while `messages.length === 0`
-and a project root resolves; once the conversation runs, scope lives in
-the workspace context bar as before.
+and a project root resolves; on `AgentChatPane` it additionally passes
+`trailing={<WorkspaceStatusCluster />}` (see "Context Row" below), so
+the passive git/PR status sits right of the branch control even before
+the first send. Once the conversation has messages, scope is read-only
+and the row is replaced by the Context Row.
 
 **Deferred worktree creation.** The old immediate-create "+ New
 worktree…" row is gone — picking "New worktree" only sets
@@ -1043,6 +1046,81 @@ and the titlebar tab drive one implementation, not a fork:
 `src/components/chat/session-history-menu.tsx` (`SessionHistoryList` +
 `useSessionHistory`, now consumed by both `SessionSelector` and the
 title-bar chat tab). See `docs/features/gui-chrome.md`.
+
+### Context Row (running-thread status)
+
+Design: `.design-import/Context Row.dc.html` (claude.ai/design handoff).
+Once a thread has messages, `AgentChatPane`'s `belowComposerSlot` swaps
+`ThreadScopeRow` for a read-only **Context Row** — the same outer
+layout (`flex justify-between px-1`), but scope is committed (the first
+send locked it in) so the left side is no longer clickable:
+
+- **Left** — static ghost-styled spans: folder icon (home icon +
+  `text-status-remote` for a home-rooted pane) + project name (`title`
+  tooltip = the resolved project root), a `·` separator, then a
+  `font-mono` branch-icon span with the workspace's checked-out branch
+  (`title="Branch: <name>"`) — omitted entirely when the workspace has
+  no `git_branch`.
+- **Right** — `<WorkspaceStatusCluster />` (`src/components/chat/WorkspaceStatusCluster.tsx`),
+  the same component `ThreadScopeRow`'s `trailing` slot uses in the
+  empty-thread state, so the passive status reads identically on both
+  sides of the first send.
+
+The row renders only when `messages.length > 0 && workspaceProjectRoot`;
+otherwise `belowComposerSlot` falls through to `undefined` (unresolved
+project root, e.g. very early boot).
+
+**`WorkspaceStatusCluster`** is self-contained — it reads
+`useActiveWorkspace()` directly rather than taking props (valid here
+because `PaneContainer` only ever mounts panes for the active
+workspace, so any `AgentChatPane` instance's workspace IS the active
+one). It renders:
+
+- the **background-browser indicator** (first in the cluster, mirroring
+  its old bottom-bar position) when the workspace has a live, pane-less
+  `agent_browser_sessions` entry — the shared
+  `BackgroundBrowserIndicator` + `useBackgroundBrowserSession` pair
+  (`src/components/browser/background-browser-indicator.tsx`, extracted
+  verbatim from `WorkspaceContextBar`, which still consumes them for
+  the terminal-pane/GUI cases where the bar renders). Click opens the
+  peek overlay (`useBrowserPeekStore().open`). The bar's
+  `enableAgentChat && workspace_type !== "open_flow"` gate is implicit
+  in the cluster's mount context (a disabled flag renders a
+  placeholder instead of the pane; OpenFlow never routes through
+  `PaneContainer`);
+- a **behind chip** (`↓N`, `text-warning`) when `git_behind > 0`;
+- a **PR chip** (`#N`, tone-tinted via `PR_CHIP_TONE` — the single
+  shared map in `src/components/github/pr-status-icon.tsx`, also used
+  by `WorkspaceContextBar`) that opens `pr_url` on click;
+- a **workspace-details button** (window icon + chevron-up) that opens
+  a `~290px` popover (`side="top" align="end"`) with:
+  - a header — workspace title, then `project · device` in
+    `font-mono` subtext;
+  - detail rows: Branch, Base (only once known — fetched on open via
+    `getGithubPrByPath(cwd, pr_number)` for `PullRequestInfo.base_branch`,
+    since `WorkspaceSnapshot` doesn't carry it; omitted on fetch
+    failure), Behind base (warning tone, if any), Ahead (success tone,
+    if any), Uncommitted (`+A −D`, if any), Pull request (`#N ·
+    <state>`, tone-tinted via `prStatusTextClass`), Location (`this
+    device` or the resolved host name);
+  - a footer with up to two quick actions: **View PR #N** (only with a
+    `pr_url`) and **Sync ↓N** (only while `git_behind > 0` — calls
+    `gitPullChanges(cwd)` with a busy label + an error toast on
+    failure, mirroring `changes-panel.tsx`'s `handlePull`).
+
+Renders `null` with no active workspace, or with neither a `git_branch`
+nor a background browser session. The git chips + details popover
+additionally require the branch, so a git-less workspace with a live
+background browser shows the Browser pill alone — matching the old
+bar's "browser indicator alone" case.
+
+**Bottom bar interaction.** While an Agent Chat pane is the active pane
+of the active surface in GUI chrome, `WorkspaceContextBar` renders
+`null` — the Context Row now owns that detail inline. See
+`docs/features/workspace-context-bar.md` and
+`useAgentChatPaneActive()` (`src/hooks/use-gui-chrome.ts`). A terminal
+(or other) pane active in GUI mode keeps the bottom bar; legacy chrome
+(Beta flag off) is unaffected.
 
 ## Tauri command surface
 

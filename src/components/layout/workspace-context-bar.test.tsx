@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   hosts: [] as Array<{ id: number; name: string }>,
   openUrl: vi.fn().mockResolvedValue(undefined),
   agentBrowserSessions: [] as AgentBrowserSession[],
+  agentChatPaneActive: false,
 }));
 
 vi.mock("@/stores/app-store", () => ({
@@ -43,6 +44,9 @@ vi.mock("@/stores/ui-store", () => ({
 }));
 vi.mock("@/stores/hosts-store", () => ({
   useHosts: () => mocks.hosts,
+}));
+vi.mock("@/hooks/use-gui-chrome", () => ({
+  useAgentChatPaneActive: () => mocks.agentChatPaneActive,
 }));
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: (...args: unknown[]) => mocks.openUrl(...args),
@@ -114,6 +118,7 @@ beforeEach(() => {
   mocks.hosts = [];
   mocks.openUrl.mockClear();
   mocks.agentBrowserSessions = [];
+  mocks.agentChatPaneActive = false;
   useBrowserPeekStore.setState({ openWorkspaceId: null });
 });
 
@@ -148,6 +153,20 @@ describe("WorkspaceContextBar", () => {
     mocks.onboardingProjectDir = "/home/dev/projects/repo";
     const { container } = render(<WorkspaceContextBar />);
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing when an Agent Chat pane is the active GUI-mode surface (Context Row owns the detail)", () => {
+    mocks.workspace = makeWorkspace();
+    mocks.agentChatPaneActive = true;
+    const { container } = render(<WorkspaceContextBar />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("still renders for a non-agent-chat active pane (e.g. a terminal) in GUI mode", () => {
+    mocks.workspace = makeWorkspace();
+    mocks.agentChatPaneActive = false;
+    render(<WorkspaceContextBar />);
+    expect(screen.getByText("feature/19-cloud-push")).toBeInTheDocument();
   });
 
   it("shows branch, worktree kind, and 'This device' for a local worktree", () => {

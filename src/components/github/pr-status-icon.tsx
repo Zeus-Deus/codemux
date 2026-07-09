@@ -26,10 +26,36 @@ const STATE_TO_TONE: Record<PrStatusState, string> = {
   draft: "text-muted-foreground bg-muted-foreground/15",
 };
 
+/** Tinted border/fill/text per PR state for a bordered "PR chip" button
+ *  (the workspace context bar's PR chip and the Context Row's status
+ *  cluster). Same tone family as `STATE_TO_TONE` above, but with the
+ *  border + hover treatment a clickable chip needs so the PR reads as a
+ *  labeled action rather than a bare icon. Single home for both
+ *  consumers — do not duplicate this map. */
+export const PR_CHIP_TONE: Record<PrStatusState, string> = {
+  open: "text-status-open border-status-open/40 bg-status-open/10 hover:bg-status-open/20",
+  merged:
+    "text-accent-violet border-accent-violet/40 bg-accent-violet/10 hover:bg-accent-violet/20",
+  closed:
+    "text-destructive border-destructive/40 bg-destructive/10 hover:bg-destructive/20",
+  draft:
+    "text-muted-foreground border-muted-foreground/40 bg-muted-foreground/10 hover:bg-muted-foreground/20",
+};
+
 export function prStatusToneClass(state: string | null | undefined): string | null {
   const normalized = normalizePrState(state);
   if (!normalized) return null;
   return STATE_TO_TONE[normalized];
+}
+
+/** Text-only color for a PR state — no background/border, for a value
+ *  rendered inline in a detail row (the Context Row popover's "Pull
+ *  request" row). Same color-per-state as `STATE_TO_ICON`/`PR_CHIP_TONE`
+ *  above, just without their chip chrome. */
+export function prStatusTextClass(state: string | null | undefined): string | null {
+  const normalized = normalizePrState(state);
+  if (!normalized) return null;
+  return STATE_TO_ICON[normalized].colorCls;
 }
 
 export function normalizePrState(state: string | null | undefined): PrStatusState | null {

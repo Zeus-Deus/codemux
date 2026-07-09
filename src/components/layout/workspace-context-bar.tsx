@@ -1,33 +1,23 @@
-import { Cloud, Folder, GitBranch, Globe, Laptop } from "lucide-react";
+import { Cloud, Folder, GitBranch, Laptop } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
-import { useActiveWorkspace, useAppStore } from "@/stores/app-store";
-import { useBrowserPeekStore } from "@/stores/browser-peek-store";
+import { useActiveWorkspace } from "@/stores/app-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useHosts } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
+import { useAgentChatPaneActive } from "@/hooks/use-gui-chrome";
 import {
+  BackgroundBrowserIndicator,
+  useBackgroundBrowserSession,
+} from "@/components/browser/background-browser-indicator";
+import {
+  PR_CHIP_TONE,
   PrStatusIcon,
   humanizePrState,
   normalizePrState,
-  type PrStatusState,
 } from "@/components/github/pr-status-icon";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
-
-/** Tinted border/fill/text per PR state for the context-bar chip.
- *  Same tone family as `PrStatusIcon` / `prStatusToneClass`, but with
- *  the bordered chip treatment the context bar uses so the PR reads
- *  as a labeled, clickable action rather than a bare icon. */
-const PR_CHIP_TONE: Record<PrStatusState, string> = {
-  open: "text-status-open border-status-open/40 bg-status-open/10 hover:bg-status-open/20",
-  merged:
-    "text-accent-violet border-accent-violet/40 bg-accent-violet/10 hover:bg-accent-violet/20",
-  closed:
-    "text-destructive border-destructive/40 bg-destructive/10 hover:bg-destructive/20",
-  draft:
-    "text-muted-foreground border-muted-foreground/40 bg-muted-foreground/10 hover:bg-muted-foreground/20",
-};
 
 /**
  * Workspace context bar — the passive, read-only status strip under the
@@ -41,8 +31,11 @@ const PR_CHIP_TONE: Record<PrStatusState, string> = {
  * detailed) — so nothing is lost when the sidebar is set to Clean.
  *
  * Hidden when there is nothing to report: no active workspace, a
- * brand-new (unscoped) chat draft, the onboarding wizard, or a
- * workspace with no git context at all (e.g. a home-dir workspace).
+ * brand-new (unscoped) chat draft, the onboarding wizard, a workspace
+ * with no git context at all (e.g. a home-dir workspace), or — in GUI
+ * chrome — an active Agent Chat pane, which now carries the same
+ * detail inline in its own Context Row under the composer (see
+ * `docs/features/agent-chat.md` "Context Row").
  */
 export function WorkspaceContextBar() {
   // Hooks run unconditionally; all visibility gates come after.
@@ -57,25 +50,23 @@ export function WorkspaceContextBar() {
   const hasActiveDraft = useChatDraftStore((s) => s.activeDraftId !== null);
   const onboardingProjectDir = useUIStore((s) => s.onboardingProjectDir);
   const hosts = useHosts();
-  // GUI-mode background browser session for the active workspace (see
-  // docs/features/browser.md "Background browser in GUI mode") — a
-  // detached agent browser session that is live (`is_active`) but not
-  // attached to a pane (`pane_id === null`).
-  const backgroundBrowserSession = useAppStore((s) => {
-    const wsId = workspace?.workspace_id;
-    if (!wsId) return null;
-    const session = s.appState?.agent_browser_sessions?.find(
-      (abs) => abs.workspace_id === wsId,
-    );
-    if (!session || !session.is_active || session.pane_id) return null;
-    return session;
-  });
-  const openPeek = useBrowserPeekStore((s) => s.open);
+  // The Context Row (below the composer) now owns this workspace's
+  // git/PR detail while an Agent Chat pane is the active surface —
+  // showing both would duplicate the same numbers twice on screen.
+  // A terminal (or other) pane active in GUI mode keeps this bar.
+  const agentChatPaneActive = useAgentChatPaneActive();
+  // GUI-mode background browser session for the active workspace —
+  // shared lookup with the Context Row's status cluster (see the
+  // hook's doc comment).
+  const backgroundBrowserSession = useBackgroundBrowserSession(
+    workspace?.workspace_id,
+  );
 
   // Brand-new chat draft: the workspace scope isn't locked in yet, so
   // there is nothing to report (mirrors WorkspaceMain's draft branch).
   if (lazyEnabled && hasActiveDraft) return null;
   if (!workspace) return null;
+  if (agentChatPaneActive) return null;
 
   // Onboarding wizard occupies the content area for this workspace.
   const isOnboarding =
@@ -177,19 +168,7 @@ export function WorkspaceContextBar() {
       <div className="ml-auto flex shrink-0 items-center gap-2">
         {/* GUI-mode background browser indicator — opens the peek overlay */}
         {showBrowserIndicator && (
-          <button
-            type="button"
-            onClick={() => openPeek(workspace.workspace_id)}
-            aria-label="Browser running in background — view"
-            className="inline-flex h-[26px] items-center gap-1.5 rounded-md border border-status-remote/30 bg-status-remote/10 px-2.5 text-[11px] font-semibold text-status-remote transition-colors hover:bg-status-remote/16 hover:text-foreground"
-          >
-            <Globe className="h-3 w-3" aria-hidden />
-            Browser
-            <span
-              className="cm-blink h-1.5 w-1.5 rounded-full bg-status-working"
-              aria-hidden
-            />
-          </button>
+          <BackgroundBrowserIndicator workspaceId={workspace.workspace_id} />
         )}
 
         {/* PR chip — opens the PR on GitHub */}
