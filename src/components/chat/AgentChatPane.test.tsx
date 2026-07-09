@@ -562,6 +562,25 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
     expect(container.querySelector('[data-testid="transcript"]')).toBeNull();
     expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
   });
+
+  it("hides the docked subagent activity bar while drilled into a subagent, and shows it again on Esc", () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+    // Orchestrator mode: one live subagent — the bar is up.
+    expect(
+      container.querySelector('[data-testid="subagent-activity-bar"]'),
+    ).not.toBeNull();
+
+    fireEvent.click(container.querySelector('[data-testid="enter-subagent"]')!);
+    // Design: the docked bar only shows in the conversation view.
+    expect(
+      container.querySelector('[data-testid="subagent-activity-bar"]'),
+    ).toBeNull();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      container.querySelector('[data-testid="subagent-activity-bar"]'),
+    ).not.toBeNull();
+  });
 });
 
 describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {

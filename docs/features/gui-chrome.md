@@ -44,8 +44,10 @@ sidebar boundary so tabs start where the content pane starts (design:
   workspace's backend-owned tabs as compact pills (h-7, rounded-lg) with a
   per-tab status dot (highest-priority `pane_statuses` across the tab's panes),
   a chat-bubble / terminal / kind icon, and a hover/active-revealed close `X`.
-  The **active chat tab** grows a chevron opening the session-history dropdown
-  and renders the live "N subagents running" pill inline beside it.
+  The **active chat tab** grows a chevron opening the session-history dropdown.
+  (The inline "N subagents running" pill that used to ride beside it was
+  removed in favor of the docked `SubagentActivityBar` above the composer —
+  see `docs/features/agent-chat.md` "Docked live activity bar".)
   Activation/close route through the existing `activateTab` / `closeTab`
   commands. Pills cap at `max-w-[130px]` and the strip scrolls
   horizontally (wheel → horizontal translation, hidden scrollbar) instead
@@ -93,8 +95,11 @@ titlebar tab share one implementation (see "Important Touch Points").
   run-start checkpoint exists).
 - `+` launcher covering GUI chat presets, CLI agents (with Shift-split),
   Terminal/Browser panes, and Manage presets.
-- Inline ember chat favorite; rehomed right-panel toggle + RunButton; the "N
-  subagents running" status pill kept alive next to the active chat tab.
+- Inline ember chat favorite; rehomed right-panel toggle + RunButton. (The
+  "N subagents running" status pill that originally rehomed next to the
+  active chat tab was later removed — subagent status now lives in the
+  docked `SubagentActivityBar` above the composer; see
+  `docs/features/agent-chat.md` "Docked live activity bar".)
 - Tab drag-reorder via a pointer-based drag (pointerdown on a pill body +
   ~5px movement threshold → drag mode, drop index computed from tab
   midpoints, same `reorder_tabs` backend command and insertion-indicator

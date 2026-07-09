@@ -302,7 +302,7 @@ export function subagentRunItems(messages: ChatViewItem[]): SubagentRunItem[] {
 }
 
 /** Count of currently-running subagents across the whole thread — feeds
- *  the pane sub-header "N subagents running" pill. */
+ *  the docked {@link SubagentActivityBar}. */
 export function countRunningSubagents(messages: ChatViewItem[]): number {
   let n = 0;
   for (const card of subagentRunItems(messages)) {
@@ -333,4 +333,45 @@ export function subagentOrdinal(messages: ChatViewItem[], id: string): number {
     if (idx >= 0) return idx + 1;
   }
   return 0;
+}
+
+/** One currently-running subagent, flattened out of its card, with enough
+ *  context to render a docked-bar row and jump back to the card it came
+ *  from. */
+export interface RunningSubagentEntry {
+  subagent: SubagentView;
+  /** The `subagent_run` card id — the jump target (design "from
+   *  <reply>"). */
+  cardId: string;
+  /** 1-based position of the card among the thread's `subagent_run`
+   *  cards. */
+  cardIndex: number;
+  /** "task N" label for the expand-list row, or null when the thread has
+   *  only one card (the design allows omitting "from" in that case —
+   *  there is nothing to disambiguate). */
+  fromLabel: string | null;
+}
+
+/** Every currently-running subagent across every `subagent_run` card in
+ *  the thread, no matter which reply spawned it (design "one bar for the
+ *  whole thread"). Feeds the docked {@link SubagentActivityBar}: its
+ *  `.length` is the bar's count, and each entry carries the "from"
+ *  label + jump target for the expand list. */
+export function runningSubagentEntries(
+  messages: ChatViewItem[],
+): RunningSubagentEntry[] {
+  const cards = subagentRunItems(messages);
+  const entries: RunningSubagentEntry[] = [];
+  cards.forEach((card, cardIdx) => {
+    for (const sub of card.subagents) {
+      if (!isRunning(sub)) continue;
+      entries.push({
+        subagent: sub,
+        cardId: card.id,
+        cardIndex: cardIdx + 1,
+        fromLabel: cards.length > 1 ? `task ${cardIdx + 1}` : null,
+      });
+    }
+  });
+  return entries;
 }

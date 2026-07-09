@@ -11,6 +11,7 @@ import {
   mergeStatus,
   newSubagentView,
   recentToolCalls,
+  runningSubagentEntries,
   subagentActivityLine,
   subagentElapsedMs,
   subagentMetaLine,
@@ -216,5 +217,29 @@ describe("whole-thread lookups", () => {
     expect(toneIndexForId("abc")).toBe(toneIndexForId("abc"));
     expect(toneIndexForId("abc")).toBeGreaterThanOrEqual(0);
     expect(toneIndexForId("abc")).toBeLessThan(5);
+  });
+
+  it("flattens running subagents with no from-label when there is one card", () => {
+    const entries = runningSubagentEntries(messages);
+    expect(entries.map((e) => e.subagent.id)).toEqual(["a", "c"]);
+    expect(entries.every((e) => e.cardId === "run-1")).toBe(true);
+    expect(entries.every((e) => e.fromLabel === null)).toBe(true);
+  });
+
+  it("labels each running subagent with its originating card once several cards exist", () => {
+    const cardTwo: SubagentRunItem = {
+      kind: "subagent_run",
+      id: "run-2",
+      seq: 1,
+      turn_id: "t2",
+      subagents: [view({ id: "d", status: "running" })],
+    };
+    const multi: ChatViewItem[] = [...messages, cardTwo];
+    const entries = runningSubagentEntries(multi);
+    expect(entries.map((e) => [e.subagent.id, e.cardId, e.fromLabel])).toEqual([
+      ["a", "run-1", "task 1"],
+      ["c", "run-1", "task 1"],
+      ["d", "run-2", "task 2"],
+    ]);
   });
 });
