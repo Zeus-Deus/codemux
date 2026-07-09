@@ -1,6 +1,6 @@
 {
   "name": "codemux",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "The Agentic Development Environment for Builders",
   "type": "module",
   "scripts": {
