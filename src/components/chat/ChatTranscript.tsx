@@ -32,10 +32,9 @@ interface Props {
 }
 
 /**
- * Transcript shell. The scroll container, stick-to-bottom pinning and
- * row windowing all live inside the virtualized `MessageList` (the
- * virtualizer must own its scroller to map scroll offsets onto the
- * rendered window) — this layer just sizes it and derives the
+ * Transcript shell. The scroll container and stick-to-bottom tracking
+ * (owned by the shadcn scroller engine inside `MessageList`) both live
+ * inside `MessageList` — this layer just sizes it and derives the
  * thinking-pulse flag.
  */
 export function ChatTranscript({
