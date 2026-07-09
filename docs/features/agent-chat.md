@@ -853,6 +853,128 @@ multi-provider model picker. The empty-state composer (before a session
 exists) lives in `DraftChatSurface.tsx`; the "no panes" home landing
 lives in `ChatHomeLanding.tsx`.
 
+### Thread Scope (first-send scope controls)
+
+BOTH first-send surfaces — `DraftChatSurface` (lazy-creation draft) and
+`AgentChatPane`'s new-thread empty state (`messages.length === 0` on a
+real workspace's pane) — render their scope controls **below** the
+composer as one shared borderless `ThreadScopeRow`
+(`src/components/chat/pickers/ThreadScopeRow.tsx`), threaded through
+`Composer`'s `belowComposerSlot` prop (a sibling of `zone1Override`,
+which both surfaces now pass `null` while a project root resolves — the
+cwd label moved into the row's location control). Three states, matched
+to the surface's target / `checkoutMode`:
+
+- **Project · current checkout** — a `location · checkout` group on the
+  left (ghost text buttons, each opening a popover) and a `from ⑂
+  <branch>` control on the right, plus a centered muted hint below
+  ("Runs in `<project>`'s current checkout on `<branch>`. Changes land
+  directly in your working copy.").
+- **Project · worktree** — the checkout popover's "New worktree" option
+  reveals an optional mono name input ("name — leave empty to
+  auto-name") with a hint that empty names auto-derive from the first
+  message, like the CLI.
+- **Home** — only the location control renders (no checkout/branch —
+  there's no project to scope); the hint reads "No project — this agent
+  runs on your machine in the home directory (~)…". `PresetBar` returns
+  `null` outright for a home draft (previously it rendered fully
+  disabled) via an early-return on the pre-existing `isHomeDraft` check.
+
+**Draft store fields.** `ChatDraft` gained three optional fields
+(`chat-draft-store.ts`), defaulted in `makeDraft` and read with `??`
+fallbacks at every call site so pre-redesign persisted drafts still
+deserialize: `checkoutMode: "current" | "worktree"` (default
+`"current"`), `worktreeName: string` (default `""`), `baseBranch:
+string` (default `""` — also doubles as the row's best-effort display
+of "the project's current checked-out branch"; seeded from the
+main/master/first-branch heuristic once the branch list loads, since a
+draft has no workspace snapshot to ask).
+
+**Location binding (`ThreadScopeLocation`).** The row takes a
+discriminated `location` prop so one component serves both surfaces:
+
+- `{ kind: "draft", target, onChangeTarget }` — locations retarget the
+  client-side draft; nothing is created before first send.
+- `{ kind: "workspace", isHome, onSelectHomeWorkspace, onSelectProject }`
+  — the pane is bound to a REAL workspace, so locations navigate:
+  picking a project fires `onSelectProject`, whose `AgentChatPane` call
+  site keeps the retired `ProjectPicker`'s onChange behavior verbatim
+  (clear the active draft, activate the project's first workspace, else
+  open the new-workspace dialog seeded with the path); "Home directory
+  (~)" only renders when a home-rooted workspace already exists (or the
+  pane itself is home-rooted) and hops to it via
+  `onSelectHomeWorkspace` — the location popover never creates hidden
+  workspaces.
+
+**Pane-surface state + branch display.** `AgentChatPane` keeps
+`checkoutMode`/`worktreeName`/`baseBranch` as pane-local `useState`
+(per-pane lifetime; there is no draft to persist into), and seeds
+`baseBranch` from the workspace snapshot's `git_branch` — the real
+checked-out branch — falling back to the heuristic only when the
+snapshot has none. The row renders only while `messages.length === 0`
+and a project root resolves; once the conversation runs, scope lives in
+the workspace context bar as before.
+
+**Deferred worktree creation.** The old immediate-create "+ New
+worktree…" row is gone — picking "New worktree" only sets
+`checkoutMode`; the worktree is created as part of the SAME submit that
+sends the first message. The shared naming/creation helper is
+`createDeferredWorktree` (exported from
+`src/lib/agent-chat/materialize.ts`): name precedence is trimmed
+`worktreeName` verbatim → `generateBranchName(firstMessage,
+projectPath)` (the CLI's AI first-message naming) →
+`generateRandomBranchName(projectPath)` on error/empty, then
+`createWorktreeWorkspace` off the row's `baseBranch` with the `"empty"`
+layout. The two surfaces route it differently:
+
+- **Draft surface** — `materializeAndSend` takes an optional
+  `worktreeProjectPath` (resolved by `DraftChatSurface`:
+  `target.projectPath` for a `project` target, the resolved
+  `existingWorkspaceProjectRoot` for `existing_workspace`); it creates
+  the worktree, re-resolves the pane/session cwd to the new worktree's
+  real cwd (read back from the app-store), and continues down the
+  existing create-pane → mark-materialized → seed-slice →
+  start-session → send-turn ordering (shared `thread_id` throughout, so
+  the first send can't hit `session_not_found`).
+- **Pane empty state** — `AgentChatPane`'s `handleDeferredWorktreeSubmit`
+  intercepts the composer submit ONLY while `messages.length === 0 &&
+  checkoutMode === "worktree"` (everything else stays on the unmodified
+  `handleSubmit`): it calls `createDeferredWorktree`, then
+  `prestartWorktreeSession(wsId, config)` — extended to return
+  `{ paneId, threadId } | null` and to take an optional session config
+  (model / permissionMode / effort / contextWindow / mode) so the new
+  session launches with the pane's picker values — then sends the first
+  turn into the returned `threadId` with the same
+  skills/attachment-block/mode-prefix/images pipeline `handleSubmit`
+  uses (attachment CONTENT staged on the old thread is injected into
+  the turn; the chip UI stays behind and is cleared), appends the
+  optimistic user bubble to the new thread, clears this pane's
+  composer, and activates the new workspace. The stale GitHub-detail
+  re-fetch pass is deliberately skipped on this path. If the prestart
+  returns `null` (workspace not yet in the store), the text stays in
+  the old composer, a warning toast fires, and the new workspace is
+  activated anyway.
+
+`checkoutMode === "current"` (the default) is unchanged from before the
+redesign on both surfaces — no worktree, no new Tauri calls.
+
+**Branch control ↔ checkout mode coupling.** The branch popover
+(`ThreadScopeRow`'s `BranchControl` — search, All/Worktrees tabs, kind
+icons, mono ages, amber WORKTREE badge on rows with a worktree on this
+device) shares one `baseBranch` value for both "the checked-out branch"
+(current mode) and "the worktree's base" (worktree mode). Picking a
+DIFFERENT branch while on `"current"` auto-flips `checkoutMode` to
+`"worktree"` with the picked branch as base — the control never
+silently repoints the user's real checkout. Picking the SAME branch, or
+any branch while already on `"worktree"`, just updates `baseBranch`.
+
+`WorktreePicker` and `DerivativeBranchPicker` were **deleted** —
+`ThreadScopeRow` absorbed both first-send surfaces and the "switch to a
+sibling worktree" affordance moved to the sidebar (siblings stay
+reachable there); `ProjectPicker`
+(`src/components/overlays/project-picker.tsx`) survives for the
+new-workspace dialog only.
+
 **GUI chrome suppression.** When the Beta flag is on and the chat pane is
 the **sole root** of its surface (not a split), `AgentChatPaneHeader` does
 NOT render — the title bar absorbs the tab, its session-history dropdown,

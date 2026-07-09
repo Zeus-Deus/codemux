@@ -17,6 +17,9 @@ vi.mock("@/tauri/commands", () => ({
   createEmptyWorkspace: vi.fn((cwd: string) =>
     Promise.resolve(cwd === "/home/user" ? "ws-home" : "ws-project"),
   ),
+  createWorktreeWorkspace: vi.fn().mockResolvedValue("ws-worktree"),
+  generateBranchName: vi.fn().mockResolvedValue("ai-named-branch"),
+  generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
 }));
@@ -33,6 +36,9 @@ import {
   agentChatStartSession,
   applyPreset,
   createEmptyWorkspace,
+  createWorktreeWorkspace,
+  generateBranchName,
+  generateRandomBranchName,
   getHomeDir,
   renameWorkspace,
 } from "@/tauri/commands";
@@ -94,10 +100,15 @@ describe("materializeAndSend", () => {
       .mockImplementation((cwd: string) =>
         Promise.resolve(cwd === "/home/user" ? "ws-home" : "ws-project"),
       );
+    vi.mocked(createWorktreeWorkspace).mockClear().mockResolvedValue("ws-worktree");
+    vi.mocked(generateBranchName).mockClear().mockResolvedValue("ai-named-branch");
+    vi.mocked(generateRandomBranchName)
+      .mockClear()
+      .mockResolvedValue("random-branch");
     vi.mocked(getHomeDir).mockClear().mockResolvedValue("/home/user");
     vi.mocked(renameWorkspace).mockClear().mockResolvedValue(undefined);
     // Stage C home-branch reads homeDir from the app-store cache.
-    useAppStore.setState({ homeDir: "/home/user" });
+    useAppStore.setState({ homeDir: "/home/user", appState: null });
   });
 
   describe("happy path", () => {
@@ -553,6 +564,268 @@ describe("materializeAndSend", () => {
       );
 
       expect(result).toEqual({ success: false, error: "backend said no" });
+    });
+  });
+
+  describe("deferred worktree creation (Thread Scope redesign)", () => {
+    function seedCreatedWorktreeWorkspace(cwd: string) {
+      // `createDeferredWorktree` resolves the new workspace's real cwd
+      // by reading it back from the app-store — `emit_app_state` fires
+      // synchronously inside `create_worktree_workspace` before the
+      // Tauri invoke resolves in production. Mirrors
+      // `prestart-worktree-session.ts`'s same trick.
+      useAppStore.setState({
+        homeDir: "/home/user",
+        appState: {
+          schema_version: 1,
+          active_workspace_id: "ws-worktree",
+          workspaces: [
+            {
+              workspace_id: "ws-worktree",
+              cwd,
+            },
+          ],
+        } as never,
+      });
+    }
+
+    it("auto-names from the first message when worktreeName is empty (generateBranchName)", async () => {
+      seedCreatedWorktreeWorkspace("/projects/foo-ai-named-branch");
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "",
+        baseBranch: "main",
+      });
+
+      const result = await materializeAndSend(
+        draft,
+        "fix the login bug",
+        "/projects/foo",
+        actions,
+        null,
+        null,
+        [],
+        "/projects/foo",
+      );
+
+      expect(result.success).toBe(true);
+      expect(generateBranchName).toHaveBeenCalledWith(
+        "fix the login bug",
+        "/projects/foo",
+      );
+      expect(generateRandomBranchName).not.toHaveBeenCalled();
+      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+        "/projects/foo",
+        "ai-named-branch",
+        true,
+        "empty",
+        "main",
+        null,
+        null,
+      );
+      // The project's own checkout is never touched.
+      expect(createEmptyWorkspace).not.toHaveBeenCalled();
+      // Pane + session launch inside the NEW worktree's cwd, not the
+      // caller-supplied `/projects/foo`.
+      expect(agentChatCreatePane).toHaveBeenCalledWith(
+        "ws-worktree",
+        "claude",
+        "/projects/foo-ai-named-branch",
+      );
+      const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(startInput.cwd).toBe("/projects/foo-ai-named-branch");
+    });
+
+    it("falls back to generateRandomBranchName when generateBranchName throws", async () => {
+      seedCreatedWorktreeWorkspace("/projects/foo-random-branch");
+      vi.mocked(generateBranchName).mockRejectedValueOnce(
+        new Error("no api key"),
+      );
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "",
+        baseBranch: "main",
+      });
+
+      const result = await materializeAndSend(
+        draft,
+        "fix the login bug",
+        "/projects/foo",
+        actions,
+        null,
+        null,
+        [],
+        "/projects/foo",
+      );
+
+      expect(result.success).toBe(true);
+      expect(generateRandomBranchName).toHaveBeenCalledWith("/projects/foo");
+      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+        "/projects/foo",
+        "random-branch",
+        true,
+        "empty",
+        "main",
+        null,
+        null,
+      );
+    });
+
+    it("falls back to generateRandomBranchName when generateBranchName resolves empty", async () => {
+      seedCreatedWorktreeWorkspace("/projects/foo-random-branch");
+      vi.mocked(generateBranchName).mockResolvedValueOnce("   ");
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "",
+        baseBranch: "main",
+      });
+
+      await materializeAndSend(
+        draft,
+        "fix the login bug",
+        "/projects/foo",
+        actions,
+        null,
+        null,
+        [],
+        "/projects/foo",
+      );
+
+      expect(generateRandomBranchName).toHaveBeenCalledWith("/projects/foo");
+      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+        "/projects/foo",
+        "random-branch",
+        true,
+        "empty",
+        "main",
+        null,
+        null,
+      );
+    });
+
+    it("uses an explicit worktreeName verbatim, without calling generateBranchName", async () => {
+      seedCreatedWorktreeWorkspace("/projects/foo-my-branch");
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "  my-branch  ",
+        baseBranch: "develop",
+      });
+
+      await materializeAndSend(
+        draft,
+        "hello",
+        "/projects/foo",
+        actions,
+        null,
+        null,
+        [],
+        "/projects/foo",
+      );
+
+      expect(generateBranchName).not.toHaveBeenCalled();
+      expect(generateRandomBranchName).not.toHaveBeenCalled();
+      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+        "/projects/foo",
+        "my-branch",
+        true,
+        "empty",
+        "develop",
+        null,
+        null,
+      );
+    });
+
+    it("checkoutMode 'current' (the default) never creates a worktree, even with a worktreeProjectPath", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "current",
+      });
+
+      const result = await materializeAndSend(
+        draft,
+        "hello",
+        "/projects/foo",
+        actions,
+        null,
+        null,
+        [],
+        "/projects/foo",
+      );
+
+      expect(result.success).toBe(true);
+      expect(createWorktreeWorkspace).not.toHaveBeenCalled();
+      expect(generateBranchName).not.toHaveBeenCalled();
+      expect(generateRandomBranchName).not.toHaveBeenCalled();
+      // Falls through to the ordinary project-target path.
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/projects/foo");
+    });
+
+    it("checkoutMode 'worktree' without a worktreeProjectPath (e.g. a home target) falls through unchanged", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "home" },
+        checkoutMode: "worktree",
+      });
+
+      const result = await materializeAndSend(
+        draft,
+        "hello",
+        "/home/user",
+        actions,
+        null,
+        null,
+        [],
+        null,
+      );
+
+      expect(result.success).toBe(true);
+      expect(createWorktreeWorkspace).not.toHaveBeenCalled();
+      expect(createEmptyWorkspace).toHaveBeenCalledWith("/home/user", {
+        skipSetup: true,
+      });
+    });
+
+    it("worktree creation failure surfaces via markSendFailed, no pane/session calls", async () => {
+      vi.mocked(createWorktreeWorkspace).mockRejectedValueOnce(
+        new Error("branch already exists"),
+      );
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "taken-name",
+      });
+
+      const result = await materializeAndSend(
+        draft,
+        "hello",
+        "/projects/foo",
+        actions,
+        null,
+        null,
+        [],
+        "/projects/foo",
+      );
+
+      expect(result).toEqual({
+        success: false,
+        error: "branch already exists",
+      });
+      expect(actions.markSendFailed).toHaveBeenCalledWith(
+        "draft-1",
+        "branch already exists",
+      );
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+      expect(agentChatStartSession).not.toHaveBeenCalled();
     });
   });
 });

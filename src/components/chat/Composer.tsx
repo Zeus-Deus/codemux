@@ -150,6 +150,13 @@ interface Props {
    *  render nothing above the textarea (a running chat keeps its
    *  scope in the workspace context bar instead). */
   zone1Override?: React.ReactNode;
+  /** Thread Scope redesign — optional slot rendered BELOW the composer
+   *  card (inside the same max-w-[760px] column), under the footer.
+   *  The draft surface uses this for `ThreadScopeRow` (location ·
+   *  checkout · from-branch + the centered scope hint). `undefined`
+   *  (the default) renders nothing — existing non-draft call sites are
+   *  unaffected. */
+  belowComposerSlot?: React.ReactNode;
   /** Step 8 Stage 1 — staged attachments rendered as a chip strip
    *  inside the composer card, above the textarea. Empty array hides
    *  the strip. Defaults to `[]` so existing call sites keep working
@@ -244,6 +251,7 @@ export function Composer({
   errorMessage = null,
   showStopButton = true,
   zone1Override,
+  belowComposerSlot,
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
   onToggleExpandPr,
@@ -2232,6 +2240,9 @@ export function Composer({
             attachOpen={attachOpen}
           />
         </div>
+        {belowComposerSlot ? (
+          <div className="pt-1.5">{belowComposerSlot}</div>
+        ) : null}
       </div>
     </div>
   );

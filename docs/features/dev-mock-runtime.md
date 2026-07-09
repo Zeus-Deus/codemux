@@ -71,6 +71,13 @@ Command handling:
   `{ index, message }` dispatch the real IPC layer uses — followed by
   `item_completed` / `turn_completed` / `session_state_changed`,
   mirroring the backend's `forward_event` channel routing.
+- **Draft surface / Thread Scope exercisable**
+  (`enable_lazy_workspace_creation` is ON in the mock flags): "New
+  thread"/"New agent" render the draft composer with the below-composer
+  `ThreadScopeRow`, and a `list_branches_detailed` mock returns a
+  recency-sorted branch list whose names overlap the seeded codemux
+  worktree workspaces — so the "from ⑂ branch" picker's All/Worktrees
+  tabs, WORKTREE badges, kind icons, and ages all light up in dev.
 
 ## Current Constraints
 

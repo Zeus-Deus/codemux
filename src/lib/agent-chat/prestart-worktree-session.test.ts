@@ -22,6 +22,10 @@ vi.mock("@/stores/app-store", () => ({
 const ensureThreadMock = vi.fn();
 const setPermissionModeMock = vi.fn();
 const setSessionLaunchModeMock = vi.fn();
+const setModelMock = vi.fn();
+const setEffortMock = vi.fn();
+const setContextWindowMock = vi.fn();
+const setModeMock = vi.fn();
 vi.mock("@/stores/agent-chat-store", () => ({
   DEFAULT_THREAD_PERMISSION_MODE: "bypassPermissions",
   useAgentChatStore: {
@@ -29,6 +33,10 @@ vi.mock("@/stores/agent-chat-store", () => ({
       ensureThread: ensureThreadMock,
       setPermissionMode: setPermissionModeMock,
       setSessionLaunchMode: setSessionLaunchModeMock,
+      setModel: setModelMock,
+      setEffort: setEffortMock,
+      setContextWindow: setContextWindowMock,
+      setMode: setModeMock,
     }),
   },
 }));
@@ -43,6 +51,10 @@ describe("prestartWorktreeSession", () => {
     ensureThreadMock.mockReset();
     setPermissionModeMock.mockReset();
     setSessionLaunchModeMock.mockReset();
+    setModelMock.mockReset();
+    setEffortMock.mockReset();
+    setContextWindowMock.mockReset();
+    setModeMock.mockReset();
     createPaneMock.mockResolvedValue("pane-1");
     startSessionMock.mockResolvedValue("thread-echo");
   });
@@ -148,5 +160,55 @@ describe("prestartWorktreeSession", () => {
     // the caller continues with activateWorkspace — failure is
     // non-blocking for the rest of the flow.
     expect(createPaneMock).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Thread Scope deferred-worktree extensions ──
+
+  it("returns { paneId, threadId } matching the created pane + session (and null on the store fallback)", async () => {
+    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/w" }];
+    const result = await prestartWorktreeSession("ws-new");
+    expect(result).not.toBeNull();
+    expect(result!.paneId).toBe("pane-1");
+    const startInput = startSessionMock.mock.calls[0][2];
+    expect(result!.threadId).toBe(startInput.thread_id);
+
+    workspacesSnapshot = [];
+    const missing = await prestartWorktreeSession("ws-missing");
+    expect(missing).toBeNull();
+  });
+
+  it("plumbs the optional config into start_session and the slice seed", async () => {
+    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/w" }];
+    const result = await prestartWorktreeSession("ws-new", {
+      model: "claude-opus-4-7",
+      permissionMode: "plan",
+      effort: "high",
+      contextWindow: "1m",
+      mode: "plan",
+    });
+    const [, , input] = startSessionMock.mock.calls[0];
+    expect(input.model).toBe("claude-opus-4-7");
+    expect(input.permission_mode).toBe("plan");
+    expect(input.effort).toBe("high");
+    expect(input.context_window).toBe("1m");
+    const tid = result!.threadId;
+    expect(setModelMock).toHaveBeenCalledWith(tid, "claude-opus-4-7");
+    expect(setEffortMock).toHaveBeenCalledWith(tid, "high");
+    expect(setContextWindowMock).toHaveBeenCalledWith(tid, "1m");
+    expect(setModeMock).toHaveBeenCalledWith(tid, "plan");
+    expect(setPermissionModeMock).toHaveBeenCalledWith(tid, "plan");
+    expect(setSessionLaunchModeMock).toHaveBeenCalledWith(tid, "plan");
+  });
+
+  it("omitted config keeps the legacy defaults and skips the optional slice setters", async () => {
+    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/w" }];
+    await prestartWorktreeSession("ws-new");
+    const [, , input] = startSessionMock.mock.calls[0];
+    expect(input.model).toBeNull();
+    expect(input.permission_mode).toBe("bypassPermissions");
+    expect(setModelMock).not.toHaveBeenCalled();
+    expect(setEffortMock).not.toHaveBeenCalled();
+    expect(setContextWindowMock).not.toHaveBeenCalled();
+    expect(setModeMock).not.toHaveBeenCalled();
   });
 });
