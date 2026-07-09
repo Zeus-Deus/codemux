@@ -21,7 +21,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   notifications: { sound_enabled: true, desktop_enabled: true },
   file_tree: { show_hidden_files: false },
   session_restore: { enabled: true, scrollback_lines: 10_000, max_total_mb: 100 },
-  agent_chat: { checkpoints_enabled: false },
+  agent_chat: { checkpoints_enabled: false, background_browser_desktop_viewport: false },
 };
 
 export interface SyncedSettingsState {
@@ -176,3 +176,6 @@ export const selectShowResourceMonitor = (s: SyncedSettingsState): boolean =>
 
 export const selectAgentCheckpointsEnabled = (s: SyncedSettingsState): boolean =>
   s.settings.agent_chat?.checkpoints_enabled ?? false;
+
+export const selectBackgroundBrowserDesktopViewport = (s: SyncedSettingsState): boolean =>
+  s.settings.agent_chat?.background_browser_desktop_viewport ?? false;

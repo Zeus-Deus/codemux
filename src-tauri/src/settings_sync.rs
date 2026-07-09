@@ -124,10 +124,21 @@ pub struct FileTreeSettings {
 /// the run's changes can be rolled back. Defaults to OFF — the
 /// snapshot writes objects into the user's repo, which must be a
 /// deliberate choice.
+///
+/// `background_browser_desktop_viewport` pins a GUI-mode background
+/// browser's CDP viewport to a real desktop size (1280×800, matching
+/// the `desktop` preset / `RESET_SPEC` in `browser_viewport.rs`) when
+/// the peek popover (`BrowserPeekOverlay.tsx`) is showing it, instead
+/// of shrinking the viewport to the tiny popover's pixel size — the
+/// popover's canvas letterboxes the larger frame down to fit. Defaults
+/// to OFF so today's container-sync behavior is unchanged out of the
+/// box.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct AgentChatSettings {
     #[serde(default)]
     pub checkpoints_enabled: bool,
+    #[serde(default)]
+    pub background_browser_desktop_viewport: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -520,6 +531,7 @@ mod tests {
             },
             agent_chat: AgentChatSettings {
                 checkpoints_enabled: true,
+                background_browser_desktop_viewport: true,
             },
         };
 
@@ -542,6 +554,7 @@ mod tests {
         assert_eq!(back.session_restore.scrollback_lines, 5000);
         assert_eq!(back.session_restore.max_total_mb, 50);
         assert!(back.agent_chat.checkpoints_enabled);
+        assert!(back.agent_chat.background_browser_desktop_viewport);
     }
 
     /// A settings blob saved before the agent_chat section existed
@@ -552,6 +565,20 @@ mod tests {
         let legacy = r#"{"appearance":{"theme":"dark"}}"#;
         let parsed: UserSettings = serde_json::from_str(legacy).unwrap();
         assert!(!parsed.agent_chat.checkpoints_enabled);
+        assert!(!parsed.agent_chat.background_browser_desktop_viewport);
+    }
+
+    /// A settings blob saved before `background_browser_desktop_viewport`
+    /// existed (but with an `agent_chat` section already present) still
+    /// deserializes — the new field defaults to OFF via serde default,
+    /// not a deserialize error.
+    #[test]
+    #[serial]
+    fn missing_desktop_viewport_field_defaults_off() {
+        let legacy = r#"{"agent_chat":{"checkpoints_enabled":true}}"#;
+        let parsed: UserSettings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.agent_chat.checkpoints_enabled);
+        assert!(!parsed.agent_chat.background_browser_desktop_viewport);
     }
 
     /// Patching one section preserves all other sections when round-tripped through cache.

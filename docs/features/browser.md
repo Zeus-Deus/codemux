@@ -129,6 +129,23 @@ own compact header instead. Both props are additive and default to today's
 pane behavior (`workspaceId` unset falls through to the exact prior
 `browser_id`-only lookup; `hideToolbar` defaults to showing the toolbar).
 
+**Desktop-size peek viewport (opt-in)**: by default, `BrowserPane` syncs the
+browser's real CDP viewport to its container — inside the 440×300 peek that
+means pages reflow at popover dimensions and agents end up re-sending
+`viewport` every turn. Settings → Agent → "Desktop-size background browser"
+(`UserSettings.agent_chat.background_browser_desktop_viewport`, synced
+settings, default OFF) instead pins the peek's viewport to 1280×800 —
+matching the `desktop` preset / `RESET_SPEC` in
+`src-tauri/src/browser_viewport.rs` — via a new optional `BrowserPane`
+`fixedViewport` prop. When set, the WebSocket-open handshake sends the fixed
+size instead of container dims, and the `ResizeObserver` keeps syncing the
+canvas element to the container but skips the viewport re-send, so the
+existing frame-draw letterbox scales the full-size frame down to fit. Input
+mapping needs no changes — `mapToViewport` already routes clicks through the
+canvas rect + draw rect into viewport coordinates. Applies only to the peek
+overlay; normal browser panes (and the peek with the setting off) keep the
+container-sync behavior unchanged.
+
 ## Expected Operating Model
 
 - agents control the browser programmatically
