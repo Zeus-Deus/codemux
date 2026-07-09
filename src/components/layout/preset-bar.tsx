@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, memo } from "react";
 import { Settings, Plus } from "lucide-react";
 import {
   DndContext,
@@ -127,7 +127,7 @@ interface PresetBarProps {
   disabled?: boolean;
 }
 
-export function PresetBar({
+function PresetBarImpl({
   workspaceId,
   draftId,
   disabled = false,
@@ -650,3 +650,9 @@ async function launchChatAgentOnWorkspace(
 ): Promise<void> {
   await agentChatCreatePane(workspaceId, "claude", null, launchMode);
 }
+
+// #127: memo is effective because setAppState performs structural sharing. The
+// props here are primitives (workspaceId/draftId/disabled), so backend ticks
+// that don't change them skip this bar's re-render.
+export const PresetBar = memo(PresetBarImpl);
+PresetBar.displayName = "PresetBar";

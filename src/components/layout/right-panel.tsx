@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { Check, Loader2, X } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
@@ -91,7 +92,10 @@ const TAB_TRIGGER_CLS = cn(
   "data-[state=inactive]:hover:!text-muted-foreground data-[state=inactive]:hover:!bg-muted/20",
 );
 
-export function RightPanel({ workspace, activeTab }: Props) {
+// #127: memo is effective because setAppState performs structural sharing — the
+// `workspace` snapshot keeps a stable ref across backend ticks that don't change
+// it, and `activeTab` is a primitive, so shallow compare skips re-renders.
+export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Props) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const workspaceWorkflow = useWorkspaceWorkflow(workspace);
   // The Orchestration tab appears only once a run is approved (design:
@@ -175,4 +179,4 @@ export function RightPanel({ workspace, activeTab }: Props) {
       </Tabs>
     </div>
   );
-}
+});

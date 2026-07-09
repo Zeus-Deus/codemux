@@ -592,6 +592,63 @@ describe("buildSessionWorkspaceIndex", () => {
   });
 });
 
+describe("useAppStore.setAppState — structural sharing identity", () => {
+  it("returns the previous snapshot ref when a deep-equal snapshot arrives", () => {
+    const ws = makeWs({
+      workspace_id: "ws-1",
+      surfaces: [makeSurface(termPane("p1", "s1"))],
+    });
+    const a = makeAppState([ws]);
+    useAppStore.setState({ appState: null });
+    try {
+      useAppStore.getState().setAppState(a);
+      const first = useAppStore.getState().appState;
+      expect(first).toBe(a); // first store has no prev → stored as-is.
+
+      // A fresh-ref deep clone simulates the Rust snapshot rebuild over IPC.
+      const clone = JSON.parse(JSON.stringify(a)) as AppStateSnapshot;
+      expect(clone).not.toBe(a);
+      useAppStore.getState().setAppState(clone);
+      // Nothing changed → same top-level ref as before, zero fan-out.
+      expect(useAppStore.getState().appState).toBe(first);
+    } finally {
+      useAppStore.setState({ appState: null });
+    }
+  });
+
+  it("gives a new top ref but keeps unchanged workspace identity on change", () => {
+    const wsA = makeWs({
+      workspace_id: "ws-A",
+      surfaces: [makeSurface(termPane("pa", "sa"))],
+    });
+    const wsB = makeWs({
+      workspace_id: "ws-B",
+      surfaces: [makeSurface(termPane("pb", "sb"))],
+    });
+    const first = makeAppState([wsA, wsB]);
+    useAppStore.setState({ appState: null });
+    try {
+      useAppStore.getState().setAppState(first);
+      const prev = useAppStore.getState().appState!;
+
+      // Fresh-ref clone with only ws-A's pane_statuses changed.
+      const changed = JSON.parse(JSON.stringify(first)) as AppStateSnapshot;
+      changed.pane_statuses = { pa: "working" };
+      useAppStore.getState().setAppState(changed);
+      const next = useAppStore.getState().appState!;
+
+      expect(next).not.toBe(prev); // top ref is new
+      // Unchanged workspaces keep prev identity.
+      expect(next.workspaces).toBe(prev.workspaces);
+      expect(next.workspaces[0]).toBe(prev.workspaces[0]);
+      expect(next.workspaces[1]).toBe(prev.workspaces[1]);
+      expect(next.pane_statuses).toEqual({ pa: "working" });
+    } finally {
+      useAppStore.setState({ appState: null });
+    }
+  });
+});
+
 describe("getSessionWorkspaceId", () => {
   it("reads the cached index from useAppStore.getState()", () => {
     const ws = makeWs({
