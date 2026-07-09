@@ -79,7 +79,7 @@ The legacy Playwright/Node.js path and the unused `BrowserManager` Rust CDP impl
 
 Codemux authenticates against a Better Auth API server at `api.codemux.org` (override with `CODEMUX_API_URL`). The desktop app stores encrypted tokens locally and sends Bearer tokens for all API calls.
 
-- auth logic: `src-tauri/src/auth.rs` (encryption, token storage, CSRF, machine key)
+- auth logic: `src-tauri/src/auth/` — `mod.rs` (token storage, CSRF, machine key), `api.rs` (Better Auth HTTP client), `derivation.rs` (Argon2id + HKDF credential derivation; retained as the Vexis cross-product protocol canary after skills sync moved server-side in PR #112)
 - auth commands: `src-tauri/src/commands/auth.rs` (OAuth flow, email sign-in/up, session check)
 - settings sync: `src-tauri/src/settings_sync.rs` (server fetch/push, offline cache, dirty flag)
 - settings commands: `src-tauri/src/commands/settings_sync.rs` (get, update, patch, reset)

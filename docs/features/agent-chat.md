@@ -694,8 +694,8 @@ Three hard rules, enforced by `sidecar/claude-agent/scripts/check-tos-boundary.s
    itself; the sidecar is a transport only.
 3. **No direct `claude` inference.** All inference runs through
    `@anthropic-ai/claude-agent-sdk`'s `query()`. The sole exception is
-   `src/auth-probe.ts`, which is allow-listed for `claude --version`
-   and `claude auth status` subprocess calls.
+   `sidecar/claude-agent/src/auth-probe.ts`, which is allow-listed for
+   `claude --version` and `claude auth status` subprocess calls.
 
 A fourth rule — no `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` env
 reads — is enforced by the same check.

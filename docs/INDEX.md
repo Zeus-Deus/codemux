@@ -53,9 +53,9 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - File editor: `docs/features/file-editor.md`
 - Diff viewer: `docs/features/diff-viewer.md`
 - File tree: `docs/features/file-tree.md`
-- Merge resolver: `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
+- Merge resolver (**currently unreachable from the UI** — backend, commands, store, and settings row intact, but both entry-point buttons were removed by `92965c9`): `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
 - Changes panel: `docs/features/changes-panel.md`
-- Review tab / PR integration: `docs/features/review-integration.md`
+- Review tab / PR integration (resting layout: header + checks + read-only threads; the review composer, merge controls, and deployments were intentionally removed, backends retained): `docs/features/review-integration.md`
 - GitHub issues: `docs/features/github-issues.md`
 - Terminal system: `docs/features/terminal.md`
 - Resource monitor (title-bar CPU/memory): `docs/features/resource-monitor.md`
@@ -82,7 +82,8 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Project avatars (sidebar project image + color customization, favicon derivation + cache-bust): `docs/features/project-avatars.md`
 - IDE integration: `docs/features/ide-integration.md`
 - Left sidebar (two-state expanded ↔ icon rail, with aggregate agent-status dots on collapsed project avatars + per-project hover flyout — Superset-adapted): `docs/features/sidebar.md`
-- Workspace context bar (bottom status strip under the work surface: branch · kind · ↑↓ · diff · PR/issue chips · device for the active workspace — the detail home for the clean sidebar appearance): `docs/features/workspace-context-bar.md`
+- Workspace context bar (bottom status strip under the work surface: branch · kind · ↑↓ · diff · PR/issue chips · background-browser pill · device for the active workspace — the detail home for the clean sidebar appearance; since PR #144 it hides itself while an Agent Chat pane is active in GUI chrome, and the same detail renders in the pane's Context Row instead): `docs/features/workspace-context-bar.md`
+- Context Row (the Agent Chat pane's below-composer status row — read-only project/branch labels + the shared `WorkspaceStatusCluster` (behind chip, PR chip, `BackgroundBrowserIndicator`, workspace-details popover); renders once a thread has messages and as `ThreadScopeRow`'s `trailing` slot before the first send, so status reads identically on both sides of first send; PR #144, on `main`, unreleased after `v0.12.0`): `docs/features/agent-chat.md` (§ Context Row (running-thread status)); the bar's side of the split at `docs/features/workspace-context-bar.md`
 - GUI chrome (Agent Chat Beta on: the four chrome rows collapse to a single `h-10` title bar with in-titlebar tabs + `+` agent launcher + inline chat favorite + rehomed right-panel/Run controls; legacy chrome byte-identical when the flag is off; PR #135, shipped `v0.12.0` — the in-titlebar "N subagents running" pill was later removed by PR #143 in favor of the docked `SubagentActivityBar`): `docs/features/gui-chrome.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`

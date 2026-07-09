@@ -10,6 +10,8 @@
 
 An AI-powered merge conflict resolver that works on temporary branches. When merge conflicts are detected, the user can trigger an AI agent to resolve them. The agent works on a temp branch (`bot/merge-*`), never touching real branches without explicit user approval.
 
+> **Status: currently unreachable from the UI.** The backend, the Tauri command surface, the frontend command wrappers, the zustand state machine, and the Settings config row all still exist and are wired to each other. What is missing is a **UI entry point** — the two buttons that called `startResolution` ("Resolve with AI" in the PR panel, "Merge Assistant" in the Changes panel) were removed by the refined-minimal UI pass (`92965c9`, "slim Changes panel + ADE-native right sidebar"), and `src/stores/ai-merge-store.ts` now has zero importers. Everything below describes a working system with no front door. Re-adding an entry point that calls `useAiMergeStore().startResolution(...)` should restore the whole flow; nothing else is known to be missing.
+
 ## Current Model
 
 ### Safety Rules
@@ -62,16 +64,20 @@ Resolver settings are in Settings > Editor & Workflow > Agent:
 
 ## What Works Today
 
+Present and wired to each other, but not reachable by a user:
+
 - Temporary branch creation from conflict state
 - AI agent invocation to resolve conflicts
 - Resolution diff generation for review
 - Approve/reject workflow with proper branch cleanup
-- Frontend state machine tracking full resolver lifecycle
-- Backend Tauri commands: `create_resolver_branch`, `resolve_conflicts_with_agent`, `apply_resolution`, `abort_resolution`, `get_resolution_diff`
-- Integration with Changes panel and PR panel
+- Frontend state machine tracking full resolver lifecycle (`ai-merge-store.ts`, no importers)
+- Backend Tauri commands, all registered in `lib.rs`: `create_resolver_branch`, `resolve_conflicts_with_agent`, `apply_resolution`, `abort_resolution`, `get_resolution_diff`
+- Frontend wrappers in `src/tauri/commands.ts` for all five
+- Settings → Editor & Workflow → Agent → "Merge Conflict Resolver" (CLI + model picker, default strategy)
 
 ## Current Constraints
 
+- **No UI entry point** — nothing in `src/components/` imports `ai-merge-store.ts` or calls `startResolution`. This is the single blocking gap; see the status note at the top.
 - Single-agent resolution only (no multi-agent parallel resolution)
 - No partial resolution support (all conflicts resolved at once or none)
 - No automatic test running after resolution (manual verification required)
@@ -84,8 +90,9 @@ Resolver settings are in Settings > Editor & Workflow > Agent:
 - `src-tauri/src/git.rs` — `create_resolver_branch`, `apply_resolution`, `abort_resolution`, `get_resolution_diff`, `strip_resolver_prefix`, `has_conflict_markers`, `scan_files_for_conflict_markers`
 - `src-tauri/src/ai.rs` — `resolve_conflicts_with_agent` (agent invocation), `run_resolver_cli` (hardened spawn helper: stdin-null + piped stdout/stderr + kill_on_drop), `verify_resolution` (post-agent gate), `generate_commit_message` (also routed through `run_resolver_cli` so a hung claude can't lock up the commit-message UI)
 - `src-tauri/src/commands/git.rs` — Tauri command wrappers for resolver operations
-- `src/stores/ai-merge-store.ts` — Frontend state machine (zustand); `startResolution` auto-cleans stale temp branches
-- `src/tauri/commands.ts` — Frontend command wrappers
-- `src/components/workspace/changes-panel.tsx` — "Merge Assistant" entry point; HoverCard exposes file list / agent / temp branch during resolution
-- `src/components/workspace/pr-panel.tsx` — "Resolve Conflicts" entry point
-- `src/components/ui/hover-card.tsx` — shadcn HoverCard wrapper used by resolver progress UI
+- `src/stores/ai-merge-store.ts` — Frontend state machine (zustand); `startResolution` auto-cleans stale temp branches. **Currently has no importers.**
+- `src/tauri/commands.ts` — Frontend command wrappers (all five still exported)
+- `src/components/settings/settings-view.tsx` — "Merge Conflict Resolver" config row (`setAiResolverCli` / `setAiResolverModel` / `setAiResolverStrategy`)
+- `src/components/workspace/changes-panel.tsx` — hosts plain git merge state (`getMergeState` / `abortMerge` / `continueMerge`, conflict badges). The former "Merge Assistant" resolver entry point lived here and is **gone**.
+- `src/components/workspace/review-panel.tsx` — the former "Resolve with AI" entry point lived in its predecessor `pr-panel.tsx` and is **gone**.
+- `src/components/ui/hover-card.tsx` — shadcn HoverCard wrapper, formerly used by the resolver progress UI
