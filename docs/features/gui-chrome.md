@@ -140,7 +140,8 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
   slot-composition branch, `RightPanelToggle`, `PinnedChatFavorite`,
   `TitleBarWorkspaceSlots`.
 - `src/components/layout/title-bar-tabs.tsx` — pill tab strip + active chat tab
-  (chevron dropdown, subagents pill, checkpoint dialog).
+  (chevron dropdown, checkpoint dialog). The inline subagents pill that used to
+  live here was removed by PR #143 — see `src/components/chat/SubagentActivityBar.tsx`.
 - `src/components/layout/agent-launcher.tsx` — the `+` popover.
 - `src/hooks/use-preset-store.ts` — live preset snapshot for the launcher +
   favorite.

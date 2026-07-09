@@ -7,8 +7,13 @@
 - Audience: The implementer of Step 13 and reviewers deciding whether
   to merge `feature/agent-chat` to `main` once the toggle lands.
 - Authority: Pre-merge research only — **no code in this stage**.
-- Update when: Any of the inventories below drift (e.g. a new flag
-  surfaces, a new Settings section is added) before Step 13 starts.
+  Step 13 has since LANDED; the file inventories below are a
+  **point-in-time snapshot taken before the merge** and are no longer
+  maintained (e.g. `pickers/WorktreePicker.tsx` was deleted by PR #142,
+  `SubagentActivityBar.tsx` was added by PR #143). Treat them as
+  history. For the current flag surface and file map, read
+  `docs/features/agent-chat.md` and `docs/features/gui-chrome.md`.
+- Update when: Do not update. Superseded by the feature docs above.
 - Read next: `docs/features/agent-chat.md`,
   `docs/features/multi-provider-chat.md`,
   `docs/features/skills-sync.md`, `docs/features/mcp-server.md`.
