@@ -209,15 +209,20 @@ Contract preserved from the pre-redesign renderer:
   their `items` array each build, as the old tool-group rows did; the
   stable `run:<first-id>` key keeps the scroller row from remounting as
   the run grows and transitions working → settled.)
-- **Stick-to-bottom.** Pinned-ness is tracked from real scroll events
-  (≤ 80 px from the bottom); after every transcript change (or
-  streaming-marker toggle), if pinned, it snaps to the tail. Content
-  growth alone never unpins, so auto-scroll never fights a user
-  reading history. This is implemented directly in `MessageList.tsx`
-  (mount tail-snap with a bounded settle loop + pinned-follow effect)
-  because `content-visibility` rows expose only estimated heights
-  until rendered — the engine's own mount positioning and smooth
-  `scrollToEnd` land short on large hydrated transcripts.
+- **Stick-to-bottom.** The shadcn scroller engine
+  (`MessageScrollerProvider autoScroll`) is the single owner of
+  tail-tracking: its `following-bottom` state machine re-scrolls to
+  the end whenever a ResizeObserver/MutationObserver detects content
+  growth while following, unpins on a real user gesture (wheel /
+  touch / keydown), and re-pins once the reader scrolls back within
+  its `scrollEdgeThreshold` (default 8px) of the bottom. `MessageList`
+  no longer runs a competing hand-rolled pin/snap loop — an earlier
+  version did (direct `scrollTop` writes on a separate 80px
+  threshold), which produced visible jitter fighting the engine in
+  the 8–80px band; that machinery was deleted. The viewport also sets
+  `overflow-anchor: none` so native browser scroll anchoring can't
+  fight the engine's programmatic scrolls while `content-visibility`
+  rows settle from estimated to real heights.
 - **Turn anchoring is deliberately OFF** (`scrollAnchor={false}` on
   every row): with hundreds of pre-hydrated rows the engine's anchor
   handling scrolls the viewport to a stale early anchor when new items
@@ -227,9 +232,10 @@ Contract preserved from the pre-redesign renderer:
   scroller row (both the step list and per-step inline detail); the
   browser re-derives sizes as rows materialize.
 - **Streaming marker** (shimmer status) renders as the last row inside
-  the scroller content (not a footer) so the tail snap keeps it
-  visible while streaming; the jump-to-latest pill is the restyled
-  `MessageScrollerButton` with a direct-DOM snap fallback. **A working
+  the scroller content (not a footer) so the engine's following-bottom
+  tracking keeps it visible while streaming; the jump-to-latest pill is
+  the restyled `MessageScrollerButton` (its own `scrollToEnd`, which
+  also re-enters following-bottom mode). **A working
   Activity block already shows the single live line, so the marker is
   suppressed when one is the transcript tail** — `MessageList` passes
   the thread `streaming` flag into `buildTranscriptSlots`, and the
@@ -323,9 +329,10 @@ already Beta-gated pane and simply hides on short threads.
   cold jump across thousands of estimated pixels lands the target well off
   (and re-calling `scrollToMessage` reproduces the same wrong offset), so
   the loop instead nudges `scrollTop` by the target row's *measured* offset
-  error each frame until it rests near the top (same spirit as
-  `MessageList`'s own mount settle loop). Jumping up fires real scroll
-  events, so the `#77` `pinnedRef` unpins itself — no extra coordination.
+  error each frame until it rests near the top (its own settle loop,
+  independent of the transcript's tail-tracking). Jumping up fires real
+  scroll events, so the scroller engine's `following-bottom` mode unpins
+  itself on the gesture — no extra coordination needed.
   The rail overlays the viewport's left gutter but is its **sibling**, so
   its `<nav>` forwards `onWheel` to the viewport's `scrollTop` — otherwise
   wheeling over that 28px strip would be a dead zone. Ticks are real `<button>`s (`Enter`/`Space`,
