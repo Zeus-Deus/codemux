@@ -11,7 +11,6 @@ import {
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
 import { materializeAndSend } from "@/lib/agent-chat/materialize";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
-import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
@@ -32,7 +31,6 @@ import {
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
 import {
-  activateWorkspace,
   checkGhStatus,
   checkGithubRepo,
   getGithubIssueByPath,
@@ -51,10 +49,8 @@ import type {
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
 import { DEFAULT_THREAD_PERMISSION_MODE } from "@/stores/agent-chat-store";
-import { ProjectPicker } from "@/components/overlays/project-picker";
-import { DerivativeBranchPicker } from "./pickers/DerivativeBranchPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
-import { WorktreePicker } from "./pickers/WorktreePicker";
+import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 
 /** Grace period between `markPromoted` and `clearDraft`. Gives any
  *  in-flight selector a chance to observe the promotion before the
@@ -190,8 +186,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   ]);
 
   // Project root of the workspace targeted by an `existing_workspace`
-  // draft. Used to scope the WorktreePicker (so the dropdown lists the
-  // sibling worktrees of the targeted workspace, not unrelated ones).
+  // draft. Scopes the ThreadScopeRow's checkout/branch controls to the
+  // targeted workspace's project (not unrelated ones).
   const existingWorkspaceProjectRoot = useAppStore((s) => {
     if (draft.target.kind !== "existing_workspace") return null;
     const wsId = draft.target.workspaceId;
@@ -199,15 +195,25 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     return ws?.project_root ?? ws?.cwd ?? null;
   });
 
-  // Derivative branch for "+ New worktree…" inline submit. Lives at
-  // this level (not the picker) so WorktreePicker and
-  // DerivativeBranchPicker stay in sync.
-  const [derivativeBranch, setDerivativeBranch] = useState("main");
+  // Thread Scope redesign — resolved project root fed to `ThreadScopeRow`
+  // for the checkout + branch controls. `null` for home drafts (no
+  // project) and for an `existing_workspace` target whose workspace
+  // hasn't hydrated into app-state yet.
+  const scopeProjectPath = useMemo(() => {
+    switch (draft.target.kind) {
+      case "home":
+        return null;
+      case "project":
+        return draft.target.projectPath;
+      case "existing_workspace":
+        return existingWorkspaceProjectRoot;
+    }
+  }, [draft.target, existingWorkspaceProjectRoot]);
 
   const displayCwd = useMemo(() => {
     switch (draft.target.kind) {
       case "home":
-        return null; // ProjectPicker zone1Override owns this slot
+        return null; // LocationControl owns this slot
       case "project":
         return draft.target.projectPath;
       case "existing_workspace":
@@ -305,6 +311,22 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // path. Empty array when no images staged.
     const imagePayloads = buildImagePayloads(liveAttachments);
 
+    // Thread Scope redesign — when the checkout popover is set to
+    // "worktree", pass along the project root to fork from so
+    // `materializeAndSend` defers worktree creation to this submit
+    // (auto-naming from `text` when the name field was left empty).
+    // `null` for "current" checkout or a home target (nothing to
+    // fork), which keeps every pre-existing target-resolution path
+    // byte-identical.
+    const worktreeProjectPath =
+      currentDraft.checkoutMode === "worktree"
+        ? currentDraft.target.kind === "project"
+          ? currentDraft.target.projectPath
+          : currentDraft.target.kind === "existing_workspace"
+            ? existingWorkspaceProjectRoot
+            : null
+        : null;
+
     void materializeAndSend(
       currentDraft,
       text,
@@ -326,6 +348,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       skillBodies,
       attachmentBlock,
       imagePayloads,
+      worktreeProjectPath,
     )
       .then((result) => {
         if (result.success) {
@@ -348,6 +371,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     draft.draftId,
     appHomeDir,
     existingWorkspaceCwd,
+    existingWorkspaceProjectRoot,
     activeSidebarWorkspaceId,
     activeSidebarProjectPath,
     setActiveDraft,
@@ -752,93 +776,58 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     updateDraftConfig(draft.draftId, { mode: "default" });
   }, [draft.draftId, updateDraftConfig]);
 
-  // Zone 1 dispatch:
-  //  - home target → ProjectPicker (lets the user retarget without
-  //    sending first; clicking a project switches the draft target).
-  //  - project target → WorktreePicker + DerivativeBranchPicker scoped
-  //    to that project. The "+ New worktree…" row transforms into an
-  //    inline input that creates a worktree directly (no dialog). The
-  //    derivative picker controls the base branch for that submit.
-  //  - existing_workspace target → same pair scoped to the targeted
-  //    workspace's project.
-  const handleWorktreeCreated = async (wsId: string) => {
-    // Attach a chat pane AND pre-start the provider session BEFORE
-    // activating the workspace. This mirrors materializeAndSend's
-    // ordering: by the time AgentChatPane mounts, `pane.thread_id`
-    // is already set so the mount-effect adopts it via the
-    // `if (threadId) ensureThread(...)` branch, avoiding the race
-    // where the user's first send lands with an unregistered
-    // thread_id → `session_not_found`. See
-    // `prestart-worktree-session.ts` for the full rationale.
-    try {
-      await prestartWorktreeSession(wsId);
-    } catch (err) {
-      console.error("Failed to prestart worktree chat session:", err);
-    }
-    // Clear the draft after the pane exists so the ensure-draft hook
-    // has a non-empty workspace to observe and stays dormant.
-    setActiveDraft(null);
-    activateWorkspace(wsId).catch(console.error);
-  };
-
-  // D11 scope-pills row: worktree + branch pills (rounded-full) plus a
-  // hint spelling out what a first send will create. Only rendered on
-  // the draft surface (no live session yet) — a running chat graduates
-  // this into the workspace context bar. The `rise-in` animation is a
-  // one-shot entrance (globals.css) so the row settles in as the draft
-  // acquires a project scope.
-  const renderScopePills = (
-    projectPath: string,
-    draftTarget: ChatDraft["target"],
-  ) => (
-    <div className="rise-in flex flex-wrap items-center gap-2.5">
-      <WorktreePicker
-        mode="draft"
-        projectPath={projectPath}
-        draftTarget={draftTarget}
-        derivativeBranch={derivativeBranch}
-        onChangeDraftTarget={(target) =>
-          updateDraftTarget(draft.draftId, target)
-        }
-        onWorktreeCreated={handleWorktreeCreated}
-      />
-      <DerivativeBranchPicker
-        projectPath={projectPath}
-        value={derivativeBranch}
-        onChange={setDerivativeBranch}
-      />
-      <span className="text-[11.5px] text-muted-foreground">
-        {"→"} new worktree from{" "}
-        <span className="font-mono text-foreground/70">{derivativeBranch}</span>
-      </span>
-    </div>
+  // Thread Scope redesign — the row rendered below the composer via
+  // `belowComposerSlot`. Replaces the above-composer ProjectPicker
+  // (home target) / WorktreePicker + DerivativeBranchPicker (project /
+  // existing_workspace targets) that used to occupy `zone1Override`.
+  // Worktree creation is no longer immediate: `checkoutMode` +
+  // `worktreeName` + `baseBranch` are just draft config now, and
+  // `handleSubmit` passes the resolved project path through to
+  // `materializeAndSend`, which creates the worktree (auto-named from
+  // the first message when the name is empty) as part of the same
+  // submit that sends it.
+  const handleChangeTarget = useCallback(
+    (target: ChatDraft["target"]) => updateDraftTarget(draft.draftId, target),
+    [draft.draftId, updateDraftTarget],
+  );
+  const handleChangeCheckoutMode = useCallback(
+    (mode: "current" | "worktree") =>
+      updateDraftConfig(draft.draftId, { checkoutMode: mode }),
+    [draft.draftId, updateDraftConfig],
+  );
+  const handleChangeWorktreeName = useCallback(
+    (name: string) => updateDraftConfig(draft.draftId, { worktreeName: name }),
+    [draft.draftId, updateDraftConfig],
+  );
+  const handleChangeBaseBranch = useCallback(
+    (branch: string) => updateDraftConfig(draft.draftId, { baseBranch: branch }),
+    [draft.draftId, updateDraftConfig],
   );
 
-  const zone1Override = (() => {
-    if (draft.target.kind === "home") {
-      return (
-        <ProjectPicker
-          value={null}
-          onChange={(path) => {
-            updateDraftTarget(draft.draftId, {
-              kind: "project",
-              projectPath: path,
-            });
-          }}
-        />
-      );
-    }
-    if (draft.target.kind === "project") {
-      return renderScopePills(draft.target.projectPath, draft.target);
-    }
-    if (draft.target.kind === "existing_workspace") {
-      // `undefined` → Composer's default cwd label as the fallback
-      // when the workspace has no resolvable project root.
-      if (!existingWorkspaceProjectRoot) return undefined;
-      return renderScopePills(existingWorkspaceProjectRoot, draft.target);
-    }
-    return undefined;
-  })();
+  const belowComposerSlot = (
+    <ThreadScopeRow
+      location={{
+        kind: "draft",
+        target: draft.target,
+        onChangeTarget: handleChangeTarget,
+      }}
+      projectPath={scopeProjectPath}
+      checkoutMode={draft.checkoutMode ?? "current"}
+      worktreeName={draft.worktreeName ?? ""}
+      baseBranch={draft.baseBranch ?? ""}
+      disabled={draft.promoting}
+      onChangeCheckoutMode={handleChangeCheckoutMode}
+      onChangeWorktreeName={handleChangeWorktreeName}
+      onChangeBaseBranch={handleChangeBaseBranch}
+    />
+  );
+
+  // Design D10/D12 → Thread Scope: home drafts read "Message the
+  // agent…"; project / existing_workspace drafts keep the existing
+  // isDraft-derived default ("Describe what you want the agent to
+  // do…") by passing `undefined`.
+  const placeholderOverride =
+    draft.target.kind === "home" ? "Message the agent…" : undefined;
 
   const composerEl = (
     <Composer
@@ -861,10 +850,16 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       sessionReady={true}
       // No live session yet — drives the draft-variant placeholder copy.
       isDraft={true}
+      placeholderOverride={placeholderOverride}
       showProviderPicker={true}
       showStopButton={false}
       errorMessage={draft.lastSendError}
-      zone1Override={zone1Override}
+      // Thread Scope redesign — the cwd label above the composer moved
+      // into ThreadScopeRow's location control below it; `null` hides
+      // Composer's own zone-1 slot rather than falling back to a plain
+      // cwd string.
+      zone1Override={null}
+      belowComposerSlot={belowComposerSlot}
       mode={draft.mode}
       stagedAttachments={stagedAttachments}
       onRemoveAttachment={(id) =>

@@ -225,7 +225,12 @@ const FEATURE_FLAGS: FeatureFlags = {
   // per-thread Channel streaming path (issue #75) are both primary
   // dev-iteration surfaces. All chat IPC is mocked below.
   enable_agent_chat: true,
-  enable_lazy_workspace_creation: false,
+  // On in the mock so the draft surface (chat-home landing + Thread
+  // Scope row below the composer) is a primary dev-iteration surface —
+  // "New thread"/"New agent" render the draft composer with the
+  // location · checkout · from-branch controls instead of eagerly
+  // creating a workspace.
+  enable_lazy_workspace_creation: true,
 };
 
 const SYNCED_SETTINGS: UserSettings = {
@@ -1478,6 +1483,31 @@ const handlers: Record<string, Handler> = {
   // ── MCP runtime ──
   get_mcp_runtime_status: () => ({ servers: [], running: false }),
   list_mcp_servers: () => [],
+
+  // ── Branch listing (Thread Scope row's "from ⑂ branch" picker) ──
+  //
+  // Mirrors `git_list_branches_detailed`: deduped local/remote
+  // branches sorted by recency. Names overlap the seeded codemux
+  // worktree workspaces (mock-fixtures.ts) so the picker's
+  // All/Worktrees tabs and WORKTREE badges light up, plus a few
+  // local-only and remote-only rows for the kind icons.
+  list_branches_detailed: () => {
+    const now = Math.floor(Date.now() / 1000);
+    const DAY = 86_400;
+    return [
+      { name: "main", last_commit_unix: now - 2 * DAY, is_local: true, is_remote: true },
+      { name: "feature/auth-refactor", last_commit_unix: now - 3 * DAY, is_local: true, is_remote: true },
+      { name: "fix/sidebar-flicker", last_commit_unix: now - 5 * DAY, is_local: true, is_remote: false },
+      { name: "feature/40-dev-mock-tauri-runtime", last_commit_unix: now - 8 * DAY, is_local: true, is_remote: true },
+      { name: "chore/port-detection", last_commit_unix: now - 12 * DAY, is_local: true, is_remote: false },
+      { name: "feature/75-chat-channel", last_commit_unix: now - 15 * DAY, is_local: true, is_remote: true },
+      { name: "t3code/094b1560", last_commit_unix: now - 21 * DAY, is_local: true, is_remote: false },
+      { name: "feature-208-address-and-sector-support", last_commit_unix: now - 35 * DAY, is_local: false, is_remote: true },
+      { name: "feature-189-search-history-delete", last_commit_unix: now - 38 * DAY, is_local: false, is_remote: true },
+      { name: "fix-prod-dockerfile", last_commit_unix: now - 44 * DAY, is_local: false, is_remote: true },
+      { name: "feature-186-roleGuard", last_commit_unix: now - 60 * DAY, is_local: false, is_remote: true },
+    ];
+  },
 
   // ── Workspace config / scripts (sidebar setup banner, default-branch
   //    cache) ──

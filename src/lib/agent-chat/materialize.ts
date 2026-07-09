@@ -5,6 +5,9 @@ import {
   agentChatStartSession,
   applyPreset,
   createEmptyWorkspace,
+  createWorktreeWorkspace,
+  generateBranchName,
+  generateRandomBranchName,
   getHomeDir,
   renameWorkspace,
 } from "@/tauri/commands";
@@ -120,24 +123,56 @@ export async function materializeAndSend(
    *  `buildImagePayloads` so this lib stays free of store imports.
    *  Defaults to empty so existing call sites keep compiling. */
   images: Array<{ data: number[]; media_type: string }> = [],
+  /** Thread Scope redesign — project root to fork a deferred worktree
+   *  from, when `draft.checkoutMode === "worktree"`. `null` (the
+   *  default) keeps the pre-existing target-resolution behavior
+   *  (`"current"` checkout, or a `home`/`existing_workspace` target
+   *  where there is nothing to fork). The caller resolves this because
+   *  `draft.target` alone doesn't carry a project path for
+   *  `existing_workspace` targets — see `DraftChatSurface`'s
+   *  `existingWorkspaceProjectRoot`. */
+  worktreeProjectPath: string | null = null,
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
-  // 1. Resolve the target workspace.
+  // 1. Resolve the target workspace. A `"worktree"` checkout mode
+  //    takes priority over the target-kind switch below: instead of
+  //    reusing/creating a workspace on the project's existing
+  //    checkout, it creates a brand-new sibling worktree (deferred
+  //    from the checkout popover's immediate-create UX, so the name
+  //    can be auto-derived from `text` — the first message — exactly
+  //    like the CLI does). `effectiveCwd` starts as the caller's
+  //    resolved cwd and is swapped for the freshly-created worktree's
+  //    real cwd below so the pane + session launch inside the new
+  //    worktree, not the original checkout.
   let workspaceId: string;
+  let effectiveCwd = cwd;
   try {
-    switch (draft.target.kind) {
-      case "home": {
-        const created = await createHomeRootedWorkspace(text);
-        workspaceId = created;
-        break;
+    if (draft.checkoutMode === "worktree" && worktreeProjectPath) {
+      workspaceId = await createDeferredWorktree(
+        worktreeProjectPath,
+        draft.worktreeName ?? "",
+        draft.baseBranch ?? "",
+        text,
+      );
+      const createdWorkspace = useAppStore
+        .getState()
+        .appState?.workspaces.find((w) => w.workspace_id === workspaceId);
+      if (createdWorkspace?.cwd) effectiveCwd = createdWorkspace.cwd;
+    } else {
+      switch (draft.target.kind) {
+        case "home": {
+          const created = await createHomeRootedWorkspace(text);
+          workspaceId = created;
+          break;
+        }
+        case "project":
+          workspaceId = await createEmptyWorkspace(draft.target.projectPath);
+          break;
+        case "existing_workspace":
+          workspaceId = draft.target.workspaceId;
+          break;
       }
-      case "project":
-        workspaceId = await createEmptyWorkspace(draft.target.projectPath);
-        break;
-      case "existing_workspace":
-        workspaceId = draft.target.workspaceId;
-        break;
     }
   } catch (err) {
     const message = errorMessage(err);
@@ -148,7 +183,7 @@ export async function materializeAndSend(
   // 2. Create a chat pane on that workspace.
   let paneId: string;
   try {
-    paneId = await agentChatCreatePane(workspaceId, draft.provider, cwd);
+    paneId = await agentChatCreatePane(workspaceId, draft.provider, effectiveCwd);
   } catch (err) {
     const message = errorMessage(err);
     actions.markSendFailed(draft.draftId, message);
@@ -188,7 +223,7 @@ export async function materializeAndSend(
   try {
     await agentChatStartSession(paneId, draft.provider, {
       thread_id: draft.threadId,
-      cwd,
+      cwd: effectiveCwd,
       model: draft.model,
       resume_cursor: null,
       permission_mode: effectivePermissionMode(draft),
@@ -521,6 +556,59 @@ async function createHomeRootedWorkspace(firstMessage: string): Promise<string> 
     });
   }
   return workspaceId;
+}
+
+/** Thread Scope redesign — create the sibling worktree a `"worktree"`
+ *  checkout mode defers to submit time.
+ *
+ *  Naming order matches the design's "like the CLI does" promise:
+ *   1. The user's typed name (trimmed), if non-empty — used verbatim.
+ *   2. Otherwise `generateBranchName(firstMessage, projectPath)` — the
+ *      same AI/first-message naming the CLI uses. Any failure (network,
+ *      no API key, empty result) falls through to (3) rather than
+ *      aborting the send.
+ *   3. `generateRandomBranchName(projectPath)` — the existing
+ *      adjective-noun random-name fallback.
+ *
+ *  Errors from `createWorktreeWorkspace` itself propagate to the
+ *  caller's try/catch — no local handling needed here.
+ *
+ *  Exported because BOTH first-send surfaces share it: the draft
+ *  surface (via `materializeAndSend` above) and `AgentChatPane`'s
+ *  empty-state deferred-worktree submit path. */
+export async function createDeferredWorktree(
+  projectPath: string,
+  worktreeName: string,
+  baseBranch: string,
+  firstMessage: string,
+): Promise<string> {
+  let name = worktreeName.trim();
+  if (!name) {
+    try {
+      name = (await generateBranchName(firstMessage, projectPath)).trim();
+    } catch (err) {
+      console.warn(
+        "[materialize] generateBranchName failed, falling back to a random name:",
+        errorMessage(err),
+      );
+      name = "";
+    }
+    if (!name) {
+      name = await generateRandomBranchName(projectPath);
+    }
+  }
+  return await createWorktreeWorkspace(
+    projectPath,
+    name,
+    true,
+    // "empty" layout — no terminal/PTY surfaces; the caller attaches
+    // the chat pane afterward (materialize step 2, or
+    // `prestartWorktreeSession` on the pane surface).
+    "empty",
+    baseBranch || null,
+    null,
+    null,
+  );
 }
 
 /** Resolve the cwd a fresh session / terminal should launch under.

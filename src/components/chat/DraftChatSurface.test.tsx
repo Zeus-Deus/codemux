@@ -115,70 +115,46 @@ vi.mock("@/stores/picker-favorites-store", () => ({
   ),
 }));
 
-// Stub the ProjectPicker: the real one subscribes to useAppStore via
-// a selector that returns a fresh `?? []` array when appState is null,
-// which loops under jsdom with no store bootstrap. Tests care only
-// that the picker RENDERS in the Zone 1 slot for home drafts — the
-// picker's own tests live next to the picker.
-vi.mock("@/components/overlays/project-picker", () => ({
-  ProjectPicker: ({ value }: { value: string | null }) => (
-    <button data-testid="project-picker-stub">
-      {value ?? "Select project"}
-    </button>
-  ),
-}));
-
-// Stub the WorktreePicker for the same reason — DraftChatSurface tests
-// are about dispatch, not about the picker's internal rendering. The
+// Stub ThreadScopeRow — the real one owns three popovers (location /
+// checkout / branch) each with their own store subscriptions and
+// Tauri round-trips; DraftChatSurface tests care about DISPATCH (what
+// gets wired to the draft store / materializeAndSend), not about the
+// popovers' own rendering — that lives in ThreadScopeRow.test.tsx. The
 // stub records the most recently passed props so individual tests can
 // invoke the callbacks directly to exercise the dispatch logic.
-type WorktreePickerStubProps = {
-  mode: "draft" | "active";
-  projectPath: string;
-  draftTarget?: import("@/stores/chat-draft-store").ChatDraft["target"];
-  derivativeBranch: string;
-  onChangeDraftTarget?: (
-    t: import("@/stores/chat-draft-store").DraftTarget,
-  ) => void;
-  onSwitchWorkspace?: (id: string) => void;
-  onWorktreeCreated: (id: string) => void;
+type ThreadScopeRowStubProps = {
+  location: {
+    kind: "draft";
+    target: import("@/stores/chat-draft-store").ChatDraft["target"];
+    onChangeTarget: (
+      t: import("@/stores/chat-draft-store").DraftTarget,
+    ) => void;
+  };
+  projectPath: string | null;
+  checkoutMode: "current" | "worktree";
+  worktreeName: string;
+  baseBranch: string;
+  disabled?: boolean;
+  onChangeCheckoutMode: (mode: "current" | "worktree") => void;
+  onChangeWorktreeName: (name: string) => void;
+  onChangeBaseBranch: (branch: string) => void;
 };
-const lastWorktreePickerProps: { current: WorktreePickerStubProps | null } = {
+const lastThreadScopeRowProps: { current: ThreadScopeRowStubProps | null } = {
   current: null,
 };
-vi.mock("@/components/chat/pickers/WorktreePicker", () => ({
-  WorktreePicker: (props: WorktreePickerStubProps) => {
-    lastWorktreePickerProps.current = props;
+vi.mock("@/components/chat/pickers/ThreadScopeRow", () => ({
+  ThreadScopeRow: (props: ThreadScopeRowStubProps) => {
+    lastThreadScopeRowProps.current = props;
     return (
       <button
-        data-testid="worktree-picker-stub"
-        data-project-path={props.projectPath}
-        data-mode={props.mode}
-        data-derivative-branch={props.derivativeBranch}
+        data-testid="thread-scope-row-stub"
+        data-location-kind={props.location.kind}
+        data-target-kind={props.location.target.kind}
+        data-project-path={props.projectPath ?? ""}
+        data-checkout-mode={props.checkoutMode}
+        data-base-branch={props.baseBranch}
       >
-        worktree:{props.projectPath}
-      </button>
-    );
-  },
-}));
-
-type DerivativeBranchPickerStubProps = {
-  projectPath: string;
-  value: string;
-  onChange: (branch: string) => void;
-};
-const lastDerivativePickerProps: {
-  current: DerivativeBranchPickerStubProps | null;
-} = { current: null };
-vi.mock("@/components/chat/pickers/DerivativeBranchPicker", () => ({
-  DerivativeBranchPicker: (props: DerivativeBranchPickerStubProps) => {
-    lastDerivativePickerProps.current = props;
-    return (
-      <button
-        data-testid="derivative-branch-picker-stub"
-        data-value={props.value}
-      >
-        derivative:{props.value}
+        scope:{props.projectPath ?? "home"}
       </button>
     );
   },
@@ -211,8 +187,7 @@ function resetStores() {
     showNewWorkspaceDialog: false,
     newWorkspaceProjectDir: null,
   });
-  lastWorktreePickerProps.current = null;
-  lastDerivativePickerProps.current = null;
+  lastThreadScopeRowProps.current = null;
 }
 
 function renderSurface() {
@@ -343,13 +318,13 @@ describe("DraftChatSurface", () => {
       expect(alert.textContent).toContain("boom");
     });
 
-    it("renders the Zone 1 ProjectPicker stub for home drafts", () => {
+    it("renders the ThreadScopeRow stub below the composer for home drafts, targeting home with no project", () => {
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { container } = renderSurface();
-      // ProjectPicker renders a trigger button with "Select project"
-      // text when value=null.
-      expect(container.textContent).toContain("Select project");
+      const { getByTestId } = renderSurface();
+      const stub = getByTestId("thread-scope-row-stub");
+      expect(stub.dataset.targetKind).toBe("home");
+      expect(stub.dataset.projectPath).toBe("");
     });
 
     it("home draft seeds its target to the active sidebar workspace (so send reuses it instead of spawning a duplicate worktree)", async () => {
@@ -393,13 +368,14 @@ describe("DraftChatSurface", () => {
 
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { findByText, queryByText } = renderSurface();
+      const { findByTestId } = renderSurface();
       // Seeding effect reads the hydrated appHomeDir from useAppStore
       // (set via resetStores) and flips target home → existing_workspace
-      // on the first effect pass. The ProjectPicker stub is gone; the
-      // WorktreePicker stub scoped to that project appears.
-      await findByText("worktree:/projects/whatsapp-intake-bot");
-      expect(queryByText("Select project")).toBeNull();
+      // on the first effect pass. The ThreadScopeRow stub now reports
+      // the resolved project path instead of the bare "home" target.
+      const stub = await findByTestId("thread-scope-row-stub");
+      expect(stub.dataset.targetKind).toBe("existing_workspace");
+      expect(stub.dataset.projectPath).toBe("/projects/whatsapp-intake-bot");
       // Store is persistently flipped to existing_workspace so the
       // send path reuses the active workspace rather than creating a
       // new one.
@@ -449,37 +425,30 @@ describe("DraftChatSurface", () => {
 
       const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { findByText } = renderSurface();
-      // Picker stays on "Select project" — the draft remains home.
-      await findByText("Select project");
+      const { findByTestId } = renderSurface();
+      // Stub stays targeted at "home" — the draft remains home.
+      const stub = await findByTestId("thread-scope-row-stub");
+      expect(stub.dataset.targetKind).toBe("home");
       const after = useChatDraftStore.getState().draftsById[draft.draftId];
       expect(after?.target).toEqual({ kind: "home" });
     });
 
-    it("renders the WorktreePicker for project-target drafts (not ProjectPicker)", () => {
+    it("renders the ThreadScopeRow stub scoped to the project path for project-target drafts", () => {
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { container } = renderSurface();
-      // ProjectPicker stub absent.
-      expect(container.textContent).not.toContain("Select project");
-      // WorktreePicker stub present, scoped to the project path.
-      expect(container.textContent).toContain("worktree:/projects/foo");
+      const { getByTestId } = renderSurface();
+      const stub = getByTestId("thread-scope-row-stub");
+      expect(stub.dataset.targetKind).toBe("project");
+      expect(stub.dataset.projectPath).toBe("/projects/foo");
+      // checkoutMode / baseBranch default from `makeDraft` — the row
+      // reads them straight off the draft, no local component state.
+      expect(stub.dataset.checkoutMode).toBe("current");
+      expect(stub.dataset.baseBranch).toBe("");
     });
 
-    it("renders the D11 scope hint spelling out the new worktree base branch", () => {
-      const draft = useChatDraftStore
-        .getState()
-        .getOrCreateProjectDraft("/projects/foo");
-      useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { container } = renderSurface();
-      // The hint reflects the derivative branch (defaults to "main").
-      expect(container.textContent).toContain("new worktree from");
-      expect(container.textContent).toContain("main");
-    });
-
-    it("renders the WorktreePicker for existing_workspace drafts scoped to that workspace's project", () => {
+    it("renders the ThreadScopeRow stub scoped to the project path for existing_workspace drafts", () => {
       // Seed app-state so the surface can resolve the workspace's project_root.
       const appStateStub = {
         schema_version: 1,
@@ -525,8 +494,11 @@ describe("DraftChatSurface", () => {
           workspaceId: "ws-foo-feat",
         });
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { container } = renderSurface();
-      expect(container.textContent).toContain("worktree:/projects/foo");
+      const { getByTestId } = renderSurface();
+      const stub = getByTestId("thread-scope-row-stub");
+      expect(stub.dataset.targetKind).toBe("existing_workspace");
+      // Scoped to the workspace's project_root, NOT its cwd.
+      expect(stub.dataset.projectPath).toBe("/projects/foo");
     });
   });
 
@@ -696,7 +668,7 @@ describe("DraftChatSurface", () => {
     });
   });
 
-  describe("Stage D — WorktreePicker dispatch", () => {
+  describe("Stage D — ThreadScopeRow dispatch (Thread Scope redesign)", () => {
     function seedAppStateWithFooFeat() {
       useAppStore.setState({
         appState: {
@@ -733,14 +705,14 @@ describe("DraftChatSurface", () => {
       });
     }
 
-    it("project draft → onChangeDraftTarget with existing_workspace updates the draft target", () => {
+    it("project draft → onChangeTarget with existing_workspace updates the draft target", () => {
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
-      expect(lastWorktreePickerProps.current).not.toBeNull();
-      lastWorktreePickerProps.current!.onChangeDraftTarget?.({
+      expect(lastThreadScopeRowProps.current).not.toBeNull();
+      lastThreadScopeRowProps.current!.location.onChangeTarget({
         kind: "existing_workspace",
         workspaceId: "ws-foo-feat",
       });
@@ -751,88 +723,32 @@ describe("DraftChatSurface", () => {
       });
     });
 
-    it("project draft → onWorktreeCreated pre-starts the session (create_pane + start_session with real cwd), THEN clears draft + activates", async () => {
-      // Seed the new workspace in the app-store so prestartWorktreeSession
-      // can read its cwd. In production, emit_app_state inside
-      // create_worktree_workspace populates this before the Tauri
-      // invoke returns.
-      useAppStore.setState({
-        appState: {
-          schema_version: 1,
-          active_workspace_id: "ws-new",
-          workspaces: [
-            {
-              workspace_id: "ws-new",
-              title: "New Worktree",
-              workspace_type: "standard",
-              cwd: "/projects/foo-feat",
-              git_branch: "feat/x",
-              git_ahead: 0,
-              git_behind: 0,
-              git_additions: 0,
-              git_deletions: 0,
-              git_changed_files: 0,
-              notification_count: 0,
-              notifications_muted: false,
-              latest_agent_state: null,
-              worktree_path: "/projects/foo-feat",
-              project_root: "/projects/foo",
-              pr_number: null,
-              pr_state: null,
-              pr_url: null,
-              linked_issue: null,
-              tabs: [],
-              active_tab_id: "",
-              active_surface_id: "",
-              surfaces: [],
-            },
-          ],
-        } as never,
-      });
+    it("onChangeCheckoutMode('worktree') flips the draft's checkoutMode", () => {
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
-      expect(lastWorktreePickerProps.current).not.toBeNull();
-      expect(lastWorktreePickerProps.current!.projectPath).toBe(
-        "/projects/foo",
-      );
-      const {
-        activateWorkspace,
-        agentChatCreatePane,
-        agentChatStartSession,
-      } = await import("@/tauri/commands");
-      vi.mocked(activateWorkspace).mockClear();
-      vi.mocked(agentChatCreatePane).mockClear();
-      vi.mocked(agentChatStartSession).mockClear();
-      await lastWorktreePickerProps.current!.onWorktreeCreated("ws-new");
-      // create_pane receives the REAL cwd, not null — closes the
-      // mount-effect `if (!cwd) return` guard that used to silently
-      // skip session start.
-      expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
-        "ws-new",
-        "claude",
-        "/projects/foo-feat",
-      );
-      // start_session runs BEFORE activateWorkspace so by the time
-      // AgentChatPane mounts, the adapter HashMap already has an
-      // entry for this thread_id.
-      expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1);
-      const [paneId, provider, input] =
-        vi.mocked(agentChatStartSession).mock.calls[0];
-      expect(paneId).toBe("pane-new");
-      expect(provider).toBe("claude");
-      expect(input.cwd).toBe("/projects/foo-feat");
-      expect(input.permission_mode).toBe("bypassPermissions");
-      // Draft cleared before activation so the new pane mounts solo.
-      expect(useChatDraftStore.getState().activeDraftId).toBeNull();
-      expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-new");
-      // The legacy dialog does NOT open.
-      expect(useUIStore.getState().showNewWorkspaceDialog).toBe(false);
+      expect(lastThreadScopeRowProps.current!.checkoutMode).toBe("current");
+      lastThreadScopeRowProps.current!.onChangeCheckoutMode("worktree");
+      const next = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(next.checkoutMode).toBe("worktree");
     });
 
-    it("existing_workspace draft → WorktreePicker scope uses the targeted workspace's project_root, NOT its cwd", async () => {
+    it("onChangeWorktreeName / onChangeBaseBranch persist onto the draft", () => {
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      renderSurface();
+      lastThreadScopeRowProps.current!.onChangeWorktreeName("my-feature");
+      lastThreadScopeRowProps.current!.onChangeBaseBranch("develop");
+      const next = useChatDraftStore.getState().draftsById[draft.draftId];
+      expect(next.worktreeName).toBe("my-feature");
+      expect(next.baseBranch).toBe("develop");
+    });
+
+    it("existing_workspace draft → ThreadScopeRow scope uses the targeted workspace's project_root, NOT its cwd", () => {
       // Seed a workspace whose cwd differs from its project_root, so a
       // bug that uses cwd by mistake would fail this assertion.
       seedAppStateWithFooFeat();
@@ -847,70 +763,20 @@ describe("DraftChatSurface", () => {
         });
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
-      expect(lastWorktreePickerProps.current).not.toBeNull();
-      // The picker is scoped to the workspace's project_root —
-      // /projects/foo, not /projects/foo-feat-x (the cwd).
-      expect(lastWorktreePickerProps.current!.projectPath).toBe(
+      expect(lastThreadScopeRowProps.current).not.toBeNull();
+      // Scoped to the workspace's project_root — /projects/foo, not
+      // /projects/foo-feat-x (the cwd).
+      expect(lastThreadScopeRowProps.current!.projectPath).toBe(
         "/projects/foo",
       );
-      const { activateWorkspace } = await import("@/tauri/commands");
-      vi.mocked(activateWorkspace).mockClear();
-      // onWorktreeCreated is fired with a workspace id that isn't in
-      // the store — prestartWorktreeSession takes its safe fallback
-      // and skips create_pane / start_session. The draft-clear and
-      // activateWorkspace calls still need to happen regardless.
-      await lastWorktreePickerProps.current!.onWorktreeCreated("ws-new");
-      expect(useChatDraftStore.getState().activeDraftId).toBeNull();
-      expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-new");
     });
 
-    it("project draft → renders DerivativeBranchPicker seeded to 'main'", () => {
-      const draft = useChatDraftStore
-        .getState()
-        .getOrCreateProjectDraft("/projects/foo");
-      useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { container } = renderSurface();
-      expect(
-        container.querySelector(
-          '[data-testid="derivative-branch-picker-stub"]',
-        ),
-      ).not.toBeNull();
-      expect(lastDerivativePickerProps.current).not.toBeNull();
-      expect(lastDerivativePickerProps.current!.projectPath).toBe(
-        "/projects/foo",
-      );
-      expect(lastDerivativePickerProps.current!.value).toBe("main");
-      // The WorktreePicker's `derivativeBranch` prop mirrors the
-      // DerivativeBranchPicker's value — they share state at the
-      // DraftChatSurface level.
-      expect(lastWorktreePickerProps.current!.derivativeBranch).toBe("main");
-    });
-
-    it("changing the derivative branch flows into the WorktreePicker's derivativeBranch prop", () => {
-      const draft = useChatDraftStore
-        .getState()
-        .getOrCreateProjectDraft("/projects/foo");
-      useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { rerender } = renderSurface();
-      expect(lastDerivativePickerProps.current).not.toBeNull();
-      lastDerivativePickerProps.current!.onChange("develop");
-      rerender(
-        <TooltipProvider>
-          <DraftChatSurface />
-        </TooltipProvider>,
-      );
-      expect(lastWorktreePickerProps.current!.derivativeBranch).toBe(
-        "develop",
-      );
-      expect(lastDerivativePickerProps.current!.value).toBe("develop");
-    });
-
-    it("existing_workspace draft whose target workspace is not in app-state renders the cwd fallback (no override)", () => {
+    it("existing_workspace draft whose target workspace is not in app-state still renders the row with projectPath=null", () => {
       // No workspace in app-state matches the draft's workspaceId →
-      // existingWorkspaceProjectRoot resolves to null → zone1Override
-      // returns null → Composer falls back to its read-only cwd label.
-      // existingWorkspaceCwd is also null in this case so the cwd
-      // strip just hides too.
+      // existingWorkspaceProjectRoot resolves to null. Unlike the old
+      // zone1Override (which hid the row entirely), ThreadScopeRow
+      // always renders — it just shows the location control only,
+      // internally, since `projectPath` is null.
       const draft = useChatDraftStore
         .getState()
         .getOrCreateProjectDraft("/projects/foo");
@@ -921,16 +787,12 @@ describe("DraftChatSurface", () => {
           workspaceId: "ws-not-here",
         });
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
-      const { container } = renderSurface();
-      // No WorktreePicker rendered.
-      expect(
-        container.querySelector('[data-testid="worktree-picker-stub"]'),
-      ).toBeNull();
-      // No ProjectPicker either (only home drafts get that).
-      expect(container.textContent).not.toContain("Select project");
+      renderSurface();
+      expect(lastThreadScopeRowProps.current).not.toBeNull();
+      expect(lastThreadScopeRowProps.current!.projectPath).toBeNull();
     });
 
-    it("existing_workspace draft passes the draftTarget through to the picker", () => {
+    it("existing_workspace draft passes the draftTarget through to the row", () => {
       seedAppStateWithFooFeat();
       const draft = useChatDraftStore
         .getState()
@@ -942,8 +804,68 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().updateDraftTarget(draft.draftId, target);
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
-      expect(lastWorktreePickerProps.current!.draftTarget).toEqual(target);
-      expect(lastWorktreePickerProps.current!.mode).toBe("draft");
+      expect(lastThreadScopeRowProps.current!.location.target).toEqual(target);
+    });
+
+    it("draft.promoting disables the row", () => {
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().markPromoting(draft.draftId);
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      renderSurface();
+      expect(lastThreadScopeRowProps.current!.disabled).toBe(true);
+    });
+  });
+
+  describe("Thread Scope redesign — deferred worktree creation on submit", () => {
+    it("checkoutMode 'worktree' passes the resolved project path through to materializeAndSend", async () => {
+      vi.mocked(materializeAndSend).mockResolvedValueOnce({
+        success: true,
+        workspaceId: "ws-worktree",
+        paneId: "pane-new",
+        threadId: "tid-w",
+      });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "hello");
+      useChatDraftStore
+        .getState()
+        .updateDraftConfig(draft.draftId, { checkoutMode: "worktree" });
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+      fireEvent.keyDown(ta, { key: "Enter" });
+      await vi.waitFor(() => {
+        expect(materializeAndSend).toHaveBeenCalled();
+      });
+      const call = vi.mocked(materializeAndSend).mock.calls[0];
+      // (draft, text, cwd, actions, skillBodies, attachmentBlock,
+      //  imagePayloads, worktreeProjectPath)
+      expect(call[7]).toBe("/projects/foo");
+    });
+
+    it("checkoutMode 'current' (the default) passes null as the worktree project path", async () => {
+      vi.mocked(materializeAndSend).mockResolvedValueOnce({
+        success: true,
+        workspaceId: "ws-project",
+        paneId: "pane-new",
+        threadId: "tid-c",
+      });
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "hello");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container } = renderSurface();
+      const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+      fireEvent.keyDown(ta, { key: "Enter" });
+      await vi.waitFor(() => {
+        expect(materializeAndSend).toHaveBeenCalled();
+      });
+      const call = vi.mocked(materializeAndSend).mock.calls[0];
+      expect(call[7]).toBeNull();
     });
   });
 });

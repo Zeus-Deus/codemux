@@ -133,6 +133,31 @@ describe("Composer", () => {
     });
   });
 
+  describe("belowComposerSlot (Thread Scope redesign)", () => {
+    it("renders the slot below the composer card when provided", () => {
+      const { container, getByText } = renderComposer({
+        belowComposerSlot: <div>scope row here</div>,
+      });
+      expect(getByText("scope row here")).toBeInTheDocument();
+      // Below the composer-wrapper card in DOM order, not above it.
+      const wrapper = container.querySelector(
+        '[data-testid="composer-wrapper"]',
+      )!;
+      const slot = getByText("scope row here");
+      expect(wrapper.compareDocumentPosition(slot)).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+    });
+
+    it("renders nothing extra when belowComposerSlot is omitted", () => {
+      const { container } = renderComposer();
+      const wrapper = container.querySelector(
+        '[data-testid="composer-wrapper"]',
+      )!;
+      expect(wrapper.nextElementSibling).toBeNull();
+    });
+  });
+
   describe("staged attachment chip strip (Step 8 Stage 1 — image-only post-2.1)", () => {
     // Stage 2.1 moved file/folder chips inside the textarea (rendered
     // by the mirror overlay). The above-textarea strip is now
