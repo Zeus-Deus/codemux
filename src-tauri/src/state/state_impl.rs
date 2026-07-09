@@ -1899,6 +1899,12 @@ impl AppStateStore {
                     .iter()
                     .any(|id| id == &session.session_id.0)
             });
+            let removed_agent_browser_sessions: Vec<String> = snapshot
+                .agent_browser_sessions
+                .iter()
+                .filter(|s| s.workspace_id.0 == workspace_id)
+                .map(|s| s.cli_session_name.clone())
+                .collect();
             snapshot
                 .agent_browser_sessions
                 .retain(|s| s.workspace_id.0 != workspace_id);
@@ -1910,6 +1916,7 @@ impl AppStateStore {
                     .map(SessionId)
                     .collect(),
                 removed_agent_chat_threads,
+                removed_agent_browser_sessions,
             });
         }
 
@@ -1930,6 +1937,12 @@ impl AppStateStore {
                 .iter()
                 .any(|id| id == &session.session_id.0)
         });
+        let removed_agent_browser_sessions: Vec<String> = snapshot
+            .agent_browser_sessions
+            .iter()
+            .filter(|s| s.workspace_id.0 == workspace_id)
+            .map(|s| s.cli_session_name.clone())
+            .collect();
         snapshot
             .agent_browser_sessions
             .retain(|s| s.workspace_id.0 != workspace_id);
@@ -1947,6 +1960,7 @@ impl AppStateStore {
                 .map(SessionId)
                 .collect(),
             removed_agent_chat_threads,
+            removed_agent_browser_sessions,
         })
     }
 
@@ -2454,11 +2468,14 @@ impl AppStateStore {
         // agent-browser Chromium storage state (cookies, localStorage)
         // persists across app restarts. Workspace IDs are regenerated
         // on each startup, but the cwd stays the same.
-        let cli_session_name = snapshot
+        let workspace_cwd = snapshot
             .workspaces
             .iter()
             .find(|w| w.workspace_id.0 == workspace_id)
-            .map(|w| stable_browser_session_name(&w.cwd))
+            .map(|w| w.cwd.clone());
+        let workspace_exists = workspace_cwd.is_some();
+        let cli_session_name = workspace_cwd
+            .map(|cwd| stable_browser_session_name(&cwd))
             .unwrap_or_else(|| format!("ws-{workspace_id}"));
         let session = AgentBrowserSession {
             session_id: next_id("agent-browser"),
@@ -2471,7 +2488,19 @@ impl AppStateStore {
             browser_id: None,
             user_dismissed: false,
         };
-        snapshot.agent_browser_sessions.push(session.clone());
+        // Only persist the record when the workspace actually exists
+        // (issue #126 review): an in-flight `browser_automation` racing a
+        // workspace close can land here with a dead workspace_id, and a
+        // persisted record for a dead workspace can never be closed — it
+        // would permanently poison the orphan sweep's live set, which
+        // treats every tracked `cli_session_name` as live unconditionally.
+        // Returning the transient session keeps the in-flight caller
+        // working; if a daemon does get spawned under this name, the
+        // periodic sweep reaps it later precisely BECAUSE the name never
+        // enters the live set.
+        if workspace_exists {
+            snapshot.agent_browser_sessions.push(session.clone());
+        }
         session
     }
 
@@ -3427,6 +3456,23 @@ impl AppStateStore {
             }
         }
     }
+
+    /// Every agent-browser CLI session name that could belong to a live
+    /// workspace: the stable cwd-derived name for every workspace, plus the
+    /// `cli_session_name` of every tracked `agent_browser_sessions` entry.
+    /// Consumed by the periodic orphan sweep (issue #126) — a tracked
+    /// session survives the sweep as long as its name shows up here.
+    pub fn live_agent_browser_session_names(&self) -> std::collections::HashSet<String> {
+        let snapshot = self.inner.lock().unwrap();
+        let mut names = std::collections::HashSet::new();
+        for w in &snapshot.workspaces {
+            names.insert(stable_browser_session_name(&w.cwd));
+        }
+        for s in &snapshot.agent_browser_sessions {
+            names.insert(s.cli_session_name.clone());
+        }
+        names
+    }
 }
 
 pub struct CloseTabResult {
@@ -3447,6 +3493,15 @@ pub struct CloseWorkspaceResult {
     pub fallback: WorkspaceId,
     pub removed_sessions: Vec<SessionId>,
     pub removed_agent_chat_threads: Vec<(crate::agent_provider::ProviderKind, String)>,
+    /// `cli_session_name`s of the agent-browser sessions removed alongside
+    /// this workspace (issue #126). Collected under the same lock
+    /// acquisition that removes the workspace, so there is no TOCTOU race
+    /// with a concurrent agent-browser session creation for this
+    /// workspace: a session created after this snapshot simply won't
+    /// belong to the (now-gone) workspace, and one created before it is
+    /// guaranteed to be caught here rather than leaking as an orphaned
+    /// daemon.
+    pub removed_agent_browser_sessions: Vec<String>,
 }
 
 fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionId>) {
@@ -6035,6 +6090,135 @@ mod tests {
 
         assert_eq!(s1.session_id, s2.session_id);
         assert_eq!(store.snapshot().agent_browser_sessions.len(), 1);
+    }
+
+    /// Regression guard for issue #126: closing a workspace must return the
+    /// `cli_session_name`s of the agent-browser sessions that were removed
+    /// alongside it, so the command layer can reap the daemon instead of
+    /// leaking it for the rest of the app's lifetime. Exercises the
+    /// "close the last workspace" branch of `close_workspace`.
+    #[test]
+    fn close_last_workspace_returns_removed_agent_browser_sessions() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+
+        let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let result = store
+            .close_workspace(&ws_id.0)
+            .expect("close should succeed");
+        assert_eq!(
+            result.removed_agent_browser_sessions,
+            vec![session.cli_session_name]
+        );
+        assert!(store.snapshot().agent_browser_sessions.is_empty());
+    }
+
+    /// Same as above but for the "other workspaces remain" branch, and
+    /// checks that an unrelated workspace's agent-browser session survives
+    /// the close untouched (the reap must be scoped to the closed
+    /// workspace only, never anyone else's live daemon).
+    #[test]
+    fn close_one_of_many_workspaces_returns_only_its_agent_browser_sessions() {
+        let store = AppStateStore::default();
+        let ws1_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let ws2_id = store.create_workspace_at_path(std::path::PathBuf::from("/tmp/ab-b"));
+
+        let s1 = store.resolve_agent_browser_session(&ws1_id.0, 9223);
+        let s2 = store.resolve_agent_browser_session(&ws2_id.0, 9224);
+
+        let result = store
+            .close_workspace(&ws2_id.0)
+            .expect("close should succeed");
+        assert_eq!(result.removed_agent_browser_sessions, vec![s2.cli_session_name]);
+
+        let after = store.snapshot();
+        assert_eq!(after.agent_browser_sessions.len(), 1);
+        assert_eq!(after.agent_browser_sessions[0].cli_session_name, s1.cli_session_name);
+    }
+
+    /// `live_agent_browser_session_names` must contain both the cwd-derived
+    /// stable name (for workspaces that never opened a browser pane yet)
+    /// and the actual tracked `cli_session_name` (which is what the sweep
+    /// compares tracked daemon keys against). Issue #126.
+    #[test]
+    fn live_agent_browser_session_names_contains_cwd_derived_and_tracked_names() {
+        let store = AppStateStore::default();
+        let ws1_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let ws1_cwd = store.snapshot().workspaces[0].cwd.clone();
+        let ws2_id = store.create_workspace_at_path(std::path::PathBuf::from("/tmp/ab-live"));
+
+        // ws1 has an active agent-browser session; ws2 has never opened one.
+        let s1 = store.resolve_agent_browser_session(&ws1_id.0, 9223);
+
+        let live = store.live_agent_browser_session_names();
+        assert!(live.contains(&s1.cli_session_name));
+        assert!(live.contains(&stable_browser_session_name(&ws1_cwd)));
+        let ws2_cwd = store
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws2_id)
+            .unwrap()
+            .cwd
+            .clone();
+        assert!(live.contains(&stable_browser_session_name(&ws2_cwd)));
+    }
+
+    /// Issue #126 review, Fix 3: resolving an agent-browser session for a
+    /// workspace_id that no longer exists (an in-flight `browser_automation`
+    /// racing a close) must return a usable transient session WITHOUT
+    /// persisting it — a persisted record for a dead workspace can never be
+    /// closed and would permanently poison the orphan sweep's live set.
+    #[test]
+    fn resolve_agent_browser_session_for_dead_workspace_is_not_persisted() {
+        let store = AppStateStore::default();
+
+        let session = store.resolve_agent_browser_session("no-such-workspace", 9223);
+        // The transient session keeps the in-flight caller working...
+        assert_eq!(session.workspace_id.0, "no-such-workspace");
+        assert_eq!(session.cli_session_name, "ws-no-such-workspace");
+        // ...but nothing is persisted, so the sweep's live set stays clean.
+        assert!(store.snapshot().agent_browser_sessions.is_empty());
+        assert!(!store
+            .live_agent_browser_session_names()
+            .contains("ws-no-such-workspace"));
+    }
+
+    /// Issue #126 review, Fix 1: two workspaces at the SAME cwd share one
+    /// cli_session_name (it's a pure hash of the cwd) and therefore one
+    /// daemon. Closing one workspace returns the shared name in
+    /// `removed_agent_browser_sessions`, but the post-close live set must
+    /// STILL contain that name — that is the exact property the reap
+    /// helper's skip check relies on to avoid killing the daemon the
+    /// surviving workspace's pane is using.
+    #[test]
+    fn shared_cwd_close_keeps_session_name_in_live_set() {
+        let store = AppStateStore::default();
+        let shared = std::path::PathBuf::from("/tmp/ab-shared-cwd");
+        let ws1_id = store.create_workspace_at_path(shared.clone());
+        let ws2_id = store.create_workspace_at_path(shared);
+
+        let s1 = store.resolve_agent_browser_session(&ws1_id.0, 9223);
+        let s2 = store.resolve_agent_browser_session(&ws2_id.0, 9224);
+        assert_eq!(
+            s1.cli_session_name, s2.cli_session_name,
+            "same cwd must derive the same stable session name"
+        );
+
+        let result = store
+            .close_workspace(&ws1_id.0)
+            .expect("close should succeed");
+        // The closed workspace's session IS reported...
+        assert_eq!(
+            result.removed_agent_browser_sessions,
+            vec![s1.cli_session_name.clone()]
+        );
+        // ...but the surviving workspace still maps to the same name, so
+        // the post-close live set keeps it and the reap skips the close.
+        assert!(store
+            .live_agent_browser_session_names()
+            .contains(&s1.cli_session_name));
     }
 
     #[test]
