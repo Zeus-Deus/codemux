@@ -135,8 +135,11 @@ export function latestWorkflowRun(messages: ChatViewItem[]): WorkflowRunItem | n
 }
 
 /** Count of currently-running agents across every workflow run in the
- *  thread — feeds the pane sub-header pill alongside
- *  `countRunningSubagents`. */
+ *  thread — the workflow-side counterpart of `countRunningSubagents`.
+ *  (The pane sub-header pill both used to feed was removed in favor of
+ *  the docked `SubagentActivityBar`, which covers plain subagent runs;
+ *  workflow surfaces track their own status via `WorkflowRunCard` /
+ *  the Orchestration panel.) */
 export function countRunningWorkflowAgents(messages: ChatViewItem[]): number {
   let n = 0;
   for (const item of workflowRunItems(messages)) {

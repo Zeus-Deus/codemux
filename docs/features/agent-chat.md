@@ -438,7 +438,10 @@ turn — see [Sidebar status indicators](#sidebar-status-indicators).
   activity line while running / muted result when done, mono
   `elapsed · N tools` meta, Enter button, chevron), an inline "Recent
   activity" peek (last 3 child tool rows + "Enter subagent"), and the
-  footer note.
+  footer note. The card root carries `data-subagent-card={item.id}` so
+  the docked activity bar (below) can locate + scroll to + flash-
+  highlight it by plain DOM query — no prop plumbing through
+  `MessageList`/`ChatTranscript` needed.
 - `SubagentView.tsx` + `SubagentBreadcrumb.tsx` — the read-only drill-in:
   a `← Orchestrator › ⟨ordinal⟩ Name` breadcrumb with model chip and
   right-aligned blinking status, a tone-tinted read-only banner, the
@@ -448,11 +451,59 @@ turn — see [Sidebar status indicators](#sidebar-status-indicators).
   state; entering swaps the transcript body and the sub-header for the
   breadcrumb, Esc / back returns, and the composer stays parent-bound
   with the placeholder "Steering goes to the orchestrator…".
-  `AgentChatPaneHeader.tsx` shows an amber blinking "N subagents running"
-  pill while any subagent runs. All tones consume design-system tokens
-  (running = `status-working`, completed = `status-open`, failed =
-  `status-attention`); `.cm-blink` in `globals.css` honors
-  reduced-motion.
+
+### Docked live activity bar (`SubagentActivityBar.tsx`)
+
+Replaces the old pane-header / title-bar "N subagents running" pills
+(removed — they read as a broken tab strip entry once the drill-in and
+orchestration card already say the same thing). One docked bar per
+thread, mounted in `AgentChatPane.tsx` between the transcript and the
+composer, hidden while `enteredSubagentId` is set (design: the bar only
+shows in the conversation view) and rendered as `null` entirely while
+idle — no resting state.
+
+- **Whole-thread rollup.** `runningSubagentEntries` (`subagents.ts`)
+  flattens every `running`/`pending` subagent across **every**
+  `subagent_run` card in the thread, tagging each with its card id and a
+  `from task N` label (omitted when the thread has only one card — there
+  is nothing to disambiguate). The bar's count and expand-list both key
+  off this list, so scattered work from different replies still reads as
+  one signal.
+- **1 running** → the whole bar is one click target labelled "View";
+  clicking jumps straight to that subagent's card.
+- **>1 running** → the action chip reads "Show all" / "Hide" with a
+  rotating caret; clicking the bar toggles an expand list that opens
+  upward (`rise-in` class) above the bar: a header
+  ("N subagents running · across this thread · tap one to jump") and one
+  row per running subagent (spinner, name, shimmering activity, mono
+  elapsed, `from <label>`, chevron) — clicking a row collapses the list
+  and jumps to that subagent's card.
+- **Just finished** (the running count is observed transitioning from
+  `>0` to `0` — never on initial mount or a thread hydrate): the bar
+  flashes green for ~2.5s (check icon, "Subagents finished", muted mono
+  "all tasks complete · results are in the thread"), then unmounts. The
+  flash is itself clickable (design gallery "Jump" CTA): it jumps to the
+  card of the last subagent that was still running before the
+  transition.
+- **Jump + highlight.** `AgentChatPane.tsx`'s `handleJumpToSubagentCard`
+  queries the pane's own DOM subtree (via a `paneRootRef`, so split panes
+  each jump within their own transcript) for
+  `[data-slot="message-scroller-viewport"]` and the target
+  `[data-subagent-card]`, applies the `subagent-card-highlight` class
+  (ember `box-shadow` ring, ~1100ms, token-driven per the design-system
+  no-hardcoded-color rule) via plain `classList`, and runs a bounded rAF
+  correction loop (mirroring `MessageTrail.tsx`'s own jump — `content-
+  visibility:auto` rows only expose estimated heights until they render)
+  to settle the scroll position. Plain DOM query works because
+  `MessageList` renders every slot (no windowing — see "Transcript
+  scroller" above), so the target node always exists even off-screen.
+  The bar itself never touches the DOM directly — it calls the `onJump`
+  callback prop and lets the pane do the query, since the bar is mounted
+  outside the `MessageScroller` provider tree.
+- All tones consume design-system tokens (running = `status-working`,
+  finished flash = `status-open`, highlight ring = `accent-ember`); the
+  top-edge sweep animation (`cm-sweep` in `globals.css`) and `.cm-blink`
+  (still used by the breadcrumb's status dot) honor reduced-motion.
 
 The dev mock seeds one subagent turn in the demo transcript and exposes
 `window.__codemuxChatMock.streamSubagents()` for a live two-subagent
@@ -978,8 +1029,10 @@ new-workspace dialog only.
 **GUI chrome suppression.** When the Beta flag is on and the chat pane is
 the **sole root** of its surface (not a split), `AgentChatPaneHeader` does
 NOT render — the title bar absorbs the tab, its session-history dropdown,
-close, "Restore checkpoint", and the "N subagents running" pill (`PaneNode`
-gates on `isSurfaceRoot`). In split layouts the per-pane header still
+close, and "Restore checkpoint" (`PaneNode` gates on `isSurfaceRoot`);
+subagent status now lives in the docked activity bar (see "Docked live
+activity bar" above), not either header, so there is no "N subagents
+running" pill left to absorb. In split layouts the per-pane header still
 renders, so split/close/drag keep working. The session-switch orchestration
 (stop → hydrate → resume), the checkpoint-restore state, and the grouped
 session list were extracted into shared pieces so the legacy per-pane header

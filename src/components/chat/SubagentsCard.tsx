@@ -30,6 +30,11 @@ import { cn } from "@/lib/utils";
  * mutates only this card's `item` reference, so exactly this row
  * re-renders (issue #77 scroller contract preserved). A local 1s tick
  * refreshes the derived elapsed time while any subagent is running.
+ *
+ * The root carries `data-subagent-card={item.id}` so the docked
+ * {@link SubagentActivityBar} can locate + scroll to + flash-highlight
+ * this card by plain DOM query, without any new prop plumbing through
+ * MessageList/ChatTranscript.
  */
 export const SubagentsCard = memo(function SubagentsCard({
   item,
@@ -50,7 +55,10 @@ export const SubagentsCard = memo(function SubagentsCard({
   const activeCount = subs.filter((s) => isRunning(s)).length;
 
   return (
-    <div className="overflow-hidden rounded-[13px] border border-border bg-foreground/[0.025]">
+    <div
+      data-subagent-card={item.id}
+      className="overflow-hidden rounded-[13px] border border-border bg-foreground/[0.025]"
+    >
       {/* Aggregate header */}
       <div className="flex items-center gap-2.5 border-b border-border/60 px-3.5 py-3">
         <span className="flex h-5 w-5 shrink-0 items-center justify-center">

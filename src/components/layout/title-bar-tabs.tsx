@@ -25,10 +25,8 @@ import { PresetIcon } from "@/components/icons/preset-icon";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 import { useAgentChatCheckpointRestore } from "@/hooks/use-agent-chat-checkpoint-restore";
 import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
-import { countRunningSubagents } from "@/lib/agent-chat/subagents";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { cn } from "@/lib/utils";
-import { selectThread, useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import { activateTab, closeTab, reorderTabs } from "@/tauri/commands";
 import type {
@@ -287,9 +285,11 @@ function useTabReorder(workspace: WorkspaceSnapshot) {
 /**
  * Workspace tabs merged into the title bar for GUI chrome. Each tab is a
  * compact pill; the active chat tab grows a chevron that opens the shared
- * session-history dropdown, and a live "N subagents running" pill rides
- * alongside it. Tabs stay backend-owned — activation/close/reorder go
- * through the existing commands. Reorder is a pointer-driven drag (see
+ * session-history dropdown. Live subagent status no longer rides an
+ * inline pill here — it lives in the docked `SubagentActivityBar` above
+ * the composer (see `docs/features/agent-chat.md` "Docked live activity
+ * bar"). Tabs stay backend-owned — activation/close/reorder go through
+ * the existing commands. Reorder is a pointer-driven drag (see
  * `useTabReorder` below) rather than the legacy TabBar's HTML5 DnD.
  */
 export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
@@ -491,11 +491,6 @@ function ActiveChatTab({
     restoring,
     handleRestoreConfirmed,
   } = useAgentChatCheckpointRestore(pane.thread_id);
-  const runningSubagents = useAgentChatStore((s) => {
-    const slice = pane.thread_id ? selectThread(pane.thread_id)(s) : null;
-    return slice ? countRunningSubagents(slice.messages) : 0;
-  });
-
   const handleClose = (e: React.MouseEvent) => {
     e.stopPropagation();
     closeTab(workspaceId, tab.tab_id).catch(console.error);
@@ -567,21 +562,6 @@ function ActiveChatTab({
           <X className="h-3 w-3" />
         </button>
       </div>
-
-      {/* "N subagents running" — status signal that used to sit on the
-          pane sub-header; kept alive inline next to the active chat tab. */}
-      {runningSubagents > 0 && (
-        <span
-          className="inline-flex shrink-0 items-center gap-1.5 pl-0.5 text-[11px] font-semibold text-status-working"
-          data-testid="titlebar-subagents-pill"
-        >
-          <span
-            className="cm-blink h-1.5 w-1.5 rounded-full bg-status-working"
-            aria-hidden
-          />
-          {runningSubagents} subagent{runningSubagents === 1 ? "" : "s"} running
-        </span>
-      )}
 
       <RestoreCheckpointDialog
         open={confirmOpen}
