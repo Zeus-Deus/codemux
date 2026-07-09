@@ -598,6 +598,12 @@ export const checkIsGitRepo = (path: string) =>
 export const initGitRepo = (path: string) =>
   invoke<string>("init_git_repo", { path });
 
+/** Re-gather branch / ahead-behind / diff counts (and the `is_git` flag)
+ *  for one workspace and emit fresh app state — used right after
+ *  "Initialize Git" so the UI flips without waiting for the poll loop. */
+export const refreshWorkspaceGitInfo = (workspaceId: string) =>
+  invoke("refresh_workspace_git_info", { workspaceId });
+
 export const gitCloneRepo = (url: string, targetDir: string) =>
   invoke<string>("git_clone_repo", { url, targetDir });
 

@@ -1555,6 +1555,17 @@ const handlers: Record<string, Handler> = {
   save_terminal_scrollback: () => undefined,
   flush_scrollback_cache: () => 0,
 
+  // ── Changes panel (git status) ──
+  // Shape-safe stubs: the panel expects an ARRAY from get_git_status —
+  // the `list_*`-only default of `null` crashes `files.filter(...)`.
+  // Empty status = "Working tree clean" for git workspaces, and lets
+  // the non-git `scratchpad` seed exercise the "Not a git repository"
+  // empty state (`is_git: false` → showNoGitState).
+  get_git_status: () => [],
+  get_git_branch_info: () => null,
+  get_merge_state: () => null,
+  check_claude_available: () => false,
+
   // ── Mutators: patch in-memory state + re-emit ──
   activate_workspace: (a) => {
     if (findWorkspace(a.workspaceId)) {

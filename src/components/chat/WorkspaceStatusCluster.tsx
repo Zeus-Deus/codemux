@@ -21,6 +21,7 @@ import {
   BackgroundBrowserIndicator,
   useBackgroundBrowserSession,
 } from "@/components/browser/background-browser-indicator";
+import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { getGithubPrByPath, gitPullChanges } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
 
@@ -67,6 +68,10 @@ export function WorkspaceStatusCluster() {
   const [open, setOpen] = useState(false);
   const [prInfo, setPrInfo] = useState<PullRequestInfo | null>(null);
   const [pulling, setPulling] = useState(false);
+  // Explicit "Initialize Git" affordance for non-git project folders —
+  // this cluster replaces the context bar while a chat pane is active,
+  // so it must carry the same opt-in nudge (never auto-`git init`).
+  const { initialize, initializing } = useInitializeGit(workspace ?? null);
 
   const cwd = workspace ? (workspace.worktree_path ?? workspace.cwd) : null;
   const prNumber = workspace?.pr_number ?? null;
@@ -92,7 +97,8 @@ export function WorkspaceStatusCluster() {
 
   if (!workspace) return null;
   const gitBranch = workspace.git_branch;
-  if (!gitBranch && !backgroundBrowserSession) return null;
+  const showNoGit = !gitBranch && showNoGitState(workspace);
+  if (!gitBranch && !showNoGit && !backgroundBrowserSession) return null;
 
   const prState = normalizePrState(workspace.pr_state);
   const prHumanState = humanizePrState(workspace.pr_state);
@@ -133,6 +139,19 @@ export function WorkspaceStatusCluster() {
           PR chip). Opens the peek overlay. */}
       {backgroundBrowserSession && (
         <BackgroundBrowserIndicator workspaceId={workspace.workspace_id} />
+      )}
+
+      {showNoGit && (
+        <button
+          type="button"
+          onClick={initialize}
+          disabled={initializing}
+          aria-label="Initialize a git repository in this project folder"
+          title="This project is not a git repository — worktrees, diffs, and checkpoints are unavailable until one is initialized"
+          className="inline-flex h-[26px] shrink-0 items-center rounded-md border px-2 font-mono text-[11px] font-semibold text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {initializing ? "Initializing…" : "Initialize Git"}
+        </button>
       )}
 
       {gitBranch && (

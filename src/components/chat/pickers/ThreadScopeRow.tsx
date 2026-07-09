@@ -152,13 +152,40 @@ export function ThreadScopeRow({
   const showProjectControls = !isHome && projectPath !== null;
   const projectName = projectPath ? basename(projectPath) : "";
 
+  // Non-git projects can't have worktrees or base branches — hide the
+  // checkout + branch controls instead of letting a "New worktree" send
+  // die on the backend's `Not a git repository` error. Gated off the
+  // workspace snapshot (`is_git`, optimistic when unknown) rather than a
+  // live probe: every project in the location list is derived from an
+  // existing workspace, so one always carries the flag.
+  const workspaces = useAppStore(
+    (s) => s.appState?.workspaces ?? EMPTY_WORKSPACES,
+  );
+  const projectIsGit = useMemo(() => {
+    if (!projectPath) return true;
+    const ws = workspaces.find(
+      (w) => (w.project_root ?? w.cwd) === projectPath,
+    );
+    return ws ? ws.is_git !== false : true;
+  }, [workspaces, projectPath]);
+
+  // A stale draft (or a project switch) can arrive with "worktree" mode
+  // already picked — snap it back so first send can't hit the error.
+  useEffect(() => {
+    if (!projectIsGit && checkoutMode === "worktree") {
+      onChangeCheckoutMode("current");
+    }
+  }, [projectIsGit, checkoutMode, onChangeCheckoutMode]);
+
   const scopeHint = isHome
     ? "No project — this agent runs on your machine in the home directory (~). Just chat, run commands, or point it at files anywhere."
     : !showProjectControls
       ? null
-      : checkoutMode === "worktree"
-        ? `Creates an isolated worktree off ${baseBranch || "…"} in ${projectName}. Leave the name empty and it’s auto-named from your first message.`
-        : `Runs in ${projectName}’s current checkout on ${baseBranch || "…"}. Changes land directly in your working copy.`;
+      : !projectIsGit
+        ? `Runs directly in ${projectName}’s folder. Not a git repository — initialize one to unlock isolated worktrees.`
+        : checkoutMode === "worktree"
+          ? `Creates an isolated worktree off ${baseBranch || "…"} in ${projectName}. Leave the name empty and it’s auto-named from your first message.`
+          : `Runs in ${projectName}’s current checkout on ${baseBranch || "…"}. Changes land directly in your working copy.`;
 
   return (
     <div className="rise-in flex flex-col items-center gap-3 px-1">
@@ -170,7 +197,7 @@ export function ThreadScopeRow({
             activeProjectPath={projectPath}
             disabled={disabled}
           />
-          {showProjectControls && (
+          {showProjectControls && projectIsGit && (
             <>
               <span className="select-none text-muted-foreground/50">·</span>
               <CheckoutControl
@@ -185,7 +212,7 @@ export function ThreadScopeRow({
         </div>
         {(showProjectControls || trailing) && (
           <div className="flex shrink-0 items-center gap-1.5">
-            {showProjectControls && projectPath && (
+            {showProjectControls && projectIsGit && projectPath && (
               <BranchControl
                 projectPath={projectPath}
                 checkoutMode={checkoutMode}

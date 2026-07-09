@@ -69,6 +69,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
 import { useAiCommitStore } from "@/stores/ai-commit-store";
+import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import { cn } from "@/lib/utils";
 import type {
   WorkspaceSnapshot,
@@ -312,6 +313,12 @@ export function ChangesPanel({ workspace }: Props) {
   const conflicted = useMemo(() => files.filter((f) => f.status === "conflicted"), [files]);
   const isMerging = !!(mergeState?.is_merging || mergeState?.is_rebasing);
   const totalChanges = files.length;
+
+  // Non-git project folder: `getGitStatus` errors (swallowed to `[]`), so
+  // without this flag the panel would render a false "Working tree clean".
+  // Instead we name the state and offer the explicit, opt-in `git init`.
+  const showNoGit = showNoGitState(workspace);
+  const { initialize, initializing } = useInitializeGit(workspace);
 
   const refresh = useCallback(() => {
     if (!cwd) return;
@@ -654,10 +661,31 @@ export function ChangesPanel({ workspace }: Props) {
       <ScrollArea className="flex-1 min-h-0">
         <div className="py-1">
           {totalChanges === 0 ? (
-            <div className="flex flex-col items-center justify-center py-10 gap-1.5 text-muted-foreground/70">
-              <Check className="size-4 opacity-50" />
-              <p className="text-[11px]">Working tree clean</p>
-            </div>
+            showNoGit ? (
+              <div className="flex flex-col items-center justify-center px-4 py-10 gap-2 text-center text-muted-foreground/70">
+                <GitBranch className="size-4 opacity-50" />
+                <p className="text-[11px]">
+                  Not a git repository — changes can&apos;t be tracked
+                </p>
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  className="h-6 text-[10px] bg-foreground/[0.08] hover:bg-foreground/[0.14] text-foreground border border-border/60"
+                  onClick={async () => {
+                    await initialize();
+                    refresh();
+                  }}
+                  disabled={initializing}
+                >
+                  {initializing ? "Initializing…" : "Initialize Git"}
+                </Button>
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center py-10 gap-1.5 text-muted-foreground/70">
+                <Check className="size-4 opacity-50" />
+                <p className="text-[11px]">Working tree clean</p>
+              </div>
+            )
           ) : (
             <>
               <FileSection
@@ -693,7 +721,10 @@ export function ChangesPanel({ workspace }: Props) {
           AI-message preview banner (when present) above the smart
           Commit button. Banner uses a left-rule pull-quote treatment
           so the generated text reads as an editorial artifact, not
-          just another form field. */}
+          just another form field. Hidden for non-git folders — every
+          action here (commit/push/pull/fetch) needs a repo, and the
+          empty state above already offers Initialize Git. */}
+      {!showNoGit && (
       <div className="shrink-0 border-t border-border/60 bg-card/40 p-2 space-y-2">
         {showPreview && (
           <div className="rounded-md border border-border/60 bg-background overflow-hidden">
@@ -801,6 +832,7 @@ export function ChangesPanel({ workspace }: Props) {
           />
         )}
       </div>
+      )}
     </div>
   );
 }

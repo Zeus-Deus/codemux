@@ -1,7 +1,5 @@
 import { useCallback } from "react";
 import {
-  checkIsGitRepo,
-  initGitRepo,
   dbAddRecentProject,
   gitCloneRepo,
   createEmptyWorkspace,
@@ -50,16 +48,12 @@ export async function openProjectFlow(): Promise<OpenProjectResult> {
   if (!folder) return { success: false };
 
   const name = basename(folder);
-  const isGit = await checkIsGitRepo(folder);
 
-  if (!isGit) {
-    const confirmed = window.confirm(
-      `"${name}" is not a git repository. Initialize one?`,
-    );
-    if (!confirmed) return { success: false };
-    await initGitRepo(folder);
-  }
-
+  // Non-git folders are accepted as-is — same as every other add path
+  // (sidebar "+", chat drafts, onboarding). The workspace runs in
+  // plain-directory mode and the UI offers an explicit "Initialize Git"
+  // action instead of gating project-add on git (we never `git init` a
+  // user's folder without an explicit click).
   await dbAddRecentProject(folder, name);
 
   // Only show the onboarding wizard for truly first-time users — no existing

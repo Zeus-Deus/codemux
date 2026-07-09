@@ -28,8 +28,8 @@ use tauri::{Emitter, Manager, State};
 /// them via `spawn_blocking` and then apply the result synchronously to
 /// state — `AppStateStore` references can't cross the `spawn_blocking`
 /// boundary.
-#[derive(Default)]
 pub(crate) struct WorkspaceGitInfo {
+    pub is_git: bool,
     pub branch: Option<String>,
     pub ahead: u32,
     pub behind: u32,
@@ -44,6 +44,9 @@ pub(crate) struct WorkspaceGitInfo {
 /// corrupted `.git` directories. Pure I/O — touches no shared state, so it
 /// is safe to call from `spawn_blocking`.
 pub(crate) fn gather_workspace_git_info(repo_path: &Path) -> WorkspaceGitInfo {
+    // Same predicate worktree creation uses (`find_git_root`), so "is this
+    // a git workspace" and "can this project have worktrees" never disagree.
+    let is_git = crate::config::workspace_config::find_git_root(repo_path).is_some();
     let branch_info = crate::git::git_branch_info(repo_path).ok();
     let diff_stat = crate::git::git_diff_stat(repo_path).ok();
     let changed_files = crate::git::git_status(repo_path).map(|f| f.len() as u32).unwrap_or(0);
@@ -60,12 +63,31 @@ pub(crate) fn gather_workspace_git_info(repo_path: &Path) -> WorkspaceGitInfo {
         .map(|s| s.staged_deletions + s.unstaged_deletions)
         .unwrap_or(0);
 
-    WorkspaceGitInfo { branch, ahead, behind, additions, deletions, changed_files }
+    WorkspaceGitInfo { is_git, branch, ahead, behind, additions, deletions, changed_files }
+}
+
+impl Default for WorkspaceGitInfo {
+    /// The error-path fallback (e.g. a panicked `spawn_blocking` gather).
+    /// `is_git: true` keeps a transient failure from flashing the
+    /// "Initialize Git" affordance on a real repo — optimistic, matching
+    /// the serde default on the snapshot field.
+    fn default() -> Self {
+        Self {
+            is_git: true,
+            branch: None,
+            ahead: 0,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            changed_files: 0,
+        }
+    }
 }
 
 fn apply_workspace_git_info(state: &AppStateStore, workspace_id: &str, info: WorkspaceGitInfo) {
     state.update_workspace_git_info(
         workspace_id,
+        info.is_git,
         info.branch,
         info.ahead,
         info.behind,
@@ -2493,12 +2515,35 @@ mod git_info_tests {
         // `.git/` must yield default values, not panic.
         let tmp = TempDir::new().expect("tempdir");
         let info = gather_workspace_git_info(tmp.path());
+        assert!(!info.is_git, "a non-git dir must report is_git=false");
         assert!(info.branch.is_none(), "no branch in a non-git dir");
         assert_eq!(info.ahead, 0);
         assert_eq!(info.behind, 0);
         assert_eq!(info.additions, 0);
         assert_eq!(info.deletions, 0);
         assert_eq!(info.changed_files, 0);
+    }
+
+    #[test]
+    fn gather_workspace_git_info_flips_is_git_after_git_init() {
+        // The exact flow the "Initialize Git" affordance runs: bare
+        // `git init` on a plain folder, then a re-gather — `is_git`
+        // must flip to true so the UI swaps the affordance for the
+        // normal git surfaces.
+        let tmp = TempDir::new().expect("tempdir");
+        assert!(!gather_workspace_git_info(tmp.path()).is_git);
+
+        let out = std::process::Command::new("git")
+            .arg("init")
+            .current_dir(tmp.path())
+            .output()
+            .expect("run git init");
+        assert!(out.status.success(), "git init failed: {out:?}");
+
+        let info = gather_workspace_git_info(tmp.path());
+        assert!(info.is_git, "freshly-initialized repo must report is_git=true");
+        // Unborn HEAD: branch may or may not resolve depending on git
+        // version — the flag, not the branch, is the contract here.
     }
 
     #[test]

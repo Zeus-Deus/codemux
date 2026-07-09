@@ -239,6 +239,7 @@ function makeWorkspace(seed: WorkspaceSeed): WorkspaceSnapshot {
     title: seed.title,
     workspace_type: seed.workspace_type ?? "standard",
     cwd: seed.cwd,
+    is_git: seed.is_git ?? true,
     git_branch: seed.git_branch ?? null,
     git_ahead: seed.git_ahead ?? 0,
     git_behind: seed.git_behind ?? 0,
@@ -677,6 +678,23 @@ const wsSiteRedesign = makeWorkspace({
   git_changed_files: 11,
 });
 
+// Project 4 — scratchpad: a plain non-git folder opened as a project.
+// Exercises the non-git degradation surfaces: no branch/PR chips, the
+// "no git" state + "Initialize Git" affordance in the context bar and
+// Changes panel, and the hidden worktree option in Thread Scope.
+
+const scratchRoot = `${PROJECTS}/scratchpad`;
+
+const wsScratchpad = makeWorkspace({
+  workspace_id: "ws-scratchpad-main",
+  title: "scratchpad",
+  cwd: scratchRoot,
+  project_root: scratchRoot,
+  project_uid: "uid-scratchpad",
+  workspace_kind: "main",
+  is_git: false,
+});
+
 const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxMain,
   wsCodemuxChat,
@@ -695,6 +713,7 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsVexisInstaller,
   wsSiteMain,
   wsSiteRedesign,
+  wsScratchpad,
 ];
 
 // ── Config + persistence ────────────────────────────────────────────
