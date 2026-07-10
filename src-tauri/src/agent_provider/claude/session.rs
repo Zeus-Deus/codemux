@@ -87,6 +87,11 @@ pub(crate) struct ClaudeSessionState {
     /// dispatch order. Drained one-at-a-time as the session returns to
     /// idle (see [`ClaudeSession::drain_queue`]).
     pub queued_turns: VecDeque<QueuedTurn>,
+    /// Set while a `drain_queue` has popped an item and is mid-flight in
+    /// `do_send`, before `active_turn` is populated. Guards against two
+    /// concurrent drains (notifications task + inline interrupt fallback)
+    /// each popping and dispatching an item in the same idle window.
+    pub dispatching: bool,
 }
 
 /// A user turn parked in the follow-up queue behind the active turn.
@@ -107,19 +112,41 @@ fn mint_queued_id() -> String {
 
 /// Move the queued turn with `queued_id` to the front of `queue` so it
 /// is the next item [`ClaudeSession::drain_queue`] dispatches. Returns
-/// `true` when the item was found (and is now at the front), `false`
-/// when no such id is queued (already dispatched / cancelled / unknown).
-/// A no-op when the item is already at the front.
-fn promote_queued_to_front(queue: &mut VecDeque<QueuedTurn>, queued_id: &str) -> bool {
+/// `Some(original_index)` when the item was found (and is now at the
+/// front), `None` when no such id is queued (already dispatched /
+/// cancelled / unknown). A no-op when the item is already at the front.
+/// The returned index lets a caller undo the reorder via
+/// [`restore_queued_position`] when a follow-up step (e.g. `interrupt`)
+/// fails.
+fn promote_queued_to_front(queue: &mut VecDeque<QueuedTurn>, queued_id: &str) -> Option<usize> {
     match queue.iter().position(|q| q.queued_id == queued_id) {
-        Some(0) => true,
+        Some(0) => Some(0),
         Some(pos) => {
             if let Some(item) = queue.remove(pos) {
                 queue.push_front(item);
             }
-            true
+            Some(pos)
         }
-        None => false,
+        None => None,
+    }
+}
+
+/// Undo a [`promote_queued_to_front`] by moving `queued_id` back to
+/// `original_index`. Finds the item's CURRENT position first — it may
+/// have been dispatched or cancelled in the meantime, in which case this
+/// is a no-op. Otherwise it is removed and re-inserted at
+/// `min(original_index, queue.len())` so the queue order is restored.
+fn restore_queued_position(
+    queue: &mut VecDeque<QueuedTurn>,
+    queued_id: &str,
+    original_index: usize,
+) {
+    let Some(pos) = queue.iter().position(|q| q.queued_id == queued_id) else {
+        return;
+    };
+    if let Some(item) = queue.remove(pos) {
+        let insert_at = original_index.min(queue.len());
+        queue.insert(insert_at, item);
     }
 }
 
@@ -282,6 +309,7 @@ impl ClaudeSession {
             permission_mode: input.permission_mode.clone(),
             sdk_session_id: None,
             queued_turns: VecDeque::new(),
+            dispatching: false,
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -397,16 +425,27 @@ impl ClaudeSession {
     pub async fn drain_queue(self: &Arc<Self>) {
         loop {
             // Pop the next item only if the session is truly idle: no
-            // active turn, Ready status, and nothing parked on approval.
+            // active turn, Ready status, nothing parked on approval, and
+            // no concurrent drain already mid-dispatch. The `dispatching`
+            // flag closes the gap between popping here and `do_send`
+            // setting `active_turn` — without it a second drain sees the
+            // session idle and pops the NEXT item, double-dispatching.
             let next = {
                 let mut state = self.state.lock().await;
                 let idle = state.active_turn.is_none()
                     && matches!(state.status, SessionStatus::Ready)
-                    && state.pending_approvals.is_empty();
+                    && state.pending_approvals.is_empty()
+                    && !state.dispatching;
                 if !idle {
                     return;
                 }
-                state.queued_turns.pop_front()
+                match state.queued_turns.pop_front() {
+                    Some(queued) => {
+                        state.dispatching = true;
+                        Some(queued)
+                    }
+                    None => None,
+                }
             };
             let Some(queued) = next else { return };
             let text = queued.input.text.clone();
@@ -419,6 +458,10 @@ impl ClaudeSession {
                 .await
             {
                 Ok(turn_id) => {
+                    {
+                        let mut state = self.state.lock().await;
+                        state.dispatching = false;
+                    }
                     let _ = self.event_tx.send(ProviderRuntimeEvent::QueuedTurnDispatched {
                         thread_id: self.thread_id.clone(),
                         queued_id: queued.queued_id,
@@ -428,6 +471,10 @@ impl ClaudeSession {
                     return;
                 }
                 Err(err) => {
+                    {
+                        let mut state = self.state.lock().await;
+                        state.dispatching = false;
+                    }
                     // Don't wedge the queue: surface the failure, cancel
                     // this item, and try the next one.
                     let _ = self.event_tx.send(ProviderRuntimeEvent::RuntimeWarning {
@@ -488,31 +535,56 @@ impl ClaudeSession {
     /// dispatched between the UI click and this call).
     ///
     /// When a turn is active we call [`interrupt`](Self::interrupt), which
-    /// flips the session to `Ready` and ends with `drain_queue()` — so the
-    /// item we just moved to the front goes out next. When the session is
-    /// already idle (the turn finished during the click→call race) we just
-    /// `drain_queue()` directly.
+    /// ends the SDK query's current turn. The sidecar emits
+    /// `turn-interrupted` (the session stays alive and rebuilds a resumed
+    /// query on the next send-turn; the queue is preserved) rather than
+    /// tearing the session down. The promoted item then dispatches via the
+    /// notifications-task drain that fires on `turn-interrupted`, or via
+    /// `interrupt`'s own inline fallback drain — whichever runs first; the
+    /// `dispatching` guard in [`drain_queue`](Self::drain_queue) makes that
+    /// race safe. When the session is already idle (the turn finished
+    /// during the click→call race) we just `drain_queue()` directly.
     ///
-    /// **Pending approvals:** `drain_queue` refuses to dispatch while
-    /// `pending_approvals` is non-empty, and `interrupt` does not clear
-    /// them (only session close/error does). So — exactly like a manual
-    /// stop-button interrupt — if a tool approval is outstanding the
-    /// promoted message stays queued until that approval resolves, then
-    /// drains. Send-now deliberately does not invent new approval-clearing
-    /// behaviour.
+    /// If the promotion succeeds but the interrupt RPC then fails, we undo
+    /// the reorder (via [`restore_queued_position`]) before propagating the
+    /// error, so a failed steer does not silently leave the queue
+    /// reordered.
+    ///
+    /// **Pending approvals:** an interrupt now aborts any outstanding
+    /// approval sidecar-side and emits `request-resolved` for it, which
+    /// clears the stale `pending_approvals` entry (see
+    /// [`mutate_state_from_notification`]). So the promoted message no
+    /// longer waits on a zombie approval — the following drain dispatches
+    /// it as soon as the turn ends.
     pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
-        let has_active_turn = {
+        let (has_active_turn, original_index) = {
             let mut state = self.state.lock().await;
-            if !promote_queued_to_front(&mut state.queued_turns, queued_id) {
+            match promote_queued_to_front(&mut state.queued_turns, queued_id) {
+                Some(idx) => (state.active_turn.is_some(), idx),
                 // Unknown / already-dispatched / cancelled — no-op.
-                return Ok(());
+                None => return Ok(()),
             }
-            state.active_turn.is_some()
         };
         if has_active_turn {
-            // Soft-stop the running turn; `interrupt` flips to Ready and
-            // drains, dispatching the item we just promoted to the front.
-            self.interrupt(None).await
+            // Soft-stop the running turn; the sidecar's `turn-interrupted`
+            // notification (or `interrupt`'s inline fallback drain)
+            // dispatches the item we just promoted to the front.
+            match self.interrupt(None).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    // Undo the reorder so a failed steer doesn't leave the
+                    // queue silently rearranged.
+                    {
+                        let mut state = self.state.lock().await;
+                        restore_queued_position(
+                            &mut state.queued_turns,
+                            queued_id,
+                            original_index,
+                        );
+                    }
+                    Err(err)
+                }
+            }
         } else {
             // Race: the turn finished between the UI click and this call.
             // The session is idle, so just drain the promoted item out.
@@ -619,22 +691,32 @@ impl ClaudeSession {
             .map_err(|e| ProviderError::RpcError {
                 message: format!("interrupt RPC failed: {e}"),
             })?;
-        // Announce Ready before mutating local state so subscribers
-        // never observe `Ready` in the struct with no corresponding
-        // event in flight. The SessionEnded notification that the
-        // sidecar will emit next translates to `Closed`, so this is
-        // the only place Ready is surfaced after an interrupt.
-        let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-            thread_id: self.thread_id.clone(),
-            status: SessionStatus::Ready,
-        });
+        // By the time the RPC returns, the sidecar's `turn-interrupted`
+        // notification may ALREADY have been processed by the
+        // notifications task, which may already have flipped the session
+        // to Ready and drained the queue — dispatching the next turn and
+        // setting `active_turn` to a NEW turn. Only surface Ready + clear
+        // state when the turn we interrupted is still the active one (the
+        // notification hasn't landed yet); otherwise we would clobber the
+        // freshly-dispatched turn and could double-dispatch.
         {
             let mut state = self.state.lock().await;
-            state.active_turn = None;
-            state.status = SessionStatus::Ready;
+            if state.active_turn == active && active.is_some() {
+                state.active_turn = None;
+                state.status = SessionStatus::Ready;
+                // Announce Ready while holding the lock so subscribers
+                // never observe `Ready` in the struct with no
+                // corresponding event in flight.
+                let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: self.thread_id.clone(),
+                    status: SessionStatus::Ready,
+                });
+            }
         }
-        // The user probably interrupted to make the next (queued) message
-        // go sooner — drain now that the session is idle again.
+        // Fallback drain: if the notification hasn't run yet, this
+        // dispatches the next (queued) turn now that the session is idle.
+        // The `dispatching` guard makes a concurrent drain (from the
+        // notifications task) safe.
         self.drain_queue().await;
         Ok(())
     }
@@ -675,7 +757,7 @@ impl ClaudeSession {
     }
 
     pub async fn respond_to_request(
-        &self,
+        self: &Arc<Self>,
         request_id: RequestId,
         decision: crate::agent_provider::ApprovalDecision,
     ) -> Result<(), ProviderError> {
@@ -699,7 +781,15 @@ impl ClaudeSession {
             )
             .await;
         match res {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // The approval cleared, so the session may now be idle
+                // with a queued follow-up waiting. The notification path
+                // usually covers this, but draining here closes the
+                // ordering gap between the local removal above and the
+                // sidecar's `request-resolved` notification arriving.
+                self.drain_queue().await;
+                Ok(())
+            }
             Err(crate::json_rpc_child::RpcChildError::RpcError(err))
                 if err.code == -32602 =>
             {
@@ -1310,6 +1400,29 @@ async fn mutate_state_from_notification(
                 SessionStatus::Closed
             };
         }
+        SidecarNotification::TurnInterrupted { .. } => {
+            // An explicit interrupt RPC ended the turn but the session
+            // survives. Clear the active turn and return to Ready — but
+            // only from Running, so we never resurrect a session that has
+            // since gone Closed / Error.
+            let mut state = session.state.lock().await;
+            state.active_turn = None;
+            if matches!(state.status, SessionStatus::Running { .. }) {
+                state.status = SessionStatus::Ready;
+            }
+        }
+        SidecarNotification::RequestResolved { request_id, .. } => {
+            // The sidecar resolved a pending approval on its own — e.g.
+            // an interrupt that aborted a turn with an outstanding tool
+            // approval emits `request-resolved` with a deny decision.
+            // Nothing else removes entries on the notification path (only
+            // the local `respond_to_request` / `shutdown` do), so without
+            // this the stale entry would block `drain_queue` forever.
+            let mut state = session.state.lock().await;
+            state
+                .pending_approvals
+                .remove(&RequestId(request_id.clone()));
+        }
         SidecarNotification::SessionError { error, .. } => {
             let mut state = session.state.lock().await;
             state.status = SessionStatus::Error {
@@ -1354,7 +1467,7 @@ mod tests {
     #[test]
     fn promote_queued_to_front_unknown_id_is_noop() {
         let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
-        assert!(!promote_queued_to_front(&mut q, "missing"));
+        assert_eq!(promote_queued_to_front(&mut q, "missing"), None);
         // Order unchanged.
         let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
@@ -1363,7 +1476,8 @@ mod tests {
     #[test]
     fn promote_queued_to_front_moves_mid_queue_item() {
         let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b"), queued("c")].into();
-        assert!(promote_queued_to_front(&mut q, "c"));
+        // Returns the item's original index so the reorder can be undone.
+        assert_eq!(promote_queued_to_front(&mut q, "c"), Some(2));
         let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
         assert_eq!(ids, ["c", "a", "b"]);
     }
@@ -1371,8 +1485,38 @@ mod tests {
     #[test]
     fn promote_queued_to_front_head_item_stays_put() {
         let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
-        assert!(promote_queued_to_front(&mut q, "a"));
+        assert_eq!(promote_queued_to_front(&mut q, "a"), Some(0));
         let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
         assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn restore_queued_position_undoes_a_promotion() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b"), queued("c")].into();
+        let idx = promote_queued_to_front(&mut q, "c").unwrap();
+        assert_eq!(idx, 2);
+        restore_queued_position(&mut q, "c", idx);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn restore_queued_position_already_dispatched_is_noop() {
+        // The item was promoted then removed (dispatched/cancelled)
+        // before restore ran — restoring is a harmless no-op.
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        restore_queued_position(&mut q, "gone", 1);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn restore_queued_position_clamps_out_of_range_index() {
+        // A stale original index past the current end clamps to the tail
+        // rather than panicking.
+        let mut q: VecDeque<QueuedTurn> = [queued("c"), queued("a")].into();
+        restore_queued_position(&mut q, "c", 9);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
     }
 }

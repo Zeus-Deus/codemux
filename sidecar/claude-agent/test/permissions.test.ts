@@ -162,8 +162,8 @@ test("ExitPlanMode emits plan-proposed and returns deny with interrupt=true", as
   expect((plan?.params as { plan: string }).plan).toBe("first do X");
 });
 
-test("abort on signal rejects the pending decision and translates to deny", async () => {
-  const { emit } = recorder();
+test("abort on signal rejects the pending decision, emits request-resolved deny, and clears pending", async () => {
+  const { emit, events } = recorder();
   const pending: PendingApprovals = new Map();
   const cb = makeCanUseTool("thr", emit, pending);
   const controller = new AbortController();
@@ -173,10 +173,27 @@ test("abort on signal rejects the pending decision and translates to deny", asyn
     { signal: controller.signal, toolUseID: "tu" },
   );
   await new Promise((r) => setTimeout(r, 0));
+  const requestId = [...pending.keys()][0] as string;
   controller.abort();
   const result = await promise;
   expect(result.behavior).toBe("deny");
+  if (result.behavior === "deny") {
+    expect(result.message).toBe("Tool request was aborted.");
+  }
   expect(pending.size).toBe(0);
+  // The host mirrors this to clear its own pending-approvals map;
+  // without it the dispatch queue wedges after an interrupt.
+  const resolved = events.find((e) => e.method === "request-resolved");
+  expect(resolved).toBeDefined();
+  const params = resolved?.params as {
+    requestId: string;
+    decision: ApprovalDecision;
+  };
+  expect(params.requestId).toBe(requestId);
+  expect(params.decision.behavior).toBe("deny");
+  if (params.decision.behavior === "deny") {
+    expect(params.decision.message).toBe("Tool request was aborted.");
+  }
 });
 
 // ────────────────────────────────────────────────────────────────────

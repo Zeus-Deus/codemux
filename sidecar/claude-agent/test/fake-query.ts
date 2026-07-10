@@ -28,6 +28,10 @@ export class FakeQuery implements AsyncIterable<SDKMessage> {
   public setPermissionModeCalls: PermissionMode[] = [];
   public interruptCalls = 0;
   public closed = false;
+  /** When set, `interrupt()` throws this from the iterator, emulating
+   *  the real SDK aborting the query when interrupted. Leave null to
+   *  emulate a soft interrupt where the iterator keeps running. */
+  public interruptError: Error | null = null;
 
   public initResult: unknown = {
     commands: [],
@@ -137,6 +141,9 @@ export class FakeQuery implements AsyncIterable<SDKMessage> {
 
   async interrupt(): Promise<void> {
     this.interruptCalls += 1;
+    if (this.interruptError) {
+      this.errorStream(this.interruptError);
+    }
   }
 
   async setModel(model?: string): Promise<void> {

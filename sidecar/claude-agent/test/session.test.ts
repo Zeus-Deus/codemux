@@ -7,7 +7,9 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import type { EventEmitter } from "../src/session.ts";
 import {
   ClaudeSession,
+  resetInterruptExitTimeoutForTests,
   resetQueryFactoryForTests,
+  setInterruptExitTimeoutForTests,
   setQueryFactoryForTests,
   type SessionStartInput,
 } from "../src/session.ts";
@@ -40,6 +42,34 @@ function minimalInput(overrides: Partial<SessionStartInput> = {}): SessionStartI
   };
 }
 
+/** Minimal assistant SDK message carrying a `session_id`, shared by
+ *  the interrupt/rebuild tests. */
+function mkAssistant(sessionId: string): SDKMessage {
+  return {
+    type: "assistant",
+    message: {
+      id: "m1",
+      type: "message",
+      role: "assistant",
+      content: [],
+      model: "claude-opus",
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    },
+    parent_tool_use_id: null,
+    uuid: "u-1" as `${string}-${string}-${string}-${string}-${string}`,
+    session_id: sessionId,
+  } as unknown as SDKMessage;
+}
+
+/** An abort-like error matching the SDK's interrupt-abort shape. */
+function abortLikeError(): Error {
+  const err = new Error("request was aborted");
+  err.name = "AbortError";
+  return err;
+}
+
 let fake: FakeQuery;
 
 beforeEach(() => {
@@ -47,10 +77,14 @@ beforeEach(() => {
     fake = new FakeQuery(args);
     return asQuery(fake);
   });
+  // Keep the interrupt-exit race short so the soft-interrupt (timeout)
+  // path doesn't stall the suite.
+  setInterruptExitTimeoutForTests(50);
 });
 
 afterEach(() => {
   resetQueryFactoryForTests();
+  resetInterruptExitTimeoutForTests();
 });
 
 test("session starts with minimal options and emits session-configured", () => {
@@ -360,6 +394,113 @@ test("session-ended with reason=interrupted when query throws AbortError-like", 
       (e.params as { reason: string }).reason === "interrupted",
   );
   expect(ended).toBeDefined();
+  await session.close();
+});
+
+test("interrupt on an abort-like exit emits turn-interrupted, not session-ended", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  // The SDK aborts the query when interrupted; model that on the fake.
+  fake.interruptError = abortLikeError();
+  await session.interrupt();
+  expect(events.filter((e) => e.method === "session-ended")).toHaveLength(0);
+  const interrupted = events.filter((e) => e.method === "turn-interrupted");
+  expect(interrupted).toHaveLength(1);
+  expect((interrupted[0]?.params as { threadId: string }).threadId).toBe("t-1");
+  await session.close();
+});
+
+test("sendTurn after an interrupt rebuilds a resumed query that consumes the turn", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  // Observe an sdk session id on the original query.
+  fakes[0]?.emit(mkAssistant("sdk-sess-1"));
+  await new Promise((r) => setTimeout(r, 10));
+  // Interrupt kills the original query.
+  const first = fakes[0] as FakeQuery;
+  first.interruptError = abortLikeError();
+  await session.interrupt();
+  // The next turn transparently rebuilds a resumed query.
+  await session.sendTurn({ text: "resumed turn" });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(fakes.length).toBe(2);
+  // The rebuild resumes from the previously observed sdk session id and
+  // drops the explicit fresh-session uuid.
+  expect(fakes[1]?.capturedOptions?.resume).toBe("sdk-sess-1");
+  expect(fakes[1]?.capturedOptions?.sessionId).toBeUndefined();
+  // The message lands on the NEW query, not the dead one.
+  expect(fakes[1]?.capturedPrompts.length).toBe(1);
+  expect(fakes[0]?.capturedPrompts.length).toBe(0);
+  await session.close();
+});
+
+test("rebuilt query re-emits sdk-session-id when its first message carries a new id", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  fakes[0]?.emit(mkAssistant("sdk-sess-1"));
+  await new Promise((r) => setTimeout(r, 10));
+  const first = fakes[0] as FakeQuery;
+  first.interruptError = abortLikeError();
+  await session.interrupt();
+  await session.sendTurn({ text: "again" });
+  // The resumed session is issued a fresh id.
+  fakes[1]?.emit(mkAssistant("sdk-sess-2"));
+  await new Promise((r) => setTimeout(r, 10));
+  const ids = events
+    .filter((e) => e.method === "sdk-session-id")
+    .map((e) => (e.params as { sessionId: string }).sessionId);
+  expect(ids).toEqual(["sdk-sess-1", "sdk-sess-2"]);
+  await session.close();
+});
+
+test("setModel/setPermissionMode while the query is dead don't throw and are reflected on rebuild", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  const first = fakes[0] as FakeQuery;
+  first.interruptError = abortLikeError();
+  await session.interrupt();
+  // Query is dead — these record without touching the dead query.
+  await session.setModel("claude-opus-4-8");
+  await session.setPermissionMode("plan");
+  expect(fakes[0]?.setModelCalls).toEqual([]);
+  expect(fakes[0]?.setPermissionModeCalls).toEqual([]);
+  await session.sendTurn({ text: "go" });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(fakes[1]?.capturedOptions?.model).toBe("claude-opus-4-8");
+  expect(fakes[1]?.capturedOptions?.permissionMode).toBe("plan");
+  await session.close();
+});
+
+test("interrupt with a soft (non-exiting) iterator resolves without turn-interrupted and stays usable", async () => {
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(minimalInput(), emit);
+  // interruptError stays null — the fake's iterator keeps running, so
+  // the interrupt-exit race resolves via the (lowered) timeout.
+  await session.interrupt();
+  expect(fake.interruptCalls).toBe(1);
+  expect(events.some((e) => e.method === "turn-interrupted")).toBe(false);
+  // Session is still usable and did NOT rebuild (query still live).
+  await session.sendTurn({ text: "still here" });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(fake.capturedPrompts.length).toBe(1);
   await session.close();
 });
 

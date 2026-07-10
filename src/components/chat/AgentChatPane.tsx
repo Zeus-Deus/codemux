@@ -1605,15 +1605,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   }, [isSending, streaming, activeTurnId]);
 
   // Interrupt mechanic: the SDK's `query.interrupt()` causes its
-  // async iterator to exit. The session is functionally dead after
-  // that (ClaudeAdapter.ts:2363 calls `stopSessionInternal`
-  // unconditionally). The reference impl's next `sendTurn` creates
-  // a brand-new SDK query transparently via
-  // `ensureSessionForThread`. Our Rust adapter has no equivalent
-  // auto-recreate, so we do it proactively:
-  // interrupt for the immediate turn abort, then stop + start the
-  // session so subsequent turns land on a live SDK query. Transcript
-  // and picker state persist via `migrateThreadId`.
+  // async iterator to exit, so the underlying SDK query is dead after
+  // an interrupt. The sidecar now recovers from that transparently —
+  // like the reference multi-provider client, its next `send-turn`
+  // rebuilds a resumed SDK query for the (surviving) session, so a bare
+  // interrupt already lets subsequent turns land on a live query.
+  // The Stop button still performs a deliberate hard reset: interrupt
+  // for the immediate turn abort, then stop + start the session (fresh
+  // thread id, resume cursor) so subsequent turns land on a known-good
+  // SDK query and any wedged sidecar state is cleared. Transcript and
+  // picker state persist via `migrateThreadId`.
   const handleStop = useCallback(() => {
     if (!threadId) return;
     if (restarting) return;
