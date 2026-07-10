@@ -11,6 +11,11 @@ interface Props {
    *  acknowledged streaming OR the composer's optimistic flag is set.
    *  Drives the transcript-tail "working" marker. */
   streaming: boolean;
+  /** Stall-watchdog state — drives the amber "no activity" tail notice. */
+  stalled?: { silentForSecs: number } | null;
+  /** True when the last run never cleanly settled — drives the
+   *  "Run interrupted" tail divider. */
+  interrupted?: boolean;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). Forwarded to MessageList; Stage 3 wires the real value. */
   sessionStartedAt?: number;
@@ -40,6 +45,8 @@ interface Props {
 export function ChatTranscript({
   messages,
   streaming,
+  stalled,
+  interrupted,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -57,6 +64,8 @@ export function ChatTranscript({
         messages={messages}
         showThinking={showThinking}
         streaming={streaming}
+        stalled={stalled}
+        interrupted={interrupted}
         sessionStartedAt={sessionStartedAt}
         provider={provider}
         onRespondToRequest={onRespondToRequest}

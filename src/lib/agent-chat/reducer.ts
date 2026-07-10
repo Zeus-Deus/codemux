@@ -938,7 +938,13 @@ function appendUserMessageLocal(
     // existing snapshot-style assertions honest).
     ...(images && images.length > 0 ? { images } : {}),
   };
-  return { ...next, messages: [...next.messages, item] };
+  // Sending a new turn (including the one-click "Continue run") clears the
+  // interrupted flag: the optimistic bubble is the user resuming the run.
+  return {
+    ...next,
+    interrupted: false,
+    messages: [...next.messages, item],
+  };
 }
 
 /**
@@ -969,16 +975,34 @@ export function appendUserMessage(
  * Local-only action: roll back an optimistic user bubble by its client
  * nonce. Used when the send RPC fails outright so no orphan bubble is
  * left behind (fixes the pre-queue orphan bug). No-op when not found.
+ *
+ * `restoreInterrupted` re-arms the `interrupted` flag when the rolled-back
+ * send was a resume attempt on an interrupted thread: `appendUserMessage`
+ * optimistically clears `interrupted` (the bubble is the user resuming), so a
+ * failed send must put it back or the "Run interrupted" divider + Continue
+ * chip vanish with no recovery affordance after a single failed click. The
+ * caller passes the pre-append `interrupted` value so a send on a
+ * never-interrupted thread never spuriously grows the affordance.
  */
 export function removeUserMessageByNonce(
   state: ChatThreadState,
   clientNonce: string,
+  restoreInterrupted = false,
 ): ChatThreadState {
   const idx = state.messages.findIndex(
     (m) => m.kind === "user_message" && m.clientNonce === clientNonce,
   );
-  if (idx < 0) return state;
-  return { ...state, messages: state.messages.filter((_, i) => i !== idx) };
+  if (idx < 0) {
+    // Bubble already gone (or never appended): still honor an interrupted
+    // restore so a failed resume keeps its affordance.
+    return restoreInterrupted && !state.interrupted
+      ? { ...state, interrupted: true }
+      : state;
+  }
+  const messages = state.messages.filter((_, i) => i !== idx);
+  return restoreInterrupted
+    ? { ...state, interrupted: true, messages }
+    : { ...state, messages };
 }
 
 /** Find a queued user bubble by its backend queued id. */
@@ -1049,7 +1073,22 @@ function applyEventInner(
   event: ProviderRuntimeEvent,
   now: Clock,
 ): ChatThreadState {
+  // The stall notice is transient: ANY real event other than a fresh
+  // `run_stalled` means the thread is no longer silent, so clear it up
+  // front. Rebinding here (rather than clearing per-case) means switch
+  // arms that return `state` untouched still carry the cleared flag.
+  if (event.type !== "run_stalled" && state.stalled !== null) {
+    state = { ...state, stalled: null };
+  }
   switch (event.type) {
+    case "run_stalled": {
+      const next = { silentForSecs: event.silent_for_secs };
+      if (state.stalled && state.stalled.silentForSecs === next.silentForSecs) {
+        return state;
+      }
+      return { ...state, stalled: next };
+    }
+
     case "session_configured": {
       // Nothing to render in the transcript yet; the composer/footer
       // read session config via separate commands.
@@ -1059,8 +1098,10 @@ function applyEventInner(
     case "session_state_changed": {
       const status = event.status;
       if (status.status === "running") {
-        if (state.streaming) return state;
-        return { ...state, streaming: true };
+        // A fresh turn started — clear any stale interrupted flag so the
+        // "Run interrupted" divider / Continue chip drop immediately.
+        if (state.streaming && !state.interrupted) return state;
+        return { ...state, streaming: true, interrupted: false };
       }
       if (status.status === "ready") {
         if (!state.streaming) return state;
@@ -1076,8 +1117,21 @@ function applyEventInner(
         const settled = interruptRunningSubagents(
           stopRunningWorkflows(state.messages),
         );
-        if (settled === state.messages && !state.streaming) return state;
-        return { ...state, streaming: false, messages: settled };
+        // Belt-and-braces: a death path that couldn't recover the turn id
+        // still surfaces as an error while streaming. Mark the thread
+        // interrupted so the Continue affordance appears even without a
+        // `child_exited` `turn_completed`. Closed is a clean stop and
+        // never sets it.
+        const interrupted =
+          status.status === "error" && state.streaming ? true : state.interrupted;
+        if (
+          settled === state.messages &&
+          !state.streaming &&
+          interrupted === state.interrupted
+        ) {
+          return state;
+        }
+        return { ...state, streaming: false, interrupted, messages: settled };
       }
       return state;
     }
@@ -1113,6 +1167,8 @@ function applyEventInner(
       return {
         ...state,
         streaming: true,
+        // Live output means the run recovered — drop any interrupted flag.
+        interrupted: false,
         messages: ctx.messages,
         nextSeq: ctx.nextSeq,
       };
@@ -1195,10 +1251,18 @@ function applyEventInner(
         // has no other terminal signal coming (the sidecar tears the
         // session down) — stop it here so it doesn't spin forever.
         messages = stopRunningWorkflows(messages);
+        // A synthetic child-exit completion (provider watchdog) marks the
+        // run as interrupted so the transcript shows the "Run interrupted"
+        // divider and the composer offers a Continue chip. A user-initiated
+        // stop lands here too but with subtype "interrupted", NOT
+        // "child_exited", so it never nags with the Continue affordance.
+        const interrupted =
+          event.status.subtype === "child_exited" ? true : state.interrupted;
         const { seq, next: seqBumped } = takeSeq({ ...state, messages });
         return {
           ...seqBumped,
           streaming: false,
+          interrupted,
           messages: [
             ...seqBumped.messages,
             {
@@ -1211,7 +1275,14 @@ function applyEventInner(
           ],
         };
       }
-      return { ...state, streaming: false, messages };
+      // A clean (non-error) completion clears any lingering `interrupted`
+      // flag. The stdout-reader / exit-watchdog race can persist BOTH a
+      // synthetic `child_exited` completion and the real success completion
+      // for the same turn; the success is the later of the two (the watchdog
+      // only synthesizes while `active_turn` is still set, which the result
+      // message clears), so clearing here — live AND on hydrate replay — keeps
+      // a genuinely-finished run from being mislabelled "Run interrupted".
+      return { ...state, streaming: false, interrupted: false, messages };
     }
 
     case "request_opened": {
@@ -1400,7 +1471,13 @@ function applyEventInner(
       const { seq, next } = takeSeq(state);
       const { queued: _dropped, ...rest } = existing;
       const promoted: UserMessageItem = { ...rest, seq };
-      return { ...next, messages: replaceItem(next.messages, idx, promoted) };
+      // A dispatched follow-up means a live turn is starting — clear any
+      // interrupted flag so the Continue chip / divider drop.
+      return {
+        ...next,
+        interrupted: false,
+        messages: replaceItem(next.messages, idx, promoted),
+      };
     }
 
     case "queued_turn_cancelled": {

@@ -333,6 +333,19 @@ export interface ChatThreadState {
    *  increasing; never reset across a silent session restart so the
    *  migrated transcript stays ordered relative to new items. */
   nextSeq: number;
+  /** Non-null while the stall watchdog has flagged this thread as
+   *  silently mid-turn (issue #154). Set by the transient `run_stalled`
+   *  event and cleared by the next real activity; never persisted, so a
+   *  hydrated thread always starts `null`. Drives the amber "no activity"
+   *  transcript notice. */
+  stalled: { silentForSecs: number } | null;
+  /** True when the thread's last turn never settled — the run died
+   *  without a terminal event (child exit, laptop sleep, usage cutoff).
+   *  Computed at hydrate (last persisted user turn has no later
+   *  `turn_completed`) and set live on a `child_exited` turn error.
+   *  Drives the "Run interrupted" divider and the composer's Continue
+   *  chip. */
+  interrupted: boolean;
 }
 
 export function emptyThreadState(): ChatThreadState {
@@ -341,6 +354,8 @@ export function emptyThreadState(): ChatThreadState {
     streaming: false,
     pendingRequestIds: [],
     nextSeq: 0,
+    stalled: null,
+    interrupted: false,
   };
 }
 

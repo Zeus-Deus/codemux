@@ -20,6 +20,20 @@
 //! The module is intentionally protocol-layer only. It knows nothing about
 //! Codex's method names, Claude's SDK events, or any other provider; higher
 //! layers decide what methods mean.
+//!
+//! # Exit-drain guarantee
+//!
+//! **Messages the child successfully wrote before dying are always routed;
+//! pending requests are failed only after the stdout pipe is fully
+//! drained.** A child's final response/notification can still be sitting in
+//! the kernel pipe buffer when `child.wait()` returns — the watchdog used to
+//! fail all pending requests the instant the child died, which could drop a
+//! response whose bytes had already been written (e.g. a sidecar that emits
+//! its final turn result and then exits). The watchdog now waits for the
+//! reader task to reach EOF (bounded by [`PIPE_DRAIN_TIMEOUT`], protecting
+//! against a grandchild inheriting the stdout fd and holding the pipe open)
+//! before failing whatever is genuinely still outstanding. This applies to
+//! both the voluntary-exit and graceful-shutdown paths.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -39,6 +53,12 @@ const STDERR_TAIL_CAPACITY: usize = 8 * 1024;
 /// How long `shutdown()` waits for a cooperative exit after closing stdin
 /// before resorting to `kill()`.
 const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the watchdog waits for the reader task to drain stdout to EOF
+/// after the child exits, before failing outstanding requests (see the
+/// module-level "Exit-drain guarantee"). Once the child is dead EOF arrives
+/// promptly — the bound only matters when a grandchild process inherited
+/// the stdout fd and is holding the pipe open.
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// Depth of the incoming-request mpsc queue. Higher values absorb bursty
 /// providers at the cost of more memory; the value is a conservative ceiling
 /// well above what any current CLI uses.
@@ -303,8 +323,10 @@ impl JsonRpcChild {
             });
         }
 
-        // Reader task: parses stdout lines and routes them.
-        {
+        // Reader task: parses stdout lines and routes them. The JoinHandle
+        // is handed to the watchdog so it can await EOF before failing
+        // pending requests (the module-level "Exit-drain guarantee").
+        let reader_handle = {
             let pending_reader = Arc::clone(&pending);
             let notifications_tx_reader = notifications_tx.clone();
             let incoming_tx_reader = incoming_tx.clone();
@@ -336,8 +358,8 @@ impl JsonRpcChild {
                 // Dropping `incoming_tx_reader` (the only remaining sender
                 // besides the watchdog-held clone) will eventually close the
                 // channel once watchdog drops its clone too.
-            });
-        }
+            })
+        };
 
         // Watchdog task: owns the Child, waits for either a voluntary exit or
         // a shutdown request, then populates exit_info and wakes pending
@@ -368,6 +390,35 @@ impl JsonRpcChild {
                 alive_watchdog.store(false, Ordering::SeqCst);
 
                 let code = exit_status.ok().and_then(|s| s.code());
+                // Publish exit info immediately so requests arriving from
+                // here on fail with the informative `ChildExited` rather
+                // than `AlreadyShutdown` while the drain below runs.
+                {
+                    let tail_snapshot = stderr_tail_watchdog
+                        .lock()
+                        .map(|t| t.snapshot())
+                        .unwrap_or_default();
+                    if let Ok(mut slot) = exit_info_watchdog.lock() {
+                        *slot = Some(ExitInfo {
+                            code,
+                            stderr_tail: tail_snapshot,
+                        });
+                    }
+                }
+
+                // Exit-drain guarantee (see module docs): a response the
+                // child wrote just before exiting can still be sitting in
+                // the kernel pipe buffer. Failing pending requests NOW would
+                // drop it — the caller would see "child process exited" for
+                // a request the child actually answered (and the reader
+                // would later log the orphaned response as an unknown id).
+                // Wait for the reader to reach EOF so every buffered message
+                // is routed first; bounded because a grandchild inheriting
+                // the stdout fd can hold the pipe open indefinitely.
+                let _ = tokio::time::timeout(PIPE_DRAIN_TIMEOUT, reader_handle).await;
+
+                // Refresh the stderr tail: the drain window may have let the
+                // stderr task capture the child's final diagnostics too.
                 let tail_snapshot = stderr_tail_watchdog
                     .lock()
                     .map(|t| t.snapshot())
@@ -379,7 +430,9 @@ impl JsonRpcChild {
                     });
                 }
 
-                // Fail every outstanding request so callers unblock.
+                // Fail every request that is GENUINELY still outstanding —
+                // anything the child answered has already been resolved and
+                // removed from the map by the reader during the drain.
                 let pending_list = pending_watchdog
                     .lock()
                     .map(|mut m| m.drain())

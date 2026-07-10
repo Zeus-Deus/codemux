@@ -671,6 +671,190 @@ the inline Subagents card + drill-in described above. See
 `docs/features/workflow-orchestration.md` for the full model; this file
 does not duplicate it.
 
+## Dead-run detection & interrupted turns
+
+Issue #154. A run can die without emitting a terminal event — the
+sidecar / app-server / shared server is killed by a laptop sleep, a
+crash, or a provider usage-limit cutoff. Before this work every "working"
+indicator stayed live forever (`pane_statuses` stuck on `Working`, the
+thread `streaming` flag true, the background-browser `LIVE` chip never
+released) and the user had to *know* the run was dead and manually type
+"continue". Three additive parts close the gap.
+
+### Synthetic child-exit terminal event
+
+When a provider's child process dies unexpectedly **mid-turn**, its
+watchdog now settles the in-flight turn before tearing the session down:
+
+- Claude (`claude/session.rs`) and Codex (`codex/session.rs`) per-session
+  child-exit watchdogs recover the `active_turn` (set during both
+  `Running` and `WaitingApproval`) **before** clearing it and emit a
+  synthetic `TurnCompleted { status: Error { subtype: "child_exited" } }`,
+  then the existing `SessionStateChanged::Error`.
+- OpenCode has no per-session child; its SSE listener (`opencode/sse.rs`)
+  reconnects up to `MAX_RECONNECT_ATTEMPTS` (5) and, on giving up, now
+  runs the same terminal sequence for the session (previously it emitted
+  only a `RuntimeWarning`). Whether a turn is in flight is tracked on
+  `EventContext.turn_active`, armed by `send_turn` **only after the
+  `prompt_async` POST succeeds** (a failed POST never started a turn, so a
+  later SSE give-up must not synthesize a `child_exited` completion for a
+  phantom turn) and disarmed when a parent `TurnCompleted` / terminal
+  session state flows.
+
+### Live recovery (no app restart)
+
+The synthetic completion is only half the story: after the watchdog fires,
+the next send on that thread must actually rebuild the dead session. All
+three providers now converge on one shape:
+
+- Each dead session is flagged so the provider's `has_session` reports it
+  **absent**, which routes the next send through `ensure_live_session`
+  (`commands/agent_chat.rs`) to rebuild it — the same choke point that
+  handles post-restart auto-resume. OpenCode's SSE listener flips a shared
+  `dead` `AtomicBool` on give-up; Claude and Codex set a per-session `dead`
+  `AtomicBool` in their child-exit watchdog. It is deliberately **not**
+  keyed off `SessionStatus::Error`: Codex sets `Error` on a mere *turn*
+  failure (a live child that refused a prompt) and on a non-retryable
+  server error, and Claude sets it from a `session-error` notification —
+  none of which mean the child is gone. Only the watchdog (a confirmed dead
+  child) sets `dead`, so a recoverable error stays recoverable in place.
+- The dead session stays in the provider's `sessions` map (only
+  `stop_session` removes it), so each provider's `start_session` now
+  **evicts-and-replaces** a dead entry under the write lock (atomic
+  check→remove against a concurrent rebuild) and shuts the corpse down
+  cleanly, instead of failing the rebuild with the "session already exists"
+  `ValidationError`. Without this the OpenCode rebuild in particular
+  dead-ended: `has_session` said absent, `ensure_live_session` called
+  `start_session`, and the `contains_key` guard found the corpse and
+  errored — every send failed permanently.
+- **OpenCode resume cursor.** OpenCode keeps sessions on disk, so a rebuilt
+  session can readopt its old server-side session id and keep the
+  conversation context. The adapter emits a `ResumeCursorUpdated` carrying
+  the OpenCode session id on every session start (it has no SDK cursor
+  notification of its own), so `forward_event` persists it on the
+  `agent_chat_sessions` row exactly like Claude/Codex. On rebuild,
+  `ensure_live_session` threads `{"resume": <session_id>}` back in and
+  `OpenCodeSession::start` **validates** the id with
+  `GET /session/{id}/message?limit=1` before readopting it — a 404/error
+  means the id is stale, so it falls back to a fresh `POST /session` (the
+  visible transcript still hydrates from the DB either way). Best-effort:
+  `supports_session_resume` is now `true` for OpenCode.
+- **OpenCode shared-server respawn.** The rebuild only works if the shared
+  `opencode serve` child is actually reachable — and the SSE give-up that
+  triggers this whole path usually means that child *died* (laptop sleep,
+  crash), while `OpenCodeServerManager` cached its handle forever (nothing
+  in production calls `stop()`). `ensure_running`
+  (`opencode/manager.rs`) therefore probes the cached server with a
+  short-timeout authenticated `GET /` on every call: any HTTP response
+  (401/404 included) proves it alive. Failure kinds are deliberately
+  distinguished (two-strike policy): a connect error (dead loopback port
+  refuses instantly, deterministically) is an immediate dead verdict,
+  while a probe timeout (or other transport error) only condemns after
+  one retry also fails — a server that is merely wedged for a moment
+  must not be SIGKILLed, since that invalidates every live session's
+  handle at once. A confirmed corpse is dropped (`kill_on_drop` reaps
+  it) and respawned under the same lock, so racing callers serialize
+  onto the fresh server. The respawn mints a new port +
+  password — fine, because the only sessions holding the old handle are
+  the dead ones this scenario invalidated, and the disk-persisted session
+  readopt above recovers the conversation on the new server. An HTTP
+  probe (not `Child::try_wait`) on purpose: `try_wait` needs
+  `&mut Child` behind the shared `Arc`, and can't detect a
+  hung-but-alive server anyway.
+
+The event list is built by the shared pure helper
+`child_exit_events(thread_id, active_turn, message)` in
+`agent_provider/events.rs`. **Ordering is load-bearing**: `TurnCompleted`
+first so the activity + pane-status trackers see the turn settle while the
+thread state is intact, then `Error` to tear tracking down. When no turn
+is in flight (`active_turn` is `None`) only the `Error` event is produced —
+a child that dies while idle has no dangling turn, so no spurious
+`interrupted` signal reaches the frontend. Because `turn_completed`
+persists (`should_persist_event`), hydrate after a restart replays a
+settled turn. The subtype string `"child_exited"`
+(`CHILD_EXITED_SUBTYPE`) is the frontend's key; a user-initiated stop
+produces subtype `"interrupted"` instead, so it never triggers the
+Continue affordance.
+
+### Stall watchdog (`RunStalled`)
+
+A child that is alive but silent (usage-limit cutoff, wedged tool call)
+emits no terminal event at all, so a heartbeat is needed. A new
+Tauri-managed `RunActivityTracker` (`commands/agent_chat.rs`, mirroring
+`SubagentTracker`) records a wall-clock `last_event` per thread inside
+`forward_event`, via the pure `activity_update(current, event, now)`:
+mid-turn events (running, deltas, items, subagent/workflow updates,
+dispatched queue turns, resolved requests) stamp `now`; approval prompts
+(`RequestOpened` / `WaitingApproval`) additionally **pause** the stall
+clock (waiting on the user is expected silence); turn/session settlement
+removes the entry so the map stays bounded. Wall clock (`SystemTime`) on
+purpose — after suspend/resume the elapsed silence includes the sleep
+window, which is exactly the wake-from-sleep case the issue asks for.
+
+`spawn_stall_watchdog` (started from `lib.rs` right after
+`spawn_event_bridge`, same `agent_chat_enabled` gate) sweeps every
+`STALL_SWEEP_INTERVAL` (30s) and, for any thread mid-turn and silent for
+at least `STALL_THRESHOLD` (600s — long enough that a quiet legitimate
+tool call never trips it), forwards a new additive
+`ProviderRuntimeEvent::RunStalled { thread_id, silent_for_secs }`. The
+event is **transient**: never persisted, re-emitted each tick while still
+stalled (keeps the surfaced duration fresh), leaves the sidebar dot
+untouched (`map_event_to_pane_status` returns `None` for it — the run may
+be fine), and is cleared by the reducer on the next real activity. It
+renders as an amber "No activity for Nm — the agent may have stopped."
+tail notice in `MessageList` (design tokens only).
+
+### Interrupted turn + Continue affordance (frontend)
+
+A new `interrupted` flag on `ChatThreadState`
+(`src/lib/agent-chat/types.ts`) drives the recovery UX:
+
+- **Hydrate detection** — the pure `lastTurnUnsettled(payloads)`
+  (`src/lib/agent-chat/hydrate.ts`) returns true when the last persisted
+  `user_message` envelope has no later `turn_completed`; `replayPayloads`
+  ORs that with the replay-observed `child_exited` completion so both the
+  "app died mid-turn" and "watchdog settled the turn" cases surface.
+- **Live detection** — the reducer sets `interrupted` on a
+  `turn_completed` with `subtype === "child_exited"` and (belt-and-braces)
+  on a `session_state_changed{error}` while streaming. It clears on the
+  next running / dispatched-queue / content event, on the optimistic
+  user-message append, and on a **success** `turn_completed`. Clearing on
+  success matters because the stdout-reader / exit-watchdog race can persist
+  BOTH a synthetic `child_exited` completion and the real success completion
+  for one turn (the success is the later of the two, since the watchdog only
+  synthesizes while `active_turn` is still set); without it a
+  genuinely-finished run stays labelled "Run interrupted" forever. Applied
+  in the reducer, so it holds on live events AND on hydrate replay.
+- **Render** — `MessageList` shows a "Run interrupted" tail divider
+  (cloning the `SessionStartMarker` hairline pattern, amber label) while
+  not streaming, and `Composer` shows a one-click "Continue run" chip in
+  its attachment strip. The chip calls `AgentChatPane`'s
+  `handleContinueRun`, which routes `handleSubmit("Continue", { continueRun:
+  true })` through the normal `agentChatSendTurn` path — same
+  optimistic-bubble + rollback + backend auto-resume as a manual send, with
+  two deliberate differences: the Continue send **does not consume the
+  composer** (it leaves the user's in-progress draft and staged attachment
+  chips intact and sends a plain "Continue" with no images — a resume must
+  not eat a half-typed next message), and the send-failure rollback
+  **restores `interrupted`**. The optimistic append clears `interrupted`, so
+  `removeUserMessageByNonce` takes the pre-append value and re-arms the flag
+  on failure; otherwise one failed Continue click would drop the divider +
+  chip with no recovery affordance left.
+- **Deliberate Stop vs interrupted.** A user Stop settles its turn with a
+  persisted `turn_completed{subtype:"interrupted"}` (Claude via the sidecar
+  `session-ended`, Codex via the app-server `turn/completed`), which flows
+  asynchronously. `handleStop` now **awaits the interrupt before tearing the
+  session down** so the interrupt is ordered ahead of `stop_session`, whose
+  graceful shutdown (EOF → grace → kill) then leaves the settlement time to
+  reach the event bridge (which persists from the broadcast independent of
+  the child's liveness). Without the await the settlement could lose the
+  race and a deliberate Stop would hydrate as "Run interrupted" after a
+  restart.
+
+The dev mock exposes `window.__codemuxChatMock.streamRunStalled()` and
+`window.__codemuxChatMock.interruptRun()` for browser QA of the amber
+notice, the divider, and the Continue chip.
+
 ## Current Constraints
 
 - **Beta-gated.** The chat pane is hidden unless the user opts in via

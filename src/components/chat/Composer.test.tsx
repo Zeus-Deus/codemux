@@ -814,4 +814,76 @@ describe("Composer", () => {
       expect(onSubmit).not.toHaveBeenCalled();
     });
   });
+
+  describe("Continue-run chip (issue #154)", () => {
+    const CHIP = "composer-continue-run-chip";
+
+    it("renders when interrupted with nothing in flight and a handler wired", () => {
+      const { getByTestId } = renderComposer({
+        interrupted: true,
+        onContinueRun: vi.fn(),
+      });
+      const chip = getByTestId(CHIP);
+      expect(chip).toHaveTextContent("Continue run");
+    });
+
+    it("clicking the chip calls onContinueRun exactly once", () => {
+      const onContinueRun = vi.fn();
+      const { getByTestId } = renderComposer({
+        interrupted: true,
+        onContinueRun,
+      });
+      fireEvent.click(getByTestId(CHIP));
+      expect(onContinueRun).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not render while streaming (a live turn owns the composer)", () => {
+      const { queryByTestId } = renderComposer({
+        interrupted: true,
+        streaming: true,
+        onContinueRun: vi.fn(),
+      });
+      expect(queryByTestId(CHIP)).toBeNull();
+    });
+
+    it("does not render while the send RPC is in flight (sending)", () => {
+      const { queryByTestId } = renderComposer({
+        interrupted: true,
+        sending: true,
+        onContinueRun: vi.fn(),
+      });
+      expect(queryByTestId(CHIP)).toBeNull();
+    });
+
+    it("does not render without an onContinueRun handler", () => {
+      const { queryByTestId } = renderComposer({ interrupted: true });
+      expect(queryByTestId(CHIP)).toBeNull();
+    });
+
+    it("does not render when the thread is not interrupted", () => {
+      const { queryByTestId } = renderComposer({
+        interrupted: false,
+        onContinueRun: vi.fn(),
+      });
+      expect(queryByTestId(CHIP)).toBeNull();
+    });
+
+    it("mounts the attachment strip when the chip is its only occupant", () => {
+      // Default mode + no staged attachments would normally hide the whole
+      // strip — the chip alone must be enough to mount it, and nothing
+      // else (no mode pill, no attachment chips) should render inside.
+      const { getByTestId } = renderComposer({
+        interrupted: true,
+        onContinueRun: vi.fn(),
+        mode: "default",
+        stagedAttachments: [],
+      });
+      const strip = getByTestId("composer-attachment-strip");
+      const chip = getByTestId(CHIP);
+      expect(strip).toContainElement(chip);
+      // The chip is the strip's sole child.
+      expect(strip.children).toHaveLength(1);
+      expect(strip.firstElementChild).toBe(chip);
+    });
+  });
 });

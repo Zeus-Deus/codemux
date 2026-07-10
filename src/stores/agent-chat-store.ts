@@ -172,8 +172,15 @@ interface AgentChatStore {
     images?: UserMessageImage[],
   ) => void;
   /** Roll back an optimistic user bubble by its client nonce (send RPC
-   *  failed). No-op when not found. */
-  removeUserMessageByNonce: (threadId: string, clientNonce: string) => void;
+   *  failed). No-op when not found. `restoreInterrupted` re-arms the
+   *  interrupted flag when the failed send was a resume of an interrupted
+   *  thread, so the "Run interrupted" divider + Continue chip survive a failed
+   *  click. */
+  removeUserMessageByNonce: (
+    threadId: string,
+    clientNonce: string,
+    restoreInterrupted?: boolean,
+  ) => void;
   /** Flag a permission request as in-flight while the invoke runs. */
   markRequestResponding: (
     threadId: string,
@@ -329,11 +336,11 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       })),
     ),
 
-  removeUserMessageByNonce: (threadId, clientNonce) =>
+  removeUserMessageByNonce: (threadId, clientNonce, restoreInterrupted) =>
     set((state) =>
       updateSlice(state, threadId, (slice) => ({
         ...slice,
-        ...removeUserMessageByNonce(slice, clientNonce),
+        ...removeUserMessageByNonce(slice, clientNonce, restoreInterrupted),
       })),
     ),
 

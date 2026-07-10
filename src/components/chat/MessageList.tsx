@@ -1,4 +1,4 @@
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, TriangleAlert } from "lucide-react";
 import {
   memo,
   useCallback,
@@ -59,6 +59,13 @@ interface Props {
    *  Activity block; also suppresses the separate StreamingMarker when a
    *  working Activity block is already the tail (one live line). */
   streaming?: boolean;
+  /** Non-null while the stall watchdog has flagged this mid-turn thread
+   *  as silent (issue #154). Renders an amber "no activity" notice at the
+   *  transcript tail in place of the ember streaming marker. */
+  stalled?: { silentForSecs: number } | null;
+  /** True when the last run never cleanly settled (child exit / crash).
+   *  Renders a "Run interrupted" tail divider while not streaming. */
+  interrupted?: boolean;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). When absent a plain "Session started" divider renders.
    *  Stage 3 wires the real value through AgentChatPane. */
@@ -130,6 +137,8 @@ export function MessageList({
   messages,
   showThinking = false,
   streaming = false,
+  stalled = null,
+  interrupted = false,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -273,9 +282,26 @@ export function MessageList({
               </div>
             )}
 
-            {showThinking && !tailIsWorkingActivity && (
+            {/* A silently-stalled mid-turn run (issue #154): amber notice
+                in place of the ember streaming marker. Takes priority over
+                the marker so the two never stack. */}
+            {stalled && streaming && (
+              <div className="mt-[13px]">
+                <RunStalledNotice silentForSecs={stalled.silentForSecs} />
+              </div>
+            )}
+
+            {showThinking && !tailIsWorkingActivity && !(stalled && streaming) && (
               <div className="mt-[13px]">
                 <StreamingMarker messages={ordered} />
+              </div>
+            )}
+
+            {/* The last run never cleanly settled (child exit / crash).
+                Mutually exclusive with the streaming marker via `!streaming`. */}
+            {interrupted && !streaming && (
+              <div className="mt-[13px]">
+                <RunInterruptedDivider />
               </div>
             )}
           </MessageScrollerContent>
@@ -313,6 +339,44 @@ const WS_FADE_STYLE: CSSProperties = {
   WebkitMaskImage:
     "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 20px), transparent 100%)",
 };
+
+/** Amber "no activity" notice shown at the tail of a silently-stalled
+ *  mid-turn run (issue #154). Advisory only — the run may still be alive
+ *  (a long quiet tool call), so the copy hedges. Tokens only, per
+ *  docs/reference/DESIGN-SYSTEM.md (no hardcoded colors). */
+function RunStalledNotice({ silentForSecs }: { silentForSecs: number }) {
+  const minutes = Math.max(1, Math.floor(silentForSecs / 60));
+  return (
+    <div
+      role="status"
+      data-testid="run-stalled-notice"
+      className="flex items-center gap-2 rounded-md bg-warning/10 px-3 py-2 text-[12px] text-warning"
+    >
+      <TriangleAlert className="h-3.5 w-3.5 shrink-0" aria-hidden />
+      <span>
+        No activity for {minutes}m — the agent may have stopped.
+      </span>
+    </div>
+  );
+}
+
+/** "Run interrupted" tail divider — clones the SessionStartMarker hairline
+ *  pattern with an amber (warning-token) label. Shown when the last run
+ *  died without cleanly settling and no turn is in flight. */
+function RunInterruptedDivider() {
+  return (
+    <div
+      data-testid="run-interrupted-divider"
+      className="flex items-center gap-3 text-warning"
+    >
+      <span className="h-px flex-1 bg-warning/40" />
+      <span className="font-mono text-[10.5px] font-medium tracking-wide">
+        Run interrupted
+      </span>
+      <span className="h-px flex-1 bg-warning/40" />
+    </div>
+  );
+}
 
 function SessionStartMarker({ startedAt }: { startedAt?: number }) {
   return (

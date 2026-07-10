@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -348,6 +349,8 @@ pub fn agent_chat_close_pane(
     if let Some((_, thread_id)) = &chat_thread {
         let tracker: State<'_, SubagentTracker> = app.state();
         tracker.clear_thread(thread_id);
+        let activity: State<'_, RunActivityTracker> = app.state();
+        activity.clear_thread(thread_id);
     }
     // close_pane errors when the pane id is unknown — treat that as a
     // no-op to keep the command idempotent.
@@ -585,6 +588,28 @@ pub async fn agent_chat_start_session(
             eprintln!(
                 "[codemux::agent_chat] failed to persist session record: {error}"
             );
+        }
+        // Persist a provider-returned resume cursor NOW, after the row
+        // exists. The async `ResumeCursorUpdated` persist path is a plain
+        // UPDATE racing this upsert across a spawned bridge task — when the
+        // event wins it updates 0 rows and the cursor is silently lost,
+        // leaving the FIRST dead-run rebuild with no conversation context
+        // (OpenCode returns its cursor at start; Claude's SDK id arrives
+        // later by event and Codex's start-time cursor carries no
+        // extractable id, so this is a no-op for them). Best-effort like the
+        // neighboring persists.
+        if let Some(sdk_session_id) = session
+            .resume_cursor
+            .as_ref()
+            .and_then(extract_sdk_session_id)
+        {
+            if let Err(error) =
+                db.set_agent_chat_sdk_session_id(&session.thread_id.0, &sdk_session_id)
+            {
+                eprintln!(
+                    "[codemux::agent_chat] failed to persist start-time resume cursor: {error}"
+                );
+            }
         }
         // Persist the per-thread chat config the session started with so
         // a restart re-seeds the pickers and auto-resume rebuilds the SDK
@@ -1838,6 +1863,14 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     let tracker: State<'_, SubagentTracker> = app.state();
     publish_pane_status(app, &tracker, &event);
 
+    // Record last-activity for the stall watchdog. Keyed on the event's
+    // thread; thread-less events (global warnings) and the transient
+    // `RunStalled` itself are no-ops inside the tracker.
+    if let Some(activity_thread) = thread_id_for_event(&event) {
+        let activity: State<'_, RunActivityTracker> = app.state();
+        activity.record(&activity_thread.0, &event, SystemTime::now());
+    }
+
     let thread_id = thread_id_for_event(&event)
         // Events without a thread_id (e.g. global RuntimeWarning) are
         // forwarded with an empty ThreadId so the frontend at least
@@ -2080,7 +2113,11 @@ fn map_event_to_pane_status(
         // indicator untouched.
         | ProviderRuntimeEvent::TurnQueued { .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { .. }
-        | ProviderRuntimeEvent::QueuedTurnCancelled { .. } => None,
+        | ProviderRuntimeEvent::QueuedTurnCancelled { .. }
+        // A stall is advisory only — the run may well be fine (a long quiet
+        // tool call). The sidebar dot must NOT change; the amber transcript
+        // notice is the entire signal.
+        | ProviderRuntimeEvent::RunStalled { .. } => None,
         // A workflow launching/completing doesn't itself imply a pane
         // status transition — the subagents it spawns and the turn it
         // runs within already drive `Working`/`Review` via their own
@@ -2161,6 +2198,235 @@ fn run_finished(status: PaneStatus) -> bool {
     matches!(status, PaneStatus::Review | PaneStatus::Idle)
 }
 
+// ── Per-thread run-activity tracking (stall watchdog) ─────────────────
+
+/// How long a mid-turn thread may go silent (zero runtime events) before
+/// the stall watchdog flags it. 10 minutes on purpose: long enough that a
+/// legitimately quiet stretch — a slow `cargo build`, a big network fetch,
+/// a model just thinking — never trips it, short enough that a silently
+/// dead run (laptop slept mid-turn, a provider usage-limit cutoff that
+/// emits no terminal event) surfaces to the user in a reasonable time.
+const STALL_THRESHOLD: Duration = Duration::from_secs(600);
+
+/// How often [`spawn_stall_watchdog`] sweeps the activity tracker. 30s
+/// keeps the surfaced "no activity for Nm" duration reasonably fresh
+/// without waking the runtime more than twice a minute.
+const STALL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wall-vs-monotonic gap beyond which the sweep logs a wake-from-sleep
+/// breadcrumb. The wall-clock elapsed already handles correctness (the
+/// sleep window counts as silence, which is the point); this is only a
+/// diagnostic.
+const WAKE_JUMP_LOG_THRESHOLD: Duration = Duration::from_secs(60);
+
+/// Per-thread record of the last observed runtime activity, used to
+/// detect a mid-turn run that has gone silent.
+///
+/// Wall clock ([`SystemTime`]) on purpose: after a suspend/resume the
+/// elapsed silence includes the sleep window, which is exactly the
+/// wake-from-sleep detection issue #154 asks for (a monotonic clock would
+/// "pause" across sleep and never notice the dead run).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThreadActivity {
+    /// When the last activity-bearing event was observed.
+    last_event: SystemTime,
+    /// Whether a turn is in flight. Only mid-turn threads can stall.
+    mid_turn: bool,
+    /// Whether the thread is parked on a user approval. Waiting on the
+    /// USER is expected silence, so the stall clock pauses.
+    waiting_approval: bool,
+}
+
+/// Outcome of feeding one event to the activity tracker. Kept as a pure
+/// value so [`activity_update`] is unit-testable without any shared state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ActivityUpdate {
+    /// Replace the thread's activity record with this value.
+    Set(ThreadActivity),
+    /// Remove the thread entry (turn settled / session gone). Keeps the
+    /// map bounded — entries only exist while a thread is mid-turn.
+    Remove,
+    /// Leave the current record untouched (event is not activity).
+    Ignore,
+}
+
+/// Pure decision: how `event` affects a thread's run-activity record,
+/// given the current entry (if any) and the current wall-clock time.
+///
+/// Every mid-turn signal stamps `now` and (re)arms `mid_turn`; an
+/// approval prompt additionally pauses the stall clock (`waiting_approval`)
+/// until it resolves. Turn/session settlement removes the entry.
+/// [`ProviderRuntimeEvent::RunStalled`] is explicitly ignored so a
+/// re-emitted stall notice can never count as activity and reset its own
+/// clock.
+fn activity_update(
+    current: Option<&ThreadActivity>,
+    event: &ProviderRuntimeEvent,
+    now: SystemTime,
+) -> ActivityUpdate {
+    use crate::agent_provider::SessionStatus;
+    let mid_turn = |waiting_approval: bool| {
+        ActivityUpdate::Set(ThreadActivity {
+            last_event: now,
+            mid_turn: true,
+            waiting_approval,
+        })
+    };
+    match event {
+        // Real agent progress — the turn is alive and not waiting on us.
+        ProviderRuntimeEvent::ContentDelta { .. }
+        | ProviderRuntimeEvent::ItemCompleted { .. }
+        | ProviderRuntimeEvent::SubagentUpdated { .. }
+        | ProviderRuntimeEvent::WorkflowUpdated { .. }
+        | ProviderRuntimeEvent::QueuedTurnDispatched { .. }
+        | ProviderRuntimeEvent::RequestResolved { .. } => mid_turn(false),
+        // A turn started (Codex/OpenCode emit this reliably per turn).
+        ProviderRuntimeEvent::SessionStateChanged {
+            status: SessionStatus::Running { .. },
+            ..
+        } => mid_turn(false),
+        // Waiting on the user — pause the stall clock.
+        ProviderRuntimeEvent::RequestOpened { .. }
+        | ProviderRuntimeEvent::SessionStateChanged {
+            status: SessionStatus::WaitingApproval { .. },
+            ..
+        } => mid_turn(true),
+        // Turn/session settled — the thread is no longer mid-turn.
+        ProviderRuntimeEvent::TurnCompleted { .. }
+        | ProviderRuntimeEvent::SessionStateChanged {
+            status: SessionStatus::Ready
+                | SessionStatus::Closed
+                | SessionStatus::Error { .. },
+            ..
+        } => ActivityUpdate::Remove,
+        // Everything else (Starting/Ready-lifecycle noise, warnings,
+        // resume cursors, queue enqueue/cancel, config) is not activity;
+        // crucially `RunStalled` itself must not reset the clock.
+        _ => {
+            // Preserve the current record if one exists; otherwise there is
+            // nothing to track.
+            let _ = current;
+            ActivityUpdate::Ignore
+        }
+    }
+}
+
+/// Pure sweep predicate: `Some(silent_secs)` when a thread is mid-turn,
+/// not waiting on the user, and silent for at least `threshold`.
+fn select_stalled(a: &ThreadActivity, now: SystemTime, threshold: Duration) -> Option<u64> {
+    if !a.mid_turn || a.waiting_approval {
+        return None;
+    }
+    let elapsed = now.duration_since(a.last_event).unwrap_or_default();
+    if elapsed >= threshold {
+        Some(elapsed.as_secs())
+    } else {
+        None
+    }
+}
+
+/// Tauri-managed, per-thread run-activity tracker feeding the stall
+/// watchdog. Mirrors [`SubagentTracker`]: a single `Mutex<HashMap>` held
+/// only for the duration of one event's decision. Only *live* provider
+/// events reach it (transcript hydration replays on the frontend, never
+/// through `forward_event`), so no replay guard is needed.
+#[derive(Default)]
+pub struct RunActivityTracker {
+    threads: Mutex<HashMap<String, ThreadActivity>>,
+}
+
+impl RunActivityTracker {
+    /// Fold one event into `thread_id`'s activity record.
+    fn record(&self, thread_id: &str, event: &ProviderRuntimeEvent, now: SystemTime) {
+        if thread_id.is_empty() {
+            return;
+        }
+        let mut threads = self.threads.lock().expect("activity tracker poisoned");
+        match activity_update(threads.get(thread_id), event, now) {
+            ActivityUpdate::Set(activity) => {
+                threads.insert(thread_id.to_string(), activity);
+            }
+            ActivityUpdate::Remove => {
+                threads.remove(thread_id);
+            }
+            ActivityUpdate::Ignore => {}
+        }
+    }
+
+    /// Snapshot the threads that have been mid-turn and silent for at
+    /// least `threshold`, with how long (seconds) each has been silent.
+    fn stalled(&self, now: SystemTime, threshold: Duration) -> Vec<(String, u64)> {
+        let threads = self.threads.lock().expect("activity tracker poisoned");
+        threads
+            .iter()
+            .filter_map(|(id, activity)| {
+                select_stalled(activity, now, threshold).map(|secs| (id.clone(), secs))
+            })
+            .collect()
+    }
+
+    /// Forget all activity tracking for `thread_id`. Called on explicit
+    /// pane close so a thread whose terminal event is never observed can't
+    /// keep tripping the watchdog. Idempotent.
+    pub fn clear_thread(&self, thread_id: &str) {
+        let mut threads = self.threads.lock().expect("activity tracker poisoned");
+        threads.remove(thread_id);
+    }
+}
+
+/// Background sweep: every [`STALL_SWEEP_INTERVAL`] flag any thread that
+/// has been mid-turn and silent for at least [`STALL_THRESHOLD`] by
+/// forwarding a [`ProviderRuntimeEvent::RunStalled`]. Advisory only — the
+/// session is never touched. Re-emitting on subsequent ticks while still
+/// stalled is intentional: it keeps the UI's "no activity for Nm" duration
+/// fresh, and the event is transient (never persisted, cleared by the
+/// frontend on the next real activity).
+///
+/// Spawned once from `lib.rs` right after `spawn_event_bridge`, inside the
+/// same `agent_chat_enabled` gate. Generic over the Tauri runtime so the
+/// unit tests can drive the pure helpers on the mock runtime.
+pub async fn spawn_stall_watchdog<R: Runtime>(app: AppHandle<R>) {
+    tauri::async_runtime::spawn(async move {
+        let mut interval = tokio::time::interval(STALL_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Previous tick's (monotonic, wall) pair, for the wake-from-sleep
+        // breadcrumb. Correctness rides on wall-clock elapsed; this is
+        // diagnostics only.
+        let mut prev: Option<(std::time::Instant, SystemTime)> = None;
+        loop {
+            interval.tick().await;
+            let now_mono = std::time::Instant::now();
+            let now_wall = SystemTime::now();
+            if let Some((prev_mono, prev_wall)) = prev {
+                let mono_delta = now_mono.duration_since(prev_mono);
+                let wall_delta = now_wall
+                    .duration_since(prev_wall)
+                    .unwrap_or_default();
+                if wall_delta > mono_delta + WAKE_JUMP_LOG_THRESHOLD {
+                    eprintln!(
+                        "[codemux::agent_chat] stall watchdog observed a wake-from-sleep jump (wall {wall_delta:?} vs monotonic {mono_delta:?})"
+                    );
+                }
+            }
+            prev = Some((now_mono, now_wall));
+
+            let stalled = {
+                let tracker: State<'_, RunActivityTracker> = app.state();
+                tracker.stalled(now_wall, STALL_THRESHOLD)
+            };
+            for (thread_id, silent_for_secs) in stalled {
+                forward_event(
+                    &app,
+                    ProviderRuntimeEvent::RunStalled {
+                        thread_id: ThreadId(thread_id),
+                        silent_for_secs,
+                    },
+                );
+            }
+        }
+    });
+}
+
 /// Whether a canonical provider event should be written to
 /// `agent_chat_messages`. Extracted so the policy is unit-testable
 /// without an `AppHandle`.
@@ -2180,6 +2446,10 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             // restart via hydrate-replay, not a bespoke schema.
             | ProviderRuntimeEvent::WorkflowUpdated { .. }
     )
+    // NOTE: `RunStalled` is deliberately NOT persisted. It is a transient
+    // advisory recomputed live by the stall watchdog; the durable record of
+    // a dead run is the settled/`child_exited` `TurnCompleted`, which drives
+    // the "Run interrupted" divider on hydrate.
 }
 
 /// Pull the SDK session UUID out of the opaque `resume_cursor` JSON.
@@ -2214,7 +2484,8 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, .. }
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
-        | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. } => Some(thread_id.clone()),
+        | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::RunStalled { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
 }
@@ -2582,6 +2853,200 @@ mod tests {
             status: SessionStatus::Ready,
         };
         assert!(!should_persist_event(&e));
+    }
+
+    #[test]
+    fn should_not_persist_run_stalled() {
+        // Transient advisory — recomputed live, never replayed.
+        let e = ProviderRuntimeEvent::RunStalled {
+            thread_id: tid(),
+            silent_for_secs: 700,
+        };
+        assert!(!should_persist_event(&e));
+    }
+
+    // ── Run-activity tracker + stall selection (pure) ──
+
+    fn running_event() -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: tid(),
+            status: SessionStatus::Running { active_turn: turn() },
+        }
+    }
+
+    #[test]
+    fn activity_running_arms_mid_turn_and_stamps() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        match activity_update(None, &running_event(), now) {
+            ActivityUpdate::Set(a) => {
+                assert!(a.mid_turn);
+                assert!(!a.waiting_approval);
+                assert_eq!(a.last_event, now);
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn activity_content_delta_stamps_mid_turn() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(50);
+        let e = ProviderRuntimeEvent::ContentDelta {
+            thread_id: tid(),
+            turn_id: turn(),
+            delta: ContentDelta::Text { text: "hi".into() },
+            subagent_id: None,
+        };
+        assert!(matches!(
+            activity_update(None, &e, now),
+            ActivityUpdate::Set(ThreadActivity { mid_turn: true, waiting_approval: false, .. })
+        ));
+    }
+
+    #[test]
+    fn activity_approval_pauses_the_stall_clock() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let opened = ProviderRuntimeEvent::RequestOpened {
+            thread_id: tid(),
+            turn_id: turn(),
+            request_id: req(),
+            request_kind: "tool".into(),
+            payload: json!({}),
+            tool_use_id: None,
+            subagent_id: None,
+        };
+        assert!(matches!(
+            activity_update(None, &opened, now),
+            ActivityUpdate::Set(ThreadActivity { waiting_approval: true, .. })
+        ));
+        let waiting = ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: tid(),
+            status: SessionStatus::WaitingApproval { request_id: req() },
+        };
+        assert!(matches!(
+            activity_update(None, &waiting, now),
+            ActivityUpdate::Set(ThreadActivity { waiting_approval: true, .. })
+        ));
+        // Resolving the approval un-pauses the clock.
+        let resolved = ProviderRuntimeEvent::RequestResolved {
+            thread_id: tid(),
+            request_id: req(),
+            decision: ApprovalDecision::AllowForSession,
+        };
+        assert!(matches!(
+            activity_update(None, &resolved, now),
+            ActivityUpdate::Set(ThreadActivity { waiting_approval: false, mid_turn: true, .. })
+        ));
+    }
+
+    #[test]
+    fn activity_turn_completed_and_terminal_states_remove() {
+        let now = SystemTime::UNIX_EPOCH;
+        let completed = ProviderRuntimeEvent::TurnCompleted {
+            thread_id: tid(),
+            turn_id: turn(),
+            status: TurnStatus::Success,
+            usage: None,
+        };
+        assert_eq!(activity_update(None, &completed, now), ActivityUpdate::Remove);
+        for status in [
+            SessionStatus::Ready,
+            SessionStatus::Closed,
+            SessionStatus::Error { message: "x".into() },
+        ] {
+            let e = ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status,
+            };
+            assert_eq!(activity_update(None, &e, now), ActivityUpdate::Remove);
+        }
+    }
+
+    #[test]
+    fn activity_run_stalled_is_ignored_not_activity() {
+        // RunStalled itself must never reset the clock, or the notice would
+        // keep resurrecting its own freshness.
+        let now = SystemTime::UNIX_EPOCH;
+        let e = ProviderRuntimeEvent::RunStalled {
+            thread_id: tid(),
+            silent_for_secs: 700,
+        };
+        assert_eq!(activity_update(None, &e, now), ActivityUpdate::Ignore);
+    }
+
+    #[test]
+    fn select_stalled_respects_threshold_boundary() {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let a = ThreadActivity {
+            last_event: base,
+            mid_turn: true,
+            waiting_approval: false,
+        };
+        // Just under threshold → not stalled.
+        assert_eq!(
+            select_stalled(&a, base + STALL_THRESHOLD - Duration::from_secs(1), STALL_THRESHOLD),
+            None
+        );
+        // Exactly at threshold → stalled, reports elapsed seconds.
+        assert_eq!(
+            select_stalled(&a, base + STALL_THRESHOLD, STALL_THRESHOLD),
+            Some(STALL_THRESHOLD.as_secs())
+        );
+    }
+
+    #[test]
+    fn select_stalled_excludes_waiting_and_idle() {
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let late = base + STALL_THRESHOLD + Duration::from_secs(60);
+        // Waiting on the user is expected silence — never stalled.
+        let waiting = ThreadActivity {
+            last_event: base,
+            mid_turn: true,
+            waiting_approval: true,
+        };
+        assert_eq!(select_stalled(&waiting, late, STALL_THRESHOLD), None);
+        // Not mid-turn → nothing to stall.
+        let idle = ThreadActivity {
+            last_event: base,
+            mid_turn: false,
+            waiting_approval: false,
+        };
+        assert_eq!(select_stalled(&idle, late, STALL_THRESHOLD), None);
+    }
+
+    #[test]
+    fn activity_tracker_records_and_sweeps() {
+        let tracker = RunActivityTracker::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
+        tracker.record("thread-a", &running_event(), t0);
+        // Below threshold: not yet stalled.
+        assert!(tracker
+            .stalled(t0 + Duration::from_secs(300), STALL_THRESHOLD)
+            .is_empty());
+        // Past threshold: surfaced.
+        let stalled = tracker.stalled(t0 + STALL_THRESHOLD, STALL_THRESHOLD);
+        assert_eq!(stalled, vec![("thread-a".to_string(), STALL_THRESHOLD.as_secs())]);
+        // A settling turn removes the entry — the map stays bounded.
+        let completed = ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId("thread-a".into()),
+            turn_id: turn(),
+            status: TurnStatus::Success,
+            usage: None,
+        };
+        tracker.record("thread-a", &completed, t0 + STALL_THRESHOLD);
+        assert!(tracker
+            .stalled(t0 + STALL_THRESHOLD * 2, STALL_THRESHOLD)
+            .is_empty());
+    }
+
+    #[test]
+    fn run_stalled_leaves_pane_status_untouched() {
+        // Advisory only — the sidebar dot must not move.
+        let mut st = ThreadSubagentState::default();
+        let e = ProviderRuntimeEvent::RunStalled {
+            thread_id: tid(),
+            silent_for_secs: 700,
+        };
+        assert_eq!(map_event_to_pane_status(&e, &mut st), None);
     }
 
     #[test]

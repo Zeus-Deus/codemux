@@ -199,6 +199,7 @@ pub fn run() {
         // while subagents it spawned are still running. Consulted by
         // forward_event → publish_pane_status. See agent_chat.rs.
         .manage(commands::agent_chat::SubagentTracker::default())
+        .manage(commands::agent_chat::RunActivityTracker::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
@@ -794,6 +795,14 @@ pub fn run() {
                         // fresh Tokio task each.
                         commands::agent_chat::spawn_event_bridge(registry_handle.clone())
                             .await;
+                        // Detect silently-dead runs: a periodic sweep that
+                        // flags mid-turn threads gone quiet past the stall
+                        // threshold (issue #154). Advisory only — it never
+                        // kills a session.
+                        commands::agent_chat::spawn_stall_watchdog(
+                            registry_handle.clone(),
+                        )
+                        .await;
                     });
                 }
             }

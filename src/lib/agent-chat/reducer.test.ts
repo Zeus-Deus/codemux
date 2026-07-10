@@ -2092,3 +2092,207 @@ describe("agent-chat reducer — workflows", () => {
     expect(agent.status).toBe("interrupted");
   });
 });
+
+describe("dead-run detection (issue #154)", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  const running: ProviderRuntimeEvent = {
+    type: "session_state_changed",
+    thread_id: "t1",
+    status: { status: "running", active_turn: "turn-1" },
+  };
+  const stalled: ProviderRuntimeEvent = {
+    type: "run_stalled",
+    thread_id: "t1",
+    silent_for_secs: 640,
+  };
+
+  it("run_stalled sets the stalled marker", () => {
+    const state = runEvents([running, stalled]);
+    expect(state.stalled).toEqual({ silentForSecs: 640 });
+  });
+
+  it("the next real activity clears the stalled marker", () => {
+    const afterStall = runEvents([running, stalled]);
+    expect(afterStall.stalled).not.toBeNull();
+    const afterDelta = applyEvent(afterStall, {
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "text", text: "back alive" },
+    });
+    expect(afterDelta.stalled).toBeNull();
+  });
+
+  it("a re-emitted run_stalled does not thrash state when unchanged", () => {
+    const once = runEvents([running, stalled]);
+    const twice = applyEvent(once, stalled);
+    expect(twice).toBe(once);
+  });
+
+  it("turn_completed with child_exited marks the thread interrupted", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "sidecar exited unexpectedly",
+        },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(true);
+    expect(state.streaming).toBe(false);
+  });
+
+  it("a user-initiated stop (interrupted subtype) does NOT set interrupted", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "interrupted",
+          message: "session interrupted",
+        },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(false);
+  });
+
+  it("session_state_changed error while streaming sets interrupted (belt-and-braces)", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "session_state_changed",
+        thread_id: "t1",
+        status: { status: "error", message: "server unreachable" },
+      },
+    ]);
+    expect(state.interrupted).toBe(true);
+  });
+
+  it("a clean ready/closed stop does not set interrupted", () => {
+    const ready = runEvents([
+      running,
+      {
+        type: "session_state_changed",
+        thread_id: "t1",
+        status: { status: "ready" },
+      },
+    ]);
+    expect(ready.interrupted).toBe(false);
+  });
+
+  it("a fresh running turn clears the interrupted flag", () => {
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "dead",
+        },
+        usage: null,
+      },
+    ]);
+    expect(interrupted.interrupted).toBe(true);
+    const resumed = applyEvent(interrupted, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "running", active_turn: "turn-2" },
+    });
+    expect(resumed.interrupted).toBe(false);
+  });
+
+  it("appending a user message clears the interrupted flag", () => {
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+    ]);
+    const resumed = appendUserMessage(interrupted, "Continue");
+    expect(resumed.interrupted).toBe(false);
+  });
+
+  it("a success completion after a child_exited completion clears interrupted (settle-race)", () => {
+    // The stdout-reader / exit-watchdog race can persist BOTH a synthetic
+    // child_exited completion and the real success completion for the same
+    // turn. Replaying them in that order must end up NOT interrupted so a
+    // genuinely-finished run is never mislabelled after a restart.
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(false);
+  });
+
+  it("rolling back a failed resume send restores the interrupted flag", () => {
+    // A Continue send optimistically clears `interrupted`; if the send RPC
+    // then fails, the rollback must re-arm it (passing the pre-append value)
+    // so the "Run interrupted" divider + Continue chip survive one failed
+    // click instead of vanishing with no recovery affordance.
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+    ]);
+    expect(interrupted.interrupted).toBe(true);
+    const optimistic = appendUserMessage(interrupted, "Continue", undefined, "nonce-1");
+    expect(optimistic.interrupted).toBe(false);
+    const rolledBack = removeUserMessageByNonce(optimistic, "nonce-1", true);
+    expect(rolledBack.interrupted).toBe(true);
+    // The optimistic bubble is gone (no orphan left behind).
+    expect(
+      rolledBack.messages.some(
+        (m) => m.kind === "user_message" && m.text === "Continue",
+      ),
+    ).toBe(false);
+  });
+
+  it("rolling back a normal (non-resume) send does NOT arm interrupted", () => {
+    const clean = appendUserMessage(
+      createEmptyThreadState(),
+      "hello",
+      undefined,
+      "nonce-2",
+    );
+    const rolledBack = removeUserMessageByNonce(clean, "nonce-2", false);
+    expect(rolledBack.interrupted).toBe(false);
+  });
+});

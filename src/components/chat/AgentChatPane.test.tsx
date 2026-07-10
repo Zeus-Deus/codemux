@@ -159,6 +159,7 @@ vi.mock("./Composer", () => ({
     zone1Override,
     belowComposerSlot,
     onSubmit,
+    onContinueRun,
     onModeRemove,
     onModeActivate,
     onModelChange,
@@ -167,6 +168,7 @@ vi.mock("./Composer", () => ({
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
     onSubmit: () => void;
+    onContinueRun?: () => void;
     onModeRemove: () => void;
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
     onModelChange: (model: string) => void;
@@ -176,6 +178,10 @@ vi.mock("./Composer", () => ({
       <div data-testid="zone1">{zone1Override}</div>
       <div data-testid="below-composer">{belowComposerSlot}</div>
       <button data-testid="composer-submit" onClick={() => onSubmit()} />
+      <button
+        data-testid="composer-continue"
+        onClick={() => onContinueRun?.()}
+      />
       <button data-testid="mode-remove" onClick={() => onModeRemove()} />
       <button
         data-testid="mode-activate-plan"
@@ -536,6 +542,42 @@ describe("AgentChatPane empty-state branch", () => {
     expect(
       container.querySelector('[data-testid="home-landing"]'),
     ).toBeNull();
+  });
+});
+
+describe("AgentChatPane Continue-run chip (issue #154)", () => {
+  beforeEach(async () => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {};
+    workspaceIdForPaneOverride = "ws-home";
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
+      turn_id: "turn-1",
+      queued_id: null,
+    } as never);
+  });
+
+  it("sends a plain 'Continue' turn with NO images (staged attachments left intact)", async () => {
+    // Seed a non-empty composer draft so the test also proves the Continue
+    // send does not depend on the draft (it sends the literal 'Continue').
+    currentSliceOverrides = {
+      "thread-x": { inputDraft: "half-typed next message" },
+    };
+    const { container } = render(<AgentChatPane pane={pane} />);
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    fireEvent.click(
+      container.querySelector('[data-testid="composer-continue"]')!,
+    );
+    await waitFor(() => {
+      expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
+    });
+    const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
+    expect(sendInput.thread_id).toBe("thread-x");
+    expect(sendInput.text).toBe("Continue");
+    // No images travel with a Continue send even if attachments were staged.
+    expect(sendInput.images).toEqual([]);
   });
 });
 

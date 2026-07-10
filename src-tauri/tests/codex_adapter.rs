@@ -33,7 +33,7 @@ use codemux_lib::agent_provider::codex::{CodexAgentProvider, CodexProviderConfig
 use codemux_lib::agent_provider::{
     AgentProvider, ApprovalDecision, CompletedItem, ContentDelta, ProviderError,
     ProviderRuntimeEvent, RequestId, SendTurnInput, SessionStatus, StartSessionInput,
-    SubagentStatus, ThreadId, TurnId,
+    SubagentStatus, ThreadId, TurnId, TurnStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -635,8 +635,13 @@ async fn child_process_crash_emits_error_state() {
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
     start_session_resilient(&provider, start_input("t-crash")).await.unwrap();
     let mut stream = provider.event_stream();
-    // turn/start will succeed then the fixture exits.
-    let _ = provider
+    // turn/start succeeds, then the fixture exits. The Ok is guaranteed by
+    // JsonRpcChild's exit-drain: the fixture writes the response BEFORE
+    // exiting, so it must be routed (not failed as "child process exited")
+    // even when the watchdog observes the exit first — which is also what
+    // deterministically arms `active_turn` for the synthetic completion
+    // asserted below.
+    provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-crash".into()),
             text: "x".into(),
@@ -646,24 +651,87 @@ async fn child_process_crash_emits_error_state() {
             permission_mode_override: None,
             client_nonce: None,
         })
-        .await;
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
 
+    // Issue #154: the mid-turn child death settles the in-flight turn with a
+    // synthetic `TurnCompleted { child_exited }` ahead of the terminal Error.
+    let mut saw_child_exit_turn = false;
     let mut saw_error = false;
     let _ = timeout(Duration::from_secs(3), async {
         while let Some(ev) = stream.next().await {
-            if let ProviderRuntimeEvent::SessionStateChanged { status, .. } = &ev {
-                if let SessionStatus::Error { message } = status {
-                    if message.contains("exited") {
-                        saw_error = true;
-                        break;
+            match &ev {
+                ProviderRuntimeEvent::TurnCompleted { status, .. } => {
+                    if let TurnStatus::Error { subtype, .. } = status {
+                        if subtype == "child_exited" {
+                            saw_child_exit_turn = true;
+                        }
                     }
                 }
+                ProviderRuntimeEvent::SessionStateChanged { status, .. } => {
+                    if let SessionStatus::Error { message } = status {
+                        if message.contains("exited") {
+                            saw_error = true;
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     })
     .await;
     assert!(saw_error, "expected SessionStateChanged Error after crash");
+    assert!(
+        saw_child_exit_turn,
+        "expected a synthetic child_exited TurnCompleted before the Error"
+    );
     let _ = provider.stop_session(ThreadId("t-crash".into())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_child_is_evicted_and_start_session_rebuilds() {
+    // Issue #154 live-recovery path: after the child-exit watchdog marks a
+    // session dead, `has_session` must report it absent AND a fresh
+    // `start_session` for the SAME thread must evict the corpse and rebuild
+    // instead of failing with "codex session already exists".
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_EXIT_AFTER", "turn/start")]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let thread = ThreadId("t-evict".into());
+    start_session_resilient(&provider, start_input("t-evict"))
+        .await
+        .unwrap();
+    assert!(provider.has_session(&thread).await, "session live after start");
+    // Deterministically Ok — the fixture answers turn/start before exiting
+    // and JsonRpcChild's exit-drain routes that response (see
+    // `child_process_crash_emits_error_state`).
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: thread.clone(),
+            text: "x".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
+    let went_absent = timeout(Duration::from_secs(3), async {
+        loop {
+            if !provider.has_session(&thread).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(went_absent.is_ok(), "dead session must be reported absent");
+    start_session_resilient(&provider, start_input("t-evict"))
+        .await
+        .expect("rebuild after death must succeed");
+    assert!(provider.has_session(&thread).await, "rebuilt session live");
+    let _ = provider.stop_session(thread).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

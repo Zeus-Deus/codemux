@@ -1272,7 +1272,13 @@ async fn sidecar_exit_mid_session_emits_error_state() {
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-crash")).await.unwrap();
     let mut stream = provider.event_stream();
-    let _ = provider
+    // send-turn is answered, then the fixture exits. The Ok is guaranteed
+    // by JsonRpcChild's exit-drain: the fixture writes the response BEFORE
+    // exiting, so it must be routed (not failed as "child process exited")
+    // even when the watchdog observes the exit first — which is also what
+    // deterministically arms `active_turn` for the synthetic completion
+    // asserted below.
+    provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-crash".into()),
             text: "x".into(),
@@ -1282,21 +1288,88 @@ async fn sidecar_exit_mid_session_emits_error_state() {
             permission_mode_override: None,
             client_nonce: None,
         })
-        .await;
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
+    // Issue #154: a mid-turn child death must settle the in-flight turn with
+    // a synthetic `TurnCompleted { child_exited }` BEFORE the terminal
+    // `SessionStateChanged::Error`, so the turn settles through the whole
+    // pipeline and persists a durable record for hydrate.
+    let mut saw_child_exit_turn = false;
     let mut saw_error = false;
     let _ = timeout(Duration::from_secs(4), async {
         while let Some(ev) = stream.next().await {
-            if let ProviderRuntimeEvent::SessionStateChanged { status, .. } = &ev {
-                if matches!(status, SessionStatus::Error { .. }) {
-                    saw_error = true;
-                    break;
+            match &ev {
+                ProviderRuntimeEvent::TurnCompleted { status, .. } => {
+                    if let TurnStatus::Error { subtype, .. } = status {
+                        if subtype == "child_exited" {
+                            saw_child_exit_turn = true;
+                        }
+                    }
                 }
+                ProviderRuntimeEvent::SessionStateChanged { status, .. } => {
+                    if matches!(status, SessionStatus::Error { .. }) {
+                        saw_error = true;
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
     })
     .await;
-    assert!(saw_error);
+    assert!(saw_error, "expected a terminal SessionStateChanged::Error");
+    assert!(
+        saw_child_exit_turn,
+        "expected a synthetic child_exited TurnCompleted before the Error"
+    );
     let _ = provider.stop_session(ThreadId("t-crash".into())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_sidecar_is_evicted_and_start_session_rebuilds() {
+    // Issue #154 live-recovery path: after the child-exit watchdog marks a
+    // session dead, `has_session` must report it absent AND a fresh
+    // `start_session` for the SAME thread must evict the corpse and rebuild
+    // instead of failing with "claude session already exists" — otherwise
+    // every send after a mid-run death fails permanently.
+    let wrapper = wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_EXIT_AFTER", "send-turn")]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let thread = ThreadId("t-evict".into());
+    provider.start_session(start_input("t-evict")).await.unwrap();
+    assert!(provider.has_session(&thread).await, "session live after start");
+    // Deterministically Ok — the fixture answers send-turn before exiting
+    // and JsonRpcChild's exit-drain routes that response (see
+    // `sidecar_exit_mid_session_emits_error_state`).
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: thread.clone(),
+            text: "x".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
+    // Wait for the watchdog (100ms poll) to observe the dead child.
+    let went_absent = timeout(Duration::from_secs(4), async {
+        loop {
+            if !provider.has_session(&thread).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(went_absent.is_ok(), "dead session must be reported absent");
+    // The rebuild must succeed (evict-and-replace), not error on "already exists".
+    provider
+        .start_session(start_input("t-evict"))
+        .await
+        .expect("rebuild after death must succeed");
+    assert!(provider.has_session(&thread).await, "rebuilt session live");
+    let _ = provider.stop_session(thread).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

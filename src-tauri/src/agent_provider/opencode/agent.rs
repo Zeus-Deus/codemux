@@ -50,6 +50,17 @@ impl Default for OpenCodeProviderConfig {
     }
 }
 
+/// The resume cursor for an OpenCode session. The server-side session id IS
+/// the resume handle (OpenCode persists sessions on disk and readopts them by
+/// id), so the cursor is simply `{"resume": <session_id>}` — the same shape
+/// `ensure_live_session` threads back into `StartSessionInput.resume_cursor`
+/// and, crucially, the shape `extract_sdk_session_id` in
+/// `commands::agent_chat` knows how to persist. Keep those three in lockstep:
+/// a key rename here silently breaks the start-time cursor persist.
+pub fn resume_cursor_for(session_id: &crate::agent_provider::ProviderSessionId) -> serde_json::Value {
+    serde_json::json!({ "resume": session_id.0 })
+}
+
 /// `AgentProvider` for OpenCode, backed by the singleton
 /// [`OpenCodeServerManager`] and a per-thread [`OpenCodeSession`] map.
 pub struct OpenCodeAgentProvider {
@@ -122,11 +133,12 @@ impl AgentProvider for OpenCodeAgentProvider {
             supports_synchronous_tool_approval: true,
             // `POST /session/{id}/abort` interrupts a running turn.
             supports_interrupt: true,
-            // OpenCode persists sessions on disk; resume by sending
-            // a fresh `start_session` with the saved provider
-            // session id is supported by the server but Codemux does
-            // not yet thread the cursor through. False until we wire it.
-            supports_session_resume: false,
+            // OpenCode persists sessions on disk. On a live rebuild after a
+            // dead SSE listener, `start_session` readopts the saved server-side
+            // session id (validated via `GET /session/{id}/message`) so the
+            // resumed session keeps its conversation context, falling back to a
+            // fresh session when the id is stale/unknown. Best-effort but wired.
+            supports_session_resume: true,
         }
     }
 
@@ -135,22 +147,52 @@ impl AgentProvider for OpenCodeAgentProvider {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         let thread_id = input.thread_id.clone();
-        {
-            let sessions = self.sessions.read().await;
-            if sessions.contains_key(&thread_id) {
-                return Err(ProviderError::ValidationError {
-                    message: format!(
-                        "opencode session already exists for thread {:?}",
-                        thread_id.0
-                    ),
-                });
+        // Evict a corpse before rebuilding: if the SSE listener gave up on an
+        // unreachable server it flipped the session's `dead` flag but left the
+        // entry in the map (only `stop_session` removes). Without this, the
+        // rebuild `ensure_live_session` drives after `has_session` reports the
+        // dead session absent would hit the `contains_key` guard below and fail
+        // permanently. Remove the dead entry under the write lock (atomic
+        // check→remove against a concurrent rebuild) and shut it down cleanly
+        // below. A still-live session for this thread is a genuine double-start
+        // and stays a ValidationError.
+        let dead_evicted = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get(&thread_id) {
+                Some(existing) if existing.is_dead() => sessions.remove(&thread_id),
+                Some(_) => {
+                    return Err(ProviderError::ValidationError {
+                        message: format!(
+                            "opencode session already exists for thread {:?}",
+                            thread_id.0
+                        ),
+                    });
+                }
+                None => None,
             }
-        }
+        };
+        // Drop the corpse WITHOUT calling `shutdown()`: its SSE listener task
+        // has already exited (the give-up path returns after flipping `dead`),
+        // so there is nothing to abort, and `shutdown()` would
+        // `DELETE /session/{id}` — destroying the very server-side session the
+        // resume below wants to readopt. Just let the Arc drop.
+        drop(dead_evicted);
+        // Best-effort resume: `ensure_live_session` passes
+        // `{"resume": <opencode_session_id>}` when the persisted row carries the
+        // server-side session id. OpenCode keeps sessions on disk, so a rebuilt
+        // session can readopt that id and keep its conversation context instead
+        // of starting blank. `OpenCodeSession::start` validates the id and falls
+        // back to a fresh session when it is stale/unknown.
+        let resume_session_id = input
+            .resume_cursor
+            .as_ref()
+            .and_then(super::session::resume_session_id_from_cursor);
         let session = OpenCodeSession::start(
             self.manager.clone(),
             thread_id.clone(),
             input.model.clone(),
             input.effort.clone(),
+            resume_session_id,
             self.event_tx.clone(),
         )
         .await?;
@@ -162,9 +204,17 @@ impl AgentProvider for OpenCodeAgentProvider {
         Ok(ProviderSession {
             thread_id,
             provider: ProviderKind::OpenCode,
-            session_id: provider_session_id,
+            session_id: provider_session_id.clone(),
             status: SessionStatus::Ready,
-            resume_cursor: None,
+            // The OpenCode session id IS the resume cursor (the server keeps
+            // sessions on disk and readopts them by id). Returning it here —
+            // not only via the async `ResumeCursorUpdated` event — lets
+            // `agent_chat_start_session` persist it synchronously after the
+            // session row is upserted, so the FIRST dead-run rebuild already
+            // finds a cursor. (The event alone races the row upsert: its
+            // persist is a plain UPDATE that silently hits 0 rows when the
+            // bridge task wins.) Mirrors the Codex adapter's shape.
+            resume_cursor: Some(resume_cursor_for(&provider_session_id)),
         })
     }
 
@@ -243,7 +293,15 @@ impl AgentProvider for OpenCodeAgentProvider {
     }
 
     async fn has_session(&self, thread_id: &ThreadId) -> bool {
-        self.sessions.read().await.contains_key(thread_id)
+        // A session whose SSE listener gave up on an unreachable server is
+        // treated as absent, so `ensure_live_session` rebuilds a fresh one
+        // (with the resume cursor) on the next send instead of routing to a
+        // dead server.
+        self.sessions
+            .read()
+            .await
+            .get(thread_id)
+            .is_some_and(|session| !session.is_dead())
     }
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {
@@ -255,7 +313,9 @@ impl AgentProvider for OpenCodeAgentProvider {
                 provider: ProviderKind::OpenCode,
                 session_id: session.provider_session_id.clone(),
                 status: SessionStatus::Ready,
-                resume_cursor: None,
+                // Same cursor `start_session` returns — the session id is
+                // the resume handle.
+                resume_cursor: Some(resume_cursor_for(&session.provider_session_id)),
             });
         }
         Ok(out)
@@ -291,7 +351,7 @@ mod tests {
         assert!(!caps.supports_mid_session_permission_change);
         assert!(caps.supports_synchronous_tool_approval);
         assert!(caps.supports_interrupt);
-        assert!(!caps.supports_session_resume);
+        assert!(caps.supports_session_resume);
     }
 
     #[tokio::test]
@@ -332,6 +392,26 @@ mod tests {
             .await
             .expect_err("must fail");
         assert!(matches!(err, ProviderError::ValidationError { .. }));
+    }
+
+    #[test]
+    fn resume_cursor_round_trips_through_the_command_layer_extractor() {
+        // `agent_chat_start_session` persists the start-time cursor via
+        // `extract_sdk_session_id`, and `ensure_live_session` rebuilds with
+        // `{"resume": <id>}` — this pins the three shapes in lockstep. A key
+        // rename in `resume_cursor_for` would silently break the synchronous
+        // start-time persist (the fallback event path races the row upsert),
+        // losing the FIRST dead-run rebuild's conversation context.
+        use crate::agent_provider::ProviderSessionId;
+        let cursor = resume_cursor_for(&ProviderSessionId("ses_abc".into()));
+        assert_eq!(
+            crate::commands::agent_chat::extract_sdk_session_id(&cursor),
+            Some("ses_abc".to_string())
+        );
+        assert_eq!(
+            super::super::session::resume_session_id_from_cursor(&cursor),
+            Some("ses_abc".to_string())
+        );
     }
 
     #[tokio::test]
