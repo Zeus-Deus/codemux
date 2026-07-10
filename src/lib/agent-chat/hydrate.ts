@@ -5,7 +5,7 @@ import {
   appendUserMessage,
   createEmptyThreadState,
 } from "./reducer";
-import type { ChatThreadState } from "./types";
+import type { ChatThreadState, UserMessageImage } from "./types";
 
 /**
  * Synthetic envelope written by the backend in `agent_chat_send_turn`
@@ -19,6 +19,12 @@ export interface UserMessageEnvelope {
   type: "user_message";
   thread_id: string;
   text: string;
+  /** Images attached to this turn, written by the backend when the
+   *  turn carried paste/drop/picker images. Each `path` is an absolute
+   *  filesystem location the webview loads via Tauri's asset protocol
+   *  (mapped onto the bubble item's `images[].src`). Absent for
+   *  text-only turns and for turns persisted before the field existed. */
+  images?: Array<{ path: string; media_type?: string }>;
 }
 
 type ReplayPayload = UserMessageEnvelope | ProviderRuntimeEvent;
@@ -43,7 +49,13 @@ export function replayPayloads(payloads: string[]): ChatThreadState {
     const parsed = parsePayload(raw);
     if (!parsed) continue;
     if (parsed.type === "user_message") {
-      state = appendUserMessage(state, parsed.text);
+      // Map the persisted `images` (absolute paths) onto the bubble's
+      // display shape; `src` is the path, which `resolveAssetSrc`
+      // routes through Tauri's asset protocol at render time.
+      const images: UserMessageImage[] | undefined = parsed.images?.map(
+        (img) => ({ src: img.path, mediaType: img.media_type }),
+      );
+      state = appendUserMessage(state, parsed.text, undefined, undefined, images);
     } else {
       state = applyEvent(state, parsed);
     }
@@ -91,7 +103,26 @@ function parsePayload(raw: string): ReplayPayload | null {
   if (type === "user_message") {
     const text = (value as { text?: unknown }).text;
     if (typeof text !== "string") return null;
-    return value as UserMessageEnvelope;
+    // Sanitize the optional `images` array: keep only well-formed
+    // entries with a string `path`, so a malformed row can never feed
+    // a non-string `src` into the render layer. A missing / non-array
+    // `images` field yields `undefined` (text-only turn).
+    const rawImages = (value as { images?: unknown }).images;
+    const images = Array.isArray(rawImages)
+      ? rawImages.flatMap((entry) => {
+          if (!entry || typeof entry !== "object") return [];
+          const path = (entry as { path?: unknown }).path;
+          if (typeof path !== "string") return [];
+          const mediaType = (entry as { media_type?: unknown }).media_type;
+          return [
+            {
+              path,
+              media_type: typeof mediaType === "string" ? mediaType : undefined,
+            },
+          ];
+        })
+      : undefined;
+    return { type: "user_message", thread_id: (value as { thread_id?: string }).thread_id ?? "", text, images };
   }
   // Provider events — trust the discriminated union shape. Unknown
   // discriminators fall through to the reducer's `warnOnce` path.

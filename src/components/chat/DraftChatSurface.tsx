@@ -4,6 +4,7 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildImageDisplaySources,
   buildImagePayloads,
   buildIssueResolvedContent,
   buildPrResolvedContent,
@@ -310,6 +311,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // Stage 6 — extract resolved image bytes for the multimodal SDK
     // path. Empty array when no images staged.
     const imagePayloads = buildImagePayloads(liveAttachments);
+    // The same images as `data:` URLs so the optimistic
+    // user bubble in the new pane renders their thumbnails immediately.
+    const imageDisplaySources = buildImageDisplaySources(liveAttachments);
 
     // Thread Scope redesign — when the checkout popover is set to
     // "worktree", pass along the project root to fork from so
@@ -348,6 +352,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       skillBodies,
       attachmentBlock,
       imagePayloads,
+      imageDisplaySources,
       worktreeProjectPath,
     )
       .then((result) => {

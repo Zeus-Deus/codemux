@@ -32,7 +32,12 @@ Left → right:
   disabled without a URL.
 - **Issue chip** — `IssueDetailPopover` in its `chip` variant
   (`Issue #40` with state dot); the detail popover opens upward
-  (`side="top"`).
+  (`side="top"`). Shown while `workspace.linked_issue` is set, and part
+  of the bar's "something to show" visibility set. The same chip (same
+  props) also lives in the Context Row's `WorkspaceStatusCluster`, so
+  when the bar hides for an active agent-chat pane the linked issue
+  stays visible there (see `docs/features/agent-chat.md` § "Context
+  Row"); its details popover additionally carries an Issue row.
 - **Device** — laptop icon + "This device", or cloud icon + host name
   (resolved from `useHosts()` by `host_id`) for remote workspaces.
 - **Background browser indicator** (GUI mode only — `docs/features/browser.md`
@@ -116,7 +121,7 @@ new data plumbing.
 - `src/stores/browser-peek-store.ts` — the indicator's click target (opens the peek)
 - `src/dev/tauri-mock.ts` — `get_github_issue` mock for the popover
 - `src/components/layout/workspace-context-bar.test.tsx` — unit tests
-- `src/components/chat/WorkspaceStatusCluster.tsx` — the Context Row's relocated version of this bar's git/PR detail + browser indicator (see `docs/features/agent-chat.md`)
+- `src/components/chat/WorkspaceStatusCluster.tsx` — the Context Row's relocated version of this bar's git/PR/issue detail + browser indicator (PR chip, linked-issue chip, background-browser indicator, details popover; see `docs/features/agent-chat.md`)
 
 ## Notes
 

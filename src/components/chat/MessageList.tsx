@@ -13,6 +13,7 @@ import type {
   ChatViewItem,
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
+import { cn } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import type { ApprovalDecision } from "@/tauri/events";
@@ -32,7 +33,11 @@ import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
-import { buildTranscriptSlots, type ActivityStep } from "./transcript-slots";
+import {
+  buildTranscriptSlots,
+  type ActivityStep,
+  type TranscriptSlot,
+} from "./transcript-slots";
 
 interface Props {
   messages: ChatViewItem[];
@@ -85,12 +90,24 @@ interface Props {
  * the end on every ResizeObserver/MutationObserver-detected content
  * change while following, unpins on user wheel/touch/keydown gestures,
  * and re-pins once the reader scrolls back within its 8px edge
- * threshold. The viewport also disables native browser scroll
- * anchoring (`overflow-anchor: none`) so `content-visibility:auto`'s
- * estimated-then-real row height settling can't fight the engine's
- * programmatic scrolls. Per-item turn anchoring is still off (see
- * `scrollAnchor={false}` below) — that remains a deliberate,
- * independent setting.
+ * threshold. Scroll stability is split by ownership: native browser
+ * scroll anchoring owns free-scroll (while the reader scrolls history it
+ * absorbs the `content-visibility:auto` estimated-then-real height
+ * settling of rows above the viewport); the engine owns following-bottom.
+ * The two never fight because the viewport disables anchoring by default
+ * (`[overflow-anchor:none]` — pinned/following, the engine owns the tail
+ * snap) and re-enables it only while the reader is away from the bottom
+ * (`data-[scrollable~=end]:[overflow-anchor:auto]` — the engine keeps
+ * "end" in the viewport's `data-scrollable` attribute exactly while the
+ * user is unpinned in history, updated promptly on scroll commits). Do
+ * NOT scope this off `data-autoscrolling`: that attribute is only
+ * rewritten on engine state commits and stays stale — set — indefinitely
+ * after the user scrolls up and goes idle, which is precisely when
+ * anchoring is needed. Per-item turn anchoring is still off (see
+ * `scrollAnchor={false}` below) — that remains a deliberate, independent
+ * setting. Per-slot `contain-intrinsic-size` estimates
+ * (`intrinsicSizeClass`) keep each first-reveal settle small so
+ * anchoring's corrections stay imperceptible.
  *
  * Layout is derived by the pure `buildTranscriptSlots` (turn grouping,
  * tool-run folding, avatar/turn-boundary metadata). Each slot is one
@@ -208,7 +225,10 @@ export function MessageList({
                 // The scroller engine's `following-bottom` mode owns
                 // tail tracking (see the file-top doc comment).
                 scrollAnchor={false}
-                className={slot.turnStart ? "mt-5" : "mt-[13px]"}
+                className={cn(
+                  slot.turnStart ? "mt-5" : "mt-[13px]",
+                  intrinsicSizeClass(slot),
+                )}
               >
                 {slot.body.kind === "activity" ? (
                   <ActivityRowMemo
@@ -321,6 +341,41 @@ function subagentNameFor(
 ): string | null {
   if (item.kind !== "permission_request" || !item.subagent_id) return null;
   return subagentNames.get(item.subagent_id) ?? "subagent";
+}
+
+/**
+ * Per-slot `content-visibility` first-reveal estimate. Each row is
+ * `[content-visibility:auto]`, so before it first paints the browser lays
+ * it out at the `contain-intrinsic-size` estimate and only measures the
+ * real height on reveal. When the user scrolls up through cold history the
+ * difference between estimate and real height is exactly the correction the
+ * browser's native scroll anchoring has to absorb — so the closer the
+ * estimate is to a row-type's typical height, the smaller (and less
+ * visible) that correction is in BOTH scroll directions. Keying the
+ * estimate off the slot's body kind gets us most of that accuracy for free
+ * without any measurement, observers, or JS scroll compensation. Rows with
+ * no strong typical height fall through to the `MessageScrollerItem`
+ * default (`auto_6rem`); tailwind-merge lets the per-row estimate here win
+ * over that default (last arbitrary-property wins).
+ */
+function intrinsicSizeClass(slot: TranscriptSlot): string {
+  // Folded mechanical-step runs (reasoning + tool calls) render a multi-row
+  // Activity block, so they're taller than a single step.
+  if (slot.body.kind === "activity") return "[contain-intrinsic-size:auto_8rem]";
+  switch (slot.body.item.kind) {
+    case "user_message":
+      return "[contain-intrinsic-size:auto_3.5rem]";
+    case "assistant_message":
+      return "[contain-intrinsic-size:auto_7rem]";
+    case "tool_call":
+    case "reasoning":
+      return "[contain-intrinsic-size:auto_5rem]";
+    case "subagent_run":
+    case "workflow_run":
+      return "[contain-intrinsic-size:auto_14rem]";
+    default:
+      return "";
+  }
 }
 
 // ---------------------------------------------------------------------------
