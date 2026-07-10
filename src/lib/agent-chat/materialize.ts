@@ -22,6 +22,7 @@ import type { TerminalPreset } from "@/tauri/types";
 import { deriveTitleFromFirstMessage } from "./derive-title";
 import { applyAllPrefixes } from "./mode-prefix";
 import type { UserMessageImage } from "./types";
+import { waitForWorkspaceCwd } from "./wait-for-workspace-cwd";
 
 /**
  * Mutations performed as `materializeAndSend` progresses. Kept as a bag
@@ -162,6 +163,15 @@ export async function materializeAndSend(
   //    resolved cwd and is swapped for the freshly-created worktree's
   //    real cwd below so the pane + session launch inside the new
   //    worktree, not the original checkout.
+  //
+  //    HARD INVARIANT: a `"worktree"` submit must NEVER
+  //    create the pane or start the session at the parent/project-root
+  //    cwd. The new worktree workspace only reaches the app-store via
+  //    the async `app-state-changed` event, so a synchronous read-back
+  //    ~always missed and silently launched the agent in the user's
+  //    real checkout. `waitForWorkspaceCwd` awaits the store landing the
+  //    workspace; on timeout we fail the send (draft text preserved via
+  //    the existing markSendFailed pathway) rather than proceeding.
   let workspaceId: string;
   let effectiveCwd = cwd;
   try {
@@ -172,10 +182,14 @@ export async function materializeAndSend(
         draft.baseBranch ?? "",
         text,
       );
-      const createdWorkspace = useAppStore
-        .getState()
-        .appState?.workspaces.find((w) => w.workspace_id === workspaceId);
-      if (createdWorkspace?.cwd) effectiveCwd = createdWorkspace.cwd;
+      const worktreeCwd = await waitForWorkspaceCwd(workspaceId);
+      if (!worktreeCwd) {
+        const message =
+          "Timed out resolving the new worktree's location. Please send again.";
+        actions.markSendFailed(draft.draftId, message);
+        return { success: false, error: message };
+      }
+      effectiveCwd = worktreeCwd;
     } else {
       switch (draft.target.kind) {
         case "home": {

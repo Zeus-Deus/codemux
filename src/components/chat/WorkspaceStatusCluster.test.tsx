@@ -4,6 +4,7 @@ import { render, screen, cleanup, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type {
   AgentBrowserSession,
+  GitHubIssue,
   PullRequestInfo,
   WorkspaceSnapshot,
 } from "@/tauri/types";
@@ -15,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   hosts: [] as Array<{ id: number; name: string }>,
   openUrl: vi.fn().mockResolvedValue(undefined),
   getGithubPrByPath: vi.fn().mockResolvedValue(null as PullRequestInfo | null),
+  getGithubIssue: vi.fn().mockResolvedValue(null as GitHubIssue | null),
   gitPullChanges: vi.fn().mockResolvedValue(undefined),
   agentBrowserSessions: [] as AgentBrowserSession[],
 }));
@@ -36,6 +38,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 }));
 vi.mock("@/tauri/commands", () => ({
   getGithubPrByPath: (...args: unknown[]) => mocks.getGithubPrByPath(...args),
+  getGithubIssue: (...args: unknown[]) => mocks.getGithubIssue(...args),
   gitPullChanges: (...args: unknown[]) => mocks.gitPullChanges(...args),
 }));
 vi.mock("@/lib/toast", () => ({
@@ -101,6 +104,7 @@ beforeEach(() => {
   mocks.hosts = [];
   mocks.openUrl.mockClear();
   mocks.getGithubPrByPath.mockReset().mockResolvedValue(null);
+  mocks.getGithubIssue.mockReset().mockResolvedValue(null);
   mocks.gitPullChanges.mockReset().mockResolvedValue(undefined);
   mocks.agentBrowserSessions = [];
   vi.mocked(toast.error).mockClear();
@@ -345,5 +349,72 @@ describe("WorkspaceStatusCluster", () => {
     expect(
       screen.getByRole("button", { name: "Workspace details" }),
     ).toBeInTheDocument();
+  });
+
+  // ── Linked-issue chip ──
+  // Relocated from the old bottom WorkspaceContextBar (which hides while
+  // an agent-chat pane is active) — same shared `IssueDetailPopover`
+  // (chip variant, opening upward), so a thread's linked issue stays
+  // visible on the Context Row (regression from PR #144).
+
+  const LINKED_ISSUE = {
+    number: 146,
+    title: "Context Row loses the linked-issue chip",
+    state: "Open" as const,
+    labels: [],
+  };
+
+  it("renders the linked-issue chip and opens the detail popover upward", async () => {
+    mocks.workspace = makeWorkspace({ linked_issue: LINKED_ISSUE });
+    render(<WorkspaceStatusCluster />);
+    const chip = screen.getByText("Issue #146").closest("button")!;
+    expect(chip).toBeInTheDocument();
+    await userEvent.click(chip);
+    const content = await waitFor(() => {
+      const el = document.querySelector(
+        "[data-testid='issue-detail-content']",
+      );
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    // The popover opens upward (`side="top"`, mirroring the old bar).
+    expect(content.closest("[data-side]")).toHaveAttribute("data-side", "top");
+    expect(mocks.getGithubIssue).toHaveBeenCalledWith("ws-1", 146);
+  });
+
+  it("renders the issue chip alone (no git chips / details button) for a branch-less workspace with a linked issue", () => {
+    mocks.workspace = makeWorkspace({
+      git_branch: null,
+      linked_issue: LINKED_ISSUE,
+    });
+    const { container } = render(<WorkspaceStatusCluster />);
+    expect(container).not.toBeEmptyDOMElement();
+    expect(screen.getByText("Issue #146")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Workspace details" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders no issue chip when the workspace has no linked issue", () => {
+    mocks.workspace = makeWorkspace({ linked_issue: null });
+    render(<WorkspaceStatusCluster />);
+    expect(screen.queryByText(/^Issue #/)).not.toBeInTheDocument();
+  });
+
+  it("shows the Issue row in the details popover when a linked issue is present", async () => {
+    mocks.workspace = makeWorkspace({ linked_issue: LINKED_ISSUE });
+    const user = userEvent.setup();
+    render(<WorkspaceStatusCluster />);
+    await user.click(screen.getByRole("button", { name: "Workspace details" }));
+    expect(screen.getByText("Issue")).toBeInTheDocument();
+    expect(screen.getByText("#146 · Open")).toBeInTheDocument();
+  });
+
+  it("omits the Issue row from the details popover without a linked issue", async () => {
+    mocks.workspace = makeWorkspace({ linked_issue: null });
+    const user = userEvent.setup();
+    render(<WorkspaceStatusCluster />);
+    await user.click(screen.getByRole("button", { name: "Workspace details" }));
+    expect(screen.queryByText("Issue")).not.toBeInTheDocument();
   });
 });

@@ -21,6 +21,7 @@ import {
   BackgroundBrowserIndicator,
   useBackgroundBrowserSession,
 } from "@/components/browser/background-browser-indicator";
+import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { getGithubPrByPath, gitPullChanges } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
 
@@ -39,9 +40,13 @@ import type { PullRequestInfo } from "@/tauri/types";
  *    its upstream,
  *  - a PR chip (#N, tone-tinted per state) that opens the PR on
  *    GitHub,
+ *  - a linked-issue chip (Issue #N) that opens the issue detail
+ *    popover upward — the same `IssueDetailPopover` (chip variant) the
+ *    old bar rendered, so a thread's linked issue stays visible on the
+ *    Context Row,
  *  - a "workspace details" button that opens a compact popover with
  *    the full picture (branch, base, behind, ahead, uncommitted diff,
- *    PR, device) plus quick View PR / Sync actions.
+ *    PR, issue, device) plus quick View PR / Sync actions.
  *
  * Self-contained: reads the active workspace directly. This only ever
  * renders from inside an `AgentChatPane`, and `PaneContainer` only
@@ -53,10 +58,12 @@ import type { PullRequestInfo } from "@/tauri/types";
  * OpenFlow workspaces never route through `PaneContainer`.)
  *
  * Renders nothing when there is no active workspace, or there is
- * neither a git branch nor a background browser session (nothing
- * passive to report). The git chips + details popover additionally
- * require the branch, so a git-less workspace with a live background
- * browser shows the Browser pill alone — matching the old bar.
+ * neither a git branch, a background browser session, nor a linked
+ * issue (nothing passive to report). The git chips + details popover
+ * additionally require the branch, so a git-less workspace with a live
+ * background browser shows the Browser pill alone, and one with only a
+ * linked issue shows the Issue chip alone — matching the old bar's
+ * visibility set (`hasGit || prState || linked_issue || browser`).
  */
 export function WorkspaceStatusCluster() {
   const workspace = useActiveWorkspace();
@@ -92,7 +99,8 @@ export function WorkspaceStatusCluster() {
 
   if (!workspace) return null;
   const gitBranch = workspace.git_branch;
-  if (!gitBranch && !backgroundBrowserSession) return null;
+  if (!gitBranch && !backgroundBrowserSession && !workspace.linked_issue)
+    return null;
 
   const prState = normalizePrState(workspace.pr_state);
   const prHumanState = humanizePrState(workspace.pr_state);
@@ -109,6 +117,21 @@ export function WorkspaceStatusCluster() {
   const deviceLabel = isRemote ? (hostName ?? "Remote host") : "this device";
 
   const projectName = basename(workspace.project_root ?? workspace.cwd);
+
+  /* Linked-issue chip — opens the issue detail popover upward. Mirrors
+     the old bottom bar's usage (chip variant, `side="top"`). Rendered
+     right after the PR chip (the old bar's ordering); unlike the git
+     chips it does not require a branch, so a branch-less workspace with
+     a linked issue still shows it (standalone render below). */
+  const issueChip = workspace.linked_issue ? (
+    <IssueDetailPopover
+      workspaceId={workspace.workspace_id}
+      issue={workspace.linked_issue}
+      variant="chip"
+      side="top"
+      align="end"
+    />
+  ) : null;
 
   const handlePrClick = () => {
     if (workspace.pr_url) openUrl(workspace.pr_url).catch(console.error);
@@ -172,6 +195,8 @@ export function WorkspaceStatusCluster() {
             </button>
           )}
 
+          {issueChip}
+
           <Popover open={open} onOpenChange={setOpen}>
             <PopoverTrigger asChild>
               <button
@@ -233,6 +258,17 @@ export function WorkspaceStatusCluster() {
                     valueClassName={prStatusTextClass(workspace.pr_state) ?? undefined}
                   />
                 )}
+                {workspace.linked_issue && (
+                  <DetailRow
+                    label="Issue"
+                    value={`#${workspace.linked_issue.number} · ${workspace.linked_issue.state}`}
+                    valueClassName={
+                      workspace.linked_issue.state === "Open"
+                        ? "text-success"
+                        : "text-muted-foreground"
+                    }
+                  />
+                )}
                 <DetailRow label="Location" value={deviceLabel} muted />
               </div>
               {(workspace.pr_url || showBehind) && (
@@ -262,6 +298,10 @@ export function WorkspaceStatusCluster() {
           </Popover>
         </>
       )}
+
+      {/* Branch-less workspace with a linked issue: the git block above
+          didn't render, so show the Issue chip standalone. */}
+      {!gitBranch && issueChip}
     </div>
   );
 }

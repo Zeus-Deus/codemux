@@ -22,6 +22,19 @@ vi.mock("@/tauri/commands", () => ({
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
+  // `waitForWorkspaceCwd` (worktree arm) polls this on its direct-fetch
+  // fallback path. Return the store's current snapshot so a poll never
+  // clobbers seeded state; the worktree tests drive resolution via the
+  // store subscription instead.
+  getAppState: vi.fn(() =>
+    Promise.resolve(
+      useAppStore.getState().appState ?? {
+        schema_version: 1,
+        active_workspace_id: "",
+        workspaces: [],
+      },
+    ),
+  ),
 }));
 
 import {
@@ -835,6 +848,119 @@ describe("materializeAndSend", () => {
       );
       expect(agentChatCreatePane).not.toHaveBeenCalled();
       expect(agentChatStartSession).not.toHaveBeenCalled();
+    });
+
+    it("waits for the app-store to hydrate the worktree AFTER a delay, then launches at the WORKTREE cwd", async () => {
+      // Reproduce the real race (PR #142 deferred-worktree cwd bug): the store does NOT yet
+      // hold the new worktree when `create_worktree_workspace` resolves.
+      // The app-state event lands ~asynchronously; the pane + session
+      // must still launch inside the worktree, never the project root.
+      useAppStore.setState({
+        homeDir: "/home/user",
+        appState: {
+          schema_version: 1,
+          active_workspace_id: "ws-codemux-main",
+          workspaces: [{ workspace_id: "ws-codemux-main", cwd: "/projects/foo" }],
+        } as never,
+      });
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "",
+        baseBranch: "main",
+      });
+
+      const promise = materializeAndSend(
+        draft,
+        "fix the login bug",
+        "/projects/foo",
+        actions,
+        null,
+        null,
+        [],
+        [],
+        "/projects/foo",
+      );
+
+      // The worktree workspace only reaches the store after a tick —
+      // exactly like the async `app-state-changed` Tauri event.
+      setTimeout(() => {
+        useAppStore.setState({
+          appState: {
+            schema_version: 1,
+            active_workspace_id: "ws-worktree",
+            workspaces: [
+              { workspace_id: "ws-codemux-main", cwd: "/projects/foo" },
+              {
+                workspace_id: "ws-worktree",
+                cwd: "/projects/foo-ai-named-branch",
+              },
+            ],
+          } as never,
+        });
+      }, 20);
+
+      const result = await promise;
+
+      expect(result.success).toBe(true);
+      // NEVER the parent `/projects/foo`.
+      expect(agentChatCreatePane).toHaveBeenCalledWith(
+        "ws-worktree",
+        "claude",
+        "/projects/foo-ai-named-branch",
+      );
+      const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(startInput.cwd).toBe("/projects/foo-ai-named-branch");
+    });
+
+    it("HARD INVARIANT: never hydrates → fails the send safely, session NEVER started at the project root", async () => {
+      vi.useFakeTimers();
+      // Store never gains the worktree workspace — the app-state event
+      // is dropped/never delivered.
+      useAppStore.setState({
+        homeDir: "/home/user",
+        appState: {
+          schema_version: 1,
+          active_workspace_id: "ws-codemux-main",
+          workspaces: [{ workspace_id: "ws-codemux-main", cwd: "/projects/foo" }],
+        } as never,
+      });
+      const actions = makeActions();
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "",
+        baseBranch: "main",
+      });
+
+      const promise = materializeAndSend(
+        draft,
+        "fix the login bug",
+        "/projects/foo",
+        actions,
+        null,
+        null,
+        [],
+        [],
+        "/projects/foo",
+      );
+      // Drive past the resolver's timeout (default 5s).
+      await vi.advanceTimersByTimeAsync(6_000);
+      const result = await promise;
+      vi.useRealTimers();
+
+      expect(result.success).toBe(false);
+      expect(actions.markSendFailed).toHaveBeenCalledWith(
+        "draft-1",
+        expect.stringContaining("worktree"),
+      );
+      // The invariant: the pane is never created and the session is
+      // never started — so it can NEVER launch at the parent
+      // `/projects/foo`.
+      expect(agentChatCreatePane).not.toHaveBeenCalled();
+      expect(agentChatStartSession).not.toHaveBeenCalled();
+      expect(agentChatSendTurn).not.toHaveBeenCalled();
     });
   });
 });
