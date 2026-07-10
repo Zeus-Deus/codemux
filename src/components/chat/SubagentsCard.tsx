@@ -1,4 +1,5 @@
 import {
+  Ban,
   Check,
   ChevronDown,
   ChevronRight,
@@ -50,7 +51,11 @@ export const SubagentsCard = memo(function SubagentsCard({
   const [openId, setOpenId] = useState<string | null>(null);
 
   const doneCount = subs.filter(
-    (s) => s.status === "completed" || s.status === "failed" || s.status === "stopped",
+    (s) =>
+      s.status === "completed" ||
+      s.status === "failed" ||
+      s.status === "stopped" ||
+      s.status === "interrupted",
   ).length;
   const activeCount = subs.filter((s) => isRunning(s)).length;
 
@@ -167,6 +172,10 @@ function SubagentRow({
             />
           ) : sub.status === "failed" ? (
             <X className={cn("h-[18px] w-[18px]", tone.text)} strokeWidth={1.8} aria-hidden />
+          ) : sub.status === "interrupted" ? (
+            // Muted-amber non-spinning glyph — settled-but-unresolved, not
+            // a green success check and not a red failure ✕.
+            <Ban className={cn("h-[17px] w-[17px]", tone.text)} strokeWidth={1.8} aria-hidden />
           ) : (
             <Check
               className={cn("h-[18px] w-[18px]", tone.text)}

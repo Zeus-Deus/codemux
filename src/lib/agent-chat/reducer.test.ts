@@ -789,6 +789,36 @@ describe("agent-chat reducer", () => {
     warn.mockRestore();
   });
 
+  it("runtime_warning promotes a rejected rate-limit event to an inline runtime_notice", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "runtime_warning",
+      thread_id: "t1",
+      message: "rate limit event",
+      original_payload: { rate_limit_info: { status: "rejected" } },
+    });
+    expect(state.messages).toHaveLength(1);
+    const notice = state.messages[0];
+    expect(notice.kind).toBe("runtime_notice");
+    if (notice.kind === "runtime_notice") {
+      expect(notice.message).toBe(
+        "Usage limit reached — the provider stopped the run.",
+      );
+    }
+  });
+
+  it("runtime_warning debug noise still appends nothing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const base = createEmptyThreadState();
+    const after = applyEvent(base, {
+      type: "runtime_warning",
+      thread_id: "t1",
+      message: "rate limit event",
+      original_payload: { rate_limit_info: { status: "allowed" } },
+    });
+    expect(after).toBe(base);
+    warn.mockRestore();
+  });
+
   it("content_delta that follows a sealed assistant + tool_call starts a NEW assistant block at a fresh seq (AskUserQuestion position bug)", () => {
     // Reproduces the AskUserQuestion "Answered above older tool calls"
     // bug. Timeline: assistant emits a preamble, a tool runs, the user
@@ -1543,6 +1573,100 @@ describe("agent-chat reducer — subagents", () => {
       cards(once)[0].subagents[0].items.length,
     );
   });
+
+  // ── Run-state settlement (issue #153) ──
+
+  it("a parent-scoped tool_result settles a stuck running subagent (the issue shape)", () => {
+    const state = runEvents([
+      subagentUpdated({
+        subagent_id: "s1",
+        status: "running",
+        name: "Explore",
+        parent_item_id: "spawn-1",
+      }),
+      // The raw spawning tool_result flows through the PARENT flow (no
+      // subagent_id) because the adapter's demux lost track — and no
+      // terminal snapshot ever follows.
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "spawn-1", content: "ok", is_error: false },
+      },
+    ]);
+    const sub = cards(state)[0].subagents[0];
+    expect(sub.status).toBe("completed");
+    expect(sub.statusAssumed).toBe(true);
+  });
+
+  it("a parent-scoped error tool_result settles the subagent as failed", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", parent_item_id: "spawn-1" }),
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "spawn-1", content: "boom", is_error: true },
+      },
+    ]);
+    expect(cards(state)[0].subagents[0].status).toBe("failed");
+  });
+
+  it("a subagent-TAGGED tool_result does NOT settle the subagent view", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", parent_item_id: "spawn-1" }),
+      subItem("s1", { kind: "tool_use", tool_name: "Bash", tool_use_id: "child-1", input: {} }),
+      // Tagged with subagent_id → routes into the sub-transcript, never
+      // the parent settle path.
+      subItem("s1", { kind: "tool_result", tool_use_id: "child-1", content: "ok", is_error: false }),
+    ]);
+    const sub = cards(state)[0].subagents[0];
+    expect(sub.status).toBe("running");
+    expect(sub.statusAssumed).toBeUndefined();
+  });
+
+  it("session_state_changed closed interrupts running subagents even when not streaming", () => {
+    const running = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", name: "A" }),
+    ]);
+    expect(running.streaming).toBe(false);
+    const closed = applyEvent(running, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "closed" },
+    });
+    expect(cards(closed)[0].subagents[0].status).toBe("interrupted");
+    expect(cards(closed)[0].subagents[0].statusAssumed).toBe(true);
+  });
+
+  it("session_state_changed error interrupts running subagents", () => {
+    const running = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", name: "A" }),
+    ]);
+    const errored = applyEvent(running, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "error", message: "boom" },
+    });
+    expect(cards(errored)[0].subagents[0].status).toBe("interrupted");
+  });
+
+  it("a new user turn (not streaming) interrupts leftover running subagents", () => {
+    const running = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", name: "A" }),
+    ]);
+    const next = appendUserMessage(running, "another question");
+    expect(cards(next)[0].subagents[0].status).toBe("interrupted");
+  });
+
+  it("a queued follow-up (streaming) leaves running subagents alone", () => {
+    const running = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", name: "A" }),
+    ]);
+    const streaming = { ...running, streaming: true };
+    const next = appendUserMessage(streaming, "queued behind the active turn");
+    expect(cards(next)[0].subagents[0].status).toBe("running");
+  });
 });
 
 describe("agent-chat reducer — workflows", () => {
@@ -1795,5 +1919,52 @@ describe("agent-chat reducer — workflows", () => {
     });
     const wf = workflows(state)[0];
     expect(wf.status).toBe("completed");
+  });
+
+  it("a parent-scoped tool_result for the Workflow tool settles the run + its agents (issue #153)", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        workflow_id: "wf1",
+        phase: "Explore",
+      }),
+      // The Workflow tool's own tool_result (tool_use_id == workflow_id)
+      // leaks through the parent flow with no terminal workflow snapshot.
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "wf1", content: "done", is_error: false },
+      },
+    ]);
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("completed");
+    const agent = wf.phases.find((p) => p.title === "Explore")!.agents[0];
+    expect(agent.status).toBe("completed");
+    expect(agent.statusAssumed).toBe(true);
+  });
+
+  it("an error tool_result for the Workflow tool fails the run and interrupts its agents", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        workflow_id: "wf1",
+        phase: "Explore",
+      }),
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "wf1", content: "boom", is_error: true },
+      },
+    ]);
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("failed");
+    const agent = wf.phases.find((p) => p.title === "Explore")!.agents[0];
+    expect(agent.status).toBe("interrupted");
   });
 });

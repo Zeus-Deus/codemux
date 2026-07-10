@@ -535,9 +535,55 @@ idle — no resting state.
   top-edge sweep animation (`cm-sweep` in `globals.css`) and `.cm-blink`
   (still used by the breadcrumb's status dot) honor reduced-motion.
 
+### Run-state settlement (issue #153)
+
+The transcript layer's only "running → terminal" transition used to be a
+terminal `subagent_updated` snapshot. When the Claude adapter's demux
+loses track (sidecar restart/resume) the spawning `Task` tool's raw
+parent-scoped `tool_result` flows through and no terminal snapshot ever
+arrives, so a subagent could show "N running" forever — persisted that
+way, and resurrected on hydrate. The frontend now settles run state from
+several additional signals (the transcript-layer counterpart of the
+backend `SubagentTracker`; pure helpers in `subagents.ts`, unit-tested):
+
+- **`tool_result` derivation.** A parent-scoped `tool_result` (no
+  `subagent_id`) whose `tool_use_id` matches a still-running subagent's
+  demux id **or** its `parentItemId` (the spawning tool_use/call id,
+  merged from `SubagentSnapshot.parent_item_id`) settles that subagent
+  (`completed`, or `failed` on error). A subagent-**tagged** `tool_result`
+  routes into the sub-transcript and never settles the row. The matching
+  Workflow tool's own `tool_result` likewise settles the run and its
+  in-flight phase agents.
+- **Forced settle.** `session_state_changed{closed|error}` and a new user
+  turn (mirroring `SubagentTracker::clear_thread` on send) interrupt every
+  running/pending subagent and stop running workflows; a queued follow-up
+  (sent while streaming) leaves the active turn's subagents alone.
+- **Interrupted-on-hydrate.** The hydrate reconciliation force-settles any
+  subagent still running at end-of-replay to a **view-only `interrupted`**
+  status (`SubagentViewStatus = SubagentStatus | "interrupted"`, never on
+  the wire; muted-amber tone, a non-spinning glyph) and stops a still-
+  `running` workflow — a resumed transcript never renders a live spinner.
+  A `pending_approval` workflow is preserved (a resting state awaiting the
+  user, not a runaway spinner).
+- **`statusAssumed` + revive-on-running-snapshot.** Every inferred
+  settlement stamps `statusAssumed`, so a later **real** `running`
+  snapshot (e.g. a Claude background task re-emitting `running` via
+  `task_progress`) revives the row back to `running`, and a later real
+  terminal snapshot wins by rank and clears the flag. This makes the
+  inference self-healing on live streams and on replay.
+- **`runtime_warning` notices.** A small classifier (`runtime-notice.ts`)
+  promotes the user-facing runtime warnings — a provider rate-limit
+  rejection (`rate_limit_info.status === "rejected"`), the SDK's
+  enumerated `assistant error: …` — into a compact muted-amber inline
+  `runtime_notice` transcript row; all other `runtime_warning`s stay
+  console-only debug noise.
+
 The dev mock seeds one subagent turn in the demo transcript and exposes
 `window.__codemuxChatMock.streamSubagents()` for a live two-subagent
-lifecycle over the real per-thread Channel.
+lifecycle over the real per-thread Channel. Because the seeded transcript
+is served through the hydrate path, its still-running subagent (and the
+mid-run `/workflow` demo) correctly settle to `interrupted`/`stopped` on
+load; the live running bar remains demoable via `streamSubagents()`.
 
 **Workflow runs are a Claude-only relative of this system.** When a
 Claude session runs a top-level `Workflow` tool_use (a script that

@@ -1,5 +1,5 @@
 import { statusTone, type SubagentToneClasses } from "@/lib/agent-chat/subagents";
-import type { SubagentStatus, WorkflowRunStatus } from "@/lib/agent-chat/types";
+import type { SubagentViewStatus, WorkflowRunStatus } from "@/lib/agent-chat/types";
 
 export type { SubagentToneClasses };
 
@@ -50,7 +50,7 @@ export function workflowPhaseTone(
  *  started — the design's "queued" hollow-dot row) reads as muted rather
  *  than amber-running, so it doesn't visually compete with agents
  *  actually in flight. */
-export function workflowAgentTone(status: SubagentStatus): SubagentToneClasses {
+export function workflowAgentTone(status: SubagentViewStatus): SubagentToneClasses {
   if (status === "pending") return statusTone("stopped");
   return statusTone(status);
 }
