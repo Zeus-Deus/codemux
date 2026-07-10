@@ -1357,6 +1357,8 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
     expect(appendUserMessageMock).toHaveBeenCalledWith(
       startInput.thread_id,
       "fix the login bug",
+      undefined,
+      [],
     );
     // 4. Draft cleared so the new pane mounts solo.
     expect(setActiveDraftMock).toHaveBeenCalledWith(null);

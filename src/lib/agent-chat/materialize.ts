@@ -21,6 +21,7 @@ import type { TerminalPreset } from "@/tauri/types";
 
 import { deriveTitleFromFirstMessage } from "./derive-title";
 import { applyAllPrefixes } from "./mode-prefix";
+import type { UserMessageImage } from "./types";
 import { waitForWorkspaceCwd } from "./wait-for-workspace-cwd";
 
 /**
@@ -51,8 +52,17 @@ export interface MaterializeActions {
    *  home before the live pane mounts. */
   ensureThread: (threadId: string) => void;
   /** Writes the optimistic user message into the agent-chat slice so
-   *  the live pane renders it as soon as it takes over. */
-  appendUserMessage: (threadId: string, text: string) => void;
+   *  the live pane renders it as soon as it takes over. `images` (when
+   *  present) carries the turn's staged images as `data:` URLs so the
+   *  bubble shows their thumbnails without waiting for a round-trip.
+   *  Signature matches the store action so `chat.appendUserMessage`
+   *  can be passed straight through. */
+  appendUserMessage: (
+    threadId: string,
+    text: string,
+    clientNonce?: string,
+    images?: UserMessageImage[],
+  ) => void;
   // ── Stage C Effort-lock fix: mirror the draft's session config
   //    onto the agent-chat slice so the ReasoningPicker (which gates
   //    on `slice.model`) renders correctly when `AgentChatPane`
@@ -124,6 +134,13 @@ export async function materializeAndSend(
    *  `buildImagePayloads` so this lib stays free of store imports.
    *  Defaults to empty so existing call sites keep compiling. */
   images: Array<{ data: number[]; media_type: string }> = [],
+  /** Display shape of the same staged images (`data:` URLs), for the
+   *  optimistic user bubble's thumbnails. Distinct from `images` above,
+   *  which is the raw-bytes wire shape the SDK needs. Caller
+   *  pre-extracts via `buildImageDisplaySources` so this lib stays free
+   *  of store imports. Defaults to empty so existing call sites keep
+   *  compiling. */
+  imageDisplaySources: UserMessageImage[] = [],
   /** Thread Scope redesign — project root to fork a deferred worktree
    *  from, when `draft.checkoutMode === "worktree"`. `null` (the
    *  default) keeps the pre-existing target-resolution behavior
@@ -227,7 +244,7 @@ export async function materializeAndSend(
   //    slice's `model` stays null and the pickers silently vanish.
   actions.ensureThread(draft.threadId);
   seedSliceFromDraft(draft, actions);
-  actions.appendUserMessage(draft.threadId, text);
+  actions.appendUserMessage(draft.threadId, text, undefined, imageDisplaySources);
 
   // 4. Start the provider session with the draft's pre-minted thread
   //    id. The backend accepts the caller's id verbatim (verified on

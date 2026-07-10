@@ -134,6 +134,18 @@ The chat pane stack:
     bytes (not a temp-file path) because the chat stages bytes in
     memory. A text-only clipboard rejects the command → default paste
     runs untouched.
+  - **Attached images render in the sent bubble.** On send,
+    the staged image bytes are also turned into `data:` URLs
+    (`buildImageDisplaySources`) and stamped onto the optimistic
+    `UserMessageItem.images` — so the sent turn shows its own thumbnails,
+    not just the provider. The persisted `user_message` envelope gains an
+    optional `images: [{ path, media_type }]` (absolute fs paths written
+    backend-side); on hydrate those map onto `images[].src`.
+    `UserMessage` renders a wrapping thumbnail row (rounded, bordered,
+    ≤160px, broken-image fallback) with click-to-open lightbox
+    (`Dialog`, Esc / click-outside). `resolveAssetSrc` normalises both
+    forms: `data:` URLs (fresh optimistic send) pass through untouched,
+    absolute paths (hydrated) go through `convertFileSrc`.
 - **Slash command popup** with cross-provider parsing.
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
   compat. Server-side sync (see `docs/features/skills-sync.md`).
@@ -976,8 +988,12 @@ sends the first message. The shared naming/creation helper is
 `createDeferredWorktree` (exported from
 `src/lib/agent-chat/materialize.ts`): name precedence is trimmed
 `worktreeName` verbatim → `generateBranchName(firstMessage,
-projectPath)` (the CLI's AI first-message naming) →
-`generateRandomBranchName(projectPath)` on error/empty, then
+projectPath)` (the CLI's AI first-message naming, backed by
+`branch_name.rs::generate_ai_name`; the underlying `claude --print` call
+is bounded by a 30s timeout, and any failure — spawn error, timeout,
+non-zero exit, empty output — is logged via `log::warn!` to the native
+log instead of failing silently) → `generateRandomBranchName(projectPath)`
+on error/empty, then
 `createWorktreeWorkspace` off the row's `baseBranch` with the `"empty"`
 layout. The two surfaces route it differently:
 

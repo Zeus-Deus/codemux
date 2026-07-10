@@ -36,6 +36,7 @@ import {
   MOCK_CHAT_THREAD_ID,
   MOCK_HOME_DIR,
   MOCK_USER,
+  MOCK_USER_IMAGE_DATA_URL,
   MOCK_WORKFLOW_APPROVAL_THREAD_ID,
   MOCK_WORKFLOW_COMPLETE_THREAD_ID,
   MOCK_WORKFLOW_RUNNING_THREAD_ID,
@@ -427,6 +428,12 @@ function mockChatTranscript(): string[] {
     type: "user_message",
     thread_id: T,
     text: "Implement clipboard-paste fallback",
+    // Seed an attached image on this tail turn so the
+    // thumbnail + lightbox render the moment the default seeded thread
+    // opens. The persisted envelope shape is `{ path, media_type }`;
+    // the mock uses a data URL as the `path` so it renders in a plain
+    // browser (no `convertFileSrc`).
+    images: [{ path: MOCK_USER_IMAGE_DATA_URL, media_type: "image/png" }],
   });
   for (const envelope of subagentTurnEnvelopes(T, subTurnId)) push(envelope);
   push({
