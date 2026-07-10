@@ -879,6 +879,7 @@ describe("materializeAndSend", () => {
         null,
         null,
         [],
+        [],
         "/projects/foo",
       );
 
@@ -940,6 +941,7 @@ describe("materializeAndSend", () => {
         actions,
         null,
         null,
+        [],
         [],
         "/projects/foo",
       );
