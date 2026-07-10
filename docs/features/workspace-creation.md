@@ -150,8 +150,14 @@ git-dependent features with honest messaging instead of silence.
   `showNoGitState` + `useInitializeGit`): shown only for LOCAL,
   STANDARD project workspaces with `is_git === false` (Home is not a
   project; `attach_only`/host-backed cwds are host paths the local
-  probe can't judge). Clicking runs bare `git init` (no commit) then
-  `refresh_workspace_git_info` so the git UI lights up immediately.
+  probe can't judge). Clicking runs bare `git init` (no commit) via the
+  dedicated `init_git_repo_no_commit` command (`git::git_init_no_commit`
+  — init only, never `git add`/`commit`, so the user's files and any
+  secrets are never staged), then `refresh_workspace_git_info` so the
+  git UI lights up immediately. The commit-ful `init_git_repo`
+  (`git init` + `add` + initial commit) intentionally remains — it backs
+  `create_empty_repo`'s new-empty-project flow, where an initial commit
+  is the wanted starting point.
 
 ### Surfaces
 

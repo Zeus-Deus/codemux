@@ -2526,24 +2526,59 @@ mod git_info_tests {
 
     #[test]
     fn gather_workspace_git_info_flips_is_git_after_git_init() {
-        // The exact flow the "Initialize Git" affordance runs: bare
-        // `git init` on a plain folder, then a re-gather — `is_git`
-        // must flip to true so the UI swaps the affordance for the
-        // normal git surfaces.
+        // The exact flow the "Initialize Git" affordance runs, exercised
+        // through the REAL function the button calls
+        // (`crate::git::git_init_no_commit`) rather than a raw `git init`
+        // shell-out — so this test would fail if that function ever
+        // regressed back into staging/committing the user's files.
         let tmp = TempDir::new().expect("tempdir");
-        assert!(!gather_workspace_git_info(tmp.path()).is_git);
 
-        let out = std::process::Command::new("git")
-            .arg("init")
+        // A plain folder holding a would-be secret. If init ever staged
+        // or committed, this is exactly the kind of file that must NOT
+        // end up in the tree.
+        std::fs::write(tmp.path().join(".env"), "SECRET=x").expect("write .env");
+
+        // Pre-init: not a repo.
+        assert!(
+            !gather_workspace_git_info(tmp.path()).is_git,
+            "a plain folder must report is_git=false before init"
+        );
+
+        // Run the actual affordance path: bare init, no commit.
+        crate::git::git_init_no_commit(tmp.path()).expect("git_init_no_commit");
+
+        // Post-init: now a repo.
+        assert!(
+            gather_workspace_git_info(tmp.path()).is_git,
+            "freshly-initialized repo must report is_git=true"
+        );
+
+        // No commit was created — HEAD is unborn, so `rev-parse --verify
+        // HEAD` must fail. (A commit-ful init would resolve here.)
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
             .current_dir(tmp.path())
             .output()
-            .expect("run git init");
-        assert!(out.status.success(), "git init failed: {out:?}");
+            .expect("run git rev-parse");
+        assert!(
+            !head.status.success(),
+            "HEAD must be unborn after a bare init (no commit), got: {head:?}"
+        );
 
-        let info = gather_workspace_git_info(tmp.path());
-        assert!(info.is_git, "freshly-initialized repo must report is_git=true");
-        // Unborn HEAD: branch may or may not resolve depending on git
-        // version — the flag, not the branch, is the contract here.
+        // Nothing was staged: the .env must show as untracked (`?? .env`),
+        // NOT added (`A  .env`). Bare init needs no user.name/email config.
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("run git status");
+        assert!(status.status.success(), "git status failed: {status:?}");
+        let porcelain = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            porcelain.lines().any(|l| l == "?? .env"),
+            "the .env file must be UNTRACKED (`?? .env`), not staged; \
+             porcelain was: {porcelain:?}"
+        );
     }
 
     #[test]

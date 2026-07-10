@@ -67,6 +67,11 @@ vi.mock("@/hooks/use-project-actions", () => ({
 vi.mock("@/tauri/commands", () => ({
   dbGetUiState: vi.fn().mockResolvedValue(null),
   listBranchesDetailed: vi.fn(),
+  // Probe fallback used by ThreadScopeRow when no workspace row carries
+  // the project's `is_git` flag. Defaults to true (git repo) so the
+  // checkout/branch controls render as they did pre-probe; individual
+  // tests override it to exercise the non-git path.
+  checkIsGitRepo: vi.fn().mockResolvedValue(true),
 }));
 
 import { ThreadScopeRow, type ThreadScopeRowProps } from "./ThreadScopeRow";

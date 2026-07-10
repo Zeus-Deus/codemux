@@ -598,6 +598,13 @@ export const checkIsGitRepo = (path: string) =>
 export const initGitRepo = (path: string) =>
   invoke<string>("init_git_repo", { path });
 
+/** No-stage/no-commit variant behind the "Initialize Git" affordance —
+ *  runs a bare `git init` only, never staging or committing the user's
+ *  existing files (contrast `initGitRepo`, which also adds + makes an
+ *  initial commit for the new-empty-project flow). */
+export const initGitRepoNoCommit = (path: string) =>
+  invoke<string>("init_git_repo_no_commit", { path });
+
 /** Re-gather branch / ahead-behind / diff counts (and the `is_git` flag)
  *  for one workspace and emit fresh app state — used right after
  *  "Initialize Git" so the UI flips without waiting for the poll loop. */

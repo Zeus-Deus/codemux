@@ -1566,6 +1566,35 @@ const handlers: Record<string, Handler> = {
   get_merge_state: () => null,
   check_claude_available: () => false,
 
+  // ── Initialize Git (non-git project affordance) ──
+  // These three let the "Initialize Git" click be exercised end-to-end
+  // in browser dev against the non-git `scratchpad` seed: the probe
+  // reports it as non-git, the bare-init mutator flips its `is_git` flag
+  // and re-emits, and the follow-up refresh is a no-op (the flag already
+  // flipped).
+  //
+  // `check_is_git_repo` returns false only for the `scratchpad` seed
+  // (`src/dev/mock-fixtures.ts`), true for every real git project.
+  check_is_git_repo: (a) => !String(a.path ?? "").endsWith("/scratchpad"),
+
+  // Bare `git init` (no stage/commit) — flip `is_git` on every workspace
+  // rooted at the given path so the UI swaps the affordance for the
+  // normal git surfaces without waiting for a poll.
+  init_git_repo_no_commit: (a) => {
+    const path = String(a.path ?? "");
+    let mutated = false;
+    for (const ws of appState.workspaces) {
+      if ((ws.project_root ?? ws.cwd) === path) {
+        ws.is_git = true;
+        mutated = true;
+      }
+    }
+    if (mutated) emitAppState();
+    return "Repository initialized";
+  },
+  // No-op: the init handler above already flipped the flag + re-emitted.
+  refresh_workspace_git_info: () => undefined,
+
   // ── Mutators: patch in-memory state + re-emit ──
   activate_workspace: (a) => {
     if (findWorkspace(a.workspaceId)) {

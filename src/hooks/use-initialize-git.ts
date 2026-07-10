@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { initGitRepo, refreshWorkspaceGitInfo } from "@/tauri/commands";
+import { initGitRepoNoCommit, refreshWorkspaceGitInfo } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
@@ -48,7 +48,7 @@ export function useInitializeGit(workspace: WorkspaceSnapshot | null) {
     if (!workspace || initializing) return;
     setInitializing(true);
     try {
-      await initGitRepo(workspace.project_root ?? workspace.cwd);
+      await initGitRepoNoCommit(workspace.project_root ?? workspace.cwd);
       await refreshWorkspaceGitInfo(workspace.workspace_id);
     } catch (err) {
       toast.error(`Git initialization failed: ${err}`);

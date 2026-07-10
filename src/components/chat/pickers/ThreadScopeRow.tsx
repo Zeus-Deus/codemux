@@ -35,7 +35,11 @@ import {
 } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
 import type { DraftTarget } from "@/stores/chat-draft-store";
-import { dbGetUiState, listBranchesDetailed } from "@/tauri/commands";
+import {
+  checkIsGitRepo,
+  dbGetUiState,
+  listBranchesDetailed,
+} from "@/tauri/commands";
 import type { BranchDetail, WorkspaceSnapshot } from "@/tauri/types";
 
 import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
@@ -154,20 +158,65 @@ export function ThreadScopeRow({
 
   // Non-git projects can't have worktrees or base branches — hide the
   // checkout + branch controls instead of letting a "New worktree" send
-  // die on the backend's `Not a git repository` error. Gated off the
-  // workspace snapshot (`is_git`, optimistic when unknown) rather than a
-  // live probe: every project in the location list is derived from an
-  // existing workspace, so one always carries the flag.
+  // die on the backend's `Not a git repository` error.
+  //
+  // Two-tier source for "is this project a git repo?":
+  //  1. Snapshot first — the matching workspace row's `is_git` flag
+  //     (optimistic `true` when the flag is unknown/undefined). This is
+  //     the common case: most targeted projects already have a live
+  //     workspace carrying the flag.
+  //  2. Async probe fallback — when NO workspace row matches
+  //     `projectPath` (a fresh draft targeting a just-opened project
+  //     before app-state hydrates, or a recent project with no live
+  //     workspace), the snapshot can't answer, so fall back to a live
+  //     `check_is_git_repo` probe cached per path. While the probe is in
+  //     flight (or if it returns a non-boolean — the dev mock's default
+  //     fallback, or an IPC failure) we stay optimistic `true` so the
+  //     controls never flash off.
   const workspaces = useAppStore(
     (s) => s.appState?.workspaces ?? EMPTY_WORKSPACES,
   );
+  const matchedWorkspace = useMemo(() => {
+    if (!projectPath) return undefined;
+    return workspaces.find((w) => (w.project_root ?? w.cwd) === projectPath);
+  }, [workspaces, projectPath]);
+
+  // Per-path probe cache for projects with no live workspace row.
+  const [gitProbe, setGitProbe] = useState<Record<string, boolean>>({});
+  useEffect(() => {
+    // Only probe when a project is targeted AND the snapshot can't answer
+    // (no workspace row matches). Skip once we already have a result.
+    if (!projectPath || matchedWorkspace) return;
+    if (projectPath in gitProbe) return;
+    let cancelled = false;
+    checkIsGitRepo(projectPath)
+      .then((res) => {
+        if (cancelled) return;
+        // A non-boolean (null/undefined from the dev mock's default
+        // fallback) stays optimistic-true, matching the snapshot default.
+        setGitProbe((prev) => ({
+          ...prev,
+          [projectPath]: typeof res === "boolean" ? res : true,
+        }));
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setGitProbe((prev) => ({ ...prev, [projectPath]: true }));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectPath, matchedWorkspace, gitProbe]);
+
   const projectIsGit = useMemo(() => {
     if (!projectPath) return true;
-    const ws = workspaces.find(
-      (w) => (w.project_root ?? w.cwd) === projectPath,
-    );
-    return ws ? ws.is_git !== false : true;
-  }, [workspaces, projectPath]);
+    if (matchedWorkspace) return matchedWorkspace.is_git !== false;
+    // No workspace row — defer to the probe cache, staying optimistic
+    // (true) until it resolves.
+    const probed = gitProbe[projectPath];
+    return probed === undefined ? true : probed;
+  }, [projectPath, matchedWorkspace, gitProbe]);
 
   // A stale draft (or a project switch) can arrive with "worktree" mode
   // already picked — snap it back so first send can't hit the error.
