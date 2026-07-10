@@ -1283,19 +1283,38 @@ async fn sidecar_exit_mid_session_emits_error_state() {
             client_nonce: None,
         })
         .await;
+    // Issue #154: a mid-turn child death must settle the in-flight turn with
+    // a synthetic `TurnCompleted { child_exited }` BEFORE the terminal
+    // `SessionStateChanged::Error`, so the turn settles through the whole
+    // pipeline and persists a durable record for hydrate.
+    let mut saw_child_exit_turn = false;
     let mut saw_error = false;
     let _ = timeout(Duration::from_secs(4), async {
         while let Some(ev) = stream.next().await {
-            if let ProviderRuntimeEvent::SessionStateChanged { status, .. } = &ev {
-                if matches!(status, SessionStatus::Error { .. }) {
-                    saw_error = true;
-                    break;
+            match &ev {
+                ProviderRuntimeEvent::TurnCompleted { status, .. } => {
+                    if let TurnStatus::Error { subtype, .. } = status {
+                        if subtype == "child_exited" {
+                            saw_child_exit_turn = true;
+                        }
+                    }
                 }
+                ProviderRuntimeEvent::SessionStateChanged { status, .. } => {
+                    if matches!(status, SessionStatus::Error { .. }) {
+                        saw_error = true;
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
     })
     .await;
-    assert!(saw_error);
+    assert!(saw_error, "expected a terminal SessionStateChanged::Error");
+    assert!(
+        saw_child_exit_turn,
+        "expected a synthetic child_exited TurnCompleted before the Error"
+    );
     let _ = provider.stop_session(ThreadId("t-crash".into())).await;
 }
 

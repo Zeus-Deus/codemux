@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { ProviderRuntimeEvent } from "@/tauri/events";
 
-import { replayPayloads } from "./hydrate";
+import { lastTurnUnsettled, replayPayloads } from "./hydrate";
 
 function user(text: string): string {
   return JSON.stringify({ type: "user_message", thread_id: "t", text });
@@ -408,5 +408,95 @@ describe("replayPayloads", () => {
     if (ended?.kind === "turn_ended") {
       expect(ended.status.kind).toBe("error");
     }
+  });
+});
+
+describe("lastTurnUnsettled (issue #154)", () => {
+  const completed = (turnId: string): string =>
+    event({
+      type: "turn_completed",
+      thread_id: "t",
+      turn_id: turnId,
+      status: { kind: "success" },
+      usage: null,
+    });
+
+  it("is false for an empty thread", () => {
+    expect(lastTurnUnsettled([])).toBe(false);
+  });
+
+  it("is true when the last user turn has no later turn_completed", () => {
+    expect(lastTurnUnsettled([completed("turn-0"), user("still running…")])).toBe(
+      true,
+    );
+  });
+
+  it("is false when the last user turn settled", () => {
+    expect(lastTurnUnsettled([user("hi"), completed("turn-1")])).toBe(false);
+  });
+
+  it("is true for a settled turn followed by a fresh unsettled one", () => {
+    expect(
+      lastTurnUnsettled([
+        user("one"),
+        completed("turn-1"),
+        user("two — never finished"),
+      ]),
+    ).toBe(true);
+  });
+
+  it("ignores malformed rows", () => {
+    expect(lastTurnUnsettled(["not json", user("hi")])).toBe(true);
+  });
+});
+
+describe("replayPayloads interrupted/stalled (issue #154)", () => {
+  it("carries interrupted from an unsettled tail and stalled stays null", () => {
+    const state = replayPayloads([
+      user("first"),
+      event({
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      }),
+      user("second — interrupted"),
+    ]);
+    expect(state.interrupted).toBe(true);
+    expect(state.stalled).toBeNull();
+  });
+
+  it("marks interrupted when replay observed a child_exited terminal turn", () => {
+    const state = replayPayloads([
+      user("go"),
+      event({
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "sidecar exited unexpectedly",
+        },
+        usage: null,
+      }),
+    ]);
+    expect(state.interrupted).toBe(true);
+  });
+
+  it("is not interrupted for a cleanly settled thread", () => {
+    const state = replayPayloads([
+      user("go"),
+      event({
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      }),
+    ]);
+    expect(state.interrupted).toBe(false);
+    expect(state.stalled).toBeNull();
   });
 });

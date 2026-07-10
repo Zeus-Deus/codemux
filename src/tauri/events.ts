@@ -363,6 +363,17 @@ export type ProviderRuntimeEvent =
       type: "queued_turn_cancelled";
       thread_id: string;
       queued_id: string;
+    }
+  // Stall watchdog (mirrors `ProviderRuntimeEvent::RunStalled` in
+  // src-tauri/src/agent_provider/events.rs). Emitted when a mid-turn
+  // thread has produced no runtime events past the stall threshold.
+  // Advisory only — transient, never persisted, and cleared by the
+  // reducer on the next real activity.
+  | {
+      type: "run_stalled";
+      thread_id: string;
+      /** Seconds since the last observed runtime event for this thread. */
+      silent_for_secs: number;
     };
 
 /** Canonical provider event payload as delivered to the frontend —

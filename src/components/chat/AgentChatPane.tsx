@@ -445,6 +445,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const draft = slice?.inputDraft ?? "";
   const messages = slice?.messages ?? EMPTY_MESSAGES;
   const streaming = slice?.streaming ?? false;
+  // Dead-run detection (issue #154): the stall notice + interrupted /
+  // Continue affordances read straight off the thread slice.
+  const stalled = slice?.stalled ?? null;
+  const interrupted = slice?.interrupted ?? false;
 
   // Subagent drill-in view state (locked decision 3): the pane swaps its
   // transcript body for a read-only sub-transcript and its sub-header for
@@ -997,7 +1001,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     clearDraft,
   ]);
 
-  const handleSubmit = useCallback(() => {
+  const handleSubmit = useCallback((textOverride?: string) => {
     // Synchronous ref check BEFORE any React state reads — closes the
     // same-tick race that the `useState` guard can't (captured closure
     // sees the pre-set snapshot when two Enter presses fire in one
@@ -1005,7 +1009,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // `sendInFlightRef.current === true` and bails.
     if (sendInFlightRef.current) return;
     if (!threadId) return;
-    const rawText = draft.trim();
+    // `textOverride` is the one-click "Continue run" path (issue #154):
+    // it sends fixed text through this same machinery so the optimistic
+    // bubble, rollback, and backend auto-resume all behave identically to
+    // a manual send. A string is only ever passed by `handleContinueRun`;
+    // the Composer always calls `onSubmit()` with no args.
+    const rawText = (typeof textOverride === "string" ? textOverride : draft).trim();
     if (!rawText) return;
     const plan = planSubmit({ rawText, provider, effort });
     sendInFlightRef.current = true;
@@ -1176,6 +1185,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     clearStagedAttachments,
     updateStagedAttachment,
   ]);
+
+  /** One-click "Continue run" (issue #154): resume an interrupted run by
+   *  sending the fixed text "Continue" through the normal send path — the
+   *  same thing users type manually today. Routing through
+   *  `agentChatSendTurn` means the backend's `ensure_live_session` choke
+   *  point transparently rebuilds the dead session with the resume cursor.
+   *  Appending the optimistic bubble clears the interrupted flag. */
+  const handleContinueRun = useCallback(() => {
+    handleSubmit("Continue");
+  }, [handleSubmit]);
 
   /** Step 8 Stage 2 — orchestrates the chip lifecycle when the user
    *  picks a file from the `@` mention popup. The Composer has
@@ -2568,6 +2587,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // RPC ack-lag without blocking queueing.
       streaming={streaming}
       sending={isSending}
+      // Dead-run recovery (issue #154): a Continue chip in the composer
+      // strip when the last run died and nothing is in flight.
+      interrupted={interrupted}
+      onContinueRun={handleContinueRun}
       sessionReady={sessionReady}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}
@@ -2638,6 +2661,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             <ChatTranscript
               messages={messages}
               streaming={streaming || isSending}
+              stalled={stalled}
+              interrupted={interrupted}
               sessionStartedAt={sessionStartedAt}
               provider={provider}
               onRespondToRequest={handleRespond}

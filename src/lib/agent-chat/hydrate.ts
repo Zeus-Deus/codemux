@@ -82,7 +82,49 @@ export function replayPayloads(payloads: string[]): ChatThreadState {
     messages,
     streaming: false,
     pendingRequestIds: [],
+    // Interrupted when EITHER the replay itself observed a `child_exited`
+    // terminal turn (the watchdog persisted a `turn_completed` error) OR
+    // the raw history ends with an unsettled user turn (the app died before
+    // any terminal event was written — laptop sleep, hard crash). Both mean
+    // "the last run never cleanly finished", so the tail shows the "Run
+    // interrupted" divider and the composer offers a Continue chip.
+    interrupted: state.interrupted || lastTurnUnsettled(payloads),
+    // Transient — never persisted, so a hydrated thread always starts clear.
+    stalled: null,
   };
+}
+
+/**
+ * Pure helper: does the persisted history end with an unsettled user turn?
+ *
+ * Scans the ordered raw payloads for the LAST `user_message` envelope and
+ * returns true iff one exists and NO later payload is a `turn_completed`
+ * event. `session_state_changed` is never persisted, so `turn_completed`
+ * is the sole settlement marker; queued-turn envelopes persist at dispatch
+ * time, so ordering is sound. Exported for direct unit testing.
+ */
+export function lastTurnUnsettled(payloads: string[]): boolean {
+  const types = payloads.map((raw) => {
+    try {
+      const value = JSON.parse(raw) as unknown;
+      return value &&
+        typeof value === "object" &&
+        typeof (value as { type?: unknown }).type === "string"
+        ? (value as { type: string }).type
+        : null;
+    } catch {
+      return null;
+    }
+  });
+  let lastUserIdx = -1;
+  for (let i = 0; i < types.length; i++) {
+    if (types[i] === "user_message") lastUserIdx = i;
+  }
+  if (lastUserIdx < 0) return false;
+  for (let i = lastUserIdx + 1; i < types.length; i++) {
+    if (types[i] === "turn_completed") return false;
+  }
+  return true;
 }
 
 function parsePayload(raw: string): ReplayPayload | null {

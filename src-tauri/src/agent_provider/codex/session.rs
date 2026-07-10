@@ -892,18 +892,28 @@ fn spawn_child_exit_watchdog(
                         // Only flip to Error if the session wasn't
                         // already asked to close.
                         if !matches!(status, SessionStatus::Closed) {
-                            let error_status = SessionStatus::Error {
-                                message: "codex app-server exited unexpectedly".into(),
-                            };
-                            {
+                            let msg = "codex app-server exited unexpectedly".to_string();
+                            // Recover the in-flight turn id before clearing it so
+                            // the watchdog can settle it with a synthetic terminal
+                            // `TurnCompleted` ahead of the Error state.
+                            let active_turn = {
                                 let mut state = session.state.lock().await;
-                                state.status = error_status.clone();
-                                state.active_turn = None;
+                                let active_turn = state.active_turn.take();
+                                state.status = SessionStatus::Error {
+                                    message: msg.clone(),
+                                };
+                                active_turn
+                            };
+                            // TurnCompleted(child_exited) first, then the Error
+                            // state — see `child_exit_events` for the ordering
+                            // contract.
+                            for event in crate::agent_provider::child_exit_events(
+                                session.thread_id.clone(),
+                                active_turn,
+                                msg,
+                            ) {
+                                let _ = event_tx.send(event);
                             }
-                            let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-                                thread_id: session.thread_id.clone(),
-                                status: error_status,
-                            });
                             session.cancel_all_queued().await;
                         }
                         break;

@@ -552,6 +552,105 @@ the inline Subagents card + drill-in described above. See
 `docs/features/workflow-orchestration.md` for the full model; this file
 does not duplicate it.
 
+## Dead-run detection & interrupted turns
+
+Issue #154. A run can die without emitting a terminal event — the
+sidecar / app-server / shared server is killed by a laptop sleep, a
+crash, or a provider usage-limit cutoff. Before this work every "working"
+indicator stayed live forever (`pane_statuses` stuck on `Working`, the
+thread `streaming` flag true, the background-browser `LIVE` chip never
+released) and the user had to *know* the run was dead and manually type
+"continue". Three additive parts close the gap.
+
+### Synthetic child-exit terminal event
+
+When a provider's child process dies unexpectedly **mid-turn**, its
+watchdog now settles the in-flight turn before tearing the session down:
+
+- Claude (`claude/session.rs`) and Codex (`codex/session.rs`) per-session
+  child-exit watchdogs recover the `active_turn` (set during both
+  `Running` and `WaitingApproval`) **before** clearing it and emit a
+  synthetic `TurnCompleted { status: Error { subtype: "child_exited" } }`,
+  then the existing `SessionStateChanged::Error`.
+- OpenCode has no per-session child; its SSE listener (`opencode/sse.rs`)
+  reconnects up to `MAX_RECONNECT_ATTEMPTS` (5) and, on giving up, now
+  runs the same terminal sequence for the session (previously it emitted
+  only a `RuntimeWarning`). It also flips a shared `dead` flag so the
+  provider's `has_session` reports the session absent and the next send
+  rebuilds a fresh one through `ensure_live_session` (with the resume
+  cursor) rather than POSTing to a dead server. Whether a turn is in
+  flight is tracked on `EventContext.turn_active` (armed by `send_turn`,
+  disarmed when a parent `TurnCompleted` / terminal session state flows).
+
+The event list is built by the shared pure helper
+`child_exit_events(thread_id, active_turn, message)` in
+`agent_provider/events.rs`. **Ordering is load-bearing**: `TurnCompleted`
+first so the activity + pane-status trackers see the turn settle while the
+thread state is intact, then `Error` to tear tracking down. When no turn
+is in flight (`active_turn` is `None`) only the `Error` event is produced —
+a child that dies while idle has no dangling turn, so no spurious
+`interrupted` signal reaches the frontend. Because `turn_completed`
+persists (`should_persist_event`), hydrate after a restart replays a
+settled turn. The subtype string `"child_exited"`
+(`CHILD_EXITED_SUBTYPE`) is the frontend's key; a user-initiated stop
+produces subtype `"interrupted"` instead, so it never triggers the
+Continue affordance.
+
+### Stall watchdog (`RunStalled`)
+
+A child that is alive but silent (usage-limit cutoff, wedged tool call)
+emits no terminal event at all, so a heartbeat is needed. A new
+Tauri-managed `RunActivityTracker` (`commands/agent_chat.rs`, mirroring
+`SubagentTracker`) records a wall-clock `last_event` per thread inside
+`forward_event`, via the pure `activity_update(current, event, now)`:
+mid-turn events (running, deltas, items, subagent/workflow updates,
+dispatched queue turns, resolved requests) stamp `now`; approval prompts
+(`RequestOpened` / `WaitingApproval`) additionally **pause** the stall
+clock (waiting on the user is expected silence); turn/session settlement
+removes the entry so the map stays bounded. Wall clock (`SystemTime`) on
+purpose — after suspend/resume the elapsed silence includes the sleep
+window, which is exactly the wake-from-sleep case the issue asks for.
+
+`spawn_stall_watchdog` (started from `lib.rs` right after
+`spawn_event_bridge`, same `agent_chat_enabled` gate) sweeps every
+`STALL_SWEEP_INTERVAL` (30s) and, for any thread mid-turn and silent for
+at least `STALL_THRESHOLD` (600s — long enough that a quiet legitimate
+tool call never trips it), forwards a new additive
+`ProviderRuntimeEvent::RunStalled { thread_id, silent_for_secs }`. The
+event is **transient**: never persisted, re-emitted each tick while still
+stalled (keeps the surfaced duration fresh), leaves the sidebar dot
+untouched (`map_event_to_pane_status` returns `None` for it — the run may
+be fine), and is cleared by the reducer on the next real activity. It
+renders as an amber "No activity for Nm — the agent may have stopped."
+tail notice in `MessageList` (design tokens only).
+
+### Interrupted turn + Continue affordance (frontend)
+
+A new `interrupted` flag on `ChatThreadState`
+(`src/lib/agent-chat/types.ts`) drives the recovery UX:
+
+- **Hydrate detection** — the pure `lastTurnUnsettled(payloads)`
+  (`src/lib/agent-chat/hydrate.ts`) returns true when the last persisted
+  `user_message` envelope has no later `turn_completed`; `replayPayloads`
+  ORs that with the replay-observed `child_exited` completion so both the
+  "app died mid-turn" and "watchdog settled the turn" cases surface.
+- **Live detection** — the reducer sets `interrupted` on a
+  `turn_completed` with `subtype === "child_exited"` and (belt-and-braces)
+  on a `session_state_changed{error}` while streaming. It clears on the
+  next running / dispatched-queue / content event and on the optimistic
+  user-message append.
+- **Render** — `MessageList` shows a "Run interrupted" tail divider
+  (cloning the `SessionStartMarker` hairline pattern, amber label) while
+  not streaming, and `Composer` shows a one-click "Continue run" chip in
+  its attachment strip. The chip calls `AgentChatPane`'s
+  `handleContinueRun`, which routes `handleSubmit("Continue")` through the
+  normal `agentChatSendTurn` path — identical optimistic-bubble +
+  rollback + backend auto-resume behavior to a manual send.
+
+The dev mock exposes `window.__codemuxChatMock.streamRunStalled()` and
+`window.__codemuxChatMock.interruptRun()` for browser QA of the amber
+notice, the divider, and the Continue chip.
+
 ## Current Constraints
 
 - **Beta-gated.** The chat pane is hidden unless the user opts in via

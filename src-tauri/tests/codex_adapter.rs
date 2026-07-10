@@ -33,7 +33,7 @@ use codemux_lib::agent_provider::codex::{CodexAgentProvider, CodexProviderConfig
 use codemux_lib::agent_provider::{
     AgentProvider, ApprovalDecision, CompletedItem, ContentDelta, ProviderError,
     ProviderRuntimeEvent, RequestId, SendTurnInput, SessionStatus, StartSessionInput,
-    SubagentStatus, ThreadId, TurnId,
+    SubagentStatus, ThreadId, TurnId, TurnStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -648,21 +648,38 @@ async fn child_process_crash_emits_error_state() {
         })
         .await;
 
+    // Issue #154: the mid-turn child death settles the in-flight turn with a
+    // synthetic `TurnCompleted { child_exited }` ahead of the terminal Error.
+    let mut saw_child_exit_turn = false;
     let mut saw_error = false;
     let _ = timeout(Duration::from_secs(3), async {
         while let Some(ev) = stream.next().await {
-            if let ProviderRuntimeEvent::SessionStateChanged { status, .. } = &ev {
-                if let SessionStatus::Error { message } = status {
-                    if message.contains("exited") {
-                        saw_error = true;
-                        break;
+            match &ev {
+                ProviderRuntimeEvent::TurnCompleted { status, .. } => {
+                    if let TurnStatus::Error { subtype, .. } = status {
+                        if subtype == "child_exited" {
+                            saw_child_exit_turn = true;
+                        }
                     }
                 }
+                ProviderRuntimeEvent::SessionStateChanged { status, .. } => {
+                    if let SessionStatus::Error { message } = status {
+                        if message.contains("exited") {
+                            saw_error = true;
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     })
     .await;
     assert!(saw_error, "expected SessionStateChanged Error after crash");
+    assert!(
+        saw_child_exit_turn,
+        "expected a synthetic child_exited TurnCompleted before the Error"
+    );
     let _ = provider.stop_session(ThreadId("t-crash".into())).await;
 }
 

@@ -11,6 +11,7 @@ import {
   Image as ImageIcon,
   ListTodo,
   MessageCircleQuestion,
+  RotateCw,
   Server,
   Settings,
 } from "lucide-react";
@@ -120,6 +121,14 @@ interface Props {
    *  backend acks). Blocks submit to avoid a double-send, but — unlike
    *  `streaming` — does not block queueing a follow-up. Defaults false. */
   sending?: boolean;
+  /** True when the thread's last run died without cleanly settling
+   *  (issue #154). When set (and nothing is in flight) the composer
+   *  strip shows a one-click "Continue run" chip. Defaults false. */
+  interrupted?: boolean;
+  /** Click handler for the "Continue run" chip. Sends the fixed text
+   *  "Continue" through the normal send path. Required for the chip to
+   *  render. */
+  onContinueRun?: () => void;
   sessionReady: boolean;
   showProviderPicker: boolean;
   /** True on the pre-session draft surface (no live session yet). Only
@@ -243,6 +252,8 @@ export function Composer({
   ultrathinkInBodyText,
   streaming,
   sending = false,
+  interrupted = false,
+  onContinueRun,
   sessionReady,
   showProviderPicker,
   isDraft = false,
@@ -1970,11 +1981,26 @@ export function Composer({
           {(mode !== "default" ||
             stagedAttachments.some(
               (a) => a.kind === "image" || a.kind === "pr",
-            )) && (
+            ) ||
+            (interrupted && !streaming && !sending && !!onContinueRun)) && (
             <div
               data-testid="composer-attachment-strip"
               className="flex flex-wrap gap-1.5 px-3 pt-2"
             >
+              {/* Dead-run recovery (issue #154): a one-click chip that
+                  resumes the interrupted run. Amber-tinted, mirroring
+                  ModePill's shape. */}
+              {interrupted && !streaming && !sending && onContinueRun && (
+                <button
+                  type="button"
+                  data-testid="composer-continue-run-chip"
+                  onClick={onContinueRun}
+                  className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs text-warning hover:bg-warning/25"
+                >
+                  <RotateCw className="h-3 w-3" aria-hidden />
+                  <span>Continue run</span>
+                </button>
+              )}
               {mode !== "default" && (
                 <ModePill
                   mode={mode as ActivePillMode}

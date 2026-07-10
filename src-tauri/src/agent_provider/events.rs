@@ -367,6 +367,69 @@ pub enum ProviderRuntimeEvent {
         thread_id: ThreadId,
         queued_id: String,
     },
+    /// Emitted by the stall watchdog when a mid-turn thread has produced no
+    /// runtime events for longer than the stall threshold. Advisory only —
+    /// the session is NOT killed; the UI renders an amber notice.
+    ///
+    /// Transient by design: never persisted (a dead run has no durable
+    /// "stalled" fact — the durable record is the settled/interrupted turn)
+    /// and re-emitted on every sweep tick while the silence continues so the
+    /// surfaced duration stays fresh. The frontend clears it on the next
+    /// real activity for the thread.
+    RunStalled {
+        thread_id: ThreadId,
+        /// Seconds since the last observed runtime event for this thread.
+        silent_for_secs: u64,
+    },
+}
+
+/// Turn-error subtype stamped on the synthetic [`TurnStatus::Error`] a
+/// provider watchdog emits when its child process dies mid-turn. The
+/// frontend keys the "Run interrupted" / Continue affordance off this
+/// exact string, so it must stay in lockstep with
+/// `src/lib/agent-chat/reducer.ts`.
+pub const CHILD_EXITED_SUBTYPE: &str = "child_exited";
+
+/// Build the terminal runtime events a provider watchdog should emit when
+/// its child process (sidecar / app-server / shared server) dies
+/// unexpectedly mid-run.
+///
+/// Ordering is load-bearing: the synthetic [`TurnCompleted`] is emitted
+/// **before** the [`SessionStateChanged::Error`] so the activity and
+/// pane-status trackers see the in-flight turn *settle* while the thread
+/// state is still intact; the `Error` event then tears tracking down. The
+/// `TurnCompleted` is also persisted, so hydrate after a restart replays a
+/// settled — not dangling — turn.
+///
+/// When no turn is in flight (`active_turn` is `None`) only the `Error`
+/// event is produced: a child that dies while idle has no dangling turn to
+/// settle, so emitting a synthetic completion would strand the frontend on
+/// a spurious "interrupted" signal for a thread that was never mid-run.
+///
+/// [`TurnCompleted`]: ProviderRuntimeEvent::TurnCompleted
+/// [`SessionStateChanged::Error`]: ProviderRuntimeEvent::SessionStateChanged
+pub fn child_exit_events(
+    thread_id: ThreadId,
+    active_turn: Option<TurnId>,
+    message: String,
+) -> Vec<ProviderRuntimeEvent> {
+    let mut events = Vec::with_capacity(2);
+    if let Some(turn_id) = active_turn {
+        events.push(ProviderRuntimeEvent::TurnCompleted {
+            thread_id: thread_id.clone(),
+            turn_id,
+            status: TurnStatus::Error {
+                subtype: CHILD_EXITED_SUBTYPE.to_string(),
+                message: message.clone(),
+            },
+            usage: None,
+        });
+    }
+    events.push(ProviderRuntimeEvent::SessionStateChanged {
+        thread_id,
+        status: SessionStatus::Error { message },
+    });
+    events
 }
 
 #[cfg(test)]
@@ -527,6 +590,87 @@ mod tests {
             }
             other => panic!("expected ContentDelta, got {other:?}"),
         }
+    }
+
+    // ── RunStalled wire form ──
+
+    #[test]
+    fn run_stalled_serializes_snake_case_tagged() {
+        let event = ProviderRuntimeEvent::RunStalled {
+            thread_id: ThreadId("t1".into()),
+            silent_for_secs: 640,
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["type"], "run_stalled");
+        assert_eq!(v["thread_id"], "t1");
+        assert_eq!(v["silent_for_secs"], 640);
+        // Round-trips back to a RunStalled.
+        let back: ProviderRuntimeEvent = serde_json::from_value(v).unwrap();
+        match back {
+            ProviderRuntimeEvent::RunStalled {
+                thread_id,
+                silent_for_secs,
+            } => {
+                assert_eq!(thread_id.0, "t1");
+                assert_eq!(silent_for_secs, 640);
+            }
+            other => panic!("expected RunStalled, got {other:?}"),
+        }
+    }
+
+    // ── child_exit_events ordering ──
+
+    #[test]
+    fn child_exit_events_settles_turn_then_errors() {
+        let events = child_exit_events(
+            ThreadId("t1".into()),
+            Some(TurnId("turn-9".into())),
+            "sidecar exited".into(),
+        );
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ProviderRuntimeEvent::TurnCompleted {
+                thread_id,
+                turn_id,
+                status,
+                usage,
+            } => {
+                assert_eq!(thread_id.0, "t1");
+                assert_eq!(turn_id.0, "turn-9");
+                assert!(usage.is_none());
+                match status {
+                    TurnStatus::Error { subtype, message } => {
+                        assert_eq!(subtype, CHILD_EXITED_SUBTYPE);
+                        assert_eq!(message, "sidecar exited");
+                    }
+                    other => panic!("expected Error status, got {other:?}"),
+                }
+            }
+            other => panic!("expected TurnCompleted first, got {other:?}"),
+        }
+        assert!(matches!(
+            &events[1],
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Error { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn child_exit_events_without_active_turn_only_errors() {
+        // A child that dies while idle has no dangling turn to settle, so
+        // only the Error event is produced — no spurious TurnCompleted that
+        // would strand the frontend on a false "interrupted" signal.
+        let events = child_exit_events(ThreadId("t1".into()), None, "dead".into());
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Error { .. },
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -21,6 +21,7 @@
 //! 5. [`shutdown`](OpenCodeSession::shutdown) — abort the SSE task,
 //!    `DELETE /session/{id}`, emit `Closed` state.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{broadcast, Mutex};
@@ -69,6 +70,11 @@ pub struct OpenCodeSession {
     router: Arc<Mutex<SseRouter>>,
     sse_handle: Mutex<Option<JoinHandle<()>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    /// Set by the SSE listener when it gives up on an unreachable server.
+    /// [`is_dead`](OpenCodeSession::is_dead) reports it so the provider's
+    /// `has_session` treats the corpse as absent and the next send rebuilds
+    /// a fresh session via `ensure_live_session`.
+    dead: Arc<AtomicBool>,
 }
 
 impl OpenCodeSession {
@@ -133,13 +139,20 @@ impl OpenCodeSession {
             thread_id: thread_id.clone(),
             turn_id: initial_turn,
             provider_session_id: provider_session_id.clone(),
+            turn_active: false,
         }));
 
+        // Shared liveness flag: the SSE listener flips it when it exhausts
+        // its reconnect budget (server gone), which makes `has_session`
+        // report the session dead so the next send auto-resumes through
+        // `ensure_live_session` rather than POSTing to a corpse.
+        let dead = Arc::new(AtomicBool::new(false));
         let router = Arc::new(Mutex::new(SseRouter::new(session_resp.id.clone())));
         let peer = SsePeer {
             session_id: session_resp.id.clone(),
             event_ctx: event_ctx.clone(),
             router: router.clone(),
+            dead: dead.clone(),
         };
         let sse_handle = spawn_sse_listener(
             server_handle.base_url.clone(),
@@ -168,7 +181,15 @@ impl OpenCodeSession {
             router,
             sse_handle: Mutex::new(Some(sse_handle)),
             event_tx,
+            dead,
         }))
+    }
+
+    /// Whether the SSE listener has declared this session's server
+    /// unreachable (reconnect budget exhausted). A dead session is
+    /// treated as absent by the provider so the next send auto-resumes.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
     }
 
     /// Send a user turn. Mints a new Codemux turn id, threads it into
@@ -184,6 +205,10 @@ impl OpenCodeSession {
         {
             let mut ctx = self.event_ctx.lock().await;
             ctx.turn_id = turn_id.clone();
+            // Arm the give-up path: a turn is now in flight, so if the SSE
+            // listener exhausts its reconnect budget before this turn
+            // settles it must synthesize a `child_exited` `TurnCompleted`.
+            ctx.turn_active = true;
         }
 
         let model = match model_override {
@@ -372,6 +397,7 @@ mod tests {
             thread_id: ThreadId("t1".into()),
             turn_id: initial_turn,
             provider_session_id: provider_session_id.clone(),
+            turn_active: false,
         }));
         let session = Arc::new(OpenCodeSession {
             thread_id: ThreadId("t1".into()),
@@ -384,6 +410,7 @@ mod tests {
             router: Arc::new(Mutex::new(SseRouter::new(provider_session_id.0.clone()))),
             sse_handle: Mutex::new(None),
             event_tx: tx.clone(),
+            dead: Arc::new(AtomicBool::new(false)),
         });
         (session, tx, rx)
     }

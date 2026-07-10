@@ -35,8 +35,8 @@ use codemux_lib::agent_provider::{
 };
 use codemux_lib::commands::agent_chat::{
     feature_flag_on, forward_event, thread_id_for_event, AgentChatChannelRegistry,
-    AgentChatEventPayload, ProviderRegistry, SubagentTracker, AGENT_CHAT_EVENT,
-    FEATURE_DISABLED_ERROR,
+    AgentChatEventPayload, ProviderRegistry, RunActivityTracker, SubagentTracker,
+    AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
 };
 use codemux_lib::database::DatabaseStore;
 use codemux_lib::observability::{FeatureFlags, ObservabilityStore};
@@ -338,6 +338,7 @@ fn mock_app_with_chat_state() -> tauri::App<tauri::test::MockRuntime> {
     app.manage(DatabaseStore::new_in_memory());
     app.manage(AgentChatChannelRegistry::default());
     app.manage(SubagentTracker::default());
+    app.manage(RunActivityTracker::default());
     app.manage(AppStateStore::default());
     app
 }

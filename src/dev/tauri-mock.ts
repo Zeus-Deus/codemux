@@ -862,6 +862,49 @@ function streamMockSubagents(
   return turnId;
 }
 
+/** Dead-run detection QA (issue #154): fire a `run_stalled` on a thread,
+ *  first flipping it to `streaming` so the amber "no activity" tail notice
+ *  renders (the notice only shows mid-turn). */
+function streamMockRunStalled(
+  threadId: string = MOCK_CHAT_THREAD_ID,
+  silentForSecs = 700,
+): void {
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "running", active_turn: `stall-turn-${Date.now()}` },
+  });
+  emitChatEvent(threadId, {
+    type: "run_stalled",
+    thread_id: threadId,
+    silent_for_secs: silentForSecs,
+  });
+}
+
+/** Dead-run detection QA (issue #154): settle a live turn with a synthetic
+ *  `child_exited` error — exactly what the provider watchdogs emit when a
+ *  sidecar/server dies mid-turn. Drives the "Run interrupted" divider and
+ *  the composer's Continue chip. */
+function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
+  const turnId = `interrupted-turn-${Date.now()}`;
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "running", active_turn: turnId },
+  });
+  emitChatEvent(threadId, {
+    type: "turn_completed",
+    thread_id: threadId,
+    turn_id: turnId,
+    status: {
+      kind: "error",
+      subtype: "child_exited",
+      message: "claude-agent sidecar exited unexpectedly",
+    },
+    usage: null,
+  });
+}
+
 // Expose the stream triggers for browser-console / automation use.
 (
   window as unknown as {
@@ -869,12 +912,16 @@ function streamMockSubagents(
       threadId: string;
       streamReply: typeof streamMockChatReply;
       streamSubagents: typeof streamMockSubagents;
+      streamRunStalled: typeof streamMockRunStalled;
+      interruptRun: typeof interruptMockRun;
     };
   }
 ).__codemuxChatMock = {
   threadId: MOCK_CHAT_THREAD_ID,
   streamReply: streamMockChatReply,
   streamSubagents: streamMockSubagents,
+  streamRunStalled: streamMockRunStalled,
+  interruptRun: interruptMockRun,
 };
 
 // A small, mutable preset store so the preset bar + structured editor are

@@ -122,6 +122,13 @@ pub struct EventContext {
     /// OpenCode's session id for the active session — used to
     /// surface as the `ProviderSessionId` on `SessionConfigured`.
     pub provider_session_id: ProviderSessionId,
+    /// Whether a user turn is currently in flight for this session.
+    /// Set true when `send_turn` posts a prompt, cleared when the
+    /// parent turn settles (idle → `TurnCompleted`, or a terminal
+    /// session state). The SSE give-up path reads it to decide whether
+    /// the dead server left a dangling turn that must be settled with a
+    /// synthetic `child_exited` `TurnCompleted`.
+    pub turn_active: bool,
 }
 
 /// Translate one OpenCode SSE event to zero or more Codemux runtime
@@ -693,6 +700,7 @@ mod tests {
             thread_id: ThreadId("thread_1".into()),
             turn_id: TurnId("turn_1".into()),
             provider_session_id: ProviderSessionId("sess_1".into()),
+            turn_active: true,
         }
     }
 

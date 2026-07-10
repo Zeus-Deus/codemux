@@ -36,7 +36,13 @@ afterEach(() => cleanup());
 // mock context is needed.
 function renderList(
   messages: ChatViewItem[],
-  extra?: { showThinking?: boolean; streaming?: boolean; sessionStartedAt?: number },
+  extra?: {
+    showThinking?: boolean;
+    streaming?: boolean;
+    sessionStartedAt?: number;
+    stalled?: { silentForSecs: number } | null;
+    interrupted?: boolean;
+  },
 ) {
   return render(
     <MessageList messages={messages} {...extra} {...noopHandlers} />,
@@ -609,5 +615,82 @@ describe("MessageList background browser chip", () => {
     );
     expect(screen.queryByText("Browser opened in background")).toBeNull();
     expect(screen.queryByText("Live")).toBeNull();
+  });
+});
+
+describe("MessageList dead-run detection (issue #154)", () => {
+  const userTurn: ChatViewItem = {
+    kind: "user_message",
+    id: "um-1",
+    seq: 0,
+    text: "do the thing",
+  };
+
+  describe("stall notice", () => {
+    it("renders the amber notice with floored minutes while stalled mid-turn", () => {
+      renderList([userTurn], {
+        streaming: true,
+        stalled: { silentForSecs: 700 },
+      });
+      const notice = screen.getByTestId("run-stalled-notice");
+      // 700s / 60 = 11.67 → floors to 11.
+      expect(notice).toHaveTextContent(
+        "No activity for 11m — the agent may have stopped.",
+      );
+    });
+
+    it("clamps sub-minute silences up to 1m (never '0m')", () => {
+      renderList([userTurn], {
+        streaming: true,
+        stalled: { silentForSecs: 30 },
+      });
+      expect(screen.getByTestId("run-stalled-notice")).toHaveTextContent(
+        "No activity for 1m",
+      );
+    });
+
+    it("does not render when the thread is not streaming", () => {
+      // A stale `stalled` value on a settled thread (e.g. the terminal
+      // event raced the sweep) must not show a mid-turn notice.
+      renderList([userTurn], {
+        streaming: false,
+        stalled: { silentForSecs: 700 },
+      });
+      expect(screen.queryByTestId("run-stalled-notice")).toBeNull();
+    });
+
+    it("suppresses the StreamingMarker while the notice shows (mutual exclusion)", () => {
+      renderList([userTurn], {
+        showThinking: true,
+        streaming: true,
+        stalled: { silentForSecs: 700 },
+      });
+      expect(screen.getByTestId("run-stalled-notice")).toBeInTheDocument();
+      // The shimmer marker would otherwise render for showThinking=true
+      // (see the "streaming marker" cases above) — the amber notice
+      // replaces it rather than stacking under it.
+      expect(
+        screen.queryByRole("status", { name: "Agent is working" }),
+      ).toBeNull();
+      expect(screen.queryByText("Working…")).toBeNull();
+    });
+  });
+
+  describe("run-interrupted divider", () => {
+    it("renders the divider with its label when interrupted and not streaming", () => {
+      renderList([userTurn], { interrupted: true, streaming: false });
+      const divider = screen.getByTestId("run-interrupted-divider");
+      expect(divider).toHaveTextContent("Run interrupted");
+    });
+
+    it("does not render while streaming (a live turn owns the tail)", () => {
+      renderList([userTurn], { interrupted: true, streaming: true });
+      expect(screen.queryByTestId("run-interrupted-divider")).toBeNull();
+    });
+
+    it("does not render when the thread is not interrupted", () => {
+      renderList([userTurn], { interrupted: false, streaming: false });
+      expect(screen.queryByTestId("run-interrupted-divider")).toBeNull();
+    });
   });
 });

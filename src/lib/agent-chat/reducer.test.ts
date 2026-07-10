@@ -1797,3 +1797,143 @@ describe("agent-chat reducer — workflows", () => {
     expect(wf.status).toBe("completed");
   });
 });
+
+describe("dead-run detection (issue #154)", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  const running: ProviderRuntimeEvent = {
+    type: "session_state_changed",
+    thread_id: "t1",
+    status: { status: "running", active_turn: "turn-1" },
+  };
+  const stalled: ProviderRuntimeEvent = {
+    type: "run_stalled",
+    thread_id: "t1",
+    silent_for_secs: 640,
+  };
+
+  it("run_stalled sets the stalled marker", () => {
+    const state = runEvents([running, stalled]);
+    expect(state.stalled).toEqual({ silentForSecs: 640 });
+  });
+
+  it("the next real activity clears the stalled marker", () => {
+    const afterStall = runEvents([running, stalled]);
+    expect(afterStall.stalled).not.toBeNull();
+    const afterDelta = applyEvent(afterStall, {
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "text", text: "back alive" },
+    });
+    expect(afterDelta.stalled).toBeNull();
+  });
+
+  it("a re-emitted run_stalled does not thrash state when unchanged", () => {
+    const once = runEvents([running, stalled]);
+    const twice = applyEvent(once, stalled);
+    expect(twice).toBe(once);
+  });
+
+  it("turn_completed with child_exited marks the thread interrupted", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "sidecar exited unexpectedly",
+        },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(true);
+    expect(state.streaming).toBe(false);
+  });
+
+  it("a user-initiated stop (interrupted subtype) does NOT set interrupted", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "interrupted",
+          message: "session interrupted",
+        },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(false);
+  });
+
+  it("session_state_changed error while streaming sets interrupted (belt-and-braces)", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "session_state_changed",
+        thread_id: "t1",
+        status: { status: "error", message: "server unreachable" },
+      },
+    ]);
+    expect(state.interrupted).toBe(true);
+  });
+
+  it("a clean ready/closed stop does not set interrupted", () => {
+    const ready = runEvents([
+      running,
+      {
+        type: "session_state_changed",
+        thread_id: "t1",
+        status: { status: "ready" },
+      },
+    ]);
+    expect(ready.interrupted).toBe(false);
+  });
+
+  it("a fresh running turn clears the interrupted flag", () => {
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "dead",
+        },
+        usage: null,
+      },
+    ]);
+    expect(interrupted.interrupted).toBe(true);
+    const resumed = applyEvent(interrupted, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "running", active_turn: "turn-2" },
+    });
+    expect(resumed.interrupted).toBe(false);
+  });
+
+  it("appending a user message clears the interrupted flag", () => {
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+    ]);
+    const resumed = appendUserMessage(interrupted, "Continue");
+    expect(resumed.interrupted).toBe(false);
+  });
+});

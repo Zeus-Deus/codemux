@@ -243,7 +243,15 @@ impl AgentProvider for OpenCodeAgentProvider {
     }
 
     async fn has_session(&self, thread_id: &ThreadId) -> bool {
-        self.sessions.read().await.contains_key(thread_id)
+        // A session whose SSE listener gave up on an unreachable server is
+        // treated as absent, so `ensure_live_session` rebuilds a fresh one
+        // (with the resume cursor) on the next send instead of routing to a
+        // dead server.
+        self.sessions
+            .read()
+            .await
+            .get(thread_id)
+            .is_some_and(|session| !session.is_dead())
     }
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {

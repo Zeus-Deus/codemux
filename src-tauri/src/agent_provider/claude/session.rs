@@ -1170,17 +1170,28 @@ fn spawn_child_exit_watchdog(
                         let intentional = *session.intentionally_closed.read().await;
                         if !intentional {
                             let msg = "claude-agent sidecar exited unexpectedly".to_string();
-                            {
+                            // Recover the in-flight turn id (populated during
+                            // both Running and WaitingApproval) BEFORE clearing
+                            // it, so the watchdog can settle it with a synthetic
+                            // terminal `TurnCompleted`.
+                            let active_turn = {
                                 let mut state = session.state.lock().await;
+                                let active_turn = state.active_turn.take();
                                 state.status = SessionStatus::Error {
                                     message: msg.clone(),
                                 };
-                                state.active_turn = None;
+                                active_turn
+                            };
+                            // TurnCompleted(child_exited) first, then the Error
+                            // state — see `child_exit_events` for why the order
+                            // matters.
+                            for event in crate::agent_provider::child_exit_events(
+                                session.thread_id.clone(),
+                                active_turn,
+                                msg,
+                            ) {
+                                let _ = event_tx.send(event);
                             }
-                            let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-                                thread_id: session.thread_id.clone(),
-                                status: SessionStatus::Error { message: msg },
-                            });
                             session.cancel_all_queued().await;
                         }
                         break;

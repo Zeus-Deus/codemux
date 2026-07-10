@@ -132,6 +132,10 @@ pub struct SsePeer {
     pub session_id: String,
     pub event_ctx: Arc<Mutex<EventContext>>,
     pub router: Arc<Mutex<SseRouter>>,
+    /// Shared with [`super::session::OpenCodeSession`]: set true when this
+    /// listener exhausts its reconnect budget so the provider treats the
+    /// session as dead and the next send auto-resumes.
+    pub dead: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Spawn the SSE listener task. Returns the join handle so the
@@ -330,8 +334,29 @@ async fn handle_record(
     };
 
     let ctx = peer.event_ctx.lock().await.clone();
+    let mut turn_settled = false;
     for runtime in opencode_event_to_runtime(event, &ctx, subagent_id.as_deref()) {
+        // A parent-scoped turn completion or terminal session state means
+        // the in-flight turn is over — disarm the give-up path so a later
+        // server death while idle does NOT synthesize a spurious
+        // `child_exited` turn. Subagents never produce these, so any such
+        // event here is the root session's.
+        if matches!(
+            runtime,
+            ProviderRuntimeEvent::TurnCompleted { .. }
+                | ProviderRuntimeEvent::SessionStateChanged {
+                    status: crate::agent_provider::SessionStatus::Ready
+                        | crate::agent_provider::SessionStatus::Closed
+                        | crate::agent_provider::SessionStatus::Error { .. },
+                    ..
+                }
+        ) {
+            turn_settled = true;
+        }
         let _ = event_tx.send(runtime);
+    }
+    if turn_settled {
+        peer.event_ctx.lock().await.turn_active = false;
     }
 }
 
@@ -417,11 +442,45 @@ async fn backoff_or_quit(
             peer,
             format!("opencode_sse_giving_up_after_{MAX_RECONNECT_ATTEMPTS}_attempts"),
         ));
+        emit_give_up_terminal(peer, event_tx).await;
         return false;
     }
     let backoff_secs = std::cmp::min(8u64, 1u64 << (*attempt - 1));
     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
     true
+}
+
+/// Settle a session whose server became unreachable (reconnect budget
+/// exhausted). Unlike a plain `RuntimeWarning`, this drives the session
+/// through the standard terminal pipeline so the sidebar clears, the
+/// background browser releases, and — if a turn was in flight — the
+/// frontend surfaces an interrupted turn with a Continue affordance.
+///
+/// Marks the session dead so the provider's `has_session` reports it
+/// absent and the next send rebuilds a fresh session via
+/// `ensure_live_session` instead of POSTing to a corpse.
+async fn emit_give_up_terminal(
+    peer: &SsePeer,
+    event_tx: &broadcast::Sender<ProviderRuntimeEvent>,
+) {
+    use std::sync::atomic::Ordering;
+    peer.dead.store(true, Ordering::Relaxed);
+    let (thread_id, active_turn) = {
+        let ctx = peer.event_ctx.lock().await;
+        let active_turn = if ctx.turn_active {
+            Some(ctx.turn_id.clone())
+        } else {
+            None
+        };
+        (ctx.thread_id.clone(), active_turn)
+    };
+    for event in crate::agent_provider::child_exit_events(
+        thread_id,
+        active_turn,
+        "opencode server unreachable".to_string(),
+    ) {
+        let _ = event_tx.send(event);
+    }
 }
 
 fn warn(peer: &SsePeer, message: String) -> ProviderRuntimeEvent {
@@ -449,9 +508,58 @@ mod tests {
                 thread_id: ThreadId("t1".into()),
                 turn_id: TurnId("turn1".into()),
                 provider_session_id: ProviderSessionId(session_id.to_string()),
+                turn_active: false,
             })),
             router: Arc::new(Mutex::new(SseRouter::new(session_id))),
+            dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    #[tokio::test]
+    async fn give_up_with_active_turn_settles_then_errors_and_marks_dead() {
+        use std::sync::atomic::Ordering;
+        let p = peer("sess-1");
+        p.event_ctx.lock().await.turn_active = true;
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_give_up_terminal(&p, &tx).await;
+        // Dead flag set so the provider auto-resumes on the next send.
+        assert!(p.dead.load(Ordering::Relaxed));
+        // TurnCompleted(child_exited) first…
+        match rx.try_recv().unwrap() {
+            ProviderRuntimeEvent::TurnCompleted { status, .. } => match status {
+                crate::agent_provider::TurnStatus::Error { subtype, .. } => {
+                    assert_eq!(subtype, "child_exited");
+                }
+                other => panic!("expected Error status, got {other:?}"),
+            },
+            other => panic!("expected TurnCompleted first, got {other:?}"),
+        }
+        // …then the terminal Error.
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: crate::agent_provider::SessionStatus::Error { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn give_up_without_active_turn_only_errors() {
+        // Server died while idle — no dangling turn to settle, so no
+        // spurious `child_exited` TurnCompleted (which would falsely mark
+        // the frontend thread interrupted).
+        let p = peer("sess-2");
+        let (tx, mut rx) = broadcast::channel(8);
+        emit_give_up_terminal(&p, &tx).await;
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: crate::agent_provider::SessionStatus::Error { .. },
+                ..
+            }
+        ));
+        assert!(rx.try_recv().is_err(), "no second event expected");
     }
 
     #[test]
