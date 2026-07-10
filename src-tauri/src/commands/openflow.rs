@@ -1877,7 +1877,16 @@ pub fn stop_openflow_run(
     app_state.remove_terminal_sessions(&session_ids);
 
     if let Some(workspace_id) = openflow_workspace_id {
-        let _ = app_state.close_workspace(&workspace_id.0);
+        // Reap the run workspace's agent-browser daemons on teardown
+        // (issue #126) — OpenFlow workspaces are prime agent-browser
+        // users, and this direct state-level close bypasses the command
+        // paths in commands/workspace.rs that normally handle it.
+        if let Ok(close_result) = app_state.close_workspace(&workspace_id.0) {
+            crate::commands::workspace::reap_agent_browser_sessions(
+                &app,
+                close_result.removed_agent_browser_sessions,
+            );
+        }
     }
 
     let _ = store.remove_run(&run_id);
