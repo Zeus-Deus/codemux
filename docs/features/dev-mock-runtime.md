@@ -60,7 +60,10 @@ Command handling:
     `MOCK_CHAT_THREAD_ID`; `agent_chat_list_messages` hydrates a long
     generated transcript so the virtualized MessageList is exercisable,
     and `window.__codemuxChatMock.streamReply()` triggers a live
-    streamed reply on demand.
+    streamed reply on demand (`{ emptyGapTicks: N }` reproduces the
+    issue #155 stream shape — an empty first text delta then N silent
+    ticks before prose — for verifying the working indicator never
+    drops out mid-turn).
   - `chat-streaming` — its pane has no thread bound, walking the
     fresh-session flow: `agent_chat_start_session`, then the
     per-thread channel pair

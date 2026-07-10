@@ -70,6 +70,130 @@ describe("agent-chat reducer", () => {
     expect(state.streaming).toBe(true);
   });
 
+  describe("empty text deltas never materialize an assistant message", () => {
+    const textDelta = (text: string): ProviderRuntimeEvent => ({
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "text", text },
+    });
+    const assistants = (s: ChatThreadState): AssistantMessageItem[] =>
+      s.messages.filter(
+        (m): m is AssistantMessageItem => m.kind === "assistant_message",
+      );
+
+    it("an empty first delta creates no assistant item", () => {
+      const state = runEvents([textDelta("")]);
+      expect(assistants(state)).toHaveLength(0);
+      // Nothing appended → nextSeq untouched.
+      expect(state.nextSeq).toBe(0);
+      // The delta still marks the turn streaming (session-owned flag path).
+      expect(state.streaming).toBe(true);
+    });
+
+    it("a whitespace-only first delta creates no assistant item", () => {
+      const state = runEvents([textDelta("   \n\t")]);
+      expect(assistants(state)).toHaveLength(0);
+      expect(state.nextSeq).toBe(0);
+    });
+
+    it("an empty delta then a non-empty delta yields exactly one item with the right text", () => {
+      const state = runEvents([textDelta(""), textDelta("Hello")]);
+      const list = assistants(state);
+      expect(list).toHaveLength(1);
+      expect(list[0].text).toBe("Hello");
+      expect(list[0].streaming).toBe(true);
+    });
+
+    it("an empty delta merging into an existing streaming tail is a no-op (same reference, same text)", () => {
+      const first = runEvents([textDelta("Hi")]);
+      const before = first.messages[first.messages.length - 1];
+      const after = applyEvent(first, textDelta(""));
+      const list = assistants(after);
+      expect(list).toHaveLength(1);
+      expect(list[0].text).toBe("Hi");
+      // Reference-stable: the empty merge cloned nothing.
+      expect(after.messages[after.messages.length - 1]).toBe(before);
+    });
+
+    it("an empty delta between tool steps keeps the run contiguous (no phantom item to break it)", () => {
+      // Reproduces the settle-mid-run bug: a Read runs, then Claude opens a
+      // new text block with an empty delta, then another Read runs. The
+      // empty delta must NOT land an assistant_message between the two
+      // tools (which would flush the live Activity run as settled).
+      const state = runEvents([
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_use_id: "tu-1",
+            tool_name: "Read",
+            input: { file_path: "/a" },
+          },
+        },
+        textDelta(""),
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_use_id: "tu-2",
+            tool_name: "Read",
+            input: { file_path: "/b" },
+          },
+        },
+      ]);
+      expect(assistants(state)).toHaveLength(0);
+      expect(state.messages.map((m) => m.kind)).toEqual([
+        "tool_call",
+        "tool_call",
+      ]);
+    });
+
+    it("an assistant_text completion after only-empty deltas settles without a blank row", () => {
+      const state = runEvents([
+        {
+          type: "session_state_changed",
+          thread_id: "t1",
+          status: { status: "running", active_turn: "turn-1" },
+        },
+        textDelta(""),
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: { kind: "assistant_text", text: "" },
+        },
+        {
+          type: "turn_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          status: { kind: "success" },
+          usage: null,
+        },
+      ]);
+      // No orphaned/blank assistant row, no crash, turn settled.
+      expect(assistants(state)).toHaveLength(0);
+      expect(state.streaming).toBe(false);
+    });
+
+    it("hydrate/replay of the same deltas produces an identical item count", () => {
+      const events: ProviderRuntimeEvent[] = [
+        textDelta(""),
+        textDelta("real text"),
+        textDelta(""),
+      ];
+      const live = runEvents(events);
+      __resetReducerIdCounterForTests();
+      const replayed = runEvents(events);
+      expect(assistants(replayed).length).toBe(assistants(live).length);
+      expect(assistants(replayed)[0].text).toBe("real text");
+    });
+  });
+
   it("item_completed(assistant_text) after deltas seals with the full final text (no duplication, no truncation)", () => {
     // The Rust producer emits content_delta chunks during streaming,
     // then a single item_completed(assistant_text) carrying the FULL

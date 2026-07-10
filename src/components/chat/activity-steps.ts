@@ -157,6 +157,7 @@ export function deriveActivitySummary(steps: ActivityStep[]): string {
   let edits = 0;
   let commands = 0;
   let webCount = 0;
+  let other = 0;
   for (const s of steps) {
     if (isReasoning(s)) continue;
     switch (FAMILY_BY_TOOL[s.tool_name] ?? "other") {
@@ -172,6 +173,11 @@ export function deriveActivitySummary(steps: ActivityStep[]): string {
       case "web":
         webCount += 1;
         break;
+      default:
+        // `other`-family tools (Task/agent spawns, MCP tools, …) still
+        // count toward the fallback tally, so an all-`other` run reports
+        // its real step count instead of "Worked through 0 steps".
+        other += 1;
     }
   }
   const reading = reads + webCount;
@@ -183,7 +189,7 @@ export function deriveActivitySummary(steps: ActivityStep[]): string {
   if (onlyCommands) return "Ran commands";
   if (edits > 0 && reading > 0 && commands === 0) return "Explored and edited files";
   if (commands > 0) return "Ran commands and inspected the code";
-  const toolCount = reads + edits + commands + webCount;
+  const toolCount = reads + edits + commands + webCount + other;
   return `Worked through ${toolCount} step${toolCount === 1 ? "" : "s"}`;
 }
 
