@@ -347,6 +347,16 @@ pub struct WorkspaceSnapshot {
     pub title: String,
     pub workspace_type: WorkspaceType,
     pub cwd: String,
+    /// Whether this workspace's directory is inside a git repository
+    /// (`find_git_root` resolves). Non-git folders are first-class:
+    /// they run in plain-directory mode (no worktrees, no diffs, no
+    /// checkpoints) and the UI offers an explicit "Initialize Git"
+    /// action instead of hiding everything silently. Stamped by
+    /// `populate_git_info` alongside the other git fields. Additive;
+    /// old persisted snapshots deserialize as `true` (optimistic, like
+    /// the pre-field behavior) and are corrected on the first refresh.
+    #[serde(default = "default_true")]
+    pub is_git: bool,
     pub git_branch: Option<String>,
     #[serde(default)]
     pub git_ahead: u32,
@@ -708,6 +718,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title,
             workspace_type: WorkspaceType::OpenFlow,
             cwd,
@@ -840,6 +851,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title: format!("Workspace {workspace_index}"),
             workspace_type: WorkspaceType::Standard,
             cwd,
@@ -910,6 +922,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title,
             workspace_type: WorkspaceType::Standard,
             // `cwd` mirrors `worktree_path` for adopted workspaces —
@@ -981,6 +994,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title,
             workspace_type: WorkspaceType::Standard,
             cwd: project_root.clone(),
@@ -1075,6 +1089,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title,
             workspace_type: WorkspaceType::Standard,
             // `cwd` is a host path that does not exist on this device. It
@@ -1209,6 +1224,7 @@ impl AppStateStore {
         let default_tab_id = next_id("tab");
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title: format!("Workspace {workspace_index}"),
             workspace_type: WorkspaceType::Standard,
             cwd,
@@ -1525,9 +1541,11 @@ impl AppStateStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_workspace_git_info(
         &self,
         workspace_id: &str,
+        is_git: bool,
         branch: Option<String>,
         ahead: u32,
         behind: u32,
@@ -1541,6 +1559,7 @@ impl AppStateStore {
             .iter_mut()
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
         {
+            workspace.is_git = is_git;
             workspace.git_branch = branch;
             workspace.git_ahead = ahead;
             workspace.git_behind = behind;
@@ -3857,6 +3876,7 @@ fn default_app_state() -> AppStateSnapshot {
         active_workspace_id: workspace_id.clone(),
         workspaces: vec![WorkspaceSnapshot {
             workspace_id,
+            is_git: true,
             title: "Workspace 1".into(),
             workspace_type: WorkspaceType::Standard,
             cwd: cwd.clone(),

@@ -2376,6 +2376,7 @@ mod tests {
         use crate::state::*;
         WorkspaceSnapshot {
             workspace_id: WorkspaceId(id.to_string()),
+            is_git: true,
             title: "my-feature".to_string(),
             workspace_type: WorkspaceType::Standard,
             cwd: "/home/user/projects/repo".to_string(),

@@ -1587,6 +1587,7 @@ pub fn run() {
             commands::set_project_scripts,
             commands::check_is_git_repo,
             commands::init_git_repo,
+            commands::init_git_repo_no_commit,
             commands::create_empty_repo,
             commands::get_git_status,
             commands::get_git_diff,

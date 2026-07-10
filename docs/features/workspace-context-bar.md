@@ -93,6 +93,12 @@ new data plumbing.
 - Local vs. remote device label with host-name resolution.
 - Fully exercisable in the browser dev runtime — the mock seeds git/PR/issue
   data and implements `get_github_issue` so the popover renders content.
+- Non-git project folders: instead of rendering nothing, the bar shows
+  "Not a git repository" + an explicit "Initialize Git" button (bare
+  `git init` on click, then an immediate git-info refresh). Gated by
+  `showNoGitState` — local standard workspaces with `is_git === false`
+  only, so Home and host-backed workspaces stay hidden as before. See
+  `docs/features/workspace-creation.md` § "Non-Git Projects".
 
 ## Current Constraints
 
