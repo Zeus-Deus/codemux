@@ -210,6 +210,42 @@ async fn child_exit_fails_pending() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn response_written_just_before_exit_is_routed_not_dropped() {
+    // Exit-drain guarantee: the child answers the request and exits
+    // IMMEDIATELY — the response bytes may still be sitting in the kernel
+    // pipe buffer when the watchdog's `child.wait()` returns. The watchdog
+    // must wait for the reader to drain stdout to EOF before failing
+    // pending requests, so this request resolves with the real result, not
+    // "child process exited". (Regression guard for the CI-observed race
+    // where the watchdog won and the reader later logged the orphaned
+    // response as an unknown id.)
+    let child = JsonRpcChild::spawn(config()).await.expect("spawn");
+    let result = child
+        .request("echo_then_exit", json!({"final": true}))
+        .await
+        .expect("response written before exit must be routed");
+    assert_eq!(result, json!({"final": true}));
+
+    // The child is gone; the handle must observe the exit promptly (the
+    // drain must not hang once EOF has been reached).
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while child.is_alive() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("exit must be observed promptly after the drain");
+    let after = child.request("echo", json!(1)).await;
+    assert!(
+        matches!(
+            after,
+            Err(RpcChildError::ChildExited { .. }) | Err(RpcChildError::AlreadyShutdown)
+        ),
+        "post-exit request must fail fast, got: {after:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_is_graceful() {
     let child = JsonRpcChild::spawn(config()).await.expect("spawn");
     assert!(child.is_alive());

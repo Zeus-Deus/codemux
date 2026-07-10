@@ -20,6 +20,11 @@
 //!   - `exit`             → exit cleanly. If params.code is a number, use it
 //!                          as the exit code; if params.stderr is a string,
 //!                          write it to stderr first.
+//!   - `echo_then_exit`   → respond with result = params, then exit 0
+//!                          immediately. Exercises the "child writes its
+//!                          final response and dies" race — the response
+//!                          bytes may still be in the kernel pipe buffer
+//!                          when the watchdog observes the exit.
 //!   - `echo_err`         → respond with an RPC error with
 //!                          code/message/data from params.
 //!
@@ -201,6 +206,12 @@ fn main() {
                     }
                     write_line(&json!({"jsonrpc":"2.0","id":id,"error":err}));
                 }
+            }
+            "echo_then_exit" => {
+                if let Some(id) = id {
+                    write_line(&json!({"jsonrpc":"2.0","id":id,"result":msg.params}));
+                }
+                std::process::exit(0);
             }
             "exit" => {
                 let code = msg

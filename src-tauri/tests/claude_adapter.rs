@@ -1272,7 +1272,13 @@ async fn sidecar_exit_mid_session_emits_error_state() {
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-crash")).await.unwrap();
     let mut stream = provider.event_stream();
-    let _ = provider
+    // send-turn is answered, then the fixture exits. The Ok is guaranteed
+    // by JsonRpcChild's exit-drain: the fixture writes the response BEFORE
+    // exiting, so it must be routed (not failed as "child process exited")
+    // even when the watchdog observes the exit first — which is also what
+    // deterministically arms `active_turn` for the synthetic completion
+    // asserted below.
+    provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-crash".into()),
             text: "x".into(),
@@ -1282,7 +1288,8 @@ async fn sidecar_exit_mid_session_emits_error_state() {
             permission_mode_override: None,
             client_nonce: None,
         })
-        .await;
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
     // Issue #154: a mid-turn child death must settle the in-flight turn with
     // a synthetic `TurnCompleted { child_exited }` BEFORE the terminal
     // `SessionStateChanged::Error`, so the turn settles through the whole
@@ -1330,7 +1337,10 @@ async fn dead_sidecar_is_evicted_and_start_session_rebuilds() {
     let thread = ThreadId("t-evict".into());
     provider.start_session(start_input("t-evict")).await.unwrap();
     assert!(provider.has_session(&thread).await, "session live after start");
-    let _ = provider
+    // Deterministically Ok — the fixture answers send-turn before exiting
+    // and JsonRpcChild's exit-drain routes that response (see
+    // `sidecar_exit_mid_session_emits_error_state`).
+    provider
         .send_turn(SendTurnInput {
             thread_id: thread.clone(),
             text: "x".into(),
@@ -1340,7 +1350,8 @@ async fn dead_sidecar_is_evicted_and_start_session_rebuilds() {
             permission_mode_override: None,
             client_nonce: None,
         })
-        .await;
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
     // Wait for the watchdog (100ms poll) to observe the dead child.
     let went_absent = timeout(Duration::from_secs(4), async {
         loop {

@@ -635,8 +635,13 @@ async fn child_process_crash_emits_error_state() {
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
     start_session_resilient(&provider, start_input("t-crash")).await.unwrap();
     let mut stream = provider.event_stream();
-    // turn/start will succeed then the fixture exits.
-    let _ = provider
+    // turn/start succeeds, then the fixture exits. The Ok is guaranteed by
+    // JsonRpcChild's exit-drain: the fixture writes the response BEFORE
+    // exiting, so it must be routed (not failed as "child process exited")
+    // even when the watchdog observes the exit first — which is also what
+    // deterministically arms `active_turn` for the synthetic completion
+    // asserted below.
+    provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-crash".into()),
             text: "x".into(),
@@ -646,7 +651,8 @@ async fn child_process_crash_emits_error_state() {
             permission_mode_override: None,
             client_nonce: None,
         })
-        .await;
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
 
     // Issue #154: the mid-turn child death settles the in-flight turn with a
     // synthetic `TurnCompleted { child_exited }` ahead of the terminal Error.
@@ -696,7 +702,10 @@ async fn dead_child_is_evicted_and_start_session_rebuilds() {
         .await
         .unwrap();
     assert!(provider.has_session(&thread).await, "session live after start");
-    let _ = provider
+    // Deterministically Ok — the fixture answers turn/start before exiting
+    // and JsonRpcChild's exit-drain routes that response (see
+    // `child_process_crash_emits_error_state`).
+    provider
         .send_turn(SendTurnInput {
             thread_id: thread.clone(),
             text: "x".into(),
@@ -706,7 +715,8 @@ async fn dead_child_is_evicted_and_start_session_rebuilds() {
             permission_mode_override: None,
             client_nonce: None,
         })
-        .await;
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
     let went_absent = timeout(Duration::from_secs(3), async {
         loop {
             if !provider.has_session(&thread).await {
