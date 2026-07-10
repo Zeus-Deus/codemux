@@ -1,5 +1,11 @@
 import { ArrowDown } from "lucide-react";
-import { memo, useCallback, useMemo, type CSSProperties } from "react";
+import {
+  memo,
+  useCallback,
+  useMemo,
+  useRef,
+  type CSSProperties,
+} from "react";
 
 import {
   MessageScroller,
@@ -33,8 +39,10 @@ import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
+import { transcriptFadeEnabled } from "./transcript-fade";
 import {
   buildTranscriptSlots,
+  reuseTranscriptSlots,
   type ActivityStep,
   type TranscriptSlot,
 } from "./transcript-slots";
@@ -110,9 +118,13 @@ interface Props {
  * anchoring's corrections stay imperceptible.
  *
  * Layout is derived by the pure `buildTranscriptSlots` (turn grouping,
- * tool-run folding, avatar/turn-boundary metadata). Each slot is one
- * `MessageScrollerItem` with a stable `messageId`; the row leaves are
- * memoized so a single streaming token re-renders exactly one row.
+ * tool-run folding, avatar/turn-boundary metadata), then `reuseTranscriptSlots`
+ * swaps unchanged slots back to their previous object identity across rebuilds.
+ * Each slot renders one `MessageScrollerItem` (with a stable `messageId`)
+ * through a two-level memo: the whole-row wrapper `SlotRowMemo` skips on that
+ * reused-slot identity, and the leaf (`ItemRowMemo` / `ActivityRowMemo`) skips
+ * independently — so a single streaming token re-renders exactly one wrapper
+ * and one leaf while the rest of the transcript skips reconciliation.
  */
 export function MessageList({
   messages,
@@ -186,10 +198,23 @@ export function MessageList({
     return map;
   }, [ordered]);
 
-  const slots = useMemo(
-    () => buildTranscriptSlots(ordered, streaming),
-    [ordered, streaming],
-  );
+  // Slot-object reuse across rebuilds (issue #129). Every store update (each
+  // streaming token) rebuilds all slots, but `reuseTranscriptSlots` swaps
+  // unchanged slots back to their previous object identity — that identity is
+  // exactly what lets the memoized `SlotRowMemo` wrapper skip. The ref holds
+  // the last returned array to diff against; mutating it inside `useMemo` is
+  // the accepted cache pattern here (deterministic under StrictMode's
+  // double-render — the second pass diffs the first pass's result and returns
+  // it unchanged).
+  const prevSlotsRef = useRef<TranscriptSlot[]>([]);
+  const slots = useMemo(() => {
+    const next = reuseTranscriptSlots(
+      prevSlotsRef.current,
+      buildTranscriptSlots(ordered, streaming),
+    );
+    prevSlotsRef.current = next;
+    return next;
+  }, [ordered, streaming]);
 
   // A working Activity block already shows the single live line, so the
   // separate shimmer marker is suppressed when one is the transcript tail
@@ -206,7 +231,9 @@ export function MessageList({
             provider, sibling of the viewport). Reads the active turn from
             `visibleMessageIds`; hides itself on short threads. */}
         <MessageTrail slots={slots} />
-        <MessageScrollerViewport style={WS_FADE_STYLE}>
+        <MessageScrollerViewport
+          style={transcriptFadeEnabled() ? WS_FADE_STYLE : undefined}
+        >
           <MessageScrollerContent
             aria-busy={showThinking || undefined}
             className="mx-auto w-full max-w-[760px] gap-0 px-7 pb-[30px] pt-[26px]"
@@ -214,45 +241,27 @@ export function MessageList({
             <SessionStartMarker startedAt={sessionStartedAt} />
 
             {slots.map((slot) => (
-              <MessageScrollerItem
+              <SlotRowMemo
                 key={slot.key}
-                messageId={slot.messageId}
-                // Turn anchoring is deliberately OFF: with a fully
-                // hydrated transcript (hundreds of pre-existing rows)
-                // the engine's anchor handling scrolls the viewport to
-                // a stale early anchor when new items register mid-
-                // stream, which breaks the stick-to-bottom contract.
-                // The scroller engine's `following-bottom` mode owns
-                // tail tracking (see the file-top doc comment).
-                scrollAnchor={false}
-                className={cn(
-                  slot.turnStart ? "mt-5" : "mt-[13px]",
-                  intrinsicSizeClass(slot),
-                )}
-              >
-                {slot.body.kind === "activity" ? (
-                  <ActivityRowMemo
-                    items={slot.body.items}
-                    working={slot.body.working}
-                    showAvatar={slot.showAvatar}
-                    provider={provider}
-                  />
-                ) : (
-                  <ItemRowMemo
-                    item={slot.body.item}
-                    showAvatar={slot.showAvatar}
-                    provider={provider}
-                    approval={lookupApproval(slot.body.item, requestsById)}
-                    subagentName={subagentNameFor(slot.body.item, subagentNames)}
-                    onRespondToRequest={onRespondToRequest}
-                    onAcceptPlan={onAcceptPlan}
-                    onRejectPlan={onRejectPlan}
-                    onCancelQueued={onCancelQueued}
-                    onEnterSubagent={onEnterSubagent}
-                    workspaceId={workspaceId}
-                  />
-                )}
-              </MessageScrollerItem>
+                slot={slot}
+                provider={provider}
+                approval={
+                  slot.body.kind === "item"
+                    ? lookupApproval(slot.body.item, requestsById)
+                    : null
+                }
+                subagentName={
+                  slot.body.kind === "item"
+                    ? subagentNameFor(slot.body.item, subagentNames)
+                    : null
+                }
+                workspaceId={workspaceId}
+                onRespondToRequest={onRespondToRequest}
+                onAcceptPlan={onAcceptPlan}
+                onRejectPlan={onRejectPlan}
+                onCancelQueued={onCancelQueued}
+                onEnterSubagent={onEnterSubagent}
+              />
             ))}
 
             {showBrowserChip && backgroundBrowserSession && workspaceId && (
@@ -289,7 +298,15 @@ export function MessageList({
 /** Viewport edge fade (design `wsFade`): dissolve content at the top/bottom
  *  of the scroll surface. A mask, not an overlay, so it works over any
  *  background. The installed shadcn build ships no `scroll-fade` utility,
- *  so this is applied inline. */
+ *  so this is applied inline.
+ *
+ *  Gated off on Linux WebKitGTK (issue #129, see `transcript-fade.ts`): the
+ *  app forces that engine into non-composited (CPU) mode via the
+ *  `WEBKIT_DISABLE_COMPOSITING_MODE` / `WEBKIT_DISABLE_DMABUF_RENDERER` env
+ *  vars in `src-tauri/src/lib.rs`, where this mask forces a full-viewport CPU
+ *  re-rasterization on every scroll frame. The design intent is kept on every
+ *  composited platform (macOS / Windows / dev-mock Chromium — byte-identical),
+ *  and the `codemux:transcript-fade` localStorage override re-enables it. */
 const WS_FADE_STYLE: CSSProperties = {
   maskImage:
     "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 20px), transparent 100%)",
@@ -583,11 +600,90 @@ function ActivityRow({
   );
 }
 
-// Default shallow comparison is enough: the parent passes the reducer's
-// stable `item` / `approval` references, so an untouched row keeps its
-// props identity and skips the whole ItemRow → leaf-component chain. One
-// streaming token mutates exactly one item → exactly one row re-renders.
-// (Activity rows rebuild their `items` array each pass, like the old tool
-// groups did; stable slot keys keep the scroller row from remounting.)
+// Two-level memoization (issue #129). Level 1 is `SlotRowMemo`, the whole-row
+// wrapper below — it owns the `MessageScrollerItem` element and the
+// activity/item branch. `reuseTranscriptSlots` keeps an untouched slot's object
+// identity across store rebuilds, so with the reducer's stable `item` /
+// `approval` references and a per-session-stable `provider` the wrapper's props
+// stay shallow-equal and its default `memo` comparison skips the row entirely —
+// including the `MessageScrollerItem` re-render. Level 2 is these leaves
+// (`ItemRowMemo` / `ActivityRowMemo`), which independently skip when their own
+// props are unchanged. A single streaming token mutates exactly one slot → its
+// wrapper AND its leaf are the only things that re-render. (Activity rows
+// rebuild their `items` array each pass, like the old tool groups did; the
+// stable slot key keeps the scroller row from remounting.)
 const ItemRowMemo = memo(ItemRow);
 const ActivityRowMemo = memo(ActivityRow);
+
+/**
+ * Whole-row wrapper (level-1 memo — see the comment above the leaf memos). It
+ * owns the `MessageScrollerItem` element (key stays on the mapped element in
+ * the parent) and dispatches to the activity/item leaf. Splitting it out of
+ * the `slots.map()` body is what lets the reused-slot identity skip an
+ * untouched row's wrapper re-render, not just its leaf.
+ */
+function SlotRow({
+  slot,
+  provider,
+  approval,
+  subagentName,
+  workspaceId,
+  onRespondToRequest,
+  onAcceptPlan,
+  onRejectPlan,
+  onCancelQueued,
+  onEnterSubagent,
+}: {
+  slot: TranscriptSlot;
+  provider?: AgentChatProviderKind | null;
+  approval: PermissionRequestItem | null;
+  subagentName: string | null;
+  workspaceId?: string | null;
+  onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
+  onAcceptPlan: (requestId: string) => void | Promise<void>;
+  onRejectPlan: (requestId: string) => void | Promise<void>;
+  onCancelQueued?: (queuedId: string, text: string) => void;
+  onEnterSubagent?: (subagentId: string) => void;
+}) {
+  return (
+    <MessageScrollerItem
+      messageId={slot.messageId}
+      // Turn anchoring is deliberately OFF: with a fully hydrated transcript
+      // (hundreds of pre-existing rows) the engine's anchor handling scrolls
+      // the viewport to a stale early anchor when new items register mid-
+      // stream, which breaks the stick-to-bottom contract. The scroller
+      // engine's `following-bottom` mode owns tail tracking (see the file-top
+      // doc comment).
+      scrollAnchor={false}
+      className={cn(
+        slot.turnStart ? "mt-5" : "mt-[13px]",
+        intrinsicSizeClass(slot),
+      )}
+    >
+      {slot.body.kind === "activity" ? (
+        <ActivityRowMemo
+          items={slot.body.items}
+          working={slot.body.working}
+          showAvatar={slot.showAvatar}
+          provider={provider}
+        />
+      ) : (
+        <ItemRowMemo
+          item={slot.body.item}
+          showAvatar={slot.showAvatar}
+          provider={provider}
+          approval={approval}
+          subagentName={subagentName}
+          onRespondToRequest={onRespondToRequest}
+          onAcceptPlan={onAcceptPlan}
+          onRejectPlan={onRejectPlan}
+          onCancelQueued={onCancelQueued}
+          onEnterSubagent={onEnterSubagent}
+          workspaceId={workspaceId}
+        />
+      )}
+    </MessageScrollerItem>
+  );
+}
+
+const SlotRowMemo = memo(SlotRow);

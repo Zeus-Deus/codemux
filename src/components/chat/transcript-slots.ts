@@ -152,6 +152,77 @@ export function buildTranscriptSlots(
   return slots;
 }
 
+/**
+ * Per-token O(changed rows) reconciliation helper (issue #129). Every store
+ * update (each streaming token) rebuilds ALL slot objects, so — without this —
+ * every memoized whole-row wrapper re-runs even though only one leaf changed.
+ * This returns an array where each element of `next` is REPLACED by the
+ * equivalent `prev` slot object (matched by key), so unchanged rows keep their
+ * object identity and their memoized wrapper skips.
+ *
+ * Two slots are equivalent when their identity/metadata AND body match:
+ *  - item bodies: same `item` reference (the reducer hands out stable refs).
+ *  - activity bodies: same `working` flag and element-wise identical `items`.
+ *
+ * If every result element is reference-equal to the corresponding `prev`
+ * element and lengths match, `prev` itself is returned so the array identity
+ * is stable too (lets `MessageTrail`'s memos skip as a bonus). Matching is via
+ * a Map keyed by `slot.key` (O(n); no index-alignment assumption).
+ */
+export function reuseTranscriptSlots(
+  prev: TranscriptSlot[],
+  next: TranscriptSlot[],
+): TranscriptSlot[] {
+  const prevByKey = new Map<string, TranscriptSlot>();
+  for (const slot of prev) prevByKey.set(slot.key, slot);
+
+  let allReused = prev.length === next.length;
+  const result: TranscriptSlot[] = new Array(next.length);
+  for (let i = 0; i < next.length; i++) {
+    const nextSlot = next[i];
+    const prevSlot = prevByKey.get(nextSlot.key);
+    if (prevSlot && slotsEquivalent(prevSlot, nextSlot)) {
+      result[i] = prevSlot;
+      // Reused, but a reorder/removal can leave it at a different index.
+      if (prevSlot !== prev[i]) allReused = false;
+    } else {
+      result[i] = nextSlot;
+      allReused = false;
+    }
+  }
+  return allReused ? prev : result;
+}
+
+function slotsEquivalent(a: TranscriptSlot, b: TranscriptSlot): boolean {
+  if (
+    a.key !== b.key ||
+    a.messageId !== b.messageId ||
+    a.scrollAnchor !== b.scrollAnchor ||
+    a.side !== b.side ||
+    a.showAvatar !== b.showAvatar ||
+    a.turnStart !== b.turnStart
+  ) {
+    return false;
+  }
+  return bodiesEquivalent(a.body, b.body);
+}
+
+function bodiesEquivalent(a: SlotBody, b: SlotBody): boolean {
+  if (a.kind === "item" && b.kind === "item") {
+    return a.item === b.item;
+  }
+  if (a.kind === "activity" && b.kind === "activity") {
+    if (a.working !== b.working || a.items.length !== b.items.length) {
+      return false;
+    }
+    for (let i = 0; i < a.items.length; i++) {
+      if (a.items[i] !== b.items[i]) return false;
+    }
+    return true;
+  }
+  return false;
+}
+
 function slotIdentity(body: SlotBody): {
   key: string;
   messageId: string;
