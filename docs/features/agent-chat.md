@@ -739,6 +739,28 @@ three providers now converge on one shape:
   means the id is stale, so it falls back to a fresh `POST /session` (the
   visible transcript still hydrates from the DB either way). Best-effort:
   `supports_session_resume` is now `true` for OpenCode.
+- **OpenCode shared-server respawn.** The rebuild only works if the shared
+  `opencode serve` child is actually reachable — and the SSE give-up that
+  triggers this whole path usually means that child *died* (laptop sleep,
+  crash), while `OpenCodeServerManager` cached its handle forever (nothing
+  in production calls `stop()`). `ensure_running`
+  (`opencode/manager.rs`) therefore probes the cached server with a
+  short-timeout authenticated `GET /` on every call: any HTTP response
+  (401/404 included) proves it alive. Failure kinds are deliberately
+  distinguished (two-strike policy): a connect error (dead loopback port
+  refuses instantly, deterministically) is an immediate dead verdict,
+  while a probe timeout (or other transport error) only condemns after
+  one retry also fails — a server that is merely wedged for a moment
+  must not be SIGKILLed, since that invalidates every live session's
+  handle at once. A confirmed corpse is dropped (`kill_on_drop` reaps
+  it) and respawned under the same lock, so racing callers serialize
+  onto the fresh server. The respawn mints a new port +
+  password — fine, because the only sessions holding the old handle are
+  the dead ones this scenario invalidated, and the disk-persisted session
+  readopt above recovers the conversation on the new server. An HTTP
+  probe (not `Child::try_wait`) on purpose: `try_wait` needs
+  `&mut Child` behind the shared `Arc`, and can't detect a
+  hung-but-alive server anyway.
 
 The event list is built by the shared pure helper
 `child_exit_events(thread_id, active_turn, message)` in

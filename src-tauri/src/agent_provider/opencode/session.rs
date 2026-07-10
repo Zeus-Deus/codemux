@@ -722,6 +722,89 @@ mod tests {
         );
     }
 
+    /// End-to-end dead-run recovery (issue #154): the shared server dies,
+    /// the manager's liveness probe respawns it, and `OpenCodeSession::start`
+    /// readopts the persisted server-side session id on the NEW server —
+    /// recovering the conversation context without an app restart. Drives
+    /// the real `ensure_running` spawn path via the fake `opencode` binary
+    /// from the manager test fixtures (banners `$FAKE_OPENCODE_URL`), with
+    /// mock HTTP servers standing in for the child's API surface.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial(opencode_path)]
+    async fn dead_server_respawn_then_start_readopts_persisted_session() {
+        use super::super::manager::{write_fake_opencode_binary, DisposableHttpServer};
+
+        // Backend A is a disposable responder (NOT mockito — its pooled
+        // servers keep the port listening after drop, so they can't
+        // simulate a dead server); backend B is mockito so the readopt
+        // probe can be asserted on.
+        let backend_a = DisposableHttpServer::start().await;
+        let backend_a_url = backend_a.url.clone();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_fake_opencode_binary(tmp.path());
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        // SAFETY: serial_test serialises this against every other
+        // opencode test that touches PATH / FAKE_OPENCODE_URL.
+        unsafe {
+            std::env::set_var("PATH", tmp.path());
+            std::env::set_var("FAKE_OPENCODE_URL", &backend_a_url);
+        }
+
+        let manager = Arc::new(OpenCodeServerManager::new());
+        let first = manager.ensure_running().await;
+
+        // Bind the replacement backend BEFORE killing A so the OS can't
+        // reuse A's freed ephemeral port for B — that would make the
+        // probe of the dead A URL hit live B and skip the respawn this
+        // test exists to exercise. The replacement knows the persisted
+        // session id: OpenCode keeps sessions on disk, so a respawned
+        // server can address them. Then the server "dies" (laptop sleep
+        // / crash) and its port starts refusing connections.
+        let mut backend_b = Server::new_async().await;
+        let readopt = backend_b
+            .mock("GET", "/session/ses_keep/message?limit=1")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        backend_a.kill().await;
+        unsafe {
+            std::env::set_var("FAKE_OPENCODE_URL", backend_b.url());
+        }
+
+        // A session rebuild with the persisted resume id: ensure_running
+        // must detect the dead cache, respawn onto backend B, and the
+        // readopt probe must succeed there — no `POST /session` fired.
+        let (tx, _rx) = broadcast::channel(64);
+        let started = OpenCodeSession::start(
+            manager.clone(),
+            ThreadId("t-respawn".into()),
+            None,
+            None,
+            Some("ses_keep".into()),
+            tx,
+        )
+        .await;
+
+        // Restore the environment BEFORE asserting so a failure can't
+        // leak the mutated PATH into later serial tests.
+        unsafe {
+            std::env::set_var("PATH", original_path);
+            std::env::remove_var("FAKE_OPENCODE_URL");
+        }
+        manager.stop().await;
+
+        first.expect("initial ensure_running must succeed");
+        let session = started.expect("rebuild after server death must succeed");
+        assert_eq!(
+            session.provider_session_id.0, "ses_keep",
+            "rebuilt session must readopt the persisted session id"
+        );
+        readopt.assert_async().await;
+        session.shutdown().await;
+    }
+
     #[tokio::test]
     async fn session_is_addressable_true_on_success_false_on_404() {
         let mut server = Server::new_async().await;
