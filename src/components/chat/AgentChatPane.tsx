@@ -13,6 +13,7 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildImageDisplaySources,
   buildImagePayloads,
   buildIssueResolvedContent,
   buildPrResolvedContent,
@@ -1112,6 +1113,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // translate to provider-specific shapes (Claude `image/base64`,
       // Codex `image_url` data URI).
       const imagePayloads = buildImagePayloads(liveAttachments);
+      // The same images as `data:` URLs, attached to the
+      // optimistic bubble so the sent turn shows its thumbnails (the
+      // bytes only live in memory until the backend persists them).
+      const imageDisplaySources = buildImageDisplaySources(liveAttachments);
       const sdkText = applyAllPrefixes(
         rawText,
         mode,
@@ -1127,7 +1132,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         typeof crypto !== "undefined" && "randomUUID" in crypto
           ? crypto.randomUUID()
           : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      appendUserMessage(threadId, plan.text, clientNonce);
+      appendUserMessage(threadId, plan.text, clientNonce, imageDisplaySources);
       // Clear chips per-turn (matches the inputDraft = "" reset that
       // appendUserMessage already does for the textarea).
       clearStagedAttachments(threadId);
@@ -2421,6 +2426,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           activeAttachments(rawText, liveAttachments),
         );
         const imagePayloads = buildImagePayloads(liveAttachments);
+        // Display shape (`data:` URLs) for the optimistic
+        // bubble's thumbnails in the freshly-prestarted thread.
+        const imageDisplaySources = buildImageDisplaySources(liveAttachments);
         const sdkText = applyAllPrefixes(
           rawText,
           mode,
@@ -2432,7 +2440,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // mounts on activation renders the user bubble immediately.
         useAgentChatStore
           .getState()
-          .appendUserMessage(prestarted.threadId, plan.text);
+          .appendUserMessage(
+            prestarted.threadId,
+            plan.text,
+            undefined,
+            imageDisplaySources,
+          );
         await agentChatSendTurn(provider, {
           thread_id: prestarted.threadId,
           text: sdkText,

@@ -361,6 +361,38 @@ describe("agent-chat reducer", () => {
     expect(state.messages[0].kind).toBe("user_message");
   });
 
+  it("appendUserMessage attaches images when provided", () => {
+    const state = appendUserMessage(
+      createEmptyThreadState(),
+      "look at this",
+      undefined,
+      undefined,
+      [{ src: "data:image/png;base64,AAAA", mediaType: "image/png" }],
+    );
+    const item = state.messages[0];
+    expect(item.kind).toBe("user_message");
+    if (item.kind === "user_message") {
+      expect(item.images).toEqual([
+        { src: "data:image/png;base64,AAAA", mediaType: "image/png" },
+      ]);
+    }
+  });
+
+  it("appendUserMessage omits `images` entirely for a text-only turn", () => {
+    // Empty / undefined image lists must not stamp an `images` key, so
+    // a text-only bubble stays byte-identical to the pre-images shape.
+    const withUndefined = appendUserMessage(createEmptyThreadState(), "hi");
+    const withEmpty = appendUserMessage(
+      createEmptyThreadState(),
+      "hi",
+      undefined,
+      undefined,
+      [],
+    );
+    expect("images" in withUndefined.messages[0]).toBe(false);
+    expect("images" in withEmpty.messages[0]).toBe(false);
+  });
+
   it("resume_cursor_updated is a transcript-level no-op (cursor stored in store, not ChatThreadState)", () => {
     const base = createEmptyThreadState();
     const after = applyEvent(base, {

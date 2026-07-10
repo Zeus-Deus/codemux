@@ -312,3 +312,50 @@ export function buildImagePayloads(
       media_type: a.resolvedImage.mime,
     }));
 }
+
+/**
+ * Base64-encode raw bytes for use in a `data:` URL.
+ *
+ * `btoa` needs a binary string, and the obvious
+ * `String.fromCharCode(...bytes)` spread passes every byte as its own
+ * argument — which overflows the call stack for anything but a tiny
+ * image (JS engines cap argument counts in the tens of thousands). We
+ * encode in fixed 32 KB windows so the per-call argument count stays
+ * bounded regardless of image size.
+ */
+function bytesToBase64(bytes: Uint8Array): string {
+  const CHUNK = 0x8000; // 32 KB — comfortably under engine arg limits.
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    const window = bytes.subarray(i, i + CHUNK);
+    binary += String.fromCharCode(...window);
+  }
+  return btoa(binary);
+}
+
+/**
+ * Sibling to `buildImagePayloads`: instead of the wire shape for the
+ * SDK, produce the display shape the user-message bubble renders
+ * (`{ src, mediaType }`). Each staged image becomes a self-contained
+ * `data:` URL so the optimistically-appended bubble can show the
+ * thumbnail immediately — before the turn round-trips and the backend
+ * persists the bytes to disk.
+ *
+ * Filters to resolved images exactly like `buildImagePayloads` so a
+ * still-loading chip never renders as a broken thumbnail, and returns
+ * `[]` when nothing is staged so callers can pass it straight into the
+ * optimistic append.
+ */
+export function buildImageDisplaySources(
+  attachments: Attachment[],
+): Array<{ src: string; mediaType: string }> {
+  return attachments
+    .filter(
+      (a): a is Attachment & { resolvedImage: { mime: string; bytes: Uint8Array } } =>
+        a.kind === "image" && !!a.resolvedImage,
+    )
+    .map((a) => ({
+      src: `data:${a.resolvedImage.mime};base64,${bytesToBase64(a.resolvedImage.bytes)}`,
+      mediaType: a.resolvedImage.mime,
+    }));
+}

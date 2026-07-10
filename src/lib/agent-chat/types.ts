@@ -10,6 +10,33 @@ export type { SubagentStatus };
 export type ChatItemId = string;
 
 /**
+ * One image attached to a user turn, in the shape the right-aligned
+ * bubble renders as a thumbnail (and opens in a lightbox).
+ *
+ * `src` is one of two forms, distinguished only by how the item was
+ * created — the renderer never has to know which:
+ *   - A `data:` URL, built optimistically at send time from the staged
+ *     image bytes (`resolvedImage.bytes` + `.mime`). At that point the
+ *     image lives only in memory, so a self-contained data URL is the
+ *     only thing that can render before any round-trip.
+ *   - An absolute filesystem path, read back at hydrate from the
+ *     persisted `user_message` envelope's `images[].path` (the backend
+ *     wrote the bytes to disk when the turn was sent).
+ *
+ * The renderer routes `src` through `resolveAssetSrc` (src/lib/
+ * asset-url.ts): data URLs pass through untouched, absolute paths go
+ * through Tauri's asset protocol (`convertFileSrc`). That keeps the
+ * bubble oblivious to the fresh-vs-hydrated distinction.
+ */
+export interface UserMessageImage {
+  src: string;
+  /** MIME type (`image/png`, …) when known. Purely informational
+   *  today (alt text / future download); the `<img>` src carries its
+   *  own type for data URLs. */
+  mediaType?: string;
+}
+
+/**
  * Every ChatViewItem carries a monotonic `seq`. The render layer sorts
  * by `seq` so message order is a property of the data, not of React
  * reconciliation or store-update timing. Mirrors a reference
@@ -35,6 +62,12 @@ export interface UserMessageItem {
    *  event reconcile against this exact item instead of appending a
    *  duplicate. Absent for hydrated / backend-reconstructed items. */
   clientNonce?: string;
+  /** Images attached to this turn (paste / drop / picker). Optimistic
+   *  appends carry `data:` URLs built from the staged bytes at send
+   *  time; hydrated items carry absolute filesystem paths mapped from
+   *  the persisted envelope's `images[].path`. Absent for text-only
+   *  turns and for messages persisted before this field existed. */
+  images?: UserMessageImage[];
 }
 
 export interface AssistantMessageItem {
