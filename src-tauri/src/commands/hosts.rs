@@ -200,6 +200,7 @@ pub async fn hosts_test_connection(
             ProbeOutcome::Reachable {
                 codemux_remote_version: Some(version),
                 uname,
+                ..
             } => {
                 // Automations preflight — flag a host that can't reach
                 // GitHub before an automation silently fails at run time.
@@ -240,18 +241,37 @@ pub async fn hosts_test_connection(
             ProbeOutcome::Reachable {
                 codemux_remote_version: None,
                 uname,
-            } => HostTestResult {
-                ok: false,
-                message: format!(
-                    "Reachable, but codemux-remote isn't installed yet{}",
-                    uname
-                        .as_ref()
-                        .map(|u| format!(" ({u})"))
-                        .unwrap_or_default()
-                ),
-                needs_install: true,
-                uname,
-            },
+                binary_present_but_broken,
+            } => {
+                let uname_suffix = uname
+                    .as_ref()
+                    .map(|u| format!(" ({u})"))
+                    .unwrap_or_default();
+                // `needs_install: true` drives the same Install button
+                // in either case — the button re-uploads over whatever
+                // is there. But the message distinguishes a genuinely
+                // absent binary from a present-but-corrupted one (issue
+                // #133) so the user understands they're repairing, not
+                // installing fresh — and that repair is safe for a
+                // running daemon (the new file is swapped in without a
+                // restart).
+                let message = if binary_present_but_broken {
+                    format!(
+                        "Reachable, but codemux-remote is present and not working \
+                         (binary may be corrupted or truncated){uname_suffix}. \
+                         Install to repair — this replaces the file without touching \
+                         a running daemon."
+                    )
+                } else {
+                    format!("Reachable, but codemux-remote isn't installed yet{uname_suffix}")
+                };
+                HostTestResult {
+                    ok: false,
+                    message,
+                    needs_install: true,
+                    uname,
+                }
+            }
             ProbeOutcome::Unreachable { reason } => HostTestResult {
                 ok: false,
                 message: reason,
