@@ -1044,6 +1044,72 @@ pub fn run() {
                 }
             });
 
+            // ── Agent-browser orphan sweep (issue #126) ──
+            //
+            // Reap-on-close (see `reap_agent_browser_sessions` in
+            // commands/workspace.rs) is the primary teardown mechanism: it
+            // fires the instant a workspace closes on either close path.
+            // This sweep is the backstop for any other route a workspace
+            // can disappear through (e.g. a future removal path that
+            // forgets to call the reap helper, or a state mutation this
+            // review missed) — without it, a single missed teardown site
+            // would leak a headless Chromium daemon for the rest of the
+            // app's lifetime, which is exactly the bug reported in #126.
+            //
+            // Safety properties:
+            //   - In-memory-keys-only: `manager.session_keys()` only ever
+            //     returns sessions THIS app instance spawned, so the sweep
+            //     can never touch a daemon owned by another codemux
+            //     instance (no `agent-browser session list` shell-out).
+            //   - `ws-*` filter: only workspace-scoped session names are
+            //     eligible for the sweep (`orphaned_ws_sessions`). User
+            //     browser-pane sessions (`browser-NNN`) and the `default`
+            //     session are never touched.
+            //   - Ordering: `tracked` is snapshotted from the manager
+            //     BEFORE `live` is computed from app state. A session
+            //     created concurrently with a sweep tick is therefore
+            //     guaranteed to show up in `live` (its workspace still
+            //     exists when we read state) even if it raced into
+            //     `tracked` — so a session can never be reaped moments
+            //     after it was created.
+            let sweep_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                const SWEEP_INTERVAL_SECS: u64 = 300;
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                    SWEEP_INTERVAL_SECS,
+                ));
+                // Consume the immediate first tick — the sweep must not
+                // run at t=0, before startup reconcile (PID-file adoption,
+                // workspace hydration) has had room to settle.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+
+                    let manager: tauri::State<'_, agent_browser::AgentBrowserManager> =
+                        sweep_handle.state();
+                    // FIRST: snapshot tracked keys before computing the
+                    // live set — see the ordering note above.
+                    let tracked = manager.session_keys().await;
+
+                    let state: tauri::State<'_, state::AppStateStore> =
+                        sweep_handle.state();
+                    let live = state.live_agent_browser_session_names();
+
+                    for name in agent_browser::orphaned_ws_sessions(&tracked, &live) {
+                        eprintln!(
+                            "[codemux::browser] sweep: closing orphaned agent-browser \
+                             session {name} (owning workspace gone)"
+                        );
+                        if let Err(error) = manager.close(&name).await {
+                            eprintln!(
+                                "[codemux::browser] sweep: failed to close orphaned \
+                                 session {name}: {error}"
+                            );
+                        }
+                    }
+                }
+            });
+
             let fetch_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 const TICK_SECS: u64 = 60;
@@ -1587,6 +1653,7 @@ pub fn run() {
             commands::set_project_scripts,
             commands::check_is_git_repo,
             commands::init_git_repo,
+            commands::init_git_repo_no_commit,
             commands::create_empty_repo,
             commands::get_git_status,
             commands::get_git_diff,

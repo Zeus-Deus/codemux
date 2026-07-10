@@ -28,8 +28,8 @@ use tauri::{Emitter, Manager, State};
 /// them via `spawn_blocking` and then apply the result synchronously to
 /// state — `AppStateStore` references can't cross the `spawn_blocking`
 /// boundary.
-#[derive(Default)]
 pub(crate) struct WorkspaceGitInfo {
+    pub is_git: bool,
     pub branch: Option<String>,
     pub ahead: u32,
     pub behind: u32,
@@ -44,6 +44,9 @@ pub(crate) struct WorkspaceGitInfo {
 /// corrupted `.git` directories. Pure I/O — touches no shared state, so it
 /// is safe to call from `spawn_blocking`.
 pub(crate) fn gather_workspace_git_info(repo_path: &Path) -> WorkspaceGitInfo {
+    // Same predicate worktree creation uses (`find_git_root`), so "is this
+    // a git workspace" and "can this project have worktrees" never disagree.
+    let is_git = crate::config::workspace_config::find_git_root(repo_path).is_some();
     let branch_info = crate::git::git_branch_info(repo_path).ok();
     let diff_stat = crate::git::git_diff_stat(repo_path).ok();
     let changed_files = crate::git::git_status(repo_path).map(|f| f.len() as u32).unwrap_or(0);
@@ -60,12 +63,31 @@ pub(crate) fn gather_workspace_git_info(repo_path: &Path) -> WorkspaceGitInfo {
         .map(|s| s.staged_deletions + s.unstaged_deletions)
         .unwrap_or(0);
 
-    WorkspaceGitInfo { branch, ahead, behind, additions, deletions, changed_files }
+    WorkspaceGitInfo { is_git, branch, ahead, behind, additions, deletions, changed_files }
+}
+
+impl Default for WorkspaceGitInfo {
+    /// The error-path fallback (e.g. a panicked `spawn_blocking` gather).
+    /// `is_git: true` keeps a transient failure from flashing the
+    /// "Initialize Git" affordance on a real repo — optimistic, matching
+    /// the serde default on the snapshot field.
+    fn default() -> Self {
+        Self {
+            is_git: true,
+            branch: None,
+            ahead: 0,
+            behind: 0,
+            additions: 0,
+            deletions: 0,
+            changed_files: 0,
+        }
+    }
 }
 
 fn apply_workspace_git_info(state: &AppStateStore, workspace_id: &str, info: WorkspaceGitInfo) {
     state.update_workspace_git_info(
         workspace_id,
+        info.is_git,
         info.branch,
         info.ahead,
         info.behind,
@@ -658,6 +680,59 @@ pub async fn close_workspace_with_worktree(
     .await
 }
 
+/// Fire-and-forget teardown of the agent-browser CLI session(s) that
+/// belonged to a just-closed workspace (issue #126: agent-browser daemons
+/// used to accumulate for the app's whole lifetime because nothing ever
+/// reaped them on workspace close — only an app restart's blanket cleanup
+/// caught them).
+///
+/// Shared-cwd safety: two workspaces opened at the same cwd get separate
+/// `AgentBrowserSession` records but the SAME `cli_session_name` (it is a
+/// pure hash of the cwd via `stable_browser_session_name`), so they share
+/// one daemon in the manager map. Closing workspace A must therefore NOT
+/// kill the daemon workspace B's live pane still uses. Before closing
+/// each name, the spawned task re-checks
+/// `live_agent_browser_session_names()` — computed AFTER the close's
+/// state mutation completed, so it is the post-close live set — and skips
+/// any name still referenced. This gives refcount-like semantics for
+/// free: the daemon dies only when the LAST workspace sharing the name
+/// closes, because that later close's reap finds the name no longer live.
+///
+/// Spawns a single background task per call rather than blocking the
+/// close command on daemon teardown: `manager.close()` is already
+/// timeout-bounded internally (see the module doc in `agent_browser.rs`),
+/// so there's no correctness reason to await it here, only a latency one.
+/// `pub(crate)` so every `AppStateStore::close_workspace` call site
+/// (the two close commands here, OpenFlow run teardown, and the
+/// workspaces-sync reconcile/rollback paths) shares the one
+/// implementation instead of drifting.
+pub(crate) fn reap_agent_browser_sessions(app: &tauri::AppHandle, names: Vec<String>) {
+    if names.is_empty() {
+        return;
+    }
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let manager: State<'_, AgentBrowserManager> = app_handle.state();
+        let state: State<'_, AppStateStore> = app_handle.state();
+        // Post-close live set — see the shared-cwd rationale in the doc
+        // comment. Anything still in here belongs to a surviving workspace.
+        let live = state.live_agent_browser_session_names();
+        for name in names {
+            if live.contains(&name) {
+                eprintln!(
+                    "[codemux::browser] skip reap of {name}: still referenced by a live workspace"
+                );
+                continue;
+            }
+            if let Err(error) = manager.close(&name).await {
+                eprintln!(
+                    "[codemux::browser] failed to close agent-browser session {name} on workspace close: {error}"
+                );
+            }
+        }
+    });
+}
+
 /// Shared close-workspace implementation backing both the Tauri command
 /// (in-app sidebar / branch picker close affordances) and the
 /// `close_workspace` control-socket command exposed via the Phase 1.6
@@ -719,6 +794,13 @@ pub(crate) async fn close_workspace_with_worktree_impl(
     let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
+
+    // Reap the agent-browser CLI session(s) that belonged to this
+    // workspace (issue #126). This path (worktree closes + the MCP
+    // `workspace_close` tool) previously had NO agent-browser teardown at
+    // all — it was the main source of the daemon leak the issue reports.
+    // See `reap_agent_browser_sessions` for the fire-and-forget rationale.
+    reap_agent_browser_sessions(&app, close_result.removed_agent_browser_sessions);
 
     // Tear down the SSH tunnel + cached remote client for a workspace
     // that was pushed to a host. Without this, closing a remote
@@ -1023,26 +1105,15 @@ pub async fn close_workspace(
         crate::mcp_server::remove_mcp_config(Path::new(cwd));
     }
 
-    // Close agent browser CLI session for this workspace.
-    // P2 from docs/plans/browser-stream-fix.md removed the workspace_id
-    // alias the manager used to register, so closing under
-    // cli_session_name is sufficient — there is no longer a second key
-    // to reap.
-    {
-        let cli_name = state.find_detached_agent_browser(&workspace_id)
-            .map(|s| s.cli_session_name.clone());
-        let app_handle = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let manager: State<'_, AgentBrowserManager> = app_handle.state();
-            if let Some(cli) = cli_name {
-                if let Err(error) = manager.close(&cli).await {
-                    eprintln!("[AGENT_BROWSER] Failed to close agent browser for workspace: {error}");
-                }
-            }
-        });
-    }
-
     let result = state.close_workspace(&workspace_id)?;
+
+    // Reap the agent-browser CLI session(s) that belonged to this
+    // workspace (issue #126). `result.removed_agent_browser_sessions` is
+    // collected under the same lock acquisition that removed the
+    // workspace from state, so this can't race a concurrent session
+    // creation for the same workspace — see the doc comment on
+    // `CloseWorkspaceResult`.
+    reap_agent_browser_sessions(&app, result.removed_agent_browser_sessions);
 
     // Tear down the SSH tunnel + cached client for a workspace that was
     // pushed to a host. This is the sibling of the teardown in
@@ -2493,12 +2564,70 @@ mod git_info_tests {
         // `.git/` must yield default values, not panic.
         let tmp = TempDir::new().expect("tempdir");
         let info = gather_workspace_git_info(tmp.path());
+        assert!(!info.is_git, "a non-git dir must report is_git=false");
         assert!(info.branch.is_none(), "no branch in a non-git dir");
         assert_eq!(info.ahead, 0);
         assert_eq!(info.behind, 0);
         assert_eq!(info.additions, 0);
         assert_eq!(info.deletions, 0);
         assert_eq!(info.changed_files, 0);
+    }
+
+    #[test]
+    fn gather_workspace_git_info_flips_is_git_after_git_init() {
+        // The exact flow the "Initialize Git" affordance runs, exercised
+        // through the REAL function the button calls
+        // (`crate::git::git_init_no_commit`) rather than a raw `git init`
+        // shell-out — so this test would fail if that function ever
+        // regressed back into staging/committing the user's files.
+        let tmp = TempDir::new().expect("tempdir");
+
+        // A plain folder holding a would-be secret. If init ever staged
+        // or committed, this is exactly the kind of file that must NOT
+        // end up in the tree.
+        std::fs::write(tmp.path().join(".env"), "SECRET=x").expect("write .env");
+
+        // Pre-init: not a repo.
+        assert!(
+            !gather_workspace_git_info(tmp.path()).is_git,
+            "a plain folder must report is_git=false before init"
+        );
+
+        // Run the actual affordance path: bare init, no commit.
+        crate::git::git_init_no_commit(tmp.path()).expect("git_init_no_commit");
+
+        // Post-init: now a repo.
+        assert!(
+            gather_workspace_git_info(tmp.path()).is_git,
+            "freshly-initialized repo must report is_git=true"
+        );
+
+        // No commit was created — HEAD is unborn, so `rev-parse --verify
+        // HEAD` must fail. (A commit-ful init would resolve here.)
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--verify", "HEAD"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("run git rev-parse");
+        assert!(
+            !head.status.success(),
+            "HEAD must be unborn after a bare init (no commit), got: {head:?}"
+        );
+
+        // Nothing was staged: the .env must show as untracked (`?? .env`),
+        // NOT added (`A  .env`). Bare init needs no user.name/email config.
+        let status = std::process::Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(tmp.path())
+            .output()
+            .expect("run git status");
+        assert!(status.status.success(), "git status failed: {status:?}");
+        let porcelain = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            porcelain.lines().any(|l| l == "?? .env"),
+            "the .env file must be UNTRACKED (`?? .env`), not staged; \
+             porcelain was: {porcelain:?}"
+        );
     }
 
     #[test]

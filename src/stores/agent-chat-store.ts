@@ -9,7 +9,11 @@ import {
   markRequestResponding,
   removeUserMessageByNonce,
 } from "@/lib/agent-chat/reducer";
-import type { ChatThreadState, ChatViewItem } from "@/lib/agent-chat/types";
+import type {
+  ChatThreadState,
+  ChatViewItem,
+  UserMessageImage,
+} from "@/lib/agent-chat/types";
 import type { AgentChatCheckpointRecord } from "@/tauri/commands";
 import type {
   ApprovalDecision,
@@ -158,11 +162,14 @@ interface AgentChatStore {
   ensureThread: (threadId: string) => void;
   /** Apply a canonical provider event to the matching slice. */
   applyEvent: (threadId: string, event: ProviderRuntimeEvent) => void;
-  /** Append a user message optimistically (no provider echo). */
+  /** Append a user message optimistically (no provider echo).
+   *  `images` (when present) carries the turn's staged images as
+   *  `data:` URLs so the bubble renders their thumbnails immediately. */
   appendUserMessage: (
     threadId: string,
     text: string,
     clientNonce?: string,
+    images?: UserMessageImage[],
   ) => void;
   /** Roll back an optimistic user bubble by its client nonce (send RPC
    *  failed). No-op when not found. */
@@ -313,11 +320,11 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       }),
     ),
 
-  appendUserMessage: (threadId, text, clientNonce) =>
+  appendUserMessage: (threadId, text, clientNonce, images) =>
     set((state) =>
       updateSlice(state, threadId, (slice) => ({
         ...slice,
-        ...appendUserMessage(slice, text, undefined, clientNonce),
+        ...appendUserMessage(slice, text, undefined, clientNonce, images),
         inputDraft: "",
       })),
     ),

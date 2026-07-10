@@ -18,6 +18,7 @@ import {
   type SubagentRunItem,
   type SubagentView,
   type ToolCallItem,
+  type UserMessageImage,
   type UserMessageItem,
   type WorkflowRunItem,
 } from "./types";
@@ -829,6 +830,7 @@ function appendUserMessageLocal(
   text: string,
   now: Clock,
   clientNonce?: string,
+  images?: UserMessageImage[],
 ): ChatThreadState {
   const sealed = sealTrailingReasoning(state, now);
   const { seq, next } = takeSeq(sealed);
@@ -838,6 +840,10 @@ function appendUserMessageLocal(
     seq,
     text,
     ...(clientNonce ? { clientNonce } : {}),
+    // Only stamp `images` when there actually are some, so a text-only
+    // turn's item stays byte-identical to the pre-images shape (keeps
+    // existing snapshot-style assertions honest).
+    ...(images && images.length > 0 ? { images } : {}),
   };
   return { ...next, messages: [...next.messages, item] };
 }
@@ -849,14 +855,21 @@ function appendUserMessageLocal(
  * later `turn_queued` event reconcile this exact bubble instead of
  * duplicating it, and lets an error path roll it back
  * (`removeUserMessageByNonce`).
+ *
+ * `images` (when present) attaches the turn's paste/drop/picker images
+ * to the bubble so they render alongside the text — `data:` URLs on an
+ * optimistic send, absolute filesystem paths on a hydrate replay.
  */
 export function appendUserMessage(
   state: ChatThreadState,
   text: string,
   now: Clock = defaultClock,
   clientNonce?: string,
+  images?: UserMessageImage[],
 ): ChatThreadState {
-  return maybeCapMessages(appendUserMessageLocal(state, text, now, clientNonce));
+  return maybeCapMessages(
+    appendUserMessageLocal(state, text, now, clientNonce, images),
+  );
 }
 
 /**

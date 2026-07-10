@@ -119,6 +119,18 @@ function terminalSurface(label: string, cwd: string): PaneRefs {
  *  browser (issue #77). */
 export const MOCK_CHAT_THREAD_ID = "thread-mock-chat";
 
+/** Inline data-URL PNG (200×120, teal field + magenta band + border)
+ *  used to seed a user turn's attached image in the dev mock. A
+ *  self-contained data URL is what an optimistic send produces at
+ *  runtime, and — crucially — it passes straight through
+ *  `resolveAssetSrc` (bypassing `convertFileSrc`), so the thumbnail +
+ *  lightbox render in a plain browser where Tauri's asset protocol is
+ *  unavailable. Persisted turns use `{ path, media_type }`; the mock
+ *  smuggles the data URL in via `path` so the same hydrate mapping
+ *  (`path` → `src`) exercises the render path. */
+export const MOCK_USER_IMAGE_DATA_URL =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAMgAAAB4CAIAAAA48Cq8AAADNUlEQVR4nO3cu7HVUBAF0RcENjYOaRAiQTybSIgIm6K4+tw5mj57umoHoOlapqSPL1+/OVe+j/YncJETllsyYbkl+wvW7x8/y/f91yd83lt176OwhrdmbtG9T8Manhu78nt7YM1sDV/tvW2wZuZuP+exe5thjWo96t5+WHNaj7oXAWtO7jn3gmDFtx51LwtWfO459xJhpbYedS8UVmTrUfdyYUXmnnMvHVZS61H3bgArKfece7eBFdB61L07wdq99ah7N4O1e+459/4XVnkdW4+69xWsFYGG555z7zEsbWnrxr2nYMF5tafU1r/3XoBFtrVL7jn3XoOlLW2tgiUveS2EpS1trYIF59Wedritd2GRbQFzz+FVAEtb2loFS17yWghLW9paBQvOq53OHFtLYJFtyWtvWNpC1YuCJS9avShY2kLVi4IF59VOJ9LWc7DItuS1NyxtoepFwZIXrV4ULG2h6kXB0haqXhQsedHqRcHSFqpeFCx50epFwdIWql4ULDivdjob2SLCItuS196wtIWqFwVLXrR6UbC0haoXBQvOq70M09Y2sMi25LU3LG2h6kXBkhetXhQsbaHqXYM1MJC2Cu99BWtgIHlV3XsAa2AdbZXcewxrZiB5vXnvWVgD62jrnV2ANTOQth6CNS2QvJ6DNaeOtp6GNSeQvBpgxdfRVhus+EDa6oQVHEhe9+qVwYqso63b9SphRQaS17169bCS6mjrdr0lsJICaeteuoWwMgLJ6169tbB2r9O+9ji36y2HtXsgwtrj3Kj36p1363DWHudqveOPKYYH4qy9zKV0x7C0hVp7nJP1TsHSFmrtcc7UOwtLXrS1x3m9a7C0hVp7nEpY2kKtPU4lLHnR1h6nEpa2UGuPUwlLXrS1x6mEpS3U2uNUwtIWau1x6v+PlRdIXghY2kItCpa8aIuCpS3UomDJC7U0WNpCLQqWtlCLgiUv2qJgaQu1KFjyQi0NlrZQi4KlLdSiYMmLtihY2kItCpa8UEuDpS3UomBpC7UoWPKiLQqWtlCLgiUv1NJgaQu1KFjaQi0Klrxoi4KlLdSiYMkLtTuwnKuasNySCcstmbDckv0BOQvYwYr8AtoAAAAASUVORK5CYII=";
+
 /** Build an agent-chat surface (+ tab) for a workspace. Mirrors the
  *  backend's `create_agent_chat_pane`: the surface root is an
  *  `agent_chat` pane and the tab keeps `kind: "terminal"` (TabKind has
@@ -239,6 +251,7 @@ function makeWorkspace(seed: WorkspaceSeed): WorkspaceSnapshot {
     title: seed.title,
     workspace_type: seed.workspace_type ?? "standard",
     cwd: seed.cwd,
+    is_git: seed.is_git ?? true,
     git_branch: seed.git_branch ?? null,
     git_ahead: seed.git_ahead ?? 0,
     git_behind: seed.git_behind ?? 0,
@@ -284,6 +297,17 @@ const ISSUE_MOCK: LinkedIssue = {
   labels: ["enhancement"],
 };
 
+/** Linked to the agent-chat-demo workspace so the Context Row's
+ *  linked-issue chip (relocated from the old bottom bar) is visible and
+ *  clickable under `npm run dev` — the mock's `get_github_issue`
+ *  expands this into a full issue for the popover. */
+const ISSUE_CHAT: LinkedIssue = {
+  number: 146,
+  title: "Context Row loses the linked-issue chip on agent-chat surfaces",
+  state: "Open",
+  labels: ["bug", "regression"],
+};
+
 // ── Workspaces ──────────────────────────────────────────────────────
 //
 // Project 1 — codemux: 1 primary (repo root) + 4 worktrees, covering
@@ -321,6 +345,9 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
     pr_number: 172,
     pr_state: "open",
     pr_url: "https://github.com/example/codemux/pull/172",
+    // Linked issue so the Context Row's relocated linked-issue chip
+    // (PR #144 dropped it from agent-chat surfaces) is demoable here.
+    linked_issue: ISSUE_CHAT,
     git_ahead: 2,
     git_behind: 5,
     git_additions: 9,
@@ -677,6 +704,23 @@ const wsSiteRedesign = makeWorkspace({
   git_changed_files: 11,
 });
 
+// Project 4 — scratchpad: a plain non-git folder opened as a project.
+// Exercises the non-git degradation surfaces: no branch/PR chips, the
+// "no git" state + "Initialize Git" affordance in the context bar and
+// Changes panel, and the hidden worktree option in Thread Scope.
+
+const scratchRoot = `${PROJECTS}/scratchpad`;
+
+const wsScratchpad = makeWorkspace({
+  workspace_id: "ws-scratchpad-main",
+  title: "scratchpad",
+  cwd: scratchRoot,
+  project_root: scratchRoot,
+  project_uid: "uid-scratchpad",
+  workspace_kind: "main",
+  is_git: false,
+});
+
 const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxMain,
   wsCodemuxChat,
@@ -695,6 +739,7 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsVexisInstaller,
   wsSiteMain,
   wsSiteRedesign,
+  wsScratchpad,
 ];
 
 // ── Config + persistence ────────────────────────────────────────────

@@ -53,8 +53,12 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 }));
 // IssueDetailPopover fetches the full issue lazily on open; the bar
 // tests only assert the trigger chip, so a null resolve is enough.
+// initGitRepo / refreshWorkspaceGitInfo back the non-git "Initialize
+// Git" affordance (use-initialize-git.ts).
 vi.mock("@/tauri/commands", () => ({
   getGithubIssue: vi.fn().mockResolvedValue(null),
+  initGitRepo: vi.fn().mockResolvedValue("/home/dev/projects/scratch"),
+  refreshWorkspaceGitInfo: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Late import so the mocks above apply.
@@ -135,6 +139,53 @@ describe("WorkspaceContextBar", () => {
       git_branch: null,
       pr_state: null,
       linked_issue: null,
+    });
+    const { container } = render(<WorkspaceContextBar />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("shows the no-git state + Initialize Git for a local non-git project workspace", () => {
+    mocks.workspace = makeWorkspace({
+      is_git: false,
+      git_branch: null,
+      worktree_path: null,
+    });
+    render(<WorkspaceContextBar />);
+    expect(screen.getByText("Not a git repository")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: /initialize a git repository/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the no-git affordance off non-standard and host-backed workspaces", () => {
+    // Home workspace: not a project — no nudge.
+    mocks.workspace = makeWorkspace({
+      is_git: false,
+      git_branch: null,
+      worktree_path: null,
+      workspace_type: "home",
+    });
+    const home = render(<WorkspaceContextBar />);
+    expect(home.container).toBeEmptyDOMElement();
+    cleanup();
+
+    // Host-backed workspace: local is_git probe is meaningless.
+    mocks.workspace = makeWorkspace({
+      is_git: false,
+      git_branch: null,
+      worktree_path: null,
+      host_id: 7,
+    });
+    const hosted = render(<WorkspaceContextBar />);
+    expect(hosted.container).toBeEmptyDOMElement();
+  });
+
+  it("treats a missing is_git (older snapshot) as git — no affordance flash", () => {
+    mocks.workspace = makeWorkspace({
+      git_branch: null,
+      worktree_path: null,
     });
     const { container } = render(<WorkspaceContextBar />);
     expect(container).toBeEmptyDOMElement();

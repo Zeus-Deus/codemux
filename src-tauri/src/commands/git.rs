@@ -27,6 +27,19 @@ pub async fn init_git_repo(path: String) -> Result<String, String> {
         .map_err(|e| format!("init_git_repo task join failed: {e}"))?
 }
 
+// Bare-init variant behind the user-facing "Initialize Git" affordance:
+// runs ONLY `git init`, never staging or committing the user's existing
+// files. Deliberately separate from `init_git_repo` (init + add + initial
+// commit), which stays commit-ful for `create_empty_repo`'s new-project
+// flow — see `crate::git::git_init_no_commit` for the full rationale.
+#[tauri::command]
+pub async fn init_git_repo_no_commit(path: String) -> Result<String, String> {
+    let path = crate::project::expand_tilde(&path);
+    tokio::task::spawn_blocking(move || crate::git::git_init_no_commit(Path::new(&path)))
+        .await
+        .map_err(|e| format!("init_git_repo_no_commit task join failed: {e}"))?
+}
+
 #[tauri::command]
 pub async fn create_empty_repo(parent_dir: String, name: String) -> Result<String, String> {
     // The New Project screen lets the user *type* the location (placeholder

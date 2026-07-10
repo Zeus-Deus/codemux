@@ -1027,6 +1027,13 @@ pub async fn agent_chat_send_turn(
     let thread_id_for_persist = input.thread_id.0.clone();
     let user_text_for_persist = input.text.clone();
     let first_line = first_line_title(&input.text);
+    // Persist any attachments to disk NOW, before the provider consumes
+    // `input`. This runs for both immediate and queued sends: the bytes
+    // are in hand here and nowhere else (the deferred, dispatch-time
+    // envelope write in `forward_event` only sees `text`). Best-effort —
+    // a failed write is logged and skipped inside the helper and never
+    // blocks the turn.
+    let saved_images = save_chat_images(&thread_id_for_persist, &input.images);
     // A genuine new user turn is the authoritative, provider-agnostic
     // anchor for resetting subagent tracking. Clear the thread's tracker
     // entry here so a subagent left non-terminal by the previous turn
@@ -1067,8 +1074,25 @@ pub async fn agent_chat_send_turn(
     // this is the one chance to record them. Best-effort: a failed write
     // means resume will skip this user turn but the live conversation is
     // unaffected.
-    if result.queued_id.is_none() {
-        persist_user_message(&db, &thread_id_for_persist, &user_text_for_persist);
+    match &result.queued_id {
+        None => persist_user_message(
+            &db,
+            &thread_id_for_persist,
+            &user_text_for_persist,
+            &saved_images,
+        ),
+        // Queued: stash the (already-on-disk) image records keyed by the
+        // provider's queued_id so the deferred envelope write in
+        // `forward_event`'s `QueuedTurnDispatched` arm can attach them at
+        // real turn order. Skip the map entirely when there are no images
+        // (nothing to carry — the dispatch persist writes text only).
+        Some(queued_id) if !saved_images.is_empty() => {
+            pending_queued_images()
+                .lock()
+                .unwrap()
+                .insert(queued_id.clone(), saved_images);
+        }
+        Some(_) => {}
     }
     Ok(result)
 }
@@ -1094,14 +1118,150 @@ pub async fn agent_chat_cancel_queued_turn(
         .map_err(provider_err)
 }
 
+/// A chat image attachment that has been written to disk for the
+/// transcript. User messages (and their images) never come back through
+/// the provider event stream, so the only record of an attachment is the
+/// path we mint here plus its original MIME type — both go onto the
+/// `user_message` envelope so a resumed conversation can re-render the
+/// image the same way the live send did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedChatImage {
+    /// Absolute path to the on-disk copy of the image bytes.
+    path: String,
+    /// Original media type (e.g. `"image/png"`), echoed verbatim so the
+    /// frontend can label / re-encode the attachment on hydrate.
+    media_type: String,
+}
+
+/// Map a media type to a file extension for the on-disk copy. Deliberately
+/// narrow — only the types Agent Chat actually accepts — with a `bin`
+/// fallback so an unknown/garbage MIME still round-trips to disk rather
+/// than being dropped. Case-insensitive because clients are inconsistent
+/// about MIME casing (mirrors `files::clipboard_image_extension`).
+fn chat_image_extension(media_type: &str) -> &'static str {
+    match media_type.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
+}
+
+/// Resolve a thread's chat-image directory:
+/// `<config>/<APP_DIR_NAME>/agent-chat/images/<thread_id>/`.
+///
+/// Mirrors how [`crate::database`] resolves its store path (config dir +
+/// app name) so images live beside the transcript DB — a durable location
+/// a resumed conversation can rely on — rather than in a temp dir the OS
+/// may reap out from under it (unlike the ephemeral clipboard-paste files
+/// in `commands::files`).
+fn chat_images_dir(thread_id: &str) -> Option<std::path::PathBuf> {
+    Some(
+        dirs::config_dir()?
+            .join(crate::APP_DIR_NAME)
+            .join("agent-chat")
+            .join("images")
+            .join(thread_id),
+    )
+}
+
+/// Write each attachment's bytes to disk under the thread's image dir and
+/// return the records to record on the transcript envelope.
+///
+/// Best-effort by contract: a failed directory-create or write logs and
+/// SKIPS that image — it must never propagate an error that would block
+/// the turn (the live send still carries the bytes to the provider). An
+/// empty input is a cheap no-op returning an empty vec, so callers can
+/// invoke it unconditionally.
+fn save_chat_images(
+    thread_id: &str,
+    images: &[crate::agent_provider::ImageInput],
+) -> Vec<PersistedChatImage> {
+    if images.is_empty() {
+        return Vec::new();
+    }
+    let Some(dir) = chat_images_dir(thread_id) else {
+        eprintln!(
+            "[codemux::agent_chat] could not resolve config dir; \
+             skipping {} chat image(s)",
+            images.len()
+        );
+        return Vec::new();
+    };
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        eprintln!(
+            "[codemux::agent_chat] failed to create chat image dir {}: {error}",
+            dir.display()
+        );
+        return Vec::new();
+    }
+    let mut saved = Vec::with_capacity(images.len());
+    for image in images {
+        let ext = chat_image_extension(&image.media_type);
+        let path = dir.join(format!("{}.{ext}", uuid::Uuid::new_v4()));
+        match std::fs::write(&path, &image.data) {
+            Ok(()) => saved.push(PersistedChatImage {
+                path: path.to_string_lossy().into_owned(),
+                media_type: image.media_type.clone(),
+            }),
+            Err(error) => eprintln!(
+                "[codemux::agent_chat] failed to write chat image {}: {error}",
+                path.display()
+            ),
+        }
+    }
+    saved
+}
+
+/// Process-wide bridge carrying a QUEUED send's on-disk image records
+/// through to the deferred user-message envelope write.
+///
+/// The provider's follow-up queue carries a queued turn's *text* to
+/// dispatch, but it has no notion of the transcript paths the command
+/// layer minted — those live only here, keyed by the same `queued_id` the
+/// provider echoes on [`ProviderRuntimeEvent::QueuedTurnDispatched`]. An
+/// immediate (non-queued) send never touches this map: its envelope is
+/// written inline in [`agent_chat_send_turn`]. Follows the same
+/// module-static idiom as [`resume_locks`] to avoid threading a new
+/// managed state through every `forward_event` test harness.
+fn pending_queued_images() -> &'static Mutex<HashMap<String, Vec<PersistedChatImage>>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, Vec<PersistedChatImage>>>> =
+        OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// Append the synthetic `{"type":"user_message"}` transcript envelope.
 /// Best-effort — a failed write only means resume skips this user turn.
-fn persist_user_message(db: &DatabaseStore, thread_id: &str, text: &str) {
-    let user_msg = serde_json::json!({
+///
+/// When `images` is non-empty the envelope gains an `"images"` array of
+/// `{"path","media_type"}` records; it is OMITTED entirely otherwise so
+/// older transcripts and image-less turns stay byte-identical (backward
+/// compatible — the frontend hydrate treats a missing field as "no
+/// attachments").
+fn persist_user_message(
+    db: &DatabaseStore,
+    thread_id: &str,
+    text: &str,
+    images: &[PersistedChatImage],
+) {
+    let mut user_msg = serde_json::json!({
         "type": "user_message",
         "thread_id": thread_id,
         "text": text,
     });
+    if !images.is_empty() {
+        let images_json: Vec<serde_json::Value> = images
+            .iter()
+            .map(|image| {
+                serde_json::json!({
+                    "path": image.path,
+                    "media_type": image.media_type,
+                })
+            })
+            .collect();
+        user_msg["images"] = serde_json::Value::Array(images_json);
+    }
     if let Ok(payload) = serde_json::to_string(&user_msg) {
         let _ = db.append_agent_chat_message(thread_id, &payload);
     }
@@ -1496,6 +1656,13 @@ pub async fn agent_chat_delete_session(
     db: State<'_, DatabaseStore>,
     thread_id: String,
 ) -> Result<(), String> {
+    // Best-effort: drop the thread's on-disk image directory alongside the
+    // DB rows. The messages cascade via FK, but the image files live
+    // outside SQLite, so nothing else would ever reclaim them. A failure
+    // here (missing dir is the common case) must not fail the delete.
+    if let Some(dir) = chat_images_dir(&thread_id) {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     db.delete_agent_chat_session(&thread_id)
 }
 
@@ -1607,12 +1774,36 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     // in provider memory, so this event is the one moment the command
     // layer can record the turn.
     if let ProviderRuntimeEvent::QueuedTurnDispatched {
-        thread_id, text, ..
+        thread_id,
+        queued_id,
+        text,
+        ..
     } = &event
     {
         if !thread_id.0.is_empty() {
             let db: State<'_, DatabaseStore> = app.state();
-            persist_user_message(&db, &thread_id.0, text);
+            // Reclaim any image records stashed at enqueue time (see
+            // `pending_queued_images`) so the deferred envelope carries the
+            // same attachments an immediate send would have. Absent entry →
+            // a text-only queued turn, persisted with no images.
+            let images = pending_queued_images()
+                .lock()
+                .unwrap()
+                .remove(queued_id)
+                .unwrap_or_default();
+            persist_user_message(&db, &thread_id.0, text, &images);
+        }
+    }
+    // A queued turn was cancelled before it dispatched, so its envelope
+    // will never be written. Drop the stashed image records and best-effort
+    // delete the orphaned on-disk copies so a cancelled attachment does not
+    // leak a file forever.
+    if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } = &event {
+        let orphaned = pending_queued_images().lock().unwrap().remove(queued_id);
+        if let Some(images) = orphaned {
+            for image in images {
+                let _ = std::fs::remove_file(&image.path);
+            }
         }
     }
     // Best-effort transcript persistence so the SessionSelector resume
@@ -2073,6 +2264,78 @@ mod tests {
         assert_eq!(title.chars().count(), 58);
     }
 
+    // ── chat image persistence ──
+
+    #[test]
+    fn chat_image_extension_maps_known_types_and_falls_back() {
+        assert_eq!(chat_image_extension("image/png"), "png");
+        assert_eq!(chat_image_extension("image/jpeg"), "jpg");
+        assert_eq!(chat_image_extension("image/jpg"), "jpg");
+        assert_eq!(chat_image_extension("image/gif"), "gif");
+        assert_eq!(chat_image_extension("image/webp"), "webp");
+        // Case-insensitive.
+        assert_eq!(chat_image_extension("IMAGE/PNG"), "png");
+        // Unknown / non-image types fall back to `bin` rather than drop.
+        assert_eq!(chat_image_extension("image/heic"), "bin");
+        assert_eq!(chat_image_extension("application/pdf"), "bin");
+    }
+
+    /// Build the user_message envelope the same way `persist_user_message`
+    /// does, so the shape assertions below don't need a DB.
+    fn user_message_envelope(
+        thread_id: &str,
+        text: &str,
+        images: &[PersistedChatImage],
+    ) -> serde_json::Value {
+        let mut user_msg = json!({
+            "type": "user_message",
+            "thread_id": thread_id,
+            "text": text,
+        });
+        if !images.is_empty() {
+            let images_json: Vec<serde_json::Value> = images
+                .iter()
+                .map(|image| json!({"path": image.path, "media_type": image.media_type}))
+                .collect();
+            user_msg["images"] = serde_json::Value::Array(images_json);
+        }
+        user_msg
+    }
+
+    #[test]
+    fn user_message_envelope_omits_images_when_none() {
+        let envelope = user_message_envelope("t1", "hello", &[]);
+        assert_eq!(
+            envelope,
+            json!({"type": "user_message", "thread_id": "t1", "text": "hello"})
+        );
+        // The field is ABSENT, not `null` — backward compatible with the
+        // pre-images transcript shape.
+        assert!(envelope.get("images").is_none());
+    }
+
+    #[test]
+    fn user_message_envelope_includes_images_when_present() {
+        let images = vec![
+            PersistedChatImage {
+                path: "/tmp/a.png".into(),
+                media_type: "image/png".into(),
+            },
+            PersistedChatImage {
+                path: "/tmp/b.jpg".into(),
+                media_type: "image/jpeg".into(),
+            },
+        ];
+        let envelope = user_message_envelope("t1", "look", &images);
+        assert_eq!(
+            envelope["images"],
+            json!([
+                {"path": "/tmp/a.png", "media_type": "image/png"},
+                {"path": "/tmp/b.jpg", "media_type": "image/jpeg"},
+            ])
+        );
+    }
+
     #[test]
     fn extract_sdk_session_id_handles_all_three_keys() {
         assert_eq!(
@@ -2113,6 +2376,7 @@ mod tests {
         use crate::state::*;
         WorkspaceSnapshot {
             workspace_id: WorkspaceId(id.to_string()),
+            is_git: true,
             title: "my-feature".to_string(),
             workspace_type: WorkspaceType::Standard,
             cwd: "/home/user/projects/repo".to_string(),

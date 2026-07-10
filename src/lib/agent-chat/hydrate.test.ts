@@ -36,6 +36,56 @@ describe("replayPayloads", () => {
     });
   });
 
+  it("maps a user_message envelope's images onto the item", () => {
+    const state = replayPayloads([
+      JSON.stringify({
+        type: "user_message",
+        thread_id: "t",
+        text: "see attached",
+        images: [
+          { path: "/tmp/codemux/a.png", media_type: "image/png" },
+          { path: "/tmp/codemux/b.jpg" },
+        ],
+      }),
+    ]);
+    expect(state.messages).toHaveLength(1);
+    const item = state.messages[0];
+    expect(item.kind).toBe("user_message");
+    if (item.kind === "user_message") {
+      // `path` → `src`; `media_type` → `mediaType` (undefined when the
+      // backend omitted it).
+      expect(item.images).toEqual([
+        { src: "/tmp/codemux/a.png", mediaType: "image/png" },
+        { src: "/tmp/codemux/b.jpg", mediaType: undefined },
+      ]);
+    }
+  });
+
+  it("drops malformed image entries and keeps text-only when images is absent", () => {
+    const state = replayPayloads([
+      JSON.stringify({
+        type: "user_message",
+        thread_id: "t",
+        text: "mixed",
+        images: [
+          { path: "/ok.png", media_type: "image/png" },
+          { media_type: "image/png" }, // no path → dropped
+          "not-an-object", // → dropped
+          null, // → dropped
+        ],
+      }),
+      user("plain"),
+    ]);
+    const [withImages, plain] = state.messages;
+    if (withImages.kind === "user_message") {
+      expect(withImages.images).toEqual([
+        { src: "/ok.png", mediaType: "image/png" },
+      ]);
+    }
+    // A turn with no `images` field never gains one.
+    expect("images" in plain).toBe(false);
+  });
+
   it("rebuilds an assistant message from a completed item", () => {
     const state = replayPayloads([
       user("hi"),

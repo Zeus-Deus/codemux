@@ -119,10 +119,15 @@ pub async fn generate_ai_name(prompt: &str, repo_path: &Path) -> String {
     );
 
     // Try claude first
-    if let Some(name) = try_ai_cli("claude", &["--print"], &meta_prompt).await {
-        let sanitized = sanitize_branch_name(&name);
-        if !sanitized.is_empty() {
-            return deconflict_branch_name(&sanitized, repo_path);
+    match try_ai_cli("claude", &["--print"], &meta_prompt).await {
+        Ok(name) => {
+            let sanitized = sanitize_branch_name(&name);
+            if !sanitized.is_empty() {
+                return deconflict_branch_name(&sanitized, repo_path);
+            }
+        }
+        Err(reason) => {
+            log::warn!("AI branch naming failed, falling back to random name: {reason}");
         }
     }
 
@@ -130,14 +135,31 @@ pub async fn generate_ai_name(prompt: &str, repo_path: &Path) -> String {
     generate_random_name(repo_path)
 }
 
-async fn try_ai_cli(binary: &str, args: &[&str], prompt: &str) -> Option<String> {
+/// AI naming timeout. Warm `claude --print` calls measured at 5-9s on this
+/// machine; 30s gives real headroom for cold starts / network latency while
+/// still bounding a hung CLI (the child is killed on timeout, see
+/// `kill_on_drop` below).
+const AI_CLI_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Number of stderr bytes to keep in failure logs (claude CLI's error
+/// reasons are usually short; this avoids dumping huge output into logs).
+const STDERR_EXCERPT_LEN: usize = 200;
+
+/// Run an AI CLI with `prompt` on stdin. Returns the trimmed stdout on
+/// success, or `Err(reason)` describing why it failed (spawn error, timeout,
+/// non-zero exit, empty output) so callers can log a diagnosable reason.
+async fn try_ai_cli(binary: &str, args: &[&str], prompt: &str) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(args);
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+    // Reap the child if we time out below, rather than leaking it.
+    cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().ok()?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn `{binary}`: {e}"))?;
 
     // Write prompt to stdin
     if let Some(mut stdin) = child.stdin.take() {
@@ -146,15 +168,33 @@ async fn try_ai_cli(binary: &str, args: &[&str], prompt: &str) -> Option<String>
         drop(stdin);
     }
 
-    let result = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await;
+    let result = tokio::time::timeout(AI_CLI_TIMEOUT, child.wait_with_output()).await;
 
-    match result {
-        Ok(Ok(output)) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if text.is_empty() { None } else { Some(text) }
+    let output = match result {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(format!("`{binary}` process error: {e}")),
+        Err(_) => {
+            return Err(format!(
+                "`{binary}` timed out after {}s",
+                AI_CLI_TIMEOUT.as_secs()
+            ));
         }
-        _ => None,
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let excerpt: String = stderr.trim().chars().take(STDERR_EXCERPT_LEN).collect();
+        return Err(format!(
+            "`{binary}` exited with {}: {excerpt}",
+            output.status
+        ));
     }
+
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err(format!("`{binary}` produced empty output"));
+    }
+    Ok(text)
 }
 
 /// Escape a string for safe embedding in double-quoted shell arguments.
@@ -436,6 +476,22 @@ mod tests {
             "path\\\\\\nline2"
         );
         // bash $'path\\\\\\nline2' → path\ + newline + line2
+    }
+
+    #[tokio::test]
+    async fn try_ai_cli_reports_spawn_failure_reason() {
+        // No network/real-CLI dependency: this binary should never exist.
+        let result = try_ai_cli(
+            "codemux-definitely-not-a-real-binary",
+            &["--print"],
+            "prompt",
+        )
+        .await;
+        let err = result.expect_err("nonexistent binary must fail to spawn");
+        assert!(
+            err.contains("failed to spawn"),
+            "expected spawn-failure reason, got: {err}"
+        );
     }
 
     #[test]

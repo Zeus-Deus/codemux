@@ -774,6 +774,12 @@ export interface WorkspaceSnapshot {
   title: string;
   workspace_type: WorkspaceType;
   cwd: string;
+  /** Whether the workspace directory is inside a git repository. Non-git
+   *  folders run in plain-directory mode (no worktrees/diffs/checkpoints)
+   *  and the UI offers an explicit "Initialize Git" action. Optional —
+   *  older snapshots persisted without it; treat missing as `true`
+   *  (optimistic, matching the Rust serde default). */
+  is_git?: boolean;
   git_branch: string | null;
   git_ahead: number;
   git_behind: number;
