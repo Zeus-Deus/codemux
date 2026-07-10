@@ -12,6 +12,8 @@ import { FolderOpen, Loader2 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { pickFolder } from "@/lib/file-dialog";
+import { useCloneProgress } from "@/hooks/use-clone-progress";
+import { CloneProgressRow } from "@/components/overlays/clone-progress-row";
 
 export function CloneDialog() {
   const open = useUIStore((s) => s.showCloneDialog);
@@ -22,6 +24,11 @@ export function CloneDialog() {
   const [targetDir, setTargetDir] = useState("");
   const [cloning, setCloning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // The exact path handed to `git clone`, so the progress subscription
+  // filters to this clone. Empty = no clone running.
+  const [cloneTarget, setCloneTarget] = useState("");
+
+  const cloneProgress = useCloneProgress(cloning, cloneTarget);
 
   const handleOpenChange = (open: boolean) => {
     if (!open) {
@@ -29,6 +36,7 @@ export function CloneDialog() {
       setTargetDir("");
       setError(null);
       setCloning(false);
+      setCloneTarget("");
     }
     setOpen(open);
   };
@@ -45,6 +53,7 @@ export function CloneDialog() {
     if (!dir) return;
 
     setCloning(true);
+    setCloneTarget(dir);
     setError(null);
     try {
       await cloneProject(url.trim(), dir);
@@ -53,6 +62,7 @@ export function CloneDialog() {
       setError(String(err));
     } finally {
       setCloning(false);
+      setCloneTarget("");
     }
   };
 
@@ -114,6 +124,15 @@ export function CloneDialog() {
           {error && (
             <div className="p-2 rounded-md bg-destructive/10 border border-destructive/20 text-xs text-destructive">
               {error}
+            </div>
+          )}
+
+          {cloning && (
+            <div className="rounded-md border border-border/50 bg-foreground/5 px-3 py-2.5">
+              <CloneProgressRow progress={cloneProgress} />
+              <p className="mt-2 text-[11px] text-muted-foreground">
+                Cloning — this can take a while on slow connections…
+              </p>
             </div>
           )}
 

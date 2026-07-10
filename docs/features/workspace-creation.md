@@ -35,6 +35,36 @@ Creation dispatches one of:
 
 After creation: preset applied, issue linked, project marked as recent, workspace activated.
 
+### Cloning a Repository
+
+The New Project → Clone flow and the standalone Clone dialog both call the
+`git_clone_repo` Tauri command (`src-tauri/src/commands/git.rs`). Frontend
+invoke args are `{ url, targetDir }`; the command signature also takes an
+injected `tauri::AppHandle` so it can stream progress.
+
+- **Stall-based timeout, not an absolute cap.** The clone runs
+  `git clone --progress` and reads stderr incrementally. It fails only when
+  **no new output arrives for 120 consecutive seconds** — a healthy slow
+  clone that keeps emitting progress never times out. On stall the child is
+  killed and the command returns `"git clone stalled — no progress for 120
+  seconds. …"`; the partially-cloned target dir is removed **only if it did
+  not exist before the clone started**. (This replaced an earlier absolute
+  120s timeout that killed legitimate slow clones.)
+- **Fail-fast auth.** Spawned with `GIT_TERMINAL_PROMPT=0` so an
+  auth-required URL errors out instead of hanging on a hidden prompt.
+- **Progress events.** Each parsed progress update emits a
+  `git-clone-progress` Tauri event with payload `{ targetDir, phase,
+  percent, detail }` (`percent` is `null` for phase-only lines like
+  `Cloning into …`; `detail` is the raw trimmed git line, e.g.
+  `Receiving objects: 42% (…), 12.00 MiB | 1.20 MiB/s`). Emission is
+  throttled to phase/percent changes. git separates progress lines with
+  `\r`, so the reader splits on both `\r` and `\n`. The pure parser
+  (`parse_clone_progress`) is unit-tested. The frontend subscribes via
+  `useCloneProgress` (filtered on `targetDir`) and renders a phase +
+  percent + determinate bar (indeterminate pulse when `percent` is null)
+  through `CloneProgressRow`. A real git failure still returns
+  `"git clone failed: <stderr tail>"`.
+
 ### Project Onboarding
 
 Shown on first project open (`project-onboarding.tsx`, ~616 lines). Two steps:
