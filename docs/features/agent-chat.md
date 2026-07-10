@@ -214,13 +214,24 @@ slot — see "Activity block" below), and per-slot identity.
 
 Contract preserved from the pre-redesign renderer:
 
-- **Stable keys + memo rows.** Per-slot keys are still `slot.item.id`
-  / `run:<first-id>` (as `MessageScrollerItem messageId`), and rows
-  render through memoized leaves (`ItemRowMemo` / `ActivityRowMemo`)
-  — a streaming token mutates exactly one row. (Activity rows rebuild
-  their `items` array each build, as the old tool-group rows did; the
-  stable `run:<first-id>` key keeps the scroller row from remounting as
-  the run grows and transitions working → settled.)
+- **Stable keys + two-level memo rows.** Per-slot keys are still
+  `slot.item.id` / `run:<first-id>` (as `MessageScrollerItem messageId`).
+  Rows render through **two** memo levels (issue #129): a whole-row
+  wrapper `SlotRowMemo` (owns the `MessageScrollerItem` element + the
+  activity/item branch) and the leaves `ItemRowMemo` / `ActivityRowMemo`.
+  The wrapper's skip depends on **slot-object reuse**: `buildTranscriptSlots`
+  rebuilds every slot on each store update (each streaming token), so
+  `reuseTranscriptSlots` swaps unchanged slots back to their previous object
+  identity (matched by key; item bodies compared by `item` reference,
+  activity bodies by `working` + element-wise `items`), returning the prev
+  array itself when nothing changed. With that reused identity plus the
+  reducer's stable `item` / `approval` refs, an untouched row's wrapper props
+  stay shallow-equal and it skips reconciliation entirely — so a streaming
+  token re-renders **exactly one wrapper and one leaf**, and the rest of the
+  transcript is untouched. (Activity rows still rebuild their `items` array
+  each build, as the old tool-group rows did; the stable `run:<first-id>` key
+  keeps the scroller row from remounting as the run grows and transitions
+  working → settled.)
 - **Stick-to-bottom.** The shadcn scroller engine
   (`MessageScrollerProvider autoScroll`) is the single owner of
   tail-tracking: its `following-bottom` state machine re-scrolls to
@@ -271,6 +282,45 @@ Contract preserved from the pre-redesign renderer:
   the thread `streaming` flag into `buildTranscriptSlots`, and the
   marker only renders when the tail slot is not a working Activity block
   (it still fills the gap right after send, before any step arrives).
+
+### Perf on Linux WebKitGTK (issue #129)
+
+Three transcript-scroll fixes for the Linux app webview (all
+frontend-only; no Rust change):
+
+- **Viewport edge-fade mask gated off on Linux WebKitGTK.** The design
+  edge fade (`WS_FADE_STYLE`) is a CSS `mask-image` on the scroll
+  viewport. On Linux the app forces WebKitGTK into **non-composited
+  (CPU) mode** — `src-tauri/src/lib.rs` sets
+  `WEBKIT_DISABLE_COMPOSITING_MODE=1` and
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` — where a viewport mask forces a
+  **full-viewport CPU re-rasterization on every scroll frame** (the
+  scroll jank in the issue). So the mask is disabled on Linux WebKitGTK
+  and kept everywhere it composites (macOS / Windows / dev-mock Chromium
+  — byte-identical rendering). The decision is a pure, injectable helper
+  (`transcript-fade.ts`, `decideTranscriptFade`), cached once per session,
+  and honors a `localStorage["codemux:transcript-fade"] = "on" | "off"`
+  override first (live A/B escape hatch for profiling, mirroring the
+  terminal renderer override); the WebKitGTK check itself moved to the
+  shared `@/lib/webkit` `isLinuxWebKitGtk` (re-exported from
+  `webgl-renderer-probe.ts`). A one-time `console.info` states the verdict
+  only when the fade is disabled or overridden.
+- **Slot-object reuse + a memoized whole-row wrapper** (see "Stable keys
+  + two-level memo rows" above): `reuseTranscriptSlots` preserves an
+  untouched slot's object identity across the per-token rebuild, so with
+  the two-level memo a streaming token re-renders exactly one row wrapper
+  and one leaf — the rest of the transcript skips reconciliation instead
+  of re-running all *n* wrappers per token.
+- **One-shot `content-visibility` support warning.** Row containment
+  (`[content-visibility:auto]` per row) is what keeps thousands of rows
+  cheap; on old WebKitGTK builds the property can be a silent no-op. On
+  module load `transcript-fade.ts` checks `CSS.supports("content-visibility",
+  "auto")` once and `console.warn`s (grep-able on `content-visibility`) if
+  it is unsupported (suppressed under vitest). Diagnostic only — no
+  behavior change.
+- **DMABUF renderer hypothesis** from the issue is already handled by the
+  `lib.rs` env defaults above (`WEBKIT_DISABLE_DMABUF_RENDERER=1`), so no
+  additional change is needed for it.
 
 ### Activity block (Activity Stream)
 

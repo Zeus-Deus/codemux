@@ -6,11 +6,15 @@
  *     cheap with `content-visibility:auto` row containment (not by
  *     unmounting off-screen rows), so jsdom sees them all.
  *  2. A streaming token delta (tail row replaced in place by the reducer)
- *     re-renders exactly one row — the memoized-row win holds on the
+ *     re-renders exactly one row LEAF — the memoized-leaf win holds on the
  *     MessageScroller.
+ *  3. That same delta re-renders exactly one row WRAPPER
+ *     (`SlotRowMemo` → `MessageScrollerItem`) — the two-level memo + slot
+ *     reuse (issue #129) skips reconciliation for every untouched row.
  *
  * The scroller renders plain rows: no external virtualization context to
- * mock.
+ * mock (wrapper renders are counted by wrapping the real `MessageScrollerItem`
+ * in a counting passthrough).
  */
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -23,7 +27,7 @@ import type {
 import { MessageList } from "./MessageList";
 
 // Replace the prose renderer with a counting stub so we can observe
-// per-row render counts without markdown noise.
+// per-row (leaf) render counts without markdown noise.
 const renderCounts = new Map<string, number>();
 vi.mock("./AssistantMessage", () => ({
   AssistantMessage: ({ item }: { item: AssistantMessageItem }) => {
@@ -32,9 +36,29 @@ vi.mock("./AssistantMessage", () => ({
   },
 }));
 
+// Count WRAPPER (level-1 memo) renders by wrapping the real
+// `MessageScrollerItem` in a counting passthrough — the rest of the engine
+// module (provider/viewport/hooks used by MessageList and MessageTrail) is
+// preserved via `importActual` so the real scroller still drives the DOM.
+const itemRenderCounts = vi.hoisted(() => new Map<string, number>());
+vi.mock("@/components/ui/message-scroller", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/components/ui/message-scroller")>();
+  const RealItem = actual.MessageScrollerItem;
+  return {
+    ...actual,
+    MessageScrollerItem: (props: Parameters<typeof RealItem>[0]) => {
+      const id = String(props.messageId ?? "");
+      itemRenderCounts.set(id, (itemRenderCounts.get(id) ?? 0) + 1);
+      return <RealItem {...props} />;
+    },
+  };
+});
+
 afterEach(() => {
   cleanup();
   renderCounts.clear();
+  itemRenderCounts.clear();
 });
 
 function assistantMsg(seq: number, text: string): AssistantMessageItem {
@@ -91,5 +115,30 @@ describe("MessageList rendering & memoization", () => {
       expect(renderCounts.get(`am-${i}`)).toBe(before.get(`am-${i}`));
     }
     expect(renderCounts.get("am-11")).toBe((before.get("am-11") ?? 0) + 1);
+  });
+
+  it("re-renders exactly one row WRAPPER when a token delta mutates the tail", () => {
+    const initial: ChatViewItem[] = [];
+    for (let i = 0; i < 12; i++) {
+      initial.push(assistantMsg(i, `message body ${i}`));
+    }
+    const { rerender } = renderList(initial);
+    // Every row mounted through the counting wrapper (all 12 rows exist).
+    expect(itemRenderCounts.size).toBe(12);
+    const before = new Map(itemRenderCounts);
+
+    const next = initial.slice();
+    next[11] = { ...assistantMsg(11, "message body 11 plus-token") };
+    rerender(<MessageList messages={next} {...noopHandlers} />);
+    expect(
+      screen.getByText("message body 11 plus-token"),
+    ).toBeInTheDocument();
+
+    // Slot-object reuse keeps every untouched wrapper's props shallow-equal, so
+    // only the tail wrapper re-renders — not just its leaf.
+    for (let i = 0; i < 11; i++) {
+      expect(itemRenderCounts.get(`am-${i}`)).toBe(before.get(`am-${i}`));
+    }
+    expect(itemRenderCounts.get("am-11")).toBe((before.get("am-11") ?? 0) + 1);
   });
 });
