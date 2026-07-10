@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, memo } from "react";
 import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { BrowserToolbar } from "./BrowserToolbar";
@@ -84,7 +84,11 @@ interface PendingMove {
   modifiers: number;
 }
 
-export function BrowserPane({ browserId, focused, visible, workspaceId, hideToolbar, fixedViewport }: Props) {
+// #127: memo is effective because setAppState performs structural sharing —
+// PaneNode drives this with primitive props (browserId/focused/visible), so the
+// pane skips re-render on backend ticks that don't touch them. Export-only
+// wrapper: the component body below is unchanged.
+export const BrowserPane = memo(function BrowserPane({ browserId, focused, visible, workspaceId, hideToolbar, fixedViewport }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -943,4 +947,4 @@ export function BrowserPane({ browserId, focused, visible, workspaceId, hideTool
       </div>
     </div>
   );
-}
+});

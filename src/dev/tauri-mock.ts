@@ -48,6 +48,11 @@ import {
   workflowRunningEnvelopes,
 } from "./mock-fixtures";
 import type {
+  ScrollbackMeta,
+  ScrollbackPayload,
+  ScrollbackRestore,
+} from "@/tauri/commands";
+import type {
   AppStateSnapshot,
   ChatModelInfo,
   CliToolInfo,
@@ -144,28 +149,50 @@ function emitEvent(name: string, payload: unknown): void {
   }
 }
 
-/**
- * Feed a one-shot banner line into a terminal pane's PTY output
- * `Channel`. A `@tauri-apps/api` `Channel` registers its internal
- * dispatcher through `transformCallback`, exposing the resulting id as
- * `channel.id`. We look that callback up and hand it a single ordered
- * message (`{ index: 0, message }`); the dispatcher forwards
- * `message` to the pane's `onmessage`, which decodes the string to
- * bytes and writes them to xterm. Best-effort: any shape mismatch is
- * swallowed so a terminal that renders differently never breaks boot.
- */
-function pushMockTerminalBanner(channel: unknown): void {
-  const id = (channel as { id?: number } | undefined)?.id;
-  if (typeof id !== "number") return;
+// ── Terminal PTY output channels ────────────────────────────────────
+//
+// Each mounted TerminalPane registers a `@tauri-apps/api` `Channel` via
+// `attach_pty_output`; live PTY bytes arrive as ordered
+// `{ index, message }` frames pushed through that channel's
+// `transformCallback` dispatcher (index MUST be sequential from 0 — the
+// Channel's internal ordering buffer stalls on a gap). We keep a
+// session→channel map so (a) the mount banner and (b) the on-demand
+// flood (issue #128) can push through EVERY currently-attached pane,
+// tracking `nextIndex` per channel so ordering stays intact across both.
+
+interface MockPtyChannelEntry {
+  /** The `@tauri-apps/api` Channel object passed by the frontend. */
+  channel: unknown;
+  /** Next ordered frame index for this channel (starts at 0 per attach:
+   *  a fresh Channel instance has an empty ordering buffer). */
+  nextIndex: number;
+}
+
+const ptyChannels = new Map<string, MockPtyChannelEntry>();
+
+const MOCK_TERMINAL_BANNER =
+  "\r\n  \x1b[2m(mock terminal — no PTY in plain-browser dev; " +
+  "run `npm run tauri:dev` for a real shell)\x1b[0m\r\n";
+
+/** Push one ordered frame through a tracked PTY channel. Best-effort:
+ *  any shape mismatch / stale callback is swallowed so a terminal that
+ *  renders differently never breaks boot. Returns whether it landed. */
+function ptyChannelPush(entry: MockPtyChannelEntry, message: string): boolean {
+  const id = (entry.channel as { id?: number } | undefined)?.id;
+  if (typeof id !== "number") return false;
   const cb = callbacks.get(id);
-  if (!cb) return;
-  const banner =
-    "\r\n  \x1b[2m(mock terminal — no PTY in plain-browser dev; " +
-    "run `npm run tauri:dev` for a real shell)\x1b[0m\r\n";
+  if (!cb) return false;
+  // Consume the frame index only AFTER a successful dispatch: the
+  // @tauri-apps/api Channel buffers frames by index and stalls forever on a
+  // gap, so burning an index on a frame whose callback threw would wedge
+  // every subsequent frame on this channel.
+  const frame = { index: entry.nextIndex, message };
   try {
-    cb.fn({ index: 0, message: banner } as unknown as never);
+    cb.fn(frame as unknown as never);
+    entry.nextIndex++;
+    return true;
   } catch {
-    /* channel shape differs — banner is cosmetic, ignore */
+    return false;
   }
 }
 
@@ -217,6 +244,169 @@ function emitChatEvent(threadId: string, event: unknown): void {
 // "Agent chat (mocked end-to-end)" section below — it routes every
 // frame through `emitChatEvent`, so the channel is the only live
 // transport, exactly like the real backend.
+
+// ── Terminal scrollback stores (issue #128) ─────────────────────────
+//
+// Faithful twin of `src-tauri/src/scrollback.rs`: TWO distinct stores.
+//
+//   (a) An in-memory CACHE keyed by `session_id`. A TerminalPane puts
+//       its serialized buffer here on unmount (`cache_terminal_scrollback`)
+//       and removes it on the next mount (`uncache_terminal_scrollback`).
+//   (b) A "disk" store keyed by `(workspace_id, pane_id)`. Written
+//       directly by `save_terminal_scrollback` (live panes on close) and
+//       by `flush_scrollback_cache` DRAINING the cache. Read ONLY by
+//       `get_terminal_scrollback` — the cache is never read directly,
+//       matching the backend.
+//
+// Every handler emits a `[mock::scrollback]` console line so the close /
+// restore dance is observable end-to-end in a plain browser (this is what
+// the issue #128 e2e run asserts on).
+
+/** A "disk" entry: the stored payload plus the epoch-ms save time used
+ *  to synthesize `ScrollbackMeta.saved_at` on read (the backend stamps
+ *  this at write time in `save_scrollback`). */
+interface MockScrollbackDiskEntry {
+  payload: ScrollbackPayload;
+  savedAt: number;
+}
+
+const scrollbackCache = new Map<string, ScrollbackPayload>();
+const scrollbackDisk = new Map<string, MockScrollbackDiskEntry>();
+
+const diskKey = (workspaceId: string, paneId: string): string =>
+  `${workspaceId}::${paneId}`;
+
+/** First 8 chars of an id — matches the backend log convention and keeps
+ *  the observability lines compact but greppable. */
+const shortId = (id: string): string => id.slice(0, 8);
+
+/** Approximate byte size for the `bytes=` log fields: the JS (UTF-16)
+ *  string length, not an encoded byte count. Terminal payloads are
+ *  ASCII-dominant, so length ≈ UTF-8 bytes — and exactness isn't worth a
+ *  full O(n) TextEncoder copy of a multi-MB payload on the timed
+ *  unmount/switch path these log lines sit on. */
+const approxByteLen = (s: string): number => s.length;
+
+/** Last ~40 chars of `data`, JSON-escaped (quotes included) so control
+ *  bytes like `\r\n` render as escapes in one greppable token. */
+const tailOf = (data: string): string => JSON.stringify(data.slice(-40));
+
+function logScrollback(line: string): void {
+  console.info(`[mock::scrollback] ${line}`);
+}
+
+/** Build the `ScrollbackRestore` a `get_terminal_scrollback` hit returns:
+ *  the stored `data` plus a well-formed `ScrollbackMeta` derived from the
+ *  stored payload (mirrors `save_scrollback`'s meta construction). */
+/** Write one payload to the "disk" store, stamping the save time — shared
+ *  by `save_terminal_scrollback` (live panes on close) and
+ *  `flush_scrollback_cache` (cache drain), mirroring the backend's
+ *  `save_scrollback`. */
+function writeScrollbackDisk(payload: ScrollbackPayload): void {
+  scrollbackDisk.set(diskKey(payload.workspace_id, payload.pane_id), {
+    payload,
+    savedAt: Date.now(),
+  });
+}
+
+function buildScrollbackRestore(entry: MockScrollbackDiskEntry): ScrollbackRestore {
+  const p = entry.payload;
+  const meta: ScrollbackMeta = {
+    pane_id: p.pane_id,
+    session_id: p.session_id,
+    workspace_id: p.workspace_id,
+    working_directory: p.working_directory,
+    original_command: p.original_command ?? null,
+    cols: p.cols,
+    rows: p.rows,
+    adapter_captures: p.adapter_captures ?? {},
+    adapter_id: p.adapter_id ?? null,
+    alternate_buffer: p.alternate_buffer ?? false,
+    saved_at: entry.savedAt,
+  };
+  return { data: p.data, meta };
+}
+
+// ── Terminal flood + serialize triggers (issue #128) ────────────────
+//
+// Exposed on `window.__codemuxTerminalMock` for browser-console /
+// automation use, and bound to two rare keydown combos below so the
+// CLI-driven browser (`codemux browser key-press`, no JS eval) can drive
+// them too.
+
+let floodCounter = 0;
+
+/**
+ * Push `lines` numbered lines through EVERY currently-attached PTY output
+ * channel, ending with a distinctive `MOCK-FLOOD-END <n>` marker so the
+ * e2e run can wait for the tail. Delivered in ~64 KiB chunks, a few
+ * chunks per `setTimeout(…, 0)` tick, so the whole flood lands within a
+ * couple of seconds without one giant synchronous burst — the real PTY
+ * delivers chunked too, and this keeps the serialize path realistic.
+ */
+function floodTerminals(lines = 150_000): void {
+  const sessionIds = [...ptyChannels.keys()];
+  const floodId = ++floodCounter;
+  const CHUNK_BYTES = 64 * 1024;
+  const CHUNKS_PER_TICK = 8;
+  let lineNo = 0;
+  let totalBytes = 0;
+
+  console.info(
+    `[mock::terminal] flood start sessions=${sessionIds.length} lines=${lines} id=${floodId} totalBytes=0`,
+  );
+
+  const pushToAll = (chunk: string): void => {
+    // Resolve each session's channel entry FRESH on every push: a pane that
+    // re-attaches mid-flood registers a NEW entry (nextIndex reset to 0) and
+    // must receive the remaining frames plus the MOCK-FLOOD-END marker — a
+    // one-shot snapshot of the entries would keep pushing into the detached
+    // channel instead.
+    for (const sessionId of sessionIds) {
+      const entry = ptyChannels.get(sessionId);
+      if (entry) ptyChannelPush(entry, chunk);
+    }
+    // Flood chunks are pure ASCII, so string length IS the byte count.
+    totalBytes += chunk.length;
+  };
+
+  const tick = (): void => {
+    for (let c = 0; c < CHUNKS_PER_TICK; c++) {
+      if (lineNo >= lines) {
+        // Final distinctive marker closes the flood — one greppable tail.
+        pushToAll(`MOCK-FLOOD-END ${floodId}\r\n`);
+        console.info(
+          `[mock::terminal] flood done sessions=${sessionIds.length} totalBytes=${totalBytes}`,
+        );
+        return;
+      }
+      let buf = "";
+      while (lineNo < lines && buf.length < CHUNK_BYTES) {
+        lineNo++;
+        buf += `flood line ${lineNo}\r\n`;
+      }
+      pushToAll(buf);
+    }
+    setTimeout(tick, 0);
+  };
+
+  // Kick off async so the caller (keydown handler / console) returns
+  // immediately and the flood streams across subsequent ticks.
+  setTimeout(tick, 0);
+}
+
+/**
+ * Dispatch the backend's app-close `serialize-terminal-buffers` event
+ * (payload `null`, see `src/tauri/events.ts`) to the app's listeners so
+ * the close-path serialization dance (`use-scrollback-serializer.ts`)
+ * runs live/flushes against the mock stores above.
+ */
+function emitSerializeBuffers(): void {
+  console.info(
+    "[mock::terminal] emitSerializeBuffers -> serialize-terminal-buffers",
+  );
+  emitEvent("serialize-terminal-buffers", null);
+}
 
 // ── Static command returns ──────────────────────────────────────────
 
@@ -559,11 +749,18 @@ function drainChatQueue(threadId: string): void {
  *  backend's `forward_event` routing. */
 function streamMockChatReply(
   threadId: string,
-  opts: { tokens?: number; intervalMs?: number } = {},
+  opts: { tokens?: number; intervalMs?: number; emptyGapTicks?: number } = {},
 ): string {
   const turnId = `live-turn-${++mockChatTurnSeq}`;
   const tokens = Math.max(1, opts.tokens ?? 120);
   const intervalMs = Math.max(5, opts.intervalMs ?? 40);
+  // `emptyGapTicks` reproduces the real partial-message stream shape from
+  // issue #155: after the tool run, the provider opens the text content
+  // block with an EMPTY first delta, then goes silent for a while before
+  // prose streams. Used to visually verify the transcript never reads
+  // finished-and-empty during that gap. 0 (default) keeps the old shape.
+  let gapTicksLeft = Math.max(0, opts.emptyGapTicks ?? 0);
+  let emptyDeltaSent = false;
   const send = (event: unknown) => emitChatEvent(threadId, event);
 
   chatActiveTurns.add(threadId);
@@ -688,6 +885,20 @@ function streamMockChatReply(
       toolIdx += 1;
       toolSubphase = "use";
       if (toolIdx >= TOOL_STEPS.length) phase = "text";
+      return;
+    }
+    if (!emptyDeltaSent && gapTicksLeft > 0) {
+      emptyDeltaSent = true;
+      send({
+        type: "content_delta",
+        thread_id: threadId,
+        turn_id: turnId,
+        delta: { kind: "text", text: "" },
+      });
+      return;
+    }
+    if (gapTicksLeft > 0) {
+      gapTicksLeft -= 1;
       return;
     }
     emitted += 1;
@@ -923,6 +1134,46 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
   streamRunStalled: streamMockRunStalled,
   interruptRun: interruptMockRun,
 };
+
+// Expose the terminal flood + serialize triggers for browser-console /
+// automation use (issue #128 scrollback serialize/restore e2e).
+(
+  window as unknown as {
+    __codemuxTerminalMock: {
+      flood: typeof floodTerminals;
+      emitSerializeBuffers: typeof emitSerializeBuffers;
+    };
+  }
+).__codemuxTerminalMock = {
+  flood: floodTerminals,
+  emitSerializeBuffers,
+};
+
+// CLI-drivable triggers: the browser is driven by `codemux browser
+// key-press` (no JS eval), so bind two RARE combos to the same helpers.
+// Capture phase + preventDefault/stopPropagation so the chord never
+// reaches xterm. `e.code` (physical key) is used so the binding is
+// layout-independent even while Alt mangles `e.key`.
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if (!(e.ctrlKey && e.altKey && e.shiftKey)) return;
+    if (e.code === "KeyF") {
+      e.preventDefault();
+      e.stopPropagation();
+      console.info("[mock::terminal] key-combo Ctrl+Alt+Shift+F -> flood()");
+      floodTerminals();
+    } else if (e.code === "KeyS") {
+      e.preventDefault();
+      e.stopPropagation();
+      console.info(
+        "[mock::terminal] key-combo Ctrl+Alt+Shift+S -> emitSerializeBuffers()",
+      );
+      emitSerializeBuffers();
+    }
+  },
+  true,
+);
 
 // A small, mutable preset store so the preset bar + structured editor are
 // exercisable in the browser dev environment. Mirrors the real backend:
@@ -1596,21 +1847,77 @@ const handlers: Record<string, Handler> = {
     message: null,
     exit_code: null,
   }),
-  get_terminal_scrollback: () => null,
   attach_pty_output: (a) => {
-    pushMockTerminalBanner(a.channel);
+    const sessionId = a.sessionId as string;
+    // Newest attach wins: a fresh Channel has an empty ordering buffer,
+    // so nextIndex resets to 0. The mount banner is the first frame.
+    const entry: MockPtyChannelEntry = { channel: a.channel, nextIndex: 0 };
+    ptyChannels.set(sessionId, entry);
+    ptyChannelPush(entry, MOCK_TERMINAL_BANNER);
     return undefined;
   },
   resize_pty: () => undefined,
   write_to_pty: () => undefined,
-  detach_pty_output: () => undefined,
+  detach_pty_output: (a) => {
+    ptyChannels.delete(a.sessionId as string);
+    return undefined;
+  },
   pause_pty_output: () => undefined,
   resume_pty_output: () => undefined,
   clear_agent_status: () => undefined,
-  cache_terminal_scrollback: () => undefined,
-  uncache_terminal_scrollback: () => undefined,
-  save_terminal_scrollback: () => undefined,
-  flush_scrollback_cache: () => 0,
+
+  // ── Terminal scrollback (issue #128) — faithful two-store twin of
+  //    `src-tauri/src/scrollback.rs`; see the store section above. ──
+  save_terminal_scrollback: (a) => {
+    const payload = a.payload as ScrollbackPayload;
+    writeScrollbackDisk(payload);
+    logScrollback(
+      `save session=${shortId(payload.session_id)} bytes=${approxByteLen(payload.data)} tail=${tailOf(payload.data)}`,
+    );
+    return undefined;
+  },
+  get_terminal_scrollback: (a) => {
+    const workspaceId = a.workspaceId as string;
+    const paneId = a.paneId as string;
+    const entry = scrollbackDisk.get(diskKey(workspaceId, paneId));
+    if (!entry) {
+      logScrollback(`get ws=${shortId(workspaceId)} pane=${shortId(paneId)} -> miss`);
+      return null;
+    }
+    logScrollback(
+      `get ws=${shortId(workspaceId)} pane=${shortId(paneId)} -> hit bytes=${approxByteLen(entry.payload.data)}`,
+    );
+    return buildScrollbackRestore(entry);
+  },
+  cache_terminal_scrollback: (a) => {
+    const payload = a.payload as ScrollbackPayload;
+    scrollbackCache.set(payload.session_id, payload);
+    logScrollback(
+      `cache session=${shortId(payload.session_id)} bytes=${approxByteLen(payload.data)} alt=${payload.alternate_buffer} tail=${tailOf(payload.data)}`,
+    );
+    return undefined;
+  },
+  uncache_terminal_scrollback: (a) => {
+    const sessionId = a.sessionId as string;
+    scrollbackCache.delete(sessionId);
+    logScrollback(`uncache session=${shortId(sessionId)}`);
+    return undefined;
+  },
+  flush_scrollback_cache: () => {
+    // Drain the cache; write only non-empty payloads to the disk store
+    // (empty ones are useless to restore from) — mirrors
+    // `flush_cache_to_disk`. Returns the count actually written.
+    let saved = 0;
+    for (const payload of scrollbackCache.values()) {
+      if (payload.data.length > 0) {
+        writeScrollbackDisk(payload);
+        saved++;
+      }
+    }
+    scrollbackCache.clear();
+    logScrollback(`flush -> ${saved}`);
+    return saved;
+  },
 
   // ── Changes panel (git status) ──
   // Shape-safe stubs: the panel expects an ARRAY from get_git_status —

@@ -680,6 +680,59 @@ pub async fn close_workspace_with_worktree(
     .await
 }
 
+/// Fire-and-forget teardown of the agent-browser CLI session(s) that
+/// belonged to a just-closed workspace (issue #126: agent-browser daemons
+/// used to accumulate for the app's whole lifetime because nothing ever
+/// reaped them on workspace close — only an app restart's blanket cleanup
+/// caught them).
+///
+/// Shared-cwd safety: two workspaces opened at the same cwd get separate
+/// `AgentBrowserSession` records but the SAME `cli_session_name` (it is a
+/// pure hash of the cwd via `stable_browser_session_name`), so they share
+/// one daemon in the manager map. Closing workspace A must therefore NOT
+/// kill the daemon workspace B's live pane still uses. Before closing
+/// each name, the spawned task re-checks
+/// `live_agent_browser_session_names()` — computed AFTER the close's
+/// state mutation completed, so it is the post-close live set — and skips
+/// any name still referenced. This gives refcount-like semantics for
+/// free: the daemon dies only when the LAST workspace sharing the name
+/// closes, because that later close's reap finds the name no longer live.
+///
+/// Spawns a single background task per call rather than blocking the
+/// close command on daemon teardown: `manager.close()` is already
+/// timeout-bounded internally (see the module doc in `agent_browser.rs`),
+/// so there's no correctness reason to await it here, only a latency one.
+/// `pub(crate)` so every `AppStateStore::close_workspace` call site
+/// (the two close commands here, OpenFlow run teardown, and the
+/// workspaces-sync reconcile/rollback paths) shares the one
+/// implementation instead of drifting.
+pub(crate) fn reap_agent_browser_sessions(app: &tauri::AppHandle, names: Vec<String>) {
+    if names.is_empty() {
+        return;
+    }
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let manager: State<'_, AgentBrowserManager> = app_handle.state();
+        let state: State<'_, AppStateStore> = app_handle.state();
+        // Post-close live set — see the shared-cwd rationale in the doc
+        // comment. Anything still in here belongs to a surviving workspace.
+        let live = state.live_agent_browser_session_names();
+        for name in names {
+            if live.contains(&name) {
+                eprintln!(
+                    "[codemux::browser] skip reap of {name}: still referenced by a live workspace"
+                );
+                continue;
+            }
+            if let Err(error) = manager.close(&name).await {
+                eprintln!(
+                    "[codemux::browser] failed to close agent-browser session {name} on workspace close: {error}"
+                );
+            }
+        }
+    });
+}
+
 /// Shared close-workspace implementation backing both the Tauri command
 /// (in-app sidebar / branch picker close affordances) and the
 /// `close_workspace` control-socket command exposed via the Phase 1.6
@@ -741,6 +794,13 @@ pub(crate) async fn close_workspace_with_worktree_impl(
     let close_result = state
         .close_workspace(&workspace_id)
         .map_err(|e| format!("Failed to close workspace: {e}"))?;
+
+    // Reap the agent-browser CLI session(s) that belonged to this
+    // workspace (issue #126). This path (worktree closes + the MCP
+    // `workspace_close` tool) previously had NO agent-browser teardown at
+    // all — it was the main source of the daemon leak the issue reports.
+    // See `reap_agent_browser_sessions` for the fire-and-forget rationale.
+    reap_agent_browser_sessions(&app, close_result.removed_agent_browser_sessions);
 
     // Tear down the SSH tunnel + cached remote client for a workspace
     // that was pushed to a host. Without this, closing a remote
@@ -1045,26 +1105,15 @@ pub async fn close_workspace(
         crate::mcp_server::remove_mcp_config(Path::new(cwd));
     }
 
-    // Close agent browser CLI session for this workspace.
-    // P2 from docs/plans/browser-stream-fix.md removed the workspace_id
-    // alias the manager used to register, so closing under
-    // cli_session_name is sufficient — there is no longer a second key
-    // to reap.
-    {
-        let cli_name = state.find_detached_agent_browser(&workspace_id)
-            .map(|s| s.cli_session_name.clone());
-        let app_handle = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let manager: State<'_, AgentBrowserManager> = app_handle.state();
-            if let Some(cli) = cli_name {
-                if let Err(error) = manager.close(&cli).await {
-                    eprintln!("[AGENT_BROWSER] Failed to close agent browser for workspace: {error}");
-                }
-            }
-        });
-    }
-
     let result = state.close_workspace(&workspace_id)?;
+
+    // Reap the agent-browser CLI session(s) that belonged to this
+    // workspace (issue #126). `result.removed_agent_browser_sessions` is
+    // collected under the same lock acquisition that removed the
+    // workspace from state, so this can't race a concurrent session
+    // creation for the same workspace — see the doc comment on
+    // `CloseWorkspaceResult`.
+    reap_agent_browser_sessions(&app, result.removed_agent_browser_sessions);
 
     // Tear down the SSH tunnel + cached client for a workspace that was
     // pushed to a host. This is the sibling of the teardown in

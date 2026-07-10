@@ -5,7 +5,8 @@ import {
   appendUserMessage,
   createEmptyThreadState,
 } from "./reducer";
-import type { ChatThreadState, UserMessageImage } from "./types";
+import { interruptRunningSubagents } from "./subagents";
+import type { ChatThreadState, ChatViewItem, UserMessageImage } from "./types";
 
 /**
  * Synthetic envelope written by the backend in `agent_chat_send_turn`
@@ -72,11 +73,34 @@ export function replayPayloads(payloads: string[]): ChatThreadState {
   const hasStreamingReasoning = state.messages.some(
     (m) => m.kind === "reasoning" && m.streaming,
   );
-  const messages = hasStreamingReasoning
+  let messages: ChatViewItem[] = hasStreamingReasoning
     ? state.messages.map((m) =>
         m.kind === "reasoning" && m.streaming ? { ...m, streaming: false } : m,
       )
     : state.messages;
+
+  // Belt-and-braces run-state reconciliation (issue #153): a transcript
+  // that ends mid-run — the last persisted event was a `running` snapshot
+  // with no terminal snapshot after it — must NEVER hydrate with a live
+  // spinner. Interrupt every still-running subagent (in cards and
+  // workflow phases) and stop any still-`running` workflow. This mirrors
+  // the reducer's own settle paths and self-heals: if the persisted
+  // stream actually did settle a subagent (e.g. a parent `tool_result`
+  // the reducer derived from), that terminal state already won during
+  // replay and is left untouched here.
+  //
+  // A `pending_approval` workflow is deliberately PRESERVED — it is a
+  // legitimate persisted resting state awaiting the user's decision (the
+  // "Run as a workflow?" card), not a runaway spinner, and the backend
+  // auto-resume re-establishes the session so the approval can still be
+  // answered after a restart.
+  messages = interruptRunningSubagents(messages);
+  messages = messages.map((m) =>
+    m.kind === "workflow_run" && m.status === "running"
+      ? { ...m, status: "stopped" as const }
+      : m,
+  );
+
   return {
     ...state,
     messages,

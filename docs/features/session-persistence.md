@@ -16,6 +16,12 @@ Session persistence saves terminal scrollback content when Codemux closes and re
 
 On close, the Rust backend emits `serialize-terminal-buffers` to the frontend. Each mounted `TerminalPane` uses `@xterm/addon-serialize` to capture its buffer content. The serialized data is sent back to the backend via `save_terminal_scrollback` and written to `~/.local/share/codemux/scrollback/{workspace_id}/{pane_id}.dat` (Linux) or `%APPDATA%\codemux\scrollback\{workspace_id}\{pane_id}.dat` (Windows) with a JSON metadata sidecar.
 
+#### Idle Pre-Serialization (fresh-if-clean)
+
+Serializing a deep scrollback is synchronous main-thread work and, for plain shells, is the dominant cost of a workspace/tab switch — the >30ms hotspot of issue #128. To keep that cost off the latency-critical unmount/close path, each `TerminalPane` runs a per-pane idle serializer (`scrollback-idle-serializer.ts`). It watches the write-pump byte stream (an O(1) `notifyOutput` per chunk, so the per-keystroke local-echo path stays cheap) and, once output has been quiet for 1s (and ≥5s since the last serialize), runs `serializeAddon.serialize()` in a `requestIdleCallback` slot (setTimeout fallback where rIC is unavailable) and caches the result. A resize invalidates the cache (reflow); alt-screen panes are never idle-serialized.
+
+On unmount (tab/workspace switch) and on the close serialize dance, `buildScrollbackPayload` reuses the cached buffer when it is still clean — the switch then pays no serialize cost at all — and falls back to a fresh synchronous serialize when the cache is dirty, so persistence semantics are unchanged in the fallback. Only the serialized `data` bytes are reused; the rest of the payload metadata (session lookup, workspace id, cwd, cols/rows, adapter captures) is recomputed fresh at save time either way. A reused buffer is always primary-screen content, so it is persisted with `alternate_buffer: false`. The >30ms timing log is tagged `trigger=unmount|close|idle`, and DEV builds additionally log every serialize/flush decision with `reused=true|false`.
+
 The backend waits for the frontend to ack with a `scrollback-serialization-complete` event, then closes regardless. The timeout differs per platform:
 
 - **Linux/macOS**: 3 seconds. Tauri IPC is fast enough that the happy path completes well under budget.
@@ -166,7 +172,8 @@ Codemux detects this automatically: if the terminal was in alternate buffer mode
 - `src-tauri/src/settings_sync.rs` — `SessionRestoreSettings` struct (defaults: `enabled=true`, `scrollback_lines=10000`, `max_total_mb=100`)
 - `src-tauri/src/state/state_impl.rs` — `original_command` field on `TerminalSessionSnapshot`
 - `src-tauri/src/commands/presets.rs` — sets `original_command` when applying presets
-- `src/components/terminal/TerminalPane.tsx` — serialize addon and scrollback restore
+- `src/components/terminal/TerminalPane.tsx` — serialize addon and scrollback restore; `buildScrollbackPayload` (accepts an idle-precomputed buffer) + `buildFreshOrCached` fresh-if-clean reuse on unmount/close
+- `src/components/terminal/scrollback-idle-serializer.ts` — per-pane idle serializer that pre-serializes a clean buffer while the pane is quiet so the unmount/close path can skip the synchronous serialize (issue #128); falls back to a fresh serialize when dirty
 - `src/hooks/use-scrollback-serializer.ts` — global serialization coordinator
 - `src/tauri/commands.ts` — scrollback and adapter command wrappers
 - `~/.config/codemux/session-adapters.toml` — user-editable adapter config

@@ -214,13 +214,24 @@ slot — see "Activity block" below), and per-slot identity.
 
 Contract preserved from the pre-redesign renderer:
 
-- **Stable keys + memo rows.** Per-slot keys are still `slot.item.id`
-  / `run:<first-id>` (as `MessageScrollerItem messageId`), and rows
-  render through memoized leaves (`ItemRowMemo` / `ActivityRowMemo`)
-  — a streaming token mutates exactly one row. (Activity rows rebuild
-  their `items` array each build, as the old tool-group rows did; the
-  stable `run:<first-id>` key keeps the scroller row from remounting as
-  the run grows and transitions working → settled.)
+- **Stable keys + two-level memo rows.** Per-slot keys are still
+  `slot.item.id` / `run:<first-id>` (as `MessageScrollerItem messageId`).
+  Rows render through **two** memo levels (issue #129): a whole-row
+  wrapper `SlotRowMemo` (owns the `MessageScrollerItem` element + the
+  activity/item branch) and the leaves `ItemRowMemo` / `ActivityRowMemo`.
+  The wrapper's skip depends on **slot-object reuse**: `buildTranscriptSlots`
+  rebuilds every slot on each store update (each streaming token), so
+  `reuseTranscriptSlots` swaps unchanged slots back to their previous object
+  identity (matched by key; item bodies compared by `item` reference,
+  activity bodies by `working` + element-wise `items`), returning the prev
+  array itself when nothing changed. With that reused identity plus the
+  reducer's stable `item` / `approval` refs, an untouched row's wrapper props
+  stay shallow-equal and it skips reconciliation entirely — so a streaming
+  token re-renders **exactly one wrapper and one leaf**, and the rest of the
+  transcript is untouched. (Activity rows still rebuild their `items` array
+  each build, as the old tool-group rows did; the stable `run:<first-id>` key
+  keeps the scroller row from remounting as the run grows and transitions
+  working → settled.)
 - **Stick-to-bottom.** The shadcn scroller engine
   (`MessageScrollerProvider autoScroll`) is the single owner of
   tail-tracking: its `following-bottom` state machine re-scrolls to
@@ -271,6 +282,65 @@ Contract preserved from the pre-redesign renderer:
   the thread `streaming` flag into `buildTranscriptSlots`, and the
   marker only renders when the tail slot is not a working Activity block
   (it still fills the gap right after send, before any step arrives).
+  The marker carries a **live elapsed-time suffix** ("Writing… · 40s"):
+  `StreamingMarker` derives the active turn's start with
+  `deriveTurnStartedAt` (the earliest reducer-stamped `started_at` of the
+  reasoning / tool steps after the last non-queued user turn) and ticks a
+  text node via `setInterval` writing `textContent` directly — no
+  per-second React re-render of the transcript. No start is derivable in
+  the gap right after send or on a hydrated transcript whose rows predate
+  the timestamp fields; the suffix is then omitted rather than faked.
+- **Empty deltas never materialize a message.** The partial-message
+  stream often opens a new text content block with an empty (or
+  whitespace-only) first delta. `appendTextDelta` (`reducer.ts`) drops it
+  instead of creating an empty `assistant_message`: an empty row would
+  render near-blank AND, as a non-step item, flush the live Activity run
+  as settled mid-turn — so the transcript would read finished-but-empty
+  while the turn is still working. The drop is deterministic, so a
+  hydrate/replay of the same events (`hydrate.ts`) keeps the identical
+  item count as live streaming. `shouldShowThinkingIndicator`
+  (`thinking.ts`) also keeps the tail marker up for a
+  streaming-but-empty `assistant_message` as defense in depth for a
+  provider that lands one anyway.
+
+### Perf on Linux WebKitGTK (issue #129)
+
+Three transcript-scroll fixes for the Linux app webview (all
+frontend-only; no Rust change):
+
+- **Viewport edge-fade mask gated off on Linux WebKitGTK.** The design
+  edge fade (`WS_FADE_STYLE`) is a CSS `mask-image` on the scroll
+  viewport. On Linux the app forces WebKitGTK into **non-composited
+  (CPU) mode** — `src-tauri/src/lib.rs` sets
+  `WEBKIT_DISABLE_COMPOSITING_MODE=1` and
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` — where a viewport mask forces a
+  **full-viewport CPU re-rasterization on every scroll frame** (the
+  scroll jank in the issue). So the mask is disabled on Linux WebKitGTK
+  and kept everywhere it composites (macOS / Windows / dev-mock Chromium
+  — byte-identical rendering). The decision is a pure, injectable helper
+  (`transcript-fade.ts`, `decideTranscriptFade`), cached once per session,
+  and honors a `localStorage["codemux:transcript-fade"] = "on" | "off"`
+  override first (live A/B escape hatch for profiling, mirroring the
+  terminal renderer override); the WebKitGTK check itself moved to the
+  shared `@/lib/webkit` `isLinuxWebKitGtk` (re-exported from
+  `webgl-renderer-probe.ts`). A one-time `console.info` states the verdict
+  only when the fade is disabled or overridden.
+- **Slot-object reuse + a memoized whole-row wrapper** (see "Stable keys
+  + two-level memo rows" above): `reuseTranscriptSlots` preserves an
+  untouched slot's object identity across the per-token rebuild, so with
+  the two-level memo a streaming token re-renders exactly one row wrapper
+  and one leaf — the rest of the transcript skips reconciliation instead
+  of re-running all *n* wrappers per token.
+- **One-shot `content-visibility` support warning.** Row containment
+  (`[content-visibility:auto]` per row) is what keeps thousands of rows
+  cheap; on old WebKitGTK builds the property can be a silent no-op. On
+  module load `transcript-fade.ts` checks `CSS.supports("content-visibility",
+  "auto")` once and `console.warn`s (grep-able on `content-visibility`) if
+  it is unsupported (suppressed under vitest). Diagnostic only — no
+  behavior change.
+- **DMABUF renderer hypothesis** from the issue is already handled by the
+  `lib.rs` env defaults above (`WEBKIT_DISABLE_DMABUF_RENDERER=1`), so no
+  additional change is needed for it.
 
 ### Activity block (Activity Stream)
 
@@ -289,7 +359,10 @@ derivations (unit-tested in `activity-steps.test.ts`).
   rolls up to a green circled check + a derived summary sentence
   (`deriveActivitySummary`: read-heavy → "Explored the codebase",
   command-heavy → "Ran commands", edit-heavy → "Edited files", mixed →
-  sensible) + a mono `N steps · 1m 12s` meta (duration from step
+  sensible; its "Worked through N steps" fallback counts **all**
+  non-reasoning steps including `other`-family tools — Task/agent spawns,
+  MCP tools — so it never claims fewer steps than the header meta) + a
+  mono `N steps · 1m 12s` meta (duration from step
   `started_at`/`completed_at`, omitted when < 1s / not derivable, e.g.
   hydrated transcripts) + a Details/Hide toggle. On settle the block
   re-renders collapsed (any mid-stream expansion resets).
@@ -535,9 +608,55 @@ idle — no resting state.
   top-edge sweep animation (`cm-sweep` in `globals.css`) and `.cm-blink`
   (still used by the breadcrumb's status dot) honor reduced-motion.
 
+### Run-state settlement (issue #153)
+
+The transcript layer's only "running → terminal" transition used to be a
+terminal `subagent_updated` snapshot. When the Claude adapter's demux
+loses track (sidecar restart/resume) the spawning `Task` tool's raw
+parent-scoped `tool_result` flows through and no terminal snapshot ever
+arrives, so a subagent could show "N running" forever — persisted that
+way, and resurrected on hydrate. The frontend now settles run state from
+several additional signals (the transcript-layer counterpart of the
+backend `SubagentTracker`; pure helpers in `subagents.ts`, unit-tested):
+
+- **`tool_result` derivation.** A parent-scoped `tool_result` (no
+  `subagent_id`) whose `tool_use_id` matches a still-running subagent's
+  demux id **or** its `parentItemId` (the spawning tool_use/call id,
+  merged from `SubagentSnapshot.parent_item_id`) settles that subagent
+  (`completed`, or `failed` on error). A subagent-**tagged** `tool_result`
+  routes into the sub-transcript and never settles the row. The matching
+  Workflow tool's own `tool_result` likewise settles the run and its
+  in-flight phase agents.
+- **Forced settle.** `session_state_changed{closed|error}` and a new user
+  turn (mirroring `SubagentTracker::clear_thread` on send) interrupt every
+  running/pending subagent and stop running workflows; a queued follow-up
+  (sent while streaming) leaves the active turn's subagents alone.
+- **Interrupted-on-hydrate.** The hydrate reconciliation force-settles any
+  subagent still running at end-of-replay to a **view-only `interrupted`**
+  status (`SubagentViewStatus = SubagentStatus | "interrupted"`, never on
+  the wire; muted-amber tone, a non-spinning glyph) and stops a still-
+  `running` workflow — a resumed transcript never renders a live spinner.
+  A `pending_approval` workflow is preserved (a resting state awaiting the
+  user, not a runaway spinner).
+- **`statusAssumed` + revive-on-running-snapshot.** Every inferred
+  settlement stamps `statusAssumed`, so a later **real** `running`
+  snapshot (e.g. a Claude background task re-emitting `running` via
+  `task_progress`) revives the row back to `running`, and a later real
+  terminal snapshot wins by rank and clears the flag. This makes the
+  inference self-healing on live streams and on replay.
+- **`runtime_warning` notices.** A small classifier (`runtime-notice.ts`)
+  promotes the user-facing runtime warnings — a provider rate-limit
+  rejection (`rate_limit_info.status === "rejected"`), the SDK's
+  enumerated `assistant error: …` — into a compact muted-amber inline
+  `runtime_notice` transcript row; all other `runtime_warning`s stay
+  console-only debug noise.
+
 The dev mock seeds one subagent turn in the demo transcript and exposes
 `window.__codemuxChatMock.streamSubagents()` for a live two-subagent
-lifecycle over the real per-thread Channel.
+lifecycle over the real per-thread Channel. Because the seeded transcript
+is served through the hydrate path, its still-running subagent (and the
+mid-run `/workflow` demo) correctly settle to `interrupted`/`stopped` on
+load; the live running bar remains demoable via `streamSubagents()`.
 
 **Workflow runs are a Claude-only relative of this system.** When a
 Claude session runs a top-level `Workflow` tool_use (a script that

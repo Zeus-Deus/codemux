@@ -23,6 +23,12 @@ export function shouldShowThinkingIndicator(
   const last = messages[messages.length - 1];
   switch (last.kind) {
     case "assistant_message":
+      // A streaming assistant tail normally renders its own caret, so the
+      // pulse steps back (`!streaming` → false). But a streaming-but-EMPTY
+      // tail renders nothing yet — keep the marker up so the turn never
+      // looks finished. Layer 1 drops empty deltas before they become an
+      // item; this is defense in depth for providers that still land one.
+      if (last.streaming && last.text.length === 0) return true;
       return !last.streaming;
     case "reasoning":
       // A streaming reasoning block renders its own "Thinking…" header, so
@@ -49,6 +55,9 @@ export function shouldShowThinkingIndicator(
       );
     case "user_message":
     case "turn_ended":
+    case "runtime_notice":
+      // Settled inline rows — back to dead time waiting on the agent, so
+      // the tail pulse fills the gap (still gated by `streaming` above).
       return true;
   }
 }

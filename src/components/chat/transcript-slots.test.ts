@@ -7,7 +7,7 @@ import type {
   ToolCallItem,
 } from "@/lib/agent-chat/types";
 
-import { buildTranscriptSlots } from "./transcript-slots";
+import { buildTranscriptSlots, reuseTranscriptSlots } from "./transcript-slots";
 
 function userMsg(seq: number, text = "hi"): ChatViewItem {
   return { kind: "user_message", id: `um-${seq}`, seq, text };
@@ -246,6 +246,75 @@ describe("buildTranscriptSlots — subagent card", () => {
       "item",
       "activity",
     ]);
+  });
+});
+
+describe("reuseTranscriptSlots — per-token slot-object reuse", () => {
+  it("(a) reuses every slot object except the changed one on a token delta", () => {
+    const a0 = assistantMsg(0, "a");
+    const a1 = assistantMsg(1, "b");
+    const a2 = assistantMsg(2, "c");
+    const prev = buildTranscriptSlots([a0, a1, a2]);
+    // Reducer `replaceItem` for a streaming delta: the tail item is a NEW
+    // object (same id), the rest keep their references.
+    const a2next = assistantMsg(2, "c plus-token");
+    const next = buildTranscriptSlots([a0, a1, a2next]);
+
+    const reused = reuseTranscriptSlots(prev, next);
+    expect(reused).not.toBe(prev); // an element changed → new array
+    expect(reused[0]).toBe(prev[0]);
+    expect(reused[1]).toBe(prev[1]);
+    // The mutated row is the fresh slot, not the stale prev one.
+    expect(reused[2]).toBe(next[2]);
+    expect(reused[2]).not.toBe(prev[2]);
+  });
+
+  it("(b) returns the prev ARRAY identity when nothing changed", () => {
+    const items = [assistantMsg(0, "a"), assistantMsg(1, "b"), assistantMsg(2, "c")];
+    const prev = buildTranscriptSlots(items);
+    // A rebuild off the SAME item references — fresh slot objects, equivalent.
+    const next = buildTranscriptSlots(items);
+    const reused = reuseTranscriptSlots(prev, next);
+    expect(reused).toBe(prev);
+  });
+
+  it("(c) rebuilds only the grown tail activity run, reusing earlier slots", () => {
+    const t0 = tool(0);
+    const t1 = tool(1);
+    const am = assistantMsg(2);
+    const t3 = tool(3);
+    const t4 = tool(4);
+    const t5 = tool(5);
+    // Two activity runs split by a prose row: [activity, item, activity].
+    const prev = buildTranscriptSlots([t0, t1, am, t3, t4]);
+    // A new step lands on the TAIL run only.
+    const next = buildTranscriptSlots([t0, t1, am, t3, t4, t5]);
+
+    const reused = reuseTranscriptSlots(prev, next);
+    expect(reused).not.toBe(prev);
+    expect(reused[0]).toBe(prev[0]); // leading run unchanged
+    expect(reused[1]).toBe(prev[1]); // prose row unchanged
+    expect(reused[2]).toBe(next[2]); // grown run is the fresh slot
+    expect(reused[2]).not.toBe(prev[2]);
+    if (reused[2].body.kind === "activity") {
+      expect(reused[2].body.items).toHaveLength(3);
+    }
+  });
+
+  it("(d) matches by key (not index), so a removal doesn't leak the wrong reuse", () => {
+    const a0 = assistantMsg(0, "a");
+    const a1 = assistantMsg(1, "b");
+    const a2 = assistantMsg(2, "c");
+    const prev = buildTranscriptSlots([a0, a1, a2]);
+    // Drop the middle row: am-2 shifts from index 2 to index 1.
+    const next = buildTranscriptSlots([a0, a2]);
+
+    const reused = reuseTranscriptSlots(prev, next);
+    expect(reused).toHaveLength(2);
+    expect(reused[0]).toBe(prev[0]);
+    // am-2 is reused by KEY from prev[2], even though it now sits at index 1.
+    expect(reused[1]).toBe(prev[2]);
+    expect(reused[1].messageId).toBe("am-2");
   });
 });
 

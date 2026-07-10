@@ -7,7 +7,13 @@ import type {
   WorkflowSnapshot,
 } from "@/tauri/events";
 
-import { mergeSnapshot, newSubagentView } from "./subagents";
+import { runtimeNoticeFromWarning } from "./runtime-notice";
+import {
+  interruptRunningSubagents,
+  mergeSnapshot,
+  newSubagentView,
+  settleSubagentsForToolResult,
+} from "./subagents";
 import {
   emptyThreadState,
   type AssistantMessageItem,
@@ -15,11 +21,13 @@ import {
   type ChatViewItem,
   type PermissionRequestItem,
   type ReasoningItem,
+  type RuntimeNoticeItem,
   type SubagentRunItem,
   type SubagentView,
   type ToolCallItem,
   type UserMessageImage,
   type UserMessageItem,
+  type WorkflowPhaseView,
   type WorkflowRunItem,
 } from "./types";
 import { mergeWorkflowSnapshot, newWorkflowRunItem } from "./workflows";
@@ -288,6 +296,10 @@ function appendTextDelta(
     tail.streaming &&
     (!tail.turn_id || tail.turn_id === turnId)
   ) {
+    // Merging an empty delta into the existing streaming tail changes
+    // nothing — keep the ctx reference-stable rather than cloning the row
+    // (tail is the assistant, so no reasoning was sealed above).
+    if (text.length === 0) return ctx;
     const next: AssistantMessageItem = {
       ...tail,
       turn_id: turnId,
@@ -299,6 +311,16 @@ function appendTextDelta(
       nextSeq: ctx.nextSeq,
     };
   }
+  // No streaming assistant tail to merge into. Providers (notably the
+  // partial-message stream) routinely open a fresh text content block with
+  // an empty first delta. Materializing an assistant_message for it would
+  // render a near-blank row AND, being a non-step item, settle the live
+  // Activity run mid-turn — so the transcript reads finished-but-empty while
+  // the turn is still working. Drop the empty / whitespace-only delta; a
+  // later non-empty delta creates the row. The guard is deterministic, so a
+  // hydrate/replay of the same event sequence produces the identical item
+  // count as live streaming.
+  if (text.trim().length === 0) return ctx;
   const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
   const newAssistant: AssistantMessageItem = {
     kind: "assistant_message",
@@ -353,6 +375,14 @@ function applyCompletedItemToList(
           messages: replaceItem(messages, existing.index, next),
           nextSeq: ctx.nextSeq,
         };
+      }
+      // No streaming assistant to seal. A completion whose text is empty
+      // (a turn whose only text block was empty — Layer 1 dropped its
+      // deltas) must not materialize a blank settled row: there is nothing
+      // to render and nothing to seal. Return the (reasoning-sealed)
+      // messages so the turn still settles cleanly.
+      if (item.text.length === 0) {
+        return { messages, nextSeq: ctx.nextSeq };
       }
       const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
       const newAssistant: AssistantMessageItem = {
@@ -701,13 +731,61 @@ function applyWorkflowSubagentUpdated(
 }
 
 /** Stop every workflow still `running`/`pending_approval` — used when
- *  the thread's turn dies with no other terminal signal coming for it. */
+ *  the thread's turn dies with no other terminal signal coming for it.
+ *  Returns the SAME array reference when no workflow changed, so callers
+ *  can cheaply detect a no-op (issue #153: the session-close settle path
+ *  keys off reference identity to avoid a needless state churn). */
 function stopRunningWorkflows(messages: ChatViewItem[]): ChatViewItem[] {
-  return messages.map((m) => {
+  let changed = false;
+  const next: ChatViewItem[] = messages.map((m) => {
     if (m.kind !== "workflow_run") return m;
     if (m.status !== "running" && m.status !== "pending_approval") return m;
+    changed = true;
     return { ...m, status: "stopped" };
   });
+  return changed ? next : messages;
+}
+
+/** Settle a workflow whose spawning `Workflow` tool_use just produced a
+ *  parent-scoped `tool_result` (the raw spawn result leaked through
+ *  because the adapter's demux lost track — issue #153): flip the run to
+ *  `completed`/`failed` and settle its still-running phase agents
+ *  (`completed` on success; view-only `interrupted` on error) with
+ *  `statusAssumed` so a later real snapshot can revive/confirm them.
+ *  Same-ref when there is no matching in-flight workflow. */
+function settleWorkflowForToolResult(
+  messages: ChatViewItem[],
+  toolUseId: string,
+  isError: boolean,
+): ChatViewItem[] {
+  const found = findWorkflow(messages, toolUseId);
+  if (!found) return messages;
+  if (
+    found.item.status !== "running" &&
+    found.item.status !== "pending_approval"
+  ) {
+    return messages;
+  }
+  const agentTarget: SubagentView["status"] = isError
+    ? "interrupted"
+    : "completed";
+  const phases: WorkflowPhaseView[] = found.item.phases.map((p) => {
+    let phaseChanged = false;
+    const agents: SubagentView[] = p.agents.map((a) => {
+      if (a.status === "running" || a.status === "pending") {
+        phaseChanged = true;
+        return { ...a, status: agentTarget, statusAssumed: true };
+      }
+      return a;
+    });
+    return phaseChanged ? { ...p, agents } : p;
+  });
+  const nextItem: WorkflowRunItem = {
+    ...found.item,
+    status: isError ? "failed" : "completed",
+    phases,
+  };
+  return replaceItem(messages, found.index, nextItem);
 }
 
 /** Merge a `workflow_updated` snapshot into its item (non-null fields
@@ -832,7 +910,22 @@ function appendUserMessageLocal(
   clientNonce?: string,
   images?: UserMessageImage[],
 ): ChatThreadState {
-  const sealed = sealTrailingReasoning(state, now);
+  let sealed = sealTrailingReasoning(state, now);
+  // A new user turn while nothing is streaming is a fresh boundary —
+  // mirror the backend `SubagentTracker::clear_thread` on send (issue
+  // #153): interrupt any leftover running subagents and stop any leftover
+  // running workflow from a PRIOR turn so they don't spin under the new
+  // turn. When STREAMING (this is a queued follow-up parked behind an
+  // active turn) leave them alone — that turn is still live. On hydrate
+  // replay this also runs for each persisted user_message and self-
+  // corrects: a later replayed `running` snapshot revives, a later
+  // terminal snapshot wins by rank.
+  if (!state.streaming) {
+    const settled = interruptRunningSubagents(
+      stopRunningWorkflows(sealed.messages),
+    );
+    if (settled !== sealed.messages) sealed = { ...sealed, messages: settled };
+  }
   const { seq, next } = takeSeq(sealed);
   const item: UserMessageItem = {
     kind: "user_message",
@@ -1010,20 +1103,35 @@ function applyEventInner(
         if (state.streaming && !state.interrupted) return state;
         return { ...state, streaming: true, interrupted: false };
       }
-      if (
-        status.status === "ready" ||
-        status.status === "closed" ||
-        status.status === "error"
-      ) {
+      if (status.status === "ready") {
+        if (!state.streaming) return state;
+        return { ...state, streaming: false };
+      }
+      if (status.status === "closed" || status.status === "error") {
+        // Session teardown is a hard boundary with no further terminal
+        // signal coming for anything still in flight (issue #153): stop
+        // running workflows and interrupt running/pending subagents so a
+        // persisted transcript never resurrects a perpetual spinner.
+        // Settle even when `streaming` is already false (the running flag
+        // is cleared independently of subagent lifetimes).
+        const settled = interruptRunningSubagents(
+          stopRunningWorkflows(state.messages),
+        );
         // Belt-and-braces: a death path that couldn't recover the turn id
         // still surfaces as an error while streaming. Mark the thread
         // interrupted so the Continue affordance appears even without a
-        // `child_exited` `turn_completed`. Ready/closed are clean stops
-        // and never set it.
+        // `child_exited` `turn_completed`. Closed is a clean stop and
+        // never sets it.
         const interrupted =
           status.status === "error" && state.streaming ? true : state.interrupted;
-        if (!state.streaming && interrupted === state.interrupted) return state;
-        return { ...state, streaming: false, interrupted };
+        if (
+          settled === state.messages &&
+          !state.streaming &&
+          interrupted === state.interrupted
+        ) {
+          return state;
+        }
+        return { ...state, streaming: false, interrupted, messages: settled };
       }
       return state;
     }
@@ -1086,10 +1194,31 @@ function applyEventInner(
         event.turn_id,
         now,
       );
-      if (ctx.messages === state.messages && ctx.nextSeq === state.nextSeq) {
+      let messages = ctx.messages;
+      // A parent-scoped `tool_result` for a spawning tool settles any
+      // subagent the adapter's demux lost track of (issue #153): normally
+      // the Claude adapter suppresses the spawn tool_result and emits a
+      // terminal snapshot, but on a sidecar restart/resume the raw
+      // parent-scoped result leaks through and no terminal snapshot ever
+      // arrives — leaving the row stuck "running" forever. Derive the
+      // settlement here (revivable by a later real `running` snapshot for
+      // Claude background tasks).
+      if (item.kind === "tool_result") {
+        messages = settleSubagentsForToolResult(
+          messages,
+          item.tool_use_id,
+          item.is_error,
+        );
+        messages = settleWorkflowForToolResult(
+          messages,
+          item.tool_use_id,
+          item.is_error,
+        );
+      }
+      if (messages === state.messages && ctx.nextSeq === state.nextSeq) {
         return state;
       }
-      return { ...state, messages: ctx.messages, nextSeq: ctx.nextSeq };
+      return { ...state, messages, nextSeq: ctx.nextSeq };
     }
 
     case "subagent_updated": {
@@ -1259,10 +1388,33 @@ function applyEventInner(
     }
 
     case "runtime_warning": {
-      // Runtime warnings carry SDK-lifecycle debug strings meant for
-      // devtools, not the transcript. Surface to console only.
-      console.warn("[agent-chat]", event.message, event.original_payload ?? event);
-      return state;
+      // Most runtime warnings carry SDK-lifecycle debug strings meant for
+      // devtools, not the transcript. The classifier promotes only the
+      // user-facing ones (provider rate-limit rejection, enumerated
+      // assistant errors) to an inline notice; the rest stay console-only.
+      const notice = runtimeNoticeFromWarning(
+        event.message,
+        event.original_payload,
+      );
+      if (notice == null) {
+        console.warn(
+          "[agent-chat]",
+          event.message,
+          event.original_payload ?? event,
+        );
+        return state;
+      }
+      // A notice is a non-thinking boundary — seal any trailing reasoning
+      // before it lands.
+      const sealed = sealTrailingReasoning(state, now);
+      const { seq, next } = takeSeq(sealed);
+      const item: RuntimeNoticeItem = {
+        kind: "runtime_notice",
+        id: nextId("notice"),
+        seq,
+        message: notice,
+      };
+      return { ...next, messages: [...next.messages, item] };
     }
 
     case "resume_cursor_updated": {

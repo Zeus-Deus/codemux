@@ -4,6 +4,7 @@ import type {
   ChatViewItem,
   SubagentRunItem,
   SubagentView,
+  SubagentViewStatus,
   ToolCallItem,
 } from "./types";
 
@@ -17,22 +18,33 @@ import type {
 /** Rank used to keep `status` monotonic across dribbled snapshots: a
  *  provider that re-emits the default `pending` must never regress a row
  *  that is already running or finished. */
-const STATUS_RANK: Record<SubagentStatus, number> = {
+const STATUS_RANK: Record<SubagentViewStatus, number> = {
   pending: 0,
   running: 1,
   completed: 2,
   failed: 2,
   stopped: 2,
+  // View-only forced-settle state — terminal rank so a stray `running`
+  // snapshot can't quietly regress it via `mergeStatus`; the revive rule
+  // in `mergeSnapshot` is the ONLY path back to `running`.
+  interrupted: 2,
 };
 
 /** Merge an incoming wire `status` without regressing. A `pending`
  *  update (the serde default) never overwrites a more-advanced state;
- *  anything else (running / terminal) wins. */
+ *  anything else (running / terminal) wins. `current` may be the
+ *  view-only `interrupted`; the incoming wire status is never that.
+ *
+ *  Defensive: a missing/unknown incoming status (the wire type says
+ *  `status` is required, but replayed dev fixtures and hand-built
+ *  payloads can omit it — Rust serde-defaults it to `pending`) is
+ *  treated as `pending`, i.e. a no-op. Without this, an `undefined`
+ *  status would leak into the view and crash `statusTone` at render. */
 export function mergeStatus(
-  current: SubagentStatus,
+  current: SubagentViewStatus,
   incoming: SubagentStatus,
-): SubagentStatus {
-  if (incoming === "pending") return current;
+): SubagentViewStatus {
+  if (incoming === "pending" || STATUS_RANK[incoming] == null) return current;
   if (STATUS_RANK[incoming] < STATUS_RANK[current]) return current;
   return incoming;
 }
@@ -64,7 +76,31 @@ export function mergeSnapshot(
   snap: SubagentSnapshot,
 ): SubagentView {
   const next: SubagentView = { ...view };
-  next.status = mergeStatus(view.status, snap.status);
+  // Revive rule: a real `running` snapshot un-settles a row that was
+  // inferred to have finished (interrupted, or any assumed status —
+  // e.g. a Claude background task re-emitting `running` via task_progress
+  // after its spawn tool_result was derived as settled).
+  if (
+    snap.status === "running" &&
+    (view.status === "interrupted" || view.statusAssumed)
+  ) {
+    next.status = "running";
+    next.statusAssumed = false;
+  } else {
+    next.status = mergeStatus(view.status, snap.status);
+    // A REAL terminal snapshot (completed/failed/stopped) that wins by
+    // rank clears a previously-assumed flag — the settlement is now
+    // authoritative. Guarded on `view.statusAssumed` so a normal (never
+    // assumed) view's shape stays byte-identical (no stray `false` key).
+    if (
+      view.statusAssumed &&
+      next.status === snap.status &&
+      snap.status !== "pending"
+    ) {
+      next.statusAssumed = false;
+    }
+  }
+  if (snap.parent_item_id != null) next.parentItemId = snap.parent_item_id;
   if (snap.name != null) next.name = snap.name;
   if (snap.agent_type != null) next.agentType = snap.agent_type;
   if (snap.model != null) next.model = snap.model;
@@ -84,7 +120,8 @@ export function isDone(view: SubagentView): boolean {
   return (
     view.status === "completed" ||
     view.status === "failed" ||
-    view.status === "stopped"
+    view.status === "stopped" ||
+    view.status === "interrupted"
   );
 }
 
@@ -227,6 +264,8 @@ export function subagentActivityLine(view: SubagentView): string {
       return "Failed";
     case "stopped":
       return "Stopped";
+    case "interrupted":
+      return "Interrupted";
     default:
       return "Pending";
   }
@@ -245,6 +284,8 @@ export function subagentStatusLabel(view: SubagentView): string {
       return "Failed";
     case "stopped":
       return "Stopped";
+    case "interrupted":
+      return "Interrupted";
   }
 }
 
@@ -258,7 +299,7 @@ export interface SubagentToneClasses {
   border: string;
 }
 
-export function statusTone(status: SubagentStatus): SubagentToneClasses {
+export function statusTone(status: SubagentViewStatus): SubagentToneClasses {
   switch (status) {
     case "running":
     case "pending":
@@ -267,6 +308,16 @@ export function statusTone(status: SubagentStatus): SubagentToneClasses {
         chipBg: "bg-status-working/15 text-status-working",
         softBg: "bg-status-working/[0.08]",
         border: "border-status-working/25",
+      };
+    case "interrupted":
+      // Muted amber — settled-but-unresolved (forced stop / left mid-run).
+      // Same hue as running (status-working) but dimmed, so it reads as
+      // "was working, now halted" rather than success/failure.
+      return {
+        text: "text-status-working/80",
+        chipBg: "bg-status-working/10 text-status-working/80",
+        softBg: "bg-status-working/[0.05]",
+        border: "border-status-working/20",
       };
     case "completed":
       return {
@@ -374,4 +425,102 @@ export function runningSubagentEntries(
     }
   });
   return entries;
+}
+
+// ── Run-state settlement (issue #153) ──
+//
+// Force a stuck-running subagent to a terminal VIEW state when the only
+// real terminal signal (a terminal `subagent_updated` snapshot) never
+// arrives — a parent-scoped `tool_result` for the spawning tool, a
+// session close/error, a new user turn, or a hydrate that ends mid-run.
+// Every settlement stamps `statusAssumed` so a later real `running`
+// snapshot can revive it (see `mergeSnapshot`) and a later real terminal
+// snapshot wins by rank and clears the flag.
+
+/** Map every `SubagentView` inside a card / workflow-phase container
+ *  through `fn`, preserving reference identity for any item (and any
+ *  phase) whose agents didn't change — so the transcript array stays
+ *  reference-stable where nothing settled. Non-container items pass
+ *  through untouched. */
+function mapItemSubagents(
+  item: ChatViewItem,
+  fn: (sub: SubagentView) => SubagentView,
+): ChatViewItem {
+  if (item.kind === "subagent_run") {
+    let changed = false;
+    const subs = item.subagents.map((s) => {
+      const n = fn(s);
+      if (n !== s) changed = true;
+      return n;
+    });
+    return changed ? { ...item, subagents: subs } : item;
+  }
+  if (item.kind === "workflow_run") {
+    let changed = false;
+    const phases = item.phases.map((p) => {
+      let phaseChanged = false;
+      const agents = p.agents.map((s) => {
+        const n = fn(s);
+        if (n !== s) phaseChanged = true;
+        return n;
+      });
+      if (!phaseChanged) return p;
+      changed = true;
+      return { ...p, agents };
+    });
+    return changed ? { ...item, phases } : item;
+  }
+  return item;
+}
+
+function mapAllSubagents(
+  messages: ChatViewItem[],
+  fn: (sub: SubagentView) => SubagentView,
+): ChatViewItem[] {
+  let changed = false;
+  const next = messages.map((m) => {
+    const nm = mapItemSubagents(m, fn);
+    if (nm !== m) changed = true;
+    return nm;
+  });
+  return changed ? next : messages;
+}
+
+/**
+ * Settle every running subagent (in `subagent_run` cards AND
+ * `workflow_run` phases) whose demux key or spawning tool matches a
+ * parent-scoped `tool_result`: `sub.id === toolUseId` (Claude keys on
+ * the spawning tool_use_id) or `sub.parentItemId === toolUseId`. Sets
+ * `completed` (or `failed` when `isError`) + `statusAssumed`. Returns the
+ * SAME array reference when nothing matched.
+ */
+export function settleSubagentsForToolResult(
+  messages: ChatViewItem[],
+  toolUseId: string,
+  isError: boolean,
+): ChatViewItem[] {
+  const target: SubagentViewStatus = isError ? "failed" : "completed";
+  return mapAllSubagents(messages, (sub) => {
+    if (!isRunning(sub)) return sub;
+    if (sub.id !== toolUseId && sub.parentItemId !== toolUseId) return sub;
+    return { ...sub, status: target, statusAssumed: true };
+  });
+}
+
+/**
+ * Force every running/pending subagent (in `subagent_run` cards AND
+ * `workflow_run` phases) to the view-only `interrupted` state +
+ * `statusAssumed`. Used on session close/error, a new user turn, and the
+ * hydrate reconciliation, so a transcript that ends mid-run never renders
+ * a perpetual spinner. Returns the SAME array reference when none were
+ * running.
+ */
+export function interruptRunningSubagents(
+  messages: ChatViewItem[],
+): ChatViewItem[] {
+  return mapAllSubagents(messages, (sub) =>
+    isRunning(sub)
+      ? { ...sub, status: "interrupted", statusAssumed: true }
+      : sub,
+  );
 }

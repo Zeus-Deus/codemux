@@ -7,6 +7,15 @@ import type {
 
 export type { SubagentStatus };
 
+/**
+ * View-only subagent status. `interrupted` never appears on the wire —
+ * it is derived in the frontend when a run is force-settled (a new turn,
+ * a session close/error, or a hydrate that ends mid-run) so a persisted
+ * transcript never resurrects a perpetual "running" spinner. A later real
+ * `running` snapshot revives an interrupted row (see `mergeSnapshot`).
+ */
+export type SubagentViewStatus = SubagentStatus | "interrupted";
+
 export type ChatItemId = string;
 
 /**
@@ -179,7 +188,18 @@ export interface SubagentView {
   name?: string;
   agentType?: string;
   model?: string;
-  status: SubagentStatus;
+  status: SubagentViewStatus;
+  /** The spawning tool_use / call id (`SubagentSnapshot.parent_item_id`)
+   *  for all three providers. Lets a parent-scoped `tool_result` settle
+   *  this row when the adapter's demux lost track and let the raw
+   *  spawning `tool_result` through (the issue-#153 stuck-thread shape). */
+  parentItemId?: string;
+  /** True when `status` was settled by INFERENCE (a parent-scoped
+   *  `tool_result` derivation, a forced settle on close/new-turn, or a
+   *  hydrate reconciliation) rather than a real terminal snapshot. A real
+   *  terminal snapshot clears it; a real `running` snapshot revives an
+   *  assumed/interrupted row back to `running` and clears it. */
+  statusAssumed?: boolean;
   /** Provider-pushed "currently doing X" line, when supplied. */
   activity?: string;
   /** Final report first surfaced on completion. */
@@ -280,6 +300,20 @@ export interface WorkflowRunItem {
   approvalRequestId: string | null;
 }
 
+/**
+ * A compact inline notice surfaced from a `runtime_warning` the reducer
+ * decides is user-facing (a provider rate-limit rejection, an enumerated
+ * SDK assistant error). Most `runtime_warning`s stay console-only debug
+ * noise; the classifier (`runtime-notice.ts`) decides which ones become
+ * one of these rows. Rendered as a muted-amber left-bordered line.
+ */
+export interface RuntimeNoticeItem {
+  kind: "runtime_notice";
+  id: ChatItemId;
+  seq: number;
+  message: string;
+}
+
 export type ChatViewItem =
   | UserMessageItem
   | AssistantMessageItem
@@ -288,7 +322,8 @@ export type ChatViewItem =
   | PermissionRequestItem
   | TurnEndedItem
   | SubagentRunItem
-  | WorkflowRunItem;
+  | WorkflowRunItem
+  | RuntimeNoticeItem;
 
 export interface ChatThreadState {
   messages: ChatViewItem[];

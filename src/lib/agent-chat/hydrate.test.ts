@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import type { ProviderRuntimeEvent } from "@/tauri/events";
 
 import { lastTurnUnsettled, replayPayloads } from "./hydrate";
+import { findSubagentView, runningSubagentEntries } from "./subagents";
+import type { WorkflowRunItem } from "./types";
 
 function user(text: string): string {
   return JSON.stringify({ type: "user_message", thread_id: "t", text });
@@ -408,6 +410,108 @@ describe("replayPayloads", () => {
     if (ended?.kind === "turn_ended") {
       expect(ended.status.kind).toBe("error");
     }
+  });
+
+  // ── Run-state reconciliation (issue #153) ──
+
+  it("interrupts a subagent left running by a transcript that ends mid-run", () => {
+    const state = replayPayloads([
+      user("delegate"),
+      event({
+        type: "subagent_updated",
+        thread_id: "t",
+        subagent: {
+          subagent_id: "s1",
+          status: "running",
+          name: "Explore",
+          parent_item_id: "tool-1",
+        },
+      } as ProviderRuntimeEvent),
+      // No terminal snapshot, no tool_result — the stuck-forever shape.
+    ]);
+    const sub = findSubagentView(state.messages, "s1");
+    expect(sub?.status).toBe("interrupted");
+    expect(sub?.statusAssumed).toBe(true);
+    // Never resurrects a live spinner in the docked bar.
+    expect(runningSubagentEntries(state.messages)).toHaveLength(0);
+  });
+
+  it("self-heals: a running snapshot then a parent tool_result hydrates as completed (not interrupted)", () => {
+    const state = replayPayloads([
+      user("delegate"),
+      event({
+        type: "subagent_updated",
+        thread_id: "t",
+        subagent: {
+          subagent_id: "s1",
+          status: "running",
+          name: "Explore",
+          parent_item_id: "tool-1",
+        },
+      } as ProviderRuntimeEvent),
+      // The raw parent-scoped tool_result for the spawning tool leaks
+      // through (demux lost track) — the reducer derives the settlement,
+      // which the hydrate reconciliation then leaves untouched.
+      event({
+        type: "item_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "tool-1", content: "ok", is_error: false },
+      }),
+    ]);
+    const sub = findSubagentView(state.messages, "s1");
+    expect(sub?.status).toBe("completed");
+    expect(sub?.statusAssumed).toBe(true);
+    expect(runningSubagentEntries(state.messages)).toHaveLength(0);
+  });
+
+  it("stops a workflow left running by a truncated transcript", () => {
+    const state = replayPayloads([
+      user("/workflow audit"),
+      event({
+        type: "workflow_updated",
+        thread_id: "t",
+        workflow: {
+          workflow_id: "wf",
+          status: "running",
+          name: "Audit",
+          phases: [{ title: "Run", detail: null }],
+        },
+      } as ProviderRuntimeEvent),
+    ]);
+    const wf = state.messages.find(
+      (m): m is WorkflowRunItem => m.kind === "workflow_run",
+    );
+    expect(wf?.status).toBe("stopped");
+  });
+
+  it("preserves a pending_approval workflow on hydrate (a resting state, not a spinner)", () => {
+    const state = replayPayloads([
+      user("/workflow audit"),
+      event({
+        type: "workflow_updated",
+        thread_id: "t",
+        workflow: {
+          workflow_id: "wf",
+          status: "pending_approval",
+          name: "Audit",
+          phases: [{ title: "Run", detail: null }],
+        },
+      } as ProviderRuntimeEvent),
+      event({
+        type: "request_opened",
+        thread_id: "t",
+        turn_id: "turn-1",
+        request_id: "req-1",
+        request_kind: "other",
+        payload: {},
+        tool_use_id: "wf",
+      }),
+    ]);
+    const wf = state.messages.find(
+      (m): m is WorkflowRunItem => m.kind === "workflow_run",
+    );
+    expect(wf?.status).toBe("pending_approval");
   });
 });
 

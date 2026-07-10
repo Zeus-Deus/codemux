@@ -60,7 +60,10 @@ Command handling:
     `MOCK_CHAT_THREAD_ID`; `agent_chat_list_messages` hydrates a long
     generated transcript so the virtualized MessageList is exercisable,
     and `window.__codemuxChatMock.streamReply()` triggers a live
-    streamed reply on demand.
+    streamed reply on demand (`{ emptyGapTicks: N }` reproduces the
+    issue #155 stream shape — an empty first text delta then N silent
+    ticks before prose — for verifying the working indicator never
+    drops out mid-turn).
   - `chat-streaming` — its pane has no thread bound, walking the
     fresh-session flow: `agent_chat_start_session`, then the
     per-thread channel pair
@@ -71,6 +74,26 @@ Command handling:
   `{ index, message }` dispatch the real IPC layer uses — followed by
   `item_completed` / `turn_completed` / `session_state_changed`,
   mirroring the backend's `forward_event` channel routing.
+- **Terminal scrollback serialize/restore mocked end-to-end**
+  (issue #128). The mock is a faithful two-store twin of
+  `src-tauri/src/scrollback.rs`: a session-keyed in-memory **cache**
+  (`cache_terminal_scrollback` puts on unmount,
+  `uncache_terminal_scrollback` removes on the next mount) and a
+  `(workspace, pane)`-keyed **"disk"** store written by
+  `save_terminal_scrollback` (live panes on close) and by
+  `flush_scrollback_cache` draining the cache; `get_terminal_scrollback`
+  reads **only** the disk store, matching the backend. Every handler
+  emits a `[mock::scrollback]` console line, so the
+  close → flush → disk → restore dance is observable in a plain browser.
+  PTY output channels are tracked per session (ordered `{ index, message }`
+  frames, index sequential per attach), and
+  `window.__codemuxTerminalMock` exposes `flood()` (150k numbered lines
+  ending `MOCK-FLOOD-END <n>`, chunked across ticks like a real PTY) and
+  `emitSerializeBuffers()` (fires the app-close `serialize-terminal-buffers`
+  event). Both are also bound to `Ctrl+Alt+Shift+F` / `Ctrl+Alt+Shift+S`
+  so the CLI-driven browser (`codemux browser key-press`, no JS eval) can
+  drive the serialize/restore e2e — flood a pane, switch, and assert the
+  idle-serializer reuse vs. dirty-fallback behavior.
 - **Draft surface / Thread Scope exercisable**
   (`enable_lazy_workspace_creation` is ON in the mock flags): "New
   thread"/"New agent" render the draft composer with the below-composer
@@ -83,6 +106,7 @@ Command handling:
 
 - Dev-only — never loads in production or under real Tauri IPC
 - Not a backend substitute: handlers are fixtures + in-memory state, not real terminal/git/agent behavior. Terminals, real PTY output, git operations, agent sessions, and anything needing the Rust runtime are not exercised here.
+- The terminal scrollback stores are in-memory twins of `scrollback.rs` (no real file I/O to `~/.local/share/codemux/scrollback/`, no real xterm serialize behind them). They exercise the frontend cache/flush/restore wiring and its observability, not a real PTY — `flood()` pushes synthetic frames through the output channel, it does not spawn a shell.
 - The command surface was enumerated once at implementation time; commands added later fall through to the logged default until added to the router
 - For real-IPC behavior use `npm run tauri:dev` (desktop window, not visible in the Codemux browser pane)
 

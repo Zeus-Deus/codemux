@@ -180,7 +180,12 @@ export function workflowPhaseStats(
   for (const agent of phase.agents) {
     if (agent.status === "running" || agent.status === "pending") running += 1;
     else if (agent.status === "completed") done += 1;
-    else if (agent.status === "failed" || agent.status === "stopped") failed += 1;
+    else if (
+      agent.status === "failed" ||
+      agent.status === "stopped" ||
+      agent.status === "interrupted"
+    )
+      failed += 1;
     if (agent.totalTokens != null) tokens += agent.totalTokens;
     if (agent.startedAt != null) {
       minStart = minStart == null ? agent.startedAt : Math.min(minStart, agent.startedAt);
@@ -208,9 +213,15 @@ export function workflowPhaseStatus(
   if (hasRunning) return "running";
   if (phase.agents.length > 0) {
     const allTerminal = phase.agents.every(
-      (a) => a.status === "completed" || a.status === "failed" || a.status === "stopped",
+      (a) =>
+        a.status === "completed" ||
+        a.status === "failed" ||
+        a.status === "stopped" ||
+        a.status === "interrupted",
     );
     if (allTerminal) {
+      // `interrupted` behaves like `stopped` here — only a real `failed`
+      // marks the phase failed.
       const hasFailed = phase.agents.some((a) => a.status === "failed");
       return hasFailed ? "failed" : "done";
     }
