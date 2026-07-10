@@ -1936,4 +1936,68 @@ describe("dead-run detection (issue #154)", () => {
     const resumed = appendUserMessage(interrupted, "Continue");
     expect(resumed.interrupted).toBe(false);
   });
+
+  it("a success completion after a child_exited completion clears interrupted (settle-race)", () => {
+    // The stdout-reader / exit-watchdog race can persist BOTH a synthetic
+    // child_exited completion and the real success completion for the same
+    // turn. Replaying them in that order must end up NOT interrupted so a
+    // genuinely-finished run is never mislabelled after a restart.
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(false);
+  });
+
+  it("rolling back a failed resume send restores the interrupted flag", () => {
+    // A Continue send optimistically clears `interrupted`; if the send RPC
+    // then fails, the rollback must re-arm it (passing the pre-append value)
+    // so the "Run interrupted" divider + Continue chip survive one failed
+    // click instead of vanishing with no recovery affordance.
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+    ]);
+    expect(interrupted.interrupted).toBe(true);
+    const optimistic = appendUserMessage(interrupted, "Continue", undefined, "nonce-1");
+    expect(optimistic.interrupted).toBe(false);
+    const rolledBack = removeUserMessageByNonce(optimistic, "nonce-1", true);
+    expect(rolledBack.interrupted).toBe(true);
+    // The optimistic bubble is gone (no orphan left behind).
+    expect(
+      rolledBack.messages.some(
+        (m) => m.kind === "user_message" && m.text === "Continue",
+      ),
+    ).toBe(false);
+  });
+
+  it("rolling back a normal (non-resume) send does NOT arm interrupted", () => {
+    const clean = appendUserMessage(
+      createEmptyThreadState(),
+      "hello",
+      undefined,
+      "nonce-2",
+    );
+    const rolledBack = removeUserMessageByNonce(clean, "nonce-2", false);
+    expect(rolledBack.interrupted).toBe(false);
+  });
 });

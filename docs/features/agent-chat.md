@@ -575,12 +575,51 @@ watchdog now settles the in-flight turn before tearing the session down:
 - OpenCode has no per-session child; its SSE listener (`opencode/sse.rs`)
   reconnects up to `MAX_RECONNECT_ATTEMPTS` (5) and, on giving up, now
   runs the same terminal sequence for the session (previously it emitted
-  only a `RuntimeWarning`). It also flips a shared `dead` flag so the
-  provider's `has_session` reports the session absent and the next send
-  rebuilds a fresh one through `ensure_live_session` (with the resume
-  cursor) rather than POSTing to a dead server. Whether a turn is in
-  flight is tracked on `EventContext.turn_active` (armed by `send_turn`,
-  disarmed when a parent `TurnCompleted` / terminal session state flows).
+  only a `RuntimeWarning`). Whether a turn is in flight is tracked on
+  `EventContext.turn_active`, armed by `send_turn` **only after the
+  `prompt_async` POST succeeds** (a failed POST never started a turn, so a
+  later SSE give-up must not synthesize a `child_exited` completion for a
+  phantom turn) and disarmed when a parent `TurnCompleted` / terminal
+  session state flows.
+
+### Live recovery (no app restart)
+
+The synthetic completion is only half the story: after the watchdog fires,
+the next send on that thread must actually rebuild the dead session. All
+three providers now converge on one shape:
+
+- Each dead session is flagged so the provider's `has_session` reports it
+  **absent**, which routes the next send through `ensure_live_session`
+  (`commands/agent_chat.rs`) to rebuild it — the same choke point that
+  handles post-restart auto-resume. OpenCode's SSE listener flips a shared
+  `dead` `AtomicBool` on give-up; Claude and Codex set a per-session `dead`
+  `AtomicBool` in their child-exit watchdog. It is deliberately **not**
+  keyed off `SessionStatus::Error`: Codex sets `Error` on a mere *turn*
+  failure (a live child that refused a prompt) and on a non-retryable
+  server error, and Claude sets it from a `session-error` notification —
+  none of which mean the child is gone. Only the watchdog (a confirmed dead
+  child) sets `dead`, so a recoverable error stays recoverable in place.
+- The dead session stays in the provider's `sessions` map (only
+  `stop_session` removes it), so each provider's `start_session` now
+  **evicts-and-replaces** a dead entry under the write lock (atomic
+  check→remove against a concurrent rebuild) and shuts the corpse down
+  cleanly, instead of failing the rebuild with the "session already exists"
+  `ValidationError`. Without this the OpenCode rebuild in particular
+  dead-ended: `has_session` said absent, `ensure_live_session` called
+  `start_session`, and the `contains_key` guard found the corpse and
+  errored — every send failed permanently.
+- **OpenCode resume cursor.** OpenCode keeps sessions on disk, so a rebuilt
+  session can readopt its old server-side session id and keep the
+  conversation context. The adapter emits a `ResumeCursorUpdated` carrying
+  the OpenCode session id on every session start (it has no SDK cursor
+  notification of its own), so `forward_event` persists it on the
+  `agent_chat_sessions` row exactly like Claude/Codex. On rebuild,
+  `ensure_live_session` threads `{"resume": <session_id>}` back in and
+  `OpenCodeSession::start` **validates** the id with
+  `GET /session/{id}/message?limit=1` before readopting it — a 404/error
+  means the id is stale, so it falls back to a fresh `POST /session` (the
+  visible transcript still hydrates from the DB either way). Best-effort:
+  `supports_session_resume` is now `true` for OpenCode.
 
 The event list is built by the shared pure helper
 `child_exit_events(thread_id, active_turn, message)` in
@@ -637,15 +676,39 @@ A new `interrupted` flag on `ChatThreadState`
 - **Live detection** — the reducer sets `interrupted` on a
   `turn_completed` with `subtype === "child_exited"` and (belt-and-braces)
   on a `session_state_changed{error}` while streaming. It clears on the
-  next running / dispatched-queue / content event and on the optimistic
-  user-message append.
+  next running / dispatched-queue / content event, on the optimistic
+  user-message append, and on a **success** `turn_completed`. Clearing on
+  success matters because the stdout-reader / exit-watchdog race can persist
+  BOTH a synthetic `child_exited` completion and the real success completion
+  for one turn (the success is the later of the two, since the watchdog only
+  synthesizes while `active_turn` is still set); without it a
+  genuinely-finished run stays labelled "Run interrupted" forever. Applied
+  in the reducer, so it holds on live events AND on hydrate replay.
 - **Render** — `MessageList` shows a "Run interrupted" tail divider
   (cloning the `SessionStartMarker` hairline pattern, amber label) while
   not streaming, and `Composer` shows a one-click "Continue run" chip in
   its attachment strip. The chip calls `AgentChatPane`'s
-  `handleContinueRun`, which routes `handleSubmit("Continue")` through the
-  normal `agentChatSendTurn` path — identical optimistic-bubble +
-  rollback + backend auto-resume behavior to a manual send.
+  `handleContinueRun`, which routes `handleSubmit("Continue", { continueRun:
+  true })` through the normal `agentChatSendTurn` path — same
+  optimistic-bubble + rollback + backend auto-resume as a manual send, with
+  two deliberate differences: the Continue send **does not consume the
+  composer** (it leaves the user's in-progress draft and staged attachment
+  chips intact and sends a plain "Continue" with no images — a resume must
+  not eat a half-typed next message), and the send-failure rollback
+  **restores `interrupted`**. The optimistic append clears `interrupted`, so
+  `removeUserMessageByNonce` takes the pre-append value and re-arms the flag
+  on failure; otherwise one failed Continue click would drop the divider +
+  chip with no recovery affordance left.
+- **Deliberate Stop vs interrupted.** A user Stop settles its turn with a
+  persisted `turn_completed{subtype:"interrupted"}` (Claude via the sidecar
+  `session-ended`, Codex via the app-server `turn/completed`), which flows
+  asynchronously. `handleStop` now **awaits the interrupt before tearing the
+  session down** so the interrupt is ordered ahead of `stop_session`, whose
+  graceful shutdown (EOF → grace → kill) then leaves the settlement time to
+  reach the event bridge (which persists from the broadcast independent of
+  the child's liveness). Without the await the settlement could lose the
+  race and a deliberate Stop would hydrate as "Run interrupted" after a
+  restart.
 
 The dev mock exposes `window.__codemuxChatMock.streamRunStalled()` and
 `window.__codemuxChatMock.interruptRun()` for browser QA of the amber

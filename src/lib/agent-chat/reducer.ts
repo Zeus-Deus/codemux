@@ -882,16 +882,34 @@ export function appendUserMessage(
  * Local-only action: roll back an optimistic user bubble by its client
  * nonce. Used when the send RPC fails outright so no orphan bubble is
  * left behind (fixes the pre-queue orphan bug). No-op when not found.
+ *
+ * `restoreInterrupted` re-arms the `interrupted` flag when the rolled-back
+ * send was a resume attempt on an interrupted thread: `appendUserMessage`
+ * optimistically clears `interrupted` (the bubble is the user resuming), so a
+ * failed send must put it back or the "Run interrupted" divider + Continue
+ * chip vanish with no recovery affordance after a single failed click. The
+ * caller passes the pre-append `interrupted` value so a send on a
+ * never-interrupted thread never spuriously grows the affordance.
  */
 export function removeUserMessageByNonce(
   state: ChatThreadState,
   clientNonce: string,
+  restoreInterrupted = false,
 ): ChatThreadState {
   const idx = state.messages.findIndex(
     (m) => m.kind === "user_message" && m.clientNonce === clientNonce,
   );
-  if (idx < 0) return state;
-  return { ...state, messages: state.messages.filter((_, i) => i !== idx) };
+  if (idx < 0) {
+    // Bubble already gone (or never appended): still honor an interrupted
+    // restore so a failed resume keeps its affordance.
+    return restoreInterrupted && !state.interrupted
+      ? { ...state, interrupted: true }
+      : state;
+  }
+  const messages = state.messages.filter((_, i) => i !== idx);
+  return restoreInterrupted
+    ? { ...state, interrupted: true, messages }
+    : { ...state, messages };
 }
 
 /** Find a queued user bubble by its backend queued id. */
@@ -1128,7 +1146,14 @@ function applyEventInner(
           ],
         };
       }
-      return { ...state, streaming: false, messages };
+      // A clean (non-error) completion clears any lingering `interrupted`
+      // flag. The stdout-reader / exit-watchdog race can persist BOTH a
+      // synthetic `child_exited` completion and the real success completion
+      // for the same turn; the success is the later of the two (the watchdog
+      // only synthesizes while `active_turn` is still set, which the result
+      // message clears), so clearing here — live AND on hydrate replay — keeps
+      // a genuinely-finished run from being mislabelled "Run interrupted".
+      return { ...state, streaming: false, interrupted: false, messages };
     }
 
     case "request_opened": {

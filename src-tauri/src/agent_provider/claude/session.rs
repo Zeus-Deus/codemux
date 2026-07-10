@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -124,6 +125,17 @@ pub(crate) struct ClaudeSession {
     /// Flag telling the watchdog "closed on purpose, don't emit
     /// SessionStateChanged::Error on exit".
     intentionally_closed: Arc<RwLock<bool>>,
+    /// Set by the child-exit watchdog when the sidecar dies *unintentionally*
+    /// mid-session. [`is_dead`](ClaudeSession::is_dead) reports it so the
+    /// provider's `has_session` treats the corpse as absent and the next send
+    /// rebuilds a fresh session (with the resume cursor) via
+    /// `ensure_live_session` instead of routing to a dead child.
+    ///
+    /// Deliberately NOT keyed off `SessionStatus::Error`: only the watchdog
+    /// (a confirmed dead child) sets this. A transient error status set by a
+    /// `session-error` notification while the sidecar is still alive must stay
+    /// recoverable in place without a teardown/rebuild.
+    dead: Arc<AtomicBool>,
     /// Optional MCP runtime registry — populated when the provider was
     /// constructed with `mcp_registry: Some(...)`. Used by
     /// `handle_mcp_tool_call` to route `mcp-tool-call` requests from
@@ -275,6 +287,7 @@ impl ClaudeSession {
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
             intentionally_closed: Arc::new(RwLock::new(false)),
+            dead: Arc::new(AtomicBool::new(false)),
             mcp_registry: spawn.mcp_registry.clone(),
         });
 
@@ -529,6 +542,13 @@ impl ClaudeSession {
             },
         });
         Ok(turn_id)
+    }
+
+    /// Whether the child-exit watchdog has declared this session's sidecar
+    /// dead (unintentional exit). A dead session is treated as absent by the
+    /// provider so the next send auto-resumes instead of routing to a corpse.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
     }
 
     pub async fn interrupt(self: &Arc<Self>, turn_id: Option<TurnId>) -> Result<(), ProviderError> {
@@ -1169,6 +1189,11 @@ fn spawn_child_exit_watchdog(
                         // ClaudeSession::shutdown.
                         let intentional = *session.intentionally_closed.read().await;
                         if !intentional {
+                            // Mark the session dead so the provider's
+                            // `has_session` reports it absent and the next send
+                            // rebuilds via `ensure_live_session` with the resume
+                            // cursor rather than routing to the dead child.
+                            session.dead.store(true, Ordering::Relaxed);
                             let msg = "claude-agent sidecar exited unexpectedly".to_string();
                             // Recover the in-flight turn id (populated during
                             // both Running and WaitingApproval) BEFORE clearing

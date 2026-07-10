@@ -1001,7 +1001,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     clearDraft,
   ]);
 
-  const handleSubmit = useCallback((textOverride?: string) => {
+  const handleSubmit = useCallback((
+    textOverride?: string,
+    options?: { continueRun?: boolean },
+  ) => {
     // Synchronous ref check BEFORE any React state reads — closes the
     // same-tick race that the `useState` guard can't (captured closure
     // sees the pre-set snapshot when two Enter presses fire in one
@@ -1014,8 +1017,20 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // bubble, rollback, and backend auto-resume all behave identically to
     // a manual send. A string is only ever passed by `handleContinueRun`;
     // the Composer always calls `onSubmit()` with no args.
+    //
+    // `continueRun` is the recovery send: it must NOT consume the composer.
+    // The user may be mid-way through typing their next message with staged
+    // attachments; resuming a dead run should leave that draft + its chips
+    // untouched and send a plain "Continue" with no images.
+    const isContinue = options?.continueRun === true;
     const rawText = (typeof textOverride === "string" ? textOverride : draft).trim();
     if (!rawText) return;
+    // Snapshot the pre-append interrupted state + composer draft so a failed
+    // send can restore both (the optimistic append clears `interrupted` and
+    // the store's `appendUserMessage` resets `inputDraft`).
+    const preSendInterrupted =
+      useAgentChatStore.getState().threads[threadId]?.interrupted ?? false;
+    const composerDraft = draft;
     const plan = planSubmit({ rawText, provider, effort });
     sendInFlightRef.current = true;
     setIsSending(true);
@@ -1029,7 +1044,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // turn — better to send something than to hard-block on a flaky
       // gh call.
       try {
-        const preStale = useAgentChatStore.getState().threads[threadId];
+        // A Continue send carries no attachments, so skip the stale refresh.
+        const preStale = isContinue
+          ? undefined
+          : useAgentChatStore.getState().threads[threadId];
         const staleList = (preStale?.stagedAttachments ?? []).filter((a) => {
           if (a.kind !== "issue" && a.kind !== "pr") return false;
           if (a.metadata.isLoading) return false;
@@ -1112,7 +1130,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // appears in the textarea (`rawText`); deleting a token excludes
       // its file from the prompt without an explicit chip-removal.
       const liveSlice = useAgentChatStore.getState().threads[threadId];
-      const liveAttachments = liveSlice?.stagedAttachments ?? [];
+      // A Continue send never carries attachments or images: it leaves the
+      // user's staged chips intact for their real next message and sends plain
+      // "Continue". An empty list makes every downstream builder a no-op.
+      const liveAttachments = isContinue ? [] : (liveSlice?.stagedAttachments ?? []);
       const attachmentBlock = buildAttachmentBlock(
         activeAttachments(rawText, liveAttachments),
       );
@@ -1142,9 +1163,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ? crypto.randomUUID()
           : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       appendUserMessage(threadId, plan.text, clientNonce, imageDisplaySources);
-      // Clear chips per-turn (matches the inputDraft = "" reset that
-      // appendUserMessage already does for the textarea).
-      clearStagedAttachments(threadId);
+      if (isContinue) {
+        // Preserve the composer: `appendUserMessage` reset `inputDraft` to ""
+        // as a side effect, so restore the user's in-progress text. Staged
+        // chips are left untouched (no `clearStagedAttachments` below).
+        setInputDraft(threadId, composerDraft);
+      } else {
+        // Clear chips per-turn (matches the inputDraft = "" reset that
+        // appendUserMessage already does for the textarea).
+        clearStagedAttachments(threadId);
+      }
       const input = {
         thread_id: threadId,
         text: sdkText,
@@ -1162,10 +1190,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         await agentChatSendTurn(provider, input);
       } catch (err) {
         // Genuine failure — roll back the optimistic bubble so no orphan
-        // is left, and restore the text into the composer so the user
-        // doesn't lose it.
-        removeUserMessageByNonce(threadId, clientNonce);
-        setInputDraft(threadId, rawText);
+        // is left. `restoreInterrupted` re-arms the "Run interrupted"
+        // divider + Continue chip when the failed send was itself a resume
+        // of an interrupted thread (the optimistic append cleared the flag),
+        // so one failed click never strands the run with no recovery
+        // affordance.
+        removeUserMessageByNonce(threadId, clientNonce, preSendInterrupted);
+        // Restore the composer text so the user doesn't lose it. A Continue
+        // send never owned the draft (it preserved the user's own in-progress
+        // text above), so leave that intact rather than stamping "Continue".
+        if (!isContinue) {
+          setInputDraft(threadId, rawText);
+        }
         toast.error(`Failed to send turn: ${err}`);
         sendInFlightRef.current = false;
         setIsSending(false);
@@ -1193,7 +1229,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
    *  point transparently rebuilds the dead session with the resume cursor.
    *  Appending the optimistic bubble clears the interrupted flag. */
   const handleContinueRun = useCallback(() => {
-    handleSubmit("Continue");
+    handleSubmit("Continue", { continueRun: true });
   }, [handleSubmit]);
 
   /** Step 8 Stage 2 — orchestrates the chip lifecycle when the user
@@ -1639,12 +1675,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (!currentSlice) return;
     setRestarting(true);
     void (async () => {
-      // Fire-and-forget the interrupt RPC so the SDK query aborts
-      // immediately — don't block on it.
-      agentChatInterruptTurn(provider, threadId, null).catch(() => {
-        // Stop path will also tear down the sidecar; an interrupt
-        // failure here is safe to swallow.
-      });
+      // Await the interrupt BEFORE tearing the session down. The provider
+      // settles a user stop with a persisted `turn_completed{interrupted}`
+      // (Claude via the sidecar's `session-ended`, Codex via the app-server's
+      // `turn/completed`) that flows asynchronously. If we fired the interrupt
+      // and immediately killed the child, that settlement could lose the race
+      // and the stopped turn would hydrate as an unsettled — i.e. "Run
+      // interrupted" — turn after a restart. Awaiting orders the interrupt
+      // ahead of `stop_session`, whose graceful shutdown (EOF → grace → kill)
+      // then gives the settlement time to reach the event bridge (which
+      // persists from the broadcast independent of the child's liveness). An
+      // interrupt failure is safe to swallow — the stop below tears down anyway.
+      try {
+        await agentChatInterruptTurn(provider, threadId, null);
+      } catch {
+        // Non-fatal: the teardown below still restarts the session.
+      }
       try {
         await agentChatStopSession(provider, threadId);
       } catch (err) {

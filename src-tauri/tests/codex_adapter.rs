@@ -684,6 +684,47 @@ async fn child_process_crash_emits_error_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_child_is_evicted_and_start_session_rebuilds() {
+    // Issue #154 live-recovery path: after the child-exit watchdog marks a
+    // session dead, `has_session` must report it absent AND a fresh
+    // `start_session` for the SAME thread must evict the corpse and rebuild
+    // instead of failing with "codex session already exists".
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_EXIT_AFTER", "turn/start")]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let thread = ThreadId("t-evict".into());
+    start_session_resilient(&provider, start_input("t-evict"))
+        .await
+        .unwrap();
+    assert!(provider.has_session(&thread).await, "session live after start");
+    let _ = provider
+        .send_turn(SendTurnInput {
+            thread_id: thread.clone(),
+            text: "x".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await;
+    let went_absent = timeout(Duration::from_secs(3), async {
+        loop {
+            if !provider.has_session(&thread).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(went_absent.is_ok(), "dead session must be reported absent");
+    start_session_resilient(&provider, start_input("t-evict"))
+        .await
+        .expect("rebuild after death must succeed");
+    assert!(provider.has_session(&thread).await, "rebuilt session live");
+    let _ = provider.stop_session(thread).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_send_turn_queues_instead_of_erroring() {
     // Follow-up queueing: a second send while the first turn is active is
     // now QUEUED (not rejected). The fixture emits only turn/started, so

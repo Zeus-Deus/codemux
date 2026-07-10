@@ -589,6 +589,28 @@ pub async fn agent_chat_start_session(
                 "[codemux::agent_chat] failed to persist session record: {error}"
             );
         }
+        // Persist a provider-returned resume cursor NOW, after the row
+        // exists. The async `ResumeCursorUpdated` persist path is a plain
+        // UPDATE racing this upsert across a spawned bridge task — when the
+        // event wins it updates 0 rows and the cursor is silently lost,
+        // leaving the FIRST dead-run rebuild with no conversation context
+        // (OpenCode returns its cursor at start; Claude's SDK id arrives
+        // later by event and Codex's start-time cursor carries no
+        // extractable id, so this is a no-op for them). Best-effort like the
+        // neighboring persists.
+        if let Some(sdk_session_id) = session
+            .resume_cursor
+            .as_ref()
+            .and_then(extract_sdk_session_id)
+        {
+            if let Err(error) =
+                db.set_agent_chat_sdk_session_id(&session.thread_id.0, &sdk_session_id)
+            {
+                eprintln!(
+                    "[codemux::agent_chat] failed to persist start-time resume cursor: {error}"
+                );
+            }
+        }
         // Persist the per-thread chat config the session started with so
         // a restart re-seeds the pickers and auto-resume rebuilds the SDK
         // session with the same settings. Best-effort — a failed write

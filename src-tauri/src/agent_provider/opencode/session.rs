@@ -86,6 +86,7 @@ impl OpenCodeSession {
         thread_id: ThreadId,
         initial_model: Option<String>,
         initial_variant: Option<String>,
+        resume_session_id: Option<String>,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     ) -> Result<Arc<Self>, ProviderError> {
         let server_handle = manager.ensure_running().await.map_err(|err| {
@@ -109,30 +110,51 @@ impl OpenCodeSession {
                 source: Some(err.to_string()),
             })?;
 
-        let create_url = format!("{}/session", server_handle.base_url.trim_end_matches('/'));
-        let body = SessionCreateRequest::default();
-        let response = http
-            .post(&create_url)
-            .basic_auth("opencode", Some(&server_handle.server_password))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| ProviderError::RpcError {
-                message: format!("session_create_send_failed: {err}"),
-            })?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(ProviderError::RpcError {
-                message: format!("session_create_http_status_{}", status.as_u16()),
-            });
-        }
-        let session_resp: SessionResponse = response.json().await.map_err(|err| {
-            ProviderError::RpcError {
-                message: format!("session_create_decode_failed: {err}"),
+        // Best-effort resume: readopt the persisted server-side session id when
+        // it still exists on the OpenCode server (it persists sessions on disk,
+        // so a rebuilt session — even after a server restart — can keep its
+        // conversation context). We probe `GET /session/{id}/message?limit=1`:
+        // a success means the session is addressable, so we skip `POST /session`
+        // and reuse the id; a 404 / error means it is stale, so we fall through
+        // to creating a fresh session (the visible transcript still hydrates
+        // from the DB, so the user keeps their history either way).
+        let base = server_handle.base_url.trim_end_matches('/').to_string();
+        let resumed_id = match &resume_session_id {
+            Some(id) if session_is_addressable(&http, &base, &server_handle.server_password, id).await => {
+                Some(id.clone())
             }
-        })?;
-        let provider_session_id = ProviderSessionId(session_resp.id.clone());
+            _ => None,
+        };
+        let session_id = match resumed_id {
+            Some(id) => id,
+            None => {
+                let create_url = format!("{base}/session");
+                let body = SessionCreateRequest::default();
+                let response = http
+                    .post(&create_url)
+                    .basic_auth("opencode", Some(&server_handle.server_password))
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|err| ProviderError::RpcError {
+                        message: format!("session_create_send_failed: {err}"),
+                    })?;
+
+                let status = response.status();
+                if !status.is_success() {
+                    return Err(ProviderError::RpcError {
+                        message: format!("session_create_http_status_{}", status.as_u16()),
+                    });
+                }
+                let session_resp: SessionResponse = response.json().await.map_err(|err| {
+                    ProviderError::RpcError {
+                        message: format!("session_create_decode_failed: {err}"),
+                    }
+                })?;
+                session_resp.id
+            }
+        };
+        let provider_session_id = ProviderSessionId(session_id.clone());
 
         let initial_turn = TurnId(format!("turn_{}", Uuid::new_v4()));
         let event_ctx = Arc::new(Mutex::new(EventContext {
@@ -147,9 +169,9 @@ impl OpenCodeSession {
         // report the session dead so the next send auto-resumes through
         // `ensure_live_session` rather than POSTing to a corpse.
         let dead = Arc::new(AtomicBool::new(false));
-        let router = Arc::new(Mutex::new(SseRouter::new(session_resp.id.clone())));
+        let router = Arc::new(Mutex::new(SseRouter::new(session_id.clone())));
         let peer = SsePeer {
-            session_id: session_resp.id.clone(),
+            session_id: session_id.clone(),
             event_ctx: event_ctx.clone(),
             router: router.clone(),
             dead: dead.clone(),
@@ -164,6 +186,20 @@ impl OpenCodeSession {
         let _ = event_tx.send(ProviderRuntimeEvent::SessionConfigured {
             thread_id: thread_id.clone(),
             provider_session_id: provider_session_id.clone(),
+        });
+        // Persist the server-side session id (via the command layer's
+        // `ResumeCursorUpdated` handler) so a later live rebuild after a dead
+        // SSE listener can readopt it and keep the conversation context.
+        // OpenCode never emits this on its own (no SDK cursor notification), so
+        // the adapter surfaces it here on every session start — fresh or
+        // resumed — mirroring the `{"resume": id}` shape Claude/Codex use.
+        // This event heals the row on rebuilds; the *initial* session's cursor
+        // is persisted synchronously by `agent_chat_start_session` from the
+        // `ProviderSession.resume_cursor` the provider returns, because this
+        // event races the row upsert across the bridge task.
+        let _ = event_tx.send(ProviderRuntimeEvent::ResumeCursorUpdated {
+            thread_id: thread_id.clone(),
+            resume_cursor: super::agent::resume_cursor_for(&provider_session_id),
         });
         let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
             thread_id: thread_id.clone(),
@@ -202,13 +238,14 @@ impl OpenCodeSession {
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
         let turn_id = TurnId(format!("turn_{}", Uuid::new_v4()));
+        // Swap the turn id into the routing context up front so SSE events for
+        // this turn tag correctly — but DO NOT arm `turn_active` yet. Arming is
+        // deferred until the POST succeeds: a failed `prompt_async` means no
+        // turn ever started, so a later SSE give-up must not synthesize a
+        // `child_exited` completion for a phantom turn.
         {
             let mut ctx = self.event_ctx.lock().await;
             ctx.turn_id = turn_id.clone();
-            // Arm the give-up path: a turn is now in flight, so if the SSE
-            // listener exhausts its reconnect budget before this turn
-            // settles it must synthesize a `child_exited` `TurnCompleted`.
-            ctx.turn_active = true;
         }
 
         let model = match model_override {
@@ -236,12 +273,21 @@ impl OpenCodeSession {
             .basic_auth("opencode", Some(&self.server_handle.server_password))
             .json(&body)
             .send()
-            .await
-            .map_err(|err| ProviderError::RpcError {
-                message: format!("prompt_async_send_failed: {err}"),
-            })?;
+            .await;
+        let response = match response {
+            Ok(r) => r,
+            Err(err) => {
+                // POST never landed — make sure the give-up path stays disarmed
+                // (defensive against a stale prior arm) and surface the error.
+                self.event_ctx.lock().await.turn_active = false;
+                return Err(ProviderError::RpcError {
+                    message: format!("prompt_async_send_failed: {err}"),
+                });
+            }
+        };
         let status = response.status();
         if !status.is_success() {
+            self.event_ctx.lock().await.turn_active = false;
             let body = response.text().await.unwrap_or_default();
             return Err(ProviderError::RpcError {
                 message: format!(
@@ -250,6 +296,10 @@ impl OpenCodeSession {
                 ),
             });
         }
+        // POST accepted — NOW arm the give-up path: a turn is genuinely in
+        // flight, so if the SSE listener exhausts its reconnect budget before
+        // this turn settles it must synthesize a `child_exited` `TurnCompleted`.
+        self.event_ctx.lock().await.turn_active = true;
         let _ = self.event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
             thread_id: self.thread_id.clone(),
             status: SessionStatus::Running {
@@ -361,6 +411,46 @@ impl OpenCodeSession {
             thread_id: self.thread_id.clone(),
             status: SessionStatus::Closed,
         });
+    }
+}
+
+/// Pull the OpenCode server-side session id out of the resume cursor
+/// `ensure_live_session` threads in (`{"resume": <session_id>}`). Returns
+/// `None` for an absent/mis-shaped cursor so the caller starts fresh.
+pub fn resume_session_id_from_cursor(cursor: &serde_json::Value) -> Option<String> {
+    cursor
+        .get("resume")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Whether the OpenCode server can still address `session_id`. Probes
+/// `GET /session/{id}/message?limit=1`: a success status means the session
+/// is known (in memory or loaded from disk) and safe to readopt on a live
+/// rebuild; any error / non-success means it is stale, so the caller creates
+/// a fresh session instead. Best-effort — a transport error is treated as
+/// "not addressable" so we never route a resumed turn at a session the server
+/// has forgotten.
+async fn session_is_addressable(
+    http: &reqwest::Client,
+    base_url: &str,
+    server_password: &str,
+    session_id: &str,
+) -> bool {
+    let url = format!(
+        "{}/session/{}/message?limit=1",
+        base_url,
+        urlencoding::encode(session_id)
+    );
+    match http
+        .get(&url)
+        .basic_auth("opencode", Some(server_password))
+        .send()
+        .await
+    {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
     }
 }
 
@@ -612,6 +702,51 @@ mod tests {
             } => {}
             other => panic!("wrong event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resume_session_id_from_cursor_extracts_resume_key() {
+        assert_eq!(
+            resume_session_id_from_cursor(&serde_json::json!({ "resume": "ses_abc" })),
+            Some("ses_abc".to_string())
+        );
+        // Missing / empty / non-string → None so the caller starts fresh.
+        assert_eq!(resume_session_id_from_cursor(&serde_json::json!({})), None);
+        assert_eq!(
+            resume_session_id_from_cursor(&serde_json::json!({ "resume": "" })),
+            None
+        );
+        assert_eq!(
+            resume_session_id_from_cursor(&serde_json::json!({ "resume": 42 })),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn session_is_addressable_true_on_success_false_on_404() {
+        let mut server = Server::new_async().await;
+        let ok = server
+            .mock("GET", "/session/ses_live/message?limit=1")
+            .with_status(200)
+            .with_body("[]")
+            .create_async()
+            .await;
+        let gone = server
+            .mock("GET", "/session/ses_gone/message?limit=1")
+            .with_status(404)
+            .create_async()
+            .await;
+        let http = reqwest::Client::new();
+        assert!(
+            session_is_addressable(&http, &server.url(), "pw", "ses_live").await,
+            "a known session must be addressable"
+        );
+        assert!(
+            !session_is_addressable(&http, &server.url(), "pw", "ses_gone").await,
+            "a stale session id must not be addressable"
+        );
+        ok.assert_async().await;
+        gone.assert_async().await;
     }
 
     #[tokio::test]

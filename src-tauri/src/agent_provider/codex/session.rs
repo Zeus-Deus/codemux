@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -124,6 +124,18 @@ pub(crate) struct CodexSession {
     shutdown_tx: broadcast::Sender<()>,
     /// Background task JoinHandles retained so `Drop` can abort them.
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Set by the child-exit watchdog when `codex app-server` dies
+    /// *unintentionally* mid-session. [`is_dead`](CodexSession::is_dead)
+    /// reports it so the provider's `has_session` treats the corpse as absent
+    /// and the next send rebuilds a fresh session (with the resume cursor) via
+    /// `ensure_live_session` instead of routing to a dead child.
+    ///
+    /// Deliberately NOT keyed off `SessionStatus::Error`: Codex also sets
+    /// `Error` on a *turn* failure (a live child that just refused a prompt)
+    /// and on a non-retryable server `error` notification — neither means the
+    /// child is gone. Only the watchdog (a confirmed dead child) sets this, so
+    /// a recoverable error stays recoverable in place without a rebuild.
+    dead: Arc<AtomicBool>,
 }
 
 impl CodexSession {
@@ -329,6 +341,7 @@ impl CodexSession {
             event_tx: event_tx.clone(),
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
+            dead: Arc::new(AtomicBool::new(false)),
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -597,6 +610,13 @@ impl CodexSession {
             };
         }
         Ok(turn_id)
+    }
+
+    /// Whether the child-exit watchdog has declared this session's
+    /// `codex app-server` dead (unintentional exit). A dead session is
+    /// treated as absent by the provider so the next send auto-resumes.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
     }
 
     /// Interrupt the currently active turn. If `turn_id` is provided,
@@ -892,6 +912,11 @@ fn spawn_child_exit_watchdog(
                         // Only flip to Error if the session wasn't
                         // already asked to close.
                         if !matches!(status, SessionStatus::Closed) {
+                            // Mark the session dead so the provider's
+                            // `has_session` reports it absent and the next send
+                            // rebuilds via `ensure_live_session` with the resume
+                            // cursor rather than routing to the dead child.
+                            session.dead.store(true, Ordering::Relaxed);
                             let msg = "codex app-server exited unexpectedly".to_string();
                             // Recover the in-flight turn id before clearing it so
                             // the watchdog can settle it with a synthetic terminal
