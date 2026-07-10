@@ -21,6 +21,19 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::timeout;
 
+/// Minimum size (in bytes) a candidate `codemux-remote` binary must be
+/// before we'll treat it as a real, uploadable binary. The production
+/// binary is ~16 MB; the dev-build placeholder sidecars checked into
+/// `src-tauri/binaries/` are 0 bytes. 1 MB is comfortably above any
+/// plausible placeholder yet far below the real binary, so it cleanly
+/// separates "actual binary" from "empty/truncated placeholder".
+///
+/// Issue #133: without this gate, a 0-byte placeholder passed the old
+/// `.exists()` check and the background upgrade poller atomically
+/// installed the empty file over a working production binary on the
+/// host — silent corruption. See `plausible_remote_binary`.
+pub(crate) const MIN_PLAUSIBLE_REMOTE_BINARY_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BootstrapResult {
@@ -81,6 +94,17 @@ pub fn target_for_uname(uname: &str) -> Option<&'static str> {
 /// and push-to-host dies on first attempt. The dev fallbacks are
 /// what let `cargo build && npm run tauri:dev` work for push to a
 /// SAME-ARCH remote without running the full release pipeline.
+///
+/// **Size gate (issue #133):** every candidate is validated by
+/// `plausible_remote_binary` — it must exist, be a regular file, AND
+/// be at least `MIN_PLAUSIBLE_REMOTE_BINARY_BYTES`. A bare
+/// `.exists()` check let a 0-byte dev placeholder (the empty sidecar
+/// files checked into `src-tauri/binaries/`) qualify as "bundled";
+/// the background upgrade poller then atomically installed that empty
+/// file over a working host binary, bricking it. Gating on size means
+/// an empty/tiny candidate is treated as *not bundled* → the caller
+/// returns `BinaryNotBundled { wanted_target }` and a dev build fails
+/// loudly instead of silently shipping a placeholder to a host.
 pub fn bundled_binary_path(
     app: Option<&tauri::AppHandle>,
     target: &str,
@@ -93,7 +117,7 @@ pub fn bundled_binary_path(
             let candidate = resource_dir
                 .join("binaries")
                 .join(format!("codemux-remote-{target}"));
-            if candidate.exists() {
+            if plausible_remote_binary(&candidate) {
                 return Some(candidate);
             }
         }
@@ -106,7 +130,7 @@ pub fn bundled_binary_path(
         PathBuf::from(format!("../binaries/codemux-remote-{target}")),
     ];
     for c in candidates {
-        if c.exists() {
+        if plausible_remote_binary(&c) {
             return Some(c);
         }
     }
@@ -126,7 +150,7 @@ pub fn bundled_binary_path(
                     "codemux-remote"
                 };
                 let candidate = parent.join(sibling_name);
-                if candidate.exists() {
+                if plausible_remote_binary(&candidate) {
                     return Some(candidate);
                 }
             }
@@ -134,6 +158,23 @@ pub fn bundled_binary_path(
     }
 
     None
+}
+
+/// True only when `path` points at a regular file that is at least
+/// `MIN_PLAUSIBLE_REMOTE_BINARY_BYTES` in size — i.e. a candidate that
+/// could actually be a real `codemux-remote`.
+///
+/// Returns false for a missing path, a directory, or an empty/truncated
+/// file. This is the guard that stops a 0-byte dev placeholder (or a
+/// half-written file) from ever being uploaded over a working host
+/// binary (issue #133). A `metadata` error (permission denied, broken
+/// symlink) also yields false — if we can't confirm the size, we don't
+/// trust the candidate.
+fn plausible_remote_binary(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.len() >= MIN_PLAUSIBLE_REMOTE_BINARY_BYTES,
+        Err(_) => false,
+    }
 }
 
 /// True when `target` equals the rust target triple this codemux
@@ -560,21 +601,73 @@ pub async fn provision_workspace_mcp_config(
         .map_err(|e| format!("writing .mcp.json: {e}"))
 }
 
-/// Upload a binary to the remote host, atomically replacing whatever
-/// is currently at `remote_path` and marking it `chmod +x`.
+/// Build the remote shell one-liner that receives the streamed binary
+/// on stdin, verifies its byte count, and atomically swaps it into
+/// place. Extracted so tests can assert the exact pipeline without an
+/// SSH round-trip.
 ///
-/// Uses `ssh … 'cat > <path>.tmp && chmod +x <path>.tmp && mv <path>.tmp <path>'`
-/// with the binary streamed via stdin, all in **one** SSH session:
+/// `remote_path` may contain `~/` — the tilde-aware `shell_escape`
+/// keeps the leading `~/` unquoted (so the remote shell expands it to
+/// $HOME) while single-quoting the rest, neutralising any shell
+/// metacharacters in a future caller's path (today's callers pass a
+/// hardcoded path, so this is defense-in-depth).
+///
+/// `expected_len` is the exact source byte count. The remote reads back
+/// `wc -c < {p}.tmp` and refuses to `mv` unless it matches — the fix
+/// for issue #133, where a partially-streamed binary (e.g. a local
+/// `write_all` that failed mid-flight) sent EOF to `cat`, which exited
+/// 0, letting the old code `chmod`+`mv` a truncated file over a working
+/// binary. Atomic ≠ verified.
+///
+/// Pipeline shape:
+/// `umask 077 && mkdir -p … && cat > tmp && [ wc -c == len ] && chmod +x tmp && mv -f tmp p || { warn; rm -f tmp; exit 1; }`
+///
+/// In POSIX sh, `a && b && … && e || f` runs `f` when the `&&` chain
+/// fails at ANY step. So a failure of mkdir, cat, the size check,
+/// chmod, or mv all funnel into the `|| { … }` block: it removes the
+/// tmp file, prints a clear stderr reason (which surfaces in
+/// `BootstrapResult::UploadFailed`), and exits non-zero. Crucially the
+/// previously-working binary at `{p}` is never touched, because it's
+/// only replaced by the final `mv` which only runs on full success.
+fn upload_script(remote_path: &str, expected_len: u64) -> String {
+    // `umask 077` lands the tmpfile 0600 the moment it's created;
+    // `chmod +x` then bumps it to 0700 before the rename. `mv -f`
+    // overwrites whatever was at the destination — important when a
+    // stale older binary from a previous Codemux install is there.
+    // Note the `{{`/`}}` escaping: they emit literal `{`/`}` for the
+    // shell's `|| { … }` group command.
+    let p = crate::ssh::push::shell_escape(remote_path);
+    format!(
+        "umask 077 && mkdir -p \"$(dirname {p})\" && \
+         cat > {p}.tmp && \
+         [ \"$(wc -c < {p}.tmp)\" -eq {expected_len} ] && \
+         chmod +x {p}.tmp && \
+         mv -f {p}.tmp {p} || \
+         {{ echo \"upload integrity check failed: expected {expected_len} bytes\" >&2; rm -f {p}.tmp; exit 1; }}"
+    )
+}
+
+/// Upload a binary to the remote host, verifying its byte count before
+/// atomically replacing whatever is currently at `remote_path` and
+/// marking it `chmod +x`.
+///
+/// Streams the binary via stdin into a remote shell one-liner (see
+/// `upload_script`), all in **one** SSH session:
 ///
 /// 1. The remote login shell expands `~/`, sidestepping the OpenSSH
 ///    9.0+ SFTP-default scp bug where `~` is taken literally and the
 ///    upload fails with `dest open ".local/bin/foo": Failure`.
-/// 2. Writing to a sibling `.tmp` path and then `mv`-ing into place
-///    makes the swap atomic — if anything is currently exec'ing the
-///    old binary, the new one becomes visible at the path the moment
-///    rename completes. Old fd-holders keep running on the old inode
-///    until they exit.
-/// 3. Single SSH round-trip (was three: mkdir, scp, chmod). Cheaper
+/// 2. The remote reads back `wc -c` on the received tmpfile and refuses
+///    to promote it unless the byte count matches the source exactly
+///    (issue #133). A stream that failed partway — or any other reason
+///    the tmpfile ends up short — is rejected, the tmpfile removed, and
+///    the previously-working binary at the destination left untouched.
+///    Atomicity alone doesn't help here: a truncated file `mv`'d into
+///    place is atomically wrong.
+/// 3. Only after the size check pass does `mv -f` swap the new binary
+///    into place — atomic, so anything exec'ing the old binary keeps
+///    running on the old inode until it exits.
+/// 4. Single SSH round-trip (was three: mkdir, scp, chmod). Cheaper
 ///    on flaky networks.
 ///
 /// `remote_path` may contain `~/` — the remote shell expands it.
@@ -593,23 +686,18 @@ async fn ssh_upload_executable(
         .await
         .map_err(|e| format!("read {}: {e}", local_binary.display()))?;
 
-    // One-liner the remote shell runs. Use `umask 077` so the tmpfile
-    // is 0600 from the moment it lands; `chmod +x` then bumps it to
-    // 0700 before the rename. `mv -f` overwrites whatever was at the
-    // destination — important when a stale older binary from a
-    // previous Codemux install is sitting there.
-    // Tilde-aware shell quoting: preserves a leading `~/` (so the
-    // remote shell still expands it to $HOME) while single-quoting the
-    // rest, closing any shell-injection surface if a future caller ever
-    // passes a path with metacharacters. Today's callers pass a
-    // hardcoded path, so this is defense-in-depth.
-    let p = crate::ssh::push::shell_escape(remote_path);
-    let script = format!(
-        "umask 077 && mkdir -p \"$(dirname {p})\" && \
-         cat > {p}.tmp && \
-         chmod +x {p}.tmp && \
-         mv -f {p}.tmp {p}"
-    );
+    // Refuse an empty source outright. An empty file would trivially
+    // satisfy the remote `[ … -eq 0 ]` size check, defeating the whole
+    // guard — never even attempt the upload. Belt-and-braces on top of
+    // the ≥1 MB plausibility gate in `bundled_binary_path` (issue #133).
+    if bytes.is_empty() {
+        return Err(format!(
+            "refusing to upload empty binary {} (0 bytes)",
+            local_binary.display()
+        ));
+    }
+
+    let script = upload_script(remote_path, bytes.len() as u64);
 
     let mut child = Command::new("ssh")
         .arg("-o")
@@ -625,12 +713,16 @@ async fn ssh_upload_executable(
         .map_err(|e| format!("ssh spawn failed: {e}"))?;
 
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|e| format!("failed to stream binary: {e}"))?;
+        if let Err(e) = stdin.write_all(&bytes).await {
+            // The stream failed partway. The remote `wc -c` check is
+            // the real backstop against a truncated install, but don't
+            // leave the ssh child (and its remote shell) running —
+            // kill it so we don't dangle a half-written tmpfile.
+            let _ = child.kill().await;
+            return Err(format!("failed to stream binary: {e}"));
+        }
         // `stdin` drops here, closing the pipe so `cat` sees EOF and
-        // exits 0, letting the chained `chmod` + `mv` run.
+        // exits 0, letting the chained size check + `chmod` + `mv` run.
     }
 
     let out = timeout(deadline, child.wait_with_output())
@@ -881,6 +973,110 @@ mod tests {
         assert!(result.is_ok(), "second upload failed: {:?}", result);
         let on_disk2 = std::fs::read(&dst).unwrap();
         assert_eq!(on_disk2, payload2, "second upload didn't replace");
+
+        // Issue #133: an empty source must be rejected locally with Err
+        // and must NOT create or replace the destination. The dest here
+        // already holds `payload2`; after a rejected empty upload it must
+        // still hold `payload2` untouched.
+        let empty_src = tmp.path().join("empty-payload.bin");
+        std::fs::write(&empty_src, b"").unwrap();
+        let empty_result = ssh_upload_executable(
+            "localhost",
+            &dst_str,
+            &empty_src,
+            Duration::from_secs(15),
+        )
+        .await;
+        assert!(
+            empty_result.is_err(),
+            "empty source must be rejected, got: {empty_result:?}"
+        );
+        let on_disk3 = std::fs::read(&dst).unwrap();
+        assert_eq!(
+            on_disk3, payload2,
+            "rejected empty upload must not touch the destination"
+        );
+
+        // And a brand-new destination path must never be created by an
+        // empty upload either.
+        let fresh_dst = dst_dir.join("never-created");
+        let fresh_result = ssh_upload_executable(
+            "localhost",
+            &fresh_dst.to_string_lossy(),
+            &empty_src,
+            Duration::from_secs(15),
+        )
+        .await;
+        assert!(fresh_result.is_err(), "empty source must be rejected");
+        assert!(
+            !fresh_dst.exists(),
+            "rejected empty upload must not create the destination"
+        );
+    }
+
+    #[test]
+    fn plausible_remote_binary_gates_on_size_and_file_type() {
+        // Issue #133: only a real, sufficiently-large regular file may
+        // ever be uploaded. Exercise every reject reason plus the pass.
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Missing path → false (nothing to upload).
+        assert!(!plausible_remote_binary(&tmp.path().join("does-not-exist")));
+
+        // 0-byte file → false. This is the exact dev-placeholder shape
+        // that bricked hosts before the fix.
+        let empty = tmp.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!plausible_remote_binary(&empty));
+
+        // Small (4 KB) file → false. A truncated / half-written binary
+        // is still far below the 1 MB floor.
+        let small = tmp.path().join("small");
+        std::fs::write(&small, vec![0u8; 4 * 1024]).unwrap();
+        assert!(!plausible_remote_binary(&small));
+
+        // A directory → false (must be a regular file).
+        let dir = tmp.path().join("a-dir");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!plausible_remote_binary(&dir));
+
+        // File at exactly the 1 MB floor → true (real binary is ~16 MB,
+        // this stands in for it without writing 16 MB to disk).
+        let big = tmp.path().join("big");
+        std::fs::write(&big, vec![0u8; MIN_PLAUSIBLE_REMOTE_BINARY_BYTES as usize]).unwrap();
+        assert!(plausible_remote_binary(&big));
+    }
+
+    #[test]
+    fn upload_script_verifies_byte_count_and_cleans_up() {
+        // Lock in the integrity-check pipeline shape (issue #133).
+        let script = upload_script("~/.local/bin/codemux-remote", 16_777_216);
+
+        // The size check reads the received tmpfile back with `wc -c`
+        // and compares against the exact expected byte count.
+        assert!(script.contains("wc -c"), "must read back byte count");
+        assert!(
+            script.contains("-eq 16777216"),
+            "must compare against the exact expected length: {script}"
+        );
+
+        // On any failure the tmpfile is removed and we exit non-zero so
+        // the prior binary is left untouched and the error propagates.
+        assert!(script.contains("rm -f"), "must clean up the tmpfile on failure");
+        assert!(script.contains("exit 1"), "must exit non-zero on failure");
+
+        // The core atomic-install chain is preserved.
+        assert!(script.contains("umask 077"), "tmpfile must land 0600");
+        assert!(script.contains("chmod +x"), "must mark executable");
+        assert!(script.contains("mv -f"), "must atomically replace");
+
+        // Tilde-aware escaping: a `~/`-prefixed path keeps the leading
+        // `~/` unquoted (so the remote shell expands it) with the body
+        // single-quoted — exactly what `shell_escape` produces.
+        assert!(
+            script.contains("~/'.local/bin/codemux-remote'"),
+            "must preserve tilde-aware escaping: {script}"
+        );
     }
 
     #[test]
