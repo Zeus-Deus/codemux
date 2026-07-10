@@ -82,6 +82,25 @@ export const onWorktreeIncludesApplied = (
 ): Promise<UnlistenFn> =>
   listen<WorktreeIncludesApplied>("worktree-includes-applied", (e) => cb(e.payload));
 
+// ── git clone progress ──
+//
+// Mirror of src-tauri/src/commands/git.rs:GitCloneProgress. Emitted on
+// each parsed `git clone --progress` update (throttled to phase/percent
+// changes). Filter on `targetDir` to match your own in-flight clone.
+export interface GitCloneProgress {
+  targetDir: string;
+  phase: string;
+  percent: number | null;
+  detail: string;
+}
+
+export const GIT_CLONE_PROGRESS_EVENT = "git-clone-progress";
+
+export const onGitCloneProgress = (
+  cb: EventCallback<GitCloneProgress>,
+): Promise<UnlistenFn> =>
+  listen<GitCloneProgress>(GIT_CLONE_PROGRESS_EVENT, (e) => cb(e.payload));
+
 export const onOpenflowCycle = (
   cb: EventCallback<OrchestratorTriggerResult>,
 ): Promise<UnlistenFn> =>

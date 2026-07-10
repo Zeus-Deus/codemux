@@ -614,6 +614,16 @@ export const refreshWorkspaceGitInfo = (workspaceId: string) =>
 export const gitCloneRepo = (url: string, targetDir: string) =>
   invoke<string>("git_clone_repo", { url, targetDir });
 
+// Live `git clone --progress` updates stream over the `git-clone-progress`
+// Tauri event — the payload type and the typed `onGitCloneProgress`
+// subscriber live in the event registry. Re-exported here so callers that
+// already import from `@/tauri/commands` can reach both.
+export {
+  GIT_CLONE_PROGRESS_EVENT,
+  onGitCloneProgress,
+  type GitCloneProgress,
+} from "./events";
+
 export const createEmptyRepo = (parentDir: string, name: string) =>
   invoke<string>("create_empty_repo", { parentDir, name });
 

@@ -471,31 +471,261 @@ pub async fn resolve_conflicts_with_agent(
     .await
 }
 
+/// One parsed unit of `git clone --progress` output.
+///
+/// `phase` is a human-readable label ("Cloning", "Receiving objects", …),
+/// `percent` the 0–100 completion for that phase when git reports one, and
+/// `detail` the raw trimmed line so the UI can surface the throughput tail
+/// ("12.00 MiB | 1.20 MiB/s").
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CloneProgress {
+    phase: String,
+    percent: Option<u8>,
+    detail: String,
+}
+
+/// Serde payload for the `git-clone-progress` Tauri event. `targetDir` lets a
+/// listener filter to its own in-flight clone (there could be several).
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitCloneProgress {
+    target_dir: String,
+    phase: String,
+    percent: Option<u8>,
+    detail: String,
+}
+
+/// Wire event name shared with the frontend (`src/tauri/events.ts`).
+const GIT_CLONE_PROGRESS_EVENT: &str = "git-clone-progress";
+
+/// git's progress phases that carry a `NN%` completion. Anything else
+/// (remote chatter, `fatal:` errors, `done.` footers) is treated as
+/// non-progress and routed to the error tail instead.
+const CLONE_PROGRESS_PHASES: &[&str] = &[
+    "Counting objects",
+    "Compressing objects",
+    "Receiving objects",
+    "Resolving deltas",
+    "Enumerating objects",
+    "Unpacking objects",
+];
+
+/// Extract a trailing/embedded `NN%` from a progress fragment, clamped to
+/// 0–100. Hand-rolled (no regex dep) — walk to each `%` and read the digit
+/// run before it.
+fn parse_percent(s: &str) -> Option<u8> {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'%' {
+            let mut j = i;
+            while j > 0 && bytes[j - 1].is_ascii_digit() {
+                j -= 1;
+            }
+            if j < i {
+                if let Ok(n) = s[j..i].parse::<u32>() {
+                    return Some(n.min(100) as u8);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Parse a single raw `git clone --progress` line into a `CloneProgress`.
+///
+/// git separates in-place progress updates with `\r`, so the caller splits on
+/// both `\r` and `\n` before handing each line here. Returns `None` for lines
+/// that aren't recognizable progress (blank lines, `remote:`-only chatter,
+/// `fatal:`/`error:` messages) so the caller can keep those for the failure
+/// tail instead.
+fn parse_clone_progress(line: &str) -> Option<CloneProgress> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Strip any number of leading `remote:` prefixes — server-side phases
+    // arrive as `remote: Counting objects: 42% (...)`.
+    let mut content = trimmed;
+    while let Some(rest) = content.strip_prefix("remote:") {
+        content = rest.trim_start();
+    }
+    if content.is_empty() {
+        return None;
+    }
+
+    // "Cloning into 'repo'..." — the opening line, no percent.
+    if content.starts_with("Cloning into") {
+        return Some(CloneProgress {
+            phase: "Cloning".to_string(),
+            percent: None,
+            detail: trimmed.to_string(),
+        });
+    }
+
+    // Progress lines are "<label>: <rest with NN%>". Only accept a known
+    // phase label so arbitrary remote chatter falls through to the tail.
+    let colon = content.find(':')?;
+    let label = content[..colon].trim();
+    let phase = CLONE_PROGRESS_PHASES
+        .iter()
+        .find(|p| p.eq_ignore_ascii_case(label))?;
+    let rest = &content[colon + 1..];
+
+    Some(CloneProgress {
+        phase: (*phase).to_string(),
+        percent: parse_percent(rest),
+        detail: trimmed.to_string(),
+    })
+}
+
 #[tauri::command]
-pub async fn git_clone_repo(url: String, target_dir: String) -> Result<String, String> {
+pub async fn git_clone_repo(
+    app: tauri::AppHandle,
+    url: String,
+    target_dir: String,
+) -> Result<String, String> {
+    use std::collections::VecDeque;
+    use std::process::Stdio;
     use std::time::Duration;
+    use tauri::Emitter;
+    use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
+
+    // Fail if git produces NO new output for this long. A healthy slow clone
+    // keeps emitting `--progress` lines, so it can run for hours without ever
+    // tripping this — only a genuinely wedged transfer stalls. (This replaces
+    // the old absolute 120s cap that killed legitimate slow clones.)
+    const STALL: Duration = Duration::from_secs(120);
 
     // The clone target is built from a hand-typed location in the New Project
     // screen; a literal `~` would clone into a phantom `~` directory under the
     // process cwd. Expand it so the repo lands where the user expects.
     let target_dir = crate::project::expand_tilde(&target_dir);
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(120),
-        tokio::process::Command::new("git")
-            .args(["clone", &url, &target_dir])
-            .output(),
-    )
-    .await;
+    // Record pre-existence so a stall-kill only removes a dir WE created —
+    // never a directory the user already had.
+    let existed_before = Path::new(&target_dir).exists();
 
-    match result {
-        Ok(Ok(output)) if output.status.success() => Ok(target_dir),
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(format!("git clone failed: {}", stderr.trim()))
+    let mut child = Command::new("git")
+        .args(["clone", "--progress", &url, &target_dir])
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stdin(Stdio::null())
+        // No interactive credential prompt: an auth-required URL should fail
+        // fast instead of blocking forever on a hidden password prompt.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // If this future is dropped (command cancelled), reap the child.
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Failed to run git clone: {e}"))?;
+
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "failed to capture git clone output".to_string())?;
+
+    let mut buf = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
+    // Last ~20 non-progress lines, so a real failure returns git's own
+    // message instead of progress spam.
+    let mut tail: VecDeque<String> = VecDeque::new();
+    let mut last_phase: Option<String> = None;
+    let mut last_percent: Option<u8> = None;
+    let mut stalled = false;
+
+    loop {
+        match tokio::time::timeout(STALL, stderr.read(&mut buf)).await {
+            // No output at all for STALL seconds → wedged transfer.
+            Err(_) => {
+                stalled = true;
+                let _ = child.start_kill();
+                break;
+            }
+            // EOF — git has closed stderr and is exiting.
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                pending.extend_from_slice(&buf[..n]);
+
+                // git delimits in-place progress with `\r`, real lines with
+                // `\n` — split on both. Keep any trailing partial fragment.
+                let mut lines: Vec<String> = Vec::new();
+                let mut start = 0;
+                for i in 0..pending.len() {
+                    if pending[i] == b'\r' || pending[i] == b'\n' {
+                        if i > start {
+                            lines.push(String::from_utf8_lossy(&pending[start..i]).into_owned());
+                        }
+                        start = i + 1;
+                    }
+                }
+                pending.drain(0..start);
+
+                for line in lines {
+                    match parse_clone_progress(&line) {
+                        Some(progress) => {
+                            // Light throttle: only emit when the phase or the
+                            // percent actually changed.
+                            if last_phase.as_deref() != Some(progress.phase.as_str())
+                                || last_percent != progress.percent
+                            {
+                                last_phase = Some(progress.phase.clone());
+                                last_percent = progress.percent;
+                                let _ = app.emit(
+                                    GIT_CLONE_PROGRESS_EVENT,
+                                    GitCloneProgress {
+                                        target_dir: target_dir.clone(),
+                                        phase: progress.phase,
+                                        percent: progress.percent,
+                                        detail: progress.detail,
+                                    },
+                                );
+                            }
+                        }
+                        None => {
+                            let t = line.trim();
+                            if !t.is_empty() {
+                                tail.push_back(t.to_string());
+                                if tail.len() > 20 {
+                                    tail.pop_front();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                return Err(format!("Failed to read git clone output: {e}"));
+            }
         }
-        Ok(Err(e)) => Err(format!("Failed to run git clone: {e}")),
-        Err(_) => Err("git clone timed out after 120 seconds".to_string()),
+    }
+
+    // Reap the child (also completes the kill we started on stall).
+    let status = child.wait().await;
+
+    if stalled {
+        // We killed it, so git didn't get to clean up its own partial work.
+        // Remove the target ONLY if it didn't exist before we started.
+        if !existed_before {
+            let _ = std::fs::remove_dir_all(&target_dir);
+        }
+        return Err(
+            "git clone stalled — no progress for 120 seconds. Check your network connection and try again."
+                .to_string(),
+        );
+    }
+
+    let status = status.map_err(|e| format!("git clone wait failed: {e}"))?;
+    if status.success() {
+        Ok(target_dir)
+    } else {
+        let detail = tail.iter().cloned().collect::<Vec<_>>().join("\n");
+        let detail = detail.trim();
+        if detail.is_empty() {
+            Err(format!("git clone failed ({status})"))
+        } else {
+            Err(format!("git clone failed: {detail}"))
+        }
     }
 }
 
@@ -594,5 +824,89 @@ mod tests {
         );
 
         let _ = blocking.await;
+    }
+}
+
+#[cfg(test)]
+mod clone_progress_tests {
+    //! Tests for `parse_clone_progress` — the pure parser behind the
+    //! `git-clone-progress` events. Covers each `git clone --progress` line
+    //! shape (percent extraction, phase labels, `remote:` prefixes) plus the
+    //! non-progress lines that must fall through to the failure tail.
+    use super::{parse_clone_progress, CloneProgress};
+
+    #[test]
+    fn cloning_into_line_is_phase_only() {
+        let p = parse_clone_progress("Cloning into 'my-repo'...").unwrap();
+        assert_eq!(p.phase, "Cloning");
+        assert_eq!(p.percent, None);
+        assert_eq!(p.detail, "Cloning into 'my-repo'...");
+    }
+
+    #[test]
+    fn remote_counting_objects_with_percent() {
+        let p = parse_clone_progress("remote: Counting objects:  42% (1260/2934)").unwrap();
+        assert_eq!(p.phase, "Counting objects");
+        assert_eq!(p.percent, Some(42));
+    }
+
+    #[test]
+    fn remote_compressing_objects_phase() {
+        let p = parse_clone_progress("remote: Compressing objects: 100% (10/10), done.").unwrap();
+        assert_eq!(p.phase, "Compressing objects");
+        assert_eq!(p.percent, Some(100));
+    }
+
+    #[test]
+    fn receiving_objects_keeps_throughput_detail() {
+        let line = "Receiving objects:  42% (1234/2934), 12.00 MiB | 1.20 MiB/s";
+        let p = parse_clone_progress(line).unwrap();
+        assert_eq!(p.phase, "Receiving objects");
+        assert_eq!(p.percent, Some(42));
+        assert_eq!(p.detail, line);
+    }
+
+    #[test]
+    fn resolving_deltas_with_percent() {
+        let p = parse_clone_progress("Resolving deltas:  10% (29/290)").unwrap();
+        assert_eq!(
+            p,
+            CloneProgress {
+                phase: "Resolving deltas".to_string(),
+                percent: Some(10),
+                detail: "Resolving deltas:  10% (29/290)".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn percent_is_clamped_to_100() {
+        // Defensive: a malformed 999% must never overflow the u8 payload.
+        let p = parse_clone_progress("Receiving objects: 999% (1/1)").unwrap();
+        assert_eq!(p.percent, Some(100));
+    }
+
+    #[test]
+    fn blank_and_whitespace_lines_are_none() {
+        assert_eq!(parse_clone_progress(""), None);
+        assert_eq!(parse_clone_progress("   \t"), None);
+    }
+
+    #[test]
+    fn remote_chatter_without_known_phase_is_none() {
+        // Not a progress phase — must fall through so it can land in the
+        // error tail rather than firing a bogus progress event.
+        assert_eq!(
+            parse_clone_progress("remote: Total 2934 (delta 42), reused 0 (delta 0)"),
+            None
+        );
+    }
+
+    #[test]
+    fn fatal_error_line_is_none() {
+        assert_eq!(
+            parse_clone_progress("fatal: repository 'https://x/y.git' not found"),
+            None
+        );
     }
 }

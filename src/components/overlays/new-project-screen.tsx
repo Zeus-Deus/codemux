@@ -23,6 +23,8 @@ import {
   activateWorkspace,
 } from "@/tauri/commands";
 import { pickFolder } from "@/lib/file-dialog";
+import { useCloneProgress } from "@/hooks/use-clone-progress";
+import { CloneProgressRow } from "@/components/overlays/clone-progress-row";
 
 type Mode = "empty" | "clone";
 
@@ -57,6 +59,12 @@ export function NewProjectScreen() {
   const [cloneUrl, setCloneUrl] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Target dir of the in-flight clone, so we can subscribe to its
+  // `git-clone-progress` events. Empty string = no clone running.
+  const [cloneTarget, setCloneTarget] = useState("");
+
+  const cloning = loading && mode === "clone" && cloneTarget !== "";
+  const cloneProgress = useCloneProgress(cloning, cloneTarget);
 
   // Auto-derive name from clone URL
   const derivedName =
@@ -103,6 +111,7 @@ export function NewProjectScreen() {
           return;
         }
         const targetDir = `${parentDir.trim()}/${effectiveName || derivedName}`;
+        setCloneTarget(targetDir);
         projectPath = await gitCloneRepo(url, targetDir);
       }
 
@@ -127,6 +136,7 @@ export function NewProjectScreen() {
       setError(String(err));
     } finally {
       setLoading(false);
+      setCloneTarget("");
     }
   };
 
@@ -278,8 +288,22 @@ export function NewProjectScreen() {
             </div>
           )}
 
+          {/* Live clone progress — replaces the bare "Cloning..." spinner
+              with phase + percent + a determinate bar so a slow clone
+              never looks hung. */}
+          {cloning && (
+            <div className="rounded-md border border-border/50 bg-foreground/5 px-4 py-3">
+              <CloneProgressRow progress={cloneProgress} />
+            </div>
+          )}
+
           {/* Submit */}
-          <div className="flex justify-end pt-2 border-t border-border/40">
+          <div className="flex items-center justify-end gap-3 pt-2 border-t border-border/40">
+            {cloning && (
+              <span className="mr-auto text-xs text-muted-foreground">
+                Cloning — this can take a while on slow connections…
+              </span>
+            )}
             <Button onClick={handleCreate} disabled={loading} size="sm" className="bg-foreground text-background hover:bg-foreground/90">
               {loading && <Loader2 className="h-3 w-3 animate-spin mr-1" />}
               {loading

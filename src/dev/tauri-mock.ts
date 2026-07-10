@@ -1912,6 +1912,46 @@ const handlers: Record<string, Handler> = {
   // No-op: the init handler above already flipped the flag + re-emitted.
   refresh_workspace_git_info: () => undefined,
 
+  // Fake `git clone` that streams realistic `git-clone-progress` events
+  // over ~5s, then resolves with the target dir — so the New Project /
+  // Clone progress UI is demoable in `npm run dev` without a real remote.
+  // Mirrors src-tauri/src/commands/git.rs:GitCloneProgress (camelCase).
+  git_clone_repo: async (a) => {
+    const targetDir = String(a.targetDir ?? `${MOCK_HOME_DIR}/projects/cloned`);
+    const emit = (
+      phase: string,
+      percent: number | null,
+      detail: string,
+    ) =>
+      emitEvent("git-clone-progress", {
+        targetDir,
+        phase,
+        percent,
+        detail,
+      });
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    emit("Cloning", null, `Cloning into '${targetDir.split("/").pop()}'...`);
+    await sleep(500);
+    for (const pct of [20, 55, 88, 100]) {
+      emit("Counting objects", pct, `remote: Counting objects: ${pct}% (2934/2934)`);
+      await sleep(300);
+    }
+    // Receiving objects climbs 5%→96% with a throughput detail line.
+    for (const pct of [5, 23, 47, 68, 84, 96]) {
+      const mib = ((pct / 100) * 42).toFixed(2);
+      emit(
+        "Receiving objects",
+        pct,
+        `Receiving objects: ${pct}% (${Math.round((pct / 100) * 2934)}/2934), ${mib} MiB | 1.20 MiB/s`,
+      );
+      await sleep(500);
+    }
+    emit("Resolving deltas", 100, "Resolving deltas: 100% (1420/1420), done.");
+    await sleep(300);
+    return targetDir;
+  },
+
   // ── Deferred worktree first-send (Thread Scope) ──
   //
   // Faithfully reproduces the async race the fix targets: the new
