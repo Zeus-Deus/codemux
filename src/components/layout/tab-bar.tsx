@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, memo } from "react";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import {
@@ -48,7 +48,7 @@ function collectPaneIds(node: PaneNodeSnapshot): string[] {
   return [node.pane_id];
 }
 
-export function TabBar({ workspace }: Props) {
+function TabBarImpl({ workspace }: Props) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const rightPanelTab = useUIStore(
     (s) => s.rightPanelTabs[workspace.workspace_id] ?? null,
@@ -386,3 +386,9 @@ function EditorDirtyDot({ tabId }: { tabId: string }) {
   if (!isDirty) return null;
   return <span className="w-1.5 h-1.5 rounded-full bg-foreground/50 shrink-0" title="Unsaved changes" />;
 }
+
+// #127: memo is effective because setAppState performs structural sharing, so
+// the `workspace` snapshot keeps a stable ref across backend ticks that don't
+// change it — shallow compare then skips this tab strip's re-render.
+export const TabBar = memo(TabBarImpl);
+TabBar.displayName = "TabBar";

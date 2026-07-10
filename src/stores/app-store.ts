@@ -7,6 +7,7 @@ import type {
   SurfaceSnapshot,
 } from "@/tauri/types";
 import { basename, tailSegments, segmentCount } from "@/lib/path";
+import { shareStructural } from "@/lib/structural-share";
 import type { HostView } from "@/tauri/commands";
 
 interface AppStore {
@@ -37,7 +38,16 @@ export const useAppStore = create<AppStore>((set) => ({
   homeDir: null,
   workspacePushPullInFlight: null,
   workspacePushPullStartedAt: null,
-  setAppState: (snapshot) => set({ appState: snapshot }),
+  // Structural sharing: reconcile the incoming snapshot against the one we
+  // already hold so unchanged subtrees keep their previous reference. When
+  // nothing changed the returned ref equals the previous snapshot, so zustand
+  // selector subscribers see zero fan-out. See `@/lib/structural-share`.
+  setAppState: (snapshot) =>
+    set((state) => ({
+      appState: state.appState
+        ? shareStructural(state.appState, snapshot)
+        : snapshot,
+    })),
   setHomeDir: (homeDir) => set({ homeDir }),
   // Pair the workspace id with a start timestamp so "elapsed" can
   // be computed at render time. Null clears both.
@@ -60,14 +70,26 @@ export const useAppStore = create<AppStore>((set) => ({
 // events, and PR/port refreshes all fire emit_app_state, so under
 // normal use these ticks happen many times per second.
 //
-// `useActiveWorkspace()` returns the matching workspace OBJECT from a
-// fresh snapshot. Even when nothing about the active workspace
-// semantically changed, the returned reference differs every tick, so
-// every consumer subscribed via this hook re-renders on every tick.
-// That cascaded into MarkdownRendered (full markdown re-parse), the
-// pane container, the tab bar, etc.
+// `useActiveWorkspace()` returns the matching workspace OBJECT from the
+// snapshot. Before structural sharing, a fresh snapshot meant a fresh
+// workspace reference every tick, so every consumer subscribed via this
+// hook re-rendered on every tick — cascading into MarkdownRendered (full
+// markdown re-parse), the pane container, the tab bar, etc.
 //
 // Mitigation:
+//
+// 0. `setAppState` (above) now runs `shareStructural(prev, next)` before
+//    storing the snapshot. It reconciles the fresh IPC payload against the
+//    snapshot we already hold and REUSES prev references for every subtree
+//    that is deep-equal — so a no-op backend tick returns the *same*
+//    top-level ref (zero selector fan-out), and a change to one workspace
+//    leaves all other workspaces', surfaces', and pane subtrees' refs
+//    untouched. This is what makes `useActiveWorkspace` / `useActiveSurface`
+//    stable across no-op ticks, and it is what makes the `React.memo`
+//    boundaries on the pane tree (added in the same change) actually pay off
+//    — an unchanged pane subtree keeps its identity, so memo short-circuits.
+//    (This is NOT the old full-snapshot JSON.stringify dedup, which was
+//    removed for causing freezes — see `src/hooks/use-app-state.ts`.)
 //
 // 1. Primitive-slice selectors (`useActiveWorkspaceId`,
 //    `useActiveWorkspaceCwd`, etc.) below return primitive strings
@@ -81,9 +103,10 @@ export const useAppStore = create<AppStore>((set) => ({
 //    downstream of WorkspaceMain — react-markdown re-parsing — is
 //    mitigated separately by `React.memo` on `MarkdownRendered`.
 //
-// `useShallow` would NOT help here. It does shallow compare, but the
-// Rust snapshot rebuild gives every nested array (surfaces, tabs)
-// fresh refs, so shallow compare always trips.
+// Before structural sharing, `useShallow` would NOT have helped: the Rust
+// snapshot rebuild gave every nested array (surfaces, tabs) fresh refs, so
+// a shallow compare always tripped. Structural sharing fixes this at the
+// source by restoring reference stability for unchanged subtrees.
 export function useActiveWorkspace(): WorkspaceSnapshot | null {
   return useAppStore((s) => {
     if (!s.appState) return null;
