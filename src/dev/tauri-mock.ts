@@ -559,11 +559,18 @@ function drainChatQueue(threadId: string): void {
  *  backend's `forward_event` routing. */
 function streamMockChatReply(
   threadId: string,
-  opts: { tokens?: number; intervalMs?: number } = {},
+  opts: { tokens?: number; intervalMs?: number; emptyGapTicks?: number } = {},
 ): string {
   const turnId = `live-turn-${++mockChatTurnSeq}`;
   const tokens = Math.max(1, opts.tokens ?? 120);
   const intervalMs = Math.max(5, opts.intervalMs ?? 40);
+  // `emptyGapTicks` reproduces the real partial-message stream shape from
+  // issue #155: after the tool run, the provider opens the text content
+  // block with an EMPTY first delta, then goes silent for a while before
+  // prose streams. Used to visually verify the transcript never reads
+  // finished-and-empty during that gap. 0 (default) keeps the old shape.
+  let gapTicksLeft = Math.max(0, opts.emptyGapTicks ?? 0);
+  let emptyDeltaSent = false;
   const send = (event: unknown) => emitChatEvent(threadId, event);
 
   chatActiveTurns.add(threadId);
@@ -688,6 +695,20 @@ function streamMockChatReply(
       toolIdx += 1;
       toolSubphase = "use";
       if (toolIdx >= TOOL_STEPS.length) phase = "text";
+      return;
+    }
+    if (!emptyDeltaSent && gapTicksLeft > 0) {
+      emptyDeltaSent = true;
+      send({
+        type: "content_delta",
+        thread_id: threadId,
+        turn_id: turnId,
+        delta: { kind: "text", text: "" },
+      });
+      return;
+    }
+    if (gapTicksLeft > 0) {
+      gapTicksLeft -= 1;
       return;
     }
     emitted += 1;

@@ -288,6 +288,10 @@ function appendTextDelta(
     tail.streaming &&
     (!tail.turn_id || tail.turn_id === turnId)
   ) {
+    // Merging an empty delta into the existing streaming tail changes
+    // nothing — keep the ctx reference-stable rather than cloning the row
+    // (tail is the assistant, so no reasoning was sealed above).
+    if (text.length === 0) return ctx;
     const next: AssistantMessageItem = {
       ...tail,
       turn_id: turnId,
@@ -299,6 +303,16 @@ function appendTextDelta(
       nextSeq: ctx.nextSeq,
     };
   }
+  // No streaming assistant tail to merge into. Providers (notably the
+  // partial-message stream) routinely open a fresh text content block with
+  // an empty first delta. Materializing an assistant_message for it would
+  // render a near-blank row AND, being a non-step item, settle the live
+  // Activity run mid-turn — so the transcript reads finished-but-empty while
+  // the turn is still working. Drop the empty / whitespace-only delta; a
+  // later non-empty delta creates the row. The guard is deterministic, so a
+  // hydrate/replay of the same event sequence produces the identical item
+  // count as live streaming.
+  if (text.trim().length === 0) return ctx;
   const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
   const newAssistant: AssistantMessageItem = {
     kind: "assistant_message",
@@ -353,6 +367,14 @@ function applyCompletedItemToList(
           messages: replaceItem(messages, existing.index, next),
           nextSeq: ctx.nextSeq,
         };
+      }
+      // No streaming assistant to seal. A completion whose text is empty
+      // (a turn whose only text block was empty — Layer 1 dropped its
+      // deltas) must not materialize a blank settled row: there is nothing
+      // to render and nothing to seal. Return the (reasoning-sealed)
+      // messages so the turn still settles cleanly.
+      if (item.text.length === 0) {
+        return { messages, nextSeq: ctx.nextSeq };
       }
       const { seq, ctx: c2 } = takeSeqList({ messages, nextSeq: ctx.nextSeq });
       const newAssistant: AssistantMessageItem = {

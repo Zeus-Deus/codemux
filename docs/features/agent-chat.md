@@ -271,6 +271,26 @@ Contract preserved from the pre-redesign renderer:
   the thread `streaming` flag into `buildTranscriptSlots`, and the
   marker only renders when the tail slot is not a working Activity block
   (it still fills the gap right after send, before any step arrives).
+  The marker carries a **live elapsed-time suffix** ("Writing… · 40s"):
+  `StreamingMarker` derives the active turn's start with
+  `deriveTurnStartedAt` (the earliest reducer-stamped `started_at` of the
+  reasoning / tool steps after the last non-queued user turn) and ticks a
+  text node via `setInterval` writing `textContent` directly — no
+  per-second React re-render of the transcript. No start is derivable in
+  the gap right after send or on a hydrated transcript whose rows predate
+  the timestamp fields; the suffix is then omitted rather than faked.
+- **Empty deltas never materialize a message.** The partial-message
+  stream often opens a new text content block with an empty (or
+  whitespace-only) first delta. `appendTextDelta` (`reducer.ts`) drops it
+  instead of creating an empty `assistant_message`: an empty row would
+  render near-blank AND, as a non-step item, flush the live Activity run
+  as settled mid-turn — so the transcript would read finished-but-empty
+  while the turn is still working. The drop is deterministic, so a
+  hydrate/replay of the same events (`hydrate.ts`) keeps the identical
+  item count as live streaming. `shouldShowThinkingIndicator`
+  (`thinking.ts`) also keeps the tail marker up for a
+  streaming-but-empty `assistant_message` as defense in depth for a
+  provider that lands one anyway.
 
 ### Activity block (Activity Stream)
 
@@ -289,7 +309,10 @@ derivations (unit-tested in `activity-steps.test.ts`).
   rolls up to a green circled check + a derived summary sentence
   (`deriveActivitySummary`: read-heavy → "Explored the codebase",
   command-heavy → "Ran commands", edit-heavy → "Edited files", mixed →
-  sensible) + a mono `N steps · 1m 12s` meta (duration from step
+  sensible; its "Worked through N steps" fallback counts **all**
+  non-reasoning steps including `other`-family tools — Task/agent spawns,
+  MCP tools — so it never claims fewer steps than the header meta) + a
+  mono `N steps · 1m 12s` meta (duration from step
   `started_at`/`completed_at`, omitted when < 1s / not derivable, e.g.
   hydrated transcripts) + a Details/Hide toggle. On settle the block
   re-renders collapsed (any mid-stream expansion resets).

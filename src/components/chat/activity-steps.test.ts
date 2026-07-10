@@ -56,6 +56,24 @@ describe("deriveActivitySummary", () => {
       "Explored and edited files",
     );
   });
+  it("all other-family tools (Task / MCP) hit the fallback with the correct count", () => {
+    // `other`-family tools used to be dropped from the fallback tally, so a
+    // run of only Task / MCP tools claimed "Worked through 0 steps" while
+    // the header meta said "3 steps". They now count.
+    expect(
+      deriveActivitySummary([
+        tool("Task"),
+        tool("mcp__codemux__browser_click"),
+        tool("Task"),
+      ]),
+    ).toBe("Worked through 3 steps");
+  });
+  it("counts other-family tools alongside a reasoning step (reasoning excluded from the tool tally)", () => {
+    // A lone Task with a thought falls to the fallback; the tool tally is 1.
+    expect(deriveActivitySummary([tool("Task"), think()])).toBe(
+      "Worked through 1 step",
+    );
+  });
 });
 
 describe("deriveWorkingCounter", () => {

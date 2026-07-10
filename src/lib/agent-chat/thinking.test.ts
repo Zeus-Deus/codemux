@@ -101,6 +101,14 @@ describe("shouldShowThinkingIndicator", () => {
     expect(shouldShowThinkingIndicator(msgs, true)).toBe(false);
   });
 
+  it("shows while a streaming-but-empty assistant tail renders nothing yet", () => {
+    // Defense in depth for a provider that lands an empty streaming
+    // assistant message despite the reducer's drop-empty-delta guard: the
+    // row shows no caret, so the tail marker must keep the turn alive.
+    const msgs: ChatViewItem[] = [userMsg(0), assistantMsg(1, true, "")];
+    expect(shouldShowThinkingIndicator(msgs, true)).toBe(true);
+  });
+
   it("shows when the trailing assistant message has sealed", () => {
     const msgs: ChatViewItem[] = [userMsg(0), assistantMsg(1, false, "done")];
     expect(shouldShowThinkingIndicator(msgs, true)).toBe(true);
