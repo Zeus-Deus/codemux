@@ -231,10 +231,28 @@ Contract preserved from the pre-redesign renderer:
   no longer runs a competing hand-rolled pin/snap loop — an earlier
   version did (direct `scrollTop` writes on a separate 80px
   threshold), which produced visible jitter fighting the engine in
-  the 8–80px band; that machinery was deleted. The viewport also sets
-  `overflow-anchor: none` so native browser scroll anchoring can't
-  fight the engine's programmatic scrolls while `content-visibility`
-  rows settle from estimated to real heights.
+  the 8–80px band; that machinery was deleted. Scroll stability is
+  **split by ownership**: native browser scroll anchoring owns
+  free-scroll — while the reader scrolls history it absorbs the
+  `content-visibility:auto` estimated-then-real height settling of rows
+  above the viewport (the mechanism the content-visibility spec relies
+  on) — and the engine owns following-bottom. They never fight because
+  the viewport disables anchoring by default (`[overflow-anchor:none]` —
+  pinned/following, the engine owns the tail snap) and re-enables it
+  **only while the reader is away from the bottom**
+  (`data-[scrollable~=end]:[overflow-anchor:auto]`; the engine keeps
+  `end` in the viewport's `data-scrollable` attribute exactly while the
+  user is unpinned in history, and updates it promptly on scroll
+  commits). Do NOT scope this off `data-autoscrolling` instead: that
+  attribute is only rewritten on engine state commits and measured stale
+  — still set minutes after the user scrolled up and went idle — which
+  would leave anchoring off exactly when the reader needs it. Per-slot
+  `contain-intrinsic-size` estimates
+  (`intrinsicSizeClass` in `MessageList`, keyed off the slot body kind)
+  keep each first-reveal settle small so anchoring's corrections stay
+  imperceptible in both scroll directions. (An earlier build set a blanket
+  `overflow-anchor: none`, which disabled anchoring everywhere and let
+  those settles drift the viewport hundreds of px per wheel batch.)
 - **Turn anchoring is deliberately OFF** (`scrollAnchor={false}` on
   every row): with hundreds of pre-hydrated rows the engine's anchor
   handling scrolls the viewport to a stale early anchor when new items
