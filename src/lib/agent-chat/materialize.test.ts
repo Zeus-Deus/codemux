@@ -356,6 +356,8 @@ describe("materializeAndSend", () => {
       expect(actions.appendUserMessage).toHaveBeenCalledWith(
         "tid-7",
         "first turn text",
+        undefined,
+        [],
       );
     });
 
@@ -607,6 +609,7 @@ describe("materializeAndSend", () => {
         null,
         null,
         [],
+        [],
         "/projects/foo",
       );
 
@@ -659,6 +662,7 @@ describe("materializeAndSend", () => {
         null,
         null,
         [],
+        [],
         "/projects/foo",
       );
 
@@ -694,6 +698,7 @@ describe("materializeAndSend", () => {
         null,
         null,
         [],
+        [],
         "/projects/foo",
       );
 
@@ -727,6 +732,7 @@ describe("materializeAndSend", () => {
         null,
         null,
         [],
+        [],
         "/projects/foo",
       );
 
@@ -758,6 +764,7 @@ describe("materializeAndSend", () => {
         null,
         null,
         [],
+        [],
         "/projects/foo",
       );
 
@@ -783,6 +790,7 @@ describe("materializeAndSend", () => {
         actions,
         null,
         null,
+        [],
         [],
         null,
       );
@@ -812,6 +820,7 @@ describe("materializeAndSend", () => {
         actions,
         null,
         null,
+        [],
         [],
         "/projects/foo",
       );
@@ -1263,6 +1272,8 @@ describe("materializeWithPreset", () => {
       expect(actions.appendUserMessage).toHaveBeenCalledWith(
         draft.threadId,
         userText,
+        undefined,
+        [],
       );
 
       // SDK send: wrapper applied.

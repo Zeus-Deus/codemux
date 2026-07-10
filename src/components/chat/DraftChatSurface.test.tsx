@@ -842,8 +842,8 @@ describe("DraftChatSurface", () => {
       });
       const call = vi.mocked(materializeAndSend).mock.calls[0];
       // (draft, text, cwd, actions, skillBodies, attachmentBlock,
-      //  imagePayloads, worktreeProjectPath)
-      expect(call[7]).toBe("/projects/foo");
+      //  imagePayloads, imageDisplaySources, worktreeProjectPath)
+      expect(call[8]).toBe("/projects/foo");
     });
 
     it("checkoutMode 'current' (the default) passes null as the worktree project path", async () => {
@@ -865,7 +865,7 @@ describe("DraftChatSurface", () => {
         expect(materializeAndSend).toHaveBeenCalled();
       });
       const call = vi.mocked(materializeAndSend).mock.calls[0];
-      expect(call[7]).toBeNull();
+      expect(call[8]).toBeNull();
     });
   });
 });
