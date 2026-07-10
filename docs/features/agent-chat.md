@@ -1538,6 +1538,59 @@ item and continues — the queue never wedges.
 queued_id)` cancels a queued turn (idempotent). Wrapper:
 `agentChatCancelQueuedTurn` in `src/tauri/commands.ts`.
 
+### Send now (steer)
+
+The greyed queued bubble also exposes a hover-reveal **"Send now"** action
+(a `CornerDownLeft` icon in the same pill row as Cancel) that dispatches
+the queued message *immediately* instead of waiting for the active turn to
+finish. This mirrors Claude Code's interrupt-and-resubmit steering path.
+
+The command `agent_chat_send_queued_turn_now(provider, thread_id,
+queued_id)` (wrapper `agentChatSendQueuedTurnNow`) routes through the trait
+method `send_queued_turn_now` (default no-op for OpenCode) to the session's
+`send_queued_now`. That method, under the state lock:
+
+1. **Promote to front.** Locate `queued_id` in `queued_turns` and move it
+   to the front (`promote_queued_to_front`) so it is the next item the
+   drain dispatches. An unknown / already-dispatched / already-cancelled id
+   is a silent no-op `Ok(())` — the same idempotency philosophy as
+   `cancel_queued`, covering the race where the item dispatched between the
+   UI click and this call.
+2. **Interrupt + drain.** If a turn is active it calls the existing
+   interrupt path — a **soft** stop: the SDK/Codex session, the full
+   transcript, and all on-disk work are preserved; **nothing** is discarded.
+   - *Claude:* `interrupt(None)` flips the session to `Ready` and ends with
+     `drain_queue()`, so the promoted item dispatches inline.
+   - *Codex:* `interrupt_turn(None)` does not drain inline — the abort lands
+     as a `turn/completed` notification that returns the session to `Ready`
+     and the event loop drains there. If `interrupt_turn` returns the "no
+     active turn" `ValidationError` (turn finished during the click→call
+     race) it falls back to `drain_queue()` directly.
+   - If the session is already idle (the turn finished before the call) it
+     just `drain_queue()`s.
+
+The promoted message then dispatches through the identical
+`QueuedTurnDispatched` path as a normal drain, so the reducer promotes the
+greyed bubble and `forward_event` writes the deferred user-message envelope
+(with any `pending_queued_images`) exactly as before — no persistence
+changes were needed.
+
+**Pending-approval behaviour (verified).** `drain_queue` refuses to
+dispatch while `pending_approvals` is non-empty, and neither Claude's
+`interrupt` nor Codex's `interrupt_turn` clears pending approvals (only
+session `Closed`/`Error` does, in `shutdown`/teardown). So send-now behaves
+**identically to a manual stop-button interrupt**: if a tool approval is
+still outstanding, the promoted message stays queued until the user
+resolves that approval, then drains. Send-now deliberately does not invent
+new approval-clearing behaviour.
+
+**Frontend.** `handleSendQueuedNow` in `AgentChatPane` calls the command
+with no optimistic state change — the `queued_turn_dispatched` event
+promotes the bubble and the interrupt's `ready`/`running` state events
+settle the composer. Errors surface via a toast, like `handleCancelQueued`.
+The `onSendQueuedNow` prop threads through
+`ChatTranscript → MessageList → ItemRow → UserMessage`.
+
 **Frontend.** `UserMessageItem` gained `queued?: { queuedId }` (greyed
 render + "Queued" pill + hover-X) and `clientNonce?` (reconciliation +
 error rollback). Queued items sort to the very bottom via a `QUEUED_SEQ_BASE`
@@ -1558,8 +1611,11 @@ follow-up.
 
 **Out of scope (TODO):**
 
-- **Steering / inject-into-live-turn** (Cmd+Enter "send now" that injects
-  into the running turn rather than queuing behind it).
+- **True inject-into-live-turn steering** (feeding the message into the
+  *running* turn via the SDK's `streamInput` without interrupting).
+  Remains out of scope pending SDK support. The interrupt-based **"Send
+  now"** above (soft-stop + promote-to-front + drain) is **done** and
+  covers the steering use-case for now.
 - **Editing a queued message in place** (cancel-restores-to-composer
   covers the common case).
 - **Persisting the queue across app restart.**

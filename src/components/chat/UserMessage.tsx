@@ -1,5 +1,5 @@
 import { memo, useState } from "react";
-import { ImageOff, X } from "lucide-react";
+import { CornerDownLeft, ImageOff, X } from "lucide-react";
 
 import {
   Dialog,
@@ -26,15 +26,19 @@ import { cn } from "@/lib/utils";
  *
  * Follow-up queueing: while `item.queued` is set the bubble renders
  * greyed-out (reduced opacity + muted foreground) with a small "Queued"
- * pill and, on hover, an X to cancel — cancelling restores the text into
- * the composer (handled by the parent). All colors are theme tokens.
+ * pill and, on hover, two actions — "Send now" (steer: soft-interrupt the
+ * active turn and dispatch this message immediately, keeping all progress)
+ * and an X to cancel (restores the text into the composer). Both are
+ * handled by the parent. All colors are theme tokens.
  */
 export const UserMessage = memo(function UserMessage({
   item,
   onCancelQueued,
+  onSendQueuedNow,
 }: {
   item: UserMessageItem;
   onCancelQueued?: (queuedId: string, text: string) => void;
+  onSendQueuedNow?: (queuedId: string) => void;
 }) {
   const queued = item.queued;
   const images = item.images ?? [];
@@ -76,6 +80,18 @@ export const UserMessage = memo(function UserMessage({
             <span className="rounded-full bg-muted px-2 py-[1px] text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
               Queued
             </span>
+            {onSendQueuedNow ? (
+              <button
+                type="button"
+                aria-label="Send now"
+                title="Interrupt current work and send this message now — progress so far is kept"
+                onClick={() => onSendQueuedNow(queued.queuedId)}
+                className="flex items-center gap-0.5 rounded text-[10px] text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100"
+              >
+                <CornerDownLeft className="h-3 w-3" aria-hidden />
+                Send now
+              </button>
+            ) : null}
             {onCancelQueued ? (
               <button
                 type="button"

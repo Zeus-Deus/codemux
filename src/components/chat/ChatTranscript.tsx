@@ -23,6 +23,9 @@ interface Props {
   /** Follow-up queueing: cancel a queued turn (X on the greyed bubble).
    *  `text` is passed back so the caller can restore it to the composer. */
   onCancelQueued?: (queuedId: string, text: string) => void;
+  /** Follow-up queueing: send a queued turn now (steer) — soft-interrupts
+   *  the active turn and dispatches this message immediately. */
+  onSendQueuedNow?: (queuedId: string) => void;
   /** Enter a subagent's read-only drill-in (design "Enter subagent"). */
   onEnterSubagent?: (subagentId: string) => void;
   /** Forwarded to MessageList for the WorkflowRunCard "Open panel"
@@ -46,6 +49,7 @@ export function ChatTranscript({
   onAcceptPlan,
   onRejectPlan,
   onCancelQueued,
+  onSendQueuedNow,
   onEnterSubagent,
   workspaceId,
 }: Props) {
@@ -63,6 +67,7 @@ export function ChatTranscript({
         onAcceptPlan={onAcceptPlan}
         onRejectPlan={onRejectPlan}
         onCancelQueued={onCancelQueued}
+        onSendQueuedNow={onSendQueuedNow}
         onEnterSubagent={onEnterSubagent}
         workspaceId={workspaceId}
       />

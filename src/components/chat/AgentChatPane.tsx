@@ -57,6 +57,7 @@ import {
 import {
   activateWorkspace,
   agentChatCancelQueuedTurn,
+  agentChatSendQueuedTurnNow,
   agentChatGetSession,
   agentChatInterruptTurn,
   agentChatListMessages,
@@ -1698,6 +1699,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     [threadId, provider, setInputDraft],
   );
 
+  // Follow-up queueing: send a queued turn NOW (steer). The backend
+  // promotes it to the front of the queue and soft-interrupts the active
+  // turn — the session, transcript, and on-disk work are all preserved —
+  // then dispatches it as a normal follow-up. No optimistic state change:
+  // the `queued_turn_dispatched` event promotes the greyed bubble and the
+  // interrupt's `ready`/`running` state events settle the composer.
+  const handleSendQueuedNow = useCallback(
+    (queuedId: string) => {
+      if (!threadId) return;
+      agentChatSendQueuedTurnNow(provider, threadId, queuedId).catch((err) => {
+        toast.error(`Failed to send queued message: ${err}`);
+      });
+    },
+    [threadId, provider],
+  );
+
   const handleRespond = useCallback(
     (requestId: string, decision: ApprovalDecision) => {
       if (!threadId) return;
@@ -2644,6 +2661,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               onAcceptPlan={handleAcceptPlan}
               onRejectPlan={handleRejectPlan}
               onCancelQueued={handleCancelQueued}
+              onSendQueuedNow={handleSendQueuedNow}
               onEnterSubagent={handleEnterSubagent}
               workspaceId={workspaceIdForPane}
             />

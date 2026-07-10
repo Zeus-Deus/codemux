@@ -1118,6 +1118,33 @@ pub async fn agent_chat_cancel_queued_turn(
         .map_err(provider_err)
 }
 
+/// Send a queued (not-yet-dispatched) follow-up turn **now**: promote it
+/// to the front of the queue and dispatch it immediately, soft-interrupting
+/// the active turn if one is running. The interrupt preserves the session,
+/// the full transcript, and all on-disk work — nothing is discarded — and
+/// the message then runs as a normal follow-up turn so the agent re-plans
+/// with the steer. Idempotent — an unknown or already-dispatched id is a
+/// silent success. No persistence work here: the interrupt's `Ready` state
+/// events settle the composer and the provider's `QueuedTurnDispatched`
+/// event (handled in [`forward_event`]) promotes the bubble and writes the
+/// deferred user-message envelope, attaching any `pending_queued_images`.
+#[tauri::command]
+pub async fn agent_chat_send_queued_turn_now(
+    app: AppHandle,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+    queued_id: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    impl_
+        .send_queued_turn_now(thread_id, queued_id)
+        .await
+        .map_err(provider_err)
+}
+
 /// A chat image attachment that has been written to disk for the
 /// transcript. User messages (and their images) never come back through
 /// the provider event stream, so the only record of an attachment is the

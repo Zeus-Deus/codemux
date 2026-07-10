@@ -105,6 +105,24 @@ fn mint_queued_id() -> String {
     format!("claude-queued-{}", uuid::Uuid::new_v4())
 }
 
+/// Move the queued turn with `queued_id` to the front of `queue` so it
+/// is the next item [`ClaudeSession::drain_queue`] dispatches. Returns
+/// `true` when the item was found (and is now at the front), `false`
+/// when no such id is queued (already dispatched / cancelled / unknown).
+/// A no-op when the item is already at the front.
+fn promote_queued_to_front(queue: &mut VecDeque<QueuedTurn>, queued_id: &str) -> bool {
+    match queue.iter().position(|q| q.queued_id == queued_id) {
+        Some(0) => true,
+        Some(pos) => {
+            if let Some(item) = queue.remove(pos) {
+                queue.push_front(item);
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// A live Claude session handle.
 pub(crate) struct ClaudeSession {
     pub thread_id: ThreadId,
@@ -455,6 +473,52 @@ impl ClaudeSession {
             });
         }
         Ok(())
+    }
+
+    /// **Send now (steer):** promote a queued follow-up to the front of
+    /// the queue and dispatch it immediately, interrupting the active
+    /// turn if one is running. This is a *soft* stop — the SDK session,
+    /// the full transcript, and all on-disk work are preserved; nothing
+    /// is discarded. The promoted message then dispatches as a normal
+    /// follow-up turn, so the agent re-plans with the user's steer.
+    ///
+    /// Idempotent: an unknown / already-dispatched / already-cancelled id
+    /// is a silent no-op `Ok(())` (the same philosophy as
+    /// [`cancel_queued`](Self::cancel_queued) — the item may have just
+    /// dispatched between the UI click and this call).
+    ///
+    /// When a turn is active we call [`interrupt`](Self::interrupt), which
+    /// flips the session to `Ready` and ends with `drain_queue()` — so the
+    /// item we just moved to the front goes out next. When the session is
+    /// already idle (the turn finished during the click→call race) we just
+    /// `drain_queue()` directly.
+    ///
+    /// **Pending approvals:** `drain_queue` refuses to dispatch while
+    /// `pending_approvals` is non-empty, and `interrupt` does not clear
+    /// them (only session close/error does). So — exactly like a manual
+    /// stop-button interrupt — if a tool approval is outstanding the
+    /// promoted message stays queued until that approval resolves, then
+    /// drains. Send-now deliberately does not invent new approval-clearing
+    /// behaviour.
+    pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
+        let has_active_turn = {
+            let mut state = self.state.lock().await;
+            if !promote_queued_to_front(&mut state.queued_turns, queued_id) {
+                // Unknown / already-dispatched / cancelled — no-op.
+                return Ok(());
+            }
+            state.active_turn.is_some()
+        };
+        if has_active_turn {
+            // Soft-stop the running turn; `interrupt` flips to Ready and
+            // drains, dispatching the item we just promoted to the front.
+            self.interrupt(None).await
+        } else {
+            // Race: the turn finished between the UI click and this call.
+            // The session is idle, so just drain the promoted item out.
+            self.drain_queue().await;
+            Ok(())
+        }
     }
 
     /// Cancel every queued turn, emitting a
@@ -1267,5 +1331,48 @@ mod tests {
             "alreadyClosed": true
         })));
         assert!(!stop_response_indicates_already_closed(&json!({})));
+    }
+
+    /// Build a bare `QueuedTurn` with a given id for reorder tests. The
+    /// `input` payload is irrelevant to `promote_queued_to_front`, which
+    /// only inspects `queued_id`.
+    fn queued(id: &str) -> QueuedTurn {
+        QueuedTurn {
+            queued_id: id.to_string(),
+            input: SendTurnInput {
+                thread_id: ThreadId("t".into()),
+                text: String::new(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+            },
+        }
+    }
+
+    #[test]
+    fn promote_queued_to_front_unknown_id_is_noop() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        assert!(!promote_queued_to_front(&mut q, "missing"));
+        // Order unchanged.
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn promote_queued_to_front_moves_mid_queue_item() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b"), queued("c")].into();
+        assert!(promote_queued_to_front(&mut q, "c"));
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn promote_queued_to_front_head_item_stays_put() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        assert!(promote_queued_to_front(&mut q, "a"));
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
     }
 }

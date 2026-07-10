@@ -1280,6 +1280,22 @@ export const agentChatCancelQueuedTurn = (
     queuedId,
   });
 
+/** Send a queued (not-yet-dispatched) follow-up turn **now**: the backend
+ *  promotes it to the front of the queue and soft-interrupts the active
+ *  turn (session, transcript, and on-disk work are preserved), then
+ *  dispatches it as a normal follow-up. The `queued_turn_dispatched` event
+ *  promotes the greyed bubble — no optimistic state change needed here. */
+export const agentChatSendQueuedTurnNow = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  queuedId: string,
+) =>
+  invoke<void>("agent_chat_send_queued_turn_now", {
+    provider,
+    threadId,
+    queuedId,
+  });
+
 export const agentChatRespondToRequest = (
   provider: AgentChatProviderKind,
   threadId: string,
