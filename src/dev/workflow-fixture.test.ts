@@ -57,11 +57,16 @@ describe("workflow demo fixtures", () => {
     }
   });
 
-  it("running thread: phase 1 done, phase 2 mixed states with a findings badge, phase 3 pending", () => {
+  it("running thread: phase 1 done, phase 2 in-flight agents interrupted on hydrate", () => {
     const state = replay(workflowRunningEnvelopes("t-running"));
     const wf = soleWorkflow(state);
 
-    expect(wf.status).toBe("running");
+    // The persisted stream ends mid-run (no terminal workflow snapshot),
+    // so the hydrate reconciliation (issue #153) stops the workflow and
+    // interrupts its still-in-flight agents — a resumed transcript never
+    // resurrects a live spinner. (A genuinely live run is demoed via the
+    // real event stream, not this persisted-replay path.)
+    expect(wf.status).toBe("stopped");
     // Stays linked after resolution so transcript-slots keeps suppressing
     // the standalone resolved permission block (no stray "Allowed" row).
     expect(wf.approvalRequestId).toBe("req-workflow-running");
@@ -72,13 +77,15 @@ describe("workflow demo fixtures", () => {
 
     const audit = phase(wf, "Audit each file for missing auth");
     const byId = Object.fromEntries(audit.agents.map((a) => [a.id, a]));
+    // Already-terminal agents are left untouched…
     expect(byId["audit-auth"].status).toBe("completed");
     expect(byId["audit-billing"].status).toBe("completed");
     expect(byId["audit-webhooks"].status).toBe("completed");
-    expect(byId["audit-orders"].status).toBe("running");
-    expect(byId["audit-reports"].status).toBe("running");
-    expect(byId["audit-admin"].status).toBe("pending");
-    expect(byId["audit-search"].status).toBe("pending");
+    // …and the running / pending ones are force-settled to interrupted.
+    expect(byId["audit-orders"].status).toBe("interrupted");
+    expect(byId["audit-reports"].status).toBe("interrupted");
+    expect(byId["audit-admin"].status).toBe("interrupted");
+    expect(byId["audit-search"].status).toBe("interrupted");
 
     expect(subagentFindingBadge(byId["audit-auth"])).toEqual({ label: "clean", tone: "green" });
     expect(subagentFindingBadge(byId["audit-billing"])).toEqual({

@@ -387,6 +387,8 @@ function intrinsicSizeClass(slot: TranscriptSlot): string {
     case "tool_call":
     case "reasoning":
       return "[contain-intrinsic-size:auto_5rem]";
+    case "runtime_notice":
+      return "[contain-intrinsic-size:auto_2.5rem]";
     case "subagent_run":
     case "workflow_run":
       return "[contain-intrinsic-size:auto_14rem]";
@@ -572,6 +574,15 @@ function renderAssistantBody(
         <div className="py-0.5 text-xs text-muted-foreground">
           Turn ended: {item.status.subtype}
           {item.status.message ? ` — ${item.status.message}` : ""}
+        </div>
+      );
+    case "runtime_notice":
+      // Compact muted-amber inline notice (provider rate-limit rejection,
+      // enumerated assistant error) — a left-bordered line in the
+      // assistant gutter. Tokens only (design-system no-hardcoded-color).
+      return (
+        <div className="border-l-2 border-status-working/40 bg-status-working/10 px-3 py-1.5 text-[12px] text-status-working">
+          {item.message}
         </div>
       );
     case "subagent_run":

@@ -49,6 +49,9 @@ export function shouldShowThinkingIndicator(
       );
     case "user_message":
     case "turn_ended":
+    case "runtime_notice":
+      // Settled inline rows — back to dead time waiting on the agent, so
+      // the tail pulse fills the gap (still gated by `streaming` above).
       return true;
   }
 }
