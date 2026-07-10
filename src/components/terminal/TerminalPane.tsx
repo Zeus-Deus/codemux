@@ -40,6 +40,7 @@ import {
 } from "@/tauri/commands";
 import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
 import { createWritePump } from "./terminal-write-pump";
+import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
 import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
 import { onTerminalStatus } from "@/tauri/events";
 // TODO: re-enable as "system theme" option in settings
@@ -128,6 +129,13 @@ function extractBytes(payload: unknown): Uint8Array | null {
   if (Array.isArray(payload)) return new Uint8Array(payload as number[]);
   if (typeof payload === "string") return new TextEncoder().encode(payload);
   return null;
+}
+
+/** True while the terminal is showing the alternate screen (vim, htop,
+ *  Claude Code, …). Alt-screen content serializes to garbage and is never
+ *  cached or restored. */
+function isAltScreen(t: Terminal): boolean {
+  return t.buffer.active.type === "alternate";
 }
 
 // #127: memo is effective because setAppState performs structural sharing —
@@ -480,7 +488,36 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // ── Scrollback serialization helper ──
     // Shared between the live-serialize registry (on close) and the unmount
     // cache path (on tab/workspace switch).
-    const buildScrollbackPayload = (): ScrollbackPayload | null => {
+    //
+    // `precomputedData` lets the caller skip the expensive `serialize()` call
+    // entirely by supplying an already-serialized buffer — the idle serializer
+    // below opportunistically produces one while the pane is quiet so the
+    // latency-critical unmount/close path doesn't have to pay for it (issue
+    // #128). A precomputed buffer is ALWAYS primary-screen content (the idle
+    // cache is only ever taken off the primary screen and only handed back when
+    // we're still on it), so we persist it with `alternate_buffer: false`. All
+    // other payload metadata (session lookup, workspace id, cwd, cols/rows,
+    // adapter captures) is still recomputed fresh at call time. `trigger` only
+    // tags the >30ms timing log so the two call sites are distinguishable.
+    // One timed serialize shared by the idle path and the synchronous
+    // fallback in buildScrollbackPayload. Only the serialize + timing is
+    // unified: the two `[codemux::terminal-serialize]` log lines differ per
+    // trigger (idle has no `alt=` field, and DEV gating differs) and are an
+    // observability contract asserted by e2e, so each caller emits its own.
+    const timedSerialize = (
+      sa: SerializeAddon,
+    ): { data: string; ms: number; lines: number } => {
+      const lines =
+        useSyncedSettingsStore.getState().settings.session_restore
+          .scrollback_lines;
+      const start = performance.now();
+      const data = sa.serialize({ scrollback: lines });
+      return { data, ms: performance.now() - start, lines };
+    };
+
+    const buildScrollbackPayload = (
+      opts: { precomputedData?: string; trigger: "unmount" | "close" },
+    ): ScrollbackPayload | null => {
       const t = termRef.current;
       const sa = serializeAddonRef.current;
       if (!t || !sa) return null;
@@ -499,8 +536,11 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       // workspaces. See `buildSessionWorkspaceIndex` in `app-store.ts`.
       const workspaceId = getSessionWorkspaceId(sid);
 
-      // Detect alternate screen buffer (TUI apps: vim, htop, Claude Code, etc.)
-      const isAlternateBuffer = t.buffer.active.type === "alternate";
+      const pre = opts.precomputedData;
+
+      // Detect alternate screen buffer (TUI apps: vim, htop, Claude Code, etc.).
+      // Irrelevant when we already hold a precomputed (primary-screen) buffer.
+      const isAlternateBuffer = pre !== undefined ? false : isAltScreen(t);
 
       // Alt-screen content is garbled when serialized and is therefore NEVER
       // restored (the mount path guards on `!meta.alternate_buffer`). Running
@@ -510,19 +550,23 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       // the user switches between. Skip the serialize for alt-screen panes and
       // persist an empty buffer with the flag set; the live PTY reattach
       // replay reconstructs the screen on return regardless.
-      const scrollbackLines =
-        useSyncedSettingsStore.getState().settings.session_restore.scrollback_lines;
-      const serializeStart = performance.now();
-      const data = isAlternateBuffer
-        ? ""
-        : sa.serialize({ scrollback: scrollbackLines });
-      const serializeMs = performance.now() - serializeStart;
-      if (serializeMs > 30) {
-        // eslint-disable-next-line no-console
-        console.info(
-          `[codemux::terminal-serialize] sid=${sid.slice(0, 8)} ` +
-            `serialize=${serializeMs.toFixed(0)}ms bytes=${data.length} alt=${isAlternateBuffer}`,
-        );
+      let data: string;
+      if (pre !== undefined) {
+        // Reuse the idle-cached serialization — skip serialize() entirely.
+        data = pre;
+      } else if (isAlternateBuffer) {
+        data = "";
+      } else {
+        const { data: freshData, ms } = timedSerialize(sa);
+        data = freshData;
+        if (ms > 30) {
+          // eslint-disable-next-line no-console
+          console.info(
+            `[codemux::terminal-serialize] sid=${sid.slice(0, 8)} ` +
+              `trigger=${opts.trigger} serialize=${ms.toFixed(0)}ms ` +
+              `bytes=${data.length} alt=${isAlternateBuffer}`,
+          );
+        }
       }
 
       return {
@@ -543,8 +587,103 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       };
     };
 
-    // Register for live serialization on close
-    const unregisterSerialize = registerTerminalForSerialize(sid, buildScrollbackPayload);
+    // ── Idle-time scrollback serializer ──
+    // Opportunistically serializes the buffer while the pane is quiet so the
+    // unmount/close path can reuse the result instead of blocking the workspace
+    // switch on a synchronous serialize (issue #128). Closes over termRef /
+    // serializeAddonRef so it always serializes the live buffer.
+    // The idle cache bakes in the scrollback_lines value used at serialize
+    // time, and a synced-settings change emits no output and no resize — so
+    // nothing else invalidates the cache. Track the value each idle serialize
+    // used; buildFreshOrCached treats the cache as stale when the current
+    // setting differs (otherwise a switch within one idle cycle would persist
+    // with the old line count).
+    let idleSerializedScrollbackLines = -1;
+
+    const idleSerializer = createIdleScrollbackSerializer({
+      serialize: () => {
+        const sa = serializeAddonRef.current;
+        if (!sa) return "";
+        const { data, ms, lines } = timedSerialize(sa);
+        idleSerializedScrollbackLines = lines;
+        if (import.meta.env.DEV || ms > 30) {
+          // DEV observability: every idle serialize. Prod noise unchanged:
+          // only the existing >30ms warning, now tagged trigger=idle — a
+          // pathological serialize is worth surfacing even off the critical
+          // path.
+          // eslint-disable-next-line no-console
+          console.info(
+            `[codemux::terminal-serialize] sid=${sid.slice(0, 8)} ` +
+              `trigger=idle serialize=${ms.toFixed(0)}ms bytes=${data.length}`,
+          );
+        }
+        return data;
+      },
+      isAlternateBuffer: () => {
+        const t = termRef.current;
+        return t !== null && isAltScreen(t);
+      },
+      // When session restore is off the unmount path discards the payload, so
+      // an idle serialize would be pure wasted main-thread work — gate the
+      // idle path on the same setting.
+      isEnabled: () =>
+        useSyncedSettingsStore.getState().settings.session_restore.enabled,
+    });
+
+    // A resize reflows the buffer, invalidating any cached serialization — feed
+    // it so the idle cache re-serializes after the new geometry settles.
+    const resizeDisposable = term.onResize(() => idleSerializer.notifyResize());
+
+    // `term.write` is async: the pump-side notifyOutput below fires when a
+    // chunk is HANDED to xterm, but the parser can still hold unparsed
+    // backlog when the 1s settle window elapses — the idle cache would latch
+    // "clean" against a buffer that's still about to change. onWriteParsed
+    // fires at most once per frame, after data parsing completes, and can
+    // fire while writes are still pending — so while backlog remains, each
+    // frame's parse slice refreshes lastOutputAt and the settle window can't
+    // elapse mid-parse. The pair of hooks covers both boundaries:
+    // written-but-not-yet-parsed (pump) and the parse tail (here).
+    const writeParsedDisposable = term.onWriteParsed(() =>
+      idleSerializer.notifyOutput(),
+    );
+
+    // Fresh-if-clean: reuse the idle cache when it's still up to date, else fall
+    // back to a fresh synchronous serialize so persistence never regresses.
+    const buildFreshOrCached = (
+      trigger: "unmount" | "close",
+    ): ScrollbackPayload | null => {
+      let fresh = idleSerializer.getFreshData();
+      if (
+        fresh !== null &&
+        useSyncedSettingsStore.getState().settings.session_restore
+          .scrollback_lines !== idleSerializedScrollbackLines
+      ) {
+        // scrollback_lines changed since the cache was taken. Settings
+        // changes emit no output/resize, so the serializer can't observe
+        // them — without this check the switch would persist a payload built
+        // with the stale line count.
+        fresh = null;
+      }
+      const payload = buildScrollbackPayload({
+        precomputedData: fresh?.data,
+        trigger,
+      });
+      if (import.meta.env.DEV) {
+        // eslint-disable-next-line no-console
+        console.info(
+          `[codemux::terminal-serialize] sid=${sid.slice(0, 8)} ` +
+            `trigger=${trigger} reused=${fresh !== null} ` +
+            `bytes=${payload?.data.length ?? 0}`,
+        );
+      }
+      return payload;
+    };
+
+    // Register for live serialization on close (app quit). Uses the same
+    // fresh-if-clean dance so a quit right after an idle serialize is cheap.
+    const unregisterSerialize = registerTerminalForSerialize(sid, () =>
+      buildFreshOrCached("close"),
+    );
 
     // Clear any stale cached scrollback for this session (we're live now)
     uncacheTerminalScrollback(sid).catch(() => {});
@@ -594,7 +733,14 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // so cleanup can always release it (the backend also self-heals via a
     // resume-on-attach + max-park backstop).
     let flowPaused = false;
-    const pump = createWritePump((data) => term.write(data), {
+    // Every byte written to xterm flows through here — live PTY output, the
+    // reattach replay, AND the disk-scrollback restore — so this is the single
+    // choke point that feeds the idle serializer's dirty tracking. Keep the
+    // notify O(1): it's on the per-keystroke local-echo path too.
+    const pump = createWritePump((data) => {
+      term.write(data);
+      idleSerializer.notifyOutput();
+    }, {
       onHighWatermark: () => {
         flowPaused = true;
         pausePtyOutput(sid).catch((err) => {
@@ -781,6 +927,9 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         resumePtyOutput(sid).catch(console.error);
       }
 
+      resizeDisposable.dispose();
+      writeParsedDisposable.dispose();
+
       containerEl.removeEventListener("input", blockNewline, true);
       blockNewlineRef.current = null;
 
@@ -803,14 +952,22 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
       window.removeEventListener("resize", windowResize);
 
       // Cache scrollback BEFORE disposing xterm — the serialize addon needs
-      // the live terminal buffer. This covers tab switches and workspace switches.
+      // the live terminal buffer. This covers tab switches and workspace
+      // switches. Fresh-if-clean: if the idle serializer already produced an
+      // up-to-date buffer while the pane was quiet, reuse it and skip the
+      // synchronous serialize that used to block the switch (issue #128);
+      // otherwise fall back to a fresh serialize so persistence never regresses.
       const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
       if (restoreEnabled) {
-        const payload = buildScrollbackPayload();
+        const payload = buildFreshOrCached("unmount");
         if (payload && payload.data) {
           cacheTerminalScrollback(payload).catch(() => {});
         }
       }
+
+      // Dispose the idle serializer BEFORE term.dispose() so a pending idle
+      // callback can't serialize into a torn-down terminal.
+      idleSerializer.dispose();
 
       unregisterSerialize();
       // Dispose the WebGL addon before the terminal so its GPU context /
