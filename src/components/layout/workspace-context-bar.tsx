@@ -7,6 +7,7 @@ import { useFeatureFlags } from "@/stores/feature-flags";
 import { useHosts } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useAgentChatPaneActive } from "@/hooks/use-gui-chrome";
+import { showNoGitState, useInitializeGit } from "@/hooks/use-initialize-git";
 import {
   BackgroundBrowserIndicator,
   useBackgroundBrowserSession,
@@ -61,6 +62,10 @@ export function WorkspaceContextBar() {
   const backgroundBrowserSession = useBackgroundBrowserSession(
     workspace?.workspace_id,
   );
+  // Explicit "Initialize Git" affordance for non-git project folders —
+  // the opt-in replacement for silently rendering nothing (t3code-style;
+  // we never `git init` without a click).
+  const { initialize, initializing } = useInitializeGit(workspace ?? null);
 
   // Brand-new chat draft: the workspace scope isn't locked in yet, so
   // there is nothing to report (mirrors WorkspaceMain's draft branch).
@@ -77,6 +82,7 @@ export function WorkspaceContextBar() {
 
   const prState = normalizePrState(workspace.pr_state);
   const hasGit = !!workspace.git_branch;
+  const showNoGit = !hasGit && showNoGitState(workspace);
 
   const showBrowserIndicator =
     enableAgentChat &&
@@ -84,7 +90,13 @@ export function WorkspaceContextBar() {
     !!backgroundBrowserSession;
 
   // Nothing to report at all (e.g. a home-directory workspace).
-  if (!hasGit && !prState && !workspace.linked_issue && !showBrowserIndicator) {
+  if (
+    !hasGit &&
+    !showNoGit &&
+    !prState &&
+    !workspace.linked_issue &&
+    !showBrowserIndicator
+  ) {
     return null;
   }
 
@@ -162,6 +174,30 @@ export function WorkspaceContextBar() {
               )}
             </span>
           )}
+        </>
+      )}
+
+      {showNoGit && (
+        <>
+          {/* Non-git project: name the state and offer the explicit,
+              opt-in `git init` — mirrors the branch/kind cluster's
+              position so the bar reads the same either way. */}
+          <div className="flex min-w-0 items-center gap-2">
+            <GitBranch className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+            <span className="truncate text-xs text-muted-foreground">
+              Not a git repository
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={initialize}
+            disabled={initializing}
+            aria-label="Initialize a git repository in this project folder"
+            className="inline-flex h-[26px] shrink-0 items-center rounded-md border px-2.5 text-[11px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {initializing ? "Initializing…" : "Initialize Git"}
+          </button>
         </>
       )}
 

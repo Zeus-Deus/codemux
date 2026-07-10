@@ -1746,6 +1746,30 @@ pub fn git_init_repo(path: &Path) -> Result<String, String> {
     Ok("Repository initialized".to_string())
 }
 
+/// Bare `git init` — creates the repository and stops. It never runs
+/// `git add` or `git commit`, so no user files are staged and no commit
+/// is created (HEAD stays unborn until the user makes their own first
+/// commit).
+///
+/// This is the split-out counterpart of `git_init_repo` above, and the
+/// two are intentionally different:
+///
+/// - `git_init_no_commit` backs the user-facing "Initialize Git"
+///   affordance (`use-initialize-git.ts`), which turns an *existing*
+///   folder full of the user's own files into a repo on an explicit
+///   click. That flow must NEVER stage or commit anything — the folder
+///   may hold secrets, `node_modules`, or anything else the user has
+///   not vetted, and there is no `.gitignore` yet. Silently committing
+///   all of it would be a data-safety footgun.
+/// - `git_init_repo` stays commit-ful because its only caller is
+///   `create_empty_repo`'s "new empty project" flow, where the folder
+///   was just created by us and an initial (empty-ish) commit is the
+///   desired starting point.
+pub fn git_init_no_commit(path: &Path) -> Result<String, String> {
+    run_git(path, &["init"])?;
+    Ok("Repository initialized".to_string())
+}
+
 pub fn git_list_branches(repo_path: &Path, remote: bool) -> Result<Vec<String>, String> {
     // We use `for-each-ref` with the FULL refname rather than `git branch
     // --format=%(refname:short)`, because `:short` collapses

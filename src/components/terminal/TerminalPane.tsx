@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, memo } from "react";
 import { Terminal } from "@xterm/xterm";
 import type { ITheme } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -138,7 +138,11 @@ function isAltScreen(t: Terminal): boolean {
   return t.buffer.active.type === "alternate";
 }
 
-export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
+// #127: memo is effective because setAppState performs structural sharing —
+// PaneNode passes only primitive props (sessionId/paneId/focused/visible/title),
+// so the exported pane skips re-render on backend ticks that don't change them.
+// Export-only wrapper: the component body below is unchanged.
+export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
   // TODO: re-enable as "system theme" option in settings
   // const { theme, shellAppearance } = useThemeColors();
 
@@ -1077,4 +1081,4 @@ export function TerminalPane({ sessionId, paneId, focused, visible }: Props) {
       </div>
     </div>
   );
-}
+});

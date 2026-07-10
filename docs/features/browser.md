@@ -172,6 +172,79 @@ canvas rect + draw rect into viewport coordinates. Applies only to the peek
 overlay; normal browser panes (and the peek with the setting off) keep the
 container-sync behavior unchanged.
 
+## Session reaping during app lifetime (issue #126)
+
+Before this fix, agent-browser daemons (the headless Chromium processes
+behind each `AgentBrowserSession`) only got cleaned up on app restart
+(`kill_stream_daemons`/PID-file reconciliation in `AgentBrowserManager::new_*`).
+Closing a workspace mid-session never tore down its daemon, so long-running
+app sessions accumulated one orphaned Chromium process per closed workspace
+that had ever opened a browser pane or background session.
+
+**Reap-on-close (primary mechanism).** `AppStateStore::close_workspace`
+collects the `cli_session_name`s of the agent-browser sessions removed
+alongside the workspace — under the same lock acquisition that removes the
+workspace, so there's no TOCTOU race with a concurrent session creation for
+that workspace — and returns them on `CloseWorkspaceResult
+.removed_agent_browser_sessions`. Every close path reaps them via the
+shared `pub(crate) reap_agent_browser_sessions` helper in
+`src-tauri/src/commands/workspace.rs`, which fire-and-forgets a single
+background task calling `AgentBrowserManager::close()` per name (already
+timeout-bounded internally, so this never blocks the close command):
+
+- `close_workspace` (plain workspace close, sidebar/palette).
+- `close_workspace_with_worktree_impl` (worktree close + the MCP
+  `workspace_close` tool). This path previously had **no** agent-browser
+  teardown at all — it was the main leak the issue reported.
+- `stop_openflow_run` (`commands/openflow.rs`) — OpenFlow run teardown
+  closes the run's workspace via a direct state-level call, so it wires
+  the same reap (OpenFlow workspaces are prime agent-browser users).
+- The workspaces-sync paths in `commands/workspaces_sync.rs`:
+  `workspaces_reconcile_copy` (detaching a standalone-copy card) and the
+  two adopt-rollback sites that remove a just-created shell.
+
+**Shared-cwd safety (post-close live-set check).** Two workspaces opened
+at the same cwd get separate `AgentBrowserSession` records but the SAME
+`cli_session_name` (a pure hash of the cwd via
+`stable_browser_session_name`), so they share one daemon. Before closing
+each name, the reap task re-computes
+`AppStateStore::live_agent_browser_session_names()` — after the close's
+state mutation completed, so it's the post-close live set — and skips any
+name a surviving workspace still maps to. This gives refcount-like
+semantics: the daemon dies only when the LAST workspace sharing the name
+closes. Relatedly, `resolve_agent_browser_session` no longer persists a
+session record when the target workspace doesn't exist (an in-flight
+`browser_automation` racing a close) — a persisted record for a dead
+workspace could never be closed and would permanently poison the sweep's
+live set; the transient session is returned un-persisted, and any daemon
+spawned under it is orphan-swept later precisely because its name never
+enters the live set.
+
+**Periodic orphan sweep (backstop).** A background loop in `lib.rs`'s
+`.setup()` closure ticks every 5 minutes (skipping the immediate first tick
+so it never runs at t=0, before startup reconcile settles) and closes any
+tracked `ws-*` session whose owning workspace no longer exists — catching
+anything reap-on-close misses (e.g. a future workspace-removal path that
+forgets to call the reap helper). Each tick:
+
+1. `AgentBrowserManager::session_keys()` snapshots the tracked session keys
+   FIRST.
+2. `AppStateStore::live_agent_browser_session_names()` then computes the
+   live set (the stable cwd-derived name for every workspace, plus every
+   tracked `agent_browser_sessions[].cli_session_name`).
+3. `agent_browser::orphaned_ws_sessions(&tracked, &live)` — a pure,
+   unit-tested helper — returns tracked keys that start with `ws-` and
+   aren't in the live set; each gets closed via `manager.close()`.
+
+Safety properties: snapshotting `tracked` before `live` means a session
+created mid-sweep is always in the live set and can never be reaped: the
+ordering guarantees the workspace still exists in state at the moment
+`live` is read. The sweep only ever inspects `AgentBrowserManager`'s
+in-memory map (no `agent-browser session list` shell-out), so it can never
+touch a daemon owned by another codemux instance. The `ws-*` filter means
+user-initiated browser-pane sessions (`browser-NNN`) and the `default`
+session are never swept, only workspace-scoped ones.
+
 ## Expected Operating Model
 
 - agents control the browser programmatically
@@ -207,7 +280,9 @@ container-sync behavior unchanged.
 - `src/components/chat/BackgroundBrowserChip.tsx` — the inline conversation chip for a background session
 - `src/hooks/use-gui-chrome.ts` — the shared `useGuiChrome()` gate the chip/indicator/peek key off
 - `src/stores/browser-peek-store.ts` — peek open/closed state (single `openWorkspaceId`; cleared on workspace switch)
-- `src-tauri/src/state/state_impl.rs` — `AgentBrowserSession` (`is_active`, `pane_id`, `current_url`), `mark_agent_browser_active` / `mark_agent_browser_inactive` / `release_detached_agent_browser`, `attach_agent_browser_to_pane`, `detach_agent_browser_from_pane`, `find_detached_agent_browser`
+- `src-tauri/src/state/state_impl.rs` — `AgentBrowserSession` (`is_active`, `pane_id`, `current_url`), `mark_agent_browser_active` / `mark_agent_browser_inactive` / `release_detached_agent_browser`, `attach_agent_browser_to_pane`, `detach_agent_browser_from_pane`, `find_detached_agent_browser`, `CloseWorkspaceResult.removed_agent_browser_sessions`, `live_agent_browser_session_names` (issue #126)
 - `src-tauri/src/commands/agent_chat.rs` — `publish_pane_status` calls `release_detached_agent_browser` once a run settles to `Review`/`Idle` (see "Run-finished release" above)
+- `src-tauri/src/commands/workspace.rs` — `reap_agent_browser_sessions` shared helper, called from both `close_workspace` and `close_workspace_with_worktree_impl` (issue #126)
+- `src-tauri/src/agent_browser.rs` — `AgentBrowserManager::session_keys`, `orphaned_ws_sessions` pure helper backing the periodic orphan sweep in `lib.rs` (issue #126)
 - `docs/reference/BROWSER-AGENT-COMMANDS.md` — CLI and socket command reference
 - `docs/archive/browser-stream-fix.md` — landed cross-platform stream-stability plan (PID tracking, single canonical key, atomic teardown, symmetric bind probe, reactive frontend reconnect)

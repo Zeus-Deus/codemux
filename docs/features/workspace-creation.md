@@ -120,6 +120,70 @@ instead of accepting the agent's default and restarting.
 - **Persistence.** The last pick per family is remembered in `ui-store`
   (`lastModelSelections`) and restored on reopen.
 
+## Non-Git Projects
+
+Any folder can be opened as a project — git is not required. This is a
+deliberate, t3code-aligned UX decision: never refuse a folder, never
+mutate it (`git init` only ever runs on an explicit user click), degrade
+git-dependent features with honest messaging instead of silence.
+
+### Model
+
+- **Add paths never gate on git.** All entry points (folder picker /
+  Ctrl+O, sidebar "+", chat drafts, onboarding) accept non-git folders
+  silently. The old folder-picker `window.confirm` ("… is not a git
+  repository. Initialize one?") that refused the project on decline was
+  removed (`use-project-actions.ts`).
+- **Plain-directory mode.** `create_workspace_impl` /
+  `create_empty_workspace` resolve `project_root` via
+  `find_git_root(...).unwrap_or(folder)` — the folder itself is the
+  workspace root. Worktree creation intentionally hard-errors
+  (`"Not a git repository"`), so the UI must not offer it (see below).
+- **`is_git` snapshot flag.** `gather_workspace_git_info` stamps
+  `WorkspaceSnapshot.is_git` using the same `find_git_root` predicate
+  worktree creation uses. Serde-defaults to `true` (optimistic) so old
+  persisted/synced snapshots render exactly as before until their first
+  refresh; the error-path `WorkspaceGitInfo::default()` is also
+  `is_git: true` so a transient gather failure never flashes the
+  affordance on a real repo.
+- **Explicit "Initialize Git" affordance** (`use-initialize-git.ts` —
+  `showNoGitState` + `useInitializeGit`): shown only for LOCAL,
+  STANDARD project workspaces with `is_git === false` (Home is not a
+  project; `attach_only`/host-backed cwds are host paths the local
+  probe can't judge). Clicking runs bare `git init` (no commit) via the
+  dedicated `init_git_repo_no_commit` command (`git::git_init_no_commit`
+  — init only, never `git add`/`commit`, so the user's files and any
+  secrets are never staged), then `refresh_workspace_git_info` so the
+  git UI lights up immediately. The commit-ful `init_git_repo`
+  (`git init` + `add` + initial commit) intentionally remains — it backs
+  `create_empty_repo`'s new-empty-project flow, where an initial commit
+  is the wanted starting point.
+
+### Surfaces
+
+- **Workspace context bar** — "Not a git repository" + Initialize Git
+  button where the branch/kind cluster would render.
+- **Context Row status cluster** (chat panes) — compact Initialize Git
+  chip with an explanatory tooltip.
+- **Changes panel** — "Not a git repository — changes can't be tracked"
+  + Initialize Git, replacing the false "Working tree clean" (git
+  errors were swallowed to `[]`).
+- **Thread Scope row** — checkout + branch controls hidden for non-git
+  projects (gated off the project's workspace snapshot); a stale
+  "worktree" draft mode is snapped back to "current"; the scope hint
+  says the run lands in the folder and how to unlock worktrees.
+
+### Known remaining gaps
+
+- `new-workspace-dialog.tsx` (branch modes) still assumes git; a
+  non-git project going through it surfaces the backend error as a
+  toast rather than hiding the branch UI.
+- Checkpoints silently no-op for non-git (backend returns `Ok(None)`) —
+  acceptable, matches t3code.
+- After a bare `git init` (unborn HEAD) the branch may stay `None`
+  until the first commit, so branch-gated UI stays hidden — also
+  matches t3code.
+
 ## Current Constraints
 
 - Layout selection not exposed in the dialog (defaults to single pane)

@@ -1763,6 +1763,7 @@ mod tests {
         use crate::state::*;
         WorkspaceSnapshot {
             workspace_id: WorkspaceId(id.to_string()),
+            is_git: true,
             title: id.to_string(),
             workspace_type: WorkspaceType::Standard,
             cwd: cwd.to_string(),

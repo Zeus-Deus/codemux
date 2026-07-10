@@ -134,6 +134,18 @@ The chat pane stack:
     bytes (not a temp-file path) because the chat stages bytes in
     memory. A text-only clipboard rejects the command → default paste
     runs untouched.
+  - **Attached images render in the sent bubble.** On send,
+    the staged image bytes are also turned into `data:` URLs
+    (`buildImageDisplaySources`) and stamped onto the optimistic
+    `UserMessageItem.images` — so the sent turn shows its own thumbnails,
+    not just the provider. The persisted `user_message` envelope gains an
+    optional `images: [{ path, media_type }]` (absolute fs paths written
+    backend-side); on hydrate those map onto `images[].src`.
+    `UserMessage` renders a wrapping thumbnail row (rounded, bordered,
+    ≤160px, broken-image fallback) with click-to-open lightbox
+    (`Dialog`, Esc / click-outside). `resolveAssetSrc` normalises both
+    forms: `data:` URLs (fresh optimistic send) pass through untouched,
+    absolute paths (hydrated) go through `convertFileSrc`.
 - **Slash command popup** with cross-provider parsing.
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
   compat. Server-side sync (see `docs/features/skills-sync.md`).
@@ -219,10 +231,28 @@ Contract preserved from the pre-redesign renderer:
   no longer runs a competing hand-rolled pin/snap loop — an earlier
   version did (direct `scrollTop` writes on a separate 80px
   threshold), which produced visible jitter fighting the engine in
-  the 8–80px band; that machinery was deleted. The viewport also sets
-  `overflow-anchor: none` so native browser scroll anchoring can't
-  fight the engine's programmatic scrolls while `content-visibility`
-  rows settle from estimated to real heights.
+  the 8–80px band; that machinery was deleted. Scroll stability is
+  **split by ownership**: native browser scroll anchoring owns
+  free-scroll — while the reader scrolls history it absorbs the
+  `content-visibility:auto` estimated-then-real height settling of rows
+  above the viewport (the mechanism the content-visibility spec relies
+  on) — and the engine owns following-bottom. They never fight because
+  the viewport disables anchoring by default (`[overflow-anchor:none]` —
+  pinned/following, the engine owns the tail snap) and re-enables it
+  **only while the reader is away from the bottom**
+  (`data-[scrollable~=end]:[overflow-anchor:auto]`; the engine keeps
+  `end` in the viewport's `data-scrollable` attribute exactly while the
+  user is unpinned in history, and updates it promptly on scroll
+  commits). Do NOT scope this off `data-autoscrolling` instead: that
+  attribute is only rewritten on engine state commits and measured stale
+  — still set minutes after the user scrolled up and went idle — which
+  would leave anchoring off exactly when the reader needs it. Per-slot
+  `contain-intrinsic-size` estimates
+  (`intrinsicSizeClass` in `MessageList`, keyed off the slot body kind)
+  keep each first-reveal settle small so anchoring's corrections stay
+  imperceptible in both scroll directions. (An earlier build set a blanket
+  `overflow-anchor: none`, which disabled anchoring everywhere and let
+  those settles drift the viewport hundreds of px per wheel batch.)
 - **Turn anchoring is deliberately OFF** (`scrollAnchor={false}` on
   every row): with hundreds of pre-hydrated rows the engine's anchor
   handling scrolls the viewport to a stale early anchor when new items
@@ -976,8 +1006,12 @@ sends the first message. The shared naming/creation helper is
 `createDeferredWorktree` (exported from
 `src/lib/agent-chat/materialize.ts`): name precedence is trimmed
 `worktreeName` verbatim → `generateBranchName(firstMessage,
-projectPath)` (the CLI's AI first-message naming) →
-`generateRandomBranchName(projectPath)` on error/empty, then
+projectPath)` (the CLI's AI first-message naming, backed by
+`branch_name.rs::generate_ai_name`; the underlying `claude --print` call
+is bounded by a 30s timeout, and any failure — spawn error, timeout,
+non-zero exit, empty output — is logged via `log::warn!` to the native
+log instead of failing silently) → `generateRandomBranchName(projectPath)`
+on error/empty, then
 `createWorktreeWorkspace` off the row's `baseBranch` with the `"empty"`
 layout. The two surfaces route it differently:
 
@@ -985,11 +1019,12 @@ layout. The two surfaces route it differently:
   `worktreeProjectPath` (resolved by `DraftChatSurface`:
   `target.projectPath` for a `project` target, the resolved
   `existingWorkspaceProjectRoot` for `existing_workspace`); it creates
-  the worktree, re-resolves the pane/session cwd to the new worktree's
-  real cwd (read back from the app-store), and continues down the
-  existing create-pane → mark-materialized → seed-slice →
-  start-session → send-turn ordering (shared `thread_id` throughout, so
-  the first send can't hit `session_not_found`).
+  the worktree, resolves the pane/session cwd to the new worktree's real
+  cwd via `waitForWorkspaceCwd` (see the cwd-resolution invariant
+  below), and continues down the existing create-pane →
+  mark-materialized → seed-slice → start-session → send-turn ordering
+  (shared `thread_id` throughout, so the first send can't hit
+  `session_not_found`).
 - **Pane empty state** — `AgentChatPane`'s `handleDeferredWorktreeSubmit`
   intercepts the composer submit ONLY while `messages.length === 0 &&
   checkoutMode === "worktree"` (everything else stays on the unmodified
@@ -1004,10 +1039,32 @@ layout. The two surfaces route it differently:
   the turn; the chip UI stays behind and is cleared), appends the
   optimistic user bubble to the new thread, clears this pane's
   composer, and activates the new workspace. The stale GitHub-detail
-  re-fetch pass is deliberately skipped on this path. If the prestart
-  returns `null` (workspace not yet in the store), the text stays in
-  the old composer, a warning toast fires, and the new workspace is
-  activated anyway.
+  re-fetch pass is deliberately skipped on this path. `prestartWorktreeSession`
+  resolves its cwd via `waitForWorkspaceCwd` too, so it now succeeds on
+  first send instead of returning `null` on a routine store miss; it
+  keeps the `null` contract only for a genuine timeout, in which case
+  the text stays in the old composer, a warning toast fires, and the new
+  workspace is activated anyway.
+
+**CWD-resolution invariant.** A freshly-created worktree
+workspace only reaches the Zustand app-store via the async
+`app-state-changed` Tauri event, which has essentially never been
+processed by the time `create_worktree_workspace`'s `invoke` promise
+resolves. The previous synchronous read-back (`useAppStore.getState()`
+right after the invoke) therefore missed ~always and silently left the
+pane + agent session launching at the PARENT checkout cwd (the project
+root) — so agents committed into the user's real working copy. Both
+surfaces now share `waitForWorkspaceCwd(workspaceId, timeoutMs = 5000)`
+(`src/lib/agent-chat/wait-for-workspace-cwd.ts`): it awaits the
+workspace landing in the store with a non-empty `cwd`, racing the
+store subscription (`app-state-changed`) against a polled direct
+`get_app_state` fetch (written back into the store) so a
+dropped/reordered event can't strand it. **Hard invariant:** a
+`checkoutMode === "worktree"` submit must NEVER create the pane or start
+the session at the parent/project-root cwd — on timeout,
+`materializeAndSend` fails the send via `markSendFailed` (draft text
+preserved) rather than proceeding, and `prestartWorktreeSession` returns
+`null` (mount-effect fallback).
 
 `checkoutMode === "current"` (the default) is unchanged from before the
 redesign on both surfaces — no worktree, no new Tauri calls.
@@ -1092,6 +1149,13 @@ one). It renders:
 - a **PR chip** (`#N`, tone-tinted via `PR_CHIP_TONE` — the single
   shared map in `src/components/github/pr-status-icon.tsx`, also used
   by `WorkspaceContextBar`) that opens `pr_url` on click;
+- a **linked-issue chip** (`Issue #N`) — the shared
+  `IssueDetailPopover` (chip variant, `side="top" align="end"`,
+  `src/components/github/issue-detail-popover.tsx`) the old bar used,
+  reused verbatim so a thread's linked issue stays visible after PR #144
+  relocated the bar's content here. Unlike the git chips it renders
+  independent of the branch, so a branch-less workspace with only a
+  linked issue shows the Issue chip alone;
 - a **workspace-details button** (window icon + chevron-up) that opens
   a `~290px` popover (`side="top" align="end"`) with:
   - a header — workspace title, then `project · device` in
@@ -1101,18 +1165,21 @@ one). It renders:
     since `WorkspaceSnapshot` doesn't carry it; omitted on fetch
     failure), Behind base (warning tone, if any), Ahead (success tone,
     if any), Uncommitted (`+A −D`, if any), Pull request (`#N ·
-    <state>`, tone-tinted via `prStatusTextClass`), Location (`this
-    device` or the resolved host name);
+    <state>`, tone-tinted via `prStatusTextClass`), Issue (`#N ·
+    <state>`, only with a `linked_issue` — `text-success` when Open else
+    `text-muted-foreground`, the same tone the sidebar/issue components
+    use), Location (`this device` or the resolved host name);
   - a footer with up to two quick actions: **View PR #N** (only with a
     `pr_url`) and **Sync ↓N** (only while `git_behind > 0` — calls
     `gitPullChanges(cwd)` with a busy label + an error toast on
     failure, mirroring `changes-panel.tsx`'s `handlePull`).
 
-Renders `null` with no active workspace, or with neither a `git_branch`
-nor a background browser session. The git chips + details popover
-additionally require the branch, so a git-less workspace with a live
-background browser shows the Browser pill alone — matching the old
-bar's "browser indicator alone" case.
+Renders `null` with no active workspace, or with neither a `git_branch`,
+a background browser session, nor a `linked_issue`. The git chips +
+details popover additionally require the branch, so a git-less workspace
+with a live background browser shows the Browser pill alone, and one
+with only a linked issue shows the Issue chip alone — matching the old
+bar's visibility set (`hasGit || prState || linked_issue || browser`).
 
 **Bottom bar interaction.** While an Agent Chat pane is the active pane
 of the active surface in GUI chrome, `WorkspaceContextBar` renders

@@ -963,8 +963,16 @@ pub async fn workspaces_adopt_synced(
                 app.state();
             let db: tauri::State<'_, DatabaseStore> = app.state();
             // Remove the half-created shell (it has no PTY sessions yet,
-            // so this is a clean no-side-effect removal).
-            let _ = app_state.close_workspace(&workspace_id);
+            // so this is a clean no-side-effect removal). Still route any
+            // removed agent-browser session names through the shared reap
+            // (issue #126) — a shell shouldn't have one, but if anything
+            // raced a session onto it we'd otherwise leak the daemon.
+            if let Ok(close_result) = app_state.close_workspace(&workspace_id) {
+                crate::commands::workspace::reap_agent_browser_sessions(
+                    &app,
+                    close_result.removed_agent_browser_sessions,
+                );
+            }
             // Revert the row to a sibling/remote-only row (workspace_id
             // NULL) so reconcile doesn't tombstone it and the overview
             // keeps offering "Pull to this device".
@@ -1222,7 +1230,15 @@ async fn adopt_worktree_via_repo_rsync(
                 db.link_workspace_sync_to_local(&server_id, &workspace_id.0)
             })
         {
-            let _ = app_state.close_workspace(&workspace_id.0);
+            // Rollback of a just-created shell — route any removed
+            // agent-browser session names through the shared reap
+            // (issue #126), mirroring the single-dir adopt rollback.
+            if let Ok(close_result) = app_state.close_workspace(&workspace_id.0) {
+                crate::commands::workspace::reap_agent_browser_sessions(
+                    &app,
+                    close_result.removed_agent_browser_sessions,
+                );
+            }
             drop(app_state);
             drop(db);
             crate::state::emit_app_state(&app);
@@ -1649,10 +1665,16 @@ pub async fn workspaces_reconcile_copy(
 
     // Safe: detach the copy's workspace card. close_workspace (state-level)
     // removes the workspace from app_state WITHOUT deleting the directory —
-    // the files (and any local-only history) stay on disk.
+    // the files (and any local-only history) stay on disk. The copy's
+    // agent-browser daemon (if any) IS reaped, though — the workspace card
+    // is gone, so nothing could drive that browser anymore (issue #126).
     {
         let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();
-        app_state.close_workspace(&workspace_id)?;
+        let close_result = app_state.close_workspace(&workspace_id)?;
+        crate::commands::workspace::reap_agent_browser_sessions(
+            &app,
+            close_result.removed_agent_browser_sessions,
+        );
     }
     crate::state::emit_app_state(&app);
 

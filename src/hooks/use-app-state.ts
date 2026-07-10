@@ -27,6 +27,13 @@ export function useAppStateInit(skip = false) {
   // handle no-op fan-out — workspace state can grow with each opened
   // surface/pane/session, so the stringify scaled with usage and was
   // a real freeze contributor under sustained backend churn.
+  //
+  // Reference stability is now restored *without* stringifying: `setAppState`
+  // (src/stores/app-store.ts) runs `shareStructural(prev, next)`, a single
+  // O(n) structural-sharing walk that allocates NO strings and reuses prev
+  // references for every unchanged subtree. It runs at most once per this
+  // 16ms debounce window — distinct from the removed stringify dedup, which
+  // serialized the whole snapshot to a multi-KB string on every tick.
   const handleStateChanged = useCallback(
     (payload: AppStateSnapshot) => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
