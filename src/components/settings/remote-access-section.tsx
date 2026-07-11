@@ -48,6 +48,7 @@ import {
   describeDevice,
   endpointSecurityHint,
   formatCountdown,
+  groupEndpoints,
   msUntil,
   newlyPendingSessionIds,
   pendingSessions,
@@ -55,6 +56,7 @@ import {
   relativeTime,
   validatePort,
   type DeviceKind,
+  type EndpointGroupView,
 } from "./remote-access-utils";
 
 // ── Clipboard (secure-context aware) ─────────────────────────────────
@@ -150,10 +152,18 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
   return (
     <div className="flex items-start gap-3 py-2.5">
       <div className="min-w-0 flex-1 space-y-1">
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <code className="truncate font-mono text-[12.5px] text-foreground">
             {endpoint.url}
           </code>
+          {endpoint.recommended && (
+            <Badge
+              variant="outline"
+              className="border-accent-ember/30 bg-accent-ember/10 text-[10px] font-medium text-accent-ember"
+            >
+              Recommended
+            </Badge>
+          )}
           {hint.secure ? (
             <Badge
               variant="outline"
@@ -177,6 +187,74 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
         </p>
       </div>
       <CopyButton text={endpoint.url} label={`Copy ${endpoint.url}`} />
+    </div>
+  );
+}
+
+// ── Grouped endpoint list ────────────────────────────────────────────
+//
+// The backend hands back a curated set already sorted into coarse groups
+// (this device / local network / Tailscale / other). We render each group
+// under a labelled header with a one-line explanation; the catch-all
+// "other" group is tucked behind a default-closed disclosure so stray IPv6
+// and link-local addresses don't clutter the common case.
+
+function EndpointGroupRows({ endpoints }: { endpoints: WebRemoteEndpoint[] }) {
+  return (
+    <div className="divide-y divide-border/50">
+      {endpoints.map((e) => (
+        <EndpointRow key={`${e.kind}:${e.host}`} endpoint={e} />
+      ))}
+    </div>
+  );
+}
+
+function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
+  if (group.collapsible) {
+    return (
+      <details className="group rounded-md border border-border/50 bg-muted/20 px-3 py-2">
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[12.5px] font-semibold text-foreground marker:content-none">
+          <span className="text-muted-foreground/70 transition-transform group-open:rotate-90">
+            ›
+          </span>
+          {group.title}
+          <span className="font-normal text-muted-foreground/70">
+            ({group.endpoints.length})
+          </span>
+        </summary>
+        <div className="mt-1.5 space-y-1">
+          <p className="text-[11.5px] leading-relaxed text-muted-foreground/70">
+            {group.explanation}
+          </p>
+          <EndpointGroupRows endpoints={group.endpoints} />
+        </div>
+      </details>
+    );
+  }
+  return (
+    <div className="space-y-1">
+      <p className="text-[12.5px] font-semibold text-foreground">
+        {group.title}
+      </p>
+      <p className="text-[11.5px] leading-relaxed text-muted-foreground/70">
+        {group.explanation}
+      </p>
+      <EndpointGroupRows endpoints={group.endpoints} />
+    </div>
+  );
+}
+
+function GroupedEndpoints({
+  endpoints,
+}: {
+  endpoints: WebRemoteEndpoint[];
+}) {
+  const groups = useMemo(() => groupEndpoints(endpoints), [endpoints]);
+  return (
+    <div className="space-y-4">
+      {groups.map((g) => (
+        <EndpointGroupBlock key={g.id} group={g} />
+      ))}
     </div>
   );
 }
@@ -225,6 +303,33 @@ function PairingPanel({
   const qrSvg = useQrSvg(fullUrl);
   const expired = remainingMs <= 0;
 
+  // Same curated grouping as the "Reachable at" list: real endpoints inline,
+  // stray "other" addresses collapsed behind a disclosure. Docker/virtual
+  // interfaces never reach the frontend, so they can't appear here either.
+  const grouped = useMemo(() => groupEndpoints(endpoints), [endpoints]);
+  const inlineEndpoints = grouped
+    .filter((g) => !g.collapsible)
+    .flatMap((g) => g.endpoints);
+  const otherEndpoints = grouped
+    .filter((g) => g.collapsible)
+    .flatMap((g) => g.endpoints);
+
+  const renderChip = (e: WebRemoteEndpoint) => (
+    <button
+      key={`${e.kind}:${e.host}`}
+      type="button"
+      onClick={() => setSelectedHost(e.host)}
+      className={cn(
+        "rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors",
+        e.host === selectedHost
+          ? "border-accent-ember/40 bg-accent-ember/10 text-accent-ember"
+          : "border-border/60 text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {e.kind === "loopback" ? "This device" : e.host}
+    </button>
+  );
+
   return (
     <div className="rounded-lg border border-border/60 bg-muted/30 p-4">
       <div className="flex flex-col gap-4 sm:flex-row">
@@ -272,24 +377,29 @@ function PairingPanel({
           </div>
 
           {/* Endpoint chooser — a QR is scanned from a phone, so it should
-              target a reachable network address, not loopback. */}
+              target a reachable network address, not loopback. Grouped the
+              same way as "Reachable at": inline chips for the useful
+              endpoints, an "Other addresses" disclosure for the rest. */}
           {endpoints.length > 1 && (
-            <div className="flex flex-wrap gap-1.5">
-              {endpoints.map((e) => (
-                <button
-                  key={`${e.kind}:${e.host}`}
-                  type="button"
-                  onClick={() => setSelectedHost(e.host)}
-                  className={cn(
-                    "rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors",
-                    e.host === selectedHost
-                      ? "border-accent-ember/40 bg-accent-ember/10 text-accent-ember"
-                      : "border-border/60 text-muted-foreground hover:text-foreground",
-                  )}
-                >
-                  {e.kind === "loopback" ? "This device" : e.host}
-                </button>
-              ))}
+            <div className="space-y-1.5">
+              {inlineEndpoints.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {inlineEndpoints.map(renderChip)}
+                </div>
+              )}
+              {otherEndpoints.length > 0 && (
+                <details className="group">
+                  <summary className="flex w-fit cursor-pointer list-none items-center gap-1 text-[11px] font-medium text-muted-foreground marker:content-none hover:text-foreground">
+                    <span className="transition-transform group-open:rotate-90">
+                      ›
+                    </span>
+                    Other addresses ({otherEndpoints.length})
+                  </summary>
+                  <div className="mt-1.5 flex flex-wrap gap-1.5">
+                    {otherEndpoints.map(renderChip)}
+                  </div>
+                </details>
+              )}
             </div>
           )}
 
@@ -792,11 +902,7 @@ export function RemoteAccessSection() {
                   : "Starting the server…"}
               </p>
             ) : (
-              <div className="divide-y divide-border/50">
-                {endpoints.map((e) => (
-                  <EndpointRow key={`${e.kind}:${e.host}`} endpoint={e} />
-                ))}
-              </div>
+              <GroupedEndpoints endpoints={endpoints} />
             )}
           </section>
 

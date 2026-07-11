@@ -1783,35 +1783,55 @@ export function createSeedAppState(): AppStateSnapshot {
 //
 // Exercises the Settings → Remote Access panel in plain-browser dev. The
 // mock state machine in `tauri-mock.ts` owns the mutable enabled/config
-// state; these are the immutable seed shapes it starts from. Per the
-// Stage-2 acceptance criteria: two+ endpoints (one HTTPS mesh hostname,
-// one LAN IP), three sessions (one live, one idle, one pending approval),
+// state; these are the immutable seed shapes it starts from. The endpoint
+// set spans every display group (this device / local network / Tailscale /
+// other) so the grouped "Reachable at" list and pairing chips render in
+// full, alongside three sessions (one live, one idle, one pending approval)
 // and a pairing response builder.
 
 export const MOCK_WEB_REMOTE_PORT = 4377;
 
-/** Reachable endpoints. Loopback (secure), a LAN IP (plain HTTP), and a
- *  MagicDNS hostname served over HTTPS by the mesh (secure) — so the panel
- *  renders both the "Secure" and "Limited" security hints. */
+/**
+ * Reachable endpoints, one per display group so the grouped UI renders end
+ * to end: loopback (this device, secure), a LAN IP (local network, plain
+ * HTTP), a tailnet IP + a MagicDNS hostname served over HTTPS (Tailscale;
+ * the MagicDNS name is the recommended "from anywhere" option), and a lone
+ * IPv6 ULA address to exercise the collapsed "Other addresses" disclosure.
+ */
 export function mockWebRemoteEndpoints(port: number): WebRemoteEndpoint[] {
-  const host = (h: string, secure: boolean, scheme: string, kind: string, label: string) => ({
+  const ep = (
+    kind: string,
+    group: string,
+    h: string,
+    secure: boolean,
+    scheme: string,
+    recommended: boolean,
+    label: string,
+  ): WebRemoteEndpoint => ({
     kind,
+    group,
     host: h,
     port,
-    url: `${scheme}://${h}:${port}`,
+    // Bracket IPv6 literals in the URL host, matching the backend.
+    url: `${scheme}://${h.includes(":") ? `[${h}]` : h}:${port}`,
     secure,
+    recommended,
     label,
   });
   return [
-    host("127.0.0.1", true, "http", "loopback", "This device only (secure context)"),
-    host("192.168.1.42", false, "http", "lan", "Local network (plain HTTP)"),
-    host(
+    ep("loopback", "this_device", "127.0.0.1", true, "http", false, "This device only (secure context)"),
+    ep("lan", "local_network", "192.168.68.58", false, "http", false, "Local network (plain HTTP)"),
+    ep("tailnet", "tailscale", "100.119.27.64", false, "http", false, "Over your tailnet"),
+    ep(
+      "magicdns",
+      "tailscale",
       "mac-studio.tail9c2f.ts.net",
       true,
       "https",
-      "magicdns",
-      "MagicDNS name over your mesh's HTTPS serve (trusted certificate)",
+      true,
+      "MagicDNS name over Tailscale's HTTPS serve (trusted certificate)",
     ),
+    ep("lan", "other", "fd7a:115c:a1e0::42", false, "http", false, "Other network address (plain HTTP)"),
   ];
 }
 

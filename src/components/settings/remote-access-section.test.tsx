@@ -74,19 +74,70 @@ function endpoints(): WebRemoteEndpoint[] {
   return [
     {
       kind: "loopback",
+      group: "this_device",
       host: "127.0.0.1",
       port: 4377,
       url: "http://127.0.0.1:4377",
       secure: true,
+      recommended: false,
       label: "loopback",
     },
     {
       kind: "lan",
+      group: "local_network",
       host: "192.168.1.42",
       port: 4377,
       url: "http://192.168.1.42:4377",
       secure: false,
+      recommended: true,
       label: "lan",
+    },
+  ];
+}
+
+/** A richer set spanning every group — including a collapsed "other" — to
+ *  exercise the grouped "Reachable at" rendering. */
+function groupedEndpoints(): WebRemoteEndpoint[] {
+  return [
+    {
+      kind: "loopback",
+      group: "this_device",
+      host: "127.0.0.1",
+      port: 4377,
+      url: "http://127.0.0.1:4377",
+      secure: true,
+      recommended: false,
+      label: "",
+    },
+    {
+      kind: "lan",
+      group: "local_network",
+      host: "192.168.68.58",
+      port: 4377,
+      url: "http://192.168.68.58:4377",
+      secure: false,
+      recommended: false,
+      label: "",
+    },
+    {
+      kind: "magicdns",
+      group: "tailscale",
+      host: "mac-studio.tail9c2f.ts.net",
+      port: 4377,
+      url: "https://mac-studio.tail9c2f.ts.net:4377",
+      secure: true,
+      recommended: true,
+      label: "",
+    },
+    {
+      kind: "lan",
+      group: "other",
+      host: "fd7a:115c:a1e0::42",
+      port: 4377,
+      url: "http://[fd7a:115c:a1e0::42]:4377",
+      secure: false,
+      recommended: false,
+      label: "",
     },
   ];
 }
@@ -172,7 +223,7 @@ describe("RemoteAccessSection — enabled", () => {
     cmds.webRemoteStatus.mockResolvedValue(enabledStatus());
   });
 
-  it("renders endpoints with Secure vs Limited hints", async () => {
+  it("renders endpoints grouped under labelled headers with Secure vs Limited hints", async () => {
     render(<RemoteAccessSection />);
     await waitFor(() =>
       expect(screen.getByText("http://127.0.0.1:4377")).toBeInTheDocument(),
@@ -180,10 +231,33 @@ describe("RemoteAccessSection — enabled", () => {
     expect(screen.getByText("http://192.168.1.42:4377")).toBeInTheDocument();
     expect(screen.getByText("Secure")).toBeInTheDocument();
     expect(screen.getByText("Limited")).toBeInTheDocument();
+    // Grouped headers + the recommended chip on the primary LAN endpoint.
+    expect(screen.getByText("This device")).toBeInTheDocument();
+    expect(screen.getByText("Local network")).toBeInTheDocument();
+    expect(screen.getByText("Recommended")).toBeInTheDocument();
     // The insecure hint spells out the clipboard/notifications degradation.
     expect(
       screen.getByText(/browser clipboard and notifications are disabled/i),
     ).toBeInTheDocument();
+  });
+
+  it("shows the Tailscale group and hides 'other' addresses behind a disclosure", async () => {
+    cmds.webRemoteListEndpoints.mockResolvedValue(groupedEndpoints());
+    render(<RemoteAccessSection />);
+    await waitFor(() =>
+      expect(
+        screen.getByText("https://mac-studio.tail9c2f.ts.net:4377"),
+      ).toBeInTheDocument(),
+    );
+    // Tailscale section header + its explanation are visible.
+    expect(screen.getByText("Tailscale")).toBeInTheDocument();
+    expect(screen.getByText(/set up Tailscale's HTTPS serve/i)).toBeInTheDocument();
+    // The "other" IPv6 address lives inside a collapsed disclosure — its
+    // details element is present but closed by default.
+    const otherSummary = screen.getByText(/Other addresses/i);
+    const details = otherSummary.closest("details");
+    expect(details).not.toBeNull();
+    expect(details).not.toHaveAttribute("open");
   });
 
   it("renders the pending-approval row and approves it", async () => {

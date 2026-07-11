@@ -39,7 +39,7 @@ Module layout:
 - `auth.rs` — pairing tokens, sessions, WS tickets, the rate limiter, origin checks.
 - `dispatch.rs` — invoke dispatch via synthesized `on_message`, plus the channel interceptor/router.
 - `events.rs` — the `listen_any` fan-out hub with per-event refcounting.
-- `endpoints.rs` — reachable-endpoint enumeration (loopback / LAN / tailnet / MagicDNS).
+- `endpoints.rs` — reachable-endpoint enumeration (loopback / LAN / tailnet / MagicDNS), de-noised of Docker/virtual interfaces and grouped for the UI (This device / Local network / Tailscale / Other) with one `recommended` hint.
 - `assets.rs` — the authenticated `/api/assets` file route (`convertFileSrc` replacement).
 - `proxy.rs` — the auth-gated browser-pane WS + HTTP proxy to loopback `agent-browser` daemons.
 - `snapshot.rs` — the authenticated `/api/snapshot` bulk state-bootstrap route (a small versioned client API).
@@ -115,12 +115,16 @@ Credentials travel two ways, both funneled through the same `authenticate`: an `
 
 ## Endpoint enumeration
 
-`web_remote_list_endpoints` (`endpoints::list`) enumerates every URL a browser could use to reach the bound server, so the settings UI can show copy-ready links with an accurate per-endpoint security note:
+`web_remote_list_endpoints` (`endpoints::list`) enumerates every URL a browser could use to reach the bound server, so the settings UI can show copy-ready links with an accurate per-endpoint security note. Each entry carries a `kind`, a coarse UI `group`, a `secure` flag, and a single `recommended` hint:
 
-- **loopback** (`127.0.0.1`) — always first, and the one origin a browser treats as a **secure context** over plain HTTP (so clipboard/notifications keep working here).
-- **lan** — every non-loopback private IPv4 (RFC 1918 + link-local) and non-link-local IPv6 on a local interface.
-- **tailnet** — interface IPs inside the `100.64.0.0/10` CGNAT range, plus whatever `tailscale status --json` reports for this node (when the mesh CLI is present).
-- **magicdns** — the node's MagicDNS name, labeled with a hint to enable the mesh's HTTPS serve for a trusted certificate.
+- **loopback** (`127.0.0.1`) — always first, and the one origin a browser treats as a **secure context** over plain HTTP (so clipboard/notifications keep working here). Group: `this_device`.
+- **lan** — non-loopback **RFC 1918** private IPv4 on a real local interface. Group: `local_network`. (Marginal addresses — `169.254` link-local IPv4 and non-link-local IPv6 that aren't on the tailnet — are still surfaced, but grouped as `other`.)
+- **tailnet** — interface IPs inside the `100.64.0.0/10` CGNAT range, plus every address (IPv4 **and** IPv6) that `tailscale status --json` reports for this node (when the mesh CLI is present). Group: `tailscale`.
+- **magicdns** — the node's MagicDNS name, labeled with a hint to enable the mesh's HTTPS serve for a trusted certificate. Group: `tailscale`.
+
+**Virtual interfaces are filtered by name.** Docker bridges (`docker*`, `br-*`), `veth` pairs, libvirt (`virbr*`), Kubernetes CNI plumbing (`cni`/`flannel`/`cali`/`kube`), VirtualBox/VMware host-only nets, ZeroTier (`zt*`), and the Tailscale tunnel (`tailscale*`) are skipped by `is_virtual_iface`, so their `172.x`/`169.254.x`/etc. addresses never masquerade as a reachable endpoint. (The `br-` prefix is hyphenated so a real bridge `br0` survives.) Tailnet addresses come from the CLI rather than the skipped `tailscale0` interface — which is why a Tailscale IPv6 lands under `tailscale`, not `other`.
+
+**Groups drive the UI.** The four groups — `this_device`, `local_network`, `tailscale`, `other` — render as labelled sections in both the "Reachable at" list and the pairing-card device picker; empty groups are dropped and `other` sits behind a default-closed disclosure. Exactly one endpoint is marked `recommended` (the best "reach from anywhere" option: MagicDNS, else a tailnet IP, else a local-network IP; loopback-only leaves nothing marked), surfaced with a "Recommended" chip. The frontend grouping helper (`remote-access-utils.ts`) degrades any unrecognised `group` value into `other`, so a future backend group can't render blank.
 
 Only loopback reports `secure: true`. LAN/tailnet are plain HTTP from the server's point of view — it can't know whether a mesh proxy is terminating TLS in front of it — so they report `secure: false` and the UI surfaces the consequence. Everything degrades gracefully: no interfaces, no `tailscale` binary, or a malformed status blob just yields fewer entries, never an error.
 
@@ -130,7 +134,7 @@ Settings → Remote Access (`src/components/settings/remote-access-section.tsx`)
 
 - **Master toggle** with a plain-language exposure warning (turning it on lets other devices drive this one).
 - **Port field** with validation; a port change while running rebinds the listener.
-- **Endpoint list** with copy buttons and a per-endpoint security note (secure loopback vs plain-HTTP LAN vs mesh HTTPS), from `web_remote_list_endpoints`.
+- **Grouped endpoint list** — copy buttons under group headers (This device / Local network / Tailscale, with an `other` disclosure), a per-endpoint security note (secure loopback vs plain-HTTP LAN vs mesh HTTPS), and a **Recommended** marker on the best from-anywhere endpoint, from `web_remote_list_endpoints`.
 - **Pairing generator** — a link plus a client-side-rendered **QR code** (`use-qr-svg.ts`) encoding the `/#pair=<token>` URL, with a live countdown to the token's 10-minute expiry.
 - **Paired/connected devices list** — name, platform (derived from the user agent), last-seen relative time, and a live-connection dot, with per-device **revoke** and **revoke-all**.
 - **Approval-mode toggle** and the **pending-approval flow** — newly pending devices raise a desktop notification + badge and show approve/reject controls.

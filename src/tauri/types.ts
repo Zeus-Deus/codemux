@@ -1223,6 +1223,9 @@ export interface WebRemotePairingInfo {
 export interface WebRemoteEndpoint {
   /** `loopback` | `lan` | `tailnet` | `magicdns`. */
   kind: string;
+  /** Coarse UI grouping: `this_device` | `local_network` | `tailscale` |
+   *  `other`. Drives the labelled sections in the settings panel. */
+  group: string;
   /** IP literal or DNS hostname (no scheme, no port). */
   host: string;
   port: number;
@@ -1231,6 +1234,9 @@ export interface WebRemoteEndpoint {
   /** Whether a browser treats this origin as a secure context. Only
    *  loopback qualifies over plain HTTP. */
   secure: boolean;
+  /** The single best "reach from anywhere" endpoint, surfaced with a
+   *  "Recommended" chip. At most one endpoint carries this. */
+  recommended: boolean;
   /** Short human hint for the settings UI. */
   label: string;
 }

@@ -15,6 +15,7 @@ import {
   endpointIsSecure,
   endpointSecurityHint,
   formatCountdown,
+  groupEndpoints,
   msUntil,
   newlyPendingSessionIds,
   pendingSessions,
@@ -26,10 +27,12 @@ import {
 function ep(partial: Partial<WebRemoteEndpoint>): WebRemoteEndpoint {
   return {
     kind: "lan",
+    group: "local_network",
     host: "192.168.1.5",
     port: 4377,
     url: "http://192.168.1.5:4377",
     secure: false,
+    recommended: false,
     label: "",
     ...partial,
   };
@@ -100,17 +103,72 @@ describe("pairing URL composition", () => {
 
   it("prefers a networked endpoint over loopback for the QR target", () => {
     const eps = [
-      ep({ kind: "loopback", host: "127.0.0.1" }),
+      ep({ kind: "loopback", group: "this_device", host: "127.0.0.1" }),
       ep({ kind: "lan", host: "192.168.1.5" }),
     ];
     expect(pickPrimaryEndpoint(eps)?.host).toBe("192.168.1.5");
   });
 
+  it("prefers the recommended endpoint over any other networked one", () => {
+    const eps = [
+      ep({ kind: "loopback", group: "this_device", host: "127.0.0.1" }),
+      ep({ kind: "lan", host: "192.168.1.5" }),
+      ep({
+        kind: "magicdns",
+        group: "tailscale",
+        host: "box.ts.net",
+        url: "https://box.ts.net:4377",
+        recommended: true,
+      }),
+    ];
+    expect(pickPrimaryEndpoint(eps)?.host).toBe("box.ts.net");
+  });
+
   it("falls back to loopback when it is the only endpoint", () => {
-    expect(pickPrimaryEndpoint([ep({ kind: "loopback", host: "127.0.0.1" })])?.host).toBe(
-      "127.0.0.1",
-    );
+    expect(
+      pickPrimaryEndpoint([
+        ep({ kind: "loopback", group: "this_device", host: "127.0.0.1" }),
+      ])?.host,
+    ).toBe("127.0.0.1");
     expect(pickPrimaryEndpoint([])).toBeNull();
+  });
+});
+
+describe("groupEndpoints", () => {
+  it("buckets endpoints into ordered groups and drops empty ones", () => {
+    const eps = [
+      ep({ kind: "loopback", group: "this_device", host: "127.0.0.1" }),
+      ep({ kind: "lan", group: "local_network", host: "192.168.1.5" }),
+      ep({ kind: "tailnet", group: "tailscale", host: "100.64.0.1" }),
+      ep({ kind: "lan", group: "other", host: "fd00::5", url: "http://[fd00::5]:4377" }),
+    ];
+    const groups = groupEndpoints(eps);
+    // Ordered this_device → local_network → tailscale → other; no empty groups.
+    expect(groups.map((g) => g.id)).toEqual([
+      "this_device",
+      "local_network",
+      "tailscale",
+      "other",
+    ]);
+    // Only the catch-all group is collapsible.
+    expect(groups.find((g) => g.id === "other")?.collapsible).toBe(true);
+    expect(groups.find((g) => g.id === "this_device")?.collapsible).toBe(false);
+  });
+
+  it("omits a group with no endpoints (e.g. no Tailscale)", () => {
+    const groups = groupEndpoints([
+      ep({ kind: "loopback", group: "this_device", host: "127.0.0.1" }),
+      ep({ kind: "lan", group: "local_network", host: "192.168.1.5" }),
+    ]);
+    expect(groups.map((g) => g.id)).toEqual(["this_device", "local_network"]);
+  });
+
+  it("degrades an unknown group value into 'other'", () => {
+    const groups = groupEndpoints([
+      ep({ kind: "lan", group: "made_up", host: "10.0.0.9" }),
+    ]);
+    expect(groups.map((g) => g.id)).toEqual(["other"]);
+    expect(groups[0].endpoints[0].host).toBe("10.0.0.9");
   });
 });
 

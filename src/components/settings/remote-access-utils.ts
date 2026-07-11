@@ -55,6 +55,86 @@ export function endpointSecurityHint(ep: WebRemoteEndpoint): EndpointSecurityHin
   };
 }
 
+// ── Endpoint grouping ────────────────────────────────────────────────
+
+export type EndpointGroupId =
+  | "this_device"
+  | "local_network"
+  | "tailscale"
+  | "other";
+
+export interface EndpointGroupMeta {
+  id: EndpointGroupId;
+  /** Section header. */
+  title: string;
+  /** One-line explanation shown under the header. */
+  explanation: string;
+  /** When true the group is tucked behind a default-closed disclosure. */
+  collapsible: boolean;
+}
+
+/**
+ * The display order + copy for the endpoint sections. The backend's coarse
+ * `group` maps 1:1 onto these; anything unrecognised falls into "other".
+ */
+export const ENDPOINT_GROUPS: EndpointGroupMeta[] = [
+  {
+    id: "this_device",
+    title: "This device",
+    explanation: "Only this computer",
+    collapsible: false,
+  },
+  {
+    id: "local_network",
+    title: "Local network",
+    explanation: "Other devices on your home/office network",
+    collapsible: false,
+  },
+  {
+    id: "tailscale",
+    title: "Tailscale",
+    explanation:
+      "Reach this machine from anywhere on your tailnet — set up Tailscale's HTTPS serve for a secure connection",
+    collapsible: false,
+  },
+  {
+    id: "other",
+    title: "Other addresses",
+    explanation: "Extra addresses that only work on some networks",
+    collapsible: true,
+  },
+];
+
+export interface EndpointGroupView extends EndpointGroupMeta {
+  endpoints: WebRemoteEndpoint[];
+}
+
+const KNOWN_GROUP_IDS = new Set<string>(ENDPOINT_GROUPS.map((g) => g.id));
+
+/**
+ * Bucket endpoints into the display groups, preserving the backend's order
+ * within each group and dropping groups that ended up empty. Any unknown
+ * `group` value degrades into "other" so a future backend addition never
+ * disappears from the UI.
+ */
+export function groupEndpoints(
+  endpoints: WebRemoteEndpoint[],
+): EndpointGroupView[] {
+  const buckets = new Map<EndpointGroupId, WebRemoteEndpoint[]>();
+  for (const e of endpoints) {
+    const id: EndpointGroupId = KNOWN_GROUP_IDS.has(e.group)
+      ? (e.group as EndpointGroupId)
+      : "other";
+    const list = buckets.get(id);
+    if (list) list.push(e);
+    else buckets.set(id, [e]);
+  }
+  return ENDPOINT_GROUPS.map((meta) => ({
+    ...meta,
+    endpoints: buckets.get(meta.id) ?? [],
+  })).filter((g) => g.endpoints.length > 0);
+}
+
 // ── Pairing URL composition ──────────────────────────────────────────
 
 /** Compose the full auto-pair URL for an endpoint: `<url>/#pair=<token>`. */
@@ -70,14 +150,17 @@ export function composePairUrl(
 /**
  * The endpoint a QR code / primary pairing link should target. A QR is
  * meant to be scanned from a *phone*, so loopback (`127.0.0.1`, only
- * reachable from the desktop itself) is the worst choice — prefer the
- * first reachable network endpoint, falling back to loopback only when
+ * reachable from the desktop itself) is the worst choice. Prefer the
+ * backend's `recommended` endpoint (the best "from anywhere" option), then
+ * the first reachable network endpoint, falling back to loopback only when
  * that is all that exists.
  */
 export function pickPrimaryEndpoint(
   endpoints: WebRemoteEndpoint[],
 ): WebRemoteEndpoint | null {
   if (endpoints.length === 0) return null;
+  const recommended = endpoints.find((e) => e.recommended);
+  if (recommended) return recommended;
   const networked = endpoints.find((e) => e.kind !== "loopback");
   return networked ?? endpoints[0];
 }
