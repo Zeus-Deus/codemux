@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { RemoteConnectionChip } from "@/components/remote/remote-connection-indicator";
 import { ResourceMonitor } from "./resource-monitor";
 import { TitleBarTabs } from "./title-bar-tabs";
 import { AgentLauncher } from "./agent-launcher";
@@ -463,6 +464,10 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
             <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
           )}
           <WindowControls />
+          {/* Web remote client only: the connection chip takes the slot the
+              hidden window controls free up. Quiet while connected; the loud
+              reconnecting/offline states live in the app-wide banner. */}
+          {isRemoteClient() && <RemoteConnectionChip />}
         </div>
       </div>
     );
@@ -520,6 +525,10 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
         )}
         <WindowControls />
+        {/* Web remote client only: the connection chip takes the slot the
+            hidden window controls free up. Quiet while connected; the loud
+            reconnecting/offline states live in the app-wide banner. */}
+        {isRemoteClient() && <RemoteConnectionChip compact />}
       </div>
     </div>
   );

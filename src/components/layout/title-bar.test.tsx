@@ -176,6 +176,7 @@ function makeWorkspace(): WorkspaceSnapshot {
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { agentChatCreatePane, applyPreset } from "@/tauri/commands";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
+import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import { TitleBar } from "./title-bar";
 
 function renderBar() {
@@ -376,5 +377,45 @@ describe("TitleBar GUI chrome — pinned preset tiles", () => {
     await waitFor(() =>
       expect(screen.getAllByText("Claude Code").length).toBeGreaterThan(0),
     );
+  });
+});
+
+describe("TitleBar — web-remote connection chip placement", () => {
+  afterEach(() => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = undefined;
+    useRemoteConnectionStore.setState({
+      status: null,
+      host: "",
+      offlineMessage: null,
+    });
+  });
+
+  it("renders the connection chip in the right cluster on the web client when connected (legacy bar)", () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    useRemoteConnectionStore.getState().setConnected("127.0.0.1:4379");
+    state.enableAgentChat = false;
+    const { getByTestId } = renderBar();
+    expect(getByTestId("remote-connection-chip")).toBeInTheDocument();
+  });
+
+  it("renders the connection chip in the right cluster on the web client when connected (GUI chrome bar)", () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    useRemoteConnectionStore.getState().setConnected("127.0.0.1:4379");
+    state.enableAgentChat = true;
+    const { getByTestId } = renderBar();
+    expect(getByTestId("remote-connection-chip")).toBeInTheDocument();
+  });
+
+  it("renders no chip on desktop (non-remote), byte-identical to before", () => {
+    useRemoteConnectionStore.getState().setConnected("127.0.0.1:4379");
+    const { queryByTestId } = renderBar();
+    expect(queryByTestId("remote-connection-chip")).toBeNull();
+  });
+
+  it("renders no chip on the web client while reconnecting (that is the banner's job)", () => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    useRemoteConnectionStore.getState().setReconnecting("127.0.0.1:4379");
+    const { queryByTestId } = renderBar();
+    expect(queryByTestId("remote-connection-chip")).toBeNull();
   });
 });

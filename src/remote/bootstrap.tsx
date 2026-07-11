@@ -22,7 +22,7 @@ import ReactDOM from "react-dom/client";
 import { installShim } from "./shim";
 import type { ConnectionStatus } from "./transport";
 import { fetchSnapshot } from "./snapshot-seed";
-import { createRemoteIndicator } from "./status-banner";
+import { useRemoteConnectionStore } from "./remote-connection-store";
 import {
   clearSession,
   deriveDeviceName,
@@ -358,7 +358,7 @@ export async function bootstrapRemote(): Promise<void> {
   const baseUrl = window.location.origin;
   const host = window.location.host;
   const overlay = new BootstrapOverlay();
-  const indicator = createRemoteIndicator();
+  const connection = useRemoteConnectionStore.getState();
   const appVersion = await fetchAppVersion(baseUrl);
 
   // Pre-mount: the connect loop drives re-pairing. Post-mount ("live"): a
@@ -366,15 +366,15 @@ export async function bootstrapRemote(): Promise<void> {
   let phase: "connecting" | "live" = "connecting";
 
   function handleStatus(status: ConnectionStatus): void {
-    // The persistent "Remote — <host>" pill lives once the socket is up;
-    // a drop degrades it to a pulsing amber "Reconnecting…" in place.
-    if (status === "reconnecting") indicator.setReconnecting(host);
-    else if (status === "connected") indicator.setLive(host);
+    // Connected → a quiet chip in the title bar's right cluster; a drop
+    // degrades to the loud, centered "Reconnecting…" banner in its place.
+    if (status === "reconnecting") connection.setReconnecting(host);
+    else if (status === "connected") connection.setConnected(host);
   }
   function handleUnauthorized(): void {
     clearSession();
     if (phase === "live") {
-      indicator.setOffline("Remote access revoked");
+      connection.setOffline("Remote access revoked");
       window.setTimeout(() => window.location.reload(), 1600);
     }
     // While still connecting, the loop below re-prompts for pairing.
