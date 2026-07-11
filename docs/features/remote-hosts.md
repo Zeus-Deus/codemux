@@ -352,15 +352,19 @@ Three modules under `src-tauri/src/ssh/` (Unix-only — Windows gracefully skips
 ```sh
 printf 'UNAME: ' ; uname -sm
 if command -v codemux-remote >/dev/null 2>&1 ; then
-  printf 'CMR: ' ; codemux-remote version
+  printf 'CMR: ' ; codemux-remote version 2>/dev/null || printf 'BROKEN\n'
+elif [ -x "$HOME/.local/bin/codemux-remote" ] ; then
+  printf 'CMR: ' ; "$HOME/.local/bin/codemux-remote" version 2>/dev/null || printf 'BROKEN\n'
 else
   printf 'CMR: NOT_INSTALLED\n'
 fi
 ```
 
+The `2>/dev/null || printf 'BROKEN\n'` on both version invocations matters (issue #133): a truncated ELF exec-fails with exit 126, and since the invocation is the last statement of its branch, that would become ssh's exit status — the probe would report `Unreachable` with raw exec noise instead of a classifiable result. The fallback converts exec failure into a `CMR: BROKEN` line (exit 0), which — like the bare `CMR: ` line a 0-byte binary produces — is unparseable as version JSON and gets classified as present-but-broken.
+
 Parses the output into one of three outcomes:
-- `Reachable { codemux_remote_version: Some(...), uname: Some(...) }` — green light.
-- `Reachable { codemux_remote_version: None, uname: Some(...) }` — host is up, binary missing → triggers the bootstrap-install consent modal.
+- `Reachable { codemux_remote_version: Some(...), uname: Some(...), .. }` — green light.
+- `Reachable { codemux_remote_version: None, uname: Some(...), binary_present_but_broken }` — host is up but the binary isn't usable. `binary_present_but_broken: false` → genuinely absent → the bootstrap-install consent modal ("isn't installed yet"); `true` → something is at the install path but doesn't produce valid version output (0-byte or truncated binary — issue #133) → "present and not working … Install to repair".
 - `Unreachable { reason }` — SSH itself failed (DNS, refused, auth, timeout). `reason` is the SSH stderr so the user can debug.
 
 Critical SSH flags (locked in via unit tests):
@@ -378,6 +382,11 @@ Runs after the user clicks "Install" in the consent modal. Four steps:
 4. Re-probe via `ssh ... codemux-remote version` to verify the install worked. Parse out the reported version.
 
 Returns `BootstrapResult::Installed { reported_version }` on success; one of three failure variants otherwise, each with a specific error message the UI surfaces verbatim.
+
+**Integrity guards (issue #133).** A field host once ended up with a 0-byte, mode-0700 `~/.local/bin/codemux-remote` — the atomic install had shipped an empty file over a working binary, and both devices then reported "Reachable, but codemux-remote isn't installed yet". Two guards close the holes:
+
+- **Local ≥1 MB plausibility gate.** `bundled_binary_path` no longer accepts any candidate that merely `.exists()`. Every lookup tier (Tauri resource dir, source-tree relative paths, dev sibling-exe fallback) is filtered through `plausible_remote_binary`, which requires a regular file of at least `MIN_PLAUSIBLE_REMOTE_BINARY_BYTES` (1 MB; the real binary is ~16 MB). The 0-byte placeholder sidecars checked into `src-tauri/binaries/` for dev builds no longer qualify — an empty candidate is treated as *not bundled* → `BinaryNotBundled { wanted_target }`, so a dev build fails loudly instead of silently uploading a placeholder over a host's good binary.
+- **Remote `wc -c` byte-count verification.** `ssh_upload_executable` streams into a `.tmp` and the remote reads it back with `wc -c`, comparing against the exact source length *before* the `mv`. The pipeline is `umask 077 && mkdir -p … && cat > tmp && [ wc -c == len ] && chmod +x tmp && mv -f tmp p || { warn; rm -f tmp; exit 1; }`: any failure in the `&&` chain (including a size mismatch from a partially-streamed upload) funnels into the `|| { … }` cleanup — the tmp file is removed, a clear reason goes to stderr (surfacing in `BootstrapResult::UploadFailed`), and the prior binary at the destination is left untouched (atomic ≠ verified). The function also rejects a 0-byte source outright before spawning ssh (an empty file would trivially pass a `-eq 0` check), and kills the ssh child if the local `write_all` fails partway rather than letting `cat` see a clean EOF.
 
 ### `tunnel.rs` — SSH-tunneled daemon
 
@@ -428,8 +437,8 @@ The pane built in 2a now uses the real probe + bootstrap:
 
 - **DevicePicker** (`src/components/hosts/device-picker.test.tsx`): 7 tests — local label, custom local label, remote selection, fallback when configured hostId is missing, dropdown open with Local Device entry, Other Hosts submenu, graceful failure when `hostsList` rejects.
 - **codemux-remote binary** (`src-tauri/tests/codemux_remote_binary.rs`): 3 tests — `version` subcommand prints valid JSON, no-subcommand defaults to version, end-to-end spawn-and-reap via `PtyDaemonClient` against the real binary.
-- **SSH probe** (`src-tauri/src/ssh/probe.rs::tests`): 5 tests — argv construction (BatchMode + ConnectTimeout + StrictHostKeyChecking + target + command position), parsing reachable+installed, reachable+missing, unparseable version, empty payload.
-- **SSH bootstrap** (`src-tauri/src/ssh/bootstrap.rs::tests`): 3 tests — `target_for_uname` covers all four release targets including aliases (`amd64`, `arm64`), returns None for unsupported (FreeBSD/Windows/garbage), trims whitespace.
+- **SSH probe** (`src-tauri/src/ssh/probe.rs::tests`): 8 tests — argv construction (BatchMode + ConnectTimeout + StrictHostKeyChecking + target + command position), the `~/.local/bin` PATH fallback + the `|| printf 'BROKEN'` exec-failure fallback on both version invocations, parsing reachable+installed (broken=false), reachable+missing/`NOT_INSTALLED` (broken=false), unparseable version → version None + `binary_present_but_broken: true`, the bare-`CMR:` line from a 0-byte binary → broken=true, the `CMR: BROKEN` marker from a truncated-ELF exec failure → broken=true (issue #133), empty payload. The unparseable-version case is no longer treated as "not installed" — it's classified as present-but-broken so the UI can offer "Install to repair".
+- **SSH bootstrap** (`src-tauri/src/ssh/bootstrap.rs::tests`): 5 tests — `target_for_uname` covers all four release targets including aliases (`amd64`, `arm64`), returns None for unsupported (FreeBSD/Windows/garbage), trims whitespace; `plausible_remote_binary` gates on size + file type (missing / 0-byte / 4 KB / directory → false, ≥1 MB file → true — issue #133); `upload_script` locks in the `wc -c` byte-count check, the exact expected length, `rm -f` + `exit 1` cleanup, the `umask 077`/`chmod +x`/`mv -f` chain, and tilde-aware escaping. The localhost E2E `ssh_upload_executable` test also now asserts an empty source is rejected with Err and never creates/replaces the destination.
 - **SSH tunnel** (`src-tauri/src/ssh/tunnel.rs::tests`): 4 tests — required ssh flags locked in, `-L` forwarding spec contains both paths, remote command is the last arg, target comes before remote command.
 - **SSH round-trip** (`src-tauri/tests/codemux_ssh_roundtrip.rs`, post-`v0.7.6`): an env-gated (`CODEMUX_E2E_SSH_HOST`) real-host harness that drives a push / `--delete`-mirror / pull-back / `RemoteNotFound` / `.mcp.json`-absolute / tilde round-trip against an SSH target, encoding the `RemoteNotFound`, `.mcp.json`-absolute, and tilde-expansion regressions. Skips with a `SKIP:` message when the env var is unset, so CI stays green without a live host.
 
@@ -472,6 +481,10 @@ Landed since the original 2b–2d cut: **"Push workspace to host" action** (`8c7
 
 **"Reachable, but codemux-remote isn't installed yet" but the Install button does nothing:**
 - Check the laptop's `src-tauri/binaries/` directory has `codemux-remote-<target>` for the host's uname. In dev builds, cross-compiles aren't usually run; the bootstrap returns `BinaryNotBundled` with the target triple it was looking for.
+
+**"Reachable, but codemux-remote is present and not working (binary may be corrupted or truncated)" — or, on pre-fix builds, "isn't installed yet" with a 0-byte `~/.local/bin/codemux-remote` while an old daemon keeps running:**
+- **Cause (issue #133).** Pre-fix Codemux builds could atomically install an empty or truncated binary — a dev 0-byte placeholder that passed the old `.exists()` check, or an upload whose stream failed partway but whose `cat` still saw a clean EOF. The file at the install path exists (mode 0700) but is not a runnable binary; a `serve`/`pty-daemon` started earlier keeps running from the now-deleted inode, so the host still *works* until that daemon exits — which is why both devices reported the binary "missing". The probe now classifies this as present-but-broken (`binary_present_but_broken: true`) so the UI says "Install to repair" instead of "isn't installed yet".
+- **Repair.** Click plain **Install** on Settings → Hosts. It re-uploads (now with the local ≥1 MB gate + remote `wc -c` verification) over the broken file WITHOUT restarting the running daemon — the swap is atomic and old fd-holders keep running until they idle out. The daemon picks up the new binary on its next idle auto-upgrade or on reboot. Do **not** use "Reinstall agent" while live host sessions matter — it `pkill`s the pty-daemon and drops those sessions.
 
 **Probe says "Permission denied (publickey)":**
 - Your key isn't authorized on the host. Add the laptop's public key to the host's `~/.ssh/authorized_keys`. Codemux deliberately doesn't paper over this — it would mean storing your private key in our process, which is a security regression.

@@ -40,6 +40,13 @@
  * pane mount would be wasteful on the very machines this protects.
  */
 
+import { isLinuxWebKitGtk } from "@/lib/webkit";
+
+// `isLinuxWebKitGtk` moved to `@/lib/webkit` (shared with the chat transcript
+// fade gate, issue #129). Re-exported here so existing importers/tests that
+// pull it from this module keep working.
+export { isLinuxWebKitGtk };
+
 /**
  * Known software-rasterizer markers in `UNMASKED_RENDERER_WEBGL` strings.
  *
@@ -87,20 +94,6 @@ function defaultContextFactory(): ProbeGlContext | null {
   const canvas = document.createElement("canvas");
   // Match the addon's requirement: it renders with WebGL2 specifically.
   return canvas.getContext("webgl2") as ProbeGlContext | null;
-}
-
-/**
- * True when running inside Linux WebKitGTK — the Tauri app webview on Linux.
- * WebKit UA without a Chromium token, on a non-mac platform: WebKitGTK is the
- * only such engine Codemux can meet (Chromium-family UAs all carry "Chrome";
- * macOS WKWebView carries "Macintosh"/"Mac OS X").
- */
-export function isLinuxWebKitGtk(userAgent: string): boolean {
-  return (
-    /AppleWebKit/i.test(userAgent) &&
-    !/Chrom(e|ium)|Edg\//i.test(userAgent) &&
-    !/Macintosh|Mac OS X/i.test(userAgent)
-  );
 }
 
 function readRendererOverride(): "webgl" | "dom" | null {

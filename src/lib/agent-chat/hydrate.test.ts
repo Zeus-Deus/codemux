@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import type { ProviderRuntimeEvent } from "@/tauri/events";
 
-import { replayPayloads } from "./hydrate";
+import { lastTurnUnsettled, replayPayloads } from "./hydrate";
+import { findSubagentView, runningSubagentEntries } from "./subagents";
+import type { WorkflowRunItem } from "./types";
 
 function user(text: string): string {
   return JSON.stringify({ type: "user_message", thread_id: "t", text });
@@ -34,6 +36,56 @@ describe("replayPayloads", () => {
       text: "world",
       seq: 1,
     });
+  });
+
+  it("maps a user_message envelope's images onto the item", () => {
+    const state = replayPayloads([
+      JSON.stringify({
+        type: "user_message",
+        thread_id: "t",
+        text: "see attached",
+        images: [
+          { path: "/tmp/codemux/a.png", media_type: "image/png" },
+          { path: "/tmp/codemux/b.jpg" },
+        ],
+      }),
+    ]);
+    expect(state.messages).toHaveLength(1);
+    const item = state.messages[0];
+    expect(item.kind).toBe("user_message");
+    if (item.kind === "user_message") {
+      // `path` → `src`; `media_type` → `mediaType` (undefined when the
+      // backend omitted it).
+      expect(item.images).toEqual([
+        { src: "/tmp/codemux/a.png", mediaType: "image/png" },
+        { src: "/tmp/codemux/b.jpg", mediaType: undefined },
+      ]);
+    }
+  });
+
+  it("drops malformed image entries and keeps text-only when images is absent", () => {
+    const state = replayPayloads([
+      JSON.stringify({
+        type: "user_message",
+        thread_id: "t",
+        text: "mixed",
+        images: [
+          { path: "/ok.png", media_type: "image/png" },
+          { media_type: "image/png" }, // no path → dropped
+          "not-an-object", // → dropped
+          null, // → dropped
+        ],
+      }),
+      user("plain"),
+    ]);
+    const [withImages, plain] = state.messages;
+    if (withImages.kind === "user_message") {
+      expect(withImages.images).toEqual([
+        { src: "/ok.png", mediaType: "image/png" },
+      ]);
+    }
+    // A turn with no `images` field never gains one.
+    expect("images" in plain).toBe(false);
   });
 
   it("rebuilds an assistant message from a completed item", () => {
@@ -358,5 +410,197 @@ describe("replayPayloads", () => {
     if (ended?.kind === "turn_ended") {
       expect(ended.status.kind).toBe("error");
     }
+  });
+
+  // ── Run-state reconciliation (issue #153) ──
+
+  it("interrupts a subagent left running by a transcript that ends mid-run", () => {
+    const state = replayPayloads([
+      user("delegate"),
+      event({
+        type: "subagent_updated",
+        thread_id: "t",
+        subagent: {
+          subagent_id: "s1",
+          status: "running",
+          name: "Explore",
+          parent_item_id: "tool-1",
+        },
+      } as ProviderRuntimeEvent),
+      // No terminal snapshot, no tool_result — the stuck-forever shape.
+    ]);
+    const sub = findSubagentView(state.messages, "s1");
+    expect(sub?.status).toBe("interrupted");
+    expect(sub?.statusAssumed).toBe(true);
+    // Never resurrects a live spinner in the docked bar.
+    expect(runningSubagentEntries(state.messages)).toHaveLength(0);
+  });
+
+  it("self-heals: a running snapshot then a parent tool_result hydrates as completed (not interrupted)", () => {
+    const state = replayPayloads([
+      user("delegate"),
+      event({
+        type: "subagent_updated",
+        thread_id: "t",
+        subagent: {
+          subagent_id: "s1",
+          status: "running",
+          name: "Explore",
+          parent_item_id: "tool-1",
+        },
+      } as ProviderRuntimeEvent),
+      // The raw parent-scoped tool_result for the spawning tool leaks
+      // through (demux lost track) — the reducer derives the settlement,
+      // which the hydrate reconciliation then leaves untouched.
+      event({
+        type: "item_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "tool-1", content: "ok", is_error: false },
+      }),
+    ]);
+    const sub = findSubagentView(state.messages, "s1");
+    expect(sub?.status).toBe("completed");
+    expect(sub?.statusAssumed).toBe(true);
+    expect(runningSubagentEntries(state.messages)).toHaveLength(0);
+  });
+
+  it("stops a workflow left running by a truncated transcript", () => {
+    const state = replayPayloads([
+      user("/workflow audit"),
+      event({
+        type: "workflow_updated",
+        thread_id: "t",
+        workflow: {
+          workflow_id: "wf",
+          status: "running",
+          name: "Audit",
+          phases: [{ title: "Run", detail: null }],
+        },
+      } as ProviderRuntimeEvent),
+    ]);
+    const wf = state.messages.find(
+      (m): m is WorkflowRunItem => m.kind === "workflow_run",
+    );
+    expect(wf?.status).toBe("stopped");
+  });
+
+  it("preserves a pending_approval workflow on hydrate (a resting state, not a spinner)", () => {
+    const state = replayPayloads([
+      user("/workflow audit"),
+      event({
+        type: "workflow_updated",
+        thread_id: "t",
+        workflow: {
+          workflow_id: "wf",
+          status: "pending_approval",
+          name: "Audit",
+          phases: [{ title: "Run", detail: null }],
+        },
+      } as ProviderRuntimeEvent),
+      event({
+        type: "request_opened",
+        thread_id: "t",
+        turn_id: "turn-1",
+        request_id: "req-1",
+        request_kind: "other",
+        payload: {},
+        tool_use_id: "wf",
+      }),
+    ]);
+    const wf = state.messages.find(
+      (m): m is WorkflowRunItem => m.kind === "workflow_run",
+    );
+    expect(wf?.status).toBe("pending_approval");
+  });
+});
+
+describe("lastTurnUnsettled (issue #154)", () => {
+  const completed = (turnId: string): string =>
+    event({
+      type: "turn_completed",
+      thread_id: "t",
+      turn_id: turnId,
+      status: { kind: "success" },
+      usage: null,
+    });
+
+  it("is false for an empty thread", () => {
+    expect(lastTurnUnsettled([])).toBe(false);
+  });
+
+  it("is true when the last user turn has no later turn_completed", () => {
+    expect(lastTurnUnsettled([completed("turn-0"), user("still running…")])).toBe(
+      true,
+    );
+  });
+
+  it("is false when the last user turn settled", () => {
+    expect(lastTurnUnsettled([user("hi"), completed("turn-1")])).toBe(false);
+  });
+
+  it("is true for a settled turn followed by a fresh unsettled one", () => {
+    expect(
+      lastTurnUnsettled([
+        user("one"),
+        completed("turn-1"),
+        user("two — never finished"),
+      ]),
+    ).toBe(true);
+  });
+
+  it("ignores malformed rows", () => {
+    expect(lastTurnUnsettled(["not json", user("hi")])).toBe(true);
+  });
+});
+
+describe("replayPayloads interrupted/stalled (issue #154)", () => {
+  it("carries interrupted from an unsettled tail and stalled stays null", () => {
+    const state = replayPayloads([
+      user("first"),
+      event({
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      }),
+      user("second — interrupted"),
+    ]);
+    expect(state.interrupted).toBe(true);
+    expect(state.stalled).toBeNull();
+  });
+
+  it("marks interrupted when replay observed a child_exited terminal turn", () => {
+    const state = replayPayloads([
+      user("go"),
+      event({
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "sidecar exited unexpectedly",
+        },
+        usage: null,
+      }),
+    ]);
+    expect(state.interrupted).toBe(true);
+  });
+
+  it("is not interrupted for a cleanly settled thread", () => {
+    const state = replayPayloads([
+      user("go"),
+      event({
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      }),
+    ]);
+    expect(state.interrupted).toBe(false);
+    expect(state.stalled).toBeNull();
   });
 });

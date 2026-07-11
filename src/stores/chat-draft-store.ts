@@ -78,6 +78,31 @@ export interface ChatDraft {
    *  Optional + defaults to `false` so older persisted drafts
    *  deserialize unchanged. */
   lockedToHome?: boolean;
+  /** Thread Scope redesign — where the agent should work relative to
+   *  the target project. `"current"` (default) sends into the
+   *  project's existing checkout; `"worktree"` defers creation of a
+   *  fresh git worktree to submit time (`materializeAndSend`), named
+   *  either from `worktreeName` (if set) or auto-derived from the
+   *  first message / a random fallback. Irrelevant for `target.kind
+   *  === "home"` drafts (no project, nothing to branch off of).
+   *
+   *  Optional + defaults to `"current"` via read-site fallbacks so
+   *  older persisted drafts deserialize unchanged. */
+  checkoutMode?: "current" | "worktree";
+  /** User-typed worktree name for a deferred `"worktree"` checkout.
+   *  Empty string (the default) means "auto-name at submit time" —
+   *  see `checkoutMode`. Optional, defaults to `""`. */
+  worktreeName?: string;
+  /** Base branch the Thread Scope branch control is pointed at. Also
+   *  doubles as the best-effort display of "the project's current
+   *  checked-out branch" while `checkoutMode === "current"` (see
+   *  `ThreadScopeRow`) — picking a DIFFERENT branch while on
+   *  `"current"` flips `checkoutMode` to `"worktree"` with that pick
+   *  as the base, since silently repointing the user's real checkout
+   *  would be destructive. Optional, defaults to `""` (picker seeds
+   *  it once branches load, mirroring the branch popover's
+   *  main/master/first-branch heuristic). */
+  baseBranch?: string;
 }
 
 export interface ChatDraftStore {
@@ -113,6 +138,9 @@ export interface ChatDraftStore {
         | "contextWindow"
         | "permissionMode"
         | "mode"
+        | "checkoutMode"
+        | "worktreeName"
+        | "baseBranch"
       >
     >,
   ) => void;
@@ -217,6 +245,9 @@ function makeDraft(
     promoting: false,
     lastSendError: null,
     lockedToHome: opts.lockedToHome ?? false,
+    checkoutMode: "current",
+    worktreeName: "",
+    baseBranch: "",
   };
 }
 

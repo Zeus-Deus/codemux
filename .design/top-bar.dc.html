@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:opsz,wght@9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --sans:'DM Sans',ui-sans-serif,system-ui,sans-serif;
+    --mono:'JetBrains Mono',ui-monospace,monospace;
+    --bg:oklch(0.163 0.004 59); --bg2:oklch(0.198 0.005 59); --card:oklch(0.230 0.005 59); --card-h:oklch(0.262 0.006 59);
+    --pop:oklch(0.212 0.005 59); --pop-h:oklch(0.262 0.006 59);
+    --titlebar:oklch(0.142 0.004 59); --sidebar:oklch(0.180 0.004 59); --bd:oklch(0.303 0.006 59); --bd-soft:oklch(0.256 0.005 59);
+    --fg:oklch(0.972 0.003 70); --fg2:oklch(0.735 0.007 59); --fg3:oklch(0.578 0.008 59);
+    --primary:oklch(0.935 0.006 75); --primary-fg:oklch(0.205 0.01 60);
+    --ember:oklch(0.705 0.152 47);
+    --c-green:oklch(0.74 0.14 156); --c-amber:oklch(0.80 0.13 80); --c-sky:oklch(0.74 0.10 232);
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{font-family:var(--sans);background:#e8e6e1;}
+  .wsScroll::-webkit-scrollbar{width:9px}
+</style>
+<template id="__bundler_thumbnail"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><rect width="100" height="100" rx="18" fill="#1a1815"/><g fill="none" stroke="#d97757" stroke-width="3.6" stroke-linecap="round"><path d="M20 30h60M20 50h60M20 70h60"/></g></svg></template>
+</helmet>
+
+<div style="width:1180px;padding:38px;background:#e8e6e1;font-family:var(--sans);">
+
+  <div style="max-width:1100px;margin:0 auto 20px;text-align:center;">
+    <h1 style="margin:0 0 7px;font-size:22px;font-weight:700;letter-spacing:-.02em;color:#1c1a17;">A tighter top bar</h1>
+    <p style="margin:0 auto;max-width:720px;font-size:13.5px;line-height:1.6;color:#5b564e;">Three space fixes: tabs align to the content pane (not floating above the sidebar), pinned presets become icon squares, and Set&nbsp;Run collapses to a split icon button. Old bar on top, refined below.</p>
+  </div>
+
+  <!-- ===== OLD BAR ===== -->
+  <div style="max-width:1000px;margin:0 auto 10px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#8a857c;">Today</div>
+  <div style="max-width:1000px;margin:0 auto 30px;border-radius:11px;overflow:hidden;box-shadow:0 10px 30px rgba(0,0,0,.18);border:1px solid rgba(0,0,0,.24);">
+    <div style="display:flex;align-items:center;gap:2px;height:42px;padding:0 12px;background:var(--titlebar);">
+      <button style="width:28px;height:28px;border-radius:7px;border:none;background:transparent;color:var(--fg3);cursor:pointer;display:flex;align-items:center;justify-content:center;flex:none;"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2.5" width="12" height="11" rx="1.6"></rect><path d="M6 2.5v11" stroke-linecap="round"></path></svg></button>
+      <div style="display:flex;align-items:center;gap:7px;height:28px;padding:0 9px 0 10px;border-radius:8px;background:var(--bg);color:var(--fg);font-size:12px;font-weight:600;flex:none;"><svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 3.5h11v7h-5l-3 2.2V10.5h-3z" stroke-linejoin="round"></path></svg>Agent Chat<svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:.5;"><path d="M3 4.5 6 7.5 9 4.5" stroke-linecap="round"></path></svg><svg width="11" height="11" viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.5" style="opacity:.6;"><path d="M3 3l6 6M9 3l-6 6" stroke-linecap="round"></path></svg></div>
+      <button style="width:26px;height:26px;border-radius:7px;border:none;background:transparent;color:var(--fg3);cursor:pointer;font-size:15px;flex:none;">+</button>
+      <div style="display:flex;align-items:center;gap:7px;height:28px;padding:0 11px;border-radius:8px;border:1px solid color-mix(in oklch,var(--ember) 35%,transparent);background:color-mix(in oklch,var(--ember) 12%,transparent);color:var(--fg);font-size:11.5px;font-weight:600;flex:none;margin-left:4px;"><span style="width:13px;height:13px;border-radius:4px;background:color-mix(in oklch,var(--ember) 26%,transparent);color:var(--ember);display:flex;align-items:center;justify-content:center;font-size:8px;font-weight:800;">❖</span>Chat Agent</div>
+      <div style="margin-left:auto;display:flex;align-items:center;gap:9px;flex:none;">
+        <button style="width:28px;height:28px;border-radius:7px;border:none;background:transparent;color:var(--fg3);cursor:pointer;display:flex;align-items:center;justify-content:center;"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M9 2H4.5A1.5 1.5 0 0 0 3 3.5v9A1.5 1.5 0 0 0 4.5 14h7a1.5 1.5 0 0 0 1.5-1.5V6z" stroke-linejoin="round"></path></svg></button>
+        <div style="display:flex;align-items:center;gap:8px;height:28px;padding:0 11px;border-radius:8px;background:color-mix(in oklch,var(--fg) 8%,transparent);color:var(--fg);font-size:12px;font-weight:600;"><svg width="12" height="12" viewBox="0 0 16 16" fill="var(--c-green)" stroke="none"><path d="M4 3l9 5-9 5z"></path></svg>Set Run<span style="font-family:var(--mono);font-size:10px;color:var(--fg3);background:color-mix(in oklch,var(--fg) 10%,transparent);padding:1px 5px;border-radius:4px;">Ctrl+Shift+G</span></div>
+        <button style="width:28px;height:28px;border-radius:7px;border:none;background:transparent;color:var(--fg3);cursor:pointer;display:flex;align-items:center;justify-content:center;"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.1"></circle><path d="M8 1.6v1.8M8 12.6v1.8M1.6 8h1.8M12.6 8h1.8M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3" stroke-linecap="round"></path></svg></button>
+        <button style="width:28px;height:28px;border-radius:7px;border:none;background:transparent;color:var(--fg3);cursor:pointer;display:flex;align-items:center;justify-content:center;"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2.2" y="2.5" width="11.6" height="11" rx="1.6"></rect></svg></button>
+        <div style="display:flex;align-items:center;gap:7px;height:28px;padding:0 10px;border-radius:8px;background:color-mix(in oklch,var(--c-sky) 12%,transparent);color:var(--fg);font-size:12px;font-weight:600;"><span style="width:12px;height:12px;border-radius:3px;background:var(--c-sky);"></span>VS Code<svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.5" style="opacity:.5;"><path d="M3 4.5 6 7.5 9 4.5" stroke-linecap="round"></path></svg></div>
+        <div style="display:flex;align-items:center;gap:13px;color:var(--fg3);margin-left:5px;"><span style="width:11px;height:1.4px;background:currentColor;"></span><span style="width:10px;height:10px;border:1.4px solid currentColor;border-radius:2px;"></span><svg width="11" height="11" viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.4"><path d="M2 2l8 8M10 2l-8 8" stroke-linecap="round"></path></svg></div>
+      </div>
+    </div>
+    <div style="display:flex;height:74px;">
+      <div style="width:150px;flex:none;background:var(--sidebar);border-right:1px solid var(--bd-soft);"></div>
+      <div style="flex:1;background:var(--bg);"></div>
+    </div>
+  </div>
+
+  <!-- ===== REFINED BAR ===== -->
+  <div style="max-width:1000px;margin:0 auto 10px;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#8a857c;">Refined</div>
+  <div style="max-width:1000px;margin:0 auto;border-radius:11px;overflow:hidden;box-shadow:0 14px 36px rgba(0,0,0,.22);border:1px solid rgba(0,0,0,.24);position:relative;">
+    <div style="display:flex;align-items:center;height:42px;background:var(--titlebar);">
+      <!-- far-left: sidebar toggle only (sidebar-width cluster) -->
+      <div style="width:150px;flex:none;display:flex;align-items:center;gap:6px;padding:0 10px;border-right:1px solid var(--bd-soft);height:100%;">
+        <button style="width:28px;height:28px;border-radius:7px;border:none;background:transparent;color:var(--fg3);cursor:pointer;display:flex;align-items:center;justify-content:center;flex:none;" style-hover="background:color-mix(in oklch,var(--fg) 9%,transparent);color:var(--fg);"><svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2.5" width="12" height="11" rx="1.6"></rect><path d="M6 2.5v11" stroke-linecap="round"></path></svg></button>
+      </div>
+
+      <!-- tabs (scrollable) + pinned presets to the right of the last tab -->
+      <div style="flex:1;min-width:0;display:flex;align-items:center;gap:7px;padding:0 10px;height:100%;">
+        <!-- scrollable tab strip -->
+        <div style="flex:0 1 auto;min-width:0;display:flex;align-items:center;gap:3px;overflow-x:auto;height:100%;">
+          <div style="display:flex;align-items:center;gap:6px;width:118px;height:29px;padding:0 7px 0 10px;border-radius:8px;background:var(--bg);color:var(--fg);font-size:12px;font-weight:600;flex:none;">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="flex:none;"><path d="M2.5 3.5h11v7h-5l-3 2.2V10.5h-3z" stroke-linejoin="round"></path></svg>
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">git pull</span>
+            <svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" style="opacity:.55;flex:none;"><path d="M3 4.5 6 7.5 9 4.5" stroke-linecap="round"></path></svg>
+            <svg width="11" height="11" viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.5" style="opacity:.6;flex:none;"><path d="M3 3l6 6M9 3l-6 6" stroke-linecap="round"></path></svg>
+          </div>
+          <div style="display:flex;align-items:center;gap:6px;width:118px;height:29px;padding:0 10px;border-radius:8px;color:var(--fg3);font-size:12px;font-weight:500;flex:none;">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" style="flex:none;"><path d="M3 4.5 6 7 3 9.5M7.5 10h5.5" stroke-linecap="round" stroke-linejoin="round"></path></svg>
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Workspace 1</span>
+          </div>
+        </div>
+        <!-- new-tab -->
+        <button title="New agent" style="width:26px;height:26px;border-radius:7px;border:none;background:transparent;color:var(--fg3);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:16px;flex:none;" style-hover="background:color-mix(in oklch,var(--fg) 9%,transparent);color:var(--fg);">+</button>
+        <!-- divider + pinned preset icon squares (right of last tab, as before) -->
+        <div style="width:1px;height:16px;background:var(--bd-soft);flex:none;"></div>
+        <button title="Chat Agent" style="width:27px;height:27px;border-radius:7px;border:1px solid color-mix(in oklch,var(--ember) 40%,transparent);background:color-mix(in oklch,var(--ember) 14%,transparent);color:var(--ember);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex:none;">❖</button>
+        <button title="Claude Code" style="width:27px;height:27px;border-radius:7px;border:1px solid var(--bd);background:var(--bg2);color:var(--fg2);cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;flex:none;" style-hover="background:var(--card-h);">✳</button>
+      </div>
+
+      <!-- right cluster -->
+      <div style="flex:none;display:flex;align-items:center;gap:8px;padding:0 12px;height:100%;">
+        <!-- Set Run split icon button -->
+        <div style="display:flex;align-items:center;height:28px;border-radius:7px;overflow:hidden;border:1px solid var(--bd);background:var(--bg2);">
+          <button title="Set Run  ·  Ctrl+Shift+G" style="display:flex;align-items:center;gap:6px;height:100%;padding:0 9px;border:none;background:transparent;color:var(--fg);cursor:pointer;font-family:var(--sans);font-size:11.5px;font-weight:600;" style-hover="background:var(--card-h);"><svg width="11" height="11" viewBox="0 0 16 16" fill="var(--c-green)" stroke="none"><path d="M4 3l9 5-9 5z"></path></svg>Run</button>
+          <div style="width:1px;height:16px;background:var(--bd);"></div>
+          <button title="Configure run command" style="width:24px;height:100%;border:none;background:transparent;color:var(--fg3);cursor:pointer;display:flex;align-items:center;justify-content:center;" style-hover="background:var(--card-h);color:var(--fg);"><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M3 4.5 6 7.5 9 4.5" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+        </div>
+        <button title="Open in editor: VS Code — click to change" style="display:flex;align-items:center;gap:7px;height:28px;padding:0 9px;border-radius:7px;border:1px solid var(--bd);background:var(--bg2);color:var(--fg);cursor:pointer;flex:none;font-family:var(--sans);font-size:11.5px;font-weight:600;" style-hover="background:var(--card-h);"><span style="width:13px;height:13px;border-radius:3px;background:var(--c-sky);flex:none;"></span><svg width="10" height="10" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.6" style="opacity:.55;"><path d="M3 4.5 6 7.5 9 4.5" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+        <div style="width:1px;height:16px;background:var(--bd-soft);"></div>
+        <div style="display:flex;align-items:center;gap:14px;color:var(--fg3);"><span style="width:11px;height:1.4px;background:currentColor;"></span><span style="width:10px;height:10px;border:1.4px solid currentColor;border-radius:2px;"></span><svg width="11" height="11" viewBox="0 0 12 12" stroke="currentColor" stroke-width="1.4"><path d="M2 2l8 8M10 2l-8 8" stroke-linecap="round"></path></svg></div>
+      </div>
+    </div>
+    <div style="display:flex;height:74px;">
+      <div style="width:150px;flex:none;background:var(--sidebar);border-right:1px solid var(--bd-soft);"></div>
+      <div style="flex:1;background:var(--bg);position:relative;"></div>
+    </div>
+  </div>
+
+  <!-- notes -->
+  <div style="max-width:1000px;margin:22px auto 0;display:flex;gap:16px;">
+    <sc-for list="{{ notes }}" as="n" hint-placeholder-count="3">
+      <div style="flex:1;padding:13px 15px;border-radius:11px;background:#dedbd4;border:1px solid #cfccc4;">
+        <div style="font-size:12px;font-weight:700;color:#1c1a17;margin-bottom:4px;">{{ n.t }}</div>
+        <div style="font-size:11.5px;line-height:1.5;color:#5b564e;">{{ n.b }}</div>
+      </div>
+    </sc-for>
+  </div>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1180,&quot;height&quot;:540}}">
+class Component extends DCLogic {
+  renderVals() {
+    return {
+      notes: [
+        { t:'Tabs align to the pane', b:'Only the sidebar toggle sits far-left (sidebar-width). Tabs begin where the chat pane begins, and scroll horizontally with the wheel/trackpad if they ever overflow — like the old preset bar did.' },
+        { t:'Pins sit after the last tab', b:'Chat Agent + any pin are 27px glyph tiles right of the tabs (where they were before), with hover tooltips. + opens the full launcher.' },
+        { t:'Set Run split + editor dropdown', b:'Run is a split button (click = run, caret = configure) — the standalone gear is gone. The editor button keeps its caret so you can still pick the IDE / open target.' },
+      ],
+    };
+  }
+}
+</script>
+</body>
+</html>

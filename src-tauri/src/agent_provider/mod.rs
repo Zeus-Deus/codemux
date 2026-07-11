@@ -16,12 +16,16 @@ pub mod provider;
 pub mod types;
 
 pub use errors::{ProviderError, SerializableProviderError};
-pub use events::{CompletedItem, ContentDelta, ProviderRuntimeEvent, TurnStatus, TurnUsage};
+pub use events::{
+    child_exit_events, CompletedItem, ContentDelta, ProviderRuntimeEvent, SubagentSnapshot,
+    SubagentStatus, TurnStatus, TurnUsage, WorkflowPhaseSnapshot, WorkflowSnapshot,
+    CHILD_EXITED_SUBTYPE,
+};
 pub use instance::ProviderInstanceId;
 pub use provider::{AgentProvider, ProviderEventStream};
 pub use types::{
     ApprovalDecision, ChatModelInfo, ContextWindowOption, EffortGranularity, ImageInput,
     PermissionModeOption, ProviderCapabilities, ProviderChatCapabilities, ProviderKind,
-    ProviderSession, ProviderSessionId, RequestId, SendTurnInput, SessionStatus,
+    ProviderSession, ProviderSessionId, RequestId, SendOutcome, SendTurnInput, SessionStatus,
     StartSessionInput, ThreadId, TurnId, TurnStartResult,
 };

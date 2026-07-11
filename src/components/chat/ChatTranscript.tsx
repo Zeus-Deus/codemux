@@ -11,6 +11,11 @@ interface Props {
    *  acknowledged streaming OR the composer's optimistic flag is set.
    *  Drives the transcript-tail "working" marker. */
   streaming: boolean;
+  /** Stall-watchdog state — drives the amber "no activity" tail notice. */
+  stalled?: { silentForSecs: number } | null;
+  /** True when the last run never cleanly settled — drives the
+   *  "Run interrupted" tail divider. */
+  interrupted?: boolean;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). Forwarded to MessageList; Stage 3 wires the real value. */
   sessionStartedAt?: number;
@@ -20,23 +25,40 @@ interface Props {
   onRespondToRequest: (requestId: string, decision: ApprovalDecision) => void;
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
+  /** Follow-up queueing: cancel a queued turn (X on the greyed bubble).
+   *  `text` is passed back so the caller can restore it to the composer. */
+  onCancelQueued?: (queuedId: string, text: string) => void;
+  /** Follow-up queueing: send a queued turn now (steer) — soft-interrupts
+   *  the active turn and dispatches this message immediately. */
+  onSendQueuedNow?: (queuedId: string) => void;
+  /** Enter a subagent's read-only drill-in (design "Enter subagent"). */
+  onEnterSubagent?: (subagentId: string) => void;
+  /** Forwarded to MessageList for the WorkflowRunCard "Open panel"
+   *  affordance and the GUI-mode background-browser chip lookup
+   *  (docs/features/browser.md). */
+  workspaceId?: string | null;
 }
 
 /**
- * Transcript shell. The scroll container, stick-to-bottom pinning and
- * row windowing all live inside the virtualized `MessageList` (the
- * virtualizer must own its scroller to map scroll offsets onto the
- * rendered window) — this layer just sizes it and derives the
+ * Transcript shell. The scroll container and stick-to-bottom tracking
+ * (owned by the shadcn scroller engine inside `MessageList`) both live
+ * inside `MessageList` — this layer just sizes it and derives the
  * thinking-pulse flag.
  */
 export function ChatTranscript({
   messages,
   streaming,
+  stalled,
+  interrupted,
   sessionStartedAt,
   provider,
   onRespondToRequest,
   onAcceptPlan,
   onRejectPlan,
+  onCancelQueued,
+  onSendQueuedNow,
+  onEnterSubagent,
+  workspaceId,
 }: Props) {
   const showThinking = shouldShowThinkingIndicator(messages, streaming);
 
@@ -45,11 +67,18 @@ export function ChatTranscript({
       <MessageList
         messages={messages}
         showThinking={showThinking}
+        streaming={streaming}
+        stalled={stalled}
+        interrupted={interrupted}
         sessionStartedAt={sessionStartedAt}
         provider={provider}
         onRespondToRequest={onRespondToRequest}
         onAcceptPlan={onAcceptPlan}
         onRejectPlan={onRejectPlan}
+        onCancelQueued={onCancelQueued}
+        onSendQueuedNow={onSendQueuedNow}
+        onEnterSubagent={onEnterSubagent}
+        workspaceId={workspaceId}
       />
     </div>
   );

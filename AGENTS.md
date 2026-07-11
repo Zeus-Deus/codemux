@@ -19,11 +19,10 @@
 
 ## UI & Feature Work
 
-- The `/codemux-ui` skill auto-loads for visual and component work. It defines design standards, theming rules, and ADE feature patterns.
+- For visual and component work, read `docs/reference/DESIGN-SYSTEM.md` (color tokens, theming layers, the no-hardcoded-colors rule) and the relevant `docs/features/*` doc. (The former `/codemux-ui` skill was removed in PR #115; its theming rules now live in the design-system reference.)
 
 ## Skills
 
-- `/codemux-ui` auto-loads for visual and component work.
 - `/codemux-features` auto-loads for new ADE feature implementation.
 - `/codemux-openflow` auto-loads for orchestration runtime work.
 

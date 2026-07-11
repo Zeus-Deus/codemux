@@ -1978,6 +1978,22 @@ export function SettingsView() {
                       }}
                     />
                   </SettingRow>
+                  <Separator />
+                  {/* GUI-mode background browser viewport pin. Like the
+                      checkpoint toggle, only meaningful with the Agent
+                      Chat beta on — the peek popover it affects is a
+                      GUI-chrome surface. */}
+                  <SettingRow
+                    label="Desktop-size background browser"
+                    description="Start the agent's background browser at a real desktop viewport (1280×800) so pages render at full size in the peek popover, scaled to fit."
+                  >
+                    <Switch
+                      checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? false}
+                      onCheckedChange={(checked) => {
+                        updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
+                      }}
+                    />
+                  </SettingRow>
                 </>
               )}
             </div>

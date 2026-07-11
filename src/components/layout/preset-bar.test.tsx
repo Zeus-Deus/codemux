@@ -341,28 +341,28 @@ describe("PresetBar — Home-draft full gating (Task 7b revised)", () => {
     });
   });
 
-  it("Home draft + CLI preset → button is disabled and click is a no-op", async () => {
+  it("Home draft + CLI preset → the bar does not render at all (Thread Scope redesign)", async () => {
     const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
     useChatDraftStore.getState().setActiveDraft(draft.draftId);
 
     const cli = makePreset({ kind: "cli" });
     mockGetPresets.mockResolvedValue(makeSnapshot([cli]));
 
-    renderDraftPresetBar({ presets: [cli], draftId: draft.draftId });
+    const { container } = renderDraftPresetBar({
+      presets: [cli],
+      draftId: draft.draftId,
+    });
     await flushPromises();
 
-    const button = screen.getByRole("button", { name: /claude code/i });
-    expect(button).toBeDisabled();
-    // userEvent refuses to click disabled controls by default, matching
-    // the real browser semantics. Firing the low-level event bypasses
-    // pointer-capture checks and confirms our handler still bails.
-    fireEvent.click(button);
-    await flushPromises();
+    // No stray disabled bar — the component returns null outright for
+    // a Home draft (there's no project to launch CLI presets against).
+    expect(screen.queryByRole("button", { name: /claude code/i })).toBeNull();
+    expect(container.querySelector("button")).toBeNull();
     expect(mockMaterializeWithPreset).not.toHaveBeenCalled();
     expect(mockApplyPreset).not.toHaveBeenCalled();
   });
 
-  it("Home draft + Chat Agent preset → button is ALSO disabled (prevents duplicate chat)", async () => {
+  it("Home draft + Chat Agent preset → the bar does not render at all (prevents duplicate chat)", async () => {
     const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
     useChatDraftStore.getState().setActiveDraft(draft.draftId);
 
@@ -374,13 +374,14 @@ describe("PresetBar — Home-draft full gating (Task 7b revised)", () => {
     });
     mockGetPresets.mockResolvedValue(makeSnapshot([chatAgent]));
 
-    renderDraftPresetBar({ presets: [chatAgent], draftId: draft.draftId });
+    const { container } = renderDraftPresetBar({
+      presets: [chatAgent],
+      draftId: draft.draftId,
+    });
     await flushPromises();
 
-    const button = screen.getByRole("button", { name: /chat agent/i });
-    expect(button).toBeDisabled();
-    fireEvent.click(button);
-    await flushPromises();
+    expect(screen.queryByRole("button", { name: /chat agent/i })).toBeNull();
+    expect(container.querySelector("button")).toBeNull();
     // No dispatch of any kind — the user is already in a chat draft.
     expect(mockMaterializeWithPreset).not.toHaveBeenCalled();
     expect(mockApplyPreset).not.toHaveBeenCalled();

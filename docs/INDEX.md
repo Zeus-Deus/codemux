@@ -15,7 +15,8 @@
 5. relevant feature docs in `docs/features/`
 6. `docs/reference/ARCHITECTURE.md` if you need the repo/layer map
 7. `docs/reference/CONTROL.md` if touching CLI, socket, browser automation, memory, or indexing
-8. `AGENTS.md` for Codemux-specific agent operating rules
+8. `docs/reference/DESIGN-SYSTEM.md` if touching UI, components, colors, or theming
+9. `AGENTS.md` for Codemux-specific agent operating rules
 
 If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_REINDEX.md`.
 
@@ -34,7 +35,10 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Settings panel: `docs/features/settings.md`
 - Settings sync: `docs/features/settings-sync.md`
 - Agent Chat (Beta-gated chat pane, providers, sidecar, attachments): `docs/features/agent-chat.md`
+- Subagent view (cross-provider Subagents orchestration card + read-only drill-in — Claude / Codex / OpenCode; PR #125, shipped `v0.11.0`; the docked per-thread `SubagentActivityBar` that replaced the pane-header/titlebar "N subagents running" pills landed in PR #143, shipped `v0.13.0`): `docs/features/agent-chat.md` (§ Subagent view (cross-provider), § Docked live activity bar); locked plan + implementation record at `docs/plans/subagent-view.md`
 - Agent run checkpoints (issue #80 — opt-in background rollback snapshot at run start + restore): `docs/features/agent-chat.md` (§ Run checkpoints); design note at `docs/plans/agent-run-checkpoint.md`
+- Thread Scope (first-send scope controls moved below the composer on BOTH the draft surface and the pane's new-thread empty state — location/checkout/branch `ThreadScopeRow`, deferred + auto-named worktree creation on first send, Home draft hides the preset bar; PR #142, shipped `v0.13.0`): `docs/features/agent-chat.md` (§ Thread Scope (first-send scope controls))
+- Workflow orchestration (Claude-only — `Workflow` tool_use tap → in-thread `WorkflowRunCard` approval/progress/summary + conditional Orchestration right-panel tab with per-phase agent drill-in + `/workflow` slash command; PR #137, shipped `v0.12.0`): `docs/features/workflow-orchestration.md`
 - Multi-provider chat (Step 12): `docs/features/multi-provider-chat.md`; plan + final-state summary at `docs/plans/step-12-opencode-implementation-plan.md`; research at `docs/plans/step-12-opencode-research.md`; operator UI smoke at `docs/plans/step-12-ui-smoke-checklist.md`
 - Skills sync (server-side, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/plans/step-10-skills-sync.md`; research at `docs/plans/step-10-skills-sync-research.md`; operator UI smoke at `docs/plans/step-10-ui-smoke-checklist.md`
 - Attachments + context system (Step 8): `docs/plans/step-8-attachments.md` (research + locked plan)
@@ -43,14 +47,15 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md` (browser stream stability fix archived at `docs/archive/browser-stream-fix.md`)
+- Background browser in Agent Chat GUI mode (agent-opened browser runs detached instead of splitting the chat — inline chip + context-bar indicator + floating `BrowserPeekOverlay` with promote-to-pane; PR #138, shipped `v0.12.0`; run-finished `LIVE` release (PR #139) + opt-in desktop-size peek viewport `agent_chat.background_browser_desktop_viewport` (PR #140), both shipped `v0.13.0`): `docs/features/browser.md` (§ Background browser in GUI mode, § Run-finished release, § Desktop-size peek viewport)
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
 - MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/plans/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`; **MCP-on-remote** (headless `codemux-remote serve` + 12-tool stdio MCP bridge — landed in `v0.6.2`, `worktree_create` added in `v0.7.5`) plan at `docs/plans/mcp-on-remote.md`; the `v0.7.5` agent-created-workspace pull/adoption fix is tracked at `docs/plans/remote-workspace-pull-fix.md`
 - File editor: `docs/features/file-editor.md`
 - Diff viewer: `docs/features/diff-viewer.md`
 - File tree: `docs/features/file-tree.md`
-- Merge resolver: `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
+- Merge resolver (**currently unreachable from the UI** — backend, commands, store, and settings row intact, but both entry-point buttons were removed by `92965c9`): `docs/features/merge-resolver.md`, `docs/plans/git-bot.md`
 - Changes panel: `docs/features/changes-panel.md`
-- Review tab / PR integration: `docs/features/review-integration.md`
+- Review tab / PR integration (resting layout: header + checks + read-only threads; the review composer, merge controls, and deployments were intentionally removed, backends retained): `docs/features/review-integration.md`
 - GitHub issues: `docs/features/github-issues.md`
 - Terminal system: `docs/features/terminal.md`
 - Resource monitor (title-bar CPU/memory): `docs/features/resource-monitor.md`
@@ -71,19 +76,23 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Project memory: `docs/features/project-memory.md`
 - Command palette: `docs/features/command-palette.md`
 - Workspace creation: `docs/features/workspace-creation.md`; model-selection-at-launch plan at `docs/plans/model-selection-before-launch.md`
+- Non-git projects (plain-folder mode — `is_git` snapshot flag, opt-in "Initialize Git" bare-`git init` affordance in the context bar / Context Row cluster / Changes panel, worktree controls hidden in Thread Scope, no add-path git gate; PRs #147/#148, shipped `v0.13.1`): `docs/features/workspace-creation.md` (§ Non-Git Projects)
 - Workspaces overview (full-screen device-grouped list with filters, sibling-device adoption, confirm-before-push + undo, divergence chip, elapsed-time pill): `docs/features/workspaces-overview.md`
 - Project identity (first-class `project_uid` + `main`/`worktree` kind + boot sweep, Superset-adapted): `docs/plans/project-identity.md`
 - Workspaces sync (cross-device workspace registry — `/api/workspaces` + 30s pull/push loop + git-HEAD divergence tracking + **asymmetric auto-publish from `codemux-remote` hosts** via the 60s `hosts_inventory` SSH poller): `docs/features/workspaces-sync.md`; **repo-unit sync** (treat repo root + worktrees as one shared-history unit instead of cloning the default-branch checkout into a divergent copy; protected non-deletable `repo root` entry + `standalone copy` warning chip — shipped `v0.7.8`, snapshot-local only) — current behavior in `docs/features/workspaces-sync.md` + `docs/features/workspaces-overview.md`, plan + remaining follow-ups (SSH round-trip validation) at `docs/plans/repo-unit-sync.md`; **`v0.7.9` multi-device robustness pass** (project-first "Pull project" + protected root + `default_branch`, serialized adopts, `dedupe_sibling_rows`, one-repo-root-per-project, uid-keyed collision-safe host paths, non-destructive "Reconcile copy") in `docs/features/workspaces-sync.md` § "Robustness hardening"
 - Project avatars (sidebar project image + color customization, favicon derivation + cache-bust): `docs/features/project-avatars.md`
 - IDE integration: `docs/features/ide-integration.md`
 - Left sidebar (two-state expanded ↔ icon rail, with aggregate agent-status dots on collapsed project avatars + per-project hover flyout — Superset-adapted): `docs/features/sidebar.md`
-- Workspace context bar (bottom status strip under the work surface: branch · kind · ↑↓ · diff · PR/issue chips · device for the active workspace — the detail home for the clean sidebar appearance): `docs/features/workspace-context-bar.md`
+- Workspace context bar (bottom status strip under the work surface: branch · kind · ↑↓ · diff · PR/issue chips · background-browser pill · device for the active workspace — the detail home for the clean sidebar appearance; since PR #144 it hides itself while an Agent Chat pane is active in GUI chrome, and the same detail renders in the pane's Context Row instead): `docs/features/workspace-context-bar.md`
+- Context Row (the Agent Chat pane's below-composer status row — read-only project/branch labels + the shared `WorkspaceStatusCluster` (behind chip, PR chip, `BackgroundBrowserIndicator`, workspace-details popover); renders once a thread has messages and as `ThreadScopeRow`'s `trailing` slot before the first send, so status reads identically on both sides of first send; PR #144, shipped `v0.13.0`): `docs/features/agent-chat.md` (§ Context Row (running-thread status)); the bar's side of the split at `docs/features/workspace-context-bar.md`
+- GUI chrome (Agent Chat Beta on: the four chrome rows collapse to a single `h-10` title bar with in-titlebar tabs + `+` agent launcher + inline chat favorite + rehomed right-panel/Run controls; legacy chrome byte-identical when the flag is off; PR #135, shipped `v0.12.0` — the in-titlebar "N subagents running" pill was later removed by PR #143 in favor of the docked `SubagentActivityBar`): `docs/features/gui-chrome.md`
 - Notifications: `docs/features/notifications.md`
 - Auto-update: `docs/features/auto-update.md`
 - Windows cross-platform work: `docs/plans/windows-support.md`
 - Dev mock runtime (dual-guarded `src/dev/` Tauri shim that boots the real UI in a plain browser under `npm run dev` with seed data, for visual/screenshot work): `docs/features/dev-mock-runtime.md`
 - Web remote access (embedded default-off HTTP+WS server in the desktop app; a browser on another device loads the same UI bundle and drives the same running instance via a `__TAURI_INTERNALS__` WebSocket shim — pairing-token auth, mirror-mode multi-client stream fan-out, web fallbacks incl. remote project creation): `docs/features/web-remote-access.md`; locked design contract + remaining work at `docs/plans/web-remote-access.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
+- Design system (color tokens, theming layers, `.theme-warm`/density scales, the no-hardcoded-colors rule — shadcn stone base `b1HYEHloH`): `docs/reference/DESIGN-SYSTEM.md`
 - Keyboard shortcuts: `docs/reference/SHORTCUTS.md`
 - Feature inventory: `docs/reference/FEATURES.md`
 - Control and automation work: `docs/reference/CONTROL.md`

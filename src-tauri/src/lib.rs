@@ -206,6 +206,12 @@ pub fn run() {
         // events (incl. the content_delta token stream) to it instead
         // of broadcasting on the global event bus. See issue #75.
         .manage(commands::agent_chat::AgentChatChannelRegistry::default())
+        // Per-thread running-subagent tracker: keeps the sidebar
+        // "working" spinner alive when the parent chat turn finishes
+        // while subagents it spawned are still running. Consulted by
+        // forward_event → publish_pane_status. See agent_chat.rs.
+        .manage(commands::agent_chat::SubagentTracker::default())
+        .manage(commands::agent_chat::RunActivityTracker::default())
         // Step 12 Stage 2 — singleton supervisor for the lazily
         // spawned `opencode serve` child. `ensure_running()` is the
         // entry point used by `opencode_list_models`; the server is
@@ -809,6 +815,14 @@ pub fn run() {
                         // fresh Tokio task each.
                         commands::agent_chat::spawn_event_bridge(registry_handle.clone())
                             .await;
+                        // Detect silently-dead runs: a periodic sweep that
+                        // flags mid-turn threads gone quiet past the stall
+                        // threshold (issue #154). Advisory only — it never
+                        // kills a session.
+                        commands::agent_chat::spawn_stall_watchdog(
+                            registry_handle.clone(),
+                        )
+                        .await;
                     });
                 }
             }
@@ -1055,6 +1069,72 @@ pub fn run() {
                                 run,
                             ),
                         );
+                    }
+                }
+            });
+
+            // ── Agent-browser orphan sweep (issue #126) ──
+            //
+            // Reap-on-close (see `reap_agent_browser_sessions` in
+            // commands/workspace.rs) is the primary teardown mechanism: it
+            // fires the instant a workspace closes on either close path.
+            // This sweep is the backstop for any other route a workspace
+            // can disappear through (e.g. a future removal path that
+            // forgets to call the reap helper, or a state mutation this
+            // review missed) — without it, a single missed teardown site
+            // would leak a headless Chromium daemon for the rest of the
+            // app's lifetime, which is exactly the bug reported in #126.
+            //
+            // Safety properties:
+            //   - In-memory-keys-only: `manager.session_keys()` only ever
+            //     returns sessions THIS app instance spawned, so the sweep
+            //     can never touch a daemon owned by another codemux
+            //     instance (no `agent-browser session list` shell-out).
+            //   - `ws-*` filter: only workspace-scoped session names are
+            //     eligible for the sweep (`orphaned_ws_sessions`). User
+            //     browser-pane sessions (`browser-NNN`) and the `default`
+            //     session are never touched.
+            //   - Ordering: `tracked` is snapshotted from the manager
+            //     BEFORE `live` is computed from app state. A session
+            //     created concurrently with a sweep tick is therefore
+            //     guaranteed to show up in `live` (its workspace still
+            //     exists when we read state) even if it raced into
+            //     `tracked` — so a session can never be reaped moments
+            //     after it was created.
+            let sweep_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                const SWEEP_INTERVAL_SECS: u64 = 300;
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                    SWEEP_INTERVAL_SECS,
+                ));
+                // Consume the immediate first tick — the sweep must not
+                // run at t=0, before startup reconcile (PID-file adoption,
+                // workspace hydration) has had room to settle.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+
+                    let manager: tauri::State<'_, agent_browser::AgentBrowserManager> =
+                        sweep_handle.state();
+                    // FIRST: snapshot tracked keys before computing the
+                    // live set — see the ordering note above.
+                    let tracked = manager.session_keys().await;
+
+                    let state: tauri::State<'_, state::AppStateStore> =
+                        sweep_handle.state();
+                    let live = state.live_agent_browser_session_names();
+
+                    for name in agent_browser::orphaned_ws_sessions(&tracked, &live) {
+                        eprintln!(
+                            "[codemux::browser] sweep: closing orphaned agent-browser \
+                             session {name} (owning workspace gone)"
+                        );
+                        if let Err(error) = manager.close(&name).await {
+                            eprintln!(
+                                "[codemux::browser] sweep: failed to close orphaned \
+                                 session {name}: {error}"
+                            );
+                        }
                     }
                 }
             });
@@ -1554,6 +1634,8 @@ pub fn run() {
             commands::dev_agent_chat_spawn_test_pane,
             commands::agent_chat_start_session,
             commands::agent_chat_send_turn,
+            commands::agent_chat_cancel_queued_turn,
+            commands::agent_chat_send_queued_turn_now,
             commands::agent_chat_interrupt_turn,
             commands::agent_chat_respond_to_request,
             commands::agent_chat_set_model,
@@ -1562,6 +1644,8 @@ pub fn run() {
             commands::list_launch_gemini_models,
             commands::agent_chat_stop_session,
             commands::agent_chat_list_sessions,
+            commands::agent_chat_get_session,
+            commands::agent_chat_update_session_config,
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
@@ -1618,6 +1702,7 @@ pub fn run() {
             commands::set_project_scripts,
             commands::check_is_git_repo,
             commands::init_git_repo,
+            commands::init_git_repo_no_commit,
             commands::create_empty_repo,
             commands::get_git_status,
             commands::get_git_diff,
@@ -1700,6 +1785,7 @@ pub fn run() {
             commands::write_file,
             commands::save_clipboard_image_bytes,
             commands::paste_clipboard_image_to_file,
+            commands::paste_clipboard_image,
             commands::grep_count_pattern,
             commands::reveal_in_file_manager,
             commands::start_oauth_flow,

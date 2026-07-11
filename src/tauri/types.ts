@@ -51,9 +51,14 @@ export interface SessionRestoreSettings {
 
 /** Mirrors src-tauri/src/settings_sync.rs:AgentChatSettings.
  *  `checkpoints_enabled` is the opt-in for the run-start rollback
- *  checkpoint (issue #80) — default OFF. */
+ *  checkpoint (issue #80) — default OFF.
+ *  `background_browser_desktop_viewport` pins the GUI-mode background
+ *  browser's peek popover (`BrowserPeekOverlay.tsx`) to a real desktop
+ *  viewport (1280×800) instead of shrinking to the popover's pixel
+ *  size — default OFF. */
 export interface AgentChatSyncSettings {
   checkpoints_enabled: boolean;
+  background_browser_desktop_viewport: boolean;
 }
 
 export interface UserSettings {
@@ -769,6 +774,12 @@ export interface WorkspaceSnapshot {
   title: string;
   workspace_type: WorkspaceType;
   cwd: string;
+  /** Whether the workspace directory is inside a git repository. Non-git
+   *  folders run in plain-directory mode (no worktrees/diffs/checkpoints)
+   *  and the UI offers an explicit "Initialize Git" action. Optional —
+   *  older snapshots persisted without it; treat missing as `true`
+   *  (optimistic, matching the Rust serde default). */
+  is_git?: boolean;
   git_branch: string | null;
   git_ahead: number;
   git_behind: number;

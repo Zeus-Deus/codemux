@@ -521,35 +521,288 @@ impl NotificationMessage {
 }
 
 /// Params for `thread/started`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// # Wire-drift tolerance
+///
+/// Two shapes are observed in the wild and both must decode:
+///
+/// * **Legacy flat** — `{ "threadId": "..." }`.
+/// * **v2 nested** — `{ "thread": { "id": "...", "parentThreadId": "...",
+///   "agentNickname": "...", "agentRole": "..." } }`.
+///
+/// The nested shape additionally carries subagent identity: when Codex
+/// spawns a sub-agent thread, `parentThreadId` points at the spawning
+/// thread and `agentNickname` / `agentRole` name the sub-agent. Those
+/// fields let the adapter demux child-thread notifications into the
+/// canonical subagent view. Both shapes are decoded via an untagged
+/// helper enum; a malformed payload (neither `threadId` nor `thread.id`)
+/// fails to deserialize and falls through to
+/// [`NotificationMessage::Unknown`].
+#[derive(Debug, Clone)]
 pub struct ThreadStartedParams {
-    /// Codex thread identifier.
+    /// Codex thread identifier of the thread that started.
     pub thread_id: String,
+    /// Parent thread id — set only when this thread is a spawned
+    /// sub-agent (v2 nested shape).
+    pub parent_thread_id: Option<String>,
+    /// Random unique nickname assigned to an AgentControl-spawned
+    /// sub-agent (v2 nested shape).
+    pub agent_nickname: Option<String>,
+    /// Role (`agent_role`) assigned to an AgentControl-spawned sub-agent
+    /// (v2 nested shape).
+    pub agent_role: Option<String>,
+}
+
+/// Untagged decode helper for [`ThreadStartedParams`]. Tries the v2
+/// nested shape first, then the legacy flat shape.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ThreadStartedWire {
+    Nested { thread: ThreadStartedThread },
+    Flat {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+    },
+}
+
+/// Subset of the v2 `Thread` object we care about for demux/identity.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadStartedThread {
+    id: String,
+    #[serde(default)]
+    parent_thread_id: Option<String>,
+    #[serde(default)]
+    agent_nickname: Option<String>,
+    #[serde(default)]
+    agent_role: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for ThreadStartedParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match ThreadStartedWire::deserialize(deserializer)? {
+            ThreadStartedWire::Nested { thread } => Self {
+                thread_id: thread.id,
+                parent_thread_id: thread.parent_thread_id,
+                agent_nickname: thread.agent_nickname,
+                agent_role: thread.agent_role,
+            },
+            ThreadStartedWire::Flat { thread_id } => Self {
+                thread_id,
+                parent_thread_id: None,
+                agent_nickname: None,
+                agent_role: None,
+            },
+        })
+    }
+}
+
+/// Shared subset of the v2 `Turn` object used by both turn notifications.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnObj {
+    id: String,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    error: Option<TurnErrorObj>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+}
+
+/// The v2 `TurnError` object; we only surface its `message`.
+#[derive(Deserialize)]
+struct TurnErrorObj {
+    message: String,
 }
 
 /// Params for `turn/started`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// Decodes BOTH the legacy flat `{ threadId, turnId }` shape AND the v2
+/// nested `{ threadId, turn: { id, status, ... } }` shape.
+#[derive(Debug, Clone)]
 pub struct TurnStartedParams {
-    /// Codex thread identifier.
+    /// Codex thread identifier (may be the parent thread or a sub-agent
+    /// child thread — the adapter demuxes on it).
     pub thread_id: String,
     /// Turn identifier.
     pub turn_id: String,
 }
 
+/// Untagged decode helper for [`TurnStartedParams`].
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TurnStartedWire {
+    Nested {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        turn: TurnObj,
+    },
+    Flat {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "turnId")]
+        turn_id: String,
+    },
+}
+
+impl<'de> Deserialize<'de> for TurnStartedParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match TurnStartedWire::deserialize(deserializer)? {
+            TurnStartedWire::Nested { thread_id, turn } => Self {
+                thread_id,
+                turn_id: turn.id,
+            },
+            TurnStartedWire::Flat {
+                thread_id,
+                turn_id,
+            } => Self { thread_id, turn_id },
+        })
+    }
+}
+
 /// Params for `turn/completed`.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+///
+/// Decodes BOTH the legacy flat `{ threadId, turnId, status, error }`
+/// shape AND the v2 nested `{ threadId, turn: { id, status, error,
+/// durationMs } }` shape. `status` is preserved verbatim; the v2 nested
+/// shape reports `completed` / `interrupted` / `failed` / `inProgress`
+/// where the legacy shape reports `succeeded` / `failed`, and the
+/// translator accepts both vocabularies.
+#[derive(Debug, Clone)]
 pub struct TurnCompletedParams {
     /// Codex thread identifier.
     pub thread_id: String,
     /// Turn identifier.
     pub turn_id: String,
-    /// Outcome status — typically `"succeeded"` or `"failed"`.
+    /// Outcome status. Legacy: `"succeeded"` / `"failed"`. v2:
+    /// `"completed"` / `"interrupted"` / `"failed"` / `"inProgress"`.
     pub status: String,
-    /// Optional error string when `status == "failed"`.
+    /// Error message when the turn failed (flattened from the v2
+    /// `TurnError` object or taken from the legacy flat string).
     pub error: Option<String>,
+    /// Elapsed wall-clock time in milliseconds, when the v2 shape
+    /// reports it. Feeds a sub-agent's `duration_ms` for child turns.
+    pub duration_ms: Option<u64>,
+}
+
+/// Untagged decode helper for [`TurnCompletedParams`].
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TurnCompletedWire {
+    Nested {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        turn: TurnObj,
+    },
+    Flat {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "turnId")]
+        turn_id: String,
+        status: String,
+        #[serde(default)]
+        error: Option<String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for TurnCompletedParams {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match TurnCompletedWire::deserialize(deserializer)? {
+            TurnCompletedWire::Nested { thread_id, turn } => Self {
+                thread_id,
+                turn_id: turn.id,
+                status: turn.status.unwrap_or_default(),
+                error: turn.error.map(|e| e.message),
+                duration_ms: turn.duration_ms,
+            },
+            TurnCompletedWire::Flat {
+                thread_id,
+                turn_id,
+                status,
+                error,
+            } => Self {
+                thread_id,
+                turn_id,
+                status,
+                error,
+                duration_ms: None,
+            },
+        })
+    }
+}
+
+/// Decoded `collabAgentToolCall` thread item (the multi-agent launch /
+/// lifecycle tool call). Emitted on the parent thread when it spawns,
+/// waits on, or closes a sub-agent. The adapter maps it to
+/// [`SubagentUpdated`](crate::agent_provider::ProviderRuntimeEvent::SubagentUpdated)
+/// and suppresses its generic tool rendering.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabAgentToolCallItem {
+    /// Unique identifier for this collab tool call (the spawning
+    /// `parent_item_id`).
+    pub id: String,
+    /// Which collab tool ran: `spawnAgent` | `sendInput` | `resumeAgent`
+    /// | `wait` | `closeAgent`.
+    pub tool: String,
+    /// Current status of the collab tool call: `inProgress` |
+    /// `completed` | `failed`.
+    pub status: String,
+    /// Thread id of the agent issuing the collab request.
+    #[serde(default)]
+    pub sender_thread_id: Option<String>,
+    /// Thread ids of the receiving agents. For `spawnAgent` this is the
+    /// newly spawned child thread id(s).
+    #[serde(default)]
+    pub receiver_thread_ids: Vec<String>,
+    /// Last known status of the target agents, keyed by thread id.
+    /// `BTreeMap` for deterministic iteration in tests.
+    #[serde(default)]
+    pub agents_states: std::collections::BTreeMap<String, CollabAgentStateObj>,
+    /// Model requested for the spawned agent, when applicable.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Prompt text sent as part of the collab tool call, when available.
+    #[serde(default)]
+    pub prompt: Option<String>,
+}
+
+/// Per-agent state block inside [`CollabAgentToolCallItem::agents_states`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollabAgentStateObj {
+    /// One of `pendingInit` | `running` | `interrupted` | `completed` |
+    /// `errored` | `shutdown` | `notFound`.
+    pub status: String,
+    /// Optional live status message — feeds the subagent activity line.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// Decoded `subAgentActivity` thread item — a cheap status tick emitted
+/// when a sub-agent starts, is interacted with, or is interrupted.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubAgentActivityItem {
+    /// Unique identifier for this activity item.
+    pub id: String,
+    /// Thread id of the sub-agent this activity refers to.
+    pub agent_thread_id: String,
+    /// Path to the sub-agent, when reported.
+    #[serde(default)]
+    pub agent_path: Option<String>,
+    /// One of `started` | `interacted` | `interrupted`.
+    pub kind: String,
 }
 
 /// Params for a server-emitted `error` notification.
@@ -1088,5 +1341,202 @@ mod tests {
 
         let r = ServerRequestMessage::from_raw("foo/baz", json!({}));
         assert_eq!(r.request_kind(), "unknown");
+    }
+
+    // ── Wire-drift tolerance: thread/started ──
+
+    #[test]
+    fn thread_started_decodes_legacy_flat_shape() {
+        let m = NotificationMessage::from_raw("thread/started", json!({"threadId": "flat-1"}));
+        match m {
+            NotificationMessage::ThreadStarted(p) => {
+                assert_eq!(p.thread_id, "flat-1");
+                assert!(p.parent_thread_id.is_none());
+                assert!(p.agent_nickname.is_none());
+                assert!(p.agent_role.is_none());
+            }
+            _ => panic!("expected ThreadStarted"),
+        }
+    }
+
+    #[test]
+    fn thread_started_decodes_v2_nested_shape_with_subagent_identity() {
+        let m = NotificationMessage::from_raw(
+            "thread/started",
+            json!({
+                "thread": {
+                    "id": "child-1",
+                    "parentThreadId": "parent-1",
+                    "agentNickname": "Explore",
+                    "agentRole": "explore",
+                    // extra fields the real server sends are ignored:
+                    "cwd": "/tmp",
+                    "status": "running",
+                    "turns": []
+                }
+            }),
+        );
+        match m {
+            NotificationMessage::ThreadStarted(p) => {
+                assert_eq!(p.thread_id, "child-1");
+                assert_eq!(p.parent_thread_id.as_deref(), Some("parent-1"));
+                assert_eq!(p.agent_nickname.as_deref(), Some("Explore"));
+                assert_eq!(p.agent_role.as_deref(), Some("explore"));
+            }
+            _ => panic!("expected ThreadStarted"),
+        }
+    }
+
+    // ── Wire-drift tolerance: turn/started ──
+
+    #[test]
+    fn turn_started_decodes_legacy_flat_shape() {
+        let m = NotificationMessage::from_raw(
+            "turn/started",
+            json!({"threadId": "c1", "turnId": "t1"}),
+        );
+        match m {
+            NotificationMessage::TurnStarted(p) => {
+                assert_eq!(p.thread_id, "c1");
+                assert_eq!(p.turn_id, "t1");
+            }
+            _ => panic!("expected TurnStarted"),
+        }
+    }
+
+    #[test]
+    fn turn_started_decodes_v2_nested_shape() {
+        let m = NotificationMessage::from_raw(
+            "turn/started",
+            json!({"threadId": "c1", "turn": {"id": "t1", "status": "inProgress", "items": []}}),
+        );
+        match m {
+            NotificationMessage::TurnStarted(p) => {
+                assert_eq!(p.thread_id, "c1");
+                assert_eq!(p.turn_id, "t1");
+            }
+            _ => panic!("expected TurnStarted"),
+        }
+    }
+
+    // ── Wire-drift tolerance: turn/completed ──
+
+    #[test]
+    fn turn_completed_decodes_legacy_flat_shape() {
+        let m = NotificationMessage::from_raw(
+            "turn/completed",
+            json!({"threadId": "c1", "turnId": "t1", "status": "succeeded"}),
+        );
+        match m {
+            NotificationMessage::TurnCompleted(p) => {
+                assert_eq!(p.thread_id, "c1");
+                assert_eq!(p.turn_id, "t1");
+                assert_eq!(p.status, "succeeded");
+                assert!(p.error.is_none());
+                assert!(p.duration_ms.is_none());
+            }
+            _ => panic!("expected TurnCompleted"),
+        }
+    }
+
+    #[test]
+    fn turn_completed_decodes_legacy_flat_error_string() {
+        let m = NotificationMessage::from_raw(
+            "turn/completed",
+            json!({"threadId": "c1", "turnId": "t1", "status": "failed", "error": "boom"}),
+        );
+        match m {
+            NotificationMessage::TurnCompleted(p) => {
+                assert_eq!(p.status, "failed");
+                assert_eq!(p.error.as_deref(), Some("boom"));
+            }
+            _ => panic!("expected TurnCompleted"),
+        }
+    }
+
+    #[test]
+    fn turn_completed_decodes_v2_nested_shape_with_duration_and_error() {
+        let m = NotificationMessage::from_raw(
+            "turn/completed",
+            json!({
+                "threadId": "c1",
+                "turn": {
+                    "id": "t1",
+                    "status": "failed",
+                    "durationMs": 4321,
+                    "error": {"message": "kaboom", "additionalDetails": null},
+                    "items": []
+                }
+            }),
+        );
+        match m {
+            NotificationMessage::TurnCompleted(p) => {
+                assert_eq!(p.thread_id, "c1");
+                assert_eq!(p.turn_id, "t1");
+                assert_eq!(p.status, "failed");
+                assert_eq!(p.error.as_deref(), Some("kaboom"));
+                assert_eq!(p.duration_ms, Some(4321));
+            }
+            _ => panic!("expected TurnCompleted"),
+        }
+    }
+
+    #[test]
+    fn turn_completed_v2_nested_completed_status_preserved() {
+        // v2 vocabulary reports "completed" (not "succeeded"); the raw
+        // string is preserved for the translator to normalize.
+        let m = NotificationMessage::from_raw(
+            "turn/completed",
+            json!({"threadId": "c1", "turn": {"id": "t1", "status": "completed", "items": []}}),
+        );
+        match m {
+            NotificationMessage::TurnCompleted(p) => assert_eq!(p.status, "completed"),
+            _ => panic!("expected TurnCompleted"),
+        }
+    }
+
+    // ── collabAgentToolCall / subAgentActivity item decode ──
+
+    #[test]
+    fn collab_agent_tool_call_item_decodes_spawn_fields() {
+        let call: CollabAgentToolCallItem = serde_json::from_value(json!({
+            "type": "collabAgentToolCall",
+            "id": "call-1",
+            "tool": "spawnAgent",
+            "status": "completed",
+            "senderThreadId": "parent-1",
+            "receiverThreadIds": ["child-1"],
+            "model": "gpt-5.4",
+            "prompt": "explore the repo",
+            "agentsStates": {
+                "child-1": {"status": "running", "message": "reading files"}
+            }
+        }))
+        .unwrap();
+        assert_eq!(call.id, "call-1");
+        assert_eq!(call.tool, "spawnAgent");
+        assert_eq!(call.status, "completed");
+        assert_eq!(call.sender_thread_id.as_deref(), Some("parent-1"));
+        assert_eq!(call.receiver_thread_ids, vec!["child-1".to_string()]);
+        assert_eq!(call.model.as_deref(), Some("gpt-5.4"));
+        let st = call.agents_states.get("child-1").unwrap();
+        assert_eq!(st.status, "running");
+        assert_eq!(st.message.as_deref(), Some("reading files"));
+    }
+
+    #[test]
+    fn sub_agent_activity_item_decodes_fields() {
+        let act: SubAgentActivityItem = serde_json::from_value(json!({
+            "type": "subAgentActivity",
+            "id": "act-1",
+            "agentThreadId": "child-1",
+            "agentPath": "root/child",
+            "kind": "interacted"
+        }))
+        .unwrap();
+        assert_eq!(act.id, "act-1");
+        assert_eq!(act.agent_thread_id, "child-1");
+        assert_eq!(act.agent_path.as_deref(), Some("root/child"));
+        assert_eq!(act.kind, "interacted");
     }
 }

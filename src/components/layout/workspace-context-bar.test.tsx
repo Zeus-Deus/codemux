@@ -2,7 +2,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import type { WorkspaceSnapshot } from "@/tauri/types";
+import type { AgentBrowserSession, WorkspaceSnapshot } from "@/tauri/types";
 
 // ── Mocks ──
 //
@@ -11,18 +11,28 @@ import type { WorkspaceSnapshot } from "@/tauri/types";
 const mocks = vi.hoisted(() => ({
   workspace: null as WorkspaceSnapshot | null,
   lazyEnabled: false,
+  enableAgentChat: false,
   activeDraftId: null as string | null,
   onboardingProjectDir: null as string | null,
   hosts: [] as Array<{ id: number; name: string }>,
   openUrl: vi.fn().mockResolvedValue(undefined),
+  agentBrowserSessions: [] as AgentBrowserSession[],
+  agentChatPaneActive: false,
 }));
 
 vi.mock("@/stores/app-store", () => ({
   useActiveWorkspace: () => mocks.workspace,
+  useAppStore: (sel: (s: Record<string, unknown>) => unknown) =>
+    sel({
+      appState: { agent_browser_sessions: mocks.agentBrowserSessions },
+    }),
 }));
 vi.mock("@/stores/feature-flags", () => ({
   useFeatureFlags: (sel: (s: Record<string, unknown>) => unknown) =>
-    sel({ enableLazyWorkspaceCreation: mocks.lazyEnabled }),
+    sel({
+      enableLazyWorkspaceCreation: mocks.lazyEnabled,
+      enableAgentChat: mocks.enableAgentChat,
+    }),
 }));
 vi.mock("@/stores/chat-draft-store", () => ({
   useChatDraftStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -35,17 +45,25 @@ vi.mock("@/stores/ui-store", () => ({
 vi.mock("@/stores/hosts-store", () => ({
   useHosts: () => mocks.hosts,
 }));
+vi.mock("@/hooks/use-gui-chrome", () => ({
+  useAgentChatPaneActive: () => mocks.agentChatPaneActive,
+}));
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: (...args: unknown[]) => mocks.openUrl(...args),
 }));
 // IssueDetailPopover fetches the full issue lazily on open; the bar
 // tests only assert the trigger chip, so a null resolve is enough.
+// initGitRepo / refreshWorkspaceGitInfo back the non-git "Initialize
+// Git" affordance (use-initialize-git.ts).
 vi.mock("@/tauri/commands", () => ({
   getGithubIssue: vi.fn().mockResolvedValue(null),
+  initGitRepo: vi.fn().mockResolvedValue("/home/dev/projects/scratch"),
+  refreshWorkspaceGitInfo: vi.fn().mockResolvedValue(undefined),
 }));
 
 // Late import so the mocks above apply.
 import { WorkspaceContextBar } from "./workspace-context-bar";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -78,13 +96,34 @@ function makeWorkspace(
   };
 }
 
+function makeBackgroundSession(
+  overrides: Partial<AgentBrowserSession> = {},
+): AgentBrowserSession {
+  return {
+    session_id: "abs-1",
+    workspace_id: "ws-1",
+    cli_session_name: "ws-abc123",
+    stream_url: "ws://localhost:9223",
+    current_url: "https://example.com",
+    is_active: true,
+    pane_id: null,
+    browser_id: null,
+    user_dismissed: false,
+    ...overrides,
+  };
+}
+
 beforeEach(() => {
   mocks.workspace = null;
   mocks.lazyEnabled = false;
+  mocks.enableAgentChat = false;
   mocks.activeDraftId = null;
   mocks.onboardingProjectDir = null;
   mocks.hosts = [];
   mocks.openUrl.mockClear();
+  mocks.agentBrowserSessions = [];
+  mocks.agentChatPaneActive = false;
+  useBrowserPeekStore.setState({ openWorkspaceId: null });
 });
 
 afterEach(cleanup);
@@ -105,6 +144,53 @@ describe("WorkspaceContextBar", () => {
     expect(container).toBeEmptyDOMElement();
   });
 
+  it("shows the no-git state + Initialize Git for a local non-git project workspace", () => {
+    mocks.workspace = makeWorkspace({
+      is_git: false,
+      git_branch: null,
+      worktree_path: null,
+    });
+    render(<WorkspaceContextBar />);
+    expect(screen.getByText("Not a git repository")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: /initialize a git repository/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the no-git affordance off non-standard and host-backed workspaces", () => {
+    // Home workspace: not a project — no nudge.
+    mocks.workspace = makeWorkspace({
+      is_git: false,
+      git_branch: null,
+      worktree_path: null,
+      workspace_type: "home",
+    });
+    const home = render(<WorkspaceContextBar />);
+    expect(home.container).toBeEmptyDOMElement();
+    cleanup();
+
+    // Host-backed workspace: local is_git probe is meaningless.
+    mocks.workspace = makeWorkspace({
+      is_git: false,
+      git_branch: null,
+      worktree_path: null,
+      host_id: 7,
+    });
+    const hosted = render(<WorkspaceContextBar />);
+    expect(hosted.container).toBeEmptyDOMElement();
+  });
+
+  it("treats a missing is_git (older snapshot) as git — no affordance flash", () => {
+    mocks.workspace = makeWorkspace({
+      git_branch: null,
+      worktree_path: null,
+    });
+    const { container } = render(<WorkspaceContextBar />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it("renders nothing while a lazy-creation chat draft is active", () => {
     mocks.workspace = makeWorkspace();
     mocks.lazyEnabled = true;
@@ -118,6 +204,20 @@ describe("WorkspaceContextBar", () => {
     mocks.onboardingProjectDir = "/home/dev/projects/repo";
     const { container } = render(<WorkspaceContextBar />);
     expect(container).toBeEmptyDOMElement();
+  });
+
+  it("renders nothing when an Agent Chat pane is the active GUI-mode surface (Context Row owns the detail)", () => {
+    mocks.workspace = makeWorkspace();
+    mocks.agentChatPaneActive = true;
+    const { container } = render(<WorkspaceContextBar />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("still renders for a non-agent-chat active pane (e.g. a terminal) in GUI mode", () => {
+    mocks.workspace = makeWorkspace();
+    mocks.agentChatPaneActive = false;
+    render(<WorkspaceContextBar />);
+    expect(screen.getByText("feature/19-cloud-push")).toBeInTheDocument();
   });
 
   it("shows branch, worktree kind, and 'This device' for a local worktree", () => {
@@ -214,5 +314,67 @@ describe("WorkspaceContextBar", () => {
     render(<WorkspaceContextBar />);
     expect(screen.getByText("pandora")).toBeInTheDocument();
     expect(screen.queryByText("This device")).not.toBeInTheDocument();
+  });
+
+  // ── GUI-mode background browser indicator ──
+  // (docs/features/browser.md "Background browser in GUI mode")
+
+  it("shows the background-browser indicator in GUI mode with a live background session, and opens the peek on click", async () => {
+    mocks.workspace = makeWorkspace();
+    mocks.enableAgentChat = true;
+    mocks.agentBrowserSessions = [makeBackgroundSession()];
+    render(<WorkspaceContextBar />);
+    const indicator = screen.getByRole("button", { name: /Browser running in background/ });
+    expect(indicator).toBeInTheDocument();
+    expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
+    await userEvent.click(indicator);
+    expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);
+  });
+
+  it("hides the background-browser indicator when the Agent Chat beta flag is off (flag-off byte-identical path)", () => {
+    mocks.workspace = makeWorkspace();
+    mocks.enableAgentChat = false;
+    mocks.agentBrowserSessions = [makeBackgroundSession()];
+    render(<WorkspaceContextBar />);
+    expect(
+      screen.queryByRole("button", { name: /Browser running in background/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the background-browser indicator for an OpenFlow workspace even with the flag on", () => {
+    mocks.workspace = makeWorkspace({ workspace_type: "open_flow" });
+    mocks.enableAgentChat = true;
+    mocks.agentBrowserSessions = [makeBackgroundSession()];
+    render(<WorkspaceContextBar />);
+    expect(
+      screen.queryByRole("button", { name: /Browser running in background/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("hides the background-browser indicator once the session is attached to a pane (no longer background)", () => {
+    mocks.workspace = makeWorkspace();
+    mocks.enableAgentChat = true;
+    mocks.agentBrowserSessions = [
+      makeBackgroundSession({ pane_id: "pane-1", browser_id: "browser-1" }),
+    ];
+    render(<WorkspaceContextBar />);
+    expect(
+      screen.queryByRole("button", { name: /Browser running in background/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders the bar for the browser indicator alone even with no git/PR/issue to report", () => {
+    mocks.workspace = makeWorkspace({
+      git_branch: null,
+      pr_state: null,
+      linked_issue: null,
+    });
+    mocks.enableAgentChat = true;
+    mocks.agentBrowserSessions = [makeBackgroundSession()];
+    const { container } = render(<WorkspaceContextBar />);
+    expect(container).not.toBeEmptyDOMElement();
+    expect(
+      screen.getByRole("button", { name: /Browser running in background/ }),
+    ).toBeInTheDocument();
   });
 });

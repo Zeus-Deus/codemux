@@ -122,6 +122,23 @@ export function resetQueryFactoryForTests(): void {
   queryFactory = defaultQuery;
 }
 
+/** How long `interrupt()` waits for the SDK query's iterator to exit
+ *  before assuming the interrupt was treated as soft. Real SDK aborts
+ *  land in single-digit milliseconds; the ceiling only guards against
+ *  a hung subprocess. */
+let interruptExitTimeoutMs = 2000;
+
+/** Lower the interrupt-exit timeout so tests don't wait on the real
+ *  ceiling. Mirrors the `setQueryFactoryForTests` DI seam. */
+export function setInterruptExitTimeoutForTests(ms: number): void {
+  interruptExitTimeoutMs = ms;
+}
+
+/** Restore the default interrupt-exit timeout. Call from test teardown. */
+export function resetInterruptExitTimeoutForTests(): void {
+  interruptExitTimeoutMs = 2000;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -173,6 +190,12 @@ function buildQueryOptions(
     pathToClaudeCodeExecutable: input.pathToClaudeCodeExecutable,
     settingSources: ["user", "project", "local"],
     includePartialMessages: true,
+    // Ask the SDK to emit human-readable `summary` fields on
+    // `task_progress` events so the subagent card's activity line can
+    // show "currently doing X" instead of only a tool name. Subagent
+    // view (Stage 1). Everything else in the subagent pipeline is
+    // Rust-side.
+    agentProgressSummaries: true,
     canUseTool,
     // `env: process.env` pass-through matches the research finding.
     // The SDK itself is responsible for reading the user's Claude
@@ -226,12 +249,29 @@ function buildQueryOptions(
 /** A single live SDK session bound to one runtime thread. */
 export class ClaudeSession {
   readonly threadId: string;
-  private readonly promptQueue: AsyncPromptQueue<SDKUserMessage>;
-  private readonly query: Query;
+  /** Rebuilt by `ensureLiveQuery` after an interrupt, so mutable. */
+  private promptQueue: AsyncPromptQueue<SDKUserMessage>;
+  /** Rebuilt by `ensureLiveQuery` after an interrupt, so mutable. */
+  private query: Query;
   private readonly emitter: EventEmitter;
   private readonly pendingApprovals: PendingApprovals;
   private closed = false;
   private iterationTask: Promise<void>;
+  /** Full start input, retained so `ensureLiveQuery` can rebuild a
+   *  resumed query after an interrupt kills the original. Mutable
+   *  session settings (`model`, `permissionMode`, `mcpTools`) are
+   *  recorded here as they change so a rebuild keeps fidelity. */
+  private readonly startInput: SessionStartInput;
+  /** The `canUseTool` bridge, retained so a rebuilt query reuses the
+   *  same closure over `pendingApprovals` and the emitter. */
+  private readonly canUseTool: CanUseTool;
+  /** True while `interrupt()` is in flight, so `consumeMessages` knows
+   *  an iterator exit is expected and stays silent instead of firing
+   *  `session-ended`. */
+  private interrupting = false;
+  /** True once an interrupt has killed the SDK query. The next
+   *  `sendTurn` rebuilds a resumed query via `ensureLiveQuery`. */
+  private queryDead = false;
   /** SDK-assigned session id, observed from the first incoming SDK
    *  message that carries `session_id`. Forwarded to the Rust side
    *  as a `sdk-session-id` notification so restarts can resume from
@@ -249,15 +289,22 @@ export class ClaudeSession {
     this.threadId = input.threadId;
     this.emitter = emit;
     this.effort = input.effort;
+    // Shallow copy so later `setModel`/`setPermissionMode`/`updateMcpTools`
+    // recordings don't mutate the caller's object; copy `mcpTools` too
+    // since it's the one array field a rebuild reads back.
+    this.startInput = { ...input };
+    if (input.mcpTools) {
+      this.startInput.mcpTools = [...input.mcpTools];
+    }
     this.promptQueue = new AsyncPromptQueue<SDKUserMessage>();
     this.pendingApprovals = new Map();
 
-    const canUseTool = makeCanUseTool(
+    this.canUseTool = makeCanUseTool(
       input.threadId,
       emit,
       this.pendingApprovals,
     );
-    const options = buildQueryOptions(input, canUseTool);
+    const options = buildQueryOptions(input, this.canUseTool);
 
     this.query = queryFactory({
       prompt: this.promptQueue,
@@ -288,6 +335,14 @@ export class ClaudeSession {
         });
         this.emitSpecialCases(message);
       }
+      // An interrupt makes the SDK iterator exit — sometimes cleanly
+      // like this, sometimes via an abort-like throw below. Mark the
+      // query dead so the next `sendTurn` rebuilds a resumed query, and
+      // stay silent: `interrupt()` fires the `turn-interrupted` event.
+      if (this.interrupting && !this.closed) {
+        this.queryDead = true;
+        return;
+      }
       if (!this.closed) {
         this.emitter.notification("session-ended", {
           threadId: this.threadId,
@@ -295,6 +350,12 @@ export class ClaudeSession {
         });
       }
     } catch (err) {
+      // Interrupt-driven abort: same silent, mark-dead handling as the
+      // clean-exit path above.
+      if (this.interrupting && !this.closed && isAbortLikeError(err)) {
+        this.queryDead = true;
+        return;
+      }
       if (isAbortLikeError(err)) {
         this.emitter.notification("session-ended", {
           threadId: this.threadId,
@@ -372,6 +433,9 @@ export class ClaudeSession {
     if (this.closed) {
       throw new Error("session is closed");
     }
+    // If a prior interrupt killed the query, transparently rebuild a
+    // resumed one before enqueuing this turn.
+    this.ensureLiveQuery();
     // If a per-turn model override was supplied, apply it before the
     // turn is dispatched. The SDK applies `setModel` to subsequent
     // messages, not retroactively, which matches what we want.
@@ -417,12 +481,77 @@ export class ClaudeSession {
     this.promptQueue.push(msg);
   }
 
-  /** Halt the current turn. The SDK emits no final `result` for an
-   *  interrupted turn; our message-iteration loop surfaces a
-   *  `session-ended` notification with `reason: "interrupted"`. */
+  /** Halt the current turn. `query.interrupt()` makes the SDK query's
+   *  iterator exit, so the query is marked dead and the next
+   *  `sendTurn` rebuilds a resumed query. A `turn-interrupted`
+   *  notification (not `session-ended`) tells the host the turn is
+   *  over but the session lives. */
   async interrupt(): Promise<void> {
-    if (this.closed) return;
-    await this.query.interrupt();
+    if (this.closed || this.queryDead) return;
+    this.interrupting = true;
+    try {
+      await this.query.interrupt();
+      // Wait for `consumeMessages` to observe the iterator exit (which
+      // flips `queryDead`), bounded by a timeout in case the SDK
+      // treated the interrupt as soft and kept iterating.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.iterationTask,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, interruptExitTimeoutMs);
+        }),
+      ]);
+      if (timer !== undefined) clearTimeout(timer);
+      if (this.queryDead && !this.closed) {
+        this.emitter.notification("turn-interrupted", {
+          threadId: this.threadId,
+        });
+      }
+      // If the timeout won (iterator still alive), do nothing extra:
+      // the `finally` reset restores old behavior for a later exit.
+    } finally {
+      this.interrupting = false;
+    }
+  }
+
+  /** Rebuild the SDK query after an interrupt marked it dead. No-op
+   *  while the query is live or the session is closed. The rebuilt
+   *  query resumes the SDK session so history is preserved; the SDK
+   *  issues a fresh session id which `observeSdkSessionId` re-emits so
+   *  the host updates its resume cursor. Mirrors the reference impl's
+   *  `ensureSessionForThread`. */
+  private ensureLiveQuery(): void {
+    if (!this.queryDead || this.closed) return;
+
+    const resume = this.sdkSessionId ?? this.startInput.resume;
+    // A resumed session is issued a NEW session id by the SDK; clear
+    // the observed id so `observeSdkSessionId` re-emits it.
+    this.sdkSessionId = null;
+
+    // Best-effort reap of the dead subprocess.
+    try {
+      this.query.close();
+    } catch (err) {
+      logger.warn("query.close during rebuild threw", {
+        threadId: this.threadId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    this.queryDead = false;
+    this.promptQueue = new AsyncPromptQueue<SDKUserMessage>();
+    // Drop the explicit `sessionId` — that uuid named the ORIGINAL
+    // fresh session; the rebuild resumes instead.
+    const rebuildInput: SessionStartInput = { ...this.startInput };
+    delete rebuildInput.sessionId;
+    if (resume === undefined) {
+      delete rebuildInput.resume;
+    } else {
+      rebuildInput.resume = resume;
+    }
+    const options = buildQueryOptions(rebuildInput, this.canUseTool);
+    this.query = queryFactory({ prompt: this.promptQueue, options });
+    this.iterationTask = this.consumeMessages();
   }
 
   /** Stage 4 — push an updated MCP tool list to the live SDK
@@ -435,6 +564,10 @@ export class ClaudeSession {
    *  is the right shape for "user disabled all MCPs". Idempotent. */
   async updateMcpTools(tools: RegisteredMcpTool[]): Promise<void> {
     if (this.closed) return;
+    // Record first so a rebuild after an interrupt keeps the latest
+    // tool list even if the live query call below throws / is skipped.
+    this.startInput.mcpTools = tools;
+    if (this.queryDead) return;
     const servers: Record<string, ReturnType<typeof buildCodemuxMcpServer>> =
       tools.length > 0 ? { codemux: buildCodemuxMcpServer(tools) } : {};
     try {
@@ -456,6 +589,15 @@ export class ClaudeSession {
     if (this.closed) {
       throw new Error("session is closed");
     }
+    // Record first so a rebuild after an interrupt keeps the latest
+    // model even if the live query call below throws / is skipped.
+    // `undefined` reverts to the SDK default, so drop the recorded key.
+    if (model === undefined) {
+      delete this.startInput.model;
+    } else {
+      this.startInput.model = model;
+    }
+    if (this.queryDead) return;
     await this.query.setModel(model);
   }
 
@@ -464,6 +606,8 @@ export class ClaudeSession {
     if (this.closed) {
       throw new Error("session is closed");
     }
+    this.startInput.permissionMode = mode;
+    if (this.queryDead) return;
     await this.query.setPermissionMode(mode);
   }
 

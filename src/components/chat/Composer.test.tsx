@@ -133,6 +133,31 @@ describe("Composer", () => {
     });
   });
 
+  describe("belowComposerSlot (Thread Scope redesign)", () => {
+    it("renders the slot below the composer card when provided", () => {
+      const { container, getByText } = renderComposer({
+        belowComposerSlot: <div>scope row here</div>,
+      });
+      expect(getByText("scope row here")).toBeInTheDocument();
+      // Below the composer-wrapper card in DOM order, not above it.
+      const wrapper = container.querySelector(
+        '[data-testid="composer-wrapper"]',
+      )!;
+      const slot = getByText("scope row here");
+      expect(wrapper.compareDocumentPosition(slot)).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+    });
+
+    it("renders nothing extra when belowComposerSlot is omitted", () => {
+      const { container } = renderComposer();
+      const wrapper = container.querySelector(
+        '[data-testid="composer-wrapper"]',
+      )!;
+      expect(wrapper.nextElementSibling).toBeNull();
+    });
+  });
+
   describe("staged attachment chip strip (Step 8 Stage 1 — image-only post-2.1)", () => {
     // Stage 2.1 moved file/folder chips inside the textarea (rendered
     // by the mirror overlay). The above-textarea strip is now
@@ -600,6 +625,12 @@ describe("Composer", () => {
         "data-selected",
         "true",
       );
+      // The WORKFLOWS group's single `/workflow` row follows MODES.
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      expect(getByTestId("slash-item-workflow")).toHaveAttribute(
+        "data-selected",
+        "true",
+      );
       fireEvent.keyDown(textarea, { key: "ArrowDown" });
       // Wraps around to the top.
       expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
@@ -607,8 +638,8 @@ describe("Composer", () => {
         "true",
       );
       fireEvent.keyDown(textarea, { key: "ArrowUp" });
-      // Wraps from top to bottom.
-      expect(getByTestId("slash-item-mode:debug")).toHaveAttribute(
+      // Wraps from top to bottom, landing on the last item (/workflow).
+      expect(getByTestId("slash-item-workflow")).toHaveAttribute(
         "data-selected",
         "true",
       );
@@ -781,6 +812,78 @@ describe("Composer", () => {
         shiftKey: true,
       });
       expect(onSubmit).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("Continue-run chip (issue #154)", () => {
+    const CHIP = "composer-continue-run-chip";
+
+    it("renders when interrupted with nothing in flight and a handler wired", () => {
+      const { getByTestId } = renderComposer({
+        interrupted: true,
+        onContinueRun: vi.fn(),
+      });
+      const chip = getByTestId(CHIP);
+      expect(chip).toHaveTextContent("Continue run");
+    });
+
+    it("clicking the chip calls onContinueRun exactly once", () => {
+      const onContinueRun = vi.fn();
+      const { getByTestId } = renderComposer({
+        interrupted: true,
+        onContinueRun,
+      });
+      fireEvent.click(getByTestId(CHIP));
+      expect(onContinueRun).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not render while streaming (a live turn owns the composer)", () => {
+      const { queryByTestId } = renderComposer({
+        interrupted: true,
+        streaming: true,
+        onContinueRun: vi.fn(),
+      });
+      expect(queryByTestId(CHIP)).toBeNull();
+    });
+
+    it("does not render while the send RPC is in flight (sending)", () => {
+      const { queryByTestId } = renderComposer({
+        interrupted: true,
+        sending: true,
+        onContinueRun: vi.fn(),
+      });
+      expect(queryByTestId(CHIP)).toBeNull();
+    });
+
+    it("does not render without an onContinueRun handler", () => {
+      const { queryByTestId } = renderComposer({ interrupted: true });
+      expect(queryByTestId(CHIP)).toBeNull();
+    });
+
+    it("does not render when the thread is not interrupted", () => {
+      const { queryByTestId } = renderComposer({
+        interrupted: false,
+        onContinueRun: vi.fn(),
+      });
+      expect(queryByTestId(CHIP)).toBeNull();
+    });
+
+    it("mounts the attachment strip when the chip is its only occupant", () => {
+      // Default mode + no staged attachments would normally hide the whole
+      // strip — the chip alone must be enough to mount it, and nothing
+      // else (no mode pill, no attachment chips) should render inside.
+      const { getByTestId } = renderComposer({
+        interrupted: true,
+        onContinueRun: vi.fn(),
+        mode: "default",
+        stagedAttachments: [],
+      });
+      const strip = getByTestId("composer-attachment-strip");
+      const chip = getByTestId(CHIP);
+      expect(strip).toContainElement(chip);
+      // The chip is the strip's sole child.
+      expect(strip.children).toHaveLength(1);
+      expect(strip.firstElementChild).toBe(chip);
     });
   });
 });

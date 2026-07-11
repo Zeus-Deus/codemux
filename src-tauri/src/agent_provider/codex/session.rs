@@ -6,9 +6,9 @@
 //! that translate the child's notifications into the canonical event
 //! stream.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,8 +17,8 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::agent_provider::{
-    ProviderError, ProviderRuntimeEvent, ProviderSessionId, RequestId, SessionStatus, ThreadId,
-    TurnId,
+    ProviderError, ProviderRuntimeEvent, ProviderSessionId, RequestId, SendOutcome, SendTurnInput,
+    SessionStatus, ThreadId, TurnId,
 };
 use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
@@ -28,7 +28,7 @@ use super::protocol::{
     ThreadStartResponse, TurnInputItem, TurnInterruptParams, TurnStartParams, TurnStartResponse,
     RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS,
 };
-use super::translate::{translate_notification, translate_server_request};
+use super::translate::{translate_notification_with, translate_server_request, CodexSubagentDemux};
 
 /// Default per-request timeout, mirroring the upstream reference's
 /// `sendRequest(..., 20_000)` default.
@@ -78,6 +78,67 @@ pub(crate) struct CodexSessionState {
     /// — mirrors the reference's `collaborationMode.settings.reasoning_effort`
     /// session default.
     pub default_effort: Option<String>,
+    /// Follow-up turns queued while a turn was in flight, in FIFO
+    /// dispatch order. Drained one-at-a-time as the session returns to
+    /// idle (see [`CodexSession::drain_queue`]).
+    pub queued_turns: VecDeque<QueuedTurn>,
+}
+
+/// A user turn parked in the follow-up queue behind the active turn.
+#[derive(Debug, Clone)]
+pub(crate) struct QueuedTurn {
+    /// Backend-generated id, stable for the lifetime of the queued item.
+    pub queued_id: String,
+    /// The original send input, replayed verbatim when the turn
+    /// dispatches.
+    pub input: SendTurnInput,
+}
+
+/// Mint a queue id unique within this process.
+fn mint_queued_id() -> String {
+    format!(
+        "codex-queued-{}",
+        NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Move the queued turn with `queued_id` to the front of `queue` so it
+/// is the next item [`CodexSession::drain_queue`] dispatches. Returns
+/// `Some(original_index)` when the item was found (and is now at the
+/// front), `None` when no such id is queued. A no-op when it is already
+/// at the front. The returned index lets a caller undo the reorder via
+/// [`restore_queued_position`] when a follow-up step (e.g.
+/// `interrupt_turn`) fails.
+fn promote_queued_to_front(queue: &mut VecDeque<QueuedTurn>, queued_id: &str) -> Option<usize> {
+    match queue.iter().position(|q| q.queued_id == queued_id) {
+        Some(0) => Some(0),
+        Some(pos) => {
+            if let Some(item) = queue.remove(pos) {
+                queue.push_front(item);
+            }
+            Some(pos)
+        }
+        None => None,
+    }
+}
+
+/// Undo a [`promote_queued_to_front`] by moving `queued_id` back to
+/// `original_index`. Finds the item's CURRENT position first — it may
+/// have been dispatched or cancelled in the meantime, in which case this
+/// is a no-op. Otherwise it is removed and re-inserted at
+/// `min(original_index, queue.len())` so the queue order is restored.
+fn restore_queued_position(
+    queue: &mut VecDeque<QueuedTurn>,
+    queued_id: &str,
+    original_index: usize,
+) {
+    let Some(pos) = queue.iter().position(|q| q.queued_id == queued_id) else {
+        return;
+    };
+    if let Some(item) = queue.remove(pos) {
+        let insert_at = original_index.min(queue.len());
+        queue.insert(insert_at, item);
+    }
 }
 
 /// Handle for a live Codex session.
@@ -94,10 +155,26 @@ pub(crate) struct CodexSession {
     pub child: Arc<JsonRpcChild>,
     /// Mutable session state.
     pub state: Mutex<CodexSessionState>,
+    /// Broadcast sender used to emit runtime events from methods that
+    /// mutate the follow-up queue (enqueue / dispatch / cancel). The
+    /// background tasks receive their own clone via spawn args.
+    event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     /// Shutdown signal for the background notification / request tasks.
     shutdown_tx: broadcast::Sender<()>,
     /// Background task JoinHandles retained so `Drop` can abort them.
     tasks: Mutex<Vec<JoinHandle<()>>>,
+    /// Set by the child-exit watchdog when `codex app-server` dies
+    /// *unintentionally* mid-session. [`is_dead`](CodexSession::is_dead)
+    /// reports it so the provider's `has_session` treats the corpse as absent
+    /// and the next send rebuilds a fresh session (with the resume cursor) via
+    /// `ensure_live_session` instead of routing to a dead child.
+    ///
+    /// Deliberately NOT keyed off `SessionStatus::Error`: Codex also sets
+    /// `Error` on a *turn* failure (a live child that just refused a prompt)
+    /// and on a non-retryable server `error` notification — neither means the
+    /// child is gone. Only the watchdog (a confirmed dead child) sets this, so
+    /// a recoverable error stays recoverable in place without a rebuild.
+    dead: Arc<AtomicBool>,
 }
 
 impl CodexSession {
@@ -115,10 +192,17 @@ impl CodexSession {
         permission_mode: Option<String>,
         effort: Option<String>,
         resume_cursor: Option<Value>,
+        caller_env: Option<HashMap<String, String>>,
         spawn: CodexSpawnConfig,
         event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     ) -> Result<Arc<Self>, ProviderError> {
-        let mut env = HashMap::new();
+        // Start from the caller-supplied workspace env (CODEMUX_WORKSPACE_ID,
+        // CODEMUX_PANE_ID, BROWSER, …) so the agent's Bash subprocesses route
+        // `codemux browser open` at their OWN workspace. Provider-critical
+        // vars are overlaid AFTER so they win on conflict — CODEX_HOME must
+        // point at Codemux's managed config dir regardless of what the
+        // workspace env carries.
+        let mut env = caller_env.unwrap_or_default();
         if let Some(home) = spawn.codex_home.as_ref() {
             env.insert("CODEX_HOME".to_string(), home.to_string_lossy().to_string());
         }
@@ -285,6 +369,7 @@ impl CodexSession {
             status: SessionStatus::Ready,
             model,
             default_effort: effort,
+            queued_turns: VecDeque::new(),
         });
         let session = Arc::new(Self {
             thread_id: thread_id.clone(),
@@ -292,8 +377,10 @@ impl CodexSession {
             cwd,
             child: Arc::clone(&child),
             state,
+            event_tx: event_tx.clone(),
             shutdown_tx: shutdown_tx.clone(),
             tasks: Mutex::new(Vec::new()),
+            dead: Arc::new(AtomicBool::new(false)),
         });
 
         // Emit SessionConfigured up front so subscribers see the thread
@@ -338,33 +425,233 @@ impl CodexSession {
         Ok(session)
     }
 
-    /// Queue a user turn on this session. Returns the Codex-assigned turn
-    /// identifier. Codex applies `effort` per-turn (no session restart
-    /// needed), so the override is threaded straight into the RPC.
-    pub async fn send_turn(
+    /// Clone of the canonical event broadcaster, for methods that emit
+    /// follow-up-queue events off the background-task path.
+    fn event_tx(&self) -> broadcast::Sender<ProviderRuntimeEvent> {
+        self.event_tx.clone()
+    }
+
+    /// Send a user turn, or **queue** it behind the active turn.
+    ///
+    /// Idle → the turn starts immediately ([`SendOutcome::Started`]).
+    /// Busy → the input is pushed onto the FIFO follow-up queue, a
+    /// [`ProviderRuntimeEvent::TurnQueued`] is emitted, and
+    /// [`SendOutcome::Queued`] is returned; the turn dispatches later via
+    /// [`drain_queue`](Self::drain_queue). The busy check re-runs under
+    /// the lock so there is no TOCTOU with a just-finished turn.
+    pub async fn enqueue_or_send(
+        self: &Arc<Self>,
+        input: SendTurnInput,
+    ) -> Result<SendOutcome, ProviderError> {
+        {
+            let mut state = self.state.lock().await;
+            if state.active_turn.is_some() {
+                let queued_id = mint_queued_id();
+                let text = input.text.clone();
+                let client_nonce = input.client_nonce.clone();
+                state.queued_turns.push_back(QueuedTurn {
+                    queued_id: queued_id.clone(),
+                    input,
+                });
+                drop(state);
+                let _ = self.event_tx().send(ProviderRuntimeEvent::TurnQueued {
+                    thread_id: self.thread_id.clone(),
+                    queued_id: queued_id.clone(),
+                    client_nonce,
+                    text,
+                });
+                return Ok(SendOutcome::Queued(queued_id));
+            }
+        }
+        let turn_id = self
+            .do_send(
+                input.text,
+                input.images,
+                input.model_override,
+                input.effort_override,
+            )
+            .await?;
+        Ok(SendOutcome::Started(turn_id))
+    }
+
+    /// Pop the next queued turn (if idle) and dispatch it. No-op when the
+    /// queue is empty or a turn is active. Emits
+    /// [`ProviderRuntimeEvent::QueuedTurnDispatched`] on success; a failed
+    /// dispatch cancels the item (never wedges the queue) and the next is
+    /// attempted.
+    pub async fn drain_queue(self: &Arc<Self>) {
+        loop {
+            let next = {
+                let mut state = self.state.lock().await;
+                let idle = state.active_turn.is_none()
+                    && matches!(state.status, SessionStatus::Ready)
+                    && state.pending_approvals.is_empty();
+                if !idle {
+                    return;
+                }
+                state.queued_turns.pop_front()
+            };
+            let Some(queued) = next else { return };
+            let text = queued.input.text.clone();
+            match self
+                .do_send(
+                    queued.input.text,
+                    queued.input.images,
+                    queued.input.model_override,
+                    queued.input.effort_override,
+                )
+                .await
+            {
+                Ok(turn_id) => {
+                    let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnDispatched {
+                        thread_id: self.thread_id.clone(),
+                        queued_id: queued.queued_id,
+                        turn_id,
+                        text,
+                    });
+                    return;
+                }
+                Err(err) => {
+                    let _ = self.event_tx().send(ProviderRuntimeEvent::RuntimeWarning {
+                        thread_id: Some(self.thread_id.clone()),
+                        message: format!(
+                            "queued turn {} failed to dispatch: {err}",
+                            queued.queued_id
+                        ),
+                        original_payload: None,
+                    });
+                    let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                        thread_id: self.thread_id.clone(),
+                        queued_id: queued.queued_id,
+                    });
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Cancel a single queued turn by id (user pressed X). Emits
+    /// [`ProviderRuntimeEvent::QueuedTurnCancelled`] when found; idempotent.
+    pub async fn cancel_queued(&self, queued_id: &str) -> Result<(), ProviderError> {
+        let removed = {
+            let mut state = self.state.lock().await;
+            if let Some(pos) = state
+                .queued_turns
+                .iter()
+                .position(|q| q.queued_id == queued_id)
+            {
+                state.queued_turns.remove(pos);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                thread_id: self.thread_id.clone(),
+                queued_id: queued_id.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// **Send now (steer):** promote a queued follow-up to the front of
+    /// the queue and dispatch it immediately, interrupting the active
+    /// turn if one is running. Soft stop — the Codex thread, transcript,
+    /// and on-disk work are preserved; nothing is discarded.
+    ///
+    /// Idempotent: an unknown / already-dispatched id is a silent no-op.
+    ///
+    /// When a turn is active we call
+    /// [`interrupt_turn`](Self::interrupt_turn). Unlike Claude's
+    /// `interrupt`, it does NOT drain inline — the abort lands as a
+    /// `turn/completed` (or aborted) notification that returns the session
+    /// to `Ready`, and the event loop drains there, dispatching the item
+    /// we just promoted to the front. If `interrupt_turn` returns the
+    /// "no active turn" `ValidationError` because the turn finished during
+    /// the click→call race, we fall back to draining directly. When the
+    /// session is already idle we drain directly.
+    ///
+    /// **Pending approvals:** like a manual interrupt, an outstanding
+    /// approval keeps `drain_queue` from dispatching until it resolves, so
+    /// the promoted message stays queued until then.
+    pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
+        let (has_active_turn, original_index) = {
+            let mut state = self.state.lock().await;
+            match promote_queued_to_front(&mut state.queued_turns, queued_id) {
+                Some(idx) => (state.active_turn.is_some(), idx),
+                // Unknown / already-dispatched / cancelled — no-op.
+                None => return Ok(()),
+            }
+        };
+        if has_active_turn {
+            // Soft-stop the running turn. The event-loop drain (on the
+            // resulting turn/completed → Ready) dispatches the promoted
+            // item — `interrupt_turn` does not drain inline.
+            match self.interrupt_turn(None).await {
+                Ok(()) => Ok(()),
+                // Race: the turn finished between our busy check and the
+                // interrupt RPC. The session is idle, so drain directly.
+                Err(ProviderError::ValidationError { .. }) => {
+                    self.drain_queue().await;
+                    Ok(())
+                }
+                Err(err) => {
+                    // A real interrupt failure: undo the reorder so a
+                    // failed steer doesn't leave the queue silently
+                    // rearranged.
+                    {
+                        let mut state = self.state.lock().await;
+                        restore_queued_position(
+                            &mut state.queued_turns,
+                            queued_id,
+                            original_index,
+                        );
+                    }
+                    Err(err)
+                }
+            }
+        } else {
+            // Already idle — drain the promoted item out.
+            self.drain_queue().await;
+            Ok(())
+        }
+    }
+
+    /// Cancel every queued turn, emitting a cancellation for each. Used
+    /// when the session closes or errors.
+    async fn cancel_all_queued(&self) {
+        let drained: Vec<String> = {
+            let mut state = self.state.lock().await;
+            state.queued_turns.drain(..).map(|q| q.queued_id).collect()
+        };
+        for queued_id in drained {
+            let _ = self.event_tx().send(ProviderRuntimeEvent::QueuedTurnCancelled {
+                thread_id: self.thread_id.clone(),
+                queued_id,
+            });
+        }
+    }
+
+    /// Dispatch a user turn on the `codex app-server`. Returns the
+    /// Codex-assigned turn id. Codex applies `effort` per-turn, so the
+    /// override is threaded straight into the RPC. Does NOT perform the
+    /// busy check (callers gate that); assumes the session is idle.
+    async fn do_send(
         &self,
         text: String,
         images: Vec<crate::agent_provider::ImageInput>,
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
-        let (codex_thread_id, model_default, effort_default, already_active) = {
+        let (codex_thread_id, model_default, effort_default) = {
             let state = self.state.lock().await;
             (
                 state.codex_thread_id.clone(),
                 state.model.clone(),
                 state.default_effort.clone(),
-                state.active_turn.clone(),
             )
         };
-        if let Some(active) = already_active {
-            return Err(ProviderError::ValidationError {
-                message: format!(
-                    "session has an active turn ({}); wait for it to complete or interrupt it",
-                    active.0
-                ),
-            });
-        }
 
         // Codex's `turn/start` accepts a heterogeneous input array.
         // The Responses-style format places images BEFORE text (per
@@ -425,6 +712,13 @@ impl CodexSession {
             };
         }
         Ok(turn_id)
+    }
+
+    /// Whether the child-exit watchdog has declared this session's
+    /// `codex app-server` dead (unintentional exit). A dead session is
+    /// treated as absent by the provider so the next send auto-resumes.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::Relaxed)
     }
 
     /// Interrupt the currently active turn. If `turn_id` is provided,
@@ -505,6 +799,9 @@ impl CodexSession {
     /// short-circuits on repeat calls, and the tasks list is drained, so
     /// later invocations are cheap no-ops.
     pub async fn shutdown(&self) {
+        // Cancel any queued follow-ups so the UI clears its greyed items.
+        self.cancel_all_queued().await;
+
         // Signal background tasks first so they stop pumping events
         // mid-teardown.
         let _ = self.shutdown_tx.send(());
@@ -612,6 +909,13 @@ fn spawn_notifications_task(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut notifications = child.notifications();
+        // One demux per session, rooted at the parent Codex thread id, so
+        // child-thread (sub-agent) registrations persist across messages.
+        let parent_codex_thread_id = {
+            let state = session.state.lock().await;
+            state.codex_thread_id.clone()
+        };
+        let mut demux = CodexSubagentDemux::new(parent_codex_thread_id);
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => break,
@@ -622,11 +926,29 @@ fn spawn_notifications_task(
                             // Update local state for a few special
                             // notifications before broadcasting.
                             update_state_from_notification(&session, &msg).await;
-                            let events = translate_notification(&session.thread_id, msg);
+                            let events =
+                                translate_notification_with(&mut demux, &session.thread_id, msg);
                             for ev in events {
                                 if event_tx.send(ev).is_err() {
                                     // No subscribers — silently drop.
                                 }
+                            }
+                            // Follow-up queue: a TurnCompleted notification
+                            // returns the session to idle (Ready), an
+                            // Error/child-exit tears it down. Drain the next
+                            // queued turn when idle; cancel the whole queue
+                            // when the session is gone. Runs after
+                            // `update_state_from_notification` released the
+                            // lock so `do_send` can re-acquire it.
+                            let status = {
+                                let state = session.state.lock().await;
+                                state.status.clone()
+                            };
+                            match status {
+                                SessionStatus::Closed | SessionStatus::Error { .. } => {
+                                    session.cancel_all_queued().await;
+                                }
+                                _ => session.drain_queue().await,
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -692,18 +1014,34 @@ fn spawn_child_exit_watchdog(
                         // Only flip to Error if the session wasn't
                         // already asked to close.
                         if !matches!(status, SessionStatus::Closed) {
-                            let error_status = SessionStatus::Error {
-                                message: "codex app-server exited unexpectedly".into(),
-                            };
-                            {
+                            // Mark the session dead so the provider's
+                            // `has_session` reports it absent and the next send
+                            // rebuilds via `ensure_live_session` with the resume
+                            // cursor rather than routing to the dead child.
+                            session.dead.store(true, Ordering::Relaxed);
+                            let msg = "codex app-server exited unexpectedly".to_string();
+                            // Recover the in-flight turn id before clearing it so
+                            // the watchdog can settle it with a synthetic terminal
+                            // `TurnCompleted` ahead of the Error state.
+                            let active_turn = {
                                 let mut state = session.state.lock().await;
-                                state.status = error_status.clone();
-                                state.active_turn = None;
+                                let active_turn = state.active_turn.take();
+                                state.status = SessionStatus::Error {
+                                    message: msg.clone(),
+                                };
+                                active_turn
+                            };
+                            // TurnCompleted(child_exited) first, then the Error
+                            // state — see `child_exit_events` for the ordering
+                            // contract.
+                            for event in crate::agent_provider::child_exit_events(
+                                session.thread_id.clone(),
+                                active_turn,
+                                msg,
+                            ) {
+                                let _ = event_tx.send(event);
                             }
-                            let _ = event_tx.send(ProviderRuntimeEvent::SessionStateChanged {
-                                thread_id: session.thread_id.clone(),
-                                status: error_status,
-                            });
+                            session.cancel_all_queued().await;
                         }
                         break;
                     }
@@ -720,10 +1058,19 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
     match msg {
         NotificationMessage::TurnStarted(p) => {
             let mut state = session.state.lock().await;
-            state.active_turn = Some(TurnId(p.turn_id.clone()));
+            // Only the parent thread drives the session's active turn;
+            // a sub-agent's turn must never touch parent turn state.
+            if p.thread_id == state.codex_thread_id {
+                state.active_turn = Some(TurnId(p.turn_id.clone()));
+            }
         }
         NotificationMessage::TurnCompleted(p) => {
             let mut state = session.state.lock().await;
+            // Sub-agent turn completions are handled as SubagentUpdated in
+            // the translator; leave the parent session state untouched.
+            if p.thread_id != state.codex_thread_id {
+                return;
+            }
             if state
                 .active_turn
                 .as_ref()
@@ -747,9 +1094,18 @@ async fn update_state_from_notification(session: &CodexSession, msg: &Notificati
         }
         NotificationMessage::Error(e) if !e.will_retry => {
             let mut state = session.state.lock().await;
-            state.status = SessionStatus::Error {
-                message: e.message.clone(),
-            };
+            // Scope a terminal error to the parent session only when it is
+            // unscoped or explicitly targets the parent thread; a
+            // sub-agent's error must not fail the whole session.
+            if e
+                .thread_id
+                .as_deref()
+                .map_or(true, |t| t == state.codex_thread_id)
+            {
+                state.status = SessionStatus::Error {
+                    message: e.message.clone(),
+                };
+            }
         }
         _ => {}
     }
@@ -772,5 +1128,77 @@ mod tests {
         let a = mint_request_id();
         let b = mint_request_id();
         assert_ne!(a.0, b.0);
+    }
+
+    /// Build a bare `QueuedTurn` with a given id for reorder tests. Only
+    /// `queued_id` is inspected by `promote_queued_to_front`.
+    fn queued(id: &str) -> QueuedTurn {
+        QueuedTurn {
+            queued_id: id.to_string(),
+            input: SendTurnInput {
+                thread_id: ThreadId("t".into()),
+                text: String::new(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+            },
+        }
+    }
+
+    #[test]
+    fn promote_queued_to_front_unknown_id_is_noop() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        assert_eq!(promote_queued_to_front(&mut q, "missing"), None);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn promote_queued_to_front_moves_mid_queue_item() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b"), queued("c")].into();
+        // Returns the item's original index so the reorder can be undone.
+        assert_eq!(promote_queued_to_front(&mut q, "c"), Some(2));
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn promote_queued_to_front_head_item_stays_put() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        assert_eq!(promote_queued_to_front(&mut q, "a"), Some(0));
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn restore_queued_position_undoes_a_promotion() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b"), queued("c")].into();
+        let idx = promote_queued_to_front(&mut q, "c").unwrap();
+        assert_eq!(idx, 2);
+        restore_queued_position(&mut q, "c", idx);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn restore_queued_position_already_dispatched_is_noop() {
+        // The item was promoted then removed (dispatched/cancelled)
+        // before restore ran — restoring is a harmless no-op.
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        restore_queued_position(&mut q, "gone", 1);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn restore_queued_position_clamps_out_of_range_index() {
+        // A stale original index past the current end clamps to the tail
+        // rather than panicking.
+        let mut q: VecDeque<QueuedTurn> = [queued("c"), queued("a")].into();
+        restore_queued_position(&mut q, "c", 9);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
     }
 }

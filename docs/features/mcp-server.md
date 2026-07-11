@@ -196,7 +196,7 @@ managed connectors vs. `mcp__codemux__*` from our facade).
 `McpServer` instance via the Claude Agent SDK's `createSdkMcpServer`
 helper. Each tool's handler issues a `mcp-tool-call` JSON-RPC request
 back to the Rust side via the bidirectional protocol added in Stage 3
-(`src/upstream-rpc.ts`). Rust's `spawn_incoming_requests_task` in
+(`sidecar/claude-agent/src/upstream-rpc.ts`). Rust's `spawn_incoming_requests_task` in
 `agent_provider/claude/session.rs` routes `mcp-tool-call` requests to
 `McpRegistry::dispatch_tool_call`, which forwards `tools/call` to the
 backing child and pipes the result back.

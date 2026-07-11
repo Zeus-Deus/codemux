@@ -120,19 +120,29 @@ async fn check_and_upgrade(
         ProbeOutcome::Reachable {
             codemux_remote_version: Some(v),
             uname,
+            ..
         } => (v, uname),
         ProbeOutcome::Reachable {
             codemux_remote_version: None,
+            binary_present_but_broken,
             ..
         } => {
-            // Host reachable but codemux-remote not installed. Don't
-            // install it as part of the background poll — that
+            // Host reachable but codemux-remote not usable. Don't
+            // install/repair it as part of the background poll — that
             // requires the user's consent (handled by the Install
             // button on Settings → Hosts). The background poll only
-            // *upgrades* existing installations.
-            return Ok(UpgradeOutcome::Skipped {
-                reason: "codemux-remote not installed (background poll won't auto-install — use Settings → Hosts)".into(),
-            });
+            // *upgrades* existing, working installations.
+            //
+            // Distinguish "present but broken" (0-byte / truncated
+            // binary — issue #133) from "genuinely absent" so the
+            // Skipped reason tells the operator which it is. Either way
+            // we stay Skipped: no consent for a background repair.
+            let reason = if binary_present_but_broken {
+                "codemux-remote present but not working — background poll won't auto-repair; use Settings → Hosts → Install".to_string()
+            } else {
+                "codemux-remote not installed (background poll won't auto-install — use Settings → Hosts)".to_string()
+            };
+            return Ok(UpgradeOutcome::Skipped { reason });
         }
         ProbeOutcome::Unreachable { reason } => {
             return Ok(UpgradeOutcome::Skipped {

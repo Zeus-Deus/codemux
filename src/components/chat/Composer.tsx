@@ -11,6 +11,7 @@ import {
   Image as ImageIcon,
   ListTodo,
   MessageCircleQuestion,
+  RotateCw,
   Server,
   Settings,
 } from "lucide-react";
@@ -22,6 +23,7 @@ import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import {
   buildModeCommands,
+  buildWorkflowCommand,
   filterCommandMenuItems,
   filterSlashItems,
   findMentionAtCursor,
@@ -46,6 +48,7 @@ import {
   listProjectFolders,
   listPullRequests,
   MCP_CODEMUX_SELF_ID,
+  pasteClipboardImage,
   type McpServerConfig,
 } from "@/tauri/commands";
 import { Switch } from "@/components/ui/switch";
@@ -114,6 +117,18 @@ interface Props {
   permissionModes: PermissionModeOption[] | null;
   ultrathinkInBodyText: boolean;
   streaming: boolean;
+  /** True while THIS composer's send RPC is in flight (before the
+   *  backend acks). Blocks submit to avoid a double-send, but — unlike
+   *  `streaming` — does not block queueing a follow-up. Defaults false. */
+  sending?: boolean;
+  /** True when the thread's last run died without cleanly settling
+   *  (issue #154). When set (and nothing is in flight) the composer
+   *  strip shows a one-click "Continue run" chip. Defaults false. */
+  interrupted?: boolean;
+  /** Click handler for the "Continue run" chip. Sends the fixed text
+   *  "Continue" through the normal send path. Required for the chip to
+   *  render. */
+  onContinueRun?: () => void;
   sessionReady: boolean;
   showProviderPicker: boolean;
   /** True on the pre-session draft surface (no live session yet). Only
@@ -122,6 +137,10 @@ interface Props {
    *  steer the agent…" (design D10). Mode-specific placeholders
    *  (plan/ask/debug) are unaffected. Defaults to false. */
   isDraft?: boolean;
+  /** When set, overrides the computed textarea placeholder entirely.
+   *  Used by the subagent drill-in to swap in "Steering goes to the
+   *  orchestrator…" while the composer stays parent-bound. */
+  placeholderOverride?: string;
   /** Composer-level Cursor-style mode pill. Swaps the placeholder,
    *  hides the permission picker, and toggles the mode selector
    *  (dropdown → pill). */
@@ -140,6 +159,13 @@ interface Props {
    *  render nothing above the textarea (a running chat keeps its
    *  scope in the workspace context bar instead). */
   zone1Override?: React.ReactNode;
+  /** Thread Scope redesign — optional slot rendered BELOW the composer
+   *  card (inside the same max-w-[760px] column), under the footer.
+   *  The draft surface uses this for `ThreadScopeRow` (location ·
+   *  checkout · from-branch + the centered scope hint). `undefined`
+   *  (the default) renders nothing — existing non-draft call sites are
+   *  unaffected. */
+  belowComposerSlot?: React.ReactNode;
   /** Step 8 Stage 1 — staged attachments rendered as a chip strip
    *  inside the composer card, above the textarea. Empty array hides
    *  the strip. Defaults to `[]` so existing call sites keep working
@@ -225,13 +251,18 @@ export function Composer({
   permissionModes,
   ultrathinkInBodyText,
   streaming,
+  sending = false,
+  interrupted = false,
+  onContinueRun,
   sessionReady,
   showProviderPicker,
   isDraft = false,
+  placeholderOverride,
   mode,
   errorMessage = null,
   showStopButton = true,
   zone1Override,
+  belowComposerSlot,
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
   onToggleExpandPr,
@@ -381,6 +412,14 @@ export function Composer({
     [mode, onModeActivate],
   );
 
+  // `/workflow` — gated to the Claude provider (server-side runtime
+  // support only exists there). Shared between the typed `/` popup and
+  // the `+` menu so the gating logic lives in one place.
+  const workflowCommand = useMemo(
+    () => buildWorkflowCommand({ isClaude: provider === "claude" }),
+    [provider],
+  );
+
   // ─── Skills (Cursor-style inline tokens) ─────────────────────────
   // Lazy-load on first popup open. Picking a skill expands the typed
   // `/<query>` to the full `/<skill-name>` in the textarea — the slash
@@ -416,8 +455,8 @@ export function Composer({
   );
 
   const allSlashItems = useMemo(
-    () => [...modeCommands, ...skillItems],
-    [modeCommands, skillItems],
+    () => [...modeCommands, workflowCommand, ...skillItems],
+    [modeCommands, workflowCommand, skillItems],
   );
 
   // Surface skill-loading + skill-error in the popup footer so the user
@@ -955,6 +994,11 @@ export function Composer({
           disabled: mode === "ask",
           onSelect: () => {},
         },
+        // WORKFLOWS — single row, gated to the Claude provider. Kept
+        // visible-but-disabled for other providers (design D-parity
+        // with the `attach:image` capability gate) so the affordance
+        // stays discoverable rather than vanishing.
+        workflowCommand,
         {
           id: "attach:file",
           label: "File…",
@@ -1121,6 +1165,7 @@ export function Composer({
     isGithubRepo,
     ghAuthenticated,
     modelSupportsImages,
+    workflowCommand,
   ]);
 
   const attachPopupFooter = useMemo(() => {
@@ -1257,6 +1302,15 @@ export function Composer({
         requestAnimationFrame(() => textareaRef.current?.focus());
         return;
       }
+      // `/workflow` — insert the literal command text at the cursor so
+      // the user types their task after it and sends it as a normal
+      // message; the Claude runtime parses the prefix and drives the
+      // orchestration server-side (no frontend workflow logic here).
+      if (item.id === "workflow") {
+        insertAtCursor("/workflow ");
+        closeAttachPopup();
+        return;
+      }
       // File / folder picks: insert the inline token, dispatch the
       // resolve callback to the parent, close the popup.
       if (item.id.startsWith("attach-file:")) {
@@ -1292,6 +1346,7 @@ export function Composer({
       attachFileMatches,
       attachFolderMatches,
       insertInlineToken,
+      insertAtCursor,
       closeAttachPopup,
       onAttachFile,
       onAttachFolder,
@@ -1398,19 +1453,25 @@ export function Composer({
   );
 
   const handleSlashSelect = (item: SlashCommandItem) => {
+    // Mirrors the `+` menu's `handleAttachPopupSelect` guard — Enter on
+    // a highlighted-but-disabled row (e.g. `/workflow` on a non-Claude
+    // provider) must no-op rather than expand/activate it. Mouse clicks
+    // are already double-guarded inside SlashCommandPopup itself.
+    if (item.disabled) return;
     if (slashAnchor) {
       const consumedLength = 1 + slashAnchor.query.length;
       const before = draft.slice(0, slashAnchor.start);
       const after = draft.slice(slashAnchor.start + consumedLength);
 
-      if (item.id.startsWith("skill:")) {
+      if (item.id.startsWith("skill:") || item.id === "workflow") {
         // Cursor-style inline expansion. Replace the typed `/<query>`
-        // with the full `/<skill-name> ` (trailing space so the user can
-        // keep typing context after the token without an extra
-        // keystroke). The mirror overlay highlights it; send-time
-        // parsing resolves it to the skill body.
-        const skillName = item.command.replace(/^\//, "");
-        const insertion = `/${skillName}${after.startsWith(" ") ? "" : " "}`;
+        // with the full `/<skill-name> ` or `/workflow ` (trailing
+        // space so the user can keep typing context after the token
+        // without an extra keystroke). The mirror overlay highlights
+        // skill tokens; `/workflow` is handled server-side by the
+        // Claude runtime — this composer only ever inserts the text.
+        const tokenName = item.command.replace(/^\//, "");
+        const insertion = `/${tokenName}${after.startsWith(" ") ? "" : " "}`;
         const next = before + insertion + after;
         onDraftChange(next);
         // Cursor lands right after the inserted token (and the space we
@@ -1445,20 +1506,58 @@ export function Composer({
   const handlePasteImage = useCallback(
     async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
       if (!onAttachImage) return;
+
+      // ── Fast path: clipboardData carries the image bytes ──────────
+      // Works in the browser dev mock (npm run dev / Chrome) and on
+      // platforms where the webview exposes image files on the paste
+      // event. Keep it FIRST so those paths never pay for the IPC
+      // round-trip below.
       const items = Array.from(e.clipboardData?.items ?? []);
       const imageItems = items.filter(
         (item) => item.kind === "file" && item.type.startsWith("image/"),
       );
-      if (imageItems.length === 0) return;
-      // Prevent the data-URL fallback the browser would otherwise
-      // dump into the textarea. We still let plain-text paste work
-      // because that branch only fires when the clipboard has no
-      // image files in it.
-      e.preventDefault();
-      for (const item of imageItems) {
-        const file = item.getAsFile();
-        if (file) await onAttachImage(file);
+      if (imageItems.length > 0) {
+        // Prevent the data-URL fallback the browser would otherwise
+        // dump into the textarea. We still let plain-text paste work
+        // because this branch only fires when the clipboard has image
+        // files in it.
+        e.preventDefault();
+        for (const item of imageItems) {
+          const file = item.getAsFile();
+          if (file) await onAttachImage(file);
+        }
+        return;
       }
+
+      // ── Fallback: Linux/WebKit2GTK strips image payloads from the JS
+      // paste event, so `clipboardData.items` never contains an image
+      // file. Read the OS clipboard server-side instead (mirrors the
+      // new-workspace dialog's `paste_clipboard_image_to_file`). The
+      // Rust command encodes a real PNG and returns the bytes; we wrap
+      // them in a File so the parent's onAttachImage runs the exact
+      // same MIME/size/animated-GIF validation + staging as the "+"
+      // picker. Composer stays display-only — the bytes flow straight
+      // through onAttachImage. ──
+      let payload: Awaited<ReturnType<typeof pasteClipboardImage>>;
+      try {
+        payload = await pasteClipboardImage();
+      } catch {
+        // No image on the OS clipboard (text-only) or plugin error.
+        // We did NOT preventDefault above, so the default paste has
+        // already run — plain text lands in the textarea normally.
+        return;
+      }
+      if (!payload.bytes.length) return;
+      // Defensive preventDefault to match the dialog. On WebKit an
+      // image-only clipboard pastes no text, so by the time this async
+      // call resolves there's nothing to clobber; on a text+image
+      // clipboard the text has already been pasted (acceptable — the
+      // user gets both the text and the attached image).
+      e.preventDefault();
+      const file = new File([payload.bytes], "pasted-image.png", {
+        type: payload.mime || "image/png",
+      });
+      await onAttachImage(file);
     },
     [onAttachImage],
   );
@@ -1534,7 +1633,16 @@ export function Composer({
   const [dragDepth, setDragDepth] = useState(0);
   const isDragging = dragDepth > 0;
 
-  const canSubmit = sessionReady && !streaming && draft.trim().length > 0;
+  // Follow-up queueing: submit is allowed WHILE a turn streams (the send
+  // is queued, not rejected). It is still blocked while this composer's
+  // own send RPC is in flight (`sending`) to avoid a double-send. The
+  // Stop button stays visible whenever a turn is active or a send is
+  // mid-flight (`busy`).
+  const busy = streaming || sending;
+  const canSubmit = sessionReady && !sending && draft.trim().length > 0;
+  // Subtle affordance so the user knows Enter will queue rather than
+  // interrupt, shown only while a turn streams and there's text to send.
+  const showQueueHint = streaming && draft.trim().length > 0;
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     // Shift+Tab cycles modes regardless of popup state. preventDefault
@@ -1873,11 +1981,26 @@ export function Composer({
           {(mode !== "default" ||
             stagedAttachments.some(
               (a) => a.kind === "image" || a.kind === "pr",
-            )) && (
+            ) ||
+            (interrupted && !streaming && !sending && !!onContinueRun)) && (
             <div
               data-testid="composer-attachment-strip"
               className="flex flex-wrap gap-1.5 px-3 pt-2"
             >
+              {/* Dead-run recovery (issue #154): a one-click chip that
+                  resumes the interrupted run. Amber-tinted, mirroring
+                  ModePill's shape. */}
+              {interrupted && !streaming && !sending && onContinueRun && (
+                <button
+                  type="button"
+                  data-testid="composer-continue-run-chip"
+                  onClick={onContinueRun}
+                  className="inline-flex items-center gap-1.5 rounded-full bg-warning/15 px-2.5 py-1 text-xs text-warning hover:bg-warning/25"
+                >
+                  <RotateCw className="h-3 w-3" aria-hidden />
+                  <span>Continue run</span>
+                </button>
+              )}
               {mode !== "default" && (
                 <ModePill
                   mode={mode as ActivePillMode}
@@ -2096,7 +2219,7 @@ export function Composer({
               }}
               placeholder={
                 sessionReady
-                  ? placeholderForMode(mode, isDraft)
+                  ? (placeholderOverride ?? placeholderForMode(mode, isDraft))
                   : "Starting session…"
               }
               rows={1}
@@ -2111,6 +2234,11 @@ export function Composer({
               style={{ maxHeight: `${MAX_ROWS_APPROX_PX}px` }}
             />
           </div>
+          {showQueueHint ? (
+            <div className="px-3 pb-1 text-[11px] leading-none text-muted-foreground/70">
+              Enter to queue
+            </div>
+          ) : null}
           <ComposerFooter
             provider={provider}
             model={model}
@@ -2121,7 +2249,7 @@ export function Composer({
             effortLabelMap={effortLabelMap}
             permissionModes={permissionModes}
             ultrathinkInBodyText={ultrathinkInBodyText}
-            streaming={streaming}
+            streaming={busy}
             canSubmit={canSubmit}
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
@@ -2138,6 +2266,9 @@ export function Composer({
             attachOpen={attachOpen}
           />
         </div>
+        {belowComposerSlot ? (
+          <div className="pt-1.5">{belowComposerSlot}</div>
+        ) : null}
       </div>
     </div>
   );

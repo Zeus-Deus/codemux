@@ -34,6 +34,11 @@ interface Props {
   node: PaneNodeSnapshot;
   activePaneId: string;
   visible: boolean;
+  /** True only for the top-level pane of a surface (not split children).
+   *  In GUI chrome a sole-root agent_chat pane drops its header — session
+   *  history + close live on the title-bar tab instead. Split panes keep
+   *  their per-pane header regardless. */
+  isSurfaceRoot?: boolean;
 }
 
 function normalizeChildSizes(raw: number[], count: number): number[] {
@@ -197,7 +202,18 @@ function handleDragStart(
 
 // ── Component ──
 
-export function PaneNode({ node, activePaneId, visible }: Props) {
+function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Props) {
+  // #127: hooks hoisted above the split branch so hook order stays stable if a
+  // fiber flips between split↔leaf at the same position (the old code called
+  // these AFTER an early `return` for split nodes — a conditional-hook bug that
+  // would throw on such a swap). For split nodes the pane_statuses selector just
+  // returns undefined — harmless — and it stays a stable primitive slice under
+  // structural sharing.
+  const paneStatus: PaneStatus | undefined = useAppStore(
+    (s) => s.appState?.pane_statuses[node.pane_id],
+  );
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+
   if (node.kind === "split") {
     const sizes = normalizeChildSizes(node.child_sizes, node.children.length);
     const sizesFr = sizes.map((s) => `${Math.max(s, 0.05)}fr`);
@@ -228,10 +244,6 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
   }
 
   const isActive = node.pane_id === activePaneId;
-  const paneStatus: PaneStatus | undefined = useAppStore(
-    (s) => s.appState?.pane_statuses[node.pane_id],
-  );
-  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
   const handleActivate = () => {
     if (!isActive) activatePane(node.pane_id).catch(console.error);
@@ -308,17 +320,25 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
         </div>
       );
     }
+    // GUI chrome (Agent Chat Beta on) collapses a sole-root chat pane's
+    // header into the title-bar tab: history + close move up there, so
+    // rendering the per-pane header would double the chrome. Split panes
+    // (isSurfaceRoot false) always keep their header for per-pane
+    // split/close/drag.
+    const hideChatHeader = enableAgentChat && isSurfaceRoot;
     return (
       <div
         className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
         data-pane-drop-id={node.pane_id}
         onPointerDown={handleActivate}
       >
-        <AgentChatPaneHeader
-          pane={node}
-          isActive={isActive}
-          onPointerDown={(e) => handleDragStart(e, node.pane_id)}
-        />
+        {!hideChatHeader && (
+          <AgentChatPaneHeader
+            pane={node}
+            isActive={isActive}
+            onPointerDown={(e) => handleDragStart(e, node.pane_id)}
+          />
+        )}
         <div className="flex-1 min-h-0 overflow-hidden">
           {/*
             `key={node.pane_id}` is REQUIRED for per-pane isolation.
@@ -374,3 +394,11 @@ export function PaneNode({ node, activePaneId, visible }: Props) {
 
   return null;
 }
+
+// #127: React.memo pays off because setAppState now performs structural sharing
+// — unchanged pane subtrees keep a stable `node` ref across the backend's
+// ~60Hz snapshot re-emits, so the default shallow prop compare skips
+// reconciliation. The recursive `<PaneNode>` in the split branch references
+// this memoized const (not `PaneNodeImpl`), so nested panes memoize too.
+export const PaneNode = React.memo(PaneNodeImpl);
+PaneNode.displayName = "PaneNode";

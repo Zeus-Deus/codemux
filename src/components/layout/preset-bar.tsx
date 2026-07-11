@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, memo } from "react";
 import { Settings, Plus } from "lucide-react";
 import {
   DndContext,
@@ -127,7 +127,7 @@ interface PresetBarProps {
   disabled?: boolean;
 }
 
-export function PresetBar({
+function PresetBarImpl({
   workspaceId,
   draftId,
   disabled = false,
@@ -245,6 +245,17 @@ export function PresetBar({
 
   const inDraftMode = draftId != null;
   const isHomeDraft = inDraftMode && activeDraft?.target.kind === "home";
+
+  // Thread Scope redesign — a Home draft has no project, so the whole
+  // bar doesn't belong here: CLI presets need project context and a
+  // Chat Agent click would spawn a duplicate chat on top of the draft
+  // being composed. Previously this rendered a fully-disabled bar
+  // (see `isPresetDisabled` / `presetDisabledTooltip` below, now
+  // unreachable dead code kept for the other draft/workspace modes'
+  // shared logic); now it doesn't render at all. Picking a project via
+  // the new Thread Scope location control flips the target away from
+  // `home` and the bar reappears enabled.
+  if (isHomeDraft) return null;
 
   function isPresetDisabled(_preset: TerminalPreset): boolean {
     if (disabled) return true;
@@ -639,3 +650,9 @@ async function launchChatAgentOnWorkspace(
 ): Promise<void> {
   await agentChatCreatePane(workspaceId, "claude", null, launchMode);
 }
+
+// #127: memo is effective because setAppState performs structural sharing. The
+// props here are primitives (workspaceId/draftId/disabled), so backend ticks
+// that don't change them skip this bar's re-render.
+export const PresetBar = memo(PresetBarImpl);
+PresetBar.displayName = "PresetBar";

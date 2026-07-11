@@ -602,8 +602,31 @@ export const checkIsGitRepo = (path: string) =>
 export const initGitRepo = (path: string) =>
   invoke<string>("init_git_repo", { path });
 
+/** No-stage/no-commit variant behind the "Initialize Git" affordance —
+ *  runs a bare `git init` only, never staging or committing the user's
+ *  existing files (contrast `initGitRepo`, which also adds + makes an
+ *  initial commit for the new-empty-project flow). */
+export const initGitRepoNoCommit = (path: string) =>
+  invoke<string>("init_git_repo_no_commit", { path });
+
+/** Re-gather branch / ahead-behind / diff counts (and the `is_git` flag)
+ *  for one workspace and emit fresh app state — used right after
+ *  "Initialize Git" so the UI flips without waiting for the poll loop. */
+export const refreshWorkspaceGitInfo = (workspaceId: string) =>
+  invoke("refresh_workspace_git_info", { workspaceId });
+
 export const gitCloneRepo = (url: string, targetDir: string) =>
   invoke<string>("git_clone_repo", { url, targetDir });
+
+// Live `git clone --progress` updates stream over the `git-clone-progress`
+// Tauri event — the payload type and the typed `onGitCloneProgress`
+// subscriber live in the event registry. Re-exported here so callers that
+// already import from `@/tauri/commands` can reach both.
+export {
+  GIT_CLONE_PROGRESS_EVENT,
+  onGitCloneProgress,
+  type GitCloneProgress,
+} from "./events";
 
 export const createEmptyRepo = (parentDir: string, name: string) =>
   invoke<string>("create_empty_repo", { parentDir, name });
@@ -1128,6 +1151,29 @@ export const saveClipboardImageBytes = (
 export const pasteClipboardImageToFile = (): Promise<string> =>
   invoke<string>("paste_clipboard_image_to_file");
 
+/// Read the OS clipboard as an image, encode it as PNG, and return the
+/// encoded bytes + MIME directly (no temp file).
+///
+/// This is the agent-chat sibling of `pasteClipboardImageToFile`. The
+/// chat composer stages image bytes in memory rather than a filesystem
+/// path, so we ship the encoded PNG across IPC once (Rust→JS) instead
+/// of writing a temp file the composer would then have to read back and
+/// clean up. Throws when the clipboard holds no image (e.g. text-only),
+/// which the caller should treat as "let the default paste run".
+///
+/// WebKit hands the serialized `Vec<u8>` back as a `number[]`, so we
+/// rewrap it in a `Uint8Array` before returning.
+export interface ClipboardImagePayload {
+  bytes: Uint8Array;
+  mime: string;
+}
+export const pasteClipboardImage = async (): Promise<ClipboardImagePayload> => {
+  const raw = await invoke<{ bytes: number[]; mime: string }>(
+    "paste_clipboard_image",
+  );
+  return { bytes: new Uint8Array(raw.bytes), mime: raw.mime };
+};
+
 // ── Dialogs ──
 
 export const pickFolderDialog = (title: string) =>
@@ -1203,6 +1249,19 @@ export interface AgentChatSendTurnInput {
    *  `sandboxPolicy` on `turn/start`. Wired in the backend struct;
    *  MVP Codex UI still round-trips mode via session restart. */
   permission_mode_override?: string | null;
+  /** Follow-up queueing — optimistic-send correlation token. When the
+   *  turn is queued behind an active turn the backend echoes this on the
+   *  `turn_queued` event so the reducer reconciles the greyed bubble
+   *  instead of duplicating it. */
+  client_nonce?: string | null;
+}
+
+/** Result of `agent_chat_send_turn`. When `queued_id` is set the turn
+ *  was queued behind an active turn (rendered greyed-out) instead of
+ *  starting immediately; `turn_id` is an empty placeholder in that case. */
+export interface TurnStartResult {
+  turn_id: string;
+  queued_id: string | null;
 }
 
 export const getHomeDir = () => invoke<string>("get_home_dir");
@@ -1230,7 +1289,7 @@ export const agentChatStartSession = (
 export const agentChatSendTurn = (
   provider: AgentChatProviderKind,
   input: AgentChatSendTurnInput,
-) => invoke<string>("agent_chat_send_turn", { provider, input });
+) => invoke<TurnStartResult>("agent_chat_send_turn", { provider, input });
 
 export const agentChatInterruptTurn = (
   provider: AgentChatProviderKind,
@@ -1241,6 +1300,36 @@ export const agentChatInterruptTurn = (
     provider,
     threadId,
     turnId,
+  });
+
+/** Cancel a queued (not-yet-dispatched) follow-up turn. On success the
+ *  provider emits a `queued_turn_cancelled` event so the UI removes the
+ *  greyed bubble. */
+export const agentChatCancelQueuedTurn = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  queuedId: string,
+) =>
+  invoke<void>("agent_chat_cancel_queued_turn", {
+    provider,
+    threadId,
+    queuedId,
+  });
+
+/** Send a queued (not-yet-dispatched) follow-up turn **now**: the backend
+ *  promotes it to the front of the queue and soft-interrupts the active
+ *  turn (session, transcript, and on-disk work are preserved), then
+ *  dispatches it as a normal follow-up. The `queued_turn_dispatched` event
+ *  promotes the greyed bubble — no optimistic state change needed here. */
+export const agentChatSendQueuedTurnNow = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+  queuedId: string,
+) =>
+  invoke<void>("agent_chat_send_queued_turn_now", {
+    provider,
+    threadId,
+    queuedId,
   });
 
 export const agentChatRespondToRequest = (
@@ -1289,6 +1378,26 @@ export interface AgentChatSessionRecord {
   title: string | null;
   created_at: string;
   last_active_at: string;
+  /** Persisted per-thread picker config (nullable). Written from
+   *  `agent_chat_start_session` + `agent_chat_update_session_config`
+   *  and carried across silent restarts so the pane rehydrates the
+   *  user's chosen model / reasoning / context / permission mode after
+   *  an app restart instead of falling back to the provider default. */
+  model: string | null;
+  effort: string | null;
+  context_window: string | null;
+  permission_mode: string | null;
+}
+
+/** Partial per-thread config patch for
+ *  `agent_chat_update_session_config`. Only the fields present are
+ *  overwritten in the DB row (snake_case to match the Rust struct /
+ *  DB columns). This is DB-only — it never requires a live session. */
+export interface AgentChatSessionConfigUpdate {
+  model?: string | null;
+  effort?: string | null;
+  context_window?: string | null;
+  permission_mode?: string | null;
 }
 
 export const agentChatListSessions = (
@@ -1307,6 +1416,26 @@ export const agentChatRenameSession = (threadId: string, title: string) =>
 
 export const agentChatDeleteSession = (threadId: string) =>
   invoke<void>("agent_chat_delete_session", { threadId });
+
+/** Fetch a single persisted session row by thread id, INCLUDING rows
+ *  whose `sdk_session_id` is still null (unlike `agentChatListSessions`,
+ *  which filters those out). Returns `null` when no row exists. Used by
+ *  the pane's mount-seed effect to restore picker config + resume
+ *  cursor after an app restart. */
+export const agentChatGetSession = (threadId: string) =>
+  invoke<AgentChatSessionRecord | null>("agent_chat_get_session", {
+    threadId,
+  });
+
+/** Persist per-thread picker config to the session row without touching
+ *  the live provider session. Only the provided fields are overwritten.
+ *  Fired fire-and-forget from the picker handlers so a value the user
+ *  picks survives an app restart even when no live session exists. */
+export const agentChatUpdateSessionConfig = (
+  threadId: string,
+  config: AgentChatSessionConfigUpdate,
+) =>
+  invoke<void>("agent_chat_update_session_config", { threadId, config });
 
 /**
  * Return the persisted message envelopes for a thread, in original

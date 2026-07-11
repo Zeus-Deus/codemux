@@ -8,9 +8,11 @@
 
 ## What This Feature Is
 
-The Review tab is a right-sidebar surface that displays pull request details, reviews, checks, deployments, and merge controls for the current workspace branch. It integrates with GitHub via the `gh` CLI tool.
+The Review tab is a right-sidebar surface that displays pull request details, review threads, and CI checks for the current workspace branch. It integrates with GitHub via the `gh` CLI tool.
 
-> The tab was previously named "PR." It was renamed to "Review" in Phase 3 of the right-sidebar work to match Superset's terminology. The underlying data flow and feature set are unchanged; only the tab id, label, and component file names moved (`pr-panel.tsx` → `review-panel.tsx`, `pr/` subfolder → `review/`).
+> The tab was previously named "PR." It was renamed to "Review" in Phase 3 of the right-sidebar work to match Superset's terminology (`pr-panel.tsx` → `review-panel.tsx`, `pr/` subfolder → `review/`).
+>
+> A later pass **stripped the panel to Superset's resting layout** — title + status badge + checks + comments only. The review composer (Approve / Request changes / Comment), the merge controls, and the deployments section were intentionally removed (see the comment in `review-panel.tsx`). Their Rust backends are retained for a potential future re-wire, so `merge_pull_request` and the review-submission commands still exist and are registered — they simply have no caller in `src/components/`.
 
 ## Current Model
 
@@ -20,12 +22,16 @@ PR data is fetched from GitHub through `gh` CLI commands routed via Rust (`src-t
 
 - PR creation from panel when no PR exists for the current branch (title, body, base branch, draft toggle)
 - PR header with number, title, state (draft/open/merged/closed), source and target branches, addition/deletion stats, review decision badge, external link to GitHub
-- Review submission: approve, request changes, or comment with textarea
 - Check status display: pass/fail summary with individual check names, status icons, and clickable detail links
-- Deployment info: environment names, state badges (success/pending/failure), preview links
-- Merge controls: squash merge, create merge commit, or rebase merge with dual-confirmation safety
-- Conflict detection and "Resolve with AI" entry point
+- Review threads: existing review comments and inline review comments, rendered read-only
 - Collapsible sections with item counts
+
+Removed from this surface (backends retained, no UI caller):
+
+- Review submission (approve / request changes / comment)
+- Merge controls (squash / merge commit / rebase)
+- Deployment info (environments, state badges, preview links)
+- Conflict detection and the "Resolve with AI" entry point — see `docs/features/merge-resolver.md`, which is currently unreachable from the UI for this reason
 
 ## Incoming PRs View
 
@@ -50,12 +56,11 @@ The view fetches up to 50 PRs via `gh pr list` and shows a "View all on GitHub" 
 
 ## Important Touch Points
 
-- `src/components/workspace/pr-panel.tsx` — main PR panel
-- `src/components/workspace/pr/pr-header.tsx` — PR metadata display
-- `src/components/workspace/pr/pr-merge-controls.tsx` — merge method selection and execution
-- `src/components/workspace/pr/pr-review-actions.tsx` — review submission
-- `src/components/workspace/pr/pr-checks.tsx` — CI check status
-- `src/components/workspace/pr/pr-deployments.tsx` — deployment status
-- `src/components/workspace/pr/incoming-prs-view.tsx` — incoming PRs list
+- `src/components/workspace/review-panel.tsx` — main Review panel (fetching, polling, resting layout)
+- `src/components/workspace/review/review-header.tsx` — PR metadata display
+- `src/components/workspace/review/review-checks.tsx` — CI check status
+- `src/components/workspace/review/review-threads.tsx` — review + inline review comments (read-only)
+- `src/components/workspace/review/incoming-prs-view.tsx` — incoming PRs list
+- `src/components/workspace/review/collapsible-section.tsx` — collapsible section wrapper with item counts
 - `src-tauri/src/github.rs` — GitHub data fetching via gh CLI
-- `src-tauri/src/commands/github.rs` — Tauri GitHub commands
+- `src-tauri/src/commands/github.rs` — Tauri GitHub commands (incl. the still-registered, currently uncalled `merge_pull_request`)

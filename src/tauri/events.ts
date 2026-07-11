@@ -82,6 +82,25 @@ export const onWorktreeIncludesApplied = (
 ): Promise<UnlistenFn> =>
   listen<WorktreeIncludesApplied>("worktree-includes-applied", (e) => cb(e.payload));
 
+// ── git clone progress ──
+//
+// Mirror of src-tauri/src/commands/git.rs:GitCloneProgress. Emitted on
+// each parsed `git clone --progress` update (throttled to phase/percent
+// changes). Filter on `targetDir` to match your own in-flight clone.
+export interface GitCloneProgress {
+  targetDir: string;
+  phase: string;
+  percent: number | null;
+  detail: string;
+}
+
+export const GIT_CLONE_PROGRESS_EVENT = "git-clone-progress";
+
+export const onGitCloneProgress = (
+  cb: EventCallback<GitCloneProgress>,
+): Promise<UnlistenFn> =>
+  listen<GitCloneProgress>(GIT_CLONE_PROGRESS_EVENT, (e) => cb(e.payload));
+
 export const onOpenflowCycle = (
   cb: EventCallback<OrchestratorTriggerResult>,
 ): Promise<UnlistenFn> =>
@@ -157,6 +176,93 @@ export type CompletedItem =
       is_error: boolean;
     };
 
+// ── Subagents (cross-provider) ──
+//
+// Mirror of src-tauri/src/agent_provider/events.rs:SubagentSnapshot /
+// SubagentStatus (Stage 1). Field names are the SERIALIZED snake_case
+// wire names. Every field except `subagent_id` / `status` is optional
+// and `#[serde(default)]` on the Rust side, so old persisted rows (and
+// providers that only dribble identity out over several events) decode
+// cleanly. The frontend reducer merges non-null fields into its
+// per-subagent view state.
+
+export type SubagentStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped";
+
+export interface SubagentSnapshot {
+  /** Stable demux key (Claude parent_tool_use_id, Codex child threadId,
+   *  OpenCode child sessionID). Required. */
+  subagent_id: string;
+  /** tool_use / call id of the block that spawned this subagent. */
+  parent_item_id?: string | null;
+  /** Display name — "Explore", nickname, or agent name. */
+  name?: string | null;
+  /** subagent_type / role / agent. */
+  agent_type?: string | null;
+  model?: string | null;
+  status: SubagentStatus;
+  /** Live "currently doing X" line pushed by the provider. */
+  activity?: string | null;
+  /** Final report text, on completion. */
+  result_text?: string | null;
+  tool_use_count?: number | null;
+  total_tokens?: number | null;
+  duration_ms?: number | null;
+  /** Provider-native id (codex threadId, opencode sessionID, claude agentId). */
+  provider_ref?: string | null;
+  /** When this subagent was spawned while a `Workflow` tool run was
+   *  active, that workflow's `workflow_id`. Lets the reducer route the
+   *  snapshot into the workflow's phase view instead of the generic
+   *  subagent-run card. `null` outside a workflow run. */
+  workflow_id?: string | null;
+  /** Best-effort phase label parsed from a `phase:X` hint in the
+   *  provider's task label. `null` when no hint was found — the reducer
+   *  falls back to the workflow's last planned phase title. */
+  phase?: string | null;
+}
+
+// ── Workflows (Claude dynamic-workflow orchestration) ──
+//
+// Mirror of src-tauri/src/agent_provider/events.rs:WorkflowSnapshot /
+// WorkflowPhaseSnapshot. Same additive-serde discipline as
+// SubagentSnapshot: every field but `workflow_id` is optional and
+// `#[serde(default)]` on the Rust side.
+
+export type WorkflowRunWireStatus =
+  | "pending_approval"
+  | "running"
+  | "completed"
+  | "failed"
+  | "stopped";
+
+export interface WorkflowPhaseSnapshot {
+  title: string;
+  detail?: string | null;
+}
+
+export interface WorkflowSnapshot {
+  /** Stable key — the `tool_use_id` of the `Workflow` tool call. */
+  workflow_id: string;
+  status: string;
+  /** Workflow name — `meta.name`, falling back to a saved workflow's
+   *  `input.name`. */
+  name?: string | null;
+  description?: string | null;
+  /** Raw script text (`input.script`), for a "view source" affordance. */
+  script?: string | null;
+  /** Planned phases parsed from `meta.phases`, in script order. */
+  phases?: WorkflowPhaseSnapshot[] | null;
+  /** Final result text on completion/failure, truncated server-side. */
+  result_text?: string | null;
+  total_tokens?: number | null;
+  agent_count?: number | null;
+  duration_ms?: number | null;
+}
+
 export type TurnStatus =
   | { kind: "success" }
   | { kind: "error"; subtype: string; message: string }
@@ -180,12 +286,30 @@ export type ProviderRuntimeEvent =
       thread_id: string;
       turn_id: string;
       delta: ContentDelta;
+      /** When set, this delta belongs to the sub-transcript of the
+       *  identified subagent (Claude `parent_tool_use_id`, Codex child
+       *  threadId). `#[serde(default)]` on the Rust side, so absent /
+       *  `null` for ordinary parent-thread streaming. */
+      subagent_id?: string | null;
     }
   | {
       type: "item_completed";
       thread_id: string;
       turn_id: string;
       item: CompletedItem;
+      /** When set, this completed item belongs to the identified
+       *  subagent's sub-transcript rather than the parent flow. */
+      subagent_id?: string | null;
+    }
+  | {
+      type: "subagent_updated";
+      thread_id: string;
+      subagent: SubagentSnapshot;
+    }
+  | {
+      type: "workflow_updated";
+      thread_id: string;
+      workflow: WorkflowSnapshot;
     }
   | {
       type: "turn_completed";
@@ -207,6 +331,10 @@ export type ProviderRuntimeEvent =
        *  requests (plan, Codex server-initiated, or when the provider
        *  didn't supply one). */
       tool_use_id: string | null;
+      /** When a subagent raised this approval, its demux key — lets the
+       *  UI label the request "from subagent X" in the parent flow and
+       *  mirror it into the drill-in. `#[serde(default)]`. */
+      subagent_id?: string | null;
     }
   | {
       type: "request_resolved";
@@ -229,6 +357,42 @@ export type ProviderRuntimeEvent =
       type: "resume_cursor_updated";
       thread_id: string;
       resume_cursor: unknown;
+    }
+  // Follow-up queueing (mirrors `ProviderRuntimeEvent` in
+  // src-tauri/src/agent_provider/events.rs). A send that arrives while a
+  // turn is in flight is queued instead of rejected.
+  | {
+      type: "turn_queued";
+      thread_id: string;
+      queued_id: string;
+      /** Echoes the optimistic-send correlation token so the reducer can
+       *  grey out the already-appended bubble instead of duplicating it.
+       *  `null` for older callers / a remounted pane. */
+      client_nonce: string | null;
+      text: string;
+    }
+  | {
+      type: "queued_turn_dispatched";
+      thread_id: string;
+      queued_id: string;
+      turn_id: string;
+      text: string;
+    }
+  | {
+      type: "queued_turn_cancelled";
+      thread_id: string;
+      queued_id: string;
+    }
+  // Stall watchdog (mirrors `ProviderRuntimeEvent::RunStalled` in
+  // src-tauri/src/agent_provider/events.rs). Emitted when a mid-turn
+  // thread has produced no runtime events past the stall threshold.
+  // Advisory only — transient, never persisted, and cleared by the
+  // reducer on the next real activity.
+  | {
+      type: "run_stalled";
+      thread_id: string;
+      /** Seconds since the last observed runtime event for this thread. */
+      silent_for_secs: number;
     };
 
 /** Canonical provider event payload as delivered to the frontend —

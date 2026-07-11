@@ -35,6 +35,36 @@ Creation dispatches one of:
 
 After creation: preset applied, issue linked, project marked as recent, workspace activated.
 
+### Cloning a Repository
+
+The New Project → Clone flow and the standalone Clone dialog both call the
+`git_clone_repo` Tauri command (`src-tauri/src/commands/git.rs`). Frontend
+invoke args are `{ url, targetDir }`; the command signature also takes an
+injected `tauri::AppHandle` so it can stream progress.
+
+- **Stall-based timeout, not an absolute cap.** The clone runs
+  `git clone --progress` and reads stderr incrementally. It fails only when
+  **no new output arrives for 120 consecutive seconds** — a healthy slow
+  clone that keeps emitting progress never times out. On stall the child is
+  killed and the command returns `"git clone stalled — no progress for 120
+  seconds. …"`; the partially-cloned target dir is removed **only if it did
+  not exist before the clone started**. (This replaced an earlier absolute
+  120s timeout that killed legitimate slow clones.)
+- **Fail-fast auth.** Spawned with `GIT_TERMINAL_PROMPT=0` so an
+  auth-required URL errors out instead of hanging on a hidden prompt.
+- **Progress events.** Each parsed progress update emits a
+  `git-clone-progress` Tauri event with payload `{ targetDir, phase,
+  percent, detail }` (`percent` is `null` for phase-only lines like
+  `Cloning into …`; `detail` is the raw trimmed git line, e.g.
+  `Receiving objects: 42% (…), 12.00 MiB | 1.20 MiB/s`). Emission is
+  throttled to phase/percent changes. git separates progress lines with
+  `\r`, so the reader splits on both `\r` and `\n`. The pure parser
+  (`parse_clone_progress`) is unit-tested. The frontend subscribes via
+  `useCloneProgress` (filtered on `targetDir`) and renders a phase +
+  percent + determinate bar (indeterminate pulse when `percent` is null)
+  through `CloneProgressRow`. A real git failure still returns
+  `"git clone failed: <stderr tail>"`.
+
 ### Project Onboarding
 
 Shown on first project open (`project-onboarding.tsx`, ~616 lines). Two steps:
@@ -119,6 +149,70 @@ instead of accepting the agent's default and restarting.
   nothing — untouched workspaces are byte-identical to pre-feature.
 - **Persistence.** The last pick per family is remembered in `ui-store`
   (`lastModelSelections`) and restored on reopen.
+
+## Non-Git Projects
+
+Any folder can be opened as a project — git is not required. This is a
+deliberate, t3code-aligned UX decision: never refuse a folder, never
+mutate it (`git init` only ever runs on an explicit user click), degrade
+git-dependent features with honest messaging instead of silence.
+
+### Model
+
+- **Add paths never gate on git.** All entry points (folder picker /
+  Ctrl+O, sidebar "+", chat drafts, onboarding) accept non-git folders
+  silently. The old folder-picker `window.confirm` ("… is not a git
+  repository. Initialize one?") that refused the project on decline was
+  removed (`use-project-actions.ts`).
+- **Plain-directory mode.** `create_workspace_impl` /
+  `create_empty_workspace` resolve `project_root` via
+  `find_git_root(...).unwrap_or(folder)` — the folder itself is the
+  workspace root. Worktree creation intentionally hard-errors
+  (`"Not a git repository"`), so the UI must not offer it (see below).
+- **`is_git` snapshot flag.** `gather_workspace_git_info` stamps
+  `WorkspaceSnapshot.is_git` using the same `find_git_root` predicate
+  worktree creation uses. Serde-defaults to `true` (optimistic) so old
+  persisted/synced snapshots render exactly as before until their first
+  refresh; the error-path `WorkspaceGitInfo::default()` is also
+  `is_git: true` so a transient gather failure never flashes the
+  affordance on a real repo.
+- **Explicit "Initialize Git" affordance** (`use-initialize-git.ts` —
+  `showNoGitState` + `useInitializeGit`): shown only for LOCAL,
+  STANDARD project workspaces with `is_git === false` (Home is not a
+  project; `attach_only`/host-backed cwds are host paths the local
+  probe can't judge). Clicking runs bare `git init` (no commit) via the
+  dedicated `init_git_repo_no_commit` command (`git::git_init_no_commit`
+  — init only, never `git add`/`commit`, so the user's files and any
+  secrets are never staged), then `refresh_workspace_git_info` so the
+  git UI lights up immediately. The commit-ful `init_git_repo`
+  (`git init` + `add` + initial commit) intentionally remains — it backs
+  `create_empty_repo`'s new-empty-project flow, where an initial commit
+  is the wanted starting point.
+
+### Surfaces
+
+- **Workspace context bar** — "Not a git repository" + Initialize Git
+  button where the branch/kind cluster would render.
+- **Context Row status cluster** (chat panes) — compact Initialize Git
+  chip with an explanatory tooltip.
+- **Changes panel** — "Not a git repository — changes can't be tracked"
+  + Initialize Git, replacing the false "Working tree clean" (git
+  errors were swallowed to `[]`).
+- **Thread Scope row** — checkout + branch controls hidden for non-git
+  projects (gated off the project's workspace snapshot); a stale
+  "worktree" draft mode is snapped back to "current"; the scope hint
+  says the run lands in the folder and how to unlock worktrees.
+
+### Known remaining gaps
+
+- `new-workspace-dialog.tsx` (branch modes) still assumes git; a
+  non-git project going through it surfaces the backend error as a
+  toast rather than hiding the branch UI.
+- Checkpoints silently no-op for non-git (backend returns `Ok(None)`) —
+  acceptable, matches t3code.
+- After a bare `git init` (unborn HEAD) the branch may stay `None`
+  until the first commit, so branch-gated UI stays hidden — also
+  matches t3code.
 
 ## Current Constraints
 

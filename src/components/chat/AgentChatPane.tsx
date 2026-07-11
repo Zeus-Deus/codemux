@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Folder, GitBranch, Home } from "lucide-react";
 
 import { useAgentChatEvents } from "@/hooks/use-agent-chat-events";
 import {
@@ -12,6 +13,7 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildImageDisplaySources,
   buildImagePayloads,
   buildIssueResolvedContent,
   buildPrResolvedContent,
@@ -23,7 +25,14 @@ import {
   selectActiveSkills,
   useSkillsStore,
 } from "@/stores/skills-store";
-import type { ChatViewItem } from "@/lib/agent-chat/types";
+import type {
+  ChatViewItem,
+  PermissionRequestItem,
+} from "@/lib/agent-chat/types";
+import {
+  findSubagentView,
+  subagentOrdinal,
+} from "@/lib/agent-chat/subagents";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
@@ -47,6 +56,9 @@ import {
 } from "@/stores/provider-capabilities-store";
 import {
   activateWorkspace,
+  agentChatCancelQueuedTurn,
+  agentChatSendQueuedTurnNow,
+  agentChatGetSession,
   agentChatInterruptTurn,
   agentChatListMessages,
   agentChatListSessions,
@@ -56,6 +68,7 @@ import {
   agentChatSetPermissionMode,
   agentChatStartSession,
   agentChatStopSession,
+  agentChatUpdateSessionConfig,
   checkGhStatus,
   checkGithubRepo,
   getGithubIssueByPath,
@@ -64,8 +77,11 @@ import {
   grepCountPattern,
   readFileForAttachment,
   readFolderForAttachment,
+  type AgentChatSessionConfigUpdate,
+  type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
+import { createDeferredWorktree } from "@/lib/agent-chat/materialize";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
@@ -80,6 +96,9 @@ import type {
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
+import { SubagentActivityBar } from "./SubagentActivityBar";
+import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
+import { SubagentView } from "./SubagentView";
 import { DebugCleanupBanner } from "./DebugCleanupBanner";
 import { DebugExitDialog, type DebugExitChoice } from "./DebugExitDialog";
 import {
@@ -87,10 +106,9 @@ import {
   ComposerPendingInputPanel,
 } from "./ComposerPendingInputPanel";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
-import { DerivativeBranchPicker } from "./pickers/DerivativeBranchPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
-import { WorktreePicker } from "./pickers/WorktreePicker";
-import { ProjectPicker } from "@/components/overlays/project-picker";
+import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
+import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
 import { useUIStore } from "@/stores/ui-store";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
@@ -149,6 +167,19 @@ export function detectAnimatedGif(buffer: ArrayBuffer): boolean {
   }
   return false;
 }
+
+// Jump-to-card correction-loop tuning for the docked SubagentActivityBar
+// (see `handleJumpToSubagentCard` below). Mirrors MessageTrail.tsx's own
+// jump constants: `content-visibility:auto` rows only expose estimated
+// heights until they render, so a single scrollTop computation can land
+// off; a few corrective rAF passes converge on the real offset.
+const JUMP_SCROLL_MARGIN_PX = 16;
+const JUMP_SETTLE_TOLERANCE_PX = 2;
+const JUMP_SETTLE_STABLE_FRAMES = 3;
+const JUMP_SETTLE_MAX_FRAMES = 40;
+/** How long the ember ring highlight stays on a jumped-to card (design:
+ *  "flashes `box-shadow` ... for ~1100ms"). */
+const JUMP_HIGHLIGHT_MS = 1100;
 
 export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
@@ -336,6 +367,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   });
   const isHomeWorkspace =
     homeDir !== null && workspaceProjectRoot === homeDir;
+  // The pane workspace's actual checked-out branch (from the workspace
+  // snapshot's git watcher). Thread Scope prefers this over the branch
+  // picker's main/master heuristic for the "current checkout" display,
+  // since it's the real answer to "which branch am I on?".
+  const paneWorkspaceBranch = useAppStore((s) => {
+    if (!s.appState) return null;
+    const ws = s.appState.workspaces.find(
+      (w) =>
+        w.workspace_id === (workspaceIdForPane ?? s.appState!.active_workspace_id),
+    );
+    return ws?.git_branch ?? null;
+  });
   const setShowNewWorkspaceDialog = useUIStore(
     (s) => s.setShowNewWorkspaceDialog,
   );
@@ -359,6 +402,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const setStoreEffort = useAgentChatStore((s) => s.setEffort);
   const setStoreContextWindow = useAgentChatStore((s) => s.setContextWindow);
+  const setStoreResumeCursor = useAgentChatStore((s) => s.setResumeCursor);
   const setStoreMode = useAgentChatStore((s) => s.setMode);
   const setStoreModePriorPermissionMode = useAgentChatStore(
     (s) => s.setModePriorPermissionMode,
@@ -379,6 +423,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const skillsRegistry = useSkillsStore(selectActiveSkills);
   const migrateThreadId = useAgentChatStore((s) => s.migrateThreadId);
   const appendUserMessage = useAgentChatStore((s) => s.appendUserMessage);
+  const removeUserMessageByNonce = useAgentChatStore(
+    (s) => s.removeUserMessageByNonce,
+  );
   const markRequestResponding = useAgentChatStore(
     (s) => s.markRequestResponding,
   );
@@ -399,6 +446,151 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const draft = slice?.inputDraft ?? "";
   const messages = slice?.messages ?? EMPTY_MESSAGES;
   const streaming = slice?.streaming ?? false;
+  // Dead-run detection (issue #154): the stall notice + interrupted /
+  // Continue affordances read straight off the thread slice.
+  const stalled = slice?.stalled ?? null;
+  const interrupted = slice?.interrupted ?? false;
+
+  // Subagent drill-in view state (locked decision 3): the pane swaps its
+  // transcript body for a read-only sub-transcript and its sub-header for
+  // a breadcrumb, but the composer stays wired to the parent thread. Kept
+  // as local state; entering is triggered from the orchestration card, Esc
+  // returns.
+  const [enteredSubagentId, setEnteredSubagentId] = useState<string | null>(
+    null,
+  );
+  const enteredSubagent = useMemo(
+    () =>
+      enteredSubagentId ? findSubagentView(messages, enteredSubagentId) : null,
+    [messages, enteredSubagentId],
+  );
+  // The subagent vanished (thread switch / hydrate) — fall back to the
+  // orchestrator so we never render a dangling breadcrumb.
+  useEffect(() => {
+    if (enteredSubagentId && !enteredSubagent) setEnteredSubagentId(null);
+  }, [enteredSubagentId, enteredSubagent]);
+  // Approval requests that bubbled from the entered subagent, mirrored
+  // into the drill-in (locked decision 4).
+  const enteredSubagentRequests = useMemo<PermissionRequestItem[]>(() => {
+    if (!enteredSubagentId) return EMPTY_REQUESTS;
+    return messages.filter(
+      (m): m is PermissionRequestItem =>
+        m.kind === "permission_request" && m.subagent_id === enteredSubagentId,
+    );
+  }, [messages, enteredSubagentId]);
+  const handleEnterSubagent = useCallback((subagentId: string) => {
+    setEnteredSubagentId(subagentId);
+  }, []);
+  const handleExitSubagent = useCallback(() => {
+    setEnteredSubagentId(null);
+  }, []);
+  // Esc leaves the drill-in and returns to the orchestrator.
+  useEffect(() => {
+    if (!enteredSubagentId) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        setEnteredSubagentId(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [enteredSubagentId]);
+  // Scoped to this pane's own subtree (not `document`) so split panes each
+  // jump within their own transcript. Plain DOM query rather than the
+  // MessageScroller engine's `scrollToMessage`: the docked bar lives
+  // outside the scroller's provider tree, and MessageList renders every
+  // slot (no windowing — see docs/features/agent-chat.md "Transcript
+  // scroller"), so a direct query by `data-subagent-card` always finds the
+  // node.
+  const paneRootRef = useRef<HTMLDivElement>(null);
+  // Live handles for an in-flight jump (rAF settle loop + highlight
+  // timeout), cancelled on a re-jump, a thread switch, and unmount — the
+  // same hygiene as MessageList's / MessageTrail's own settle loops.
+  const jumpFrameRef = useRef<number | null>(null);
+  const jumpHighlightRef = useRef<{
+    timer: number;
+    card: HTMLElement;
+  } | null>(null);
+  const cancelJump = useCallback(() => {
+    if (jumpFrameRef.current != null) {
+      cancelAnimationFrame(jumpFrameRef.current);
+      jumpFrameRef.current = null;
+    }
+    if (jumpHighlightRef.current != null) {
+      window.clearTimeout(jumpHighlightRef.current.timer);
+      jumpHighlightRef.current.card.classList.remove(
+        "subagent-card-highlight",
+      );
+      jumpHighlightRef.current = null;
+    }
+  }, []);
+  // Cleanup-only effect: cancels any in-flight jump when the thread
+  // changes and on unmount.
+  useEffect(() => cancelJump, [cancelJump, threadId]);
+  const handleJumpToSubagentCard = useCallback(
+    (cardId: string) => {
+      const root = paneRootRef.current;
+      if (!root) return;
+      const viewport = root.querySelector<HTMLElement>(
+        '[data-slot="message-scroller-viewport"]',
+      );
+      if (!viewport) return;
+      const findCard = () => {
+        const nodes = viewport.querySelectorAll<HTMLElement>(
+          "[data-subagent-card]",
+        );
+        for (const node of Array.from(nodes)) {
+          if (node.dataset.subagentCard === cardId) return node;
+        }
+        return null;
+      };
+      let card = findCard();
+      if (!card) return;
+
+      // A jump already in flight (or a lingering highlight on another
+      // card) is superseded by this one.
+      cancelJump();
+
+      card.classList.add("subagent-card-highlight");
+      jumpHighlightRef.current = {
+        card,
+        timer: window.setTimeout(() => {
+          jumpHighlightRef.current?.card.classList.remove(
+            "subagent-card-highlight",
+          );
+          jumpHighlightRef.current = null;
+        }, JUMP_HIGHLIGHT_MS),
+      };
+
+      let frames = 0;
+      let stableFrames = 0;
+      const settle = () => {
+        jumpFrameRef.current = null;
+        if (!card?.isConnected) card = findCard();
+        if (!card) return;
+        const top =
+          card.getBoundingClientRect().top -
+          viewport.getBoundingClientRect().top;
+        const delta = top - JUMP_SCROLL_MARGIN_PX;
+        if (Math.abs(delta) > JUMP_SETTLE_TOLERANCE_PX) {
+          viewport.scrollTop += delta;
+          stableFrames = 0;
+        } else {
+          stableFrames += 1;
+        }
+        frames += 1;
+        if (
+          stableFrames < JUMP_SETTLE_STABLE_FRAMES &&
+          frames < JUMP_SETTLE_MAX_FRAMES
+        ) {
+          jumpFrameRef.current = requestAnimationFrame(settle);
+        }
+      };
+      jumpFrameRef.current = requestAnimationFrame(settle);
+    },
+    [cancelJump],
+  );
   const activeTurnId = slice?.activeTurnId ?? null;
   const model = slice?.model ?? null;
   const permissionMode =
@@ -434,27 +626,123 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
   }, [threadId, capabilities, permissionMode, setStorePermissionMode]);
 
-  // Seed slice.model with the provider's default whenever the slice
-  // exists (threadId set) but has no model yet. Three paths land in
-  // this state:
+  // Seed the slice's picker config from the persisted session row
+  // whenever the slice exists (threadId set) but has no model yet.
+  // Three paths land in this state:
   //   (a) app restart — the pane snapshot still carries a thread_id,
   //       but the in-memory store was wiped, so `ensureThread` below
-  //       creates a fresh empty slice
+  //       creates a fresh empty slice. THIS is the restart bug: the
+  //       DB row holds the user's chosen model / effort / context /
+  //       permission mode + the durable `sdk_session_id`, none of
+  //       which live in the wiped store.
   //   (b) resume from session history — `hydrateThread` rebuilds the
   //       transcript from persisted events, none of which carry the
-  //       chosen model
+  //       chosen model.
   //   (c) any future flow that pre-creates a slice without seeding
   //       the model (e.g. silent restart on a thread that never got
-  //       a model assigned)
-  // Without this seed, ReasoningPicker (which short-circuits on
-  // `!model`) renders nothing and the user loses the effort /
-  // context-window picker. Idempotent — bails the moment a model is
-  // present.
+  //       a model assigned).
+  //
+  // We fetch `agent_chat_get_session(threadId)` (which — unlike the
+  // history list — returns rows whose `sdk_session_id` is still null)
+  // and seed model/effort/contextWindow/permissionMode from it,
+  // falling back to the provider default only when the row (or its
+  // model column) is absent. Fetching FIRST and seeding once avoids
+  // flashing the Opus default and then swapping to the persisted
+  // model. `resumeCursor` is restored from `sdk_session_id` so a
+  // picker-triggered silent restart resumes the SDK session instead
+  // of starting fresh.
+  //
+  // Race safety: gated on `model === null`, and we re-check the live
+  // slice after the async fetch so a selection the user made while the
+  // fetch was in flight is never clobbered. `seedAttemptedRef` (keyed
+  // by thread id, released on teardown like the hydrate effect) keeps
+  // StrictMode's double-mount from firing two fetches. Without this
+  // seed, ReasoningPicker (which short-circuits on `!model`) renders
+  // nothing and the user loses the effort / context-window picker.
+  const seedAttemptedRef = useRef<string | null>(null);
   useEffect(() => {
     if (!threadId) return;
     if (model !== null) return;
-    setStoreModel(threadId, defaultModelForProvider(provider));
-  }, [threadId, model, provider, setStoreModel]);
+    if (seedAttemptedRef.current === threadId) return;
+    seedAttemptedRef.current = threadId;
+    const seedThreadId = threadId;
+    const seedProvider = provider;
+    let cancelled = false;
+    void (async () => {
+      let record: AgentChatSessionRecord | null = null;
+      try {
+        record = await agentChatGetSession(seedThreadId);
+      } catch (err) {
+        // Soft-fail: fall through to the provider default so the
+        // pickers still render. Log so it's debuggable.
+        console.warn("[agent-chat] get-session on mount failed:", err);
+      }
+      if (cancelled) return;
+      // Never overwrite a value the user picked while the fetch was in
+      // flight — the picker handlers write straight to the slice. The
+      // guard is PER FIELD (not a single `model`-only bail): a user can
+      // change permission-mode / effort / context — or nothing but the
+      // model — during the in-flight window, and each field must be
+      // protected independently. A field is only seeded when the live
+      // slice still holds its unseeded sentinel (the `emptySlice`
+      // default), i.e. the user hasn't touched it. `!current` means the
+      // slice doesn't exist yet, so seeding is unconditionally safe.
+      const current = useAgentChatStore.getState().threads[seedThreadId];
+      // A model pick runs the compat planner, which OWNS effort/context
+      // for the new model — so if the user picked a model mid-flight we
+      // must not re-seed model/effort/context from the (now stale) row.
+      const modelUntouched = !current || current.model === null;
+      if (modelUntouched) {
+        setStoreModel(
+          seedThreadId,
+          record?.model ?? defaultModelForProvider(seedProvider),
+        );
+      }
+      if (record) {
+        if (modelUntouched) {
+          if (record.effort != null && (!current || current.effort === null))
+            setStoreEffort(seedThreadId, record.effort);
+          if (
+            record.context_window != null &&
+            (!current || current.contextWindow === null)
+          )
+            setStoreContextWindow(seedThreadId, record.context_window);
+        }
+        if (
+          record.permission_mode != null &&
+          (!current ||
+            current.permissionMode === DEFAULT_THREAD_PERMISSION_MODE)
+        )
+          setStorePermissionMode(seedThreadId, record.permission_mode);
+        // Resume cursor is independent of the model pick, so seed it even
+        // when the user changed the model mid-flight — otherwise a later
+        // picker-triggered restart would start fresh instead of resuming.
+        if (!current || current.resumeCursor == null)
+          setStoreResumeCursor(
+            seedThreadId,
+            record.sdk_session_id ? { resume: record.sdk_session_id } : null,
+          );
+      }
+    })();
+    return () => {
+      cancelled = true;
+      // Release the attempt marker on teardown so StrictMode's
+      // mount→unmount→remount cycle re-seeds on the real mount instead
+      // of bailing on a stale marker (mirrors hydrateAttemptedRef).
+      if (seedAttemptedRef.current === threadId) {
+        seedAttemptedRef.current = null;
+      }
+    };
+  }, [
+    threadId,
+    model,
+    provider,
+    setStoreModel,
+    setStoreEffort,
+    setStoreContextWindow,
+    setStorePermissionMode,
+    setStoreResumeCursor,
+  ]);
 
   // Resolve the session-start timestamp for the D2 transcript marker.
   // The persisted sessions list is the only place a chat's wall-clock
@@ -714,7 +1002,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     clearDraft,
   ]);
 
-  const handleSubmit = useCallback(() => {
+  const handleSubmit = useCallback((
+    textOverride?: string,
+    options?: { continueRun?: boolean },
+  ) => {
     // Synchronous ref check BEFORE any React state reads — closes the
     // same-tick race that the `useState` guard can't (captured closure
     // sees the pre-set snapshot when two Enter presses fire in one
@@ -722,8 +1013,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     // `sendInFlightRef.current === true` and bails.
     if (sendInFlightRef.current) return;
     if (!threadId) return;
-    const rawText = draft.trim();
+    // `textOverride` is the one-click "Continue run" path (issue #154):
+    // it sends fixed text through this same machinery so the optimistic
+    // bubble, rollback, and backend auto-resume all behave identically to
+    // a manual send. A string is only ever passed by `handleContinueRun`;
+    // the Composer always calls `onSubmit()` with no args.
+    //
+    // `continueRun` is the recovery send: it must NOT consume the composer.
+    // The user may be mid-way through typing their next message with staged
+    // attachments; resuming a dead run should leave that draft + its chips
+    // untouched and send a plain "Continue" with no images.
+    const isContinue = options?.continueRun === true;
+    const rawText = (typeof textOverride === "string" ? textOverride : draft).trim();
     if (!rawText) return;
+    // Snapshot the pre-append interrupted state + composer draft so a failed
+    // send can restore both (the optimistic append clears `interrupted` and
+    // the store's `appendUserMessage` resets `inputDraft`).
+    const preSendInterrupted =
+      useAgentChatStore.getState().threads[threadId]?.interrupted ?? false;
+    const composerDraft = draft;
     const plan = planSubmit({ rawText, provider, effort });
     sendInFlightRef.current = true;
     setIsSending(true);
@@ -737,7 +1045,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // turn — better to send something than to hard-block on a flaky
       // gh call.
       try {
-        const preStale = useAgentChatStore.getState().threads[threadId];
+        // A Continue send carries no attachments, so skip the stale refresh.
+        const preStale = isContinue
+          ? undefined
+          : useAgentChatStore.getState().threads[threadId];
         const staleList = (preStale?.stagedAttachments ?? []).filter((a) => {
           if (a.kind !== "issue" && a.kind !== "pr") return false;
           if (a.metadata.isLoading) return false;
@@ -820,7 +1131,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // appears in the textarea (`rawText`); deleting a token excludes
       // its file from the prompt without an explicit chip-removal.
       const liveSlice = useAgentChatStore.getState().threads[threadId];
-      const liveAttachments = liveSlice?.stagedAttachments ?? [];
+      // A Continue send never carries attachments or images: it leaves the
+      // user's staged chips intact for their real next message and sends plain
+      // "Continue". An empty list makes every downstream builder a no-op.
+      const liveAttachments = isContinue ? [] : (liveSlice?.stagedAttachments ?? []);
       const attachmentBlock = buildAttachmentBlock(
         activeAttachments(rawText, liveAttachments),
       );
@@ -830,6 +1144,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // translate to provider-specific shapes (Claude `image/base64`,
       // Codex `image_url` data URI).
       const imagePayloads = buildImagePayloads(liveAttachments);
+      // The same images as `data:` URLs, attached to the
+      // optimistic bubble so the sent turn shows its thumbnails (the
+      // bytes only live in memory until the backend persists them).
+      const imageDisplaySources = buildImageDisplaySources(liveAttachments);
       const sdkText = applyAllPrefixes(
         rawText,
         mode,
@@ -837,20 +1155,54 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         skillBodies,
         attachmentBlock,
       );
-      appendUserMessage(threadId, plan.text);
-      // Clear chips per-turn (matches the inputDraft = "" reset that
-      // appendUserMessage already does for the textarea).
-      clearStagedAttachments(threadId);
+      // Optimistic append carries a client nonce so a `turn_queued`
+      // event can reconcile THIS exact bubble (grey it out) instead of
+      // duplicating it, and so an outright RPC failure can roll it back
+      // (fixes the pre-queue orphan-bubble bug).
+      const clientNonce =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      appendUserMessage(threadId, plan.text, clientNonce, imageDisplaySources);
+      if (isContinue) {
+        // Preserve the composer: `appendUserMessage` reset `inputDraft` to ""
+        // as a side effect, so restore the user's in-progress text. Staged
+        // chips are left untouched (no `clearStagedAttachments` below).
+        setInputDraft(threadId, composerDraft);
+      } else {
+        // Clear chips per-turn (matches the inputDraft = "" reset that
+        // appendUserMessage already does for the textarea).
+        clearStagedAttachments(threadId);
+      }
       const input = {
         thread_id: threadId,
         text: sdkText,
         images: imagePayloads,
         model_override: null,
         effort_override: plan.effortOverride,
+        client_nonce: clientNonce,
       };
       try {
+        // Backend is authoritative: if a turn was already in flight the
+        // send is QUEUED (result.queued_id set) rather than rejected. In
+        // that case the `turn_queued` event greys the optimistic bubble;
+        // we do nothing extra here. An immediate start keeps the bubble
+        // as a normal user message.
         await agentChatSendTurn(provider, input);
       } catch (err) {
+        // Genuine failure — roll back the optimistic bubble so no orphan
+        // is left. `restoreInterrupted` re-arms the "Run interrupted"
+        // divider + Continue chip when the failed send was itself a resume
+        // of an interrupted thread (the optimistic append cleared the flag),
+        // so one failed click never strands the run with no recovery
+        // affordance.
+        removeUserMessageByNonce(threadId, clientNonce, preSendInterrupted);
+        // Restore the composer text so the user doesn't lose it. A Continue
+        // send never owned the draft (it preserved the user's own in-progress
+        // text above), so leave that intact rather than stamping "Continue".
+        if (!isContinue) {
+          setInputDraft(threadId, rawText);
+        }
         toast.error(`Failed to send turn: ${err}`);
         sendInFlightRef.current = false;
         setIsSending(false);
@@ -865,9 +1217,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     cwd,
     skillsRegistry,
     appendUserMessage,
+    removeUserMessageByNonce,
+    setInputDraft,
     clearStagedAttachments,
     updateStagedAttachment,
   ]);
+
+  /** One-click "Continue run" (issue #154): resume an interrupted run by
+   *  sending the fixed text "Continue" through the normal send path — the
+   *  same thing users type manually today. Routing through
+   *  `agentChatSendTurn` means the backend's `ensure_live_session` choke
+   *  point transparently rebuilds the dead session with the resume cursor.
+   *  Appending the optimistic bubble clears the interrupted flag. */
+  const handleContinueRun = useCallback(() => {
+    handleSubmit("Continue", { continueRun: true });
+  }, [handleSubmit]);
 
   /** Step 8 Stage 2 — orchestrates the chip lifecycle when the user
    *  picks a file from the `@` mention popup. The Composer has
@@ -1296,15 +1660,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   }, [isSending, streaming, activeTurnId]);
 
   // Interrupt mechanic: the SDK's `query.interrupt()` causes its
-  // async iterator to exit. The session is functionally dead after
-  // that (ClaudeAdapter.ts:2363 calls `stopSessionInternal`
-  // unconditionally). The reference impl's next `sendTurn` creates
-  // a brand-new SDK query transparently via
-  // `ensureSessionForThread`. Our Rust adapter has no equivalent
-  // auto-recreate, so we do it proactively:
-  // interrupt for the immediate turn abort, then stop + start the
-  // session so subsequent turns land on a live SDK query. Transcript
-  // and picker state persist via `migrateThreadId`.
+  // async iterator to exit, so the underlying SDK query is dead after
+  // an interrupt. The sidecar now recovers from that transparently —
+  // like the reference multi-provider client, its next `send-turn`
+  // rebuilds a resumed SDK query for the (surviving) session, so a bare
+  // interrupt already lets subsequent turns land on a live query.
+  // The Stop button still performs a deliberate hard reset: interrupt
+  // for the immediate turn abort, then stop + start the session (fresh
+  // thread id, resume cursor) so subsequent turns land on a known-good
+  // SDK query and any wedged sidecar state is cleared. Transcript and
+  // picker state persist via `migrateThreadId`.
   const handleStop = useCallback(() => {
     if (!threadId) return;
     if (restarting) return;
@@ -1312,12 +1677,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (!currentSlice) return;
     setRestarting(true);
     void (async () => {
-      // Fire-and-forget the interrupt RPC so the SDK query aborts
-      // immediately — don't block on it.
-      agentChatInterruptTurn(provider, threadId, null).catch(() => {
-        // Stop path will also tear down the sidecar; an interrupt
-        // failure here is safe to swallow.
-      });
+      // Await the interrupt BEFORE tearing the session down. The provider
+      // settles a user stop with a persisted `turn_completed{interrupted}`
+      // (Claude via the sidecar's `session-ended`, Codex via the app-server's
+      // `turn/completed`) that flows asynchronously. If we fired the interrupt
+      // and immediately killed the child, that settlement could lose the race
+      // and the stopped turn would hydrate as an unsettled — i.e. "Run
+      // interrupted" — turn after a restart. Awaiting orders the interrupt
+      // ahead of `stop_session`, whose graceful shutdown (EOF → grace → kill)
+      // then gives the settlement time to reach the event bridge (which
+      // persists from the broadcast independent of the child's liveness). An
+      // interrupt failure is safe to swallow — the stop below tears down anyway.
+      try {
+        await agentChatInterruptTurn(provider, threadId, null);
+      } catch {
+        // Non-fatal: the teardown below still restarts the session.
+      }
       try {
         await agentChatStopSession(provider, threadId);
       } catch (err) {
@@ -1366,6 +1741,45 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     migrateThreadId,
     setSessionLaunchMode,
   ]);
+
+  // Follow-up queueing: cancel a queued (not-yet-dispatched) turn. The
+  // backend emits `queued_turn_cancelled`, which the reducer uses to
+  // remove the greyed bubble — so we don't optimistically remove here.
+  // On success we restore the cancelled text into the composer draft so
+  // the user can edit and resend (prepended if the composer already has
+  // content, to avoid clobbering an in-progress draft).
+  const handleCancelQueued = useCallback(
+    (queuedId: string, text: string) => {
+      if (!threadId) return;
+      const tid = threadId;
+      void (async () => {
+        try {
+          await agentChatCancelQueuedTurn(provider, tid, queuedId);
+          const current = useAgentChatStore.getState().threads[tid]?.inputDraft ?? "";
+          setInputDraft(tid, current.trim().length > 0 ? `${text}\n${current}` : text);
+        } catch (err) {
+          toast.error(`Failed to cancel queued message: ${err}`);
+        }
+      })();
+    },
+    [threadId, provider, setInputDraft],
+  );
+
+  // Follow-up queueing: send a queued turn NOW (steer). The backend
+  // promotes it to the front of the queue and soft-interrupts the active
+  // turn — the session, transcript, and on-disk work are all preserved —
+  // then dispatches it as a normal follow-up. No optimistic state change:
+  // the `queued_turn_dispatched` event promotes the greyed bubble and the
+  // interrupt's `ready`/`running` state events settle the composer.
+  const handleSendQueuedNow = useCallback(
+    (queuedId: string) => {
+      if (!threadId) return;
+      agentChatSendQueuedTurnNow(provider, threadId, queuedId).catch((err) => {
+        toast.error(`Failed to send queued message: ${err}`);
+      });
+    },
+    [threadId, provider],
+  );
 
   const handleRespond = useCallback(
     (requestId: string, decision: ApprovalDecision) => {
@@ -1561,6 +1975,23 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setStorePermissionMode(threadId, "plan");
         setSessionLaunchMode(threadId, "plan");
         setStoreMode(threadId, newMode);
+        // The Plan/Ask pill is a TRANSIENT, session-live override that
+        // lives only in the in-memory slice (`mode` +
+        // `modePriorPermissionMode`) — neither is persisted. But
+        // `agent_chat_set_permission_mode` just wrote "plan" to the DB
+        // row, so a restart would auto-resume a read-only "plan" session
+        // with the pill gone and the prior mode unrecoverable. Re-persist
+        // the user's DURABLE permission choice so the DB reflects the
+        // real per-thread mode and a restart resumes in it (pill off),
+        // instead of a stale, pill-less read-only lock.
+        agentChatUpdateSessionConfig(threadId, {
+          permission_mode: priorMode,
+        }).catch((err) => {
+          console.warn(
+            "[agent-chat] failed to re-persist durable permission mode",
+            err,
+          );
+        });
       } else {
         setStoreMode(threadId, newMode);
       }
@@ -1688,6 +2119,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     triggerDebugCleanup,
   ]);
 
+  // Design G: mirror every picker change into the persisted session
+  // row so the user's choice survives an app restart even when no live
+  // session exists (the backend `set_model` / `set_permission_mode`
+  // paths persist too, but the effort / context-window pickers restart
+  // the session rather than calling a setter, and a mode already live
+  // on the session early-returns before any restart). Fire-and-forget:
+  // the DB write is best-effort and a failure only costs the
+  // restart-time restore of one field, so we log at console level
+  // rather than toasting.
+  const persistSessionConfig = useCallback(
+    (config: AgentChatSessionConfigUpdate) => {
+      if (!threadId) return;
+      agentChatUpdateSessionConfig(threadId, config).catch((err) => {
+        console.warn("[agent-chat] persist session config failed:", err);
+      });
+    },
+    [threadId],
+  );
+
   const handleModelChange = useCallback(
     (next: string) => {
       if (!threadId) return;
@@ -1703,12 +2153,19 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         currentEffort: effort,
         currentContextWindow: contextWindow,
       });
+      // Fold the model change and any compat-driven effort/context
+      // resets into a single persisted patch so a restart doesn't
+      // restore a stale effort that the new model no longer supports.
+      const configPatch: AgentChatSessionConfigUpdate = { model: next };
       if (plan.resetEffort !== undefined) {
         setStoreEffort(threadId, plan.resetEffort);
+        configPatch.effort = plan.resetEffort;
       }
       if (plan.resetContextWindow !== undefined) {
         setStoreContextWindow(threadId, plan.resetContextWindow);
+        configPatch.context_window = plan.resetContextWindow;
       }
+      persistSessionConfig(configPatch);
       agentChatSetModel(provider, threadId, next).catch((err) => {
         toast.error(`Failed to set model: ${err}`);
       });
@@ -1722,6 +2179,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       setStoreModel,
       setStoreEffort,
       setStoreContextWindow,
+      persistSessionConfig,
     ],
   );
 
@@ -1740,6 +2198,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       });
       if (!plan) return;
       setStorePermissionMode(threadId, plan.setPermissionMode);
+      // Persist the mode BEFORE the early return below: when the mode
+      // is already live we skip the restart, so the DB write is the
+      // only thing that carries this choice across a restart.
+      persistSessionConfig({ permission_mode: plan.setPermissionMode });
       // Skip the restart when the same mode is already live on the
       // current session — avoids a no-op session teardown.
       if (currentSlice.sessionLaunchMode === plan.setPermissionMode) return;
@@ -1749,7 +2211,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // PerTurn providers: the mode is already persisted; the next
       // `sendTurn` picks it up via `permission_mode_override`.
     },
-    [threadId, capabilities, setStorePermissionMode, restartSessionWith],
+    [
+      threadId,
+      capabilities,
+      setStorePermissionMode,
+      restartSessionWith,
+      persistSessionConfig,
+    ],
   );
 
   /**
@@ -1773,6 +2241,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       if (plan.setEffort !== null) {
         setStoreEffort(threadId, plan.setEffort);
+        persistSessionConfig({ effort: plan.setEffort });
       }
       if (plan.restart) {
         restartSessionWith({ effort: plan.setEffort });
@@ -1786,6 +2255,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       setInputDraft,
       setStoreEffort,
       restartSessionWith,
+      persistSessionConfig,
     ],
   );
 
@@ -1793,6 +2263,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     (next: string) => {
       if (!threadId) return;
       setStoreContextWindow(threadId, next);
+      persistSessionConfig({ context_window: next });
       // Context window on Claude is encoded into the model id (e.g.
       // `claude-opus-4-7[1m]`), which is a session-init parameter.
       // Mid-session change → restart.
@@ -1800,7 +2271,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         restartSessionWith({ contextWindow: next });
       }
     },
-    [threadId, provider, setStoreContextWindow, restartSessionWith],
+    [
+      threadId,
+      provider,
+      setStoreContextWindow,
+      restartSessionWith,
+      persistSessionConfig,
+    ],
   );
 
   const handleProviderChange = useCallback(
@@ -1819,90 +2296,288 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   const sessionReady = threadId != null && !starting && !restarting;
 
-  // Derivative branch — base the "+ New worktree…" inline submit
-  // forks from. Persists for the pane's lifetime; defaults to "main".
-  const [derivativeBranch, setDerivativeBranch] = useState("main");
+  // ── Thread Scope (new-thread empty state) ──
+  //
+  // Pane-local scope state, per-pane lifetime (there is no draft to
+  // persist into — this pane is bound to a real workspace). Mirrors
+  // the draft surface's `checkoutMode`/`worktreeName`/`baseBranch`
+  // draft fields:
+  //  - "current" (default): keep chatting in this pane's workspace.
+  //  - "worktree": the FIRST submit creates a sibling worktree
+  //    (deferred; auto-named from the first message when the name is
+  //    empty), routes the message into the new worktree's session,
+  //    and activates it — see `handleDeferredWorktreeSubmit`.
+  const [checkoutMode, setCheckoutMode] = useState<"current" | "worktree">(
+    "current",
+  );
+  const [worktreeName, setWorktreeName] = useState("");
+  // Seed lazily from the workspace's actual checked-out branch when
+  // it's already hydrated at mount; the fill-if-empty effect below
+  // covers late hydration. A user pick (or the branch popover's
+  // main/master fallback seed) makes the value non-empty and is never
+  // clobbered.
+  const [baseBranch, setBaseBranch] = useState<string>(
+    () => paneWorkspaceBranch ?? "",
+  );
+  useEffect(() => {
+    if (!paneWorkspaceBranch) return;
+    setBaseBranch((prev) => (prev === "" ? paneWorkspaceBranch : prev));
+  }, [paneWorkspaceBranch]);
 
-  // Zone 1 dispatch — Home-rooted panes get a ProjectPicker so the
-  // user can hop to a different project mid-conversation. All other
-  // panes get a WorktreePicker + DerivativeBranchPicker pair scoped to
-  // this pane's project so the user can switch worktrees or create
-  // one inline.
-  const zone1Override = (() => {
-    // `undefined` keeps the Composer's default cwd label.
-    if (!workspaceProjectRoot) return undefined;
-    // Scope pills sit above the composer only while the chat is new.
-    // Once the conversation is running, scope detail lives in the
-    // workspace context bar instead (bottom strip), so nothing renders
-    // above the composer (`null` suppresses the cwd label too).
-    if (messages.length > 0) return null;
-    if (isHomeWorkspace) {
-      return (
-        <ProjectPicker
-          value={null}
-          onChange={(targetProjectPath) => {
-            // Clear any active draft — the project switch promotes us
-            // into a real workspace, so the draft surface should not
-            // re-mount on top of it (Stage C Bug-2 pattern).
-            useChatDraftStore.getState().setActiveDraft(null);
-            const snapshot = useAppStore.getState().appState;
-            const groups = snapshot
-              ? groupWorkspacesByProject(snapshot.workspaces, homeDir)
-              : [];
-            const targetGroup = groups.find(
-              (g) => g.projectPath === targetProjectPath,
-            );
-            const target = targetGroup?.workspaces[0];
-            if (target) {
-              activateWorkspace(target.workspace_id).catch(console.error);
-            } else {
-              setShowNewWorkspaceDialog(true, targetProjectPath);
-            }
-          }}
-        />
+  // Zone 1 — nothing renders above the composer anymore: the scope
+  // lives BELOW it (`belowComposerSlot`) — `ThreadScopeRow` while the
+  // thread is empty, the Context Row once it has messages (see below).
+  // `undefined` (no resolvable project root) keeps the Composer's
+  // default cwd label as before.
+  const zone1Override = workspaceProjectRoot ? null : undefined;
+
+  // Old ProjectPicker onChange behavior, verbatim: clear any active
+  // draft (Stage C Bug-2 pattern — a draft pinned to this slot would
+  // otherwise re-render on top of the activated workspace), then
+  // activate the picked project's first workspace, else open the
+  // new-workspace dialog seeded with the path.
+  const handleScopeSelectProject = useCallback(
+    (targetProjectPath: string) => {
+      useChatDraftStore.getState().setActiveDraft(null);
+      const snapshot = useAppStore.getState().appState;
+      const groups = snapshot
+        ? groupWorkspacesByProject(snapshot.workspaces, homeDir)
+        : [];
+      const targetGroup = groups.find(
+        (g) => g.projectPath === targetProjectPath,
       );
-    }
-    return (
-      <div className="flex items-center gap-2">
-        <WorktreePicker
-          mode="active"
-          projectPath={workspaceProjectRoot}
-          currentWorkspaceId={workspaceIdForPane ?? undefined}
-          derivativeBranch={derivativeBranch}
-          onSwitchWorkspace={(wsId) => {
-            // Bug-2 draft-clear pattern: any draft pinned to this slot
-            // would otherwise re-render on top of the activated
-            // workspace's pane.
-            useChatDraftStore.getState().setActiveDraft(null);
-            activateWorkspace(wsId).catch(console.error);
-          }}
-          onWorktreeCreated={async (wsId) => {
-            // Pre-start the session before activating — otherwise
-            // the newly mounted AgentChatPane races to mint its own
-            // thread_id, and the user's first send can land before
-            // the session is registered in the adapter's HashMap
-            // (→ `session_not_found`). See
-            // `prestart-worktree-session.ts` for the rationale.
-            try {
-              await prestartWorktreeSession(wsId);
-            } catch (err) {
-              console.error(
-                "Failed to prestart worktree chat session:",
-                err,
-              );
-            }
-            useChatDraftStore.getState().setActiveDraft(null);
-            activateWorkspace(wsId).catch(console.error);
-          }}
-        />
-        <DerivativeBranchPicker
-          projectPath={workspaceProjectRoot}
-          value={derivativeBranch}
-          onChange={setDerivativeBranch}
-        />
+      const target = targetGroup?.workspaces[0];
+      if (target) {
+        activateWorkspace(target.workspace_id).catch(console.error);
+      } else {
+        setShowNewWorkspaceDialog(true, targetProjectPath);
+      }
+    },
+    [homeDir, setShowNewWorkspaceDialog],
+  );
+
+  const handleScopeSelectHomeWorkspace = useCallback((wsId: string) => {
+    useChatDraftStore.getState().setActiveDraft(null);
+    activateWorkspace(wsId).catch(console.error);
+  }, []);
+
+  const belowComposerSlot =
+    messages.length === 0 && workspaceProjectRoot ? (
+      <ThreadScopeRow
+        location={{
+          kind: "workspace",
+          isHome: isHomeWorkspace,
+          onSelectHomeWorkspace: handleScopeSelectHomeWorkspace,
+          onSelectProject: handleScopeSelectProject,
+        }}
+        // `null` for a home-rooted pane — no project, so the checkout +
+        // branch controls hide and the home scope hint renders.
+        projectPath={isHomeWorkspace ? null : workspaceProjectRoot}
+        checkoutMode={checkoutMode}
+        worktreeName={worktreeName}
+        baseBranch={baseBranch}
+        disabled={isSending}
+        onChangeCheckoutMode={setCheckoutMode}
+        onChangeWorktreeName={setWorktreeName}
+        onChangeBaseBranch={setBaseBranch}
+        // Real workspace on this surface — the status cluster has a
+        // git branch to report from its first render, unlike
+        // `DraftChatSurface`, which has no workspace yet and doesn't
+        // pass this.
+        trailing={<WorkspaceStatusCluster />}
+      />
+    ) : messages.length > 0 && workspaceProjectRoot ? (
+      // Context Row (design: `.design-import/Context Row.dc.html`) —
+      // once the thread has messages, scope is committed (the first
+      // send locked it in), so this half turns read-only: static
+      // project/branch labels on the left, the same passive git/PR
+      // status cluster on the right that the old bottom
+      // `WorkspaceContextBar` used to show (now hidden for this pane —
+      // see `useAgentChatPaneActive`).
+      <div className="flex w-full items-center justify-between gap-2.5 px-1">
+        <div className="flex min-w-0 items-center gap-0.5 text-xs font-semibold text-foreground/90">
+          <span
+            className="inline-flex h-[27px] shrink-0 items-center gap-1.5 rounded-md px-2"
+            title={workspaceProjectRoot}
+          >
+            {isHomeWorkspace ? (
+              <Home className="size-3.5 text-status-remote" />
+            ) : (
+              <Folder className="size-3.5 text-muted-foreground" />
+            )}
+            <span className="max-w-[140px] truncate">
+              {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
+            </span>
+          </span>
+          {paneWorkspaceBranch && (
+            <>
+              <span className="select-none text-muted-foreground/50">·</span>
+              <span
+                className="inline-flex h-[27px] shrink-0 items-center gap-1.5 rounded-md px-2 font-mono"
+                title={`Branch: ${paneWorkspaceBranch}`}
+              >
+                <GitBranch className="size-3 text-muted-foreground" />
+                <span className="max-w-[160px] truncate">
+                  {paneWorkspaceBranch}
+                </span>
+              </span>
+            </>
+          )}
+        </div>
+        <WorkspaceStatusCluster />
       </div>
-    );
-  })();
+    ) : undefined;
+
+  /** Thread Scope deferred-worktree first send. Replaces `handleSubmit`
+   *  ONLY while the thread is empty AND the checkout control is set to
+   *  "New worktree" (see `composerOnSubmit` below) — every other send
+   *  goes through the unmodified `handleSubmit`.
+   *
+   *  Order of operations (mirrors `materializeAndSend`'s worktree arm):
+   *   1. Create the sibling worktree via the shared
+   *      `createDeferredWorktree` (name precedence: typed name →
+   *      `generateBranchName(firstMessage)` → random fallback) off the
+   *      selected base branch.
+   *   2. `prestartWorktreeSession` — attach a chat pane + start a
+   *      session on the NEW workspace before anything else, so the
+   *      first turn below can't land ahead of the adapter registering
+   *      the thread (`session_not_found`). Carries this pane's picker
+   *      config so the new session matches what the user configured.
+   *   3. Send the first turn into the new thread with the same
+   *      skills/attachment-block/mode-prefix/image pipeline
+   *      `handleSubmit` uses. Attachments staged on THIS pane's thread
+   *      are injected into the turn's text/images (their chips stay
+   *      keyed to the old thread and are cleared below — the content
+   *      travels, the chip UI does not).
+   *      Limitation vs `handleSubmit`: the stale GitHub-detail
+   *      re-fetch pass is skipped — acceptable for a first turn, the
+   *      chips were fetched moments ago on this same surface.
+   *   4. Clear this pane's composer + chips and activate the new
+   *      workspace.
+   *
+   *  Failure policy: worktree/session resources created by earlier
+   *  steps are not rolled back (same as materialize); the composer
+   *  text stays in THIS pane so the user can retry. */
+  const handleDeferredWorktreeSubmit = useCallback(() => {
+    if (sendInFlightRef.current) return;
+    if (!workspaceProjectRoot) return;
+    const rawText = draft.trim();
+    if (!rawText) return;
+    const plan = planSubmit({ rawText, provider, effort });
+    sendInFlightRef.current = true;
+    setIsSending(true);
+    void (async () => {
+      try {
+        const wsId = await createDeferredWorktree(
+          workspaceProjectRoot,
+          worktreeName,
+          baseBranch,
+          rawText,
+        );
+        const prestarted = await prestartWorktreeSession(wsId, {
+          model,
+          // Same plan/ask coupling as materialize's
+          // `effectivePermissionMode`: both modes boot the SDK with
+          // writes locked off.
+          permissionMode:
+            mode === "plan" || mode === "ask"
+              ? "plan"
+              : permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE,
+          effort,
+          contextWindow,
+          mode,
+        });
+        if (!prestarted) {
+          // Degenerate: the new workspace hasn't hydrated into the
+          // store (event-delivery reordering). The worktree exists but
+          // there is no session to send into — keep the user's text in
+          // THIS composer and just flip over; they can re-send in the
+          // new pane (its mount-effect starts the session).
+          toast.warning(
+            "Worktree created — send your message again in the new workspace.",
+          );
+          useChatDraftStore.getState().setActiveDraft(null);
+          activateWorkspace(wsId).catch(console.error);
+          return;
+        }
+        const skillBodies = resolveSkillBodies(rawText, skillsRegistry);
+        const liveSlice = threadId
+          ? useAgentChatStore.getState().threads[threadId]
+          : undefined;
+        const liveAttachments = liveSlice?.stagedAttachments ?? [];
+        const attachmentBlock = buildAttachmentBlock(
+          activeAttachments(rawText, liveAttachments),
+        );
+        const imagePayloads = buildImagePayloads(liveAttachments);
+        // Display shape (`data:` URLs) for the optimistic
+        // bubble's thumbnails in the freshly-prestarted thread.
+        const imageDisplaySources = buildImageDisplaySources(liveAttachments);
+        const sdkText = applyAllPrefixes(
+          rawText,
+          mode,
+          effort,
+          skillBodies,
+          attachmentBlock,
+        );
+        // Optimistic echo into the NEW thread's slice so the pane that
+        // mounts on activation renders the user bubble immediately.
+        useAgentChatStore
+          .getState()
+          .appendUserMessage(
+            prestarted.threadId,
+            plan.text,
+            undefined,
+            imageDisplaySources,
+          );
+        await agentChatSendTurn(provider, {
+          thread_id: prestarted.threadId,
+          text: sdkText,
+          images: imagePayloads,
+          model_override: null,
+          effort_override: plan.effortOverride,
+          permission_mode_override: null,
+        });
+        // Success — clean this pane's composer/chips and flip to the
+        // new workspace.
+        if (threadId) {
+          setInputDraft(threadId, "");
+          clearStagedAttachments(threadId);
+        }
+        useChatDraftStore.getState().setActiveDraft(null);
+        activateWorkspace(wsId).catch(console.error);
+      } catch (err) {
+        toast.error(`Failed to start in a new worktree: ${err}`);
+      } finally {
+        sendInFlightRef.current = false;
+        setIsSending(false);
+      }
+    })();
+  }, [
+    workspaceProjectRoot,
+    draft,
+    provider,
+    effort,
+    mode,
+    model,
+    permissionMode,
+    contextWindow,
+    threadId,
+    worktreeName,
+    baseBranch,
+    skillsRegistry,
+    setInputDraft,
+    clearStagedAttachments,
+  ]);
+
+  // Intercept ONLY the empty-thread + worktree-mode first send;
+  // everything else stays on the unmodified `handleSubmit` path.
+  const composerOnSubmit =
+    messages.length === 0 &&
+    checkoutMode === "worktree" &&
+    !isHomeWorkspace &&
+    workspaceProjectRoot !== null
+      ? handleDeferredWorktreeSubmit
+      : handleSubmit;
 
   // AskUserQuestion prompts render as a composer-attached panel
   // (one-question-per-card pattern, similar to Claude.ai) rather
@@ -1955,7 +2630,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // An empty pane reads as a new chat: "Describe what you want the
       // agent to do…" until the first turn lands (design D10 copy).
       isDraft={messages.length === 0}
+      // In a subagent drill-in the composer stays parent-bound; only the
+      // placeholder changes to make that explicit (design copy).
+      placeholderOverride={
+        enteredSubagent ? "Steering goes to the orchestrator…" : undefined
+      }
       zone1Override={zone1Override}
+      belowComposerSlot={belowComposerSlot}
       provider={provider}
       model={model}
       permissionMode={permissionMode}
@@ -1965,7 +2646,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
       ultrathinkInBodyText={ultrathinkInBodyText}
-      streaming={streaming || isSending}
+      // Real streaming only — a follow-up sent while this is true gets
+      // QUEUED, not blocked. `sending` blocks re-submit during the send
+      // RPC ack-lag without blocking queueing.
+      streaming={streaming}
+      sending={isSending}
+      // Dead-run recovery (issue #154): a Continue chip in the composer
+      // strip when the last run died and nothing is in flight.
+      interrupted={interrupted}
+      onContinueRun={handleContinueRun}
       sessionReady={sessionReady}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}
@@ -1987,7 +2676,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (!threadId) return;
         setInputDraft(threadId, next);
       }}
-      onSubmit={handleSubmit}
+      onSubmit={composerOnSubmit}
       onStop={handleStop}
       onProviderChange={handleProviderChange}
       onModelChange={handleModelChange}
@@ -2008,20 +2697,60 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ) : null;
 
   return (
-    <div className="flex h-full w-full flex-col bg-background">
+    <div
+      ref={paneRootRef}
+      className="flex h-full w-full flex-col bg-background"
+    >
       {messages.length === 0 ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (
         <>
-          <ChatTranscript
-            messages={messages}
-            streaming={streaming || isSending}
-            sessionStartedAt={sessionStartedAt}
-            provider={provider}
-            onRespondToRequest={handleRespond}
-            onAcceptPlan={handleAcceptPlan}
-            onRejectPlan={handleRejectPlan}
-          />
+          {enteredSubagent ? (
+            // Drill-in: breadcrumb sub-header + read-only sub-transcript.
+            // The composer below stays wired to the parent thread.
+            <>
+              <SubagentBreadcrumb
+                subagent={enteredSubagent}
+                ordinal={subagentOrdinal(messages, enteredSubagent.id)}
+                onBack={handleExitSubagent}
+              />
+              <div className="flex-1 min-h-0 w-full overflow-y-auto">
+                <SubagentView
+                  subagent={enteredSubagent}
+                  requests={enteredSubagentRequests}
+                />
+              </div>
+            </>
+          ) : (
+            <ChatTranscript
+              messages={messages}
+              streaming={streaming || isSending}
+              stalled={stalled}
+              interrupted={interrupted}
+              sessionStartedAt={sessionStartedAt}
+              provider={provider}
+              onRespondToRequest={handleRespond}
+              onAcceptPlan={handleAcceptPlan}
+              onRejectPlan={handleRejectPlan}
+              onCancelQueued={handleCancelQueued}
+              onSendQueuedNow={handleSendQueuedNow}
+              onEnterSubagent={handleEnterSubagent}
+              workspaceId={workspaceIdForPane}
+            />
+          )}
+          {/* Docked live subagent activity bar (design "A living status,
+              docked by the composer"): one bar for the whole thread,
+              hidden while drilled into a subagent (the design only shows
+              it in the conversation view) and hidden entirely while idle. */}
+          {!enteredSubagent && (
+            <div className="px-7 pt-2.5">
+              <SubagentActivityBar
+                messages={messages}
+                threadId={threadId}
+                onJump={handleJumpToSubagentCard}
+              />
+            </div>
+          )}
           {/* Composer region (design D10): a hairline lifts the whole
               composer column — AskUserQuestion panel, debug banner, and
               the composer card — off the scrolling transcript. */}
@@ -2041,4 +2770,5 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 }
 
 const EMPTY_MESSAGES: ChatViewItem[] = [];
+const EMPTY_REQUESTS: PermissionRequestItem[] = [];
 const EMPTY_ATTACHMENTS: Attachment[] = [];

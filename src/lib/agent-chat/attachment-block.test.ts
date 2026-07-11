@@ -4,6 +4,7 @@ import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
+  buildImageDisplaySources,
   buildImagePayloads,
   buildIssueResolvedContent,
   buildPrResolvedContent,
@@ -589,5 +590,85 @@ describe("buildImagePayloads (Step 8 Stage 6)", () => {
     const out = buildImagePayloads([file, folder, img]);
     expect(out).toHaveLength(1);
     expect(out[0]?.media_type).toBe("image/png");
+  });
+});
+
+describe("buildImageDisplaySources", () => {
+  // The display shape the user-message bubble renders:
+  // `{ src: data-URL, mediaType }`. Same resolved-image filter as
+  // `buildImagePayloads`, but base64-encodes into a self-contained
+  // `data:` URL so the optimistic bubble shows thumbnails immediately.
+  function makeImageAttachment(
+    overrides: Partial<Attachment> = {},
+  ): Attachment {
+    return {
+      id: "img-1",
+      kind: "image",
+      ref: "image:img-1",
+      metadata: { label: "screenshot.png" },
+      resolvedImage: {
+        mime: "image/png",
+        bytes: new Uint8Array([1, 2, 3, 4]),
+      },
+      ...overrides,
+    };
+  }
+
+  it("builds a base64 data URL from the resolved bytes", () => {
+    const out = buildImageDisplaySources([makeImageAttachment()]);
+    // btoa of bytes [1,2,3,4] is "AQIDBA==".
+    expect(out).toEqual([
+      { src: "data:image/png;base64,AQIDBA==", mediaType: "image/png" },
+    ]);
+  });
+
+  it("skips loading images and non-image attachments", () => {
+    const loading: Attachment = {
+      id: "loading",
+      kind: "image",
+      ref: "image:loading",
+      metadata: { label: "pasting…", isLoading: true },
+    };
+    const file: Attachment = {
+      id: "f",
+      kind: "file",
+      ref: "x.ts",
+      metadata: { label: "x.ts" },
+      resolvedContent: "alpha",
+    };
+    expect(buildImageDisplaySources([loading, file])).toEqual([]);
+  });
+
+  it("preserves order and per-image mime across multiple images", () => {
+    const a = makeImageAttachment({
+      id: "a",
+      resolvedImage: { mime: "image/png", bytes: new Uint8Array([0]) },
+    });
+    const b = makeImageAttachment({
+      id: "b",
+      resolvedImage: { mime: "image/jpeg", bytes: new Uint8Array([255]) },
+    });
+    const out = buildImageDisplaySources([a, b]);
+    expect(out.map((s) => s.mediaType)).toEqual(["image/png", "image/jpeg"]);
+    expect(out[0]?.src.startsWith("data:image/png;base64,")).toBe(true);
+    expect(out[1]?.src.startsWith("data:image/jpeg;base64,")).toBe(true);
+  });
+
+  it("encodes a large image without a call-stack overflow", () => {
+    // 256 KB — well past the ~64K single-call argument ceiling that a
+    // naive `String.fromCharCode(...bytes)` spread would blow. The
+    // chunked encoder must handle it.
+    const big = new Uint8Array(256 * 1024);
+    for (let i = 0; i < big.length; i++) big[i] = i % 256;
+    const out = buildImageDisplaySources([
+      makeImageAttachment({ resolvedImage: { mime: "image/png", bytes: big } }),
+    ]);
+    expect(out).toHaveLength(1);
+    // Round-trip a prefix to confirm the base64 is valid, not garbage.
+    const b64 = out[0]!.src.split(",")[1]!;
+    const decoded = atob(b64);
+    expect(decoded.charCodeAt(0)).toBe(0);
+    expect(decoded.charCodeAt(1)).toBe(1);
+    expect(decoded.length).toBe(big.length);
   });
 });

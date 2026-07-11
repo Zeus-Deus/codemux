@@ -32,7 +32,7 @@ use codemux_lib::agent_provider::claude::{
 };
 use codemux_lib::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderError, ProviderRuntimeEvent, RequestId,
-    SendTurnInput, SessionStatus, StartSessionInput, ThreadId, TurnId, TurnStatus,
+    SendTurnInput, SessionStatus, StartSessionInput, SubagentStatus, ThreadId, TurnId, TurnStatus,
 };
 
 fn fake_sidecar() -> PathBuf {
@@ -287,6 +287,7 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap()
@@ -320,6 +321,7 @@ async fn consecutive_turns_stamp_distinct_turn_ids_on_content_deltas() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap()
@@ -374,6 +376,7 @@ async fn send_turn_emits_session_state_changed_running_with_matching_turn_id() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -463,6 +466,7 @@ async fn interrupt_emits_session_state_changed_ready() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -558,6 +562,7 @@ async fn send_turn_three_times_in_a_row_succeeds_without_validation_error() {
                 model_override: None,
                 effort_override: None,
                 permission_mode_override: None,
+                client_nonce: None,
             })
             .await
             .unwrap_or_else(|e| {
@@ -637,6 +642,7 @@ async fn send_turn_emits_content_deltas_then_item_completed_then_turn_completed(
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -689,6 +695,7 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -735,6 +742,7 @@ async fn unknown_sdk_message_variant_surfaces_as_runtime_warning() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -784,6 +792,7 @@ async fn request_opened_for_command_tool_routes_to_request_opened_event() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -849,6 +858,7 @@ async fn interrupt_turn_sends_interrupt_rpc() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -871,6 +881,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -966,6 +977,7 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap_err();
@@ -982,10 +994,14 @@ async fn duplicate_start_session_returns_validation_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_send_turn_returns_validation_error() {
+async fn concurrent_send_turn_queues_instead_of_erroring() {
+    // Follow-up queueing: a second send while the first turn is active is
+    // now QUEUED, not rejected. The fake sidecar never scripts a
+    // `result`, so the first turn stays active and the second parks.
     let provider = provider_with_fake().await;
     provider.start_session(start_input("t-busy")).await.unwrap();
-    provider
+    let mut stream = provider.event_stream();
+    let first = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-busy".into()),
             text: "first".into(),
@@ -993,10 +1009,13 @@ async fn concurrent_send_turn_returns_validation_error() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
-    let err = provider
+    assert!(first.queued_id.is_none(), "first send starts immediately");
+
+    let second = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-busy".into()),
             text: "second".into(),
@@ -1004,11 +1023,221 @@ async fn concurrent_send_turn_returns_validation_error() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: Some("nonce-2".into()),
         })
         .await
-        .unwrap_err();
-    assert!(matches!(err, ProviderError::ValidationError { .. }));
+        .unwrap();
+    let queued_id = second
+        .queued_id
+        .expect("second send should be queued behind the active turn");
+
+    let ev = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::TurnQueued { .. } = ev {
+                return Some(ev);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten()
+    .expect("expected a TurnQueued event");
+    match ev {
+        ProviderRuntimeEvent::TurnQueued {
+            queued_id: qid,
+            client_nonce,
+            text,
+            ..
+        } => {
+            assert_eq!(qid, queued_id);
+            assert_eq!(client_nonce.as_deref(), Some("nonce-2"));
+            assert_eq!(text, "second");
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
     provider.stop_session(ThreadId("t-busy".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_turns_dispatch_fifo_on_completion() {
+    // Two follow-ups queued behind an active turn dispatch in FIFO order
+    // as each prior turn completes. The fake sidecar emits one scripted
+    // `result` per send-turn RPC — the turn-boundary clear signal that
+    // triggers the drain.
+    let script = write_script(json!([
+        { "after": "send-turn", "delay_ms": 5, "emit": "notification",
+          "method": "sdk-message",
+          "params": { "threadId": "t-fifo", "message": {
+            "type": "result", "subtype": "success", "turn_id": "r1",
+            "duration_ms": 1, "num_turns": 1 } } },
+        { "after": "send-turn", "delay_ms": 5, "emit": "notification",
+          "method": "sdk-message",
+          "params": { "threadId": "t-fifo", "message": {
+            "type": "result", "subtype": "success", "turn_id": "r2",
+            "duration_ms": 1, "num_turns": 1 } } },
+        { "after": "send-turn", "delay_ms": 5, "emit": "notification",
+          "method": "sdk-message",
+          "params": { "threadId": "t-fifo", "message": {
+            "type": "result", "subtype": "success", "turn_id": "r3",
+            "duration_ms": 1, "num_turns": 1 } } }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input("t-fifo")).await.unwrap();
+    let mut stream = provider.event_stream();
+
+    for (text, nonce) in [("A", "n-a"), ("B", "n-b"), ("C", "n-c")] {
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: ThreadId("t-fifo".into()),
+                text: text.into(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: Some(nonce.into()),
+            })
+            .await
+            .unwrap();
+    }
+
+    // The two follow-ups (B, C) dispatch in FIFO order.
+    let dispatched = timeout(Duration::from_secs(5), async {
+        let mut texts = Vec::new();
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::QueuedTurnDispatched { text, .. } = ev {
+                texts.push(text);
+                if texts.len() >= 2 {
+                    break;
+                }
+            }
+        }
+        texts
+    })
+    .await
+    .unwrap_or_default();
+    assert_eq!(
+        dispatched,
+        vec!["B".to_string(), "C".to_string()],
+        "queued follow-ups B, C dispatch in FIFO order"
+    );
+    provider.stop_session(ThreadId("t-fifo".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_queued_turn_removes_it() {
+    let provider = provider_with_fake().await;
+    provider
+        .start_session(start_input("t-cancel"))
+        .await
+        .unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-cancel".into()),
+            text: "first".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+    let queued = provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-cancel".into()),
+            text: "second".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap()
+        .queued_id
+        .expect("second send queued");
+
+    provider
+        .cancel_queued_turn(ThreadId("t-cancel".into()), queued.clone())
+        .await
+        .unwrap();
+
+    let cancelled = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } = ev {
+                return Some(queued_id);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    assert_eq!(cancelled.as_deref(), Some(queued.as_str()));
+
+    // Cancelling again is a silent no-op (idempotent).
+    provider
+        .cancel_queued_turn(ThreadId("t-cancel".into()), queued)
+        .await
+        .unwrap();
+    provider
+        .stop_session(ThreadId("t-cancel".into()))
+        .await
+        .ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closing_session_cancels_queued_turns() {
+    let provider = provider_with_fake().await;
+    provider.start_session(start_input("t-close")).await.unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-close".into()),
+            text: "first".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+    let queued = provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-close".into()),
+            text: "second".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap()
+        .queued_id
+        .expect("second send queued");
+
+    provider.stop_session(ThreadId("t-close".into())).await.ok();
+
+    let cancelled = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } = ev {
+                return Some(queued_id);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    assert_eq!(cancelled.as_deref(), Some(queued.as_str()));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1043,7 +1272,13 @@ async fn sidecar_exit_mid_session_emits_error_state() {
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
     provider.start_session(start_input("t-crash")).await.unwrap();
     let mut stream = provider.event_stream();
-    let _ = provider
+    // send-turn is answered, then the fixture exits. The Ok is guaranteed
+    // by JsonRpcChild's exit-drain: the fixture writes the response BEFORE
+    // exiting, so it must be routed (not failed as "child process exited")
+    // even when the watchdog observes the exit first — which is also what
+    // deterministically arms `active_turn` for the synthetic completion
+    // asserted below.
+    provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-crash".into()),
             text: "x".into(),
@@ -1051,22 +1286,90 @@ async fn sidecar_exit_mid_session_emits_error_state() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
-        .await;
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
+    // Issue #154: a mid-turn child death must settle the in-flight turn with
+    // a synthetic `TurnCompleted { child_exited }` BEFORE the terminal
+    // `SessionStateChanged::Error`, so the turn settles through the whole
+    // pipeline and persists a durable record for hydrate.
+    let mut saw_child_exit_turn = false;
     let mut saw_error = false;
     let _ = timeout(Duration::from_secs(4), async {
         while let Some(ev) = stream.next().await {
-            if let ProviderRuntimeEvent::SessionStateChanged { status, .. } = &ev {
-                if matches!(status, SessionStatus::Error { .. }) {
-                    saw_error = true;
-                    break;
+            match &ev {
+                ProviderRuntimeEvent::TurnCompleted { status, .. } => {
+                    if let TurnStatus::Error { subtype, .. } = status {
+                        if subtype == "child_exited" {
+                            saw_child_exit_turn = true;
+                        }
+                    }
                 }
+                ProviderRuntimeEvent::SessionStateChanged { status, .. } => {
+                    if matches!(status, SessionStatus::Error { .. }) {
+                        saw_error = true;
+                        break;
+                    }
+                }
+                _ => {}
             }
         }
     })
     .await;
-    assert!(saw_error);
+    assert!(saw_error, "expected a terminal SessionStateChanged::Error");
+    assert!(
+        saw_child_exit_turn,
+        "expected a synthetic child_exited TurnCompleted before the Error"
+    );
     let _ = provider.stop_session(ThreadId("t-crash".into())).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dead_sidecar_is_evicted_and_start_session_rebuilds() {
+    // Issue #154 live-recovery path: after the child-exit watchdog marks a
+    // session dead, `has_session` must report it absent AND a fresh
+    // `start_session` for the SAME thread must evict the corpse and rebuild
+    // instead of failing with "claude session already exists" — otherwise
+    // every send after a mid-run death fails permanently.
+    let wrapper = wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_EXIT_AFTER", "send-turn")]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let thread = ThreadId("t-evict".into());
+    provider.start_session(start_input("t-evict")).await.unwrap();
+    assert!(provider.has_session(&thread).await, "session live after start");
+    // Deterministically Ok — the fixture answers send-turn before exiting
+    // and JsonRpcChild's exit-drain routes that response (see
+    // `sidecar_exit_mid_session_emits_error_state`).
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: thread.clone(),
+            text: "x".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
+    // Wait for the watchdog (100ms poll) to observe the dead child.
+    let went_absent = timeout(Duration::from_secs(4), async {
+        loop {
+            if !provider.has_session(&thread).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(went_absent.is_ok(), "dead session must be reported absent");
+    // The rebuild must succeed (evict-and-replace), not error on "already exists".
+    provider
+        .start_session(start_input("t-evict"))
+        .await
+        .expect("rebuild after death must succeed");
+    assert!(provider.has_session(&thread).await, "rebuilt session live");
+    let _ = provider.stop_session(thread).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1093,6 +1396,7 @@ async fn session_ended_with_iteration_complete_emits_turn_completed_success() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -1140,6 +1444,7 @@ async fn session_ended_with_interrupted_emits_turn_error_interrupted() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -1186,6 +1491,7 @@ async fn session_error_emits_session_state_changed_plus_warning() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -1287,6 +1593,7 @@ async fn event_ordering_across_rapid_bursts() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -1313,6 +1620,169 @@ async fn event_ordering_across_rapid_bursts() {
         assert_eq!(t, &format!("{i}"));
     }
     provider.stop_session(ThreadId("t-burst".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_lifecycle_launch_progress_completion_flows_through_adapter() {
+    // Full Claude subagent lifecycle driven through the real notification
+    // task (so the per-session SubagentDemux persists across messages):
+    // launch (Agent tool_use) → task_progress → foreground completion via
+    // tool_result + structured tool_use_result AgentOutput.
+    let script = write_script(json!([
+        {
+            "after": "send-turn", "delay_ms": 5, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-sub",
+                "message": {
+                    "type": "assistant",
+                    "parent_tool_use_id": null,
+                    "turn_id": "sdk-turn-1",
+                    "message": { "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_sub",
+                        "name": "Agent",
+                        "input": {
+                            "subagent_type": "Explore",
+                            "model": "claude-sonnet-4",
+                            "description": "explore",
+                            "prompt": "look"
+                        }
+                    }]}
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 10, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-sub",
+                "message": {
+                    "type": "system",
+                    "subtype": "task_progress",
+                    "task_id": "task_1",
+                    "tool_use_id": "toolu_sub",
+                    "usage": {"total_tokens": 800, "tool_uses": 2, "duration_ms": 1500},
+                    "summary": "Reading files"
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 15, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-sub",
+                "message": {
+                    "type": "user",
+                    "parent_tool_use_id": null,
+                    "turn_id": "sdk-turn-1",
+                    "message": { "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_sub",
+                        "content": "done",
+                        "is_error": false
+                    }]},
+                    "tool_use_result": {
+                        "status": "completed",
+                        "agentId": "agent_final",
+                        "agentType": "Explore",
+                        "totalToolUseCount": 5,
+                        "totalDurationMs": 9000,
+                        "totalTokens": 4200,
+                        "content": [{"type": "text", "text": "Explored the tree"}],
+                        "prompt": "look"
+                    }
+                }
+            }
+        },
+        {
+            "after": "send-turn", "delay_ms": 20, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-sub",
+                "message": {
+                    "type": "result",
+                    "subtype": "success",
+                    "turn_id": "sdk-turn-1",
+                    "duration_ms": 30,
+                    "num_turns": 1
+                }
+            }
+        }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input("t-sub")).await.unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-sub".into()),
+            text: "spawn a subagent".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+
+    let mut saw_running = false;
+    let mut saw_progress_tokens = false;
+    let mut saw_completed = false;
+    let mut leaked_generic_item = false;
+    let _ = timeout(Duration::from_secs(5), async {
+        while let Some(ev) = stream.next().await {
+            match &ev {
+                ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                    assert_eq!(subagent.subagent_id, "toolu_sub");
+                    match subagent.status {
+                        SubagentStatus::Running => {
+                            saw_running = true;
+                            if subagent.total_tokens == Some(800) {
+                                saw_progress_tokens = true;
+                            }
+                        }
+                        SubagentStatus::Completed => {
+                            saw_completed = true;
+                            assert_eq!(subagent.provider_ref.as_deref(), Some("agent_final"));
+                            assert_eq!(subagent.total_tokens, Some(4200));
+                            assert_eq!(subagent.tool_use_count, Some(5));
+                            assert_eq!(
+                                subagent.result_text.as_deref(),
+                                Some("Explored the tree")
+                            );
+                        }
+                        other => panic!("unexpected subagent status {other:?}"),
+                    }
+                }
+                // The Agent launch tool_use and its tool_result must be
+                // suppressed — never surfaced as generic items.
+                ProviderRuntimeEvent::ItemCompleted {
+                    subagent_id: None, ..
+                } => {
+                    leaked_generic_item = true;
+                }
+                _ => {}
+            }
+            if saw_completed {
+                break;
+            }
+        }
+    })
+    .await;
+
+    assert!(saw_running, "expected a Running SubagentUpdated on launch");
+    assert!(saw_progress_tokens, "expected task_progress usage to flow");
+    assert!(saw_completed, "expected a Completed SubagentUpdated");
+    assert!(
+        !leaked_generic_item,
+        "Agent tool_use / tool_result must be suppressed, not surfaced as generic items"
+    );
+    provider.stop_session(ThreadId("t-sub".into())).await.ok();
 }
 
 // --------------------------------------------------------------------------
@@ -1406,6 +1876,7 @@ async fn claude_real_session() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();

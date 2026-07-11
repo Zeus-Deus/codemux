@@ -231,6 +231,47 @@ describe("Composer + button + attach popup (Step 8 Stage 3)", () => {
     expect(getByText("File…")).toBeInTheDocument();
   });
 
+  it("shows /workflow enabled for the Claude provider in the + popup", () => {
+    const { getByTestId, getByText } = renderControlled({ provider: "claude" });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const row = getByTestId("slash-item-workflow");
+    // cmdk emits `data-disabled="false"` for enabled items; either a
+    // missing attribute or "false" both mean "enabled".
+    const attr = row.getAttribute("data-disabled");
+    expect(attr === null || attr === "false").toBe(true);
+    expect(getByText("Orchestrate this task with many subagents")).toBeInTheDocument();
+  });
+
+  it("picking /workflow from the + popup inserts the literal /workflow token", () => {
+    const onDraftChange = vi.fn();
+    const { getByTestId } = renderControlled({
+      provider: "claude",
+      onDraftChange,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    fireEvent.click(getByTestId("slash-item-workflow"));
+    const calls = onDraftChange.mock.calls;
+    const finalText = calls[calls.length - 1]?.[0];
+    expect(finalText).toBe("/workflow ");
+  });
+
+  it.each(["codex", "opencode"] as const)(
+    "shows /workflow disabled with a reason for the %s provider, and picking it is a no-op",
+    (provider) => {
+      const onDraftChange = vi.fn();
+      const { getByTestId, getByText } = renderControlled({
+        provider,
+        onDraftChange,
+      });
+      fireEvent.click(getByTestId("composer-attach-button"));
+      const row = getByTestId("slash-item-workflow");
+      expect(row.getAttribute("data-disabled")).toBe("true");
+      expect(getByText("Only available with Claude models")).toBeInTheDocument();
+      fireEvent.click(row);
+      expect(onDraftChange).not.toHaveBeenCalled();
+    },
+  );
+
   it("picking File… pivots to the file submode and fetches files", async () => {
     listProjectFilesMock.mockResolvedValue([makeFile()]);
     const { getByTestId, findByText } = renderControlled({

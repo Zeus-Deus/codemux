@@ -1,3 +1,4 @@
+import { memo } from "react";
 import { PaneNode } from "./PaneNode";
 import { EmptyWorkspaceState } from "./empty-workspace-state";
 import type { WorkspaceSnapshot } from "@/tauri/types";
@@ -6,7 +7,10 @@ interface Props {
   workspace: WorkspaceSnapshot;
 }
 
-export function PaneContainer({ workspace }: Props) {
+// #127: memo is effective because setAppState performs structural sharing, so
+// the `workspace` snapshot keeps a stable ref across backend ticks when nothing
+// in it changed — shallow compare then skips the whole pane-tree render.
+export const PaneContainer = memo(function PaneContainer({ workspace }: Props) {
   const activeSurface = workspace.surfaces.find(
     (s) => s.surface_id === workspace.active_surface_id,
   );
@@ -21,7 +25,8 @@ export function PaneContainer({ workspace }: Props) {
         node={activeSurface.root}
         activePaneId={activeSurface.active_pane_id}
         visible
+        isSurfaceRoot
       />
     </div>
   );
-}
+});

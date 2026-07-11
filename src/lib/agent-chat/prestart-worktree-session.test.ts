@@ -10,18 +10,23 @@ vi.mock("@/tauri/commands", () => ({
   agentChatStartSession: (...args: unknown[]) => startSessionMock(...args),
 }));
 
-let workspacesSnapshot: Array<{ workspace_id: string; cwd: string }> = [];
-vi.mock("@/stores/app-store", () => ({
-  useAppStore: {
-    getState: () => ({
-      appState: { workspaces: workspacesSnapshot },
-    }),
-  },
+// The cwd-resolution race lives in `./wait-for-workspace-cwd` and has
+// its own dedicated tests (`wait-for-workspace-cwd.test.ts`). Here we
+// mock it so these tests exercise prestart's own logic in isolation:
+// a resolved cwd → full prestart; a `null` (genuine timeout) → the
+// mount-effect fallback contract.
+const waitForWorkspaceCwdMock = vi.fn();
+vi.mock("./wait-for-workspace-cwd", () => ({
+  waitForWorkspaceCwd: (...args: unknown[]) => waitForWorkspaceCwdMock(...args),
 }));
 
 const ensureThreadMock = vi.fn();
 const setPermissionModeMock = vi.fn();
 const setSessionLaunchModeMock = vi.fn();
+const setModelMock = vi.fn();
+const setEffortMock = vi.fn();
+const setContextWindowMock = vi.fn();
+const setModeMock = vi.fn();
 vi.mock("@/stores/agent-chat-store", () => ({
   DEFAULT_THREAD_PERMISSION_MODE: "bypassPermissions",
   useAgentChatStore: {
@@ -29,6 +34,10 @@ vi.mock("@/stores/agent-chat-store", () => ({
       ensureThread: ensureThreadMock,
       setPermissionMode: setPermissionModeMock,
       setSessionLaunchMode: setSessionLaunchModeMock,
+      setModel: setModelMock,
+      setEffort: setEffortMock,
+      setContextWindow: setContextWindowMock,
+      setMode: setModeMock,
     }),
   },
 }));
@@ -37,12 +46,19 @@ import { prestartWorktreeSession } from "./prestart-worktree-session";
 
 describe("prestartWorktreeSession", () => {
   beforeEach(() => {
-    workspacesSnapshot = [];
+    waitForWorkspaceCwdMock.mockReset();
+    // Default: the worktree cwd resolves. Individual tests override the
+    // resolved value or set it to `null` to exercise the timeout path.
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/worktree-feat");
     createPaneMock.mockReset();
     startSessionMock.mockReset();
     ensureThreadMock.mockReset();
     setPermissionModeMock.mockReset();
     setSessionLaunchModeMock.mockReset();
+    setModelMock.mockReset();
+    setEffortMock.mockReset();
+    setContextWindowMock.mockReset();
+    setModeMock.mockReset();
     createPaneMock.mockResolvedValue("pane-1");
     startSessionMock.mockResolvedValue("thread-echo");
   });
@@ -51,7 +67,7 @@ describe("prestartWorktreeSession", () => {
     // Regression: passing null leaves `pane.cwd` null and makes the
     // mount-effect's `if (!cwd) return` guard fire, which is the
     // original race that produced session_not_found.
-    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/worktree-feat" }];
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/worktree-feat");
     await prestartWorktreeSession("ws-new");
     expect(createPaneMock).toHaveBeenCalledTimes(1);
     expect(createPaneMock).toHaveBeenCalledWith(
@@ -66,7 +82,7 @@ describe("prestartWorktreeSession", () => {
     // adapter's HashMap holds the thread_id. Callers activate the
     // workspace afterward so AgentChatPane mounts with a live
     // session already in place.
-    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/worktree-feat" }];
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/worktree-feat");
     await prestartWorktreeSession("ws-new");
     expect(startSessionMock).toHaveBeenCalledTimes(1);
     const [paneId, provider, input] = startSessionMock.mock.calls[0];
@@ -92,7 +108,7 @@ describe("prestartWorktreeSession", () => {
       events.push("start_session");
       return "thread-echo";
     });
-    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/w" }];
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/w");
     await prestartWorktreeSession("ws-new");
     expect(events).toEqual(["create_pane", "start_session"]);
   });
@@ -101,7 +117,7 @@ describe("prestartWorktreeSession", () => {
     // AgentChatPane's mount-effect adopts pane.thread_id and calls
     // ensureThread; pickers read from the slice. Seeding here means
     // the live pane mounts against a populated slice, not a bare one.
-    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/w" }];
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/w");
     await prestartWorktreeSession("ws-new");
     expect(ensureThreadMock).toHaveBeenCalledTimes(1);
     expect(setPermissionModeMock).toHaveBeenCalledTimes(1);
@@ -118,7 +134,7 @@ describe("prestartWorktreeSession", () => {
   });
 
   it("reuses the SAME thread_id across start_session and the slice seed", async () => {
-    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/w" }];
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/w");
     await prestartWorktreeSession("ws-new");
     const startInput = startSessionMock.mock.calls[0][2];
     const seededThreadId = ensureThreadMock.mock.calls[0][0];
@@ -126,12 +142,12 @@ describe("prestartWorktreeSession", () => {
   });
 
   it("defers to the mount-effect path when the workspace isn't in the store yet (fallback)", async () => {
-    // Edge case: Tauri event delivery hasn't landed the new
-    // workspace by the time we run. Rather than fabricating a bad
-    // cwd (sidecar would spawn in the wrong directory), we skip and
+    // Edge case: the cwd never reached the store within the timeout
+    // (`waitForWorkspaceCwd` resolves null). Rather than fabricating a
+    // bad cwd (sidecar would spawn in the wrong directory), we skip and
     // let AgentChatPane's mount-effect handle it. No worse than the
     // pre-fix behavior.
-    workspacesSnapshot = [];
+    waitForWorkspaceCwdMock.mockResolvedValue(null);
     await prestartWorktreeSession("ws-missing");
     expect(createPaneMock).not.toHaveBeenCalled();
     expect(startSessionMock).not.toHaveBeenCalled();
@@ -139,7 +155,7 @@ describe("prestartWorktreeSession", () => {
   });
 
   it("propagates backend errors from agent_chat_start_session (so the caller can log)", async () => {
-    workspacesSnapshot = [{ workspace_id: "ws-new", cwd: "/tmp/w" }];
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/w");
     startSessionMock.mockRejectedValueOnce(new Error("sidecar spawn failed"));
     await expect(prestartWorktreeSession("ws-new")).rejects.toThrow(
       "sidecar spawn failed",
@@ -148,5 +164,76 @@ describe("prestartWorktreeSession", () => {
     // the caller continues with activateWorkspace — failure is
     // non-blocking for the rest of the flow.
     expect(createPaneMock).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Thread Scope deferred-worktree extensions ──
+
+  it("returns { paneId, threadId } matching the created pane + session (and null on the store fallback)", async () => {
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/w");
+    const result = await prestartWorktreeSession("ws-new");
+    expect(result).not.toBeNull();
+    expect(result!.paneId).toBe("pane-1");
+    const startInput = startSessionMock.mock.calls[0][2];
+    expect(result!.threadId).toBe(startInput.thread_id);
+
+    waitForWorkspaceCwdMock.mockResolvedValue(null);
+    const missing = await prestartWorktreeSession("ws-missing");
+    expect(missing).toBeNull();
+  });
+
+  it("plumbs the optional config into start_session and the slice seed", async () => {
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/w");
+    const result = await prestartWorktreeSession("ws-new", {
+      model: "claude-opus-4-7",
+      permissionMode: "plan",
+      effort: "high",
+      contextWindow: "1m",
+      mode: "plan",
+    });
+    const [, , input] = startSessionMock.mock.calls[0];
+    expect(input.model).toBe("claude-opus-4-7");
+    expect(input.permission_mode).toBe("plan");
+    expect(input.effort).toBe("high");
+    expect(input.context_window).toBe("1m");
+    const tid = result!.threadId;
+    expect(setModelMock).toHaveBeenCalledWith(tid, "claude-opus-4-7");
+    expect(setEffortMock).toHaveBeenCalledWith(tid, "high");
+    expect(setContextWindowMock).toHaveBeenCalledWith(tid, "1m");
+    expect(setModeMock).toHaveBeenCalledWith(tid, "plan");
+    expect(setPermissionModeMock).toHaveBeenCalledWith(tid, "plan");
+    expect(setSessionLaunchModeMock).toHaveBeenCalledWith(tid, "plan");
+  });
+
+  it("first-send succeeds with the worktree cwd even when it resolves after a delay", async () => {
+    // Regression (PR #142 deferred-worktree cwd bug): the store often hasn't landed the new
+    // worktree by the time prestart runs. `waitForWorkspaceCwd` awaits
+    // it; prestart must then launch the pane + session at the WORKTREE
+    // cwd, not return null on a routine store miss.
+    waitForWorkspaceCwdMock.mockImplementationOnce(
+      () =>
+        new Promise((r) => setTimeout(() => r("/tmp/worktree-delayed"), 10)),
+    );
+    const result = await prestartWorktreeSession("ws-new");
+    expect(waitForWorkspaceCwdMock).toHaveBeenCalledWith("ws-new");
+    expect(result).not.toBeNull();
+    expect(createPaneMock).toHaveBeenCalledWith(
+      "ws-new",
+      "claude",
+      "/tmp/worktree-delayed",
+    );
+    const [, , input] = startSessionMock.mock.calls[0];
+    expect(input.cwd).toBe("/tmp/worktree-delayed");
+  });
+
+  it("omitted config keeps the legacy defaults and skips the optional slice setters", async () => {
+    waitForWorkspaceCwdMock.mockResolvedValue("/tmp/w");
+    await prestartWorktreeSession("ws-new");
+    const [, , input] = startSessionMock.mock.calls[0];
+    expect(input.model).toBeNull();
+    expect(input.permission_mode).toBe("bypassPermissions");
+    expect(setModelMock).not.toHaveBeenCalled();
+    expect(setEffortMock).not.toHaveBeenCalled();
+    expect(setContextWindowMock).not.toHaveBeenCalled();
+    expect(setModeMock).not.toHaveBeenCalled();
   });
 });

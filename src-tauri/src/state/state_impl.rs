@@ -347,6 +347,16 @@ pub struct WorkspaceSnapshot {
     pub title: String,
     pub workspace_type: WorkspaceType,
     pub cwd: String,
+    /// Whether this workspace's directory is inside a git repository
+    /// (`find_git_root` resolves). Non-git folders are first-class:
+    /// they run in plain-directory mode (no worktrees, no diffs, no
+    /// checkpoints) and the UI offers an explicit "Initialize Git"
+    /// action instead of hiding everything silently. Stamped by
+    /// `populate_git_info` alongside the other git fields. Additive;
+    /// old persisted snapshots deserialize as `true` (optimistic, like
+    /// the pre-field behavior) and are corrected on the first refresh.
+    #[serde(default = "default_true")]
+    pub is_git: bool,
     pub git_branch: Option<String>,
     #[serde(default)]
     pub git_ahead: u32,
@@ -708,6 +718,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title,
             workspace_type: WorkspaceType::OpenFlow,
             cwd,
@@ -840,6 +851,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title: format!("Workspace {workspace_index}"),
             workspace_type: WorkspaceType::Standard,
             cwd,
@@ -910,6 +922,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title,
             workspace_type: WorkspaceType::Standard,
             // `cwd` mirrors `worktree_path` for adopted workspaces —
@@ -981,6 +994,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title,
             workspace_type: WorkspaceType::Standard,
             cwd: project_root.clone(),
@@ -1075,6 +1089,7 @@ impl AppStateStore {
 
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title,
             workspace_type: WorkspaceType::Standard,
             // `cwd` is a host path that does not exist on this device. It
@@ -1209,6 +1224,7 @@ impl AppStateStore {
         let default_tab_id = next_id("tab");
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
+            is_git: true,
             title: format!("Workspace {workspace_index}"),
             workspace_type: WorkspaceType::Standard,
             cwd,
@@ -1525,9 +1541,11 @@ impl AppStateStore {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn update_workspace_git_info(
         &self,
         workspace_id: &str,
+        is_git: bool,
         branch: Option<String>,
         ahead: u32,
         behind: u32,
@@ -1541,6 +1559,7 @@ impl AppStateStore {
             .iter_mut()
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
         {
+            workspace.is_git = is_git;
             workspace.git_branch = branch;
             workspace.git_ahead = ahead;
             workspace.git_behind = behind;
@@ -1899,6 +1918,12 @@ impl AppStateStore {
                     .iter()
                     .any(|id| id == &session.session_id.0)
             });
+            let removed_agent_browser_sessions: Vec<String> = snapshot
+                .agent_browser_sessions
+                .iter()
+                .filter(|s| s.workspace_id.0 == workspace_id)
+                .map(|s| s.cli_session_name.clone())
+                .collect();
             snapshot
                 .agent_browser_sessions
                 .retain(|s| s.workspace_id.0 != workspace_id);
@@ -1910,6 +1935,7 @@ impl AppStateStore {
                     .map(SessionId)
                     .collect(),
                 removed_agent_chat_threads,
+                removed_agent_browser_sessions,
             });
         }
 
@@ -1930,6 +1956,12 @@ impl AppStateStore {
                 .iter()
                 .any(|id| id == &session.session_id.0)
         });
+        let removed_agent_browser_sessions: Vec<String> = snapshot
+            .agent_browser_sessions
+            .iter()
+            .filter(|s| s.workspace_id.0 == workspace_id)
+            .map(|s| s.cli_session_name.clone())
+            .collect();
         snapshot
             .agent_browser_sessions
             .retain(|s| s.workspace_id.0 != workspace_id);
@@ -1947,6 +1979,7 @@ impl AppStateStore {
                 .map(SessionId)
                 .collect(),
             removed_agent_chat_threads,
+            removed_agent_browser_sessions,
         })
     }
 
@@ -2454,11 +2487,14 @@ impl AppStateStore {
         // agent-browser Chromium storage state (cookies, localStorage)
         // persists across app restarts. Workspace IDs are regenerated
         // on each startup, but the cwd stays the same.
-        let cli_session_name = snapshot
+        let workspace_cwd = snapshot
             .workspaces
             .iter()
             .find(|w| w.workspace_id.0 == workspace_id)
-            .map(|w| stable_browser_session_name(&w.cwd))
+            .map(|w| w.cwd.clone());
+        let workspace_exists = workspace_cwd.is_some();
+        let cli_session_name = workspace_cwd
+            .map(|cwd| stable_browser_session_name(&cwd))
             .unwrap_or_else(|| format!("ws-{workspace_id}"));
         let session = AgentBrowserSession {
             session_id: next_id("agent-browser"),
@@ -2471,7 +2507,19 @@ impl AppStateStore {
             browser_id: None,
             user_dismissed: false,
         };
-        snapshot.agent_browser_sessions.push(session.clone());
+        // Only persist the record when the workspace actually exists
+        // (issue #126 review): an in-flight `browser_automation` racing a
+        // workspace close can land here with a dead workspace_id, and a
+        // persisted record for a dead workspace can never be closed — it
+        // would permanently poison the orphan sweep's live set, which
+        // treats every tracked `cli_session_name` as live unconditionally.
+        // Returning the transient session keeps the in-flight caller
+        // working; if a daemon does get spawned under this name, the
+        // periodic sweep reaps it later precisely BECAUSE the name never
+        // enters the live set.
+        if workspace_exists {
+            snapshot.agent_browser_sessions.push(session.clone());
+        }
         session
     }
 
@@ -2579,6 +2627,78 @@ impl AppStateStore {
             })?;
         session.stream_url = format!("ws://localhost:{stream_port}");
         Ok(())
+    }
+
+    /// Mark an agent browser session as live/active without attaching it to
+    /// a pane. Used by the GUI-mode background-browsing gate in
+    /// `control.rs`'s `browser_automation` handler: when pane creation is
+    /// suppressed (Agent Chat GUI beta on, non-OpenFlow workspace), the
+    /// session would otherwise never flip `is_active` (only
+    /// `attach_agent_browser_to_pane` does that), so the frontend's
+    /// "background session is live" chip/indicator would never see it.
+    /// Returns `false` when no session exists yet for the workspace.
+    pub fn mark_agent_browser_active(&self, workspace_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        session.is_active = true;
+        true
+    }
+
+    /// Mark an agent browser session as no longer live. Mirror of
+    /// [`mark_agent_browser_active`](Self::mark_agent_browser_active): the
+    /// `browser_automation` handler calls this when a `close` action
+    /// completes successfully, so the GUI-mode background chip /
+    /// context-bar indicator / peek overlay (which key off `is_active`)
+    /// stop presenting the session as live. The session itself is kept
+    /// (URL, cli_session_name) for a later reopen — this only flips the
+    /// liveness flag. Returns `false` when no session exists for the
+    /// workspace.
+    pub fn mark_agent_browser_inactive(&self, workspace_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        session.is_active = false;
+        true
+    }
+
+    /// Release a workspace's *background/detached* agent browser session
+    /// when the agent-chat run that was driving it finishes. Backs the
+    /// run-lifecycle wiring in `agent_chat.rs`'s `publish_pane_status`:
+    /// agents rarely call `browser close` themselves, so without this the
+    /// GUI-mode background chip / context-bar indicator (which key off
+    /// `is_active`) would show "LIVE" forever after the turn is long done.
+    /// Only flips the flag — and only returns `true` — when the session
+    /// exists, is currently active, AND has no `pane_id` (i.e. it is in
+    /// background/detached mode, not the legacy split-pane flow). A
+    /// pane-attached session has its own lifecycle (explicit user close /
+    /// pane close) and must be left untouched here. The session itself
+    /// (URL, cli_session_name) is kept so a later browser action from the
+    /// agent simply re-marks it active and the chip returns.
+    pub fn release_detached_agent_browser(&self, workspace_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        if !session.is_active || session.pane_id.is_some() {
+            return false;
+        }
+        session.is_active = false;
+        true
     }
 
     /// Update the current URL on the agent browser session for a workspace.
@@ -2869,6 +2989,67 @@ impl AppStateStore {
         } else {
             false
         }
+    }
+
+    /// Resolve a chat `thread_id` to its `AgentChat` pane and update the
+    /// pane status, the chat-pane analogue of
+    /// [`set_pane_status_by_session`]. The terminal resolver deliberately
+    /// skips `AgentChat` nodes (chat panes carry a `thread_id`, not a PTY
+    /// `session_id`), so chat sessions need their own thread→pane walk to
+    /// publish into the shared `pane_statuses` store the sidebar reads.
+    ///
+    /// Returns `true` only when the stored status actually changed, so the
+    /// high-frequency `content_delta` token stream can skip a redundant
+    /// frontend emit once the pane is already `Working`. `Idle` removes the
+    /// entry, mirroring the session-keyed variant.
+    pub fn set_pane_status_by_thread(&self, thread_id: &str, status: PaneStatus) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let pane_id = snapshot.workspaces.iter().find_map(|ws| {
+            ws.surfaces
+                .iter()
+                .find_map(|s| find_agent_chat_pane_id(&s.root, thread_id))
+        });
+        let Some(pane_id) = pane_id else {
+            return false;
+        };
+        if status == PaneStatus::Idle {
+            return snapshot.pane_statuses.remove(&pane_id.0).is_some();
+        }
+        if snapshot.pane_statuses.get(&pane_id.0) == Some(&status) {
+            return false;
+        }
+        snapshot.pane_statuses.insert(pane_id.0, status);
+        true
+    }
+
+    /// Resolve a chat `thread_id` to the id of the `AgentChat` pane it is
+    /// bound to, walking every workspace surface. Returns `None` when no
+    /// pane currently carries the thread (e.g. the pane was closed). Used
+    /// by the backend auto-resume path to rebuild the workspace env
+    /// overlay for a session it is silently restarting.
+    pub fn agent_chat_pane_id_for_thread(&self, thread_id: &str) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().find_map(|ws| {
+            ws.surfaces
+                .iter()
+                .find_map(|s| find_agent_chat_pane_id(&s.root, thread_id))
+                .map(|pane_id| pane_id.0)
+        })
+    }
+
+    /// Whether the `AgentChat` pane bound to `thread_id` currently lives in
+    /// the active workspace. Mirrors `hooks.rs`'s `is_pane_active_for_session`
+    /// so a chat turn that finishes in the workspace the user is already
+    /// looking at clears to `Idle` instead of raising a review dot.
+    pub fn is_thread_pane_in_active_workspace(&self, thread_id: &str) -> bool {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot.workspaces.iter().any(|ws| {
+            ws.workspace_id == snapshot.active_workspace_id
+                && ws
+                    .surfaces
+                    .iter()
+                    .any(|s| find_agent_chat_pane_id(&s.root, thread_id).is_some())
+        })
     }
 
     /// Clear working/permission status for a session (on terminal exit).
@@ -3294,6 +3475,23 @@ impl AppStateStore {
             }
         }
     }
+
+    /// Every agent-browser CLI session name that could belong to a live
+    /// workspace: the stable cwd-derived name for every workspace, plus the
+    /// `cli_session_name` of every tracked `agent_browser_sessions` entry.
+    /// Consumed by the periodic orphan sweep (issue #126) — a tracked
+    /// session survives the sweep as long as its name shows up here.
+    pub fn live_agent_browser_session_names(&self) -> std::collections::HashSet<String> {
+        let snapshot = self.inner.lock().unwrap();
+        let mut names = std::collections::HashSet::new();
+        for w in &snapshot.workspaces {
+            names.insert(stable_browser_session_name(&w.cwd));
+        }
+        for s in &snapshot.agent_browser_sessions {
+            names.insert(s.cli_session_name.clone());
+        }
+        names
+    }
 }
 
 pub struct CloseTabResult {
@@ -3314,6 +3512,15 @@ pub struct CloseWorkspaceResult {
     pub fallback: WorkspaceId,
     pub removed_sessions: Vec<SessionId>,
     pub removed_agent_chat_threads: Vec<(crate::agent_provider::ProviderKind, String)>,
+    /// `cli_session_name`s of the agent-browser sessions removed alongside
+    /// this workspace (issue #126). Collected under the same lock
+    /// acquisition that removes the workspace, so there is no TOCTOU race
+    /// with a concurrent agent-browser session creation for this
+    /// workspace: a session created after this snapshot simply won't
+    /// belong to the (now-gone) workspace, and one created before it is
+    /// guaranteed to be caught here rather than leaking as an orphaned
+    /// daemon.
+    pub removed_agent_browser_sessions: Vec<String>,
 }
 
 fn collect_session_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<SessionId>) {
@@ -3724,6 +3931,7 @@ fn default_app_state() -> AppStateSnapshot {
         active_workspace_id: workspace_id.clone(),
         workspaces: vec![WorkspaceSnapshot {
             workspace_id,
+            is_git: true,
             title: "Workspace 1".into(),
             workspace_type: WorkspaceType::Standard,
             cwd: cwd.clone(),
@@ -3961,6 +4169,26 @@ pub fn find_terminal_pane_id(root: &PaneNodeSnapshot, target_session_id: &str) -
         PaneNodeSnapshot::Split { children, .. } => children
             .iter()
             .find_map(|child| find_terminal_pane_id(child, target_session_id)),
+        _ => None,
+    }
+}
+
+/// Resolve a chat `thread_id` to the `AgentChat` pane bound to it, if any.
+/// The chat-pane counterpart to [`find_terminal_pane_id`]: the terminal
+/// walker matches on the PTY `session_id` and skips `AgentChat` nodes, so
+/// chat status publishing needs this thread-keyed resolver instead. Only
+/// panes that have already been bound to a session (`thread_id.is_some()`)
+/// can match.
+pub fn find_agent_chat_pane_id(root: &PaneNodeSnapshot, target_thread_id: &str) -> Option<PaneId> {
+    match root {
+        PaneNodeSnapshot::AgentChat {
+            pane_id,
+            thread_id: Some(thread_id),
+            ..
+        } if thread_id == target_thread_id => Some(pane_id.clone()),
+        PaneNodeSnapshot::Split { children, .. } => children
+            .iter()
+            .find_map(|child| find_agent_chat_pane_id(child, target_thread_id)),
         _ => None,
     }
 }
@@ -5884,6 +6112,135 @@ mod tests {
         assert_eq!(store.snapshot().agent_browser_sessions.len(), 1);
     }
 
+    /// Regression guard for issue #126: closing a workspace must return the
+    /// `cli_session_name`s of the agent-browser sessions that were removed
+    /// alongside it, so the command layer can reap the daemon instead of
+    /// leaking it for the rest of the app's lifetime. Exercises the
+    /// "close the last workspace" branch of `close_workspace`.
+    #[test]
+    fn close_last_workspace_returns_removed_agent_browser_sessions() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+
+        let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let result = store
+            .close_workspace(&ws_id.0)
+            .expect("close should succeed");
+        assert_eq!(
+            result.removed_agent_browser_sessions,
+            vec![session.cli_session_name]
+        );
+        assert!(store.snapshot().agent_browser_sessions.is_empty());
+    }
+
+    /// Same as above but for the "other workspaces remain" branch, and
+    /// checks that an unrelated workspace's agent-browser session survives
+    /// the close untouched (the reap must be scoped to the closed
+    /// workspace only, never anyone else's live daemon).
+    #[test]
+    fn close_one_of_many_workspaces_returns_only_its_agent_browser_sessions() {
+        let store = AppStateStore::default();
+        let ws1_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let ws2_id = store.create_workspace_at_path(std::path::PathBuf::from("/tmp/ab-b"));
+
+        let s1 = store.resolve_agent_browser_session(&ws1_id.0, 9223);
+        let s2 = store.resolve_agent_browser_session(&ws2_id.0, 9224);
+
+        let result = store
+            .close_workspace(&ws2_id.0)
+            .expect("close should succeed");
+        assert_eq!(result.removed_agent_browser_sessions, vec![s2.cli_session_name]);
+
+        let after = store.snapshot();
+        assert_eq!(after.agent_browser_sessions.len(), 1);
+        assert_eq!(after.agent_browser_sessions[0].cli_session_name, s1.cli_session_name);
+    }
+
+    /// `live_agent_browser_session_names` must contain both the cwd-derived
+    /// stable name (for workspaces that never opened a browser pane yet)
+    /// and the actual tracked `cli_session_name` (which is what the sweep
+    /// compares tracked daemon keys against). Issue #126.
+    #[test]
+    fn live_agent_browser_session_names_contains_cwd_derived_and_tracked_names() {
+        let store = AppStateStore::default();
+        let ws1_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let ws1_cwd = store.snapshot().workspaces[0].cwd.clone();
+        let ws2_id = store.create_workspace_at_path(std::path::PathBuf::from("/tmp/ab-live"));
+
+        // ws1 has an active agent-browser session; ws2 has never opened one.
+        let s1 = store.resolve_agent_browser_session(&ws1_id.0, 9223);
+
+        let live = store.live_agent_browser_session_names();
+        assert!(live.contains(&s1.cli_session_name));
+        assert!(live.contains(&stable_browser_session_name(&ws1_cwd)));
+        let ws2_cwd = store
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws2_id)
+            .unwrap()
+            .cwd
+            .clone();
+        assert!(live.contains(&stable_browser_session_name(&ws2_cwd)));
+    }
+
+    /// Issue #126 review, Fix 3: resolving an agent-browser session for a
+    /// workspace_id that no longer exists (an in-flight `browser_automation`
+    /// racing a close) must return a usable transient session WITHOUT
+    /// persisting it — a persisted record for a dead workspace can never be
+    /// closed and would permanently poison the orphan sweep's live set.
+    #[test]
+    fn resolve_agent_browser_session_for_dead_workspace_is_not_persisted() {
+        let store = AppStateStore::default();
+
+        let session = store.resolve_agent_browser_session("no-such-workspace", 9223);
+        // The transient session keeps the in-flight caller working...
+        assert_eq!(session.workspace_id.0, "no-such-workspace");
+        assert_eq!(session.cli_session_name, "ws-no-such-workspace");
+        // ...but nothing is persisted, so the sweep's live set stays clean.
+        assert!(store.snapshot().agent_browser_sessions.is_empty());
+        assert!(!store
+            .live_agent_browser_session_names()
+            .contains("ws-no-such-workspace"));
+    }
+
+    /// Issue #126 review, Fix 1: two workspaces at the SAME cwd share one
+    /// cli_session_name (it's a pure hash of the cwd) and therefore one
+    /// daemon. Closing one workspace returns the shared name in
+    /// `removed_agent_browser_sessions`, but the post-close live set must
+    /// STILL contain that name — that is the exact property the reap
+    /// helper's skip check relies on to avoid killing the daemon the
+    /// surviving workspace's pane is using.
+    #[test]
+    fn shared_cwd_close_keeps_session_name_in_live_set() {
+        let store = AppStateStore::default();
+        let shared = std::path::PathBuf::from("/tmp/ab-shared-cwd");
+        let ws1_id = store.create_workspace_at_path(shared.clone());
+        let ws2_id = store.create_workspace_at_path(shared);
+
+        let s1 = store.resolve_agent_browser_session(&ws1_id.0, 9223);
+        let s2 = store.resolve_agent_browser_session(&ws2_id.0, 9224);
+        assert_eq!(
+            s1.cli_session_name, s2.cli_session_name,
+            "same cwd must derive the same stable session name"
+        );
+
+        let result = store
+            .close_workspace(&ws1_id.0)
+            .expect("close should succeed");
+        // The closed workspace's session IS reported...
+        assert_eq!(
+            result.removed_agent_browser_sessions,
+            vec![s1.cli_session_name.clone()]
+        );
+        // ...but the surviving workspace still maps to the same name, so
+        // the post-close live set keeps it and the reap skips the close.
+        assert!(store
+            .live_agent_browser_session_names()
+            .contains(&s1.cli_session_name));
+    }
+
     #[test]
     fn stable_browser_session_name_bounds_socket_path_for_long_branches() {
         // Reproduction: a codemux worktree whose git branch name is long.
@@ -5969,6 +6326,119 @@ mod tests {
         // Session still exists and is_active stays true (process still running)
         let snap = store.snapshot();
         assert_eq!(snap.agent_browser_sessions.len(), 1);
+    }
+
+    #[test]
+    fn mark_agent_browser_active_flips_is_active_without_attaching_pane() {
+        // Backs the GUI-mode background-browsing gate: control.rs suppresses
+        // pane creation but must still be able to mark the detached session
+        // live so the frontend's background chip/indicator can render it.
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+        assert!(!session.is_active);
+
+        let found = store.mark_agent_browser_active(&ws_id.0);
+        assert!(found);
+
+        let snap = store.snapshot();
+        let updated = &snap.agent_browser_sessions[0];
+        assert!(updated.is_active);
+        assert!(updated.pane_id.is_none());
+        assert!(updated.browser_id.is_none());
+    }
+
+    #[test]
+    fn mark_agent_browser_active_returns_false_when_no_session() {
+        let store = AppStateStore::default();
+        assert!(!store.mark_agent_browser_active("no-such-workspace"));
+    }
+
+    #[test]
+    fn mark_agent_browser_inactive_clears_is_active_but_keeps_session() {
+        // Backs the `close`-action wiring in control.rs: a successful
+        // browser close must drop `is_active` so the GUI-mode background
+        // chip/indicator/peek stop showing LIVE — while the session itself
+        // (URL, cli_session_name) survives for a later reopen.
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        store.mark_agent_browser_active(&ws_id.0);
+        store
+            .update_agent_browser_url(&ws_id.0, "https://example.com".into())
+            .unwrap();
+        assert!(store.snapshot().agent_browser_sessions[0].is_active);
+
+        let found = store.mark_agent_browser_inactive(&ws_id.0);
+        assert!(found);
+
+        let snap = store.snapshot();
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+        let updated = &snap.agent_browser_sessions[0];
+        assert!(!updated.is_active);
+        assert_eq!(updated.current_url.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn mark_agent_browser_inactive_returns_false_when_no_session() {
+        let store = AppStateStore::default();
+        assert!(!store.mark_agent_browser_inactive("no-such-workspace"));
+    }
+
+    #[test]
+    fn release_detached_agent_browser_flips_paneless_active_session() {
+        // Backs the run-finished release in `agent_chat.rs`'s
+        // `publish_pane_status`: a background (pane-less) session that is
+        // active should flip inactive so the GUI chip stops showing LIVE.
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        store.mark_agent_browser_active(&ws_id.0);
+        assert!(store.snapshot().agent_browser_sessions[0].is_active);
+
+        let released = store.release_detached_agent_browser(&ws_id.0);
+        assert!(released);
+
+        let snap = store.snapshot();
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+        assert!(!snap.agent_browser_sessions[0].is_active);
+    }
+
+    #[test]
+    fn release_detached_agent_browser_leaves_pane_attached_session_untouched() {
+        // A pane-attached session (legacy split-pane mode) has its own
+        // close lifecycle; the run-finished release must not touch it.
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+        assert!(store.snapshot().agent_browser_sessions[0].is_active);
+
+        let released = store.release_detached_agent_browser(&ws_id.0);
+        assert!(!released);
+
+        let snap = store.snapshot();
+        assert!(snap.agent_browser_sessions[0].is_active);
+        assert!(snap.agent_browser_sessions[0].pane_id.is_some());
+    }
+
+    #[test]
+    fn release_detached_agent_browser_returns_false_when_no_session_or_inactive() {
+        let store = AppStateStore::default();
+        assert!(!store.release_detached_agent_browser("no-such-workspace"));
+
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        // Freshly resolved session starts inactive.
+        assert!(!store.release_detached_agent_browser(&ws_id.0));
     }
 
     #[test]
@@ -6465,6 +6935,113 @@ mod tests {
 
         // Unknown pane id is a clean None, not a panic.
         assert_eq!(store.agent_chat_pane_thread("does-not-exist"), None);
+    }
+
+    #[test]
+    fn set_pane_status_by_thread_resolves_and_reports_changes() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+
+        // Unbound pane cannot be resolved by thread id yet.
+        assert!(!store.set_pane_status_by_thread("thread-1", PaneStatus::Working));
+        assert!(store.snapshot().pane_statuses.is_empty());
+
+        store.set_agent_chat_thread_id(&pane_id.0, Some("thread-1".into()));
+
+        // First transition writes and reports "changed".
+        assert!(store.set_pane_status_by_thread("thread-1", PaneStatus::Working));
+        assert_eq!(
+            store.snapshot().pane_statuses.get(&pane_id.0),
+            Some(&PaneStatus::Working)
+        );
+
+        // Re-writing the same status is a no-op (drives the change-guard
+        // that keeps the content_delta stream from spamming emits).
+        assert!(!store.set_pane_status_by_thread("thread-1", PaneStatus::Working));
+
+        // A real change writes again.
+        assert!(store.set_pane_status_by_thread("thread-1", PaneStatus::Review));
+        assert_eq!(
+            store.snapshot().pane_statuses.get(&pane_id.0),
+            Some(&PaneStatus::Review)
+        );
+
+        // Idle removes the entry (and reports the removal as a change).
+        assert!(store.set_pane_status_by_thread("thread-1", PaneStatus::Idle));
+        assert!(store.snapshot().pane_statuses.is_empty());
+        // Removing a missing entry is not a change.
+        assert!(!store.set_pane_status_by_thread("thread-1", PaneStatus::Idle));
+
+        // Unknown thread never resolves.
+        assert!(!store.set_pane_status_by_thread("does-not-exist", PaneStatus::Working));
+    }
+
+    #[test]
+    fn is_thread_pane_in_active_workspace_tracks_focus() {
+        let store = AppStateStore::default();
+        let active_ws = store.snapshot().active_workspace_id.clone();
+        let active_pane = store
+            .create_agent_chat_pane(&active_ws.0, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&active_pane.0, Some("thread-active".into()));
+
+        // A second workspace that is NOT the active one.
+        let other_ws = store.create_workspace_with_layout(
+            PathBuf::from("/tmp/codemux-thread-focus"),
+            WorkspacePresetLayout::Single,
+        );
+        let other_pane = store
+            .create_agent_chat_pane(&other_ws.0, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&other_pane.0, Some("thread-other".into()));
+
+        // create_agent_chat_pane activates the workspace it inserts into, so
+        // pin focus back to the first workspace for a deterministic check.
+        store.activate_workspace(&active_ws.0);
+
+        assert!(store.is_thread_pane_in_active_workspace("thread-active"));
+        assert!(!store.is_thread_pane_in_active_workspace("thread-other"));
+        assert!(!store.is_thread_pane_in_active_workspace("nope"));
+
+        store.activate_workspace(&other_ws.0);
+        assert!(!store.is_thread_pane_in_active_workspace("thread-active"));
+        assert!(store.is_thread_pane_in_active_workspace("thread-other"));
+    }
+
+    #[test]
+    fn find_agent_chat_pane_id_walks_splits_and_skips_unbound() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        // Two chat panes in the same surface (the second splits the first).
+        let pane_a = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        let pane_b = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&pane_a.0, Some("thread-a".into()));
+        store.set_agent_chat_thread_id(&pane_b.0, Some("thread-b".into()));
+
+        let snapshot = store.snapshot();
+        let workspace = workspace_by_id(&snapshot, &ws_id);
+        let root = &workspace.surfaces[0].root;
+
+        assert_eq!(find_agent_chat_pane_id(root, "thread-a"), Some(pane_a));
+        assert_eq!(find_agent_chat_pane_id(root, "thread-b"), Some(pane_b.clone()));
+        // Unbound / unknown thread ids never match.
+        assert_eq!(find_agent_chat_pane_id(root, "thread-c"), None);
+
+        // Clearing a binding drops it from the walk.
+        store.set_agent_chat_thread_id(&pane_b.0, None);
+        let cleared = store.snapshot();
+        let workspace = workspace_by_id(&cleared, &ws_id);
+        assert_eq!(
+            find_agent_chat_pane_id(&workspace.surfaces[0].root, "thread-b"),
+            None
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ import {
 } from "@/stores/settings-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
+import { BrowserPeekOverlay } from "@/components/browser/BrowserPeekOverlay";
 import { AppSidebar } from "./app-sidebar";
 import { TitleBar } from "./title-bar";
 import { WorkspaceMain } from "./workspace-main";
@@ -126,6 +127,11 @@ export function AppShell() {
               its clean appearance. Renders nothing when there's nothing
               to report (draft chat, onboarding, non-git workspace). */}
           <WorkspaceContextBar />
+          {/* GUI-mode background browser peek — absolutely positioned
+              inside this `relative` SidebarInset, so it floats over
+              WorkspaceMain without resizing it. Renders nothing unless
+              GUI chrome applies and the peek is explicitly opened. */}
+          <BrowserPeekOverlay />
         </SidebarInset>
         <CommandPalette
           open={commandPaletteOpen}

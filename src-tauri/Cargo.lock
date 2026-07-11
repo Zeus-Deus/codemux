@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "codemux"
-version = "0.9.5"
+version = "0.13.2"
 dependencies = [
  "aes-gcm",
  "argon2",

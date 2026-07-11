@@ -459,3 +459,60 @@ body.pane-resizing iframe {
   }
 }
 
+/* Blinking status dot (design wsBlink) shared by several live-status
+ * indicators — the subagent breadcrumb, the background-browser chip, the
+ * right-panel tab, the workspace context bar. Formerly also used by the
+ * now-removed "N subagents running" pane-header / title-bar pills,
+ * replaced by the docked SubagentActivityBar. Opacity pulse only, so it
+ * reads over any tint; honours reduced-motion. Apply via `cm-blink`. */
+@keyframes cm-blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.3;
+  }
+}
+.cm-blink {
+  animation: cm-blink 1.3s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cm-blink {
+    animation: none;
+  }
+}
+
+/* Top-edge "sweep" progress segment on the docked SubagentActivityBar
+ * (design wsSweep) — a thin bar-within-a-bar that slides left→right while
+ * any subagent runs, reading as ambient progress rather than a discrete
+ * loading percentage. Honours reduced-motion. Apply via `cm-sweep` to the
+ * absolutely-positioned inner segment (the outer track just clips it). */
+@keyframes cm-sweep {
+  0% {
+    left: -38%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+.cm-sweep {
+  animation: cm-sweep 1.7s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cm-sweep {
+    animation: none;
+  }
+}
+
+/* Temporary jump-highlight applied to a Subagents orchestration card
+ * when the docked SubagentActivityBar scrolls the transcript to it
+ * (design: ember ring flash, ~1100ms, added/removed by JS — see
+ * AgentChatPane's jump handler). Token-driven so it reads in both
+ * palettes; no keyframe needed since it's a single add/remove, but the
+ * transition softens the moment it's cleared. */
+.subagent-card-highlight {
+  box-shadow: 0 0 0 2px var(--accent-ember);
+  transition: box-shadow 0.3s ease;
+}
+

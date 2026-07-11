@@ -13,6 +13,7 @@ import { DraftChatSurface } from "@/components/chat/DraftChatSurface";
 import { EditorPane } from "@/components/editor/EditorPane";
 import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
 import { ProjectOnboarding } from "@/components/overlays/project-onboarding";
+import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 
 const RIGHT_PANEL_MIN = 240;
 const RIGHT_PANEL_MAX = 500;
@@ -84,11 +85,26 @@ export function WorkspaceMain() {
   const activeWorkspace = useActiveWorkspace();
   const onboardingProjectDir = useUIStore((s) => s.onboardingProjectDir);
   const setOnboardingProjectDir = useUIStore((s) => s.setOnboardingProjectDir);
-  const rightPanelTab = useUIStore((s) =>
+  const rightPanelTabRaw = useUIStore((s) =>
     activeWorkspace
       ? s.rightPanelTabs[activeWorkspace.workspace_id] ?? null
       : null,
   );
+  // Stale-tab guard: a workspace can persist "orchestration" as its last
+  // right-panel tab (e.g. the workflow run finished and its thread was
+  // closed) with no run left to show. Coerce the RENDERED tab back to
+  // Files without touching the persisted store value — a pure fallback,
+  // not a `setRightPanelTab` call, so there's nothing to loop on.
+  // `pending_approval` runs don't surface the tab either (the in-thread
+  // approval card owns that state), so they coerce away too — keep this
+  // predicate in sync with RightPanel's tab gate.
+  const { run: activeWorkflowRun } = useWorkspaceWorkflow(activeWorkspace);
+  const showableWorkflowRun =
+    activeWorkflowRun != null && activeWorkflowRun.status !== "pending_approval";
+  const rightPanelTab =
+    rightPanelTabRaw === "orchestration" && !showableWorkflowRun
+      ? "files"
+      : rightPanelTabRaw;
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
 
   // Auto-dismiss onboarding when a workspace is created through any path ("+", CLI, etc.).
@@ -125,6 +141,10 @@ export function WorkspaceMain() {
   // present on both drafts and real workspaces — a preset click on a
   // draft materialises the workspace via `materializeWithPreset`.
   const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
+  // GUI chrome (Agent Chat Beta): the title bar absorbs the tab strip +
+  // preset launcher, so those stacked rows drop here. Off ⇒ legacy chrome
+  // renders byte-identical.
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
   const activeDraft = useChatDraftStore((s) =>
     s.activeDraftId ? s.draftsById[s.activeDraftId] ?? null : null,
@@ -182,10 +202,13 @@ export function WorkspaceMain() {
 
   return (
     <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
-      {/* Left: tab bar + preset bar + pane content */}
+      {/* Left: tab bar + preset bar + pane content. In GUI chrome the
+          title bar hosts the tabs + launcher, so both rows are dropped. */}
       <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
-        <TabBar workspace={activeWorkspace} />
-        <PresetBar workspaceId={activeWorkspace.workspace_id} />
+        {!enableAgentChat && <TabBar workspace={activeWorkspace} />}
+        {!enableAgentChat && (
+          <PresetBar workspaceId={activeWorkspace.workspace_id} />
+        )}
         <div className="flex-1 min-h-0 overflow-hidden">
           {activeTab?.kind === "diff" ? (
             <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />

@@ -33,6 +33,29 @@ pub enum ProbeOutcome {
         /// by the bootstrap step to pick the right binary to scp.
         /// Example: `"Linux x86_64"`, `"Darwin arm64"`.
         uname: Option<String>,
+        /// True when the remote emitted a `CMR:` line that is neither
+        /// `NOT_INSTALLED` nor a parseable `version` JSON payload —
+        /// i.e. *something* is present at the install path / on PATH
+        /// but it doesn't produce valid version output. Two corruption
+        /// modes from issue #133, two mechanisms:
+        ///
+        /// - A 0-byte file executes as an empty shell script: exit 0,
+        ///   no output → the probe emits a bare `CMR: ` line.
+        /// - A truncated ELF fails to exec (exit 126, "Exec format
+        ///   error"); the probe command's `2>/dev/null || printf
+        ///   'BROKEN\n'` fallback swallows the noise and emits
+        ///   `CMR: BROKEN` (keeping ssh's exit status 0 so we still
+        ///   parse stdout instead of reporting Unreachable).
+        ///
+        /// Both are unparseable as version JSON → classified broken,
+        /// not merely missing — the UI can then say "installed but
+        /// corrupted — Install to repair" instead of "isn't installed
+        /// yet".
+        ///
+        /// `#[serde(default)]` so payloads serialized before this field
+        /// existed still deserialize (to `false`).
+        #[serde(default)]
+        binary_present_but_broken: bool,
     },
     /// SSH did not connect (DNS failure, refused, timeout, key not
     /// authorized). The user-visible message comes from `reason`.
@@ -89,11 +112,26 @@ pub fn build_probe_argv(ssh_target: &str, timeout_secs: u64) -> Vec<String> {
         // every subsequent "Test connection" press. Mirrors the same
         // fix applied in `commands::hosts::ensure_remote_binary_current`
         // and the supervisor's tunnel-spawn command.
+        //
+        // Both version invocations carry `2>/dev/null || printf 'BROKEN\n'`
+        // (issue #133): a truncated ELF fails to exec with exit 126
+        // ("cannot execute binary file: Exec format error"), and because
+        // the version invocation is the LAST statement of its `if`
+        // branch, that 126 would become the whole remote command's exit
+        // status — ssh exits 126 and `probe_host` takes the
+        // `!status.success()` path, reporting `Unreachable` with raw
+        // exec noise instead of ever reaching `parse_probe_stdout`. The
+        // `|| printf` fallback turns exec failure into a `CMR: BROKEN`
+        // line and printf's exit 0, so the probe stays Reachable and
+        // the parser classifies present-but-broken (→ "Install to
+        // repair"). `2>/dev/null` keeps the shell's exec-error noise
+        // out of the stream. The genuinely-absent branch
+        // (`NOT_INSTALLED`) is untouched.
         "printf 'UNAME: ' ; uname -sm ; \
          if command -v codemux-remote >/dev/null 2>&1 ; then \
-           printf 'CMR: ' ; codemux-remote version ; \
+           printf 'CMR: ' ; codemux-remote version 2>/dev/null || printf 'BROKEN\\n' ; \
          elif [ -x \"$HOME/.local/bin/codemux-remote\" ] ; then \
-           printf 'CMR: ' ; \"$HOME/.local/bin/codemux-remote\" version ; \
+           printf 'CMR: ' ; \"$HOME/.local/bin/codemux-remote\" version 2>/dev/null || printf 'BROKEN\\n' ; \
          else \
            printf 'CMR: NOT_INSTALLED\\n' ; \
          fi"
@@ -161,21 +199,32 @@ pub fn parse_probe_stdout(stdout: &str) -> ProbeOutcome {
             cmr_line = Some(rest.trim().to_string());
         }
     }
+    let mut binary_present_but_broken = false;
     let codemux_remote_version = match cmr_line.as_deref() {
+        // No `CMR:` line at all, or an explicit `NOT_INSTALLED`: the
+        // binary is genuinely absent. Not broken.
         None | Some("NOT_INSTALLED") => None,
         Some(json_line) => {
             // The `version` subcommand emits {"name":"codemux-remote","version":"x.y.z",...}
-            // Parse it; on any error treat as "not installed" so the
-            // UI offers the bootstrap path (better than claiming an
-            // unparseable version is fine).
-            serde_json::from_str::<serde_json::Value>(json_line)
+            let parsed = serde_json::from_str::<serde_json::Value>(json_line)
                 .ok()
-                .and_then(|v| v["version"].as_str().map(|s| s.to_string()))
+                .and_then(|v| v["version"].as_str().map(|s| s.to_string()));
+            if parsed.is_none() {
+                // Something answered on the `CMR:` line but it's not a
+                // parseable version (incl. an empty string from a 0-byte
+                // binary running as an empty script, or exec-format noise
+                // from a truncated ELF). The binary is present but broken
+                // — classify it so the UI offers "Install to repair"
+                // rather than "isn't installed yet" (issue #133).
+                binary_present_but_broken = true;
+            }
+            parsed
         }
     };
     ProbeOutcome::Reachable {
         codemux_remote_version,
         uname,
+        binary_present_but_broken,
     }
 }
 
@@ -227,6 +276,24 @@ mod tests {
             cmd.contains("\"$HOME/.local/bin/codemux-remote\" version"),
             "fallback must invoke the binary's version subcommand"
         );
+        // BOTH version invocations must carry the `|| printf 'BROKEN`
+        // failure fallback (issue #133). Without it, a truncated ELF
+        // exec-fails with exit 126 as the LAST statement of its branch,
+        // that 126 becomes the whole remote command's (and ssh's) exit
+        // status, and probe_host reports `Unreachable` with raw exec
+        // noise — parse_probe_stdout is never reached, so the
+        // present-but-broken classification (and the Install-to-repair
+        // path) can never fire.
+        assert!(
+            cmd.contains("codemux-remote version 2>/dev/null || printf 'BROKEN"),
+            "PATH-lookup branch must tolerate exec failure: {cmd}"
+        );
+        assert!(
+            cmd.contains(
+                "\"$HOME/.local/bin/codemux-remote\" version 2>/dev/null || printf 'BROKEN"
+            ),
+            "absolute-path fallback branch must tolerate exec failure: {cmd}"
+        );
     }
 
     #[test]
@@ -238,9 +305,12 @@ CMR: {"name":"codemux-remote","version":"0.3.1","protocol_version":1}
             ProbeOutcome::Reachable {
                 codemux_remote_version,
                 uname,
+                binary_present_but_broken,
             } => {
                 assert_eq!(codemux_remote_version.as_deref(), Some("0.3.1"));
                 assert_eq!(uname.as_deref(), Some("Linux x86_64"));
+                // A cleanly-installed binary is not "broken".
+                assert!(!binary_present_but_broken);
             }
             other => panic!("expected Reachable, got {other:?}"),
         }
@@ -253,9 +323,13 @@ CMR: {"name":"codemux-remote","version":"0.3.1","protocol_version":1}
             ProbeOutcome::Reachable {
                 codemux_remote_version,
                 uname,
+                binary_present_but_broken,
             } => {
                 assert!(codemux_remote_version.is_none());
                 assert_eq!(uname.as_deref(), Some("Darwin arm64"));
+                // Explicit NOT_INSTALLED means genuinely absent, not
+                // broken — the UI says "install", not "repair".
+                assert!(!binary_present_but_broken);
             }
             other => panic!("expected Reachable, got {other:?}"),
         }
@@ -263,17 +337,64 @@ CMR: {"name":"codemux-remote","version":"0.3.1","protocol_version":1}
 
     #[test]
     fn parse_probe_stdout_unparseable_version_treats_as_missing() {
-        // If a malformed remote emits garbage where we expect JSON,
-        // we degrade gracefully — pretend the binary isn't installed
-        // so the user gets offered the bootstrap path. This is safer
-        // than reporting a phantom version.
+        // If a malformed remote emits garbage where we expect JSON, we
+        // no longer pretend the binary isn't installed. Version is still
+        // None (we have nothing usable), but we now classify it as
+        // present-but-broken so the UI can offer "Install to repair"
+        // instead of "isn't installed yet" (issue #133).
         let payload = "UNAME: Linux x86_64\nCMR: not-json-at-all\n";
         match parse_probe_stdout(payload) {
             ProbeOutcome::Reachable {
                 codemux_remote_version,
+                binary_present_but_broken,
                 ..
             } => {
                 assert!(codemux_remote_version.is_none());
+                assert!(binary_present_but_broken);
+            }
+            other => panic!("expected Reachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_probe_stdout_bare_cmr_from_zero_byte_binary_is_broken() {
+        // A 0-byte codemux-remote executes as an empty shell script:
+        // exits 0, prints nothing, so the probe's `printf 'CMR: '`
+        // yields a bare `CMR: ` line with no version JSON (and here no
+        // trailing newline). This is the exact field-observed corruption
+        // from issue #133 — must be classified broken, not missing.
+        let payload = "UNAME: Linux x86_64\nCMR: ";
+        match parse_probe_stdout(payload) {
+            ProbeOutcome::Reachable {
+                codemux_remote_version,
+                uname,
+                binary_present_but_broken,
+            } => {
+                assert!(codemux_remote_version.is_none());
+                assert_eq!(uname.as_deref(), Some("Linux x86_64"));
+                assert!(binary_present_but_broken);
+            }
+            other => panic!("expected Reachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_probe_stdout_broken_marker_from_exec_failure_is_broken() {
+        // A truncated ELF can't exec: the remote command's `2>/dev/null
+        // || printf 'BROKEN\n'` fallback emits this exact marker (and
+        // keeps ssh's exit status 0 so we parse stdout at all instead
+        // of reporting Unreachable). `BROKEN` is not parseable version
+        // JSON → classified present-but-broken (issue #133).
+        let payload = "UNAME: Linux x86_64\nCMR: BROKEN\n";
+        match parse_probe_stdout(payload) {
+            ProbeOutcome::Reachable {
+                codemux_remote_version,
+                uname,
+                binary_present_but_broken,
+            } => {
+                assert!(codemux_remote_version.is_none());
+                assert_eq!(uname.as_deref(), Some("Linux x86_64"));
+                assert!(binary_present_but_broken);
             }
             other => panic!("expected Reachable, got {other:?}"),
         }
@@ -283,15 +404,18 @@ CMR: {"name":"codemux-remote","version":"0.3.1","protocol_version":1}
     fn parse_probe_stdout_handles_missing_lines() {
         // Empty payload means nothing got back. Still parse as
         // Reachable (the ssh process succeeded) with both fields
-        // None — the UI will treat this as "weird, retry."
+        // None — the UI will treat this as "weird, retry." No `CMR:`
+        // line at all means not-broken (nothing claimed to be present).
         let outcome = parse_probe_stdout("");
         match outcome {
             ProbeOutcome::Reachable {
                 codemux_remote_version,
                 uname,
+                binary_present_but_broken,
             } => {
                 assert!(codemux_remote_version.is_none());
                 assert!(uname.is_none());
+                assert!(!binary_present_but_broken);
             }
             other => panic!("expected Reachable, got {other:?}"),
         }

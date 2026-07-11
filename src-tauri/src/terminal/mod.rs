@@ -1301,7 +1301,12 @@ impl Drop for ChildGuard {
 /// Build worktree environment variables and dynamic agent context for a PTY session.
 /// Used by both `spawn_pty_for_session()` and `spawn_pty_for_agent()` to ensure
 /// consistent env var injection across user shells and agent processes.
-fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, String)> {
+///
+/// Exposed `pub(crate)` so the agent-chat command layer can reuse the exact
+/// same workspace-level vars when overlaying env onto a chat sidecar
+/// (see `crate::commands::agent_chat::workspace_env_overlay`), keeping the
+/// terminal and chat surfaces in lockstep.
+pub(crate) fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(String, String)> {
     let root = ws.project_root.clone().unwrap_or_else(|| {
         crate::scripts::resolve_root_path(std::path::Path::new(&ws.cwd))
             .to_string_lossy()
@@ -5116,6 +5121,7 @@ mod tests {
         use crate::state::*;
         WorkspaceSnapshot {
             workspace_id: WorkspaceId(id.to_string()),
+            is_git: true,
             title: title.to_string(),
             workspace_type: WorkspaceType::Standard,
             cwd: cwd.to_string(),

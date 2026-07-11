@@ -1,5 +1,6 @@
 import {
   BookOpen,
+  Bot,
   CheckSquare,
   FileText,
   FolderSearch,
@@ -17,7 +18,13 @@ import {
  * chips stay consistent.
  */
 
-export type ToolCategory = "search" | "file" | "terminal" | "web" | "other";
+export type ToolCategory =
+  | "search"
+  | "file"
+  | "terminal"
+  | "web"
+  | "agent"
+  | "other";
 
 const CATEGORY_BY_TOOL: Record<string, ToolCategory> = {
   Grep: "search",
@@ -30,6 +37,12 @@ const CATEGORY_BY_TOOL: Record<string, ToolCategory> = {
   NotebookEdit: "file",
   Bash: "terminal",
   WebFetch: "web",
+  // Subagent-spawn tools. Normally suppressed by the adapter (the
+  // orchestration card replaces them), but a stray occurrence still
+  // reads as an agent hand-off (ember, Bot glyph). "Task" is the
+  // pre-v2.1.63 name; "Agent" the current one — map both.
+  Task: "agent",
+  Agent: "agent",
 };
 
 export function toolCategory(toolName: string): ToolCategory {
@@ -48,6 +61,8 @@ const ICON_BY_TOOL: Record<string, LucideIcon> = {
   WebSearch: Globe,
   TodoWrite: CheckSquare,
   NotebookEdit: BookOpen,
+  Task: Bot,
+  Agent: Bot,
 };
 
 export function toolIcon(toolName: string): LucideIcon {
@@ -59,6 +74,7 @@ const ICON_BY_CATEGORY: Record<ToolCategory, LucideIcon> = {
   file: FileText,
   terminal: Terminal,
   web: Globe,
+  agent: Bot,
   other: Wrench,
 };
 
@@ -74,6 +90,8 @@ export function categoryTint(category: ToolCategory): string {
       return "bg-status-remote/15 text-status-remote";
     case "web":
       return "bg-accent-violet/15 text-accent-violet";
+    case "agent":
+      return "bg-accent-ember/15 text-accent-ember";
     case "file":
     case "terminal":
     case "other":

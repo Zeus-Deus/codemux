@@ -171,16 +171,30 @@ impl AgentProvider for ClaudeAgentProvider {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         let thread_id = input.thread_id.clone();
-        {
-            let sessions = self.sessions.read().await;
-            if sessions.contains_key(&thread_id) {
-                return Err(ProviderError::ValidationError {
-                    message: format!(
-                        "claude session already exists for thread {:?}",
-                        thread_id.0
-                    ),
-                });
+        // Evict a corpse before rebuilding: if the child-exit watchdog marked
+        // the existing session dead, remove it under the write lock (so the
+        // check→remove is atomic against a concurrent rebuild) and shut it down
+        // cleanly below. A still-live session for this thread is a genuine
+        // double-start and stays a ValidationError.
+        let dead_evicted = {
+            let mut sessions = self.sessions.write().await;
+            match sessions.get(&thread_id) {
+                Some(existing) if existing.is_dead() => sessions.remove(&thread_id),
+                Some(_) => {
+                    return Err(ProviderError::ValidationError {
+                        message: format!(
+                            "claude session already exists for thread {:?}",
+                            thread_id.0
+                        ),
+                    });
+                }
+                None => None,
             }
+        };
+        if let Some(dead) = dead_evicted {
+            // Best-effort: reap the dead sidecar's tasks before spawning the
+            // replacement. The child is already gone; this just tidies handles.
+            dead.shutdown().await;
         }
         let session = ClaudeSession::spawn_and_initialize(
             thread_id.clone(),
@@ -218,10 +232,18 @@ impl AgentProvider for ClaudeAgentProvider {
         let session = session.ok_or_else(|| ProviderError::SessionNotFound {
             thread_id: input.thread_id.clone(),
         })?;
-        let turn_id = session
-            .send_turn(input.text, input.images, input.model_override)
-            .await?;
-        Ok(TurnStartResult { turn_id })
+        Ok(match session.enqueue_or_send(input).await? {
+            crate::agent_provider::SendOutcome::Started(turn_id) => TurnStartResult {
+                turn_id,
+                queued_id: None,
+            },
+            crate::agent_provider::SendOutcome::Queued(queued_id) => TurnStartResult {
+                // No live turn yet — the real id arrives on
+                // QueuedTurnDispatched. Empty placeholder keeps the shape.
+                turn_id: TurnId(String::new()),
+                queued_id: Some(queued_id),
+            },
+        })
     }
 
     async fn interrupt_turn(
@@ -235,6 +257,38 @@ impl AgentProvider for ClaudeAgentProvider {
         };
         let session = session.ok_or(ProviderError::SessionNotFound { thread_id })?;
         session.interrupt(turn_id).await
+    }
+
+    async fn cancel_queued_turn(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<(), ProviderError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&thread_id).cloned()
+        };
+        // A missing session means nothing is queued — treat as a no-op.
+        let Some(session) = session else {
+            return Ok(());
+        };
+        session.cancel_queued(&queued_id).await
+    }
+
+    async fn send_queued_turn_now(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<(), ProviderError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&thread_id).cloned()
+        };
+        // A missing session means nothing is queued — treat as a no-op.
+        let Some(session) = session else {
+            return Ok(());
+        };
+        session.send_queued_now(&queued_id).await
     }
 
     async fn respond_to_request(
@@ -287,6 +341,18 @@ impl AgentProvider for ClaudeAgentProvider {
             status: SessionStatus::Closed,
         });
         Ok(())
+    }
+
+    async fn has_session(&self, thread_id: &ThreadId) -> bool {
+        // A session whose sidecar died unintentionally (child-exit watchdog
+        // set `dead`) is treated as absent, so `ensure_live_session` rebuilds
+        // a fresh one (with the resume cursor) on the next send instead of
+        // routing to a dead child. Mirrors the OpenCode provider.
+        self.sessions
+            .read()
+            .await
+            .get(thread_id)
+            .is_some_and(|session| !session.is_dead())
     }
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {

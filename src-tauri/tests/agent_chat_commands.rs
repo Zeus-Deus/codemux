@@ -35,7 +35,8 @@ use codemux_lib::agent_provider::{
 };
 use codemux_lib::commands::agent_chat::{
     feature_flag_on, forward_event, thread_id_for_event, AgentChatChannelRegistry,
-    AgentChatEventPayload, ProviderRegistry, AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
+    AgentChatEventPayload, ProviderRegistry, RunActivityTracker, SubagentTracker,
+    AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
 };
 use codemux_lib::database::DatabaseStore;
 use codemux_lib::observability::{FeatureFlags, ObservabilityStore};
@@ -225,6 +226,7 @@ async fn send_turn_forwards_to_selected_provider() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -296,6 +298,7 @@ async fn registry_returns_none_when_provider_missing() {
 #[test]
 fn thread_id_for_event_extracts_bound_threads() {
     let delta = ProviderRuntimeEvent::ContentDelta {
+        subagent_id: None,
         thread_id: ThreadId("th-1".into()),
         turn_id: TurnId("tn-1".into()),
         delta: codemux_lib::agent_provider::ContentDelta::Text {
@@ -326,12 +329,17 @@ fn thread_id_for_event_extracts_bound_threads() {
 }
 
 /// Build a MockRuntime app with the managed state `forward_event`
-/// touches: an in-memory DatabaseStore (transcript persistence) and
-/// the per-thread channel registry (issue #75 routing).
+/// touches: an in-memory DatabaseStore (transcript persistence), the
+/// per-thread channel registry (issue #75 routing), and the
+/// AppStateStore (chat sessions publish their lifecycle into
+/// `pane_statuses` so the sidebar shows working/needs-input/review).
 fn mock_app_with_chat_state() -> tauri::App<tauri::test::MockRuntime> {
     let app = tauri::test::mock_app();
     app.manage(DatabaseStore::new_in_memory());
     app.manage(AgentChatChannelRegistry::default());
+    app.manage(SubagentTracker::default());
+    app.manage(RunActivityTracker::default());
+    app.manage(AppStateStore::default());
     app
 }
 
@@ -357,6 +365,7 @@ fn capture_channel() -> (
 
 fn text_delta(thread: &str, text: &str) -> ProviderRuntimeEvent {
     ProviderRuntimeEvent::ContentDelta {
+        subagent_id: None,
         thread_id: ThreadId(thread.into()),
         turn_id: TurnId("turn-1".into()),
         delta: codemux_lib::agent_provider::ContentDelta::Text { text: text.into() },
@@ -385,6 +394,7 @@ async fn event_bridge_routes_thread_events_to_attached_channel() {
     registry.attach("thread-bridge", channel);
 
     let event = ProviderRuntimeEvent::ItemCompleted {
+        subagent_id: None,
         thread_id: ThreadId("thread-bridge".into()),
         turn_id: TurnId("turn-1".into()),
         item: CompletedItem::AssistantText {
@@ -472,6 +482,7 @@ async fn event_bridge_persists_transcript_even_without_channel() {
     }
 
     let event = ProviderRuntimeEvent::ItemCompleted {
+        subagent_id: None,
         thread_id: ThreadId("thread-unattached".into()),
         turn_id: TurnId("turn-1".into()),
         item: CompletedItem::AssistantText {
@@ -526,6 +537,142 @@ async fn event_bridge_emits_threadless_warnings_on_event_bus() {
     }
 }
 
+/// Bind a chat pane to `thread` inside `state` and return its pane id.
+/// The pane must carry a thread id for the status walker to resolve it.
+fn bind_chat_pane(state: &AppStateStore, workspace_id: &str, thread: &str) -> String {
+    let pane = state
+        .create_agent_chat_pane(workspace_id, None, None, None)
+        .expect("create_agent_chat_pane");
+    state.set_agent_chat_thread_id(&pane.0, Some(thread.into()));
+    pane.0
+}
+
+#[tokio::test]
+async fn forward_event_publishes_status_into_pane_statuses() {
+    // A chat session's lifecycle must land in the shared pane_statuses
+    // store so the sidebar renders working/needs-input/review for chat
+    // workspaces, exactly like terminal agents.
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+    let state: State<'_, AppStateStore> = handle.state();
+
+    // Put the chat pane in a NON-active workspace so a completed turn
+    // resolves to Review (the active-workspace path downgrades to Idle,
+    // covered separately below).
+    let bg_ws = state
+        .create_workspace_with_layout(
+            std::path::PathBuf::from("/tmp/codemux-chat-status-bg"),
+            codemux_lib::state::WorkspacePresetLayout::Single,
+        )
+        .0;
+    let pane = bind_chat_pane(&state, &bg_ws, "thread-status");
+    // Foreground a different workspace so `bg_ws` is not active.
+    let fg_ws = state
+        .create_workspace_with_layout(
+            std::path::PathBuf::from("/tmp/codemux-chat-status-fg"),
+            codemux_lib::state::WorkspacePresetLayout::Single,
+        )
+        .0;
+    state.activate_workspace(&fg_ws);
+
+    let status_of = |pane: &str| state.snapshot().pane_statuses.get(pane).cloned();
+
+    // Streaming deltas → Working.
+    forward_event(&handle, text_delta("thread-status", "hello"));
+    assert_eq!(status_of(&pane), Some(codemux_lib::state::PaneStatus::Working));
+
+    // A pending approval → Permission.
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::RequestOpened {
+            thread_id: ThreadId("thread-status".into()),
+            turn_id: TurnId("turn-1".into()),
+            request_id: RequestId("req-1".into()),
+            request_kind: "tool".into(),
+            payload: serde_json::json!({}),
+            tool_use_id: None,
+            subagent_id: None,
+        },
+    );
+    assert_eq!(
+        status_of(&pane),
+        Some(codemux_lib::state::PaneStatus::Permission)
+    );
+
+    // Turn finishes while the workspace is NOT active → Review.
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId("thread-status".into()),
+            turn_id: TurnId("turn-1".into()),
+            status: codemux_lib::agent_provider::TurnStatus::Success,
+            usage: None,
+        },
+    );
+    assert_eq!(status_of(&pane), Some(codemux_lib::state::PaneStatus::Review));
+
+    // Session closes → entry cleared.
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::SessionStateChanged {
+            thread_id: ThreadId("thread-status".into()),
+            status: codemux_lib::agent_provider::SessionStatus::Closed,
+        },
+    );
+    assert_eq!(status_of(&pane), None, "closed session clears the indicator");
+}
+
+#[tokio::test]
+async fn forward_event_downgrades_review_to_idle_in_active_workspace() {
+    // Parity with the terminal path: a turn that finishes in the
+    // workspace the user is already looking at clears to Idle instead of
+    // nagging with a review dot.
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+    let state: State<'_, AppStateStore> = handle.state();
+
+    let active_ws = state.snapshot().active_workspace_id.0;
+    let pane = bind_chat_pane(&state, &active_ws, "thread-focused");
+    // create_agent_chat_pane keeps its workspace active; assert that.
+    assert!(state.is_thread_pane_in_active_workspace("thread-focused"));
+
+    forward_event(&handle, text_delta("thread-focused", "hi"));
+    assert_eq!(
+        state.snapshot().pane_statuses.get(&pane).cloned(),
+        Some(codemux_lib::state::PaneStatus::Working)
+    );
+
+    forward_event(
+        &handle,
+        ProviderRuntimeEvent::TurnCompleted {
+            thread_id: ThreadId("thread-focused".into()),
+            turn_id: TurnId("turn-1".into()),
+            status: codemux_lib::agent_provider::TurnStatus::Success,
+            usage: None,
+        },
+    );
+    assert_eq!(
+        state.snapshot().pane_statuses.get(&pane).cloned(),
+        None,
+        "completed turn in the active workspace clears instead of Review"
+    );
+}
+
+#[tokio::test]
+async fn forward_event_ignores_status_for_unbound_threads() {
+    // An event for a thread with no resolvable chat pane must not create
+    // a spurious pane_statuses entry (and must not panic).
+    let app = mock_app_with_chat_state();
+    let handle = app.handle().clone();
+    let state: State<'_, AppStateStore> = handle.state();
+
+    forward_event(&handle, text_delta("no-such-thread", "hi"));
+    assert!(
+        state.snapshot().pane_statuses.is_empty(),
+        "unbound thread must not seed a status entry"
+    );
+}
+
 #[tokio::test]
 async fn full_bridge_pipeline_streams_provider_events_per_thread() {
     // End-to-end through the real pipeline: provider broadcast →
@@ -554,6 +701,7 @@ async fn full_bridge_pipeline_streams_provider_events_per_thread() {
         provider.emit(text_delta("pipe-b", &format!("tok-b{i}")));
     }
     provider.emit(ProviderRuntimeEvent::ItemCompleted {
+        subagent_id: None,
         thread_id: ThreadId("pipe-a".into()),
         turn_id: TurnId("turn-1".into()),
         item: CompletedItem::AssistantText {
@@ -596,6 +744,257 @@ async fn full_bridge_pipeline_streams_provider_events_per_thread() {
     }
     let b = captured_b.lock().unwrap();
     assert!(b.iter().all(|p| p.thread_id.0 == "pipe-b"));
+}
+
+// ── Backend auto-resume after a restart ──
+//
+// The bug: after the app is closed and reopened, the provider's live
+// session map is empty (no startup rehydration) but the persisted
+// `agent_chat_sessions` row survives. Every turn on the reopened pane
+// used to hit `session_not_found`. `ensure_live_session` must transparently
+// rebuild the session from that row — reusing the SAME thread_id, resuming
+// from the persisted `sdk_session_id`, with the persisted model — so the
+// turn goes through.
+//
+// Drives the REAL `ClaudeAgentProvider` against the `fake_claude_sidecar`
+// (script-driven, no SDK / Anthropic account) so we can assert on exactly
+// what `start-session` the auto-resume sent.
+
+mod auto_resume {
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use codemux_lib::agent_provider::claude::{ClaudeAgentProvider, ClaudeProviderConfig};
+    use codemux_lib::agent_provider::{AgentProvider, ProviderKind, SendTurnInput, ThreadId};
+    use codemux_lib::commands::agent_chat::{ensure_live_session, ProviderRegistry};
+    use codemux_lib::database::{AgentChatSessionConfig, DatabaseStore};
+    use codemux_lib::state::AppStateStore;
+    use serde_json::Value;
+    use tauri::Manager;
+
+    fn fake_sidecar() -> PathBuf {
+        PathBuf::from(env!("CARGO_BIN_EXE_fake_claude_sidecar"))
+    }
+
+    /// Minimal POSIX shell escaper, mirroring the local module in
+    /// `claude_adapter.rs` (which is a test-local module, not a crate).
+    mod shell_escape {
+        pub fn escape<S: AsRef<str>>(s: S) -> String {
+            let s = s.as_ref();
+            if s.is_empty() {
+                return "''".into();
+            }
+            if s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "._-/=".contains(c))
+            {
+                return s.to_string();
+            }
+            let mut out = String::from("'");
+            for c in s.chars() {
+                if c == '\'' {
+                    out.push_str("'\\''");
+                } else {
+                    out.push(c);
+                }
+            }
+            out.push('\'');
+            out
+        }
+    }
+
+    /// Bash wrapper that exports `FAKE_CLAUDE_SIDECAR_CAPTURE=<path>` then
+    /// `exec`s the fake sidecar, so the sidecar records every received
+    /// `start-session`'s params to `capture` for later assertion. Mirrors
+    /// `claude_adapter.rs::wrapper_with_env`. Written into `dir` (a
+    /// caller-owned tempdir that must outlive the spawned session).
+    fn capture_wrapper(dir: &std::path::Path, capture: &std::path::Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("wrap.sh");
+        let body = format!(
+            "#!/usr/bin/env bash\nset -e\nexport FAKE_CLAUDE_SIDECAR_CAPTURE={}\nexec {} \"$@\"\n",
+            shell_escape::escape(capture.to_string_lossy()),
+            shell_escape::escape(fake_sidecar().to_string_lossy()),
+        );
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    async fn claude_provider_with_capture(wrapper: PathBuf) -> Arc<ClaudeAgentProvider> {
+        Arc::new(
+            ClaudeAgentProvider::new(ClaudeProviderConfig {
+                sidecar_binary: Some(wrapper),
+                claude_binary: Some(PathBuf::from("/usr/bin/claude")),
+                event_channel_capacity: 1024,
+                mcp_registry: None,
+            })
+            .await
+            .expect("provider"),
+        )
+    }
+
+    fn read_capture(path: &std::path::Path) -> Vec<Value> {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<Value>(l).expect("valid capture json"))
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_after_dead_session_auto_resumes_with_persisted_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let capture = tmp.path().join("start-session-capture.jsonl");
+        let cwd = tmp.path().join("workdir");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let wrapper = capture_wrapper(tmp.path(), &capture);
+
+        // Managed state the command path touches. A fresh provider whose
+        // session map is EMPTY models the post-restart process.
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle().clone();
+
+        let provider = claude_provider_with_capture(wrapper).await;
+        {
+            let registry: tauri::State<'_, ProviderRegistry> = handle.state();
+            registry.set_claude(provider.clone() as Arc<dyn AgentProvider>).await;
+        }
+
+        // Seed the persisted row exactly as it would survive a restart:
+        // a live sdk_session_id + a chosen model, but NO live session.
+        let thread = ThreadId("chat-pane-448-1783369893274".into());
+        {
+            let db: tauri::State<'_, DatabaseStore> = handle.state();
+            db.upsert_agent_chat_session(
+                &thread.0,
+                "ws-1",
+                Some(&cwd.to_string_lossy()),
+                "claude",
+            )
+            .unwrap();
+            db.set_agent_chat_sdk_session_id(&thread.0, "sdk-uuid-123")
+                .unwrap();
+            db.update_agent_chat_session_config(
+                &thread.0,
+                &AgentChatSessionConfig {
+                    model: AgentChatSessionConfig::set("claude-opus-4-8"),
+                    ..AgentChatSessionConfig::default()
+                },
+            )
+            .unwrap();
+        }
+
+        // Precondition: the map is empty (the restart bug's starting point).
+        assert!(
+            !provider.has_session(&thread).await,
+            "no live session should exist before auto-resume"
+        );
+
+        // The choke point: rebuild the dead session from the DB row.
+        ensure_live_session(&handle, ProviderKind::Claude, &thread)
+            .await
+            .expect("auto-resume should succeed");
+
+        // The session is live again under the SAME thread_id.
+        assert!(
+            provider.has_session(&thread).await,
+            "auto-resume must rebind a live session to the same thread_id"
+        );
+
+        // The fake sidecar received a start-session carrying the persisted
+        // resume cursor and model.
+        let captured = read_capture(&capture);
+        assert_eq!(captured.len(), 1, "exactly one start-session was sent");
+        let params = &captured[0]["params"];
+        assert_eq!(
+            params["threadId"].as_str(),
+            Some(thread.0.as_str()),
+            "resumed session reuses the same thread_id"
+        );
+        assert_eq!(
+            params["resume"].as_str(),
+            Some("sdk-uuid-123"),
+            "resume cursor threaded through from the persisted sdk_session_id"
+        );
+        assert_eq!(
+            params["model"].as_str(),
+            Some("claude-opus-4-8"),
+            "persisted model threaded through to the SDK start-session"
+        );
+
+        // And a turn now goes through instead of session_not_found.
+        provider
+            .send_turn(SendTurnInput {
+                thread_id: thread.clone(),
+                text: "still here after restart?".into(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+            })
+            .await
+            .expect("send_turn succeeds on the resumed session");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ensure_live_session_is_a_noop_when_session_already_live() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let capture = tmp.path().join("capture.jsonl");
+        let cwd = tmp.path().join("workdir");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let wrapper = capture_wrapper(tmp.path(), &capture);
+
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle().clone();
+
+        let provider = claude_provider_with_capture(wrapper).await;
+        {
+            let registry: tauri::State<'_, ProviderRegistry> = handle.state();
+            registry.set_claude(provider.clone() as Arc<dyn AgentProvider>).await;
+        }
+
+        let thread = ThreadId("thread-live".into());
+        {
+            let db: tauri::State<'_, DatabaseStore> = handle.state();
+            db.upsert_agent_chat_session(&thread.0, "ws-1", Some(&cwd.to_string_lossy()), "claude")
+                .unwrap();
+        }
+
+        // Start a real session so the map has an entry.
+        provider
+            .start_session(codemux_lib::agent_provider::StartSessionInput {
+                thread_id: thread.clone(),
+                cwd: cwd.clone(),
+                model: None,
+                resume_cursor: None,
+                permission_mode: None,
+                effort: None,
+                context_window: None,
+                additional_directories: vec![],
+                env: None,
+                extra: Value::Null,
+            })
+            .await
+            .expect("start ok");
+        let captures_after_start = read_capture(&capture).len();
+
+        // ensure_live_session must NOT start a second session.
+        ensure_live_session(&handle, ProviderKind::Claude, &thread)
+            .await
+            .expect("no-op ok");
+        assert_eq!(
+            read_capture(&capture).len(),
+            captures_after_start,
+            "a live session must not be restarted by ensure_live_session"
+        );
+    }
 }
 
 // ── Run checkpoints (issue #80) ──

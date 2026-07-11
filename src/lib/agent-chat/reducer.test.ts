@@ -8,6 +8,7 @@ import {
   appendUserMessage,
   createEmptyThreadState,
   markRequestResponding,
+  removeUserMessageByNonce,
   type Clock,
 } from "./reducer";
 import type {
@@ -15,7 +16,10 @@ import type {
   ChatThreadState,
   PermissionRequestItem,
   ReasoningItem,
+  SubagentRunItem,
   ToolCallItem,
+  UserMessageItem,
+  WorkflowRunItem,
 } from "./types";
 
 function runEvents(
@@ -64,6 +68,130 @@ describe("agent-chat reducer", () => {
     expect(assistants[0].text).toBe("Hello, world");
     expect(assistants[0].streaming).toBe(true);
     expect(state.streaming).toBe(true);
+  });
+
+  describe("empty text deltas never materialize an assistant message", () => {
+    const textDelta = (text: string): ProviderRuntimeEvent => ({
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "text", text },
+    });
+    const assistants = (s: ChatThreadState): AssistantMessageItem[] =>
+      s.messages.filter(
+        (m): m is AssistantMessageItem => m.kind === "assistant_message",
+      );
+
+    it("an empty first delta creates no assistant item", () => {
+      const state = runEvents([textDelta("")]);
+      expect(assistants(state)).toHaveLength(0);
+      // Nothing appended → nextSeq untouched.
+      expect(state.nextSeq).toBe(0);
+      // The delta still marks the turn streaming (session-owned flag path).
+      expect(state.streaming).toBe(true);
+    });
+
+    it("a whitespace-only first delta creates no assistant item", () => {
+      const state = runEvents([textDelta("   \n\t")]);
+      expect(assistants(state)).toHaveLength(0);
+      expect(state.nextSeq).toBe(0);
+    });
+
+    it("an empty delta then a non-empty delta yields exactly one item with the right text", () => {
+      const state = runEvents([textDelta(""), textDelta("Hello")]);
+      const list = assistants(state);
+      expect(list).toHaveLength(1);
+      expect(list[0].text).toBe("Hello");
+      expect(list[0].streaming).toBe(true);
+    });
+
+    it("an empty delta merging into an existing streaming tail is a no-op (same reference, same text)", () => {
+      const first = runEvents([textDelta("Hi")]);
+      const before = first.messages[first.messages.length - 1];
+      const after = applyEvent(first, textDelta(""));
+      const list = assistants(after);
+      expect(list).toHaveLength(1);
+      expect(list[0].text).toBe("Hi");
+      // Reference-stable: the empty merge cloned nothing.
+      expect(after.messages[after.messages.length - 1]).toBe(before);
+    });
+
+    it("an empty delta between tool steps keeps the run contiguous (no phantom item to break it)", () => {
+      // Reproduces the settle-mid-run bug: a Read runs, then Claude opens a
+      // new text block with an empty delta, then another Read runs. The
+      // empty delta must NOT land an assistant_message between the two
+      // tools (which would flush the live Activity run as settled).
+      const state = runEvents([
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_use_id: "tu-1",
+            tool_name: "Read",
+            input: { file_path: "/a" },
+          },
+        },
+        textDelta(""),
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_use_id: "tu-2",
+            tool_name: "Read",
+            input: { file_path: "/b" },
+          },
+        },
+      ]);
+      expect(assistants(state)).toHaveLength(0);
+      expect(state.messages.map((m) => m.kind)).toEqual([
+        "tool_call",
+        "tool_call",
+      ]);
+    });
+
+    it("an assistant_text completion after only-empty deltas settles without a blank row", () => {
+      const state = runEvents([
+        {
+          type: "session_state_changed",
+          thread_id: "t1",
+          status: { status: "running", active_turn: "turn-1" },
+        },
+        textDelta(""),
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: { kind: "assistant_text", text: "" },
+        },
+        {
+          type: "turn_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          status: { kind: "success" },
+          usage: null,
+        },
+      ]);
+      // No orphaned/blank assistant row, no crash, turn settled.
+      expect(assistants(state)).toHaveLength(0);
+      expect(state.streaming).toBe(false);
+    });
+
+    it("hydrate/replay of the same deltas produces an identical item count", () => {
+      const events: ProviderRuntimeEvent[] = [
+        textDelta(""),
+        textDelta("real text"),
+        textDelta(""),
+      ];
+      const live = runEvents(events);
+      __resetReducerIdCounterForTests();
+      const replayed = runEvents(events);
+      expect(assistants(replayed).length).toBe(assistants(live).length);
+      expect(assistants(replayed)[0].text).toBe("real text");
+    });
   });
 
   it("item_completed(assistant_text) after deltas seals with the full final text (no duplication, no truncation)", () => {
@@ -161,6 +289,81 @@ describe("agent-chat reducer", () => {
     );
     expect(tools).toHaveLength(1);
     expect(tools[0].status).toBe("running");
+  });
+
+  it("stamps started_at on tool_use and completed_at on tool_result from the injected clock", () => {
+    // Clock ticks 100 → 100 → 200: use lands at 100, result at 200.
+    const ticks = [100, 200];
+    let i = 0;
+    const clock: Clock = () => ticks[Math.min(i++, ticks.length - 1)];
+    const state = runEvents(
+      [
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_use_id: "tu-9",
+            tool_name: "Bash",
+            input: { command: "cargo test" },
+          },
+        },
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_result",
+            tool_use_id: "tu-9",
+            content: "ok",
+            is_error: false,
+          },
+        },
+      ],
+      createEmptyThreadState(),
+      clock,
+    );
+    const tool = state.messages.find(
+      (m): m is ToolCallItem => m.kind === "tool_call",
+    );
+    expect(tool?.started_at).toBe(100);
+    expect(tool?.completed_at).toBe(200);
+  });
+
+  it("stamps completed_at on a result-first placeholder and started_at when the use lands", () => {
+    const ticks = [500, 900];
+    let i = 0;
+    const clock: Clock = () => ticks[Math.min(i++, ticks.length - 1)];
+    const state = runEvents(
+      [
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: { kind: "tool_result", tool_use_id: "tu-r", content: "42", is_error: false },
+        },
+        {
+          type: "item_completed",
+          thread_id: "t1",
+          turn_id: "turn-1",
+          item: {
+            kind: "tool_use",
+            tool_use_id: "tu-r",
+            tool_name: "Bash",
+            input: { command: "echo 42" },
+          },
+        },
+      ],
+      createEmptyThreadState(),
+      clock,
+    );
+    const tool = state.messages.find(
+      (m): m is ToolCallItem => m.kind === "tool_call",
+    );
+    // Result landed first (500), then the use stamped its own start (900).
+    expect(tool?.completed_at).toBe(500);
+    expect(tool?.started_at).toBe(900);
   });
 
   it("tracks permission-request lifecycle: append → resolve → collapse", () => {
@@ -280,6 +483,38 @@ describe("agent-chat reducer", () => {
     const state = appendUserMessage(createEmptyThreadState(), "hello");
     expect(state.messages).toHaveLength(1);
     expect(state.messages[0].kind).toBe("user_message");
+  });
+
+  it("appendUserMessage attaches images when provided", () => {
+    const state = appendUserMessage(
+      createEmptyThreadState(),
+      "look at this",
+      undefined,
+      undefined,
+      [{ src: "data:image/png;base64,AAAA", mediaType: "image/png" }],
+    );
+    const item = state.messages[0];
+    expect(item.kind).toBe("user_message");
+    if (item.kind === "user_message") {
+      expect(item.images).toEqual([
+        { src: "data:image/png;base64,AAAA", mediaType: "image/png" },
+      ]);
+    }
+  });
+
+  it("appendUserMessage omits `images` entirely for a text-only turn", () => {
+    // Empty / undefined image lists must not stamp an `images` key, so
+    // a text-only bubble stays byte-identical to the pre-images shape.
+    const withUndefined = appendUserMessage(createEmptyThreadState(), "hi");
+    const withEmpty = appendUserMessage(
+      createEmptyThreadState(),
+      "hi",
+      undefined,
+      undefined,
+      [],
+    );
+    expect("images" in withUndefined.messages[0]).toBe(false);
+    expect("images" in withEmpty.messages[0]).toBe(false);
   });
 
   it("resume_cursor_updated is a transcript-level no-op (cursor stored in store, not ChatThreadState)", () => {
@@ -675,6 +910,36 @@ describe("agent-chat reducer", () => {
       { type: "stream_event" },
     );
 
+    warn.mockRestore();
+  });
+
+  it("runtime_warning promotes a rejected rate-limit event to an inline runtime_notice", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "runtime_warning",
+      thread_id: "t1",
+      message: "rate limit event",
+      original_payload: { rate_limit_info: { status: "rejected" } },
+    });
+    expect(state.messages).toHaveLength(1);
+    const notice = state.messages[0];
+    expect(notice.kind).toBe("runtime_notice");
+    if (notice.kind === "runtime_notice") {
+      expect(notice.message).toBe(
+        "Usage limit reached — the provider stopped the run.",
+      );
+    }
+  });
+
+  it("runtime_warning debug noise still appends nothing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const base = createEmptyThreadState();
+    const after = applyEvent(base, {
+      type: "runtime_warning",
+      thread_id: "t1",
+      message: "rate limit event",
+      original_payload: { rate_limit_info: { status: "allowed" } },
+    });
+    expect(after).toBe(base);
     warn.mockRestore();
   });
 
@@ -1080,5 +1345,954 @@ describe("agent-chat reducer", () => {
       // The head reasoning block was trimmed with the rest — no special-casing.
       expect(reasoningItems(state)).toHaveLength(0);
     });
+  });
+});
+
+describe("agent-chat reducer — follow-up queueing", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  const users = (s: ChatThreadState): UserMessageItem[] =>
+    s.messages.filter((m): m is UserMessageItem => m.kind === "user_message");
+
+  it("turn_queued reconciles the optimistic bubble by client nonce (no duplicate)", () => {
+    // Composer optimistically appended a bubble carrying a nonce.
+    let state = appendUserMessage(
+      createEmptyThreadState(),
+      "second message",
+      undefined,
+      "nonce-x",
+    );
+    expect(users(state)).toHaveLength(1);
+    expect(users(state)[0].queued).toBeUndefined();
+
+    state = applyEvent(state, {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-1",
+      client_nonce: "nonce-x",
+      text: "second message",
+    });
+
+    const list = users(state);
+    expect(list).toHaveLength(1); // reconciled, not duplicated
+    expect(list[0].queued).toEqual({ queuedId: "q-1" });
+    expect(list[0].text).toBe("second message");
+  });
+
+  it("turn_queued without a matching bubble appends a greyed item (remount case)", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-2",
+      client_nonce: null,
+      text: "reconstructed",
+    });
+    const list = users(state);
+    expect(list).toHaveLength(1);
+    expect(list[0].queued).toEqual({ queuedId: "q-2" });
+    expect(list[0].text).toBe("reconstructed");
+  });
+
+  it("queued items sort to the very bottom, below later streaming content", () => {
+    let state = appendUserMessage(
+      createEmptyThreadState(),
+      "queued one",
+      undefined,
+      "n1",
+    );
+    state = applyEvent(state, {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-1",
+      client_nonce: "n1",
+      text: "queued one",
+    });
+    // An assistant message streams in AFTER the enqueue.
+    state = applyEvent(state, {
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "text", text: "assistant reply" },
+    });
+    const queued = users(state)[0];
+    const assistant = state.messages.find(
+      (m): m is AssistantMessageItem => m.kind === "assistant_message",
+    );
+    expect(queued.seq).toBeGreaterThan(assistant!.seq);
+  });
+
+  it("queued_turn_dispatched promotes the bubble and re-seqs it to the tail", () => {
+    let state = appendUserMessage(
+      createEmptyThreadState(),
+      "hello",
+      undefined,
+      "n1",
+    );
+    state = applyEvent(state, {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-1",
+      client_nonce: "n1",
+      text: "hello",
+    });
+    const queuedSeq = users(state)[0].seq;
+    state = applyEvent(state, {
+      type: "queued_turn_dispatched",
+      thread_id: "t1",
+      queued_id: "q-1",
+      turn_id: "turn-9",
+      text: "hello",
+    });
+    const list = users(state);
+    expect(list).toHaveLength(1);
+    expect(list[0].queued).toBeUndefined(); // promoted to normal
+    expect(list[0].seq).toBeLessThan(queuedSeq); // re-seq'd out of the queued band
+    expect(list[0].text).toBe("hello");
+  });
+
+  it("queued_turn_cancelled removes the greyed bubble", () => {
+    let state = applyEvent(createEmptyThreadState(), {
+      type: "turn_queued",
+      thread_id: "t1",
+      queued_id: "q-3",
+      client_nonce: null,
+      text: "bye",
+    });
+    expect(users(state)).toHaveLength(1);
+    state = applyEvent(state, {
+      type: "queued_turn_cancelled",
+      thread_id: "t1",
+      queued_id: "q-3",
+    });
+    expect(users(state)).toHaveLength(0);
+  });
+
+  it("dispatch/cancel for an unknown queued id are safe no-ops", () => {
+    const base = appendUserMessage(createEmptyThreadState(), "x", undefined, "n");
+    const afterDispatch = applyEvent(base, {
+      type: "queued_turn_dispatched",
+      thread_id: "t1",
+      queued_id: "missing",
+      turn_id: "t",
+      text: "x",
+    });
+    expect(afterDispatch.messages).toEqual(base.messages);
+    const afterCancel = applyEvent(base, {
+      type: "queued_turn_cancelled",
+      thread_id: "t1",
+      queued_id: "missing",
+    });
+    expect(afterCancel.messages).toEqual(base.messages);
+  });
+
+  it("removeUserMessageByNonce rolls back an optimistic bubble", () => {
+    const state = appendUserMessage(
+      createEmptyThreadState(),
+      "oops",
+      undefined,
+      "nonce-err",
+    );
+    expect(users(state)).toHaveLength(1);
+    const rolledBack = removeUserMessageByNonce(state, "nonce-err");
+    expect(users(rolledBack)).toHaveLength(0);
+    // Unknown nonce is a no-op.
+    expect(removeUserMessageByNonce(state, "other").messages).toEqual(
+      state.messages,
+    );
+  });
+});
+
+describe("agent-chat reducer — subagents", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  function subagentUpdated(
+    subagent: Record<string, unknown>,
+  ): ProviderRuntimeEvent {
+    return {
+      type: "subagent_updated",
+      thread_id: "t1",
+      subagent: subagent as never,
+    } as ProviderRuntimeEvent;
+  }
+  function subItem(
+    subagentId: string,
+    item: Record<string, unknown>,
+  ): ProviderRuntimeEvent {
+    return {
+      type: "item_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      subagent_id: subagentId,
+      item: item as never,
+    } as ProviderRuntimeEvent;
+  }
+  function cards(state: ChatThreadState): SubagentRunItem[] {
+    return state.messages.filter(
+      (m): m is SubagentRunItem => m.kind === "subagent_run",
+    );
+  }
+
+  it("materialises a SubagentRunItem card on the first subagent_updated", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "Explore" }),
+    ]);
+    const all = cards(state);
+    expect(all).toHaveLength(1);
+    expect(all[0].subagents).toHaveLength(1);
+    expect(all[0].subagents[0]).toMatchObject({
+      id: "a",
+      name: "Explore",
+      status: "running",
+    });
+  });
+
+  it("joins a second subagent to the same contiguous card", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      subagentUpdated({ subagent_id: "b", status: "running", name: "B" }),
+    ]);
+    const all = cards(state);
+    expect(all).toHaveLength(1);
+    expect(all[0].subagents.map((s) => s.id)).toEqual(["a", "b"]);
+  });
+
+  it("opens a NEW card when a parent item interrupts the spawn group", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      // A parent-flow assistant message breaks contiguity.
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "assistant_text", text: "interlude" },
+      },
+      subagentUpdated({ subagent_id: "b", status: "running", name: "B" }),
+    ]);
+    expect(cards(state)).toHaveLength(2);
+  });
+
+  it("merges snapshots (non-null wins) and keeps status monotonic", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "Impl" }),
+      subagentUpdated({ subagent_id: "a", status: "running", model: "opus" }),
+      subagentUpdated({
+        subagent_id: "a",
+        status: "completed",
+        result_text: "All done",
+        tool_use_count: 28,
+      }),
+      // A stray default-pending update must not revive a finished row.
+      subagentUpdated({ subagent_id: "a", status: "pending" }),
+    ]);
+    const sub = cards(state)[0].subagents[0];
+    expect(sub).toMatchObject({
+      name: "Impl",
+      model: "opus",
+      status: "completed",
+      resultText: "All done",
+      toolUseCount: 28,
+    });
+  });
+
+  it("routes subagent_id-tagged items into the subagent's sub-transcript, not the parent flow", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      subItem("a", {
+        kind: "tool_use",
+        tool_name: "Read",
+        tool_use_id: "x",
+        input: { file_path: "/f" },
+      }),
+      subItem("a", { kind: "tool_result", tool_use_id: "x", content: "ok", is_error: false }),
+      subItem("a", { kind: "assistant_text", text: "child says hi" }),
+    ]);
+    // The parent transcript holds ONLY the card (no leaked child rows).
+    expect(state.messages).toHaveLength(1);
+    const sub = cards(state)[0].subagents[0];
+    const childTool = sub.items.find((i) => i.kind === "tool_call");
+    expect(childTool).toMatchObject({ tool_name: "Read", status: "done" });
+    expect(
+      sub.items.some(
+        (i) => i.kind === "assistant_message" && i.text === "child says hi",
+      ),
+    ).toBe(true);
+  });
+
+  it("streams subagent content_delta into the sub-transcript", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      {
+        type: "content_delta",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        subagent_id: "a",
+        delta: { kind: "text", text: "Hel" },
+      },
+      {
+        type: "content_delta",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        subagent_id: "a",
+        delta: { kind: "text", text: "lo" },
+      },
+    ]);
+    const sub = cards(state)[0].subagents[0];
+    const msg = sub.items.find((i) => i.kind === "assistant_message");
+    expect(msg).toMatchObject({ text: "Hello" });
+    // The parent thread's streaming flag is owned by session_state, not
+    // by child deltas.
+    expect(state.streaming).toBe(false);
+  });
+
+  it("tags a bubbled request_opened with its subagent_id", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      {
+        type: "request_opened",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        request_id: "req-1",
+        request_kind: "command",
+        payload: {},
+        tool_use_id: null,
+        subagent_id: "a",
+      },
+    ]);
+    const req = state.messages.find(
+      (m): m is PermissionRequestItem => m.kind === "permission_request",
+    );
+    expect(req?.subagent_id).toBe("a");
+    // Bubbles into the parent flow so the turn can't stall invisibly.
+    expect(state.pendingRequestIds).toContain("req-1");
+  });
+
+  it("caps a subagent's retained items", () => {
+    const events: ProviderRuntimeEvent[] = [
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+    ];
+    for (let i = 0; i < 600; i++) {
+      events.push(subItem("a", { kind: "assistant_text", text: `m${i}` }));
+    }
+    const state = runEvents(events);
+    const sub = cards(state)[0].subagents[0];
+    expect(sub.items.length).toBeLessThanOrEqual(500);
+  });
+
+  it("survives a persisted replay unchanged (old rows still deserialize)", () => {
+    // subagent_updated without a `type`-less payload — replay path uses
+    // applyEvent; here we just confirm the reducer is a pure function of
+    // the same events applied twice.
+    const events: ProviderRuntimeEvent[] = [
+      subagentUpdated({ subagent_id: "a", status: "running", name: "A" }),
+      subItem("a", { kind: "assistant_text", text: "hi" }),
+    ];
+    const once = runEvents(events);
+    __resetReducerIdCounterForTests();
+    const twice = runEvents(events);
+    expect(cards(twice)[0].subagents[0].items.length).toBe(
+      cards(once)[0].subagents[0].items.length,
+    );
+  });
+
+  // ── Run-state settlement (issue #153) ──
+
+  it("a parent-scoped tool_result settles a stuck running subagent (the issue shape)", () => {
+    const state = runEvents([
+      subagentUpdated({
+        subagent_id: "s1",
+        status: "running",
+        name: "Explore",
+        parent_item_id: "spawn-1",
+      }),
+      // The raw spawning tool_result flows through the PARENT flow (no
+      // subagent_id) because the adapter's demux lost track — and no
+      // terminal snapshot ever follows.
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "spawn-1", content: "ok", is_error: false },
+      },
+    ]);
+    const sub = cards(state)[0].subagents[0];
+    expect(sub.status).toBe("completed");
+    expect(sub.statusAssumed).toBe(true);
+  });
+
+  it("a parent-scoped error tool_result settles the subagent as failed", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", parent_item_id: "spawn-1" }),
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "spawn-1", content: "boom", is_error: true },
+      },
+    ]);
+    expect(cards(state)[0].subagents[0].status).toBe("failed");
+  });
+
+  it("a subagent-TAGGED tool_result does NOT settle the subagent view", () => {
+    const state = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", parent_item_id: "spawn-1" }),
+      subItem("s1", { kind: "tool_use", tool_name: "Bash", tool_use_id: "child-1", input: {} }),
+      // Tagged with subagent_id → routes into the sub-transcript, never
+      // the parent settle path.
+      subItem("s1", { kind: "tool_result", tool_use_id: "child-1", content: "ok", is_error: false }),
+    ]);
+    const sub = cards(state)[0].subagents[0];
+    expect(sub.status).toBe("running");
+    expect(sub.statusAssumed).toBeUndefined();
+  });
+
+  it("session_state_changed closed interrupts running subagents even when not streaming", () => {
+    const running = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", name: "A" }),
+    ]);
+    expect(running.streaming).toBe(false);
+    const closed = applyEvent(running, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "closed" },
+    });
+    expect(cards(closed)[0].subagents[0].status).toBe("interrupted");
+    expect(cards(closed)[0].subagents[0].statusAssumed).toBe(true);
+  });
+
+  it("session_state_changed error interrupts running subagents", () => {
+    const running = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", name: "A" }),
+    ]);
+    const errored = applyEvent(running, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "error", message: "boom" },
+    });
+    expect(cards(errored)[0].subagents[0].status).toBe("interrupted");
+  });
+
+  it("a new user turn (not streaming) interrupts leftover running subagents", () => {
+    const running = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", name: "A" }),
+    ]);
+    const next = appendUserMessage(running, "another question");
+    expect(cards(next)[0].subagents[0].status).toBe("interrupted");
+  });
+
+  it("a queued follow-up (streaming) leaves running subagents alone", () => {
+    const running = runEvents([
+      subagentUpdated({ subagent_id: "s1", status: "running", name: "A" }),
+    ]);
+    const streaming = { ...running, streaming: true };
+    const next = appendUserMessage(streaming, "queued behind the active turn");
+    expect(cards(next)[0].subagents[0].status).toBe("running");
+  });
+});
+
+describe("agent-chat reducer — workflows", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  function workflowUpdated(workflow: Record<string, unknown>): ProviderRuntimeEvent {
+    return {
+      type: "workflow_updated",
+      thread_id: "t1",
+      workflow: workflow as never,
+    } as ProviderRuntimeEvent;
+  }
+  function workflowSubagentUpdated(
+    subagent: Record<string, unknown>,
+  ): ProviderRuntimeEvent {
+    return {
+      type: "subagent_updated",
+      thread_id: "t1",
+      subagent: subagent as never,
+    } as ProviderRuntimeEvent;
+  }
+  function workflowSubItem(
+    subagentId: string,
+    item: Record<string, unknown>,
+  ): ProviderRuntimeEvent {
+    return {
+      type: "item_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      subagent_id: subagentId,
+      item: item as never,
+    } as ProviderRuntimeEvent;
+  }
+  function workflows(state: ChatThreadState): WorkflowRunItem[] {
+    return state.messages.filter(
+      (m): m is WorkflowRunItem => m.kind === "workflow_run",
+    );
+  }
+
+  const samplePhases = [
+    { title: "Explore", detail: "scan for suspects" },
+    { title: "Fix", detail: "apply the fixes" },
+  ];
+
+  it("materialises a WorkflowRunItem on the first workflow_updated", () => {
+    const state = runEvents([
+      workflowUpdated({
+        workflow_id: "wf1",
+        status: "running",
+        name: "Bug Hunt",
+        description: "Find and fix bugs",
+        phases: samplePhases,
+      }),
+    ]);
+    const all = workflows(state);
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({
+      workflowId: "wf1",
+      status: "running",
+      name: "Bug Hunt",
+      description: "Find and fix bugs",
+    });
+    expect(all[0].plannedPhases).toEqual(samplePhases);
+    expect(all[0].phases.map((p) => p.title)).toEqual(["Explore", "Fix"]);
+    expect(all[0].phases.every((p) => p.agents.length === 0)).toBe(true);
+  });
+
+  it("merges workflow snapshots (non-null wins) and keeps status monotonic", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", name: "Bug Hunt" }),
+      workflowUpdated({ workflow_id: "wf1", status: "completed", result_text: "done", total_tokens: 500 }),
+      // A stray duplicate "running" snapshot must not revive a finished run.
+      workflowUpdated({ workflow_id: "wf1", status: "running" }),
+    ]);
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("completed");
+    expect(wf.resultText).toBe("done");
+    expect(wf.totalTokens).toBe(500);
+    expect(wf.name).toBe("Bug Hunt");
+  });
+
+  it("routes a workflow_id-tagged subagent_updated into the matching phase, not a subagent_run card", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        name: "Explorer",
+        workflow_id: "wf1",
+        phase: "Explore",
+      }),
+    ]);
+    // No generic subagent_run card — the agent lives inside the workflow.
+    expect(state.messages.filter((m) => m.kind === "subagent_run")).toHaveLength(0);
+    const wf = workflows(state)[0];
+    const explorePhase = wf.phases.find((p) => p.title === "Explore")!;
+    expect(explorePhase.agents).toHaveLength(1);
+    expect(explorePhase.agents[0]).toMatchObject({ id: "sub-a", name: "Explorer", status: "running" });
+  });
+
+  it("falls back to the last planned phase title when the subagent has no phase hint", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({ subagent_id: "sub-a", status: "running", workflow_id: "wf1" }),
+    ]);
+    const wf = workflows(state)[0];
+    const fixPhase = wf.phases.find((p) => p.title === "Fix")!;
+    expect(fixPhase.agents.map((a) => a.id)).toEqual(["sub-a"]);
+  });
+
+  it("synthesizes a 'Run' phase bucket when there are no planned phases and no phase hint", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running" }),
+      workflowSubagentUpdated({ subagent_id: "sub-a", status: "running", workflow_id: "wf1" }),
+    ]);
+    const wf = workflows(state)[0];
+    expect(wf.phases.map((p) => p.title)).toEqual(["Run"]);
+    expect(wf.phases[0].agents.map((a) => a.id)).toEqual(["sub-a"]);
+  });
+
+  it("routes subagent_id-tagged items into the workflow phase's sub-transcript", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        workflow_id: "wf1",
+        phase: "Explore",
+      }),
+      workflowSubItem("sub-a", { kind: "assistant_text", text: "child says hi" }),
+    ]);
+    const wf = workflows(state)[0];
+    const explorePhase = wf.phases.find((p) => p.title === "Explore")!;
+    expect(
+      explorePhase.agents[0].items.some(
+        (i) => i.kind === "assistant_message" && i.text === "child says hi",
+      ),
+    ).toBe(true);
+    // The parent transcript holds only the workflow item — no leaked rows.
+    expect(state.messages).toHaveLength(1);
+  });
+
+  it("merges a subagent snapshot arriving before the workflow item via the generic fallback", () => {
+    // Out-of-order defensive path: the update is never dropped even
+    // though the workflow item hasn't been seen yet.
+    const state = runEvents([
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        workflow_id: "wf-not-seen-yet",
+      }),
+    ]);
+    expect(workflows(state)).toHaveLength(0);
+    const cards = state.messages.filter(
+      (m): m is SubagentRunItem => m.kind === "subagent_run",
+    );
+    expect(cards).toHaveLength(1);
+    expect(cards[0].subagents[0].id).toBe("sub-a");
+  });
+
+  it("links a workflow to a pending approval request via tool_use_id and flips to pending_approval", () => {
+    let state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running" }),
+    ]);
+    state = applyEvent(state, {
+      type: "request_opened",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      request_id: "req-wf",
+      request_kind: "other",
+      payload: {},
+      tool_use_id: "wf1",
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("pending_approval");
+    expect(wf.approvalRequestId).toBe("req-wf");
+  });
+
+  it("resumes to running when the gating approval is allowed", () => {
+    let state = runEvents([workflowUpdated({ workflow_id: "wf1", status: "running" })]);
+    state = applyEvent(state, {
+      type: "request_opened",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      request_id: "req-wf",
+      request_kind: "other",
+      payload: {},
+      tool_use_id: "wf1",
+    });
+    state = applyEvent(state, {
+      type: "request_resolved",
+      thread_id: "t1",
+      request_id: "req-wf",
+      decision: { decision: "allow" },
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("running");
+    // Stays linked after resolution so transcript-slots keeps suppressing
+    // the standalone resolved permission block (no stray "Allowed" row).
+    expect(wf.approvalRequestId).toBe("req-wf");
+  });
+
+  it("stops the workflow when the gating approval is denied", () => {
+    let state = runEvents([workflowUpdated({ workflow_id: "wf1", status: "running" })]);
+    state = applyEvent(state, {
+      type: "request_opened",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      request_id: "req-wf",
+      request_kind: "other",
+      payload: {},
+      tool_use_id: "wf1",
+    });
+    state = applyEvent(state, {
+      type: "request_resolved",
+      thread_id: "t1",
+      request_id: "req-wf",
+      decision: { decision: "deny", message: "no" },
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("stopped");
+  });
+
+  it("stops a still-running workflow when its turn ends in error", () => {
+    let state = runEvents([workflowUpdated({ workflow_id: "wf1", status: "running" })]);
+    state = applyEvent(state, {
+      type: "turn_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      status: { kind: "error", subtype: "interrupted", message: "session interrupted" },
+      usage: null,
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("stopped");
+  });
+
+  it("leaves a completed workflow's status alone when the turn later errors", () => {
+    let state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running" }),
+      workflowUpdated({ workflow_id: "wf1", status: "completed" }),
+    ]);
+    state = applyEvent(state, {
+      type: "turn_completed",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      status: { kind: "error", subtype: "interrupted", message: "session interrupted" },
+      usage: null,
+    });
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("completed");
+  });
+
+  it("a parent-scoped tool_result for the Workflow tool settles the run + its agents (issue #153)", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        workflow_id: "wf1",
+        phase: "Explore",
+      }),
+      // The Workflow tool's own tool_result (tool_use_id == workflow_id)
+      // leaks through the parent flow with no terminal workflow snapshot.
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "wf1", content: "done", is_error: false },
+      },
+    ]);
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("completed");
+    const agent = wf.phases.find((p) => p.title === "Explore")!.agents[0];
+    expect(agent.status).toBe("completed");
+    expect(agent.statusAssumed).toBe(true);
+  });
+
+  it("an error tool_result for the Workflow tool fails the run and interrupts its agents", () => {
+    const state = runEvents([
+      workflowUpdated({ workflow_id: "wf1", status: "running", phases: samplePhases }),
+      workflowSubagentUpdated({
+        subagent_id: "sub-a",
+        status: "running",
+        workflow_id: "wf1",
+        phase: "Explore",
+      }),
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: { kind: "tool_result", tool_use_id: "wf1", content: "boom", is_error: true },
+      },
+    ]);
+    const wf = workflows(state)[0];
+    expect(wf.status).toBe("failed");
+    const agent = wf.phases.find((p) => p.title === "Explore")!.agents[0];
+    expect(agent.status).toBe("interrupted");
+  });
+});
+
+describe("dead-run detection (issue #154)", () => {
+  beforeEach(() => {
+    __resetReducerIdCounterForTests();
+  });
+
+  const running: ProviderRuntimeEvent = {
+    type: "session_state_changed",
+    thread_id: "t1",
+    status: { status: "running", active_turn: "turn-1" },
+  };
+  const stalled: ProviderRuntimeEvent = {
+    type: "run_stalled",
+    thread_id: "t1",
+    silent_for_secs: 640,
+  };
+
+  it("run_stalled sets the stalled marker", () => {
+    const state = runEvents([running, stalled]);
+    expect(state.stalled).toEqual({ silentForSecs: 640 });
+  });
+
+  it("the next real activity clears the stalled marker", () => {
+    const afterStall = runEvents([running, stalled]);
+    expect(afterStall.stalled).not.toBeNull();
+    const afterDelta = applyEvent(afterStall, {
+      type: "content_delta",
+      thread_id: "t1",
+      turn_id: "turn-1",
+      delta: { kind: "text", text: "back alive" },
+    });
+    expect(afterDelta.stalled).toBeNull();
+  });
+
+  it("a re-emitted run_stalled does not thrash state when unchanged", () => {
+    const once = runEvents([running, stalled]);
+    const twice = applyEvent(once, stalled);
+    expect(twice).toBe(once);
+  });
+
+  it("turn_completed with child_exited marks the thread interrupted", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "sidecar exited unexpectedly",
+        },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(true);
+    expect(state.streaming).toBe(false);
+  });
+
+  it("a user-initiated stop (interrupted subtype) does NOT set interrupted", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "interrupted",
+          message: "session interrupted",
+        },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(false);
+  });
+
+  it("session_state_changed error while streaming sets interrupted (belt-and-braces)", () => {
+    const state = runEvents([
+      running,
+      {
+        type: "session_state_changed",
+        thread_id: "t1",
+        status: { status: "error", message: "server unreachable" },
+      },
+    ]);
+    expect(state.interrupted).toBe(true);
+  });
+
+  it("a clean ready/closed stop does not set interrupted", () => {
+    const ready = runEvents([
+      running,
+      {
+        type: "session_state_changed",
+        thread_id: "t1",
+        status: { status: "ready" },
+      },
+    ]);
+    expect(ready.interrupted).toBe(false);
+  });
+
+  it("a fresh running turn clears the interrupted flag", () => {
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "dead",
+        },
+        usage: null,
+      },
+    ]);
+    expect(interrupted.interrupted).toBe(true);
+    const resumed = applyEvent(interrupted, {
+      type: "session_state_changed",
+      thread_id: "t1",
+      status: { status: "running", active_turn: "turn-2" },
+    });
+    expect(resumed.interrupted).toBe(false);
+  });
+
+  it("appending a user message clears the interrupted flag", () => {
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+    ]);
+    const resumed = appendUserMessage(interrupted, "Continue");
+    expect(resumed.interrupted).toBe(false);
+  });
+
+  it("a success completion after a child_exited completion clears interrupted (settle-race)", () => {
+    // The stdout-reader / exit-watchdog race can persist BOTH a synthetic
+    // child_exited completion and the real success completion for the same
+    // turn. Replaying them in that order must end up NOT interrupted so a
+    // genuinely-finished run is never mislabelled after a restart.
+    const state = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      },
+    ]);
+    expect(state.interrupted).toBe(false);
+  });
+
+  it("rolling back a failed resume send restores the interrupted flag", () => {
+    // A Continue send optimistically clears `interrupted`; if the send RPC
+    // then fails, the rollback must re-arm it (passing the pre-append value)
+    // so the "Run interrupted" divider + Continue chip survive one failed
+    // click instead of vanishing with no recovery affordance.
+    const interrupted = runEvents([
+      running,
+      {
+        type: "turn_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        status: { kind: "error", subtype: "child_exited", message: "dead" },
+        usage: null,
+      },
+    ]);
+    expect(interrupted.interrupted).toBe(true);
+    const optimistic = appendUserMessage(interrupted, "Continue", undefined, "nonce-1");
+    expect(optimistic.interrupted).toBe(false);
+    const rolledBack = removeUserMessageByNonce(optimistic, "nonce-1", true);
+    expect(rolledBack.interrupted).toBe(true);
+    // The optimistic bubble is gone (no orphan left behind).
+    expect(
+      rolledBack.messages.some(
+        (m) => m.kind === "user_message" && m.text === "Continue",
+      ),
+    ).toBe(false);
+  });
+
+  it("rolling back a normal (non-resume) send does NOT arm interrupted", () => {
+    const clean = appendUserMessage(
+      createEmptyThreadState(),
+      "hello",
+      undefined,
+      "nonce-2",
+    );
+    const rolledBack = removeUserMessageByNonce(clean, "nonce-2", false);
+    expect(rolledBack.interrupted).toBe(false);
   });
 });

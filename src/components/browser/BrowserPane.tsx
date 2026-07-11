@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, memo } from "react";
 import { startBrowserStream, agentBrowserRun, activatePane, writeToPty } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
 import { BrowserToolbar } from "./BrowserToolbar";
@@ -38,6 +38,29 @@ interface Props {
   browserId: string;
   focused: boolean;
   visible: boolean;
+  /** When set, resolves the agent browser session by workspace instead of
+   *  strictly by `browser_id`. A detached/background agent session
+   *  (GUI-mode background browsing, docs/features/browser.md) has no
+   *  `browser_id` until it's promoted to a pane, so the peek overlay
+   *  passes the session's own `cli_session_name` as `browserId` (so the
+   *  stream daemon starts against the right session) plus `workspaceId`
+   *  so the `agent_browser_sessions` lookup still finds it. No-op for the
+   *  normal pane-attached case, where `browser_id` alone always resolves. */
+  workspaceId?: string;
+  /** Suppresses the embedded address-bar toolbar. Used by the peek
+   *  overlay, which renders its own compact header with a URL readout and
+   *  promote/close actions instead. Defaults to showing the toolbar
+   *  (today's pane behavior, unchanged). */
+  hideToolbar?: boolean;
+  /** Pins the browser's CDP viewport to a fixed size instead of syncing
+   *  it to the container. The canvas element still tracks the container's
+   *  pixel size — the frame-draw letterbox scales the (larger) frame down
+   *  to fit, and `mapToViewport` already maps input through the draw
+   *  rect, so clicks stay accurate. Used by the peek overlay's
+   *  "Desktop-size background browser" setting so the tiny popover
+   *  doesn't force the agent's page to reflow at popover dimensions.
+   *  Absent = today's container-sync behavior, unchanged. */
+  fixedViewport?: { width: number; height: number };
 }
 
 // Move-forwarding cadence (ms). Drags run tight for smooth text
@@ -63,11 +86,21 @@ interface PendingMove {
   modifiers: number;
 }
 
-export function BrowserPane({ browserId, focused, visible }: Props) {
+// #127: memo is effective because setAppState performs structural sharing —
+// PaneNode drives this with primitive props (browserId/focused/visible), so the
+// pane skips re-render on backend ticks that don't touch them. Export-only
+// wrapper: the component body below is unchanged.
+export const BrowserPane = memo(function BrowserPane({ browserId, focused, visible, workspaceId, hideToolbar, fixedViewport }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const viewportRef = useRef<ViewportInfo>({ width: 1280, height: 720 });
+  // Ref-mirror of the `fixedViewport` prop so the WebSocket and
+  // ResizeObserver effects can read it without listing it in their
+  // dependency arrays (an inline object literal from the caller would
+  // otherwise reconnect the stream every render).
+  const fixedViewportRef = useRef(fixedViewport);
+  fixedViewportRef.current = fixedViewport;
   const [status, setStatus] = useState<"starting" | "connecting" | "waiting" | "live" | "error">("starting");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [hasFrame, setHasFrame] = useState(false);
@@ -92,10 +125,21 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
   const browserSession = useAppStore(
     (s) => s.appState?.browser_sessions.find((b) => b.browser_id === browserId),
   );
-  // Check if this browser pane is backed by an agent browser session (for reconnection)
-  const agentSession = useAppStore(
-    (s) => s.appState?.agent_browser_sessions?.find((abs) => abs.browser_id === browserId),
-  );
+  // Check if this browser pane is backed by an agent browser session (for
+  // reconnection). Pane-attached sessions resolve by `browser_id`; a
+  // detached/background session (GUI-mode background browsing) has no
+  // `browser_id`, so when the caller passes `workspaceId` (the peek
+  // overlay), fall back to matching on that instead.
+  const agentSession = useAppStore((s) => {
+    const sessions = s.appState?.agent_browser_sessions;
+    if (!sessions) return undefined;
+    const byBrowserId = sessions.find((abs) => abs.browser_id === browserId);
+    if (byBrowserId) return byBrowserId;
+    if (workspaceId) {
+      return sessions.find((abs) => abs.workspace_id === workspaceId);
+    }
+    return undefined;
+  });
   const agentSessionRef = useRef(agentSession);
   agentSessionRef.current = agentSession;
 
@@ -275,6 +319,16 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         ws.onopen = () => {
           if (!active) return;
           setStatus("waiting");
+
+          // Pinned viewport: ignore container dimensions entirely — the
+          // popover canvas letterboxes the larger frame down to fit.
+          const fixed = fixedViewportRef.current;
+          if (fixed && fixed.width > 10 && fixed.height > 10) {
+            viewportRef.current = { width: fixed.width, height: fixed.height };
+            agentBrowserRun(effectiveSessionId, "viewport", { width: fixed.width, height: fixed.height }).catch(() => {});
+            sendInput({ type: "resize", width: fixed.width, height: fixed.height });
+            return;
+          }
 
           // Set initial viewport to match container dimensions
           const container = containerRef.current;
@@ -808,6 +862,10 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
         canvas.width = cw;
         canvas.height = ch;
       }
+      // Pinned viewport: the canvas tracks the container (above) but the
+      // browser's viewport stays fixed — never re-send it or overwrite
+      // viewportRef with container dims.
+      if (fixedViewportRef.current) return;
       // Debounced: tell browser to resize viewport to match
       if (resizeTimer) clearTimeout(resizeTimer);
       resizeTimer = setTimeout(() => {
@@ -831,15 +889,17 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
 
   return (
     <div className="flex h-full w-full flex-col bg-card">
-      <BrowserToolbar
-        browserId={browserId}
-        sessionId={effectiveSessionId}
-        currentUrl={currentUrl}
-        onUrlChange={setCurrentUrl}
-        loading={status === "starting" || status === "connecting"}
-        inspectorActive={inspectorActive}
-        onInspectorToggle={toggleInspector}
-      />
+      {!hideToolbar && (
+        <BrowserToolbar
+          browserId={browserId}
+          sessionId={effectiveSessionId}
+          currentUrl={currentUrl}
+          onUrlChange={setCurrentUrl}
+          loading={status === "starting" || status === "connecting"}
+          inspectorActive={inspectorActive}
+          onInspectorToggle={toggleInspector}
+        />
+      )}
       {selectedElement && (
         <InspectorPanel
           element={selectedElement}
@@ -905,4 +965,4 @@ export function BrowserPane({ browserId, focused, visible }: Props) {
       </div>
     </div>
   );
-}
+});

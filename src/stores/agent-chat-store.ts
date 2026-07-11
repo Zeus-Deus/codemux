@@ -7,8 +7,13 @@ import {
   createEmptyThreadState,
   markRequestResolved,
   markRequestResponding,
+  removeUserMessageByNonce,
 } from "@/lib/agent-chat/reducer";
-import type { ChatThreadState, ChatViewItem } from "@/lib/agent-chat/types";
+import type {
+  ChatThreadState,
+  ChatViewItem,
+  UserMessageImage,
+} from "@/lib/agent-chat/types";
 import type { AgentChatCheckpointRecord } from "@/tauri/commands";
 import type {
   ApprovalDecision,
@@ -157,8 +162,25 @@ interface AgentChatStore {
   ensureThread: (threadId: string) => void;
   /** Apply a canonical provider event to the matching slice. */
   applyEvent: (threadId: string, event: ProviderRuntimeEvent) => void;
-  /** Append a user message optimistically (no provider echo). */
-  appendUserMessage: (threadId: string, text: string) => void;
+  /** Append a user message optimistically (no provider echo).
+   *  `images` (when present) carries the turn's staged images as
+   *  `data:` URLs so the bubble renders their thumbnails immediately. */
+  appendUserMessage: (
+    threadId: string,
+    text: string,
+    clientNonce?: string,
+    images?: UserMessageImage[],
+  ) => void;
+  /** Roll back an optimistic user bubble by its client nonce (send RPC
+   *  failed). No-op when not found. `restoreInterrupted` re-arms the
+   *  interrupted flag when the failed send was a resume of an interrupted
+   *  thread, so the "Run interrupted" divider + Continue chip survive a failed
+   *  click. */
+  removeUserMessageByNonce: (
+    threadId: string,
+    clientNonce: string,
+    restoreInterrupted?: boolean,
+  ) => void;
   /** Flag a permission request as in-flight while the invoke runs. */
   markRequestResponding: (
     threadId: string,
@@ -197,6 +219,12 @@ interface AgentChatStore {
   hydrateThread: (threadId: string, payloads: string[]) => void;
   /** Clear a thread entirely (e.g. on session stop). */
   resetThread: (threadId: string) => void;
+  /** Seed / update the thread's resume cursor. Normally set by the
+   *  `ResumeCursorUpdated` event, but the mount-seed effect also uses
+   *  this to restore `{ resume: sdk_session_id }` from the persisted
+   *  session row after an app restart so a picker-triggered silent
+   *  restart resumes the SDK session instead of starting fresh. */
+  setResumeCursor: (threadId: string, resumeCursor: unknown | null) => void;
   /** Set the thread's reasoning/effort level. `null` clears to default. */
   setEffort: (threadId: string, effort: string | null) => void;
   /** Set the thread's context-window selection. `null` clears. */
@@ -299,12 +327,20 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       }),
     ),
 
-  appendUserMessage: (threadId, text) =>
+  appendUserMessage: (threadId, text, clientNonce, images) =>
     set((state) =>
       updateSlice(state, threadId, (slice) => ({
         ...slice,
-        ...appendUserMessage(slice, text),
+        ...appendUserMessage(slice, text, undefined, clientNonce, images),
         inputDraft: "",
+      })),
+    ),
+
+  removeUserMessageByNonce: (threadId, clientNonce, restoreInterrupted) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) => ({
+        ...slice,
+        ...removeUserMessageByNonce(slice, clientNonce, restoreInterrupted),
       })),
     ),
 
@@ -415,6 +451,15 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       }
       return { threads: rest };
     }),
+
+  setResumeCursor: (threadId, resumeCursor) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.resumeCursor === resumeCursor
+          ? slice
+          : { ...slice, resumeCursor },
+      ),
+    ),
 
   setEffort: (threadId, effort) =>
     set((state) =>

@@ -6,6 +6,7 @@
 //! tests can fan canonical events through the provider's stream and
 //! observe the event bridge behavior.
 
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +61,9 @@ pub struct MockAgentProvider {
     kind: ProviderKind,
     pub calls: MockAgentCalls,
     pub event_tx: broadcast::Sender<ProviderRuntimeEvent>,
+    /// Live-session registry so `has_session` mirrors a real adapter:
+    /// `start_session` inserts, `stop_session` removes.
+    live: Arc<Mutex<HashSet<ThreadId>>>,
 }
 
 impl MockAgentProvider {
@@ -69,6 +73,7 @@ impl MockAgentProvider {
             kind,
             calls: MockAgentCalls::new(),
             event_tx,
+            live: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -101,6 +106,7 @@ impl AgentProvider for MockAgentProvider {
         input: StartSessionInput,
     ) -> Result<ProviderSession, ProviderError> {
         self.calls.push(MockCall::StartSession(input.thread_id.clone()));
+        self.live.lock().unwrap().insert(input.thread_id.clone());
         Ok(ProviderSession {
             thread_id: input.thread_id.clone(),
             provider: self.kind,
@@ -115,6 +121,7 @@ impl AgentProvider for MockAgentProvider {
             .push(MockCall::SendTurn(input.thread_id.clone(), input.text));
         Ok(TurnStartResult {
             turn_id: TurnId("mock-turn".into()),
+            queued_id: None,
         })
     }
 
@@ -152,8 +159,13 @@ impl AgentProvider for MockAgentProvider {
     }
 
     async fn stop_session(&self, thread_id: ThreadId) -> Result<(), ProviderError> {
+        self.live.lock().unwrap().remove(&thread_id);
         self.calls.push(MockCall::StopSession(thread_id));
         Ok(())
+    }
+
+    async fn has_session(&self, thread_id: &ThreadId) -> bool {
+        self.live.lock().unwrap().contains(thread_id)
     }
 
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {

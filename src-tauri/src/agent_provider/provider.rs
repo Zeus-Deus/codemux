@@ -58,6 +58,35 @@ pub trait AgentProvider: Send + Sync {
         turn_id: Option<TurnId>,
     ) -> Result<(), ProviderError>;
 
+    /// Cancel a queued (not-yet-dispatched) follow-up turn by its queued
+    /// id. Idempotent — cancelling an unknown or already-dispatched id is
+    /// a silent success. The default implementation is a no-op for
+    /// providers without a follow-up queue (e.g. OpenCode).
+    async fn cancel_queued_turn(
+        &self,
+        _thread_id: ThreadId,
+        _queued_id: String,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    /// **Send now (steer):** promote a queued follow-up to the front of
+    /// the queue and dispatch it immediately, soft-interrupting the active
+    /// turn if one is running. The interrupt preserves the session,
+    /// transcript, and on-disk work — nothing is discarded — and the
+    /// promoted message then runs as a normal follow-up turn so the agent
+    /// re-plans with the steer. Idempotent — an unknown or
+    /// already-dispatched id is a silent success. The default
+    /// implementation is a no-op for providers without a follow-up queue
+    /// (e.g. OpenCode).
+    async fn send_queued_turn_now(
+        &self,
+        _thread_id: ThreadId,
+        _queued_id: String,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Respond to a pending approval request with the user's decision.
     async fn respond_to_request(
         &self,
@@ -84,6 +113,17 @@ pub trait AgentProvider: Send + Sync {
 
     /// Enumerate every currently live session the provider is tracking.
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError>;
+
+    /// Whether a live session is currently bound to `thread_id`.
+    ///
+    /// Cheap containment check against the provider's in-memory session
+    /// registry — it does not touch the subprocess. The backend
+    /// auto-resume choke point
+    /// (`commands::agent_chat::ensure_live_session`) uses this to decide
+    /// whether a turn needs a session rebuilt from the persisted DB row
+    /// (e.g. after an app restart, when the map is empty) before the
+    /// operation can proceed.
+    async fn has_session(&self, thread_id: &ThreadId) -> bool;
 
     /// Subscribe to the canonical runtime event stream.
     ///

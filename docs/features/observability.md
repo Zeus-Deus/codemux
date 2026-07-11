@@ -34,7 +34,7 @@ All six pieces are bundled in `ObservabilitySnapshot` and persisted as one JSON 
 - Permission policy consumed by OpenFlow's risky-action review
 - Safety config consumed by the OpenFlow runtime for budget + concurrency gating
 - `add_replay_record(title, summary)` ergonomics for capturing completed run summaries
-- Frontend types ported 1:1 via `src/tauri/types.ts` and exposed through `src/stores/observability-store.ts`
+- The full `ObservabilitySnapshot` is **backend-only** — `get_observability_snapshot` has no caller in `src/`. The frontend reads only the feature-flag slice, through the narrow `get_feature_flags` command into `src/stores/feature-flags.ts`, and flips the Agent Chat Beta flag via `set_agent_chat_beta`. Only `FeatureFlags` is mirrored into `src/tauri/types.ts`.
 
 ## Current Constraints
 
@@ -104,8 +104,9 @@ call sites live in `terminal/daemon_backed.rs`, `ssh/registry.rs`,
   - Types: `LogLevel`, `StructuredLogEntry`, `MetricsSnapshot`, `FeatureFlags`, `PermissionPolicy`, `ReplayRecord`, `SafetyConfig`, `ObservabilitySnapshot`
   - Store: `ObservabilityStore::default`, `snapshot`, `log`, `increment_metric`, `set_feature_flags`, `set_permission_policy`, `set_safety_config`, `add_replay_record`
   - Persistence: `load_observability_store`, `save_snapshot`, `snapshot_path`, `trim_logs`, `trim_replays`, `default_snapshot`
-- `src-tauri/src/commands/mod.rs` — Tauri commands: `get_observability_snapshot`, `add_structured_log`, `update_feature_flags`, `update_permission_policy`, `update_safety_config`, `add_replay_record`
+- `src-tauri/src/commands/mod.rs` — Tauri commands: `get_observability_snapshot`, `add_structured_log`, `update_feature_flags`, `update_permission_policy`, `update_safety_config`, `add_replay_record`, plus the two the frontend actually calls: `get_feature_flags`, `set_agent_chat_beta`
 - `src-tauri/src/trace.rs` — `cloud_push_enabled()` + the `trace_cloud_push!` macro (`CODEMUX_TRACE_CLOUD_PUSH` gate for cloud-push diagnostics)
-- `src/stores/observability-store.ts` — Zustand store consuming the snapshot
+- `src/stores/feature-flags.ts` — the only frontend consumer; zustand store over `get_feature_flags` / `set_agent_chat_beta`
+- `src/components/settings/beta-features-section.tsx` — Settings → Beta Features toggle (plain-quit on toggle off via `quit_app`)
 - `src-tauri/src/openflow/orchestrator.rs` — reads `PermissionPolicy` and `SafetyConfig` to gate risky actions and enforce run budgets
 - Persisted file: `dirs::data_dir() / APP_DIR_NAME / observability.json`, where `APP_DIR_NAME` is `codemux` for release builds and `codemux-dev` for debug builds (platform-specific: `~/.local/share/codemux/observability.json` on Linux, `%APPDATA%\codemux\observability.json` on Windows, `~/Library/Application Support/codemux/observability.json` on macOS). The legacy machine-shared `~/.codemux/observability.json` is read once and migrated forward when the per-build file doesn't exist yet.

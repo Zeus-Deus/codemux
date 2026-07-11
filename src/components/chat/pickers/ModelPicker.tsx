@@ -37,7 +37,7 @@ export const defaultModelForProvider = defaultModelId;
 
 export function modelsForProvider(
   provider: AgentChatProviderKind,
-): Array<{ id: string; label: string }> {
+): Array<{ id: string; label: string; description: string | null }> {
   return modelsForProviderFromCaps(provider);
 }
 
@@ -101,13 +101,26 @@ export function ModelPicker({ provider, value, onChange, disabled }: Props) {
                     onChange(model.id);
                     setOpen(false);
                   }}
-                  className="h-9 gap-2 text-xs"
+                  className="min-h-9 gap-2 text-xs"
                 >
-                  <ProviderLogo provider={provider} className="h-3.5 w-3.5" />
-                  <span className="flex-1 min-w-0 truncate">{model.label}</span>
+                  <ProviderLogo
+                    provider={provider}
+                    className="h-3.5 w-3.5 shrink-0"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate">{model.label}</div>
+                    {model.description ? (
+                      <div
+                        className="mt-0.5 truncate text-[11px] text-muted-foreground/70"
+                        title={model.description}
+                      >
+                        {model.description}
+                      </div>
+                    ) : null}
+                  </div>
                   <Check
                     className={cn(
-                      "h-3.5 w-3.5 text-muted-foreground",
+                      "h-3.5 w-3.5 shrink-0 text-muted-foreground",
                       current === model.id ? "opacity-100" : "opacity-0",
                     )}
                   />

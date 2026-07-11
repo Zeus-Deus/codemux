@@ -560,8 +560,14 @@ pub fn git_checkpoint_create(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // Per-call monotonic suffix so two concurrent checkpoint operations
+    // in the same process never share a temp-index path (and thus never
+    // collide on its `.lock`). `nanos` alone is insufficient under a
+    // coarse/contended clock — two threads can read the same value.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp_index = std::env::temp_dir().join(format!(
-        "codemux-checkpoint-index-{}-{nanos}",
+        "codemux-checkpoint-index-{}-{nanos}-{seq}",
         std::process::id()
     ));
 
@@ -1737,6 +1743,30 @@ pub fn git_init_repo(path: &Path) -> Result<String, String> {
     run_git(path, &["init"])?;
     run_git(path, &["add", "."])?;
     run_git(path, &["commit", "--allow-empty", "-m", "Initial commit"])?;
+    Ok("Repository initialized".to_string())
+}
+
+/// Bare `git init` — creates the repository and stops. It never runs
+/// `git add` or `git commit`, so no user files are staged and no commit
+/// is created (HEAD stays unborn until the user makes their own first
+/// commit).
+///
+/// This is the split-out counterpart of `git_init_repo` above, and the
+/// two are intentionally different:
+///
+/// - `git_init_no_commit` backs the user-facing "Initialize Git"
+///   affordance (`use-initialize-git.ts`), which turns an *existing*
+///   folder full of the user's own files into a repo on an explicit
+///   click. That flow must NEVER stage or commit anything — the folder
+///   may hold secrets, `node_modules`, or anything else the user has
+///   not vetted, and there is no `.gitignore` yet. Silently committing
+///   all of it would be a data-safety footgun.
+/// - `git_init_repo` stays commit-ful because its only caller is
+///   `create_empty_repo`'s "new empty project" flow, where the folder
+///   was just created by us and an initial (empty-ish) commit is the
+///   desired starting point.
+pub fn git_init_no_commit(path: &Path) -> Result<String, String> {
+    run_git(path, &["init"])?;
     Ok("Repository initialized".to_string())
 }
 

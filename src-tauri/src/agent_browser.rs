@@ -2188,6 +2188,34 @@ impl AgentBrowserManager {
             .entry(session_key.to_string())
             .and_modify(|s| s.last_seen_at = now);
     }
+
+    /// Return the session keys currently tracked in the in-memory map.
+    /// Used by the periodic orphan sweep (issue #126): the sweep only ever
+    /// considers sessions THIS app instance spawned, so it can never kill
+    /// a daemon belonging to another codemux instance.
+    pub async fn session_keys(&self) -> Vec<String> {
+        self.sessions.lock().await.keys().cloned().collect()
+    }
+}
+
+/// Decide which tracked session keys are orphaned `ws-*` sessions.
+/// Only workspace-scoped names (`ws-` prefix) are eligible — user
+/// browser-pane sessions (`browser-NNN`) and the `default` session are
+/// never swept. A key survives if any live workspace still maps to it.
+///
+/// Pure and synchronous on purpose: it takes plain data (no lock guards,
+/// no I/O) so it's trivially unit-testable and callable from the lib.rs
+/// sweep loop without holding either the manager's or the state store's
+/// lock while deciding what to close.
+pub(crate) fn orphaned_ws_sessions(
+    tracked_keys: &[String],
+    live_names: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    tracked_keys
+        .iter()
+        .filter(|key| key.starts_with("ws-") && !live_names.contains(*key))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -2830,14 +2858,15 @@ Active Connections
     /// reliable ECONNREFUSED.
     #[test]
     fn probe_stream_port_fails_when_nothing_is_listening() {
-        // Bind a listener, capture the port, drop it. The OS won't
-        // hand the port to anyone immediately — TIME_WAIT-ish — so
-        // probing it returns false. This is more robust than guessing
-        // a free port.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        assert!(!probe_stream_port(port, 2, Duration::from_millis(10)));
+        // Probe port 1 (IANA-reserved tcpmux, root-only to bind on Unix
+        // and unused in CI containers) for a reliable ECONNREFUSED. The
+        // earlier bind-an-ephemeral-port-then-drop-it approach was flaky
+        // under parallel test load: a merely-bound-then-dropped listener
+        // has no TIME_WAIT, so the OS could immediately hand the freed
+        // port to a concurrent test binding `127.0.0.1:0`, making the
+        // probe connect and this assertion fail. Port 1 is never bound
+        // by any test, so nothing races us.
+        assert!(!probe_stream_port(1, 2, Duration::from_millis(10)));
     }
 
     /// `allocate_port` must reject a port that something else is
@@ -2985,5 +3014,50 @@ Active Connections
             !path.exists(),
             "clear_session_pid must remove the file we wrote"
         );
+    }
+
+    // ── Periodic orphan sweep helper (issue #126) ─────────────────────
+    //
+    // `orphaned_ws_sessions` is the pure decision function behind the
+    // background sweep in lib.rs. These tests pin its contract without
+    // needing the async manager, a real daemon, or app state.
+
+    #[test]
+    fn orphaned_ws_sessions_returns_ws_session_with_no_live_workspace() {
+        let tracked = vec!["ws-abc123".to_string()];
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(orphaned_ws_sessions(&tracked, &live), vec!["ws-abc123".to_string()]);
+    }
+
+    #[test]
+    fn orphaned_ws_sessions_skips_ws_session_with_live_workspace() {
+        let tracked = vec!["ws-abc123".to_string()];
+        let live: std::collections::HashSet<String> =
+            ["ws-abc123".to_string()].into_iter().collect();
+        assert!(orphaned_ws_sessions(&tracked, &live).is_empty());
+    }
+
+    #[test]
+    fn orphaned_ws_sessions_never_sweeps_browser_pane_or_default_sessions() {
+        let tracked = vec!["browser-42".to_string(), "default".to_string()];
+        // Neither name is in the live set, but neither is a `ws-*` name, so
+        // both must survive — user browser panes and the default session
+        // are never workspace-scoped and are never candidates for the
+        // orphan sweep.
+        let live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert!(orphaned_ws_sessions(&tracked, &live).is_empty());
+    }
+
+    #[test]
+    fn orphaned_ws_sessions_handles_a_mixed_tracked_set() {
+        let tracked = vec![
+            "ws-live".to_string(),
+            "ws-orphan".to_string(),
+            "browser-7".to_string(),
+            "default".to_string(),
+        ];
+        let live: std::collections::HashSet<String> =
+            ["ws-live".to_string()].into_iter().collect();
+        assert_eq!(orphaned_ws_sessions(&tracked, &live), vec!["ws-orphan".to_string()]);
     }
 }

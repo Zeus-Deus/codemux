@@ -31,8 +31,9 @@ use codemux_lib::agent_provider::codex::auth::{
 use codemux_lib::agent_provider::codex::protocol::ClientInfo;
 use codemux_lib::agent_provider::codex::{CodexAgentProvider, CodexProviderConfig};
 use codemux_lib::agent_provider::{
-    AgentProvider, ApprovalDecision, ContentDelta, ProviderError, ProviderRuntimeEvent,
-    RequestId, SendTurnInput, SessionStatus, StartSessionInput, ThreadId, TurnId,
+    AgentProvider, ApprovalDecision, CompletedItem, ContentDelta, ProviderError,
+    ProviderRuntimeEvent, RequestId, SendTurnInput, SessionStatus, StartSessionInput,
+    SubagentStatus, ThreadId, TurnId, TurnStatus,
 };
 
 // ---------------------------------------------------------------------------
@@ -244,6 +245,7 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -336,6 +338,7 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -382,6 +385,7 @@ async fn command_approval_request_roundtrip() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -438,6 +442,7 @@ async fn command_approval_deny_roundtrip() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -485,6 +490,7 @@ async fn interrupt_turn_sends_turn_interrupt() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -519,6 +525,7 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -562,6 +569,7 @@ async fn set_model_updates_session_state() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -603,6 +611,7 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap_err();
@@ -626,8 +635,13 @@ async fn child_process_crash_emits_error_state() {
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
     start_session_resilient(&provider, start_input("t-crash")).await.unwrap();
     let mut stream = provider.event_stream();
-    // turn/start will succeed then the fixture exits.
-    let _ = provider
+    // turn/start succeeds, then the fixture exits. The Ok is guaranteed by
+    // JsonRpcChild's exit-drain: the fixture writes the response BEFORE
+    // exiting, so it must be routed (not failed as "child process exited")
+    // even when the watchdog observes the exit first — which is also what
+    // deterministically arms `active_turn` for the synthetic completion
+    // asserted below.
+    provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-crash".into()),
             text: "x".into(),
@@ -635,29 +649,96 @@ async fn child_process_crash_emits_error_state() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
-        .await;
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
 
+    // Issue #154: the mid-turn child death settles the in-flight turn with a
+    // synthetic `TurnCompleted { child_exited }` ahead of the terminal Error.
+    let mut saw_child_exit_turn = false;
     let mut saw_error = false;
     let _ = timeout(Duration::from_secs(3), async {
         while let Some(ev) = stream.next().await {
-            if let ProviderRuntimeEvent::SessionStateChanged { status, .. } = &ev {
-                if let SessionStatus::Error { message } = status {
-                    if message.contains("exited") {
-                        saw_error = true;
-                        break;
+            match &ev {
+                ProviderRuntimeEvent::TurnCompleted { status, .. } => {
+                    if let TurnStatus::Error { subtype, .. } = status {
+                        if subtype == "child_exited" {
+                            saw_child_exit_turn = true;
+                        }
                     }
                 }
+                ProviderRuntimeEvent::SessionStateChanged { status, .. } => {
+                    if let SessionStatus::Error { message } = status {
+                        if message.contains("exited") {
+                            saw_error = true;
+                            break;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     })
     .await;
     assert!(saw_error, "expected SessionStateChanged Error after crash");
+    assert!(
+        saw_child_exit_turn,
+        "expected a synthetic child_exited TurnCompleted before the Error"
+    );
     let _ = provider.stop_session(ThreadId("t-crash".into())).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_send_turn_returns_validation_error() {
+async fn dead_child_is_evicted_and_start_session_rebuilds() {
+    // Issue #154 live-recovery path: after the child-exit watchdog marks a
+    // session dead, `has_session` must report it absent AND a fresh
+    // `start_session` for the SAME thread must evict the corpse and rebuild
+    // instead of failing with "codex session already exists".
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_EXIT_AFTER", "turn/start")]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let thread = ThreadId("t-evict".into());
+    start_session_resilient(&provider, start_input("t-evict"))
+        .await
+        .unwrap();
+    assert!(provider.has_session(&thread).await, "session live after start");
+    // Deterministically Ok — the fixture answers turn/start before exiting
+    // and JsonRpcChild's exit-drain routes that response (see
+    // `child_process_crash_emits_error_state`).
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: thread.clone(),
+            text: "x".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
+    let went_absent = timeout(Duration::from_secs(3), async {
+        loop {
+            if !provider.has_session(&thread).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(went_absent.is_ok(), "dead session must be reported absent");
+    start_session_resilient(&provider, start_input("t-evict"))
+        .await
+        .expect("rebuild after death must succeed");
+    assert!(provider.has_session(&thread).await, "rebuilt session live");
+    let _ = provider.stop_session(thread).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_send_turn_queues_instead_of_erroring() {
+    // Follow-up queueing: a second send while the first turn is active is
+    // now QUEUED (not rejected). The fixture emits only turn/started, so
+    // the first turn stays active and the second parks in the queue.
     let script = write_script(json!([
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
          "params":{"threadId":"c-1","turnId":"t-busy"}}
@@ -667,7 +748,8 @@ async fn concurrent_send_turn_returns_validation_error() {
     ]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
     start_session_resilient(&provider, start_input("t-busy")).await.unwrap();
-    provider
+    let mut stream = provider.event_stream();
+    let first = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-busy".into()),
             text: "first".into(),
@@ -675,11 +757,13 @@ async fn concurrent_send_turn_returns_validation_error() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
+    assert!(first.queued_id.is_none(), "first send starts immediately");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let err = provider
+    let second = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-busy".into()),
             text: "second".into(),
@@ -687,11 +771,97 @@ async fn concurrent_send_turn_returns_validation_error() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: Some("nonce-2".into()),
         })
         .await
-        .unwrap_err();
-    assert!(matches!(err, ProviderError::ValidationError { .. }));
+        .unwrap();
+    let queued_id = second
+        .queued_id
+        .expect("second send should be queued behind the active turn");
+
+    let saw = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::TurnQueued {
+                queued_id: qid,
+                client_nonce,
+                text,
+                ..
+            } = ev
+            {
+                assert_eq!(qid, queued_id);
+                assert_eq!(client_nonce.as_deref(), Some("nonce-2"));
+                assert_eq!(text, "second");
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+    assert!(saw, "expected a TurnQueued event");
     provider.stop_session(ThreadId("t-busy".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_queued_turn_removes_it_codex() {
+    let script = write_script(json!([
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
+         "params":{"threadId":"c-1","turnId":"t-cq"}}
+    ]));
+    let wrapper = wrapper_with_env(&[
+        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
+    ]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-cq"))
+        .await
+        .unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-cq".into()),
+            text: "first".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let queued = provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-cq".into()),
+            text: "second".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap()
+        .queued_id
+        .expect("second send queued");
+
+    provider
+        .cancel_queued_turn(ThreadId("t-cq".into()), queued.clone())
+        .await
+        .unwrap();
+
+    let cancelled = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } = ev {
+                return Some(queued_id);
+            }
+        }
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    assert_eq!(cancelled.as_deref(), Some(queued.as_str()));
+    provider.stop_session(ThreadId("t-cq".into())).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -765,6 +935,7 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -881,6 +1052,7 @@ async fn bogus_response_to_unknown_jsonrpc_id_does_not_crash_adapter() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
@@ -920,6 +1092,197 @@ async fn classify_auth_output_pure_function() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter() {
+    // A full Codex multi-agent lifecycle, exercised end-to-end through the
+    // real adapter + fake app-server:
+    //   1. parent turn/started
+    //   2. collabAgentToolCall spawnAgent (inProgress) → child registered,
+    //      SubagentUpdated (Pending/Running)
+    //   3. collabAgentToolCall spawnAgent (completed) with agentsStates
+    //      running + activity message → SubagentUpdated Running
+    //   4. child thread/started (v2 nested) with nickname/role → identity
+    //   5. child turn/started (v2 nested) → SubagentUpdated Running
+    //   6. child agentMessage item/completed → ItemCompleted tagged with
+    //      subagent_id (the drill-in transcript)
+    //   7. subAgentActivity (interacted) → status tick, suppressed raw
+    //   8. child turn/completed (v2 nested, durationMs) → SubagentUpdated
+    //      Completed with duration
+    //   9. collabAgentToolCall wait (completed) agentsStates completed →
+    //      SubagentUpdated Completed
+    //  10. parent turn/completed → parent turn succeeds
+    let script = write_script(json!([
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
+         "params":{"threadId":"c-1","turnId":"pt-1"}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","item":{
+            "type":"collabAgentToolCall","id":"call-1","tool":"spawnAgent","status":"inProgress",
+            "senderThreadId":"c-1","receiverThreadIds":["c-child"],"model":"gpt-5.4",
+            "prompt":"explore the repo","agentsStates":{"c-child":{"status":"pendingInit"}}}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","item":{
+            "type":"collabAgentToolCall","id":"call-1","tool":"spawnAgent","status":"completed",
+            "senderThreadId":"c-1","receiverThreadIds":["c-child"],"model":"gpt-5.4",
+            "prompt":"explore the repo",
+            "agentsStates":{"c-child":{"status":"running","message":"reading files"}}}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"thread/started",
+         "params":{"thread":{"id":"c-child","parentThreadId":"c-1","agentNickname":"Explore",
+            "agentRole":"explore","cwd":"/tmp","status":"running","turns":[]}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
+         "params":{"threadId":"c-child","turn":{"id":"ct-1","status":"inProgress","items":[]}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-child","turnId":"ct-1","item":{
+            "type":"agentMessage","id":"cm-1","text":"child found the answer"}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","item":{
+            "type":"subAgentActivity","id":"sa-1","agentThreadId":"c-child",
+            "agentPath":"root/explore","kind":"interacted"}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/completed",
+         "params":{"threadId":"c-child","turn":{"id":"ct-1","status":"completed",
+            "durationMs":4321,"items":[]}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"item/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","item":{
+            "type":"collabAgentToolCall","id":"call-2","tool":"wait","status":"completed",
+            "senderThreadId":"c-1","receiverThreadIds":["c-child"],
+            "agentsStates":{"c-child":{"status":"completed","message":"done"}}}}},
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/completed",
+         "params":{"threadId":"c-1","turnId":"pt-1","status":"succeeded"}}
+    ]));
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-sub")).await.unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-sub".into()),
+            text: "delegate".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+
+    let mut saw_child_running = false;
+    let mut saw_child_model = false;
+    let mut saw_child_name = false;
+    let mut saw_child_activity = false;
+    let mut saw_child_completed_with_duration = false;
+    let mut saw_child_transcript_text = false;
+    let mut saw_parent_turn_completed = false;
+    // Suppression / isolation invariants:
+    let mut saw_collab_tool_render = false; // no ToolUse/ToolResult for collab item
+    let mut saw_parent_tagged_delta = false; // parent transcript must stay untagged
+    let mut collab_warning = false; // collab/subAgentActivity must not warn
+
+    let collected = timeout(Duration::from_secs(6), async {
+        while let Some(ev) = stream.next().await {
+            match &ev {
+                ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => {
+                    assert_eq!(subagent.subagent_id, "c-child");
+                    assert_eq!(subagent.provider_ref.as_deref(), Some("c-child"));
+                    if subagent.status == SubagentStatus::Running {
+                        saw_child_running = true;
+                    }
+                    if subagent.model.as_deref() == Some("gpt-5.4") {
+                        saw_child_model = true;
+                    }
+                    if subagent.name.as_deref() == Some("Explore") {
+                        saw_child_name = true;
+                    }
+                    if subagent.activity.as_deref() == Some("reading files") {
+                        saw_child_activity = true;
+                    }
+                    if subagent.status == SubagentStatus::Completed
+                        && subagent.duration_ms == Some(4321)
+                    {
+                        saw_child_completed_with_duration = true;
+                    }
+                }
+                ProviderRuntimeEvent::ItemCompleted {
+                    item,
+                    subagent_id,
+                    ..
+                } => match item {
+                    CompletedItem::AssistantText { text }
+                        if text == "child found the answer" =>
+                    {
+                        assert_eq!(
+                            subagent_id.as_deref(),
+                            Some("c-child"),
+                            "child transcript item must be tagged with its subagent_id"
+                        );
+                        saw_child_transcript_text = true;
+                    }
+                    // This scenario emits no ordinary tools; any ToolUse /
+                    // ToolResult here would mean a collabAgentToolCall or
+                    // subAgentActivity item leaked instead of being suppressed.
+                    CompletedItem::ToolUse { .. } | CompletedItem::ToolResult { .. } => {
+                        saw_collab_tool_render = true;
+                    }
+                    _ => {}
+                },
+                ProviderRuntimeEvent::ContentDelta { subagent_id, .. } => {
+                    if subagent_id.is_some() {
+                        saw_parent_tagged_delta = true;
+                    }
+                }
+                ProviderRuntimeEvent::TurnCompleted { .. } => {
+                    saw_parent_turn_completed = true;
+                }
+                ProviderRuntimeEvent::RuntimeWarning { message, .. } => {
+                    if message.contains("collabAgentToolCall")
+                        || message.contains("subAgentActivity")
+                    {
+                        collab_warning = true;
+                    }
+                }
+                _ => {}
+            }
+            if saw_child_running
+                && saw_child_model
+                && saw_child_name
+                && saw_child_activity
+                && saw_child_completed_with_duration
+                && saw_child_transcript_text
+                && saw_parent_turn_completed
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(collected.is_ok(), "timed out waiting for subagent lifecycle events");
+    assert!(saw_child_running, "missing Running SubagentUpdated");
+    assert!(saw_child_model, "missing model gpt-5.4 on a subagent snapshot");
+    assert!(saw_child_name, "missing nickname Explore from child thread/started");
+    assert!(saw_child_activity, "missing agentsStates activity line");
+    assert!(
+        saw_child_completed_with_duration,
+        "missing Completed SubagentUpdated with durationMs 4321"
+    );
+    assert!(
+        saw_child_transcript_text,
+        "missing child agentMessage routed into the drill-in transcript"
+    );
+    assert!(saw_parent_turn_completed, "missing parent TurnCompleted");
+    assert!(
+        !saw_collab_tool_render,
+        "collabAgentToolCall / subAgentActivity items must be suppressed, not rendered as tools"
+    );
+    assert!(
+        !saw_parent_tagged_delta,
+        "parent transcript deltas must never be tagged with a subagent_id"
+    );
+    assert!(
+        !collab_warning,
+        "collab / subAgentActivity items must not fall through to RuntimeWarning"
+    );
+    provider.stop_session(ThreadId("t-sub".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_during_event_streaming_does_not_panic() {
     let script = write_script(json!([
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
@@ -942,6 +1305,7 @@ async fn shutdown_during_event_streaming_does_not_panic() {
             model_override: None,
             effort_override: None,
             permission_mode_override: None,
+            client_nonce: None,
         })
         .await
         .unwrap();
