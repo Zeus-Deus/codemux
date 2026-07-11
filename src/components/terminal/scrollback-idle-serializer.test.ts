@@ -1,5 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
+import {
+  createIdleScrollbackSerializer,
+  type IdleHandle,
+} from "./scrollback-idle-serializer";
 
 /**
  * These tests drive the serializer deterministically with:
@@ -21,7 +24,12 @@ function setup(overrides: { settleMs?: number; minIntervalMs?: number } = {}) {
   let pendingIdle: ((didTimeout: boolean) => void) | null = null;
   let idleHandles = 0;
 
-  const cancelIdle = vi.fn((_handle: number) => {
+  // Param typed as the source's IdleHandle (number | ReturnType<typeof
+  // setTimeout>) rather than the narrower `number`: the injected scheduler
+  // must satisfy `(handle: IdleHandle) => void`, and in a Node type
+  // environment `ReturnType<typeof setTimeout>` widens IdleHandle beyond
+  // `number`, so a `number`-only param is not assignable there.
+  const cancelIdle = vi.fn((_handle: IdleHandle) => {
     pendingIdle = null;
   });
   const requestIdle = vi.fn((cb: (didTimeout: boolean) => void) => {
