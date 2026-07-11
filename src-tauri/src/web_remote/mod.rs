@@ -15,6 +15,7 @@
 //! - [`endpoints`]— reachable-endpoint enumeration (loopback/LAN/tailnet).
 //! - [`assets`]   — authenticated `/api/assets` file route (`convertFileSrc`).
 //! - [`proxy`]    — auth-gated browser-pane WS + HTTP proxy to loopback daemons.
+//! - [`snapshot`] — authenticated `/api/snapshot` bulk state bootstrap (versioned API).
 //!
 //! See `docs/plans/web-remote-access.md` for the locked protocol contract.
 
@@ -25,6 +26,7 @@ pub mod endpoints;
 pub mod events;
 pub mod proxy;
 pub mod server;
+pub mod snapshot;
 
 use std::sync::{Arc, Mutex};
 
@@ -271,6 +273,12 @@ async fn start_server(app: &AppHandle, shared: &Arc<Shared>) -> Result<(), Strin
 }
 
 fn stop_server(shared: &Arc<Shared>) {
+    // Sever every live socket up front. `with_graceful_shutdown` only stops the
+    // listener accepting *new* connections; an already-open WebSocket would
+    // otherwise keep working (and keep full desktop control) until it happened
+    // to reload. Disabling remote access is a security action, so kick every
+    // connected device immediately — the same mechanism revocation uses.
+    shared.connections.close_all();
     if let Some(running) = shared.runtime.lock().unwrap().take() {
         let _ = running.shutdown.send(());
     }

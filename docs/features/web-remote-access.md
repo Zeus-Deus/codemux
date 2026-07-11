@@ -30,7 +30,7 @@ Both shims stay dormant under the desktop WebView, so real-IPC behavior is byte-
 
 ### The embedded server
 
-New module `src-tauri/src/web_remote/` runs an axum server (axum is already a dependency) inside the desktop process. When enabled it binds `0.0.0.0:<port>` (default **4377**, configurable); disabling sends a graceful-shutdown oneshot that unbinds it. Config (`enabled`, `port`, `require_approval`) persists in the existing settings storage under `web_remote.config`, and `restore_on_boot` re-binds on app start if the feature was left enabled — a bind failure (port taken) is logged, never fatal.
+New module `src-tauri/src/web_remote/` runs an axum server (axum is already a dependency) inside the desktop process. When enabled it binds `0.0.0.0:<port>` (default **4377**, configurable); disabling severs every live socket (`ConnectionRegistry::close_all`, the same mechanism revocation uses) and then sends a graceful-shutdown oneshot that unbinds the listener — turning the master switch off is a security action, so already-connected devices lose control immediately rather than lingering until their next reload (graceful shutdown alone only stops *new* connections; an open WebSocket never closes on its own). A port change rebinds through the same stop→start path, so it also drops existing connections (they cannot follow to the new port). Config (`enabled`, `port`, `require_approval`) persists in the existing settings storage under `web_remote.config`, and `restore_on_boot` re-binds on app start if the feature was left enabled — a bind failure (port taken) is logged, never fatal.
 
 Module layout:
 
@@ -42,6 +42,7 @@ Module layout:
 - `endpoints.rs` — reachable-endpoint enumeration (loopback / LAN / tailnet / MagicDNS).
 - `assets.rs` — the authenticated `/api/assets` file route (`convertFileSrc` replacement).
 - `proxy.rs` — the auth-gated browser-pane WS + HTTP proxy to loopback `agent-browser` daemons.
+- `snapshot.rs` — the authenticated `/api/snapshot` bulk state-bootstrap route (a small versioned client API).
 
 The frontend served is the app's own bundle, resolved through Tauri's `AssetResolver` (assets are embedded in the release binary — there is no `dist/` on disk in production; a debug-only `dist/` fallback keeps `npm run tauri:dev` serviceable). A path with no file extension falls back to `index.html` for client-side routing.
 
@@ -52,7 +53,7 @@ The transport is `GET /ws?ticket=<one-time-ticket>`, upgraded after ticket valid
 Text frames (JSON):
 
 - C→S `{"t":"invoke","id":<u64>,"cmd":"<name>","args":{...}}`. `Channel` instances serialize (via `@tauri-apps/api`'s `toJSON`) to `"__CHANNEL__:<callbackId>"` strings, minted by the shim's own `transformCallback` registry.
-- S→C `{"t":"ok","id":<u64>,"data":<json>}` / `{"t":"err","id":<u64>,"error":<json>}` — id-matched. The server spawns one task per invoke, so responses may return out of order (allowed by design).
+- S→C `{"t":"ok","id":<u64>,"data":<json>}` / `{"t":"err","id":<u64>,"error":<json>}` — id-matched. The server spawns one task per invoke, so responses may return out of order (allowed by design). **Terminal input is the exception:** `write_to_pty` frames are drained through a per-connection serial lane (`is_ordered_invoke`) instead of a per-frame task, so a burst of keystrokes reaches the PTY in the exact order the client sent it — the task-per-invoke concurrency would otherwise let two rapid writes race and scramble the bytes, which the desktop's in-process IPC never does.
 - C→S `{"t":"listen","event":"<name>"}` / `{"t":"unlisten","event":"<name>"}`; S→C `{"t":"event","event":"<name>","payload":<json>}`.
 - S→C JSON channel body: `{"t":"chan","ch":<callbackId>,"idx":<u64>,"data":<json>}`.
 
@@ -73,6 +74,26 @@ This is uniform across every channel-taking command (`attach_pty_output`, `attac
 ### Event hub
 
 Browsers subscribe to app events over the WS; `events::EventHub` multiplexes all subscribers onto a single `AppHandle::listen_any` registration **per event name**, reference-counted by subscriber. The first subscriber registers the desktop-side listener; the last to leave (or disconnect) unregisters it. So there is exactly one desktop listener per active event no matter how many browsers watch it, and none once no one is — the desktop's own event bus sees no extra churn. Payloads forward verbatim (re-parsed to a value so they nest rather than double-encode).
+
+### HTTP snapshot bootstrap (`GET /api/snapshot`)
+
+Without help, a freshly-paired (or reconnecting) web client renders blank until a full chain completes: `POST /api/ws-ticket` → `GET /ws` upgrade → React mount → the app's own `get_app_state` invoke over the socket → the reply. `snapshot.rs` collapses the tail of that chain. It exposes one authenticated route, `GET /api/snapshot`, that returns the whole initial state in a single HTTP GET the client fires **in parallel** with the WS handshake, so the UI paints real state as soon as it mounts instead of paying a post-mount round-trip.
+
+The payload is a stable, versioned envelope:
+
+```json
+{ "api_version": 1, "app_state": <AppStateSnapshot>, "status": <WebRemoteStatus> }
+```
+
+- `app_state` is byte-for-byte what the `get_app_state` command returns — it is produced by the **same** `AppStateStore::snapshot()` call, so there is no second serialization path to keep in sync.
+- `status` is the same `WebRemoteStatus` the `web_remote_status` command and the `web-remote-state-changed` event carry (built by the shared `build_status`).
+- The response is `Cache-Control: no-store` (a live snapshot must never be served from a cache) and `application/json`.
+
+Admission is the same gate the other authenticated `/api/*` routes use (`server::require_session`): same-origin, an approved non-revoked session by bearer or the HttpOnly cookie. Unauth → 401, cross-origin → 403.
+
+**Seeding is WS-subordinate and stale-safe.** The frontend seam is entirely inside the WebSocket shim — zero app-component changes, so desktop/Tauri and dev-mock paths are byte-identical (they never install the shim, and `fetchSnapshot` is a shim option they never pass). The shim (`src/remote/{snapshot-seed,shim}.ts`) fires the prefetch at install time — concurrently with `transport.connect()` — and answers the app's **first** `get_app_state` from it, but only when the prefetch has already settled and **no** WS-delivered app-state has superseded it. The guard is a monotonic counter (`wsAppStateSeq`), bumped on every `app-state-changed` event the socket delivers: the initial seed is served only while that counter is still `0`, so a WS snapshot that arrived first always wins. The prefetch is never awaited on the hot path (a slow/hung fetch can't delay the first render — the WS invoke covers that), and any failure resolves to `null` and falls back to the WS path silently. On every **reconnect** the shim refetches and pushes the result through the same `app-state-changed` delivery the app already consumes — catching up on state that changed while the socket was down (those events had no subscriber) — again discarded if a fresher WS snapshot lands first. Full-snapshot last-writer-wins makes this safe; the counter guard makes it stale-safe.
+
+**Native-client API seed.** This endpoint is deliberately the first piece of a small, versioned API intended for future **non-web** clients (a native mobile client is the obvious next consumer), not a web-only shortcut. A native client with no WebView and no `@tauri-apps/api` shim can still bootstrap its whole view from one authenticated GET, and `api_version` lets it detect a breaking envelope change (bump it on any incompatible shape change). The web transport happens to be the first consumer; the shape is designed to outlive it.
 
 ## Auth model
 
@@ -162,8 +183,8 @@ All three are compiled only into debug builds and, even there, dormant unless an
 
 ## Verification
 
-- **Rust unit/integration** (`cargo test`, `src-tauri`): the `web_remote` suite covers the pairing lifecycle (single-use, TTL, unknown/expired rejection), ticket single-use + binding + expiry, the rate limiter, `authenticate` round-trip + revocation + pending-approval, the origin check matrix, the connection registry (targeted `close_session` frame + signal), the session-admission gate (bearer + cookie, missing/unknown/pending/cross-origin), the channel router (marker rewrite incl. nested, JSON `chan` frame + binary frame shape, per-connection route teardown), the event fan-out, the endpoint enumeration (tailnet/LAN range detection, loopback-first-and-secure, IPv6 bracketing), the asset route (regular-file MIME + length, directory/missing → 404, MIME guessing), and the proxy path guards (port range, control-char rejection). The terminal and agent-chat suites cover the fan-out invariants (two subscribers interleave, detach(A) leaves B streaming, pause(A alone) doesn't stall B, replay reaches only the attacher, registry detach removes only the matching subscriber).
-- **Frontend** (`npm run test`): shim contract tests against a fake WS (invoke round-trip, channel ordering, listen refcounting), the transport (reconnect/ticket flow), the path-browser utils, the web-notifications delivery matrix, the remote-access settings utils + section, and the update-defer decision.
+- **Rust unit/integration** (`cargo test`, `src-tauri`): the `web_remote` suite covers the pairing lifecycle (single-use, TTL, unknown/expired rejection), ticket single-use + binding + expiry, the rate limiter, `authenticate` round-trip + revocation + pending-approval, the origin check matrix, the connection registry (targeted `close_session` frame + signal), the session-admission gate (bearer + cookie, missing/unknown/pending/cross-origin), the channel router (marker rewrite incl. nested, JSON `chan` frame + binary frame shape, per-connection route teardown), the event fan-out, the endpoint enumeration (tailnet/LAN range detection, loopback-first-and-secure, IPv6 bracketing), the asset route (regular-file MIME + length, directory/missing → 404, MIME guessing), the snapshot route (`api_version`, the `{api_version, app_state, status}` envelope shape built from the real `AppStateStore::snapshot`, and its admission: unauth → 401, cross-origin → 403, approved session admitted), and the proxy path guards (port range, control-char rejection). The terminal and agent-chat suites cover the fan-out invariants (two subscribers interleave, detach(A) leaves B streaming, pause(A alone) doesn't stall B, replay reaches only the attacher, registry detach removes only the matching subscriber).
+- **Frontend** (`npm run test`): shim contract tests against a fake WS (invoke round-trip, channel ordering, listen refcounting), the transport (reconnect/ticket flow), the snapshot seeding (`fetchSnapshot` envelope validation + failure → `null`; the first `get_app_state` served from the seed with no wire frame; the seed discarded once a newer WS snapshot arrived; clean fall-back when the prefetch fails; reconnect refetch pushed via `app-state-changed`, and discarded if a fresher WS event wins the race), the path-browser utils, the web-notifications delivery matrix, the remote-access settings utils + section, and the update-defer decision.
 - **Live end-to-end** (Stage 4): the real desktop app (`npm run tauri:dev`) with the server enabled, driven through the Codemux browser pane — pair via link + QR, watch a live terminal (replay + live bytes + input), run an agent-chat turn, open an existing project, create a new workspace via the web path-browser, second-client mirroring (desktop + web at once), revoke mid-session (socket drops), and reconnect behavior.
 
 ## Relationship to remote hosts
@@ -177,13 +198,13 @@ The clean mental model: remote hosts move *where the work runs*; web remote acce
 
 ## Important Touch Points
 
-- `src-tauri/src/web_remote/` — the embedded server: `mod.rs` (state/lifecycle/commands/boot hooks), `server.rs` (router, connection registry, WS lifecycle, session gate), `auth.rs` (pairing/session/ticket/rate-limit/origin), `dispatch.rs` (invoke via `on_message` + channel router), `events.rs` (`listen_any` hub), `endpoints.rs` (endpoint enumeration), `assets.rs` (`/api/assets`), `proxy.rs` (browser-pane proxy).
+- `src-tauri/src/web_remote/` — the embedded server: `mod.rs` (state/lifecycle/commands/boot hooks), `server.rs` (router, connection registry, WS lifecycle, session gate), `auth.rs` (pairing/session/ticket/rate-limit/origin), `dispatch.rs` (invoke via `on_message` + channel router), `events.rs` (`listen_any` hub), `endpoints.rs` (endpoint enumeration), `assets.rs` (`/api/assets`), `proxy.rs` (browser-pane proxy), `snapshot.rs` (`/api/snapshot` bulk state bootstrap).
 - `src-tauri/src/lib.rs` — registers `WebRemoteState`, wires the channel interceptor to `channel_router().route`, calls `restore_on_boot` + `e2e_autostart` in `setup`, and lists the twelve `web_remote_*` commands in `generate_handler!`.
 - `src-tauri/src/database.rs` — the `web_remote_sessions` table + its accessors (insert/get/list/active-hashes/touch/approve/revoke/delete).
 - `src-tauri/src/terminal/mod.rs`, `src-tauri/src/commands/agent_chat.rs` — the multi-subscriber stream fan-out.
 - `src-tauri/src/notifications.rs` — emits the global `notification` event the web bridge consumes.
 - `src/main.tsx` — three-way runtime shim selection (real / dev mock / web shim; `?remote=1` dev override).
-- `src/remote/` — `bootstrap.tsx` (pairing screen + connect loop), `shim.ts` (installs `__TAURI_INTERNALS__`), `transport.ts` (WS + reconnect + ticket flow), `session.ts` (localStorage session), `status-banner.ts` (remote indicator), `web-remote-events.ts` (`web-remote-state-changed` helper), `bootstrap-entry.ts`.
+- `src/remote/` — `bootstrap.tsx` (pairing screen + connect loop), `shim.ts` (installs `__TAURI_INTERNALS__`; seeds the first `get_app_state` + reconnect re-seed), `transport.ts` (WS + reconnect + ticket flow), `snapshot-seed.ts` (the `/api/snapshot` prefetch feeding the seed), `session.ts` (localStorage session), `status-banner.ts` (remote indicator), `web-remote-events.ts` (`web-remote-state-changed` helper), `bootstrap-entry.ts`.
 - `src/components/remote/` — `is-remote-client.ts` (the `isRemoteClient()` source of truth), `remote-path-picker.tsx` + `-store.ts` + `path-utils.ts` (web file/folder picker).
 - `src/components/settings/remote-access-section.tsx` (+ `remote-access-utils.ts`, `use-qr-svg.ts`) — the Remote Access settings pane.
 - `src/hooks/use-web-notifications.ts` — Web Notifications / toast bridge.

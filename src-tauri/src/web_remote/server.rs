@@ -11,6 +11,7 @@
 //! - `GET  /api/health`    — public version probe.
 //! - `POST /api/pair`      — trade a one-time token for a session + cookie.
 //! - `POST /api/ws-ticket` — trade a session for a 30s single-use WS ticket.
+//! - `GET  /api/snapshot`  — authed bulk state bootstrap (versioned API).
 //! - `GET  /ws?ticket=…`   — upgrade to the WebSocket transport.
 //!
 //! Origin is checked on every state-touching request; pairing is
@@ -51,6 +52,22 @@ const PING_INTERVAL_SECS: u64 = 30;
 /// Writer handle for a connection: every frame producer (invoke
 /// responses, channel router, event hub) pushes onto this.
 pub type OutboundTx = mpsc::UnboundedSender<Message>;
+
+/// Ordered dispatch lane for invokes whose *arrival order* is load-bearing.
+/// Carries `(id, cmd, args)` and is drained by a single per-connection task,
+/// so the commands it carries are applied in exactly the order the client
+/// sent them. See [`ORDERED_INVOKE_CMDS`].
+type OrderedInvokeTx = mpsc::UnboundedSender<(u64, String, Value)>;
+
+/// Commands that MUST be applied in client-send order. Terminal input
+/// (`write_to_pty`) carries keystrokes: dispatching each on its own task
+/// (as every other invoke is) lets two writes from one client race and
+/// scramble the bytes reaching the PTY — the desktop's in-process IPC never
+/// reorders them, and the web transport must match that. These are routed
+/// through the per-connection [`OrderedInvokeTx`] instead.
+fn is_ordered_invoke(cmd: &str) -> bool {
+    matches!(cmd, "write_to_pty")
+}
 
 // ── Live connection registry ────────────────────────────────────────
 
@@ -114,6 +131,21 @@ impl ConnectionRegistry {
         }
         closed
     }
+
+    /// Force *every* live socket closed. Used when the whole server is
+    /// disabled (or rebinding to a new port) so a device that is already
+    /// connected loses control immediately — turning the master switch off is
+    /// a security action, and graceful shutdown alone would let existing
+    /// WebSockets linger indefinitely (they never close on their own). Same
+    /// mechanism as [`close_session`]: frame a Close and trip each close signal.
+    pub fn close_all(&self) -> usize {
+        let conns = self.conns.lock().unwrap();
+        for c in conns.values() {
+            let _ = c.out.send(Message::Close(None));
+            let _ = c.close.send(true);
+        }
+        conns.len()
+    }
 }
 
 // ── Router / lifecycle ──────────────────────────────────────────────
@@ -133,6 +165,8 @@ pub fn router(app: AppHandle) -> Router {
         .route("/api/health", get(health))
         .route("/api/pair", post(pair))
         .route("/api/ws-ticket", post(ws_ticket))
+        // Authenticated one-shot state bootstrap (versioned API surface).
+        .route("/api/snapshot", get(super::snapshot::serve))
         // Authenticated file streamer backing the shim's `convertFileSrc`.
         .route("/api/assets", get(super::assets::serve))
         // Browser-pane proxy to the loopback agent-browser daemons.
@@ -390,6 +424,24 @@ async fn handle_socket(app: AppHandle, session_id: String, socket: WebSocket) {
         let _ = sink.close().await;
     });
 
+    // Ordered dispatch lane: terminal input (`write_to_pty`) must reach the
+    // PTY in the exact order the client sent it. Every other invoke keeps
+    // dispatching on its own task (out-of-order responses are fine), but the
+    // ordered commands are drained one-at-a-time by this single task, in
+    // arrival order, so a burst of keystrokes can never be scrambled by the
+    // task-per-invoke concurrency below.
+    let (ordered_tx, mut ordered_rx) = mpsc::unbounded_channel::<(u64, String, Value)>();
+    let ordered_task = {
+        let app = app.clone();
+        let router = shared.channels.clone();
+        let out = out_tx.clone();
+        tokio::spawn(async move {
+            while let Some((id, cmd, args)) = ordered_rx.recv().await {
+                super::dispatch::dispatch_invoke(&app, &router, conn_id, &out, id, cmd, args).await;
+            }
+        })
+    };
+
     // Keepalive: ping every 30s; two unanswered pings closes the socket.
     let awaiting_pongs = Arc::new(AtomicU32::new(0));
     let pinger = {
@@ -424,7 +476,7 @@ async fn handle_socket(app: AppHandle, session_id: String, socket: WebSocket) {
             incoming = stream.next() => {
                 match incoming {
                     Some(Ok(Message::Text(txt))) => {
-                        handle_text_frame(&app, &shared, conn_id, &out_tx, &txt);
+                        handle_text_frame(&app, &shared, conn_id, &out_tx, &ordered_tx, &txt);
                     }
                     Some(Ok(Message::Pong(_))) => {
                         awaiting_pongs.store(0, Ordering::SeqCst);
@@ -442,6 +494,7 @@ async fn handle_socket(app: AppHandle, session_id: String, socket: WebSocket) {
     shared.channels.remove_conn(conn_id);
     shared.events.remove_conn(&app, conn_id);
     pinger.abort();
+    ordered_task.abort();
     let _ = close_tx.send(true);
     drop(out_tx);
     writer.abort();
@@ -454,6 +507,7 @@ fn handle_text_frame(
     shared: &Arc<Shared>,
     conn_id: u64,
     out: &OutboundTx,
+    ordered: &OrderedInvokeTx,
     txt: &str,
 ) {
     let value: Value = match serde_json::from_str(txt) {
@@ -476,6 +530,14 @@ fn handle_text_frame(
                 let _ = out.send(Message::Text(
                     json!({ "t": "err", "id": id, "error": "missing cmd" }).to_string(),
                 ));
+                return;
+            }
+            // Ordered commands (terminal input) go through the per-connection
+            // serial lane so their client-send order is preserved; the send
+            // is synchronous here, inside the in-order reader loop, so frames
+            // enqueue in arrival order.
+            if is_ordered_invoke(&cmd) {
+                let _ = ordered.send((id, cmd, args));
                 return;
             }
             // Task per invoke → out-of-order responses are fine (id-matched).
@@ -634,6 +696,28 @@ mod tests {
         assert!(!*crb.borrow());
     }
 
+    #[test]
+    fn close_all_severs_every_connection() {
+        // Disabling the server (or rebinding) must kick *every* connected
+        // device, regardless of session — an already-open socket keeps full
+        // control until it is closed, so graceful listener shutdown is not
+        // enough on its own.
+        let reg = ConnectionRegistry::default();
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (ctx_a, cra) = watch::channel(false);
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let (ctx_b, crb) = watch::channel(false);
+        reg.register("A", tx_a, ctx_a);
+        reg.register("B", tx_b, ctx_b);
+
+        assert_eq!(reg.close_all(), 2);
+        // Both sockets get a Close frame and have their close signal tripped.
+        assert!(matches!(rx_a.try_recv(), Ok(Message::Close(_))));
+        assert!(matches!(rx_b.try_recv(), Ok(Message::Close(_))));
+        assert!(*cra.borrow(), "A's close signal tripped");
+        assert!(*crb.borrow(), "B's close signal tripped");
+    }
+
     // ── Session gate (backs the assets + proxy route auth) ──────────
 
     fn insert_session(db: &crate::database::DatabaseStore, approved: bool) -> String {
@@ -739,5 +823,41 @@ mod tests {
         assert_eq!(extract_session_token(&h).as_deref(), Some("zzz"));
 
         assert_eq!(extract_session_token(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn terminal_input_is_routed_to_the_ordered_lane() {
+        // `write_to_pty` carries keystrokes whose order is load-bearing, so it
+        // must take the per-connection serial lane, not the task-per-invoke
+        // path that lets writes race and scramble bytes reaching the PTY.
+        assert!(is_ordered_invoke("write_to_pty"));
+
+        // Everything else stays on the concurrent path (out-of-order responses
+        // are fine and head-of-line blocking is avoided). Spot-check a few,
+        // including PTY commands whose ordering is not correctness-critical.
+        assert!(!is_ordered_invoke("get_app_state"));
+        assert!(!is_ordered_invoke("resize_pty"));
+        assert!(!is_ordered_invoke("attach_pty_output"));
+        assert!(!is_ordered_invoke(""));
+    }
+
+    #[tokio::test]
+    async fn ordered_lane_preserves_client_send_order() {
+        // The lane is a single-consumer channel drained in arrival order, so a
+        // burst of keystroke frames enqueued in send-order is delivered to the
+        // dispatcher in that same order — the property the fix relies on.
+        let (tx, mut rx) = mpsc::unbounded_channel::<(u64, String, Value)>();
+        let seq = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        for (i, ch) in seq.chars().enumerate() {
+            tx.send((i as u64, "write_to_pty".into(), json!({ "data": ch.to_string() })))
+                .unwrap();
+        }
+        drop(tx);
+
+        let mut got = String::new();
+        while let Some((_, _, args)) = rx.recv().await {
+            got.push_str(args["data"].as_str().unwrap());
+        }
+        assert_eq!(got, seq, "ordered lane must preserve client send order");
     }
 }

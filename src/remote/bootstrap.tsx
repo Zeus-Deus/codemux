@@ -21,6 +21,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { installShim } from "./shim";
 import type { ConnectionStatus } from "./transport";
+import { fetchSnapshot } from "./snapshot-seed";
 import { createRemoteIndicator } from "./status-banner";
 import {
   clearSession,
@@ -411,6 +412,11 @@ export async function bootstrapRemote(): Promise<void> {
       getToken: () => loadSession()?.sessionToken ?? null,
       onStatusChange: handleStatus,
       onUnauthorized: handleUnauthorized,
+      // Prefetch the bulk state snapshot in parallel with the WS handshake so
+      // the app's first `get_app_state` resolves without a socket round-trip
+      // (and re-sync on every reconnect). Failures fall back to the WS path.
+      fetchSnapshot: () =>
+        fetchSnapshot(baseUrl, () => loadSession()?.sessionToken ?? null),
     });
 
     if (waiting || cameFromPairing) {

@@ -26,9 +26,16 @@ import {
   type ConnectionStatus,
   type TransportDeps,
 } from "./transport";
+import type { SnapshotSeed } from "./snapshot-seed";
 
 type RawCallback = (payload: unknown) => void;
 type Args = Record<string, unknown>;
+
+/** The backend command whose first response the HTTP snapshot seeds. */
+const APP_STATE_COMMAND = "get_app_state";
+/** The event carrying a full `AppStateSnapshot` over the WS. A snapshot
+ *  delivered on this event supersedes the HTTP seed (the no-stale guard). */
+const APP_STATE_EVENT = "app-state-changed";
 
 export interface InstallShimOptions {
   /** Server origin the transport talks to (also the asset origin). */
@@ -43,6 +50,13 @@ export interface InstallShimOptions {
   onUnauthorized?(): void;
   /** Injectable transport seams (tests). */
   deps?: TransportDeps;
+  /**
+   * Fire an `/api/snapshot` prefetch, resolving to the seed (`app_state`) or
+   * `null` on any failure. Called once at install (the initial prefetch, run
+   * concurrently with the WS handshake) and again on every reconnect. When
+   * omitted, seeding is disabled and every `get_app_state` takes the WS path.
+   */
+  fetchSnapshot?(): Promise<SnapshotSeed | null>;
 }
 
 /** Sentinel: a command that isn't handled locally and must hit the wire. */
@@ -71,17 +85,85 @@ export function installShim(options: InstallShimOptions): ShimHandle {
 
   const appVersion = options.appVersion ?? "0.0.0";
 
+  // ── HTTP snapshot seed (parallel bootstrap) ─────────────────────────
+  // The initial `/api/snapshot` prefetch is kicked off here — synchronously at
+  // install, so it runs concurrently with the caller's subsequent
+  // `transport.connect()` (the ticket POST + WS upgrade). We answer the app's
+  // first `get_app_state` from it (below) so the UI paints real state without a
+  // post-mount socket round-trip.
+  const seedPromise: Promise<SnapshotSeed | null> = options.fetchSnapshot
+    ? options.fetchSnapshot()
+    : Promise.resolve(null);
+  let seedValue: SnapshotSeed | null = null;
+  let seedSettled = false;
+  let seedConsumed = false;
+  // Monotonic count of app-state snapshots delivered over the WS. This is the
+  // no-stale-overwrite guard: the seed is applied only while this is still 0
+  // (initial connect) or unchanged since a reseed was kicked off — i.e. nothing
+  // newer has arrived over the socket.
+  let wsAppStateSeq = 0;
+  let connectedCount = 0;
+
+  // Track the prefetch's settled value WITHOUT ever awaiting it on the hot
+  // path: `get_app_state` consults `seedSettled` synchronously, so a slow or
+  // hung prefetch can never delay the first render — the WS invoke covers that.
+  void seedPromise.then(
+    (v) => {
+      seedValue = v ?? null;
+      seedSettled = true;
+    },
+    () => {
+      seedSettled = true;
+    },
+  );
+
   const transport = new RemoteTransport({
     baseUrl: options.baseUrl,
     getToken: options.getToken,
     deps: options.deps,
     hooks: {
       onChannelMessage: dispatchChannel,
-      onEvent: dispatchEvent,
-      onStatusChange: (status) => options.onStatusChange?.(status),
+      onEvent: (event, payload) => {
+        // A WS-delivered app-state snapshot supersedes the HTTP seed.
+        if (event === APP_STATE_EVENT) wsAppStateSeq += 1;
+        dispatchEvent(event, payload);
+      },
+      onStatusChange: handleStatusChange,
       onUnauthorized: () => options.onUnauthorized?.(),
     },
   });
+
+  /** Forward connection-state changes to the caller's banner unchanged, and
+   *  drive reconnect re-seeding. */
+  function handleStatusChange(status: ConnectionStatus): void {
+    if (status === "connected") {
+      connectedCount += 1;
+      // The first connect's snapshot is consumed by the app's own initial
+      // `get_app_state` (seeded below). Every *re*connect refetches and pushes
+      // the snapshot straight into the store to catch up on state that changed
+      // while the socket was down — those events had no subscriber and were lost.
+      if (connectedCount > 1) reseedOnReconnect();
+    }
+    options.onStatusChange?.(status);
+  }
+
+  /** On reconnect, refetch the snapshot and apply it via the same
+   *  `app-state-changed` path the app already consumes — but only if no fresher
+   *  WS snapshot lands while the refetch is in flight (no-stale guard). */
+  function reseedOnReconnect(): void {
+    if (!options.fetchSnapshot) return;
+    const seqAtKickoff = wsAppStateSeq;
+    void options.fetchSnapshot().then(
+      (seed) => {
+        if (seed != null && wsAppStateSeq === seqAtKickoff) {
+          dispatchEvent(APP_STATE_EVENT, seed);
+        }
+      },
+      () => {
+        /* refetch failed — the resumed WS events self-heal the view */
+      },
+    );
+  }
 
   function transformCallback(fn: RawCallback, once = false): number {
     const id = nextCallbackId++;
@@ -217,6 +299,16 @@ export function installShim(options: InstallShimOptions): ShimHandle {
   async function invoke(cmd: string, args: Args = {}): Promise<unknown> {
     const local = routePlugin(cmd, args);
     if (local !== MISS) return local;
+    // First `get_app_state`: answer from the HTTP-prefetched snapshot when it
+    // is already in hand and no WS-delivered app-state has superseded it, so the
+    // UI renders without a post-mount round-trip. Never awaits the prefetch — if
+    // it isn't ready, fall through to the authoritative WS invoke (today's path).
+    if (cmd === APP_STATE_COMMAND && !seedConsumed) {
+      seedConsumed = true;
+      if (seedSettled && seedValue != null && wsAppStateSeq === 0) {
+        return seedValue;
+      }
+    }
     // Real backend command → over the wire.
     return transport.invoke(cmd, args);
   }
