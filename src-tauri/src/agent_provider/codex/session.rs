@@ -102,6 +102,45 @@ fn mint_queued_id() -> String {
     )
 }
 
+/// Move the queued turn with `queued_id` to the front of `queue` so it
+/// is the next item [`CodexSession::drain_queue`] dispatches. Returns
+/// `Some(original_index)` when the item was found (and is now at the
+/// front), `None` when no such id is queued. A no-op when it is already
+/// at the front. The returned index lets a caller undo the reorder via
+/// [`restore_queued_position`] when a follow-up step (e.g.
+/// `interrupt_turn`) fails.
+fn promote_queued_to_front(queue: &mut VecDeque<QueuedTurn>, queued_id: &str) -> Option<usize> {
+    match queue.iter().position(|q| q.queued_id == queued_id) {
+        Some(0) => Some(0),
+        Some(pos) => {
+            if let Some(item) = queue.remove(pos) {
+                queue.push_front(item);
+            }
+            Some(pos)
+        }
+        None => None,
+    }
+}
+
+/// Undo a [`promote_queued_to_front`] by moving `queued_id` back to
+/// `original_index`. Finds the item's CURRENT position first — it may
+/// have been dispatched or cancelled in the meantime, in which case this
+/// is a no-op. Otherwise it is removed and re-inserted at
+/// `min(original_index, queue.len())` so the queue order is restored.
+fn restore_queued_position(
+    queue: &mut VecDeque<QueuedTurn>,
+    queued_id: &str,
+    original_index: usize,
+) {
+    let Some(pos) = queue.iter().position(|q| q.queued_id == queued_id) else {
+        return;
+    };
+    if let Some(item) = queue.remove(pos) {
+        let insert_at = original_index.min(queue.len());
+        queue.insert(insert_at, item);
+    }
+}
+
 /// Handle for a live Codex session.
 pub(crate) struct CodexSession {
     /// Runtime-owned thread identifier.
@@ -514,6 +553,69 @@ impl CodexSession {
             });
         }
         Ok(())
+    }
+
+    /// **Send now (steer):** promote a queued follow-up to the front of
+    /// the queue and dispatch it immediately, interrupting the active
+    /// turn if one is running. Soft stop — the Codex thread, transcript,
+    /// and on-disk work are preserved; nothing is discarded.
+    ///
+    /// Idempotent: an unknown / already-dispatched id is a silent no-op.
+    ///
+    /// When a turn is active we call
+    /// [`interrupt_turn`](Self::interrupt_turn). Unlike Claude's
+    /// `interrupt`, it does NOT drain inline — the abort lands as a
+    /// `turn/completed` (or aborted) notification that returns the session
+    /// to `Ready`, and the event loop drains there, dispatching the item
+    /// we just promoted to the front. If `interrupt_turn` returns the
+    /// "no active turn" `ValidationError` because the turn finished during
+    /// the click→call race, we fall back to draining directly. When the
+    /// session is already idle we drain directly.
+    ///
+    /// **Pending approvals:** like a manual interrupt, an outstanding
+    /// approval keeps `drain_queue` from dispatching until it resolves, so
+    /// the promoted message stays queued until then.
+    pub async fn send_queued_now(self: &Arc<Self>, queued_id: &str) -> Result<(), ProviderError> {
+        let (has_active_turn, original_index) = {
+            let mut state = self.state.lock().await;
+            match promote_queued_to_front(&mut state.queued_turns, queued_id) {
+                Some(idx) => (state.active_turn.is_some(), idx),
+                // Unknown / already-dispatched / cancelled — no-op.
+                None => return Ok(()),
+            }
+        };
+        if has_active_turn {
+            // Soft-stop the running turn. The event-loop drain (on the
+            // resulting turn/completed → Ready) dispatches the promoted
+            // item — `interrupt_turn` does not drain inline.
+            match self.interrupt_turn(None).await {
+                Ok(()) => Ok(()),
+                // Race: the turn finished between our busy check and the
+                // interrupt RPC. The session is idle, so drain directly.
+                Err(ProviderError::ValidationError { .. }) => {
+                    self.drain_queue().await;
+                    Ok(())
+                }
+                Err(err) => {
+                    // A real interrupt failure: undo the reorder so a
+                    // failed steer doesn't leave the queue silently
+                    // rearranged.
+                    {
+                        let mut state = self.state.lock().await;
+                        restore_queued_position(
+                            &mut state.queued_turns,
+                            queued_id,
+                            original_index,
+                        );
+                    }
+                    Err(err)
+                }
+            }
+        } else {
+            // Already idle — drain the promoted item out.
+            self.drain_queue().await;
+            Ok(())
+        }
     }
 
     /// Cancel every queued turn, emitting a cancellation for each. Used
@@ -1026,5 +1128,77 @@ mod tests {
         let a = mint_request_id();
         let b = mint_request_id();
         assert_ne!(a.0, b.0);
+    }
+
+    /// Build a bare `QueuedTurn` with a given id for reorder tests. Only
+    /// `queued_id` is inspected by `promote_queued_to_front`.
+    fn queued(id: &str) -> QueuedTurn {
+        QueuedTurn {
+            queued_id: id.to_string(),
+            input: SendTurnInput {
+                thread_id: ThreadId("t".into()),
+                text: String::new(),
+                images: vec![],
+                model_override: None,
+                effort_override: None,
+                permission_mode_override: None,
+                client_nonce: None,
+            },
+        }
+    }
+
+    #[test]
+    fn promote_queued_to_front_unknown_id_is_noop() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        assert_eq!(promote_queued_to_front(&mut q, "missing"), None);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn promote_queued_to_front_moves_mid_queue_item() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b"), queued("c")].into();
+        // Returns the item's original index so the reorder can be undone.
+        assert_eq!(promote_queued_to_front(&mut q, "c"), Some(2));
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["c", "a", "b"]);
+    }
+
+    #[test]
+    fn promote_queued_to_front_head_item_stays_put() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        assert_eq!(promote_queued_to_front(&mut q, "a"), Some(0));
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn restore_queued_position_undoes_a_promotion() {
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b"), queued("c")].into();
+        let idx = promote_queued_to_front(&mut q, "c").unwrap();
+        assert_eq!(idx, 2);
+        restore_queued_position(&mut q, "c", idx);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn restore_queued_position_already_dispatched_is_noop() {
+        // The item was promoted then removed (dispatched/cancelled)
+        // before restore ran — restoring is a harmless no-op.
+        let mut q: VecDeque<QueuedTurn> = [queued("a"), queued("b")].into();
+        restore_queued_position(&mut q, "gone", 1);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+    }
+
+    #[test]
+    fn restore_queued_position_clamps_out_of_range_index() {
+        // A stale original index past the current end clamps to the tail
+        // rather than panicking.
+        let mut q: VecDeque<QueuedTurn> = [queued("c"), queued("a")].into();
+        restore_queued_position(&mut q, "c", 9);
+        let ids: Vec<_> = q.iter().map(|t| t.queued_id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
     }
 }

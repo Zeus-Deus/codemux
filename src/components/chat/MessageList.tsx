@@ -80,6 +80,9 @@ interface Props {
   /** Follow-up queueing: cancel a queued user turn. `text` is passed
    *  back so the caller can restore it into the composer. */
   onCancelQueued?: (queuedId: string, text: string) => void;
+  /** Follow-up queueing: send a queued user turn now (steer) —
+   *  soft-interrupts the active turn and dispatches it immediately. */
+  onSendQueuedNow?: (queuedId: string) => void;
   /** Enter a subagent's read-only drill-in (design "Enter subagent").
    *  Wired by AgentChatPane's viewMode state; absent → the card's Enter
    *  affordance is inert. */
@@ -145,6 +148,7 @@ export function MessageList({
   onAcceptPlan,
   onRejectPlan,
   onCancelQueued,
+  onSendQueuedNow,
   onEnterSubagent,
   workspaceId,
 }: Props) {
@@ -269,6 +273,7 @@ export function MessageList({
                 onAcceptPlan={onAcceptPlan}
                 onRejectPlan={onRejectPlan}
                 onCancelQueued={onCancelQueued}
+                onSendQueuedNow={onSendQueuedNow}
                 onEnterSubagent={onEnterSubagent}
               />
             ))}
@@ -496,6 +501,7 @@ function ItemRow({
   onAcceptPlan,
   onRejectPlan,
   onCancelQueued,
+  onSendQueuedNow,
   onEnterSubagent,
   workspaceId,
 }: {
@@ -508,6 +514,7 @@ function ItemRow({
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
+  onSendQueuedNow?: (queuedId: string) => void;
   onEnterSubagent?: (subagentId: string) => void;
   workspaceId?: string | null;
 }) {
@@ -537,7 +544,13 @@ function ItemRow({
   }, [item, onRejectPlan]);
 
   if (item.kind === "user_message") {
-    return <UserMessage item={item} onCancelQueued={onCancelQueued} />;
+    return (
+      <UserMessage
+        item={item}
+        onCancelQueued={onCancelQueued}
+        onSendQueuedNow={onSendQueuedNow}
+      />
+    );
   }
 
   // The orchestration card is a full-width standalone surface (no avatar
@@ -707,6 +720,7 @@ function SlotRow({
   onAcceptPlan,
   onRejectPlan,
   onCancelQueued,
+  onSendQueuedNow,
   onEnterSubagent,
 }: {
   slot: TranscriptSlot;
@@ -718,6 +732,7 @@ function SlotRow({
   onAcceptPlan: (requestId: string) => void | Promise<void>;
   onRejectPlan: (requestId: string) => void | Promise<void>;
   onCancelQueued?: (queuedId: string, text: string) => void;
+  onSendQueuedNow?: (queuedId: string) => void;
   onEnterSubagent?: (subagentId: string) => void;
 }) {
   return (
@@ -753,6 +768,7 @@ function SlotRow({
           onAcceptPlan={onAcceptPlan}
           onRejectPlan={onRejectPlan}
           onCancelQueued={onCancelQueued}
+          onSendQueuedNow={onSendQueuedNow}
           onEnterSubagent={onEnterSubagent}
           workspaceId={workspaceId}
         />

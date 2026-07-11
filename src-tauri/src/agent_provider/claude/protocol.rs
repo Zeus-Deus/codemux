@@ -351,6 +351,14 @@ pub enum SidecarNotification {
         thread_id: String,
         reason: String,
     },
+    /// The sidecar ended the SDK query's active turn in response to an
+    /// explicit `interrupt` RPC. Unlike `session-ended {reason:
+    /// "interrupted"}` (a spontaneous abort that tears the session down),
+    /// this notification means the session survives — the next send-turn
+    /// transparently rebuilds a resumed query.
+    TurnInterrupted {
+        thread_id: String,
+    },
     SessionError {
         thread_id: String,
         error: SidecarError,
@@ -427,6 +435,9 @@ impl SidecarNotification {
             "session-ended" => Self::SessionEnded {
                 thread_id: field_string(&params, "threadId"),
                 reason: field_string(&params, "reason"),
+            },
+            "turn-interrupted" => Self::TurnInterrupted {
+                thread_id: field_string(&params, "threadId"),
             },
             "session-error" => Self::SessionError {
                 thread_id: field_string(&params, "threadId"),

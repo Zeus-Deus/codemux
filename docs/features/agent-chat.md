@@ -1063,7 +1063,7 @@ Two side-channel notifications are emitted in addition to the raw
 |---|---|
 | `start-session` | Spawn a new ClaudeSession. |
 | `send-turn` | Queue a user message onto the session. |
-| `interrupt` | Halt the current turn (`query.interrupt`). |
+| `interrupt` | Halt the current turn (`query.interrupt`), await the SDK query iterator's exit, and emit `turn-interrupted` instead of `session-ended` — the session survives with the same thread id and the next `send-turn` rebuilds a resumed query. Also auto-aborts any outstanding tool approval via `request-resolved` (deny). |
 | `set-model` | Swap the session's default model. |
 | `set-permission-mode` | Change the session's permission mode. |
 | `update-mcp-tools` | Push an updated MCP tool list into the live session (`query.setMcpServers`); lets servers that come up after `start-session` surface without a chat restart. Empty list removes the codemux MCP. Idempotent. |
@@ -1143,7 +1143,11 @@ surface tiny and lets the Rust side evolve independently. Two paths:
 
 - Sidecar-specific notifications (`session-configured`,
   `request-opened`, `plan-proposed`, `user-input-requested`,
-  `session-ended`, `session-error`) map directly to trait events.
+  `session-ended`, `session-error`, `turn-interrupted`) map directly to
+  trait events. `turn-interrupted` (emitted only by the explicit interrupt
+  RPC) maps to `TurnCompleted(interrupted)` + `SessionStateChanged(Ready)`,
+  keeping the session alive; a spontaneous `session-ended
+  {reason:"interrupted"}` still maps to `Closed`.
 - SDK messages are structurally classified by `type` (and `subtype`
   for `system:*`). 15+ known shapes; unknown variants always surface
   as `RuntimeWarning` with the raw payload preserved. The
@@ -1511,7 +1515,7 @@ surfacing a `feature_disabled` string.
 | `dev_agent_chat_spawn_test_pane` | Debug-only. Spawns a chat pane in the active workspace for manual QA from the browser devtools. |
 | `agent_chat_start_session` | Start a provider session, writing the returned thread id back onto the pane. |
 | `agent_chat_send_turn` | Queue a user turn on a thread. Auto-resumes a dead session (rebuilt from its persisted row) before the turn, so a pane reopened after an app restart never sees `session_not_found`. |
-| `agent_chat_interrupt_turn` | Halt the currently-running turn. A `SessionNotFound` (nothing to interrupt on a dead session) is swallowed into `Ok`; does NOT auto-resume. |
+| `agent_chat_interrupt_turn` | Halt the currently-running turn. On a live session the turn ends as `TurnCompleted(interrupted)` and the session stays `Ready` (the sidecar keeps the thread alive and the next `send_turn` rebuilds a resumed query). A `SessionNotFound` (nothing to interrupt on an already-dead session) is swallowed into `Ok`; unlike `send_turn` it does NOT auto-resume a dead session just to interrupt it. |
 | `agent_chat_respond_to_request` | Resolve a pending approval / input request. Auto-resumes a dead session first (same choke point as `send_turn`). |
 | `agent_chat_set_model` | Swap a thread's model. Persist-always, apply-if-live: writes the model to the session row unconditionally, then applies to the live session if one exists; a `SessionNotFound` from the apply is swallowed into `Ok` (the value takes effect on the next auto-resume). |
 | `agent_chat_set_permission_mode` | Swap a thread's permission mode. Same persist-always, apply-if-live contract as `agent_chat_set_model`. |
@@ -1693,15 +1697,21 @@ queued (its `turn_id` is then an empty placeholder). OpenCode has no busy
 guard and no queue; `cancel_queued_turn` is a trait-default no-op there.
 
 **Draining.** On the turn-completion transition (Claude: the SDK `result`
-message → Ready; Codex: `turn/completed` → Ready), and after
-interrupt/abort, the session pops the next queued turn (FIFO) and
+message → Ready; Codex: `turn/completed` → Ready), and after an explicit
+interrupt (Claude: `turn-interrupted` → Ready; Codex: the `turn/completed`
+an interrupt produces), the session pops the next queued turn (FIFO) and
 dispatches it through the same internal send path
 (`drain_queue`). Dispatch happens **after** the completion handler
 releases the session lock, so `do_send` can re-acquire it without
 deadlocking. Draining only fires when the session is truly idle (Ready,
-no active turn, no pending approval). On session error/close the whole
-queue is cancelled (`cancel_all_queued`). A failed dispatch cancels that
-item and continues — the queue never wedges.
+no active turn, no pending approval) — an interrupt clears the active turn
+and auto-aborts any pending approval, so both preconditions hold. On
+session error/close the whole queue is cancelled (`cancel_all_queued`); an
+**explicit interrupt no longer counts as a close**, so the queue is
+preserved and drained rather than cancelled. A spontaneous abort that ends
+the session (Claude `session-ended {reason:"interrupted"}` not driven by
+the interrupt RPC) still translates to a close and cancels the queue. A
+failed dispatch cancels that item and continues — the queue never wedges.
 
 **Events** (`ProviderRuntimeEvent`, forwarded through `forward_event`):
 
@@ -1721,6 +1731,80 @@ item and continues — the queue never wedges.
 **Command.** `agent_chat_cancel_queued_turn(provider, thread_id,
 queued_id)` cancels a queued turn (idempotent). Wrapper:
 `agentChatCancelQueuedTurn` in `src/tauri/commands.ts`.
+
+### Send now (steer)
+
+The greyed queued bubble also exposes a hover-reveal **"Send now"** action
+(a `CornerDownLeft` icon in the same pill row as Cancel) that dispatches
+the queued message *immediately* instead of waiting for the active turn to
+finish. This mirrors Claude Code's interrupt-and-resubmit steering path.
+
+The command `agent_chat_send_queued_turn_now(provider, thread_id,
+queued_id)` (wrapper `agentChatSendQueuedTurnNow`) routes through the trait
+method `send_queued_turn_now` (default no-op for OpenCode) to the session's
+`send_queued_now`. That method, under the state lock:
+
+1. **Promote to front.** Locate `queued_id` in `queued_turns` and move it
+   to the front (`promote_queued_to_front`) so it is the next item the
+   drain dispatches. An unknown / already-dispatched / already-cancelled id
+   is a silent no-op `Ok(())` — the same idempotency philosophy as
+   `cancel_queued`, covering the race where the item dispatched between the
+   UI click and this call.
+2. **Interrupt + drain.** If a turn is active it calls the existing
+   interrupt path. The active turn ends, but the session, the full
+   transcript, and all on-disk work survive — **nothing** is discarded.
+   - *Claude:* `interrupt(None)` drives the sidecar's explicit interrupt
+     RPC, which awaits the SDK query iterator's exit and emits a
+     `turn-interrupted` notification (suppressing the old
+     `session-ended {reason:"interrupted"}` the SDK query would otherwise
+     have thrown). Rust translates that to
+     `TurnCompleted { status: Error { subtype: "interrupted" } }` plus
+     `SessionStateChanged(Ready)` — the interrupted turn closes out, but the
+     sidecar session object survives with the same thread id (**Ready**, not
+     **Closed**). The **next** `send-turn` transparently rebuilds a resumed
+     SDK query (fresh prompt queue, `resume` set to the last observed
+     sdk-session-id, which is re-observed and re-emitted so the host's resume
+     cursor stays current), so the promoted item dispatches onto that rebuilt
+     query. Rust ends `interrupt()` with `drain_queue()` and the
+     notifications task also drains when the `turn-interrupted` → `Ready`
+     transition lands; a `dispatching` guard lets those two drains race
+     without double-dispatch.
+   - *Codex:* `interrupt_turn(None)` does not drain inline — the abort lands
+     as a `turn/completed` notification that returns the session to `Ready`
+     and the event loop drains there. If `interrupt_turn` returns the "no
+     active turn" `ValidationError` (turn finished during the click→call
+     race) it falls back to `drain_queue()` directly.
+   - If the session is already idle (the turn finished before the call) it
+     just `drain_queue()`s.
+   - If the interrupt RPC itself fails, `send_queued_now` restores the
+     promoted item to its original queue position rather than leaving the
+     queue silently reordered (both the Claude and Codex paths do this).
+
+The promoted message then dispatches through the identical
+`QueuedTurnDispatched` path as a normal drain, so the reducer promotes the
+greyed bubble and `forward_event` writes the deferred user-message envelope
+(with any `pending_queued_images`) exactly as before — no persistence
+changes were needed.
+
+**Pending-approval behaviour.** `drain_queue` refuses to dispatch while
+`pending_approvals` is non-empty, so an outstanding tool approval would
+otherwise wedge a promoted send-now message behind a tool call that the
+interrupt already killed. To avoid that, an interrupt now **auto-aborts**
+any outstanding approval: the sidecar emits `request-resolved` (deny, with
+message `"Tool request was aborted."`) for the dead tool call, and the Rust
+side clears its `pending_approvals` entry on that notification. Because the
+notifications task drains the queue after **every** notification, resolving
+the approval immediately triggers dispatch — so the promoted message drains
+right away instead of waiting for the user to resolve an approval whose tool
+call no longer exists. (The approval card resolves as denied/aborted in the
+UI.)
+
+**Frontend.** `handleSendQueuedNow` in `AgentChatPane` calls the command
+with no optimistic state change — the `queued_turn_dispatched` event
+promotes the bubble and the interrupt's `ready`/`running` state events
+settle the composer. Errors surface via a toast, like `handleCancelQueued`.
+The `onSendQueuedNow` prop threads through
+`ChatTranscript → MessageList → ItemRow → UserMessage`.
 
 **Frontend.** `UserMessageItem` gained `queued?: { queuedId }` (greyed
 render + "Queued" pill + hover-X) and `clientNonce?` (reconciliation +
@@ -1742,8 +1826,11 @@ follow-up.
 
 **Out of scope (TODO):**
 
-- **Steering / inject-into-live-turn** (Cmd+Enter "send now" that injects
-  into the running turn rather than queuing behind it).
+- **True inject-into-live-turn steering** (feeding the message into the
+  *running* turn via the SDK's `streamInput` without interrupting).
+  Remains out of scope pending SDK support. The interrupt-based **"Send
+  now"** above (interrupt + promote-to-front + drain) is **done** and
+  covers the steering use-case for now.
 - **Editing a queued message in place** (cancel-restores-to-composer
   covers the common case).
 - **Persisting the queue across app restart.**

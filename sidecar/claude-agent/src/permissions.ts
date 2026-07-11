@@ -161,7 +161,18 @@ export function makeCanUseTool(
       decision = await decisionPromise;
     } catch {
       // Signal aborted before user responded — the SDK treats this as
-      // a deny. Abort handler already removed the pending entry.
+      // a deny. Abort handler already removed the local pending entry;
+      // mirror a `request-resolved` back so the host clears its own
+      // pending-approvals map too. Without it the host keeps a stale
+      // entry after an interrupt and its dispatch queue wedges forever.
+      emit.notification("request-resolved", {
+        threadId,
+        requestId,
+        decision: {
+          behavior: "deny",
+          message: "Tool request was aborted.",
+        },
+      });
       return {
         behavior: "deny",
         message: "Tool request was aborted.",

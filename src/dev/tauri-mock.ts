@@ -722,6 +722,10 @@ interface MockQueuedTurn {
   clientNonce: string | null;
 }
 const chatQueues = new Map<string, MockQueuedTurn[]>();
+// The active streaming turn's interval id per thread, so a soft interrupt
+// (stop button / "Send now" steer) can end the turn early — mirroring the
+// real backend's `interrupt`, which preserves the session and transcript.
+const chatTurnTimers = new Map<string, number>();
 
 /** Pop the next queued follow-up (if any) and dispatch it, mirroring the
  *  provider's drain-on-completion. */
@@ -737,6 +741,27 @@ function drainChatQueue(threadId: string): void {
     turn_id: turnId,
     text: next.text,
   });
+}
+
+/** Soft-interrupt the active streaming turn, mirroring the real Claude
+ *  `interrupt`: stop the stream and flip the session back to `ready`
+ *  WITHOUT discarding anything already emitted. Returns `true` when a turn
+ *  was actually running. Does NOT drain — the caller decides what to
+ *  dispatch next. */
+function interruptMockChatTurn(threadId: string): boolean {
+  if (!chatActiveTurns.has(threadId)) return false;
+  const timer = chatTurnTimers.get(threadId);
+  if (timer !== undefined) {
+    window.clearInterval(timer);
+    chatTurnTimers.delete(threadId);
+  }
+  chatActiveTurns.delete(threadId);
+  emitChatEvent(threadId, {
+    type: "session_state_changed",
+    thread_id: threadId,
+    status: { status: "ready" },
+  });
+  return true;
 }
 
 /** Simulate a streaming assistant reply on the real event channel.
@@ -935,9 +960,11 @@ function streamMockChatReply(
       });
       // Turn done — drain the next queued follow-up (FIFO).
       chatActiveTurns.delete(threadId);
+      chatTurnTimers.delete(threadId);
       drainChatQueue(threadId);
     }
   }, intervalMs);
+  chatTurnTimers.set(threadId, timer);
   return turnId;
 }
 
@@ -1512,6 +1539,28 @@ const handlers: Record<string, Handler> = {
         });
       }
     }
+    return undefined;
+  },
+  agent_chat_send_queued_turn_now: (a) => {
+    const { threadId, queuedId } = a as {
+      threadId: string;
+      queuedId: string;
+    };
+    const q = chatQueues.get(threadId);
+    const idx = q ? q.findIndex((e) => e.queuedId === queuedId) : -1;
+    // Unknown / already-dispatched id — idempotent no-op, matching the
+    // real backend.
+    if (!q || idx < 0) return undefined;
+    // Promote the item to the front of the queue so the drain dispatches
+    // it next (mirrors `promote_queued_to_front`).
+    if (idx > 0) {
+      const [item] = q.splice(idx, 1);
+      q.unshift(item);
+    }
+    // Soft-interrupt the active turn (if any); either way, drain the
+    // now-front item out immediately.
+    interruptMockChatTurn(threadId);
+    drainChatQueue(threadId);
     return undefined;
   },
   agent_chat_interrupt_turn: () => undefined,

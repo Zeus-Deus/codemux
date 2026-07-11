@@ -275,6 +275,21 @@ impl AgentProvider for CodexAgentProvider {
         session.cancel_queued(&queued_id).await
     }
 
+    async fn send_queued_turn_now(
+        &self,
+        thread_id: ThreadId,
+        queued_id: String,
+    ) -> Result<(), ProviderError> {
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&thread_id).cloned()
+        };
+        let Some(session) = session else {
+            return Ok(());
+        };
+        session.send_queued_now(&queued_id).await
+    }
+
     async fn respond_to_request(
         &self,
         thread_id: ThreadId,

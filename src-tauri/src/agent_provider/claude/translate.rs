@@ -286,6 +286,28 @@ pub fn translate_notification_with(
                 },
             ]
         }
+        SidecarNotification::TurnInterrupted { .. } => {
+            // An explicit interrupt RPC ended the active turn but the
+            // session survives (the sidecar rebuilds a resumed query on
+            // the next send-turn). Mirror the `session-ended` shape —
+            // a `TurnCompleted(Error)` closes out the interrupted turn —
+            // but keep the session `Ready`, NOT `Closed`.
+            vec![
+                ProviderRuntimeEvent::TurnCompleted {
+                    thread_id: thread_id.clone(),
+                    turn_id: TurnId(String::new()),
+                    status: TurnStatus::Error {
+                        subtype: "interrupted".into(),
+                        message: "turn interrupted".into(),
+                    },
+                    usage: None,
+                },
+                ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: thread_id.clone(),
+                    status: SessionStatus::Ready,
+                },
+            ]
+        }
         SidecarNotification::SessionError {
             thread_id: _,
             error: SidecarError { message, .. },
@@ -1984,6 +2006,35 @@ mod tests {
             &events[1],
             ProviderRuntimeEvent::SessionStateChanged {
                 status: SessionStatus::Closed,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn notification_turn_interrupted_emits_error_and_ready() {
+        // An explicit interrupt RPC keeps the session alive: the turn
+        // closes out as an interrupted error but the session returns to
+        // Ready (NOT Closed like a spontaneous `session-ended`).
+        let n = SidecarNotification::TurnInterrupted {
+            thread_id: "t".into(),
+        };
+        let events = translate_notification(&tid(), n);
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ProviderRuntimeEvent::TurnCompleted { status, .. } => match status {
+                TurnStatus::Error { subtype, message } => {
+                    assert_eq!(subtype, "interrupted");
+                    assert_eq!(message, "turn interrupted");
+                }
+                _ => panic!("expected Error"),
+            },
+            _ => panic!("expected TurnCompleted"),
+        }
+        assert!(matches!(
+            &events[1],
+            ProviderRuntimeEvent::SessionStateChanged {
+                status: SessionStatus::Ready,
                 ..
             }
         ));

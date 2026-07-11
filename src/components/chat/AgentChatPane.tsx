@@ -57,6 +57,7 @@ import {
 import {
   activateWorkspace,
   agentChatCancelQueuedTurn,
+  agentChatSendQueuedTurnNow,
   agentChatGetSession,
   agentChatInterruptTurn,
   agentChatListMessages,
@@ -1659,15 +1660,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   }, [isSending, streaming, activeTurnId]);
 
   // Interrupt mechanic: the SDK's `query.interrupt()` causes its
-  // async iterator to exit. The session is functionally dead after
-  // that (ClaudeAdapter.ts:2363 calls `stopSessionInternal`
-  // unconditionally). The reference impl's next `sendTurn` creates
-  // a brand-new SDK query transparently via
-  // `ensureSessionForThread`. Our Rust adapter has no equivalent
-  // auto-recreate, so we do it proactively:
-  // interrupt for the immediate turn abort, then stop + start the
-  // session so subsequent turns land on a live SDK query. Transcript
-  // and picker state persist via `migrateThreadId`.
+  // async iterator to exit, so the underlying SDK query is dead after
+  // an interrupt. The sidecar now recovers from that transparently —
+  // like the reference multi-provider client, its next `send-turn`
+  // rebuilds a resumed SDK query for the (surviving) session, so a bare
+  // interrupt already lets subsequent turns land on a live query.
+  // The Stop button still performs a deliberate hard reset: interrupt
+  // for the immediate turn abort, then stop + start the session (fresh
+  // thread id, resume cursor) so subsequent turns land on a known-good
+  // SDK query and any wedged sidecar state is cleared. Transcript and
+  // picker state persist via `migrateThreadId`.
   const handleStop = useCallback(() => {
     if (!threadId) return;
     if (restarting) return;
@@ -1761,6 +1763,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       })();
     },
     [threadId, provider, setInputDraft],
+  );
+
+  // Follow-up queueing: send a queued turn NOW (steer). The backend
+  // promotes it to the front of the queue and soft-interrupts the active
+  // turn — the session, transcript, and on-disk work are all preserved —
+  // then dispatches it as a normal follow-up. No optimistic state change:
+  // the `queued_turn_dispatched` event promotes the greyed bubble and the
+  // interrupt's `ready`/`running` state events settle the composer.
+  const handleSendQueuedNow = useCallback(
+    (queuedId: string) => {
+      if (!threadId) return;
+      agentChatSendQueuedTurnNow(provider, threadId, queuedId).catch((err) => {
+        toast.error(`Failed to send queued message: ${err}`);
+      });
+    },
+    [threadId, provider],
   );
 
   const handleRespond = useCallback(
@@ -2715,6 +2733,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               onAcceptPlan={handleAcceptPlan}
               onRejectPlan={handleRejectPlan}
               onCancelQueued={handleCancelQueued}
+              onSendQueuedNow={handleSendQueuedNow}
               onEnterSubagent={handleEnterSubagent}
               workspaceId={workspaceIdForPane}
             />

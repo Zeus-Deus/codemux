@@ -70,6 +70,23 @@ pub trait AgentProvider: Send + Sync {
         Ok(())
     }
 
+    /// **Send now (steer):** promote a queued follow-up to the front of
+    /// the queue and dispatch it immediately, soft-interrupting the active
+    /// turn if one is running. The interrupt preserves the session,
+    /// transcript, and on-disk work — nothing is discarded — and the
+    /// promoted message then runs as a normal follow-up turn so the agent
+    /// re-plans with the steer. Idempotent — an unknown or
+    /// already-dispatched id is a silent success. The default
+    /// implementation is a no-op for providers without a follow-up queue
+    /// (e.g. OpenCode).
+    async fn send_queued_turn_now(
+        &self,
+        _thread_id: ThreadId,
+        _queued_id: String,
+    ) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     /// Respond to a pending approval request with the user's decision.
     async fn respond_to_request(
         &self,
