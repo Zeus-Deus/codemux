@@ -540,6 +540,71 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_active_false_for_unknown_thread() {
+    // The frontend hydrate path treats an unbound thread as "not in flight".
+    let provider = provider_with_fixture();
+    assert!(
+        !provider.turn_active(&ThreadId("t-unknown".into())).await,
+        "no session bound => turn_active must be false"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_active_true_in_flight_then_false_after_settle() {
+    // `turn/started` arms `active_turn`; `turn/completed` clears it. The
+    // frontend hydrate path reads turn_active to tell "run still in flight"
+    // apart from "run died mid-turn".
+    let script = write_script(json!([
+        {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
+         "params":{"threadId":"c-1","turnId":"t-ta-1"}},
+        {"after":"turn/start","delay_ms":250,"emit":"notification","method":"turn/completed",
+         "params":{"threadId":"c-1","turnId":"t-ta-1","status":"succeeded"}}
+    ]));
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-ta")).await.unwrap();
+    assert!(
+        !provider.turn_active(&ThreadId("t-ta".into())).await,
+        "no turn yet => false"
+    );
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-ta".into()),
+            text: "hi".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+    // `active_turn` is armed asynchronously by the scripted turn/started.
+    let armed = timeout(Duration::from_secs(3), async {
+        loop {
+            if provider.turn_active(&ThreadId("t-ta".into())).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(armed.is_ok(), "turn/started must arm turn_active");
+    // turn/completed settles the turn ~250ms later.
+    let settled = timeout(Duration::from_secs(3), async {
+        loop {
+            if !provider.turn_active(&ThreadId("t-ta".into())).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "turn_active must return to false after settle");
+    provider.stop_session(ThreadId("t-ta".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_permission_mode_returns_validation_error() {
     let provider = provider_with_fixture();
     start_session_resilient(&provider, start_input("t-perm")).await.unwrap();

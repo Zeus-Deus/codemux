@@ -1373,6 +1373,119 @@ async fn dead_sidecar_is_evicted_and_start_session_rebuilds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_active_false_for_unknown_thread() {
+    // The frontend hydrate path treats an unbound thread as "not in flight".
+    let provider = provider_with_fake().await;
+    assert!(
+        !provider.turn_active(&ThreadId("t-unknown".into())).await,
+        "no session bound => turn_active must be false"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_active_true_in_flight_then_false_after_settle() {
+    // A `result` at the turn boundary clears `active_turn` while the
+    // streaming-queue session stays alive, so turn_active flips true->false
+    // without the session disappearing.
+    let script = write_script(json!([
+        {
+            "after": "send-turn", "delay_ms": 300, "emit": "notification",
+            "method": "sdk-message",
+            "params": {
+                "threadId": "t-ta",
+                "message": {
+                    "type": "result", "subtype": "success",
+                    "turn_id": "sdk-turn-1", "duration_ms": 10, "num_turns": 1
+                }
+            }
+        }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    provider.start_session(start_input("t-ta")).await.unwrap();
+    assert!(
+        !provider.turn_active(&ThreadId("t-ta".into())).await,
+        "no turn yet => false"
+    );
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-ta".into()),
+            text: "hi".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+    // `active_turn` is armed synchronously before send_turn returns.
+    assert!(
+        provider.turn_active(&ThreadId("t-ta".into())).await,
+        "turn in flight => true"
+    );
+    // The scripted result settles the turn ~300ms later.
+    let settled = timeout(Duration::from_secs(3), async {
+        loop {
+            if !provider.turn_active(&ThreadId("t-ta".into())).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "turn_active must return to false after settle");
+    assert!(
+        provider.has_session(&ThreadId("t-ta".into())).await,
+        "session stays live across the turn boundary"
+    );
+    provider.stop_session(ThreadId("t-ta".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turn_active_false_when_session_dead() {
+    // Mid-turn child death: the watchdog flips `dead`, and turn_active's
+    // is_dead() short-circuit reports false for the corpse even though a turn
+    // was in flight when the child exited — so hydrate treats a died-mid-turn
+    // run as "not in flight" (it gets the interrupted marker via other means).
+    let wrapper = wrapper_with_env(&[("FAKE_CLAUDE_SIDECAR_EXIT_AFTER", "send-turn")]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let thread = ThreadId("t-ta-dead".into());
+    provider.start_session(start_input("t-ta-dead")).await.unwrap();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: thread.clone(),
+            text: "x".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .expect("send_turn must succeed: the response is written before the exit");
+    // Wait for the watchdog (100ms poll) to observe the dead child.
+    let went_absent = timeout(Duration::from_secs(4), async {
+        loop {
+            if !provider.has_session(&thread).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(went_absent.is_ok(), "watchdog must mark the session dead");
+    assert!(
+        !provider.turn_active(&thread).await,
+        "a dead session must report turn_active false"
+    );
+    provider.stop_session(thread).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_ended_with_iteration_complete_emits_turn_completed_success() {
     let script = write_script(json!([
         {

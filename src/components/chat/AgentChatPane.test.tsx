@@ -293,6 +293,10 @@ vi.mock("@/tauri/commands", () => ({
   // with a truthy threadId — return an empty transcript so the effect
   // short-circuits without exercising the resume path in unit tests.
   agentChatListMessages: vi.fn().mockResolvedValue([]),
+  // Liveness probe fired right after `agentChatListMessages` on the
+  // hydrate path. Default to `false` (no live turn) so hydrate keeps its
+  // resume-path behavior unless a test opts into the live-run case.
+  agentChatTurnActive: vi.fn().mockResolvedValue(false),
   // The D2 session-start marker effect looks the active thread up in the
   // persisted sessions list; default to empty so it clears to the plain
   // divider unless a test seeds a record.
@@ -491,6 +495,7 @@ import { AgentChatPane } from "./AgentChatPane";
 import {
   agentChatGetSession,
   agentChatListMessages,
+  agentChatTurnActive,
   agentChatListSessions,
   agentChatSendTurn,
   agentChatSetPermissionMode,
@@ -676,6 +681,8 @@ describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
     workspaceIdForPaneOverride = "ws-home";
     vi.mocked(agentChatListMessages).mockReset();
     vi.mocked(agentChatListMessages).mockResolvedValue([]);
+    vi.mocked(agentChatTurnActive).mockReset();
+    vi.mocked(agentChatTurnActive).mockResolvedValue(false);
     hydrateThreadMock.mockClear();
   });
 
@@ -713,10 +720,76 @@ describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
     ]);
     render(<AgentChatPane pane={pane} />);
     await waitFor(() => {
-      expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", [
-        userPayload,
-        assistantPayload,
-      ]);
+      expect(hydrateThreadMock).toHaveBeenCalledWith(
+        "thread-x",
+        [userPayload, assistantPayload],
+        { runLive: false },
+      );
+    });
+  });
+
+  it("hydrates with runLive:true — and no interrupted state — when the backend reports the turn is still active", async () => {
+    // The workspace-switch false-positive: a healthy live run whose
+    // pane remounted. The persisted tail has no terminal event after the
+    // last user turn, but the backend confirms the turn is in flight, so
+    // hydrate must pass runLive so the streaming marker shows instead of
+    // the Run-interrupted divider.
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    const userPayload = JSON.stringify({
+      type: "user_message",
+      thread_id: "thread-x",
+      text: "hello",
+    });
+    const assistantPayload = JSON.stringify({
+      type: "item_completed",
+      thread_id: "thread-x",
+      turn_id: "turn-1",
+      item: { kind: "assistant_text", text: "hi back" },
+    });
+    vi.mocked(agentChatListMessages).mockResolvedValue([
+      userPayload,
+      assistantPayload,
+    ]);
+    vi.mocked(agentChatTurnActive).mockResolvedValue(true);
+    render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(hydrateThreadMock).toHaveBeenCalledWith(
+        "thread-x",
+        [userPayload, assistantPayload],
+        { runLive: true },
+      );
+    });
+  });
+
+  it("falls back to interrupted (runLive:false) when the liveness probe rejects", async () => {
+    // A backend without the command, or a transient failure, must degrade
+    // to today's heuristic behavior rather than blocking hydrate.
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    const userPayload = JSON.stringify({
+      type: "user_message",
+      thread_id: "thread-x",
+      text: "hello",
+    });
+    const assistantPayload = JSON.stringify({
+      type: "item_completed",
+      thread_id: "thread-x",
+      turn_id: "turn-1",
+      item: { kind: "assistant_text", text: "hi back" },
+    });
+    vi.mocked(agentChatListMessages).mockResolvedValue([
+      userPayload,
+      assistantPayload,
+    ]);
+    vi.mocked(agentChatTurnActive).mockRejectedValue(
+      new Error("command unavailable"),
+    );
+    render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(hydrateThreadMock).toHaveBeenCalledWith(
+        "thread-x",
+        [userPayload, assistantPayload],
+        { runLive: false },
+      );
     });
   });
 

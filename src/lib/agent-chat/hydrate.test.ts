@@ -604,3 +604,58 @@ describe("replayPayloads interrupted/stalled (issue #154)", () => {
     expect(state.stalled).toBeNull();
   });
 });
+
+describe("replayPayloads runLive (workspace-switch remount of a live run)", () => {
+  it("suppresses interrupted and streams for an unsettled tail when runLive is true", () => {
+    const payloads = [
+      user("first"),
+      event({
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: { kind: "success" },
+        usage: null,
+      }),
+      // Unsettled tail — a live run whose terminal event isn't persisted
+      // yet. Without runLive this would flag interrupted.
+      user("second — still in flight"),
+    ];
+    expect(replayPayloads(payloads).interrupted).toBe(true);
+    const live = replayPayloads(payloads, { runLive: true });
+    expect(live.interrupted).toBe(false);
+    expect(live.streaming).toBe(true);
+  });
+
+  it("keeps current behavior when runLive is false or the opts are absent", () => {
+    const payloads = [user("only — never finished")];
+    const absent = replayPayloads(payloads);
+    const explicit = replayPayloads(payloads, { runLive: false });
+    for (const state of [absent, explicit]) {
+      expect(state.interrupted).toBe(true);
+      expect(state.streaming).toBe(false);
+    }
+  });
+
+  it("overrides a replay-observed child_exited when runLive is true", () => {
+    const payloads = [
+      user("go"),
+      event({
+        type: "turn_completed",
+        thread_id: "t",
+        turn_id: "turn-1",
+        status: {
+          kind: "error",
+          subtype: "child_exited",
+          message: "sidecar exited unexpectedly",
+        },
+        usage: null,
+      }),
+    ];
+    // Default: the child_exited terminal turn flags interrupted.
+    expect(replayPayloads(payloads).interrupted).toBe(true);
+    // runLive means the run recovered / is alive — suppress it.
+    const live = replayPayloads(payloads, { runLive: true });
+    expect(live.interrupted).toBe(false);
+    expect(live.streaming).toBe(true);
+  });
+});

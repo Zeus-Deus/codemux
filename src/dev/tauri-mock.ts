@@ -1564,6 +1564,14 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   agent_chat_interrupt_turn: () => undefined,
+  // Liveness probe used by the remount-hydrate path to tell a live run
+  // (whose terminal event simply hasn't persisted yet) apart from a
+  // genuinely-interrupted one. The mock tracks in-flight turns in
+  // `chatActiveTurns`, so mirror that directly.
+  agent_chat_turn_active: (a) => {
+    const { threadId } = a as { threadId: string };
+    return chatActiveTurns.has(threadId);
+  },
   agent_chat_respond_to_request: () => undefined,
   agent_chat_set_model: () => undefined,
   agent_chat_set_permission_mode: () => undefined,

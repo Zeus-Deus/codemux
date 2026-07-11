@@ -215,8 +215,17 @@ interface AgentChatStore {
    *  conversation before a fresh provider session boots. UI-only
    *  fields (model, permissionMode, mode, …) on the slice are
    *  preserved so resume keeps the user's current picker choices.
-   *  Calling on an unknown thread creates the slice. */
-  hydrateThread: (threadId: string, payloads: string[]) => void;
+   *  Calling on an unknown thread creates the slice.
+   *
+   *  `opts.runLive` is forwarded to `replayPayloads`: when the caller
+   *  has confirmed the thread's turn is in flight (remount of a live
+   *  run) it suppresses the Run-interrupted heuristic and marks the
+   *  slice streaming. Omit for the plain resume path. */
+  hydrateThread: (
+    threadId: string,
+    payloads: string[],
+    opts?: { runLive?: boolean },
+  ) => void;
   /** Clear a thread entirely (e.g. on session stop). */
   resetThread: (threadId: string) => void;
   /** Seed / update the thread's resume cursor. Normally set by the
@@ -423,9 +432,9 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       return { threads: nextThreads };
     }),
 
-  hydrateThread: (threadId, payloads) =>
+  hydrateThread: (threadId, payloads, opts) =>
     set((state) => {
-      const replayed = replayPayloads(payloads);
+      const replayed = replayPayloads(payloads, opts);
       const existing = state.threads[threadId] ?? emptySlice();
       // Spread `replayed` last so its `messages`, `nextSeq`,
       // `streaming`, `pendingRequestIds` overwrite the empty slice's

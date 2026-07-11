@@ -228,6 +228,13 @@ impl OpenCodeSession {
         self.dead.load(Ordering::Relaxed)
     }
 
+    /// Whether a turn is currently in flight on this session. Reads the
+    /// SSE routing context's `turn_active` flag (armed on send, cleared when
+    /// the turn settles). Cheap in-memory check — does not touch the server.
+    pub async fn turn_active(&self) -> bool {
+        self.event_ctx.lock().await.turn_active
+    }
+
     /// Send a user turn. Mints a new Codemux turn id, threads it into
     /// the SSE routing context, then `POST`s `prompt_async`.
     pub async fn send_turn(

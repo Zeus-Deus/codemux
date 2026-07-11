@@ -1364,6 +1364,28 @@ pub async fn agent_chat_interrupt_turn(
     }
 }
 
+/// Whether a live turn is currently in flight on a thread.
+///
+/// Cheap in-memory probe used by the frontend hydrate-on-remount path to
+/// tell "run still in flight" apart from "run died mid-turn": a healthy
+/// mid-flight run must not be labeled "Run interrupted" after a workspace
+/// switch remount. Deliberately does NOT auto-resume — this is a read-only
+/// check against the provider's live session registry, and a thread with no
+/// live session (e.g. after a restart) is correctly `false`. The frontend
+/// treats any error as `false`, so gating/lookup failures degrade safely.
+#[tauri::command]
+pub async fn agent_chat_turn_active(
+    app: AppHandle,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+) -> Result<bool, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let registry: State<'_, ProviderRegistry> = app.state();
+    let impl_ = lookup_provider(&registry, provider).await?;
+    Ok(impl_.turn_active(&thread_id).await)
+}
+
 /// Respond to a pending approval / tool / input request.
 #[tauri::command]
 pub async fn agent_chat_respond_to_request(

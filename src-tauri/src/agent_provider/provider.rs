@@ -125,6 +125,19 @@ pub trait AgentProvider: Send + Sync {
     /// operation can proceed.
     async fn has_session(&self, thread_id: &ThreadId) -> bool;
 
+    /// Whether a live turn is currently in flight on `thread_id`.
+    ///
+    /// Cheap in-memory check: true iff a live (non-dead) session is bound to
+    /// the thread AND its `active_turn` is set (i.e. a turn is Running or
+    /// WaitingApproval). Must not touch the subprocess. The frontend hydrate
+    /// path uses this to distinguish "run still in flight" from "run died
+    /// mid-turn", so a healthy run is not falsely labeled "Run interrupted"
+    /// after a workspace switch remount. Defaults to `false` so providers
+    /// without support are safe.
+    async fn turn_active(&self, _thread_id: &ThreadId) -> bool {
+        false
+    }
+
     /// Subscribe to the canonical runtime event stream.
     ///
     /// Each call typically returns a fresh subscription; implementations are

@@ -1276,6 +1276,23 @@ export const agentChatInterruptTurn = (
     turnId,
   });
 
+/** True iff the thread has a live (non-dead) session whose turn is
+ *  currently in flight. Used by the remount-hydrate path to tell a
+ *  genuinely-finished run apart from a still-running one whose terminal
+ *  event simply hasn't been persisted yet (a workspace-switch unmount
+ *  drops the live event listener while the backend keeps streaming).
+ *  Callers must treat any invoke error as `false` so a backend that
+ *  lacks the command, or a transient failure, falls back to today's
+ *  heuristic behavior. */
+export const agentChatTurnActive = (
+  provider: AgentChatProviderKind,
+  threadId: string,
+) =>
+  invoke<boolean>("agent_chat_turn_active", {
+    provider,
+    threadId,
+  });
+
 /** Cancel a queued (not-yet-dispatched) follow-up turn. On success the
  *  provider emits a `queued_turn_cancelled` event so the UI removes the
  *  greyed bubble. */

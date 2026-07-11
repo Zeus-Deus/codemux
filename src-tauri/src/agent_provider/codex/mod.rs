@@ -353,6 +353,25 @@ impl AgentProvider for CodexAgentProvider {
             .is_some_and(|session| !session.is_dead())
     }
 
+    async fn turn_active(&self, thread_id: &ThreadId) -> bool {
+        // Cheap in-memory check for the frontend hydrate path: a live
+        // (non-dead) session bound to the thread with `active_turn` set. Does
+        // not touch the `codex app-server`. A dead session (watchdog fired)
+        // reports false even if a turn was mid-flight when the child exited.
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(thread_id).cloned()
+        };
+        let Some(session) = session else {
+            return false;
+        };
+        if session.is_dead() {
+            return false;
+        }
+        let state = session.state.lock().await;
+        state.active_turn.is_some()
+    }
+
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {
         let sessions = self.collect_sessions().await;
         let mut out = Vec::with_capacity(sessions.len());
