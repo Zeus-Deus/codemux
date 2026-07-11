@@ -220,7 +220,13 @@ export function relativeTime(
   now: number = Date.now(),
 ): string {
   if (!iso) return "never";
-  const t = Date.parse(iso);
+  // SQLite's datetime('now') yields UTC as "YYYY-MM-DD HH:MM:SS" with no
+  // timezone designator; Date.parse would read that as *local* time and
+  // skew the result by the machine's UTC offset. Normalize to ISO-8601 UTC.
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(iso)
+    ? `${iso.replace(" ", "T")}Z`
+    : iso;
+  const t = Date.parse(normalized);
   if (Number.isNaN(t)) return "unknown";
   const diff = now - t;
   if (diff < 0) return "just now";

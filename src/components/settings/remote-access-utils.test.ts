@@ -223,6 +223,15 @@ describe("time helpers", () => {
     expect(relativeTime("2026-07-04T10:00:00Z", now)).toBe("2h ago");
     expect(relativeTime("2026-07-01T12:00:00Z", now)).toBe("3d ago");
   });
+
+  it("treats SQLite datetime('now') strings (no timezone designator) as UTC", () => {
+    const now = Date.parse("2026-07-04T12:00:00Z");
+    // Same instants as above, in SQLite's "YYYY-MM-DD HH:MM:SS" UTC format —
+    // must not be skewed by the machine's local UTC offset.
+    expect(relativeTime("2026-07-04 11:59:50", now)).toBe("just now");
+    expect(relativeTime("2026-07-04 11:57:00", now)).toBe("3m ago");
+    expect(relativeTime("2026-07-04 10:00:00", now)).toBe("2h ago");
+  });
 });
 
 describe("validatePort", () => {
