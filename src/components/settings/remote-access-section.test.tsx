@@ -369,3 +369,69 @@ describe("RemoteAccessSection — enabled", () => {
     expect(screen.getByText("iPad")).toBeInTheDocument();
   });
 });
+
+// The rebind bug: a scope/port change from the *web* client rebinds the
+// server and drops this socket before web_remote_set_config can answer, so the
+// invoke rejects with "connection lost" even though the change was applied.
+// The old handler surfaced that as an error toast and snapped the control
+// back. On a web client it must instead reflect the requested value and show a
+// reconnecting affordance.
+describe("RemoteAccessSection — web-client rebind disconnect", () => {
+  beforeEach(() => {
+    cmds.webRemoteStatus.mockResolvedValue(enabledStatus());
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+  });
+  afterEach(() => {
+    delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+  });
+
+  it("treats a scope-rebind disconnect as expected: no error toast, keeps the requested value", async () => {
+    const user = userEvent.setup();
+    // The jsdom origin is http://localhost → a loopback origin, which survives
+    // every scope (no cutoff confirm). The rebind still drops the socket.
+    cmds.webRemoteSetConfig.mockRejectedValueOnce(
+      new Error("web-remote: connection lost"),
+    );
+    render(<RemoteAccessSection />);
+    const tailscaleBtn = await screen.findByRole("radio", {
+      name: /tailscale only/i,
+    });
+
+    await user.click(tailscaleBtn);
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({ bindScope: "tailscale" }),
+    );
+
+    // Optimistic value sticks (no snap-back to All networks)…
+    await waitFor(() =>
+      expect(
+        screen.getByRole("radio", { name: /tailscale only/i }),
+      ).toHaveAttribute("aria-checked", "true"),
+    );
+    // …a reconnecting affordance shows instead of an error…
+    expect(screen.getByText(/reconnecting to this device/i)).toBeInTheDocument();
+    // …and crucially, NO error toast for the expected disconnect.
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("still surfaces a genuine backend rejection as an error and reverts", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteSetConfig.mockRejectedValueOnce(
+      new Error("No Tailscale address found — connect Tailscale or choose a different access scope"),
+    );
+    render(<RemoteAccessSection />);
+    const tailscaleBtn = await screen.findByRole("radio", {
+      name: /tailscale only/i,
+    });
+
+    await user.click(tailscaleBtn);
+    await waitFor(() => expect(toast.error).toHaveBeenCalled());
+    // Reverted: the control snaps back to the server's actual scope.
+    await waitFor(() =>
+      expect(
+        screen.getByRole("radio", { name: /all networks/i }),
+      ).toHaveAttribute("aria-checked", "true"),
+    );
+    expect(screen.queryByText(/reconnecting to this device/i)).toBeNull();
+  });
+});

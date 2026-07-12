@@ -53,6 +53,110 @@ export function bindScopeOf(status: WebRemoteStatus | null): WebRemoteBindScope 
   return status?.bind_scope ?? "all";
 }
 
+/** The short control label for a scope, for interpolating into copy. Falls
+ *  back to the raw value if the scope is somehow unknown. */
+export function bindScopeLabel(scope: WebRemoteBindScope): string {
+  return BIND_SCOPE_OPTIONS.find((o) => o.value === scope)?.label ?? scope;
+}
+
+// ── Rebind cutoff prediction (web client) ────────────────────────────
+//
+// Changing the bind scope from a *web* client rebinds the server, dropping
+// this browser's socket. Whether it can reconnect depends on the origin it
+// loaded from versus what the new scope still serves:
+//
+//   - `all`       binds every interface → every origin survives.
+//   - `tailscale` binds the tailnet address(es) *plus* loopback → a loopback
+//                 or tailnet/MagicDNS origin survives; a LAN-IP origin does not.
+//   - `loopback`  binds `127.0.0.1` only → only a loopback origin survives.
+//
+// Predicting this before applying lets us confirm an intentional cutoff up
+// front (rather than leaving the user stranded on an infinite reconnect).
+
+/** How reachable the origin this client loaded from is, relative to the
+ *  server's bind scopes. */
+export type OriginReach = "loopback" | "tailnet" | "lan";
+
+/**
+ * Classify the host portion of the origin the web client loaded from
+ * (`window.location.hostname`) into an {@link OriginReach} bucket. IPv6
+ * literals may arrive bracket-wrapped (`[::1]`), so brackets are stripped
+ * first. Anything not recognisably loopback or tailnet is treated as `lan`
+ * — the most conservative bucket, so an unclassifiable origin errs toward
+ * warning about a cutoff rather than silently stranding the device.
+ */
+export function classifyOriginHost(hostname: string): OriginReach {
+  const host = (hostname || "")
+    .trim()
+    .replace(/^\[/, "")
+    .replace(/\]$/, "")
+    .toLowerCase();
+  // Loopback: localhost, IPv4 127.0.0.0/8, IPv6 ::1.
+  if (host === "localhost" || host.endsWith(".localhost")) return "loopback";
+  if (host === "::1") return "loopback";
+  if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)) return "loopback";
+  // Tailscale MagicDNS name (`machine.tailnet.ts.net`).
+  if (host.endsWith(".ts.net")) return "tailnet";
+  // Tailscale IPv6 ULA prefix (`fd7a:115c:a1e0::/48`).
+  if (host.startsWith("fd7a:115c:a1e0")) return "tailnet";
+  // Tailnet CGNAT IPv4 range `100.64.0.0/10`.
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(host);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    if (a === 100 && b >= 64 && b <= 127) return "tailnet";
+  }
+  return "lan";
+}
+
+/** Whether an origin of the given reach is still served under `scope`. */
+export function originSurvivesScope(
+  reach: OriginReach,
+  scope: WebRemoteBindScope,
+): boolean {
+  switch (scope) {
+    case "all":
+      return true;
+    case "tailscale":
+      return reach === "loopback" || reach === "tailnet";
+    case "loopback":
+      return reach === "loopback";
+    default:
+      return true;
+  }
+}
+
+/** Convenience over {@link classifyOriginHost} + {@link originSurvivesScope}:
+ *  would the current window origin (`hostname`) still reach the server after
+ *  switching to `scope`? `false` means applying it cuts this device off. */
+export function originHostSurvivesScope(
+  hostname: string,
+  scope: WebRemoteBindScope,
+): boolean {
+  return originSurvivesScope(classifyOriginHost(hostname), scope);
+}
+
+// ── Rebind-disconnect classification (web client) ────────────────────
+
+/**
+ * True when an invoke rejection is the transport's *disconnect* signal
+ * rather than a backend-returned error. A port or scope change rebinds the
+ * server, which drops this browser's socket before the
+ * `web_remote_set_config` response can return — so on a web client the
+ * invoke rejects with a transport-level "connection lost" / "not connected"
+ * message even though the backend applied the change. The desktop path
+ * (native IPC) never rebinds its own transport, so it never hits this.
+ */
+export function isRebindDisconnectError(err: unknown): boolean {
+  const msg =
+    err instanceof Error
+      ? err.message
+      : typeof err === "string"
+        ? err
+        : "";
+  return /connection lost|not connected/i.test(msg);
+}
+
 // ── Endpoint security ────────────────────────────────────────────────
 
 /**

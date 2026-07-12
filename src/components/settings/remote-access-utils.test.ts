@@ -10,7 +10,9 @@ import type {
 import {
   approvedSessions,
   BIND_SCOPE_OPTIONS,
+  bindScopeLabel,
   bindScopeOf,
+  classifyOriginHost,
   composePairUrl,
   connectedSessionCount,
   describeDevice,
@@ -18,8 +20,11 @@ import {
   endpointSecurityHint,
   formatCountdown,
   groupEndpoints,
+  isRebindDisconnectError,
   msUntil,
   newlyPendingSessionIds,
+  originHostSurvivesScope,
+  originSurvivesScope,
   pendingSessions,
   pickPrimaryEndpoint,
   relativeTime,
@@ -335,5 +340,100 @@ describe("bind scope", () => {
     expect(bindScopeOf({ ...status([]), bind_scope: "loopback" })).toBe(
       "loopback",
     );
+  });
+
+  it("labels each scope for interpolating into copy", () => {
+    expect(bindScopeLabel("all")).toBe("All networks");
+    expect(bindScopeLabel("tailscale")).toBe("Tailscale only");
+    expect(bindScopeLabel("loopback")).toBe("This device only");
+  });
+});
+
+describe("classifyOriginHost", () => {
+  it("classifies loopback origins (localhost, 127.x, ::1, brackets)", () => {
+    expect(classifyOriginHost("localhost")).toBe("loopback");
+    expect(classifyOriginHost("127.0.0.1")).toBe("loopback");
+    expect(classifyOriginHost("127.5.6.7")).toBe("loopback");
+    expect(classifyOriginHost("::1")).toBe("loopback");
+    expect(classifyOriginHost("[::1]")).toBe("loopback");
+  });
+
+  it("classifies Tailscale origins (MagicDNS, CGNAT IPv4, IPv6 ULA)", () => {
+    expect(classifyOriginHost("mac-studio.tail9c2f.ts.net")).toBe("tailnet");
+    expect(classifyOriginHost("100.64.0.1")).toBe("tailnet");
+    expect(classifyOriginHost("100.127.255.255")).toBe("tailnet");
+    expect(classifyOriginHost("fd7a:115c:a1e0::42")).toBe("tailnet");
+  });
+
+  it("treats LAN IPs and anything unrecognised as lan (conservative)", () => {
+    expect(classifyOriginHost("192.168.1.42")).toBe("lan");
+    expect(classifyOriginHost("10.0.0.9")).toBe("lan");
+    // 100.x outside the CGNAT /10 is public space, not tailnet.
+    expect(classifyOriginHost("100.63.255.255")).toBe("lan");
+    expect(classifyOriginHost("100.128.0.0")).toBe("lan");
+    expect(classifyOriginHost("box.example.com")).toBe("lan");
+    expect(classifyOriginHost("")).toBe("lan");
+  });
+});
+
+describe("originSurvivesScope — rebind cutoff prediction", () => {
+  it("every origin survives the widest scope (all)", () => {
+    expect(originSurvivesScope("loopback", "all")).toBe(true);
+    expect(originSurvivesScope("tailnet", "all")).toBe(true);
+    expect(originSurvivesScope("lan", "all")).toBe(true);
+  });
+
+  it("tailscale scope keeps loopback + tailnet, cuts off LAN", () => {
+    expect(originSurvivesScope("loopback", "tailscale")).toBe(true);
+    expect(originSurvivesScope("tailnet", "tailscale")).toBe(true);
+    expect(originSurvivesScope("lan", "tailscale")).toBe(false);
+  });
+
+  it("loopback scope keeps only loopback", () => {
+    expect(originSurvivesScope("loopback", "loopback")).toBe(true);
+    expect(originSurvivesScope("tailnet", "loopback")).toBe(false);
+    expect(originSurvivesScope("lan", "loopback")).toBe(false);
+  });
+
+  it("composes host + scope end to end", () => {
+    // A loopback browser (the e2e/pairing case) survives every scope — no cutoff.
+    expect(originHostSurvivesScope("127.0.0.1", "loopback")).toBe(true);
+    expect(originHostSurvivesScope("127.0.0.1", "tailscale")).toBe(true);
+    // A LAN browser is cut off by both narrower scopes.
+    expect(originHostSurvivesScope("192.168.1.42", "tailscale")).toBe(false);
+    expect(originHostSurvivesScope("192.168.1.42", "loopback")).toBe(false);
+    // A tailnet browser survives tailscale but not loopback-only.
+    expect(originHostSurvivesScope("box.tail1234.ts.net", "tailscale")).toBe(true);
+    expect(originHostSurvivesScope("box.tail1234.ts.net", "loopback")).toBe(false);
+  });
+});
+
+describe("isRebindDisconnectError — expected, not a failure", () => {
+  it("classifies the transport's disconnect signals as expected", () => {
+    // What the shim's reconnecting transport rejects an in-flight invoke with
+    // when a rebind (port/scope change) drops the socket before it can answer.
+    expect(isRebindDisconnectError(new Error("web-remote: connection lost"))).toBe(
+      true,
+    );
+    expect(
+      isRebindDisconnectError(
+        new Error('web-remote: not connected (cannot invoke "web_remote_set_config")'),
+      ),
+    ).toBe(true);
+    // A bare string reason (some transports reject with the raw message).
+    expect(isRebindDisconnectError("web-remote: connection lost")).toBe(true);
+  });
+
+  it("does NOT swallow a genuine backend error", () => {
+    // e.g. Tailscale scope with no tailnet address — the server rejects and
+    // keeps the old scope; that must still surface as an error.
+    expect(
+      isRebindDisconnectError(
+        new Error("No Tailscale address found — connect Tailscale or choose a different access scope"),
+      ),
+    ).toBe(false);
+    expect(isRebindDisconnectError("Unknown access scope: bogus")).toBe(false);
+    expect(isRebindDisconnectError(null)).toBe(false);
+    expect(isRebindDisconnectError(undefined)).toBe(false);
   });
 });

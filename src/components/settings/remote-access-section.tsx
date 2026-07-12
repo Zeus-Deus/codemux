@@ -5,6 +5,7 @@ import {
   Copy,
   Laptop,
   Link2,
+  Loader2,
   MonitorSmartphone,
   RefreshCw,
   Server,
@@ -13,14 +14,27 @@ import {
   Smartphone,
   Tablet,
   Trash2,
+  WifiOff,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { toast } from "@/lib/toast";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import {
   webRemoteApproveSession,
   webRemoteCreatePairing,
@@ -45,6 +59,7 @@ import { useQrSvg } from "./use-qr-svg";
 import {
   approvedSessions,
   BIND_SCOPE_OPTIONS,
+  bindScopeLabel,
   bindScopeOf,
   composePairUrl,
   connectedSessionCount,
@@ -52,8 +67,10 @@ import {
   endpointSecurityHint,
   formatCountdown,
   groupEndpoints,
+  isRebindDisconnectError,
   msUntil,
   newlyPendingSessionIds,
+  originHostSurvivesScope,
   pendingSessions,
   pickPrimaryEndpoint,
   relativeTime,
@@ -544,6 +561,38 @@ function DeviceRow({
   );
 }
 
+// ── Remote rebind lifecycle ──────────────────────────────────────────
+//
+// A port or scope change from a *web* client rebinds the server, dropping
+// this browser's socket before `web_remote_set_config` can answer — so the
+// invoke rejects with a transport disconnect, NOT because the change failed.
+// Rather than surfacing that as an error and snapping the control back, we
+// reflect the requested value optimistically and drive a small lifecycle:
+//
+//   applying     → set_config in flight (socket may still be up).
+//   reconnecting → the expected disconnect landed; the shim's reconnect loop
+//                  is re-establishing. On success we refetch status and
+//                  reconcile the control to the server's persisted value.
+//   cutoff       → this device can't come back (the new scope excludes its
+//                  origin, or the reconnect never succeeded). A clear terminal
+//                  message replaces the endless spinner.
+//
+// The desktop path never rebinds its own IPC, so none of this runs there.
+type RebindPhase =
+  | { status: "applying" }
+  | { status: "reconnecting"; kind: "port" | "scope"; requestedPort?: number }
+  | { status: "cutoff"; message: string };
+
+/** How long to wait for the reconnect loop to re-establish before declaring
+ *  the device cut off. The first backoff attempt fires ~1s after the drop, so
+ *  a reachable origin reconnects well inside this; an unreachable one (stale
+ *  origin port, excluded scope) trips the terminal state instead of spinning
+ *  forever. */
+const REBIND_RECONNECT_CAP_MS = 12_000;
+
+const SCOPE_CUTOFF_MESSAGE =
+  "Access scope changed — this device can no longer reach the server. Reconnect from an allowed endpoint to continue.";
+
 // ── Main section ─────────────────────────────────────────────────────
 
 export function RemoteAccessSection() {
@@ -554,6 +603,16 @@ export function RemoteAccessSection() {
   const [togglePending, setTogglePending] = useState(false);
   const [portPending, setPortPending] = useState(false);
   const [scopePending, setScopePending] = useState(false);
+  // Web-client rebind lifecycle (see RebindPhase). Null on desktop / at rest.
+  const [scopeOverride, setScopeOverride] = useState<WebRemoteBindScope | null>(
+    null,
+  );
+  const [rebindPhase, setRebindPhase] = useState<RebindPhase | null>(null);
+  const [pendingScopeCutoff, setPendingScopeCutoff] =
+    useState<WebRemoteBindScope | null>(null);
+  // Live transport status (populated only on the web client). Drives the
+  // reconnect-and-reconcile step after a rebind-induced disconnect.
+  const connectionStatus = useRemoteConnectionStore((s) => s.status);
   const [approvalPending, setApprovalPending] = useState(false);
   const [pairingPending, setPairingPending] = useState(false);
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
@@ -592,6 +651,31 @@ export function RemoteAccessSection() {
     }
   }, []);
 
+  /** Settle a rebind against the server's actual persisted state: adopt the
+   *  fresh status, drop the optimistic override, and clear the lifecycle. Used
+   *  both when `set_config` returned normally (no disconnect) and after the
+   *  socket reconnects. Silent by design — the reflected value is the feedback. */
+  const reconcileAfterRebind = useCallback(
+    (fresh: WebRemoteStatus) => {
+      applyStatus(fresh, { detectPending: false });
+      setPortDraft(String(fresh.port));
+      setScopeOverride(null);
+      setRebindPhase(null);
+      // A rebind changes the reachable set and invalidates any composed URL.
+      setPairing(null);
+      if (fresh.running) void refreshEndpoints();
+    },
+    [applyStatus, refreshEndpoints],
+  );
+
+  /** Enter the terminal cutoff state: this device can't reconnect. Annotate
+   *  the connection banner so the ongoing reconnect loop reads as a clear
+   *  terminal message instead of an endless "Reconnecting…" spinner. */
+  const enterCutoff = useCallback((message: string) => {
+    setRebindPhase({ status: "cutoff", message });
+    useRemoteConnectionStore.getState().setOffline(message);
+  }, []);
+
   // Initial load + live subscription.
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -622,16 +706,58 @@ export function RemoteAccessSection() {
     };
   }, [applyStatus, refreshEndpoints]);
 
+  // After a rebind-induced disconnect, the shim's reconnect loop re-establishes
+  // the socket and the store flips back to "connected". Refetch the authoritative
+  // status then and reconcile the optimistic control to it. Also self-heals a
+  // mispredicted cutoff: if the device unexpectedly comes back, it settles.
+  useEffect(() => {
+    if (!rebindPhase || rebindPhase.status === "applying") return;
+    if (connectionStatus !== "connected") return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const fresh = await webRemoteStatus();
+        if (!cancelled) reconcileAfterRebind(fresh);
+      } catch {
+        /* still settling — the effect re-runs on the next connected tick */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [rebindPhase, connectionStatus, reconcileAfterRebind]);
+
+  // Cap the reconnect wait: if the socket hasn't come back within the window,
+  // this device is cut off (stale origin port, or a scope that excludes it).
+  // Trip a clear terminal state instead of spinning indefinitely.
+  useEffect(() => {
+    if (rebindPhase?.status !== "reconnecting") return;
+    const { kind, requestedPort } = rebindPhase;
+    const timer = window.setTimeout(() => {
+      enterCutoff(
+        kind === "port" && requestedPort != null
+          ? `Port changed to ${requestedPort}. If this device dropped, reopen Codemux at the new port.`
+          : "This device didn't reconnect. Reload from an allowed endpoint to continue.",
+      );
+    }, REBIND_RECONNECT_CAP_MS);
+    return () => window.clearTimeout(timer);
+  }, [rebindPhase, enterCutoff]);
+
   const enabled = status?.enabled ?? false;
   const running = status?.running ?? false;
   const requireApproval = status?.require_approval ?? false;
-  const bindScope = bindScopeOf(status);
+  // While a web-client rebind settles, show the requested scope optimistically
+  // rather than the server's last-broadcast value.
+  const bindScope = scopeOverride ?? bindScopeOf(status);
   const pending = useMemo(() => pendingSessions(status), [status]);
   const approved = useMemo(() => approvedSessions(status), [status]);
   const connectedCount = connectedSessionCount(status);
 
   const portValidation = validatePort(portDraft);
   const portDirty = status != null && portDraft !== String(status.port);
+  // A web-client rebind is settling (or has cut this device off): freeze the
+  // server controls so a second change can't stack on the in-flight one.
+  const rebindBusy = rebindPhase !== null;
 
   const handleToggle = useCallback(
     async (next: boolean) => {
@@ -661,9 +787,41 @@ export function RemoteAccessSection() {
 
   const handleApplyPort = useCallback(async () => {
     if (!portValidation.valid || portValidation.value == null) return;
+    const nextPort = portValidation.value;
     setPortPending(true);
+
+    // Web client: the rebind drops this browser's socket before set_config can
+    // answer. Reflect the new port optimistically and settle on reconnect,
+    // rather than treating the expected disconnect as a failure.
+    if (isRemoteClient()) {
+      setPortDraft(String(nextPort));
+      setRebindPhase({ status: "applying" });
+      try {
+        const result = await webRemoteSetConfig({ port: nextPort });
+        // No disconnect — the change didn't drop us. Settle immediately.
+        reconcileAfterRebind(result);
+      } catch (err) {
+        if (isRebindDisconnectError(err)) {
+          setRebindPhase({
+            status: "reconnecting",
+            kind: "port",
+            requestedPort: nextPort,
+          });
+        } else {
+          console.error("[remote-access] set port failed:", err);
+          setPortDraft(String(status?.port ?? nextPort));
+          setRebindPhase(null);
+          toast.error(`Couldn't change the port: ${String(err)}`);
+        }
+      } finally {
+        setPortPending(false);
+      }
+      return;
+    }
+
+    // Desktop (native IPC never drops the transport): unchanged.
     try {
-      const result = await webRemoteSetConfig({ port: portValidation.value });
+      const result = await webRemoteSetConfig({ port: nextPort });
       applyStatus(result, { detectPending: false });
       setPortDraft(String(result.port));
       if (result.running) void refreshEndpoints();
@@ -676,11 +834,58 @@ export function RemoteAccessSection() {
     } finally {
       setPortPending(false);
     }
-  }, [applyStatus, portValidation, refreshEndpoints]);
+  }, [applyStatus, portValidation, reconcileAfterRebind, refreshEndpoints, status]);
+
+  // Web-client scope apply: reflect optimistically, then either settle on
+  // reconnect (reachable) or trip the terminal cutoff (excluded / capped out).
+  // Shared by the direct path and the cutoff-confirm path.
+  const applyScopeRemote = useCallback(
+    async (next: WebRemoteBindScope, opts: { expectCutoff: boolean }) => {
+      setScopeOverride(next);
+      setRebindPhase({ status: "applying" });
+      setScopePending(true);
+      try {
+        const result = await webRemoteSetConfig({ bindScope: next });
+        // No disconnect (the change didn't require a rebind) — settle now.
+        reconcileAfterRebind(result);
+      } catch (err) {
+        if (isRebindDisconnectError(err)) {
+          // Expected: the rebind dropped this socket before answering.
+          if (opts.expectCutoff) enterCutoff(SCOPE_CUTOFF_MESSAGE);
+          else setRebindPhase({ status: "reconnecting", kind: "scope" });
+        } else {
+          // A genuine backend rejection (e.g. Tailscale scope with no tailnet
+          // address): the server kept the previous scope. Drop the optimistic
+          // value and surface why.
+          console.error("[remote-access] set scope failed:", err);
+          setScopeOverride(null);
+          setRebindPhase(null);
+          toast.error(`Couldn't change the access scope: ${String(err)}`);
+        }
+      } finally {
+        setScopePending(false);
+      }
+    },
+    [enterCutoff, reconcileAfterRebind],
+  );
 
   const handleSetScope = useCallback(
     async (next: WebRemoteBindScope) => {
       if (next === bindScope) return;
+
+      // Web client: a scope change rebinds and drops this browser. If the new
+      // scope would exclude the origin we loaded from, confirm the intentional
+      // cutoff first; otherwise apply optimistically and settle on reconnect.
+      if (isRemoteClient()) {
+        if (!originHostSurvivesScope(window.location.hostname, next)) {
+          setPendingScopeCutoff(next);
+          return;
+        }
+        void applyScopeRemote(next, { expectCutoff: false });
+        return;
+      }
+
+      // Desktop (native IPC never drops the transport): unchanged.
       setScopePending(true);
       try {
         const result = await webRemoteSetConfig({ bindScope: next });
@@ -705,8 +910,14 @@ export function RemoteAccessSection() {
         setScopePending(false);
       }
     },
-    [applyStatus, bindScope, refreshEndpoints],
+    [applyScopeRemote, applyStatus, bindScope, refreshEndpoints],
   );
+
+  const confirmScopeCutoff = useCallback(() => {
+    const next = pendingScopeCutoff;
+    setPendingScopeCutoff(null);
+    if (next) void applyScopeRemote(next, { expectCutoff: true });
+  }, [applyScopeRemote, pendingScopeCutoff]);
 
   const handleToggleApproval = useCallback(
     async (next: boolean) => {
@@ -861,6 +1072,30 @@ export function RemoteAccessSection() {
           <section className="space-y-4">
             <SubHeading>Server</SubHeading>
 
+            {/* Web-client rebind lifecycle. A port/scope change from a browser
+                drops this socket before the backend can answer; rather than a
+                false error, show that the change is applying + reconnecting, or
+                a clear terminal state if this device was cut off. */}
+            {rebindPhase && rebindPhase.status !== "applying" ? (
+              rebindPhase.status === "cutoff" ? (
+                <div
+                  role="status"
+                  className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[12.5px] leading-relaxed text-status-attention"
+                >
+                  <WifiOff className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>{rebindPhase.message}</span>
+                </div>
+              ) : (
+                <div
+                  role="status"
+                  className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-[12.5px] text-status-working"
+                >
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
+                  <span>Applying change — reconnecting to this device…</span>
+                </div>
+              )
+            ) : null}
+
             {/* Access scope — which interfaces the server binds. Narrowing it
                 keeps the port off untrusted networks entirely. Changing it
                 rebinds immediately (same drop-connections path as a port
@@ -882,7 +1117,7 @@ export function RemoteAccessSection() {
                       type="button"
                       role="radio"
                       aria-checked={active}
-                      disabled={scopePending}
+                      disabled={scopePending || rebindBusy}
                       onClick={() => handleSetScope(opt.value)}
                       className={cn(
                         "rounded-[7px] px-3 py-1.5 text-[12.5px] font-medium transition-colors disabled:opacity-60",
@@ -939,7 +1174,9 @@ export function RemoteAccessSection() {
                   variant="outline"
                   size="sm"
                   className="h-9"
-                  disabled={!portDirty || !portValidation.valid || portPending}
+                  disabled={
+                    !portDirty || !portValidation.valid || portPending || rebindBusy
+                  }
                   onClick={handleApplyPort}
                 >
                   Apply
@@ -1083,6 +1320,39 @@ export function RemoteAccessSection() {
           </section>
         </>
       )}
+
+      {/* Cutoff confirm — a scope that excludes the origin this browser loaded
+          from would sever it with no way back on this address. Ask first. */}
+      <AlertDialog
+        open={pendingScopeCutoff !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingScopeCutoff(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Disconnect this device?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingScopeCutoff && (
+                <>
+                  This will disconnect this device — you're connected over{" "}
+                  <span className="font-mono text-foreground">
+                    {window.location.host}
+                  </span>
+                  , which "{bindScopeLabel(pendingScopeCutoff)}" no longer
+                  allows. You'll need to reconnect from an allowed address.
+                </>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmScopeCutoff}>
+              Continue
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
