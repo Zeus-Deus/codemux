@@ -309,6 +309,36 @@ describe("RemoteAccessSection — enabled", () => {
     expect(screen.getByLabelText(/pairing QR code/i)).toBeInTheDocument();
   });
 
+  it("defaults the access scope to All networks and switches to Tailscale only", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteSetConfig.mockResolvedValueOnce(
+      status({
+        enabled: true,
+        running: true,
+        bind_scope: "tailscale",
+        sessions: [sess({ id: "macbook", name: "MacBook Air", approved: true })],
+      }),
+    );
+    render(<RemoteAccessSection />);
+
+    // No explicit bind_scope on the initial status → the control defaults to
+    // "All networks" being selected.
+    const allBtn = await screen.findByRole("radio", { name: /all networks/i });
+    await waitFor(() => expect(allBtn).toHaveAttribute("aria-checked", "true"));
+
+    await user.click(screen.getByRole("radio", { name: /tailscale only/i }));
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({ bindScope: "tailscale" }),
+    );
+    // The returned status flips the active option.
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: /tailscale only/i })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      ),
+    );
+  });
+
   it("toasts and badges a new pending device arriving over the live event", async () => {
     render(<RemoteAccessSection />);
     await waitFor(() => expect(events.cb).not.toBeNull());

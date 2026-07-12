@@ -112,6 +112,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 # `libc` (already a dependency) backs it on Unix. Tailnet IPs + MagicDNS are
 # discovered separately by shelling out to `tailscale status --json`.
 if-addrs = "0.13"
+# Pure-Rust QR encoder for `codemux remote pair`, which prints a scannable
+# terminal QR of the pairing URL so a phone can pair over SSH without the
+# desktop GUI. `default-features = false` drops the optional image/svg/pic
+# renderers — we only use the built-in unicode (`Dense1x2`) renderer, so this
+# adds no image-processing crates to the tree.
+qrcode = { version = "0.14", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }

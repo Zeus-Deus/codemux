@@ -204,6 +204,24 @@ pub fn list(port: u16) -> Vec<Endpoint> {
     out
 }
 
+/// The tailnet IP addresses this node is reachable at: CGNAT-range
+/// (`100.64.0.0/10`) interface IPs plus every address `tailscale status
+/// --json` reports for this node. Reuses the exact discovery [`list`] uses,
+/// then keeps only `tailnet` entries (dropping loopback/LAN/MagicDNS) and
+/// parses their host back to an [`IpAddr`], so the addresses the server
+/// binds for the "Tailscale only" scope are precisely the "Tailscale"
+/// endpoints the Settings pane advertises. Empty when Tailscale is absent —
+/// the caller must NOT silently fall back to all interfaces.
+pub fn tailnet_ips() -> Vec<IpAddr> {
+    // The port is irrelevant here — we only read each endpoint's host — so
+    // pass a placeholder.
+    list(0)
+        .into_iter()
+        .filter(|e| e.kind == "tailnet")
+        .filter_map(|e| e.host.parse::<IpAddr>().ok())
+        .collect()
+}
+
 /// Classify each `(interface-name, ip)` pair into an endpoint, appending to
 /// `out`. Loopback, IPv6 link-local, and virtual/bridge interfaces are
 /// skipped. Pulled out of `list` so the name-skipping and group-assignment

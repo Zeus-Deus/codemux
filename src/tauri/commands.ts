@@ -68,6 +68,7 @@ import type {
   WebRemoteEndpoint,
   WebRemoteSessionView,
   WebRemotePairingInfo,
+  WebRemoteBindScope,
 } from "./types";
 
 // ── Platform ──
@@ -2143,16 +2144,20 @@ export const webRemoteEnable = () =>
 export const webRemoteDisable = () =>
   invoke<WebRemoteStatus>("web_remote_disable");
 
-/** Update the persisted config. `port` triggers a backend-side rebind
- *  while running; `requireApproval` gates whether new pairings sit pending
- *  until approved on the desktop. Omitted fields are left unchanged. */
+/** Update the persisted config. `port` and `bindScope` trigger a
+ *  backend-side rebind while running (dropping existing connections, which
+ *  can't follow to a new port/interface); `requireApproval` gates whether
+ *  new pairings sit pending until approved on the desktop. Omitted fields
+ *  are left unchanged. */
 export const webRemoteSetConfig = (opts: {
   port?: number;
   requireApproval?: boolean;
+  bindScope?: WebRemoteBindScope;
 }) =>
   invoke<WebRemoteStatus>("web_remote_set_config", {
     port: opts.port ?? null,
     requireApproval: opts.requireApproval ?? null,
+    bindScope: opts.bindScope ?? null,
   });
 
 /** Mint a one-time pairing token (10 min TTL, single use). Returns the

@@ -44,17 +44,26 @@ describe("web_remote_* command wrappers", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(6, "web_remote_list_sessions");
   });
 
-  it("set_config sends both fields, defaulting the omitted one to null", () => {
+  it("set_config sends all three fields, defaulting the omitted ones to null", () => {
     webRemoteSetConfig({ port: 5000 });
     expect(invokeMock).toHaveBeenLastCalledWith("web_remote_set_config", {
       port: 5000,
       requireApproval: null,
+      bindScope: null,
     });
 
     webRemoteSetConfig({ requireApproval: true });
     expect(invokeMock).toHaveBeenLastCalledWith("web_remote_set_config", {
       port: null,
       requireApproval: true,
+      bindScope: null,
+    });
+
+    webRemoteSetConfig({ bindScope: "tailscale" });
+    expect(invokeMock).toHaveBeenLastCalledWith("web_remote_set_config", {
+      port: null,
+      requireApproval: null,
+      bindScope: "tailscale",
     });
   });
 

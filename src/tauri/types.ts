@@ -1162,7 +1162,16 @@ export interface WebRemoteConfig {
   enabled: boolean;
   port: number;
   require_approval: boolean;
+  /** Which interfaces the server binds: `all` (0.0.0.0) | `tailscale`
+   *  (tailnet + loopback) | `loopback` (this device only). Optional so a
+   *  config persisted before the field existed loads as `all`; the Rust
+   *  payload always sends it. */
+  bind_scope?: WebRemoteBindScope;
 }
+
+/** Bind-scope choices for the remote server. Mirrors the `BIND_SCOPE_*`
+ *  constants in `web_remote::mod`. */
+export type WebRemoteBindScope = "all" | "tailscale" | "loopback";
 
 /** A paired device row as shown in the device-management UI. Mirrors
  *  `web_remote::SessionView`. */
@@ -1190,6 +1199,10 @@ export interface WebRemoteStatus {
   running: boolean;
   port: number;
   require_approval: boolean;
+  /** Which interfaces the server binds: `all` | `tailscale` | `loopback`.
+   *  Optional so existing status fixtures need not enumerate it; the Rust
+   *  payload always sends it. */
+  bind_scope?: WebRemoteBindScope;
   /** Raw live-WebSocket count (a single device with two tabs counts
    *  twice). */
   active_connections: number;

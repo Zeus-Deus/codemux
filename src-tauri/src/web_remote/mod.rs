@@ -28,6 +28,7 @@ pub mod proxy;
 pub mod server;
 pub mod snapshot;
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,37 @@ use tauri::{AppHandle, Emitter, Manager};
 pub const DEFAULT_PORT: u16 = 4377;
 /// Settings key under which the config JSON is persisted.
 const CONFIG_KEY: &str = "web_remote.config";
+
+// ── Bind scope (which interfaces the server listens on) ──────────────
+//
+// The default (`all`) binds `0.0.0.0` — every interface — so any LAN or
+// tailnet peer can reach the server. On a hostile network that also exposes
+// the port on the untrusted segment. The other two scopes narrow the
+// exposure so the port simply isn't open on interfaces the user doesn't
+// trust:
+//   - `tailscale` — the tailnet address(es) plus loopback, so the port is
+//     reachable only over the mesh VPN (and locally), never on the LAN.
+//   - `loopback`  — `127.0.0.1` only; reachable only from this machine
+//     (e.g. tunnelled in over SSH).
+
+/// All interfaces (`0.0.0.0`) — the default, historical behavior.
+pub const BIND_SCOPE_ALL: &str = "all";
+/// Tailnet address(es) + loopback only.
+pub const BIND_SCOPE_TAILSCALE: &str = "tailscale";
+/// Loopback (`127.0.0.1`) only.
+pub const BIND_SCOPE_LOOPBACK: &str = "loopback";
+
+fn default_bind_scope() -> String {
+    BIND_SCOPE_ALL.to_string()
+}
+
+/// Whether `scope` is one of the three recognised bind scopes.
+fn is_valid_bind_scope(scope: &str) -> bool {
+    matches!(
+        scope,
+        BIND_SCOPE_ALL | BIND_SCOPE_TAILSCALE | BIND_SCOPE_LOOPBACK
+    )
+}
 /// Global event both desktop and web UIs listen to for live updates.
 const STATE_CHANGED_EVENT: &str = "web-remote-state-changed";
 /// Global event a paired web client raises (via [`web_remote_request_update`])
@@ -50,6 +82,11 @@ pub struct WebRemoteConfig {
     pub enabled: bool,
     pub port: u16,
     pub require_approval: bool,
+    /// Which interfaces to bind: `all` (0.0.0.0) | `tailscale` | `loopback`.
+    /// `#[serde(default)]` so a config persisted before this field existed
+    /// deserializes to the historical `all` behavior instead of failing.
+    #[serde(default = "default_bind_scope")]
+    pub bind_scope: String,
 }
 
 impl Default for WebRemoteConfig {
@@ -58,6 +95,7 @@ impl Default for WebRemoteConfig {
             enabled: false,
             port: DEFAULT_PORT,
             require_approval: false,
+            bind_scope: default_bind_scope(),
         }
     }
 }
@@ -74,11 +112,16 @@ struct UpdateAvailability {
     version: Option<String>,
 }
 
-/// A running server instance. Dropping / signalling `shutdown` unbinds it.
+/// A running server instance. Sending `true` on `shutdown` unbinds every
+/// listener it owns (one per bound address). `port` and `scope` are kept for
+/// diagnostics / introspection.
 pub(crate) struct RunningServer {
     #[allow(dead_code)]
     port: u16,
-    shutdown: tokio::sync::oneshot::Sender<()>,
+    #[allow(dead_code)]
+    scope: String,
+    /// Flips to `true` to trigger graceful shutdown on all listeners.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 /// Everything shared across the server, its handlers, and the commands.
@@ -143,6 +186,10 @@ pub struct WebRemoteStatus {
     pub running: bool,
     pub port: u16,
     pub require_approval: bool,
+    /// Which interfaces the server binds: `all` | `tailscale` | `loopback`.
+    /// Surfaced so the Settings pane can render the current access scope and
+    /// so a web client sees which scope is in effect.
+    pub bind_scope: String,
     /// Number of live WebSocket connections right now (raw socket count; a
     /// single device with two tabs counts twice).
     pub active_connections: usize,
@@ -182,6 +229,96 @@ pub struct PairingInfo {
     pub expires_at: String,
 }
 
+/// Mint a one-time pairing token and build the [`PairingInfo`] payload,
+/// optionally carrying a suggested device name (used as a fallback label
+/// when the connecting client sends none). The single shared token path —
+/// the `web_remote_create_pairing` Tauri command and the `web_remote_pair`
+/// control-socket command both go through here, so there is exactly one
+/// place tokens are minted.
+pub(crate) fn mint_pairing(shared: &Arc<Shared>, suggested_name: Option<String>) -> PairingInfo {
+    let (token, _ttl) = shared.pairing.issue_named(suggested_name);
+    let expires_at = (chrono::Utc::now()
+        + chrono::Duration::seconds(auth::PAIRING_TTL.as_secs() as i64))
+    .to_rfc3339();
+    PairingInfo {
+        url_path: format!("/#pair={token}"),
+        token,
+        expires_at,
+    }
+}
+
+/// Result of the `web_remote_pair` control-socket command (the
+/// `codemux remote pair` CLI over SSH): a freshly minted pairing token plus
+/// the recommended endpoint's full pairing URL, so the terminal can print a
+/// scannable link + QR without the desktop GUI ever being opened.
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlPairing {
+    /// Full URL a browser opens to auto-pair, on the recommended endpoint:
+    /// `http://<host>:<port>/#pair=<token>`.
+    pub pairing_url: String,
+    /// The recommended endpoint's host (IP literal or MagicDNS name).
+    pub host: String,
+    pub port: u16,
+    /// The raw pairing token (also embedded in `pairing_url`).
+    pub token: String,
+    pub expires_at: String,
+    /// Whether the recommended endpoint is a browser secure context
+    /// (loopback only). Informational for the CLI.
+    pub secure: bool,
+    /// The endpoint kind backing `host` (`magicdns` | `tailnet` | `lan` |
+    /// `loopback`), so the CLI can hint how far it reaches.
+    pub endpoint_kind: String,
+}
+
+/// Pure core of [`control_pair`], taking the shared state directly so it is
+/// unit-testable without a Tauri `AppHandle`. Errors when remote access is
+/// not enabled — the server must be bound for the URL to be reachable.
+pub(crate) fn control_pair_from(
+    shared: &Arc<Shared>,
+    suggested_name: Option<String>,
+) -> Result<ControlPairing, String> {
+    let (enabled, port) = {
+        let cfg = shared.config.lock().unwrap();
+        (cfg.enabled, cfg.port)
+    };
+    if !enabled {
+        return Err("Remote access is not enabled — enable it in Settings first".to_string());
+    }
+    let info = mint_pairing(shared, suggested_name);
+    // Reuse the endpoint enumeration + its single `recommended` pick so the
+    // CLI's URL matches what the Settings pane would surface. Fall back to
+    // the first endpoint (loopback is always first) so a loopback-only host
+    // still yields a usable local URL.
+    let eps = endpoints::list(port);
+    let chosen = eps
+        .iter()
+        .find(|e| e.recommended)
+        .or_else(|| eps.first())
+        .cloned()
+        .ok_or_else(|| "No reachable endpoint found".to_string())?;
+    Ok(ControlPairing {
+        pairing_url: format!("{}{}", chosen.url, info.url_path),
+        host: chosen.host,
+        port,
+        token: info.token,
+        expires_at: info.expires_at,
+        secure: chosen.secure,
+        endpoint_kind: chosen.kind,
+    })
+}
+
+/// Mint a pairing token for the same-machine control socket (the
+/// `codemux remote pair` CLI over SSH). Reuses the shared [`mint_pairing`]
+/// token path and the endpoint enumeration, so the terminal flow and the
+/// GUI flow are the same code underneath.
+pub fn control_pair(
+    app: &AppHandle,
+    suggested_name: Option<String>,
+) -> Result<ControlPairing, String> {
+    let shared = app.state::<WebRemoteState>().shared();
+    control_pair_from(&shared, suggested_name)
+}
+
 fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
     let cfg = shared.config.lock().unwrap().clone();
     let running = shared.runtime.lock().unwrap().is_some();
@@ -207,6 +344,7 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
         running,
         port: cfg.port,
         require_approval: cfg.require_approval,
+        bind_scope: cfg.bind_scope.clone(),
         active_connections,
         connected_sessions,
         sessions,
@@ -243,30 +381,91 @@ fn load_config(app: &AppHandle) -> WebRemoteConfig {
 
 // ── Server lifecycle ────────────────────────────────────────────────
 
+/// Resolve the socket addresses to bind for a given `scope` + `port`, taking
+/// the discovered tailnet IPs as an argument so the decision is pure and
+/// unit-testable. See [`bind_addrs`] for the production entry point.
+///
+/// - `loopback`  → `127.0.0.1:port` only.
+/// - `tailscale` → every tailnet address **plus** loopback, so the port is
+///   reachable over the mesh VPN and locally but not on the LAN. Errors when
+///   `tailnet` is empty — it must NEVER silently fall back to all interfaces
+///   (that would re-expose the port on the hostile network the scope exists
+///   to hide from).
+/// - `all` (and any unrecognised value) → `0.0.0.0:port` (every interface).
+fn bind_addrs_from(scope: &str, port: u16, tailnet: Vec<IpAddr>) -> Result<Vec<SocketAddr>, String> {
+    match scope {
+        BIND_SCOPE_LOOPBACK => Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)]),
+        BIND_SCOPE_TAILSCALE => {
+            if tailnet.is_empty() {
+                return Err(
+                    "No Tailscale address found — connect Tailscale or choose a different access scope"
+                        .to_string(),
+                );
+            }
+            // Keep loopback so local use (and an SSH tunnel) still works
+            // alongside the tailnet address(es).
+            let mut addrs = vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)];
+            for ip in tailnet {
+                addrs.push(SocketAddr::new(ip, port));
+            }
+            Ok(addrs)
+        }
+        // `all` and any unknown value: bind every interface (historical
+        // behavior). Unknown values are normalised away in `web_remote_set_config`.
+        _ => Ok(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)]),
+    }
+}
+
+/// Production wrapper over [`bind_addrs_from`] that discovers the tailnet IPs
+/// via the endpoint enumeration (interface CGNAT range + `tailscale status`).
+fn bind_addrs(scope: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    bind_addrs_from(scope, port, endpoints::tailnet_ips())
+}
+
 async fn start_server(app: &AppHandle, shared: &Arc<Shared>) -> Result<(), String> {
     // Idempotent: already bound → nothing to do.
     if shared.runtime.lock().unwrap().is_some() {
         return Ok(());
     }
-    let port = shared.config.lock().unwrap().port;
-    let listener = server::bind(port).await?;
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let router = server::router(app.clone());
+    let (port, scope) = {
+        let cfg = shared.config.lock().unwrap();
+        (cfg.port, cfg.bind_scope.clone())
+    };
+    // Resolve the bind scope to concrete addresses first. A `tailscale` scope
+    // with no tailnet address fails HERE, before anything binds, so the
+    // caller (enable / rebind) surfaces the reason and leaves the server off.
+    let addrs = bind_addrs(&scope, port)?;
 
-    tokio::spawn(async move {
-        let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
-        let result = axum::serve(listener, service)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
-            })
-            .await;
-        if let Err(e) = result {
-            eprintln!("[codemux::web_remote] server exited: {e}");
-        }
-    });
+    // Bind every address up front. If any bind fails, the listeners already
+    // bound in `listeners` drop at the `?` and unbind, so we never leak a
+    // half-open server on a partial failure.
+    let mut listeners = Vec::with_capacity(addrs.len());
+    for addr in &addrs {
+        listeners.push(server::bind(*addr).await?);
+    }
+
+    // One shutdown signal shared by every listener's graceful-shutdown future.
+    let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    for listener in listeners {
+        let router = server::router(app.clone());
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let result = axum::serve(listener, service)
+                .with_graceful_shutdown(async move {
+                    // Resolves when `stop_server` flips the watch to `true`.
+                    let _ = shutdown_rx.changed().await;
+                })
+                .await;
+            if let Err(e) = result {
+                eprintln!("[codemux::web_remote] server exited: {e}");
+            }
+        });
+    }
 
     *shared.runtime.lock().unwrap() = Some(RunningServer {
         port,
+        scope,
         shutdown: shutdown_tx,
     });
     Ok(())
@@ -280,7 +479,7 @@ fn stop_server(shared: &Arc<Shared>) {
     // connected device immediately — the same mechanism revocation uses.
     shared.connections.close_all();
     if let Some(running) = shared.runtime.lock().unwrap().take() {
-        let _ = running.shutdown.send(());
+        let _ = running.shutdown.send(true);
     }
 }
 
@@ -396,7 +595,16 @@ pub async fn web_remote_enable(app: AppHandle) -> Result<WebRemoteStatus, String
     let shared = app.state::<WebRemoteState>().shared();
     shared.config.lock().unwrap().enabled = true;
     persist_config(&app, &shared);
-    start_server(&app, &shared).await?;
+    if let Err(e) = start_server(&app, &shared).await {
+        // Binding failed — e.g. the `tailscale` scope with no tailnet
+        // address, or the port is already taken. Roll the master switch back
+        // off so the UI never shows "enabled but not running", persist that,
+        // and surface the reason. The server stays off.
+        shared.config.lock().unwrap().enabled = false;
+        persist_config(&app, &shared);
+        emit_state_changed(&app);
+        return Err(e);
+    }
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
 }
@@ -416,26 +624,61 @@ pub async fn web_remote_set_config(
     app: AppHandle,
     port: Option<u16>,
     require_approval: Option<bool>,
+    bind_scope: Option<String>,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
-    let port_changed = {
+
+    // Reject an unknown scope before mutating anything, so we never persist a
+    // value the bind logic can't honour.
+    if let Some(ref s) = bind_scope {
+        if !is_valid_bind_scope(s) {
+            return Err(format!("Unknown access scope: {s}"));
+        }
+    }
+
+    let (old_port, old_scope, port_changed, scope_changed) = {
         let mut cfg = shared.config.lock().unwrap();
         let old_port = cfg.port;
+        let old_scope = cfg.bind_scope.clone();
         if let Some(p) = port {
             cfg.port = p;
         }
         if let Some(r) = require_approval {
             cfg.require_approval = r;
         }
-        cfg.port != old_port
+        if let Some(s) = bind_scope {
+            cfg.bind_scope = s;
+        }
+        (
+            old_port,
+            old_scope.clone(),
+            cfg.port != old_port,
+            cfg.bind_scope != old_scope,
+        )
     };
     persist_config(&app, &shared);
 
-    // A port change while running requires a rebind.
+    // A port or scope change while running requires a rebind (the same
+    // stop→start path a port change already used, which also drops existing
+    // connections — they can't follow to a new port/interface).
     let running = shared.runtime.lock().unwrap().is_some();
-    if running && port_changed {
+    if running && (port_changed || scope_changed) {
         stop_server(&shared);
-        start_server(&app, &shared).await?;
+        if let Err(e) = start_server(&app, &shared).await {
+            // The new binding failed (e.g. switching to `tailscale` with no
+            // tailnet address). Restore the previous config and rebind to it
+            // so the server keeps running on its last-good address instead of
+            // being left off, then report why the change was rejected.
+            {
+                let mut cfg = shared.config.lock().unwrap();
+                cfg.port = old_port;
+                cfg.bind_scope = old_scope;
+            }
+            persist_config(&app, &shared);
+            let _ = start_server(&app, &shared).await;
+            emit_state_changed(&app);
+            return Err(e);
+        }
     }
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
@@ -444,15 +687,7 @@ pub async fn web_remote_set_config(
 #[tauri::command]
 pub fn web_remote_create_pairing(app: AppHandle) -> PairingInfo {
     let shared = app.state::<WebRemoteState>().shared();
-    let (token, _ttl) = shared.pairing.issue();
-    let expires_at = (chrono::Utc::now()
-        + chrono::Duration::seconds(auth::PAIRING_TTL.as_secs() as i64))
-    .to_rfc3339();
-    PairingInfo {
-        url_path: format!("/#pair={token}"),
-        token,
-        expires_at,
-    }
+    mint_pairing(&shared, None)
 }
 
 #[tauri::command]
@@ -554,6 +789,7 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.port, DEFAULT_PORT);
         assert!(!cfg.require_approval);
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL, "default scope is all interfaces");
     }
 
     #[test]
@@ -562,12 +798,130 @@ mod tests {
             enabled: true,
             port: 5000,
             require_approval: true,
+            bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: WebRemoteConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.enabled, cfg.enabled);
         assert_eq!(back.port, cfg.port);
         assert_eq!(back.require_approval, cfg.require_approval);
+        assert_eq!(back.bind_scope, cfg.bind_scope);
+    }
+
+    #[test]
+    fn config_without_bind_scope_deserializes_to_all() {
+        // A config persisted before `bind_scope` existed must load as the
+        // historical all-interfaces behavior, not fail — `#[serde(default)]`.
+        let legacy = r#"{"enabled":true,"port":4377,"require_approval":false}"#;
+        let cfg: WebRemoteConfig = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL);
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn status_carries_bind_scope_in_snake_case() {
+        let status = WebRemoteStatus {
+            enabled: true,
+            running: true,
+            port: DEFAULT_PORT,
+            require_approval: false,
+            bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
+            active_connections: 0,
+            connected_sessions: 0,
+            sessions: vec![],
+            update_available: false,
+            update_version: None,
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(v["bind_scope"], "tailscale");
+        assert!(v.get("bindScope").is_none(), "no camelCase leakage");
+    }
+
+    // ── Bind-scope address resolution ───────────────────────────────
+
+    #[test]
+    fn bind_scope_all_binds_every_interface() {
+        let addrs = bind_addrs_from(BIND_SCOPE_ALL, 4377, vec![]).unwrap();
+        assert_eq!(addrs, vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4377)]);
+    }
+
+    #[test]
+    fn bind_scope_unknown_value_defaults_to_all() {
+        // `bind_addrs_from` treats an unrecognised scope as all-interfaces so
+        // it can never leave the server unbindable; `web_remote_set_config`
+        // rejects unknown values before they are ever persisted.
+        let addrs = bind_addrs_from("wat", 4377, vec![]).unwrap();
+        assert_eq!(addrs, vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 4377)]);
+    }
+
+    #[test]
+    fn bind_scope_loopback_binds_loopback_only() {
+        let addrs = bind_addrs_from(BIND_SCOPE_LOOPBACK, 4377, vec![]).unwrap();
+        assert_eq!(addrs, vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4377)]);
+    }
+
+    #[test]
+    fn bind_scope_tailscale_without_address_fails_and_never_falls_back() {
+        // The whole point of the scope is to NOT expose the port when there's
+        // no tailnet — a silent fall-back to 0.0.0.0 would defeat it.
+        let err = bind_addrs_from(BIND_SCOPE_TAILSCALE, 4377, vec![]).unwrap_err();
+        assert!(err.contains("No Tailscale address found"), "clear error: {err}");
+    }
+
+    #[test]
+    fn bind_scope_tailscale_binds_tailnet_plus_loopback() {
+        let tailnet: IpAddr = "100.101.102.103".parse().unwrap();
+        let addrs = bind_addrs_from(BIND_SCOPE_TAILSCALE, 4377, vec![tailnet]).unwrap();
+        // Loopback is kept so local use / an SSH tunnel still works.
+        assert!(addrs.contains(&SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4377)));
+        assert!(addrs.contains(&SocketAddr::new(tailnet, 4377)));
+        assert_eq!(addrs.len(), 2, "exactly loopback + the one tailnet address");
+    }
+
+    // ── Control-socket pairing (codemux remote pair over SSH) ───────
+
+    #[test]
+    fn control_pair_errors_when_disabled() {
+        // Default config is disabled — pairing over the control socket must
+        // refuse with a clear, actionable message and mint no token.
+        let shared = Arc::new(Shared::default());
+        let err = control_pair_from(&shared, None).unwrap_err();
+        assert!(
+            err.contains("Remote access is not enabled"),
+            "clear error: {err}"
+        );
+        assert_eq!(shared.pairing.live_count(), 0, "no token minted on the error path");
+    }
+
+    #[test]
+    fn control_pair_when_enabled_mints_a_usable_single_use_token() {
+        let shared = Arc::new(Shared::default());
+        shared.config.lock().unwrap().enabled = true;
+
+        let res = control_pair_from(&shared, Some("Phone".to_string())).unwrap();
+        // The URL is the recommended endpoint's origin + the pairing fragment;
+        // loopback is always present so we always get a usable http:// URL.
+        assert!(res.pairing_url.starts_with("http://"), "url: {}", res.pairing_url);
+        assert!(
+            res.pairing_url.ends_with(&format!("/#pair={}", res.token)),
+            "url embeds the token: {}",
+            res.pairing_url
+        );
+        assert_eq!(res.port, DEFAULT_PORT);
+
+        // The token pairs via the SAME path `/api/pair` uses (PairingStore),
+        // and is single-use: the first consume succeeds, the second fails.
+        let first = shared.pairing.consume_named(&res.token);
+        assert!(first.consumed, "minted token pairs successfully");
+        assert_eq!(
+            first.suggested_name.as_deref(),
+            Some("Phone"),
+            "the --name label rides along as the fallback device name"
+        );
+        assert!(
+            !shared.pairing.consume(&res.token),
+            "token is single-use — a second pair attempt fails"
+        );
     }
 
     #[test]
@@ -579,6 +933,7 @@ mod tests {
             running: true,
             port: DEFAULT_PORT,
             require_approval: false,
+            bind_scope: BIND_SCOPE_ALL.to_string(),
             active_connections: 3,
             connected_sessions: 2,
             sessions: vec![],
@@ -601,6 +956,7 @@ mod tests {
             running: true,
             port: DEFAULT_PORT,
             require_approval: false,
+            bind_scope: BIND_SCOPE_ALL.to_string(),
             active_connections: 0,
             connected_sessions: 0,
             sessions: vec![],

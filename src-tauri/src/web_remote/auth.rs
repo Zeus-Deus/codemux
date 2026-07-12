@@ -78,18 +78,50 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 // ── Pairing tokens ──────────────────────────────────────────────────
 
+/// A live pairing token: when it was issued, plus an optional device name
+/// suggested by whoever minted it (the `codemux remote pair --name <label>`
+/// CLI). The suggested name is used by the pair handler only as a fallback
+/// when the connecting client presents no `device_name` of its own.
+struct PairingEntry {
+    created: Instant,
+    suggested_name: Option<String>,
+}
+
+/// Outcome of consuming a pairing token: whether it was valid (single-use,
+/// within TTL) plus any suggested device name it carried.
+pub struct PairingConsume {
+    pub consumed: bool,
+    pub suggested_name: Option<String>,
+}
+
 #[derive(Default)]
 pub struct PairingStore {
-    inner: Mutex<HashMap<String, Instant>>,
+    inner: Mutex<HashMap<String, PairingEntry>>,
 }
 
 impl PairingStore {
-    /// Issue a new single-use pairing token. Returns `(token, expires_in)`.
+    /// Issue a new single-use pairing token with no suggested device name.
+    /// Returns `(token, expires_in)`.
     pub fn issue(&self) -> (String, Duration) {
+        self.issue_named(None)
+    }
+
+    /// Issue a single-use pairing token carrying an optional suggested
+    /// device name. Returns `(token, expires_in)`. The name is surfaced by
+    /// [`PairingStore::consume_named`] so the pair handler can label a
+    /// device that connects without naming itself (e.g. a QR minted from
+    /// the CLI with `--name`).
+    pub fn issue_named(&self, suggested_name: Option<String>) -> (String, Duration) {
         let token = random_token();
         let mut map = self.inner.lock().unwrap();
         Self::prune(&mut map);
-        map.insert(token.clone(), Instant::now());
+        map.insert(
+            token.clone(),
+            PairingEntry {
+                created: Instant::now(),
+                suggested_name,
+            },
+        );
         (token, PAIRING_TTL)
     }
 
@@ -97,11 +129,24 @@ impl PairingStore {
     /// the TTL. Removes it whether or not it was still fresh so a
     /// captured-but-expired token can't be retried.
     pub fn consume(&self, token: &str) -> bool {
+        self.consume_named(token).consumed
+    }
+
+    /// Consume a pairing token, also returning any suggested device name it
+    /// carried so the pair handler can use it as a fallback label. Same
+    /// single-use / TTL semantics as [`PairingStore::consume`].
+    pub fn consume_named(&self, token: &str) -> PairingConsume {
         let mut map = self.inner.lock().unwrap();
         Self::prune(&mut map);
         match map.remove(token) {
-            Some(created) => created.elapsed() < PAIRING_TTL,
-            None => false,
+            Some(entry) => PairingConsume {
+                consumed: entry.created.elapsed() < PAIRING_TTL,
+                suggested_name: entry.suggested_name,
+            },
+            None => PairingConsume {
+                consumed: false,
+                suggested_name: None,
+            },
         }
     }
 
@@ -112,8 +157,8 @@ impl PairingStore {
         map.len()
     }
 
-    fn prune(map: &mut HashMap<String, Instant>) {
-        map.retain(|_, created| created.elapsed() < PAIRING_TTL);
+    fn prune(map: &mut HashMap<String, PairingEntry>) {
+        map.retain(|_, entry| entry.created.elapsed() < PAIRING_TTL);
     }
 }
 
@@ -292,9 +337,33 @@ mod tests {
         // Simulate an already-expired issue by inserting an old timestamp.
         {
             let mut map = store.inner.lock().unwrap();
-            map.insert(token.clone(), Instant::now() - (PAIRING_TTL + Duration::from_secs(1)));
+            map.insert(
+                token.clone(),
+                PairingEntry {
+                    created: Instant::now() - (PAIRING_TTL + Duration::from_secs(1)),
+                    suggested_name: None,
+                },
+            );
         }
         assert!(!store.consume(&token), "expired token must be rejected");
+    }
+
+    #[test]
+    fn pairing_suggested_name_survives_consume_and_is_single_use() {
+        // A token minted with a suggested name (the CLI's `--name` label)
+        // returns that name once, on the single successful consume. The
+        // second consume is empty — proving the name isn't leaked twice and
+        // the single-use invariant holds for the named path too.
+        let store = PairingStore::default();
+        let (token, _ttl) = store.issue_named(Some("Kitchen iPad".to_string()));
+
+        let first = store.consume_named(&token);
+        assert!(first.consumed, "first named consume succeeds");
+        assert_eq!(first.suggested_name.as_deref(), Some("Kitchen iPad"));
+
+        let second = store.consume_named(&token);
+        assert!(!second.consumed, "second named consume fails (single-use)");
+        assert_eq!(second.suggested_name, None);
     }
 
     #[test]

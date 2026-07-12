@@ -150,10 +150,11 @@ impl ConnectionRegistry {
 
 // ── Router / lifecycle ──────────────────────────────────────────────
 
-/// Bind the public listener. `0.0.0.0` so LAN/tailnet peers can reach it.
-pub async fn bind(port: u16) -> Result<TcpListener, String> {
-    let addr = format!("0.0.0.0:{port}");
-    TcpListener::bind(&addr)
+/// Bind a listener on one resolved address. The bind scope (which
+/// addresses to listen on — all interfaces, the tailnet only, or loopback
+/// only) is decided by [`super::bind_addrs`]; this just opens one of them.
+pub async fn bind(addr: SocketAddr) -> Result<TcpListener, String> {
+    TcpListener::bind(addr)
         .await
         .map_err(|e| format!("bind {addr}: {e}"))
 }
@@ -205,7 +206,8 @@ async fn pair(
     if !shared.rate.check_and_record(peer.ip()) {
         return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
     }
-    if !shared.pairing.consume(&body.token) {
+    let consume = shared.pairing.consume_named(&body.token);
+    if !consume.consumed {
         return error(StatusCode::UNAUTHORIZED, "invalid_or_expired_token");
     }
 
@@ -218,7 +220,19 @@ async fn pair(
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let name = body.device_name.filter(|s| !s.trim().is_empty());
+    // The connecting device names itself when it can (the web client sends a
+    // derived name). Fall back to the token's suggested name — the label a
+    // `codemux remote pair --name <label>` CLI caller attached — when it
+    // doesn't, so a device paired from the terminal still shows a friendly
+    // name in the desktop list.
+    let name = body
+        .device_name
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            consume
+                .suggested_name
+                .filter(|s| !s.trim().is_empty())
+        });
 
     let insert = app.state::<crate::database::DatabaseStore>().web_remote_insert_session(
         &session_id,

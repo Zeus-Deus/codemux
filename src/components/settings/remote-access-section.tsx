@@ -34,6 +34,7 @@ import {
 } from "@/tauri/commands";
 import { onWebRemoteStateChanged } from "@/remote/web-remote-events";
 import type {
+  WebRemoteBindScope,
   WebRemoteEndpoint,
   WebRemotePairingInfo,
   WebRemoteSessionView,
@@ -43,6 +44,8 @@ import type {
 import { useQrSvg } from "./use-qr-svg";
 import {
   approvedSessions,
+  BIND_SCOPE_OPTIONS,
+  bindScopeOf,
   composePairUrl,
   connectedSessionCount,
   describeDevice,
@@ -550,6 +553,7 @@ export function RemoteAccessSection() {
   const [portDraft, setPortDraft] = useState("");
   const [togglePending, setTogglePending] = useState(false);
   const [portPending, setPortPending] = useState(false);
+  const [scopePending, setScopePending] = useState(false);
   const [approvalPending, setApprovalPending] = useState(false);
   const [pairingPending, setPairingPending] = useState(false);
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
@@ -621,6 +625,7 @@ export function RemoteAccessSection() {
   const enabled = status?.enabled ?? false;
   const running = status?.running ?? false;
   const requireApproval = status?.require_approval ?? false;
+  const bindScope = bindScopeOf(status);
   const pending = useMemo(() => pendingSessions(status), [status]);
   const approved = useMemo(() => approvedSessions(status), [status]);
   const connectedCount = connectedSessionCount(status);
@@ -672,6 +677,36 @@ export function RemoteAccessSection() {
       setPortPending(false);
     }
   }, [applyStatus, portValidation, refreshEndpoints]);
+
+  const handleSetScope = useCallback(
+    async (next: WebRemoteBindScope) => {
+      if (next === bindScope) return;
+      setScopePending(true);
+      try {
+        const result = await webRemoteSetConfig({ bindScope: next });
+        applyStatus(result, { detectPending: false });
+        // A scope change rebinds, so the reachable-endpoint set changes too.
+        if (result.running) void refreshEndpoints();
+        // A rebind drops any composed pairing URL (the old address may be gone).
+        setPairing(null);
+        toast.success(
+          next === "all"
+            ? "Now listening on every network interface."
+            : next === "tailscale"
+              ? "Now listening on Tailscale only (plus this device)."
+              : "Now listening on this device only.",
+        );
+      } catch (err) {
+        console.error("[remote-access] set scope failed:", err);
+        // The backend keeps the previous, working scope on failure and the
+        // status it broadcasts reflects that, so the control snaps back.
+        toast.error(`Couldn't change the access scope: ${String(err)}`);
+      } finally {
+        setScopePending(false);
+      }
+    },
+    [applyStatus, bindScope, refreshEndpoints],
+  );
 
   const handleToggleApproval = useCallback(
     async (next: boolean) => {
@@ -826,7 +861,47 @@ export function RemoteAccessSection() {
           <section className="space-y-4">
             <SubHeading>Server</SubHeading>
 
-            <div className="flex items-end justify-between gap-4">
+            {/* Access scope — which interfaces the server binds. Narrowing it
+                keeps the port off untrusted networks entirely. Changing it
+                rebinds immediately (same drop-connections path as a port
+                change). */}
+            <div className="space-y-2">
+              <p className="text-[13px] font-medium leading-none text-foreground">
+                Who can connect
+              </p>
+              <div
+                role="radiogroup"
+                aria-label="Access scope"
+                className="inline-flex rounded-lg border border-border/60 bg-muted/30 p-0.5"
+              >
+                {BIND_SCOPE_OPTIONS.map((opt) => {
+                  const active = opt.value === bindScope;
+                  return (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      disabled={scopePending}
+                      onClick={() => handleSetScope(opt.value)}
+                      className={cn(
+                        "rounded-[7px] px-3 py-1.5 text-[12.5px] font-medium transition-colors disabled:opacity-60",
+                        active
+                          ? "bg-accent-ember/15 text-accent-ember shadow-sm"
+                          : "text-muted-foreground hover:text-foreground",
+                      )}
+                    >
+                      {opt.label}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-[12px] leading-relaxed text-muted-foreground/85">
+                {BIND_SCOPE_OPTIONS.find((o) => o.value === bindScope)?.detail}
+              </p>
+            </div>
+
+            <div className="flex items-end justify-between gap-4 border-t border-border/60 pt-4">
               <div className="min-w-0 flex-1 space-y-1">
                 <label
                   htmlFor="web-remote-port"

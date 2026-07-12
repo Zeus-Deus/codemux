@@ -6,11 +6,52 @@
  * tested without rendering React.
  */
 import type {
+  WebRemoteBindScope,
   WebRemoteEndpoint,
   WebRemotePairingInfo,
   WebRemoteSessionView,
   WebRemoteStatus,
 } from "@/tauri/types";
+
+// ── Bind scope (which interfaces the server listens on) ──────────────
+
+export interface BindScopeOption {
+  value: WebRemoteBindScope;
+  /** Short control label. */
+  label: string;
+  /** One-line explanation shown under the control. */
+  detail: string;
+}
+
+/** The three access-scope choices, in the order the segmented control
+ *  renders them. Kept here (not inline in the component) so the copy and
+ *  ordering are unit-testable and reused by the dev mock. */
+export const BIND_SCOPE_OPTIONS: BindScopeOption[] = [
+  {
+    value: "all",
+    label: "All networks",
+    detail:
+      "Listens on every network interface. Anyone on your LAN or mesh with the port can reach it.",
+  },
+  {
+    value: "tailscale",
+    label: "Tailscale only",
+    detail:
+      "Listens only on your Tailscale address (plus this device). Recommended on untrusted networks — the port isn't exposed to the local LAN.",
+  },
+  {
+    value: "loopback",
+    label: "This device only",
+    detail:
+      "Listens only on 127.0.0.1. Reachable just from this computer — e.g. tunnelled in over SSH.",
+  },
+];
+
+/** The effective bind scope for a status payload, defaulting to `all` when
+ *  the field is absent (a config persisted before the field existed). */
+export function bindScopeOf(status: WebRemoteStatus | null): WebRemoteBindScope {
+  return status?.bind_scope ?? "all";
+}
 
 // ── Endpoint security ────────────────────────────────────────────────
 

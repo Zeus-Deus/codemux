@@ -9,6 +9,8 @@ import type {
 
 import {
   approvedSessions,
+  BIND_SCOPE_OPTIONS,
+  bindScopeOf,
   composePairUrl,
   connectedSessionCount,
   describeDevice,
@@ -303,5 +305,35 @@ describe("validatePort", () => {
     expect(validatePort("80").valid).toBe(false);
     expect(validatePort("70000").valid).toBe(false);
     expect(validatePort("").valid).toBe(false);
+  });
+});
+
+describe("bind scope", () => {
+  it("offers exactly the three scopes in a stable order", () => {
+    expect(BIND_SCOPE_OPTIONS.map((o) => o.value)).toEqual([
+      "all",
+      "tailscale",
+      "loopback",
+    ]);
+    // Every option carries a label and a one-line explanation.
+    for (const o of BIND_SCOPE_OPTIONS) {
+      expect(o.label.length).toBeGreaterThan(0);
+      expect(o.detail.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("defaults a status with no bind_scope to 'all'", () => {
+    // A config persisted before the field existed omits it on the wire.
+    expect(bindScopeOf(status([]))).toBe("all");
+    expect(bindScopeOf(null)).toBe("all");
+  });
+
+  it("reflects an explicit bind_scope", () => {
+    expect(bindScopeOf({ ...status([]), bind_scope: "tailscale" })).toBe(
+      "tailscale",
+    );
+    expect(bindScopeOf({ ...status([]), bind_scope: "loopback" })).toBe(
+      "loopback",
+    );
   });
 });

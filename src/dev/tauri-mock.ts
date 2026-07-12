@@ -72,6 +72,7 @@ import type {
   ShellAppearance,
   ThemeColors,
   UserSettings,
+  WebRemoteBindScope,
   WebRemoteSessionView,
   WebRemoteStatus,
   WorkspaceSnapshot,
@@ -1356,6 +1357,7 @@ function resourceMetrics(): ResourceMetricsSnapshot {
 let webRemotePort = MOCK_WEB_REMOTE_PORT;
 let webRemoteEnabled = false;
 let webRemoteRequireApproval = true;
+let webRemoteBindScope: WebRemoteBindScope = "all";
 let webRemoteSessions: WebRemoteSessionView[] = mockWebRemoteSessions();
 let webRemoteLiveSeq = 0;
 
@@ -1365,6 +1367,7 @@ function buildWebRemoteStatus(): WebRemoteStatus {
     running: webRemoteEnabled,
     port: webRemotePort,
     require_approval: webRemoteRequireApproval,
+    bind_scope: webRemoteBindScope,
     active_connections: webRemoteEnabled
       ? webRemoteSessions.filter((s) => s.approved && s.connected).length
       : 0,
@@ -1888,6 +1891,13 @@ const handlers: Record<string, Handler> = {
     if (typeof a.port === "number") webRemotePort = a.port;
     if (typeof a.requireApproval === "boolean") {
       webRemoteRequireApproval = a.requireApproval;
+    }
+    if (
+      a.bindScope === "all" ||
+      a.bindScope === "tailscale" ||
+      a.bindScope === "loopback"
+    ) {
+      webRemoteBindScope = a.bindScope;
     }
     emitWebRemoteState();
     return buildWebRemoteStatus();
