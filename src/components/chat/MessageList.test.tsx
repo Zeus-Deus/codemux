@@ -168,6 +168,74 @@ describe("MessageList dispatch", () => {
     expect(screen.queryByText(/Approval requested/)).toBeNull();
   });
 
+  it("shows a submitting marker while a user-input request is responding", () => {
+    renderList([
+      askReq({
+        resolution: {
+          state: "responding",
+          decision: { decision: "allow", updated_input: { answers: {} } },
+        },
+      }),
+    ]);
+    expect(screen.getByText(/Submitting answers/)).toBeInTheDocument();
+  });
+
+  it("echoes the user's answer as a reply once a user-input request resolves", () => {
+    renderList([
+      askReq({
+        resolution: {
+          state: "resolved",
+          decision: {
+            decision: "allow",
+            updated_input: {
+              questions: [],
+              answers: { "Framework?": "React" },
+            },
+          },
+        },
+      }),
+    ]);
+    // The chosen option is now visible in the transcript...
+    expect(screen.getByText("React")).toBeInTheDocument();
+    // ...instead of the old opaque "Answered" marker.
+    expect(screen.queryByText("Answered")).toBeNull();
+  });
+
+  it("labels each answer by its question header when several were asked", () => {
+    renderList([
+      askReq({
+        payload: {
+          questions: [
+            { header: "Framework", question: "Framework?", options: [] },
+            { header: "Styling", question: "Styling?", options: [] },
+          ],
+        },
+        resolution: {
+          state: "resolved",
+          decision: {
+            decision: "allow",
+            updated_input: {
+              answers: { "Framework?": "React", "Styling?": "Tailwind" },
+            },
+          },
+        },
+      }),
+    ]);
+    expect(screen.getByText("React")).toBeInTheDocument();
+    expect(screen.getByText("Tailwind")).toBeInTheDocument();
+    expect(screen.getByText("Framework")).toBeInTheDocument();
+    expect(screen.getByText("Styling")).toBeInTheDocument();
+  });
+
+  it("falls back to the plain marker when a resolved user-input carries no answer", () => {
+    renderList([
+      askReq({
+        resolution: { state: "resolved", decision: { decision: "cancel" } },
+      }),
+    ]);
+    expect(screen.getByText("Answered")).toBeInTheDocument();
+  });
+
   it("falls back to PermissionRequestBlock for unknown request_kind", () => {
     renderList([genericReq()]);
     expect(screen.getByText(/Approval requested/)).toBeInTheDocument();
