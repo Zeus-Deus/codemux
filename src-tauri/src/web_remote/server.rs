@@ -165,6 +165,9 @@ pub fn router(app: AppHandle) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/pair", post(pair))
+        // Account-mode admission: sign into the desktop's Codemux account
+        // instead of pasting a pairing code (Stage A).
+        .route("/api/pair-account", post(pair_account))
         .route("/api/ws-ticket", post(ws_ticket))
         // Authenticated one-shot state bootstrap (versioned API surface).
         .route("/api/snapshot", get(super::snapshot::serve))
@@ -182,7 +185,23 @@ pub fn router(app: AppHandle) -> Router {
 
 async fn health(State(app): State<AppHandle>) -> Response {
     let version = app.package_info().version.to_string();
-    Json(json!({ "ok": true, "version": version })).into_response()
+    // Advertise whether account mode is on so the pre-app bootstrap knows to
+    // offer the "sign in with your Codemux account" screen alongside the
+    // paste-a-code path. Public + non-sensitive: it only says which admission
+    // methods this server accepts, never anything about the account itself.
+    let account_mode_enabled = app
+        .state::<WebRemoteState>()
+        .shared()
+        .config
+        .lock()
+        .unwrap()
+        .account_mode_enabled;
+    Json(json!({
+        "ok": true,
+        "version": version,
+        "account_mode_enabled": account_mode_enabled,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -264,6 +283,106 @@ async fn pair(
         })),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct PairAccountBody {
+    email: String,
+    /// The client-derived `codemux-api-*` AuthSecret (base64), NOT a raw
+    /// password — the browser stretched it locally so the password never leaves
+    /// it. See [`super::account`].
+    auth_secret: String,
+    #[serde(default)]
+    device_name: Option<String>,
+}
+
+/// Account-mode admission (Stage A). Same origin + rate-limit discipline as
+/// [`pair`], then hands the account proof to [`super::account::verify_and_mint`]
+/// and, on success, returns `{session_id, session_token, approved}` + a
+/// `Set-Cookie` exactly like the pairing path.
+async fn pair_account(
+    State(app): State<AppHandle>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<PairAccountBody>,
+) -> Response {
+    if !auth::origin_ok(&headers) {
+        return error(StatusCode::FORBIDDEN, "origin_mismatch");
+    }
+    let shared = app.state::<WebRemoteState>().shared();
+
+    // Same per-IP limiter the pairing path uses — an account attempt is a
+    // credential attempt and must not be a brute-force oracle.
+    if !shared.rate.check_and_record(peer.ip()) {
+        return error(StatusCode::TOO_MANY_REQUESTS, "rate_limited");
+    }
+
+    let email = body.email.trim().to_string();
+    if email.is_empty() || body.auth_secret.is_empty() {
+        return error(StatusCode::BAD_REQUEST, "invalid_request");
+    }
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    let db = app.state::<crate::database::DatabaseStore>();
+    let outcome = match super::account::verify_and_mint(
+        &db,
+        &shared,
+        &email,
+        body.auth_secret,
+        body.device_name,
+        user_agent,
+    )
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => return account_pair_error_response(e),
+    };
+
+    super::emit_state_changed(&app);
+
+    // HttpOnly + SameSite=Strict cookie, identical to /api/pair, so authed
+    // asset/`<img>` GETs work for account sessions too.
+    let cookie = format!(
+        "{SESSION_COOKIE}={}; HttpOnly; SameSite=Strict; Path=/",
+        outcome.session_token
+    );
+    let mut out_headers = HeaderMap::new();
+    if let Ok(v) = cookie.parse() {
+        out_headers.insert(header::SET_COOKIE, v);
+    }
+    (
+        StatusCode::OK,
+        out_headers,
+        Json(json!({
+            "session_id": outcome.session_id,
+            "session_token": outcome.session_token,
+            "approved": outcome.approved,
+        })),
+    )
+        .into_response()
+}
+
+/// Map an [`super::account::AccountPairError`] onto its HTTP response. Kept
+/// separate (and unit-tested) so the status/code contract the browser relies on
+/// is pinned. All codes are machine tokens the client maps to friendly copy;
+/// none enumerate whether an account/email exists.
+fn account_pair_error_response(err: super::account::AccountPairError) -> Response {
+    use super::account::AccountPairError as E;
+    match err {
+        E::Disabled => error(StatusCode::FORBIDDEN, "account_mode_disabled"),
+        E::DesktopSignedOut => error(StatusCode::FORBIDDEN, "account_signed_out"),
+        E::AuthFailed => error(StatusCode::UNAUTHORIZED, "account_auth_failed"),
+        E::Mismatch => error(StatusCode::FORBIDDEN, "account_mismatch"),
+        E::Internal(reason) => {
+            // Surface the concrete cause in the server log (never to the client)
+            // so a failed mint is diagnosable without leaking internals.
+            eprintln!("[codemux::web_remote] account pairing failed: {reason}");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        }
+    }
 }
 
 async fn ws_ticket(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
@@ -761,6 +880,34 @@ mod tests {
         assert_eq!(
             gate_error_response(GateError::Pending).status(),
             StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn account_pair_errors_map_to_expected_http_status() {
+        // The browser account-login screen keys its copy off these exact
+        // status/code pairs. Disabled/signed-out/mismatch are 403; a bad
+        // credential is 401 (non-enumerating); internal is 500.
+        use super::super::account::AccountPairError as E;
+        assert_eq!(
+            account_pair_error_response(E::Disabled).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            account_pair_error_response(E::DesktopSignedOut).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            account_pair_error_response(E::Mismatch).status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            account_pair_error_response(E::AuthFailed).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            account_pair_error_response(E::Internal("x".into())).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
         );
     }
 

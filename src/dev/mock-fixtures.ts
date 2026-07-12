@@ -1850,6 +1850,7 @@ export function mockWebRemoteSessions(): WebRemoteSessionView[] {
       last_seen_at: iso(4000),
       approved: true,
       connected: true,
+      source: "pair",
     },
     {
       id: "sess-iphone",
@@ -1860,6 +1861,8 @@ export function mockWebRemoteSessions(): WebRemoteSessionView[] {
       last_seen_at: iso(18 * 60 * 1000),
       approved: true,
       connected: false,
+      // Admitted by signing into the desktop's Codemux account (account mode).
+      source: "account",
     },
     {
       id: "sess-linux-pending",
@@ -1870,6 +1873,7 @@ export function mockWebRemoteSessions(): WebRemoteSessionView[] {
       last_seen_at: null,
       approved: false,
       connected: false,
+      source: "pair",
     },
   ];
 }

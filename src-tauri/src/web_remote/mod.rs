@@ -10,6 +10,8 @@
 //! - [`mod@self`] — managed state, config persistence, lifecycle, commands.
 //! - [`server`]   — axum router, static assets, `/api/*`, `/ws`.
 //! - [`auth`]     — pairing tokens, sessions, WS tickets, origin checks.
+//! - [`account`]  — account-mode admission: verify the browser owns the same
+//!   Codemux account the desktop is signed into, then mint a session.
 //! - [`dispatch`] — invoke dispatch via synthesized `on_message` + channels.
 //! - [`events`]   — `listen_any` fan-out hub with per-event refcounting.
 //! - [`endpoints`]— reachable-endpoint enumeration (loopback/LAN/tailnet).
@@ -19,6 +21,7 @@
 //!
 //! See `docs/plans/web-remote-access.md` for the locked protocol contract.
 
+pub mod account;
 pub mod assets;
 pub mod auth;
 pub mod dispatch;
@@ -87,6 +90,22 @@ pub struct WebRemoteConfig {
     /// deserializes to the historical `all` behavior instead of failing.
     #[serde(default = "default_bind_scope")]
     pub bind_scope: String,
+    /// Master toggle for account mode (Stage A): when off, `POST
+    /// /api/pair-account` refuses with 403 and a browser cannot mint a session
+    /// by signing into the desktop's Codemux account. Default **off**, mirroring
+    /// the base feature's default-off posture — account compromise must never
+    /// reach a device that never opted in. `#[serde(default)]` so a config
+    /// persisted before this field existed loads as `false`.
+    #[serde(default)]
+    pub account_mode_enabled: bool,
+    /// Approval opt-out for account-minted sessions. Account sessions default to
+    /// **pending approval** even when `require_approval` is off (a desktop-side
+    /// approve click is a cheap circuit-breaker against a compromised account);
+    /// setting this to `true` is the explicit "trust browsers on my account
+    /// without approval" opt-out that admits them immediately. `#[serde(default)]`
+    /// so a legacy config loads as `false` (approval on).
+    #[serde(default)]
+    pub trust_account_browsers: bool,
 }
 
 impl Default for WebRemoteConfig {
@@ -96,8 +115,19 @@ impl Default for WebRemoteConfig {
             port: DEFAULT_PORT,
             require_approval: false,
             bind_scope: default_bind_scope(),
+            account_mode_enabled: false,
+            trust_account_browsers: false,
         }
     }
+}
+
+/// Whether an account-minted session should be admitted immediately (approved)
+/// or start pending. Account sessions default to pending even when the global
+/// pairing `require_approval` is off; only the explicit "trust browsers on my
+/// account" opt-out (`trust_account_browsers`) admits them without a click.
+/// Pure so it is directly unit-testable.
+pub(crate) fn account_session_approved(cfg: &WebRemoteConfig) -> bool {
+    cfg.trust_account_browsers
 }
 
 /// Desktop-updater availability, published by the desktop frontend's updater
@@ -205,6 +235,19 @@ pub struct WebRemoteStatus {
     pub update_available: bool,
     /// Version string of the available desktop update, when `update_available`.
     pub update_version: Option<String>,
+    /// Account mode (Stage A) master toggle. When on, a browser on a reachable
+    /// endpoint can sign in with the desktop's Codemux account via
+    /// `POST /api/pair-account` instead of pasting a pairing code.
+    pub account_mode_enabled: bool,
+    /// The "trust browsers on my account without approval" opt-out. When off
+    /// (default), account-minted sessions start pending approval regardless of
+    /// `require_approval`; when on, they connect immediately.
+    pub trust_account_browsers: bool,
+    /// Whether the desktop is currently signed into a Codemux account. Account
+    /// mode can only verify "same account" while the desktop is signed in, so
+    /// the Settings pane surfaces this to explain why account mode is inert when
+    /// signed out, and the browser login screen can degrade gracefully.
+    pub account_signed_in: bool,
 }
 
 /// A paired device as shown in the desktop management UI.
@@ -218,6 +261,10 @@ pub struct SessionView {
     pub approved: bool,
     /// Has at least one live WebSocket right now.
     pub connected: bool,
+    /// How the device was admitted: `"pair"` (pairing token) or `"account"`
+    /// (signed into the desktop's Codemux account). Lets the device list tag
+    /// account-minted devices distinctly from paired ones.
+    pub source: String,
 }
 
 /// Result of `web_remote_create_pairing`. QR rendering is the frontend's job.
@@ -323,8 +370,8 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
     let cfg = shared.config.lock().unwrap().clone();
     let running = shared.runtime.lock().unwrap().is_some();
     let active_connections = shared.connections.active_count();
-    let sessions: Vec<SessionView> = app
-        .state::<crate::database::DatabaseStore>()
+    let db = app.state::<crate::database::DatabaseStore>();
+    let sessions: Vec<SessionView> = db
         .web_remote_list_sessions()
         .into_iter()
         .map(|s| SessionView {
@@ -335,9 +382,13 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
             created_at: s.created_at,
             last_seen_at: s.last_seen_at,
             approved: s.approved,
+            source: s.source,
         })
         .collect();
     let connected_sessions = sessions.iter().filter(|s| s.connected).count();
+    // Account mode can only verify "same account" while the desktop holds a
+    // cached account user, so surface that state alongside the toggles.
+    let account_signed_in = crate::auth::load_cached_user(&db).is_some();
     let update = shared.update.lock().unwrap().clone();
     WebRemoteStatus {
         enabled: cfg.enabled,
@@ -350,6 +401,9 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
         sessions,
         update_available: update.available,
         update_version: update.version,
+        account_mode_enabled: cfg.account_mode_enabled,
+        trust_account_browsers: cfg.trust_account_browsers,
+        account_signed_in,
     }
 }
 
@@ -625,6 +679,8 @@ pub async fn web_remote_set_config(
     port: Option<u16>,
     require_approval: Option<bool>,
     bind_scope: Option<String>,
+    account_mode_enabled: Option<bool>,
+    trust_account_browsers: Option<bool>,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
 
@@ -648,6 +704,15 @@ pub async fn web_remote_set_config(
         }
         if let Some(s) = bind_scope {
             cfg.bind_scope = s;
+        }
+        // Account-mode toggles never rebind the listener (they only gate the
+        // `/api/pair-account` admission path), so they're applied here and
+        // persisted without touching the running server.
+        if let Some(a) = account_mode_enabled {
+            cfg.account_mode_enabled = a;
+        }
+        if let Some(t) = trust_account_browsers {
+            cfg.trust_account_browsers = t;
         }
         (
             old_port,
@@ -799,6 +864,8 @@ mod tests {
             port: 5000,
             require_approval: true,
             bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
+            account_mode_enabled: false,
+            trust_account_browsers: false,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: WebRemoteConfig = serde_json::from_str(&json).unwrap();
@@ -819,6 +886,86 @@ mod tests {
     }
 
     #[test]
+    fn config_account_mode_defaults_off_and_approval_on() {
+        // Account mode is default-off (must be explicitly opted into) and
+        // account browsers are NOT trusted by default (approval on), mirroring
+        // the design's default-off / approval-on-by-default posture.
+        let cfg = WebRemoteConfig::default();
+        assert!(!cfg.account_mode_enabled, "account mode default off");
+        assert!(
+            !cfg.trust_account_browsers,
+            "account browsers not trusted by default (approval on)"
+        );
+    }
+
+    #[test]
+    fn config_without_account_fields_deserializes_to_defaults() {
+        // A config persisted before account mode existed must load with account
+        // mode off and approval on, never fail — `#[serde(default)]`.
+        let legacy = r#"{"enabled":true,"port":4377,"require_approval":false,"bind_scope":"all"}"#;
+        let cfg: WebRemoteConfig = serde_json::from_str(legacy).unwrap();
+        assert!(!cfg.account_mode_enabled);
+        assert!(!cfg.trust_account_browsers);
+    }
+
+    #[test]
+    fn account_config_roundtrips_through_json() {
+        let cfg = WebRemoteConfig {
+            enabled: true,
+            port: 4377,
+            require_approval: false,
+            bind_scope: BIND_SCOPE_ALL.to_string(),
+            account_mode_enabled: true,
+            trust_account_browsers: true,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: WebRemoteConfig = serde_json::from_str(&json).unwrap();
+        assert!(back.account_mode_enabled);
+        assert!(back.trust_account_browsers);
+    }
+
+    #[test]
+    fn account_session_approval_follows_trust_opt_out() {
+        // Pending by default (approval on for account sessions), even when the
+        // pairing-path `require_approval` is off.
+        let mut cfg = WebRemoteConfig {
+            require_approval: false,
+            ..WebRemoteConfig::default()
+        };
+        assert!(
+            !account_session_approved(&cfg),
+            "account session pends by default despite require_approval=off"
+        );
+        // The explicit opt-out admits account browsers immediately.
+        cfg.trust_account_browsers = true;
+        assert!(account_session_approved(&cfg));
+    }
+
+    #[test]
+    fn status_carries_account_fields_in_snake_case() {
+        let status = WebRemoteStatus {
+            enabled: true,
+            running: true,
+            port: DEFAULT_PORT,
+            require_approval: false,
+            bind_scope: BIND_SCOPE_ALL.to_string(),
+            active_connections: 0,
+            connected_sessions: 0,
+            sessions: vec![],
+            update_available: false,
+            update_version: None,
+            account_mode_enabled: true,
+            trust_account_browsers: false,
+            account_signed_in: true,
+        };
+        let v = serde_json::to_value(&status).unwrap();
+        assert_eq!(v["account_mode_enabled"], true);
+        assert_eq!(v["trust_account_browsers"], false);
+        assert_eq!(v["account_signed_in"], true);
+        assert!(v.get("accountModeEnabled").is_none(), "no camelCase leakage");
+    }
+
+    #[test]
     fn status_carries_bind_scope_in_snake_case() {
         let status = WebRemoteStatus {
             enabled: true,
@@ -831,6 +978,9 @@ mod tests {
             sessions: vec![],
             update_available: false,
             update_version: None,
+            account_mode_enabled: false,
+            trust_account_browsers: false,
+            account_signed_in: false,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["bind_scope"], "tailscale");
@@ -939,6 +1089,9 @@ mod tests {
             sessions: vec![],
             update_available: false,
             update_version: None,
+            account_mode_enabled: false,
+            trust_account_browsers: false,
+            account_signed_in: false,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["active_connections"], 3);
@@ -962,6 +1115,9 @@ mod tests {
             sessions: vec![],
             update_available: true,
             update_version: Some("1.2.3".to_string()),
+            account_mode_enabled: false,
+            trust_account_browsers: false,
+            account_signed_in: false,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["update_available"], true);
@@ -998,6 +1154,7 @@ mod tests {
             last_seen_at: None,
             approved: true,
             connected,
+            source: "pair".to_string(),
         };
         let sessions = vec![mk("a", true), mk("b", false), mk("c", true)];
         let connected = sessions.iter().filter(|s| s.connected).count();

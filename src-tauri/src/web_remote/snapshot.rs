@@ -162,6 +162,9 @@ mod tests {
             sessions: vec![],
             update_available: false,
             update_version: None,
+            account_mode_enabled: false,
+            trust_account_browsers: false,
+            account_signed_in: false,
         };
 
         let body = snapshot_json(&app_state, &status);

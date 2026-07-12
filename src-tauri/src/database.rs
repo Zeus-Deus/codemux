@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -165,6 +165,15 @@ pub struct WebRemoteSessionRecord {
     pub last_seen_at: Option<String>,
     pub approved: bool,
     pub revoked: bool,
+    /// How this session was admitted: `"pair"` (pairing-token QR/link) or
+    /// `"account"` (proved ownership of the desktop's signed-in Codemux
+    /// account via `POST /api/pair-account`). Legacy rows written before this
+    /// column existed default to `"pair"`.
+    pub source: String,
+    /// For `source = "account"` sessions, the Codemux account `user.id` that
+    /// was verified to equal the desktop's own signed-in user at admission
+    /// time. `None` for pairing-token sessions.
+    pub account_user_id: Option<String>,
 }
 
 fn database_path() -> Option<PathBuf> {
@@ -549,6 +558,12 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE agent_chat_sessions ADD COLUMN effort TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN context_window TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN permission_mode TEXT",
+        // Web-remote account mode (Stage A): how a session was admitted and,
+        // for account-minted sessions, the verified Codemux account user id.
+        // `source` defaults to 'pair' so every pre-existing (pairing-token) row
+        // reads back as a paired device; account sessions set it to 'account'.
+        "ALTER TABLE web_remote_sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'pair'",
+        "ALTER TABLE web_remote_sessions ADD COLUMN account_user_id TEXT",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -3046,6 +3061,8 @@ impl DatabaseStore {
             last_seen_at: row.get(5)?,
             approved: row.get::<_, i64>(6)? != 0,
             revoked: row.get::<_, i64>(7)? != 0,
+            source: row.get(8)?,
+            account_user_id: row.get(9)?,
         })
     }
 
@@ -3063,11 +3080,37 @@ impl DatabaseStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO web_remote_sessions
-                (id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked)
-             VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), ?5, 0)",
+                (id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked, source)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), ?5, 0, 'pair')",
             params![id, name, user_agent, token_hash, approved as i64],
         )
         .map_err(|e| format!("Failed to insert web_remote session: {e}"))?;
+        Ok(())
+    }
+
+    /// Insert a session admitted through account mode (`POST /api/pair-account`).
+    /// Identical to [`web_remote_insert_session`] but tags the row
+    /// `source = 'account'` and records the verified Codemux `account_user_id`
+    /// (already checked to equal the desktop's own signed-in user), so the
+    /// device list can distinguish account-minted from pairing-minted devices
+    /// and the row carries an audit trail of which account admitted it.
+    pub fn web_remote_insert_account_session(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        user_agent: Option<&str>,
+        token_hash: &str,
+        approved: bool,
+        account_user_id: &str,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO web_remote_sessions
+                (id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked, source, account_user_id)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), ?5, 0, 'account', ?6)",
+            params![id, name, user_agent, token_hash, approved as i64, account_user_id],
+        )
+        .map_err(|e| format!("Failed to insert web_remote account session: {e}"))?;
         Ok(())
     }
 
@@ -3075,7 +3118,7 @@ impl DatabaseStore {
     pub fn web_remote_get_session(&self, id: &str) -> Option<WebRemoteSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked
+            "SELECT id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked, source, account_user_id
              FROM web_remote_sessions WHERE id = ?1",
             params![id],
             Self::row_to_web_remote_session,
@@ -3089,7 +3132,7 @@ impl DatabaseStore {
     pub fn web_remote_list_sessions(&self) -> Vec<WebRemoteSessionRecord> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = match conn.prepare(
-            "SELECT id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked
+            "SELECT id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked, source, account_user_id
              FROM web_remote_sessions WHERE revoked = 0 ORDER BY created_at DESC",
         ) {
             Ok(stmt) => stmt,

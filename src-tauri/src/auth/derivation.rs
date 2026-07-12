@@ -97,6 +97,21 @@ impl AuthSecret {
         &self.0
     }
 
+    /// Wrap an `AuthSecret` that was **already derived on the client** and
+    /// arrived over the web-remote account-pairing channel
+    /// (`POST /api/pair-account`). The browser runs the identical
+    /// `codemux-api-*` derivation ([`derive_auth_secret`]) locally and sends
+    /// only the stretched base64 secret — never the raw password — to the
+    /// desktop, which forwards it to Better Auth. This is still an `AuthSecret`
+    /// in the type sense (a stretched value, never a raw password), so the
+    /// typed boundary that keeps raw passwords off the wire is preserved: the
+    /// value that reaches [`crate::auth::login_email_api`] is a derived secret
+    /// by construction. `pub(crate)` and verbosely named so the (single) call
+    /// site stays greppable and no external code can forge one.
+    pub(crate) fn from_web_remote_derived(secret: String) -> Self {
+        AuthSecret(secret)
+    }
+
     /// Public escape hatch for integration test binaries (e.g. the
     /// `skills_smoke` example) that need to forward the secret to
     /// the live `/api/auth/desktop/signin` endpoint. Verbose name

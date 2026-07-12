@@ -30,6 +30,13 @@ import {
   storeSession,
   type RemoteSession,
 } from "./session";
+import {
+  fetchServerInfo,
+  initialAuthMode,
+  pairAccount,
+  resolveAuthMethods,
+  type AuthMethods,
+} from "./account-pair";
 
 interface PairResult {
   session: RemoteSession;
@@ -37,17 +44,6 @@ interface PairResult {
 }
 
 // ── HTTP helpers ────────────────────────────────────────────────────
-
-async function fetchAppVersion(baseUrl: string): Promise<string | null> {
-  try {
-    const res = await fetch(`${baseUrl}/api/health`, { credentials: "include" });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { version?: unknown };
-    return typeof body.version === "string" ? body.version : null;
-  } catch {
-    return null;
-  }
-}
 
 async function pairDevice(baseUrl: string, token: string): Promise<PairResult> {
   const res = await fetch(`${baseUrl}/api/pair`, {
@@ -164,10 +160,144 @@ const cardStyle: React.CSSProperties = {
   boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
 };
 
-function PairingForm(props: {
+const inputStyle: React.CSSProperties = {
+  width: "100%",
+  boxSizing: "border-box",
+  padding: "10px 12px",
+  fontSize: 13,
+  color: "var(--foreground, #e8e8e8)",
+  background: "var(--background, #0C0C0E)",
+  border: "1px solid var(--input, rgba(255,255,255,0.15))",
+  borderRadius: 9,
+  outline: "none",
+};
+
+const primaryButtonStyle = (busy: boolean): React.CSSProperties => ({
+  marginTop: 18,
+  width: "100%",
+  padding: "10px 14px",
+  fontSize: 13.5,
+  fontWeight: 600,
+  cursor: busy ? "default" : "pointer",
+  color: "#0a0a0a",
+  background: "var(--accent-ember, oklch(0.705 0.152 47))",
+  border: "none",
+  borderRadius: 9,
+  opacity: busy ? 0.7 : 1,
+});
+
+const errorStyle: React.CSSProperties = {
+  marginTop: 12,
+  fontSize: 12.5,
+  lineHeight: 1.45,
+  color: "oklch(0.72 0.16 22)",
+};
+
+const switchLinkStyle: React.CSSProperties = {
+  marginTop: 16,
+  width: "100%",
+  fontSize: 12,
+  fontWeight: 500,
+  cursor: "pointer",
+  color: "var(--muted-foreground, #9a9a97)",
+  background: "transparent",
+  border: "none",
+  textAlign: "center",
+  textDecoration: "underline",
+  textUnderlineOffset: 2,
+};
+
+/** The account (email + password) sign-in form. Derives the AuthSecret in the
+ *  browser and POSTs it to the desktop's `/api/pair-account`; the raw password
+ *  never leaves this page. */
+function AccountForm(props: {
   baseUrl: string;
-  host: string;
   onPaired(result: PairResult): void;
+  onUseCode: (() => void) | null;
+}): React.ReactElement {
+  const [email, setEmail] = React.useState("");
+  const [password, setPassword] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  async function submit(e: React.FormEvent): Promise<void> {
+    e.preventDefault();
+    if (!email.trim() || !password) {
+      setError("Enter your email and password.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await pairAccount(props.baseUrl, email, password);
+      props.onPaired(result);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Sign-in failed.");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <form style={cardStyle} onSubmit={submit}>
+      <div
+        style={{ fontSize: 17, fontWeight: 600, letterSpacing: "-0.01em", marginBottom: 6 }}
+      >
+        Sign in with your Codemux account
+      </div>
+      <div
+        style={{
+          fontSize: 13,
+          lineHeight: 1.5,
+          color: "var(--muted-foreground, #9a9a97)",
+          marginBottom: 18,
+        }}
+      >
+        Use the same Codemux account this desktop is signed into. Your password
+        is stretched on this device and never sent as-is.
+      </div>
+      <input
+        type="email"
+        value={email}
+        autoFocus
+        autoComplete="username"
+        disabled={busy}
+        onChange={(e) => setEmail(e.target.value)}
+        placeholder="Email"
+        aria-label="Email"
+        style={inputStyle}
+      />
+      <input
+        type="password"
+        value={password}
+        autoComplete="current-password"
+        disabled={busy}
+        onChange={(e) => setPassword(e.target.value)}
+        placeholder="Password"
+        aria-label="Password"
+        style={{ ...inputStyle, marginTop: 10 }}
+      />
+      {error && (
+        <div role="alert" style={errorStyle}>
+          {error}
+        </div>
+      )}
+      <button type="submit" disabled={busy} style={primaryButtonStyle(busy)}>
+        {busy ? "Signing in…" : "Sign in"}
+      </button>
+      {props.onUseCode && (
+        <button type="button" style={switchLinkStyle} onClick={props.onUseCode}>
+          Use a pairing code instead
+        </button>
+      )}
+    </form>
+  );
+}
+
+/** The pairing-code (paste-a-link) form — the offline / no-account path. */
+function CodeForm(props: {
+  baseUrl: string;
+  onPaired(result: PairResult): void;
+  onUseAccount: (() => void) | null;
 }): React.ReactElement {
   const [value, setValue] = React.useState("");
   const [busy, setBusy] = React.useState(false);
@@ -192,82 +322,88 @@ function PairingForm(props: {
   }
 
   return (
-    <div style={overlayStyle}>
-      <form style={cardStyle} onSubmit={submit}>
-        <div
-          style={{
-            fontSize: 17,
-            fontWeight: 600,
-            letterSpacing: "-0.01em",
-            marginBottom: 6,
-          }}
-        >
-          Connect to Codemux
+    <form style={cardStyle} onSubmit={submit}>
+      <div
+        style={{ fontSize: 17, fontWeight: 600, letterSpacing: "-0.01em", marginBottom: 6 }}
+      >
+        Connect to Codemux
+      </div>
+      <div
+        style={{
+          fontSize: 13,
+          lineHeight: 1.5,
+          color: "var(--muted-foreground, #9a9a97)",
+          marginBottom: 18,
+        }}
+      >
+        Paste the pairing link or code generated on the desktop app to pair this
+        device.
+      </div>
+      <input
+        type="text"
+        value={value}
+        autoFocus
+        disabled={busy}
+        onChange={(e) => setValue(e.target.value)}
+        placeholder="Pairing link or code"
+        aria-label="Pairing link or code"
+        style={{
+          ...inputStyle,
+          fontFamily: "var(--font-mono, ui-monospace, monospace)",
+        }}
+      />
+      {error && (
+        <div role="alert" style={errorStyle}>
+          {error}
         </div>
-        <div
-          style={{
-            fontSize: 13,
-            lineHeight: 1.5,
-            color: "var(--muted-foreground, #9a9a97)",
-            marginBottom: 18,
-          }}
-        >
-          Paste the pairing link or code generated on the desktop app to pair
-          this device.
-        </div>
-        <input
-          type="text"
-          value={value}
-          autoFocus
-          disabled={busy}
-          onChange={(e) => setValue(e.target.value)}
-          placeholder="Pairing link or code"
-          aria-label="Pairing link or code"
-          style={{
-            width: "100%",
-            boxSizing: "border-box",
-            padding: "10px 12px",
-            fontSize: 13,
-            fontFamily: "var(--font-mono, ui-monospace, monospace)",
-            color: "var(--foreground, #e8e8e8)",
-            background: "var(--background, #0C0C0E)",
-            border: "1px solid var(--input, rgba(255,255,255,0.15))",
-            borderRadius: 9,
-            outline: "none",
-          }}
-        />
-        {error && (
-          <div
-            role="alert"
-            style={{
-              marginTop: 12,
-              fontSize: 12.5,
-              lineHeight: 1.45,
-              color: "oklch(0.72 0.16 22)",
-            }}
-          >
-            {error}
-          </div>
-        )}
+      )}
+      <button type="submit" disabled={busy} style={primaryButtonStyle(busy)}>
+        {busy ? "Connecting…" : "Connect"}
+      </button>
+      {props.onUseAccount && (
         <button
-          type="submit"
-          disabled={busy}
-          style={{
-            marginTop: 18,
-            width: "100%",
-            padding: "10px 14px",
-            fontSize: 13.5,
-            fontWeight: 600,
-            cursor: busy ? "default" : "pointer",
-            color: "#0a0a0a",
-            background: "var(--accent-ember, oklch(0.705 0.152 47))",
-            border: "none",
-            borderRadius: 9,
-            opacity: busy ? 0.7 : 1,
-          }}
+          type="button"
+          style={switchLinkStyle}
+          onClick={props.onUseAccount}
         >
-          {busy ? "Connecting…" : "Connect"}
+          Sign in with your Codemux account instead
         </button>
+      )}
+    </form>
+  );
+}
+
+/** Chooses between account sign-in and pairing-code entry. Opens on account
+ *  sign-in when the server advertises account mode, and always keeps the code
+ *  path reachable (the offline / no-account fallback). */
+function ConnectScreen(props: {
+  baseUrl: string;
+  host: string;
+  methods: AuthMethods;
+  onPaired(result: PairResult): void;
+}): React.ReactElement {
+  const [mode, setMode] = React.useState<"account" | "code">(() =>
+    initialAuthMode(props.methods),
+  );
+
+  return (
+    <div style={overlayStyle}>
+      <div style={{ width: "100%", maxWidth: 380 }}>
+        {mode === "account" ? (
+          <AccountForm
+            baseUrl={props.baseUrl}
+            onPaired={props.onPaired}
+            onUseCode={() => setMode("code")}
+          />
+        ) : (
+          <CodeForm
+            baseUrl={props.baseUrl}
+            onPaired={props.onPaired}
+            onUseAccount={
+              props.methods.account ? () => setMode("account") : null
+            }
+          />
+        )}
         <div
           style={{
             marginTop: 16,
@@ -278,7 +414,7 @@ function PairingForm(props: {
         >
           {props.host}
         </div>
-      </form>
+      </div>
     </div>
   );
 }
@@ -359,7 +495,11 @@ export async function bootstrapRemote(): Promise<void> {
   const host = window.location.host;
   const overlay = new BootstrapOverlay();
   const connection = useRemoteConnectionStore.getState();
-  const appVersion = await fetchAppVersion(baseUrl);
+  // Probe the server: its version + whether account mode is on, which decides
+  // whether to offer "Sign in with your Codemux account" alongside the code box.
+  const serverInfo = await fetchServerInfo(baseUrl);
+  const appVersion = serverInfo.version;
+  const authMethods = resolveAuthMethods(serverInfo);
 
   // Pre-mount: the connect loop drives re-pairing. Post-mount ("live"): a
   // revocation flips the indicator to offline and falls back to pairing.
@@ -399,7 +539,12 @@ export async function bootstrapRemote(): Promise<void> {
     if (!loadSession()) {
       const result = await new Promise<PairResult>((resolve) => {
         overlay.render(
-          <PairingForm baseUrl={baseUrl} host={host} onPaired={resolve} />,
+          <ConnectScreen
+            baseUrl={baseUrl}
+            host={host}
+            methods={authMethods}
+            onPaired={resolve}
+          />,
         );
       });
       waiting = !result.approved;

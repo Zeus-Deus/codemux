@@ -1358,6 +1358,13 @@ let webRemotePort = MOCK_WEB_REMOTE_PORT;
 let webRemoteEnabled = false;
 let webRemoteRequireApproval = true;
 let webRemoteBindScope: WebRemoteBindScope = "all";
+// Account mode (Stage A): on by default in the mock so the Settings → Remote
+// Access "Account access" subsection is exercisable under `npm run dev`.
+// `accountSignedIn` mirrors the desktop being signed into a Codemux account
+// (the mock user is), which account mode requires.
+let webRemoteAccountMode = true;
+let webRemoteTrustAccount = false;
+const webRemoteAccountSignedIn = true;
 let webRemoteSessions: WebRemoteSessionView[] = mockWebRemoteSessions();
 let webRemoteLiveSeq = 0;
 
@@ -1377,6 +1384,9 @@ function buildWebRemoteStatus(): WebRemoteStatus {
       ? webRemoteSessions.filter((s) => s.connected).length
       : 0,
     sessions: webRemoteSessions,
+    account_mode_enabled: webRemoteAccountMode,
+    trust_account_browsers: webRemoteTrustAccount,
+    account_signed_in: webRemoteAccountSignedIn,
   };
 }
 
@@ -1384,13 +1394,24 @@ function emitWebRemoteState(): void {
   emitEvent("web-remote-state-changed", buildWebRemoteStatus());
 }
 
-// Console/automation hook: inject a brand-new pending device so the live
-// "device wants to connect" toast + pending badge can be observed in dev.
+// Console/automation hooks: inject devices so the live "device wants to
+// connect" toast, the pending badge, and the account-vs-paired tagging can all
+// be observed in dev.
 //   window.__codemuxRemoteMock.addPendingDevice("iPad")
+//   window.__codemuxRemoteMock.addAccountDevice("Work laptop")
+//
+// The invoke mock is a twin of the Tauri command surface, not the HTTP server,
+// so it can't host the real `POST /api/pair-account` route (that's exercised by
+// unit tests + a real server via `?remote=1`). `addAccountDevice` stands in for
+// it: it simulates the outcome of a successful account sign-in — an
+// `account`-sourced session appearing in the devices list, pending approval
+// unless account browsers are trusted — so the Settings tagging + approval flow
+// are fully demoable under `npm run dev`.
 (
   window as unknown as {
     __codemuxRemoteMock: {
       addPendingDevice(name?: string): string;
+      addAccountDevice(name?: string): string;
       setConnected(id: string, connected: boolean): void;
     };
   }
@@ -1408,6 +1429,27 @@ function emitWebRemoteState(): void {
         last_seen_at: null,
         approved: false,
         connected: false,
+        source: "pair",
+      },
+    ];
+    emitWebRemoteState();
+    return id;
+  },
+  addAccountDevice(name?: string): string {
+    const id = `sess-acct-${++webRemoteLiveSeq}`;
+    webRemoteSessions = [
+      ...webRemoteSessions,
+      {
+        id,
+        name: name ?? `Account device ${webRemoteLiveSeq}`,
+        user_agent:
+          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        created_at: new Date().toISOString(),
+        last_seen_at: null,
+        // Account sessions start pending unless account browsers are trusted.
+        approved: webRemoteTrustAccount,
+        connected: false,
+        source: "account",
       },
     ];
     emitWebRemoteState();
@@ -1898,6 +1940,12 @@ const handlers: Record<string, Handler> = {
       a.bindScope === "loopback"
     ) {
       webRemoteBindScope = a.bindScope;
+    }
+    if (typeof a.accountModeEnabled === "boolean") {
+      webRemoteAccountMode = a.accountModeEnabled;
+    }
+    if (typeof a.trustAccountBrowsers === "boolean") {
+      webRemoteTrustAccount = a.trustAccountBrowsers;
     }
     emitWebRemoteState();
     return buildWebRemoteStatus();

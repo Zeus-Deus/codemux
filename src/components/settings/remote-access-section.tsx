@@ -472,11 +472,24 @@ function PendingRow({
     <div className="flex items-center gap-3 rounded-lg border border-status-working/30 bg-status-working/[0.07] px-3.5 py-3">
       <DeviceIcon kind={d.kind} className="h-4 w-4 shrink-0 text-status-working" />
       <div className="min-w-0 flex-1">
-        <p className="truncate text-[13px] font-semibold text-foreground">
-          {d.title}
-        </p>
+        <div className="flex items-center gap-2">
+          <p className="truncate text-[13px] font-semibold text-foreground">
+            {d.title}
+          </p>
+          {session.source === "account" && (
+            <Badge
+              variant="outline"
+              className="border-border/60 text-[10px] text-muted-foreground/80"
+            >
+              Account
+            </Badge>
+          )}
+        </div>
         <p className="truncate text-[11.5px] text-muted-foreground/80">
-          {d.platform || "Unknown platform"} · asked to connect{" "}
+          {d.platform || "Unknown platform"} ·{" "}
+          {session.source === "account"
+            ? "signed in and awaiting approval"
+            : "asked to connect"}{" "}
           {relativeTime(session.created_at)}
         </p>
       </div>
@@ -518,6 +531,7 @@ function DeviceRow({
   busy: boolean;
 }) {
   const d = describeDevice(session.name, session.user_agent);
+  const isAccount = session.source === "account";
   return (
     <div className="flex items-center gap-3 py-3">
       <div className="relative shrink-0">
@@ -528,6 +542,12 @@ function DeviceRow({
           <p className="truncate text-[13px] font-semibold text-foreground">
             {d.title}
           </p>
+          <Badge
+            variant="outline"
+            className="border-border/60 text-[10px] text-muted-foreground/80"
+          >
+            {isAccount ? "Account" : "Paired"}
+          </Badge>
           {session.connected ? (
             <span className="flex items-center gap-1 text-[11px] font-medium text-status-open">
               <span className="inline-block h-1.5 w-1.5 rounded-full bg-status-open" />
@@ -541,9 +561,9 @@ function DeviceRow({
           )}
         </div>
         <p className="truncate text-[11.5px] text-muted-foreground/80">
-          {d.platform || "Unknown platform"} · paired{" "}
-          {relativeTime(session.created_at)} · last seen{" "}
-          {relativeTime(session.last_seen_at)}
+          {d.platform || "Unknown platform"} ·{" "}
+          {isAccount ? "signed in" : "paired"} {relativeTime(session.created_at)}{" "}
+          · last seen {relativeTime(session.last_seen_at)}
         </p>
       </div>
       <Button
@@ -614,6 +634,8 @@ export function RemoteAccessSection() {
   // reconnect-and-reconcile step after a rebind-induced disconnect.
   const connectionStatus = useRemoteConnectionStore((s) => s.status);
   const [approvalPending, setApprovalPending] = useState(false);
+  const [accountModePending, setAccountModePending] = useState(false);
+  const [trustAccountPending, setTrustAccountPending] = useState(false);
   const [pairingPending, setPairingPending] = useState(false);
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
   const [revokingAll, setRevokingAll] = useState(false);
@@ -746,6 +768,9 @@ export function RemoteAccessSection() {
   const enabled = status?.enabled ?? false;
   const running = status?.running ?? false;
   const requireApproval = status?.require_approval ?? false;
+  const accountModeEnabled = status?.account_mode_enabled ?? false;
+  const trustAccountBrowsers = status?.trust_account_browsers ?? false;
+  const accountSignedIn = status?.account_signed_in ?? false;
   // While a web-client rebind settles, show the requested scope optimistically
   // rather than the server's last-broadcast value.
   const bindScope = scopeOverride ?? bindScopeOf(status);
@@ -935,6 +960,48 @@ export function RemoteAccessSection() {
         toast.error(`Couldn't change approval mode: ${String(err)}`);
       } finally {
         setApprovalPending(false);
+      }
+    },
+    [applyStatus],
+  );
+
+  const handleToggleAccountMode = useCallback(
+    async (next: boolean) => {
+      setAccountModePending(true);
+      try {
+        const result = await webRemoteSetConfig({ accountModeEnabled: next });
+        applyStatus(result, { detectPending: false });
+        toast.success(
+          next
+            ? "Account sign-in is on — browsers can connect with your Codemux account."
+            : "Account sign-in is off — only pairing codes connect now.",
+        );
+      } catch (err) {
+        console.error("[remote-access] set account mode failed:", err);
+        toast.error(`Couldn't change account sign-in: ${String(err)}`);
+      } finally {
+        setAccountModePending(false);
+      }
+    },
+    [applyStatus],
+  );
+
+  const handleToggleTrustAccount = useCallback(
+    async (next: boolean) => {
+      setTrustAccountPending(true);
+      try {
+        const result = await webRemoteSetConfig({ trustAccountBrowsers: next });
+        applyStatus(result, { detectPending: false });
+        toast.success(
+          next
+            ? "Trusted — browsers on your account connect without approval."
+            : "Browsers on your account now wait for approval.",
+        );
+      } catch (err) {
+        console.error("[remote-access] set trust-account failed:", err);
+        toast.error(`Couldn't change account approval: ${String(err)}`);
+      } finally {
+        setTrustAccountPending(false);
       }
     },
     [applyStatus],
@@ -1202,6 +1269,69 @@ export function RemoteAccessSection() {
                 aria-label="Toggle approval mode"
               />
             </div>
+          </section>
+
+          {/* Account access */}
+          <section className="space-y-4">
+            <SubHeading>Account access</SubHeading>
+
+            <div className="flex items-center justify-between gap-8">
+              <div className="min-w-0 space-y-1">
+                <p className="text-[13px] font-medium leading-tight text-foreground">
+                  Sign in with a Codemux account
+                </p>
+                <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                  Let a browser that reaches this machine connect by signing into{" "}
+                  <span className="font-medium text-foreground">
+                    the same Codemux account
+                  </span>{" "}
+                  this desktop is signed into — no pairing code to copy. The
+                  desktop must stay signed in for this to work.
+                </p>
+              </div>
+              <Switch
+                checked={accountModeEnabled}
+                onCheckedChange={handleToggleAccountMode}
+                disabled={accountModePending}
+                aria-label="Toggle account sign-in"
+              />
+            </div>
+
+            {accountModeEnabled && !accountSignedIn && (
+              <div
+                role="status"
+                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[12.5px] leading-relaxed text-status-attention"
+              >
+                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  This desktop isn't signed into a Codemux account, so account
+                  sign-in can't verify anyone yet. Sign in from the account menu
+                  to activate it.
+                </span>
+              </div>
+            )}
+
+            {accountModeEnabled && (
+              <div className="flex items-center justify-between gap-8 border-t border-border/60 pt-4">
+                <div className="min-w-0 space-y-1">
+                  <p className="text-[13px] font-medium leading-tight text-foreground">
+                    Trust browsers on my account without approval
+                  </p>
+                  <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                    Off by default: a browser that signs in with your account
+                    still waits for you to approve it here. Turn on to let it
+                    connect immediately — only do this if your account is well
+                    protected.
+                  </p>
+                </div>
+                <Switch
+                  checked={trustAccountBrowsers}
+                  onCheckedChange={handleToggleTrustAccount}
+                  disabled={trustAccountPending}
+                  aria-label="Toggle trust account browsers"
+                />
+              </div>
+            )}
           </section>
 
           {/* Endpoints */}
