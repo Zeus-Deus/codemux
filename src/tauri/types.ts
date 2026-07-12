@@ -1167,6 +1167,14 @@ export interface WebRemoteConfig {
    *  config persisted before the field existed loads as `all`; the Rust
    *  payload always sends it. */
   bind_scope?: WebRemoteBindScope;
+  /** Account mode (Stage A) master toggle. When on, a browser can sign in with
+   *  the desktop's Codemux account via `POST /api/pair-account` instead of a
+   *  pairing code. Optional so legacy configs load as off. */
+  account_mode_enabled?: boolean;
+  /** "Trust browsers on my account without approval" opt-out. When off
+   *  (default), account-minted sessions start pending approval regardless of
+   *  `require_approval`; when on they connect immediately. */
+  trust_account_browsers?: boolean;
 }
 
 /** Bind-scope choices for the remote server. Mirrors the `BIND_SCOPE_*`
@@ -1189,6 +1197,10 @@ export interface WebRemoteSessionView {
   approved: boolean;
   /** Has at least one live WebSocket right now. */
   connected: boolean;
+  /** How the device was admitted: `"pair"` (pairing token) or `"account"`
+   *  (signed into the desktop's Codemux account). Optional so legacy fixtures
+   *  need not enumerate it; the Rust payload always sends it. */
+  source?: string;
 }
 
 /** Live server + device state. Returned by `web_remote_status` and
@@ -1219,6 +1231,14 @@ export interface WebRemoteStatus {
   update_available?: boolean;
   /** Version of the available desktop update, when `update_available`. */
   update_version?: string | null;
+  /** Account mode (Stage A) master toggle. Optional so existing status fixtures
+   *  need not enumerate it; the Rust payload always sends it. */
+  account_mode_enabled?: boolean;
+  /** The "trust account browsers without approval" opt-out. */
+  trust_account_browsers?: boolean;
+  /** Whether the desktop is currently signed into a Codemux account — account
+   *  mode can only verify "same account" while it is. */
+  account_signed_in?: boolean;
 }
 
 /** Result of `web_remote_create_pairing`. QR rendering is the

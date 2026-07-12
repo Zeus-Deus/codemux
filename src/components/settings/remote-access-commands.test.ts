@@ -44,12 +44,14 @@ describe("web_remote_* command wrappers", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(6, "web_remote_list_sessions");
   });
 
-  it("set_config sends all three fields, defaulting the omitted ones to null", () => {
+  it("set_config sends every field, defaulting the omitted ones to null", () => {
     webRemoteSetConfig({ port: 5000 });
     expect(invokeMock).toHaveBeenLastCalledWith("web_remote_set_config", {
       port: 5000,
       requireApproval: null,
       bindScope: null,
+      accountModeEnabled: null,
+      trustAccountBrowsers: null,
     });
 
     webRemoteSetConfig({ requireApproval: true });
@@ -57,6 +59,8 @@ describe("web_remote_* command wrappers", () => {
       port: null,
       requireApproval: true,
       bindScope: null,
+      accountModeEnabled: null,
+      trustAccountBrowsers: null,
     });
 
     webRemoteSetConfig({ bindScope: "tailscale" });
@@ -64,6 +68,27 @@ describe("web_remote_* command wrappers", () => {
       port: null,
       requireApproval: null,
       bindScope: "tailscale",
+      accountModeEnabled: null,
+      trustAccountBrowsers: null,
+    });
+
+    // Account-mode toggles ride the same command; neither rebinds the listener.
+    webRemoteSetConfig({ accountModeEnabled: true });
+    expect(invokeMock).toHaveBeenLastCalledWith("web_remote_set_config", {
+      port: null,
+      requireApproval: null,
+      bindScope: null,
+      accountModeEnabled: true,
+      trustAccountBrowsers: null,
+    });
+
+    webRemoteSetConfig({ trustAccountBrowsers: true });
+    expect(invokeMock).toHaveBeenLastCalledWith("web_remote_set_config", {
+      port: null,
+      requireApproval: null,
+      bindScope: null,
+      accountModeEnabled: null,
+      trustAccountBrowsers: true,
     });
   });
 

@@ -370,6 +370,95 @@ describe("RemoteAccessSection — enabled", () => {
   });
 });
 
+describe("RemoteAccessSection — account access", () => {
+  const accountStatus = (p: Partial<WebRemoteStatus> = {}) =>
+    status({
+      enabled: true,
+      running: true,
+      account_mode_enabled: true,
+      account_signed_in: true,
+      trust_account_browsers: false,
+      sessions: [
+        sess({
+          id: "acct-laptop",
+          name: "Work laptop",
+          approved: true,
+          source: "account",
+        }),
+        sess({
+          id: "paired-phone",
+          name: "Phone",
+          approved: true,
+          source: "pair",
+        }),
+      ],
+      ...p,
+    });
+
+  it("shows the account toggle and the approval opt-out when account mode is on", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(accountStatus());
+    render(<RemoteAccessSection />);
+    expect(
+      await screen.findByLabelText(/toggle account sign-in/i),
+    ).toBeChecked();
+    // The "trust browsers without approval" opt-out is visible + off.
+    expect(
+      screen.getByLabelText(/toggle trust account browsers/i),
+    ).not.toBeChecked();
+  });
+
+  it("toggling account sign-in calls webRemoteSetConfig({ accountModeEnabled })", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(
+      accountStatus({ account_mode_enabled: false }),
+    );
+    render(<RemoteAccessSection />);
+    const toggle = await screen.findByLabelText(/toggle account sign-in/i);
+    expect(toggle).not.toBeChecked();
+
+    await user.click(toggle);
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({
+        accountModeEnabled: true,
+      }),
+    );
+  });
+
+  it("toggling the opt-out calls webRemoteSetConfig({ trustAccountBrowsers })", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(accountStatus());
+    render(<RemoteAccessSection />);
+
+    await user.click(
+      await screen.findByLabelText(/toggle trust account browsers/i),
+    );
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({
+        trustAccountBrowsers: true,
+      }),
+    );
+  });
+
+  it("warns when account mode is on but the desktop is signed out", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      accountStatus({ account_signed_in: false }),
+    );
+    render(<RemoteAccessSection />);
+    expect(
+      await screen.findByText(/isn't signed into a Codemux account/i),
+    ).toBeInTheDocument();
+  });
+
+  it("tags account-minted vs paired devices in the list", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(accountStatus());
+    render(<RemoteAccessSection />);
+    await screen.findByText("Work laptop");
+    // Both an "Account" and a "Paired" tag are present in the devices list.
+    expect(screen.getAllByText("Account").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("Paired").length).toBeGreaterThanOrEqual(1);
+  });
+});
+
 // The rebind bug: a scope/port change from the *web* client rebinds the
 // server and drops this socket before web_remote_set_config can answer, so the
 // invoke rejects with "connection lost" even though the change was applied.

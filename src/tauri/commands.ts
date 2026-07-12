@@ -2147,17 +2147,24 @@ export const webRemoteDisable = () =>
 /** Update the persisted config. `port` and `bindScope` trigger a
  *  backend-side rebind while running (dropping existing connections, which
  *  can't follow to a new port/interface); `requireApproval` gates whether
- *  new pairings sit pending until approved on the desktop. Omitted fields
- *  are left unchanged. */
+ *  new pairings sit pending until approved on the desktop.
+ *  `accountModeEnabled` toggles the account sign-in admission path
+ *  (`POST /api/pair-account`), and `trustAccountBrowsers` is the "trust
+ *  browsers on my account without approval" opt-out — neither rebinds the
+ *  listener. Omitted fields are left unchanged. */
 export const webRemoteSetConfig = (opts: {
   port?: number;
   requireApproval?: boolean;
   bindScope?: WebRemoteBindScope;
+  accountModeEnabled?: boolean;
+  trustAccountBrowsers?: boolean;
 }) =>
   invoke<WebRemoteStatus>("web_remote_set_config", {
     port: opts.port ?? null,
     requireApproval: opts.requireApproval ?? null,
     bindScope: opts.bindScope ?? null,
+    accountModeEnabled: opts.accountModeEnabled ?? null,
+    trustAccountBrowsers: opts.trustAccountBrowsers ?? null,
   });
 
 /** Mint a one-time pairing token (10 min TTL, single use). Returns the
