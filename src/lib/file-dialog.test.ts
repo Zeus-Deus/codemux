@@ -1,6 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-// ── Mock Tauri commands + toast ──
+// ── Mock Tauri commands + toast + remote path picker ──
 vi.mock("@/tauri/commands", () => ({
   pickFolderDialog: vi.fn(),
   pickFilesDialog: vi.fn(),
@@ -13,17 +13,34 @@ vi.mock("@/lib/toast", () => ({
     warning: vi.fn(),
   },
 }));
+vi.mock("@/components/remote/remote-path-picker-store", () => ({
+  openRemotePathPicker: vi.fn(),
+}));
 
 import { pickFolderDialog, pickFilesDialog } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
+import { openRemotePathPicker } from "@/components/remote/remote-path-picker-store";
 import { pickFolder, pickFiles, NO_FILE_PICKER_BACKEND } from "./file-dialog";
 
 const mockPickFolderDialog = vi.mocked(pickFolderDialog);
 const mockPickFilesDialog = vi.mocked(pickFilesDialog);
 const mockToastError = vi.mocked(toast.error);
+const mockOpenRemotePathPicker = vi.mocked(openRemotePathPicker);
+
+/** Toggle the web-remote flag `isRemoteClient()` reads. */
+function setRemote(on: boolean): void {
+  (window as unknown as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ =
+    on;
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
+  setRemote(false);
+});
+
+afterEach(() => {
+  delete (window as unknown as { __CODEMUX_REMOTE__?: boolean })
+    .__CODEMUX_REMOTE__;
 });
 
 describe("pickFolder", () => {
@@ -86,5 +103,86 @@ describe("pickFiles", () => {
     );
     await expect(pickFiles("Attach files")).resolves.toEqual([]);
     expect(mockToastError).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── Web remote client routing ──
+//
+// On the web remote client there is no native OS dialog to reach, so the
+// chokepoint must route to the in-app path browser instead of invoking the
+// `pick_*_dialog` commands, while returning the identical shape.
+describe("remote client routing", () => {
+  it("pickFolder uses the path browser, not the native command", async () => {
+    setRemote(true);
+    mockOpenRemotePathPicker.mockResolvedValue(["/home/dev/projects/codemux"]);
+
+    await expect(pickFolder("Open project")).resolves.toBe(
+      "/home/dev/projects/codemux",
+    );
+
+    expect(mockOpenRemotePathPicker).toHaveBeenCalledWith(
+      "folder",
+      "Open project",
+    );
+    expect(mockPickFolderDialog).not.toHaveBeenCalled();
+  });
+
+  it("pickFolder maps a cancel (null) from the path browser to null", async () => {
+    setRemote(true);
+    mockOpenRemotePathPicker.mockResolvedValue(null);
+
+    await expect(pickFolder("Open project")).resolves.toBeNull();
+    expect(mockPickFolderDialog).not.toHaveBeenCalled();
+  });
+
+  it("pickFolder maps an empty selection to null", async () => {
+    setRemote(true);
+    mockOpenRemotePathPicker.mockResolvedValue([]);
+
+    await expect(pickFolder("Open project")).resolves.toBeNull();
+  });
+
+  it("pickFiles uses the path browser in multi-file mode", async () => {
+    setRemote(true);
+    mockOpenRemotePathPicker.mockResolvedValue(["/a.png", "/b.png"]);
+
+    await expect(pickFiles("Attach files")).resolves.toEqual([
+      "/a.png",
+      "/b.png",
+    ]);
+
+    expect(mockOpenRemotePathPicker).toHaveBeenCalledWith(
+      "files",
+      "Attach files",
+    );
+    expect(mockPickFilesDialog).not.toHaveBeenCalled();
+  });
+
+  it("pickFiles maps a cancel (null) to an empty list", async () => {
+    setRemote(true);
+    mockOpenRemotePathPicker.mockResolvedValue(null);
+
+    await expect(pickFiles("Attach files")).resolves.toEqual([]);
+    expect(mockPickFilesDialog).not.toHaveBeenCalled();
+  });
+
+  it("pickFiles falls back to a default title when none is given", async () => {
+    setRemote(true);
+    mockOpenRemotePathPicker.mockResolvedValue([]);
+
+    await pickFiles();
+
+    expect(mockOpenRemotePathPicker).toHaveBeenCalledWith(
+      "files",
+      "Select files",
+    );
+  });
+
+  it("desktop (flag off) still calls the native command, never the picker", async () => {
+    // Default beforeEach leaves the flag off.
+    mockPickFolderDialog.mockResolvedValue("/native/path");
+
+    await expect(pickFolder("Open project")).resolves.toBe("/native/path");
+    expect(mockOpenRemotePathPicker).not.toHaveBeenCalled();
   });
 });

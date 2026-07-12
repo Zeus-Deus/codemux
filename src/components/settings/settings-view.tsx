@@ -47,6 +47,7 @@ import {
   BookOpen,
   Server,
   Sparkles,
+  MonitorSmartphone,
 } from "lucide-react";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
@@ -133,7 +134,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, Star } from "lucide-react";
 
-type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -171,6 +172,11 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
     // not a personal preference. Always visible (no flag gate) since
     // the underlying daemon is now standard built-in behavior.
     { id: "hosts", label: "Devices", icon: Server },
+    // Remote Access — expose this desktop to a browser on another device.
+    // Sits next to Devices: both are about reaching this machine (or its
+    // sessions) from somewhere else. Always visible; the feature itself is
+    // default-off behind the section's master toggle.
+    { id: "remote_access", label: "Remote Access", icon: MonitorSmartphone },
     { id: "session_restore", label: "Session Restore", icon: RotateCcw },
   ];
 
@@ -203,13 +209,14 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
 const ALL_SECTION_IDS: Section[] = [
   "beta_features",
   "account", "appearance", "editor", "terminal", "presets", "projects",
-  "git", "agent", "permissions", "skills", "mcp", "hosts", "browser",
-  "shortcuts", "notifications", "session_restore",
+  "git", "agent", "permissions", "skills", "mcp", "hosts", "remote_access",
+  "browser", "shortcuts", "notifications", "session_restore",
 ];
 
 import { KeybindEditor } from "./keybind-editor";
 import { BetaFeaturesSection } from "./beta-features-section";
 import { HostsSection } from "./hosts-section";
+import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
 import { SkillsSection } from "./skills-section";
@@ -2034,6 +2041,9 @@ export function SettingsView() {
             <HostsSection />
           </div>
         );
+
+      case "remote_access":
+        return <RemoteAccessSection />;
 
       case "projects": {
         const ENV_VARS: Array<[string, string]> = [

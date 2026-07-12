@@ -1452,6 +1452,25 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             serde_json::to_value(serde_json::json!({ "runs": runs }))
                 .map_err(|error| error.to_string())
         })(),
+        // ── Web remote access ──
+        //
+        // Mint a one-time web-remote pairing code from the terminal (the
+        // `codemux remote pair` CLI, typically over SSH). The control socket
+        // is same-machine + unauthenticated by design — over SSH you ARE on
+        // the machine — so this is the right transport for pairing without
+        // opening the desktop GUI. Reuses the exact token path + endpoint
+        // enumeration the Settings pane uses (`web_remote::control_pair`).
+        "web_remote_pair" => {
+            let name = request
+                .params
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            crate::web_remote::control_pair(app, name)
+                .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string()))
+        }
         _ => Err(format!("Unknown control command: {}", request.command)),
     };
 

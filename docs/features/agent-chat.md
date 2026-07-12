@@ -966,10 +966,20 @@ to `codemux.exe` under `binaries/` on Windows. (It originally shipped
 as an `externalBin` under `usr/bin/`; moved to a resource because
 linuxdeploy's patchelf step corrupts the ~100 MB bun-compiled binary
 during AppImage bundling — see commit 025fa19.) At runtime, the
-`setup()` hook in `src-tauri/src/lib.rs` resolves the resource via
-`AppHandle::path().resource_dir()` and pins the resolved path into
-the `CODEMUX_CLAUDE_SIDECAR_PATH` env var so the adapter (which has
-no `AppHandle` access at construction time) can find it. The release
+`setup()` hook in `src-tauri/src/lib.rs` calls
+`resolve_sidecar(resource_dir)`
+(`agent_provider::claude::sidecar_path`), which prefers an existing
+`CODEMUX_CLAUDE_SIDECAR_PATH` override, then the
+`<resource_dir>/binaries/` copy, and — **in debug builds only** —
+falls back to the dev-tree `<CARGO_MANIFEST_DIR>/binaries/` copy so
+`npm run tauri:dev` (whose resource dir does not carry the sidecar)
+still resolves it and the agent-chat GUI can spawn. The winner is
+pinned into the `CODEMUX_CLAUDE_SIDECAR_PATH` env var so the adapter
+(which has no `AppHandle` access at construction time) can find the
+same binary. The debug fallback is compiled out of release via
+`debug_assertions`, so the release resolution stays resource-dir-only;
+when the binary exists nowhere the hook leaves the env var unset and
+the Claude provider stays unconfigured rather than panicking. The release
 workflow (`.github/workflows/release.yml`) installs Bun and
 pre-stages the binary so tauri-action finds it before bundling. CI
 (`.github/workflows/ci.yml`) does the same, with a zero-byte

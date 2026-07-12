@@ -6,6 +6,8 @@ import {
   FileDiff,
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { RemoteConnectionChip } from "@/components/remote/remote-connection-indicator";
 import { ResourceMonitor } from "./resource-monitor";
 import { TitleBarTabs } from "./title-bar-tabs";
 import { AgentLauncher } from "./agent-launcher";
@@ -454,8 +456,18 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
               when disabled. */}
           <ResourceMonitor />
           <IdeLauncher />
-          <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
+          {/* The separator only divides the content cluster from the native
+              window controls — on the web remote client those controls render
+              nothing, so the separator would dangle at the right edge. Hide it
+              there. */}
+          {!isRemoteClient() && (
+            <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
+          )}
           <WindowControls />
+          {/* Web remote client only: the connection chip takes the slot the
+              hidden window controls free up. Quiet while connected; the loud
+              reconnecting/offline states live in the app-wide banner. */}
+          {isRemoteClient() && <RemoteConnectionChip />}
         </div>
       </div>
     );
@@ -505,8 +517,18 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         )}
         <ResourceMonitor />
         <IdeLauncher compact />
-        <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
+        {/* The separator only divides the content cluster from the native
+            window controls — on the web remote client those controls render
+            nothing, so the separator would dangle at the right edge. Hide it
+            there. */}
+        {!isRemoteClient() && (
+          <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
+        )}
         <WindowControls />
+        {/* Web remote client only: the connection chip takes the slot the
+            hidden window controls free up. Quiet while connected; the loud
+            reconnecting/offline states live in the app-wide banner. */}
+        {isRemoteClient() && <RemoteConnectionChip compact />}
       </div>
     </div>
   );

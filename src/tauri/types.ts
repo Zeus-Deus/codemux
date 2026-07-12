@@ -1147,3 +1147,109 @@ export interface FileAttachmentInfo {
   /** Top-level declarations extracted when truncated. Null otherwise. */
   outline: OutlineEntry[] | null;
 }
+
+// ── Web Remote Access ─────────────────────────────────────────────────
+//
+// Wire types for the embedded web-remote server (default-off HTTP+WS
+// second frontend). These mirror the Rust structs in
+// `src-tauri/src/web_remote/` exactly — serde serializes them
+// snake_case, so every field name below matches the Rust field name.
+// The `web-remote-state-changed` event payload is `WebRemoteStatus`.
+
+/** Persisted, user-controlled server config. Mirrors
+ *  `web_remote::WebRemoteConfig`. */
+export interface WebRemoteConfig {
+  enabled: boolean;
+  port: number;
+  require_approval: boolean;
+  /** Which interfaces the server binds: `all` (0.0.0.0) | `tailscale`
+   *  (tailnet + loopback) | `loopback` (this device only). Optional so a
+   *  config persisted before the field existed loads as `all`; the Rust
+   *  payload always sends it. */
+  bind_scope?: WebRemoteBindScope;
+}
+
+/** Bind-scope choices for the remote server. Mirrors the `BIND_SCOPE_*`
+ *  constants in `web_remote::mod`. */
+export type WebRemoteBindScope = "all" | "tailscale" | "loopback";
+
+/** A paired device row as shown in the device-management UI. Mirrors
+ *  `web_remote::SessionView`. */
+export interface WebRemoteSessionView {
+  id: string;
+  /** Device name the browser reported at pairing time. */
+  name: string | null;
+  /** Raw `User-Agent` captured at pairing time. */
+  user_agent: string | null;
+  /** RFC3339 timestamp. */
+  created_at: string;
+  /** RFC3339 timestamp, or null if it never reconnected. */
+  last_seen_at: string | null;
+  /** Approved to connect. `false` = pending approval. */
+  approved: boolean;
+  /** Has at least one live WebSocket right now. */
+  connected: boolean;
+}
+
+/** Live server + device state. Returned by `web_remote_status` and
+ *  emitted as the `web-remote-state-changed` payload. Mirrors
+ *  `web_remote::WebRemoteStatus`. */
+export interface WebRemoteStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  require_approval: boolean;
+  /** Which interfaces the server binds: `all` | `tailscale` | `loopback`.
+   *  Optional so existing status fixtures need not enumerate it; the Rust
+   *  payload always sends it. */
+  bind_scope?: WebRemoteBindScope;
+  /** Raw live-WebSocket count (a single device with two tabs counts
+   *  twice). */
+  active_connections: number;
+  /** Distinct paired devices with at least one live WebSocket right now.
+   *  This is the "remote sessions active" signal the desktop updater's
+   *  defer-while-remote policy keys off (Stage 3b). */
+  connected_sessions: number;
+  sessions: WebRemoteSessionView[];
+  /** Whether the desktop updater found an update ready to install. The
+   *  desktop frontend publishes this (the web client has no updater plugin)
+   *  so a paired browser can offer a "desktop update available" prompt.
+   *  Optional so existing status fixtures need not enumerate it; the Rust
+   *  payload always sends it. */
+  update_available?: boolean;
+  /** Version of the available desktop update, when `update_available`. */
+  update_version?: string | null;
+}
+
+/** Result of `web_remote_create_pairing`. QR rendering is the
+ *  frontend's job. Mirrors `web_remote::PairingInfo`. */
+export interface WebRemotePairingInfo {
+  /** Relative link a browser opens to auto-pair: `/#pair=<token>`. */
+  url_path: string;
+  token: string;
+  /** RFC3339 expiry timestamp. */
+  expires_at: string;
+}
+
+/** One reachable place a browser could load the UI. Mirrors
+ *  `web_remote::endpoints::Endpoint`. */
+export interface WebRemoteEndpoint {
+  /** `loopback` | `lan` | `tailnet` | `magicdns`. */
+  kind: string;
+  /** Coarse UI grouping: `this_device` | `local_network` | `tailscale` |
+   *  `other`. Drives the labelled sections in the settings panel. */
+  group: string;
+  /** IP literal or DNS hostname (no scheme, no port). */
+  host: string;
+  port: number;
+  /** Ready-to-copy `http(s)://host:port` URL. */
+  url: string;
+  /** Whether a browser treats this origin as a secure context. Only
+   *  loopback qualifies over plain HTTP. */
+  secure: boolean;
+  /** The single best "reach from anywhere" endpoint, surfaced with a
+   *  "Recommended" chip. At most one endpoint carries this. */
+  recommended: boolean;
+  /** Short human hint for the settings UI. */
+  label: string;
+}

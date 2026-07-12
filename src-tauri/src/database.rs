@@ -151,6 +151,22 @@ pub struct ProjectScripts {
     pub worktree_includes: Vec<String>,
 }
 
+/// A paired web-remote browser device. One row in `web_remote_sessions`.
+/// `token_hash` is the SHA-256 (hex) of the bearer token handed to the
+/// browser at pair time; the plaintext token is never persisted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebRemoteSessionRecord {
+    pub id: String,
+    pub name: Option<String>,
+    pub user_agent: Option<String>,
+    #[serde(skip_serializing)]
+    pub token_hash: String,
+    pub created_at: String,
+    pub last_seen_at: Option<String>,
+    pub approved: bool,
+    pub revoked: bool,
+}
+
 fn database_path() -> Option<PathBuf> {
     let config = dirs::config_dir()?;
     Some(config.join(crate::APP_DIR_NAME).join("codemux.db"))
@@ -462,6 +478,24 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             WHERE dirty = 1;
         CREATE INDEX IF NOT EXISTS idx_workspaces_sync_host
             ON workspaces_sync(user_id, host_server_id);
+
+        -- Web remote access: one row per paired browser device (schema v8).
+        -- The session token is never stored in the clear — `token_hash` holds
+        -- its SHA-256 and the auth layer does a constant-time compare. A
+        -- device stays in this table (revoked = 1) after revocation so the
+        -- desktop UI can still show a history entry; the auth layer treats any
+        -- revoked = 1 row as dead. `approved` gates ws-ticket issuance when the
+        -- server runs in require-approval mode. See web_remote::auth.
+        CREATE TABLE IF NOT EXISTS web_remote_sessions (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            user_agent TEXT,
+            token_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            last_seen_at TEXT,
+            approved INTEGER NOT NULL DEFAULT 0,
+            revoked INTEGER NOT NULL DEFAULT 0
+        );
         ",
     )
     .map_err(|e| format!("Failed to create database schema: {e}"))?;
@@ -2989,6 +3023,150 @@ impl DatabaseStore {
     pub fn clear_auth_token(&self) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute("DELETE FROM auth_tokens WHERE id = 1", []);
+    }
+}
+
+// ── Web remote access sessions ──
+//
+// Persistence for paired browser devices. The auth layer
+// (`web_remote::auth`) owns token generation, hashing and the
+// constant-time compare; these methods are the storage primitives it
+// builds on. All rows are `user_id`-agnostic (single local user, like
+// the rest of the local desktop state).
+impl DatabaseStore {
+    fn row_to_web_remote_session(
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<WebRemoteSessionRecord> {
+        Ok(WebRemoteSessionRecord {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            user_agent: row.get(2)?,
+            token_hash: row.get(3)?,
+            created_at: row.get(4)?,
+            last_seen_at: row.get(5)?,
+            approved: row.get::<_, i64>(6)? != 0,
+            revoked: row.get::<_, i64>(7)? != 0,
+        })
+    }
+
+    /// Insert a freshly paired device. `token_hash` is the SHA-256 hex of
+    /// the plaintext bearer token (which the caller keeps only long enough
+    /// to hand back to the browser once).
+    pub fn web_remote_insert_session(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        user_agent: Option<&str>,
+        token_hash: &str,
+        approved: bool,
+    ) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO web_remote_sessions
+                (id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked)
+             VALUES (?1, ?2, ?3, ?4, datetime('now'), datetime('now'), ?5, 0)",
+            params![id, name, user_agent, token_hash, approved as i64],
+        )
+        .map_err(|e| format!("Failed to insert web_remote session: {e}"))?;
+        Ok(())
+    }
+
+    /// Fetch a single session by id, regardless of revoked/approved state.
+    pub fn web_remote_get_session(&self, id: &str) -> Option<WebRemoteSessionRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked
+             FROM web_remote_sessions WHERE id = ?1",
+            params![id],
+            Self::row_to_web_remote_session,
+        )
+        .ok()
+    }
+
+    /// All non-revoked sessions, newest first. This is what the desktop
+    /// device-management UI lists (pending devices included — the UI keys
+    /// off `approved`).
+    pub fn web_remote_list_sessions(&self) -> Vec<WebRemoteSessionRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, name, user_agent, token_hash, created_at, last_seen_at, approved, revoked
+             FROM web_remote_sessions WHERE revoked = 0 ORDER BY created_at DESC",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], Self::row_to_web_remote_session) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Every non-revoked session, used by the auth layer to resolve a
+    /// presented bearer token via a constant-time hash compare. Returns
+    /// `(id, token_hash, approved)` tuples so the auth layer never has to
+    /// materialise the whole record just to authenticate.
+    pub fn web_remote_active_session_hashes(&self) -> Vec<(String, String, bool)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare("SELECT id, token_hash, approved FROM web_remote_sessions WHERE revoked = 0")
+        {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Bump `last_seen_at` to now. Best-effort; a failed touch is not fatal
+    /// to a live connection.
+    pub fn web_remote_touch_session(&self, id: &str) {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE web_remote_sessions SET last_seen_at = datetime('now') WHERE id = ?1",
+            params![id],
+        );
+    }
+
+    /// Flip a pending session to approved (approval-mode flow).
+    pub fn web_remote_set_session_approved(&self, id: &str, approved: bool) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_remote_sessions SET approved = ?2 WHERE id = ?1",
+            params![id, approved as i64],
+        )
+        .map_err(|e| format!("Failed to update web_remote session approval: {e}"))?;
+        Ok(())
+    }
+
+    /// Revoke a session. The row is kept (revoked = 1) for UI history; the
+    /// auth layer treats it as dead from this point on.
+    pub fn web_remote_revoke_session(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE web_remote_sessions SET revoked = 1 WHERE id = ?1",
+            params![id],
+        )
+        .map_err(|e| format!("Failed to revoke web_remote session: {e}"))?;
+        Ok(())
+    }
+
+    /// Hard-delete a session row. Used by the reject flow — a rejected
+    /// pending device leaves no trace.
+    pub fn web_remote_delete_session(&self, id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM web_remote_sessions WHERE id = ?1", params![id])
+            .map_err(|e| format!("Failed to delete web_remote session: {e}"))?;
+        Ok(())
     }
 }
 

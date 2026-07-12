@@ -38,6 +38,11 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: WorkspaceCommand,
     },
+    /// Web remote-access operations
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
     /// Print recent lines from the desktop app's log file
     Logs {
         /// Number of lines from the end of the log to print
@@ -68,6 +73,20 @@ pub enum WorkspaceCommand {
     RerunSetup {
         /// Workspace ID (defaults to active workspace)
         workspace_id: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RemoteCommand {
+    /// Mint a one-time pairing code for the web remote server and print a
+    /// scannable link + terminal QR. Requires remote access to be enabled in
+    /// Settings first. Handy over SSH: pair a phone/laptop without opening
+    /// the desktop GUI.
+    Pair {
+        /// Optional label for the paired device. Used as a fallback name if
+        /// the connecting browser doesn't provide one of its own.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -593,6 +612,31 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
             println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
             Ok(true)
         }
+        Some(CommandSet::Remote { command }) => {
+            match command {
+                RemoteCommand::Pair { name } => {
+                    let mut params = json!({});
+                    if let Some(ref label) = name {
+                        params["name"] = json!(label);
+                    }
+                    let response = send_control_request(ControlRequest {
+                        command: "web_remote_pair".into(),
+                        params,
+                    })
+                    .await?;
+                    if !response.ok {
+                        // Surface the handler's message (e.g. "Remote access is
+                        // not enabled — enable it in Settings first") instead of
+                        // a bare `null`.
+                        return Err(response
+                            .error
+                            .unwrap_or_else(|| "Unknown error from control endpoint".to_string()));
+                    }
+                    print_pairing(&response.data.unwrap_or(json!(null)));
+                }
+            }
+            Ok(true)
+        }
         Some(CommandSet::Logs { tail }) => {
             // Purely local — reads the file tauri-plugin-log writes, so
             // it works even when (especially when) the app won't start.
@@ -693,6 +737,12 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                             "rerun-setup": { "args": "[workspace-id]", "description": "Re-run setup (.codemuxinclude + scripts) for a workspace" }
                         }
                     },
+                    "remote": {
+                        "description": "Web remote-access operations",
+                        "subcommands": {
+                            "pair": { "args": "[--name <label>]", "description": "Mint a one-time web-remote pairing code + QR (requires remote access enabled)" }
+                        }
+                    },
                     "status": { "description": "Show Codemux app status" },
                     "notify": { "args": "<message>", "description": "Send a notification to the user" },
                     "handoff": { "description": "Generate project handoff summary" },
@@ -714,6 +764,59 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
     }
 }
 
+/// Pretty-print the `web_remote_pair` result for a human at a terminal: a
+/// scannable QR of the pairing URL, then the link, token, endpoint, and
+/// expiry. The QR encodes the same `http://host:port/#pair=<token>` URL the
+/// link shows, so a phone camera can pair without any typing.
+fn print_pairing(data: &Value) {
+    let url = data["pairing_url"].as_str().unwrap_or_default();
+    let token = data["token"].as_str().unwrap_or_default();
+    let expires_at = data["expires_at"].as_str().unwrap_or_default();
+    let host = data["host"].as_str().unwrap_or_default();
+    let kind = data["endpoint_kind"].as_str().unwrap_or_default();
+    let secure = data["secure"].as_bool().unwrap_or(false);
+
+    println!();
+    match render_qr(url) {
+        Some(qr) => println!("{qr}"),
+        None => println!("(QR unavailable — use the link below)\n"),
+    }
+    println!("Pairing link:  {url}");
+    println!("Token:         {token}");
+    if !host.is_empty() {
+        let scope = if secure {
+            "secure context"
+        } else {
+            "plain HTTP — not a browser secure context"
+        };
+        println!("Endpoint:      {host} ({kind}, {scope})");
+    }
+    if !expires_at.is_empty() {
+        println!("Expires:       {expires_at}");
+    }
+    println!();
+    println!("Scan the QR with your phone — or open the link in any browser on a");
+    println!("device that can reach this machine — to pair it. One-time use.");
+}
+
+/// Render `text` to a compact terminal QR using the pure-Rust `qrcode`
+/// crate's built-in unicode renderer (two rows of modules per text line).
+/// Returns `None` if the text is too large to encode, in which case the
+/// caller falls back to printing just the link.
+fn render_qr(text: &str) -> Option<String> {
+    use qrcode::render::unicode;
+    use qrcode::{EcLevel, QrCode};
+
+    // Medium EC keeps the code compact while tolerating a smudged terminal /
+    // camera glare; the pairing URL is short so this always fits.
+    let code = QrCode::with_error_correction_level(text, EcLevel::M).ok()?;
+    Some(
+        code.render::<unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build(),
+    )
+}
+
 fn normalize_memory_kind(kind: &str) -> &'static str {
     match kind {
         "pinned" | "pinned_context" => "pinned_context",
@@ -721,6 +824,40 @@ fn normalize_memory_kind(kind: &str) -> &'static str {
         "next" | "next_step" | "next_steps" => "next_step",
         "session" | "session_summary" => "session_summary",
         _ => "pinned_context",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_qr_encodes_the_pairing_url() {
+        // The pairing URL is short, so it always encodes; the unicode
+        // renderer yields a non-trivial block of half-height module rows.
+        let url = "http://100.101.102.103:4377/#pair=deadbeefdeadbeefdeadbeefdeadbeef";
+        let qr = render_qr(url).expect("pairing URL encodes to a QR");
+        assert!(qr.lines().count() > 8, "renders multiple module rows");
+        assert!(
+            qr.chars().any(|c| c == '█' || c == '▀' || c == '▄' || c == ' '),
+            "uses the unicode Dense1x2 block glyphs"
+        );
+    }
+
+    #[test]
+    fn print_pairing_handles_a_full_control_result_without_panicking() {
+        // Mirrors the `ControlPairing` JSON the `web_remote_pair` control
+        // command returns, so the CLI's formatter is exercised end-to-end.
+        let data = json!({
+            "pairing_url": "http://100.101.102.103:4377/#pair=abc123",
+            "host": "100.101.102.103",
+            "port": 4377,
+            "token": "abc123",
+            "expires_at": "2026-07-12T10:00:00Z",
+            "secure": false,
+            "endpoint_kind": "tailnet",
+        });
+        print_pairing(&data);
     }
 }
 

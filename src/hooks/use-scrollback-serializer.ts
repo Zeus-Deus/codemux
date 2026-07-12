@@ -21,6 +21,7 @@ import {
   onSerializeTerminalBuffers,
   emitScrollbackSerializationComplete,
 } from "@/tauri/events";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 
 type SerializeCallback = () => ScrollbackPayload | null;
 
@@ -47,6 +48,13 @@ export function registerTerminalForSerialize(
  */
 export function useScrollbackSerializer() {
   useEffect(() => {
+    // The desktop window owns terminal-scrollback serialization. A remote
+    // client must never listen for `serialize-terminal-buffers`, never write
+    // scrollback files, and never ack `scrollback-serialization-complete` —
+    // otherwise a browser client would race the desktop for ownership and its
+    // ack could unblock the desktop's close before the desktop finished saving.
+    if (isRemoteClient()) return;
+
     let unlisten: (() => void) | null = null;
 
     onSerializeTerminalBuffers(async () => {

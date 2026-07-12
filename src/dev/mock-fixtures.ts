@@ -27,6 +27,7 @@ import type {
   AppStateSnapshot,
   AuthUser,
   CodemuxConfigSnapshot,
+  FileEntry,
   LinkedIssue,
   PaneNodeSnapshot,
   PaneStatus,
@@ -34,6 +35,9 @@ import type {
   SurfaceSnapshot,
   TabSnapshot,
   TerminalSessionSnapshot,
+  WebRemoteEndpoint,
+  WebRemotePairingInfo,
+  WebRemoteSessionView,
   WorkspaceSnapshot,
 } from "@/tauri/types";
 
@@ -769,6 +773,117 @@ const MOCK_PERSISTENCE: PersistenceSchema = {
 /** The home directory string the mock `get_home_dir` returns. Used by
  *  the sidebar's "Home" project grouping rule. */
 export const MOCK_HOME_DIR = HOME;
+
+// ── Fake filesystem for the web-remote path browser ─────────────────
+//
+// Stage 3b's remote path picker walks the host over `list_directory`.
+// In plain-browser dev there is no host FS, so we serve a small, static
+// tree here — just enough to exercise navigation (breadcrumbs, enter
+// dir, up, hidden toggle, file selection) end-to-end. Set
+// `window.__CODEMUX_REMOTE__ = true` in the console, then trigger any
+// pick-folder / pick-files flow to see it.
+
+function mockDir(parent: string, name: string): FileEntry {
+  return {
+    name,
+    path: `${parent}/${name}`,
+    is_dir: true,
+    size: null,
+    is_gitignored: false,
+  };
+}
+
+function mockFile(
+  parent: string,
+  name: string,
+  size = 2048,
+  isGitignored = false,
+): FileEntry {
+  return {
+    name,
+    path: `${parent}/${name}`,
+    is_dir: false,
+    size,
+    is_gitignored: isGitignored,
+  };
+}
+
+/** Absolute path → its directory entries, matching the real
+ *  `list_directory` command's `FileEntry[]` shape. */
+const MOCK_DIR_TREE: Record<string, FileEntry[]> = {
+  "/": [mockDir("", "home")],
+  "/home": [mockDir("/home", "dev")],
+  [HOME]: [
+    mockDir(HOME, "projects"),
+    mockDir(HOME, "Documents"),
+    mockDir(HOME, "Downloads"),
+    mockDir(HOME, ".config"), // hidden — only shown with show_hidden
+    mockFile(HOME, "README.md", 1200),
+    mockFile(HOME, "notes.txt", 480),
+  ],
+  [`${HOME}/projects`]: [
+    mockDir(`${HOME}/projects`, "codemux"),
+    mockDir(`${HOME}/projects`, "web-app"),
+    mockDir(`${HOME}/projects`, "scripts"),
+  ],
+  [`${HOME}/projects/codemux`]: [
+    mockDir(`${HOME}/projects/codemux`, "src"),
+    mockDir(`${HOME}/projects/codemux`, "docs"),
+    mockFile(`${HOME}/projects/codemux`, "Cargo.toml", 890),
+    mockFile(`${HOME}/projects/codemux`, "package.json", 1340),
+    mockFile(`${HOME}/projects/codemux`, ".env", 64, true), // hidden + gitignored
+  ],
+  [`${HOME}/projects/codemux/src`]: [
+    mockDir(`${HOME}/projects/codemux/src`, "components"),
+    mockFile(`${HOME}/projects/codemux/src`, "main.tsx", 512),
+    mockFile(`${HOME}/projects/codemux/src`, "App.tsx", 1024),
+  ],
+  [`${HOME}/projects/codemux/src/components`]: [
+    mockFile(`${HOME}/projects/codemux/src/components`, "button.tsx", 640),
+    mockFile(`${HOME}/projects/codemux/src/components`, "dialog.tsx", 720),
+  ],
+  [`${HOME}/projects/codemux/docs`]: [
+    mockFile(`${HOME}/projects/codemux/docs`, "INDEX.md", 300),
+  ],
+  [`${HOME}/projects/web-app`]: [
+    mockDir(`${HOME}/projects/web-app`, "src"),
+    mockFile(`${HOME}/projects/web-app`, "index.html", 420),
+    mockFile(`${HOME}/projects/web-app`, "package.json", 980),
+  ],
+  [`${HOME}/projects/web-app/src`]: [
+    mockFile(`${HOME}/projects/web-app/src`, "index.ts", 256),
+  ],
+  [`${HOME}/projects/scripts`]: [
+    mockFile(`${HOME}/projects/scripts`, "deploy.sh", 210),
+    mockFile(`${HOME}/projects/scripts`, "backup.sh", 180),
+  ],
+  [`${HOME}/Documents`]: [
+    mockFile(`${HOME}/Documents`, "resume.pdf", 90000),
+    mockFile(`${HOME}/Documents`, "todo.md", 320),
+  ],
+  [`${HOME}/Downloads`]: [],
+  [`${HOME}/.config`]: [mockDir(`${HOME}/.config`, "codemux")],
+  [`${HOME}/.config/codemux`]: [
+    mockFile(`${HOME}/.config/codemux`, "config.toml", 410),
+  ],
+};
+
+/** Mock twin of the `list_directory` command. Mirrors the backend's
+ *  contract: rejects on an unknown path (so the picker's manual-path
+ *  validation is exercisable) and hides dot-entries unless
+ *  `show_hidden`. */
+export function mockListDirectory(
+  path: string,
+  showHidden: boolean,
+): FileEntry[] {
+  const entries = MOCK_DIR_TREE[path];
+  if (!entries) {
+    throw new Error(`Not a directory: ${path}`);
+  }
+  return showHidden
+    ? entries
+    : entries.filter((e) => !e.name.startsWith("."));
+}
 
 /**
  * Runtime-event envelopes for the final seeded chat turn so the redesigned
@@ -1662,4 +1777,111 @@ export function createSeedAppState(): AppStateSnapshot {
     persistence: MOCK_PERSISTENCE,
     config: MOCK_CONFIG,
   });
+}
+
+// ── Web Remote Access seed ───────────────────────────────────────────
+//
+// Exercises the Settings → Remote Access panel in plain-browser dev. The
+// mock state machine in `tauri-mock.ts` owns the mutable enabled/config
+// state; these are the immutable seed shapes it starts from. The endpoint
+// set spans every display group (this device / local network / Tailscale /
+// other) so the grouped "Reachable at" list and pairing chips render in
+// full, alongside three sessions (one live, one idle, one pending approval)
+// and a pairing response builder.
+
+export const MOCK_WEB_REMOTE_PORT = 4377;
+
+/**
+ * Reachable endpoints, one per display group so the grouped UI renders end
+ * to end: loopback (this device, secure), a LAN IP (local network, plain
+ * HTTP), a tailnet IP + a MagicDNS hostname served over HTTPS (Tailscale;
+ * the MagicDNS name is the recommended "from anywhere" option), and a lone
+ * IPv6 ULA address to exercise the collapsed "Other addresses" disclosure.
+ */
+export function mockWebRemoteEndpoints(port: number): WebRemoteEndpoint[] {
+  const ep = (
+    kind: string,
+    group: string,
+    h: string,
+    secure: boolean,
+    scheme: string,
+    recommended: boolean,
+    label: string,
+  ): WebRemoteEndpoint => ({
+    kind,
+    group,
+    host: h,
+    port,
+    // Bracket IPv6 literals in the URL host, matching the backend.
+    url: `${scheme}://${h.includes(":") ? `[${h}]` : h}:${port}`,
+    secure,
+    recommended,
+    label,
+  });
+  return [
+    ep("loopback", "this_device", "127.0.0.1", true, "http", false, "This device only (secure context)"),
+    ep("lan", "local_network", "192.168.68.58", false, "http", false, "Local network (plain HTTP)"),
+    ep("tailnet", "tailscale", "100.119.27.64", false, "http", false, "Over your tailnet"),
+    ep(
+      "magicdns",
+      "tailscale",
+      "mac-studio.tail9c2f.ts.net",
+      true,
+      "https",
+      true,
+      "MagicDNS name over Tailscale's HTTPS serve (trusted certificate)",
+    ),
+    ep("lan", "other", "fd7a:115c:a1e0::42", false, "http", false, "Other network address (plain HTTP)"),
+  ];
+}
+
+/** Three seeded devices: a live-connected laptop, an idle phone, and a
+ *  Linux desktop still waiting for approval. */
+export function mockWebRemoteSessions(): WebRemoteSessionView[] {
+  const now = Date.now();
+  const iso = (msAgo: number) => new Date(now - msAgo).toISOString();
+  return [
+    {
+      id: "sess-macbook",
+      name: "Sam's MacBook Air",
+      user_agent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+      created_at: iso(3 * 24 * 60 * 60 * 1000),
+      last_seen_at: iso(4000),
+      approved: true,
+      connected: true,
+    },
+    {
+      id: "sess-iphone",
+      name: "iPhone 15",
+      user_agent:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+      created_at: iso(2 * 60 * 60 * 1000),
+      last_seen_at: iso(18 * 60 * 1000),
+      approved: true,
+      connected: false,
+    },
+    {
+      id: "sess-linux-pending",
+      name: "workstation",
+      user_agent:
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      created_at: iso(30 * 1000),
+      last_seen_at: null,
+      approved: false,
+      connected: false,
+    },
+  ];
+}
+
+/** A fresh one-time pairing response (10-minute TTL) with a random token. */
+export function mockWebRemotePairing(): WebRemotePairingInfo {
+  const token = Array.from({ length: 32 }, () =>
+    Math.floor(Math.random() * 16).toString(16),
+  ).join("");
+  return {
+    url_path: `/#pair=${token}`,
+    token,
+    expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
+  };
 }

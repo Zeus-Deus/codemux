@@ -90,6 +90,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Auto-update: `docs/features/auto-update.md`
 - Windows cross-platform work: `docs/plans/windows-support.md`
 - Dev mock runtime (dual-guarded `src/dev/` Tauri shim that boots the real UI in a plain browser under `npm run dev` with seed data, for visual/screenshot work): `docs/features/dev-mock-runtime.md`
+- Web remote access (embedded default-off HTTP+WS server in the desktop app; a browser on another device loads the same UI bundle and drives the same running instance via a `__TAURI_INTERNALS__` WebSocket shim — pairing-token auth, mirror-mode multi-client stream fan-out, web fallbacks incl. remote project creation): `docs/features/web-remote-access.md`; locked design contract + remaining work at `docs/plans/web-remote-access.md`
 - Repo boundaries: `docs/reference/ARCHITECTURE.md`
 - Design system (color tokens, theming layers, `.theme-warm`/density scales, the no-hardcoded-colors rule — shadcn stone base `b1HYEHloH`): `docs/reference/DESIGN-SYSTEM.md`
 - Keyboard shortcuts: `docs/reference/SHORTCUTS.md`

@@ -7,6 +7,8 @@ import {
   mapToViewport,
   sanitizeCursor,
   httpBaseFromStreamUrl,
+  portFromLoopbackStreamUrl,
+  remoteBrowserEndpoints,
   parseDaemonResult,
   chunkString,
   buildCursorProbeScript,
@@ -187,6 +189,73 @@ describe("httpBaseFromStreamUrl", () => {
     expect(httpBaseFromStreamUrl("")).toBeNull();
     expect(httpBaseFromStreamUrl("not a url")).toBeNull();
     expect(httpBaseFromStreamUrl("file:///etc/passwd")).toBeNull();
+  });
+});
+
+describe("portFromLoopbackStreamUrl", () => {
+  it("extracts the port from a loopback ws:// URL", () => {
+    expect(portFromLoopbackStreamUrl("ws://127.0.0.1:9223")).toBe(9223);
+    expect(portFromLoopbackStreamUrl("ws://127.0.0.1:9299/")).toBe(9299);
+    expect(portFromLoopbackStreamUrl("wss://127.0.0.1:9250")).toBe(9250);
+  });
+
+  it("rejects URLs without an explicit port or a websocket scheme", () => {
+    expect(portFromLoopbackStreamUrl("ws://127.0.0.1")).toBeNull();
+    expect(portFromLoopbackStreamUrl("http://127.0.0.1:9223")).toBeNull();
+    expect(portFromLoopbackStreamUrl("not a url")).toBeNull();
+    expect(portFromLoopbackStreamUrl(null)).toBeNull();
+    expect(portFromLoopbackStreamUrl(undefined)).toBeNull();
+    expect(portFromLoopbackStreamUrl("")).toBeNull();
+  });
+});
+
+describe("remoteBrowserEndpoints (loopback → served-origin proxy mapping)", () => {
+  it("maps a loopback stream URL onto the origin's /proxy/browser/<port> routes", () => {
+    const ep = remoteBrowserEndpoints("ws://127.0.0.1:9250", "http://192.168.1.5:4377");
+    expect(ep).toEqual({
+      wsUrl: "ws://192.168.1.5:4377/proxy/browser/9250/ws",
+      httpBase: "http://192.168.1.5:4377/proxy/browser/9250",
+    });
+  });
+
+  // The HTTP base must NOT be just the origin — evalOnDaemon/probeDaemon append
+  // `/api/status` and `/api/command`, which have to land under the port path.
+  it("keeps the port path on the HTTP base so /api/* resolves through the proxy", () => {
+    const ep = remoteBrowserEndpoints("ws://127.0.0.1:9260", "http://host:4377");
+    expect(`${ep?.httpBase}/api/command`).toBe(
+      "http://host:4377/proxy/browser/9260/api/command",
+    );
+    expect(`${ep?.httpBase}/api/status`).toBe(
+      "http://host:4377/proxy/browser/9260/api/status",
+    );
+  });
+
+  // A secure served origin (mesh serve / user proxy) must upgrade both schemes.
+  it("uses wss/https when the served origin is https", () => {
+    const ep = remoteBrowserEndpoints("ws://127.0.0.1:9223", "https://host.example.ts.net");
+    expect(ep).toEqual({
+      wsUrl: "wss://host.example.ts.net/proxy/browser/9223/ws",
+      httpBase: "https://host.example.ts.net/proxy/browser/9223",
+    });
+  });
+
+  // Port edge cases: both ends of the agent-browser range (9223–9299).
+  it("handles the range endpoints 9223 and 9299", () => {
+    expect(remoteBrowserEndpoints("ws://127.0.0.1:9223", "http://h:4377")?.wsUrl).toBe(
+      "ws://h:4377/proxy/browser/9223/ws",
+    );
+    expect(remoteBrowserEndpoints("ws://127.0.0.1:9299", "http://h:4377")?.httpBase).toBe(
+      "http://h:4377/proxy/browser/9299",
+    );
+  });
+
+  it("returns null when the daemon port can't be parsed", () => {
+    expect(remoteBrowserEndpoints("ws://127.0.0.1", "http://h:4377")).toBeNull();
+    expect(remoteBrowserEndpoints(undefined, "http://h:4377")).toBeNull();
+  });
+
+  it("returns null when the page origin is unparseable", () => {
+    expect(remoteBrowserEndpoints("ws://127.0.0.1:9250", "not an origin")).toBeNull();
   });
 });
 

@@ -45,6 +45,7 @@
 - browser control: `create_browser_pane`, `open_url`, `browser_automation`
 - memory and handoff: `get_project_memory`, `update_project_memory`, `add_project_memory_entry`, `generate_handoff`
 - indexing: `rebuild_index`, `index_status`, `search_index`
+- web remote access: `web_remote_pair` (mint a one-time pairing code; errors if remote access is disabled). Same-machine only — this is the SSH-in-and-pair path, no GUI needed.
 
 ## Boundary Notes
 
@@ -65,9 +66,16 @@ codemux browser snapshot
 codemux memory show
 codemux handoff
 codemux index build
+codemux remote pair
+codemux remote pair --name "Kitchen iPad"
 codemux logs --tail 200
 codemux doctor
 ```
+
+`codemux remote pair` prints a scannable terminal QR of the pairing URL plus
+the raw link, token, and expiry — pair a phone/laptop over SSH without
+opening the desktop GUI. Requires remote access to be enabled in Settings
+first (`Settings → Remote Access`).
 
 ## Local Diagnostics
 

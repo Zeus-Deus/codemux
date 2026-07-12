@@ -64,6 +64,11 @@ import type {
   WorktreeInfo,
   ProjectScripts,
   DetectedSetup,
+  WebRemoteStatus,
+  WebRemoteEndpoint,
+  WebRemoteSessionView,
+  WebRemotePairingInfo,
+  WebRemoteBindScope,
 } from "./types";
 
 // ── Platform ──
@@ -991,25 +996,47 @@ export const resizePty = (sessionId: string, cols: number, rows: number) =>
 export const clearAgentStatus = (sessionId: string) =>
   invoke("clear_agent_status", { sessionId });
 
-export const detachPtyOutput = (sessionId: string) =>
-  invoke("detach_pty_output", { sessionId });
+/** Remove the output subscriber installed by `attachPtyOutput`. `generation`
+ *  is the token that attach returned, so a late detach only ever tears down
+ *  its own subscriber — never a sibling consumer that attached the same
+ *  session concurrently. Omitting it removes every subscriber for the session
+ *  (legacy whole-session detach). */
+export const detachPtyOutput = (sessionId: string, generation?: number) =>
+  invoke("detach_pty_output", { sessionId, generation });
 
-/** Terminal output flow control: pause the daemon's PTY read loop when the
- *  renderer's xterm write queue is backed up by a fast producer. No-op for
- *  in-process sessions. See `pause_pty_output` in terminal/mod.rs. */
-export const pausePtyOutput = (sessionId: string) =>
-  invoke("pause_pty_output", { sessionId });
+/** Terminal output flow control: signal that this subscriber (`generation`)
+ *  is backed up by a fast producer. The backend only stops the PTY read loop
+ *  (applying real back-pressure to the child) once EVERY subscriber has
+ *  paused, so a caught-up mirror consumer keeps the stream flowing. Omitting
+ *  `generation` pauses the whole session (legacy). See `pause_pty_output` in
+ *  terminal/mod.rs. */
+export const pausePtyOutput = (sessionId: string, generation?: number) =>
+  invoke("pause_pty_output", { sessionId, generation });
 
-/** Resume the daemon's PTY read loop once the write queue has drained. */
-export const resumePtyOutput = (sessionId: string) =>
-  invoke("resume_pty_output", { sessionId });
+/** Clear this subscriber's back-pressure request once its write queue has
+ *  drained. Omitting `generation` resumes the whole session. See
+ *  `pausePtyOutput`. */
+export const resumePtyOutput = (sessionId: string, generation?: number) =>
+  invoke("resume_pty_output", { sessionId, generation });
 
+/** Attach an output subscriber to a session's PTY stream. Resolves with the
+ *  subscriber generation token, which must be handed to `detachPtyOutput` /
+ *  `pausePtyOutput` / `resumePtyOutput`. The real desktop backend, the
+ *  web-remote dispatch, and the dev mock all mint a real generation now, but
+ *  the return type stays `number | undefined` because callers (and a
+ *  terminal-cache test outside this lane) still model the undefined case;
+ *  they treat a missing generation as "not a real subscriber" and skip
+ *  generation-scoped teardown. */
 export const attachPtyOutput = (
   sessionId: string,
   channel: Channel<unknown>,
   skipPending?: boolean,
 ) =>
-  invoke("attach_pty_output", { channel, sessionId, skipPending });
+  invoke<number | undefined>("attach_pty_output", {
+    channel,
+    sessionId,
+    skipPending,
+  });
 
 export const getTerminalStatus = (sessionId: string) =>
   invoke<TerminalStatusPayload>("get_terminal_status", { sessionId });
@@ -2092,3 +2119,88 @@ export interface OpenOnHostOutcome {
  *  re-activates the existing local view. */
 export const workspaceOpenOnHost = (syncRowId: number) =>
   invoke<OpenOnHostOutcome>("workspace_open_on_host", { syncRowId });
+
+// ── Web Remote Access ──
+//
+// Typed wrappers for the `web_remote_*` commands defined in
+// `src-tauri/src/web_remote/mod.rs`. The embedded server is default-off;
+// enabling it binds `0.0.0.0:<port>` so a browser on another device can
+// drive this instance. Every mutator returns the fresh `WebRemoteStatus`
+// and also broadcasts it on the `web-remote-state-changed` event bus (see
+// `src/remote/web-remote-events.ts`), so callers can either use the
+// returned value directly or live-update from the event.
+
+/** Current server + paired-device snapshot. Cheap; safe on mount. */
+export const webRemoteStatus = () =>
+  invoke<WebRemoteStatus>("web_remote_status");
+
+/** Turn the server on: binds the listener and persists `enabled=true`, so
+ *  it is restored on the next app boot. */
+export const webRemoteEnable = () =>
+  invoke<WebRemoteStatus>("web_remote_enable");
+
+/** Turn the server off: tears the listener down and persists
+ *  `enabled=false`. Paired devices are kept (revoke to remove them). */
+export const webRemoteDisable = () =>
+  invoke<WebRemoteStatus>("web_remote_disable");
+
+/** Update the persisted config. `port` and `bindScope` trigger a
+ *  backend-side rebind while running (dropping existing connections, which
+ *  can't follow to a new port/interface); `requireApproval` gates whether
+ *  new pairings sit pending until approved on the desktop. Omitted fields
+ *  are left unchanged. */
+export const webRemoteSetConfig = (opts: {
+  port?: number;
+  requireApproval?: boolean;
+  bindScope?: WebRemoteBindScope;
+}) =>
+  invoke<WebRemoteStatus>("web_remote_set_config", {
+    port: opts.port ?? null,
+    requireApproval: opts.requireApproval ?? null,
+    bindScope: opts.bindScope ?? null,
+  });
+
+/** Mint a one-time pairing token (10 min TTL, single use). Returns the
+ *  relative `/#pair=<token>` path — the frontend composes full per-endpoint
+ *  URLs and renders the QR. */
+export const webRemoteCreatePairing = () =>
+  invoke<WebRemotePairingInfo>("web_remote_create_pairing");
+
+/** Enumerate reachable endpoints (loopback / LAN / tailnet / MagicDNS) for
+ *  the currently-configured port. */
+export const webRemoteListEndpoints = () =>
+  invoke<WebRemoteEndpoint[]>("web_remote_list_endpoints");
+
+/** List paired devices (approved + pending). */
+export const webRemoteListSessions = () =>
+  invoke<WebRemoteSessionView[]>("web_remote_list_sessions");
+
+/** Revoke a device: deletes its session and immediately closes any live
+ *  sockets it holds. */
+export const webRemoteRevokeSession = (sessionId: string) =>
+  invoke<WebRemoteStatus>("web_remote_revoke_session", { sessionId });
+
+/** Approve a pending device so it can connect. */
+export const webRemoteApproveSession = (sessionId: string) =>
+  invoke<WebRemoteStatus>("web_remote_approve_session", { sessionId });
+
+/** Reject a pending device: closes its sockets and erases the row. */
+export const webRemoteRejectSession = (sessionId: string) =>
+  invoke<WebRemoteStatus>("web_remote_reject_session", { sessionId });
+
+/** Publish the desktop updater's availability so paired web clients can offer
+ *  a "desktop update available" prompt. Called by the DESKTOP updater hook
+ *  only — it rides out on `web-remote-state-changed` and the `web_remote_status`
+ *  snapshot. Passing `available: false` clears any stale version. */
+export const webRemotePublishUpdateAvailable = (
+  available: boolean,
+  version: string | null,
+) =>
+  invoke<void>("web_remote_publish_update_available", { available, version });
+
+/** From a web client, ask the desktop to run its update + restart flow. The
+ *  desktop updater hook receives the `web-remote-update-requested` event and
+ *  drives its standard download/restart path (desktop confirmation UX still
+ *  applies). Agents survive the restart; the web client reconnects. */
+export const webRemoteRequestUpdate = () =>
+  invoke<void>("web_remote_request_update");
