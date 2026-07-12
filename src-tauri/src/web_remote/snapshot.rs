@@ -165,6 +165,8 @@ mod tests {
             account_mode_enabled: false,
             trust_account_browsers: false,
             account_signed_in: false,
+            relay_mode_enabled: false,
+            iroh_node_id: None,
         };
 
         let body = snapshot_json(&app_state, &status);

@@ -87,7 +87,10 @@ pub struct ConnectionRegistry {
 }
 
 impl ConnectionRegistry {
-    fn register(&self, session_id: &str, out: OutboundTx, close: watch::Sender<bool>) -> u64 {
+    /// Register a live socket for a session. `pub(super)` so the iroh transport
+    /// ([`super::iroh`]) registers its bi-streams in this same registry, giving
+    /// revocation / `close_all` reach over iroh sessions too.
+    pub(super) fn register(&self, session_id: &str, out: OutboundTx, close: watch::Sender<bool>) -> u64 {
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         self.conns.lock().unwrap().insert(
             id,
@@ -100,7 +103,7 @@ impl ConnectionRegistry {
         id
     }
 
-    fn unregister(&self, id: u64) {
+    pub(super) fn unregister(&self, id: u64) {
         self.conns.lock().unwrap().remove(&id);
     }
 
@@ -635,7 +638,13 @@ async fn handle_socket(app: AppHandle, session_id: String, socket: WebSocket) {
 }
 
 /// Route one text frame from the client per the WS protocol contract.
-fn handle_text_frame(
+///
+/// This is the single control-frame dispatcher shared by every transport that
+/// carries the `/ws` protocol: the axum WebSocket reader loop above and the
+/// iroh bi-stream bridge ([`super::iroh`]) both feed decoded JSON control frames
+/// here, so invoke / listen / unlisten behave identically no matter which
+/// transport delivered the bytes.
+pub(super) fn handle_text_frame(
     app: &AppHandle,
     shared: &Arc<Shared>,
     conn_id: u64,

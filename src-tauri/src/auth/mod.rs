@@ -231,7 +231,11 @@ fn derive_key(salt: &[u8]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-fn encrypt_data(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+/// Machine-guarded symmetric encryption (AES-256-GCM, key derived from the
+/// machine id + a random per-blob salt). Used for the encrypted auth-token
+/// blob and reused by `web_remote::iroh` to seal the desktop's stable iroh
+/// identity key at rest, so both device secrets share one machine-guard.
+pub(crate) fn encrypt_data(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
 
@@ -255,7 +259,7 @@ fn encrypt_data(plaintext: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn decrypt_data(data: &[u8]) -> Result<Vec<u8>, String> {
+pub(crate) fn decrypt_data(data: &[u8]) -> Result<Vec<u8>, String> {
     let min_len = SALT_LEN + NONCE_LEN + 16 + 1; // salt + nonce + tag + at least 1 byte
     if data.len() < min_len {
         return Err("data too short".into());

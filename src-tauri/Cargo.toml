@@ -118,6 +118,16 @@ if-addrs = "0.13"
 # renderers — we only use the built-in unicode (`Dense1x2`) renderer, so this
 # adds no image-processing crates to the tree.
 qrcode = { version = "0.14", default-features = false }
+# Pure-Rust QUIC endpoint for the web-remote "from-anywhere" transport tier.
+# The desktop becomes an iroh endpoint (default-off, gated by
+# `web_remote.config.relay_mode_enabled`) so a browser can reach a NAT'd desktop
+# over an E2E-encrypted QUIC stream via hole-punching (relay-of-last-resort
+# forwards ciphertext only — the operator never sees plaintext). The existing
+# `/ws` frame contract rides *inside* an iroh bi-stream unchanged; iroh only
+# swaps the transport. Shares the app's tokio runtime — no second runtime is
+# spawned. See `src/web_remote/iroh.rs` and
+# `docs/plans/web-remote-account-mode.md` (Design 1 §1.2, Stage C).
+iroh = "1"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
