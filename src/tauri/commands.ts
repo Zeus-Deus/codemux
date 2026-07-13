@@ -69,6 +69,7 @@ import type {
   WebRemoteSessionView,
   WebRemotePairingInfo,
   WebRemoteBindScope,
+  WebRemoteRegistrationStatus,
 } from "./types";
 
 // ── Platform ──
@@ -2151,13 +2152,16 @@ export const webRemoteDisable = () =>
  *  `accountModeEnabled` toggles the account sign-in admission path
  *  (`POST /api/pair-account`), and `trustAccountBrowsers` is the "trust
  *  browsers on my account without approval" opt-out — neither rebinds the
- *  listener. Omitted fields are left unchanged. */
+ *  listener. `relayModeEnabled` starts/stops the parallel from-anywhere iroh
+ *  endpoint (never a rebind of the axum listener). Omitted fields are left
+ *  unchanged. */
 export const webRemoteSetConfig = (opts: {
   port?: number;
   requireApproval?: boolean;
   bindScope?: WebRemoteBindScope;
   accountModeEnabled?: boolean;
   trustAccountBrowsers?: boolean;
+  relayModeEnabled?: boolean;
 }) =>
   invoke<WebRemoteStatus>("web_remote_set_config", {
     port: opts.port ?? null,
@@ -2165,7 +2169,23 @@ export const webRemoteSetConfig = (opts: {
     bindScope: opts.bindScope ?? null,
     accountModeEnabled: opts.accountModeEnabled ?? null,
     trustAccountBrowsers: opts.trustAccountBrowsers ?? null,
+    relayModeEnabled: opts.relayModeEnabled ?? null,
   });
+
+/** The device's stable iroh `node_id` (its `EndpointId`) — the address a
+ *  hosted-origin browser dials to reach this desktop over the relay transport.
+ *  `null` until relay mode has been enabled at least once (the identity key is
+ *  persisted lazily). Also surfaced on {@link WebRemoteStatus.iroh_node_id}. */
+export const webRemoteIrohNodeId = () =>
+  invoke<string | null>("web_remote_iroh_node_id");
+
+/** The from-anywhere transport's control-plane registration state (registered
+ *  flag, device/node ids, last heartbeat, last error). Registration is
+ *  best-effort and only runs while relay mode is on and the desktop is signed
+ *  into a Codemux account; the Settings pane surfaces this as a "device
+ *  registered" indicator distinct from the raw `node_id`. */
+export const webRemoteRegistrationStatus = () =>
+  invoke<WebRemoteRegistrationStatus>("web_remote_registration_status");
 
 /** Mint a one-time pairing token (10 min TTL, single use). Returns the
  *  relative `/#pair=<token>` path — the frontend composes full per-endpoint

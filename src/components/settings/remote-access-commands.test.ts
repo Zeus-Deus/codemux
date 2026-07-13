@@ -52,6 +52,7 @@ describe("web_remote_* command wrappers", () => {
       bindScope: null,
       accountModeEnabled: null,
       trustAccountBrowsers: null,
+      relayModeEnabled: null,
     });
 
     webRemoteSetConfig({ requireApproval: true });
@@ -61,6 +62,7 @@ describe("web_remote_* command wrappers", () => {
       bindScope: null,
       accountModeEnabled: null,
       trustAccountBrowsers: null,
+      relayModeEnabled: null,
     });
 
     webRemoteSetConfig({ bindScope: "tailscale" });
@@ -70,6 +72,7 @@ describe("web_remote_* command wrappers", () => {
       bindScope: "tailscale",
       accountModeEnabled: null,
       trustAccountBrowsers: null,
+      relayModeEnabled: null,
     });
 
     // Account-mode toggles ride the same command; neither rebinds the listener.
@@ -80,6 +83,7 @@ describe("web_remote_* command wrappers", () => {
       bindScope: null,
       accountModeEnabled: true,
       trustAccountBrowsers: null,
+      relayModeEnabled: null,
     });
 
     webRemoteSetConfig({ trustAccountBrowsers: true });
@@ -89,6 +93,18 @@ describe("web_remote_* command wrappers", () => {
       bindScope: null,
       accountModeEnabled: null,
       trustAccountBrowsers: true,
+      relayModeEnabled: null,
+    });
+
+    // The from-anywhere iroh transport toggle rides the same command.
+    webRemoteSetConfig({ relayModeEnabled: true });
+    expect(invokeMock).toHaveBeenLastCalledWith("web_remote_set_config", {
+      port: null,
+      requireApproval: null,
+      bindScope: null,
+      accountModeEnabled: null,
+      trustAccountBrowsers: null,
+      relayModeEnabled: true,
     });
   });
 

@@ -14,6 +14,8 @@
 //!   Codemux account the desktop is signed into, then mint a session.
 //! - [`dispatch`] — invoke dispatch via synthesized `on_message` + channels.
 //! - [`events`]   — `listen_any` fan-out hub with per-event refcounting.
+//! - [`iroh`]     — parallel from-anywhere transport (default-off): the `/ws`
+//!   protocol carried inside an E2E-encrypted iroh QUIC bi-stream.
 //! - [`endpoints`]— reachable-endpoint enumeration (loopback/LAN/tailnet).
 //! - [`assets`]   — authenticated `/api/assets` file route (`convertFileSrc`).
 //! - [`proxy`]    — auth-gated browser-pane WS + HTTP proxy to loopback daemons.
@@ -27,7 +29,9 @@ pub mod auth;
 pub mod dispatch;
 pub mod endpoints;
 pub mod events;
+pub mod iroh;
 pub mod proxy;
+pub mod registration;
 pub mod server;
 pub mod snapshot;
 
@@ -106,6 +110,15 @@ pub struct WebRemoteConfig {
     /// so a legacy config loads as `false` (approval on).
     #[serde(default)]
     pub trust_account_browsers: bool,
+    /// Master toggle for the from-anywhere **iroh transport** (Stage C). When on,
+    /// the desktop binds an iroh endpoint so a browser can reach it by `node_id`
+    /// over an E2E-encrypted QUIC stream (see [`iroh`]). Strictly additive and
+    /// **default off** — the axum `/ws` transport is unchanged and stays the
+    /// default; iroh runs in parallel only while the feature is enabled *and*
+    /// this flag is set. `#[serde(default)]` so a config persisted before this
+    /// field existed loads as `false`.
+    #[serde(default)]
+    pub relay_mode_enabled: bool,
 }
 
 impl Default for WebRemoteConfig {
@@ -117,6 +130,7 @@ impl Default for WebRemoteConfig {
             bind_scope: default_bind_scope(),
             account_mode_enabled: false,
             trust_account_browsers: false,
+            relay_mode_enabled: false,
         }
     }
 }
@@ -167,6 +181,14 @@ pub(crate) struct Shared {
     pub connections: server::ConnectionRegistry,
     pub channels: Arc<dispatch::ChannelRouter>,
     pub events: events::EventHub,
+    /// The from-anywhere iroh transport's endpoint lifecycle (default-off,
+    /// gated by `relay_mode_enabled`). Shares this same `Shared` so iroh
+    /// bi-streams register in the connection registry above.
+    pub iroh: iroh::IrohManager,
+    /// Device registration with the account control plane (default-off, started
+    /// in lockstep with the iroh endpoint when relay mode is on and the desktop
+    /// is signed in). Holds the periodic `lastSeenAt` refresh task + last status.
+    pub registration: registration::RegistrationManager,
     /// Last desktop-update availability the frontend updater hook published.
     update: Mutex<UpdateAvailability>,
 }
@@ -182,6 +204,8 @@ impl Default for Shared {
             connections: server::ConnectionRegistry::default(),
             channels: Arc::new(dispatch::ChannelRouter::default()),
             events: events::EventHub::default(),
+            iroh: iroh::IrohManager::default(),
+            registration: registration::RegistrationManager::default(),
             update: Mutex::new(UpdateAvailability::default()),
         }
     }
@@ -248,6 +272,22 @@ pub struct WebRemoteStatus {
     /// the Settings pane surfaces this to explain why account mode is inert when
     /// signed out, and the browser login screen can degrade gracefully.
     pub account_signed_in: bool,
+    /// Master toggle for the from-anywhere iroh transport (Stage C). When on and
+    /// the feature is enabled, the desktop is reachable by `node_id` over iroh.
+    pub relay_mode_enabled: bool,
+    /// The device's stable iroh `node_id` (a browser dials this), when relay
+    /// mode has ever been enabled (the identity key is persisted). `None`
+    /// otherwise. This is the address a later stage registers with the control
+    /// plane; here it is surfaced so the desktop can display/copy it.
+    pub iroh_node_id: Option<String>,
+    /// Whether this desktop is currently registered with the account device
+    /// registry, so a browser signed into the same account can discover it by
+    /// `node_id`. Only meaningful while relay mode is on and the desktop is
+    /// signed in; `false` when signed out or the registry is unreachable.
+    pub device_registered: bool,
+    /// The stable device id this desktop registers under, once a registration
+    /// attempt has run. `None` before then.
+    pub device_id: Option<String>,
 }
 
 /// A paired device as shown in the desktop management UI.
@@ -390,6 +430,8 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
     // cached account user, so surface that state alongside the toggles.
     let account_signed_in = crate::auth::load_cached_user(&db).is_some();
     let update = shared.update.lock().unwrap().clone();
+    let iroh_node_id = shared.iroh.node_id();
+    let registration = shared.registration.status();
     WebRemoteStatus {
         enabled: cfg.enabled,
         running,
@@ -404,6 +446,10 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
         account_mode_enabled: cfg.account_mode_enabled,
         trust_account_browsers: cfg.trust_account_browsers,
         account_signed_in,
+        relay_mode_enabled: cfg.relay_mode_enabled,
+        iroh_node_id,
+        device_registered: registration.registered,
+        device_id: registration.device_id,
     }
 }
 
@@ -555,11 +601,24 @@ pub fn restore_on_boot(app: &AppHandle) {
     if !enabled {
         return;
     }
+    let relay_mode_enabled = shared.config.lock().unwrap().relay_mode_enabled;
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let shared = app.state::<WebRemoteState>().shared();
         match start_server(&app, &shared).await {
-            Ok(()) => emit_state_changed(&app),
+            Ok(()) => {
+                // If the from-anywhere iroh transport was left enabled, bind it
+                // too (best-effort; never blocks or fails the boot restore).
+                if relay_mode_enabled {
+                    if let Err(e) = iroh::start(&app, &shared).await {
+                        eprintln!("[codemux::web_remote] restore-on-boot iroh bind failed: {e}");
+                    }
+                    // Re-register with the account device registry (best-effort;
+                    // no-op when signed out or the registry is unreachable).
+                    registration::start(&app, &shared);
+                }
+                emit_state_changed(&app);
+            }
             Err(e) => eprintln!("[codemux::web_remote] restore-on-boot bind failed: {e}"),
         }
     });
@@ -659,6 +718,17 @@ pub async fn web_remote_enable(app: AppHandle) -> Result<WebRemoteStatus, String
         emit_state_changed(&app);
         return Err(e);
     }
+    // Bring the parallel iroh transport up too if relay mode was left enabled.
+    // A failure here is logged but never fails the enable — iroh is strictly
+    // additive over the primary `/ws` transport, which is already bound.
+    if shared.config.lock().unwrap().relay_mode_enabled {
+        if let Err(e) = iroh::start(&app, &shared).await {
+            eprintln!("[codemux::web_remote] iroh transport enable failed: {e}");
+        }
+        // Register this device with the account control plane so an account
+        // browser can discover it (best-effort; skips when signed out).
+        registration::start(&app, &shared);
+    }
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
 }
@@ -668,7 +738,13 @@ pub fn web_remote_disable(app: AppHandle) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
     shared.config.lock().unwrap().enabled = false;
     persist_config(&app, &shared);
+    // The master switch is the kill for *every* remote transport: `stop_server`
+    // severs all live sockets (iroh sessions included, via the shared registry's
+    // `close_all`), then tear the iroh endpoint down so it stops accepting and
+    // stop refreshing this device's registration.
     stop_server(&shared);
+    iroh::stop(&shared);
+    registration::stop(&shared);
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
 }
@@ -681,6 +757,7 @@ pub async fn web_remote_set_config(
     bind_scope: Option<String>,
     account_mode_enabled: Option<bool>,
     trust_account_browsers: Option<bool>,
+    relay_mode_enabled: Option<bool>,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
 
@@ -692,10 +769,11 @@ pub async fn web_remote_set_config(
         }
     }
 
-    let (old_port, old_scope, port_changed, scope_changed) = {
+    let (old_port, old_scope, port_changed, scope_changed, relay_target, relay_changed) = {
         let mut cfg = shared.config.lock().unwrap();
         let old_port = cfg.port;
         let old_scope = cfg.bind_scope.clone();
+        let old_relay = cfg.relay_mode_enabled;
         if let Some(p) = port {
             cfg.port = p;
         }
@@ -714,11 +792,18 @@ pub async fn web_remote_set_config(
         if let Some(t) = trust_account_browsers {
             cfg.trust_account_browsers = t;
         }
+        // The iroh transport toggle is a start/stop of a *parallel* endpoint,
+        // never a rebind of the axum listener — applied below, after persist.
+        if let Some(r) = relay_mode_enabled {
+            cfg.relay_mode_enabled = r;
+        }
         (
             old_port,
             old_scope.clone(),
             cfg.port != old_port,
             cfg.bind_scope != old_scope,
+            cfg.relay_mode_enabled,
+            cfg.relay_mode_enabled != old_relay,
         )
     };
     persist_config(&app, &shared);
@@ -745,6 +830,26 @@ pub async fn web_remote_set_config(
             return Err(e);
         }
     }
+
+    // Apply an iroh relay-mode toggle. It only *runs* while the feature itself
+    // is bound (`running`); turning it on while the server is off just persists
+    // the flag, and `web_remote_enable` starts the endpoint then. An iroh start
+    // failure is logged, never fatal — the primary `/ws` transport is unaffected.
+    if relay_changed {
+        if relay_target {
+            if running {
+                if let Err(e) = iroh::start(&app, &shared).await {
+                    eprintln!("[codemux::web_remote] iroh transport enable failed: {e}");
+                }
+                // Start device registration in lockstep with the endpoint.
+                registration::start(&app, &shared);
+            }
+        } else {
+            iroh::stop(&shared);
+            registration::stop(&shared);
+        }
+    }
+
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
 }
@@ -758,8 +863,42 @@ pub fn web_remote_create_pairing(app: AppHandle) -> PairingInfo {
 #[tauri::command]
 pub fn web_remote_list_endpoints(app: AppHandle) -> Vec<endpoints::Endpoint> {
     let shared = app.state::<WebRemoteState>().shared();
-    let port = shared.config.lock().unwrap().port;
-    endpoints::list(port)
+    let (port, relay_mode_enabled) = {
+        let cfg = shared.config.lock().unwrap();
+        (cfg.port, cfg.relay_mode_enabled)
+    };
+    let mut list = endpoints::list(port);
+    // Surface the from-anywhere iroh endpoint (host = the device's node_id) only
+    // when relay mode is on and a stable identity exists. Appended last so it
+    // never displaces the HTTP endpoints' "recommended" hint.
+    if relay_mode_enabled {
+        if let Some(node_id) = shared.iroh.node_id() {
+            list.push(endpoints::iroh_endpoint(&node_id));
+        }
+    }
+    list
+}
+
+/// The device's stable iroh `node_id` (its iroh `EndpointId`) — the address a
+/// browser dials over the from-anywhere transport. Exposed so a later stage can
+/// register it with the control plane and the desktop can display/copy it.
+/// `None` until relay mode has been enabled at least once (the identity key is
+/// generated + persisted on first enable).
+#[tauri::command]
+pub fn web_remote_iroh_node_id(app: AppHandle) -> Option<String> {
+    app.state::<WebRemoteState>().shared().iroh.node_id()
+}
+
+/// This desktop's account-device-registry registration status: whether it is
+/// currently registered (discoverable by an account browser), the stable device
+/// id it registers under, the `node_id` last registered, the last successful
+/// registration time, and the last error (for diagnostics). Surfaced so the
+/// Settings pane can show a "device registered" indicator distinct from the raw
+/// `node_id`. Registration is best-effort and only runs while relay mode is on
+/// and the desktop is signed in.
+#[tauri::command]
+pub fn web_remote_registration_status(app: AppHandle) -> registration::RegistrationStatus {
+    app.state::<WebRemoteState>().shared().registration.status()
 }
 
 #[tauri::command]
@@ -866,6 +1005,7 @@ mod tests {
             bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
             account_mode_enabled: false,
             trust_account_browsers: false,
+            relay_mode_enabled: false,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: WebRemoteConfig = serde_json::from_str(&json).unwrap();
@@ -906,6 +1046,8 @@ mod tests {
         let cfg: WebRemoteConfig = serde_json::from_str(legacy).unwrap();
         assert!(!cfg.account_mode_enabled);
         assert!(!cfg.trust_account_browsers);
+        // The iroh relay transport is likewise off for a config predating it.
+        assert!(!cfg.relay_mode_enabled, "legacy config loads relay mode off");
     }
 
     #[test]
@@ -917,10 +1059,12 @@ mod tests {
             bind_scope: BIND_SCOPE_ALL.to_string(),
             account_mode_enabled: true,
             trust_account_browsers: true,
+            relay_mode_enabled: true,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: WebRemoteConfig = serde_json::from_str(&json).unwrap();
         assert!(back.account_mode_enabled);
+        assert!(back.relay_mode_enabled, "relay mode round-trips through JSON");
         assert!(back.trust_account_browsers);
     }
 
@@ -957,6 +1101,10 @@ mod tests {
             account_mode_enabled: true,
             trust_account_browsers: false,
             account_signed_in: true,
+            relay_mode_enabled: false,
+            iroh_node_id: None,
+            device_registered: false,
+            device_id: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["account_mode_enabled"], true);
@@ -981,6 +1129,10 @@ mod tests {
             account_mode_enabled: false,
             trust_account_browsers: false,
             account_signed_in: false,
+            relay_mode_enabled: false,
+            iroh_node_id: None,
+            device_registered: false,
+            device_id: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["bind_scope"], "tailscale");
@@ -1092,6 +1244,10 @@ mod tests {
             account_mode_enabled: false,
             trust_account_browsers: false,
             account_signed_in: false,
+            relay_mode_enabled: false,
+            iroh_node_id: None,
+            device_registered: false,
+            device_id: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["active_connections"], 3);
@@ -1118,6 +1274,10 @@ mod tests {
             account_mode_enabled: false,
             trust_account_browsers: false,
             account_signed_in: false,
+            relay_mode_enabled: false,
+            iroh_node_id: None,
+            device_registered: false,
+            device_id: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["update_available"], true);

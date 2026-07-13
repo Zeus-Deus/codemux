@@ -57,6 +57,30 @@ const GROUP_THIS_DEVICE: &str = "this_device";
 const GROUP_LOCAL_NETWORK: &str = "local_network";
 const GROUP_TAILSCALE: &str = "tailscale";
 const GROUP_OTHER: &str = "other";
+/// The from-anywhere iroh transport's group. New to the UI's fixed set; the
+/// frontend grouping helper degrades an unrecognised group to `other`, so this
+/// never renders blank while the browser side is still catching up.
+const GROUP_RELAY: &str = "relay";
+
+/// Build the iroh transport's endpoint entry, surfaced only when relay mode is
+/// on. The `host` is the device's `node_id` — the address a browser dials over
+/// iroh — and the URL uses an `iroh://` scheme rather than `http://`. Unlike the
+/// HTTP endpoints this is an E2E-encrypted, mutually-authenticated QUIC
+/// transport (not a browser origin), so it is always `secure`. Appended after
+/// [`mark_recommended`] so it never displaces the HTTP "from anywhere" hint.
+pub fn iroh_endpoint(node_id: &str) -> Endpoint {
+    Endpoint {
+        kind: "iroh".to_string(),
+        group: GROUP_RELAY.to_string(),
+        host: node_id.to_string(),
+        // Not a TCP port — the browser dials the node_id, not host:port.
+        port: 0,
+        url: format!("iroh://{node_id}"),
+        secure: true,
+        recommended: false,
+        label: "Reach from anywhere (end-to-end encrypted, by node id)".to_string(),
+    }
+}
 
 /// `true` if `name` looks like a virtual / container / VM / mesh interface
 /// whose addresses are not useful "reach this machine" endpoints: Docker
