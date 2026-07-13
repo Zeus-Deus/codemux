@@ -1852,6 +1852,7 @@ pub fn run() {
             web_remote::web_remote_publish_update_available,
             web_remote::web_remote_request_update,
             web_remote::web_remote_iroh_node_id,
+            web_remote::web_remote_registration_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

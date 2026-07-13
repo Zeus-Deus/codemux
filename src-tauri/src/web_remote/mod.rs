@@ -31,6 +31,7 @@ pub mod endpoints;
 pub mod events;
 pub mod iroh;
 pub mod proxy;
+pub mod registration;
 pub mod server;
 pub mod snapshot;
 
@@ -184,6 +185,10 @@ pub(crate) struct Shared {
     /// gated by `relay_mode_enabled`). Shares this same `Shared` so iroh
     /// bi-streams register in the connection registry above.
     pub iroh: iroh::IrohManager,
+    /// Device registration with the account control plane (default-off, started
+    /// in lockstep with the iroh endpoint when relay mode is on and the desktop
+    /// is signed in). Holds the periodic `lastSeenAt` refresh task + last status.
+    pub registration: registration::RegistrationManager,
     /// Last desktop-update availability the frontend updater hook published.
     update: Mutex<UpdateAvailability>,
 }
@@ -200,6 +205,7 @@ impl Default for Shared {
             channels: Arc::new(dispatch::ChannelRouter::default()),
             events: events::EventHub::default(),
             iroh: iroh::IrohManager::default(),
+            registration: registration::RegistrationManager::default(),
             update: Mutex::new(UpdateAvailability::default()),
         }
     }
@@ -274,6 +280,14 @@ pub struct WebRemoteStatus {
     /// otherwise. This is the address a later stage registers with the control
     /// plane; here it is surfaced so the desktop can display/copy it.
     pub iroh_node_id: Option<String>,
+    /// Whether this desktop is currently registered with the account device
+    /// registry, so a browser signed into the same account can discover it by
+    /// `node_id`. Only meaningful while relay mode is on and the desktop is
+    /// signed in; `false` when signed out or the registry is unreachable.
+    pub device_registered: bool,
+    /// The stable device id this desktop registers under, once a registration
+    /// attempt has run. `None` before then.
+    pub device_id: Option<String>,
 }
 
 /// A paired device as shown in the desktop management UI.
@@ -417,6 +431,7 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
     let account_signed_in = crate::auth::load_cached_user(&db).is_some();
     let update = shared.update.lock().unwrap().clone();
     let iroh_node_id = shared.iroh.node_id();
+    let registration = shared.registration.status();
     WebRemoteStatus {
         enabled: cfg.enabled,
         running,
@@ -433,6 +448,8 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
         account_signed_in,
         relay_mode_enabled: cfg.relay_mode_enabled,
         iroh_node_id,
+        device_registered: registration.registered,
+        device_id: registration.device_id,
     }
 }
 
@@ -596,6 +613,9 @@ pub fn restore_on_boot(app: &AppHandle) {
                     if let Err(e) = iroh::start(&app, &shared).await {
                         eprintln!("[codemux::web_remote] restore-on-boot iroh bind failed: {e}");
                     }
+                    // Re-register with the account device registry (best-effort;
+                    // no-op when signed out or the registry is unreachable).
+                    registration::start(&app, &shared);
                 }
                 emit_state_changed(&app);
             }
@@ -705,6 +725,9 @@ pub async fn web_remote_enable(app: AppHandle) -> Result<WebRemoteStatus, String
         if let Err(e) = iroh::start(&app, &shared).await {
             eprintln!("[codemux::web_remote] iroh transport enable failed: {e}");
         }
+        // Register this device with the account control plane so an account
+        // browser can discover it (best-effort; skips when signed out).
+        registration::start(&app, &shared);
     }
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
@@ -717,9 +740,11 @@ pub fn web_remote_disable(app: AppHandle) -> Result<WebRemoteStatus, String> {
     persist_config(&app, &shared);
     // The master switch is the kill for *every* remote transport: `stop_server`
     // severs all live sockets (iroh sessions included, via the shared registry's
-    // `close_all`), then tear the iroh endpoint down so it stops accepting.
+    // `close_all`), then tear the iroh endpoint down so it stops accepting and
+    // stop refreshing this device's registration.
     stop_server(&shared);
     iroh::stop(&shared);
+    registration::stop(&shared);
     emit_state_changed(&app);
     Ok(build_status(&app, &shared))
 }
@@ -816,9 +841,12 @@ pub async fn web_remote_set_config(
                 if let Err(e) = iroh::start(&app, &shared).await {
                     eprintln!("[codemux::web_remote] iroh transport enable failed: {e}");
                 }
+                // Start device registration in lockstep with the endpoint.
+                registration::start(&app, &shared);
             }
         } else {
             iroh::stop(&shared);
+            registration::stop(&shared);
         }
     }
 
@@ -859,6 +887,18 @@ pub fn web_remote_list_endpoints(app: AppHandle) -> Vec<endpoints::Endpoint> {
 #[tauri::command]
 pub fn web_remote_iroh_node_id(app: AppHandle) -> Option<String> {
     app.state::<WebRemoteState>().shared().iroh.node_id()
+}
+
+/// This desktop's account-device-registry registration status: whether it is
+/// currently registered (discoverable by an account browser), the stable device
+/// id it registers under, the `node_id` last registered, the last successful
+/// registration time, and the last error (for diagnostics). Surfaced so the
+/// Settings pane can show a "device registered" indicator distinct from the raw
+/// `node_id`. Registration is best-effort and only runs while relay mode is on
+/// and the desktop is signed in.
+#[tauri::command]
+pub fn web_remote_registration_status(app: AppHandle) -> registration::RegistrationStatus {
+    app.state::<WebRemoteState>().shared().registration.status()
 }
 
 #[tauri::command]
@@ -1063,6 +1103,8 @@ mod tests {
             account_signed_in: true,
             relay_mode_enabled: false,
             iroh_node_id: None,
+            device_registered: false,
+            device_id: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["account_mode_enabled"], true);
@@ -1089,6 +1131,8 @@ mod tests {
             account_signed_in: false,
             relay_mode_enabled: false,
             iroh_node_id: None,
+            device_registered: false,
+            device_id: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["bind_scope"], "tailscale");
@@ -1202,6 +1246,8 @@ mod tests {
             account_signed_in: false,
             relay_mode_enabled: false,
             iroh_node_id: None,
+            device_registered: false,
+            device_id: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["active_connections"], 3);
@@ -1230,6 +1276,8 @@ mod tests {
             account_signed_in: false,
             relay_mode_enabled: false,
             iroh_node_id: None,
+            device_registered: false,
+            device_id: None,
         };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(v["update_available"], true);

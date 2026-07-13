@@ -67,6 +67,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::ws::Message;
 use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -315,6 +316,271 @@ fn reject_frame_bytes(reject: &HandshakeReject) -> Vec<u8> {
         .into_bytes()
 }
 
+// ── Account (from-anywhere / relay) handshake ───────────────────────
+//
+// The token handshake above authenticates a session that already exists (minted
+// over the LAN via `/api/pair` or `/api/pair-account`). The **account** (relay)
+// handshake is the from-anywhere path: the browser has no pre-existing device
+// session — it holds a short-lived **connection grant** the control plane signed
+// after verifying it owns this account and this device. The grant IS the
+// credential; the desktop verifies it out-of-band and, on success, mints a fresh
+// `web_remote_sessions` row so everything downstream (`/ws` frames, revocation)
+// is identical to a paired session. See
+// `docs/plans/web-remote-account-mode.md` (Design 1 Stage C).
+//
+//   C→S  kind 0  {"t":"hello-account","grant":"<grant>","nonce":"<browserNonce>"}
+//   S→C  kind 0  {"t":"welcome","session_id":"<id>"}         (on accept)
+//   S→C  kind 0  {"t":"unauthorized","reason":"<code>"}      (on reject)
+
+/// A parsed `hello-account` first frame.
+struct AccountHello {
+    grant: String,
+    /// The per-dial nonce the browser bound at `/api/devices/:id/connect` time;
+    /// the same value is embedded in the grant, so a valid grant echoes it back
+    /// through the verify endpoint and the two must agree.
+    nonce: String,
+}
+
+/// Why an account (grant) handshake was refused. Maps to the
+/// `unauthorized.reason` code the browser sees, distinct from [`HandshakeReject`]
+/// so the codes name the account-path failure precisely.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AccountHandshakeReject {
+    /// The first frame was not a well-formed `hello-account` control frame.
+    Malformed,
+    /// The control plane did not vouch for the grant (bad signature, expired,
+    /// or the verify call itself failed) — `valid:false` or a network error.
+    Unverified,
+    /// The grant is for a different device's `node_id` than this desktop's.
+    WrongNode,
+    /// The grant's account `uid` is not the desktop's signed-in user (or the
+    /// desktop is signed out, so there is no account to match).
+    WrongAccount,
+    /// The grant verified but its bound nonce disagrees with the one the browser
+    /// presented in the frame — a replay / grant-substitution signal.
+    NonceMismatch,
+    /// The verified session is still pending desktop approval.
+    Pending,
+    /// Minting the session row failed.
+    Internal(String),
+}
+
+impl AccountHandshakeReject {
+    fn code(&self) -> &'static str {
+        match self {
+            AccountHandshakeReject::Malformed => "malformed_handshake",
+            AccountHandshakeReject::Unverified => "grant_invalid",
+            AccountHandshakeReject::WrongNode => "wrong_device",
+            AccountHandshakeReject::WrongAccount => "account_mismatch",
+            AccountHandshakeReject::NonceMismatch => "nonce_mismatch",
+            AccountHandshakeReject::Pending => "pending_approval",
+            AccountHandshakeReject::Internal(_) => "internal_error",
+        }
+    }
+}
+
+fn account_reject_frame_bytes(reject: &AccountHandshakeReject) -> Vec<u8> {
+    json!({ "t": "unauthorized", "reason": reject.code() })
+        .to_string()
+        .into_bytes()
+}
+
+/// Whether a first frame is a `hello-account` frame (the account/relay path).
+/// A frame that is not valid JSON, or whose `t` is anything else, is treated as
+/// the token path — [`authorize_handshake`] then decides admit-or-reject, so a
+/// malformed token frame keeps its existing `invalid_session`/`malformed`
+/// handling rather than being misrouted here.
+fn is_account_handshake(frame: &Frame) -> bool {
+    if frame.kind != KIND_TEXT {
+        return false;
+    }
+    serde_json::from_slice::<Value>(&frame.payload)
+        .ok()
+        .and_then(|v| v.get("t").and_then(|t| t.as_str()).map(str::to_string))
+        .as_deref()
+        == Some("hello-account")
+}
+
+/// Parse a `hello-account` first frame into its grant + nonce. `None` if the
+/// frame is malformed or the grant is empty.
+fn parse_account_hello(frame: &Frame) -> Option<AccountHello> {
+    if frame.kind != KIND_TEXT {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(&frame.payload).ok()?;
+    if value.get("t").and_then(|v| v.as_str()) != Some("hello-account") {
+        return None;
+    }
+    let grant = value.get("grant").and_then(|v| v.as_str())?.trim().to_string();
+    if grant.is_empty() {
+        return None;
+    }
+    let nonce = value
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(AccountHello { grant, nonce })
+}
+
+/// The `POST /api/devices/grant/verify` response shape. The endpoint returns
+/// `200 {valid:true, userId, deviceId, nodeId, nonce}` on a good, unexpired,
+/// correctly-signed grant, and `200 {valid:false, reason}` otherwise — it never
+/// 500s on a bad grant, so any non-2xx here is a transport/availability fault.
+#[derive(Debug, Deserialize)]
+struct GrantVerifyResponse {
+    valid: bool,
+    #[serde(rename = "userId", default)]
+    user_id: Option<String>,
+    #[serde(rename = "deviceId", default)]
+    device_id: Option<String>,
+    #[serde(rename = "nodeId", default)]
+    node_id: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+/// The identity a verified grant asserts, once the accept matrix passes.
+#[derive(Debug, PartialEq, Eq)]
+struct GrantIdentity {
+    user_id: String,
+    #[allow(dead_code)]
+    device_id: Option<String>,
+}
+
+/// Call the control plane's grant-verify endpoint. This is a machine-to-machine
+/// check — the grant is the sole credential, so no user bearer is sent. Reuses
+/// the same `CODEMUX_API_URL` base every other API call reads.
+async fn verify_grant(base: &str, grant: &str) -> Result<GrantVerifyResponse, String> {
+    let url = format!("{base}/api/devices/grant/verify");
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .json(&json!({ "grant": grant }))
+        .send()
+        .await
+        .map_err(|e| format!("grant verify request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("grant verify returned {}", resp.status()));
+    }
+    resp.json::<GrantVerifyResponse>()
+        .await
+        .map_err(|e| format!("grant verify parse failed: {e}"))
+}
+
+/// Pure accept/reject matrix for a verified grant, given this desktop's own
+/// `node_id`, its signed-in account `uid`, and the nonce the browser presented.
+/// Admits ONLY when the control plane vouched (`valid`), the grant targets THIS
+/// device's node, the grant's account matches the desktop's own signed-in user,
+/// and the presented nonce agrees with the grant's bound nonce. Pure so the
+/// whole matrix is unit-testable without the network.
+fn evaluate_grant(
+    resp: &GrantVerifyResponse,
+    own_node_id: &str,
+    own_user_id: Option<&str>,
+    presented_nonce: &str,
+) -> Result<GrantIdentity, AccountHandshakeReject> {
+    if !resp.valid {
+        return Err(AccountHandshakeReject::Unverified);
+    }
+    // The grant must target THIS device's iroh node, not some other device the
+    // same account owns.
+    if resp.node_id.as_deref().unwrap_or_default() != own_node_id {
+        return Err(AccountHandshakeReject::WrongNode);
+    }
+    // The grant's account must be the desktop's own signed-in account. Signed
+    // out (own_user_id None) → nothing to match → reject.
+    let uid = resp.user_id.as_deref().unwrap_or_default();
+    match own_user_id {
+        Some(own) if !own.is_empty() && own == uid => {}
+        _ => return Err(AccountHandshakeReject::WrongAccount),
+    }
+    // Nonce binding: a valid grant carries the browser's per-dial nonce, so the
+    // verify response echoes it. It must equal what the browser presented in the
+    // frame — a mismatch means a grant minted for a different dial was replayed.
+    // Only enforced when the response actually echoes a nonce (never rejects a
+    // legitimate connection, which by construction always matches).
+    if let Some(bound) = resp.nonce.as_deref() {
+        if !bound.is_empty() && bound != presented_nonce {
+            return Err(AccountHandshakeReject::NonceMismatch);
+        }
+    }
+    Ok(GrantIdentity {
+        user_id: uid.to_string(),
+        device_id: resp.device_id.clone(),
+    })
+}
+
+/// Reuse an existing non-revoked account session for `uid` so repeated relay
+/// dials (e.g. retries while a session is pending approval) don't pile up
+/// duplicate `web_remote_sessions` rows. Returns `(session_id, approved)`.
+fn existing_account_session(db: &DatabaseStore, uid: &str) -> Option<(String, bool)> {
+    db.web_remote_list_sessions()
+        .into_iter()
+        .find(|s| s.source == "account" && s.account_user_id.as_deref() == Some(uid))
+        .map(|s| (s.id, s.approved))
+}
+
+/// Admit an account (grant) handshake: verify the grant with the control plane,
+/// run the accept matrix against this desktop's own identity, then mint (or
+/// reuse) an account-tagged session row. Returns the `session_id` to bind the
+/// stream to, or a reject reason. Approval composes exactly as the token path:
+/// an account session defaults to pending unless `trust_account_browsers` is on,
+/// and a pending session refuses the stream (the desktop approves it in the
+/// device list, then the browser reconnects).
+///
+/// Takes `db` + `own_node_id` explicitly (rather than reaching through an
+/// `AppHandle`) so the full network + mint path is unit-testable with a mocked
+/// verify endpoint and an in-memory DB.
+async fn authorize_account_handshake(
+    db: &DatabaseStore,
+    shared: &Arc<Shared>,
+    own_node_id: &str,
+    hello: &AccountHello,
+) -> Result<String, AccountHandshakeReject> {
+    // Snapshot the approval policy up front so the non-Send config mutex guard
+    // is never held across the verify await.
+    let approve_policy = {
+        let cfg = shared.config.lock().unwrap();
+        super::account_session_approved(&cfg)
+    };
+    let own_user_id = crate::auth::load_cached_user(db).map(|u| u.id);
+
+    let base = crate::auth::api_base_url();
+    let resp = verify_grant(&base, &hello.grant)
+        .await
+        .map_err(|_| AccountHandshakeReject::Unverified)?;
+
+    let identity = evaluate_grant(&resp, own_node_id, own_user_id.as_deref(), &hello.nonce)?;
+
+    // Mint once per account (reuse an existing row on retry), tagged
+    // `source="account"` + the verified account user id. The plaintext token is
+    // discarded — the iroh stream binds directly to `session_id`, so no bearer
+    // is ever presented on this transport.
+    let (session_id, approved) = match existing_account_session(db, &identity.user_id) {
+        Some(existing) => existing,
+        None => {
+            let id = uuid::Uuid::new_v4().to_string();
+            let token = super::auth::random_token();
+            let token_hash = super::auth::sha256_hex(&token);
+            db.web_remote_insert_account_session(
+                &id,
+                None,
+                None,
+                &token_hash,
+                approve_policy,
+                &identity.user_id,
+            )
+            .map_err(AccountHandshakeReject::Internal)?;
+            (id, approve_policy)
+        }
+    };
+
+    if !approved {
+        return Err(AccountHandshakeReject::Pending);
+    }
+    Ok(session_id)
+}
+
 fn welcome_frame_bytes(session_id: &str) -> Vec<u8> {
     json!({ "t": "welcome", "session_id": session_id })
         .to_string()
@@ -540,21 +806,56 @@ async fn handle_bi_stream(
     let mut decoder = FrameDecoder::new();
     let mut readbuf = vec![0u8; 16 * 1024];
 
-    // 1. Handshake: the first frame must present a valid, approved session.
+    // 1. Handshake: the first frame either presents an existing session token
+    //    (LAN/Tailscale path) or an account connection grant (from-anywhere
+    //    path). The `t` field routes it; each path resolves to a `session_id`
+    //    the stream then binds to, or writes an `unauthorized` frame and closes.
     let handshake = match read_frame(&mut recv, &mut decoder, &mut readbuf).await {
         Ok(Some(f)) => f,
         _ => return, // stream ended / codec error before a handshake arrived
     };
-    let session = {
-        let db = app.state::<DatabaseStore>();
-        authorize_handshake(&db, &handshake)
-    };
-    let session_id = match session {
-        Ok(s) => s.id,
-        Err(reject) => {
-            let _ = write_frame(&mut send, KIND_TEXT, &reject_frame_bytes(&reject)).await;
-            let _ = send.finish();
-            return;
+    let session_id = if is_account_handshake(&handshake) {
+        // Account (grant) path: verify the grant out-of-band, then mint/reuse
+        // an account session. `own_node_id` must be this endpoint's — a grant
+        // for another device's node is rejected in the accept matrix.
+        let own_node_id = shared.iroh.node_id().unwrap_or_default();
+        let hello = match parse_account_hello(&handshake) {
+            Some(h) => h,
+            None => {
+                let reject = AccountHandshakeReject::Malformed;
+                let _ =
+                    write_frame(&mut send, KIND_TEXT, &account_reject_frame_bytes(&reject)).await;
+                let _ = send.finish();
+                return;
+            }
+        };
+        let admit = {
+            let db = app.state::<DatabaseStore>();
+            authorize_account_handshake(&db, &shared, &own_node_id, &hello).await
+        };
+        match admit {
+            Ok(id) => id,
+            Err(reject) => {
+                let _ =
+                    write_frame(&mut send, KIND_TEXT, &account_reject_frame_bytes(&reject)).await;
+                let _ = send.finish();
+                return;
+            }
+        }
+    } else {
+        // Token path: resolve the presented session token to an approved,
+        // non-revoked session (same admission logic as the HTTP session gate).
+        let session = {
+            let db = app.state::<DatabaseStore>();
+            authorize_handshake(&db, &handshake)
+        };
+        match session {
+            Ok(s) => s.id,
+            Err(reject) => {
+                let _ = write_frame(&mut send, KIND_TEXT, &reject_frame_bytes(&reject)).await;
+                let _ = send.finish();
+                return;
+            }
         }
     };
 
@@ -875,6 +1176,344 @@ mod tests {
         // A binary first frame can never be a handshake.
         let bin = Frame { kind: KIND_BINARY, payload: vec![0x01, 0x02] };
         assert_eq!(authorize_handshake(&db, &bin).unwrap_err(), HandshakeReject::Malformed);
+    }
+
+    // ── Account (grant) handshake ─────────────────────────────────────
+
+    const OWN_NODE: &str = "own-node-id-abc";
+    const OWN_UID: &str = "user-owner-1";
+
+    fn account_hello_frame(grant: &str, nonce: &str) -> Frame {
+        Frame {
+            kind: KIND_TEXT,
+            payload: json!({ "t": "hello-account", "grant": grant, "nonce": nonce })
+                .to_string()
+                .into_bytes(),
+        }
+    }
+
+    /// A grant-verify response that would ADMIT: valid, targets our node, our
+    /// account, and echoes the given nonce. Tests mutate one field to exercise
+    /// each reject branch.
+    fn good_verify(nonce: &str) -> GrantVerifyResponse {
+        GrantVerifyResponse {
+            valid: true,
+            user_id: Some(OWN_UID.to_string()),
+            device_id: Some("dev-1".to_string()),
+            node_id: Some(OWN_NODE.to_string()),
+            nonce: Some(nonce.to_string()),
+        }
+    }
+
+    #[test]
+    fn is_account_handshake_routes_only_hello_account() {
+        assert!(is_account_handshake(&account_hello_frame("g", "n")));
+        // The token hello and anything else route to the token path.
+        assert!(!is_account_handshake(&hello("tok")));
+        assert!(!is_account_handshake(&Frame {
+            kind: KIND_TEXT,
+            payload: b"not json".to_vec(),
+        }));
+        // A binary first frame is never an account handshake.
+        assert!(!is_account_handshake(&Frame { kind: KIND_BINARY, payload: vec![1, 2] }));
+    }
+
+    #[test]
+    fn parse_account_hello_extracts_grant_and_nonce() {
+        let parsed = parse_account_hello(&account_hello_frame("the-grant", "the-nonce")).unwrap();
+        assert_eq!(parsed.grant, "the-grant");
+        assert_eq!(parsed.nonce, "the-nonce");
+        // Missing/empty grant is malformed.
+        assert!(parse_account_hello(&account_hello_frame("", "n")).is_none());
+        assert!(parse_account_hello(&Frame {
+            kind: KIND_TEXT,
+            payload: json!({ "t": "hello-account", "nonce": "n" }).to_string().into_bytes(),
+        })
+        .is_none());
+    }
+
+    #[test]
+    fn evaluate_grant_admits_matching_valid_grant() {
+        let id = evaluate_grant(&good_verify("nonce-1"), OWN_NODE, Some(OWN_UID), "nonce-1")
+            .expect("a valid, matching grant is admitted");
+        assert_eq!(id.user_id, OWN_UID);
+        assert_eq!(id.device_id.as_deref(), Some("dev-1"));
+    }
+
+    #[test]
+    fn evaluate_grant_rejects_invalid_grant() {
+        // valid:false is how a bad signature OR an expired grant surfaces from
+        // the verify endpoint — both collapse to `Unverified` here.
+        let mut resp = good_verify("n");
+        resp.valid = false;
+        assert_eq!(
+            evaluate_grant(&resp, OWN_NODE, Some(OWN_UID), "n").unwrap_err(),
+            AccountHandshakeReject::Unverified
+        );
+    }
+
+    #[test]
+    fn evaluate_grant_rejects_grant_for_another_node() {
+        let mut resp = good_verify("n");
+        resp.node_id = Some("some-other-node".to_string());
+        assert_eq!(
+            evaluate_grant(&resp, OWN_NODE, Some(OWN_UID), "n").unwrap_err(),
+            AccountHandshakeReject::WrongNode
+        );
+    }
+
+    #[test]
+    fn evaluate_grant_rejects_wrong_account_and_signed_out() {
+        // A grant for a different account.
+        let mut resp = good_verify("n");
+        resp.user_id = Some("intruder-account".to_string());
+        assert_eq!(
+            evaluate_grant(&resp, OWN_NODE, Some(OWN_UID), "n").unwrap_err(),
+            AccountHandshakeReject::WrongAccount
+        );
+        // Desktop signed out (no own uid) → nothing to match → reject, even for
+        // an otherwise-valid grant.
+        assert_eq!(
+            evaluate_grant(&good_verify("n"), OWN_NODE, None, "n").unwrap_err(),
+            AccountHandshakeReject::WrongAccount
+        );
+    }
+
+    #[test]
+    fn evaluate_grant_rejects_nonce_mismatch() {
+        // The grant is bound to nonce "bound", but the browser presented "other"
+        // — a replay / grant-substitution signal.
+        assert_eq!(
+            evaluate_grant(&good_verify("bound"), OWN_NODE, Some(OWN_UID), "other").unwrap_err(),
+            AccountHandshakeReject::NonceMismatch
+        );
+    }
+
+    #[test]
+    fn account_reject_codes_are_stable() {
+        assert_eq!(AccountHandshakeReject::Malformed.code(), "malformed_handshake");
+        assert_eq!(AccountHandshakeReject::Unverified.code(), "grant_invalid");
+        assert_eq!(AccountHandshakeReject::WrongNode.code(), "wrong_device");
+        assert_eq!(AccountHandshakeReject::WrongAccount.code(), "account_mismatch");
+        assert_eq!(AccountHandshakeReject::NonceMismatch.code(), "nonce_mismatch");
+        assert_eq!(AccountHandshakeReject::Pending.code(), "pending_approval");
+        assert_eq!(
+            AccountHandshakeReject::Internal("x".into()).code(),
+            "internal_error"
+        );
+    }
+
+    // ── Full account admission: grant verify (mocked) → session mint ──
+    //
+    // These mock `POST /api/devices/grant/verify` via mockito + `CODEMUX_API_URL`
+    // and NEVER hit the real API. `CODEMUX_API_URL` mutation is serialized under
+    // the shared `mockserver` group with the auth/account tests.
+
+    fn seed_owner(db: &DatabaseStore) {
+        use crate::auth::{save_auth, AuthUser};
+        let user = AuthUser {
+            id: OWN_UID.to_string(),
+            email: "owner@example.com".to_string(),
+            name: None,
+            image: None,
+        };
+        save_auth(db, "owner-token", "2099-01-01T00:00:00Z", Some(&user)).unwrap();
+    }
+
+    fn shared_with_trust(trust: bool) -> Arc<Shared> {
+        let shared = Arc::new(Shared::default());
+        {
+            let mut cfg = shared.config.lock().unwrap();
+            cfg.enabled = true;
+            cfg.relay_mode_enabled = true;
+            cfg.trust_account_browsers = trust;
+        }
+        shared
+    }
+
+    /// Mock the verify endpoint to echo a full admit response for `grant`.
+    async fn mock_verify_admit(server: &mut mockito::Server, nonce: &str) -> mockito::Mock {
+        server
+            .mock("POST", "/api/devices/grant/verify")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "valid": true,
+                    "userId": OWN_UID,
+                    "deviceId": "dev-1",
+                    "nodeId": OWN_NODE,
+                    "nonce": nonce,
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await
+    }
+
+    async fn run_account_admit(
+        api_url: &str,
+        db: &DatabaseStore,
+        shared: &Arc<Shared>,
+        hello: &AccountHello,
+    ) -> Result<String, AccountHandshakeReject> {
+        let prev = std::env::var("CODEMUX_API_URL").ok();
+        std::env::set_var("CODEMUX_API_URL", api_url);
+        let out = authorize_account_handshake(db, shared, OWN_NODE, hello).await;
+        match prev {
+            Some(v) => std::env::set_var("CODEMUX_API_URL", v),
+            None => std::env::remove_var("CODEMUX_API_URL"),
+        }
+        out
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn account_handshake_admits_good_grant_and_mints_account_session() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(true); // trust opt-out → approved immediately
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = mock_verify_admit(&mut server, "nonce-xyz").await;
+        let url = server.url();
+
+        let hello = AccountHello { grant: "good-grant".into(), nonce: "nonce-xyz".into() };
+        let session_id = run_account_admit(&url, &db, &shared, &hello)
+            .await
+            .expect("a good grant for our node + account is admitted");
+        mock.assert_async().await;
+
+        // A real account-tagged session row was minted for the verified user.
+        let row = db.web_remote_get_session(&session_id).expect("session row exists");
+        assert_eq!(row.source, "account");
+        assert_eq!(row.account_user_id.as_deref(), Some(OWN_UID));
+        assert!(row.approved, "trust_account_browsers admits immediately");
+
+        // A second dial for the same account REUSES the row (no duplicate).
+        let mock2 = mock_verify_admit(&mut server, "nonce-xyz").await;
+        let again = run_account_admit(&url, &db, &shared, &hello).await.unwrap();
+        mock2.assert_async().await;
+        assert_eq!(again, session_id, "repeat dials reuse the account session row");
+        assert_eq!(db.web_remote_list_sessions().len(), 1, "no duplicate rows");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn account_handshake_pends_untrusted_account_browser() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(false); // approval on (default) → pends
+
+        let mut server = mockito::Server::new_async().await;
+        let _mock = mock_verify_admit(&mut server, "n").await;
+        let url = server.url();
+
+        let hello = AccountHello { grant: "g".into(), nonce: "n".into() };
+        let err = run_account_admit(&url, &db, &shared, &hello)
+            .await
+            .expect_err("an untrusted account browser pends until approved");
+        assert_eq!(err, AccountHandshakeReject::Pending);
+        // The pending row still exists so the desktop can approve it.
+        let row = db.web_remote_list_sessions().into_iter().next().expect("a pending row");
+        assert_eq!(row.source, "account");
+        assert!(!row.approved);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn account_handshake_rejects_invalid_grant_without_minting() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+
+        let mut server = mockito::Server::new_async().await;
+        // A bad/expired grant: the endpoint returns 200 {valid:false}.
+        let _mock = server
+            .mock("POST", "/api/devices/grant/verify")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "valid": false, "reason": "bad_signature" }).to_string())
+            .create_async()
+            .await;
+        let url = server.url();
+
+        let hello = AccountHello { grant: "forged".into(), nonce: "n".into() };
+        let err = run_account_admit(&url, &db, &shared, &hello)
+            .await
+            .expect_err("an invalid grant is rejected");
+        assert_eq!(err, AccountHandshakeReject::Unverified);
+        assert!(db.web_remote_list_sessions().is_empty(), "no row on a bad grant");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn account_handshake_rejects_grant_for_wrong_node() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+
+        let mut server = mockito::Server::new_async().await;
+        // Valid grant, but bound to a DIFFERENT device's node_id.
+        let _mock = server
+            .mock("POST", "/api/devices/grant/verify")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "valid": true,
+                    "userId": OWN_UID,
+                    "deviceId": "dev-other",
+                    "nodeId": "a-different-node",
+                    "nonce": "n",
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let url = server.url();
+
+        let hello = AccountHello { grant: "g".into(), nonce: "n".into() };
+        let err = run_account_admit(&url, &db, &shared, &hello)
+            .await
+            .expect_err("a grant for another node is rejected");
+        assert_eq!(err, AccountHandshakeReject::WrongNode);
+        assert!(db.web_remote_list_sessions().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(mockserver)]
+    async fn account_handshake_rejects_wrong_account_grant() {
+        let db = init_test_database();
+        seed_owner(&db);
+        let shared = shared_with_trust(true);
+
+        let mut server = mockito::Server::new_async().await;
+        // Valid grant for OUR node, but a DIFFERENT account.
+        let _mock = server
+            .mock("POST", "/api/devices/grant/verify")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                json!({
+                    "valid": true,
+                    "userId": "intruder-account",
+                    "deviceId": "dev-1",
+                    "nodeId": OWN_NODE,
+                    "nonce": "n",
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let url = server.url();
+
+        let hello = AccountHello { grant: "g".into(), nonce: "n".into() };
+        let err = run_account_admit(&url, &db, &shared, &hello)
+            .await
+            .expect_err("a grant for a different account is rejected");
+        assert_eq!(err, AccountHandshakeReject::WrongAccount);
+        assert!(db.web_remote_list_sessions().is_empty());
     }
 
     // ── Real iroh transport: end-to-end over a direct loopback path ───
