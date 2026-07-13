@@ -55,7 +55,22 @@ fn invoke(
             cmd: cmd.into(),
             callback: CallbackFn(0),
             error: CallbackFn(1),
-            url: "http://tauri.localhost".parse().unwrap(),
+            // Reuse the window's own origin (its real local URL, e.g.
+            // `tauri://localhost`) rather than a hand-written string.
+            //
+            // Tauri 2.11 hardened the IPC ACL gate: a request is now forced
+            // through capability resolution unless its origin is *local*
+            // (`webview::on_message` added `|| !is_local` to the pre-dispatch
+            // reject in 2.11; 2.10 gated only on `plugin_command || app_manifest`).
+            // The mock harness carries no ACL manifest, so a non-local origin
+            // makes every app command reject with "not allowed. Plugin not
+            // found". A literal `http://tauri.localhost` is *not* the local
+            // origin on Unix (there it is `tauri://localhost`), so it tripped
+            // the new clause. Reusing `webview.url()` models a genuine local
+            // desktop invoke — exactly what `web_remote::dispatch` does in
+            // production so ACL resolves identically — and is origin-agnostic
+            // across platforms/future Tauri versions.
+            url: webview.url().expect("webview url"),
             body: args.into(),
             headers: Default::default(),
             invoke_key: INVOKE_KEY.to_string(),
