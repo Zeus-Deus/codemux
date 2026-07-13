@@ -14,6 +14,12 @@ package/
 src-tauri/target/
 src-tauri/gen/
 
+# iroh WASM relay client — built on demand by scripts/build-iroh-wasm.sh, not
+# committed (multi-MB). The main build stays green without it.
+iroh-wasm/target/
+iroh-wasm/.tools/
+public/iroh-wasm/
+
 # Codemux local project state
 .codemux/index.json
 .codemux/observability.json

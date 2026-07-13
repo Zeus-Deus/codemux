@@ -1,0 +1,4 @@
+# Cargo build output for the wasm crate.
+/target/
+# Isolated wasm-bindgen-cli install (see scripts/build-iroh-wasm.sh).
+/.tools/

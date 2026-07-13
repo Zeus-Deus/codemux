@@ -1,0 +1,53 @@
+[package]
+name = "iroh-wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Browser (WASM) iroh client for Codemux web-remote relay transport."
+license = "Elastic-2.0"
+
+# cdylib → the .wasm artifact wasm-bindgen post-processes; rlib keeps the crate
+# usable from `cargo test`/tooling on the host.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The same iroh major the desktop endpoint uses (see src-tauri/Cargo.toml), with
+# the WASM-friendly feature set: no default (no OS-specific transports), TLS via
+# ring. The desktop and browser must share the ALPN + framing, not the build.
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+
+# Pinned to the exact wasm-bindgen the generated glue is post-processed with —
+# `wasm-bindgen-cli` must match this version byte-for-byte (the build script
+# installs `wasm-bindgen-cli@0.2.126`).
+wasm-bindgen = "=0.2.126"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+
+# Async plumbing for the read pump / write path.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+console_error_panic_hook = { version = "0.1", optional = true }
+
+# getrandom needs an explicit browser backend on wasm32-unknown-unknown. iroh's
+# graph pulls several majors; enable the browser backend on each so key
+# generation / QUIC nonces work in the browser:
+#   - 0.2 uses the `js` feature.
+#   - 0.3 / 0.4 use the `wasm_js` feature + `RUSTFLAGS=--cfg getrandom_backend="wasm_js"`
+#     (set by scripts/build-iroh-wasm.sh).
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[features]
+default = ["console_error_panic_hook"]
+
+# Size-first release profile — this artifact is fetched over the network on first
+# relay connect, so favor the smallest code (then brotli in the build script).
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

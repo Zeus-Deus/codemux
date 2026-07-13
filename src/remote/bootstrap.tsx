@@ -37,6 +37,8 @@ import {
   resolveAuthMethods,
   type AuthMethods,
 } from "./account-pair";
+import { isHostedOrigin } from "./hosted";
+import { bootstrapHosted } from "./hosted-bootstrap";
 
 interface PairResult {
   session: RemoteSession;
@@ -128,7 +130,7 @@ function extractToken(raw: string): string {
   return s;
 }
 
-function dismissSplash(): void {
+export function dismissSplash(): void {
   const splash = document.getElementById("splash");
   if (!splash) return;
   splash.classList.add("fade-out");
@@ -137,7 +139,7 @@ function dismissSplash(): void {
 
 // ── Standalone UI ───────────────────────────────────────────────────
 
-const overlayStyle: React.CSSProperties = {
+export const overlayStyle: React.CSSProperties = {
   position: "fixed",
   inset: 0,
   zIndex: 2147483645,
@@ -150,7 +152,7 @@ const overlayStyle: React.CSSProperties = {
   fontFamily: "var(--font-sans, system-ui, -apple-system, sans-serif)",
 };
 
-const cardStyle: React.CSSProperties = {
+export const cardStyle: React.CSSProperties = {
   width: "100%",
   maxWidth: 380,
   background: "var(--card, #1a1a1c)",
@@ -160,7 +162,7 @@ const cardStyle: React.CSSProperties = {
   boxShadow: "0 12px 40px rgba(0,0,0,0.45)",
 };
 
-const inputStyle: React.CSSProperties = {
+export const inputStyle: React.CSSProperties = {
   width: "100%",
   boxSizing: "border-box",
   padding: "10px 12px",
@@ -172,7 +174,7 @@ const inputStyle: React.CSSProperties = {
   outline: "none",
 };
 
-const primaryButtonStyle = (busy: boolean): React.CSSProperties => ({
+export const primaryButtonStyle = (busy: boolean): React.CSSProperties => ({
   marginTop: 18,
   width: "100%",
   padding: "10px 14px",
@@ -186,14 +188,14 @@ const primaryButtonStyle = (busy: boolean): React.CSSProperties => ({
   opacity: busy ? 0.7 : 1,
 });
 
-const errorStyle: React.CSSProperties = {
+export const errorStyle: React.CSSProperties = {
   marginTop: 12,
   fontSize: 12.5,
   lineHeight: 1.45,
   color: "oklch(0.72 0.16 22)",
 };
 
-const switchLinkStyle: React.CSSProperties = {
+export const switchLinkStyle: React.CSSProperties = {
   marginTop: 16,
   width: "100%",
   fontSize: 12,
@@ -461,7 +463,7 @@ function ConnectingView(props: {
 
 /** Owns a single React root in a dedicated overlay element so the pairing
  *  UI never fights the app's `#root` React tree. */
-class BootstrapOverlay {
+export class BootstrapOverlay {
   private container: HTMLDivElement | null = null;
   private root: ReactDOM.Root | null = null;
 
@@ -491,6 +493,15 @@ class BootstrapOverlay {
 // ── Orchestration ───────────────────────────────────────────────────
 
 export async function bootstrapRemote(): Promise<void> {
+  // Hosted relay origin (app.codemux.org / `?hosted` / build flag): there is no
+  // same-origin desktop to pair with. Sign into the account, pick a registered
+  // desktop, and connect the app to it over iroh. The rest of the client runs
+  // over that iroh pipe unchanged.
+  if (isHostedOrigin()) {
+    await bootstrapHosted();
+    return;
+  }
+
   const baseUrl = window.location.origin;
   const host = window.location.host;
   const overlay = new BootstrapOverlay();

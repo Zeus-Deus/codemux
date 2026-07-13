@@ -1175,6 +1175,10 @@ export interface WebRemoteConfig {
    *  (default), account-minted sessions start pending approval regardless of
    *  `require_approval`; when on they connect immediately. */
   trust_account_browsers?: boolean;
+  /** Master toggle for the from-anywhere iroh (relay) transport. When on and
+   *  the server is enabled, the desktop binds an iroh endpoint reachable by
+   *  `node_id`. Optional so legacy configs load as off. */
+  relay_mode_enabled?: boolean;
 }
 
 /** Bind-scope choices for the remote server. Mirrors the `BIND_SCOPE_*`
@@ -1239,6 +1243,42 @@ export interface WebRemoteStatus {
   /** Whether the desktop is currently signed into a Codemux account — account
    *  mode can only verify "same account" while it is. */
   account_signed_in?: boolean;
+  /** Master toggle for the from-anywhere iroh (relay) transport (Stage C).
+   *  Optional so existing status fixtures need not enumerate it; the Rust
+   *  payload always sends it. */
+  relay_mode_enabled?: boolean;
+  /** The device's stable iroh `node_id` (a browser on the hosted origin dials
+   *  this), when relay mode has ever been enabled. `null` otherwise. */
+  iroh_node_id?: string | null;
+  /** Whether this desktop is currently registered with the account device
+   *  registry (discoverable by a browser signed into the same account by
+   *  `node_id`). Only meaningful while relay mode is on and the desktop is
+   *  signed in; `false` when signed out or the registry is unreachable.
+   *  Optional so existing status fixtures need not enumerate it; the Rust
+   *  payload always sends it. */
+  device_registered?: boolean;
+  /** The stable device id this desktop registers under, once a registration
+   *  attempt has run. `null` before then. Mirrors the same-named field on
+   *  {@link WebRemoteRegistrationStatus}. */
+  device_id?: string | null;
+}
+
+/** Control-plane registration state for the from-anywhere iroh transport.
+ *  Returned by `web_remote_registration_status`. Mirrors
+ *  `web_remote::registration::RegistrationStatus` (serde default = snake_case).
+ *  Registration is best-effort and only runs while relay mode is on and the
+ *  desktop is signed into a Codemux account. */
+export interface WebRemoteRegistrationStatus {
+  /** The device is currently registered with the control plane. */
+  registered: boolean;
+  /** Stable per-install device id sent at registration, when known. */
+  device_id?: string | null;
+  /** The iroh `node_id` registered for this device, when known. */
+  node_id?: string | null;
+  /** RFC3339 timestamp of the last successful registration heartbeat. */
+  last_registered_at?: string | null;
+  /** Last registration error, for diagnostics (`null` when healthy). */
+  last_error?: string | null;
 }
 
 /** Result of `web_remote_create_pairing`. QR rendering is the
