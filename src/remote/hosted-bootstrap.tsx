@@ -36,6 +36,13 @@ import {
   type HostedFlowDeps,
   type HostedState,
 } from "./hosted";
+import {
+  clearOAuthParams,
+  exchangeAuthCode,
+  prepareGithubOAuth,
+  readOAuthReturn,
+  sessionOAuthStore,
+} from "./hosted-oauth";
 import { createIrohConnection } from "./iroh-connection";
 import { IrohWasmUnavailableError, loadIrohDialer } from "./iroh-wasm-loader";
 import { installShim } from "./shim";
@@ -75,6 +82,8 @@ export async function bootstrapHosted(): Promise<void> {
     }
   }
 
+  const oauthStore = sessionOAuthStore();
+
   const deps: HostedFlowDeps = {
     async signIn(email, password) {
       // Derive the AuthSecret locally — the raw password never leaves the page.
@@ -91,16 +100,48 @@ export async function bootstrapHosted(): Promise<void> {
         onUnauthorized: handleUnauthorized,
       });
     },
+    beginGithubSignIn() {
+      // Mint + store the state, then hand the browser to the API's OAuth
+      // interstitial. This unloads the page; the return leg is handled below.
+      const { url } = prepareGithubOAuth({
+        apiBase: base,
+        returnTo: window.location.origin,
+        store: oauthStore,
+      });
+      window.location.assign(url);
+    },
+    async completeGithubSignIn(code) {
+      const session = await exchangeAuthCode({ apiBase: base, code });
+      // Adopt the bearer exactly as the email/password path does, then list.
+      registry.setToken(session.token);
+      return registry.listDevices();
+    },
   };
 
   const flow = new HostedFlow(deps);
+
+  // Handle a GitHub OAuth return before the first paint: verify the echoed
+  // state, then trade the single-use code for a bearer. The code is stripped
+  // from the URL immediately so a refresh/screenshot can't leak it.
+  const ret = readOAuthReturn(window.location.search, oauthStore);
+  if (ret.kind !== "none") {
+    clearOAuthParams(window.location, window.history);
+  }
+
   const done = new Promise<void>((resolve) => {
     flow.subscribe((state) => {
       overlay.render(<HostedScreen state={state} flow={flow} apiHost={hostOf(base)} />);
       if (state.phase === "connected") resolve();
     });
   });
-  // Initial paint.
+
+  if (ret.kind === "code") {
+    void flow.resumeGithubSignIn(ret.code);
+  } else if (ret.kind === "error") {
+    flow.failSignIn(ret.message);
+  }
+
+  // Initial paint (covers the "none" case; resume/fail above already emitted).
   overlay.render(
     <HostedScreen state={flow.getState()} flow={flow} apiHost={hostOf(base)} />,
   );
@@ -234,43 +275,85 @@ function SignInForm(props: {
     void props.flow.submitSignIn(email, password);
   }
 
+  const canGithub = typeof props.flow.startGithubSignIn === "function";
+
   return (
-    <form style={cardStyle} onSubmit={submit}>
+    <div style={cardStyle}>
       <div style={titleStyle}>Sign in to connect</div>
       <div style={subtitleStyle}>
         Use your Codemux account to reach a desktop you have set up for remote
-        access. Your password is stretched on this device and never sent as-is.
+        access.
       </div>
-      <input
-        type="email"
-        value={email}
-        autoFocus
-        autoComplete="username"
-        disabled={busy}
-        onChange={(e) => setEmail(e.target.value)}
-        placeholder="Email"
-        aria-label="Email"
-        style={inputStyle}
-      />
-      <input
-        type="password"
-        value={password}
-        autoComplete="current-password"
-        disabled={busy}
-        onChange={(e) => setPassword(e.target.value)}
-        placeholder="Password"
-        aria-label="Password"
-        style={{ ...inputStyle, marginTop: 10 }}
-      />
-      {props.state.error && (
-        <div role="alert" style={errorStyle}>
-          {props.state.error}
-        </div>
+      {canGithub && (
+        <>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => props.flow.startGithubSignIn()}
+            style={githubButtonStyle(busy)}
+            aria-label="Sign in with GitHub"
+          >
+            <GithubMark />
+            <span>Sign in with GitHub</span>
+          </button>
+          <div style={dividerStyle} aria-hidden="true">
+            <span style={dividerLineStyle} />
+            <span style={dividerTextStyle}>or</span>
+            <span style={dividerLineStyle} />
+          </div>
+        </>
       )}
-      <button type="submit" disabled={busy} style={primaryButtonStyle(busy)}>
-        {busy ? "Signing in…" : "Sign in"}
-      </button>
-    </form>
+      <form onSubmit={submit}>
+        <input
+          type="email"
+          value={email}
+          autoComplete="username"
+          disabled={busy}
+          onChange={(e) => setEmail(e.target.value)}
+          placeholder="Email"
+          aria-label="Email"
+          style={inputStyle}
+        />
+        <input
+          type="password"
+          value={password}
+          autoComplete="current-password"
+          disabled={busy}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="Password"
+          aria-label="Password"
+          style={{ ...inputStyle, marginTop: 10 }}
+        />
+        {props.state.error && (
+          <div role="alert" style={errorStyle}>
+            {props.state.error}
+          </div>
+        )}
+        <button type="submit" disabled={busy} style={primaryButtonStyle(busy)}>
+          {busy ? "Signing in…" : "Sign in with email"}
+        </button>
+      </form>
+      <div style={derivationNoteStyle}>
+        With email, your password is stretched on this device and never sent
+        as-is.
+      </div>
+    </div>
+  );
+}
+
+/** GitHub logo mark (inline SVG — the bundle ships no external assets). */
+function GithubMark(): React.ReactElement {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      fill="currentColor"
+      aria-hidden="true"
+      style={{ flexShrink: 0 }}
+    >
+      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z" />
+    </svg>
   );
 }
 
@@ -417,6 +500,48 @@ const subtitleStyle: React.CSSProperties = {
   lineHeight: 1.5,
   color: "var(--muted-foreground, #9a9a97)",
   marginBottom: 18,
+};
+
+const githubButtonStyle = (busy: boolean): React.CSSProperties => ({
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 8,
+  width: "100%",
+  padding: "10px 14px",
+  fontSize: 13.5,
+  fontWeight: 600,
+  cursor: busy ? "default" : "pointer",
+  color: "var(--foreground, #e8e8e8)",
+  background: "var(--background, #0C0C0E)",
+  border: "1px solid var(--input, rgba(255,255,255,0.15))",
+  borderRadius: 9,
+  opacity: busy ? 0.7 : 1,
+});
+
+const dividerStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  margin: "14px 0",
+};
+
+const dividerLineStyle: React.CSSProperties = {
+  flex: 1,
+  height: 1,
+  background: "var(--border, rgba(255,255,255,0.1))",
+};
+
+const dividerTextStyle: React.CSSProperties = {
+  fontSize: 11,
+  color: "var(--muted-foreground, #9a9a97)",
+};
+
+const derivationNoteStyle: React.CSSProperties = {
+  marginTop: 14,
+  fontSize: 11,
+  lineHeight: 1.45,
+  color: "var(--muted-foreground, #9a9a97)",
 };
 
 const deviceRowStyle: React.CSSProperties = {

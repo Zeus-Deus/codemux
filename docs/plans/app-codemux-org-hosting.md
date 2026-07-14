@@ -134,6 +134,60 @@ The hosted client is inert until the control plane is ready. Two API-side change
 
 ---
 
+## 5b. Security headers (REQUIRED)
+
+The static host **must** send a Content-Security-Policy and the standard
+security headers. Without a CSP, an XSS on `app.codemux.org` could read the
+in-memory account bearer and drive any of the account's desktops — a
+credential-theft path *around* the (otherwise end-to-end) encryption. The
+encryption itself is unaffected; this closes the operational gap.
+
+The deployed nginx config (`~/app-codemux/default.conf` on the host) is:
+
+```nginx
+server {
+    listen 80;
+    server_name app.codemux.org;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Security headers. nginx add_header does NOT merge across levels — a
+    # location with its own add_header drops these — so the cache locations
+    # below use `expires` (not add_header) to keep inheriting them.
+    add_header Content-Security-Policy "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https: wss:; worker-src 'self' blob:; child-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https://api.codemux.org; manifest-src 'self'" always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    gzip on;
+    gzip_comp_level 6;
+    gzip_min_length 1024;
+    gzip_types application/javascript text/css application/json image/svg+xml application/wasm;
+
+    location ~ \.wasm$ { default_type application/wasm; expires 5m; try_files $uri =404; }
+    location /assets/   { expires 1y; try_files $uri =404; }
+    location /iroh-wasm/ { expires 5m; try_files $uri =404; }
+    location = /index.html { expires -1; }
+    location /          { try_files $uri $uri/ /index.html; }
+}
+```
+
+Notes:
+- `script-src 'self' 'wasm-unsafe-eval'` — the bundle ships no inline scripts,
+  so `'self'` is enough for JS; `'wasm-unsafe-eval'` is required for the iroh
+  WASM transport to instantiate.
+- `style-src 'unsafe-inline'` — the built `index.html` has one inline `<style>`
+  (splash/reset); style injection is far lower-risk than script injection.
+- `connect-src 'self' https: wss:` — permissive on the iroh relay side (the
+  relay host set is not fully enumerable and cannot be smoke-tested without a
+  live device); the real XSS defense is the tight `script-src`.
+- `Strict-Transport-Security` has **no** `includeSubDomains` on purpose, so it
+  never forces HSTS onto sibling `*.codemux.org` services.
+- After editing, `docker exec app-codemux nginx -t && docker exec app-codemux nginx -s reload`.
+
+---
+
 ## 6. Smoke test after deploy
 
 1. On a desktop: sign into the Codemux account, **Settings → Remote Access → enable**, then turn on **relay mode**. Confirm it shows a `node_id` and "device registered".

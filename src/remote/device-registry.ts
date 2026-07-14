@@ -92,6 +92,15 @@ export class DeviceRegistry {
   }
 
   /**
+   * Adopt a bearer obtained out-of-band — the GitHub OAuth code exchange
+   * (`/api/auth/web/exchange`) hands back the same account bearer the
+   * email/password `signIn` captures, so the rest of the flow is identical.
+   */
+  setToken(token: string): void {
+    this.token = token;
+  }
+
+  /**
    * Sign into the account with a pre-derived AuthSecret (the browser derives it
    * from the raw password via `deriveAuthSecret`). Captures the session on
    * success; throws a mapped {@link DeviceRegistryError} otherwise.
