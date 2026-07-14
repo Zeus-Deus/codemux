@@ -71,6 +71,18 @@ export interface HostedFlowDeps {
     device: RegisteredDevice,
     handlers: HostedConnectHandlers,
   ): Promise<void>;
+  /**
+   * Kick off the GitHub OAuth redirect. Side-effecting (navigates the browser
+   * away); the flow just marks itself busy first. Optional so existing callers
+   * that only use email/password need not provide it.
+   */
+  beginGithubSignIn?(): void;
+  /**
+   * Finish a GitHub OAuth return: exchange the single-use `code` for the account
+   * bearer, adopt it, and return the account's devices. Throws with a
+   * user-facing message on failure. Optional (see {@link beginGithubSignIn}).
+   */
+  completeGithubSignIn?(code: string): Promise<RegisteredDevice[]>;
 }
 
 type Listener = (state: HostedState) => void;
@@ -119,6 +131,45 @@ export class HostedFlow {
       return;
     }
     this.set({ busy: false, phase: "devices", devices, error: null });
+  }
+
+  /**
+   * Begin GitHub OAuth. Marks the form busy (so it disables while the browser
+   * navigates away) and delegates the redirect to the injected dep.
+   */
+  startGithubSignIn(): void {
+    if (this.state.busy) return;
+    if (!this.deps.beginGithubSignIn) return;
+    this.set({ busy: true, error: null });
+    this.deps.beginGithubSignIn();
+  }
+
+  /**
+   * Resume after a GitHub OAuth return: exchange the code, then move to the
+   * device list on success or back to sign-in (with the reason) on failure.
+   * Mirrors {@link submitSignIn} so both auth paths converge on the same state.
+   */
+  async resumeGithubSignIn(code: string): Promise<void> {
+    if (this.state.busy) return;
+    if (!this.deps.completeGithubSignIn) return;
+    this.set({ busy: true, error: null, phase: "signin" });
+    let devices: RegisteredDevice[];
+    try {
+      devices = await this.deps.completeGithubSignIn(code);
+    } catch (err) {
+      this.set({
+        busy: false,
+        phase: "signin",
+        error: err instanceof Error ? err.message : "GitHub sign-in failed.",
+      });
+      return;
+    }
+    this.set({ busy: false, phase: "devices", devices, error: null });
+  }
+
+  /** Surface an error on the sign-in screen (e.g. a failed OAuth return). */
+  failSignIn(message: string): void {
+    this.set({ phase: "signin", busy: false, error: message });
   }
 
   /** Select a device and connect the app to it over iroh. */

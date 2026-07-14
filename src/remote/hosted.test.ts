@@ -152,6 +152,63 @@ describe("HostedFlow: select → connect", () => {
   });
 });
 
+describe("HostedFlow: GitHub OAuth", () => {
+  it("startGithubSignIn marks busy and triggers the redirect dep once", () => {
+    const beginGithubSignIn = vi.fn();
+    const flow = new HostedFlow({
+      signIn: async () => [],
+      connect: async () => {},
+      beginGithubSignIn,
+      completeGithubSignIn: async () => [],
+    });
+    flow.startGithubSignIn();
+    expect(beginGithubSignIn).toHaveBeenCalledTimes(1);
+    expect(flow.getState().busy).toBe(true);
+    // A second click while busy is ignored (no double redirect).
+    flow.startGithubSignIn();
+    expect(beginGithubSignIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumeGithubSignIn exchanges the code once and lands on the device list", async () => {
+    const completeGithubSignIn = vi.fn(async () => [device("a"), device("b")]);
+    const flow = new HostedFlow({
+      signIn: async () => [],
+      connect: async () => {},
+      beginGithubSignIn: () => {},
+      completeGithubSignIn,
+    });
+    const t = track(flow);
+    await flow.resumeGithubSignIn("code-123");
+    expect(completeGithubSignIn).toHaveBeenCalledTimes(1);
+    expect(completeGithubSignIn).toHaveBeenCalledWith("code-123");
+    expect(t.last().phase).toBe("devices");
+    expect(t.last().devices.map((d) => d.id)).toEqual(["a", "b"]);
+    expect(t.last().busy).toBe(false);
+  });
+
+  it("resumeGithubSignIn returns to sign-in with the error on exchange failure", async () => {
+    const flow = new HostedFlow({
+      signIn: async () => [],
+      connect: async () => {},
+      beginGithubSignIn: () => {},
+      completeGithubSignIn: async () => {
+        throw new Error("That GitHub sign-in expired. Please sign in again.");
+      },
+    });
+    await flow.resumeGithubSignIn("bad-code");
+    expect(flow.getState().phase).toBe("signin");
+    expect(flow.getState().error).toMatch(/expired/i);
+    expect(flow.getState().busy).toBe(false);
+  });
+
+  it("failSignIn surfaces an error on the sign-in screen", () => {
+    const flow = new HostedFlow({ signIn: async () => [], connect: async () => {} });
+    flow.failSignIn("could not verify");
+    expect(flow.getState().phase).toBe("signin");
+    expect(flow.getState().error).toBe("could not verify");
+  });
+});
+
 describe("isHostedOrigin", () => {
   it("is true on the canonical hosted hostname", () => {
     expect(isHostedOrigin({ hostname: "app.codemux.org", search: "" }, {})).toBe(true);
