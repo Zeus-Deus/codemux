@@ -304,6 +304,24 @@ impl AgentProvider for OpenCodeAgentProvider {
             .is_some_and(|session| !session.is_dead())
     }
 
+    async fn turn_active(&self, thread_id: &ThreadId) -> bool {
+        // Cheap in-memory check for the frontend hydrate path: a live
+        // (non-dead) session bound to the thread whose SSE routing context has
+        // `turn_active` armed. Does not touch the server. A dead session
+        // (SSE listener gave up) reports false.
+        let session = {
+            let sessions = self.sessions.read().await;
+            sessions.get(thread_id).cloned()
+        };
+        let Some(session) = session else {
+            return false;
+        };
+        if session.is_dead() {
+            return false;
+        }
+        session.turn_active().await
+    }
+
     async fn list_sessions(&self) -> Result<Vec<ProviderSession>, ProviderError> {
         let sessions = self.sessions.read().await;
         let mut out = Vec::with_capacity(sessions.len());

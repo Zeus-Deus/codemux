@@ -814,6 +814,32 @@ A new `interrupted` flag on `ChatThreadState`
   `user_message` envelope has no later `turn_completed`; `replayPayloads`
   ORs that with the replay-observed `child_exited` completion so both the
   "app died mid-turn" and "watchdog settled the turn" cases surface.
+- **Live-run guard on hydrate** — `lastTurnUnsettled` cannot distinguish
+  "run died mid-turn" from "run is healthy but the pane wasn't watching":
+  only the active workspace renders, so switching workspaces unmounts the
+  inactive pane while its run keeps going and keeps persisting rows
+  (subagent `item_completed`s in particular grow the disk transcript past
+  the frozen in-memory slice, which is exactly what lets the remount
+  hydrate guard pass). Before this guard, switching back to a workspace
+  mid-run reliably showed a false "Run interrupted" divider + Continue
+  chip until the next live event cleared it. The remount hydrate effect
+  (`AgentChatPane.tsx`) now probes the backend **after** fetching the
+  payloads (ordering matters: if the turn settles between the two calls,
+  the settling `turn_completed` row is already in the fetched payloads,
+  so a stale "alive" answer can't mislabel a finished run) via the new
+  `agent_chat_turn_active` command — true iff a live (non-dead) session
+  is bound to the thread and its `active_turn` is set. The result is
+  threaded as `hydrateThread(threadId, payloads, { runLive })` →
+  `replayPayloads(payloads, { runLive })`: `runLive: true` forces
+  `interrupted: false` (suppressing both the unsettled-tail heuristic and
+  a replay-observed `child_exited` — an in-flight turn means the run is
+  alive/recovered) and sets `streaming: true` so the streaming marker
+  shows instead of the divider. A probe error degrades to `false`
+  (previous behavior). Backend: default trait method
+  `AgentProvider::turn_active` (false), implemented for Claude and Codex
+  as a cheap in-memory `sessions` map check (`!is_dead()` +
+  `active_turn.is_some()`) and for OpenCode via the session's SSE
+  event-context `turn_active` flag behind the same absent/dead guards.
 - **Live detection** — the reducer sets `interrupted` on a
   `turn_completed` with `subtype === "child_exited"` and (belt-and-braces)
   on a `session_state_changed{error}` while streaming. It clears on the
@@ -1526,6 +1552,7 @@ surfacing a `feature_disabled` string.
 | `agent_chat_start_session` | Start a provider session, writing the returned thread id back onto the pane. |
 | `agent_chat_send_turn` | Queue a user turn on a thread. Auto-resumes a dead session (rebuilt from its persisted row) before the turn, so a pane reopened after an app restart never sees `session_not_found`. |
 | `agent_chat_interrupt_turn` | Halt the currently-running turn. On a live session the turn ends as `TurnCompleted(interrupted)` and the session stays `Ready` (the sidecar keeps the thread alive and the next `send_turn` rebuilds a resumed query). A `SessionNotFound` (nothing to interrupt on an already-dead session) is swallowed into `Ok`; unlike `send_turn` it does NOT auto-resume a dead session just to interrupt it. |
+| `agent_chat_turn_active` | Cheap in-memory liveness probe: `true` iff a live (non-dead) session is bound to the thread and its `active_turn` is set (Running or WaitingApproval). Never touches the subprocess and never auto-resumes. Used by the remount hydrate path to suppress the false "Run interrupted" divider on a healthy mid-flight run (see "Live-run guard on hydrate"). |
 | `agent_chat_respond_to_request` | Resolve a pending approval / input request. Auto-resumes a dead session first (same choke point as `send_turn`). |
 | `agent_chat_set_model` | Swap a thread's model. Persist-always, apply-if-live: writes the model to the session row unconditionally, then applies to the live session if one exists; a `SessionNotFound` from the apply is swallowed into `Ok` (the value takes effect on the next auto-resume). |
 | `agent_chat_set_permission_mode` | Swap a thread's permission mode. Same persist-always, apply-if-live contract as `agent_chat_set_model`. |

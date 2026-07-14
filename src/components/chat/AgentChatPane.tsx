@@ -61,6 +61,7 @@ import {
   agentChatGetSession,
   agentChatInterruptTurn,
   agentChatListMessages,
+  agentChatTurnActive,
   agentChatListSessions,
   agentChatRespondToRequest,
   agentChatSendTurn,
@@ -860,7 +861,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // has strictly more rendered messages than memory. Equal /
         // shorter means the live stream kept up.
         if (replayed.messages.length <= localCount) return;
-        useAgentChatStore.getState().hydrateThread(threadId, payloads);
+        // Ask the backend whether this thread's turn is still in flight.
+        // Ordering matters: messages are fetched FIRST, liveness SECOND —
+        // if the turn settles between the two calls the `turn_completed`
+        // row is already in `payloads`, so `runLive` can only ever be a
+        // conservative false, never a stale "alive". Any invoke error
+        // (missing command, transient failure) degrades to `false`, i.e.
+        // today's heuristic behavior. A live turn means the persisted
+        // tail's missing terminal event is expected, not an interrupt —
+        // `runLive` suppresses the false Run-interrupted divider.
+        const runLive = await agentChatTurnActive(provider, threadId).catch(
+          () => false,
+        );
+        if (cancelled) return;
+        useAgentChatStore
+          .getState()
+          .hydrateThread(threadId, payloads, { runLive });
       } catch (err) {
         // Soft-fail: if hydrate fails, the user still sees whatever
         // the live stream brings in. Log so it's debuggable.

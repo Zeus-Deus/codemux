@@ -43,8 +43,29 @@ type ReplayPayload = UserMessageEnvelope | ProviderRuntimeEvent;
  * the original session ended cleanly. The caller is on the resume
  * path; a fresh provider session will flip streaming back on once
  * the user sends the next turn.
+ *
+ * `opts.runLive` overrides that resting default for one specific
+ * false-positive: a live run whose pane was unmounted and remounted
+ * (switching away from and back to a workspace tears the whole inactive
+ * workspace's pane tree down, so the live event listener detaches while
+ * the backend keeps streaming and persisting rows). On remount the
+ * persisted tail has no terminal event after the last user turn, so the
+ * `lastTurnUnsettled` heuristic would flag the transcript as
+ * "interrupted" and render a Run-interrupted divider over a perfectly
+ * healthy run. When the caller has authoritatively confirmed a turn is
+ * in flight (`runLive: true`), we force `interrupted: false` — suppressing
+ * BOTH the `lastTurnUnsettled` heuristic AND any replay-observed
+ * `child_exited` flag, since an in-flight turn means the run recovered /
+ * is alive — and set `streaming: true` so the streaming marker shows
+ * instead of the divider. The next live event keeps or clears that flag
+ * through the reducer as usual. With `opts` absent (or `runLive` falsy)
+ * behavior is identical to the resume path.
  */
-export function replayPayloads(payloads: string[]): ChatThreadState {
+export function replayPayloads(
+  payloads: string[],
+  opts?: { runLive?: boolean },
+): ChatThreadState {
+  const runLive = opts?.runLive ?? false;
   let state = createEmptyThreadState();
   for (const raw of payloads) {
     const parsed = parsePayload(raw);
@@ -104,7 +125,10 @@ export function replayPayloads(payloads: string[]): ChatThreadState {
   return {
     ...state,
     messages,
-    streaming: false,
+    // Normally a resting resume state, but when the backend confirms a
+    // turn is in flight we mark the thread streaming so the streaming
+    // marker shows instead of the Run-interrupted divider.
+    streaming: runLive,
     pendingRequestIds: [],
     // Interrupted when EITHER the replay itself observed a `child_exited`
     // terminal turn (the watchdog persisted a `turn_completed` error) OR
@@ -112,7 +136,13 @@ export function replayPayloads(payloads: string[]): ChatThreadState {
     // any terminal event was written — laptop sleep, hard crash). Both mean
     // "the last run never cleanly finished", so the tail shows the "Run
     // interrupted" divider and the composer offers a Continue chip.
-    interrupted: state.interrupted || lastTurnUnsettled(payloads),
+    //
+    // `runLive` overrides both signals: a confirmed in-flight turn means
+    // the run is alive, so neither the unsettled-tail heuristic nor a
+    // stale replay-observed `child_exited` should surface the divider.
+    interrupted: runLive
+      ? false
+      : state.interrupted || lastTurnUnsettled(payloads),
     // Transient — never persisted, so a hydrated thread always starts clear.
     stalled: null,
   };
