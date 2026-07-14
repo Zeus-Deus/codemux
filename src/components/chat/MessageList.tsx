@@ -37,6 +37,7 @@ import { StreamingMarker } from "./StreamingMarker";
 import { SubagentsCard } from "./SubagentsCard";
 import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
+import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
 import { transcriptFadeEnabled } from "./transcript-fade";
@@ -620,18 +621,26 @@ function renderAssistantBody(
             />
           );
         case "user-input": {
-          // The interactive panel for user-input prompts lives above the
+          // The interactive picker for user-input prompts lives above the
           // composer (ComposerPendingInputPanel); the transcript keeps a
-          // one-line pointer so the thread of events stays readable.
-          const label =
-            item.resolution.state === "pending"
-              ? "Input requested — answer above the composer."
-              : item.resolution.state === "responding"
-                ? "Submitting answers…"
-                : "Answered";
-          return (
-            <div className="py-0.5 text-xs text-muted-foreground">{label}</div>
-          );
+          // one-line pointer while it's still open.
+          if (item.resolution.state === "pending") {
+            return (
+              <div className="py-0.5 text-xs text-muted-foreground">
+                Input requested — answer above the composer.
+              </div>
+            );
+          }
+          if (item.resolution.state === "responding") {
+            return (
+              <div className="py-0.5 text-xs text-muted-foreground">
+                Submitting answers…
+              </div>
+            );
+          }
+          // Resolved: echo the user's selection as a reply bubble so the
+          // transcript actually shows that they answered.
+          return <UserInputAnswer item={item} />;
         }
         default:
           return (

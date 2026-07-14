@@ -639,6 +639,45 @@ function mockChatTranscript(): string[] {
     images: [{ path: MOCK_USER_IMAGE_DATA_URL, media_type: "image/png" }],
   });
   for (const envelope of subagentTurnEnvelopes(T, subTurnId)) push(envelope);
+  // A resolved AskUserQuestion (`user-input`) so the transcript shows the
+  // user's answer echoed back as a reply bubble (design QA for the
+  // UserInputAnswer row).
+  push({
+    type: "request_opened",
+    thread_id: T,
+    turn_id: subTurnId,
+    request_id: "seed-user-input-1",
+    request_kind: "user-input",
+    payload: {
+      questions: [
+        {
+          header: "Approach",
+          question: "How should we handle the clipboard fallback?",
+          multiSelect: false,
+          options: [
+            { label: "Feature-detect and degrade", description: "" },
+            { label: "Always use the legacy path", description: "" },
+          ],
+        },
+      ],
+    },
+    tool_use_id: null,
+  });
+  push({
+    type: "request_resolved",
+    thread_id: T,
+    request_id: "seed-user-input-1",
+    decision: {
+      decision: "allow",
+      updated_input: {
+        questions: [],
+        answers: {
+          "How should we handle the clipboard fallback?":
+            "Feature-detect and degrade",
+        },
+      },
+    },
+  });
   push({
     type: "turn_completed",
     thread_id: T,
