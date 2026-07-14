@@ -900,6 +900,35 @@ fn resume_lock_for(thread_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         .clone()
 }
 
+/// The provider default permission mode used to heal a session row whose
+/// persisted `permission_mode` is NULL.
+///
+/// WHY: the `permission_mode` column was added to `agent_chat_sessions`
+/// after chat had already shipped (see the
+/// `ALTER TABLE agent_chat_sessions ADD COLUMN permission_mode` migration
+/// in `database.rs`), so rows created before it read back `None`. The
+/// frontend seeds its permission picker to the provider default ("Full
+/// access" for Claude) for such rows, so if [`ensure_live_session`]
+/// rebuilds the live session passing `None` the SDK launches in `default`
+/// mode and prompts for every tool — the UI says Full access while the
+/// live session desyncs and asks for approvals on every Edit/Bash.
+/// Substituting the provider default here keeps the rebuilt session in the
+/// same mode the UI already displays.
+///
+/// The returned strings MUST match the `default_permission_mode` each
+/// provider declares in its capabilities module
+/// (`agent_provider/{claude,codex,opencode}/capabilities.rs`); they are
+/// duplicated here as a cheap `&'static str` rather than building the full
+/// capabilities bundle (which allocates the model list) just to read one
+/// field. OpenCode has no permission modes, so it stays `None`.
+fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
+    match provider {
+        ProviderKind::Claude => Some("bypassPermissions"),
+        ProviderKind::Codex => Some("danger-full-access"),
+        ProviderKind::OpenCode => None,
+    }
+}
+
 /// Ensure a live provider session is bound to `thread_id`, silently
 /// rebuilding it from the persisted `agent_chat_sessions` row when the
 /// provider's in-memory session map has no entry (the state after an app
@@ -999,12 +1028,44 @@ pub async fn ensure_live_session<R: Runtime>(
         .as_ref()
         .map(|id| serde_json::json!({ "resume": id }));
 
+    // Heal a NULL persisted permission_mode to the provider default the
+    // frontend already displays for such rows (see
+    // `fallback_permission_mode` for the WHY). `healed_permission_mode` is
+    // `Some` only when we actually substituted a default, so the
+    // best-effort persist below never rewrites a row that already carries a
+    // value.
+    let (permission_mode, healed_permission_mode) = match record.permission_mode.clone() {
+        Some(mode) => (Some(mode), None),
+        None => {
+            let fallback = fallback_permission_mode(provider_kind).map(str::to_string);
+            (fallback.clone(), fallback)
+        }
+    };
+
+    if let Some(mode) = healed_permission_mode {
+        // Best-effort heal the row so future rebuilds and the frontend's
+        // picker seed agree on the mode. Never fail the resume over a DB
+        // write — the in-memory session is already resolving to the right
+        // mode via `permission_mode` above.
+        let db: State<'_, DatabaseStore> = app.state();
+        let config = AgentChatSessionConfig {
+            permission_mode: AgentChatSessionConfig::set(mode),
+            ..AgentChatSessionConfig::default()
+        };
+        if let Err(error) = db.update_agent_chat_session_config(&thread_id.0, &config) {
+            eprintln!(
+                "[codemux::agent_chat] failed to heal NULL permission_mode for thread={}: {error}",
+                thread_id.0,
+            );
+        }
+    }
+
     let build_input = |resume_cursor: Option<serde_json::Value>| StartSessionInput {
         thread_id: thread_id.clone(),
         cwd: cwd.clone(),
         model: record.model.clone(),
         resume_cursor,
-        permission_mode: record.permission_mode.clone(),
+        permission_mode: permission_mode.clone(),
         effort: record.effort.clone(),
         context_window: record.context_window.clone(),
         additional_directories: vec![],

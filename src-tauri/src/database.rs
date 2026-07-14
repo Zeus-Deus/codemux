@@ -564,6 +564,24 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         // reads back as a paired device; account sessions set it to 'account'.
         "ALTER TABLE web_remote_sessions ADD COLUMN source TEXT NOT NULL DEFAULT 'pair'",
         "ALTER TABLE web_remote_sessions ADD COLUMN account_user_id TEXT",
+        // Backfill permission_mode for rows created before the column above
+        // existed. Those rows read back NULL, which makes backend
+        // auto-resume rebuild the live session with no permissionMode (SDK
+        // `default` mode → an approval prompt for every tool) even though
+        // the frontend has always displayed the provider default ("Full
+        // access") for them. Heal them to that same displayed default so the
+        // UI and the rebuilt session agree. `provider` is stored lowercase
+        // (see `upsert_agent_chat_session`); these strings mirror the
+        // per-provider fallback in `commands::agent_chat::fallback_permission_mode`
+        // and each provider's `default_permission_mode` in
+        // `agent_provider/*/capabilities.rs`. OpenCode has no permission
+        // modes, so its rows stay NULL. Ordered after the ALTER above so the
+        // column exists; idempotent because after the first run no NULL rows
+        // remain to update.
+        "UPDATE agent_chat_sessions SET permission_mode = 'bypassPermissions' \
+             WHERE permission_mode IS NULL AND provider = 'claude'",
+        "UPDATE agent_chat_sessions SET permission_mode = 'danger-full-access' \
+             WHERE permission_mode IS NULL AND provider = 'codex'",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -3235,6 +3253,53 @@ mod tests {
         // Delete
         db.delete_setting("theme").unwrap();
         assert_eq!(db.get_setting("theme"), None);
+    }
+
+    #[test]
+    fn backfill_null_permission_mode_migration() {
+        let db = init_test_database();
+
+        // Legacy rows: `upsert_agent_chat_session` never writes
+        // permission_mode, so the column reads back NULL — exactly the
+        // pre-column shape the migration backfills.
+        db.upsert_agent_chat_session("t-claude", "ws", Some("/tmp"), "claude")
+            .unwrap();
+        db.upsert_agent_chat_session("t-codex", "ws", Some("/tmp"), "codex")
+            .unwrap();
+        db.upsert_agent_chat_session("t-opencode", "ws", Some("/tmp"), "opencode")
+            .unwrap();
+        // A claude row that already carries an explicit non-default mode
+        // must survive the backfill untouched.
+        db.upsert_agent_chat_session("t-claude-set", "ws", Some("/tmp"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t-claude-set",
+            &AgentChatSessionConfig {
+                permission_mode: AgentChatSessionConfig::set("plan"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
+
+        // Re-run the schema migrations (idempotent) to fire the backfill.
+        {
+            let conn = db.conn.lock().unwrap();
+            create_schema(&conn).unwrap();
+        }
+
+        let mode = |thread: &str| {
+            db.get_agent_chat_session(thread)
+                .unwrap()
+                .permission_mode
+        };
+        assert_eq!(mode("t-claude").as_deref(), Some("bypassPermissions"));
+        assert_eq!(mode("t-codex").as_deref(), Some("danger-full-access"));
+        assert_eq!(mode("t-opencode"), None, "opencode rows stay NULL");
+        assert_eq!(
+            mode("t-claude-set").as_deref(),
+            Some("plan"),
+            "rows with an explicit mode are untouched"
+        );
     }
 
     #[test]
