@@ -940,6 +940,77 @@ mod auto_resume {
             .expect("send_turn succeeds on the resumed session");
     }
 
+    // Regression: a row whose `permission_mode` is NULL (created before the
+    // column existed) must NOT rebuild the live session in `default` mode.
+    // The frontend shows "Full access" (bypassPermissions) for such rows, so
+    // `ensure_live_session` substitutes the Claude provider default —
+    // otherwise the SDK prompts for every Edit/Bash while the UI says Full
+    // access. It also heals the row so the value persists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn null_permission_mode_rebuilds_with_provider_default_and_heals_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let capture = tmp.path().join("start-session-capture.jsonl");
+        let cwd = tmp.path().join("workdir");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let wrapper = capture_wrapper(tmp.path(), &capture);
+
+        let app = tauri::test::mock_app();
+        app.manage(DatabaseStore::new_in_memory());
+        app.manage(AppStateStore::default());
+        app.manage(ProviderRegistry::new());
+        let handle = app.handle().clone();
+
+        let provider = claude_provider_with_capture(wrapper).await;
+        {
+            let registry: tauri::State<'_, ProviderRegistry> = handle.state();
+            registry
+                .set_claude(provider.clone() as Arc<dyn AgentProvider>)
+                .await;
+        }
+
+        // Seed a legacy row: upsert never writes permission_mode, so it is
+        // NULL — the pre-column shape.
+        let thread = ThreadId("chat-pane-legacy-null-pm".into());
+        {
+            let db: tauri::State<'_, DatabaseStore> = handle.state();
+            db.upsert_agent_chat_session(&thread.0, "ws-1", Some(&cwd.to_string_lossy()), "claude")
+                .unwrap();
+            assert_eq!(
+                db.get_agent_chat_session(&thread.0)
+                    .unwrap()
+                    .permission_mode,
+                None,
+                "precondition: the row starts with a NULL permission_mode"
+            );
+        }
+
+        ensure_live_session(&handle, ProviderKind::Claude, &thread)
+            .await
+            .expect("auto-resume should succeed");
+
+        // The start-session carried the Claude provider default rather than
+        // launching in `default` mode.
+        let captured = read_capture(&capture);
+        assert_eq!(captured.len(), 1, "exactly one start-session was sent");
+        let params = &captured[0]["params"];
+        assert_eq!(
+            params["permissionMode"].as_str(),
+            Some("bypassPermissions"),
+            "NULL permission_mode must resolve to the Claude provider default"
+        );
+
+        // And the row was healed so future rebuilds + the frontend seed agree.
+        let db: tauri::State<'_, DatabaseStore> = handle.state();
+        assert_eq!(
+            db.get_agent_chat_session(&thread.0)
+                .unwrap()
+                .permission_mode
+                .as_deref(),
+            Some("bypassPermissions"),
+            "the NULL row must be healed to the resolved default"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ensure_live_session_is_a_noop_when_session_already_live() {
         let tmp = tempfile::tempdir().expect("tempdir");

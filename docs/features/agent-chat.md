@@ -183,6 +183,21 @@ The chat pane stack:
   pickers + resume cursor from the row, falling back to the provider
   default model only when no row (or no persisted model) exists —
   fixing the post-restart "reset to Opus" regression.
+  - **NULL `permission_mode` heal**: rows created before the
+    `permission_mode` column existed read back NULL. The frontend seeds its
+    permission picker to the provider default ("Full access" =
+    `bypassPermissions` for Claude, `danger-full-access` for Codex) for such
+    rows, so `ensure_live_session` resolves a NULL to that same provider
+    default (`fallback_permission_mode`) before rebuilding — otherwise the
+    SDK launches in `default` mode and prompts for every Edit/Bash while the
+    UI still says Full access. When it substitutes a default it also
+    best-effort persists the resolved mode back to the row (never failing
+    the resume on a DB write) so future rebuilds and the frontend seed
+    agree. A one-time `database.rs` migration backfills the same defaults
+    onto existing NULL Claude/Codex rows (OpenCode has no permission modes,
+    so its rows stay NULL). This became user-visible in v0.13.2 once the
+    dead-run watchdog started rebuilding sessions mid-lifetime, not just
+    after an app restart.
 - **Reusable JSON-RPC-over-stdio child-process helper** with timeout,
   graceful shutdown, bidirectional notifications, server-initiated
   requests, and child-exit cleanup.
