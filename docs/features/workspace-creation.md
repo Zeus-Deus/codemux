@@ -96,6 +96,33 @@ After onboarding: scripts saved to project config, worktree workspace created, w
 - Pending workspace tracking in UI during async creation
 - Ctrl+Enter keyboard shortcut to create
 
+## AI Branch Naming
+
+New-branch names are generated from the task text by `generate_ai_name`
+(`src-tauri/src/branch_name.rs`), which shells out to `claude --print`. The
+call runs **hermetically** so nothing from the desktop app's environment can
+leak into the name:
+
+- `--setting-sources ""` — loads no user/project settings: no CLAUDE.md,
+  auto-memory, skills, plugins, or MCP servers.
+- `cwd = temp dir` — a neutral working directory so no cwd-derived project
+  context is picked up.
+- inherited nested-session env vars (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`,
+  etc.) are scrubbed so the call isn't treated as a child of the app's own
+  session.
+- `--disallowedTools "*"` — the model only emits text; no tool use.
+- `--no-session-persistence` — throwaway calls don't write transcripts into
+  `~/.claude/projects`.
+
+This closes a bug where the naming CLI ran a full Claude Code session in the
+app's inherited cwd (typically the user's home directory), loading that
+directory's auto-memory and CLAUDE.md
+and producing names about **unrelated** topics from that memory. Output is also
+hardened: a strict system prompt asks for a bare token, and
+`extract_branch_candidate` unwraps any stray prose/backticks/`**bold**` before
+sanitization (models sometimes prepend "Branch name only, as requested:").
+Anything unusable falls through to the existing random adjective-noun name.
+
 ## Model Selection
 
 The model pill lets the user pick a model — and, where the CLI supports
