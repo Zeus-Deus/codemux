@@ -19,6 +19,7 @@ import {
   type SessionStartInput,
 } from "../session.ts";
 import type { ApprovalDecision } from "../permissions.ts";
+import { listCommands } from "./list-commands.ts";
 import { listModels } from "./list-models.ts";
 import { ping } from "./ping.ts";
 
@@ -345,6 +346,17 @@ const listModelsMethod: MethodHandler = async (params) => {
   });
 };
 
+const listCommandsMethod: MethodHandler = async (params) => {
+  const p = asObject(params, "list-commands");
+  return listCommands({
+    cwd: asString(p["cwd"], "cwd"),
+    pathToClaudeCodeExecutable: asString(
+      p["pathToClaudeCodeExecutable"],
+      "pathToClaudeCodeExecutable",
+    ),
+  });
+};
+
 // ---------------------------------------------------------------------------
 // Public: build the registry
 // ---------------------------------------------------------------------------
@@ -368,6 +380,7 @@ export function buildMethods(emit: EventEmitter): Record<string, MethodHandler> 
     "probe-installed": probeInstalledMethod,
     "probe-authenticated": probeAuthenticatedMethod,
     "list-models": listModelsMethod,
+    "list-commands": listCommandsMethod,
   };
 }
 

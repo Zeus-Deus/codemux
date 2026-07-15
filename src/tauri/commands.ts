@@ -1629,6 +1629,33 @@ export const listSkills = (
   includePlugins: boolean,
 ) => invoke<Skill[]>("list_skills", { projectRoot, includePlugins });
 
+/** One provider-native slash command (e.g. Claude Code's `/compact`,
+ *  `/init`, `/review`, or a custom `.claude/commands` entry).
+ *  Discovered live from the provider — never hardcoded. Selecting one
+ *  inserts the literal `/name ` text into the draft; the provider
+ *  interprets the leading slash itself at send time. */
+export interface ProviderSlashCommand {
+  /** Command name without the leading slash. */
+  name: string;
+  /** One-line description. May be empty. */
+  description: string;
+  /** Argument hint (e.g. `<pr-url>`). May be empty. */
+  argumentHint: string;
+}
+
+/** List the provider-native slash commands for a thread anchored at
+ *  `cwd`. Claude harvests via the Agent SDK's `supportedCommands()`
+ *  (cached per cwd backend-side); Codex/OpenCode currently resolve to
+ *  an empty list because they expose no discovery surface. */
+export const listChatSlashCommands = (
+  provider: AgentChatProviderKind,
+  cwd: string,
+) =>
+  invoke<ProviderSlashCommand[]>("list_chat_slash_commands", {
+    provider,
+    cwd,
+  });
+
 /** Start the file watcher. Returns the count of paths actually being
  *  watched (paths that don't exist on disk are skipped silently).
  *  Idempotent — re-calling with new args swaps the watcher's path set. */

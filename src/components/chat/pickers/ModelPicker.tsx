@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Check, ChevronDown } from "lucide-react";
 
 import {
@@ -62,12 +62,26 @@ interface Props {
   value: string | null;
   onChange: (model: string) => void;
   disabled?: boolean;
+  /** Imperative open request — increments each time the composer's
+   *  `/model` slash command fires. `0` / `undefined` means "no
+   *  request yet"; any increment pops the picker open. */
+  openSignal?: number;
 }
 
-export function ModelPicker({ provider, value, onChange, disabled }: Props) {
+export function ModelPicker({
+  provider,
+  value,
+  onChange,
+  disabled,
+  openSignal,
+}: Props) {
   const [open, setOpen] = useState(false);
   const list = modelsForProvider(provider);
   const current = value ?? list[0]?.id ?? "";
+
+  useEffect(() => {
+    if (openSignal && !disabled) setOpen(true);
+  }, [openSignal, disabled]);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

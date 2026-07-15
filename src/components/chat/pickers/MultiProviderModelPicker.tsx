@@ -164,6 +164,10 @@ interface Props {
    * user from choosing a model the backend will reject.
    */
   allowedProviders?: ReadonlyArray<AgentChatProviderKind>;
+  /** Imperative open request — increments each time the composer's
+   *  `/model` slash command fires. `0` / `undefined` means "no
+   *  request yet"; any increment pops the picker open. */
+  openSignal?: number;
 }
 
 interface ResolvedRow {
@@ -185,10 +189,15 @@ export function MultiProviderModelPicker({
   onProviderModelChange,
   disabled,
   allowedProviders,
+  openSignal,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [railKey, setRailKey] = useState<RailKey>(provider);
   const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    if (openSignal && !disabled) setOpen(true);
+  }, [openSignal, disabled]);
   // Filter the providers list once per render. Memoized via the
   // identity of `allowedProviders` so consumers passing a stable
   // array reference (the common case) don't churn the rail.

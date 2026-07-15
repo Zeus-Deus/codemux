@@ -50,6 +50,10 @@ interface Props {
   /** Whether the attach popup is currently open. Drives the button's
    *  pressed visual state. */
   attachOpen?: boolean;
+  /** Imperative model-picker open request from the composer's
+   *  `/model` slash command. Forwarded to whichever picker variant
+   *  renders. Optional; omitted by call sites that predate `/model`. */
+  modelPickerOpenSignal?: number;
 }
 
 export function ComposerFooter({
@@ -77,6 +81,7 @@ export function ComposerFooter({
   controlsDisabled,
   onAttachClick,
   attachOpen = false,
+  modelPickerOpenSignal,
 }: Props) {
   const modeIsActive = mode !== "default";
 
@@ -134,6 +139,7 @@ export function ComposerFooter({
               onModelChange(nextModel);
             }}
             disabled={controlsDisabled}
+            openSignal={modelPickerOpenSignal}
           />
         ) : (
           <ModelPicker
@@ -141,6 +147,7 @@ export function ComposerFooter({
             value={model}
             onChange={onModelChange}
             disabled={controlsDisabled}
+            openSignal={modelPickerOpenSignal}
           />
         )}
         <ReasoningPicker
