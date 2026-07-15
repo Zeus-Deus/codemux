@@ -16,6 +16,10 @@ interface Props {
   /** True when the last run never cleanly settled — drives the
    *  "Run interrupted" tail divider. */
   interrupted?: boolean;
+  /** Send → jump-to-latest signal (incrementing). Forwarded to
+   *  MessageList: each bump re-pins the transcript tail so sending a new
+   *  prompt catches the reader up even from deep in history. */
+  scrollToBottomSignal?: number;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). Forwarded to MessageList; Stage 3 wires the real value. */
   sessionStartedAt?: number;
@@ -50,6 +54,7 @@ export function ChatTranscript({
   streaming,
   stalled,
   interrupted,
+  scrollToBottomSignal,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -70,6 +75,7 @@ export function ChatTranscript({
         streaming={streaming}
         stalled={stalled}
         interrupted={interrupted}
+        scrollToBottomSignal={scrollToBottomSignal}
         sessionStartedAt={sessionStartedAt}
         provider={provider}
         onRespondToRequest={onRespondToRequest}

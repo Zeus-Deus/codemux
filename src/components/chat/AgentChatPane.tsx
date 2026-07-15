@@ -505,6 +505,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // scroller"), so a direct query by `data-subagent-card` always finds the
   // node.
   const paneRootRef = useRef<HTMLDivElement>(null);
+  // Send → jump-to-latest (catch-up on send). An incrementing counter
+  // forwarded to the transcript; bumping it snaps the viewport to the
+  // bottom and re-pins following-bottom mode. Sending a new prompt must
+  // always bring the reader to the latest content and keep them on the
+  // stream, even if they had scrolled up into history — see
+  // `ScrollToBottomOnSend` in MessageList.tsx.
+  const [scrollToBottomSignal, setScrollToBottomSignal] = useState(0);
+  const requestScrollToBottom = useCallback(
+    () => setScrollToBottomSignal((n) => n + 1),
+    [],
+  );
   // Live handles for an in-flight jump (rAF settle loop + highlight
   // timeout), cancelled on a re-jump, a thread switch, and unmount — the
   // same hygiene as MessageList's / MessageTrail's own settle loops.
@@ -1180,6 +1191,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ? crypto.randomUUID()
           : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       appendUserMessage(threadId, plan.text, clientNonce, imageDisplaySources);
+      // Catch up to the latest on send: snap the transcript to the bottom
+      // and re-pin following-bottom, even if the reader had scrolled up
+      // into history. Bumped in the same commit as the optimistic append
+      // so the jump lands on the freshly-added user bubble.
+      requestScrollToBottom();
       if (isContinue) {
         // Preserve the composer: `appendUserMessage` reset `inputDraft` to ""
         // as a side effect, so restore the user's in-progress text. Staged
@@ -1237,6 +1253,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setInputDraft,
     clearStagedAttachments,
     updateStagedAttachment,
+    requestScrollToBottom,
   ]);
 
   /** One-click "Continue run" (issue #154): resume an interrupted run by
@@ -2743,6 +2760,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               streaming={streaming || isSending}
               stalled={stalled}
               interrupted={interrupted}
+              scrollToBottomSignal={scrollToBottomSignal}
               sessionStartedAt={sessionStartedAt}
               provider={provider}
               onRespondToRequest={handleRespond}

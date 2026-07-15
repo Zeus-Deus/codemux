@@ -2,6 +2,7 @@ import { ArrowDown, TriangleAlert } from "lucide-react";
 import {
   memo,
   useCallback,
+  useEffect,
   useMemo,
   useRef,
   type CSSProperties,
@@ -14,6 +15,7 @@ import {
   MessageScrollerItem,
   MessageScrollerProvider,
   MessageScrollerViewport,
+  useMessageScroller,
 } from "@/components/ui/message-scroller";
 import type {
   ChatViewItem,
@@ -67,6 +69,13 @@ interface Props {
   /** True when the last run never cleanly settled (child exit / crash).
    *  Renders a "Run interrupted" tail divider while not streaming. */
   interrupted?: boolean;
+  /** Send → jump-to-latest signal. An incrementing counter bumped by the
+   *  composer send handlers (AgentChatPane): each increment snaps the
+   *  transcript to the bottom and re-pins following-bottom, so sending a
+   *  new prompt always catches the reader up to the latest content — even
+   *  when they had scrolled up into history. Absent / unchanged ⇒ no forced
+   *  scroll (free-scroll while reading history is preserved). */
+  scrollToBottomSignal?: number;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). When absent a plain "Session started" divider renders.
    *  Stage 3 wires the real value through AgentChatPane. */
@@ -143,6 +152,7 @@ export function MessageList({
   streaming = false,
   stalled = null,
   interrupted = false,
+  scrollToBottomSignal,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -245,6 +255,10 @@ export function MessageList({
             provider, sibling of the viewport). Reads the active turn from
             `visibleMessageIds`; hides itself on short threads. */}
         <MessageTrail slots={slots} />
+        {/* Send → jump-to-latest. Reacts to the composer send signal by
+            re-pinning the tail through the engine's own imperative API
+            (inside the provider, so `useMessageScroller` resolves). */}
+        <ScrollToBottomOnSend signal={scrollToBottomSignal} />
         <MessageScrollerViewport
           style={transcriptFadeEnabled() ? WS_FADE_STYLE : undefined}
         >
@@ -325,6 +339,41 @@ export function MessageList({
       </MessageScroller>
     </MessageScrollerProvider>
   );
+}
+
+/**
+ * Send → jump-to-latest contract. When the user sends a new prompt from
+ * the composer, sending must always bring them to the latest content and
+ * keep them following the stream — even if they had scrolled up into
+ * history (where normally only the "Jump to latest" pill would show).
+ *
+ * `signal` is an incrementing counter the send handlers bump once per
+ * send (see `AgentChatPane`); the effect fires only on a real change
+ * (never on the initial value — the transcript already mounts pinned at
+ * the bottom, and unrelated re-renders keep the same value), so
+ * free-scroll while reading history is never disturbed. Each fire calls
+ * the scroller engine's own `scrollToEnd`, which both snaps to the tail
+ * and re-enters following-bottom mode — so any content that streams in
+ * afterward keeps auto-scrolling. Going through the engine's imperative
+ * API (not a raw `scrollTop` write) is what re-arms that state machine; a
+ * manual write would move the viewport but leave the engine unpinned.
+ * Lives inside the provider (a child of `MessageScroller`) so
+ * `useMessageScroller` resolves; renders nothing.
+ */
+function ScrollToBottomOnSend({ signal }: { signal?: number }) {
+  const { scrollToEnd } = useMessageScroller();
+  const prevSignalRef = useRef(signal);
+  useEffect(() => {
+    if (signal === prevSignalRef.current) return;
+    prevSignalRef.current = signal;
+    // Bumped in the same commit as the optimistic user-message append, so
+    // this effect runs with that row already in the DOM — the snap lands
+    // on it. Re-entering following-bottom also covers the content-
+    // visibility settle: as the fresh row measures, the engine keeps the
+    // tail pinned without any extra rAF here.
+    scrollToEnd({ behavior: "auto" });
+  }, [signal, scrollToEnd]);
+  return null;
 }
 
 /** Viewport edge fade (design `wsFade`): dissolve content at the top/bottom
