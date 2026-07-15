@@ -55,7 +55,7 @@ export interface SessionRestoreSettings {
  *  `background_browser_desktop_viewport` pins the GUI-mode background
  *  browser's peek popover (`BrowserPeekOverlay.tsx`) to a real desktop
  *  viewport (1280×800) instead of shrinking to the popover's pixel
- *  size — default OFF. */
+ *  size — default ON. */
 export interface AgentChatSyncSettings {
   checkpoints_enabled: boolean;
   background_browser_desktop_viewport: boolean;

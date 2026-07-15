@@ -1988,7 +1988,7 @@ export function SettingsView() {
                     description="Start the agent's background browser at a real desktop viewport (1280×800) so pages render at full size in the peek popover, scaled to fit."
                   >
                     <Switch
-                      checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? false}
+                      checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}
                       onCheckedChange={(checked) => {
                         updateSyncedSetting("agent_chat", "background_browser_desktop_viewport", checked).catch(console.error);
                       }}

@@ -49,7 +49,7 @@ UserSettings
     max_total_mb: number       (default: 100)
   agent_chat
     checkpoints_enabled: boolean                 (default: false, run-start rollback checkpoint — issue #80)
-    background_browser_desktop_viewport: boolean (default: false, pin GUI-mode background-browser peek to 1280×800 — docs/features/browser.md)
+    background_browser_desktop_viewport: boolean (default: true — serde default_true, so blobs missing the field get ON while an explicitly saved false is kept; pin GUI-mode background-browser peek to 1280×800 — docs/features/browser.md)
 ```
 
 ### Offline Cache

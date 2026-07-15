@@ -131,14 +131,24 @@ pub struct FileTreeSettings {
 /// the peek popover (`BrowserPeekOverlay.tsx`) is showing it, instead
 /// of shrinking the viewport to the tiny popover's pixel size — the
 /// popover's canvas letterboxes the larger frame down to fit. Defaults
-/// to OFF so today's container-sync behavior is unchanged out of the
-/// box.
-#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+/// to ON — pages render at real desktop size out of the box and agents
+/// don't have to re-send `viewport` each turn; blobs where the user
+/// explicitly saved `false` keep the container-sync behavior.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct AgentChatSettings {
     #[serde(default)]
     pub checkpoints_enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub background_browser_desktop_viewport: bool,
+}
+
+impl Default for AgentChatSettings {
+    fn default() -> Self {
+        Self {
+            checkpoints_enabled: false,
+            background_browser_desktop_viewport: true,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -531,7 +541,7 @@ mod tests {
             },
             agent_chat: AgentChatSettings {
                 checkpoints_enabled: true,
-                background_browser_desktop_viewport: true,
+                background_browser_desktop_viewport: false,
             },
         };
 
@@ -554,30 +564,36 @@ mod tests {
         assert_eq!(back.session_restore.scrollback_lines, 5000);
         assert_eq!(back.session_restore.max_total_mb, 50);
         assert!(back.agent_chat.checkpoints_enabled);
-        assert!(back.agent_chat.background_browser_desktop_viewport);
+        assert!(!back.agent_chat.background_browser_desktop_viewport);
     }
 
     /// A settings blob saved before the agent_chat section existed
-    /// still deserializes — and the checkpoint opt-in stays OFF.
+    /// still deserializes — the checkpoint opt-in stays OFF and the
+    /// desktop-viewport pin gets the ON default.
     #[test]
     #[serial]
     fn missing_agent_chat_section_defaults_to_checkpoints_off() {
         let legacy = r#"{"appearance":{"theme":"dark"}}"#;
         let parsed: UserSettings = serde_json::from_str(legacy).unwrap();
         assert!(!parsed.agent_chat.checkpoints_enabled);
-        assert!(!parsed.agent_chat.background_browser_desktop_viewport);
+        assert!(parsed.agent_chat.background_browser_desktop_viewport);
     }
 
     /// A settings blob saved before `background_browser_desktop_viewport`
     /// existed (but with an `agent_chat` section already present) still
-    /// deserializes — the new field defaults to OFF via serde default,
-    /// not a deserialize error.
+    /// deserializes — the new field defaults to ON via serde default,
+    /// not a deserialize error. An explicit saved `false` still wins.
     #[test]
     #[serial]
-    fn missing_desktop_viewport_field_defaults_off() {
+    fn missing_desktop_viewport_field_defaults_on() {
         let legacy = r#"{"agent_chat":{"checkpoints_enabled":true}}"#;
         let parsed: UserSettings = serde_json::from_str(legacy).unwrap();
         assert!(parsed.agent_chat.checkpoints_enabled);
+        assert!(parsed.agent_chat.background_browser_desktop_viewport);
+
+        let explicit_off =
+            r#"{"agent_chat":{"checkpoints_enabled":true,"background_browser_desktop_viewport":false}}"#;
+        let parsed: UserSettings = serde_json::from_str(explicit_off).unwrap();
         assert!(!parsed.agent_chat.background_browser_desktop_viewport);
     }
 
