@@ -2702,6 +2702,61 @@ pub fn git_create_worktree(
     Ok(path_str)
 }
 
+/// Dirty/unpushed guard shared by `git_remove_worktree` (its
+/// force=false path) and the close-workspace pre-flight in
+/// `commands::workspace::close_workspace_with_worktree_impl`. The
+/// pre-flight exists so a refused removal returns BEFORE any workspace
+/// teardown — the workspace (and its delete dialog) stay alive for the
+/// force escalation.
+///
+/// CONTRACT: the frontend detects a guard refusal by regex-matching
+/// /use force/i on the error message, so the "Use force to override."
+/// suffix in both errors is load-bearing. Do not reword it.
+pub(crate) fn ensure_worktree_removable(worktree_path: &Path) -> Result<(), String> {
+    // Check for uncommitted changes
+    let status = run_git_permissive(worktree_path, &["status", "--porcelain"]);
+    let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
+    if dirty_count > 0 {
+        return Err(format!(
+            "Worktree has {dirty_count} uncommitted change(s). Use force to override."
+        ));
+    }
+
+    // Check for unpushed commits (only if upstream exists)
+    let upstream = run_git_permissive(
+        worktree_path,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    );
+    if !upstream.is_empty() && !upstream.contains("fatal") {
+        let unpushed = run_git_permissive(worktree_path, &["log", "@{upstream}..HEAD", "--oneline"]);
+        let unpushed_count = unpushed.lines().filter(|l| !l.is_empty()).count();
+        if unpushed_count > 0 {
+            return Err(format!(
+                "Worktree has {unpushed_count} unpushed commit(s). Use force to override."
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// True when `branch` (a shortname like "feature/x") exists as a local
+/// branch OR on ANY remote. `git show-ref --quiet -- <shortname>`
+/// matches refs by path-component suffix — refs/heads/<b> and
+/// refs/remotes/<any-remote>/<b> both hit — and reports via exit status
+/// (0 = at least one match, 1 = none). This replaces scanning
+/// `git_list_branches` output, which returned remote branches qualified
+/// ("upstream/feature/x") and therefore never equality-matched a
+/// shortname for non-origin remotes.
+pub fn git_branch_exists(repo_path: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args(["show-ref", "--quiet", "--", branch])
+        .current_dir(repo_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bool) -> Result<(), String> {
     // Find the main repo by reading .git file in worktree
     let git_file = worktree_path.join(".git");
@@ -2725,29 +2780,7 @@ pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bo
     };
 
     if !force {
-        // Check for uncommitted changes
-        let status = run_git_permissive(worktree_path, &["status", "--porcelain"]);
-        let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
-        if dirty_count > 0 {
-            return Err(format!(
-                "Worktree has {dirty_count} uncommitted change(s). Use force to override."
-            ));
-        }
-
-        // Check for unpushed commits (only if upstream exists)
-        let upstream = run_git_permissive(
-            worktree_path,
-            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-        );
-        if !upstream.is_empty() && !upstream.contains("fatal") {
-            let unpushed = run_git_permissive(worktree_path, &["log", "@{upstream}..HEAD", "--oneline"]);
-            let unpushed_count = unpushed.lines().filter(|l| !l.is_empty()).count();
-            if unpushed_count > 0 {
-                return Err(format!(
-                    "Worktree has {unpushed_count} unpushed commit(s). Use force to override."
-                ));
-            }
-        }
+        ensure_worktree_removable(worktree_path)?;
     }
 
     if force {
@@ -6950,5 +6983,100 @@ TARGET version
         assert_eq!(result, Some("master".to_string()), "expected fallback to 'master'");
         let after = run_git_permissive(&repo, &["branch", "--show-current"]);
         assert_eq!(after, "master");
+    }
+}
+
+#[cfg(test)]
+mod worktree_guard_tests {
+    //! Contract coverage for `ensure_worktree_removable` — the shared
+    //! dirty/unpushed guard behind `git_remove_worktree` AND the
+    //! close-workspace pre-flight — plus `git_branch_exists`, the
+    //! unarchive pre-flight's local+remote branch check.
+
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        run(dir, &["init", "--initial-branch=main"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        run(dir, &["add", "."]);
+        run(dir, &["commit", "-m", "init"]);
+    }
+
+    /// CONTRACT: the frontend's force-escalation detects a guard
+    /// refusal by regex-matching /use force/i on the error message, so
+    /// the "Use force to override." suffix is load-bearing. This test
+    /// pins the wording; changing it silently breaks the escalation UI.
+    #[test]
+    fn dirty_worktree_error_carries_use_force_contract_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join("dirty.txt"), "uncommitted").unwrap();
+
+        let err = ensure_worktree_removable(&repo)
+            .expect_err("a dirty worktree must refuse removal");
+        assert!(
+            err.contains("uncommitted change(s)"),
+            "unexpected guard message: {err}"
+        );
+        assert!(
+            err.contains("Use force to override."),
+            "guard error lost the frontend's /use force/i contract suffix: {err}"
+        );
+    }
+
+    #[test]
+    fn clean_worktree_is_removable() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        assert_eq!(ensure_worktree_removable(&repo), Ok(()));
+    }
+
+    /// `git_branch_exists` must see local branches, branches on ANY
+    /// remote by shortname (the old list-scan false-negatived on
+    /// non-origin remotes, whose entries come back qualified like
+    /// "upstream/feature/x"), and report absence via exit status.
+    #[test]
+    fn branch_exists_matches_local_and_any_remote_shortname() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        run(&repo, &["branch", "feature/local-branch"]);
+        // Simulate a branch that exists ONLY on a non-origin remote.
+        run(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/feature/remote-only", "HEAD"],
+        );
+
+        assert!(git_branch_exists(&repo, "main"));
+        assert!(git_branch_exists(&repo, "feature/local-branch"));
+        assert!(
+            git_branch_exists(&repo, "feature/remote-only"),
+            "shortname must match refs/remotes/<any-remote>/<branch>"
+        );
+        assert!(!git_branch_exists(&repo, "feature/nope"));
     }
 }

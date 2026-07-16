@@ -25,6 +25,7 @@
 import type {
   AgentBrowserSession,
   AppStateSnapshot,
+  ArchivedWorkspaceSnapshot,
   AuthUser,
   CodemuxConfigSnapshot,
   FileEntry,
@@ -744,6 +745,72 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsSiteMain,
   wsSiteRedesign,
   wsScratchpad,
+];
+
+// ── Archived workspaces ─────────────────────────────────────────────
+//
+// Three seeded entries across two projects so Settings → Archive renders
+// every state end to end:
+//   - a codemux worktree archived 2 days ago whose worktree is DIRTY —
+//     the first delete attempt with forceDelete=false rejects with a
+//     /use force/i message so the escalation flow is visually testable
+//     (see `delete_archived_workspace` in tauri-mock.ts);
+//   - an old-blog worktree archived 45 days ago (exercises the muted
+//     "stale" hint chip for entries older than 30 days);
+//   - the old-blog repo root (protected) — offers "Remove from archive"
+//     only, never worktree deletion.
+
+const nowSeconds = Math.floor(Date.now() / 1000);
+const blogRoot = `${PROJECTS}/old-blog`;
+
+/** Archive id of the seeded dirty-worktree entry — the mock's
+ *  `delete_archived_workspace` rejects the first non-forced delete for
+ *  this entry so the "Force delete" escalation is exercisable. */
+export const MOCK_DIRTY_ARCHIVE_ID = "arch-codemux-payments";
+
+const ARCHIVED_WORKSPACES: ArchivedWorkspaceSnapshot[] = [
+  {
+    archive_id: MOCK_DIRTY_ARCHIVE_ID,
+    workspace_id: "ws-codemux-payments",
+    title: "payments-flow",
+    cwd: `${HOME}/.codemux/worktrees/codemux/feature-payments-flow`,
+    worktree_path: `${HOME}/.codemux/worktrees/codemux/feature-payments-flow`,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "feature/payments-flow",
+    protected: false,
+    is_git: true,
+    archived_at: nowSeconds - 2 * 86_400,
+  },
+  {
+    archive_id: "arch-blog-drafts",
+    workspace_id: "ws-blog-drafts",
+    title: "draft-cleanup",
+    cwd: `${HOME}/.codemux/worktrees/old-blog/chore-draft-cleanup`,
+    worktree_path: `${HOME}/.codemux/worktrees/old-blog/chore-draft-cleanup`,
+    project_root: blogRoot,
+    project_uid: "uid-old-blog",
+    workspace_kind: "worktree",
+    git_branch: "chore/draft-cleanup",
+    protected: false,
+    is_git: true,
+    archived_at: nowSeconds - 45 * 86_400,
+  },
+  {
+    archive_id: "arch-blog-root",
+    workspace_id: "ws-blog-main",
+    title: "old-blog",
+    cwd: blogRoot,
+    worktree_path: null,
+    project_root: blogRoot,
+    project_uid: "uid-old-blog",
+    workspace_kind: "main",
+    git_branch: "main",
+    protected: true,
+    is_git: true,
+    archived_at: nowSeconds - 45 * 86_400,
+  },
 ];
 
 // ── Config + persistence ────────────────────────────────────────────
@@ -1774,6 +1841,7 @@ export function createSeedAppState(): AppStateSnapshot {
       },
     ],
     pane_statuses: paneStatuses,
+    archived_workspaces: ARCHIVED_WORKSPACES,
     persistence: MOCK_PERSISTENCE,
     config: MOCK_CONFIG,
   });

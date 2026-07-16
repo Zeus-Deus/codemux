@@ -34,6 +34,7 @@
  */
 import {
   MOCK_CHAT_THREAD_ID,
+  MOCK_DIRTY_ARCHIVE_ID,
   MOCK_HOME_DIR,
   MOCK_USER,
   MOCK_USER_IMAGE_DATA_URL,
@@ -59,6 +60,7 @@ import type {
 } from "@/tauri/commands";
 import type {
   AppStateSnapshot,
+  ArchivedWorkspaceSnapshot,
   ChatModelInfo,
   CliToolInfo,
   FeatureFlags,
@@ -2365,8 +2367,215 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   close_workspace: (a) => removeWorkspace(a.workspaceId),
-  close_workspace_with_worktree: (a) => removeWorkspace(a.workspaceId),
+  close_workspace_with_worktree: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (ws && a.removeWorktree === true) {
+      // Mirror the real backend's guards: the protected repo root is
+      // never destructively deletable, and a dirty worktree requires an
+      // explicit force (the /use force/i message drives the delete
+      // dialog's escalation state).
+      if (ws.protected === true) {
+        return Promise.reject(
+          "This workspace is the protected repo root — its files can't be deleted. Archive it instead.",
+        );
+      }
+      if (a.forceDelete !== true && ws.git_changed_files > 0) {
+        return Promise.reject(
+          `Worktree has ${ws.git_changed_files} uncommitted change(s). Use force to override.`,
+        );
+      }
+    }
+    return removeWorkspace(a.workspaceId);
+  },
+
+  // ── Workspace archive ──
+  //
+  // Twin of the Rust archive commands: archive moves a live workspace
+  // into `archived_workspaces` (files untouched), unarchive rebuilds a
+  // workspace row and activates it, delete drops the entry (respecting
+  // the protected refusal and the dirty-worktree force escalation).
+  archive_workspace: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (!ws) return Promise.reject("Workspace not found.");
+    if (ws.attach_only === true) {
+      return Promise.reject(
+        "Attach-in-place workspaces can't be archived — close them from the workspaces overview.",
+      );
+    }
+    // Mirror the backend's remote refusal: a workspace pushed to a host
+    // (host_id set) can't be archived locally — the plain close is its
+    // removal path (it stays available on its host in the overview).
+    if (ws.host_id !== null && ws.host_id !== undefined) {
+      return Promise.reject(
+        "Remote workspaces can't be archived — they're managed from the Workspaces Overview. Pull the workspace back to this device first.",
+      );
+    }
+    const archiveId = `arch-${ws.workspace_id}-${++archiveSeq}`;
+    const entry: ArchivedWorkspaceSnapshot = {
+      archive_id: archiveId,
+      workspace_id: ws.workspace_id,
+      title: ws.title,
+      cwd: ws.cwd,
+      worktree_path: ws.worktree_path,
+      project_root: ws.project_root,
+      project_uid: ws.project_uid ?? null,
+      workspace_kind:
+        ws.workspace_kind === "main" || ws.workspace_kind === "worktree"
+          ? ws.workspace_kind
+          : ws.worktree_path
+            ? "worktree"
+            : "main",
+      git_branch: ws.git_branch,
+      protected: ws.protected === true,
+      is_git: ws.is_git ?? true,
+      archived_at: Math.floor(Date.now() / 1000),
+    };
+    // A live-dirty workspace stays dirty in the archive, so deleting it
+    // later exercises the force escalation just like the seeded entry.
+    if (ws.git_changed_files > 0) dirtyArchivedIds.add(archiveId);
+    const next = appState.workspaces.filter(
+      (w) => w.workspace_id !== ws.workspace_id,
+    );
+    let active = appState.active_workspace_id;
+    if (active === ws.workspace_id) active = next[0]?.workspace_id ?? "";
+    appState = {
+      ...appState,
+      workspaces: next,
+      active_workspace_id: active,
+      archived_workspaces: [
+        ...(appState.archived_workspaces ?? []),
+        entry,
+      ],
+    };
+    emitAppState();
+    return archiveId;
+  },
+  unarchive_workspace: (a) => {
+    const entries = appState.archived_workspaces ?? [];
+    const entry = entries.find((e) => e.archive_id === a.archiveId);
+    if (!entry) {
+      return Promise.reject(
+        "Archive entry not found — nothing left to restore.",
+      );
+    }
+    const ws = buildRestoredWorkspace(entry);
+    appState = {
+      ...appState,
+      workspaces: [...appState.workspaces, ws],
+      // The real backend activates the restored workspace.
+      active_workspace_id: ws.workspace_id,
+      archived_workspaces: entries.filter(
+        (e) => e.archive_id !== a.archiveId,
+      ),
+    };
+    emitAppState();
+    return ws.workspace_id;
+  },
+  delete_archived_workspace: (a) => {
+    const entries = appState.archived_workspaces ?? [];
+    const entry = entries.find((e) => e.archive_id === a.archiveId);
+    if (!entry) return Promise.reject("Archive entry not found.");
+    if (entry.protected && a.deleteWorktree === true) {
+      return Promise.reject(
+        "This entry is a protected repo root — its files are never deleted from the archive.",
+      );
+    }
+    if (
+      a.deleteWorktree === true &&
+      a.forceDelete !== true &&
+      dirtyArchivedIds.has(entry.archive_id)
+    ) {
+      return Promise.reject(
+        "Worktree has 3 uncommitted change(s). Use force to override.",
+      );
+    }
+    dirtyArchivedIds.delete(entry.archive_id);
+    appState = {
+      ...appState,
+      archived_workspaces: entries.filter(
+        (e) => e.archive_id !== a.archiveId,
+      ),
+    };
+    emitAppState();
+    return undefined;
+  },
 };
+
+// Archive entries whose (simulated) worktree is dirty: deleting them
+// with forceDelete=false rejects with the /use force/i message. Seeded
+// with the fixture entry so the escalation is testable on first run.
+const dirtyArchivedIds = new Set<string>([MOCK_DIRTY_ARCHIVE_ID]);
+let archiveSeq = 0;
+
+/** Rebuild a live workspace row from an archive entry — the mock twin
+ *  of the backend's unarchive restore. Mirrors `buildWorktreeWorkspace`'s
+ *  structure (fresh thread-less agent_chat pane) with the entry's
+ *  identity fields carried back over. */
+function buildRestoredWorkspace(
+  entry: ArchivedWorkspaceSnapshot,
+): WorkspaceSnapshot {
+  const n = ++archiveSeq;
+  const paneId = `pane-restored-${n}`;
+  const surfaceId = `surface-restored-${n}`;
+  const tabId = `tab-restored-${n}`;
+
+  const pane: PaneNodeSnapshot = {
+    kind: "agent_chat",
+    pane_id: paneId,
+    title: entry.title,
+    thread_id: null,
+    provider: "claude",
+    cwd: entry.cwd,
+  };
+  const surface: SurfaceSnapshot = {
+    surface_id: surfaceId,
+    title: entry.title,
+    root: pane,
+    active_pane_id: paneId,
+  };
+  const tab: TabSnapshot = {
+    tab_id: tabId,
+    kind: "terminal",
+    title: entry.title,
+    surface_id: surfaceId,
+    browser_id: null,
+    icon: null,
+  };
+
+  return {
+    workspace_id: entry.workspace_id,
+    title: entry.title,
+    workspace_type: "standard",
+    cwd: entry.cwd,
+    is_git: entry.is_git,
+    git_branch: entry.git_branch,
+    git_ahead: 0,
+    git_behind: 0,
+    git_additions: 0,
+    git_deletions: 0,
+    git_changed_files: 0,
+    notification_count: 0,
+    latest_agent_state: null,
+    worktree_path: entry.worktree_path,
+    project_root: entry.project_root,
+    project_uid: entry.project_uid,
+    workspace_kind: entry.workspace_kind,
+    protected: entry.protected,
+    divergent_copy: false,
+    pr_number: null,
+    pr_state: null,
+    pr_url: null,
+    linked_issue: null,
+    notifications_muted: false,
+    tabs: [tab],
+    active_tab_id: tabId,
+    active_surface_id: surfaceId,
+    surfaces: [surface],
+    host_id: null,
+    remote_cwd: null,
+    attach_only: false,
+  };
+}
 
 /** Build a `worktree`-kind workspace with a fresh (thread-less)
  *  agent_chat pane and a DISTINCT sibling-worktree cwd, mirroring the

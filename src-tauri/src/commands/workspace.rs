@@ -755,15 +755,33 @@ pub(crate) async fn close_workspace_with_worktree_impl(
 ) -> Result<(), String> {
     let force = force_delete.unwrap_or(false);
 
-    // Worktree metadata still needs a pre-close snapshot for teardown +
-    // MCP cleanup. Session IDs come from `state.close_workspace`'s result
-    // below — no TOCTOU race with concurrent pane creation.
+    // One pre-close snapshot serves both the file-deletion guard and
+    // the teardown/MCP-cleanup metadata below. Session IDs come from
+    // `state.close_workspace`'s result — no TOCTOU race with concurrent
+    // pane creation.
+    //
+    // The guard runs BEFORE any teardown so a refused request leaves
+    // the workspace fully intact. Every delete surface (UI close
+    // dialog, control socket, MCP `workspace_close`) converges on this
+    // impl, so one check here covers them all. A protected repo-root
+    // checkout — or any workspace without a worktree of its own — must
+    // never have its files removed through the close path;
+    // archiving/closing (remove_worktree=false) is the supported way to
+    // make it disappear. Unknown workspace ids fall through so the
+    // lookup error below stays identical to today.
     let (worktree_path, branch, ws_title, ws_host_id) = {
         let snapshot = state.snapshot();
         let ws = snapshot
             .workspaces
             .iter()
             .find(|w| w.workspace_id.0 == workspace_id);
+        if remove_worktree {
+            if let Some(ws) = ws {
+                if let Some(reason) = refuse_worktree_removal(ws) {
+                    return Err(reason);
+                }
+            }
+        }
         (
             ws.and_then(|w| w.worktree_path.clone()),
             ws.and_then(|w| w.git_branch.clone()),
@@ -771,6 +789,33 @@ pub(crate) async fn close_workspace_with_worktree_impl(
             ws.and_then(|w| w.host_id),
         )
     };
+
+    // Dirty/unpushed PRE-FLIGHT, before any teardown. Without this, a
+    // remove_worktree=true close with force_delete=false tore the
+    // workspace down (teardown scripts, state removal, PTY kills) and
+    // only THEN hit `git_remove_worktree`'s guard — the error arrived
+    // after the sidebar row and its delete dialog had already
+    // unmounted, so the frontend's force escalation could never render,
+    // re-issuing with the same workspace_id failed ("No workspace
+    // found"), and the dirty worktree was orphaned on disk. Checking
+    // here returns with the workspace fully intact so the dialog stays
+    // mounted and can escalate to force. The guard inside
+    // `git_remove_worktree` still runs at removal time as a second line
+    // of defense. Blocking pool: the check shells out to git.
+    if remove_worktree && !force {
+        if let Some(ref wt_path) = worktree_path {
+            if Path::new(wt_path).exists() {
+                let wt_path = wt_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::git::ensure_worktree_removable(Path::new(&wt_path))
+                })
+                .await
+                .map_err(|e| {
+                    format!("worktree removal pre-flight task join failed: {e}")
+                })??;
+            }
+        }
+    }
 
     // Run teardown scripts before closing
     if !force {
@@ -889,16 +934,23 @@ pub(crate) async fn close_workspace_with_worktree_impl(
             } else {
                 None
             };
-            // The slow part: `git worktree remove --force` recursively deletes
+            // The slow part: `git worktree remove` recursively deletes
             // the working tree directory. On a project with thousands of
             // commits / a heavy `node_modules` this can take many seconds.
             // Offload to the blocking pool so the Tokio worker stays free for
             // other commands.
+            //
+            // Honest force: pass the caller's `force` through instead of
+            // hardcoding `true`. With force_delete=false the dirty /
+            // unpushed guard inside `git_remove_worktree` now actually
+            // fires, and its "… Use force to override." error propagates
+            // so the caller can escalate to an explicit force. Previously
+            // the hardcoded `true` silently deleted uncommitted work.
             tokio::task::spawn_blocking(move || {
                 crate::git::git_remove_worktree(
                     Path::new(&wt_path),
                     branch_to_delete.as_deref(),
-                    true,
+                    force,
                 )
             })
             .await
@@ -908,6 +960,386 @@ pub(crate) async fn close_workspace_with_worktree_impl(
 
     crate::state::emit_app_state(&app);
     Ok(())
+}
+
+/// The ONE root-protection predicate shared by every file-deletion
+/// guard (live-workspace close and archived-entry delete). A workspace
+/// / entry is an undeletable root when it is explicitly protected, its
+/// recorded kind is "main" (the primary checkout), or it has no
+/// worktree of its own (plain folder / repo root) — in all three cases
+/// "delete the files" would be meaningless or point at the user's
+/// primary checkout. Pure so it's unit-testable without an `AppHandle`,
+/// and single so the live and archived guards can never drift apart.
+fn is_undeletable_root(
+    protected: bool,
+    workspace_kind: Option<&str>,
+    worktree_path: Option<&str>,
+) -> bool {
+    protected || workspace_kind == Some("main") || worktree_path.is_none()
+}
+
+/// Decide whether a live workspace may have its files removed through
+/// the close path (`remove_worktree=true`). Returns `Some(reason)` when
+/// removal must be refused — see [`is_undeletable_root`] for the shared
+/// predicate; this wrapper only supplies the close-path wording.
+pub(crate) fn refuse_worktree_removal(
+    ws: &crate::state::WorkspaceSnapshot,
+) -> Option<String> {
+    if is_undeletable_root(
+        ws.protected,
+        ws.workspace_kind.as_deref(),
+        ws.worktree_path.as_deref(),
+    ) {
+        Some(
+            "This workspace is the project's root checkout and cannot be deleted. \
+             Archive or close it instead."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Same decision for an ARCHIVED entry: `Some(reason)` when the entry's
+/// files must not be deleted from the archive UI — same
+/// [`is_undeletable_root`] predicate, archive-UI wording. Only
+/// disposable per-branch worktrees may be deleted from the archive;
+/// root checkouts can only have their archive ENTRY removed, never
+/// their files.
+pub(crate) fn refuse_archived_file_delete(
+    entry: &crate::state::ArchivedWorkspaceSnapshot,
+) -> Option<String> {
+    if is_undeletable_root(
+        entry.protected,
+        entry.workspace_kind.as_deref(),
+        entry.worktree_path.as_deref(),
+    ) {
+        Some(
+            "This entry is a project root checkout; its files can't be deleted from here."
+                .to_string(),
+        )
+    } else {
+        None
+    }
+}
+
+/// Central archivability decision: `Some(reason)` when `ws` must not
+/// be archived. Pure and shared by every archive surface (Tauri
+/// command, control socket, MCP tool) so the rules can't drift.
+///
+/// - Attach-in-place workspaces have no local files to keep and their
+///   close is a detach (the host process keeps running) — "archive and
+///   restore later" semantics don't apply.
+/// - Remote (pushed-to-host) workspaces are managed from the
+///   Workspaces Overview; archiving would strand the tunnel/daemon
+///   lifecycle. The frontend gives remote rows a plain close instead.
+pub(crate) fn archive_refusal_reason(
+    ws: &crate::state::WorkspaceSnapshot,
+) -> Option<String> {
+    if ws.attach_only {
+        return Some(
+            "Attach-in-place workspaces can't be archived — close them from the \
+             workspaces overview."
+                .to_string(),
+        );
+    }
+    if ws.host_id.is_some() {
+        return Some(
+            "Remote workspaces can't be archived — they're managed from the \
+             Workspaces Overview. Pull the workspace back to this device first."
+                .to_string(),
+        );
+    }
+    None
+}
+
+/// Shared archive implementation behind the Tauri command and the
+/// `archive_workspace` control-socket command (exposed via the MCP
+/// `workspace_archive` tool).
+///
+/// Archiving = the exact existing close path (teardown scripts, PTY
+/// termination, sync reconcile — with `remove_worktree=false`, so the
+/// files, worktree, and branch stay untouched) plus an
+/// `ArchivedWorkspaceSnapshot` remembering how to restore it. The entry
+/// is built BEFORE the close (the workspace is gone from state after)
+/// but added only AFTER the close succeeded, so a failed teardown never
+/// produces a phantom archive entry.
+pub(crate) async fn archive_workspace_impl(
+    app: tauri::AppHandle,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    workspace_id: String,
+) -> Result<String, String> {
+    let ws = state
+        .find_workspace(&workspace_id)
+        .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+    if let Some(reason) = archive_refusal_reason(&ws) {
+        return Err(reason);
+    }
+
+    let entry = crate::state::build_archive_entry(&ws);
+    let archive_id = entry.archive_id.clone();
+
+    // remove_worktree=false + force_delete=None: teardown scripts run
+    // and their failure aborts the archive; files/branch are untouched.
+    close_workspace_with_worktree_impl(
+        app.clone(),
+        state,
+        db,
+        workspace_id,
+        false,
+        None,
+        None,
+    )
+    .await?;
+
+    state.add_archived_workspace(entry);
+    // The close impl already emitted, but that snapshot predates the
+    // entry — emit again so the archive list appears in the same user
+    // action (and the debounced persist picks it up).
+    crate::state::emit_app_state(&app);
+    Ok(archive_id)
+}
+
+/// Shared restore implementation behind the Tauri command and the
+/// `unarchive_workspace` control-socket command (MCP
+/// `workspace_unarchive`). Returns the restored workspace's id.
+///
+/// The archive entry is only removed after the restore succeeded — any
+/// error path keeps it so the user can retry (or delete it explicitly).
+pub(crate) async fn unarchive_workspace_impl(
+    app: tauri::AppHandle,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    pty_state: &crate::terminal::PtyState,
+    presets: &crate::presets::PresetStoreState,
+    archive_id: String,
+) -> Result<String, String> {
+    let entry = state
+        .find_archived_workspace(&archive_id)
+        .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
+
+    // A live workspace already at this location (the user re-opened it
+    // by hand, or another device restored it) — don't create a
+    // duplicate, just switch to it and retire the entry. A worktree
+    // entry matches ONLY on worktree_path; a root entry (no worktree)
+    // matches only a live workspace that ALSO has no worktree at the
+    // same cwd. A bare cwd match must not count for worktree entries:
+    // a live worktree workspace can share the root's cwd, and matching
+    // it would silently "restore" the wrong workspace.
+    let existing = {
+        let snapshot = state.snapshot();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|w| {
+                if entry.worktree_path.is_some() {
+                    w.worktree_path == entry.worktree_path
+                } else {
+                    w.cwd == entry.cwd && w.worktree_path.is_none()
+                }
+            })
+            .map(|w| w.workspace_id.0.clone())
+    };
+    if let Some(existing_id) = existing {
+        activate_workspace_impl(app.clone(), state, db, existing_id.clone())?;
+        let _ = state.remove_archived_workspace(&archive_id);
+        crate::state::emit_app_state(&app);
+        return Ok(existing_id);
+    }
+
+    let restored_id = if let Some(ref wt_path) = entry.worktree_path {
+        // Per-branch worktree entry: restore through the SAME creation
+        // path the branch-picker fork flow uses.
+        // `git_create_worktree`'s reuse-on-disk behavior hands back the
+        // existing directory when it's still registered for this
+        // branch; when the directory is gone but the branch survives,
+        // it checks the branch out into a fresh worktree at the
+        // conventional path.
+        let repo_path = entry
+            .project_root
+            .clone()
+            .or_else(|| {
+                crate::config::workspace_config::find_git_root(Path::new(&entry.cwd))
+                    .map(|p| p.display().to_string())
+            })
+            .ok_or_else(|| {
+                "Can't restore this workspace: its repository root is no longer known."
+                    .to_string()
+            })?;
+        let branch = entry.git_branch.clone().ok_or_else(|| {
+            "Can't restore this workspace: no branch was recorded for its worktree."
+                .to_string()
+        })?;
+
+        // Pre-flight on the blocking pool (the existence check shells
+        // out to git): with BOTH the directory and the branch gone
+        // there is nothing to rebuild the workspace from, and
+        // `git worktree add` would only fail with a cryptic ref error
+        // later. `git_branch_exists` covers local AND all-remote refs
+        // in one show-ref call — unlike the previous branch-list scan,
+        // which returned non-origin remote branches qualified
+        // ("upstream/feature/x") and so never matched a shortname.
+        let restorable = {
+            let wt_path = wt_path.clone();
+            let repo_path = repo_path.clone();
+            let branch = branch.clone();
+            tokio::task::spawn_blocking(move || {
+                Path::new(&wt_path).exists()
+                    || crate::git::git_branch_exists(Path::new(&repo_path), &branch)
+            })
+            .await
+            .map_err(|e| format!("unarchive pre-flight task join failed: {e}"))?
+        };
+        if !restorable {
+            return Err(
+                "Nothing left to restore: the worktree and its branch no longer exist."
+                    .to_string(),
+            );
+        }
+
+        let id = create_worktree_workspace_impl(
+            app.clone(),
+            state,
+            db,
+            pty_state,
+            presets,
+            repo_path,
+            branch,
+            /*new_branch=*/ false,
+            /*base=*/ None,
+            "single".to_string(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        // The creation path titles the workspace after its branch;
+        // restore whatever the user had (possibly a rename).
+        state.rename_workspace(&id, entry.title.clone());
+        id
+    } else {
+        // Repo-root / plain-folder entry: restore through the same path
+        // the "Add repository" flow uses (`create_workspace` with an
+        // explicit cwd), which re-stamps project_root / project_uid /
+        // `protected` via the normal create pipeline.
+        if !Path::new(&entry.cwd).exists() {
+            return Err(format!(
+                "Nothing left to restore: {} no longer exists on disk.",
+                entry.cwd
+            ));
+        }
+        let id = create_workspace_impl(app.clone(), state, db, Some(entry.cwd.clone())).await?;
+        state.rename_workspace(&id, entry.title.clone());
+        id
+    };
+
+    let _ = state.remove_archived_workspace(&archive_id);
+    activate_workspace_impl(app.clone(), state, db, restored_id.clone())?;
+    crate::state::emit_app_state(&app);
+    Ok(restored_id)
+}
+
+/// Shared delete implementation behind the Tauri command. Removes the
+/// archive entry; for disposable worktree entries it can also remove
+/// the worktree directory (and optionally its branch) with an honest
+/// force flag — force_delete=false keeps `git_remove_worktree`'s
+/// dirty/unpushed guard live, and its error keeps the entry so nothing
+/// is lost silently.
+pub(crate) async fn delete_archived_workspace_impl(
+    app: tauri::AppHandle,
+    state: &AppStateStore,
+    archive_id: String,
+    delete_worktree: bool,
+    delete_branch: bool,
+    force_delete: bool,
+) -> Result<(), String> {
+    let entry = state
+        .find_archived_workspace(&archive_id)
+        .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
+
+    if delete_worktree {
+        // Root checkouts and entries without a worktree must never have
+        // files deleted from here — an explicit delete_worktree=true
+        // for such an entry is refused loudly (entry kept) instead of
+        // being silently downgraded, so the caller learns the rule.
+        if let Some(reason) = refuse_archived_file_delete(&entry) {
+            return Err(reason);
+        }
+        // Guarded by the refusal above: worktree_path is Some here.
+        let wt_path = entry.worktree_path.clone().unwrap_or_default();
+        let branch_to_delete = if delete_branch {
+            entry.git_branch.clone()
+        } else {
+            None
+        };
+        // Recursive directory delete — blocking pool, same rationale as
+        // the close path. Errors (including the dirty/unpushed guard
+        // when force_delete=false) propagate and keep the entry.
+        tokio::task::spawn_blocking(move || {
+            crate::git::git_remove_worktree(
+                Path::new(&wt_path),
+                branch_to_delete.as_deref(),
+                force_delete,
+            )
+        })
+        .await
+        .map_err(|e| format!("git_remove_worktree task join failed: {e}"))??;
+    }
+
+    state.remove_archived_workspace(&archive_id)?;
+    crate::state::emit_app_state(&app);
+    Ok(())
+}
+
+// `async fn` so the close path's teardown scripts and git subprocesses
+// run off the GTK main thread — same rationale as `close_workspace`.
+#[tauri::command]
+pub async fn archive_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
+    workspace_id: String,
+) -> Result<String, String> {
+    archive_workspace_impl(app, &state, &db, workspace_id).await
+}
+
+// `async fn` for the same reason as `create_worktree_workspace`: the
+// restore path can run `git worktree add` + the git-info gather.
+#[tauri::command]
+pub async fn unarchive_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
+    pty_state: State<'_, crate::terminal::PtyState>,
+    presets: State<'_, crate::presets::PresetStoreState>,
+    archive_id: String,
+) -> Result<String, String> {
+    unarchive_workspace_impl(app, &state, &db, &pty_state, &presets, archive_id).await
+}
+
+// `async fn` because deleting a worktree is a recursive filesystem
+// delete — same rationale as `close_workspace_with_worktree`.
+#[tauri::command]
+pub async fn delete_archived_workspace(
+    app: tauri::AppHandle,
+    state: State<'_, AppStateStore>,
+    archive_id: String,
+    delete_worktree: bool,
+    delete_branch: bool,
+    force_delete: bool,
+) -> Result<(), String> {
+    delete_archived_workspace_impl(
+        app,
+        &state,
+        archive_id,
+        delete_worktree,
+        delete_branch,
+        force_delete,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -2692,5 +3124,187 @@ mod git_info_tests {
             .find(|w| w.workspace_id.0 == workspace_id.0)
             .expect("workspace exists");
         assert_eq!(ws.git_branch.as_deref(), Some("main"));
+    }
+}
+
+#[cfg(test)]
+mod archive_guard_tests {
+    //! Coverage for the pure file-deletion guards behind the archive
+    //! feature. `close_workspace_with_worktree_impl` and
+    //! `delete_archived_workspace_impl` both take an `AppHandle` (out of
+    //! reach for unit tests — same constraint as the Phase 1.6 close
+    //! tests above), so the refusal decisions are factored into pure
+    //! functions and pinned here. The impls call these verbatim, so a
+    //! regression in either function fails these tests immediately.
+
+    use super::*;
+    use crate::state::{build_archive_entry, AppStateStore};
+
+    /// A realistic `WorkspaceSnapshot` to mutate per case: built through
+    /// the real store constructor so every non-guard field carries the
+    /// shape production code produces.
+    fn sample_workspace() -> crate::state::WorkspaceSnapshot {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_at_path(PathBuf::from("/tmp/archive-guard"));
+        store
+            .snapshot()
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws_id)
+            .cloned()
+            .expect("workspace exists")
+    }
+
+    /// The shared predicate both refusal wrappers delegate to: any of
+    /// protected / kind "main" / missing worktree_path marks an
+    /// undeletable root, and only the unprotected-worktree combination
+    /// is deletable.
+    #[test]
+    fn is_undeletable_root_truth_table() {
+        assert!(is_undeletable_root(true, Some("worktree"), Some("/tmp/wt")));
+        assert!(is_undeletable_root(false, Some("main"), Some("/tmp/wt")));
+        assert!(is_undeletable_root(false, None, None));
+        assert!(is_undeletable_root(false, Some("worktree"), None));
+        assert!(
+            !is_undeletable_root(false, Some("worktree"), Some("/tmp/wt")),
+            "an unprotected per-branch worktree is the one deletable case"
+        );
+        assert!(!is_undeletable_root(false, None, Some("/tmp/wt")));
+    }
+
+    /// The live-workspace guard shares the predicate, so kind "main"
+    /// now refuses on the close path too (it used to be archive-only).
+    #[test]
+    fn refuses_worktree_removal_for_main_kind_workspace() {
+        let mut ws = sample_workspace();
+        ws.protected = false;
+        ws.worktree_path = Some("/tmp/archive-guard-wt".into());
+        ws.workspace_kind = Some("main".into());
+
+        assert!(
+            refuse_worktree_removal(&ws).is_some(),
+            "a kind=main workspace must refuse file removal even when unprotected"
+        );
+    }
+
+    #[test]
+    fn refuses_worktree_removal_for_protected_workspace() {
+        let mut ws = sample_workspace();
+        ws.protected = true;
+        ws.worktree_path = Some("/tmp/archive-guard-wt".into());
+
+        let reason = refuse_worktree_removal(&ws)
+            .expect("protected workspace must refuse worktree removal");
+        assert!(
+            reason.contains("root checkout"),
+            "unexpected refusal message: {reason}"
+        );
+    }
+
+    #[test]
+    fn refuses_worktree_removal_without_worktree_path() {
+        let mut ws = sample_workspace();
+        ws.protected = false;
+        ws.worktree_path = None;
+
+        assert!(
+            refuse_worktree_removal(&ws).is_some(),
+            "a workspace without its own worktree must refuse file removal"
+        );
+    }
+
+    #[test]
+    fn allows_worktree_removal_for_disposable_worktree() {
+        let mut ws = sample_workspace();
+        ws.protected = false;
+        ws.worktree_path = Some("/tmp/archive-guard-wt".into());
+
+        assert!(
+            refuse_worktree_removal(&ws).is_none(),
+            "an unprotected per-branch worktree is the one deletable case"
+        );
+    }
+
+    #[test]
+    fn refuses_archived_file_delete_for_protected_entry() {
+        let mut ws = sample_workspace();
+        ws.protected = true;
+        ws.worktree_path = Some("/tmp/archive-guard-wt".into());
+        ws.workspace_kind = Some("worktree".into());
+        let entry = build_archive_entry(&ws);
+
+        let reason = refuse_archived_file_delete(&entry)
+            .expect("protected entry must refuse file deletion");
+        assert!(
+            reason.contains("project root checkout"),
+            "unexpected refusal message: {reason}"
+        );
+    }
+
+    #[test]
+    fn refuses_archived_file_delete_for_main_kind_and_missing_worktree() {
+        // kind "main" refuses even if a worktree_path somehow exists…
+        let mut ws = sample_workspace();
+        ws.protected = false;
+        ws.worktree_path = Some("/tmp/archive-guard-wt".into());
+        ws.workspace_kind = Some("main".into());
+        assert!(refuse_archived_file_delete(&build_archive_entry(&ws)).is_some());
+
+        // …and a missing worktree_path refuses even with kind None.
+        ws.worktree_path = None;
+        ws.workspace_kind = None;
+        assert!(refuse_archived_file_delete(&build_archive_entry(&ws)).is_some());
+    }
+
+    #[test]
+    fn allows_archived_file_delete_for_disposable_worktree_entry() {
+        let mut ws = sample_workspace();
+        ws.protected = false;
+        ws.worktree_path = Some("/tmp/archive-guard-wt".into());
+        ws.workspace_kind = Some("worktree".into());
+
+        assert!(
+            refuse_archived_file_delete(&build_archive_entry(&ws)).is_none(),
+            "an unprotected worktree entry is the one deletable case"
+        );
+    }
+
+    #[test]
+    fn archive_refuses_attach_only_workspace() {
+        let mut ws = sample_workspace();
+        ws.attach_only = true;
+
+        let reason = archive_refusal_reason(&ws)
+            .expect("attach-in-place workspaces must refuse archiving");
+        assert!(
+            reason.contains("Attach-in-place"),
+            "unexpected refusal message: {reason}"
+        );
+    }
+
+    #[test]
+    fn archive_refuses_remote_workspace() {
+        let mut ws = sample_workspace();
+        ws.attach_only = false;
+        ws.host_id = Some(42);
+
+        let reason = archive_refusal_reason(&ws)
+            .expect("pushed-to-host workspaces must refuse archiving");
+        assert!(
+            reason.contains("Remote workspaces can't be archived"),
+            "unexpected refusal message: {reason}"
+        );
+    }
+
+    #[test]
+    fn archive_allows_plain_local_workspace() {
+        let mut ws = sample_workspace();
+        ws.attach_only = false;
+        ws.host_id = None;
+
+        assert!(
+            archive_refusal_reason(&ws).is_none(),
+            "an ordinary local workspace must be archivable"
+        );
     }
 }

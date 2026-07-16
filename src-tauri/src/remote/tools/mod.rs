@@ -419,6 +419,12 @@ fn workspace_update(params: &Value, store: &WorkspaceStore) -> ToolResult {
 fn workspace_close(params: &Value, store: &WorkspaceStore) -> ToolResult {
     let input: IdInput =
         serde_json::from_value(params.clone()).map_err(|e| ToolError::invalid(e.to_string()))?;
+    // Registry-only: `WorkspaceStore::close` deletes the SQLite row and
+    // touches nothing on disk, so the protected-root file-deletion
+    // guard the desktop close path enforces
+    // (`commands::workspace::refuse_worktree_removal`) has no
+    // equivalent here — there are no files this tool could delete. If a
+    // future revision adds worktree removal, it must adopt that guard.
     store.close(&input.id).map_err(workspace_err)?;
     Ok(json!({ "closed": input.id }))
 }

@@ -26,6 +26,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  Archive,
   ArrowLeft,
   Palette,
   Code2,
@@ -134,7 +135,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, Star } from "lucide-react";
 
-type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "archive" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
@@ -157,6 +158,10 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
     { id: "terminal", label: "Terminal", icon: TerminalSquare },
     { id: "presets", label: "Presets", icon: Zap },
     { id: "projects", label: "Projects", icon: FolderCog },
+    // Archived workspaces — the restore/delete surface for everything
+    // archived from the sidebar. Sits next to Projects because both
+    // manage the workspace lifecycle rather than personal preferences.
+    { id: "archive", label: "Archive", icon: Archive },
     { id: "git", label: "Git", icon: GitBranch },
     { id: "agent", label: "Agent", icon: Bot },
     ...(agentChatEnabled
@@ -209,11 +214,12 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
 const ALL_SECTION_IDS: Section[] = [
   "beta_features",
   "account", "appearance", "editor", "terminal", "presets", "projects",
-  "git", "agent", "permissions", "skills", "mcp", "hosts", "remote_access",
-  "browser", "shortcuts", "notifications", "session_restore",
+  "archive", "git", "agent", "permissions", "skills", "mcp", "hosts",
+  "remote_access", "browser", "shortcuts", "notifications", "session_restore",
 ];
 
 import { KeybindEditor } from "./keybind-editor";
+import { ArchiveSection } from "./archive-section";
 import { BetaFeaturesSection } from "./beta-features-section";
 import { HostsSection } from "./hosts-section";
 import { RemoteAccessSection } from "./remote-access-section";
@@ -2026,6 +2032,17 @@ export function SettingsView() {
           <McpSection projectRoot={projectRoot} />
         ) : (
           <BetaFeaturesSection />
+        );
+
+      case "archive":
+        return (
+          <div>
+            <SectionHeader
+              title="Archive"
+              description="Workspaces archived from the sidebar. Files, branches, and worktrees stay on disk until you delete them here — unarchive to bring a workspace back exactly where it was."
+            />
+            <ArchiveSection />
+          </div>
         );
 
       case "browser":

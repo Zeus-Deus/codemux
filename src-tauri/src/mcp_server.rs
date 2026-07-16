@@ -698,7 +698,7 @@ fn register_tools() -> Vec<McpTool> {
         // -- Lifecycle + issue tools (Phase 1.6 vexis-agent integration) --
         McpTool {
             name: "workspace_close",
-            description: "Close a workspace by id. Runs teardown scripts, terminates PTYs, releases the workspace's virtual display, and removes Codemux's entry from the workspace's `.mcp.json`. Optionally also removes the underlying git worktree.",
+            description: "Close a workspace by id. Runs teardown scripts, terminates PTYs, releases the workspace's virtual display, and removes Codemux's entry from the workspace's `.mcp.json`. Optionally also removes the underlying git worktree. Protected project-root checkouts can NEVER have their files deleted through this tool — `delete_worktree: true` on such a workspace errors; use `workspace_archive` instead to close it restorably.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -708,7 +708,7 @@ fn register_tools() -> Vec<McpTool> {
                     },
                     "delete_worktree": {
                         "type": "boolean",
-                        "description": "When true AND the workspace is backed by a git worktree, also runs `git worktree remove` after closing. No effect for non-worktree workspaces. Defaults to false.",
+                        "description": "When true AND the workspace is backed by a disposable git worktree, also runs `git worktree remove` after closing. Refused (with an error) for protected project-root checkouts and workspaces without a worktree. Defaults to false.",
                         "default": false
                     },
                     "delete_branch": {
@@ -718,11 +718,47 @@ fn register_tools() -> Vec<McpTool> {
                     },
                     "force_delete": {
                         "type": "boolean",
-                        "description": "Skip teardown scripts. Defaults to false (teardown errors abort the close).",
+                        "description": "Skip teardown scripts AND override the dirty-worktree safety check: without it, `delete_worktree` refuses to remove a worktree that has uncommitted changes or unpushed commits. Defaults to false.",
                         "default": false
                     }
                 },
                 "required": ["workspace_id"]
+            }),
+        },
+        McpTool {
+            name: "workspace_archive",
+            description: "Archive a workspace: close it (teardown scripts, PTY termination — exactly like `workspace_close` without `delete_worktree`) while keeping its files, worktree, and branch on disk, and record a restorable archive entry. Returns the new `archive_id`. Use `workspace_unarchive` to bring it back and `workspace_archive_list` to browse entries. Attach-in-place (remote, no local files) workspaces can't be archived.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "workspace_id": {
+                        "type": "string",
+                        "description": "Id of the workspace to archive (from `workspace_list` / `app_status`)."
+                    }
+                },
+                "required": ["workspace_id"]
+            }),
+        },
+        McpTool {
+            name: "workspace_unarchive",
+            description: "Restore an archived workspace by `archive_id` (from `workspace_archive_list`). Reuses the on-disk worktree/folder when it still exists (recreating the worktree from its branch if only the directory is gone), spawns sessions, and activates the restored workspace. Returns the new `workspace_id`. Errors — keeping the entry — when nothing is left to restore.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "archive_id": {
+                        "type": "string",
+                        "description": "Id of the archive entry to restore (from `workspace_archive_list`)."
+                    }
+                },
+                "required": ["archive_id"]
+            }),
+        },
+        McpTool {
+            name: "workspace_archive_list",
+            description: "List archived workspaces. Each entry has `archive_id`, the original `workspace_id`, `title`, `cwd`, optional `worktree_path` / `project_root` / `git_branch`, `workspace_kind` (\"main\" or \"worktree\"), `protected`, and `archived_at` (unix seconds). Pass an entry's `archive_id` to `workspace_unarchive` to restore it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
             }),
         },
         McpTool {
@@ -1332,6 +1368,29 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
                 call_socket("close_workspace", params).await
             }
         }
+        "workspace_archive" => {
+            let workspace_id = arguments
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if workspace_id.is_empty() {
+                Err("workspace_archive: missing required argument 'workspace_id'".to_string())
+            } else {
+                call_socket("archive_workspace", json!({ "workspace_id": workspace_id })).await
+            }
+        }
+        "workspace_unarchive" => {
+            let archive_id = arguments
+                .get("archive_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if archive_id.is_empty() {
+                Err("workspace_unarchive: missing required argument 'archive_id'".to_string())
+            } else {
+                call_socket("unarchive_workspace", json!({ "archive_id": archive_id })).await
+            }
+        }
+        "workspace_archive_list" => call_socket("list_archived_workspaces", json!({})).await,
         "pane_close" => {
             let pane_id = arguments
                 .get("pane_id")
@@ -1792,13 +1851,18 @@ mod tests {
     fn tool_registry_has_all_tools() {
         let tools = register_tools();
         // Tool count bumped from 39 → 44 with the Phase 1.6 lifecycle +
-        // issue tools, then 44 → 52 with the eight automation tools.
-        // Keep this number in sync with register_tools() when adding
-        // new entries.
-        assert_eq!(tools.len(), 52);
+        // issue tools, then 44 → 52 with the eight automation tools,
+        // then 52 → 55 with the workspace-archive tools
+        // (workspace_archive / workspace_unarchive /
+        // workspace_archive_list). Keep this number in sync with
+        // register_tools() when adding new entries.
+        assert_eq!(tools.len(), 55);
         let names: Vec<&str> = tools.iter().map(|t| t.name).collect();
         assert!(names.contains(&"browser_navigate"));
         assert!(names.contains(&"browser_click"));
+        assert!(names.contains(&"workspace_archive"));
+        assert!(names.contains(&"workspace_unarchive"));
+        assert!(names.contains(&"workspace_archive_list"));
         assert!(names.contains(&"browser_fill"));
         assert!(names.contains(&"browser_screenshot"));
         assert!(names.contains(&"workspace_list"));
@@ -1943,9 +2007,10 @@ mod tests {
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         // Bumped 39 → 44 with the Phase 1.6 lifecycle + issue tools,
-        // then 44 → 52 with the eight automation tools. See
+        // then 44 → 52 with the eight automation tools, then 52 → 55
+        // with the workspace-archive tools. See
         // tool_registry_has_all_tools for the canonical count.
-        assert_eq!(tools.len(), 52);
+        assert_eq!(tools.len(), 55);
         for tool in tools {
             assert!(tool.get("name").is_some());
             assert!(tool.get("description").is_some());

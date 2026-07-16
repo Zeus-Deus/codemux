@@ -5330,6 +5330,7 @@ mod tests {
             notifications: Vec::new(),
             pane_statuses: std::collections::HashMap::new(),
             agent_browser_sessions: Vec::new(),
+            archived_workspaces: Vec::new(),
         }
     }
 

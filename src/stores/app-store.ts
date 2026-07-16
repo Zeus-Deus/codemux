@@ -300,8 +300,32 @@ export interface ProjectGroup {
   workspaces: WorkspaceSnapshot[];
 }
 
-export function resolveProjectRoot(ws: WorkspaceSnapshot): string {
+/** Derive the project root for grouping: `project_root`, `cwd` fallback.
+ *  Accepts anything carrying the two fields (live `WorkspaceSnapshot`s
+ *  and `ArchivedWorkspaceSnapshot`s alike) so every surface groups by
+ *  the same key. */
+export function resolveProjectRoot(ws: {
+  project_root?: string | null;
+  cwd: string;
+}): string {
   return ws.project_root || ws.cwd;
+}
+
+/**
+ * The single label rule for a project root: the dedicated "Home" label
+ * when the root IS the user's home directory, the path basename
+ * otherwise. Shared by the sidebar grouping and Settings → Archive so
+ * both surfaces name a project identically. (Duplicate-basename
+ * disambiguation is a collision post-pass in `groupWorkspacesByProject`,
+ * layered on top of this rule.)
+ */
+export function projectDisplayName(
+  projectPath: string,
+  homeDir: string | null,
+): string {
+  return homeDir !== null && projectPath === homeDir
+    ? "Home"
+    : basename(projectPath);
 }
 
 /**
@@ -343,10 +367,7 @@ export function groupWorkspacesByProject(
 
   for (const ws of workspaces) {
     const projectPath = resolveProjectRoot(ws);
-    const isHomeRooted = homeDir !== null && projectPath === homeDir;
-    const projectName = isHomeRooted
-      ? "Home"
-      : basename(projectPath);
+    const projectName = projectDisplayName(projectPath, homeDir);
 
     if (!groups.has(projectPath)) {
       groups.set(projectPath, { name: projectName, path: projectPath, workspaces: [] });

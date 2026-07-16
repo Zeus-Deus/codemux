@@ -426,6 +426,41 @@ export const closeWorkspaceWithWorktree = (
 ) =>
   invoke<void>("close_workspace_with_worktree", { workspaceId, removeWorktree, deleteBranch, forceDelete });
 
+// ── Workspace archive ──
+//
+// Archiving removes a workspace from the sidebar and records an entry in
+// `archived_workspaces`; the files, branch, and worktree on disk are left
+// untouched. Works for every workspace kind, including the protected repo
+// root. Rejects with a message for attach-in-place workspaces.
+
+/** Archive a workspace. Resolves with the new archive entry's id, which
+ *  `unarchiveWorkspace` accepts to restore it. */
+export const archiveWorkspace = (workspaceId: string) =>
+  invoke<string>("archive_workspace", { workspaceId });
+
+/** Restore an archived workspace. Resolves with the restored workspace id;
+ *  the backend also activates it. Rejects (entry kept) when nothing is
+ *  left on disk to restore. */
+export const unarchiveWorkspace = (archiveId: string) =>
+  invoke<string>("unarchive_workspace", { archiveId });
+
+/** Permanently drop an archive entry, optionally deleting the worktree
+ *  (and branch) from disk. Protected/root entries refuse
+ *  `deleteWorktree`; a dirty worktree with `forceDelete=false` rejects
+ *  with a message matching /use force/i so the UI can escalate. */
+export const deleteArchivedWorkspace = (
+  archiveId: string,
+  deleteWorktree: boolean,
+  deleteBranch: boolean,
+  forceDelete: boolean,
+) =>
+  invoke<void>("delete_archived_workspace", {
+    archiveId,
+    deleteWorktree,
+    deleteBranch,
+    forceDelete,
+  });
+
 export const getWorkspaceConfig = (path: string) =>
   invoke<WorkspaceConfig | null>("get_workspace_config", { path });
 

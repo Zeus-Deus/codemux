@@ -835,6 +835,29 @@ export interface WorkspaceSnapshot {
   attach_only?: boolean;
 }
 
+/** A workspace that was archived out of the sidebar. The entry records
+ *  everything needed to restore the workspace later (or delete its
+ *  worktree/branch for good); the files, branch, and worktree on disk
+ *  are untouched by the archive action itself. */
+export interface ArchivedWorkspaceSnapshot {
+  archive_id: string;
+  workspace_id: string;
+  title: string;
+  cwd: string;
+  worktree_path: string | null;
+  project_root: string | null;
+  project_uid: string | null;
+  workspace_kind: "main" | "worktree" | null;
+  git_branch: string | null;
+  /** True for the repo's protected default-branch root checkout — its
+   *  files can never be deleted through the archive, only the entry
+   *  itself can be removed. */
+  protected: boolean;
+  is_git: boolean;
+  /** Unix seconds when the workspace was archived. */
+  archived_at: number;
+}
+
 export interface PersistenceSchema {
   schema_version: number;
   stores_layout_metadata: boolean;
@@ -885,6 +908,9 @@ export interface AppStateSnapshot {
   notifications: NotificationSnapshot[];
   detected_ports: PortInfoSnapshot[];
   pane_statuses: Record<string, PaneStatus>;
+  /** Archived (hidden-but-restorable) workspaces. Optional — older
+   *  snapshots persisted without the field; treat missing as `[]`. */
+  archived_workspaces?: ArchivedWorkspaceSnapshot[];
   persistence: PersistenceSchema;
   config: CodemuxConfigSnapshot;
 }

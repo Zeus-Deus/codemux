@@ -15,6 +15,7 @@ import {
   detectEditors,
   closeWorkspaceWithWorktree,
 } from "@/tauri/commands";
+import { runDeleteWithForceToast } from "@/hooks/use-force-delete";
 import logomark from "@/assets/codemux-logomark.svg";
 
 function Kbd({ children }: { children: React.ReactNode }) {
@@ -93,9 +94,14 @@ export function EmptyWorkspaceState() {
       `Delete workspace "${ws?.title || "this workspace"}"?`,
     );
     if (!confirmed) return;
-    closeWorkspaceWithWorktree(workspaceId, true, false, false).catch(
-      console.error,
-    );
+    // Backend refusals (dirty worktree, protected repo root) must not
+    // fail silently. The helper toasts the backend message; a dirty
+    // refusal gets a "Force delete" toast action that reissues with
+    // forceDelete=true.
+    void runDeleteWithForceToast({
+      run: (force) =>
+        closeWorkspaceWithWorktree(workspaceId, true, false, force),
+    });
   }, [workspaceId, ws?.title]);
 
   return (
