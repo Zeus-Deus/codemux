@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Star } from "lucide-react";
 
 import {
@@ -164,6 +164,10 @@ interface Props {
    * user from choosing a model the backend will reject.
    */
   allowedProviders?: ReadonlyArray<AgentChatProviderKind>;
+  /** Imperative open request — increments each time the composer's
+   *  `/model` slash command fires. `0` / `undefined` means "no
+   *  request yet"; any increment pops the picker open. */
+  openSignal?: number;
 }
 
 interface ResolvedRow {
@@ -185,10 +189,24 @@ export function MultiProviderModelPicker({
   onProviderModelChange,
   disabled,
   allowedProviders,
+  openSignal,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [railKey, setRailKey] = useState<RailKey>(provider);
   const [query, setQuery] = useState("");
+
+  // Consume the open signal exactly once per increment. Tracking the
+  // last-seen value in a ref (instead of gating on `openSignal &&
+  // !disabled`) prevents the picker from spontaneously reopening every
+  // time `disabled` flips back to false — e.g. on session start/restart
+  // — after `/model` has been used once in the pane's lifetime.
+  const lastSignal = useRef(openSignal);
+  useEffect(() => {
+    if (openSignal !== lastSignal.current) {
+      lastSignal.current = openSignal;
+      if (!disabled) setOpen(true);
+    }
+  }, [openSignal, disabled]);
   // Filter the providers list once per render. Memoized via the
   // identity of `allowedProviders` so consumers passing a stable
   // array reference (the common case) don't churn the rail.

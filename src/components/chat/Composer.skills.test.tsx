@@ -17,16 +17,20 @@ vi.mock("@/tauri/commands", async (importActual) => {
   return {
     ...actual,
     listSkills: vi.fn(),
+    listChatSlashCommands: vi.fn(),
   };
 });
 
 import { Composer } from "./Composer";
-import { listSkills } from "@/tauri/commands";
+import { listChatSlashCommands, listSkills } from "@/tauri/commands";
+import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import { useSkillsStore } from "@/stores/skills-store";
 
 type ComposerProps = ComponentProps<typeof Composer>;
 
 const listSkillsMock = listSkills as unknown as ReturnType<typeof vi.fn>;
+const listChatSlashCommandsMock =
+  listChatSlashCommands as unknown as ReturnType<typeof vi.fn>;
 
 function makeSkill(overrides: Partial<Skill> = {}): Skill {
   return {
@@ -118,6 +122,12 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
   beforeEach(() => {
     resetSkillsStore();
     listSkillsMock.mockReset();
+    // Provider command discovery rides the same popup-open trigger as
+    // skills; resolve it empty so skills-focused assertions (footer
+    // tone, group contents) aren't perturbed by the COMMANDS group.
+    useProviderCommandsStore.getState().invalidate();
+    listChatSlashCommandsMock.mockReset();
+    listChatSlashCommandsMock.mockResolvedValue([]);
   });
 
   afterEach(() => cleanup());

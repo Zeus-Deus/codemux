@@ -146,7 +146,38 @@ The chat pane stack:
     (`Dialog`, Esc / click-outside). `resolveAssetSrc` normalises both
     forms: `data:` URLs (fresh optimistic send) pass through untouched,
     absolute paths (hydrated) go through `convertFileSrc`.
-- **Slash command popup** with cross-provider parsing.
+- **Slash command popup** with cross-provider parsing. Five groups:
+  - **MODES** — `/plan`, `/ask`, `/debug` (state-only mode-pill
+    activation, typed text stripped) plus `/default` (returns to
+    normal build mode; only listed while a non-default mode is
+    active). Built in `buildModeCommands`
+    (`src/lib/agent-chat/slash-commands.ts`).
+  - **WORKFLOWS** — `/workflow` (Claude-gated; inserts literal text).
+  - **SETTINGS** — `/model` (GUI-local: strips the typed text and pops
+    the footer's model picker via an incrementing `openSignal` prop on
+    `ModelPicker` / `MultiProviderModelPicker`; the composer skips its
+    usual textarea refocus for this pick so the popover isn't
+    dismissed by focus-outside). Built in `buildModelCommand`.
+  - **SKILLS** — dynamic, from the skills registry (unchanged).
+  - **COMMANDS** — **provider-native slash commands, discovered live**
+    (never hardcoded). The claude-agent sidecar's `list-commands`
+    JSON-RPC method opens a transient SDK `query()` (same lifecycle as
+    `list-models`, but with `settingSources: ["user","project","local"]`)
+    and returns `supportedCommands()` — the deployed CLI's built-ins
+    (`/compact`, `/clear`, `/init`, `/review`, `/context`, …) plus
+    custom `~/.claude/commands` and `<cwd>/.claude/commands` entries.
+    Rust side: `agent_provider/claude/slash_commands.rs`
+    (`ClaudeSlashCommandCache`, per-cwd, app-lifetime, errors not
+    cached) behind the `list_chat_slash_commands` Tauri command
+    (Codex/OpenCode resolve to an empty list — no discovery surface).
+    Frontend: `provider-commands-store.ts` (lazy load on first popup
+    open, 60s TTL, keyed `(provider, cwd)`), `buildProviderCommands`
+    (case-preserving map + reserved-name filter: collisions with
+    modes / `/workflow` / `/model` / skill names are dropped so the
+    local behaviour wins). Selecting a provider command inserts the
+    literal `/name ` text (same mechanics as skills/`/workflow`); the
+    text is forwarded verbatim and the provider interprets the leading
+    slash itself — Codemux never executes provider commands locally.
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
   compat. Server-side sync (see `docs/features/skills-sync.md`).
 - **MCP host runtime** (Step 9): Codemux discovers user-installed MCP

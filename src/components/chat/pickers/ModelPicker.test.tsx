@@ -283,3 +283,54 @@ describe("ModelPicker — interaction", () => {
     expect((arg as string).length).toBeGreaterThan(0);
   });
 });
+
+describe("ModelPicker — openSignal", () => {
+  const renderSignal = (openSignal: number, disabled: boolean) =>
+    render(
+      <TooltipProvider>
+        <ModelPicker
+          provider="claude"
+          value={null}
+          onChange={vi.fn()}
+          openSignal={openSignal}
+          disabled={disabled}
+        />
+      </TooltipProvider>,
+    );
+
+  it("consumes the signal once — re-enabling after a consumed signal does not reopen", async () => {
+    // Signal arrives while the picker is disabled → stays closed.
+    const { rerender } = renderSignal(1, true);
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+
+    // Session becomes ready (`disabled` → false) WITHOUT a new signal.
+    // The old effect reopened on every `disabled` transition; consuming
+    // the signal via a ref keeps the picker closed here.
+    rerender(
+      <TooltipProvider>
+        <ModelPicker
+          provider="claude"
+          value={null}
+          onChange={vi.fn()}
+          openSignal={1}
+          disabled={false}
+        />
+      </TooltipProvider>,
+    );
+    expect(screen.queryAllByRole("option")).toHaveLength(0);
+
+    // A genuine new `/model` press (incremented signal) still opens it.
+    rerender(
+      <TooltipProvider>
+        <ModelPicker
+          provider="claude"
+          value={null}
+          onChange={vi.fn()}
+          openSignal={2}
+          disabled={false}
+        />
+      </TooltipProvider>,
+    );
+    expect(await screen.findAllByRole("option")).not.toHaveLength(0);
+  });
+});

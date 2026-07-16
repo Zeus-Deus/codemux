@@ -2,13 +2,17 @@ import type * as React from "react";
 
 import {
   Bug,
+  Cpu,
   ListTodo,
   MessageCircleQuestion,
+  RotateCcw,
+  SquareSlash,
   Workflow,
   type LucideIcon,
 } from "lucide-react";
 
 import type { ChatMode } from "@/stores/agent-chat-store";
+import type { ProviderSlashCommand } from "@/tauri/commands";
 import type { ActivePillMode } from "@/components/chat/pickers/ModePill";
 
 /**
@@ -238,17 +242,26 @@ interface BuildModeCommandsArgs {
   activeMode: ChatMode;
   /** Called when the user picks one of the mode items. */
   onActivate: (mode: ActivePillMode) => void;
+  /** Called when the user picks `/default` to return to normal build
+   *  mode. Optional so existing call sites keep compiling; the
+   *  `/default` row only renders when this is provided AND a
+   *  non-default mode is active (it's a no-op otherwise). */
+  onDeactivate?: () => void;
 }
 
 /**
  * Build the `MODES` group of slash items.
  *
  * The active mode is filtered out so the popup never shows a no-op
- * choice. When `mode === "default"`, all three modes are shown.
+ * choice. When `mode === "default"`, all three modes are shown and
+ * the `/default` row is omitted; when a mode is active, `/default`
+ * appears so the mode can be dropped without reaching for the pill's
+ * × button (parity with multi-provider chat clients).
  */
 export function buildModeCommands({
   activeMode,
   onActivate,
+  onDeactivate,
 }: BuildModeCommandsArgs): SlashCommandItem[] {
   const all: SlashCommandItem[] = [
     {
@@ -279,6 +292,17 @@ export function buildModeCommands({
       onSelect: () => onActivate("debug"),
     },
   ];
+  if (activeMode !== "default" && onDeactivate) {
+    all.push({
+      id: "mode:default",
+      label: "Default",
+      description: "Back to normal build mode",
+      command: "/default",
+      icon: RotateCcw,
+      group: "MODES",
+      onSelect: onDeactivate,
+    });
+  }
   return all.filter((item) => item.id !== `mode:${activeMode}`);
 }
 
@@ -314,6 +338,73 @@ export function buildWorkflowCommand({
     disabled: !isClaude,
     onSelect: () => {},
   };
+}
+
+interface BuildModelCommandArgs {
+  /** Called when the user picks `/model`. The composer opens the
+   *  model-picker popover in the footer — the typed text is stripped
+   *  (state-only activation, same handling as mode picks). */
+  onOpen: () => void;
+}
+
+/**
+ * Build the `/model` row — a GUI-local built-in that opens the
+ * footer's model picker instead of sending anything to the agent.
+ * Parity with multi-provider chat clients whose `/model` clears the
+ * draft and pops the picker.
+ */
+export function buildModelCommand({
+  onOpen,
+}: BuildModelCommandArgs): SlashCommandItem {
+  return {
+    id: "composer:model",
+    label: "Model",
+    description: "Switch the model for this thread",
+    command: "/model",
+    icon: Cpu,
+    group: "SETTINGS",
+    onSelect: onOpen,
+  };
+}
+
+interface BuildProviderCommandsArgs {
+  /** Provider-native commands discovered live from the provider (e.g.
+   *  Claude Code's `/compact`, `/init`, `/review`, custom
+   *  `.claude/commands` entries). Never hardcoded. */
+  commands: ProviderSlashCommand[];
+  /** Lowercased command names already claimed by Codemux-local rows
+   *  (modes, `/workflow`, `/model`, skills). Collisions are dropped
+   *  from the provider group — the local behaviour wins because it's
+   *  what the user sees highlighted and expanded client-side. */
+  reservedNames: ReadonlySet<string>;
+}
+
+/**
+ * Build the `COMMANDS` group of slash items from the provider's
+ * discovered command list.
+ *
+ * Selecting one only ever inserts the literal `/name ` text into the
+ * draft (same mechanics as `/workflow` and skills); the text is
+ * forwarded verbatim to the provider, which interprets the leading
+ * slash itself. Codemux never executes provider commands locally.
+ */
+export function buildProviderCommands({
+  commands,
+  reservedNames,
+}: BuildProviderCommandsArgs): SlashCommandItem[] {
+  return commands
+    .filter((c) => !reservedNames.has(c.name.toLowerCase()))
+    .map((c) => ({
+      id: `provider-command:${c.name}`,
+      label: c.name,
+      description:
+        c.description ||
+        (c.argumentHint ? `/${c.name} ${c.argumentHint}` : "Provider command"),
+      command: `/${c.name}`,
+      icon: SquareSlash,
+      group: "COMMANDS",
+      onSelect: () => {},
+    }));
 }
 
 /** Cycle order for Shift+Tab: default → plan → ask → debug → default. */
