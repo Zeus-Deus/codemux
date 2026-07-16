@@ -36,7 +36,7 @@ const DARK_SETTINGS: UserSettings = {
   notifications: { sound_enabled: false, desktop_enabled: true },
   file_tree: { show_hidden_files: true },
   session_restore: { enabled: true, scrollback_lines: 10000, max_total_mb: 100 },
-  agent_chat: { checkpoints_enabled: true, background_browser_desktop_viewport: true },
+  agent_chat: { checkpoints_enabled: true, background_browser_desktop_viewport: false },
 };
 
 describe("synced-settings-store", () => {
@@ -271,11 +271,11 @@ describe("synced-settings-store", () => {
 
     it("selectBackgroundBrowserDesktopViewport returns boolean", () => {
       useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
-      expect(selectBackgroundBrowserDesktopViewport(useSyncedSettingsStore.getState())).toBe(true);
+      expect(selectBackgroundBrowserDesktopViewport(useSyncedSettingsStore.getState())).toBe(false);
     });
 
-    it("selectBackgroundBrowserDesktopViewport defaults to false", () => {
-      expect(selectBackgroundBrowserDesktopViewport(useSyncedSettingsStore.getState())).toBe(false);
+    it("selectBackgroundBrowserDesktopViewport defaults to true", () => {
+      expect(selectBackgroundBrowserDesktopViewport(useSyncedSettingsStore.getState())).toBe(true);
     });
   });
 
