@@ -14,10 +14,17 @@ import {
   buildFileResolvedContent,
   buildFolderResolvedContent,
   buildImageDisplaySources,
-  buildImagePayloads,
+  buildImageRefs,
   buildIssueResolvedContent,
   buildPrResolvedContent,
+  imageAttachmentIds,
+  unstagedImageAttachments,
 } from "@/lib/agent-chat/attachment-block";
+import {
+  awaitImageStaging,
+  beginImageStaging,
+  discardStagedImage,
+} from "@/lib/agent-chat/image-staging";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
@@ -76,6 +83,7 @@ import {
   getGithubPrByPath,
   getGithubPrDiffByPath,
   grepCountPattern,
+  primeChatMcp,
   readFileForAttachment,
   readFolderForAttachment,
   type AgentChatSessionConfigUpdate,
@@ -447,6 +455,20 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const draft = slice?.inputDraft ?? "";
   const messages = slice?.messages ?? EMPTY_MESSAGES;
   const streaming = slice?.streaming ?? false;
+
+  // Warm the MCP servers once when a fresh (empty) chat pane mounts, so
+  // the prime cost overlaps the user composing rather than blocking the
+  // first `agent_chat_start_session`. Fire-and-forget; guarded so it runs
+  // at most once per pane mount and only for a not-yet-started thread.
+  const primedMcpRef = useRef(false);
+  useEffect(() => {
+    if (primedMcpRef.current) return;
+    if (messages.length > 0) return;
+    primedMcpRef.current = true;
+    void primeChatMcp().catch(() => {
+      /* best-effort */
+    });
+  }, [messages.length]);
   // Dead-run detection (issue #154): the stall notice + interrupted /
   // Continue affordances read straight off the thread slice.
   const stalled = slice?.stalled ?? null;
@@ -1165,15 +1187,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const attachmentBlock = buildAttachmentBlock(
         activeAttachments(rawText, liveAttachments),
       );
-      // Stage 6 — images travel as native multimodal content blocks at
-      // the SDK layer, NOT inside the text body. We pass the resolved
-      // bytes through `images` on SendTurnInput; the Rust adapters
-      // translate to provider-specific shapes (Claude `image/base64`,
-      // Codex `image_url` data URI).
-      const imagePayloads = buildImagePayloads(liveAttachments);
-      // The same images as `data:` URLs, attached to the
-      // optimistic bubble so the sent turn shows its thumbnails (the
-      // bytes only live in memory until the backend persists them).
+      // Images travel as native multimodal content blocks at the SDK
+      // layer, NOT inside the text body. They were staged to disk at
+      // attach time (`agent_chat_stage_image`), so the turn carries only
+      // `{ path, media_type }` references — the raw bytes never marshal
+      // across IPC as a JSON `number[]` (the multi-minute first-send
+      // stall). The `data:` URLs for the optimistic bubble are built from
+      // the still-in-memory bytes so the thumbnail shows immediately.
       const imageDisplaySources = buildImageDisplaySources(liveAttachments);
       const sdkText = applyAllPrefixes(
         rawText,
@@ -1201,7 +1221,33 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // as a side effect, so restore the user's in-progress text. Staged
         // chips are left untouched (no `clearStagedAttachments` below).
         setInputDraft(threadId, composerDraft);
-      } else {
+      }
+      // Images stage at attach time, so normally already done; await only
+      // stragglers (paste-then-Enter). Re-read fresh store state afterward
+      // because staging patches land on new attachment objects the
+      // submit-time snapshot doesn't reflect.
+      const imageIds = imageAttachmentIds(liveAttachments);
+      if (imageIds.length > 0) await awaitImageStaging(imageIds);
+      const freshAttachments = isContinue
+        ? []
+        : useAgentChatStore.getState().threads[threadId]?.stagedAttachments ?? [];
+      const unstaged = unstagedImageAttachments(freshAttachments);
+      if (unstaged.length > 0) {
+        // A staged image never landed (upload failed). The raw-bytes
+        // fallback is gone, so block the send rather than silently drop
+        // the image: roll the optimistic bubble back, restore the
+        // composer, and leave the chip (with its error) for the user.
+        removeUserMessageByNonce(threadId, clientNonce, preSendInterrupted);
+        setInputDraft(threadId, rawText);
+        toast.error(
+          "An attached image failed to upload — remove it and try again.",
+        );
+        sendInFlightRef.current = false;
+        setIsSending(false);
+        return;
+      }
+      const imageRefs = buildImageRefs(freshAttachments);
+      if (!isContinue) {
         // Clear chips per-turn (matches the inputDraft = "" reset that
         // appendUserMessage already does for the textarea).
         clearStagedAttachments(threadId);
@@ -1209,7 +1255,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const input = {
         thread_id: threadId,
         text: sdkText,
-        images: imagePayloads,
+        images: imageRefs,
         model_override: null,
         effort_override: plan.effortOverride,
         client_nonce: clientNonce,
@@ -1661,6 +1707,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             fetchedAt: Date.now(),
           },
         });
+        // Stage the bytes to disk NOW (off the send path) so the first
+        // send doesn't marshal them across IPC. Patches the chip with
+        // `stagedImage` when it lands, or a chip error if it fails.
+        beginImageStaging(threadId, id, bytes, file.type);
       } catch (err) {
         updateStagedAttachment(threadId, id, {
           metadata: {
@@ -2499,52 +2549,102 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     const plan = planSubmit({ rawText, provider, effort });
     sendInFlightRef.current = true;
     setIsSending(true);
+
+    // Instant feedback (Bug 2 fix): mirror the warm-send pattern — build
+    // the display thumbnails, append the optimistic user bubble into THIS
+    // pane's thread, and clear the composer BEFORE the multi-second
+    // worktree-create + session-start work. Previously the composer sat
+    // dead (text still visible, no bubble) until all of that finished.
+    // A client nonce lets us roll the bubble back on failure; on success
+    // we drop it here and let the freshly-prestarted thread's own
+    // optimistic bubble carry over as the pane flips.
+    const snapshotAttachments = threadId
+      ? useAgentChatStore.getState().threads[threadId]?.stagedAttachments ?? []
+      : [];
+    const imageDisplaySources = buildImageDisplaySources(snapshotAttachments);
+    const clientNonce =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    if (threadId) {
+      appendUserMessage(threadId, plan.text, clientNonce, imageDisplaySources);
+      setInputDraft(threadId, "");
+      requestScrollToBottom();
+    }
+
+    /** Roll the optimistic bubble back and restore the composer text so a
+     *  failed first send never strands an orphan bubble or eats the
+     *  user's prompt. Mirrors the warm-send / Continue-run rollback. */
+    const rollback = () => {
+      if (threadId) {
+        removeUserMessageByNonce(threadId, clientNonce);
+        setInputDraft(threadId, rawText);
+      }
+    };
+
     void (async () => {
       try {
-        const wsId = await createDeferredWorktree(
+        const created = await createDeferredWorktree(
           workspaceProjectRoot,
           worktreeName,
           baseBranch,
           rawText,
         );
-        const prestarted = await prestartWorktreeSession(wsId, {
-          model,
-          // Same plan/ask coupling as materialize's
-          // `effectivePermissionMode`: both modes boot the SDK with
-          // writes locked off.
-          permissionMode:
-            mode === "plan" || mode === "ask"
-              ? "plan"
-              : permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE,
-          effort,
-          contextWindow,
-          mode,
-        });
+        const prestarted = await prestartWorktreeSession(
+          created.workspaceId,
+          {
+            model,
+            // Same plan/ask coupling as materialize's
+            // `effectivePermissionMode`: both modes boot the SDK with
+            // writes locked off.
+            permissionMode:
+              mode === "plan" || mode === "ask"
+                ? "plan"
+                : permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE,
+            effort,
+            contextWindow,
+            mode,
+          },
+          // Skip the `waitForWorkspaceCwd` poll when the create response
+          // already carries the new worktree's cwd.
+          created.cwd,
+        );
         if (!prestarted) {
           // Degenerate: the new workspace hasn't hydrated into the
           // store (event-delivery reordering). The worktree exists but
-          // there is no session to send into — keep the user's text in
-          // THIS composer and just flip over; they can re-send in the
-          // new pane (its mount-effect starts the session).
+          // there is no session to send into — restore the composer text
+          // (and drop the optimistic bubble) and just flip over; the
+          // user can re-send in the new pane (its mount-effect starts the
+          // session).
+          rollback();
           toast.warning(
             "Worktree created — send your message again in the new workspace.",
           );
           useChatDraftStore.getState().setActiveDraft(null);
-          activateWorkspace(wsId).catch(console.error);
+          activateWorkspace(created.workspaceId).catch(console.error);
           return;
         }
         const skillBodies = resolveSkillBodies(rawText, skillsRegistry);
-        const liveSlice = threadId
-          ? useAgentChatStore.getState().threads[threadId]
-          : undefined;
-        const liveAttachments = liveSlice?.stagedAttachments ?? [];
+        // Images staged at attach time; await only stragglers, then read
+        // fresh so staging patches (new attachment objects) are visible.
+        const imageIds = imageAttachmentIds(snapshotAttachments);
+        if (imageIds.length > 0) await awaitImageStaging(imageIds);
+        const freshAttachments = threadId
+          ? useAgentChatStore.getState().threads[threadId]?.stagedAttachments ??
+            []
+          : [];
+        const unstaged = unstagedImageAttachments(freshAttachments);
+        if (unstaged.length > 0) {
+          rollback();
+          toast.error(
+            "An attached image failed to upload — remove it and try again.",
+          );
+          return;
+        }
         const attachmentBlock = buildAttachmentBlock(
-          activeAttachments(rawText, liveAttachments),
+          activeAttachments(rawText, freshAttachments),
         );
-        const imagePayloads = buildImagePayloads(liveAttachments);
-        // Display shape (`data:` URLs) for the optimistic
-        // bubble's thumbnails in the freshly-prestarted thread.
-        const imageDisplaySources = buildImageDisplaySources(liveAttachments);
+        const imageRefs = buildImageRefs(freshAttachments);
         const sdkText = applyAllPrefixes(
           rawText,
           mode,
@@ -2565,20 +2665,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         await agentChatSendTurn(provider, {
           thread_id: prestarted.threadId,
           text: sdkText,
-          images: imagePayloads,
+          images: imageRefs,
           model_override: null,
           effort_override: plan.effortOverride,
           permission_mode_override: null,
         });
-        // Success — clean this pane's composer/chips and flip to the
-        // new workspace.
+        // Success — drop this pane's optimistic bubble + chips (the new
+        // thread carries its own bubble now) and flip to the new
+        // workspace.
         if (threadId) {
-          setInputDraft(threadId, "");
+          removeUserMessageByNonce(threadId, clientNonce);
           clearStagedAttachments(threadId);
         }
         useChatDraftStore.getState().setActiveDraft(null);
-        activateWorkspace(wsId).catch(console.error);
+        activateWorkspace(created.workspaceId).catch(console.error);
       } catch (err) {
+        rollback();
         toast.error(`Failed to start in a new worktree: ${err}`);
       } finally {
         sendInFlightRef.current = false;
@@ -2598,6 +2700,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     worktreeName,
     baseBranch,
     skillsRegistry,
+    appendUserMessage,
+    removeUserMessageByNonce,
+    requestScrollToBottom,
     setInputDraft,
     clearStagedAttachments,
   ]);
@@ -2694,6 +2799,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       stagedAttachments={stagedAttachments}
       onRemoveAttachment={(id) => {
         if (!threadId) return;
+        // Best-effort delete of the backend staging file if this chip
+        // was an image that already staged.
+        const staged = useAgentChatStore
+          .getState()
+          .threads[threadId]?.stagedAttachments.find((a) => a.id === id)
+          ?.stagedImage;
+        if (staged) discardStagedImage(staged.path);
         removeStagedAttachment(threadId, id);
       }}
       onToggleExpandPr={handleToggleExpandPr}

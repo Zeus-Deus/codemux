@@ -19,6 +19,17 @@ vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echo"),
+  // MCP warmup fired on the draft surface mount; no-op in tests. Image
+  // staging commands are imported by the image-staging helper but only
+  // invoked when a test stages an image (none here).
+  primeChatMcp: vi.fn().mockResolvedValue(undefined),
+  stageChatImage: vi
+    .fn()
+    .mockResolvedValue({ path: "/staging/x.png", media_type: "image/png" }),
+  discardStagedChatImage: vi.fn().mockResolvedValue(undefined),
+  readChatImage: vi
+    .fn()
+    .mockResolvedValue({ bytes: new Uint8Array(), media_type: "image/png" }),
   // Step 8 Stage 2 — Composer's mention popup useEffect calls
   // `listProjectFiles` whenever `@` is open; default to an empty
   // resolution so the popup-not-opened tests don't flap.

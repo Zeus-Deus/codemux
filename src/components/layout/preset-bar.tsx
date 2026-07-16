@@ -349,6 +349,7 @@ function PresetBarImpl({
         markSendFailed: state.markSendFailed,
         ensureThread: chat.ensureThread,
         appendUserMessage: chat.appendUserMessage,
+        removeUserMessageByNonce: chat.removeUserMessageByNonce,
         setModel: chat.setModel,
         setPermissionMode: chat.setPermissionMode,
         setSessionLaunchMode: chat.setSessionLaunchMode,

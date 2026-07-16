@@ -78,8 +78,12 @@ export interface PrestartedWorktreeSession {
 export async function prestartWorktreeSession(
   workspaceId: string,
   config: PrestartSessionConfig = {},
+  /** Pre-resolved cwd from the create response (contract item 6). When
+   *  provided, skips the `waitForWorkspaceCwd` poll entirely; `null` /
+   *  omitted falls back to the poll. */
+  knownCwd: string | null = null,
 ): Promise<PrestartedWorktreeSession | null> {
-  const cwd = await waitForWorkspaceCwd(workspaceId);
+  const cwd = knownCwd ?? (await waitForWorkspaceCwd(workspaceId));
   if (!cwd) {
     console.warn(
       "[prestart-worktree-session] workspace cwd never reached the store; " +

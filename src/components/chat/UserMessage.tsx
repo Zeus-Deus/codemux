@@ -1,4 +1,4 @@
-import { memo, useState } from "react";
+import { memo, useCallback, useState } from "react";
 import { CornerDownLeft, ImageOff, X } from "lucide-react";
 
 import {
@@ -6,9 +6,71 @@ import {
   DialogContent,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { resolveAssetSrc } from "@/lib/asset-url";
+import { isAbsoluteFsPath, resolveAssetSrc } from "@/lib/asset-url";
+import { readChatImage } from "@/tauri/commands";
 import type { UserMessageImage, UserMessageItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
+
+/**
+ * Blob URLs for images that couldn't load via the asset protocol and
+ * had to be read back over IPC (`readChatImage`). Keyed by the original
+ * absolute fs path so every card referencing the same hydrated image
+ * shares one object URL. Deliberately not revoked (a shared URL a live
+ * `<img>` may still point at); bounded so a very long session can't leak
+ * unboundedly.
+ */
+const blobUrlCache = new Map<string, string>();
+const BLOB_CACHE_MAX = 64;
+
+/**
+ * Resolve an image `src` to something the webview can render, with an
+ * IPC-read fallback. `data:` URLs and successfully asset-converted paths
+ * render directly; when an absolute fs path fails to load (dev mock /
+ * web-remote can't reach the asset protocol) we read the bytes over IPC
+ * and render a blob URL instead, only surfacing the broken-image
+ * placeholder when that also fails.
+ */
+function useImageWithFallback(rawSrc: string): {
+  src: string | undefined;
+  failed: boolean;
+  onError: () => void;
+} {
+  const resolved = resolveAssetSrc(rawSrc, null);
+  const [blobSrc, setBlobSrc] = useState<string | null>(
+    () => blobUrlCache.get(rawSrc) ?? null,
+  );
+  const [failed, setFailed] = useState(false);
+
+  const onError = useCallback(() => {
+    // The blob URL itself failed, or the source isn't a local path we can
+    // read back — give up and show the placeholder.
+    if (blobSrc || !isAbsoluteFsPath(rawSrc)) {
+      setFailed(true);
+      return;
+    }
+    const cached = blobUrlCache.get(rawSrc);
+    if (cached) {
+      setBlobSrc(cached);
+      return;
+    }
+    void (async () => {
+      try {
+        const { bytes, media_type } = await readChatImage(rawSrc);
+        const url = URL.createObjectURL(new Blob([bytes], { type: media_type }));
+        if (blobUrlCache.size >= BLOB_CACHE_MAX) {
+          const oldest = blobUrlCache.keys().next().value;
+          if (oldest !== undefined) blobUrlCache.delete(oldest);
+        }
+        blobUrlCache.set(rawSrc, url);
+        setBlobSrc(url);
+      } catch {
+        setFailed(true);
+      }
+    })();
+  }, [rawSrc, blobSrc]);
+
+  return { src: blobSrc ?? resolved, failed, onError };
+}
 
 /**
  * Right-aligned user bubble (design D3). Card fill, soft border, the
@@ -137,10 +199,9 @@ function ImageThumbnail({
   image: UserMessageImage;
   onOpen: () => void;
 }) {
-  const [errored, setErrored] = useState(false);
-  const src = resolveAssetSrc(image.src, null);
+  const { src, failed, onError } = useImageWithFallback(image.src);
 
-  if (errored || !src) {
+  if (failed || !src) {
     return (
       <div
         className="flex h-20 w-28 items-center justify-center rounded-lg border border-border/60 bg-muted/40 text-muted-foreground"
@@ -162,7 +223,7 @@ function ImageThumbnail({
         src={src}
         alt={image.mediaType ?? "attached image"}
         className="max-h-40 max-w-[200px] object-contain"
-        onError={() => setErrored(true)}
+        onError={onError}
       />
     </button>
   );
@@ -172,10 +233,9 @@ function ImageThumbnail({
  *  a path that reads at thumbnail size but fails at full size still
  *  degrades to a placeholder rather than a browser broken-image icon. */
 function LightboxImage({ image }: { image: UserMessageImage }) {
-  const [errored, setErrored] = useState(false);
-  const src = resolveAssetSrc(image.src, null);
+  const { src, failed, onError } = useImageWithFallback(image.src);
 
-  if (errored || !src) {
+  if (failed || !src) {
     return (
       <div className="flex h-[60vh] w-full flex-col items-center justify-center gap-2 rounded-lg bg-muted/40 text-muted-foreground">
         <ImageOff className="h-8 w-8 opacity-40" aria-hidden />
@@ -189,7 +249,7 @@ function LightboxImage({ image }: { image: UserMessageImage }) {
       src={src}
       alt={image.mediaType ?? "attached image"}
       className="mx-auto max-h-[88vh] w-auto max-w-full rounded-lg object-contain"
-      onError={() => setErrored(true)}
+      onError={onError}
     />
   );
 }
