@@ -110,22 +110,113 @@ pub fn generate_random_name(repo_path: &Path) -> String {
     deconflict_branch_name(&name, repo_path)
 }
 
+/// System prompt for the AI naming call. Kept terse and imperative so the
+/// model returns a bare token rather than a chatty sentence — models otherwise
+/// prepend prose ("Branch name only, as requested:\n\n...") that used to leak
+/// straight into the branch name.
+const AI_NAME_SYSTEM_PROMPT: &str = "You generate git branch names. Reply with ONLY a short lowercase hyphenated branch name of 2-4 words describing the task. No prose, no explanation, no punctuation other than hyphens, no code formatting or markdown.";
+
+/// Cap on how much of the user's first message we embed in the naming prompt.
+/// The branch name only needs the gist; an overlong message wastes tokens and
+/// distracts the model.
+const TASK_PROMPT_MAX_CHARS: usize = 400;
+
+/// Nested-session env vars the desktop app's own Claude Code session exports.
+/// We scrub them from the spawned naming CLI so it doesn't treat itself as a
+/// child of that session (which would pull in the parent's context).
+const NESTED_SESSION_ENV_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SSE_PORT",
+];
+
+/// Truncate `s` to at most `max_chars` characters on a char boundary,
+/// appending an ellipsis when truncation happened. Uses `char_indices` so we
+/// never slice through a multi-byte UTF-8 sequence (prompts are free text).
+fn truncate_on_char_boundary(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => format!("{}…", &s[..byte_idx]),
+        None => s.to_string(),
+    }
+}
+
+/// Extract a plausible branch-name token from raw CLI stdout.
+///
+/// Even with a strict system prompt, models sometimes wrap the answer in prose
+/// ("Branch name only:\n\nfoo-bar"), backticks, or `**bold**`. We scan
+/// non-empty lines, strip that decoration, and keep only lines that look like a
+/// single branch token: no internal whitespace and 2..=80 chars. The real
+/// answer is almost always last, after any preamble, so we return the LAST
+/// qualifying line. Returns `None` when nothing qualifies — the caller treats
+/// that like a CLI failure and falls back to a random name.
+pub fn extract_branch_candidate(raw: &str) -> Option<String> {
+    let mut candidate = None;
+    for line in raw.lines() {
+        // Strip surrounding whitespace, then code/emphasis decoration, then
+        // whitespace again in case the decoration hid some.
+        let stripped = line
+            .trim()
+            .trim_matches('`')
+            .trim_start_matches("**")
+            .trim_end_matches("**")
+            .trim();
+        if stripped.is_empty() || stripped.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let len = stripped.chars().count();
+        if !(2..=80).contains(&len) {
+            continue;
+        }
+        candidate = Some(stripped.to_string());
+    }
+    candidate
+}
+
 /// Use an AI CLI to generate a branch name from a prompt.
 /// Falls back to random on any failure.
 pub async fn generate_ai_name(prompt: &str, repo_path: &Path) -> String {
-    let meta_prompt = format!(
-        "Generate a short git branch name (2-4 words, hyphenated, lowercase) for this task: {}. Return ONLY the branch name, nothing else.",
-        prompt
-    );
+    let task = truncate_on_char_boundary(prompt, TASK_PROMPT_MAX_CHARS);
+    let meta_prompt = format!("Generate a git branch name for this task: {task}");
 
-    // Try claude first
-    match try_ai_cli("claude", &["--print"], &meta_prompt).await {
-        Ok(name) => {
-            let sanitized = sanitize_branch_name(&name);
-            if !sanitized.is_empty() {
-                return deconflict_branch_name(&sanitized, repo_path);
+    // Run hermetically: a neutral cwd, no inherited settings/memory/CLAUDE.md,
+    // no tools, no session persistence. Without this the CLI ran a full session
+    // in the app's cwd and pulled that directory's auto-memory/CLAUDE.md into
+    // the name, producing branch names about unrelated topics. Per-flag "why"
+    // follows in the args list.
+    let cwd = std::env::temp_dir();
+    let args = [
+        "--print",
+        // Load no user/project settings: no CLAUDE.md, auto-memory, skills,
+        // plugins, or MCP servers can bleed into the branch name.
+        "--setting-sources",
+        "",
+        // Don't write a transcript into ~/.claude/projects for these throwaway
+        // calls.
+        "--no-session-persistence",
+        // The model only needs to emit text; deny all tools.
+        "--disallowedTools",
+        "*",
+        "--system-prompt",
+        AI_NAME_SYSTEM_PROMPT,
+    ];
+
+    match try_ai_cli("claude", &args, &meta_prompt, NESTED_SESSION_ENV_VARS, &cwd).await {
+        Ok(raw) => match extract_branch_candidate(&raw) {
+            Some(candidate) => {
+                let sanitized = sanitize_branch_name(&candidate);
+                if !sanitized.is_empty() {
+                    return deconflict_branch_name(&sanitized, repo_path);
+                }
             }
-        }
+            None => {
+                let excerpt: String = raw.trim().chars().take(120).collect();
+                log::warn!(
+                    "AI branch naming produced no usable name, falling back to random: {excerpt:?}"
+                );
+            }
+        },
         Err(reason) => {
             log::warn!("AI branch naming failed, falling back to random name: {reason}");
         }
@@ -148,9 +239,23 @@ const STDERR_EXCERPT_LEN: usize = 200;
 /// Run an AI CLI with `prompt` on stdin. Returns the trimmed stdout on
 /// success, or `Err(reason)` describing why it failed (spawn error, timeout,
 /// non-zero exit, empty output) so callers can log a diagnosable reason.
-async fn try_ai_cli(binary: &str, args: &[&str], prompt: &str) -> Result<String, String> {
+///
+/// `env_scrub` names env vars to remove from the child (e.g. inherited
+/// nested-session markers), and `cwd` sets its working directory — both keep
+/// the call from picking up context from the desktop app's environment.
+async fn try_ai_cli(
+    binary: &str,
+    args: &[&str],
+    prompt: &str,
+    env_scrub: &[&str],
+    cwd: &Path,
+) -> Result<String, String> {
     let mut cmd = tokio::process::Command::new(binary);
     cmd.args(args);
+    cmd.current_dir(cwd);
+    for var in env_scrub {
+        cmd.env_remove(var);
+    }
     cmd.stdin(std::process::Stdio::piped());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
@@ -485,6 +590,8 @@ mod tests {
             "codemux-definitely-not-a-real-binary",
             &["--print"],
             "prompt",
+            &[],
+            &std::env::temp_dir(),
         )
         .await;
         let err = result.expect_err("nonexistent binary must fail to spawn");
@@ -492,6 +599,86 @@ mod tests {
             err.contains("failed to spawn"),
             "expected spawn-failure reason, got: {err}"
         );
+    }
+
+    #[test]
+    fn extract_plain_single_line_name() {
+        assert_eq!(
+            extract_branch_candidate("add-user-auth"),
+            Some("add-user-auth".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_strips_leading_prose_line() {
+        assert_eq!(
+            extract_branch_candidate("Branch name only, as requested:\n\nsome-feature-name"),
+            Some("some-feature-name".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_unwraps_backticked_name_after_prose() {
+        assert_eq!(
+            extract_branch_candidate(
+                "The user only wants a branch name back.\n\n`fix-review-feedback`"
+            ),
+            Some("fix-review-feedback".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_unwraps_bold_name() {
+        assert_eq!(
+            extract_branch_candidate("**investigate-full-access-approvals**"),
+            Some("investigate-full-access-approvals".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_rejects_pure_prose() {
+        // Every line has internal whitespace, so nothing qualifies.
+        assert_eq!(
+            extract_branch_candidate("Sure, here you go.\nHappy to help with that."),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_rejects_empty_and_whitespace() {
+        assert_eq!(extract_branch_candidate(""), None);
+        assert_eq!(extract_branch_candidate("   \n\t\n  "), None);
+    }
+
+    #[test]
+    fn extract_picks_last_plausible_over_trailing_prose() {
+        // The name comes first, then a prose sign-off; the prose line has
+        // whitespace and is skipped, so the name still wins.
+        assert_eq!(
+            extract_branch_candidate("some-name\nHope that helps!"),
+            Some("some-name".to_string())
+        );
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_short_input_unchanged() {
+        assert_eq!(truncate_on_char_boundary("short task", 400), "short task");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_appends_ellipsis() {
+        let input = "a".repeat(500);
+        let out = truncate_on_char_boundary(&input, 400);
+        assert_eq!(out.chars().count(), 401); // 400 chars + ellipsis
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_respects_multibyte() {
+        // Multi-byte chars must not be split mid-sequence.
+        let input = "🚀".repeat(10);
+        let out = truncate_on_char_boundary(&input, 4);
+        assert_eq!(out, "🚀🚀🚀🚀…");
     }
 
     #[test]
