@@ -1,14 +1,39 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { ComponentProps } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+// Provider slash-command discovery runs on every popup open. Mock the
+// IPC so the COMMANDS group resolves empty instead of hitting the
+// unmocked Tauri bridge (which rejects and leaves a sticky error entry
+// in the shared store that can bleed across tests).
+vi.mock("@/tauri/commands", async (importActual) => {
+  const actual = (await importActual()) as Record<string, unknown>;
+  return {
+    ...actual,
+    listChatSlashCommands: vi.fn(),
+  };
+});
+
 import { Composer } from "./Composer";
+import { listChatSlashCommands } from "@/tauri/commands";
+import { useProviderCommandsStore } from "@/stores/provider-commands-store";
 import type { ChatModelInfo } from "@/tauri/types";
 import type { Attachment } from "@/stores/agent-chat-store";
 
 type ComposerProps = ComponentProps<typeof Composer>;
+
+const listChatSlashCommandsMock =
+  listChatSlashCommands as unknown as ReturnType<typeof vi.fn>;
+
+beforeEach(() => {
+  // Reset the shared provider-commands cache + IPC mock so each test
+  // starts from a clean, empty-resolving COMMANDS group.
+  useProviderCommandsStore.getState().invalidate();
+  listChatSlashCommandsMock.mockReset();
+  listChatSlashCommandsMock.mockResolvedValue([]);
+});
 
 afterEach(() => cleanup());
 
@@ -631,6 +656,12 @@ describe("Composer", () => {
         "data-selected",
         "true",
       );
+      // The SETTINGS group's single `/model` row follows WORKFLOWS.
+      fireEvent.keyDown(textarea, { key: "ArrowDown" });
+      expect(getByTestId("slash-item-composer:model")).toHaveAttribute(
+        "data-selected",
+        "true",
+      );
       fireEvent.keyDown(textarea, { key: "ArrowDown" });
       // Wraps around to the top.
       expect(getByTestId("slash-item-mode:plan")).toHaveAttribute(
@@ -638,8 +669,8 @@ describe("Composer", () => {
         "true",
       );
       fireEvent.keyDown(textarea, { key: "ArrowUp" });
-      // Wraps from top to bottom, landing on the last item (/workflow).
-      expect(getByTestId("slash-item-workflow")).toHaveAttribute(
+      // Wraps from top to bottom, landing on the last item (/model).
+      expect(getByTestId("slash-item-composer:model")).toHaveAttribute(
         "data-selected",
         "true",
       );

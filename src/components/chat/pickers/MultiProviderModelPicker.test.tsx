@@ -920,3 +920,52 @@ describe("MultiProviderModelPicker — favorites", () => {
     expect(rows.length).toBeGreaterThan(0);
   });
 });
+
+describe("MultiProviderModelPicker — openSignal", () => {
+  const renderSignal = (openSignal: number, disabled: boolean) =>
+    render(
+      <MultiProviderModelPicker
+        provider="claude"
+        model="claude-opus-4-7"
+        onProviderModelChange={vi.fn()}
+        openSignal={openSignal}
+        disabled={disabled}
+      />,
+    );
+
+  const isOpen = () =>
+    screen.queryByPlaceholderText("Search models...") !== null;
+
+  it("consumes the signal once — re-enabling after a consumed signal does not reopen", async () => {
+    // Signal arrives while the picker is disabled → stays closed.
+    const { rerender } = renderSignal(1, true);
+    expect(isOpen()).toBe(false);
+
+    // Session becomes ready (`disabled` → false) WITHOUT a new signal.
+    // The old effect reopened on every `disabled` transition; consuming
+    // the signal via a ref keeps the picker closed here.
+    rerender(
+      <MultiProviderModelPicker
+        provider="claude"
+        model="claude-opus-4-7"
+        onProviderModelChange={vi.fn()}
+        openSignal={1}
+        disabled={false}
+      />,
+    );
+    expect(isOpen()).toBe(false);
+
+    // A genuine new `/model` press (incremented signal) still opens it.
+    rerender(
+      <MultiProviderModelPicker
+        provider="claude"
+        model="claude-opus-4-7"
+        onProviderModelChange={vi.fn()}
+        openSignal={2}
+        disabled={false}
+      />,
+    );
+    await screen.findByPlaceholderText("Search models...");
+    expect(isOpen()).toBe(true);
+  });
+});

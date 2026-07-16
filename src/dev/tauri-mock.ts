@@ -1611,6 +1611,55 @@ const handlers: Record<string, Handler> = {
   // send_turn answers with the channel-streamed mock reply.
   list_chat_provider_capabilities: (a) =>
     a.provider === "claude" ? CLAUDE_CAPABILITIES : EMPTY_CAPABILITIES,
+  // Provider slash commands — in production these are harvested live
+  // from the deployed Claude Code CLI (SDK `supportedCommands()`),
+  // including custom `.claude/commands` entries. The mock serves a
+  // representative subset so the composer's COMMANDS group renders.
+  list_chat_slash_commands: (a) =>
+    a.provider === "claude"
+      ? [
+          {
+            name: "compact",
+            description: "Clear conversation history but keep a summary in context",
+            argumentHint: "<optional summary instructions>",
+          },
+          {
+            name: "clear",
+            description: "Clear conversation history and free up context",
+            argumentHint: "",
+          },
+          {
+            name: "init",
+            description: "Initialize a new CLAUDE.md file with codebase documentation",
+            argumentHint: "",
+          },
+          {
+            name: "review",
+            description: "Review a pull request",
+            argumentHint: "",
+          },
+          {
+            name: "security-review",
+            description: "Complete a security review of the pending changes",
+            argumentHint: "",
+          },
+          {
+            name: "pr-comments",
+            description: "Get comments from a GitHub pull request",
+            argumentHint: "",
+          },
+          {
+            name: "release-notes",
+            description: "View release notes",
+            argumentHint: "<version>",
+          },
+          {
+            name: "todos",
+            description: "List current todo items",
+            argumentHint: "",
+          },
+        ]
+      : [],
   agent_chat_list_messages: (a) => {
     const threadId = a.threadId as string;
     if (threadId === MOCK_CHAT_THREAD_ID) return mockChatTranscript();

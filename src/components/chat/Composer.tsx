@@ -23,6 +23,8 @@ import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
 import {
   buildModeCommands,
+  buildModelCommand,
+  buildProviderCommands,
   buildWorkflowCommand,
   filterCommandMenuItems,
   filterSlashItems,
@@ -35,6 +37,10 @@ import {
   type SlashCommandItem,
 } from "@/lib/agent-chat/slash-commands";
 import type { Attachment, ChatMode } from "@/stores/agent-chat-store";
+import {
+  selectProviderCommands,
+  useProviderCommandsStore,
+} from "@/stores/provider-commands-store";
 import {
   selectActiveSkills,
   useSkillsStore,
@@ -408,8 +414,25 @@ export function Composer({
   const mcpToggleDisabled = useMcpStore((s) => s.toggleDisabled);
 
   const modeCommands = useMemo(
-    () => buildModeCommands({ activeMode: mode, onActivate: onModeActivate }),
-    [mode, onModeActivate],
+    () =>
+      buildModeCommands({
+        activeMode: mode,
+        onActivate: onModeActivate,
+        onDeactivate: onModeRemove,
+      }),
+    [mode, onModeActivate, onModeRemove],
+  );
+
+  // `/model` — GUI-local built-in. Picking it strips the typed text
+  // and pops the footer's model picker via an incrementing signal
+  // (state-only activation, same handling as mode picks).
+  const [modelPickerOpenSignal, setModelPickerOpenSignal] = useState(0);
+  const modelCommand = useMemo(
+    () =>
+      buildModelCommand({
+        onOpen: () => setModelPickerOpenSignal((n) => n + 1),
+      }),
+    [],
   );
 
   // `/workflow` — gated to the Claude provider (server-side runtime
@@ -454,9 +477,74 @@ export function Composer({
     [draft, skills, stagedAttachments],
   );
 
+  // ─── Provider slash commands (Claude Code built-ins + custom) ────
+  // Discovered live from the provider (SDK `supportedCommands()` via
+  // the sidecar's transient probe, cached backend-side per cwd) —
+  // never hardcoded. Lazy-loaded on first popup open, same shape as
+  // skills. Picking one inserts the literal `/name ` text into the
+  // draft; the provider interprets the leading slash at send time.
+  const providerCommandsEntry = useProviderCommandsStore(
+    useMemo(() => selectProviderCommands(provider, cwd), [provider, cwd]),
+  );
+  const loadProviderCommands = useProviderCommandsStore(
+    (s) => s.loadCommands,
+  );
+
+  // Names already claimed by Codemux-local rows. A provider command
+  // with a colliding name is dropped — the local behaviour (mode
+  // pill, workflow, skill expansion) wins.
+  const reservedCommandNames = useMemo(() => {
+    const names = new Set<string>([
+      "plan",
+      "ask",
+      "debug",
+      "default",
+      "model",
+      "workflow",
+    ]);
+    for (const skill of skills) names.add(skill.name.toLowerCase());
+    return names;
+  }, [skills]);
+
+  const providerCommandItems = useMemo(
+    () =>
+      buildProviderCommands({
+        commands: providerCommandsEntry.commands,
+        reservedNames: reservedCommandNames,
+      }),
+    [providerCommandsEntry.commands, reservedCommandNames],
+  );
+
+  // Provider-native commands are forwarded to the provider verbatim,
+  // and the provider only interprets a slash command when it *leads*
+  // the message. So the COMMANDS group is offered only when the `/`
+  // starts the draft (ignoring leading whitespace). A `/` typed
+  // mid-message still opens the popup for Codemux-local rows (modes,
+  // `/model`, `/workflow`, skills — all handled client-side) but omits
+  // provider commands the provider would ignore anyway.
+  const slashLeadsMessage = useMemo(
+    () =>
+      slashAnchor !== null &&
+      draft.slice(0, slashAnchor.start).trim().length === 0,
+    [slashAnchor, draft],
+  );
+
   const allSlashItems = useMemo(
-    () => [...modeCommands, workflowCommand, ...skillItems],
-    [modeCommands, workflowCommand, skillItems],
+    () => [
+      ...modeCommands,
+      workflowCommand,
+      modelCommand,
+      ...skillItems,
+      ...(slashLeadsMessage ? providerCommandItems : []),
+    ],
+    [
+      modeCommands,
+      workflowCommand,
+      modelCommand,
+      skillItems,
+      providerCommandItems,
+      slashLeadsMessage,
+    ],
   );
 
   // Surface skill-loading + skill-error in the popup footer so the user
@@ -468,11 +556,35 @@ export function Composer({
     if (skillsError) {
       return { tone: "error" as const, message: `Skills: ${skillsError}` };
     }
+    // Command loading/error only surfaces when the COMMANDS group is
+    // actually offered (leading `/`) — mirrors the allSlashItems gate
+    // so a mid-message popup never reports a group it won't show.
+    if (slashLeadsMessage && providerCommandsEntry.error) {
+      return {
+        tone: "error" as const,
+        message: `Commands: ${providerCommandsEntry.error}`,
+      };
+    }
     if (skillsLoading && !skillsLoaded) {
       return { tone: "muted" as const, message: "Loading skills…" };
     }
+    if (
+      slashLeadsMessage &&
+      providerCommandsEntry.loading &&
+      !providerCommandsEntry.loaded
+    ) {
+      return { tone: "muted" as const, message: "Loading commands…" };
+    }
     return null;
-  }, [skillsError, skillsLoading, skillsLoaded]);
+  }, [
+    skillsError,
+    skillsLoading,
+    skillsLoaded,
+    slashLeadsMessage,
+    providerCommandsEntry.error,
+    providerCommandsEntry.loading,
+    providerCommandsEntry.loaded,
+  ]);
 
   const filteredItems = useMemo(
     () => filterSlashItems(allSlashItems, slashAnchor?.query ?? ""),
@@ -496,13 +608,18 @@ export function Composer({
   // context) or explicit Esc.
   const slashOpen = slashAnchor !== null;
 
-  // First-open lazy load. The store guards against double-fetch via TTL +
-  // in-flight loading flag, so re-firing this effect on every open is
-  // harmless and keeps the popup snappy after the initial scan.
+  // First-open lazy load. The store guards against double-fetch via its
+  // loaded + in-flight loading flags, so re-firing this effect on every
+  // open is harmless and keeps the popup snappy after the initial scan.
   useEffect(() => {
     if (!slashOpen) return;
     void loadSkills(cwd ?? null);
-  }, [slashOpen, cwd, loadSkills]);
+    // Provider command discovery rides the same first-open trigger.
+    // The store's lifetime cache + backend per-cwd cache make re-fires
+    // cheap; a null cwd (Home draft, no project anchored) is a no-op
+    // inside the store.
+    void loadProviderCommands(provider, cwd ?? null);
+  }, [slashOpen, cwd, loadSkills, loadProviderCommands, provider]);
 
   // ─── Mention popup: debounced file fetch ─────────────────────────
   // Fires on every query change while the popup is open. The 100ms
@@ -1463,13 +1580,18 @@ export function Composer({
       const before = draft.slice(0, slashAnchor.start);
       const after = draft.slice(slashAnchor.start + consumedLength);
 
-      if (item.id.startsWith("skill:") || item.id === "workflow") {
-        // Cursor-style inline expansion. Replace the typed `/<query>`
-        // with the full `/<skill-name> ` or `/workflow ` (trailing
-        // space so the user can keep typing context after the token
-        // without an extra keystroke). The mirror overlay highlights
-        // skill tokens; `/workflow` is handled server-side by the
-        // Claude runtime — this composer only ever inserts the text.
+      if (
+        item.id.startsWith("skill:") ||
+        item.id.startsWith("provider-command:") ||
+        item.id === "workflow"
+      ) {
+        // Inline token expansion. Replace the typed `/<query>` with
+        // the full `/<skill-name> `, `/workflow `, or provider
+        // `/<command> ` (trailing space so the user can keep typing
+        // context after the token without an extra keystroke). The
+        // mirror overlay highlights skill tokens; `/workflow` and
+        // provider commands are handled by the provider runtime —
+        // this composer only ever inserts the text.
         const tokenName = item.command.replace(/^\//, "");
         const insertion = `/${tokenName}${after.startsWith(" ") ? "" : " "}`;
         const next = before + insertion + after;
@@ -1487,7 +1609,13 @@ export function Composer({
         // Mode picks (and any future non-text-token items) strip the
         // typed `/<query>` because the activation is state-only.
         onDraftChange(before + after);
-        requestAnimationFrame(() => textareaRef.current?.focus());
+        // `/model` hands focus to the footer's model-picker popover —
+        // refocusing the textarea here would immediately dismiss it
+        // (Radix closes on focus-outside). Every other state-only pick
+        // returns focus to the textarea so the user keeps typing.
+        if (item.id !== "composer:model") {
+          requestAnimationFrame(() => textareaRef.current?.focus());
+        }
       }
     } else {
       requestAnimationFrame(() => textareaRef.current?.focus());
@@ -2264,6 +2392,7 @@ export function Composer({
             controlsDisabled={!sessionReady}
             onAttachClick={handleAttachClick}
             attachOpen={attachOpen}
+            modelPickerOpenSignal={modelPickerOpenSignal}
           />
         </div>
         {belowComposerSlot ? (

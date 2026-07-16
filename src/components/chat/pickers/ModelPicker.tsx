@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown } from "lucide-react";
 
 import {
@@ -62,12 +62,35 @@ interface Props {
   value: string | null;
   onChange: (model: string) => void;
   disabled?: boolean;
+  /** Imperative open request — increments each time the composer's
+   *  `/model` slash command fires. `0` / `undefined` means "no
+   *  request yet"; any increment pops the picker open. */
+  openSignal?: number;
 }
 
-export function ModelPicker({ provider, value, onChange, disabled }: Props) {
+export function ModelPicker({
+  provider,
+  value,
+  onChange,
+  disabled,
+  openSignal,
+}: Props) {
   const [open, setOpen] = useState(false);
   const list = modelsForProvider(provider);
   const current = value ?? list[0]?.id ?? "";
+
+  // Consume the open signal exactly once per increment. Tracking the
+  // last-seen value in a ref (instead of gating on `openSignal &&
+  // !disabled`) prevents the picker from spontaneously reopening every
+  // time `disabled` flips back to false — e.g. on session start/restart
+  // — after `/model` has been used once in the pane's lifetime.
+  const lastSignal = useRef(openSignal);
+  useEffect(() => {
+    if (openSignal !== lastSignal.current) {
+      lastSignal.current = openSignal;
+      if (!disabled) setOpen(true);
+    }
+  }, [openSignal, disabled]);
 
   return (
     <Popover open={open} onOpenChange={setOpen}>

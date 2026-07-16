@@ -2169,6 +2169,36 @@ pub async fn list_chat_provider_capabilities(
     }
 }
 
+/// List the provider-native slash commands available to a chat thread
+/// anchored at `cwd`. Claude is the only provider that reports a
+/// command vocabulary today (via the Agent SDK's `supportedCommands()`
+/// probe — built-ins like `/compact` / `/init` / `/review` plus custom
+/// `~/.claude/commands` and `<cwd>/.claude/commands` entries). Codex
+/// and OpenCode expose no discovery surface, so they resolve to an
+/// empty list — the composer then shows only Codemux's own built-ins,
+/// matching how reference multi-provider clients behave.
+///
+/// Selecting one of these in the UI inserts the literal `/name ` text
+/// into the draft; the text is forwarded verbatim to the provider,
+/// which interprets the leading slash itself. Codemux never executes
+/// provider commands locally.
+#[tauri::command]
+pub async fn list_chat_slash_commands(
+    provider: ProviderKind,
+    cwd: String,
+    slash_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache>,
+    >,
+) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
+    match provider {
+        ProviderKind::Claude => slash_cache.get_or_harvest(&cwd).await,
+        // No discovery surface on these providers (yet) — empty list,
+        // not an error, so the popup renders without a failure footer.
+        ProviderKind::Codex | ProviderKind::OpenCode => Ok(Vec::new()),
+    }
+}
+
 /// Gracefully terminate a session. Idempotent on the provider side.
 #[tauri::command]
 pub async fn agent_chat_stop_session(

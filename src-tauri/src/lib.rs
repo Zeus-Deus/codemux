@@ -234,6 +234,14 @@ pub fn run() {
         .manage(std::sync::Arc::new(
             crate::agent_provider::claude::capabilities::ClaudeCapabilityCache::new(),
         ))
+        // Claude slash-command cache — populated lazily (per cwd) the
+        // first time the chat composer's slash popup asks for the
+        // provider command list (`list_chat_slash_commands`). Data is
+        // harvested live from the deployed CLI via the sidecar's
+        // `list-commands` probe; nothing is hardcoded.
+        .manage(std::sync::Arc::new(
+            crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache::new(),
+        ))
         // MCP runtime registry. `agent_chat_start_session` reads this
         // via `app.state::<McpRegistry>()` to lazily prime servers
         // before launching a chat, and the `commands::mcp::*` Tauri
@@ -1647,6 +1655,7 @@ pub fn run() {
             commands::agent_chat_set_model,
             commands::agent_chat_set_permission_mode,
             commands::list_chat_provider_capabilities,
+            commands::list_chat_slash_commands,
             commands::list_launch_gemini_models,
             commands::agent_chat_stop_session,
             commands::agent_chat_list_sessions,
