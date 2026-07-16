@@ -18,17 +18,17 @@ import type { AgentChatProviderKind } from "@/tauri/types";
  * (currently only Claude reports one; Codex/OpenCode resolve empty).
  *
  * The backend caches successful harvests per cwd for the app's
- * lifetime; this store only exists so multiple composers share one
- * in-flight fetch and re-opening the popup doesn't re-invoke IPC
- * within {@link TTL_MS}.
+ * lifetime and exposes no invalidation hook, so this store mirrors
+ * that: once an entry loads it stays cached for the app's lifetime.
+ * It exists so multiple composers share one in-flight fetch and
+ * re-opening the popup doesn't re-invoke IPC. A stale cache clears
+ * on `invalidate()` (used by tests) or an app restart.
  */
 interface ProviderCommandsEntry {
   commands: ProviderSlashCommand[];
   loaded: boolean;
   loading: boolean;
   error: string | null;
-  /** epoch-ms of the last successful load. Compared against {@link TTL_MS}. */
-  loadedAt: number;
 }
 
 interface ProviderCommandsState {
@@ -44,14 +44,11 @@ interface ProviderCommandsState {
   invalidate: () => void;
 }
 
-export const TTL_MS = 60_000;
-
 const EMPTY_ENTRY: ProviderCommandsEntry = {
   commands: [],
   loaded: false,
   loading: false,
   error: null,
-  loadedAt: 0,
 };
 
 export const commandsKey = (
@@ -69,11 +66,9 @@ export const useProviderCommandsStore = create<ProviderCommandsState>()(
       if (!cwd) return;
       const key = commandsKey(provider, cwd);
       const entry = get().entries[key] ?? EMPTY_ENTRY;
-      const now = Date.now();
-      const fresh = entry.loaded && now - entry.loadedAt < TTL_MS;
 
       if (entry.loading) return;
-      if (fresh && !force) return;
+      if (entry.loaded && !force) return;
 
       set((s) => ({
         entries: {
@@ -91,7 +86,6 @@ export const useProviderCommandsStore = create<ProviderCommandsState>()(
               loaded: true,
               loading: false,
               error: null,
-              loadedAt: Date.now(),
             },
           },
         }));

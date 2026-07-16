@@ -515,13 +515,27 @@ export function Composer({
     [providerCommandsEntry.commands, reservedCommandNames],
   );
 
+  // Provider-native commands are forwarded to the provider verbatim,
+  // and the provider only interprets a slash command when it *leads*
+  // the message. So the COMMANDS group is offered only when the `/`
+  // starts the draft (ignoring leading whitespace). A `/` typed
+  // mid-message still opens the popup for Codemux-local rows (modes,
+  // `/model`, `/workflow`, skills — all handled client-side) but omits
+  // provider commands the provider would ignore anyway.
+  const slashLeadsMessage = useMemo(
+    () =>
+      slashAnchor !== null &&
+      draft.slice(0, slashAnchor.start).trim().length === 0,
+    [slashAnchor, draft],
+  );
+
   const allSlashItems = useMemo(
     () => [
       ...modeCommands,
       workflowCommand,
       modelCommand,
       ...skillItems,
-      ...providerCommandItems,
+      ...(slashLeadsMessage ? providerCommandItems : []),
     ],
     [
       modeCommands,
@@ -529,6 +543,7 @@ export function Composer({
       modelCommand,
       skillItems,
       providerCommandItems,
+      slashLeadsMessage,
     ],
   );
 
@@ -541,7 +556,10 @@ export function Composer({
     if (skillsError) {
       return { tone: "error" as const, message: `Skills: ${skillsError}` };
     }
-    if (providerCommandsEntry.error) {
+    // Command loading/error only surfaces when the COMMANDS group is
+    // actually offered (leading `/`) — mirrors the allSlashItems gate
+    // so a mid-message popup never reports a group it won't show.
+    if (slashLeadsMessage && providerCommandsEntry.error) {
       return {
         tone: "error" as const,
         message: `Commands: ${providerCommandsEntry.error}`,
@@ -550,7 +568,11 @@ export function Composer({
     if (skillsLoading && !skillsLoaded) {
       return { tone: "muted" as const, message: "Loading skills…" };
     }
-    if (providerCommandsEntry.loading && !providerCommandsEntry.loaded) {
+    if (
+      slashLeadsMessage &&
+      providerCommandsEntry.loading &&
+      !providerCommandsEntry.loaded
+    ) {
       return { tone: "muted" as const, message: "Loading commands…" };
     }
     return null;
@@ -558,6 +580,7 @@ export function Composer({
     skillsError,
     skillsLoading,
     skillsLoaded,
+    slashLeadsMessage,
     providerCommandsEntry.error,
     providerCommandsEntry.loading,
     providerCommandsEntry.loaded,
@@ -585,16 +608,16 @@ export function Composer({
   // context) or explicit Esc.
   const slashOpen = slashAnchor !== null;
 
-  // First-open lazy load. The store guards against double-fetch via TTL +
-  // in-flight loading flag, so re-firing this effect on every open is
-  // harmless and keeps the popup snappy after the initial scan.
+  // First-open lazy load. The store guards against double-fetch via its
+  // loaded + in-flight loading flags, so re-firing this effect on every
+  // open is harmless and keeps the popup snappy after the initial scan.
   useEffect(() => {
     if (!slashOpen) return;
     void loadSkills(cwd ?? null);
     // Provider command discovery rides the same first-open trigger.
-    // The store TTL + backend per-cwd cache make re-fires cheap; a
-    // null cwd (Home draft, no project anchored) is a no-op inside
-    // the store.
+    // The store's lifetime cache + backend per-cwd cache make re-fires
+    // cheap; a null cwd (Home draft, no project anchored) is a no-op
+    // inside the store.
     void loadProviderCommands(provider, cwd ?? null);
   }, [slashOpen, cwd, loadSkills, loadProviderCommands, provider]);
 

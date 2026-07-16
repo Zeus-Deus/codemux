@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Star } from "lucide-react";
 
 import {
@@ -195,8 +195,17 @@ export function MultiProviderModelPicker({
   const [railKey, setRailKey] = useState<RailKey>(provider);
   const [query, setQuery] = useState("");
 
+  // Consume the open signal exactly once per increment. Tracking the
+  // last-seen value in a ref (instead of gating on `openSignal &&
+  // !disabled`) prevents the picker from spontaneously reopening every
+  // time `disabled` flips back to false — e.g. on session start/restart
+  // — after `/model` has been used once in the pane's lifetime.
+  const lastSignal = useRef(openSignal);
   useEffect(() => {
-    if (openSignal && !disabled) setOpen(true);
+    if (openSignal !== lastSignal.current) {
+      lastSignal.current = openSignal;
+      if (!disabled) setOpen(true);
+    }
   }, [openSignal, disabled]);
   // Filter the providers list once per render. Memoized via the
   // identity of `allowedProviders` so consumers passing a stable

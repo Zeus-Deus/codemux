@@ -89,13 +89,6 @@ impl ClaudeSlashCommandCache {
         guard.insert(cwd.to_string(), commands.clone());
         Ok(commands)
     }
-
-    /// Drop every cached list. The next call re-harvests.
-    #[allow(dead_code)]
-    pub async fn invalidate(&self) {
-        let mut guard = self.inner.lock().await;
-        guard.clear();
-    }
 }
 
 /// Case-insensitive dedupe by name, first occurrence wins. The SDK
