@@ -28,6 +28,25 @@ vi.mock("@/assets/preset-icons/opencode.svg", () => ({
   default: "/mock/opencode.svg",
 }));
 
+// Send → jump-to-latest: `ScrollToBottomOnSend` calls the scroller
+// engine's imperative `scrollToEnd` (which snaps to the tail AND re-pins
+// following-bottom). Stub the hook so we can assert the wiring without a
+// live layout. `scrollToEnd` is a stable ref so the effect never refires
+// on unrelated re-renders (only on a real signal change).
+const { scrollToEndSpy } = vi.hoisted(() => ({ scrollToEndSpy: vi.fn() }));
+vi.mock("@/components/ui/message-scroller", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@/components/ui/message-scroller")>();
+  return {
+    ...actual,
+    useMessageScroller: () => ({
+      scrollToEnd: scrollToEndSpy,
+      scrollToMessage: vi.fn(),
+      scrollToStart: vi.fn(),
+    }),
+  };
+});
+
 afterEach(() => cleanup());
 
 // The MessageScroller renders every row into the DOM (perf comes from
@@ -760,5 +779,77 @@ describe("MessageList dead-run detection (issue #154)", () => {
       renderList([userTurn], { interrupted: false, streaming: false });
       expect(screen.queryByTestId("run-interrupted-divider")).toBeNull();
     });
+  });
+});
+
+describe("MessageList send → jump-to-latest", () => {
+  const userTurn: ChatViewItem = {
+    kind: "user_message",
+    id: "um-1",
+    seq: 0,
+    text: "first prompt",
+  };
+  const nextTurn: ChatViewItem = {
+    kind: "user_message",
+    id: "um-2",
+    seq: 1,
+    text: "second prompt",
+  };
+
+  afterEach(() => scrollToEndSpy.mockClear());
+
+  it("does not force a scroll on the initial render", () => {
+    render(
+      <MessageList
+        messages={[userTurn]}
+        scrollToBottomSignal={0}
+        {...noopHandlers}
+      />,
+    );
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not force a scroll when messages change but the signal does not", () => {
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn]}
+        scrollToBottomSignal={3}
+        {...noopHandlers}
+      />,
+    );
+    scrollToEndSpy.mockClear();
+    // A streamed token (new/changed messages) must never yank a reader who
+    // is scrolled up in history — only an explicit send does.
+    rerender(
+      <MessageList
+        messages={[userTurn, nextTurn]}
+        scrollToBottomSignal={3}
+        {...noopHandlers}
+      />,
+    );
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+  });
+
+  it("snaps to the tail (instant) and re-pins following when the send signal increments", () => {
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn]}
+        scrollToBottomSignal={0}
+        {...noopHandlers}
+      />,
+    );
+    scrollToEndSpy.mockClear();
+    // Mirrors a send: the optimistic user bubble appends AND the signal
+    // bumps in the same commit.
+    rerender(
+      <MessageList
+        messages={[userTurn, nextTurn]}
+        scrollToBottomSignal={1}
+        {...noopHandlers}
+      />,
+    );
+    expect(scrollToEndSpy).toHaveBeenCalledTimes(1);
+    // `behavior: "auto"` = instant catch-up (no smooth-scroll lag on send).
+    expect(scrollToEndSpy).toHaveBeenCalledWith({ behavior: "auto" });
   });
 });

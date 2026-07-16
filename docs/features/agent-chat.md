@@ -279,6 +279,19 @@ Contract preserved from the pre-redesign renderer:
   imperceptible in both scroll directions. (An earlier build set a blanket
   `overflow-anchor: none`, which disabled anchoring everywhere and let
   those settles drift the viewport hundreds of px per wheel batch.)
+- **Send re-pins to the tail (catch-up on send).** Sending a new prompt
+  from the composer always snaps the transcript to the bottom and
+  re-enters following-bottom mode — even when the reader had scrolled up
+  into history (where otherwise only the "Jump to latest" pill shows).
+  `AgentChatPane` bumps an incrementing `scrollToBottomSignal` in
+  `handleSubmit` (right after the optimistic user-message append, so the
+  jump lands on the fresh bubble; this also covers the one-click "Continue
+  run"), threaded through `ChatTranscript` → `MessageList`, where the
+  `ScrollToBottomOnSend` child fires the engine's own `scrollToEnd` (the
+  imperative API is what re-arms the state machine — a raw `scrollTop`
+  write would move the viewport but leave the engine unpinned). Only a
+  real send moves the viewport: streamed tokens and other re-renders keep
+  the same signal, so free-scroll while reading history is untouched.
 - **Turn anchoring is deliberately OFF** (`scrollAnchor={false}` on
   every row): with hundreds of pre-hydrated rows the engine's anchor
   handling scrolls the viewport to a stale early anchor when new items
