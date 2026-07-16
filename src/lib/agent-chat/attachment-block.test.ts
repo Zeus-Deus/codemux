@@ -5,9 +5,11 @@ import {
   buildFileResolvedContent,
   buildFolderResolvedContent,
   buildImageDisplaySources,
-  buildImagePayloads,
+  buildImageRefs,
   buildIssueResolvedContent,
   buildPrResolvedContent,
+  imageAttachmentIds,
+  unstagedImageAttachments,
 } from "./attachment-block";
 import { applyAllPrefixes } from "./mode-prefix";
 import type { Attachment } from "@/stores/agent-chat-store";
@@ -497,14 +499,12 @@ describe("buildPrResolvedContent", () => {
   });
 });
 
-describe("buildImagePayloads (Step 8 Stage 6)", () => {
-  // The wire shape `agent_chat_send_turn` expects: each entry is
-  // `{ data: number[], media_type: string }`. Bytes ride as a number
-  // array because Tauri's IPC layer can't carry Uint8Array directly;
-  // the Rust side reads it back into `Vec<u8>`.
-  function makeImageAttachment(
-    overrides: Partial<Attachment> = {},
-  ): Attachment {
+describe("buildImageRefs (staged-image references)", () => {
+  // The wire shape `agent_chat_send_turn` expects post-fix: each entry is
+  // `{ path, media_type }` — a reference to the backend staging file the
+  // bytes were written to at attach time. The raw `number[]` payload path
+  // was deleted (it was the multi-minute first-send stall).
+  function makeStagedImage(overrides: Partial<Attachment> = {}): Attachment {
     return {
       id: "img-1",
       kind: "image",
@@ -514,6 +514,7 @@ describe("buildImagePayloads (Step 8 Stage 6)", () => {
         mime: "image/png",
         bytes: new Uint8Array([1, 2, 3, 4]),
       },
+      stagedImage: { path: "/staging/img-1.png", mediaType: "image/png" },
       ...overrides,
     };
   }
@@ -526,49 +527,47 @@ describe("buildImagePayloads (Step 8 Stage 6)", () => {
       metadata: { label: "x.ts" },
       resolvedContent: "alpha",
     };
-    expect(buildImagePayloads([file])).toEqual([]);
+    expect(buildImageRefs([file])).toEqual([]);
   });
 
-  it("converts resolved image bytes to a numeric Vec<u8>-shaped payload", () => {
-    const out = buildImagePayloads([makeImageAttachment()]);
-    expect(out).toEqual([
-      { data: [1, 2, 3, 4], media_type: "image/png" },
+  it("maps a staged image to its { path, media_type } reference", () => {
+    expect(buildImageRefs([makeStagedImage()])).toEqual([
+      { path: "/staging/img-1.png", media_type: "image/png" },
     ]);
   });
 
-  it("preserves order across multiple resolved images", () => {
-    const a = makeImageAttachment({
+  it("preserves order across multiple staged images", () => {
+    const a = makeStagedImage({
       id: "a",
-      resolvedImage: {
-        mime: "image/png",
-        bytes: new Uint8Array([1]),
-      },
+      stagedImage: { path: "/staging/a.png", mediaType: "image/png" },
     });
-    const b = makeImageAttachment({
+    const b = makeStagedImage({
       id: "b",
-      resolvedImage: {
-        mime: "image/jpeg",
-        bytes: new Uint8Array([2]),
-      },
+      resolvedImage: { mime: "image/jpeg", bytes: new Uint8Array([2]) },
+      stagedImage: { path: "/staging/b.jpg", mediaType: "image/jpeg" },
     });
-    const out = buildImagePayloads([a, b]);
-    expect(out).toEqual([
-      { data: [1], media_type: "image/png" },
-      { data: [2], media_type: "image/jpeg" },
+    expect(buildImageRefs([a, b])).toEqual([
+      { path: "/staging/a.png", media_type: "image/png" },
+      { path: "/staging/b.jpg", media_type: "image/jpeg" },
     ]);
+  });
+
+  it("skips a resolved image whose staging hasn't landed / failed", () => {
+    // No `stagedImage` → excluded from the refs. Send-gating is the
+    // caller's job (see unstagedImageAttachments) so a dropped image is
+    // never silently sent.
+    const unstaged = makeStagedImage({ id: "u", stagedImage: undefined });
+    expect(buildImageRefs([unstaged])).toEqual([]);
   });
 
   it("skips images that are still loading (no resolvedImage)", () => {
-    // A half-resolved chip would crash the SDK call if we forwarded
-    // it. Filter it out here so the user can keep typing while the
-    // arrayBuffer() promise settles.
     const loading: Attachment = {
       id: "loading",
       kind: "image",
       ref: "image:loading",
       metadata: { label: "pasting…", isLoading: true },
     };
-    expect(buildImagePayloads([loading])).toEqual([]);
+    expect(buildImageRefs([loading])).toEqual([]);
   });
 
   it("ignores non-image attachments entirely", () => {
@@ -579,24 +578,41 @@ describe("buildImagePayloads (Step 8 Stage 6)", () => {
       metadata: { label: "x.ts" },
       resolvedContent: "alpha",
     };
-    const folder: Attachment = {
-      id: "fo",
-      kind: "folder",
-      ref: "src",
-      metadata: { label: "src" },
-      resolvedContent: "tree",
-    };
-    const img = makeImageAttachment();
-    const out = buildImagePayloads([file, folder, img]);
+    const out = buildImageRefs([file, makeStagedImage()]);
     expect(out).toHaveLength(1);
     expect(out[0]?.media_type).toBe("image/png");
+  });
+
+  it("imageAttachmentIds returns ids of resolved image chips only", () => {
+    const file: Attachment = {
+      id: "f",
+      kind: "file",
+      ref: "x.ts",
+      metadata: { label: "x.ts" },
+    };
+    const loading: Attachment = {
+      id: "loading",
+      kind: "image",
+      ref: "image:loading",
+      metadata: { label: "pasting…", isLoading: true },
+    };
+    expect(
+      imageAttachmentIds([file, loading, makeStagedImage({ id: "img-1" })]),
+    ).toEqual(["img-1"]);
+  });
+
+  it("unstagedImageAttachments flags resolved images missing a staged file", () => {
+    const staged = makeStagedImage({ id: "ok" });
+    const unstaged = makeStagedImage({ id: "bad", stagedImage: undefined });
+    const out = unstagedImageAttachments([staged, unstaged]);
+    expect(out.map((a) => a.id)).toEqual(["bad"]);
   });
 });
 
 describe("buildImageDisplaySources", () => {
   // The display shape the user-message bubble renders:
   // `{ src: data-URL, mediaType }`. Same resolved-image filter as
-  // `buildImagePayloads`, but base64-encodes into a self-contained
+  // `buildImageRefs`, but base64-encodes into a self-contained
   // `data:` URL so the optimistic bubble shows thumbnails immediately.
   function makeImageAttachment(
     overrides: Partial<Attachment> = {},

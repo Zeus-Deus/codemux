@@ -17,7 +17,12 @@ vi.mock("@/tauri/commands", () => ({
   createEmptyWorkspace: vi.fn((cwd: string) =>
     Promise.resolve(cwd === "/home/user" ? "ws-home" : "ws-project"),
   ),
-  createWorktreeWorkspace: vi.fn().mockResolvedValue("ws-worktree"),
+  // `createDeferredWorktree` now calls the *Result variant. Default cwd
+  // to null so the worktree tests keep driving cwd resolution through the
+  // store subscription (`waitForWorkspaceCwd` fallback), unchanged.
+  createWorktreeWorkspaceResult: vi
+    .fn()
+    .mockResolvedValue({ workspaceId: "ws-worktree", cwd: null }),
   generateBranchName: vi.fn().mockResolvedValue("ai-named-branch"),
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
@@ -49,7 +54,7 @@ import {
   agentChatStartSession,
   applyPreset,
   createEmptyWorkspace,
-  createWorktreeWorkspace,
+  createWorktreeWorkspaceResult,
   generateBranchName,
   generateRandomBranchName,
   getHomeDir,
@@ -69,6 +74,7 @@ function makeActions(): SpyActions {
     markSendFailed: vi.fn(),
     ensureThread: vi.fn(),
     appendUserMessage: vi.fn(),
+    removeUserMessageByNonce: vi.fn(),
     setModel: vi.fn(),
     setPermissionMode: vi.fn(),
     setSessionLaunchMode: vi.fn(),
@@ -113,7 +119,9 @@ describe("materializeAndSend", () => {
       .mockImplementation((cwd: string) =>
         Promise.resolve(cwd === "/home/user" ? "ws-home" : "ws-project"),
       );
-    vi.mocked(createWorktreeWorkspace).mockClear().mockResolvedValue("ws-worktree");
+    vi.mocked(createWorktreeWorkspaceResult)
+      .mockClear()
+      .mockResolvedValue({ workspaceId: "ws-worktree", cwd: null });
     vi.mocked(generateBranchName).mockClear().mockResolvedValue("ai-named-branch");
     vi.mocked(generateRandomBranchName)
       .mockClear()
@@ -366,15 +374,17 @@ describe("materializeAndSend", () => {
       await materializeAndSend(draft, "first turn text", "/home/user", actions);
 
       expect(actions.ensureThread).toHaveBeenCalledWith("tid-7");
+      // The optimistic append now carries a client nonce (for rollback on
+      // a failed first send); images default to `[]`.
       expect(actions.appendUserMessage).toHaveBeenCalledWith(
         "tid-7",
         "first turn text",
-        undefined,
+        expect.any(String),
         [],
       );
     });
 
-    it("still seeds the optimistic message when startSession fails afterwards", async () => {
+    it("rolls the optimistic message back (by nonce) when startSession fails afterwards", async () => {
       vi.mocked(agentChatStartSession).mockRejectedValueOnce(
         new Error("start failed"),
       );
@@ -383,6 +393,12 @@ describe("materializeAndSend", () => {
       await materializeAndSend(makeDraft(), "hello", "/home/user", actions);
 
       expect(actions.appendUserMessage).toHaveBeenCalledTimes(1);
+      // Same nonce the append used is passed to the rollback.
+      const nonce = actions.appendUserMessage.mock.calls[0][2];
+      expect(actions.removeUserMessageByNonce).toHaveBeenCalledWith(
+        "pre-minted-thread-xyz",
+        nonce,
+      );
     });
   });
 
@@ -475,8 +491,15 @@ describe("materializeAndSend", () => {
       expect(agentChatStartSession).not.toHaveBeenCalled();
       expect(agentChatSendTurn).not.toHaveBeenCalled();
       expect(activateWorkspace).not.toHaveBeenCalled();
-      // Optimistic message was never seeded — the workspace never existed.
-      expect(actions.appendUserMessage).not.toHaveBeenCalled();
+      // Instant feedback appends the optimistic bubble up front, so a
+      // workspace-create failure rolls it back by nonce rather than
+      // leaving an orphan (the append precedes creation now).
+      expect(actions.appendUserMessage).toHaveBeenCalledTimes(1);
+      const nonce = actions.appendUserMessage.mock.calls[0][2];
+      expect(actions.removeUserMessageByNonce).toHaveBeenCalledWith(
+        "pre-minted-thread-xyz",
+        nonce,
+      );
     });
 
     it("pane create failure → markSendFailed, no session calls", async () => {
@@ -632,7 +655,7 @@ describe("materializeAndSend", () => {
         "/projects/foo",
       );
       expect(generateRandomBranchName).not.toHaveBeenCalled();
-      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
         "/projects/foo",
         "ai-named-branch",
         true,
@@ -681,7 +704,7 @@ describe("materializeAndSend", () => {
 
       expect(result.success).toBe(true);
       expect(generateRandomBranchName).toHaveBeenCalledWith("/projects/foo");
-      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
         "/projects/foo",
         "random-branch",
         true,
@@ -716,7 +739,7 @@ describe("materializeAndSend", () => {
       );
 
       expect(generateRandomBranchName).toHaveBeenCalledWith("/projects/foo");
-      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
         "/projects/foo",
         "random-branch",
         true,
@@ -751,7 +774,7 @@ describe("materializeAndSend", () => {
 
       expect(generateBranchName).not.toHaveBeenCalled();
       expect(generateRandomBranchName).not.toHaveBeenCalled();
-      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
         "/projects/foo",
         "my-branch",
         true,
@@ -782,7 +805,7 @@ describe("materializeAndSend", () => {
       );
 
       expect(result.success).toBe(true);
-      expect(createWorktreeWorkspace).not.toHaveBeenCalled();
+      expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
       expect(generateBranchName).not.toHaveBeenCalled();
       expect(generateRandomBranchName).not.toHaveBeenCalled();
       // Falls through to the ordinary project-target path.
@@ -809,14 +832,14 @@ describe("materializeAndSend", () => {
       );
 
       expect(result.success).toBe(true);
-      expect(createWorktreeWorkspace).not.toHaveBeenCalled();
+      expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
       expect(createEmptyWorkspace).toHaveBeenCalledWith("/home/user", {
         skipSetup: true,
       });
     });
 
     it("worktree creation failure surfaces via markSendFailed, no pane/session calls", async () => {
-      vi.mocked(createWorktreeWorkspace).mockRejectedValueOnce(
+      vi.mocked(createWorktreeWorkspaceResult).mockRejectedValueOnce(
         new Error("branch already exists"),
       );
       const actions = makeActions();
@@ -1394,11 +1417,12 @@ describe("materializeWithPreset", () => {
 
       await materializeAndSend(draft, userText, "/projects/foo", actions);
 
-      // Transcript echo: raw user text (no ASK wrapper).
+      // Transcript echo: raw user text (no ASK wrapper). The optimistic
+      // append carries a client nonce (for rollback on a failed send).
       expect(actions.appendUserMessage).toHaveBeenCalledWith(
         draft.threadId,
         userText,
-        undefined,
+        expect.any(String),
         [],
       );
 

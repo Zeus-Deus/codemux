@@ -85,6 +85,19 @@ impl McpServerRuntime {
 pub struct McpRegistry {
     inner: Arc<Mutex<RegistryInner>>,
     status_tx: broadcast::Sender<McpServerRuntime>,
+    /// Serializes concurrent [`prime_for_chat`](Self::prime_for_chat) runs so
+    /// two primes racing on the same registry (the eager
+    /// `agent_chat_prime_mcp` warm-up firing as a draft surface mounts, and
+    /// the correctness-backstop prime inside `agent_chat_start_session`)
+    /// cannot both slip past `ensure_started`'s fast-path check and
+    /// double-spawn the same MCP child. `ensure_started` drops its lock
+    /// between the "already running?" probe and inserting the `Starting`
+    /// placeholder, so without this gate the two callers can each observe a
+    /// server as absent and each launch it. Held across the whole prime loop:
+    /// by the time the second prime acquires it every server the first prime
+    /// touched is already `Starting`/`Running`, so the second prime is the
+    /// cheap no-op the design wants.
+    prime_lock: Arc<Mutex<()>>,
 }
 
 impl std::fmt::Debug for McpRegistry {
@@ -137,6 +150,7 @@ impl Default for McpRegistry {
                 disabled_ids: HashSet::new(),
             })),
             status_tx,
+            prime_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -337,6 +351,11 @@ impl McpRegistry {
         app: Option<&AppHandle>,
         project_root: Option<&std::path::Path>,
     ) {
+        // Serialize concurrent primes so a warm-up prime and the
+        // start-session backstop prime can't double-spawn the same child
+        // (see `prime_lock`). The second waiter finds every server already
+        // `Starting`/`Running` and no-ops through `ensure_started`.
+        let _prime_guard = self.prime_lock.lock().await;
         let configs = discover_configs(project_root);
         for cfg in configs {
             // Skip non-stdio for Stage 2 (HTTP support deferred).

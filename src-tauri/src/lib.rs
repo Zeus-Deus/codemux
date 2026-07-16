@@ -291,6 +291,12 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
+            // Reap chat-image staging files leaked by a crash or an
+            // abandoned draft (best-effort, off the startup path).
+            tauri::async_runtime::spawn(
+                commands::agent_chat::sweep_stale_staged_images(),
+            );
+
             #[cfg(debug_assertions)]
             {
                 let pid = std::process::id();
@@ -1637,6 +1643,10 @@ pub fn run() {
             commands::dev_agent_chat_spawn_test_pane,
             commands::agent_chat_start_session,
             commands::agent_chat_send_turn,
+            commands::agent_chat_stage_image,
+            commands::agent_chat_discard_staged_image,
+            commands::agent_chat_read_image,
+            commands::agent_chat_prime_mcp,
             commands::agent_chat_cancel_queued_turn,
             commands::agent_chat_send_queued_turn_now,
             commands::agent_chat_interrupt_turn,

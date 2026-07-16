@@ -292,25 +292,53 @@ export function buildAttachmentBlock(
 }
 
 /**
- * Stage 6 — extract resolved image attachments into the wire shape
- * `agent_chat_send_turn` expects (`{ data: number[], media_type:
- * string }`). Skips chips that are still loading or whose read failed
- * so a half-resolved image never lands on the SDK in a malformed
- * state. Returns `[]` when no images are staged so callers can pass
- * the result through without an `?? []`.
+ * Extract resolved image attachments into the wire shape
+ * `agent_chat_send_turn` expects (`{ path, media_type }` references to
+ * backend staging files). The bytes were written to disk at attach time
+ * (`agent_chat_stage_image`), so the turn never marshals them across IPC
+ * as a JSON `number[]` — that path was the multi-minute first-send stall
+ * and has been deleted.
+ *
+ * Skips chips that aren't image kind, that never resolved, or whose
+ * staging is still in flight / failed (no `stagedImage`). Callers should
+ * `awaitImageStaging` for stragglers before calling this and block the
+ * send when {@link unstagedImageAttachments} is non-empty. Returns `[]`
+ * when nothing is staged so callers can pass the result through without
+ * an `?? []`.
  */
-export function buildImagePayloads(
+export function buildImageRefs(
   attachments: Attachment[],
-): Array<{ data: number[]; media_type: string }> {
+): Array<{ path: string; media_type: string }> {
   return attachments
     .filter(
-      (a): a is Attachment & { resolvedImage: { mime: string; bytes: Uint8Array } } =>
-        a.kind === "image" && !!a.resolvedImage,
+      (a): a is Attachment & { stagedImage: { path: string; mediaType: string } } =>
+        a.kind === "image" && !!a.resolvedImage && !!a.stagedImage,
     )
     .map((a) => ({
-      data: Array.from(a.resolvedImage.bytes),
-      media_type: a.resolvedImage.mime,
+      path: a.stagedImage.path,
+      media_type: a.stagedImage.mediaType,
     }));
+}
+
+/** Ids of the image chips the user actually attached (bytes resolved).
+ *  Callers pass these to `awaitImageStaging` so a paste-then-Enter race
+ *  waits for the staging upload to finish before building refs. */
+export function imageAttachmentIds(attachments: Attachment[]): string[] {
+  return attachments
+    .filter((a) => a.kind === "image" && !!a.resolvedImage)
+    .map((a) => a.id);
+}
+
+/** Image chips whose bytes resolved but which have no staged file (the
+ *  staging call failed, or hasn't been kicked off). Their raw bytes can no
+ *  longer be sent — the `number[]` fallback is gone — so send must be
+ *  blocked while any exist rather than silently dropping the image. */
+export function unstagedImageAttachments(
+  attachments: Attachment[],
+): Attachment[] {
+  return attachments.filter(
+    (a) => a.kind === "image" && !!a.resolvedImage && !a.stagedImage,
+  );
 }
 
 /**
@@ -322,8 +350,12 @@ export function buildImagePayloads(
  * image (JS engines cap argument counts in the tens of thousands). We
  * encode in fixed 32 KB windows so the per-call argument count stays
  * bounded regardless of image size.
+ *
+ * Exported for the `stageChatImage` JSON fallback (web-remote transport
+ * can't carry a raw invoke body) in addition to the `data:` URL builder
+ * below.
  */
-function bytesToBase64(bytes: Uint8Array): string {
+export function bytesToBase64(bytes: Uint8Array): string {
   const CHUNK = 0x8000; // 32 KB — comfortably under engine arg limits.
   let binary = "";
   for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -334,15 +366,15 @@ function bytesToBase64(bytes: Uint8Array): string {
 }
 
 /**
- * Sibling to `buildImagePayloads`: instead of the wire shape for the
- * SDK, produce the display shape the user-message bubble renders
+ * Sibling to `buildImageRefs`: instead of the staged-file references for
+ * the SDK, produce the display shape the user-message bubble renders
  * (`{ src, mediaType }`). Each staged image becomes a self-contained
  * `data:` URL so the optimistically-appended bubble can show the
  * thumbnail immediately — before the turn round-trips and the backend
  * persists the bytes to disk.
  *
- * Filters to resolved images exactly like `buildImagePayloads` so a
- * still-loading chip never renders as a broken thumbnail, and returns
+ * Filters to resolved images (bytes in memory) so a still-loading chip
+ * never renders as a broken thumbnail, and returns
  * `[]` when nothing is staged so callers can pass it straight into the
  * optimistic append.
  */
