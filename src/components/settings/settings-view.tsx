@@ -2039,7 +2039,7 @@ export function SettingsView() {
           <div>
             <SectionHeader
               title="Archive"
-              description="Workspaces archived from the sidebar. Files, branches, and worktrees stay on disk until you delete them here — unarchive to bring a workspace back exactly where it was."
+              description="Workspaces archived from the sidebar. Files, branches, and worktrees stay on disk until you delete them here — unarchive to bring a workspace back (files, branch, and worktree are preserved; the pane layout starts fresh)."
             />
             <ArchiveSection />
           </div>

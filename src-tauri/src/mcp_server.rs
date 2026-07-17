@@ -741,7 +741,7 @@ fn register_tools() -> Vec<McpTool> {
         },
         McpTool {
             name: "workspace_unarchive",
-            description: "Restore an archived workspace by `archive_id` (from `workspace_archive_list`). Reuses the on-disk worktree/folder when it still exists (recreating the worktree from its branch if only the directory is gone), spawns sessions, and activates the restored workspace. Returns the new `workspace_id`. Errors — keeping the entry — when nothing is left to restore.",
+            description: "Restore an archived workspace by `archive_id` (from `workspace_archive_list`). Reuses the on-disk worktree/folder when it still exists — adopting an imported worktree in place if it lives outside the conventional path, or recreating the worktree from its branch if only the directory is gone — then spawns sessions and activates the restored workspace. The restored workspace preserves its files, branch, worktree, and title but starts with a fresh single-pane layout (the prior pane/tab arrangement is not restored). Returns the new `workspace_id`. Errors — keeping the entry — when nothing is left to restore.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

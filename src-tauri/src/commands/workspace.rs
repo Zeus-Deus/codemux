@@ -607,6 +607,27 @@ pub async fn import_worktree_workspace(
     branch: String,
     layout: String,
 ) -> Result<String, String> {
+    import_worktree_workspace_impl(app, &state, &db, worktree_path, branch, layout).await
+}
+
+/// Adopt an already-on-disk git worktree into a fresh workspace WITHOUT
+/// running `git worktree add` — the directory is already a registered
+/// worktree, so we only build workspace state around it, spawn its
+/// sessions, run setup scripts, and register MCP. Shared by the
+/// "Import worktree" affordance and the unarchive restore path: an
+/// archived worktree recorded at a NON-conventional path still exists on
+/// disk (archiving touches nothing), so restore adopts it in place rather
+/// than routing through `create_worktree_workspace_impl`, whose
+/// `git worktree add` at the conventional path would fail with "<branch>
+/// is already used by worktree at <that path>".
+pub(crate) async fn import_worktree_workspace_impl(
+    app: tauri::AppHandle,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    worktree_path: String,
+    branch: String,
+    layout: String,
+) -> Result<String, String> {
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
         "pair" => WorkspacePresetLayout::Pair,
@@ -940,17 +961,24 @@ pub(crate) async fn close_workspace_with_worktree_impl(
             // Offload to the blocking pool so the Tokio worker stays free for
             // other commands.
             //
-            // Honest force: pass the caller's `force` through instead of
-            // hardcoding `true`. With force_delete=false the dirty /
-            // unpushed guard inside `git_remove_worktree` now actually
-            // fires, and its "… Use force to override." error propagates
-            // so the caller can escalate to an explicit force. Previously
-            // the hardcoded `true` silently deleted uncommitted work.
+            // This final removal is INTENTIONALLY forced, regardless of the
+            // caller's `force`. The dirty/unpushed pre-flight above (which
+            // runs BEFORE any teardown) is the authoritative user-facing
+            // guard: a non-forced close that reaches this point has already
+            // passed it. Passing the caller's `force` through here instead
+            // would reintroduce a TOCTOU hole — teardown scripts run after
+            // the pre-flight and execute inside the worktree, so a script
+            // that writes a file would make a non-forced
+            // `git_remove_worktree` refuse AFTER `state.close_workspace`
+            // already removed the workspace, stranding an orphaned worktree
+            // with no live row left to escalate from. Forcing here closes
+            // that hole; the pre-flight remains the only place uncommitted
+            // work can block the close.
             tokio::task::spawn_blocking(move || {
                 crate::git::git_remove_worktree(
                     Path::new(&wt_path),
                     branch_to_delete.as_deref(),
-                    force,
+                    true,
                 )
             })
             .await
@@ -1199,25 +1227,52 @@ pub(crate) async fn unarchive_workspace_impl(
             );
         }
 
-        let id = create_worktree_workspace_impl(
-            app.clone(),
-            state,
-            db,
-            pty_state,
-            presets,
-            repo_path,
-            branch,
-            /*new_branch=*/ false,
-            /*base=*/ None,
-            "single".to_string(),
-            None,
-            None,
-            None,
-            None,
-        )
-        .await?;
-        // The creation path titles the workspace after its branch;
-        // restore whatever the user had (possibly a rename).
+        // Imported worktree at a NON-conventional path: the directory
+        // still exists on disk (archiving touched nothing) but lives
+        // somewhere other than the `~/.codemux/worktrees/<repo>/<branch>`
+        // path the create flow would target. Adopt it in place —
+        // `create_worktree_workspace_impl` would compute the conventional
+        // path and its `git worktree add` would fail with "<branch> is
+        // already used by worktree at <recorded path>". When the recorded
+        // path IS the conventional one (or the dir is gone and the branch
+        // survives), fall through to the create flow, whose reuse-on-disk /
+        // recreate-from-branch handling is exactly right.
+        let adopt_in_place = Path::new(wt_path).exists()
+            && crate::git::conventional_worktree_path(Path::new(&repo_path), &branch)
+                .map(|conventional| conventional != Path::new(wt_path))
+                .unwrap_or(false);
+
+        let id = if adopt_in_place {
+            import_worktree_workspace_impl(
+                app.clone(),
+                state,
+                db,
+                wt_path.clone(),
+                branch,
+                "single".to_string(),
+            )
+            .await?
+        } else {
+            create_worktree_workspace_impl(
+                app.clone(),
+                state,
+                db,
+                pty_state,
+                presets,
+                repo_path,
+                branch,
+                /*new_branch=*/ false,
+                /*base=*/ None,
+                "single".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?
+        };
+        // The creation/adoption path titles the workspace after its
+        // branch; restore whatever the user had (possibly a rename).
         state.rename_workspace(&id, entry.title.clone());
         id
     } else {
