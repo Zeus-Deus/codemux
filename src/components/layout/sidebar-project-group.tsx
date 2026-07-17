@@ -30,6 +30,7 @@ import { cn } from "@/lib/utils";
 import {
   dbGetUiState,
   dbSetUiState,
+  archiveWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
   revealInFileManager,
@@ -37,6 +38,7 @@ import {
   activateWorkspace,
   agentChatCreatePane,
 } from "@/tauri/commands";
+import { toast } from "@/lib/toast";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
@@ -178,15 +180,53 @@ export function SidebarProjectGroup({
     }
   };
 
-  const handleCloseProject = () => {
-    const homeDir = useAppStore.getState().homeDir;
-    useChatDraftStore.getState().clearDraftsForProject(projectPath, homeDir);
-    for (const ws of workspaces) {
-      if (ws.worktree_path) {
-        closeWorkspaceWithWorktree(ws.workspace_id, false, false, true).catch(console.error);
-      } else {
-        closeWorkspace(ws.workspace_id, true).catch(console.error);
+  // Archive the whole group — non-destructive: every workspace becomes an
+  // archive entry (files/branches/worktrees untouched) and can be restored
+  // individually from Settings → Archive. Attach-in-place and remote
+  // (host-backed) members can't be archived (the backend refuses), so they
+  // get the plain non-destructive close instead — mixed groups still fully
+  // clear, like the old Close Project. Worktrees go first so the root
+  // anchors the group until the end. The awaits are deliberately
+  // sequential: each archive/close can run teardown scripts and git
+  // subprocesses in the same repo, and firing them concurrently risks
+  // racing those (lock contention, half-torn-down worktrees).
+  const handleArchiveProject = async () => {
+    const ordered = [
+      ...workspaces.filter((ws) => ws.worktree_path),
+      ...workspaces.filter((ws) => !ws.worktree_path),
+    ];
+    const failures: string[] = [];
+    for (const ws of ordered) {
+      const isAttachOrRemote = ws.attach_only === true || ws.host_id != null;
+      try {
+        if (isAttachOrRemote) {
+          if (ws.worktree_path) {
+            await closeWorkspaceWithWorktree(
+              ws.workspace_id,
+              false,
+              false,
+              false,
+            );
+          } else {
+            await closeWorkspace(ws.workspace_id, false);
+          }
+        } else {
+          await archiveWorkspace(ws.workspace_id);
+        }
+      } catch (err) {
+        console.error("[sidebar] archive failed:", err);
+        failures.push(ws.title);
       }
+    }
+    if (failures.length > 0) {
+      toast.error("Some workspaces could not be archived", {
+        description: failures.join(", "),
+      });
+    } else {
+      // Chat drafts are only cleared once every member is actually gone
+      // — clearing up front wiped drafts even when archiving failed.
+      const homeDir = useAppStore.getState().homeDir;
+      useChatDraftStore.getState().clearDraftsForProject(projectPath, homeDir);
     }
     setShowCloseDialog(false);
   };
@@ -296,11 +336,8 @@ export function SidebarProjectGroup({
             </ContextMenuSubContent>
           </ContextMenuSub>
           <ContextMenuSeparator />
-          <ContextMenuItem
-            className="text-destructive focus:text-destructive"
-            onClick={() => setShowCloseDialog(true)}
-          >
-            Close Project
+          <ContextMenuItem onClick={() => setShowCloseDialog(true)}>
+            Archive Project
           </ContextMenuItem>
         </ContextMenuContent>
       </ContextMenu>
@@ -317,12 +354,13 @@ export function SidebarProjectGroup({
         <DialogContent showCloseButton={false} className="max-w-[340px]">
           <DialogHeader>
             <DialogTitle className="text-sm">
-              Close project &ldquo;{projectName}&rdquo;?
+              Archive project &ldquo;{projectName}&rdquo;?
             </DialogTitle>
             <DialogDescription>
-              This will close {workspaces.length} workspace{workspaces.length !== 1 ? "s" : ""} and
-              kill all active terminals in this project.
-              Your files and git history will remain on disk.
+              This will archive {workspaces.length} workspace{workspaces.length !== 1 ? "s" : ""} and
+              stop the active terminals in this project. Files, branches, and
+              worktrees stay on disk — everything can be restored from
+              Settings → Archive.
             </DialogDescription>
           </DialogHeader>
           <div className="flex justify-end gap-2 pt-1">
@@ -335,12 +373,12 @@ export function SidebarProjectGroup({
               Cancel
             </Button>
             <Button
-              variant="destructive"
+              variant="secondary"
               size="sm"
               className="h-7 px-3 text-xs"
-              onClick={handleCloseProject}
+              onClick={() => void handleArchiveProject()}
             >
-              Close Project
+              Archive Project
             </Button>
           </div>
         </DialogContent>

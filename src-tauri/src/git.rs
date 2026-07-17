@@ -2574,15 +2574,18 @@ fn is_reclaimable_orphan_worktree(repo_path: &Path, path: &Path) -> bool {
     true
 }
 
-pub fn git_create_worktree(
-    repo_path: &Path,
-    branch: &str,
-    new_branch: bool,
-    base: Option<&str>,
-    pr_number: Option<u32>,
-) -> Result<String, String> {
-    let git_root = crate::config::workspace_config::find_git_root(repo_path)
-        .ok_or_else(|| format!("Not a git repository: {}", repo_path.display()))?;
+/// The conventional on-disk location `git_create_worktree` derives for a
+/// (repo, branch): `~/.codemux/worktrees/<repo-name>/<sanitized-branch>`.
+/// Returns `None` when `repo_path` isn't inside a git repository.
+///
+/// Exposed so callers (the unarchive restore path) can tell whether a
+/// recorded worktree path is the conventional one the create flow would
+/// target, or an IMPORTED worktree living elsewhere that must be adopted
+/// in place — going through `git_create_worktree` for the latter would
+/// compute this path and `git worktree add` would die with "<branch> is
+/// already used by worktree at <other path>".
+pub fn conventional_worktree_path(repo_path: &Path, branch: &str) -> Option<PathBuf> {
+    let git_root = crate::config::workspace_config::find_git_root(repo_path)?;
     let repo_name = git_root
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -2591,11 +2594,24 @@ pub fn git_create_worktree(
     let home = dirs::home_dir()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| std::env::temp_dir().to_string_lossy().to_string());
-    let worktree_path = PathBuf::from(&home)
-        .join(".codemux")
-        .join("worktrees")
-        .join(&repo_name)
-        .join(&sanitized_branch);
+    Some(
+        PathBuf::from(&home)
+            .join(".codemux")
+            .join("worktrees")
+            .join(&repo_name)
+            .join(&sanitized_branch),
+    )
+}
+
+pub fn git_create_worktree(
+    repo_path: &Path,
+    branch: &str,
+    new_branch: bool,
+    base: Option<&str>,
+    pr_number: Option<u32>,
+) -> Result<String, String> {
+    let worktree_path = conventional_worktree_path(repo_path, branch)
+        .ok_or_else(|| format!("Not a git repository: {}", repo_path.display()))?;
 
     // Ensure parent directory exists
     if let Some(parent) = worktree_path.parent() {
@@ -2641,6 +2657,17 @@ pub fn git_create_worktree(
             // repo with no stale entries is a no-op.
             let _ = run_git_permissive(repo_path, &["worktree", "prune"]);
         }
+    } else {
+        // The directory is GONE but git may still carry a stale worktree
+        // registration for it — e.g. an archived workspace whose worktree
+        // dir was hand-deleted (archiving touches nothing on disk, so the
+        // admin entry survives), or any worktree removed with `rm -rf`
+        // instead of `git worktree remove`. Without pruning, the
+        // `git worktree add` below dies with `fatal: '<path>' is a missing
+        // but already registered worktree`. Prune first so the stale
+        // registration is cleared and the add recreates cleanly.
+        // Permissive: a repo with no stale entries is a no-op.
+        let _ = run_git_permissive(repo_path, &["worktree", "prune"]);
     }
 
     if new_branch {
@@ -2702,6 +2729,94 @@ pub fn git_create_worktree(
     Ok(path_str)
 }
 
+/// Dirty/unpushed guard shared by `git_remove_worktree` (its
+/// force=false path) and the close-workspace pre-flight in
+/// `commands::workspace::close_workspace_with_worktree_impl`. The
+/// pre-flight exists so a refused removal returns BEFORE any workspace
+/// teardown — the workspace (and its delete dialog) stay alive for the
+/// force escalation.
+///
+/// CONTRACT: the frontend detects a guard refusal by regex-matching
+/// /use force/i on the error message, so the "Use force to override."
+/// suffix in both errors is load-bearing. Do not reword it.
+pub(crate) fn ensure_worktree_removable(worktree_path: &Path) -> Result<(), String> {
+    // Check for uncommitted changes
+    let status = run_git_permissive(worktree_path, &["status", "--porcelain"]);
+    let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
+    if dirty_count > 0 {
+        return Err(format!(
+            "Worktree has {dirty_count} uncommitted change(s). Use force to override."
+        ));
+    }
+
+    // Check for unpushed commits (only if upstream exists)
+    let upstream = run_git_permissive(
+        worktree_path,
+        &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+    );
+    if !upstream.is_empty() && !upstream.contains("fatal") {
+        let unpushed = run_git_permissive(worktree_path, &["log", "@{upstream}..HEAD", "--oneline"]);
+        let unpushed_count = unpushed.lines().filter(|l| !l.is_empty()).count();
+        if unpushed_count > 0 {
+            return Err(format!(
+                "Worktree has {unpushed_count} unpushed commit(s). Use force to override."
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// True when `branch` (a shortname like "feature/x") exists as a local
+/// branch OR on ANY remote — and NOT merely as a same-named tag.
+///
+/// A bare `git show-ref --quiet -- <name>` matches by path-component
+/// suffix, so it also hits refs/tags/<name>. That let a deleted branch
+/// shadowed by an identically-named tag pass the unarchive pre-flight,
+/// after which `git worktree add <branch>` would resolve the tag and
+/// check it out in DETACHED HEAD instead of the intended branch. We
+/// therefore verify the exact ref namespaces: refs/heads/<branch> for
+/// local, then refs/remotes/<remote>/<branch> for every remote-tracking
+/// ref (tags live in neither namespace, so they can't match). Remotes
+/// are enumerated from the ref store itself (not `git remote`) so a
+/// remote-tracking ref that exists without a configured remote still
+/// counts, matching the previous suffix behavior for non-origin remotes.
+pub fn git_branch_exists(repo_path: &Path, branch: &str) -> bool {
+    // Local branch — exact ref path excludes tags.
+    let local = Command::new("git")
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(repo_path)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if local {
+        return true;
+    }
+
+    // Remote-tracking branch on ANY remote, matched by shortname. A
+    // refname refs/remotes/<remote>/<rest> maps to shortname <rest> once
+    // the two leading segments (remotes, <remote>) are stripped — so
+    // refs/remotes/upstream/feature/x matches shortname "feature/x".
+    let Ok(refs) = run_git(
+        repo_path,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes"],
+    ) else {
+        return false;
+    };
+    refs.lines().any(|refname| {
+        refname
+            .strip_prefix("refs/remotes/")
+            .and_then(|r| r.split_once('/'))
+            .map(|(_remote, shortname)| shortname == branch)
+            .unwrap_or(false)
+    })
+}
+
 pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bool) -> Result<(), String> {
     // Find the main repo by reading .git file in worktree
     let git_file = worktree_path.join(".git");
@@ -2725,29 +2840,7 @@ pub fn git_remove_worktree(worktree_path: &Path, branch: Option<&str>, force: bo
     };
 
     if !force {
-        // Check for uncommitted changes
-        let status = run_git_permissive(worktree_path, &["status", "--porcelain"]);
-        let dirty_count = status.lines().filter(|l| !l.is_empty()).count();
-        if dirty_count > 0 {
-            return Err(format!(
-                "Worktree has {dirty_count} uncommitted change(s). Use force to override."
-            ));
-        }
-
-        // Check for unpushed commits (only if upstream exists)
-        let upstream = run_git_permissive(
-            worktree_path,
-            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
-        );
-        if !upstream.is_empty() && !upstream.contains("fatal") {
-            let unpushed = run_git_permissive(worktree_path, &["log", "@{upstream}..HEAD", "--oneline"]);
-            let unpushed_count = unpushed.lines().filter(|l| !l.is_empty()).count();
-            if unpushed_count > 0 {
-                return Err(format!(
-                    "Worktree has {unpushed_count} unpushed commit(s). Use force to override."
-                ));
-            }
-        }
+        ensure_worktree_removable(worktree_path)?;
     }
 
     if force {
@@ -3165,6 +3258,43 @@ C  source.txt -> copy.txt";
 
         let branches_after = git_list_branches(&repo, false).expect("list branches after");
         assert!(!branches_after.contains(&"feature-test".to_string()), "branch should be deleted");
+    }
+
+    /// Restore path "directory gone but branch survives": a worktree dir
+    /// hand-deleted (`rm -rf`, not `git worktree remove`) leaves a STALE
+    /// worktree registration. Re-creating the worktree for the same branch
+    /// must prune that stale entry first — otherwise `git worktree add`
+    /// dies with "is a missing but already registered worktree". This is
+    /// the unarchive "recreate from surviving branch" case.
+    #[test]
+    fn test_create_worktree_recreates_after_dir_deleted() {
+        let (_dir, repo) = setup_test_repo();
+        // First create at the conventional path.
+        let wt_path = git_create_worktree(&repo, "survivor-branch", true, None, None)
+            .expect("create worktree");
+        let wt = PathBuf::from(&wt_path);
+        assert!(wt.exists(), "worktree dir should exist after create");
+
+        // Hand-delete the directory WITHOUT telling git — the registration
+        // now points at a missing path.
+        std::fs::remove_dir_all(&wt).expect("delete worktree dir");
+        assert!(!wt.exists(), "worktree dir should be gone");
+
+        // Re-create for the same (surviving) branch: must prune the stale
+        // registration and re-add cleanly at the conventional path.
+        let wt_path2 = git_create_worktree(&repo, "survivor-branch", false, None, None)
+            .expect("recreate worktree after dir deleted");
+        assert_eq!(wt_path2, wt_path, "should recreate at the conventional path");
+        let wt2 = PathBuf::from(&wt_path2);
+        assert!(wt2.exists(), "recreated worktree dir should exist");
+        assert!(
+            wt2.join(".git").is_file(),
+            "should be a linked worktree (.git file)"
+        );
+        let current = run_git_permissive(&wt2, &["branch", "--show-current"]);
+        assert_eq!(current.trim(), "survivor-branch");
+
+        git_remove_worktree(&wt2, Some("survivor-branch"), true).expect("cleanup");
     }
 
     #[test]
@@ -6950,5 +7080,124 @@ TARGET version
         assert_eq!(result, Some("master".to_string()), "expected fallback to 'master'");
         let after = run_git_permissive(&repo, &["branch", "--show-current"]);
         assert_eq!(after, "master");
+    }
+}
+
+#[cfg(test)]
+mod worktree_guard_tests {
+    //! Contract coverage for `ensure_worktree_removable` — the shared
+    //! dirty/unpushed guard behind `git_remove_worktree` AND the
+    //! close-workspace pre-flight — plus `git_branch_exists`, the
+    //! unarchive pre-flight's local+remote branch check.
+
+    use super::*;
+    use std::process::Command;
+    use tempfile::TempDir;
+
+    fn run(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .expect("git spawn");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn init_repo(dir: &Path) {
+        run(dir, &["init", "--initial-branch=main"]);
+        run(dir, &["config", "user.email", "test@example.com"]);
+        run(dir, &["config", "user.name", "Test"]);
+        std::fs::write(dir.join("README.md"), "hi").unwrap();
+        run(dir, &["add", "."]);
+        run(dir, &["commit", "-m", "init"]);
+    }
+
+    /// CONTRACT: the frontend's force-escalation detects a guard
+    /// refusal by regex-matching /use force/i on the error message, so
+    /// the "Use force to override." suffix is load-bearing. This test
+    /// pins the wording; changing it silently breaks the escalation UI.
+    #[test]
+    fn dirty_worktree_error_carries_use_force_contract_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join("dirty.txt"), "uncommitted").unwrap();
+
+        let err = ensure_worktree_removable(&repo)
+            .expect_err("a dirty worktree must refuse removal");
+        assert!(
+            err.contains("uncommitted change(s)"),
+            "unexpected guard message: {err}"
+        );
+        assert!(
+            err.contains("Use force to override."),
+            "guard error lost the frontend's /use force/i contract suffix: {err}"
+        );
+    }
+
+    #[test]
+    fn clean_worktree_is_removable() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        assert_eq!(ensure_worktree_removable(&repo), Ok(()));
+    }
+
+    /// `git_branch_exists` must see local branches, branches on ANY
+    /// remote by shortname (the old list-scan false-negatived on
+    /// non-origin remotes, whose entries come back qualified like
+    /// "upstream/feature/x"), and report absence via exit status.
+    #[test]
+    fn branch_exists_matches_local_and_any_remote_shortname() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        run(&repo, &["branch", "feature/local-branch"]);
+        // Simulate a branch that exists ONLY on a non-origin remote.
+        run(
+            &repo,
+            &["update-ref", "refs/remotes/upstream/feature/remote-only", "HEAD"],
+        );
+
+        assert!(git_branch_exists(&repo, "main"));
+        assert!(git_branch_exists(&repo, "feature/local-branch"));
+        assert!(
+            git_branch_exists(&repo, "feature/remote-only"),
+            "shortname must match refs/remotes/<any-remote>/<branch>"
+        );
+        assert!(!git_branch_exists(&repo, "feature/nope"));
+    }
+
+    /// A TAG sharing a deleted branch's name must NOT count as the branch
+    /// existing. The old bare `show-ref -- <name>` matched refs/tags/<name>
+    /// too, so the unarchive pre-flight would pass and `git worktree add`
+    /// would resolve the tag and check it out in detached HEAD. Verifying
+    /// refs/heads/ (and refs/remotes/) excludes tags entirely.
+    #[test]
+    fn branch_exists_ignores_same_named_tag() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+
+        // Create, then delete, a branch — leaving no refs/heads entry.
+        run(&repo, &["branch", "release/1.0"]);
+        run(&repo, &["branch", "-D", "release/1.0"]);
+        // A tag now shadows that name in refs/tags.
+        run(&repo, &["tag", "release/1.0"]);
+
+        assert!(
+            !git_branch_exists(&repo, "release/1.0"),
+            "a same-named tag must not be mistaken for a live branch"
+        );
     }
 }

@@ -13,8 +13,11 @@ import {
   createBrowserPane,
   openInEditor,
   detectEditors,
+  closeWorkspace,
   closeWorkspaceWithWorktree,
 } from "@/tauri/commands";
+import { toast } from "@/lib/toast";
+import { runDeleteWithForceToast } from "@/hooks/use-force-delete";
 import logomark from "@/assets/codemux-logomark.svg";
 
 function Kbd({ children }: { children: React.ReactNode }) {
@@ -87,16 +90,45 @@ export function EmptyWorkspaceState() {
     setShowFileSearch(true);
   }, [setShowFileSearch]);
 
+  // A per-branch worktree can have its files removed; a repo root
+  // (protected) or a non-worktree workspace (primary checkout, plain
+  // folder, Home — `worktree_path` null) can only be closed. This mirrors
+  // `canRemoveWorktree` in the workspaces-overview row so the two delete
+  // affordances stay in lockstep with the backend's removal guard.
+  const isWorktree = !!ws?.worktree_path;
+  const isRepoRoot = ws?.protected === true;
+  const canRemoveWorktree = isWorktree && !isRepoRoot;
+
   const handleDeleteWorkspace = useCallback(() => {
     if (!workspaceId) return;
+    const title = ws?.title || "this workspace";
     const confirmed = window.confirm(
-      `Delete workspace "${ws?.title || "this workspace"}"?`,
+      canRemoveWorktree
+        ? `Delete the worktree "${title}"? Files on disk will be removed.`
+        : `Close "${title}"? Files on disk are left untouched.`,
     );
     if (!confirmed) return;
-    closeWorkspaceWithWorktree(workspaceId, true, false, false).catch(
-      console.error,
-    );
-  }, [workspaceId, ws?.title]);
+    if (canRemoveWorktree) {
+      // Worktree removal: the first attempt goes out non-forced. A dirty
+      // worktree now REFUSES before the workspace is closed; the helper
+      // toasts that message and its "Force delete" action reissues with
+      // forceDelete=true. Any other rejection is a plain error toast.
+      void runDeleteWithForceToast({
+        run: (force) =>
+          closeWorkspaceWithWorktree(workspaceId, true, false, force),
+      });
+    } else {
+      // No worktree of its own — a destructive close would be refused by
+      // the backend guard and toast a misleading error. Close
+      // (non-destructive) so the workspace disappears while its files
+      // stay on disk.
+      closeWorkspace(workspaceId, false).catch((err) =>
+        toast.error("Close failed", {
+          description: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
+  }, [workspaceId, ws?.title, canRemoveWorktree]);
 
   return (
     <div className="flex h-full flex-1 items-center justify-center px-6 py-10">
@@ -139,7 +171,9 @@ export function EmptyWorkspaceState() {
           />
         </div>
 
-        {/* Delete workspace */}
+        {/* Delete / close workspace — the label matches the action the
+            backend will actually take: only a per-branch worktree is
+            deleted (files removed); everything else is closed. */}
         <div className="mt-8 flex justify-center">
           <button
             type="button"
@@ -147,7 +181,7 @@ export function EmptyWorkspaceState() {
             className="flex items-center gap-1.5 text-xs text-muted-foreground/40 transition-colors hover:text-muted-foreground"
           >
             <Trash2 className="h-3 w-3" />
-            Delete workspace
+            {canRemoveWorktree ? "Delete workspace" : "Close workspace"}
           </button>
         </div>
       </div>

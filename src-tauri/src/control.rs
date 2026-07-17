@@ -876,6 +876,80 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
                 Err(e) => Err(e),
             }
         }
+        "archive_workspace" => {
+            // Backs the `workspace_archive` MCP tool. Same close path as
+            // `close_workspace` (teardown, PTY termination) but with the
+            // worktree/files/branch guaranteed untouched, plus an archive
+            // entry so the workspace can be restored later.
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let workspace_id = request
+                .params
+                .get("workspace_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: workspace_id".to_string());
+            match workspace_id {
+                Ok(ws_id) => crate::commands::workspace::archive_workspace_impl(
+                    app.clone(),
+                    &state,
+                    &db,
+                    ws_id.clone(),
+                )
+                .await
+                .map(|archive_id| {
+                    serde_json::json!({
+                        "workspace_id": ws_id,
+                        "archive_id": archive_id,
+                        "archived": true,
+                    })
+                }),
+                Err(e) => Err(e),
+            }
+        }
+        "unarchive_workspace" => {
+            // Backs the `workspace_unarchive` MCP tool. Restores through
+            // the same creation paths the in-app flows use (worktree
+            // create / add-repository), then activates the result.
+            let state: State<'_, AppStateStore> = app.state();
+            let db: State<'_, crate::database::DatabaseStore> = app.state();
+            let pty_state: State<'_, PtyState> = app.state();
+            let presets: State<'_, crate::presets::PresetStoreState> = app.state();
+            let archive_id = request
+                .params
+                .get("archive_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| "Missing required parameter: archive_id".to_string());
+            match archive_id {
+                Ok(aid) => crate::commands::workspace::unarchive_workspace_impl(
+                    app.clone(),
+                    &state,
+                    &db,
+                    &pty_state,
+                    &presets,
+                    aid.clone(),
+                )
+                .await
+                .map(|workspace_id| {
+                    serde_json::json!({
+                        "archive_id": aid,
+                        "workspace_id": workspace_id,
+                        "restored": true,
+                    })
+                }),
+                Err(e) => Err(e),
+            }
+        }
+        "list_archived_workspaces" => {
+            // Backs the `workspace_archive_list` MCP tool. Entries come
+            // straight from state — same data the frontend's archive UI
+            // renders — via the narrow accessor (no full-snapshot clone).
+            let state: State<'_, AppStateStore> = app.state();
+            serde_json::to_value(state.archived_workspaces_list())
+                .map(|entries| serde_json::json!({ "archived_workspaces": entries }))
+                .map_err(|e| e.to_string())
+        }
         "close_pane" => {
             // Phase 1.6: backs the `pane_close` MCP tool. Wraps the
             // existing `close_pane_impl`. State-layer `close_pane`

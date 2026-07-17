@@ -29,7 +29,7 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import {
-  X,
+  Archive,
   Laptop,
   GitBranch,
   Workflow,
@@ -37,15 +37,18 @@ import {
   BellOff,
   Cloud,
   Loader2,
+  X,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { PrStatusIcon, humanizePrState } from "@/components/github/pr-status-icon";
 import {
   activateWorkspace,
+  archiveWorkspace,
   checkoutDefaultBranchInWorkspace,
   closeWorkspace,
   closeWorkspaceWithWorktree,
   renameWorkspace,
+  unarchiveWorkspace,
   setWorkspaceMuted,
   detectEditors,
   openInEditor,
@@ -75,14 +78,34 @@ import { StatusIndicator } from "@/components/ui/status-indicator";
 import { AsciiSpinner } from "@/components/ui/ascii-spinner";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
+import { useForceDelete } from "@/hooks/use-force-delete";
 import { useDefaultBranch } from "./default-branch-cache";
+
+/** Attach-in-place and remote (pushed-to-host) workspaces can't be
+ *  archived — the backend refuses — so their removal affordance is the
+ *  old non-destructive close instead. */
+function isAttachOrRemoteWorkspace(workspace: WorkspaceSnapshot): boolean {
+  return workspace.attach_only === true || workspace.host_id != null;
+}
 
 interface Props {
   workspace: WorkspaceSnapshot;
   isActive: boolean;
 }
 
-function RemoveWorkspaceDialog({
+/** Destructive delete confirmation for deletable worktrees. Archiving
+ *  replaced the old hide/close paths, so this dialog only ever opens for
+ *  a worktree the user explicitly asked to delete (shift-click on the
+ *  archive button, or the context menu's "Delete Worktree…").
+ *
+ *  Escalation state machine (shared `useForceDelete` hook): the first
+ *  Delete issues `closeWorkspaceWithWorktree(..., forceDelete: false)`.
+ *  If the backend rejects with a dirty-worktree message matching
+ *  `USE_FORCE_PATTERN`, the dialog stays open, shows that message
+ *  verbatim in the warning box, and the button flips to "Force delete",
+ *  which reissues the same call with `forceDelete: true`. Any other
+ *  rejection surfaces as an error toast and closes the dialog. */
+function DeleteWorktreeDialog({
   workspace,
   open,
   onOpenChange,
@@ -91,7 +114,6 @@ function RemoveWorkspaceDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const isWorktree = !!workspace.worktree_path;
   const [deleteBranch, setDeleteBranch] = useState(true);
 
   const hasUnpushed = workspace.git_ahead > 0;
@@ -106,120 +128,79 @@ function RemoveWorkspaceDialog({
         ? "Has unpushed commits"
         : null;
 
-  const handleHide = () => {
-    if (isWorktree) {
-      closeWorkspaceWithWorktree(workspace.workspace_id, false, false, false).catch(console.error);
-    } else {
-      closeWorkspace(workspace.workspace_id, false).catch(console.error);
-    }
-    onOpenChange(false);
-  };
+  const { forceMessage, confirm, reset } = useForceDelete({
+    run: (force) =>
+      closeWorkspaceWithWorktree(
+        workspace.workspace_id,
+        true,
+        deleteBranch,
+        force,
+      ),
+    onDone: () => handleOpenChange(false),
+    onError: (message) => {
+      toast.error("Delete failed", { description: message });
+      handleOpenChange(false);
+    },
+  });
 
-  const handleDelete = () => {
-    if (isWorktree) {
-      closeWorkspaceWithWorktree(workspace.workspace_id, true, deleteBranch, false).catch(console.error);
-    } else {
-      closeWorkspace(workspace.workspace_id, true).catch(console.error);
+  function handleOpenChange(next: boolean) {
+    if (!next) {
+      // Reset per-open state so a re-open starts un-escalated.
+      reset();
+      setDeleteBranch(true);
     }
-    onOpenChange(false);
-  };
+    onOpenChange(next);
+  }
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent showCloseButton={false} className="max-w-[340px]">
         <DialogHeader>
           <DialogTitle className="text-sm">
-            {isWorktree
-              ? <>Remove workspace &ldquo;{workspace.title}&rdquo;?</>
-              : <>Close workspace &ldquo;{workspace.title}&rdquo;?</>}
+            Delete worktree &ldquo;{workspace.title}&rdquo;?
           </DialogTitle>
           <DialogDescription>
-            {isWorktree
-              ? "Deleting will permanently remove the worktree. You can hide instead to keep files on disk."
-              : "Removes this workspace from the sidebar. Project files on disk are untouched."}
+            Permanently removes the worktree directory from disk. To keep
+            the files, archive the workspace instead.
           </DialogDescription>
         </DialogHeader>
 
-        {hasWarnings && (
+        {(forceMessage !== null || hasWarnings) && (
           <div className="flex items-center gap-2 rounded-md border border-status-working/20 bg-status-working/10 px-2.5 py-1.5 text-xs text-status-working">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
-            {warningMessage}
+            {forceMessage ?? warningMessage}
           </div>
         )}
 
-        {isWorktree && (
-          <label className="flex items-center gap-2 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={deleteBranch}
-              onChange={(e) => setDeleteBranch(e.target.checked)}
-              className="rounded border-border"
-            />
-            <span className="text-xs text-muted-foreground">
-              Also delete local branch
-            </span>
-          </label>
-        )}
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={deleteBranch}
+            onChange={(e) => setDeleteBranch(e.target.checked)}
+            className="rounded border-border"
+          />
+          <span className="text-xs text-muted-foreground">
+            Also delete local branch
+          </span>
+        </label>
 
         <div className="flex justify-end gap-2 pt-1">
           <Button
             variant="ghost"
             size="sm"
             className="h-7 px-3 text-xs"
-            onClick={() => onOpenChange(false)}
+            onClick={() => handleOpenChange(false)}
           >
             Cancel
           </Button>
-          {isWorktree ? (
-            <>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    className="h-7 px-3 text-xs"
-                    onClick={handleHide}
-                  >
-                    Hide
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-                  Remove from sidebar. Worktree files stay on disk.
-                </TooltipContent>
-              </Tooltip>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    variant="destructive"
-                    size="sm"
-                    className="h-7 px-3 text-xs"
-                    onClick={handleDelete}
-                  >
-                    Delete
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-                  Permanently remove worktree directory from disk.
-                </TooltipContent>
-              </Tooltip>
-            </>
-          ) : (
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  className="h-7 px-3 text-xs"
-                  onClick={handleHide}
-                >
-                  Close
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-                Remove from sidebar. Project files on disk are untouched.
-              </TooltipContent>
-            </Tooltip>
-          )}
+          <Button
+            variant="destructive"
+            size="sm"
+            className="h-7 px-3 text-xs"
+            onClick={() => void confirm()}
+          >
+            {forceMessage !== null ? "Force delete" : "Delete"}
+          </Button>
         </div>
       </DialogContent>
     </Dialog>
@@ -228,11 +209,19 @@ function RemoveWorkspaceDialog({
 
 export function WorkspaceContextMenuItems({
   workspace,
-  onRemoveRequest,
+  onArchiveRequest,
+  onDeleteRequest,
   onRequestPushConfirm,
 }: {
   workspace: WorkspaceSnapshot;
-  onRemoveRequest: () => void;
+  /** Remove the row non-destructively. For local workspaces this
+   *  archives (restorable from Settings → Archive); for attach-in-place
+   *  and remote (host-backed) workspaces — which the backend refuses to
+   *  archive — it performs the plain close instead. */
+  onArchiveRequest: () => void;
+  /** Open the destructive delete-worktree dialog. Only rendered for
+   *  deletable worktrees (never the primary / protected root). */
+  onDeleteRequest: () => void;
   /** Called when the user clicks a host in the "Move to host…"
    *  submenu. Opens the Phase-4 confirmation dialog unless the
    *  user previously set "Don't ask again for this host". */
@@ -240,6 +229,13 @@ export function WorkspaceContextMenuItems({
 }) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
   const isWorktree = !!workspace.worktree_path;
+  const isAttachOrRemote = isAttachOrRemoteWorkspace(workspace);
+  // Mirror of the row's `canDelete` gate: destructive deletion is only
+  // offered for disposable local worktrees — never the primary /
+  // protected root, and never attach-in-place / remote rows (their
+  // teardown is a plain close that leaves the host side alive).
+  const canDelete =
+    isWorktree && workspace.protected !== true && !isAttachOrRemote;
   const defaultBranch = useDefaultBranch(
     workspace.project_root ?? (isWorktree ? null : workspace.cwd),
   );
@@ -495,15 +491,23 @@ export function WorkspaceContextMenuItems({
       )}
 
       <ContextMenuSeparator />
-      <ContextMenuItem onClick={onRemoveRequest}>
-        Close Worktree
+      <ContextMenuItem onClick={onArchiveRequest}>
+        {isAttachOrRemote ? "Close workspace" : "Archive Workspace"}
       </ContextMenuItem>
+      {canDelete && (
+        <ContextMenuItem
+          className="text-destructive focus:text-destructive"
+          onClick={onDeleteRequest}
+        >
+          Delete Worktree…
+        </ContextMenuItem>
+      )}
     </ContextMenuContent>
   );
 }
 
 export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
-  const [showRemoveDialog, setShowRemoveDialog] = useState(false);
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   // Phase-4 push confirmation: holds the host the user just picked
   // from the "Move to host…" submenu, so the dialog can render its
   // summary + handle the actual push on confirm.
@@ -567,6 +571,51 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
     });
   };
 
+  // Archive: remove from sidebar, keep everything on disk. Undo on the
+  // toast restores (and re-activates) the workspace via the archive id
+  // the backend returned — same 10s escape-hatch machinery as push/pull.
+  const handleArchive = async () => {
+    try {
+      const archiveId = await archiveWorkspace(workspace.workspace_id);
+      toast.undoable({
+        message: `Archived "${workspace.title}"`,
+        description: "Restore anytime from Settings → Archive.",
+        onUndo: async () => {
+          await unarchiveWorkspace(archiveId);
+        },
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error("Archive failed", { description: message });
+    }
+  };
+
+  // Non-destructive close for attach-in-place / remote rows: the backend
+  // refuses to archive them, so their removal affordance is the old
+  // close — worktree rows keep the worktree (removeWorktree=false),
+  // plain rows detach. Nothing on the host is torn down; the workspace
+  // stays reachable from the Workspaces Overview.
+  const handleClose = async () => {
+    try {
+      if (workspace.worktree_path) {
+        await closeWorkspaceWithWorktree(
+          workspace.workspace_id,
+          false,
+          false,
+          false,
+        );
+      } else {
+        await closeWorkspace(workspace.workspace_id, false);
+      }
+      toast.success(
+        `Closed "${workspace.title}" — it stays available on its host in the Workspaces Overview`,
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      toast.error("Close failed", { description: message });
+    }
+  };
+
   const isPrimary = !workspace.worktree_path;
   // A protected repo root is never destructively deletable from the sidebar
   // (close-only), aligning with the overview's `isRepoRoot` guard. Roots
@@ -574,7 +623,9 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
   // gating on `protected` too is belt-and-suspenders against a root that
   // somehow carries a worktree_path.
   const isRepoRoot = workspace.protected === true;
-  const canDelete = !isPrimary && !isRepoRoot;
+  const isAttachOrRemote = isAttachOrRemoteWorkspace(workspace);
+  const canDelete = !isPrimary && !isRepoRoot && !isAttachOrRemote;
+  const handleArchiveOrClose = isAttachOrRemote ? handleClose : handleArchive;
   const isRemote =
     workspace.host_id !== null && workspace.host_id !== undefined;
   // SSH tunnel health for this remote workspace (sleep/wake, WiFi flap,
@@ -753,7 +804,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                     className={cn(
                       "shrink-0 text-[10px] tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px]",
                       sidebarElapsedSec === null && "ml-auto",
-                      canDelete && "transition-opacity group-hover/row:opacity-0",
+                      "transition-opacity group-hover/row:opacity-0",
                     )}
                   >
                     {workspace.notification_count}
@@ -791,8 +842,8 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                       "flex items-center gap-1 shrink-0 tabular-nums",
                       // Fade out with the diff stats on hover so the issue
                       // chip never collides with the ahead/behind glyphs as
-                      // it slides left to clear the X button.
-                      canDelete && "transition-opacity group-hover/row:opacity-0",
+                      // it slides left to clear the archive button.
+                      "transition-opacity group-hover/row:opacity-0",
                     )}>
                       {workspace.git_behind > 0 && (
                         <span className="text-warning/80">↓{workspace.git_behind}</span>
@@ -804,11 +855,12 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   )}
 
                   {/* diff stats inline (no pill background) — fades on
-                      hover so the hover-reveal X has its slot. */}
+                      hover so the hover-reveal archive button has its
+                      slot. */}
                   {showGitStats && hasDiff && (
                     <span className={cn(
                       "flex items-center gap-1 shrink-0 tabular-nums ml-auto",
-                      canDelete && "transition-opacity group-hover/row:opacity-0",
+                      "transition-opacity group-hover/row:opacity-0",
                     )}>
                       {workspace.git_additions > 0 && (
                         <span className="text-success/80">+{workspace.git_additions}</span>
@@ -828,19 +880,18 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                     <div className={cn(
                       "flex items-center gap-1 shrink-0 rounded-md px-1",
                       !gitStatsVisible && "ml-auto",
-                      // The hover-reveal remove (X) button is pinned at the
+                      // The hover-reveal archive button is pinned at the
                       // right edge and overlays this slot. Unlike the diff
                       // stats / notification badge (which fade out on hover),
                       // the linked-issue badge is interactive, so instead of
-                      // hiding it we slide the cluster left by the X button's
+                      // hiding it we slide the cluster left by the button's
                       // footprint (size-6 + right-2 ≈ 32px) so the issue stays
-                      // visible and clickable while the X gets a clear slot.
-                      // On hover it also gains an opaque chip (bg-muted +
-                      // shadow, mirroring the X button) so it reads as a
-                      // distinct pill sitting cleanly over the branch name it
-                      // now overlaps, instead of colliding glyph-on-glyph.
-                      canDelete &&
-                        "transition-all group-hover/row:-translate-x-8 group-hover/row:bg-muted group-hover/row:shadow-sm",
+                      // visible and clickable while the button gets a clear
+                      // slot. On hover it also gains an opaque chip (bg-muted
+                      // + shadow, mirroring the archive button) so it reads as
+                      // a distinct pill sitting cleanly over the branch name
+                      // it now overlaps, instead of colliding glyph-on-glyph.
+                      "transition-all group-hover/row:-translate-x-8 group-hover/row:bg-muted group-hover/row:shadow-sm",
                     )}>
                       {workspace.notifications_muted && (
                         <Tooltip>
@@ -867,31 +918,59 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
               )}
             </div>
 
-            {/* Hover-reveal remove button — pinned to a fixed slot so
-                it lands at the same x-coordinate on every row. */}
-            {canDelete && (
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="absolute right-2 inset-y-0 my-auto opacity-0 group-hover/row:opacity-100 transition-opacity bg-muted text-muted-foreground shadow-sm hover:text-foreground dark:hover:bg-muted"
-                onClick={(e) => { e.stopPropagation(); setShowRemoveDialog(true); }}
-                aria-label="Remove workspace"
-              >
-                <X className="h-3.5 w-3.5" />
-              </Button>
-            )}
+            {/* Hover-reveal action button — pinned to a fixed slot so
+                it lands at the same x-coordinate on every row. Rendered
+                for EVERY row, including the primary/protected root.
+                Local rows archive (non-destructive); attach-in-place /
+                remote rows get the plain close instead, since the
+                backend refuses to archive them. Shift-click on a
+                deletable worktree opens the destructive delete dialog;
+                on protected and attach/remote rows shift-click behaves
+                like a plain click. */}
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="absolute right-2 inset-y-0 my-auto opacity-0 group-hover/row:opacity-100 transition-opacity bg-muted text-muted-foreground shadow-sm hover:text-foreground dark:hover:bg-muted"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (e.shiftKey && canDelete) {
+                      setShowDeleteDialog(true);
+                      return;
+                    }
+                    void handleArchiveOrClose();
+                  }}
+                  aria-label={
+                    isAttachOrRemote ? "Close workspace" : "Archive workspace"
+                  }
+                >
+                  {isAttachOrRemote ? (
+                    <X className="h-3.5 w-3.5" />
+                  ) : (
+                    <Archive className="h-3.5 w-3.5" />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                {isAttachOrRemote
+                  ? "Close workspace — it stays available on its host in the Workspaces Overview"
+                  : "Archive workspace — restore anytime from Settings → Archive"}
+              </TooltipContent>
+            </Tooltip>
           </div>
         </ContextMenuTrigger>
         <WorkspaceContextMenuItems
           workspace={workspace}
-          onRemoveRequest={() => setShowRemoveDialog(true)}
+          onArchiveRequest={() => void handleArchiveOrClose()}
+          onDeleteRequest={() => setShowDeleteDialog(true)}
           onRequestPushConfirm={(host) => setPendingPushHost(host)}
         />
       </ContextMenu>
-      <RemoveWorkspaceDialog
+      <DeleteWorktreeDialog
         workspace={workspace}
-        open={showRemoveDialog}
-        onOpenChange={setShowRemoveDialog}
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
       />
       <ConfirmPushDialog
         open={pendingPushHost !== null}

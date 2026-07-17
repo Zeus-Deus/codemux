@@ -88,7 +88,7 @@ added or removed.
 | Browser — Tier 3: OS-level Input | 2 | `browser_click_os`, `browser_type_os` |
 | Browser — Info & Evaluation | 3 | `browser_get_styles`, `browser_wait`, `browser_evaluate` |
 | Browser — Viewport | 2 | `browser_viewport`, `browser_viewport_presets` |
-| Workspace | 5 | `workspace_list`, `workspace_info`, `workspace_create`, `workspace_open` (Phase 1), `workspace_close` (Phase 1.6) |
+| Workspace | 8 | `workspace_list`, `workspace_info`, `workspace_create`, `workspace_open` (Phase 1), `workspace_close` (Phase 1.6), `workspace_archive`, `workspace_unarchive`, `workspace_archive_list` (see `docs/features/workspace-archive.md`; `workspace_close` refuses worktree deletion on protected roots and honors `force_delete` for the dirty-worktree guard) |
 | Pane | 4 | `pane_list`, `pane_split_right`, `pane_split_down`, `pane_close` (Phase 1.6) |
 | Notification | 1 | `notify` |
 | Git | 5 | `git_status`, `git_diff`, `git_stage`, `git_commit`, `git_push` |

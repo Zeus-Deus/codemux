@@ -16,6 +16,8 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 // Mock Tauri commands
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  archiveWorkspace: vi.fn().mockResolvedValue("archive-1"),
+  unarchiveWorkspace: vi.fn().mockResolvedValue("ws-1"),
   checkoutDefaultBranchInWorkspace: vi.fn().mockResolvedValue("main"),
   closeWorkspace: vi.fn().mockResolvedValue(undefined),
   closeWorkspaceWithWorktree: vi.fn().mockResolvedValue(undefined),
@@ -327,7 +329,9 @@ describe("SidebarWorkspaceRow", () => {
   it("shows Laptop icon for primary checkout (no worktree_path)", () => {
     const ws = makeWorkspace({ worktree_path: null });
     const { container } = render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     // Laptop icon renders as an SVG — check for the lucide class
     const laptopIcon = container.querySelector("svg.lucide-laptop");
@@ -337,7 +341,9 @@ describe("SidebarWorkspaceRow", () => {
   it("shows GitBranch icon for worktree checkout", () => {
     const ws = makeWorkspace({ worktree_path: "/home/user/.worktrees/feature" });
     const { container } = render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     const branchIcon = container.querySelector("svg.lucide-git-branch");
     expect(branchIcon).toBeInTheDocument();
@@ -453,32 +459,43 @@ describe("SidebarWorkspaceRow", () => {
       pr_url: null,
     });
     const { container } = render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     expect(container.querySelector("svg.lucide-git-branch")).toBeInTheDocument();
     expect(container.querySelector("svg.lucide-git-pull-request")).toBeNull();
   });
 
-  it("hides remove button for primary checkout (Hide-only via right-click)", () => {
+  // The hover-reveal action is the (non-destructive) archive button and
+  // renders for EVERY row — primary/protected included — since archiving
+  // never touches files. The old delete-only X button is gone.
+  it("shows the archive button for primary checkout", () => {
     const ws = makeWorkspace({ worktree_path: null });
     const { container } = render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
-    expect(container.querySelector("[aria-label='Remove workspace']")).toBeNull();
+    expect(container.querySelector("[aria-label='Archive workspace']")).not.toBeNull();
   });
 
-  it("shows remove button for worktree checkout", () => {
+  it("shows the archive button for worktree checkout", () => {
     const ws = makeWorkspace({ worktree_path: "/home/user/.worktrees/feature" });
     const { container } = render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
-    expect(container.querySelector("[aria-label='Remove workspace']")).not.toBeNull();
+    expect(container.querySelector("[aria-label='Archive workspace']")).not.toBeNull();
   });
 
   it("shows ahead/behind indicators when counts > 0", () => {
     const ws = makeWorkspace({ git_ahead: 3, git_behind: 1 });
     render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     expect(screen.getByText("↑3")).toBeInTheDocument();
     expect(screen.getByText("↓1")).toBeInTheDocument();
@@ -487,7 +504,9 @@ describe("SidebarWorkspaceRow", () => {
   it("hides ahead/behind when both are 0", () => {
     const ws = makeWorkspace({ git_ahead: 0, git_behind: 0 });
     const { container } = render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     expect(container.textContent).not.toMatch(/↑\d/);
     expect(container.textContent).not.toMatch(/↓\d/);
@@ -496,7 +515,9 @@ describe("SidebarWorkspaceRow", () => {
   it("shows diff counts on non-active workspaces", () => {
     const ws = makeWorkspace({ git_additions: 42, git_deletions: 7 });
     render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     expect(screen.getByText("+42")).toBeInTheDocument();
     expect(screen.getByText("−7")).toBeInTheDocument();
@@ -505,7 +526,9 @@ describe("SidebarWorkspaceRow", () => {
   it("shows diff counts on active workspace too", () => {
     const ws = makeWorkspace({ git_additions: 10, git_deletions: 3 });
     render(
-      <SidebarWorkspaceRow workspace={ws} isActive={true} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={true} />
+      </TooltipProvider>,
     );
     expect(screen.getByText("+10")).toBeInTheDocument();
     expect(screen.getByText("−3")).toBeInTheDocument();
@@ -516,7 +539,9 @@ describe("SidebarWorkspaceRow", () => {
       linked_issue: { number: 92, title: "Backend endpoints", state: "Open", labels: [] },
     });
     render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     expect(screen.getByText("#92")).toBeInTheDocument();
   });
@@ -524,7 +549,9 @@ describe("SidebarWorkspaceRow", () => {
   it("does NOT show linked issue when linked_issue is null", () => {
     const ws = makeWorkspace({ linked_issue: null });
     const { container } = render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     // No issue number should appear
     expect(container.textContent).not.toMatch(/#\d+/);
@@ -535,7 +562,9 @@ describe("SidebarWorkspaceRow", () => {
       linked_issue: { number: 10, title: "Open issue", state: "Open", labels: [] },
     });
     const { container: c1 } = render(
-      <SidebarWorkspaceRow workspace={wsOpen} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={wsOpen} isActive={false} />
+      </TooltipProvider>,
     );
     const openDot = c1.querySelector(".bg-success");
     expect(openDot).toBeInTheDocument();
@@ -545,7 +574,9 @@ describe("SidebarWorkspaceRow", () => {
       linked_issue: { number: 11, title: "Closed issue", state: "Closed", labels: [] },
     });
     const { container: c2 } = render(
-      <SidebarWorkspaceRow workspace={wsClosed} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={wsClosed} isActive={false} />
+      </TooltipProvider>,
     );
     const closedDot = c2.querySelector(".bg-muted-foreground");
     expect(closedDot).toBeInTheDocument();
@@ -571,7 +602,9 @@ describe("SidebarWorkspaceRow", () => {
 
       const ws = makeWorkspace({ workspace_id: "ws-target" });
       const { container } = render(
-        <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+        <TooltipProvider>
+          <SidebarWorkspaceRow workspace={ws} isActive={false} />
+        </TooltipProvider>,
       );
       const row = container.querySelector("[role='button']") as HTMLElement;
       fireEvent.click(row);
@@ -587,7 +620,9 @@ describe("SidebarWorkspaceRow", () => {
 
       const ws = makeWorkspace({ workspace_id: "ws-target-2" });
       const { container } = render(
-        <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+        <TooltipProvider>
+          <SidebarWorkspaceRow workspace={ws} isActive={false} />
+        </TooltipProvider>,
       );
       const row = container.querySelector("[role='button']") as HTMLElement;
       fireEvent.click(row);

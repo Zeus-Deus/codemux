@@ -459,6 +459,75 @@ pub struct WorkspaceSnapshot {
     pub attach_only: bool,
 }
 
+/// A workspace the user archived: the workspace itself is closed (no
+/// sessions, no sidebar row) but its files stay on disk and enough
+/// metadata is kept here to restore it later — or to delete its
+/// worktree explicitly from the archive UI. Lives in
+/// [`AppStateSnapshot::archived_workspaces`], so it persists to
+/// layout.json and reaches the frontend through the ordinary snapshot
+/// emit with zero extra plumbing.
+///
+/// Every optional field is `#[serde(default)]` so entries written by a
+/// future version with more fields still load on this one, matching the
+/// additive-field convention used across the snapshot types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedWorkspaceSnapshot {
+    /// Identity of the archive entry itself (fresh UUID at archive
+    /// time). The original workspace id is NOT reused because a
+    /// restore creates a brand-new workspace — keeping the ids apart
+    /// prevents stale frontend references from resolving to the entry.
+    pub archive_id: String,
+    /// The id the workspace had when it was archived. Informational
+    /// only (e.g. for correlating logs); never looked up against live
+    /// state.
+    pub workspace_id: String,
+    pub title: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub project_root: Option<String>,
+    #[serde(default)]
+    pub project_uid: Option<String>,
+    #[serde(default)]
+    pub workspace_kind: Option<String>,
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    #[serde(default)]
+    pub protected: bool,
+    /// Optimistic default mirrors `WorkspaceSnapshot::is_git` — see the
+    /// rationale on that field.
+    #[serde(default = "default_true")]
+    pub is_git: bool,
+    /// Unix seconds at archive time. Lets the frontend sort the archive
+    /// list by recency without a separate timestamp store.
+    pub archived_at: u64,
+}
+
+/// Copy the archive-relevant fields out of a live workspace. Pure —
+/// callers decide when to add the result to state (specifically AFTER
+/// the close path succeeded, so a failed teardown never leaves a
+/// phantom archive entry).
+pub fn build_archive_entry(ws: &WorkspaceSnapshot) -> ArchivedWorkspaceSnapshot {
+    ArchivedWorkspaceSnapshot {
+        archive_id: uuid::Uuid::new_v4().to_string(),
+        workspace_id: ws.workspace_id.0.clone(),
+        title: ws.title.clone(),
+        cwd: ws.cwd.clone(),
+        worktree_path: ws.worktree_path.clone(),
+        project_root: ws.project_root.clone(),
+        project_uid: ws.project_uid.clone(),
+        workspace_kind: ws.workspace_kind.clone(),
+        git_branch: ws.git_branch.clone(),
+        protected: ws.protected,
+        is_git: ws.is_git,
+        archived_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistenceSchema {
     pub schema_version: u32,
@@ -527,6 +596,12 @@ pub struct AppStateSnapshot {
     /// Per-pane agent status (pane_id → status). Only non-idle entries are stored.
     #[serde(default)]
     pub pane_statuses: HashMap<String, PaneStatus>,
+    /// Workspaces the user archived (closed but restorable — see
+    /// [`ArchivedWorkspaceSnapshot`]). Additive: old layout.json files
+    /// deserialize as an empty list, and persisting/emitting comes for
+    /// free because the whole snapshot is written/emitted wholesale.
+    #[serde(default)]
+    pub archived_workspaces: Vec<ArchivedWorkspaceSnapshot>,
     pub persistence: PersistenceSchema,
     pub config: CodemuxConfigSnapshot,
 }
@@ -1981,6 +2056,67 @@ impl AppStateStore {
             removed_agent_chat_threads,
             removed_agent_browser_sessions,
         })
+    }
+
+    /// Add an archive entry, first evicting any stale entry for the same
+    /// on-disk location (same `(cwd, worktree_path)` pair). Dedupe keyed
+    /// on location rather than workspace id because re-archiving the
+    /// same folder produces a NEW workspace id each cycle — without the
+    /// location key the list would grow one ghost entry per
+    /// archive/restore round-trip.
+    pub fn add_archived_workspace(&self, entry: ArchivedWorkspaceSnapshot) {
+        let mut snapshot = self.inner.lock().unwrap();
+        snapshot
+            .archived_workspaces
+            .retain(|e| !(e.cwd == entry.cwd && e.worktree_path == entry.worktree_path));
+        snapshot.archived_workspaces.push(entry);
+    }
+
+    /// Remove and return the archive entry with `archive_id`. Returning
+    /// the removed entry lets callers act on its metadata (e.g. the
+    /// worktree path) without a second lookup racing a concurrent
+    /// mutation.
+    pub fn remove_archived_workspace(
+        &self,
+        archive_id: &str,
+    ) -> Result<ArchivedWorkspaceSnapshot, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let index = snapshot
+            .archived_workspaces
+            .iter()
+            .position(|e| e.archive_id == archive_id)
+            .ok_or_else(|| format!("No archived workspace found for {archive_id}"))?;
+        Ok(snapshot.archived_workspaces.remove(index))
+    }
+
+    /// Clone of just the archive list — for readers (e.g. the
+    /// `list_archived_workspaces` control command) that would otherwise
+    /// clone the entire snapshot to look at one vec.
+    pub fn archived_workspaces_list(&self) -> Vec<ArchivedWorkspaceSnapshot> {
+        self.inner.lock().unwrap().archived_workspaces.clone()
+    }
+
+    /// Clone of the live workspace with `workspace_id`, if any — the
+    /// narrow sibling of `snapshot()` for single-workspace lookups.
+    pub fn find_workspace(&self, workspace_id: &str) -> Option<WorkspaceSnapshot> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .cloned()
+    }
+
+    /// Clone of the archive entry with `archive_id`, if any. Read-only
+    /// sibling of `remove_archived_workspace` for flows that must keep
+    /// the entry until the restore/delete actually succeeded.
+    pub fn find_archived_workspace(&self, archive_id: &str) -> Option<ArchivedWorkspaceSnapshot> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .archived_workspaces
+            .iter()
+            .find(|e| e.archive_id == archive_id)
+            .cloned()
     }
 
     pub fn reorder_workspaces(&self, workspace_ids: Vec<String>) -> bool {
@@ -3928,6 +4064,7 @@ fn default_app_state() -> AppStateSnapshot {
 
     AppStateSnapshot {
         schema_version: APP_STATE_SCHEMA_VERSION,
+        archived_workspaces: Vec::new(),
         active_workspace_id: workspace_id.clone(),
         workspaces: vec![WorkspaceSnapshot {
             workspace_id,
@@ -7111,5 +7248,171 @@ mod tests {
         });
         assert_ne!(third, first, "post-deletion call must create a fresh id");
         assert_eq!(store.find_home_workspace_id(), Some(third));
+    }
+}
+
+#[cfg(test)]
+mod archived_workspace_tests {
+    //! Coverage for the workspace-archive state layer: entry
+    //! add/dedupe/remove semantics and — critically — snapshot serde
+    //! backward compatibility, since `archived_workspaces` piggybacks on
+    //! the persisted layout.json and MUST NOT break loading of files
+    //! written before the field existed.
+
+    use super::*;
+
+    fn sample_entry(cwd: &str, worktree_path: Option<&str>) -> ArchivedWorkspaceSnapshot {
+        ArchivedWorkspaceSnapshot {
+            archive_id: uuid::Uuid::new_v4().to_string(),
+            workspace_id: "workspace-1".into(),
+            title: "My branch".into(),
+            cwd: cwd.to_string(),
+            worktree_path: worktree_path.map(str::to_string),
+            project_root: Some("/tmp/repo".into()),
+            project_uid: None,
+            workspace_kind: Some(if worktree_path.is_some() {
+                "worktree".into()
+            } else {
+                "main".into()
+            }),
+            git_branch: Some("feature/x".into()),
+            protected: false,
+            is_git: true,
+            archived_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn add_archived_workspace_appends_entry() {
+        let store = AppStateStore::default();
+        let entry = sample_entry("/tmp/repo/wt", Some("/tmp/repo/wt"));
+        let archive_id = entry.archive_id.clone();
+        store.add_archived_workspace(entry);
+
+        let snap = store.snapshot();
+        assert_eq!(snap.archived_workspaces.len(), 1);
+        assert_eq!(snap.archived_workspaces[0].archive_id, archive_id);
+    }
+
+    #[test]
+    fn add_archived_workspace_dedupes_on_location() {
+        // Re-archiving the same on-disk location must replace the stale
+        // entry, not accumulate ghosts — the dedupe key is the
+        // (cwd, worktree_path) pair, NOT the workspace id (which changes
+        // on every archive/restore cycle).
+        let store = AppStateStore::default();
+        let first = sample_entry("/tmp/repo/wt", Some("/tmp/repo/wt"));
+        let second = sample_entry("/tmp/repo/wt", Some("/tmp/repo/wt"));
+        let second_id = second.archive_id.clone();
+        store.add_archived_workspace(first);
+        store.add_archived_workspace(second);
+
+        let snap = store.snapshot();
+        assert_eq!(
+            snap.archived_workspaces.len(),
+            1,
+            "same-location entries must dedupe to the newest"
+        );
+        assert_eq!(snap.archived_workspaces[0].archive_id, second_id);
+    }
+
+    #[test]
+    fn add_archived_workspace_keeps_distinct_locations() {
+        // A root-checkout entry (worktree_path=None) and a worktree
+        // entry that happens to share the cwd string are DIFFERENT
+        // locations — the pair key must keep both.
+        let store = AppStateStore::default();
+        store.add_archived_workspace(sample_entry("/tmp/repo", None));
+        store.add_archived_workspace(sample_entry("/tmp/repo", Some("/tmp/repo/wt")));
+        store.add_archived_workspace(sample_entry("/tmp/other", None));
+
+        assert_eq!(store.snapshot().archived_workspaces.len(), 3);
+    }
+
+    #[test]
+    fn remove_archived_workspace_returns_entry_and_errors_on_unknown() {
+        let store = AppStateStore::default();
+        let entry = sample_entry("/tmp/repo/wt", Some("/tmp/repo/wt"));
+        let archive_id = entry.archive_id.clone();
+        store.add_archived_workspace(entry);
+
+        let removed = store
+            .remove_archived_workspace(&archive_id)
+            .expect("existing entry must remove");
+        assert_eq!(removed.archive_id, archive_id);
+        assert!(store.snapshot().archived_workspaces.is_empty());
+
+        let err = store
+            .remove_archived_workspace(&archive_id)
+            .expect_err("second removal must error");
+        assert!(
+            err.contains("No archived workspace"),
+            "unexpected error string: {err}"
+        );
+    }
+
+    #[test]
+    fn build_archive_entry_copies_workspace_metadata() {
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_at_path(PathBuf::from("/tmp/archive-build"));
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == ws_id)
+            .expect("workspace exists");
+
+        let entry = build_archive_entry(ws);
+        assert!(!entry.archive_id.is_empty(), "archive_id must be generated");
+        assert_ne!(
+            entry.archive_id, entry.workspace_id,
+            "archive identity must be distinct from the workspace id"
+        );
+        assert_eq!(entry.workspace_id, ws.workspace_id.0);
+        assert_eq!(entry.title, ws.title);
+        assert_eq!(entry.cwd, ws.cwd);
+        assert_eq!(entry.worktree_path, ws.worktree_path);
+        assert_eq!(entry.protected, ws.protected);
+        assert!(entry.archived_at > 0, "archived_at must be a real timestamp");
+    }
+
+    #[test]
+    fn snapshot_without_archived_workspaces_field_still_deserializes() {
+        // Backward compat: layout.json files written before the archive
+        // feature have no `archived_workspaces` key. Simulate one by
+        // serializing a current snapshot and deleting the key.
+        let snapshot = default_app_state();
+        let mut value = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let map = value.as_object_mut().expect("snapshot serializes to object");
+        assert!(
+            map.remove("archived_workspaces").is_some(),
+            "current snapshots must serialize the field (so it persists)"
+        );
+
+        let restored: AppStateSnapshot =
+            serde_json::from_value(value).expect("old-shape snapshot must deserialize");
+        assert!(
+            restored.archived_workspaces.is_empty(),
+            "missing field must default to an empty archive list"
+        );
+    }
+
+    #[test]
+    fn archived_entries_round_trip_through_snapshot_serde() {
+        // The persistence path serializes the WHOLE snapshot; entries
+        // must survive the round trip byte-for-byte in the fields that
+        // matter for restore.
+        let store = AppStateStore::default();
+        store.add_archived_workspace(sample_entry("/tmp/repo/wt", Some("/tmp/repo/wt")));
+        let snapshot = store.snapshot();
+
+        let json = serde_json::to_string(&snapshot).expect("serialize");
+        let restored: AppStateSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.archived_workspaces.len(), 1);
+        let entry = &restored.archived_workspaces[0];
+        assert_eq!(entry.cwd, "/tmp/repo/wt");
+        assert_eq!(entry.worktree_path.as_deref(), Some("/tmp/repo/wt"));
+        assert_eq!(entry.git_branch.as_deref(), Some("feature/x"));
+        assert_eq!(entry.archived_at, 1_700_000_000);
     }
 }

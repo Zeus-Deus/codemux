@@ -11,12 +11,20 @@ import type { WorkspaceSnapshot } from "@/tauri/types";
 // `vi.mock()` factories are hoisted above `import`s, so any spies they
 // reference must be created via `vi.hoisted` to survive that hoist.
 const {
+  mockArchiveWorkspace,
+  mockUnarchiveWorkspace,
   mockCheckoutDefault,
+  mockCloseWorkspace,
+  mockCloseWorkspaceWithWorktree,
   mockGetDefaultBranch,
   mockSetWorkspaceMuted,
   mockToast,
 } = vi.hoisted(() => ({
+  mockArchiveWorkspace: vi.fn(),
+  mockUnarchiveWorkspace: vi.fn(),
   mockCheckoutDefault: vi.fn(),
+  mockCloseWorkspace: vi.fn(),
+  mockCloseWorkspaceWithWorktree: vi.fn(),
   mockGetDefaultBranch: vi.fn().mockResolvedValue("main"),
   mockSetWorkspaceMuted: vi.fn().mockResolvedValue(undefined),
   mockToast: {
@@ -24,15 +32,20 @@ const {
     error: vi.fn(),
     info: vi.fn(),
     warning: vi.fn(),
+    undoable: vi.fn(),
   },
 }));
 
 vi.mock("@/tauri/commands", () => ({
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  archiveWorkspace: (...args: unknown[]) => mockArchiveWorkspace(...args),
+  unarchiveWorkspace: (...args: unknown[]) =>
+    mockUnarchiveWorkspace(...args),
   checkoutDefaultBranchInWorkspace: (...args: unknown[]) =>
     mockCheckoutDefault(...args),
-  closeWorkspace: vi.fn().mockResolvedValue(undefined),
-  closeWorkspaceWithWorktree: vi.fn().mockResolvedValue(undefined),
+  closeWorkspace: (...args: unknown[]) => mockCloseWorkspace(...args),
+  closeWorkspaceWithWorktree: (...args: unknown[]) =>
+    mockCloseWorkspaceWithWorktree(...args),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   setWorkspaceMuted: (...args: unknown[]) => mockSetWorkspaceMuted(...args),
   detectEditors: vi.fn().mockResolvedValue([]),
@@ -158,13 +171,22 @@ beforeEach(() => {
   useSettingsStore.setState({
     settings: { "sidebar.workspace_detail": "detailed" },
   });
+  mockArchiveWorkspace.mockReset();
+  mockArchiveWorkspace.mockResolvedValue("archive-1");
+  mockUnarchiveWorkspace.mockReset();
+  mockUnarchiveWorkspace.mockResolvedValue("ws-1");
   mockCheckoutDefault.mockReset();
+  mockCloseWorkspace.mockReset();
+  mockCloseWorkspace.mockResolvedValue(undefined);
+  mockCloseWorkspaceWithWorktree.mockReset();
+  mockCloseWorkspaceWithWorktree.mockResolvedValue(undefined);
   mockGetDefaultBranch.mockReset();
   mockGetDefaultBranch.mockResolvedValue("main");
   mockSetWorkspaceMuted.mockReset();
   mockSetWorkspaceMuted.mockResolvedValue(undefined);
   mockToast.success.mockReset();
   mockToast.error.mockReset();
+  mockToast.undoable.mockReset();
   __resetDefaultBranchCacheForTests();
 });
 
@@ -172,7 +194,7 @@ describe("Checkout default branch menu item", () => {
   it("renders for a primary workspace on a non-default branch", async () => {
     const ws = makeWorkspace({ worktree_path: null, git_branch: "feature/x" });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
 
     await flushDefaultBranchFetch();
@@ -188,7 +210,7 @@ describe("Checkout default branch menu item", () => {
       git_branch: "feature/x",
     });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
 
     await flushDefaultBranchFetch();
@@ -201,7 +223,7 @@ describe("Checkout default branch menu item", () => {
   it("is disabled when the primary workspace is already on the default branch", async () => {
     const ws = makeWorkspace({ worktree_path: null, git_branch: "main" });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
 
     await flushDefaultBranchFetch();
@@ -222,7 +244,7 @@ describe("Checkout default branch menu item", () => {
       git_branch: "feature/x",
     });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
 
     await flushDefaultBranchFetch();
@@ -238,7 +260,7 @@ describe("Checkout default branch menu item", () => {
     mockCheckoutDefault.mockResolvedValueOnce("main");
     const ws = makeWorkspace({ worktree_path: null, git_branch: "feature/x" });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
 
     await flushDefaultBranchFetch();
@@ -258,7 +280,7 @@ describe("Checkout default branch menu item", () => {
     );
     const ws = makeWorkspace({ worktree_path: null, git_branch: "feature/x" });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
 
     await flushDefaultBranchFetch();
@@ -279,7 +301,9 @@ describe("Checkout default branch menu item", () => {
   it("renders SidebarWorkspaceRow without crashing for a primary workspace", () => {
     const ws = makeWorkspace({ worktree_path: null });
     const { container } = render(
-      <SidebarWorkspaceRow workspace={ws} isActive={false} />,
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
     );
     expect(container.querySelector("svg.lucide-laptop")).toBeInTheDocument();
   });
@@ -297,7 +321,7 @@ describe("Checkout default branch menu item", () => {
     );
     const ws = makeWorkspace({ worktree_path: null, git_branch: "feature/x" });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
 
     const item = screen.getByRole("menuitem", { name: /Checkout default branch/i });
@@ -312,7 +336,7 @@ describe("Checkout default branch menu item", () => {
     mockGetDefaultBranch.mockResolvedValueOnce("");
     const ws = makeWorkspace({ worktree_path: null, git_branch: "" });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
     await flushDefaultBranchFetch();
 
@@ -332,7 +356,7 @@ describe("Checkout default branch menu item", () => {
     );
     const ws = makeWorkspace({ worktree_path: null, git_branch: "feature/x" });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
 
     await flushDefaultBranchFetch();
@@ -362,7 +386,7 @@ describe("Checkout default branch menu item", () => {
       git_branch: "feature/x",
     });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
     await flushDefaultBranchFetch();
 
@@ -383,7 +407,7 @@ describe("Checkout default branch menu item", () => {
       git_branch: "feature-x",
     });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
     await flushDefaultBranchFetch();
 
@@ -395,7 +419,7 @@ describe("Mute notifications menu item", () => {
   it("shows 'Mute notifications' when the workspace is not muted", async () => {
     const ws = makeWorkspace({ notifications_muted: false });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
     await flushDefaultBranchFetch();
 
@@ -410,7 +434,7 @@ describe("Mute notifications menu item", () => {
   it("shows 'Unmute notifications' when the workspace is already muted", async () => {
     const ws = makeWorkspace({ notifications_muted: true });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
     await flushDefaultBranchFetch();
 
@@ -425,7 +449,7 @@ describe("Mute notifications menu item", () => {
       notifications_muted: false,
     });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
     await flushDefaultBranchFetch();
 
@@ -443,7 +467,7 @@ describe("Mute notifications menu item", () => {
       notifications_muted: true,
     });
     render(
-      <WorkspaceContextMenuItems workspace={ws} onRemoveRequest={() => {}} />,
+      <WorkspaceContextMenuItems workspace={ws} onArchiveRequest={() => {}} onDeleteRequest={() => {}} />,
     );
     await flushDefaultBranchFetch();
 
@@ -481,6 +505,402 @@ describe("Muted indicator on the workspace row", () => {
     );
     expect(
       unmuted.container.querySelector("svg.lucide-bell-off"),
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("Archive context-menu items", () => {
+  it("renders 'Archive Workspace' and forwards clicks to onArchiveRequest", async () => {
+    const onArchive = vi.fn();
+    const ws = makeWorkspace({ worktree_path: null });
+    render(
+      <WorkspaceContextMenuItems
+        workspace={ws}
+        onArchiveRequest={onArchive}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: /Archive Workspace/i }),
+    );
+    expect(onArchive).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers 'Delete Worktree…' only for deletable worktrees", async () => {
+    const ws = makeWorkspace({
+      worktree_path: "/home/user/.codemux/worktrees/myapp/feature-x",
+      protected: false,
+    });
+    render(
+      <WorkspaceContextMenuItems
+        workspace={ws}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    expect(
+      screen.getByRole("menuitem", { name: /Delete Worktree…/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides 'Delete Worktree…' for the primary workspace and the protected root", async () => {
+    const primary = render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ worktree_path: null })}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+    expect(
+      screen.queryByRole("menuitem", { name: /Delete Worktree…/i }),
+    ).not.toBeInTheDocument();
+    primary.unmount();
+    cleanup();
+
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({
+          worktree_path: "/home/user/.codemux/worktrees/myapp/root-copy",
+          protected: true,
+        })}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+    expect(
+      screen.queryByRole("menuitem", { name: /Delete Worktree…/i }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+describe("Hover-reveal archive button", () => {
+  const renderRow = (ws: WorkspaceSnapshot) =>
+    render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
+    );
+
+  it("renders for every row — including the primary/protected root", () => {
+    renderRow(makeWorkspace({ worktree_path: null, protected: true }));
+    expect(
+      screen.getByRole("button", { name: /Archive workspace/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("plain click archives and shows an undoable toast", async () => {
+    mockArchiveWorkspace.mockResolvedValueOnce("archive-42");
+    renderRow(makeWorkspace({ workspace_id: "ws-arch", title: "My Feature" }));
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /Archive workspace/i }),
+    );
+
+    expect(mockArchiveWorkspace).toHaveBeenCalledWith("ws-arch");
+    await waitFor(() =>
+      expect(mockToast.undoable).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'Archived "My Feature"' }),
+      ),
+    );
+
+    // The toast's Undo closure restores via the archive id the backend
+    // returned.
+    const { onUndo } = mockToast.undoable.mock.calls[0][0];
+    await onUndo();
+    expect(mockUnarchiveWorkspace).toHaveBeenCalledWith("archive-42");
+  });
+
+  it("surfaces an error toast when archiving fails", async () => {
+    mockArchiveWorkspace.mockRejectedValueOnce(
+      "This workspace is attached in place on its host — close it instead of archiving.",
+    );
+    renderRow(makeWorkspace({}));
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /Archive workspace/i }),
+    );
+
+    await waitFor(() => expect(mockToast.error).toHaveBeenCalledTimes(1));
+    expect(mockToast.undoable).not.toHaveBeenCalled();
+  });
+
+  it("shift-click on a deletable worktree opens the delete dialog instead of archiving", async () => {
+    const user = userEvent.setup();
+    renderRow(
+      makeWorkspace({
+        worktree_path: "/home/user/.codemux/worktrees/myapp/feature-x",
+        protected: false,
+      }),
+    );
+
+    await user.keyboard("{Shift>}");
+    await user.click(
+      screen.getByRole("button", { name: /Archive workspace/i }),
+    );
+    await user.keyboard("{/Shift}");
+
+    expect(mockArchiveWorkspace).not.toHaveBeenCalled();
+    // Query by heading role — the (inline-mocked) context menu also
+    // renders a "Delete Worktree…" item, so plain text would be
+    // ambiguous.
+    expect(
+      await screen.findByRole("heading", { name: /Delete worktree/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("shift-click on the protected root archives like a plain click", async () => {
+    const user = userEvent.setup();
+    renderRow(
+      makeWorkspace({ workspace_id: "ws-root", worktree_path: null, protected: true }),
+    );
+
+    await user.keyboard("{Shift>}");
+    await user.click(
+      screen.getByRole("button", { name: /Archive workspace/i }),
+    );
+    await user.keyboard("{/Shift}");
+
+    expect(mockArchiveWorkspace).toHaveBeenCalledWith("ws-root");
+  });
+
+  // Safety invariant: no interaction on a protected/primary root row may
+  // ever open the destructive delete dialog — shift-click included. The
+  // root checkout owns the repo's shared history; its only removal path
+  // is the non-destructive archive.
+  it("NEVER opens the delete dialog for a protected root — shift-click archives, no destructive call", async () => {
+    const user = userEvent.setup();
+    renderRow(
+      makeWorkspace({
+        workspace_id: "ws-root",
+        worktree_path: null,
+        protected: true,
+      }),
+    );
+
+    await user.keyboard("{Shift>}");
+    await user.click(
+      screen.getByRole("button", { name: /Archive workspace/i }),
+    );
+    await user.keyboard("{/Shift}");
+
+    expect(
+      screen.queryByRole("heading", { name: /Delete worktree/i }),
+    ).not.toBeInTheDocument();
+    expect(mockCloseWorkspaceWithWorktree).not.toHaveBeenCalled();
+    expect(mockArchiveWorkspace).toHaveBeenCalledWith("ws-root");
+  });
+});
+
+describe("Remote / attach-only rows: close instead of archive", () => {
+  const renderRow = (ws: WorkspaceSnapshot) =>
+    render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={false} />
+      </TooltipProvider>,
+    );
+
+  it("the hover button on a remote (host-backed) row is 'Close workspace' and detaches non-destructively", async () => {
+    renderRow(
+      makeWorkspace({
+        workspace_id: "ws-remote",
+        title: "On host",
+        worktree_path: null,
+        host_id: 3,
+      }),
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /Close workspace/i }),
+    );
+
+    expect(mockArchiveWorkspace).not.toHaveBeenCalled();
+    expect(mockCloseWorkspace).toHaveBeenCalledWith("ws-remote", false);
+    await waitFor(() =>
+      expect(mockToast.success).toHaveBeenCalledWith(
+        'Closed "On host" — it stays available on its host in the Workspaces Overview',
+      ),
+    );
+  });
+
+  it("a remote worktree row closes WITHOUT removing the worktree (removeWorktree=false, no force)", async () => {
+    renderRow(
+      makeWorkspace({
+        workspace_id: "ws-remote-wt",
+        worktree_path: "/home/user/.codemux/worktrees/myapp/pushed",
+        host_id: 3,
+      }),
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /Close workspace/i }),
+    );
+
+    expect(mockArchiveWorkspace).not.toHaveBeenCalled();
+    expect(mockCloseWorkspaceWithWorktree).toHaveBeenCalledWith(
+      "ws-remote-wt",
+      false,
+      false,
+      false,
+    );
+  });
+
+  it("an attach-only row closes instead of archiving", async () => {
+    renderRow(
+      makeWorkspace({
+        workspace_id: "ws-attach",
+        worktree_path: null,
+        attach_only: true,
+      }),
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: /Close workspace/i }),
+    );
+
+    expect(mockArchiveWorkspace).not.toHaveBeenCalled();
+    expect(mockCloseWorkspace).toHaveBeenCalledWith("ws-attach", false);
+  });
+
+  it("shift-click on a remote worktree row does NOT open the delete dialog", async () => {
+    const user = userEvent.setup();
+    renderRow(
+      makeWorkspace({
+        workspace_id: "ws-remote-wt",
+        worktree_path: "/home/user/.codemux/worktrees/myapp/pushed",
+        host_id: 3,
+        protected: false,
+      }),
+    );
+
+    await user.keyboard("{Shift>}");
+    await user.click(
+      screen.getByRole("button", { name: /Close workspace/i }),
+    );
+    await user.keyboard("{/Shift}");
+
+    expect(
+      screen.queryByRole("heading", { name: /Delete worktree/i }),
+    ).not.toBeInTheDocument();
+    // Shift-click behaves like a plain click: the non-destructive close.
+    expect(mockCloseWorkspaceWithWorktree).toHaveBeenCalledWith(
+      "ws-remote-wt",
+      false,
+      false,
+      false,
+    );
+  });
+
+  it("the context menu offers 'Close workspace' (no Archive, no Delete Worktree…) for attach/remote rows", async () => {
+    const onArchive = vi.fn();
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({
+          worktree_path: "/home/user/.codemux/worktrees/myapp/pushed",
+          host_id: 3,
+        })}
+        onArchiveRequest={onArchive}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    expect(
+      screen.queryByRole("menuitem", { name: /Archive Workspace/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("menuitem", { name: /Delete Worktree…/i }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("menuitem", { name: /^Close workspace$/i }),
+    );
+    expect(onArchive).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Delete worktree dialog escalation", () => {
+  const worktreeWs = () =>
+    makeWorkspace({
+      workspace_id: "ws-del",
+      title: "Doomed",
+      worktree_path: "/home/user/.codemux/worktrees/myapp/doomed",
+      protected: false,
+    });
+
+  const openDialog = async (user: ReturnType<typeof userEvent.setup>) => {
+    render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={worktreeWs()} isActive={false} />
+      </TooltipProvider>,
+    );
+    await user.keyboard("{Shift>}");
+    await user.click(
+      screen.getByRole("button", { name: /Archive workspace/i }),
+    );
+    await user.keyboard("{/Shift}");
+    await screen.findByRole("heading", { name: /Delete worktree/i });
+  };
+
+  it("deletes with forceDelete=false first and keeps the branch checkbox default (true)", async () => {
+    const user = userEvent.setup();
+    await openDialog(user);
+
+    await user.click(screen.getByRole("button", { name: /^Delete$/i }));
+
+    await waitFor(() =>
+      expect(mockCloseWorkspaceWithWorktree).toHaveBeenCalledWith(
+        "ws-del",
+        true,
+        true,
+        false,
+      ),
+    );
+  });
+
+  it("escalates to 'Force delete' on a /use force/i rejection, showing the backend message verbatim", async () => {
+    const dirtyMessage =
+      "Worktree has 3 uncommitted change(s). Use force to override.";
+    mockCloseWorkspaceWithWorktree.mockRejectedValueOnce(dirtyMessage);
+    const user = userEvent.setup();
+    await openDialog(user);
+
+    await user.click(screen.getByRole("button", { name: /^Delete$/i }));
+
+    // Dialog stays open in the escalated state.
+    expect(await screen.findByText(dirtyMessage)).toBeInTheDocument();
+    expect(mockToast.error).not.toHaveBeenCalled();
+
+    await user.click(
+      screen.getByRole("button", { name: /Force delete/i }),
+    );
+    await waitFor(() =>
+      expect(mockCloseWorkspaceWithWorktree).toHaveBeenLastCalledWith(
+        "ws-del",
+        true,
+        true,
+        true,
+      ),
+    );
+  });
+
+  it("closes and toasts on any other rejection", async () => {
+    mockCloseWorkspaceWithWorktree.mockRejectedValueOnce(
+      "worktree path is locked by another process",
+    );
+    const user = userEvent.setup();
+    await openDialog(user);
+
+    await user.click(screen.getByRole("button", { name: /^Delete$/i }));
+
+    await waitFor(() => expect(mockToast.error).toHaveBeenCalledTimes(1));
+    expect(
+      screen.queryByRole("button", { name: /Force delete/i }),
     ).not.toBeInTheDocument();
   });
 });

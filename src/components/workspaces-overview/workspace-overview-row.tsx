@@ -46,6 +46,7 @@ import {
   type HostView,
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
+import { runDeleteWithForceToast } from "@/hooks/use-force-delete";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 
 import type { DivergenceInfo, OverviewItem } from "./use-overview-items";
@@ -314,14 +315,23 @@ function LocalRow({
     // Never destroy a protected repo root or an attach-in-place workspace:
     // close (detach) only, leaving files/shared history (or the live host
     // process) intact.
-    const promise = canRemoveWorktree
-      ? closeWorkspaceWithWorktree(workspace.workspace_id, true, true, false)
-      : closeWorkspace(workspace.workspace_id, false);
-    promise.catch((err) =>
-      toast.error("Delete failed", {
-        description: err instanceof Error ? err.message : String(err),
-      }),
-    );
+    if (canRemoveWorktree) {
+      // Honest force: the first attempt goes out non-forced, and a dirty
+      // worktree now REFUSES before the workspace is closed. The helper
+      // surfaces that refusal as an error toast whose "Force delete"
+      // action reissues the same call with forceDelete=true; any other
+      // rejection keeps the plain error toast.
+      void runDeleteWithForceToast({
+        run: (force) =>
+          closeWorkspaceWithWorktree(workspace.workspace_id, true, true, force),
+      });
+    } else {
+      closeWorkspace(workspace.workspace_id, false).catch((err) =>
+        toast.error("Delete failed", {
+          description: err instanceof Error ? err.message : String(err),
+        }),
+      );
+    }
   }, [
     workspace.workspace_id,
     workspace.title,
