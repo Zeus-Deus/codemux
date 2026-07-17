@@ -14,6 +14,11 @@
  *  overloaded, …). The remainder is a short human-readable reason. */
 const ASSISTANT_ERROR_PREFIX = "assistant error: ";
 
+/** Contract prefix the Claude adapter stamps on the warning it emits when
+ *  the sidecar couldn't resume a stale session and transparently rebuilt a
+ *  fresh one. The remainder is the ready-to-render notice text. */
+const RESUME_FALLBACK_PREFIX = "resume-fallback: ";
+
 /** Defensive nested access: `originalPayload.rate_limit_info.status`. */
 function readRateLimitStatus(originalPayload: unknown): string | null {
   if (!originalPayload || typeof originalPayload !== "object") return null;
@@ -33,6 +38,8 @@ function readRateLimitStatus(originalPayload: unknown): string | null {
  *   stopped the run); an informational rate-limit tick is null.
  * - `"assistant error: <reason>"` → `"Provider error: <reason>"` (the
  *   SDK's enumerated assistant errors, e.g. rate_limit / overloaded).
+ * - `"resume-fallback: <text>"` → `<text>` (stale-session recovery: the
+ *   remainder is already user-ready copy explaining the fresh session).
  * - anything else → null (SDK debug noise).
  */
 export function runtimeNoticeFromWarning(
@@ -46,6 +53,9 @@ export function runtimeNoticeFromWarning(
   }
   if (message.startsWith(ASSISTANT_ERROR_PREFIX)) {
     return "Provider error: " + message.slice(ASSISTANT_ERROR_PREFIX.length);
+  }
+  if (message.startsWith(RESUME_FALLBACK_PREFIX)) {
+    return message.slice(RESUME_FALLBACK_PREFIX.length);
   }
   return null;
 }

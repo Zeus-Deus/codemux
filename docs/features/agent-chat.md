@@ -259,6 +259,35 @@ The chat pane stack:
     so its rows stay NULL). This became user-visible in v0.13.2 once the
     dead-run watchdog started rebuilding sessions mid-lifetime, not just
     after an app restart.
+- **Stale-resume self-heal (Claude)**: a persisted `sdk_session_id` can go
+  stale — the CLI deletes old conversation JSONLs (cleanup, version
+  updates), and resuming one fails every turn with
+  `error_during_execution — No conversation found with session ID: …`,
+  permanently wedging the thread. Three layers now recover it:
+  - **Sidecar** (`sidecar/claude-agent/src/session.ts`): detects the
+    stale-resume `result` error (or the thrown-error variant), SUPPRESSES
+    it, emits a `resume-fallback {threadId, staleSessionId}` notification,
+    rebuilds a FRESH query (all resume state cleared) and replays the
+    pending user turn verbatim — so the send transparently succeeds. One
+    recovery per turn (a repeat failure surfaces normally). The CLI
+    validates `--resume` eagerly, so the error can also arrive right after
+    session start with no turn in flight; recovery still fires, just with
+    nothing to replay.
+  - **Rust** (`protocol.rs`/`session.rs`/`translate.rs`/`agent_chat.rs`):
+    `resume-fallback` clears the in-memory `sdk_session_id`, translates to
+    `ResumeCursorUpdated(null)` (the persist path clears the DB column on
+    exactly JSON null via `clear_agent_chat_sdk_session_id`) + a
+    `resume-fallback: `-prefixed `RuntimeWarning` that the frontend
+    classifier (`runtime-notice.ts`) promotes to an inline transcript
+    notice. The rebuilt query's fresh `sdk-session-id` re-persists shortly
+    after. The replayed turn stays `Running` (no state clobber).
+  - **Resume preflight** (`claude_session_file_missing` in
+    `commands/agent_chat.rs`): before `ensure_live_session` /
+    `agent_chat_start_session` hand a persisted Claude cursor to the SDK,
+    they positively confirm `<config>/projects/*/<id>.jsonl` still exists
+    (`$CLAUDE_CONFIG_DIR` or `~/.claude`). Only DEFINITIVE absence drops
+    the cursor (and best-effort clears the column); any IO doubt keeps it,
+    so a valid resume is never lost to a flaky probe.
 - **Reusable JSON-RPC-over-stdio child-process helper** with timeout,
   graceful shutdown, bidirectional notifications, server-initiated
   requests, and child-exit cleanup.
@@ -1292,8 +1321,11 @@ surface tiny and lets the Rust side evolve independently. Two paths:
 
 - Sidecar-specific notifications (`session-configured`,
   `request-opened`, `plan-proposed`, `user-input-requested`,
-  `session-ended`, `session-error`, `turn-interrupted`) map directly to
-  trait events. `turn-interrupted` (emitted only by the explicit interrupt
+  `session-ended`, `session-error`, `turn-interrupted`,
+  `resume-fallback`) map directly to trait events. `resume-fallback`
+  (stale-resume self-heal — see "Stale-resume self-heal" above) maps to
+  `ResumeCursorUpdated(null)` + a `resume-fallback: `-prefixed
+  `RuntimeWarning`. `turn-interrupted` (emitted only by the explicit interrupt
   RPC) maps to `TurnCompleted(interrupted)` + `SessionStateChanged(Ready)`,
   keeping the session alive; a spontaneous `session-ended
   {reason:"interrupted"}` still maps to `Closed`.

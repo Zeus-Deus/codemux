@@ -451,6 +451,66 @@ async fn sdk_session_id_notification_is_translated_into_resume_cursor_updated() 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_fallback_notification_clears_cursor_and_warns() {
+    // The sidecar couldn't resume a stale session and rebuilt a fresh
+    // query. The adapter must surface a null resume cursor (clear the
+    // persisted id) followed by a `resume-fallback:`-prefixed warning that
+    // the frontend promotes to an inline notice.
+    let script = write_script(json!([
+        {
+            "after": "start-session",
+            "delay_ms": 5,
+            "emit": "notification",
+            "method": "resume-fallback",
+            "params": {
+                "threadId": "t-fallback",
+                "staleSessionId": "deadbeef-1234-5678-90ab-cdef12345678"
+            }
+        }
+    ]));
+    let wrapper = wrapper_with_env(&[(
+        "FAKE_CLAUDE_SIDECAR_SCRIPT",
+        &script.path.to_string_lossy(),
+    )]);
+    let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;
+    let mut stream = provider.event_stream();
+    provider
+        .start_session(start_input("t-fallback"))
+        .await
+        .unwrap();
+
+    let mut saw_null_cursor = false;
+    let mut saw_warning = false;
+    let _ = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            match &ev {
+                ProviderRuntimeEvent::ResumeCursorUpdated { resume_cursor, .. }
+                    if resume_cursor.is_null() =>
+                {
+                    saw_null_cursor = true;
+                }
+                ProviderRuntimeEvent::RuntimeWarning { message, .. }
+                    if message.starts_with("resume-fallback: ") =>
+                {
+                    saw_warning = true;
+                }
+                _ => {}
+            }
+            if saw_null_cursor && saw_warning {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(saw_null_cursor, "expected a null ResumeCursorUpdated");
+    assert!(saw_warning, "expected a resume-fallback: RuntimeWarning");
+    provider
+        .stop_session(ThreadId("t-fallback".into()))
+        .await
+        .ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interrupt_emits_session_state_changed_ready() {
     let wrapper = wrapper_with_env(&[]);
     let provider = provider_with_custom_sidecar(wrapper.path.clone()).await;

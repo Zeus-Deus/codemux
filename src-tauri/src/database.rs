@@ -2528,6 +2528,25 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Clear the persisted SDK session UUID for a thread. Called when the
+    /// sidecar reports it could not resume the stored session (its on-disk
+    /// conversation JSONL was gone) and rebuilt a fresh query — the dead
+    /// id must never be handed back as a `resume` cursor again. The row
+    /// itself survives (the visible transcript still hydrates from it); it
+    /// just drops out of the history dropdown until a new `sdk-session-id`
+    /// repopulates the column.
+    pub fn clear_agent_chat_sdk_session_id(&self, thread_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agent_chat_sessions
+                 SET sdk_session_id = NULL
+                 WHERE thread_id = ?1",
+            params![thread_id],
+        )
+        .map_err(|e| format!("Failed to clear sdk_session_id: {e}"))?;
+        Ok(())
+    }
+
     /// Overwrite the per-thread chat configuration, honouring the
     /// tri-state of each [`AgentChatSessionConfig`] field:
     ///
@@ -4133,6 +4152,31 @@ mod tests {
                 .as_deref(),
             Some("sdk-uuid-abc")
         );
+    }
+
+    #[test]
+    fn agent_chat_sessions_clear_sdk_session_id() {
+        let db = init_test_database();
+        db.upsert_agent_chat_session("t", "ws-1", None, "claude")
+            .unwrap();
+        db.set_agent_chat_sdk_session_id("t", "sdk-uuid-abc")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("t")
+                .unwrap()
+                .sdk_session_id
+                .as_deref(),
+            Some("sdk-uuid-abc")
+        );
+
+        // Stale-session recovery drops the dead id; the row survives.
+        db.clear_agent_chat_sdk_session_id("t").unwrap();
+        let rec = db.get_agent_chat_session("t").unwrap();
+        assert_eq!(rec.sdk_session_id, None);
+
+        // Idempotent — clearing an already-null / unknown row is a no-op.
+        db.clear_agent_chat_sdk_session_id("t").unwrap();
+        db.clear_agent_chat_sdk_session_id("no-such-thread").unwrap();
     }
 
     #[test]

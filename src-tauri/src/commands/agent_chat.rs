@@ -534,6 +534,32 @@ pub async fn agent_chat_start_session(
             "[codemux::agent_chat] start_session pane={pane_id} provider={provider:?} resume_cursor=(none)"
         ),
     }
+    // Resume preflight (Claude only): the frontend may hand us a resume
+    // cursor built from a persisted `sdk_session_id` (history-dropdown
+    // pick / restart). If the CLI's on-disk session JSONL is confirmed
+    // gone, drop the cursor so the session starts fresh instead of wedging
+    // on a dead id, and best-effort clear the persisted column. Codex /
+    // OpenCode carry their own cursor shapes and are untouched.
+    if provider == ProviderKind::Claude {
+        if let Some(stale) = input
+            .resume_cursor
+            .as_ref()
+            .and_then(extract_sdk_session_id)
+            .filter(|id| claude_session_file_missing(id))
+        {
+            eprintln!(
+                "[codemux::agent_chat] dropping stale resume cursor at start pane={pane_id} \
+                 (Claude session file for {stale} is gone); starting fresh"
+            );
+            input.resume_cursor = None;
+            let db: State<'_, DatabaseStore> = app.state();
+            if let Err(error) = db.clear_agent_chat_sdk_session_id(&input.thread_id.0) {
+                eprintln!(
+                    "[codemux::agent_chat] failed to clear stale sdk_session_id at start: {error}"
+                );
+            }
+        }
+    }
     // Lazy MCP spawn: first chat session triggers child-process startup
     // for every enabled (non-disabled) MCP server discovered for this
     // workspace. Stage 3 needs the spawn to COMPLETE before
@@ -1023,10 +1049,32 @@ pub async fn ensure_live_session<R: Runtime>(
         }
     };
 
-    let resume_cursor = record
-        .sdk_session_id
-        .as_ref()
-        .map(|id| serde_json::json!({ "resume": id }));
+    // Build the resume cursor from the persisted id, but for Claude run a
+    // preflight: if the CLI's on-disk session JSONL is confirmed gone,
+    // skip the cursor and start fresh rather than wedging the rebuild on a
+    // dead id. Best-effort clear the column so no later rebuild reuses it.
+    // Codex / OpenCode carry their own cursor shapes and are untouched.
+    let resume_cursor = match record.sdk_session_id.as_ref() {
+        Some(id)
+            if provider_kind == ProviderKind::Claude && claude_session_file_missing(id) =>
+        {
+            eprintln!(
+                "[codemux::agent_chat] dropping stale resume cursor for thread={} \
+                 (Claude session file for {id} is gone); starting fresh",
+                thread_id.0,
+            );
+            let db: State<'_, DatabaseStore> = app.state();
+            if let Err(error) = db.clear_agent_chat_sdk_session_id(&thread_id.0) {
+                eprintln!(
+                    "[codemux::agent_chat] failed to clear stale sdk_session_id for thread={}: {error}",
+                    thread_id.0,
+                );
+            }
+            None
+        }
+        Some(id) => Some(serde_json::json!({ "resume": id })),
+        None => None,
+    };
 
     // Heal a NULL persisted permission_mode to the provider default the
     // frontend already displays for such rows (see
@@ -2449,6 +2497,20 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
                     "[codemux::agent_chat] failed to collapse duplicates: {error}"
                 );
             }
+        } else if resume_cursor.is_null() {
+            // A JSON-null cursor is the stale-session recovery signal (the
+            // sidecar rebuilt a fresh query because the persisted id's
+            // on-disk JSONL was gone). Clear the dead id so no later
+            // rebuild hands it back as `resume`. Only EXACT null clears —
+            // a malformed / unrecognized cursor keeps today's ignore
+            // behavior. The rebuilt query's fresh `sdk-session-id` arrives
+            // shortly and re-persists via the branch above.
+            let db: State<'_, DatabaseStore> = app.state();
+            if let Err(error) = db.clear_agent_chat_sdk_session_id(&thread_id.0) {
+                eprintln!(
+                    "[codemux::agent_chat] failed to clear stale sdk_session_id: {error}"
+                );
+            }
         }
     }
     // A queued follow-up turn just dispatched — NOW persist its
@@ -3126,6 +3188,102 @@ pub fn extract_sdk_session_id(cursor: &serde_json::Value) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Whether `session_id` looks like a value we are willing to probe for on
+/// disk. Purely a path-traversal guard for the scan in
+/// [`claude_session_file_missing_in`]: the id is interpolated into a
+/// filename, so reject anything empty or carrying path separators / parent
+/// components / NULs. We deliberately do NOT enforce a strict uuid shape —
+/// the goal is only to refuse dangerous inputs, never to reject an
+/// otherwise-valid cursor over formatting.
+fn is_plausible_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && !session_id.contains('/')
+        && !session_id.contains('\\')
+        && !session_id.contains("..")
+        && !session_id.contains('\0')
+}
+
+/// Resolve the Claude CLI config dir: `$CLAUDE_CONFIG_DIR` when set, else
+/// `~/.claude`. `None` only when neither can be resolved (no HOME).
+fn claude_config_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        if !dir.is_empty() {
+            return Some(std::path::PathBuf::from(dir));
+        }
+    }
+    dirs::home_dir().map(|home| home.join(".claude"))
+}
+
+/// POSITIVE-CONFIRMATION check against a given `config_dir`: is the Claude
+/// CLI's on-disk conversation JSONL (`<config>/projects/<slug>/<id>.jsonl`)
+/// DEFINITIVELY absent?
+///
+/// The contract is asymmetric on purpose — we only ever return `true` when
+/// we are certain the file is gone, so a stale resume cursor is dropped
+/// *only* on confirmed absence and never on IO doubt:
+///
+/// - `session_id` not plausible (traversal guard) → `false`.
+/// - `<config>/projects` missing or unreadable → `false` (uncertain).
+/// - any subdir listing errors mid-scan → `false` (uncertain).
+/// - `<id>.jsonl` found in any project subdir → `false` (present).
+/// - every subdir listed cleanly and the file was nowhere → `true`.
+///
+/// Split from the env-reading wrapper so the core logic is unit-testable
+/// with a temp dir and no env mutation.
+fn claude_session_file_missing_in(config_dir: &std::path::Path, session_id: &str) -> bool {
+    if !is_plausible_session_id(session_id) {
+        return false;
+    }
+    let projects = config_dir.join("projects");
+    let Ok(entries) = std::fs::read_dir(&projects) else {
+        // projects/ absent or unreadable — uncertain, keep resume.
+        return false;
+    };
+    let target = format!("{session_id}.jsonl");
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // Couldn't stat an entry — can't be sure the file is absent.
+            return false;
+        };
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        match std::fs::read_dir(&path) {
+            Ok(files) => {
+                for file in files {
+                    let Ok(file) = file else {
+                        return false;
+                    };
+                    if file.file_name() == std::ffi::OsStr::new(&target) {
+                        return false;
+                    }
+                }
+            }
+            Err(_) => {
+                // Couldn't read this project subdir — uncertain.
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Env-reading wrapper over [`claude_session_file_missing_in`]. Resolves
+/// the CLI config dir from `$CLAUDE_CONFIG_DIR` / `~/.claude`; returns
+/// `false` (keep the resume cursor) when the dir can't be resolved.
+///
+/// Used as a resume preflight: when a persisted Claude `sdk_session_id`'s
+/// JSONL is confirmed gone (CLI cleanup / update), we skip the resume
+/// cursor so the rebuilt session starts fresh instead of wedging on a
+/// dead id.
+pub fn claude_session_file_missing(session_id: &str) -> bool {
+    match claude_config_dir() {
+        Some(dir) => claude_session_file_missing_in(&dir, session_id),
+        None => false,
+    }
+}
+
 /// Extract the thread id carried by a provider runtime event, or
 /// `None` for events that are not bound to a specific thread
 /// (e.g. global `RuntimeWarning`s).
@@ -3493,6 +3651,59 @@ mod tests {
         assert_eq!(extract_sdk_session_id(&json!({})), None);
         assert_eq!(extract_sdk_session_id(&json!("just-a-string")), None);
         assert_eq!(extract_sdk_session_id(&json!({"resume": 42})), None);
+    }
+
+    // ── claude_session_file_missing preflight ──
+    //
+    // Positive-confirmation semantics: only return `true` when the JSONL
+    // is DEFINITIVELY absent. Any IO doubt keeps the resume cursor.
+
+    #[test]
+    fn session_file_missing_true_when_projects_dir_has_no_match() {
+        let cfg = tempfile::tempdir().unwrap();
+        // A projects/ tree that exists and lists cleanly, but holds no
+        // `<id>.jsonl` — the definitively-absent case.
+        let proj = cfg.path().join("projects").join("-home-user-repo");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("some-other-session.jsonl"), b"{}").unwrap();
+        assert!(claude_session_file_missing_in(cfg.path(), "dead-uuid"));
+    }
+
+    #[test]
+    fn session_file_present_returns_false() {
+        let cfg = tempfile::tempdir().unwrap();
+        let proj = cfg.path().join("projects").join("-home-user-repo");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("live-uuid.jsonl"), b"{}").unwrap();
+        assert!(!claude_session_file_missing_in(cfg.path(), "live-uuid"));
+    }
+
+    #[test]
+    fn session_file_present_in_second_project_dir_returns_false() {
+        let cfg = tempfile::tempdir().unwrap();
+        let a = cfg.path().join("projects").join("-a");
+        let b = cfg.path().join("projects").join("-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(b.join("live-uuid.jsonl"), b"{}").unwrap();
+        assert!(!claude_session_file_missing_in(cfg.path(), "live-uuid"));
+    }
+
+    #[test]
+    fn session_file_missing_false_when_projects_dir_absent() {
+        // Uncertain (no projects/ to scan) ⇒ keep the resume cursor.
+        let cfg = tempfile::tempdir().unwrap();
+        assert!(!claude_session_file_missing_in(cfg.path(), "any-uuid"));
+    }
+
+    #[test]
+    fn session_file_missing_rejects_implausible_ids() {
+        let cfg = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(cfg.path().join("projects")).unwrap();
+        // Traversal-guard: never probe on empty / separator / parent ids.
+        assert!(!claude_session_file_missing_in(cfg.path(), ""));
+        assert!(!claude_session_file_missing_in(cfg.path(), "../escape"));
+        assert!(!claude_session_file_missing_in(cfg.path(), "a/b"));
     }
 
     // ── workspace_env_overlay ──

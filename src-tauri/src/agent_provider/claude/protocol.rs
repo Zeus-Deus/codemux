@@ -370,6 +370,17 @@ pub enum SidecarNotification {
         thread_id: String,
         session_id: String,
     },
+    /// The sidecar could not resume the persisted SDK session (its
+    /// on-disk conversation JSONL was gone), so it transparently rebuilt
+    /// a FRESH query with no `resume` and replayed the user's turn. The
+    /// stale cursor must be cleared: `state.sdk_session_id` is reset and
+    /// the persisted id is dropped. The rebuilt query emits a new
+    /// `sdk-session-id` shortly after, which re-populates both. The
+    /// replayed turn stays `Running` until its real `result` lands.
+    ResumeFallback {
+        thread_id: String,
+        stale_session_id: Option<String>,
+    },
     Unknown {
         method: String,
         params: Value,
@@ -447,6 +458,10 @@ impl SidecarNotification {
             "sdk-session-id" => Self::SdkSessionId {
                 thread_id: field_string(&params, "threadId"),
                 session_id: field_string(&params, "sessionId"),
+            },
+            "resume-fallback" => Self::ResumeFallback {
+                thread_id: field_string(&params, "threadId"),
+                stale_session_id: field_opt_string(&params, "staleSessionId"),
             },
             _ => Self::Unknown {
                 method: method.to_string(),
@@ -729,6 +744,44 @@ mod tests {
                 assert_eq!(reason, "iteration-complete")
             }
             _ => panic!("expected SessionEnded"),
+        }
+    }
+
+    #[test]
+    fn notification_from_method_classifies_resume_fallback() {
+        let n = SidecarNotification::from_method_params(
+            "resume-fallback",
+            json!({"threadId": "t", "staleSessionId": "uuid-stale"}),
+        );
+        match n {
+            SidecarNotification::ResumeFallback {
+                thread_id,
+                stale_session_id,
+            } => {
+                assert_eq!(thread_id, "t");
+                assert_eq!(stale_session_id.as_deref(), Some("uuid-stale"));
+            }
+            _ => panic!("expected ResumeFallback"),
+        }
+    }
+
+    #[test]
+    fn notification_resume_fallback_allows_null_stale_session_id() {
+        // The sidecar may not know the stale id (e.g. it was never
+        // observed). `staleSessionId` absent / null → `None`.
+        let n = SidecarNotification::from_method_params(
+            "resume-fallback",
+            json!({"threadId": "t"}),
+        );
+        match n {
+            SidecarNotification::ResumeFallback {
+                thread_id,
+                stale_session_id,
+            } => {
+                assert_eq!(thread_id, "t");
+                assert_eq!(stale_session_id, None);
+            }
+            _ => panic!("expected ResumeFallback"),
         }
     }
 

@@ -34,6 +34,14 @@ describe("runtimeNoticeFromWarning", () => {
     ).toBe("Provider error: overloaded_error");
   });
 
+  it("promotes a resume-fallback warning to its inline notice text", () => {
+    const text =
+      "Previous session context couldn't be restored, so this turn continues in a fresh session. Your chat history is preserved.";
+    expect(runtimeNoticeFromWarning("resume-fallback: " + text, null)).toBe(
+      text,
+    );
+  });
+
   it("keeps SDK debug chatter console-only", () => {
     expect(
       runtimeNoticeFromWarning("stream_event message_start", {

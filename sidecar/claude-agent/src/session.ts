@@ -279,6 +279,20 @@ export class ClaudeSession {
    *  `context.resumeSessionId = message.session_id` pattern
    *  (ClaudeAdapter.ts:1255). */
   private sdkSessionId: string | null = null;
+  /** The most recent user turn, retained so a stale-resume self-heal
+   *  can replay it onto a freshly-rebuilt query. Reset per turn is not
+   *  needed — it always holds the latest turn. */
+  private lastUserMessage: SDKUserMessage | null = null;
+  /** Guards the stale-resume recovery to one attempt per user turn.
+   *  Reset to false at the start of each `sendTurn` so every new turn
+   *  earns a fresh recovery chance; set true once recovery fires so a
+   *  retry that fails the same way surfaces normally instead of looping. */
+  private resumeFallbackAttempted = false;
+  /** True while a stale-resume rebuild is in flight, so the OLD
+   *  `consumeMessages` loop unwinds silently (no `session-ended` /
+   *  `session-error`) without clobbering the NEW query's state. Mirrors
+   *  the `interrupting` handling. */
+  private recoveringResume = false;
   /** Session-level effort, captured at start. Used by `sendTurn` to
    *  apply the ultrathink prompt-prepend defensively. The canonical
    *  prepend lives in the frontend; this one fires only when a caller
@@ -328,12 +342,37 @@ export class ClaudeSession {
     try {
       for await (const message of this.query) {
         if (this.closed) break;
+        // Stale-resume self-heal: the SDK reported that the JSONL for
+        // the session we asked to resume is gone from disk. Rather than
+        // let the error surface (which permanently wedges the thread),
+        // suppress it, rebuild a FRESH session, and replay the pending
+        // turn if one exists. The CLI validates `--resume` EAGERLY, so
+        // this error can arrive right after session start with no turn
+        // in flight yet — recovery must not depend on `lastUserMessage`
+        // (the replay inside `recoverFromStaleResume` is conditional).
+        // One attempt per turn/eager-start; the error result is never
+        // forwarded to the host while a recovery is possible.
+        if (
+          this.isStaleResumeResult(message) &&
+          !this.resumeFallbackAttempted &&
+          !this.closed
+        ) {
+          this.recoverFromStaleResume();
+          break;
+        }
         this.observeSdkSessionId(message);
         this.emitter.notification("sdk-message", {
           threadId: this.threadId,
           message,
         });
         this.emitSpecialCases(message);
+      }
+      // A stale-resume recovery rebuilt the query on a fresh iteration
+      // task; this OLD loop must unwind without emitting anything and
+      // without touching the NEW query's state.
+      if (this.recoveringResume) {
+        this.recoveringResume = false;
+        return;
       }
       // An interrupt makes the SDK iterator exit — sometimes cleanly
       // like this, sometimes via an abort-like throw below. Mark the
@@ -350,6 +389,24 @@ export class ClaudeSession {
         });
       }
     } catch (err) {
+      // Stale-resume can also surface as a thrown error from the
+      // iterator rather than a `result` message. Same self-heal.
+      if (
+        !this.resumeFallbackAttempted &&
+        !this.closed &&
+        !this.interrupting &&
+        this.isStaleResumeError(err)
+      ) {
+        this.recoverFromStaleResume();
+        this.recoveringResume = false;
+        return;
+      }
+      // Breaking out of the loop after recovery can make the old
+      // iterator's teardown reject; stay silent, the NEW loop is live.
+      if (this.recoveringResume) {
+        this.recoveringResume = false;
+        return;
+      }
       // Interrupt-driven abort: same silent, mark-dead handling as the
       // clean-exit path above.
       if (this.interrupting && !this.closed && isAbortLikeError(err)) {
@@ -385,6 +442,71 @@ export class ClaudeSession {
       threadId: this.threadId,
       sessionId: maybeId,
     });
+  }
+
+  /** Detect the SDK's "the session I asked to resume no longer exists"
+   *  failure: a `result` message whose `subtype` is an error variant
+   *  and whose payload names the missing session. The `errors` array of
+   *  strings is the primary signal; `JSON.stringify` is a defensive
+   *  fallback for SDK versions that bury the detail elsewhere. */
+  private isStaleResumeResult(message: SDKMessage): boolean {
+    const m = message as unknown as {
+      type?: unknown;
+      subtype?: unknown;
+      errors?: unknown;
+    };
+    if (m.type !== "result") return false;
+    if (typeof m.subtype !== "string" || !m.subtype.startsWith("error")) {
+      return false;
+    }
+    const needle = "No conversation found with session ID";
+    if (
+      Array.isArray(m.errors) &&
+      m.errors.some((e) => typeof e === "string" && e.includes(needle))
+    ) {
+      return true;
+    }
+    try {
+      return JSON.stringify(message).includes(needle);
+    } catch {
+      return false;
+    }
+  }
+
+  /** String-match variant of the stale-resume signal for the throw
+   *  path, where the failure arrives as a thrown error. */
+  private isStaleResumeError(err: unknown): boolean {
+    const message = err instanceof Error ? err.message : String(err);
+    return message.includes("No conversation found with session ID");
+  }
+
+  /** Self-heal a stale resume: announce the fallback, drop every scrap
+   *  of resume state, rebuild a FRESH (non-resumed) query, and replay
+   *  the pending user turn so the send transparently retries. Marks the
+   *  attempt so a same-turn repeat surfaces normally instead of looping,
+   *  and sets `recoveringResume` so the OLD `consumeMessages` loop
+   *  unwinds silently. */
+  private recoverFromStaleResume(): void {
+    this.resumeFallbackAttempted = true;
+    this.recoveringResume = true;
+    // The resume id that was in effect for the failed attempt — surfaced
+    // so the host can drop it from its persisted cursor.
+    const staleSessionId =
+      this.sdkSessionId ?? this.startInput.resume ?? null;
+    this.emitter.notification("resume-fallback", {
+      threadId: this.threadId,
+      staleSessionId,
+    });
+    // Clear all resume state so the rebuild starts a brand-new session.
+    this.sdkSessionId = null;
+    delete this.startInput.resume;
+    delete this.startInput.sessionId;
+    // Rebuild without any resume, then re-push the user's turn onto the
+    // new prompt queue so it retries against the fresh session.
+    this.rebuildQuery({ resume: undefined });
+    if (this.lastUserMessage !== null) {
+      this.promptQueue.push(this.lastUserMessage);
+    }
   }
 
   /** Emit a side-channel notification for `ExitPlanMode`, which
@@ -478,6 +600,10 @@ export class ClaudeSession {
       },
       parent_tool_use_id: null,
     };
+    // Retain the turn and grant it one stale-resume recovery attempt
+    // before it's dispatched, so a self-heal can replay it verbatim.
+    this.lastUserMessage = msg;
+    this.resumeFallbackAttempted = false;
     this.promptQueue.push(msg);
   }
 
@@ -528,6 +654,16 @@ export class ClaudeSession {
     // the observed id so `observeSdkSessionId` re-emits it.
     this.sdkSessionId = null;
 
+    this.rebuildQuery({ resume });
+  }
+
+  /** Tear down the current query and stand up a replacement with the
+   *  given resume disposition, wiring a fresh prompt queue and iteration
+   *  task. Shared by `ensureLiveQuery` (resume-preserving, after an
+   *  interrupt) and the stale-resume self-heal (`resume: undefined`, a
+   *  fresh session). Callers own resume-cursor bookkeeping
+   *  (`sdkSessionId`, `startInput.resume`) before calling. */
+  private rebuildQuery(opts: { resume: string | undefined }): void {
     // Best-effort reap of the dead subprocess.
     try {
       this.query.close();
@@ -541,13 +677,13 @@ export class ClaudeSession {
     this.queryDead = false;
     this.promptQueue = new AsyncPromptQueue<SDKUserMessage>();
     // Drop the explicit `sessionId` — that uuid named the ORIGINAL
-    // fresh session; the rebuild resumes instead.
+    // fresh session; the rebuild resumes (or starts fresh) instead.
     const rebuildInput: SessionStartInput = { ...this.startInput };
     delete rebuildInput.sessionId;
-    if (resume === undefined) {
+    if (opts.resume === undefined) {
       delete rebuildInput.resume;
     } else {
-      rebuildInput.resume = resume;
+      rebuildInput.resume = opts.resume;
     }
     const options = buildQueryOptions(rebuildInput, this.canUseTool);
     this.query = queryFactory({ prompt: this.promptQueue, options });
