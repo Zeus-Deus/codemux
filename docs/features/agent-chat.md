@@ -970,6 +970,27 @@ The dev mock exposes `window.__codemuxChatMock.streamRunStalled()` and
 `window.__codemuxChatMock.interruptRun()` for browser QA of the amber
 notice, the divider, and the Continue chip.
 
+## AskUserQuestion answer reply (PR #165)
+
+When the agent asks a structured question (`AskUserQuestion` →
+`RequestOpened { request_kind: "user-input" }`) and the user answers it in
+the panel, the transcript now **echoes the chosen answer back as a
+right-aligned user reply bubble** (`src/components/chat/UserInputAnswer.tsx`),
+instead of leaving only a muted "Answered" marker on the question block. The
+conversation therefore reads as a genuine back-and-forth — question from the
+assistant, visible reply from the user — rather than a question that silently
+resolves in place.
+
+`MessageList.tsx` derives the reply row from the resolved
+`user-input`/AskUserQuestion request state (the same request the panel
+rendered), so it is a pure render of existing state — no new reducer
+`ChatViewItem`, no new backend event, and it survives restart because it is
+recomputed from the persisted request/answer rather than stored separately.
+The bubble shows the selected option label(s) (multi-select answers render each
+choice); the underlying `respond-to-user-input` RPC path is unchanged. The dev
+mock seeds an answered AskUserQuestion so the reply bubble can be screenshotted
+in the browser pane.
+
 ## Current Constraints
 
 - **Beta-gated.** The chat pane is hidden unless the user opts in via
