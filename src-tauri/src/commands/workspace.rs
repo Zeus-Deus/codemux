@@ -224,6 +224,21 @@ pub async fn create_workspace(
     create_workspace_impl(app, &state, &db, cwd).await
 }
 
+/// Additive return payload for the workspace-creation commands
+/// (`create_empty_workspace`, `create_worktree_workspace`).
+///
+/// Carries the resolved workspace id AND its absolute cwd so the frontend
+/// learns the cwd immediately, instead of polling `get_app_state` for the
+/// async `app-state-changed` event to land the new workspace before it can
+/// read the cwd. `workspace_id` is the exact value these commands returned
+/// as a bare string before this struct existed, so callers only need to
+/// unwrap one field to preserve the old behavior.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceCreated {
+    pub workspace_id: String,
+    pub cwd: String,
+}
+
 // `async fn` so the git-info subprocesses run on the blocking pool instead
 // of the GTK main thread (same rationale as `create_workspace` above).
 #[tauri::command]
@@ -233,7 +248,7 @@ pub async fn create_empty_workspace(
     db: State<'_, crate::database::DatabaseStore>,
     cwd: String,
     skip_setup: Option<bool>,
-) -> Result<String, String> {
+) -> Result<WorkspaceCreated, String> {
     // Defense-in-depth: a workspace cwd must always be an absolute path so
     // every terminal it spawns can `chdir` into it. A literal `~` here would
     // be stored verbatim and leave terminals stranded in `$HOME`.
@@ -259,7 +274,12 @@ pub async fn create_empty_workspace(
     }
 
     crate::state::emit_app_state(&app);
-    Ok(workspace_id.0)
+    Ok(WorkspaceCreated {
+        workspace_id: workspace_id.0,
+        // `cwd` is the tilde-expanded absolute path resolved above, i.e. the
+        // exact directory the workspace was anchored at.
+        cwd,
+    })
 }
 
 /// Return the existing Home workspace id, or create one anchored at
@@ -387,13 +407,25 @@ pub async fn create_worktree_workspace(
     agent_preset_id: Option<String>,
     model_selection: Option<crate::agent_capability::ModelSelection>,
     pr_number: Option<u32>,
-) -> Result<String, String> {
-    create_worktree_workspace_impl(
+) -> Result<WorkspaceCreated, String> {
+    let workspace_id = create_worktree_workspace_impl(
         app, &state, &db, &pty_state, &presets,
         repo_path, branch, new_branch, base, layout,
         initial_prompt, agent_preset_id, model_selection, pr_number,
     )
-    .await
+    .await?;
+    // Resolve the new workspace's cwd (the worktree checkout path) from the
+    // snapshot the impl already populated + emitted, so the frontend gets it
+    // without polling app-state. Empty string only if the workspace somehow
+    // vanished between create and lookup (it never should).
+    let cwd = state
+        .snapshot()
+        .workspaces
+        .iter()
+        .find(|w| w.workspace_id.0 == workspace_id)
+        .map(|w| w.cwd.clone())
+        .unwrap_or_default();
+    Ok(WorkspaceCreated { workspace_id, cwd })
 }
 
 /// Shared implementation behind both the Tauri command (frontend "+

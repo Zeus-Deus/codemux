@@ -513,7 +513,7 @@ pub async fn write_file(path: String, content: String) -> Result<(), String> {
 /// certainly wasn't intended for a prompt and would just blow up the
 /// agent's context. Reject at the IPC boundary so a runaway paste
 /// can't fill the disk via the temp directory.
-const MAX_CLIPBOARD_IMAGE_BYTES: usize = 25 * 1024 * 1024; // 25 MB
+pub(crate) const MAX_CLIPBOARD_IMAGE_BYTES: usize = 25 * 1024 * 1024; // 25 MB
 
 /// Resolve a stable extension for a clipboard image MIME type.
 ///

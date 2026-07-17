@@ -134,8 +134,27 @@ The chat pane stack:
     bytes (not a temp-file path) because the chat stages bytes in
     memory. A text-only clipboard rejects the command → default paste
     runs untouched.
+  - **Images stage to disk at ATTACH time, not send time.** The moment
+    an image chip's bytes resolve, `beginImageStaging`
+    (`src/lib/agent-chat/image-staging.ts`) uploads them via the
+    raw-body `agent_chat_stage_image` command (bytes as the invoke's
+    raw request payload, MIME on an `x-media-type` header — the fs
+    plugin `write_file` mechanism; a base64-JSON body fallback covers
+    the web-remote transport, which can't carry raw invoke bodies) into
+    `<config>/codemux/agent-chat/images/staging/`. The chip gains
+    `stagedImage: { path, mediaType }`; the send then passes only
+    `images: [{ path, media_type }]` refs on `agent_chat_send_turn`,
+    and the backend `finalize_chat_images` promotes staged files into
+    the thread's dir (rename) and reads the bytes for the provider.
+    Bytes therefore NEVER cross IPC as a JSON `number[]` — that path
+    (≈4 bytes of JSON per image byte, minutes of stall for a few
+    screenshots) is deleted; a chip whose staging failed blocks the
+    send with a toast instead of silently falling back. Removed chips
+    fire `agent_chat_discard_staged_image` (staging-dir-contained
+    delete); leaked staging files are reaped by a 24h-grace startup
+    sweep (`sweep_stale_staged_images`).
   - **Attached images render in the sent bubble.** On send,
-    the staged image bytes are also turned into `data:` URLs
+    the in-memory image bytes are also turned into `data:` URLs
     (`buildImageDisplaySources`) and stamped onto the optimistic
     `UserMessageItem.images` — so the sent turn shows its own thumbnails,
     not just the provider. The persisted `user_message` envelope gains an
@@ -145,8 +164,50 @@ The chat pane stack:
     ≤160px, broken-image fallback) with click-to-open lightbox
     (`Dialog`, Esc / click-outside). `resolveAssetSrc` normalises both
     forms: `data:` URLs (fresh optimistic send) pass through untouched,
-    absolute paths (hydrated) go through `convertFileSrc`.
-- **Slash command popup** with cross-provider parsing.
+    absolute paths (hydrated) go through `convertFileSrc`. Serving those
+    converted paths requires the asset-protocol scope to match
+    dot-directories (`~/.config/...`) — `tauri.conf.json` sets
+    `assetProtocol.scope: { allow: ["**"], requireLiteralLeadingDot:
+    false }`, since Unix glob scopes skip leading-dot components by
+    default (this was the "every hydrated thumbnail is a broken-image
+    icon" bug). Belt-and-braces: when an fs-path `<img>` still errors
+    (dev browser mock, web-remote client — no asset protocol), a
+    `useImageWithFallback` hook reads the bytes back over IPC
+    (`agent_chat_read_image`, path validated inside the chat-image
+    root) and renders a cached blob URL before surfacing the
+    placeholder.
+- **Slash command popup** with cross-provider parsing. Five groups:
+  - **MODES** — `/plan`, `/ask`, `/debug` (state-only mode-pill
+    activation, typed text stripped) plus `/default` (returns to
+    normal build mode; only listed while a non-default mode is
+    active). Built in `buildModeCommands`
+    (`src/lib/agent-chat/slash-commands.ts`).
+  - **WORKFLOWS** — `/workflow` (Claude-gated; inserts literal text).
+  - **SETTINGS** — `/model` (GUI-local: strips the typed text and pops
+    the footer's model picker via an incrementing `openSignal` prop on
+    `ModelPicker` / `MultiProviderModelPicker`; the composer skips its
+    usual textarea refocus for this pick so the popover isn't
+    dismissed by focus-outside). Built in `buildModelCommand`.
+  - **SKILLS** — dynamic, from the skills registry (unchanged).
+  - **COMMANDS** — **provider-native slash commands, discovered live**
+    (never hardcoded). The claude-agent sidecar's `list-commands`
+    JSON-RPC method opens a transient SDK `query()` (same lifecycle as
+    `list-models`, but with `settingSources: ["user","project","local"]`)
+    and returns `supportedCommands()` — the deployed CLI's built-ins
+    (`/compact`, `/clear`, `/init`, `/review`, `/context`, …) plus
+    custom `~/.claude/commands` and `<cwd>/.claude/commands` entries.
+    Rust side: `agent_provider/claude/slash_commands.rs`
+    (`ClaudeSlashCommandCache`, per-cwd, app-lifetime, errors not
+    cached) behind the `list_chat_slash_commands` Tauri command
+    (Codex/OpenCode resolve to an empty list — no discovery surface).
+    Frontend: `provider-commands-store.ts` (lazy load on first popup
+    open, 60s TTL, keyed `(provider, cwd)`), `buildProviderCommands`
+    (case-preserving map + reserved-name filter: collisions with
+    modes / `/workflow` / `/model` / skill names are dropped so the
+    local behaviour wins). Selecting a provider command inserts the
+    literal `/name ` text (same mechanics as skills/`/workflow`); the
+    text is forwarded verbatim and the provider interprets the leading
+    slash itself — Codemux never executes provider commands locally.
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
   compat. Server-side sync (see `docs/features/skills-sync.md`).
 - **MCP host runtime** (Step 9): Codemux discovers user-installed MCP
@@ -922,9 +983,12 @@ notice, the divider, and the Continue chip.
 - The event broadcaster uses a bounded channel (default 1024) — slow
   subscribers lose old events. This is deliberate; downstream UI must
   treat the stream as live-only.
-- **Image attachments in `send-turn`** currently route through the
-  `images` array on user turns; the SDK paths are wired but
-  multi-modal-everywhere is still settling.
+- **Image attachments in `send-turn`** route through the `images` array
+  on user turns as staged-file refs (`{ path, media_type }` — see the
+  attach-time staging note above; the command layer reads the bytes back
+  for the provider adapters, whose `SendTurnInput`/`ImageInput` contract
+  is unchanged); the SDK paths are wired but multi-modal-everywhere is
+  still settling.
 - **OpenCode credential management lives in OpenCode itself.** Codemux
   never reads or writes upstream API keys.
 
@@ -1391,27 +1455,45 @@ layout. The two surfaces route it differently:
   `target.projectPath` for a `project` target, the resolved
   `existingWorkspaceProjectRoot` for `existing_workspace`); it creates
   the worktree, resolves the pane/session cwd to the new worktree's real
-  cwd via `waitForWorkspaceCwd` (see the cwd-resolution invariant
-  below), and continues down the existing create-pane →
-  mark-materialized → seed-slice → start-session → send-turn ordering
+  cwd (preferring the `cwd` the create response now carries — see the
+  cwd-resolution invariant below), and continues down the existing
+  create-pane → mark-materialized → start-session → send-turn ordering
   (shared `thread_id` throughout, so the first send can't hit
-  `session_not_found`).
+  `session_not_found`). **Instant feedback:** the optimistic user bubble
+  (client-nonce'd) is appended into the pre-minted thread slice at the
+  TOP of `materializeAndSend`, before any workspace/session work, and
+  `DraftChatSurface` immediately swaps its landing for a
+  `DraftPendingConversation` — the sent bubble (with `data:`-URL
+  thumbnails) plus a shimmer status line driven by the new `onPhase`
+  hook ("Creating worktree…" / "Setting up workspace…" / "Starting
+  session…" / "Sending…") — and clears the composer. Every failure
+  branch rolls the bubble back via `removeUserMessageByNonce` and
+  restores the composer text. Previously nothing visible happened until
+  the whole chain (incl. the 5-9s AI branch naming and up-to-8s MCP
+  prime) resolved. Both first-send surfaces also fire a fire-and-forget
+  `agent_chat_prime_mcp` on mount so MCP warmup overlaps typing (the
+  registry's `prime_lock` serializes it against the start-session
+  backstop prime so children can't double-spawn).
 - **Pane empty state** — `AgentChatPane`'s `handleDeferredWorktreeSubmit`
   intercepts the composer submit ONLY while `messages.length === 0 &&
   checkoutMode === "worktree"` (everything else stays on the unmodified
-  `handleSubmit`): it calls `createDeferredWorktree`, then
-  `prestartWorktreeSession(wsId, config)` — extended to return
-  `{ paneId, threadId } | null` and to take an optional session config
+  `handleSubmit`): it appends a client-nonce'd optimistic bubble into
+  THIS pane's thread and clears the composer FIRST (rolled back on any
+  failure, and dropped on success once the new thread's own bubble takes
+  over), then calls `createDeferredWorktree`, then
+  `prestartWorktreeSession(wsId, config, knownCwd)` — extended to return
+  `{ paneId, threadId } | null`, to take an optional session config
   (model / permissionMode / effort / contextWindow / mode) so the new
-  session launches with the pane's picker values — then sends the first
-  turn into the returned `threadId` with the same
+  session launches with the pane's picker values, and to skip the cwd
+  poll when the create response already carried the cwd — then sends the
+  first turn into the returned `threadId` with the same
   skills/attachment-block/mode-prefix/images pipeline `handleSubmit`
   uses (attachment CONTENT staged on the old thread is injected into
   the turn; the chip UI stays behind and is cleared), appends the
-  optimistic user bubble to the new thread, clears this pane's
-  composer, and activates the new workspace. The stale GitHub-detail
-  re-fetch pass is deliberately skipped on this path. `prestartWorktreeSession`
-  resolves its cwd via `waitForWorkspaceCwd` too, so it now succeeds on
+  optimistic user bubble to the new thread, and activates the new
+  workspace. The stale GitHub-detail re-fetch pass is deliberately
+  skipped on this path. `prestartWorktreeSession` resolves its cwd via
+  `waitForWorkspaceCwd` when no `knownCwd` arrives, so it succeeds on
   first send instead of returning `null` on a routine store miss; it
   keeps the `null` contract only for a genuine timeout, in which case
   the text stays in the old composer, a warning toast fires, and the new
@@ -1430,7 +1512,14 @@ surfaces now share `waitForWorkspaceCwd(workspaceId, timeoutMs = 5000)`
 workspace landing in the store with a non-empty `cwd`, racing the
 store subscription (`app-state-changed`) against a polled direct
 `get_app_state` fetch (written back into the store) so a
-dropped/reordered event can't strand it. **Hard invariant:** a
+dropped/reordered event can't strand it. Since the first-send
+performance pass, `create_empty_workspace` / `create_worktree_workspace`
+return `WorkspaceCreated { workspace_id, cwd }` (frontend:
+`createEmptyWorkspaceResult` / `createWorktreeWorkspaceResult` +
+tolerant `normalizeWorkspaceCreate`; the legacy string-returning
+wrappers still exist for the ~20 other callers), so both surfaces read
+the cwd straight off the create response and `waitForWorkspaceCwd` is
+only the fallback when it's somehow absent. **Hard invariant:** a
 `checkoutMode === "worktree"` submit must NEVER create the pane or start
 the session at the parent/project-root cwd — on timeout,
 `materializeAndSend` fails the send via `markSendFailed` (draft text

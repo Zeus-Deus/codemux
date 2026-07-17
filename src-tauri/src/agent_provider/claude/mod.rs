@@ -14,6 +14,7 @@
 pub mod auth;
 pub mod capabilities;
 pub mod protocol;
+pub mod slash_commands;
 pub(crate) mod session;
 pub mod sidecar_path;
 pub mod translate;

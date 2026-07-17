@@ -80,10 +80,22 @@ export interface Attachment {
    *  at attach time for files, at fetch time for GitHub kinds. */
   resolvedContent?: string;
   /** Image-only: decoded bytes. Not persisted; re-attached if the user
-   *  re-pastes after a session restart. */
+   *  re-pastes after a session restart. Kept in memory even after
+   *  `stagedImage` lands because the optimistic bubble's `data:` URL is
+   *  built from these bytes. */
   resolvedImage?: {
     mime: string;
     bytes: Uint8Array;
+  };
+  /** Image-only: reference to the backend staging file the bytes were
+   *  written to at attach time (`agent_chat_stage_image`). Populated
+   *  asynchronously after `resolvedImage`; the turn's `images` payload
+   *  reads `path` from here so the raw bytes never cross IPC as JSON.
+   *  Absent while staging is in flight or after a staging failure (the
+   *  chip then carries a `metadata.error` and send is blocked). */
+  stagedImage?: {
+    path: string;
+    mediaType: string;
   };
 }
 

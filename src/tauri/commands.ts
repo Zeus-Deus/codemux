@@ -1,5 +1,8 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
 
+import { bytesToBase64 } from "@/lib/agent-chat/attachment-block";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
+
 export { Channel };
 import type {
   AgentChatProviderKind,
@@ -275,14 +278,49 @@ export const restartTerminalSession = (sessionId: string) =>
 export const createWorkspace = (cwd: string | null = null) =>
   invoke<string>("create_workspace", { cwd });
 
+/** Normalized result of a workspace-create command. The backend now
+ *  returns the freshly-created workspace's absolute `cwd` alongside its
+ *  id so first-send paths can skip the `waitForWorkspaceCwd` poll; older
+ *  backends (and other code paths) may still return a bare id string, in
+ *  which case `cwd` is `null` and the caller falls back to the poll. */
+export interface WorkspaceCreateResult {
+  workspaceId: string;
+  cwd: string | null;
+}
+
+/** Coerce the create_* response, which is either the legacy bare
+ *  workspace-id string or the additive `{ workspace_id, cwd }` object,
+ *  into a stable {@link WorkspaceCreateResult}. Tolerant of either shape
+ *  so the frontend never breaks on the sibling backend's rollout order. */
+function normalizeWorkspaceCreate(raw: unknown): WorkspaceCreateResult {
+  if (typeof raw === "string") return { workspaceId: raw, cwd: null };
+  const obj = (raw ?? {}) as {
+    workspace_id?: string;
+    workspaceId?: string;
+    cwd?: string | null;
+  };
+  return {
+    workspaceId: obj.workspace_id ?? obj.workspaceId ?? "",
+    cwd: obj.cwd ?? null,
+  };
+}
+
+/** Create an empty workspace, returning both its id and (when the
+ *  backend supplies it) its resolved cwd. */
+export const createEmptyWorkspaceResult = (
+  cwd: string,
+  opts?: { skipSetup?: boolean },
+): Promise<WorkspaceCreateResult> =>
+  invoke<unknown>("create_empty_workspace", {
+    cwd,
+    skipSetup: opts?.skipSetup ?? null,
+  }).then(normalizeWorkspaceCreate);
+
 export const createEmptyWorkspace = (
   cwd: string,
   opts?: { skipSetup?: boolean },
-) =>
-  invoke<string>("create_empty_workspace", {
-    cwd,
-    skipSetup: opts?.skipSetup ?? null,
-  });
+): Promise<string> =>
+  createEmptyWorkspaceResult(cwd, opts).then((r) => r.workspaceId);
 
 export const getOrCreateHomeWorkspace = () =>
   invoke<string>("get_or_create_home_workspace");
@@ -382,6 +420,32 @@ export const detectEditors = () =>
 export const openInEditor = (editorId: string, path: string) =>
   invoke<void>("open_in_editor", { editorId, path });
 
+/** Create a worktree workspace, returning both its id and (when the
+ *  backend supplies it) its resolved cwd — the deferred-worktree
+ *  first-send path uses the cwd to skip the `waitForWorkspaceCwd` poll. */
+export const createWorktreeWorkspaceResult = (
+  repoPath: string,
+  branch: string,
+  newBranch: boolean,
+  layout: string,
+  base?: string | null,
+  initialPrompt?: string | null,
+  agentPresetId?: string | null,
+  prNumber?: number | null,
+  modelSelection?: ModelSelection | null,
+): Promise<WorkspaceCreateResult> =>
+  invoke<unknown>("create_worktree_workspace", {
+    repoPath,
+    branch,
+    newBranch,
+    base: base ?? null,
+    layout,
+    initialPrompt: initialPrompt ?? null,
+    agentPresetId: agentPresetId ?? null,
+    modelSelection: modelSelection ?? null,
+    prNumber: prNumber ?? null,
+  }).then(normalizeWorkspaceCreate);
+
 export const createWorktreeWorkspace = (
   repoPath: string,
   branch: string,
@@ -392,18 +456,18 @@ export const createWorktreeWorkspace = (
   agentPresetId?: string | null,
   prNumber?: number | null,
   modelSelection?: ModelSelection | null,
-) =>
-  invoke<string>("create_worktree_workspace", {
+): Promise<string> =>
+  createWorktreeWorkspaceResult(
     repoPath,
     branch,
     newBranch,
-    base: base ?? null,
     layout,
-    initialPrompt: initialPrompt ?? null,
-    agentPresetId: agentPresetId ?? null,
-    modelSelection: modelSelection ?? null,
-    prNumber: prNumber ?? null,
-  });
+    base,
+    initialPrompt,
+    agentPresetId,
+    prNumber,
+    modelSelection,
+  ).then((r) => r.workspaceId);
 
 export const generateBranchName = (prompt: string, projectPath: string) =>
   invoke<string>("generate_branch_name", { prompt, projectPath });
@@ -1278,7 +1342,11 @@ export interface AgentChatStartSessionInput {
 export interface AgentChatSendTurnInput {
   thread_id: string;
   text: string;
-  images?: Array<{ data: number[]; media_type: string }>;
+  /** Staged image references. Each image's bytes are written to a
+   *  staging file at attach time (`agent_chat_stage_image`), so the turn
+   *  carries only the absolute path + MIME instead of marshalling the
+   *  raw bytes across IPC as a JSON `number[]`. */
+  images?: Array<{ path: string; media_type: string }>;
   model_override: string | null;
   /** Codex only — per-turn effort. Claude ignores this. */
   effort_override?: string | null;
@@ -1327,6 +1395,75 @@ export const agentChatSendTurn = (
   provider: AgentChatProviderKind,
   input: AgentChatSendTurnInput,
 ) => invoke<TurnStartResult>("agent_chat_send_turn", { provider, input });
+
+/** Stage a pasted/attached image's raw bytes to a backend staging file,
+ *  moving the (potentially multi-MB) upload off the send path. The bytes
+ *  travel as the invoke's raw request body (NOT a JSON `number[]`); the
+ *  MIME rides an `x-media-type` header. Returns the staging file's
+ *  absolute path, which the turn later references via `send_turn.images`.
+ *
+ *  Fallback: the web-remote bridge serializes every invoke as JSON and
+ *  drops invoke options (headers included), so the raw-body form can't
+ *  reach the command there. When the backend rejects the body shape we
+ *  retry once with the base64 JSON form it also accepts — ~1.33x the raw
+ *  size, still far cheaper than the per-byte `number[]` JSON this path
+ *  replaced. */
+export const stageChatImage = async (
+  bytes: Uint8Array,
+  mime: string,
+): Promise<{ path: string; media_type: string }> => {
+  // Web-remote client: skip the raw attempt entirely — the WS bridge
+  // would JSON-serialize the Uint8Array per-byte (the exact cost this
+  // command exists to avoid) only for the backend to reject it.
+  if (isRemoteClient()) {
+    return await invoke<{ path: string; media_type: string }>(
+      "agent_chat_stage_image",
+      { bytes_base64: bytesToBase64(bytes), media_type: mime },
+    );
+  }
+  try {
+    return await invoke<{ path: string; media_type: string }>(
+      "agent_chat_stage_image",
+      bytes,
+      { headers: { "x-media-type": mime } },
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Only the body-shape rejection warrants the JSON retry; genuine
+    // validation failures (unsupported MIME, size cap) re-throw as-is.
+    if (!message.includes("expected a raw image body")) throw err;
+    return await invoke<{ path: string; media_type: string }>(
+      "agent_chat_stage_image",
+      {
+        bytes_base64: bytesToBase64(bytes),
+        media_type: mime,
+      },
+    );
+  }
+};
+
+/** Best-effort delete of a staged image file (chip removal / draft
+ *  discard). Failures are swallowed by callers. */
+export const discardStagedChatImage = (path: string) =>
+  invoke<void>("agent_chat_discard_staged_image", { path });
+
+/** Read a staged/persisted image back off disk for contexts where the
+ *  asset protocol can't load a local path (web-remote, dev mock). Rewraps
+ *  the JSON byte array into a `Uint8Array` the caller can Blob-URL. */
+export const readChatImage = async (
+  path: string,
+): Promise<{ bytes: Uint8Array; media_type: string }> => {
+  const res = await invoke<{ bytes: number[]; media_type: string }>(
+    "agent_chat_read_image",
+    { path },
+  );
+  return { bytes: new Uint8Array(res.bytes), media_type: res.media_type };
+};
+
+/** Warm the MCP servers in the background so the up-front prime cost
+ *  overlaps composing instead of blocking the first session start.
+ *  Returns immediately; safe to fire-and-forget. */
+export const primeChatMcp = () => invoke<void>("agent_chat_prime_mcp");
 
 export const agentChatInterruptTurn = (
   provider: AgentChatProviderKind,
@@ -1663,6 +1800,33 @@ export const listSkills = (
   projectRoot: string | null,
   includePlugins: boolean,
 ) => invoke<Skill[]>("list_skills", { projectRoot, includePlugins });
+
+/** One provider-native slash command (e.g. Claude Code's `/compact`,
+ *  `/init`, `/review`, or a custom `.claude/commands` entry).
+ *  Discovered live from the provider — never hardcoded. Selecting one
+ *  inserts the literal `/name ` text into the draft; the provider
+ *  interprets the leading slash itself at send time. */
+export interface ProviderSlashCommand {
+  /** Command name without the leading slash. */
+  name: string;
+  /** One-line description. May be empty. */
+  description: string;
+  /** Argument hint (e.g. `<pr-url>`). May be empty. */
+  argumentHint: string;
+}
+
+/** List the provider-native slash commands for a thread anchored at
+ *  `cwd`. Claude harvests via the Agent SDK's `supportedCommands()`
+ *  (cached per cwd backend-side); Codex/OpenCode currently resolve to
+ *  an empty list because they expose no discovery surface. */
+export const listChatSlashCommands = (
+  provider: AgentChatProviderKind,
+  cwd: string,
+) =>
+  invoke<ProviderSlashCommand[]>("list_chat_slash_commands", {
+    provider,
+    cwd,
+  });
 
 /** Start the file watcher. Returns the count of paths actually being
  *  watched (paths that don't exist on disk are skipped silently).

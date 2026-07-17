@@ -1513,6 +1513,12 @@ function emitWebRemoteState(): void {
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown;
 
+/** In-memory staging store for `agent_chat_stage_image` (keyed by the
+ *  fake absolute path returned to the frontend). Serves `agent_chat_read_image`
+ *  so the IPC-read image fallback works end-to-end in `npm run dev`. */
+const stagedImages = new Map<string, { bytes: Uint8Array; mediaType: string }>();
+let stagedImageSeq = 0;
+
 const handlers: Record<string, Handler> = {
   // ── Auth / sync ──
   check_auth: () => MOCK_USER,
@@ -1607,6 +1613,55 @@ const handlers: Record<string, Handler> = {
   // send_turn answers with the channel-streamed mock reply.
   list_chat_provider_capabilities: (a) =>
     a.provider === "claude" ? CLAUDE_CAPABILITIES : EMPTY_CAPABILITIES,
+  // Provider slash commands — in production these are harvested live
+  // from the deployed Claude Code CLI (SDK `supportedCommands()`),
+  // including custom `.claude/commands` entries. The mock serves a
+  // representative subset so the composer's COMMANDS group renders.
+  list_chat_slash_commands: (a) =>
+    a.provider === "claude"
+      ? [
+          {
+            name: "compact",
+            description: "Clear conversation history but keep a summary in context",
+            argumentHint: "<optional summary instructions>",
+          },
+          {
+            name: "clear",
+            description: "Clear conversation history and free up context",
+            argumentHint: "",
+          },
+          {
+            name: "init",
+            description: "Initialize a new CLAUDE.md file with codebase documentation",
+            argumentHint: "",
+          },
+          {
+            name: "review",
+            description: "Review a pull request",
+            argumentHint: "",
+          },
+          {
+            name: "security-review",
+            description: "Complete a security review of the pending changes",
+            argumentHint: "",
+          },
+          {
+            name: "pr-comments",
+            description: "Get comments from a GitHub pull request",
+            argumentHint: "",
+          },
+          {
+            name: "release-notes",
+            description: "View release notes",
+            argumentHint: "<version>",
+          },
+          {
+            name: "todos",
+            description: "List current todo items",
+            argumentHint: "",
+          },
+        ]
+      : [],
   agent_chat_list_messages: (a) => {
     const threadId = a.threadId as string;
     if (threadId === MOCK_CHAT_THREAD_ID) return mockChatTranscript();
@@ -1670,6 +1725,30 @@ const handlers: Record<string, Handler> = {
   // DB-only config persist (design G). The mock has no SQLite, so this
   // is a no-op — the demo pane keeps its in-memory slice values.
   agent_chat_update_session_config: () => undefined,
+  // ── Image staging (attach-time upload; Bug 1 fix) ──
+  //
+  // `agent_chat_stage_image` is a RAW-BODY invoke (bytes as the payload,
+  // MIME on an `x-media-type` header) and is dispatched specially in
+  // `invoke` below — it never reaches this handler map. The read/discard
+  // counterparts take normal args. `agent_chat_read_image` serves bytes
+  // straight back so the hydrated-style fs-path render path (which routes
+  // through `readChatImage` in the browser, where `convertFileSrc` is the
+  // identity → the `<img>` 404s) still resolves an image end-to-end.
+  agent_chat_read_image: (a) => {
+    const entry = stagedImages.get(String(a.path));
+    if (!entry) throw new Error(`[dev mock] no staged image at ${a.path}`);
+    return {
+      bytes: Array.from(entry.bytes),
+      media_type: entry.mediaType,
+    };
+  },
+  agent_chat_discard_staged_image: (a) => {
+    stagedImages.delete(String(a.path));
+    return undefined;
+  },
+  // MCP warmup is a real background prime in the app; the mock has no MCP
+  // host, so this is a no-op that returns immediately.
+  agent_chat_prime_mcp: () => undefined,
   agent_chat_start_session: (a) =>
     (a.input as { thread_id: string }).thread_id,
   agent_chat_send_turn: (a) => {
@@ -2763,7 +2842,29 @@ function defaultResult(cmd: string): unknown {
 
 // ── The internals contract ──────────────────────────────────────────
 
-async function invoke(cmd: string, args: Args = {}): Promise<unknown> {
+async function invoke(
+  cmd: string,
+  args: Args | Uint8Array | ArrayBuffer = {},
+  options?: unknown,
+): Promise<unknown> {
+  // Raw-body invoke: `agent_chat_stage_image` sends the image bytes as
+  // the payload (not an args object), with the MIME on an `x-media-type`
+  // header. Stash the bytes under a fake absolute staging path and return
+  // it — the turn later references the path via `send_turn.images`.
+  if (args instanceof Uint8Array || args instanceof ArrayBuffer) {
+    if (cmd === "agent_chat_stage_image") {
+      const bytes = args instanceof Uint8Array ? args : new Uint8Array(args);
+      const headers = (options as { headers?: Record<string, string> } | undefined)
+        ?.headers;
+      const mediaType = headers?.["x-media-type"] ?? "image/png";
+      const ext = mediaType.split("/")[1] ?? "png";
+      const path = `${MOCK_HOME_DIR}/.codemux/staging/chat-image-${++stagedImageSeq}.${ext}`;
+      stagedImages.set(path, { bytes: new Uint8Array(bytes), mediaType });
+      return { path, media_type: mediaType };
+    }
+    return defaultResult(cmd);
+  }
+
   const handler = handlers[cmd];
   if (handler) return handler(args);
 
@@ -2774,7 +2875,11 @@ async function invoke(cmd: string, args: Args = {}): Promise<unknown> {
 }
 
 interface TauriInternals {
-  invoke: (cmd: string, args?: Args, options?: unknown) => Promise<unknown>;
+  invoke: (
+    cmd: string,
+    args?: Args | Uint8Array | ArrayBuffer,
+    options?: unknown,
+  ) => Promise<unknown>;
   transformCallback: (cb: RawCallback, once?: boolean) => number;
   unregisterCallback: (id: number) => void;
   convertFileSrc: (filePath: string, protocol?: string) => string;

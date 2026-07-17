@@ -317,11 +317,27 @@ vi.mock("@/tauri/commands", () => ({
   // deferred-submit tests assert on; per-test overrides as needed.
   applyPreset: vi.fn().mockResolvedValue(undefined),
   createEmptyWorkspace: vi.fn().mockResolvedValue("ws-empty"),
-  createWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  // `createDeferredWorktree` calls the *Result variant. `cwd: null` keeps
+  // the worktree cwd resolving through the store (`waitForWorkspaceCwd`),
+  // matching the pre-fix path these tests assert on.
+  createWorktreeWorkspaceResult: vi
+    .fn()
+    .mockResolvedValue({ workspaceId: "ws-new", cwd: null }),
   generateBranchName: vi.fn().mockResolvedValue("ai-named-branch"),
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
+  // MCP warmup fired on the empty-state mount; no-op in tests.
+  primeChatMcp: vi.fn().mockResolvedValue(undefined),
+  // Image staging (imported by the image-staging helper); only invoked
+  // when a test stages an image, which these don't.
+  stageChatImage: vi
+    .fn()
+    .mockResolvedValue({ path: "/staging/x.png", media_type: "image/png" }),
+  discardStagedChatImage: vi.fn().mockResolvedValue(undefined),
+  readChatImage: vi
+    .fn()
+    .mockResolvedValue({ bytes: new Uint8Array(), media_type: "image/png" }),
 }));
 
 const HOME_APP_STATE = {
@@ -1348,7 +1364,7 @@ describe("AgentChatPane Thread Scope — empty-state scope row", () => {
 describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
   function seedProjectPaneState() {
     // The pane's project workspace, plus the NEW worktree workspace
-    // (`ws-new`, the id createWorktreeWorkspace resolves to) so
+    // (`ws-new`, the id createWorktreeWorkspaceResult resolves to) so
     // prestartWorktreeSession can read its cwd — in production
     // emit_app_state fires inside create_worktree_workspace before the
     // invoke resolves.
@@ -1395,7 +1411,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
       agentChatCreatePane,
       agentChatSendTurn,
       agentChatStartSession,
-      createWorktreeWorkspace,
+      createWorktreeWorkspaceResult,
       generateBranchName,
       generateRandomBranchName,
     } = await import("@/tauri/commands");
@@ -1408,7 +1424,9 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
     vi.mocked(agentChatStartSession)
       .mockClear()
       .mockResolvedValue("thread-echo");
-    vi.mocked(createWorktreeWorkspace).mockClear().mockResolvedValue("ws-new");
+    vi.mocked(createWorktreeWorkspaceResult)
+      .mockClear()
+      .mockResolvedValue({ workspaceId: "ws-new", cwd: null });
     vi.mocked(generateBranchName)
       .mockClear()
       .mockResolvedValue("ai-named-branch");
@@ -1429,7 +1447,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
       agentChatCreatePane,
       agentChatSendTurn,
       agentChatStartSession,
-      createWorktreeWorkspace,
+      createWorktreeWorkspaceResult,
       generateBranchName,
     } = await import("@/tauri/commands");
     fireEvent.click(
@@ -1444,7 +1462,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
       "fix the login bug",
       "/projects/foo",
     );
-    expect(vi.mocked(createWorktreeWorkspace)).toHaveBeenCalledWith(
+    expect(vi.mocked(createWorktreeWorkspaceResult)).toHaveBeenCalledWith(
       "/projects/foo",
       "ai-named-branch",
       true,
@@ -1486,7 +1504,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
       lastThreadScopeRowProps!.onChangeWorktreeName("my-feature");
       lastThreadScopeRowProps!.onChangeBaseBranch("develop");
     });
-    const { activateWorkspace, createWorktreeWorkspace, generateBranchName } =
+    const { activateWorkspace, createWorktreeWorkspaceResult, generateBranchName } =
       await import("@/tauri/commands");
     fireEvent.click(
       container.querySelector('[data-testid="composer-submit"]')!,
@@ -1495,7 +1513,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
       expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-new");
     });
     expect(vi.mocked(generateBranchName)).not.toHaveBeenCalled();
-    expect(vi.mocked(createWorktreeWorkspace)).toHaveBeenCalledWith(
+    expect(vi.mocked(createWorktreeWorkspaceResult)).toHaveBeenCalledWith(
       "/projects/foo",
       "my-feature",
       true,
@@ -1508,7 +1526,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
 
   it("current mode (default) submit is untouched: sends to the pane's own thread, no worktree calls", async () => {
     const { container } = render(<AgentChatPane pane={projectPane} />);
-    const { agentChatSendTurn, createWorktreeWorkspace, generateBranchName } =
+    const { agentChatSendTurn, createWorktreeWorkspaceResult, generateBranchName } =
       await import("@/tauri/commands");
     fireEvent.click(
       container.querySelector('[data-testid="composer-submit"]')!,
@@ -1518,7 +1536,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
     });
     const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
     expect(sendInput.thread_id).toBe("thread-x");
-    expect(vi.mocked(createWorktreeWorkspace)).not.toHaveBeenCalled();
+    expect(vi.mocked(createWorktreeWorkspaceResult)).not.toHaveBeenCalled();
     expect(vi.mocked(generateBranchName)).not.toHaveBeenCalled();
   });
 
@@ -1528,7 +1546,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
     // No scope row when messages exist; but even a stale worktree mode
     // (state left from before the first message) must not intercept.
     // The composerOnSubmit gate re-derives per render.
-    const { agentChatSendTurn, createWorktreeWorkspace } = await import(
+    const { agentChatSendTurn, createWorktreeWorkspaceResult } = await import(
       "@/tauri/commands"
     );
     fireEvent.click(
@@ -1539,7 +1557,7 @@ describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
     });
     const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
     expect(sendInput.thread_id).toBe("thread-x");
-    expect(vi.mocked(createWorktreeWorkspace)).not.toHaveBeenCalled();
+    expect(vi.mocked(createWorktreeWorkspaceResult)).not.toHaveBeenCalled();
   });
 });
 

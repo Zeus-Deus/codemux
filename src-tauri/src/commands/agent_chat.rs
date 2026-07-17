@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
-use tauri::ipc::Channel;
+use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::{
@@ -1102,6 +1102,36 @@ pub async fn ensure_live_session<R: Runtime>(
     }
 }
 
+/// Command-layer input for [`agent_chat_send_turn`].
+///
+/// Mirrors the provider's [`SendTurnInput`] field-for-field EXCEPT `images`:
+/// the frontend now sends staged-file references
+/// (`[{ path, media_type }]`) instead of raw bytes (`{ data: number[],
+/// media_type }`). The command finalizes those refs, reads the real bytes,
+/// and builds the provider's byte-carrying `SendTurnInput` internally — the
+/// provider trait's contract is unchanged (adapters still receive bytes).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SendTurnCommandInput {
+    /// Thread the turn belongs to.
+    pub thread_id: ThreadId,
+    /// Plain-text content of the user message.
+    pub text: String,
+    /// Staged image references, in order.
+    #[serde(default)]
+    pub images: Vec<ChatImageRef>,
+    /// Optional per-turn model override.
+    pub model_override: Option<String>,
+    /// Optional per-turn effort override.
+    #[serde(default)]
+    pub effort_override: Option<String>,
+    /// Optional per-turn permission-mode override.
+    #[serde(default)]
+    pub permission_mode_override: Option<String>,
+    /// Optional client-generated correlation token for the follow-up queue.
+    #[serde(default)]
+    pub client_nonce: Option<String>,
+}
+
 /// Queue a user turn on an existing session.
 ///
 /// Returns a [`TurnStartResult`]: when the session was busy the turn is
@@ -1115,7 +1145,7 @@ pub async fn ensure_live_session<R: Runtime>(
 pub async fn agent_chat_send_turn(
     app: AppHandle,
     provider: ProviderKind,
-    input: SendTurnInput,
+    input: SendTurnCommandInput,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
@@ -1126,18 +1156,29 @@ pub async fn agent_chat_send_turn(
     ensure_live_session(&app, provider, &input.thread_id).await?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    // Capture the inputs we need for persistence before the provider
-    // consumes `input`.
+    // Capture the inputs we need for persistence before dispatching.
     let thread_id_for_persist = input.thread_id.0.clone();
     let user_text_for_persist = input.text.clone();
     let first_line = first_line_title(&input.text);
-    // Persist any attachments to disk NOW, before the provider consumes
-    // `input`. This runs for both immediate and queued sends: the bytes
-    // are in hand here and nowhere else (the deferred, dispatch-time
-    // envelope write in `forward_event` only sees `text`). Best-effort —
-    // a failed write is logged and skipped inside the helper and never
-    // blocks the turn.
-    let saved_images = save_chat_images(&thread_id_for_persist, &input.images);
+    // Finalize the staged image refs NOW: promote each staged file into the
+    // thread's dir and read its bytes back for the provider. This replaces
+    // the old bytes-writing `save_chat_images` — the transcript records use
+    // the FINAL paths and the provider gets real bytes. A security
+    // rejection (a ref outside the permitted dirs) fails the send; a per-
+    // image fs failure is logged and skipped inside the helper.
+    let (saved_images, image_inputs) =
+        finalize_chat_images(&thread_id_for_persist, &input.images).await?;
+    // Build the provider's byte-carrying input from the command DTO. The
+    // provider trait is unchanged — adapters still receive `ImageInput`s.
+    let provider_input = SendTurnInput {
+        thread_id: input.thread_id.clone(),
+        text: input.text.clone(),
+        images: image_inputs,
+        model_override: input.model_override.clone(),
+        effort_override: input.effort_override.clone(),
+        permission_mode_override: input.permission_mode_override.clone(),
+        client_nonce: input.client_nonce.clone(),
+    };
     // A genuine new user turn is the authoritative, provider-agnostic
     // anchor for resetting subagent tracking. Clear the thread's tracker
     // entry here so a subagent left non-terminal by the previous turn
@@ -1158,7 +1199,7 @@ pub async fn agent_chat_send_turn(
         let tracker: State<'_, SubagentTracker> = app.state();
         tracker.clear_thread(&thread_id_for_persist);
     }
-    let result = impl_.send_turn(input).await.map_err(provider_err)?;
+    let result = impl_.send_turn(provider_input).await.map_err(provider_err)?;
 
     // Best-effort: bump last_active_at so the session floats to the
     // top of the dropdown, and set an auto-title from the first user
@@ -1279,70 +1320,529 @@ fn chat_image_extension(media_type: &str) -> &'static str {
     }
 }
 
-/// Resolve a thread's chat-image directory:
-/// `<config>/<APP_DIR_NAME>/agent-chat/images/<thread_id>/`.
+/// Resolve the root that holds every chat-image directory:
+/// `<config>/<APP_DIR_NAME>/agent-chat/images/`.
 ///
 /// Mirrors how [`crate::database`] resolves its store path (config dir +
 /// app name) so images live beside the transcript DB — a durable location
 /// a resumed conversation can rely on — rather than in a temp dir the OS
 /// may reap out from under it (unlike the ephemeral clipboard-paste files
-/// in `commands::files`).
-fn chat_images_dir(thread_id: &str) -> Option<std::path::PathBuf> {
+/// in `commands::files`). Both the per-thread dirs and the upload
+/// [`chat_images_staging_dir`] hang off this single root so the containment
+/// checks in the stage / discard / read / finalize paths all reason about
+/// one canonical prefix.
+fn chat_images_root() -> Option<std::path::PathBuf> {
     Some(
         dirs::config_dir()?
             .join(crate::APP_DIR_NAME)
             .join("agent-chat")
-            .join("images")
-            .join(thread_id),
+            .join("images"),
     )
 }
 
-/// Write each attachment's bytes to disk under the thread's image dir and
-/// return the records to record on the transcript envelope.
+/// Resolve a thread's chat-image directory:
+/// `<config>/<APP_DIR_NAME>/agent-chat/images/<thread_id>/`. Finalized
+/// attachments for a turn land here.
+fn chat_images_dir(thread_id: &str) -> Option<std::path::PathBuf> {
+    Some(chat_images_root()?.join(thread_id))
+}
+
+/// Resolve the staging directory freshly-uploaded (not-yet-sent) images are
+/// written to: `<config>/<APP_DIR_NAME>/agent-chat/images/staging/`.
 ///
-/// Best-effort by contract: a failed directory-create or write logs and
-/// SKIPS that image — it must never propagate an error that would block
-/// the turn (the live send still carries the bytes to the provider). An
-/// empty input is a cheap no-op returning an empty vec, so callers can
-/// invoke it unconditionally.
-fn save_chat_images(
-    thread_id: &str,
-    images: &[crate::agent_provider::ImageInput],
-) -> Vec<PersistedChatImage> {
-    if images.is_empty() {
-        return Vec::new();
-    }
-    let Some(dir) = chat_images_dir(thread_id) else {
-        eprintln!(
-            "[codemux::agent_chat] could not resolve config dir; \
-             skipping {} chat image(s)",
-            images.len()
-        );
-        return Vec::new();
+/// A raw-body upload ([`agent_chat_stage_image`]) writes here first; the
+/// image is only promoted into a thread's dir when its turn actually sends
+/// ([`finalize_chat_images`]). No real thread id is the literal `"staging"`
+/// (provider-minted ids are uuids / opaque tokens), so this never collides
+/// with a per-thread dir under the same root.
+fn chat_images_staging_dir() -> Option<std::path::PathBuf> {
+    Some(chat_images_root()?.join("staging"))
+}
+
+// ── Chat-image staging / finalize (raw-body upload path) ─────────────
+//
+// Images no longer travel through the `agent_chat_send_turn` JSON payload
+// as a `number[]` per byte (a multi-MB screenshot ballooned to tens of MB
+// of JSON through WebKit IPC and stalled the send for minutes). Instead the
+// composer uploads each image once via [`agent_chat_stage_image`] (raw
+// request body — no per-byte JSON), which writes it to the shared staging
+// dir and hands back an absolute path; the send then references staged
+// files by path and [`finalize_chat_images`] promotes them into the
+// thread's dir. All fs work is async (`tokio::fs`) — nothing blocks the
+// runtime.
+
+/// The MIME types Agent Chat accepts for an attachment. Everything else is
+/// rejected at the staging boundary so a garbage payload never reaches the
+/// provider or the disk.
+const ACCEPTED_CHAT_IMAGE_MIME: [&str; 4] =
+    ["image/png", "image/jpeg", "image/gif", "image/webp"];
+
+/// A freshly-staged image the composer can reference on its next send.
+/// Serde field names match [`PersistedChatImage`]'s (`path` / `media_type`)
+/// so the frontend threads one shape through stage → send.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedChatImage {
+    /// Absolute path to the staged bytes under the staging dir.
+    pub path: String,
+    /// The validated media type (echoed back verbatim).
+    pub media_type: String,
+}
+
+/// A staged-file reference the frontend sends in place of raw bytes on a
+/// user turn. The command layer finalizes these into the thread's image dir
+/// and reads the bytes back for the provider (see [`finalize_chat_images`]).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatImageRef {
+    /// Absolute path returned by [`agent_chat_stage_image`] (staging) or an
+    /// already-finalized path inside this thread's dir.
+    pub path: String,
+    /// Original media type (e.g. `"image/png"`).
+    pub media_type: String,
+}
+
+/// The bytes + inferred media type returned by [`agent_chat_read_image`].
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatImageBytes {
+    pub bytes: Vec<u8>,
+    pub media_type: String,
+}
+
+/// Validate a client-supplied MIME string against the accepted set.
+/// Case-insensitive (clients are inconsistent about MIME casing) and
+/// returns the canonical lowercase form on success.
+fn validate_chat_image_mime(media_type: &str) -> Result<String, String> {
+    let lower = media_type.to_ascii_lowercase();
+    // Fold the jpg alias so a client sending `image/jpg` still validates.
+    let canonical = if lower == "image/jpg" {
+        "image/jpeg".to_string()
+    } else {
+        lower
     };
-    if let Err(error) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "[codemux::agent_chat] failed to create chat image dir {}: {error}",
-            dir.display()
-        );
-        return Vec::new();
+    if ACCEPTED_CHAT_IMAGE_MIME.contains(&canonical.as_str()) {
+        Ok(canonical)
+    } else {
+        Err(format!(
+            "validation_error: unsupported image media type: {media_type}"
+        ))
     }
-    let mut saved = Vec::with_capacity(images.len());
-    for image in images {
-        let ext = chat_image_extension(&image.media_type);
-        let path = dir.join(format!("{}.{ext}", uuid::Uuid::new_v4()));
-        match std::fs::write(&path, &image.data) {
-            Ok(()) => saved.push(PersistedChatImage {
-                path: path.to_string_lossy().into_owned(),
-                media_type: image.media_type.clone(),
-            }),
+}
+
+/// Reverse of [`chat_image_extension`]: infer a media type from a stored
+/// file's extension. Used by [`agent_chat_read_image`] so the fallback
+/// loader can label the bytes it returns. Unknown extensions fall back to
+/// the generic binary type rather than guessing.
+fn media_type_from_extension(path: &std::path::Path) -> String {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Verify `candidate` resolves to a path whose parent is inside `root`
+/// (both canonicalized) and return the canonicalized absolute path.
+///
+/// This is the security boundary for the discard / read commands: it
+/// defeats `../` traversal and symlinked parents by canonicalizing the
+/// candidate's PARENT directory (which must exist) rather than the file
+/// itself (which may already be gone, or is about to be read). The file
+/// name is re-joined onto the canonical parent. Returns an error when the
+/// candidate has no parent/file component, when the parent cannot be
+/// resolved, or when it escapes `root`.
+fn resolve_within(
+    root: &std::path::Path,
+    candidate: &str,
+) -> Result<std::path::PathBuf, String> {
+    let candidate = std::path::Path::new(candidate);
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| "validation_error: path has no file component".to_string())?;
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| "validation_error: path has no parent component".to_string())?;
+    let canon_root = root
+        .canonicalize()
+        .map_err(|error| format!("validation_error: cannot resolve root dir: {error}"))?;
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|error| format!("validation_error: cannot resolve path parent: {error}"))?;
+    if !canon_parent.starts_with(&canon_root) {
+        return Err(
+            "security_error: path escapes the permitted chat-image directory".to_string(),
+        );
+    }
+    Ok(canon_parent.join(file_name))
+}
+
+/// Where a [`ChatImageRef`] lives relative to the chat-image root.
+enum ChatImageRefLocation {
+    /// Under the staging dir — must be promoted into the thread's dir.
+    Staged(std::path::PathBuf),
+    /// Already inside this thread's dir — passes through unchanged.
+    ThreadLocal(std::path::PathBuf),
+}
+
+/// Classify a ref's on-disk location for [`finalize_chat_images`].
+///
+/// Security boundary: a ref pointing anywhere other than this thread's dir
+/// or the shared staging dir (a different thread's dir, or entirely outside
+/// the chat-image root) is rejected with an error so a compromised /
+/// buggy frontend cannot smuggle an arbitrary file into a turn. The
+/// candidate's canonicalized parent is compared against the canonicalized
+/// staging / thread dirs; dirs that don't exist yet simply can't match.
+fn classify_chat_image_ref(
+    staging: &std::path::Path,
+    thread_dir: &std::path::Path,
+    candidate: &str,
+) -> Result<ChatImageRefLocation, String> {
+    let candidate_path = std::path::Path::new(candidate);
+    let file_name = candidate_path
+        .file_name()
+        .ok_or_else(|| "validation_error: image path has no file component".to_string())?;
+    let parent = candidate_path
+        .parent()
+        .ok_or_else(|| "validation_error: image path has no parent component".to_string())?;
+    let canon_parent = parent
+        .canonicalize()
+        .map_err(|error| format!("validation_error: cannot resolve image parent: {error}"))?;
+
+    if staging
+        .canonicalize()
+        .map(|s| canon_parent == s)
+        .unwrap_or(false)
+    {
+        return Ok(ChatImageRefLocation::Staged(canon_parent.join(file_name)));
+    }
+    if thread_dir
+        .canonicalize()
+        .map(|t| canon_parent == t)
+        .unwrap_or(false)
+    {
+        return Ok(ChatImageRefLocation::ThreadLocal(
+            canon_parent.join(file_name),
+        ));
+    }
+    Err("security_error: image path is outside the permitted chat-image directories".to_string())
+}
+
+/// Move a staged file into its final home, falling back to copy+remove when
+/// a plain rename fails across devices (staging and the thread dir share a
+/// root today, but a symlinked config dir could straddle a mount).
+async fn move_staged_file(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+) -> Result<(), String> {
+    if tokio::fs::rename(src, dst).await.is_ok() {
+        return Ok(());
+    }
+    tokio::fs::copy(src, dst)
+        .await
+        .map_err(|error| format!("failed to finalize staged image: {error}"))?;
+    // Best-effort cleanup of the staging copy; a leftover file is harmless.
+    let _ = tokio::fs::remove_file(src).await;
+    Ok(())
+}
+
+/// Finalize a turn's staged image refs: promote staged files into the
+/// thread's dir, verify already-thread-local refs, and read every finalized
+/// file's bytes for the provider.
+///
+/// Returns `(records, image_inputs)`: `records` are the [`PersistedChatImage`]
+/// entries (FINAL absolute paths) to stamp on the transcript envelope, and
+/// `image_inputs` are the real-byte [`ImageInput`](crate::agent_provider::ImageInput)s
+/// the provider needs. A ref that fails the location classification is a
+/// SECURITY rejection and fails the whole call; a ref that classifies but
+/// then fails an fs op (missing file, unreadable) is logged and SKIPPED —
+/// mirroring the old best-effort contract so one bad attachment never blocks
+/// the turn. Empty input is a cheap no-op.
+async fn finalize_chat_images(
+    thread_id: &str,
+    refs: &[ChatImageRef],
+) -> Result<(Vec<PersistedChatImage>, Vec<crate::agent_provider::ImageInput>), String> {
+    if refs.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let staging = chat_images_staging_dir()
+        .ok_or_else(|| "config_dir_unavailable".to_string())?;
+    let thread_dir =
+        chat_images_dir(thread_id).ok_or_else(|| "config_dir_unavailable".to_string())?;
+    // Create the thread dir up front so a rename into it always has a target.
+    tokio::fs::create_dir_all(&thread_dir)
+        .await
+        .map_err(|error| format!("failed to create chat image dir: {error}"))?;
+
+    let mut records = Vec::with_capacity(refs.len());
+    let mut inputs = Vec::with_capacity(refs.len());
+    for image in refs {
+        // Classification is the security gate — propagate its error.
+        let final_path = match classify_chat_image_ref(&staging, &thread_dir, &image.path)? {
+            ChatImageRefLocation::Staged(src) => {
+                let file_name = src
+                    .file_name()
+                    .map(|n| n.to_os_string())
+                    .unwrap_or_else(|| {
+                        let ext = chat_image_extension(&image.media_type);
+                        std::ffi::OsString::from(format!("{}.{ext}", uuid::Uuid::new_v4()))
+                    });
+                let dst = thread_dir.join(&file_name);
+                if let Err(error) = move_staged_file(&src, &dst).await {
+                    eprintln!(
+                        "[codemux::agent_chat] failed to finalize staged image {}: {error}",
+                        src.display()
+                    );
+                    continue;
+                }
+                dst
+            }
+            ChatImageRefLocation::ThreadLocal(path) => path,
+        };
+        // Read the finalized bytes for the provider. A missing/unreadable
+        // file skips this attachment (best-effort) rather than failing the
+        // turn.
+        match tokio::fs::read(&final_path).await {
+            Ok(bytes) => {
+                inputs.push(crate::agent_provider::ImageInput {
+                    data: bytes,
+                    media_type: image.media_type.clone(),
+                });
+                records.push(PersistedChatImage {
+                    path: final_path.to_string_lossy().into_owned(),
+                    media_type: image.media_type.clone(),
+                });
+            }
             Err(error) => eprintln!(
-                "[codemux::agent_chat] failed to write chat image {}: {error}",
-                path.display()
+                "[codemux::agent_chat] failed to read finalized image {}: {error}",
+                final_path.display()
             ),
         }
     }
-    saved
+    Ok((records, inputs))
+}
+
+/// JSON fallback body for [`agent_chat_stage_image`] on transports that
+/// cannot carry a raw invoke payload. The web-remote bridge serializes
+/// every invoke as JSON (`dispatch_invoke` synthesizes `InvokeBody::Json`)
+/// and drops invoke options, so a remote browser client ships the bytes
+/// base64-encoded in the body instead — ~1.33x the raw size, still far
+/// cheaper than the per-byte `number[]` JSON this feature replaced.
+#[derive(Debug, Deserialize)]
+struct StageChatImageJsonBody {
+    bytes_base64: String,
+    media_type: String,
+}
+
+/// Stage a single chat image via a RAW request body (no per-byte JSON).
+///
+/// The composer invokes this as
+/// `invoke("agent_chat_stage_image", bytesUint8Array, { headers: { "x-media-type": mime } })`,
+/// so the payload arrives as [`InvokeBody::Raw`] and the MIME rides the
+/// `x-media-type` header — the same mechanism the official fs plugin's
+/// `write_file` uses. Transports that can't carry a raw body (web-remote)
+/// send [`StageChatImageJsonBody`] instead. The bytes are validated
+/// (accepted MIME + size cap) and written to the staging dir with
+/// `tokio::fs`; the returned absolute path is what the next
+/// `agent_chat_send_turn` references.
+#[tauri::command]
+pub async fn agent_chat_stage_image(
+    app: AppHandle,
+    request: Request<'_>,
+) -> Result<StagedChatImage, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+
+    // Copy the bytes out of the request so no borrow of `request` is held
+    // across the awaits below. The MIME comes from the `x-media-type`
+    // header on the raw path, or from the JSON body on the fallback path
+    // (the web-remote bridge drops invoke options, headers included).
+    let (bytes, media_type) = match request.body() {
+        InvokeBody::Raw(bytes) => {
+            let media_type = request
+                .headers()
+                .get("x-media-type")
+                .and_then(|value| value.to_str().ok())
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    "validation_error: missing x-media-type header".to_string()
+                })?;
+            (bytes.clone(), media_type)
+        }
+        InvokeBody::Json(value) => {
+            let body: StageChatImageJsonBody = serde_json::from_value(value.clone())
+                .map_err(|_| {
+                    "validation_error: expected a raw image body or \
+                     { bytes_base64, media_type }"
+                        .to_string()
+                })?;
+            use base64::Engine as _;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(body.bytes_base64.as_bytes())
+                .map_err(|error| {
+                    format!("validation_error: invalid base64 image body: {error}")
+                })?;
+            (decoded, body.media_type)
+        }
+    };
+    let media_type = validate_chat_image_mime(&media_type)?;
+    if bytes.is_empty() {
+        return Err("validation_error: empty image body".to_string());
+    }
+    if bytes.len() > crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES {
+        return Err(format!(
+            "validation_error: image too large ({:.1} MB, limit is {} MB)",
+            bytes.len() as f64 / (1024.0 * 1024.0),
+            crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
+
+    let staging =
+        chat_images_staging_dir().ok_or_else(|| "config_dir_unavailable".to_string())?;
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .map_err(|error| format!("failed to create staging dir: {error}"))?;
+    let ext = chat_image_extension(&media_type);
+    let path = staging.join(format!("{}.{ext}", uuid::Uuid::new_v4()));
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|error| format!("failed to write staged image: {error}"))?;
+
+    Ok(StagedChatImage {
+        path: path.to_string_lossy().into_owned(),
+        media_type,
+    })
+}
+
+/// Reap leaked chat-image staging files at startup.
+///
+/// A staged upload is normally either promoted into its thread's dir on
+/// send ([`finalize_chat_images`]) or deleted when the user removes the
+/// chip ([`agent_chat_discard_staged_image`]) — but a crash or an
+/// abandoned draft leaks the file. Staging paths never survive a restart
+/// of the composer that minted them (attachment chips hold their bytes in
+/// memory only), so anything past a generous grace window is garbage.
+/// The 24h grace exists for belt-and-braces coexistence with any other
+/// process sharing the config dir (e.g. a headless `codemux-remote`
+/// daemon on the same host) rather than for the desktop app itself.
+/// Best-effort: every failure is ignored — a leftover file is harmless.
+pub async fn sweep_stale_staged_images() {
+    const STAGING_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
+    let Some(staging) = chat_images_staging_dir() else {
+        return;
+    };
+    let Ok(mut entries) = tokio::fs::read_dir(&staging).await else {
+        return;
+    };
+    let now = SystemTime::now();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(metadata) = entry.metadata().await else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let age = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok());
+        if age.is_some_and(|age| age > STAGING_GRACE) {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+}
+
+/// Discard a staged image the user removed before sending. Idempotent: a
+/// path already gone is a best-effort success. Rejects any path outside the
+/// staging dir (security) so this can never be turned into an arbitrary
+/// file delete.
+#[tauri::command]
+pub async fn agent_chat_discard_staged_image(
+    app: AppHandle,
+    path: String,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let staging =
+        chat_images_staging_dir().ok_or_else(|| "config_dir_unavailable".to_string())?;
+    // Ensure the staging root exists so its canonicalization (inside
+    // `resolve_within`) succeeds even before the first upload of a session.
+    tokio::fs::create_dir_all(&staging)
+        .await
+        .map_err(|error| format!("failed to resolve staging dir: {error}"))?;
+    let resolved = resolve_within(&staging, &path)?;
+    match tokio::fs::remove_file(&resolved).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to discard staged image: {error}")),
+    }
+}
+
+/// Read a finalized (or staged) chat image's bytes back for the frontend.
+///
+/// An on-error fallback loader for contexts where the asset protocol can't
+/// serve a local path (the dev browser mock, a web-remote client). The path
+/// must resolve inside the chat-image root (any thread dir or staging);
+/// anything else is rejected. `tokio::fs::read`, media type inferred from
+/// the extension.
+#[tauri::command]
+pub async fn agent_chat_read_image(
+    app: AppHandle,
+    path: String,
+) -> Result<ChatImageBytes, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    let root = chat_images_root().ok_or_else(|| "config_dir_unavailable".to_string())?;
+    let resolved = resolve_within(&root, &path)?;
+    let media_type = media_type_from_extension(&resolved);
+    let bytes = tokio::fs::read(&resolved)
+        .await
+        .map_err(|error| format!("failed to read chat image: {error}"))?;
+    Ok(ChatImageBytes { bytes, media_type })
+}
+
+/// Warm MCP servers eagerly, before the first turn.
+///
+/// The frontend fires this as soon as a draft / new-thread surface mounts so
+/// the `npx`-launched MCP handshakes (which can take seconds on first run)
+/// overlap the user typing their first prompt instead of blocking the turn.
+/// Returns immediately: the actual `prime_for_chat` work runs on a
+/// background task. The prime the correctness backstop in
+/// [`agent_chat_start_session`] still performs becomes a cheap no-op because
+/// the registry's `prime_lock` serializes the two so they can't double-spawn
+/// (see [`crate::mcp::registry::McpRegistry`]).
+#[tauri::command]
+pub async fn agent_chat_prime_mcp(app: AppHandle) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+    // Prime against the active workspace's root when there is one so
+    // project-scoped `.mcp.json` servers warm too; a draft with no workspace
+    // primes the global/user set (project_root = None).
+    let project_root = {
+        let state: State<'_, AppStateStore> = app.state();
+        let snapshot = state.snapshot();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == snapshot.active_workspace_id)
+            .map(|w| std::path::PathBuf::from(&w.cwd))
+            .filter(|p| !p.as_os_str().is_empty())
+    };
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        use crate::mcp::registry::McpRegistry;
+        let mcp_registry: State<'_, McpRegistry> = app.state();
+        let registry = mcp_registry.inner().clone_handle();
+        registry
+            .prime_for_chat(Some(&app), project_root.as_deref())
+            .await;
+    });
+    Ok(())
 }
 
 /// Process-wide bridge carrying a QUEUED send's on-disk image records
@@ -1666,6 +2166,36 @@ pub async fn list_chat_provider_capabilities(
             )
             .await
         }
+    }
+}
+
+/// List the provider-native slash commands available to a chat thread
+/// anchored at `cwd`. Claude is the only provider that reports a
+/// command vocabulary today (via the Agent SDK's `supportedCommands()`
+/// probe — built-ins like `/compact` / `/init` / `/review` plus custom
+/// `~/.claude/commands` and `<cwd>/.claude/commands` entries). Codex
+/// and OpenCode expose no discovery surface, so they resolve to an
+/// empty list — the composer then shows only Codemux's own built-ins,
+/// matching how reference multi-provider clients behave.
+///
+/// Selecting one of these in the UI inserts the literal `/name ` text
+/// into the draft; the text is forwarded verbatim to the provider,
+/// which interprets the leading slash itself. Codemux never executes
+/// provider commands locally.
+#[tauri::command]
+pub async fn list_chat_slash_commands(
+    provider: ProviderKind,
+    cwd: String,
+    slash_cache: tauri::State<
+        '_,
+        std::sync::Arc<crate::agent_provider::claude::slash_commands::ClaudeSlashCommandCache>,
+    >,
+) -> Result<Vec<crate::agent_provider::claude::slash_commands::ProviderSlashCommand>, String> {
+    match provider {
+        ProviderKind::Claude => slash_cache.get_or_harvest(&cwd).await,
+        // No discovery surface on these providers (yet) — empty list,
+        // not an error, so the popup renders without a failure footer.
+        ProviderKind::Codex | ProviderKind::OpenCode => Ok(Vec::new()),
     }
 }
 
@@ -2678,6 +3208,206 @@ mod tests {
         // Unknown / non-image types fall back to `bin` rather than drop.
         assert_eq!(chat_image_extension("image/heic"), "bin");
         assert_eq!(chat_image_extension("application/pdf"), "bin");
+    }
+
+    // ── chat image staging: MIME + extension mapping ──
+
+    #[test]
+    fn validate_chat_image_mime_accepts_supported_types() {
+        assert_eq!(
+            validate_chat_image_mime("image/png").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            validate_chat_image_mime("image/jpeg").unwrap(),
+            "image/jpeg"
+        );
+        assert_eq!(
+            validate_chat_image_mime("image/gif").unwrap(),
+            "image/gif"
+        );
+        assert_eq!(
+            validate_chat_image_mime("image/webp").unwrap(),
+            "image/webp"
+        );
+    }
+
+    #[test]
+    fn validate_chat_image_mime_folds_jpg_alias_and_case() {
+        // `image/jpg` normalizes to the canonical `image/jpeg`.
+        assert_eq!(validate_chat_image_mime("image/jpg").unwrap(), "image/jpeg");
+        // Casing is folded.
+        assert_eq!(validate_chat_image_mime("IMAGE/PNG").unwrap(), "image/png");
+        assert_eq!(validate_chat_image_mime("Image/WebP").unwrap(), "image/webp");
+    }
+
+    #[test]
+    fn validate_chat_image_mime_rejects_unsupported() {
+        assert!(validate_chat_image_mime("image/heic").is_err());
+        assert!(validate_chat_image_mime("image/svg+xml").is_err());
+        assert!(validate_chat_image_mime("application/pdf").is_err());
+        assert!(validate_chat_image_mime("text/plain").is_err());
+    }
+
+    #[test]
+    fn media_type_from_extension_round_trips_known_types() {
+        use std::path::Path;
+        assert_eq!(
+            media_type_from_extension(Path::new("/x/a.png")),
+            "image/png"
+        );
+        assert_eq!(
+            media_type_from_extension(Path::new("/x/a.jpg")),
+            "image/jpeg"
+        );
+        assert_eq!(
+            media_type_from_extension(Path::new("/x/a.jpeg")),
+            "image/jpeg"
+        );
+        assert_eq!(
+            media_type_from_extension(Path::new("/x/a.gif")),
+            "image/gif"
+        );
+        assert_eq!(
+            media_type_from_extension(Path::new("/x/a.webp")),
+            "image/webp"
+        );
+        // Case-insensitive on the extension.
+        assert_eq!(
+            media_type_from_extension(Path::new("/x/a.PNG")),
+            "image/png"
+        );
+        // Unknown / missing extension falls back to the generic type.
+        assert_eq!(
+            media_type_from_extension(Path::new("/x/a.bin")),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            media_type_from_extension(Path::new("/x/noext")),
+            "application/octet-stream"
+        );
+    }
+
+    // ── chat image staging: path containment (security boundary) ──
+
+    #[test]
+    fn resolve_within_accepts_a_path_inside_root() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("img.png");
+        std::fs::write(&file, b"x").unwrap();
+        let resolved =
+            resolve_within(root.path(), file.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_within_accepts_a_path_in_a_subdir_of_root() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("thread-1");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("img.png");
+        std::fs::write(&file, b"x").unwrap();
+        let resolved =
+            resolve_within(root.path(), file.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, file.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_within_rejects_parent_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let inside = root.path().join("staging");
+        std::fs::create_dir_all(&inside).unwrap();
+        // A `../` escape that lands outside the root is rejected even though
+        // the components textually start under it.
+        let escape = format!("{}/../../etc/passwd", inside.display());
+        let err = resolve_within(&inside, &escape).unwrap_err();
+        assert!(err.contains("security_error") || err.contains("validation_error"));
+    }
+
+    #[test]
+    fn resolve_within_rejects_a_sibling_of_root() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("images");
+        let sibling = base.path().join("other");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        let outside = sibling.join("evil.png");
+        std::fs::write(&outside, b"x").unwrap();
+        let err = resolve_within(&root, outside.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("security_error"));
+    }
+
+    #[test]
+    fn classify_chat_image_ref_tags_staged_and_thread_local() {
+        let base = tempfile::tempdir().unwrap();
+        let staging = base.path().join("staging");
+        let thread_dir = base.path().join("thread-1");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&thread_dir).unwrap();
+
+        let staged = staging.join("s.png");
+        std::fs::write(&staged, b"x").unwrap();
+        let local = thread_dir.join("l.png");
+        std::fs::write(&local, b"x").unwrap();
+
+        match classify_chat_image_ref(&staging, &thread_dir, staged.to_str().unwrap())
+            .unwrap()
+        {
+            ChatImageRefLocation::Staged(p) => {
+                assert_eq!(p, staged.canonicalize().unwrap())
+            }
+            ChatImageRefLocation::ThreadLocal(_) => panic!("expected Staged"),
+        }
+        match classify_chat_image_ref(&staging, &thread_dir, local.to_str().unwrap())
+            .unwrap()
+        {
+            ChatImageRefLocation::ThreadLocal(p) => {
+                assert_eq!(p, local.canonicalize().unwrap())
+            }
+            ChatImageRefLocation::Staged(_) => panic!("expected ThreadLocal"),
+        }
+    }
+
+    #[test]
+    fn classify_chat_image_ref_rejects_other_thread_and_outside() {
+        let base = tempfile::tempdir().unwrap();
+        let staging = base.path().join("staging");
+        let thread_dir = base.path().join("thread-1");
+        let other_thread = base.path().join("thread-2");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::create_dir_all(&thread_dir).unwrap();
+        std::fs::create_dir_all(&other_thread).unwrap();
+
+        // A file in a DIFFERENT thread's dir is not smuggleable into this
+        // turn — even though it lives under the same chat-image root.
+        let foreign = other_thread.join("f.png");
+        std::fs::write(&foreign, b"x").unwrap();
+        assert!(
+            classify_chat_image_ref(&staging, &thread_dir, foreign.to_str().unwrap())
+                .is_err()
+        );
+
+        // A file entirely outside the tree is rejected.
+        let outside_dir = tempfile::tempdir().unwrap();
+        let outside = outside_dir.path().join("o.png");
+        std::fs::write(&outside, b"x").unwrap();
+        assert!(
+            classify_chat_image_ref(&staging, &thread_dir, outside.to_str().unwrap())
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn move_staged_file_relocates_bytes() {
+        let base = tempfile::tempdir().unwrap();
+        let src = base.path().join("staged.png");
+        let dst = base.path().join("thread-1").join("final.png");
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"pixels").unwrap();
+
+        move_staged_file(&src, &dst).await.unwrap();
+        assert!(!src.exists(), "source should be gone after finalize");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"pixels");
     }
 
     /// Build the user_message envelope the same way `persist_user_message`

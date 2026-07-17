@@ -1,16 +1,38 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { LoaderCircle } from "lucide-react";
 
 import {
   buildAttachmentBlock,
   buildFileResolvedContent,
   buildFolderResolvedContent,
   buildImageDisplaySources,
-  buildImagePayloads,
+  buildImageRefs,
   buildIssueResolvedContent,
   buildPrResolvedContent,
+  imageAttachmentIds,
+  unstagedImageAttachments,
 } from "@/lib/agent-chat/attachment-block";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
-import { materializeAndSend } from "@/lib/agent-chat/materialize";
+import {
+  awaitImageStaging,
+  beginImageStaging,
+  discardStagedImage,
+} from "@/lib/agent-chat/image-staging";
+import {
+  materializeAndSend,
+  type MaterializePhase,
+} from "@/lib/agent-chat/materialize";
+import type {
+  UserMessageImage,
+  UserMessageItem,
+} from "@/lib/agent-chat/types";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
@@ -37,6 +59,7 @@ import {
   getGithubIssueByPath,
   getGithubPrByPath,
   getGithubPrDiffByPath,
+  primeChatMcp,
   readFileForAttachment,
   readFolderForAttachment,
 } from "@/tauri/commands";
@@ -49,6 +72,7 @@ import type {
 
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
+import { UserMessage } from "./UserMessage";
 import { DEFAULT_THREAD_PERMISSION_MODE } from "@/stores/agent-chat-store";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
@@ -227,6 +251,23 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // ref pattern.
   const sendInFlightRef = useRef(false);
 
+  // Instant-feedback state (Bug 2 fix): once the user submits, we render
+  // the just-sent conversation (their bubble + a phase status line) in
+  // place of the landing, so the composer never sits dead for the
+  // multi-second workspace/session bring-up. Cleared on failure (restore
+  // composer); on success the surface unmounts as the live pane flips in.
+  const [pending, setPending] = useState<DraftPendingState | null>(null);
+
+  // Warm the MCP servers as soon as the draft mounts so the up-front
+  // prime cost overlaps the user composing, instead of blocking the
+  // first `agent_chat_start_session`. Fire-and-forget; the backend
+  // returns immediately and warms in the background.
+  useEffect(() => {
+    void primeChatMcp().catch(() => {
+      /* best-effort */
+    });
+  }, []);
+
   const handleSubmit = useCallback(() => {
     if (sendInFlightRef.current) return;
     // Re-read fresh state so a same-tick keystroke then Enter sees the
@@ -308,11 +349,9 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     const attachmentBlock = buildAttachmentBlock(
       activeAttachments(text, liveAttachments),
     );
-    // Stage 6 — extract resolved image bytes for the multimodal SDK
-    // path. Empty array when no images staged.
-    const imagePayloads = buildImagePayloads(liveAttachments);
-    // The same images as `data:` URLs so the optimistic
-    // user bubble in the new pane renders their thumbnails immediately.
+    // The staged images as `data:` URLs so both the pending conversation
+    // below AND the optimistic user bubble in the new pane render their
+    // thumbnails immediately (built from the in-memory bytes).
     const imageDisplaySources = buildImageDisplaySources(liveAttachments);
 
     // Thread Scope redesign — when the checkout popover is set to
@@ -331,47 +370,89 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
             : null
         : null;
 
-    void materializeAndSend(
-      currentDraft,
+    // Instant feedback (Bug 2 fix): render the just-sent conversation and
+    // clear the composer NOW, before the multi-second workspace/session
+    // work begins. The status line advances through the real phases via
+    // `materializeAndSend`'s `onPhase` hook.
+    const finalDraft = currentDraft;
+    setPending({
       text,
-      cwdForSession,
-      {
-        markPromoting: state.markPromoting,
-        markMaterialized: state.markMaterialized,
-        markPromoted: state.markPromoted,
-        markSendFailed: state.markSendFailed,
-        ensureThread: chat.ensureThread,
-        appendUserMessage: chat.appendUserMessage,
-        setModel: chat.setModel,
-        setPermissionMode: chat.setPermissionMode,
-        setSessionLaunchMode: chat.setSessionLaunchMode,
-        setEffort: chat.setEffort,
-        setContextWindow: chat.setContextWindow,
-        setMode: chat.setMode,
-      },
-      skillBodies,
-      attachmentBlock,
-      imagePayloads,
-      imageDisplaySources,
-      worktreeProjectPath,
-    )
-      .then((result) => {
-        if (result.success) {
-          setActiveDraft(null);
-          // Clear the chips per-turn so the fresh AgentChatPane mount
-          // doesn't render leftover chips from the draft surface.
-          clearStagedAttachments(currentDraft.threadId);
-          // §9: keep the draft entry for a grace period so any in-
-          // flight UI can still observe the promotion before cleanup.
-          const draftIdToClear = currentDraft.draftId;
-          setTimeout(() => clearDraft(draftIdToClear), CLEAR_AFTER_PROMOTION_MS);
-        } else {
-          toast.error(`Send failed: ${result.error}`);
-        }
-      })
-      .finally(() => {
+      images: imageDisplaySources,
+      phase: worktreeProjectPath ? "creating-worktree" : "creating-workspace",
+    });
+    updateDraftInput(finalDraft.draftId, "");
+
+    void (async () => {
+      // Images stage at attach time; await only stragglers, then read
+      // fresh so staging patches (new attachment objects) are visible.
+      const imageIds = imageAttachmentIds(liveAttachments);
+      if (imageIds.length > 0) await awaitImageStaging(imageIds);
+      const freshAttachments =
+        useAgentChatStore.getState().threads[finalDraft.threadId]
+          ?.stagedAttachments ?? [];
+      const unstaged = unstagedImageAttachments(freshAttachments);
+      if (unstaged.length > 0) {
+        // A staged image never landed — block the send (the raw-bytes
+        // fallback is gone) and restore the composer.
+        setPending(null);
+        updateDraftInput(finalDraft.draftId, text);
+        toast.error(
+          "An attached image failed to upload — remove it and try again.",
+        );
         sendInFlightRef.current = false;
-      });
+        return;
+      }
+      const imageRefs = buildImageRefs(freshAttachments);
+
+      const result = await materializeAndSend(
+        finalDraft,
+        text,
+        cwdForSession,
+        {
+          markPromoting: state.markPromoting,
+          markMaterialized: state.markMaterialized,
+          markPromoted: state.markPromoted,
+          markSendFailed: state.markSendFailed,
+          ensureThread: chat.ensureThread,
+          appendUserMessage: chat.appendUserMessage,
+          removeUserMessageByNonce: chat.removeUserMessageByNonce,
+          setModel: chat.setModel,
+          setPermissionMode: chat.setPermissionMode,
+          setSessionLaunchMode: chat.setSessionLaunchMode,
+          setEffort: chat.setEffort,
+          setContextWindow: chat.setContextWindow,
+          setMode: chat.setMode,
+        },
+        skillBodies,
+        attachmentBlock,
+        imageRefs,
+        imageDisplaySources,
+        worktreeProjectPath,
+        (phase) => setPending((p) => (p ? { ...p, phase } : p)),
+      );
+      if (result.success) {
+        // Flip to the real pane. The pending view stays mounted until
+        // this surface unmounts, and the live pane renders the same
+        // optimistically-appended bubble — flicker-free.
+        setActiveDraft(null);
+        // Clear the chips per-turn so the fresh AgentChatPane mount
+        // doesn't render leftover chips from the draft surface.
+        clearStagedAttachments(finalDraft.threadId);
+        // §9: keep the draft entry for a grace period so any in-flight
+        // UI can still observe the promotion before cleanup.
+        const draftIdToClear = finalDraft.draftId;
+        setTimeout(() => clearDraft(draftIdToClear), CLEAR_AFTER_PROMOTION_MS);
+      } else {
+        // `materializeAndSend` already rolled back its optimistic slice
+        // bubble; drop the pending view and restore the composer text so
+        // the user can retry. The error also surfaces via
+        // `draft.lastSendError` on the composer.
+        setPending(null);
+        updateDraftInput(finalDraft.draftId, text);
+        toast.error(`Send failed: ${result.error}`);
+      }
+      sendInFlightRef.current = false;
+    })();
   }, [
     draft.draftId,
     appHomeDir,
@@ -382,6 +463,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     setActiveDraft,
     clearDraft,
     clearStagedAttachments,
+    updateDraftInput,
   ]);
 
   // Step 8 Stage 2 — chip lifecycle for the `@` mention popup.
@@ -490,6 +572,10 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
             fetchedAt: Date.now(),
           },
         });
+        // Stage the bytes to disk NOW (off the send path); patches the
+        // chip with `stagedImage` when it lands, or a chip error on
+        // failure.
+        beginImageStaging(draft.threadId, id, bytes, file.type);
       } catch (err) {
         updateStagedAttachment(draft.threadId, id, {
           metadata: {
@@ -867,9 +953,16 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       belowComposerSlot={belowComposerSlot}
       mode={draft.mode}
       stagedAttachments={stagedAttachments}
-      onRemoveAttachment={(id) =>
-        removeStagedAttachment(draft.threadId, id)
-      }
+      onRemoveAttachment={(id) => {
+        // Best-effort delete of the backend staging file if this chip
+        // was an image that already staged.
+        const staged = useAgentChatStore
+          .getState()
+          .threads[draft.threadId]?.stagedAttachments.find((a) => a.id === id)
+          ?.stagedImage;
+        if (staged) discardStagedImage(staged.path);
+        removeStagedAttachment(draft.threadId, id);
+      }}
       onAttachFile={handleAttachFile}
       onAttachFolder={handleAttachFolder}
       onAttachIssue={handleAttachIssue}
@@ -895,8 +988,77 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     <div className="flex h-full w-full flex-col bg-background">
       <DraftSurfaceHeader />
       <div className="flex-1 min-h-0 overflow-hidden">
-        <ChatHomeLanding composer={composerEl} />
+        {pending ? (
+          <DraftPendingConversation pending={pending} composer={composerEl} />
+        ) : (
+          <ChatHomeLanding composer={composerEl} />
+        )}
       </div>
+    </div>
+  );
+}
+
+/** Local instant-feedback state for a submit that's mid-materialise. */
+interface DraftPendingState {
+  text: string;
+  images: UserMessageImage[];
+  phase: MaterializePhase;
+}
+
+const PHASE_LABEL: Record<MaterializePhase, string> = {
+  "creating-worktree": "Creating worktree…",
+  "creating-workspace": "Setting up workspace…",
+  "starting-session": "Starting session…",
+  sending: "Sending…",
+};
+
+/**
+ * The just-sent conversation, rendered the instant the user submits so
+ * the composer never sits dead through the multi-second workspace +
+ * session bring-up. Shows the sent user bubble (with `data:` URL
+ * thumbnails) above a shimmering status line that advances through the
+ * real materialize phases, with the (cleared) composer pinned below —
+ * the same column geometry as the live pane, so the hand-off to the real
+ * `AgentChatPane` is flicker-free.
+ */
+function DraftPendingConversation({
+  pending,
+  composer,
+}: {
+  pending: DraftPendingState;
+  composer: ReactNode;
+}) {
+  const item: UserMessageItem = {
+    kind: "user_message",
+    id: "draft-pending",
+    seq: 0,
+    text: pending.text,
+    images: pending.images.length > 0 ? pending.images : undefined,
+  };
+  return (
+    <div className="flex h-full w-full flex-col">
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <div className="mx-auto flex w-full max-w-[760px] flex-col gap-4 px-7 py-6">
+          <UserMessage item={item} />
+          <div
+            className="flex items-center gap-[13px] pt-0.5"
+            role="status"
+            aria-label="Starting the agent"
+          >
+            <span className="flex w-[29px] shrink-0 justify-center">
+              <LoaderCircle
+                className="h-[15px] w-[15px] animate-spin text-accent-ember"
+                strokeWidth={1.6}
+                aria-hidden
+              />
+            </span>
+            <span className="shimmer text-[12.5px] font-semibold">
+              {PHASE_LABEL[pending.phase]}
+            </span>
+          </div>
+        </div>
+      </div>
+      <div className="mx-auto w-full max-w-[760px] px-7 pb-4">{composer}</div>
     </div>
   );
 }

@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   buildModeCommands,
+  buildModelCommand,
+  buildProviderCommands,
   buildWorkflowCommand,
   filterSlashItems,
   findMentionAtCursor,
@@ -168,6 +170,101 @@ describe("buildModeCommands", () => {
       onActivate: vi.fn(),
     });
     expect(items.map((i) => i.id)).toEqual(["mode:plan", "mode:debug"]);
+  });
+
+  it("adds /default when a mode is active and onDeactivate is wired", () => {
+    const onDeactivate = vi.fn();
+    const items = buildModeCommands({
+      activeMode: "plan",
+      onActivate: vi.fn(),
+      onDeactivate,
+    });
+    expect(items.map((i) => i.id)).toEqual([
+      "mode:ask",
+      "mode:debug",
+      "mode:default",
+    ]);
+    const def = items.find((i) => i.id === "mode:default")!;
+    expect(def.command).toBe("/default");
+    def.onSelect();
+    expect(onDeactivate).toHaveBeenCalledTimes(1);
+  });
+
+  it("omits /default when default mode is already active", () => {
+    const items = buildModeCommands({
+      activeMode: "default",
+      onActivate: vi.fn(),
+      onDeactivate: vi.fn(),
+    });
+    expect(items.map((i) => i.id)).toEqual([
+      "mode:plan",
+      "mode:ask",
+      "mode:debug",
+    ]);
+  });
+});
+
+describe("buildModelCommand", () => {
+  it("is a state-only row that opens the model picker", () => {
+    const onOpen = vi.fn();
+    const item = buildModelCommand({ onOpen });
+    expect(item.id).toBe("composer:model");
+    expect(item.command).toBe("/model");
+    expect(item.group).toBe("SETTINGS");
+    item.onSelect();
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("buildProviderCommands", () => {
+  const commands = [
+    {
+      name: "compact",
+      description: "Clear history but keep a summary",
+      argumentHint: "",
+    },
+    { name: "review", description: "", argumentHint: "<pr-url>" },
+    { name: "plan", description: "colliding custom command", argumentHint: "" },
+    { name: "opaque", description: "", argumentHint: "" },
+  ];
+
+  it("maps discovered commands into the COMMANDS group", () => {
+    const items = buildProviderCommands({
+      commands,
+      reservedNames: new Set(),
+    });
+    expect(items[0]).toMatchObject({
+      id: "provider-command:compact",
+      label: "compact",
+      command: "/compact",
+      group: "COMMANDS",
+      description: "Clear history but keep a summary",
+    });
+  });
+
+  it("falls back to the argument hint, then a generic description", () => {
+    const items = buildProviderCommands({
+      commands,
+      reservedNames: new Set(),
+    });
+    expect(items.find((i) => i.label === "review")!.description).toBe(
+      "/review <pr-url>",
+    );
+    expect(items.find((i) => i.label === "opaque")!.description).toBe(
+      "Provider command",
+    );
+  });
+
+  it("drops commands whose names are reserved by local rows", () => {
+    const items = buildProviderCommands({
+      commands,
+      reservedNames: new Set(["plan"]),
+    });
+    expect(items.map((i) => i.label)).toEqual([
+      "compact",
+      "review",
+      "opaque",
+    ]);
   });
 });
 

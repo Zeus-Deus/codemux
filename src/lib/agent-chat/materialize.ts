@@ -5,11 +5,12 @@ import {
   agentChatStartSession,
   applyPreset,
   createEmptyWorkspace,
-  createWorktreeWorkspace,
+  createWorktreeWorkspaceResult,
   generateBranchName,
   generateRandomBranchName,
   getHomeDir,
   renameWorkspace,
+  type WorkspaceCreateResult,
 } from "@/tauri/commands";
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
@@ -63,6 +64,11 @@ export interface MaterializeActions {
     clientNonce?: string,
     images?: UserMessageImage[],
   ) => void;
+  /** Roll back the optimistic user message (matched by `clientNonce`)
+   *  when a step fails before/at send. Mirrors the warm-send path's
+   *  nonce rollback so a failed first send never strands an orphan
+   *  bubble in the pre-minted thread slice. */
+  removeUserMessageByNonce: (threadId: string, clientNonce: string) => void;
   // ── Stage C Effort-lock fix: mirror the draft's session config
   //    onto the agent-chat slice so the ReasoningPicker (which gates
   //    on `slice.model`) renders correctly when `AgentChatPane`
@@ -92,6 +98,22 @@ export type MaterializeResult =
       threadId: string;
     }
   | { success: false; error: string };
+
+/** Phases surfaced through `materializeAndSend`'s `onPhase` hook so the
+ *  draft surface can advance a status line as the real work progresses. */
+export type MaterializePhase =
+  | "creating-worktree"
+  | "creating-workspace"
+  | "starting-session"
+  | "sending";
+
+/** Mint a client nonce for optimistic-append rollback. Falls back to a
+ *  timestamp+random token where `crypto.randomUUID` is unavailable. */
+function mintNonce(): string {
+  return typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
 
 /**
  * Promote a draft into a real workspace and send the first turn.
@@ -129,11 +151,13 @@ export async function materializeAndSend(
    *  lib stays free of store imports. `null` when the draft has no
    *  attachments. */
   attachmentBlock: string | null = null,
-  /** Step 8 Stage 6 — image attachments converted to the wire shape
-   *  agent_chat_send_turn expects. Caller pre-extracts via
-   *  `buildImagePayloads` so this lib stays free of store imports.
-   *  Defaults to empty so existing call sites keep compiling. */
-  images: Array<{ data: number[]; media_type: string }> = [],
+  /** Image attachments as staged-file references
+   *  (`{ path, media_type }`) — the bytes were written to disk at attach
+   *  time, so the turn never marshals them across IPC as a JSON
+   *  `number[]`. Caller pre-extracts via `buildImageRefs` so this lib
+   *  stays free of store imports. Defaults to empty so existing call
+   *  sites keep compiling. */
+  images: Array<{ path: string; media_type: string }> = [],
   /** Display shape of the same staged images (`data:` URLs), for the
    *  optimistic user bubble's thumbnails. Distinct from `images` above,
    *  which is the raw-bytes wire shape the SDK needs. Caller
@@ -150,8 +174,31 @@ export async function materializeAndSend(
    *  `existing_workspace` targets — see `DraftChatSurface`'s
    *  `existingWorkspaceProjectRoot`. */
   worktreeProjectPath: string | null = null,
+  /** Instant-feedback hook — invoked as the flow advances through its
+   *  real phases so the draft surface can drive a status line
+   *  ("Creating worktree…" / "Starting session…" / "Sending…") that
+   *  tracks the actual work instead of a bare spinner. Optional; a
+   *  no-op by default. */
+  onPhase: (phase: MaterializePhase) => void = () => {},
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
+
+  // Instant feedback (Bug 2 fix): seed the pre-minted thread slice and
+  // append the optimistic user bubble BEFORE any workspace/session work.
+  // The thread id is pre-minted so the slice can exist now; the draft
+  // surface renders this bubble immediately (no more staring at a dead
+  // composer for seconds). A client nonce lets us roll the bubble back
+  // if any step below fails.
+  const clientNonce = mintNonce();
+  actions.ensureThread(draft.threadId);
+  seedSliceFromDraft(draft, actions);
+  actions.appendUserMessage(
+    draft.threadId,
+    text,
+    clientNonce,
+    imageDisplaySources,
+  );
+  onPhase(worktreeProjectPath ? "creating-worktree" : "creating-workspace");
 
   // 1. Resolve the target workspace. A `"worktree"` checkout mode
   //    takes priority over the target-kind switch below: instead of
@@ -176,16 +223,21 @@ export async function materializeAndSend(
   let effectiveCwd = cwd;
   try {
     if (draft.checkoutMode === "worktree" && worktreeProjectPath) {
-      workspaceId = await createDeferredWorktree(
+      const created = await createDeferredWorktree(
         worktreeProjectPath,
         draft.worktreeName ?? "",
         draft.baseBranch ?? "",
         text,
       );
-      const worktreeCwd = await waitForWorkspaceCwd(workspaceId);
+      workspaceId = created.workspaceId;
+      // Prefer the cwd the create response carries (contract item 6);
+      // only fall back to the `app-state-changed` poll when an older
+      // backend omits it.
+      const worktreeCwd = created.cwd ?? (await waitForWorkspaceCwd(workspaceId));
       if (!worktreeCwd) {
         const message =
           "Timed out resolving the new worktree's location. Please send again.";
+        actions.removeUserMessageByNonce(draft.threadId, clientNonce);
         actions.markSendFailed(draft.draftId, message);
         return { success: false, error: message };
       }
@@ -207,6 +259,7 @@ export async function materializeAndSend(
     }
   } catch (err) {
     const message = errorMessage(err);
+    actions.removeUserMessageByNonce(draft.threadId, clientNonce);
     actions.markSendFailed(draft.draftId, message);
     return { success: false, error: message };
   }
@@ -217,6 +270,7 @@ export async function materializeAndSend(
     paneId = await agentChatCreatePane(workspaceId, draft.provider, effectiveCwd);
   } catch (err) {
     const message = errorMessage(err);
+    actions.removeUserMessageByNonce(draft.threadId, clientNonce);
     actions.markSendFailed(draft.draftId, message);
     return { success: false, error: message };
   }
@@ -233,24 +287,15 @@ export async function materializeAndSend(
     threadId: draft.threadId,
   });
 
-  // 3. Seed the transcript optimistically. `ensureThread` + slice
-  //    creation happens implicitly inside `appendUserMessage` on the
-  //    Zustand store (via `updateSlice` which defaults to `emptySlice`)
-  //    but we call ensureThread explicitly so the slice is materialised
-  //    even if the append is a no-op for some reason. We also mirror
-  //    the draft's session config onto the slice so the composer's
-  //    pickers (ReasoningPicker, PermissionModePicker) render their
-  //    model-gated options when AgentChatPane mounts — otherwise the
-  //    slice's `model` stays null and the pickers silently vanish.
-  actions.ensureThread(draft.threadId);
-  seedSliceFromDraft(draft, actions);
-  actions.appendUserMessage(draft.threadId, text, undefined, imageDisplaySources);
+  // 3. The optimistic user bubble + slice seed already happened at the
+  //    top of this function (instant feedback). Nothing to do here.
 
   // 4. Start the provider session with the draft's pre-minted thread
   //    id. The backend accepts the caller's id verbatim (verified on
   //    the Claude adapter at claude/mod.rs:162), so the live pane's
   //    later `ensureThread(pane.thread_id)` lands on the same slice we
   //    just seeded — no migration, no flicker.
+  onPhase("starting-session");
   try {
     await agentChatStartSession(paneId, draft.provider, {
       thread_id: draft.threadId,
@@ -265,6 +310,7 @@ export async function materializeAndSend(
     });
   } catch (err) {
     const message = errorMessage(err);
+    actions.removeUserMessageByNonce(draft.threadId, clientNonce);
     actions.markSendFailed(draft.draftId, message);
     return { success: false, error: message };
   }
@@ -274,6 +320,7 @@ export async function materializeAndSend(
   //    framing we layered on top doesn't echo back into the UI. Skill
   //    bodies (if the user mentioned `/skill-name` tokens) were
   //    parsed by the caller and arrive via `skillBodies`.
+  onPhase("sending");
   try {
     await agentChatSendTurn(draft.provider, {
       thread_id: draft.threadId,
@@ -291,6 +338,7 @@ export async function materializeAndSend(
     });
   } catch (err) {
     const message = errorMessage(err);
+    actions.removeUserMessageByNonce(draft.threadId, clientNonce);
     actions.markSendFailed(draft.draftId, message);
     return { success: false, error: message };
   }
@@ -612,7 +660,7 @@ export async function createDeferredWorktree(
   worktreeName: string,
   baseBranch: string,
   firstMessage: string,
-): Promise<string> {
+): Promise<WorkspaceCreateResult> {
   let name = worktreeName.trim();
   if (!name) {
     try {
@@ -628,7 +676,10 @@ export async function createDeferredWorktree(
       name = await generateRandomBranchName(projectPath);
     }
   }
-  return await createWorktreeWorkspace(
+  // Returns `{ workspaceId, cwd }`: `cwd` is non-null when the backend
+  // carries it (letting first-send callers skip `waitForWorkspaceCwd`),
+  // null on older backends (callers fall back to the poll).
+  return await createWorktreeWorkspaceResult(
     projectPath,
     name,
     true,
