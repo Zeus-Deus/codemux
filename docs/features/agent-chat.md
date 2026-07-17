@@ -259,6 +259,31 @@ The chat pane stack:
     so its rows stay NULL). This became user-visible in v0.13.2 once the
     dead-run watchdog started rebuilding sessions mid-lifetime, not just
     after an app restart.
+  - **Silent bypass-downgrade heal (sidecar `canUseTool`)**: even when
+    every layer forwards `bypassPermissions` correctly, the Claude CLI
+    re-checks its danger-mode consent state at process boot. When that
+    read transiently fails or looks absent — which happens when concurrent
+    sessions rewrite the shared settings/consent files at the same moment —
+    the CLI silently strips bypass and boots in `default` mode, warning
+    only on stderr, so the SDK starts gating tools while the composer still
+    shows "Full access" (intermittent; re-picking Full access restarts the
+    session and usually wins the race). The invariant that fixes it: the
+    SDK never calls `canUseTool` for a session genuinely running under
+    bypass. So the sidecar's `canUseTool` (`sidecar/claude-agent/src/permissions.ts`)
+    treats any invocation while the session's INTENDED mode is
+    `bypassPermissions` as that downgrade — it auto-allows the call with
+    its original input (no Allow/Deny card, no parked request) to honor the
+    user's explicit choice, and asks `ClaudeSession` to fire a one-shot
+    live `setPermissionMode("bypassPermissions")` restore (best-effort; the
+    CLI may reject a live switch when its boot gate stripped the launch
+    flag, which is fine — the per-call auto-allow already guarantees Full
+    access semantics). The intended-mode getter reads `startInput.permissionMode`,
+    which `set_permission_mode` keeps current, so a Plan-pill flip to
+    `plan` correctly re-enables prompting. `AskUserQuestion` (a
+    clarification form, not a permission) and `ExitPlanMode` (denied with a
+    stop-now message) keep their interactive paths. The one-shot restore
+    re-arms when `ensureLiveQuery` rebuilds the query, since each CLI boot
+    may be downgraded independently.
 - **Reusable JSON-RPC-over-stdio child-process helper** with timeout,
   graceful shutdown, bidirectional notifications, server-initiated
   requests, and child-exit cleanup.

@@ -284,6 +284,15 @@ export class ClaudeSession {
    *  prepend lives in the frontend; this one fires only when a caller
    *  bypasses it and writes `effort: "ultrathink"` directly. */
   private readonly effort: string | undefined;
+  /** One-shot guard for the bypass-downgrade restore. The CLI can
+   *  silently drop a `bypassPermissions` launch to `default` when its
+   *  boot-time consent read loses a race with concurrent settings
+   *  writers (see `permissions.ts`). The first `canUseTool` under
+   *  intended bypass fires a single live `setPermissionMode` restore
+   *  attempt; further calls only auto-allow. Reset by
+   *  `ensureLiveQuery`, since a rebuilt query is a fresh CLI boot that
+   *  deserves its own restore attempt. */
+  private bypassRestoreAttempted = false;
 
   constructor(input: SessionStartInput, emit: EventEmitter) {
     this.threadId = input.threadId;
@@ -303,6 +312,14 @@ export class ClaudeSession {
       input.threadId,
       emit,
       this.pendingApprovals,
+      {
+        // `setPermissionMode` records mode changes into `startInput`,
+        // so this getter always reflects the session's live intended
+        // mode — e.g. a Plan-pill flip to "plan" disables the
+        // auto-allow, which is correct.
+        getPermissionMode: () => this.startInput.permissionMode,
+        onBypassDowngradeDetected: () => this.restoreBypassOnce(),
+      },
     );
     const options = buildQueryOptions(input, this.canUseTool);
 
@@ -539,6 +556,9 @@ export class ClaudeSession {
     }
 
     this.queryDead = false;
+    // A rebuilt query is a fresh CLI boot that may or may not be
+    // downgraded on its own; give it a fresh restore attempt.
+    this.bypassRestoreAttempted = false;
     this.promptQueue = new AsyncPromptQueue<SDKUserMessage>();
     // Drop the explicit `sessionId` — that uuid named the ORIGINAL
     // fresh session; the rebuild resumes instead.
@@ -599,6 +619,27 @@ export class ClaudeSession {
     }
     if (this.queryDead) return;
     await this.query.setModel(model);
+  }
+
+  /** One-shot attempt to restore real bypass on the live query after
+   *  the permission bridge detected a CLI downgrade (see
+   *  `permissions.ts`). Fire-and-forget: the CLI may reject a live
+   *  switch to bypass when its boot-time gate already stripped the
+   *  launch flag — that's fine, the per-call auto-allow still
+   *  guarantees Full access semantics, so a rejection is only logged.
+   *  Idempotent per query boot via `bypassRestoreAttempted`. */
+  private restoreBypassOnce(): void {
+    if (this.bypassRestoreAttempted) return;
+    this.bypassRestoreAttempted = true;
+    // Reference `this.query` lazily: this closure is created in the
+    // constructor BEFORE `this.query` is assigned, and `ensureLiveQuery`
+    // later reassigns it — so capture `this`, not the query value.
+    this.query.setPermissionMode("bypassPermissions").catch((err) => {
+      logger.warn("live setPermissionMode(bypassPermissions) restore failed", {
+        threadId: this.threadId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   /** Change the permission mode on the live session. */
