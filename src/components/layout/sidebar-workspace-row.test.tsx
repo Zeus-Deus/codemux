@@ -3,8 +3,11 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, act, waitFor, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { useSettingsStore } from "@/stores/settings-store";
-import type { WorkspaceSnapshot } from "@/tauri/types";
+import type {
+  WorkspaceSnapshot,
+  PaneStatus,
+  SurfaceSnapshot,
+} from "@/tauri/types";
 
 // ── Mocks ──
 //
@@ -109,10 +112,37 @@ vi.mock("@/components/ui/context-menu", () => {
   };
 });
 
-// App store — the row reads `workspaceStatus` from here; default to null.
+// HoverCard uses a Radix Portal + pointer-driven open that jsdom doesn't
+// exercise cleanly. Render trigger + content inline so the "n shipped" tally
+// and its popover list are directly assertable (same pattern as the
+// context-menu mock above).
+vi.mock("@/components/ui/hover-card", () => {
+  const passthrough = ({ children }: { children?: React.ReactNode }) => (
+    <>{children}</>
+  );
+  return {
+    HoverCard: passthrough,
+    HoverCardTrigger: passthrough,
+    HoverCardContent: ({ children }: { children?: React.ReactNode }) => (
+      <div>{children}</div>
+    ),
+  };
+});
+
+// App store — the row derives `workspaceStatus` from `appState.pane_statuses`.
+// A hoisted holder lets individual tests inject a snapshot (with pane
+// statuses) to drive the working / permission / review density states.
+const { appStateHolder } = vi.hoisted(() => ({
+  appStateHolder: { current: null as unknown },
+}));
 vi.mock("@/stores/app-store", () => ({
   useAppStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) =>
-    selector({ appState: null }),
+    selector({
+      appState: appStateHolder.current,
+      setWorkspacePushPullInFlight: vi.fn(),
+      workspacePushPullInFlight: null,
+      workspacePushPullStartedAt: null,
+    }),
   ),
 }));
 
@@ -122,6 +152,26 @@ import {
   WorkspaceContextMenuItems,
 } from "./sidebar-workspace-row";
 import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
+import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
+
+/** Build a single-terminal-pane surface carrying a known pane id. */
+function surfaceWithPane(paneId: string): SurfaceSnapshot {
+  return {
+    surface_id: "sf-1",
+    title: "",
+    root: { kind: "terminal", pane_id: paneId, session_id: "sess-1", title: "" },
+    active_pane_id: paneId,
+  };
+}
+
+/** Point the mocked app store at a snapshot whose single pane carries the
+ *  given agent status, so the row derives that density state. */
+function setPaneStatus(paneId: string, status: PaneStatus) {
+  appStateHolder.current = {
+    active_workspace_id: "",
+    pane_statuses: { [paneId]: status } as Record<string, PaneStatus>,
+  };
+}
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -164,12 +214,15 @@ async function flushDefaultBranchFetch() {
 
 beforeEach(() => {
   cleanup();
-  // Pin the sidebar detail level to "detailed" for the broad suite so
-  // tests that assert on branch / git-stat / indicator rendering don't
-  // depend on the product default (which is "clean"). The detail-level
-  // describe block overrides this per-case.
-  useSettingsStore.setState({
-    settings: { "sidebar.workspace_detail": "detailed" },
+  // Default every row to idle (no agent status). Density tests set a pane
+  // status explicitly. Reset the non-persisted density store so seen /
+  // settled timestamps never leak between cases.
+  appStateHolder.current = null;
+  useSidebarDensityStore.setState({
+    statusSince: {},
+    settledAt: {},
+    lastSeenAt: {},
+    workHistory: {},
   });
   mockArchiveWorkspace.mockReset();
   mockArchiveWorkspace.mockResolvedValue("archive-1");
@@ -905,62 +958,369 @@ describe("Delete worktree dialog escalation", () => {
   });
 });
 
-describe("Workspace row detail level (Settings → Appearance → Sidebar)", () => {
-  const setDetail = (level: "clean" | "branch" | "detailed") =>
-    act(() => {
-      useSettingsStore.setState({
-        settings: { "sidebar.workspace_detail": level },
-      });
-    });
+describe("State-driven row density", () => {
+  const renderRow = (ws: WorkspaceSnapshot, isActive = false) =>
+    render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={ws} isActive={isActive} />
+      </TooltipProvider>,
+    );
 
-  // The store is process-global; restore the default after each case so
-  // the rest of the suite (which relies on "detailed") is unaffected.
-  beforeEach(() => setDetail("detailed"));
-
-  const wsWithStats = () =>
+  const wsWithStats = (overrides: Partial<WorkspaceSnapshot> = {}) =>
     makeWorkspace({
       worktree_path: null,
       git_branch: "feature/x",
       git_ahead: 2,
       git_additions: 5,
+      ...overrides,
     });
 
-  it("'detailed' shows the branch name and the git stats", () => {
-    setDetail("detailed");
-    const { container } = render(
-      <TooltipProvider>
-        <SidebarWorkspaceRow workspace={wsWithStats()} isActive={false} />
-      </TooltipProvider>,
+  it("idle + clean: renders a one-liner (title only, no git line for a bare branch)", () => {
+    const { container } = renderRow(
+      makeWorkspace({ worktree_path: null, git_branch: "feature/x" }),
     );
+    expect(container.textContent).toContain("Test Workspace");
+    // A bare branch alone does not expand a calm idle row.
+    expect(container.textContent).not.toContain("feature/x");
+  });
+
+  it("idle + dirty worktree: shows the mono git line even with no agent", () => {
+    const { container } = renderRow(wsWithStats({ git_changed_files: 3 }));
     expect(container.textContent).toContain("feature/x");
     expect(container.textContent).toContain("↑2");
     expect(container.textContent).toContain("+5");
   });
 
-  it("'branch' shows the branch name but hides the git stats", () => {
-    setDetail("branch");
-    const { container } = render(
-      <TooltipProvider>
-        <SidebarWorkspaceRow workspace={wsWithStats()} isActive={false} />
-      </TooltipProvider>,
+  it("idle + ahead/behind: surfaces the git line", () => {
+    const { container } = renderRow(
+      makeWorkspace({
+        worktree_path: null,
+        git_branch: "feature/x",
+        git_ahead: 2,
+      }),
     );
     expect(container.textContent).toContain("feature/x");
-    expect(container.textContent).not.toContain("↑2");
-    expect(container.textContent).not.toContain("+5");
+    expect(container.textContent).toContain("↑2");
   });
 
-  it("'clean' hides the whole metadata line (no branch, no stats)", () => {
-    setDetail("clean");
-    const { container } = render(
+  it("working: 3-line card — spinner glyph, activity fallback, and git line", () => {
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "working", at: Date.now() - 6 * 60_000 } },
+      settledAt: {},
+      lastSeenAt: {},
+    });
+    setPaneStatus("p-work", "working");
+    const { container } = renderRow(
+      wsWithStats({ surfaces: [surfaceWithPane("p-work")] }),
+    );
+    // The braille spinner replaces the leading icon (agent-working glyph).
+    expect(
+      container.querySelector("[aria-label='Agent working']"),
+    ).not.toBeNull();
+    // Activity fallback line with a coarse elapsed.
+    expect(container.textContent).toMatch(/Working · 6m/);
+    // Git line (line 3).
+    expect(container.textContent).toContain("feature/x");
+    expect(container.textContent).toContain("+5");
+  });
+
+  it("permission: 2-line 'needs you' card with the blocker fallback + red dot", () => {
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "permission", at: Date.now() } },
+      settledAt: {},
+      lastSeenAt: {},
+    });
+    setPaneStatus("p-perm", "permission");
+    const { container } = renderRow(
+      makeWorkspace({
+        worktree_path: null,
+        surfaces: [surfaceWithPane("p-perm")],
+      }),
+    );
+    expect(container.textContent).toMatch(/Waiting for your input/);
+    // Red corner dot (StatusIndicator, permission tone).
+    expect(container.querySelector(".bg-status-attention")).not.toBeNull();
+  });
+
+  it("review (unseen): 2-line done card; 'PR opened' when a PR is open", () => {
+    const now = Date.now();
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "review", at: now } },
+      settledAt: { "ws-1": now },
+      lastSeenAt: {},
+    });
+    setPaneStatus("p-rev", "review");
+    const { container } = renderRow(
+      makeWorkspace({
+        worktree_path: null,
+        pr_state: "OPEN",
+        surfaces: [surfaceWithPane("p-rev")],
+      }),
+    );
+    expect(container.textContent).toContain("Done");
+    expect(container.textContent).toContain("PR opened");
+    expect(container.textContent).toContain("review when ready");
+  });
+
+  it("review collapses to a one-liner once the workspace has been seen", () => {
+    const now = Date.now();
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "review", at: now } },
+      settledAt: { "ws-1": now - 1000 },
+      lastSeenAt: { "ws-1": now }, // seen after it settled
+    });
+    setPaneStatus("p-rev", "review");
+    const { container } = renderRow(
+      makeWorkspace({
+        worktree_path: null,
+        surfaces: [surfaceWithPane("p-rev")],
+      }),
+    );
+    expect(container.textContent).not.toContain("review when ready");
+  });
+
+  it("re-marks an active workspace seen when it settles into review while active, collapsing the Done card", () => {
+    // Regression for the "active row that settles never auto-collapses" bug:
+    // markSeen only fired on the isActive false→true edge, so a workspace that
+    // finished while it was ALREADY the active one kept its 2-line Done card
+    // (and LIVE membership) until navigation or the ~1h fade.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(1_000_000);
+      const ws = makeWorkspace({
+        worktree_path: null,
+        surfaces: [surfaceWithPane("p-rev")],
+      });
+      // Active + working: the user is looking at it while the agent runs.
+      useSidebarDensityStore.setState({
+        statusSince: { "ws-1": { status: "working", at: 1_000_000 } },
+        settledAt: {},
+        lastSeenAt: {},
+      });
+      setPaneStatus("p-rev", "working");
+      const utils = render(
+        <TooltipProvider>
+          <SidebarWorkspaceRow workspace={ws} isActive />
+        </TooltipProvider>,
+      );
+      // Opening it stamped lastSeenAt at mount; no settle yet.
+      expect(
+        useSidebarDensityStore.getState().lastSeenAt["ws-1"],
+      ).toBe(1_000_000);
+
+      // The agent finishes later, while the workspace is still the active one.
+      vi.setSystemTime(1_005_000);
+      setPaneStatus("p-rev", "review");
+      act(() => {
+        utils.rerender(
+          <TooltipProvider>
+            <SidebarWorkspaceRow workspace={ws} isActive />
+          </TooltipProvider>,
+        );
+      });
+
+      // The row's observeStatus stamped the settle; the markSeen effect re-ran
+      // (settledAt advanced while active) and re-stamped lastSeenAt to the
+      // settle time — so the Done card collapses at once.
+      const st = useSidebarDensityStore.getState();
+      expect(st.settledAt["ws-1"]).toBe(1_005_000);
+      expect(st.lastSeenAt["ws-1"]).toBeGreaterThanOrEqual(st.settledAt["ws-1"]!);
+      expect(utils.container.textContent).not.toContain("review when ready");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a fading green ✓ on a fresh settle; it is gone after the ~1h window", () => {
+    const now = Date.now();
+    const ws = makeWorkspace({
+      worktree_path: null,
+      surfaces: [surfaceWithPane("p-rev")],
+    });
+    setPaneStatus("p-rev", "review");
+
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "review", at: now } },
+      settledAt: { "ws-1": now },
+      lastSeenAt: {},
+    });
+    const fresh = renderRow(ws);
+    expect(fresh.getByLabelText("Recently finished")).toBeInTheDocument();
+    cleanup();
+
+    // Settled >1h ago: the ✓ has faded out and the row is a plain one-liner.
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "review", at: now } },
+      settledAt: { "ws-1": now - 2 * 60 * 60_000 },
+      lastSeenAt: {},
+    });
+    const stale = renderRow(ws);
+    expect(stale.queryByLabelText("Recently finished")).not.toBeInTheDocument();
+    expect(stale.container.textContent).not.toContain("review when ready");
+  });
+
+  it("is purely state-driven — no removed sidebar.workspace_detail setting", () => {
+    // A dirty idle row shows its git stats regardless of any (now-absent)
+    // appearance setting.
+    const { container } = renderRow(wsWithStats({ git_changed_files: 1 }));
+    expect(container.textContent).toContain("feature/x");
+    expect(container.textContent).toContain("↑2");
+    expect(container.textContent).toContain("+5");
+  });
+});
+
+describe("Living row — work titles + shipped tally", () => {
+  const renderRow = (ws: WorkspaceSnapshot, isActive = false) =>
+    render(
       <TooltipProvider>
-        <SidebarWorkspaceRow workspace={wsWithStats()} isActive={false} />
+        <SidebarWorkspaceRow workspace={ws} isActive={isActive} />
       </TooltipProvider>,
     );
-    // Title (line 1) still renders…
-    expect(container.textContent).toContain("Test Workspace");
-    // …but the metadata line (branch + stats) is gone.
-    expect(container.textContent).not.toContain("feature/x");
-    expect(container.textContent).not.toContain("↑2");
-    expect(container.textContent).not.toContain("+5");
+
+  const issue = (number: number, title: string) => ({
+    number,
+    title,
+    state: "Open" as const,
+    labels: [],
+  });
+
+  it("a live row's title IS the linked-issue work title, not the worktree name", () => {
+    const now = Date.now();
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "review", at: now } },
+      settledAt: { "ws-1": now },
+      lastSeenAt: {},
+      workHistory: {},
+    });
+    setPaneStatus("p-rev", "review");
+    const { container } = renderRow(
+      makeWorkspace({
+        title: "auth-refactor", // worktree name
+        worktree_path: "/home/user/.codemux/worktrees/myapp/auth",
+        git_branch: "feature/auth",
+        linked_issue: issue(50, "Scroll pinning broken on send"),
+        surfaces: [surfaceWithPane("p-rev")],
+      }),
+    );
+    expect(container.textContent).toContain("Scroll pinning broken on send");
+    // The worktree name is not the title anymore (it lives in the tooltip).
+    expect(container.textContent).not.toContain("auth-refactor");
+  });
+
+  it("falls back to the workspace title when a live row has no linked issue", () => {
+    const now = Date.now();
+    useSidebarDensityStore.setState({
+      statusSince: { "ws-1": { status: "review", at: now } },
+      settledAt: { "ws-1": now },
+      lastSeenAt: {},
+      workHistory: {},
+    });
+    setPaneStatus("p-rev", "review");
+    const { container } = renderRow(
+      makeWorkspace({
+        title: "orphan-worktree",
+        worktree_path: "/home/user/.codemux/worktrees/myapp/orphan",
+        linked_issue: null,
+        surfaces: [surfaceWithPane("p-rev")],
+      }),
+    );
+    expect(container.textContent).toContain("orphan-worktree");
+  });
+
+  it("an idle row keeps the worktree name even with a linked issue", () => {
+    const { container } = renderRow(
+      makeWorkspace({
+        title: "auth-refactor",
+        worktree_path: "/home/user/.codemux/worktrees/myapp/auth",
+        git_branch: "feature/auth",
+        linked_issue: issue(50, "Scroll pinning broken on send"),
+      }),
+    );
+    // Worktree name stays as the title; the issue title is NOT surfaced (only
+    // its #chip is, down in the git line).
+    expect(container.textContent).toContain("auth-refactor");
+    expect(container.textContent).not.toContain(
+      "Scroll pinning broken on send",
+    );
+  });
+
+  it("retires the merged-PR icon and shows an 'n shipped' tally when new work is linked", async () => {
+    const base = makeWorkspace({
+      workspace_id: "ws-ship",
+      title: "auth-refactor",
+      worktree_path: "/home/user/.codemux/worktrees/myapp/auth",
+      git_branch: "feature/auth",
+      pr_number: 128,
+      pr_state: "merged",
+      linked_issue: issue(50, "Work A title"),
+    });
+
+    const { container, rerender } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={base} isActive={false} />
+      </TooltipProvider>,
+    );
+
+    // Before new work: a merged PR shows the violet merge icon, no tally.
+    expect(container.querySelector("svg.lucide-git-merge")).not.toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /shipped/i }),
+    ).not.toBeInTheDocument();
+
+    // New work starts in the same workspace → different linked issue.
+    rerender(
+      <TooltipProvider>
+        <SidebarWorkspaceRow
+          workspace={{ ...base, linked_issue: issue(60, "Work B title") }}
+          isActive={false}
+        />
+      </TooltipProvider>,
+    );
+
+    // The retired merge falls back to the plain branch icon…
+    await waitFor(() =>
+      expect(container.querySelector("svg.lucide-git-branch")).not.toBeNull(),
+    );
+    expect(container.querySelector("svg.lucide-git-merge")).toBeNull();
+
+    // …and a "1 shipped" tally appears, whose popover lists the shipped work.
+    expect(
+      screen.getByRole("button", { name: /^1 shipped$/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("#50")).toBeInTheDocument();
+    expect(screen.getByText("Work A title")).toBeInTheDocument();
+  });
+
+  it("baseline-promotion: merged PR + issue A present at mount, issue → B ships 1", async () => {
+    const base = makeWorkspace({
+      workspace_id: "ws-ship",
+      title: "auth-refactor",
+      worktree_path: "/home/user/.codemux/worktrees/myapp/auth",
+      pr_number: 200,
+      pr_state: "merged",
+      linked_issue: issue(11, "First shipped work"),
+    });
+    const { rerender } = render(
+      <TooltipProvider>
+        <SidebarWorkspaceRow workspace={base} isActive={false} />
+      </TooltipProvider>,
+    );
+    rerender(
+      <TooltipProvider>
+        <SidebarWorkspaceRow
+          workspace={{ ...base, linked_issue: issue(22, "Second work") }}
+          isActive={false}
+        />
+      </TooltipProvider>,
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /^1 shipped$/ }),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      useSidebarDensityStore.getState().workHistory["ws-ship"]?.shipped,
+    ).toEqual([{ prNumber: 200, issueNumber: 11, title: "First shipped work" }]);
   });
 });

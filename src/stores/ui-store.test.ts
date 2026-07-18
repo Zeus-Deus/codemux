@@ -25,6 +25,7 @@ beforeEach(() => {
     onboardingProjectDir: null,
     hasSeenOnboarding: false,
     sidebarToggleFn: null,
+    expandProjectRequest: null,
   });
   window.localStorage.clear();
 });
@@ -155,6 +156,15 @@ describe("ui-store — onboarding state", () => {
       expect(persisted.state.showNewWorkspaceDialog).toBeUndefined();
     });
 
+    it("does NOT persist the transient expand-project request", () => {
+      useUIStore.getState().requestExpandProject("/home/user/proj");
+      // Force a persist write.
+      useUIStore.getState().setOnboardingProjectDir(null);
+
+      const persisted = JSON.parse(window.localStorage.getItem(STORAGE_KEY)!);
+      expect(persisted.state.expandProjectRequest).toBeUndefined();
+    });
+
     it("persists hasSeenOnboarding alongside existing allowlist fields", () => {
       useUIStore.setState({
         rightPanelWidth: 400,
@@ -167,5 +177,30 @@ describe("ui-store — onboarding state", () => {
       expect(persisted.state.rightPanelWidth).toBe(400);
       expect(persisted.state.lastSelectedAgentId).toBe("builtin-claude");
     });
+  });
+});
+
+describe("ui-store — expand-project request (Needs-you jump)", () => {
+  it("starts with no pending expand request", () => {
+    expect(useUIStore.getState().expandProjectRequest).toBeNull();
+  });
+
+  it("requestExpandProject records the target project path", () => {
+    useUIStore.getState().requestExpandProject("/home/user/alpha");
+    expect(useUIStore.getState().expandProjectRequest).toBe("/home/user/alpha");
+  });
+
+  it("clearExpandProjectRequest clears a matching request", () => {
+    useUIStore.getState().requestExpandProject("/home/user/alpha");
+    useUIStore.getState().clearExpandProjectRequest("/home/user/alpha");
+    expect(useUIStore.getState().expandProjectRequest).toBeNull();
+  });
+
+  it("clearExpandProjectRequest is a no-op for a non-matching path (newer request wins)", () => {
+    // A stale consumer must not clobber a request that has since moved to a
+    // different group.
+    useUIStore.getState().requestExpandProject("/home/user/beta");
+    useUIStore.getState().clearExpandProjectRequest("/home/user/alpha");
+    expect(useUIStore.getState().expandProjectRequest).toBe("/home/user/beta");
   });
 });

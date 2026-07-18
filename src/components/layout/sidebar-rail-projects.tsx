@@ -6,8 +6,13 @@ import {
 } from "@/components/ui/hover-card";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { StatusIndicator } from "@/components/ui/status-indicator";
-import { AsciiSpinner } from "@/components/ui/ascii-spinner";
+import { WorkingIndicator } from "@/components/ui/working-indicator";
 import { PrStatusIcon } from "@/components/github/pr-status-icon";
+import {
+  useSettingsStore,
+  selectWorkingIndicator,
+  selectWorkingIndicatorColor,
+} from "@/stores/settings-store";
 import {
   useAppStore,
   useHomeDir,
@@ -42,8 +47,9 @@ function NotifBadge({ count }: { count: number }) {
 function flyoutWorkspaceIcon(
   workspace: WorkspaceSnapshot,
   status: ActivePaneStatus | null,
+  indicator: React.ReactNode,
 ) {
-  if (status === "working") return <AsciiSpinner />;
+  if (status === "working") return indicator;
   const isPrimary = !workspace.worktree_path;
   const isRemote =
     workspace.host_id !== null && workspace.host_id !== undefined;
@@ -74,6 +80,8 @@ function RailFlyoutWorkspaceRow({
       ? getWorkspaceStatus(workspace.surfaces, s.appState.pane_statuses)
       : null,
   );
+  const indicatorVariant = useSettingsStore(selectWorkingIndicator);
+  const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
 
   const handleClick = () => {
     useChatDraftStore.getState().setActiveDraft(null);
@@ -90,7 +98,11 @@ function RailFlyoutWorkspaceRow({
       )}
     >
       <span className="relative flex size-4 shrink-0 items-center justify-center">
-        {flyoutWorkspaceIcon(workspace, status)}
+        {flyoutWorkspaceIcon(
+          workspace,
+          status,
+          <WorkingIndicator variant={indicatorVariant} color={indicatorColor} />,
+        )}
         {status && status !== "working" && (
           <StatusIndicator
             status={status}

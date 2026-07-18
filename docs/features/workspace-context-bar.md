@@ -10,11 +10,11 @@
 
 A passive, read-only 42px status strip pinned under the work surface (inside
 `SidebarInset`, after `WorkspaceMain`). It is the "one home for the details"
-half of the sidebar-density split: the sidebar keeps glanceable identity
-(name + branch + status), while the context bar holds the full labeled git
-detail for the **active** workspace — in every sidebar appearance mode
-(`sidebar.workspace_detail`: clean / branch / detailed), so nothing is lost
-when the sidebar defaults to Clean.
+half of the sidebar-density split: the sidebar keeps glanceable, state-driven
+row density (idle rows are one-liners; only rows with live agents or dirty
+worktrees expand), while the context bar holds the full labeled git detail
+for the **active** workspace — regardless of the row's current density, so
+nothing is lost when a row rests as a one-liner.
 
 ## Current Model
 
@@ -103,9 +103,9 @@ new data plumbing.
 ## Current Constraints
 
 - Read-only by design: no commit/push/pull actions live here.
-- Shows in all sidebar appearance modes (not gated on
-  `sidebar.workspace_detail`), so Detailed mode intentionally duplicates the
-  numbers between sidebar row and bar.
+- Shows regardless of the active row's state-derived density, so an expanded
+  working row intentionally duplicates the git numbers between sidebar row
+  and bar.
 - Spans only the content area (right of the sidebar), matching the design.
 
 ## Important Touch Points

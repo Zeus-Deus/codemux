@@ -31,6 +31,12 @@ interface UIStore {
   hasSeenOnboarding: boolean;
   /** Callback ref set by AppShell after SidebarProvider mounts */
   sidebarToggleFn: (() => void) | null;
+  /** One-shot request to expand a specific project group by path. Set by the
+   *  "Needs you" strip before it scrolls to a blocked row (a row inside a
+   *  collapsed group isn't in the DOM, so the jump would otherwise no-op).
+   *  The matching {@link SidebarProjectGroup} consumes it — expands + persists
+   *  — and clears it. Transient (not persisted). */
+  expandProjectRequest: string | null;
 
   getRightPanelTab: (workspaceId: string) => RightPanelTab | null;
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
@@ -57,6 +63,13 @@ interface UIStore {
   setShowNewProjectScreen: (show: boolean) => void;
   setOnboardingProjectDir: (dir: string | null) => void;
   setSidebarToggleFn: (fn: (() => void) | null) => void;
+  /** Ask the project group at `projectPath` to expand (see
+   *  {@link expandProjectRequest}). */
+  requestExpandProject: (projectPath: string) => void;
+  /** Clear the pending expand request, but only if it still targets
+   *  `projectPath` — so a newer request for a different group isn't clobbered
+   *  by a stale consumer. */
+  clearExpandProjectRequest: (projectPath: string) => void;
 }
 
 export const useUIStore = create<UIStore>()(
@@ -82,6 +95,7 @@ export const useUIStore = create<UIStore>()(
       onboardingProjectDir: null,
       hasSeenOnboarding: false,
       sidebarToggleFn: null,
+      expandProjectRequest: null,
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
@@ -157,6 +171,16 @@ export const useUIStore = create<UIStore>()(
         ),
 
       setSidebarToggleFn: (fn) => set({ sidebarToggleFn: fn }),
+
+      requestExpandProject: (projectPath) =>
+        set({ expandProjectRequest: projectPath }),
+
+      clearExpandProjectRequest: (projectPath) =>
+        set((s) =>
+          s.expandProjectRequest === projectPath
+            ? { expandProjectRequest: null }
+            : s,
+        ),
     }),
     {
       name: "codemux-ui",

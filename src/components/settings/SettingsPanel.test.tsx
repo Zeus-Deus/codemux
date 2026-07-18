@@ -16,6 +16,7 @@ beforeAll(() => {
 
 const mockSetShowSettings = vi.fn();
 const mockSignOut = vi.fn();
+const mockSettingsSet = vi.fn();
 
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: (sel: (s: Record<string, unknown>) => unknown) =>
@@ -50,21 +51,25 @@ vi.mock("@/stores/settings-store", () => {
     "terminal.color_theme": "app",
     "terminal.font_family": "'JetBrains Mono Variable', monospace",
     auto_mcp_config: "true",
-    "sidebar.workspace_detail": "detailed",
     "appearance.palette": "cool",
     "appearance.density": "comfortable",
+    "sidebar.live_agents": "project",
+    "sidebar.working_indicator": "braille",
+    "sidebar.working_indicator_color": "status-working",
   };
   return {
     useSettingsStore: (sel: (s: Record<string, unknown>) => unknown) =>
       sel({
-        set: vi.fn(),
+        set: mockSettingsSet,
         get: (key: string) => defaults[key] ?? "",
         settings: defaults,
       }),
     selectTerminalColorTheme: () => "app",
-    selectSidebarWorkspaceDetail: () => "detailed",
     selectPalette: () => "cool",
     selectDensity: () => "comfortable",
+    selectSidebarLiveAgents: () => "project",
+    selectWorkingIndicator: () => "braille",
+    selectWorkingIndicatorColor: () => "status-working",
   };
 });
 
@@ -366,5 +371,68 @@ describe("SettingsPanel — Git section model pickers", () => {
     expect(
       screen.queryByPlaceholderText("Default"),
     ).not.toBeInTheDocument();
+  });
+});
+
+// ── Appearance → Agents section ──
+//
+// The new "Agents" subsection exposes the three sidebar-live settings:
+// grouping mode (segmented control), working-indicator variant (tile
+// picker), and indicator color (swatches). Each writes to the machine-local
+// settings store via the shared `set`.
+
+describe("SettingsPanel — Appearance Agents section", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function openAppearance() {
+    render(<SettingsView />);
+    const appearanceButtons = screen.getAllByRole("button", {
+      name: /Appearance/i,
+    });
+    fireEvent.click(appearanceButtons[0]);
+  }
+
+  it("renders the Agents subsection with all three controls", () => {
+    openAppearance();
+    expect(screen.getAllByText("Agents").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Live agents").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Working indicator").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Indicator color").length).toBeGreaterThan(0);
+    // Tile picker + swatch groups are present.
+    expect(
+      screen.getAllByRole("radiogroup", { name: /Working indicator/i }).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.getAllByRole("radiogroup", { name: /Indicator color/i }).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("choosing 'Gather on top' writes sidebar.live_agents", () => {
+    openAppearance();
+    const [gather] = screen.getAllByRole("radio", { name: /Gather on top/i });
+    fireEvent.click(gather);
+    expect(mockSettingsSet).toHaveBeenCalledWith("sidebar.live_agents", "top");
+  });
+
+  it("choosing a working-indicator tile writes sidebar.working_indicator", () => {
+    openAppearance();
+    const [sweep] = screen.getAllByRole("radio", { name: /^Sweep$/i });
+    fireEvent.click(sweep);
+    expect(mockSettingsSet).toHaveBeenCalledWith(
+      "sidebar.working_indicator",
+      "sweep",
+    );
+  });
+
+  it("choosing a color swatch writes sidebar.working_indicator_color", () => {
+    openAppearance();
+    const [violet] = screen.getAllByRole("radio", { name: /^Violet$/i });
+    fireEvent.click(violet);
+    expect(mockSettingsSet).toHaveBeenCalledWith(
+      "sidebar.working_indicator_color",
+      "accent-violet",
+    );
   });
 });

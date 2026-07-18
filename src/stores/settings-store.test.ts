@@ -38,7 +38,16 @@ import {
   getTerminalFontFamily,
   getDefaultEditor,
   getDefaultBaseBranch,
+  selectSidebarLiveAgents,
+  selectWorkingIndicator,
+  selectWorkingIndicatorColor,
 } from "./settings-store";
+
+function stateWith(settings: Record<string, string>) {
+  return { loaded: true, settings } as Parameters<
+    typeof selectSidebarLiveAgents
+  >[0];
+}
 
 describe("settings-store", () => {
   beforeEach(() => {
@@ -78,12 +87,56 @@ describe("settings-store", () => {
       expect(SETTINGS_DEFAULTS["terminal.font_family"]).toBeDefined();
       expect(SETTINGS_DEFAULTS["ai_commit_message_enabled"]).toBe("true");
       expect(SETTINGS_DEFAULTS["auto_mcp_config"]).toBe("true");
+      // Sidebar / working-indicator keys present
+      expect(SETTINGS_DEFAULTS["sidebar.live_agents"]).toBe("project");
+      expect(SETTINGS_DEFAULTS["sidebar.working_indicator"]).toBe("braille");
+      expect(SETTINGS_DEFAULTS["sidebar.working_indicator_color"]).toBe(
+        "status-working",
+      );
       // Per-user keys NOT present
       expect(SETTINGS_DEFAULTS["terminal.font_size"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["terminal.cursor_style"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["editor.default"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["git.default_base_branch"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["notification_sound_enabled"]).toBeUndefined();
+    });
+  });
+
+  // ── Sidebar / working-indicator selectors ──
+
+  describe("sidebar selectors", () => {
+    it("selectSidebarLiveAgents defaults to 'project'", () => {
+      expect(selectSidebarLiveAgents(stateWith({}))).toBe("project");
+    });
+
+    it("selectSidebarLiveAgents reflects a stored 'top' value", () => {
+      expect(
+        selectSidebarLiveAgents(stateWith({ "sidebar.live_agents": "top" })),
+      ).toBe("top");
+    });
+
+    it("selectWorkingIndicator defaults to 'braille'", () => {
+      expect(selectWorkingIndicator(stateWith({}))).toBe("braille");
+    });
+
+    it("selectWorkingIndicator reflects a stored variant", () => {
+      expect(
+        selectWorkingIndicator(
+          stateWith({ "sidebar.working_indicator": "sweep" }),
+        ),
+      ).toBe("sweep");
+    });
+
+    it("selectWorkingIndicatorColor defaults to 'status-working'", () => {
+      expect(selectWorkingIndicatorColor(stateWith({}))).toBe("status-working");
+    });
+
+    it("selectWorkingIndicatorColor reflects a stored token", () => {
+      expect(
+        selectWorkingIndicatorColor(
+          stateWith({ "sidebar.working_indicator_color": "accent-violet" }),
+        ),
+      ).toBe("accent-violet");
     });
   });
 

@@ -70,6 +70,11 @@ interface Props {
   onProjectDragStart?: (e: React.DragEvent) => void;
   dragStateId?: string | null;
   pendingWorkspaces?: PendingWorkspace[];
+  /** Workspaces lifted into the LIVE section ("gather on top" mode) — skipped
+   *  here so the group shows only its idle remainder. Their `data-ws-index`
+   *  slots are still counted (indices stay in full-group space) so drag
+   *  reorder of the remaining rows lands correctly. */
+  hiddenWorkspaceIds?: Set<string>;
 }
 
 export function SidebarProjectGroup({
@@ -81,6 +86,7 @@ export function SidebarProjectGroup({
   onProjectDragStart,
   dragStateId,
   pendingWorkspaces = [],
+  hiddenWorkspaceIds,
 }: Props) {
   const { getKeysForAction } = useResolvedKeybinds();
   const newWsKeys = getKeysForAction("newWorkspaceInProject");
@@ -91,6 +97,8 @@ export function SidebarProjectGroup({
   // that changed its favicon is re-fetched instead of served stale from cache.
   const [imageVersion, setImageVersion] = useState<string | null>(null);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
+  const expandProjectRequest = useUIStore((s) => s.expandProjectRequest);
+  const clearExpandProjectRequest = useUIStore((s) => s.clearExpandProjectRequest);
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
   const enableLazyWorkspaceCreation = useFeatureFlags(
     (s) => s.enableLazyWorkspaceCreation,
@@ -110,6 +118,20 @@ export function SidebarProjectGroup({
       if (val) setImageVersion(val);
     }).catch(() => {});
   }, [projectPath]);
+
+  // Consume an external expand request (e.g. the "Needs you" strip jumping to
+  // a blocked row inside this collapsed group). Expand + persist when it
+  // targets this group, then clear the one-shot request so it fires once.
+  useEffect(() => {
+    if (expandProjectRequest !== projectPath) return;
+    if (collapsed) {
+      setCollapsed(false);
+      dbSetUiState(`collapsed:project:${projectPath}`, "false").catch(
+        console.error,
+      );
+    }
+    clearExpandProjectRequest(projectPath);
+  }, [expandProjectRequest, projectPath, collapsed, clearExpandProjectRequest]);
 
   const handleToggle = () => {
     const next = !collapsed;
@@ -234,6 +256,12 @@ export function SidebarProjectGroup({
   const homeDir = useHomeDir();
   const isHomeGroup = projectName === "Home" && projectPath === homeDir;
 
+  // In "gather on top" mode the header counts only the idle remainder shown
+  // here (the live rows live in the LIVE section above).
+  const visibleCount = hiddenWorkspaceIds
+    ? workspaces.filter((ws) => !hiddenWorkspaceIds.has(ws.workspace_id)).length
+    : workspaces.length;
+
   return (
     <div className="pt-2.5">
       <ContextMenu>
@@ -271,7 +299,7 @@ export function SidebarProjectGroup({
             {/* Count — visible at rest, fades on hover so the + can
                 take its slot without ever colliding. */}
             <span className="text-[11px] text-muted-foreground/60 tabular-nums font-normal mr-1 transition-opacity group-hover/proj:opacity-0">
-              {workspaces.length}
+              {visibleCount}
             </span>
 
             {/* + button — hover-reveal */}
@@ -384,21 +412,26 @@ export function SidebarProjectGroup({
         </DialogContent>
       </Dialog>
 
-      {!collapsed && workspaces.map((ws, idx) => (
-        <div
-          key={ws.workspace_id}
-          data-ws-id={ws.workspace_id}
-          data-ws-index={idx}
-          draggable={!!onWorkspaceDragStart}
-          onDragStart={onWorkspaceDragStart?.(ws.workspace_id, projectPath)}
-          className={dragStateId === ws.workspace_id ? "opacity-40" : ""}
-        >
-          <SidebarWorkspaceRow
-            workspace={ws}
-            isActive={ws.workspace_id === activeWorkspaceId}
-          />
-        </div>
-      ))}
+      {!collapsed && workspaces.map((ws, idx) =>
+        // Hidden (lifted to the LIVE section) rows render nothing, but `idx`
+        // still advances so the remaining rows keep their full-group
+        // `data-ws-index` — drag reorder measures in that same index space.
+        hiddenWorkspaceIds?.has(ws.workspace_id) ? null : (
+          <div
+            key={ws.workspace_id}
+            data-ws-id={ws.workspace_id}
+            data-ws-index={idx}
+            draggable={!!onWorkspaceDragStart}
+            onDragStart={onWorkspaceDragStart?.(ws.workspace_id, projectPath)}
+            className={dragStateId === ws.workspace_id ? "opacity-40" : ""}
+          >
+            <SidebarWorkspaceRow
+              workspace={ws}
+              isActive={ws.workspace_id === activeWorkspaceId}
+            />
+          </div>
+        ),
+      )}
 
       {!collapsed && pendingWorkspaces.map((pw) => (
         <div
