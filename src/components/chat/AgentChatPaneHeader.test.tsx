@@ -212,13 +212,15 @@ describe("AgentChatPaneHeader — resume hydration", () => {
     renderHeader();
     await lastSessionSelectorProps.current!.onSelect(makeRecord());
 
-    // The new thread id slice exists (created later by start_session
-    // path) but our hydrate skip means we did NOT call into the
-    // store. Verify by counting threads pre/post.
-    const allThreads = Object.keys(useAgentChatStore.getState().threads);
-    // No hydrate-created slice (start_session is mocked and doesn't
-    // write into the store either, so we expect 0).
-    expect(allThreads).toHaveLength(0);
+    // With no payloads the transcript hydrate is skipped, but the
+    // post-start config seed still creates the slice (so the footer
+    // pickers render). The mock echoes the returned thread id
+    // ("thread-new"); assert that slice exists but carries NO replayed
+    // messages — the hydrate skip is what we're proving here.
+    const threads = useAgentChatStore.getState().threads;
+    const seeded = threads["thread-new"];
+    expect(seeded).toBeDefined();
+    expect(seeded.messages).toHaveLength(0);
   });
 
   it("continues with start_session when agentChatListMessages rejects", async () => {

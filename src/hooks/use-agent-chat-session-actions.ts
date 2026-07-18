@@ -1,8 +1,12 @@
 import { useCallback } from "react";
 
+import { defaultModelForProvider } from "@/components/chat/pickers/ModelPicker";
 import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
-import { useAgentChatStore } from "@/stores/agent-chat-store";
+import {
+  DEFAULT_THREAD_PERMISSION_MODE,
+  useAgentChatStore,
+} from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import {
   agentChatListMessages,
@@ -24,7 +28,12 @@ export interface AgentChatSessionActions {
   provider: AgentChatProviderKind;
   /** Resume a persisted session: stop the current session, hydrate the
    *  new local thread with the picked chat's transcript, then start the
-   *  provider with the record's `sdk_session_id` as the resume cursor. */
+   *  provider with the record's `sdk_session_id` as the resume cursor.
+   *  The record's persisted picker config (model / effort / context /
+   *  permission mode) rides through to the launch so the resumed session
+   *  runs in the same mode the user last chose — a NULL `permission_mode`
+   *  heals to the provider default (matching what the footer pill shows
+   *  for NULL rows). */
   handleSelect: (record: AgentChatSessionRecord) => Promise<void>;
   /** Stop the current session and start a fresh one on the same pane. */
   handleNewChat: () => Promise<void>;
@@ -99,15 +108,40 @@ export function useAgentChatSessionActions(
           // historical transcript. Log so it's debuggable.
           console.warn("[agent-chat] hydrate on resume failed:", err);
         }
-        await agentChatStartSession(paneId, provider, {
+        // Resolve the launch config from the record's persisted per-thread
+        // columns (all nullable). A NULL `permission_mode` heals to the
+        // provider default: the footer pill renders that default for NULL
+        // rows, so the session MUST actually launch in it — otherwise the
+        // provider boots in `default` (prompt-for-every-tool) while the UI
+        // advertises "Full access", the exact drift this hook exists to
+        // prevent. Model falls back to the provider default the same way
+        // the pane's on-mount seed effect does; effort/context ride through
+        // as-is (null means "use the model default").
+        const resolvedMode =
+          record.permission_mode ?? DEFAULT_THREAD_PERMISSION_MODE;
+        const resolvedModel = record.model ?? defaultModelForProvider(provider);
+        const newThreadId = await agentChatStartSession(paneId, provider, {
           thread_id: newLocalThreadId,
           cwd,
-          model: null,
+          model: record.model,
           resume_cursor: { resume: record.sdk_session_id },
-          permission_mode: null,
+          permission_mode: resolvedMode,
+          effort: record.effort,
+          context_window: record.context_window,
           additional_directories: [],
           env: null,
         });
+        // Seed the store slice for the freshly-started thread so the footer
+        // pickers reflect the launched config. `permissionMode` and
+        // `sessionLaunchMode` MUST agree — a mismatch is read as "the user
+        // changed the mode" and triggers a spurious silent restart.
+        const store = useAgentChatStore.getState();
+        store.ensureThread(newThreadId);
+        store.setModel(newThreadId, resolvedModel);
+        store.setEffort(newThreadId, record.effort);
+        store.setContextWindow(newThreadId, record.context_window);
+        store.setPermissionMode(newThreadId, resolvedMode);
+        store.setSessionLaunchMode(newThreadId, resolvedMode);
         toast.success(
           `Resumed "${sessionDisplayTitle(record)}" — agent has the full history`,
         );
@@ -131,15 +165,31 @@ export function useAgentChatSessionActions(
         useAgentChatStore.getState().resetThread(threadId);
       }
       const newLocalThreadId = `chat-${paneId}-${Date.now()}`;
-      await agentChatStartSession(paneId, provider, {
+      // Launch in the provider default mode (Full access) — the same mode
+      // the fresh store slice advertises in the footer pill. Passing `null`
+      // here would boot the provider in `default` (prompt-for-every-tool)
+      // while the pill still reads "Full access", the drift this hook exists
+      // to close.
+      const startMode = DEFAULT_THREAD_PERMISSION_MODE;
+      const startModel = defaultModelForProvider(provider);
+      const newThreadId = await agentChatStartSession(paneId, provider, {
         thread_id: newLocalThreadId,
         cwd,
         model: null,
         resume_cursor: null,
-        permission_mode: null,
+        permission_mode: startMode,
         additional_directories: [],
         env: null,
       });
+      // Seed the new slice the same way the pane's fresh-boot path does, so
+      // the pickers render immediately and `permissionMode` /
+      // `sessionLaunchMode` agree (a mismatch is read as a user mode change
+      // and triggers a spurious silent restart).
+      const store = useAgentChatStore.getState();
+      store.ensureThread(newThreadId);
+      store.setModel(newThreadId, startModel);
+      store.setPermissionMode(newThreadId, startMode);
+      store.setSessionLaunchMode(newThreadId, startMode);
     } catch (error) {
       toast.error(`Failed to start new chat: ${error}`);
     }

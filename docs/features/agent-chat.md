@@ -283,7 +283,33 @@ The chat pane stack:
     clarification form, not a permission) and `ExitPlanMode` (denied with a
     stop-now message) keep their interactive paths. The one-shot restore
     re-arms when `ensureLiveQuery` rebuilds the query, since each CLI boot
-    may be downgraded independently.
+    may be downgraded independently. NOTE: the recurring "Full access
+    still prompts" reports traced to the null-mode launch below, which
+    this guard cannot catch — when no mode is passed at launch the
+    sidecar's intended mode reads `undefined`, not `bypassPermissions`,
+    so the downgrade condition never matches.
+  - **Null-mode launch heal (the actual "Full access still prompts" root
+    cause)**: the session-history dropdown's New Chat and
+    resume-a-past-chat flows (`src/hooks/use-agent-chat-session-actions.ts`)
+    launched sessions with `permission_mode: null` (and no
+    model/effort/context config), so the SDK booted the Claude CLI in
+    `default` mode and gated every tool behind Allow/Deny cards — while
+    the composer pill showed "Full access" because a fresh store slice
+    defaults to `DEFAULT_THREAD_PERMISSION_MODE` (`bypassPermissions`)
+    and the DB row's `permission_mode` stayed NULL (`keep_or_set(None)`
+    never writes). This only hit long-lived main-workspace panes: every
+    other launch path (fresh-pane mount, draft materialize, worktree
+    prestart) already passed a real mode. Two-layer fix: (1) the hook now
+    passes `DEFAULT_THREAD_PERMISSION_MODE` on New Chat and the record's
+    persisted config (mode NULL-healed to the provider default) on
+    resume, then seeds the slice's `permissionMode` AND
+    `sessionLaunchMode` so the pill, restart detection, and the actual
+    launch agree; (2) `agent_chat_start_session` heals a `None`
+    `permission_mode` to `fallback_permission_mode(provider)` before the
+    provider consumes the input — same rationale as the
+    `ensure_live_session` heal — and persists the healed value, so no
+    future null-passing caller can ever launch a session in a mode the
+    UI doesn't display.
 - **Stale-resume self-heal (Claude)**: a persisted `sdk_session_id` can go
   stale — the CLI deletes old conversation JSONLs (cleanup, version
   updates), and resuming one fails every turn with
