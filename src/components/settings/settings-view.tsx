@@ -453,7 +453,7 @@ function WorkingIndicatorTiles({
             aria-label={opt.label}
             onClick={() => onChange(opt.value)}
             className={cn(
-              "flex h-[60px] w-[72px] flex-col items-center justify-center gap-1.5 rounded-[10px] border transition-colors",
+              "flex h-[60px] w-[72px] flex-col items-center justify-center gap-1.5 rounded-[10px] border transition-[color,background-color,border-color,transform]",
               active
                 ? "border-accent-ember bg-accent-ember/8"
                 : "border-border/60 bg-muted/30 hover:bg-muted/50 hover:-translate-y-px",

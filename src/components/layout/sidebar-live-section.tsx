@@ -31,7 +31,7 @@ export function SidebarLiveSection({ entries, activeWorkspaceId }: Props) {
     () => [...new Set(entries.map((e) => e.projectPath))],
     [entries],
   );
-  const projectPathsKey = projectPaths.join(" ");
+  const projectPathsKey = projectPaths.join("\0");
   const [colors, setColors] = useState<Record<string, string | null>>({});
   useEffect(() => {
     let cancelled = false;
