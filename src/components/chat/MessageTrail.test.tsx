@@ -32,6 +32,7 @@ vi.mock("@/components/ui/message-scroller", async (importActual) => {
 import {
   MessageScroller,
   MessageScrollerProvider,
+  MessageScrollerViewport,
 } from "@/components/ui/message-scroller";
 
 afterEach(() => {
@@ -114,5 +115,41 @@ describe("MessageTrail", () => {
     fireEvent.focus(button); // focus shows the preview immediately (no delay)
     expect(screen.getByText("Question number 2 about the transcript")).toBeInTheDocument();
     expect(screen.getByText("Reply to question 2")).toBeInTheDocument();
+  });
+
+  it("forwards rail wheel as a native wheel event on the viewport plus a scrollTop write", () => {
+    // The rail resolves the viewport as a sibling under the scroller root,
+    // so this render includes a real Viewport (the other tests omit it).
+    const slots = buildTranscriptSlots(turns(3));
+    const { container } = render(
+      <MessageScrollerProvider>
+        <MessageScroller>
+          <MessageScrollerViewport />
+          <MessageTrail slots={slots} />
+        </MessageScroller>
+      </MessageScrollerProvider>,
+    );
+
+    const viewport = container.querySelector<HTMLElement>(
+      '[data-slot="message-scroller-viewport"]',
+    );
+    expect(viewport).not.toBeNull();
+
+    // A raw scrollTop write fires only `scroll` — the scroller engine unpins
+    // its stick-to-bottom state only on a real `wheel` event reaching the
+    // viewport, so the forwarder must dispatch one before scrolling.
+    const wheelSpy = vi.fn();
+    viewport!.addEventListener("wheel", wheelSpy);
+    const before = viewport!.scrollTop;
+
+    fireEvent.wheel(
+      screen.getByRole("navigation", { name: "Conversation turns" }),
+      { deltaY: 120 },
+    );
+
+    expect(wheelSpy).toHaveBeenCalledTimes(1);
+    const forwarded = wheelSpy.mock.calls[0][0] as WheelEvent;
+    expect(forwarded.deltaY).toBe(120);
+    expect(viewport!.scrollTop).toBe(before + 120);
   });
 });

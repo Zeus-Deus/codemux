@@ -42,6 +42,7 @@ import { ToolCallCard } from "./ToolCallCard";
 import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
+import { ScrollAnchoringShim } from "./scroll-anchoring-shim";
 import { transcriptFadeEnabled } from "./transcript-fade";
 import {
   buildTranscriptSlots,
@@ -259,6 +260,13 @@ export function MessageList({
             re-pinning the tail through the engine's own imperative API
             (inside the provider, so `useMessageScroller` resolves). */}
         <ScrollToBottomOnSend signal={scrollToBottomSignal} />
+        {/* Manual scroll anchoring for engines without native
+            `overflow-anchor` (see scroll-anchoring-shim.tsx): pins the
+            topmost visible row through content-visibility height settles
+            while the reader is away from the bottom. Renders null where
+            native anchoring exists. Sibling of the viewport, resolved via
+            the shared scroller root like MessageTrail. */}
+        <ScrollAnchoringShim />
         <MessageScrollerViewport
           style={transcriptFadeEnabled() ? WS_FADE_STYLE : undefined}
         >

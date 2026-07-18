@@ -191,15 +191,34 @@ function TrailRail({
   }, []);
 
   // The rail overlays the viewport's left gutter but is its SIBLING, not an
-  // ancestor, so a wheel over this strip can't bubble to scroll the
-  // transcript — forward it manually so the gutter scrolls like the rest of
-  // the surface. This mutates real `scrollTop`, so it fires a real scroll
-  // event and MessageList's `pinnedRef` updates itself; the #77 pin contract
-  // is untouched.
+  // ancestor, so a wheel over this strip can't bubble to the viewport
+  // natively — forward it manually so the gutter scrolls like the rest of
+  // the surface. Two steps, both required:
+  //
+  // 1. Dispatch a real `wheel` event on the viewport. The scroller engine's
+  //    stick-to-bottom state machine only releases its bottom pin on genuine
+  //    user input (`wheel`/`touchmove`/nav keys) observed on the viewport; a
+  //    bare `scrollTop` write fires only a `scroll` event, which the engine
+  //    treats as programmatic — leaving it pinned and snapping the view back
+  //    to the tail on the next content mutation mid-stream. (Re-entry is not
+  //    a concern: the rail is a sibling of the viewport, so the dispatched
+  //    event never bubbles back through this handler.)
+  // 2. Mutate `scrollTop` to perform the actual scroll — a synthetic wheel
+  //    event carries no default scroll action of its own.
   const forwardWheel = useCallback(
     (e: React.WheelEvent) => {
       const viewport = resolveViewport();
-      if (viewport) viewport.scrollTop += e.deltaY;
+      if (!viewport) return;
+      viewport.dispatchEvent(
+        new WheelEvent("wheel", {
+          deltaY: e.deltaY,
+          deltaX: e.deltaX,
+          deltaMode: e.deltaMode,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+      viewport.scrollTop += e.deltaY;
     },
     [resolveViewport],
   );
