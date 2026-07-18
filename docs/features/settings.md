@@ -12,14 +12,14 @@ The settings panel is a full-screen overlay providing centralized configuration 
 
 ## Current Model
 
-Settings are organized into 12 sections. Most user-facing preferences are persisted via the synced settings store (server-synced with offline cache). UI-only state like the active section is managed in the UI store.
+Settings are organized into three nav groups (`buildNavGroups` in `settings-view.tsx`): **Beta Features** (Agent Chat), **Personal** (Account, Appearance, Notifications, Shortcuts), and **Editor & Workflow** (Editor, Terminal, Presets, Projects, Archive, Git, Agent, Browser, Devices, Remote Access, Session Restore — plus Permissions / Skills / MCP Servers, which only appear when the Agent Chat Beta is on). Most user-facing preferences are persisted via the synced settings store (server-synced with offline cache); appearance/sidebar preferences live in the machine-local `settings-store.ts`. UI-only state like the active section is managed in the UI store.
 
 ## What Works Today
 
 ### Personal Settings
 
 - **Account**: sign-in email, display name, dev mode badge, sign out
-- **Appearance**: theme preset, font family, border radius
+- **Appearance**: theme preset, font family, border radius, **color palette** (cool/warm — a `.theme-warm` root class), **spacing density** (comfortable/compact — the `data-density` root attr), and an **Agents** subsection — live-agents sidebar grouping (Stay in project / Gather on top, `sidebar.live_agents`) and the working-indicator glyph (braille / ring / blink / sweep / typing, `sidebar.working_indicator`) + color (amber / white / ember / green / sky / violet, no red, `sidebar.working_indicator_color`), each with a live preview. These drive the living sidebar (see `docs/features/sidebar.md`); the old `sidebar.workspace_detail` Clean/Branch/Detailed control was removed.
 - **Notifications**: notification sounds (agent completion/attention), desktop notification toggle (D-Bus)
 - **Shortcuts**: keyboard keybind customization with conflict detection, search, and reset to defaults
 
@@ -29,9 +29,15 @@ Settings are organized into 12 sections. Most user-facing preferences are persis
 - **Terminal**: cursor style (bar/block/underline), font size (10-22px), color theme (app/system)
 - **Presets**: terminal command presets, pin/unpin to quick-launch bar, edit/delete custom presets, toggle preset bar visibility
 - **Projects**: workspace lifecycle scripts (setup/teardown/run), worktree include patterns, `.codemuxinclude` file support, environment variable references
+- **Archive**: restore or permanently delete archived workspaces, grouped by project with relative times and stale hints (see `docs/features/workspace-archive.md`)
 - **Git**: default base branch, AI commit message generation (model override), AI merge conflict resolver (strategy/CLI/model selection)
-- **Agent**: auto-configure MCP for workspaces toggle
+- **Agent**: auto-configure MCP for workspaces toggle, run-checkpoint toggle, desktop-size background-browser peek toggle
+- **Permissions** (Agent Chat Beta only): view and manage agent tool-permission rules (allow / deny / ask) flattened across the user / project-shared / project-local scopes (see `docs/features/permissions.md`)
+- **Skills** (Agent Chat Beta only): skills sync management (see `docs/features/skills-sync.md`)
+- **MCP Servers** (Agent Chat Beta only): MCP host/server configuration (see `docs/features/mcp-server.md`)
 - **Browser**: browser profile storage size display, clear cookies/site data, clear all browser data
+- **Devices**: remote hosts / cloud-push targets — test connection, reinstall agent, upgrade status (see `docs/features/remote-hosts.md`)
+- **Remote Access**: expose this desktop to a browser on another device — default-off master toggle, bind scope, pairing (see `docs/features/web-remote-access.md`)
 - **Session Restore**: save/restore terminal scrollback on restart, scrollback line limit (1000-50000), max disk usage (10-500 MB)
 
 ## Current Constraints

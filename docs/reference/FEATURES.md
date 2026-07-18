@@ -16,7 +16,10 @@
 - Rename workspaces by double-clicking the active workspace name in the sidebar
 - Close workspaces with all child sessions
 - Auto-transition to main workspace after merge+delete
-- Workspace rows show title, git branch, compact working directory path, and PR status icon
+- Living sidebar — each workspace row's height is state-driven: working rows expand to a 3-line card (indicator + work title + issue/activity + elapsed + git line), needs-input rows to a red 2-line card with the blocker, done rows to a green 2-line card that decays after review or ~1h, idle rows stay one-liners (replacing the removed Clean/Branch/Detailed setting)
+- Work-based row naming — while an agent is live and an issue is linked, the row titles itself after the issue (+ `#n` chip) and moves the branch to the git line; a `n shipped` tally with a history popover appears once merged PRs retire
+- Pinned "Needs you" strip at the top of the workspace tree while any workspace waits for input (jump-links that activate the workspace)
+- Live-agents grouping (Settings → Appearance → Agents): "Stay in project" or "Gather on top" (all live rows hoisted into a LIVE section above the tree)
 - "Checkout default branch" workspace action
 - Derivative-branch picker with icons, recency, and worktree tab
 - Notification count badges per workspace in the sidebar
@@ -157,6 +160,8 @@
 - Sans-serif font for shell chrome, monospace for terminal content and code paths
 - Shell font family customization via backend config
 - Fallback Tokyonight-inspired theme when Omarchy unavailable
+- Color palette variant (cool / warm) and spacing density (comfortable / compact) in Settings → Appearance
+- Configurable sidebar working indicator — glyph (braille / ring / blink / sweep / typing) and color (amber / white / ember / green / sky / violet; no red, reserved for needs-input)
 
 ## Persistence
 
