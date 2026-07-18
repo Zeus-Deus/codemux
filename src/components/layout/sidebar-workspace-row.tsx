@@ -927,37 +927,28 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                 deletable worktree opens the destructive delete dialog;
                 on protected and attach/remote rows shift-click behaves
                 like a plain click. */}
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  className="absolute right-2 inset-y-0 my-auto opacity-0 group-hover/row:opacity-100 transition-opacity bg-muted text-muted-foreground shadow-sm hover:text-foreground dark:hover:bg-muted"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    if (e.shiftKey && canDelete) {
-                      setShowDeleteDialog(true);
-                      return;
-                    }
-                    void handleArchiveOrClose();
-                  }}
-                  aria-label={
-                    isAttachOrRemote ? "Close workspace" : "Archive workspace"
-                  }
-                >
-                  {isAttachOrRemote ? (
-                    <X className="h-3.5 w-3.5" />
-                  ) : (
-                    <Archive className="h-3.5 w-3.5" />
-                  )}
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-                {isAttachOrRemote
-                  ? "Close workspace — it stays available on its host in the Workspaces Overview"
-                  : "Archive workspace — restore anytime from Settings → Archive"}
-              </TooltipContent>
-            </Tooltip>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              className="absolute right-2 inset-y-0 my-auto opacity-0 group-hover/row:opacity-100 transition-opacity bg-muted text-muted-foreground shadow-sm hover:text-foreground dark:hover:bg-muted"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (e.shiftKey && canDelete) {
+                  setShowDeleteDialog(true);
+                  return;
+                }
+                void handleArchiveOrClose();
+              }}
+              aria-label={
+                isAttachOrRemote ? "Close workspace" : "Archive workspace"
+              }
+            >
+              {isAttachOrRemote ? (
+                <X className="h-3.5 w-3.5" />
+              ) : (
+                <Archive className="h-3.5 w-3.5" />
+              )}
+            </Button>
           </div>
         </ContextMenuTrigger>
         <WorkspaceContextMenuItems
