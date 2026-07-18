@@ -31,7 +31,7 @@ export interface SessionSelectorProps {
    *  fresh one with the record's `sdk_session_id` passed through as
    *  the SDK `resume` field. */
   onSelect: (record: AgentChatSessionRecord) => void;
-  /** Called when the user clicks "New Chat" at the bottom of the
+  /** Called when the user clicks "New Chat" at the top of the
    *  dropdown. */
   onNewChat: () => void;
   /**
