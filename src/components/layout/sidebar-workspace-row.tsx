@@ -59,10 +59,6 @@ import {
 } from "@/tauri/commands";
 import { useHosts } from "@/stores/hosts-store";
 import {
-  useSettingsStore,
-  selectSidebarWorkspaceDetail,
-} from "@/stores/settings-store";
-import {
   ConfirmPushDialog,
   shouldSkipPushConfirm,
 } from "@/components/overlays/confirm-push-dialog";
@@ -74,8 +70,28 @@ import {
 } from "@/stores/tunnel-status-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { getWorkspaceStatus } from "@/lib/pane-status";
+import {
+  useSidebarDensityStore,
+  formatElapsed,
+  permissionBlockerText,
+  isReviewExpanded,
+  isRetiredPr,
+  SETTLED_FADE_MS,
+} from "@/stores/sidebar-density-store";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card";
+import {
+  useSettingsStore,
+  selectWorkingIndicator,
+  selectWorkingIndicatorColor,
+} from "@/stores/settings-store";
+import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { StatusIndicator } from "@/components/ui/status-indicator";
-import { AsciiSpinner } from "@/components/ui/ascii-spinner";
+import { WorkingIndicator } from "@/components/ui/working-indicator";
+import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
 import { useForceDelete } from "@/hooks/use-force-delete";
@@ -91,6 +107,10 @@ function isAttachOrRemoteWorkspace(workspace: WorkspaceSnapshot): boolean {
 interface Props {
   workspace: WorkspaceSnapshot;
   isActive: boolean;
+  /** In "gather on top" mode a live row is lifted out of its project group
+   *  into the LIVE section; this leading chip keeps its project origin
+   *  visible. Absent (the default) inside the normal project tree. */
+  projectChip?: { name: string; color: string | null };
 }
 
 /** Destructive delete confirmation for deletable worktrees. Archiving
@@ -506,7 +526,7 @@ export function WorkspaceContextMenuItems({
   );
 }
 
-export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
+export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props) {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   // Phase-4 push confirmation: holds the host the user just picked
   // from the "Move to host…" submenu, so the dialog can render its
@@ -563,6 +583,10 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
     if (!s.appState) return null;
     return getWorkspaceStatus(workspace.surfaces, s.appState.pane_statuses);
   });
+
+  // Configurable working glyph (Settings → Appearance → Agents).
+  const indicatorVariant = useSettingsStore(selectWorkingIndicator);
+  const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
 
   const handleActivate = () => {
     useChatDraftStore.getState().setActiveDraft(null);
@@ -647,7 +671,18 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
     !isRemote &&
     !isPrimary &&
     workspace.workspace_type !== "open_flow";
-  const showWorkspaceIconAsPr = isWorktreeRow && !!workspace.pr_state;
+  // Client-observed work history for the living-row lifecycle: merged-PR
+  // retirement + the idle-row "n shipped" tally. Stable reference until the
+  // store promotes a new merge, so subscribing here is render-safe.
+  const shipped = useSidebarDensityStore(
+    (s) => s.workHistory[workspace.workspace_id]?.shipped,
+  );
+  // A retired PR (its merge already shipped, then newer work was linked)
+  // drops back to the plain gray branch icon — the current work title carries
+  // the signal now, and the merge lives in the "n shipped" tally instead.
+  const prRetired = isRetiredPr(shipped, workspace.pr_number);
+  const showWorkspaceIconAsPr =
+    isWorktreeRow && !!workspace.pr_state && !prRetired;
 
   // Phase-4d elapsed-time signal: when an in-flight push/pull
   // crosses 2 seconds, show a small "12s" pill so the user knows
@@ -699,15 +734,148 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
 
   const hasDiff = workspace.git_additions > 0 || workspace.git_deletions > 0;
   const hasAheadBehind = workspace.git_ahead > 0 || workspace.git_behind > 0;
+  // Uncommitted work — the user probably cares about the git line even when
+  // no agent is running, so a dirty idle row still expands to show it.
+  const isDirty = workspace.git_changed_files > 0 || hasDiff;
 
-  // Sidebar row density (Settings → Appearance → Sidebar):
-  //   clean    — hide the whole metadata line (icon + name + status only)
-  //   branch   — show the branch name (and health/indicators) but no git numbers
-  //   detailed — also show ahead/behind + diff stats (the original behavior)
-  const sidebarDetail = useSettingsStore(selectSidebarWorkspaceDetail);
-  const showMetaLine = sidebarDetail !== "clean";
-  const showGitStats = sidebarDetail === "detailed";
-  const gitStatsVisible = showGitStats && (hasDiff || hasAheadBehind);
+  // ── State-driven row density ──
+  //
+  // Replaces the removed Clean/Branch/Detailed setting: the workspace's live
+  // agent status + git state decide how many lines the row shows.
+  //   working    → 3 lines (spinner + title, activity, git line)
+  //   permission → 2 lines (title, blocker) — a "needs you" card
+  //   review     → 2 lines (title + chip, "Done …") until seen or ~1h passes
+  //   idle       → 1 line, +git line only when dirty / noteworthy
+  const observeStatus = useSidebarDensityStore((s) => s.observeStatus);
+  const observeWork = useSidebarDensityStore((s) => s.observeWork);
+  const markSeen = useSidebarDensityStore((s) => s.markSeen);
+  const settledAt = useSidebarDensityStore(
+    (s) => s.settledAt[workspace.workspace_id],
+  );
+  const lastSeenAt = useSidebarDensityStore(
+    (s) => s.lastSeenAt[workspace.workspace_id],
+  );
+  const statusMark = useSidebarDensityStore(
+    (s) => s.statusSince[workspace.workspace_id],
+  );
+
+  // Observe status transitions (no backend timestamp exists) so elapsed and
+  // the settled-✓ fade can be derived client-side. Non-persisted.
+  useEffect(() => {
+    observeStatus(workspace.workspace_id, workspaceStatus);
+  }, [observeStatus, workspace.workspace_id, workspaceStatus]);
+
+  // Observe the living-row lifecycle: a merged PR + linked issue is a
+  // shipped-candidate; when the linked issue later moves on to different
+  // work, the store promotes it (retiring the PR icon) and grows the tally.
+  useEffect(() => {
+    observeWork(workspace.workspace_id, {
+      issueNumber: workspace.linked_issue?.number ?? null,
+      issueTitle: workspace.linked_issue?.title ?? null,
+      prNumber: workspace.pr_number,
+      prState: workspace.pr_state,
+    });
+  }, [
+    observeWork,
+    workspace.workspace_id,
+    workspace.linked_issue,
+    workspace.pr_number,
+    workspace.pr_state,
+  ]);
+
+  // Opening the workspace "sees" it — collapsing a done row to a one-liner.
+  //
+  // markSeen normally fires on the isActive false→true edge. But a workspace
+  // that *settles into review while it is already the active one* never
+  // crosses that edge, so its 2-line Done card (and LIVE membership) would
+  // linger until navigation or the ~1h fade. `settledAt` is in the deps so
+  // the effect also re-runs when an active row's settle time advances, and we
+  // re-stamp lastSeenAt then. Choice (a): re-mark seen instantly on
+  // settle-while-active — the user already has the workspace open and is
+  // looking at it, so treating the settle as "seen" is spec-compliant (the
+  // done row collapses once seen). No grace delay: the collapse is the
+  // perceivable state change for a workspace the user is actively viewing.
+  useEffect(() => {
+    if (isActive) markSeen(workspace.workspace_id);
+  }, [isActive, settledAt, markSeen, workspace.workspace_id]);
+
+  const isWorking = workspaceStatus === "working";
+  const isPermission = workspaceStatus === "permission";
+  const isReview = workspaceStatus === "review";
+
+  // A done row expands only until it's opened (seen) or ~1h has elapsed.
+  // `isReviewExpanded` is the shared predicate the "gather on top" grouping
+  // reuses so the two never disagree about what still counts as live.
+  const reviewFresh =
+    settledAt != null && Date.now() - settledAt < SETTLED_FADE_MS;
+  const reviewExpanded = isReview && isReviewExpanded(settledAt, lastSeenAt);
+
+  const isCard = isWorking || isPermission || reviewExpanded;
+
+  // Only tick the shared coarse clock while a row needs a live elapsed/fade.
+  const needsClock = isWorking || isPermission || reviewFresh;
+  const now = useCoarseClock(needsClock);
+
+  const statusElapsed = formatElapsed(
+    statusMark != null ? now - statusMark.at : 0,
+  );
+
+  // Fading green ✓ on a just-finished row — decays over ~1h, and only once
+  // the work has settled (never while a fresh agent is mid-flight).
+  const settledOpacity =
+    settledAt != null ? 1 - (now - settledAt) / SETTLED_FADE_MS : 0;
+  const showSettledCheck =
+    !isWorking && !isPermission && settledOpacity > 0.05;
+
+  // Where the linked-issue chip lives: on line 1 for working/done cards, and
+  // in the git line for idle rows (its original home + hover-slide).
+  const issueOnTitleLine = isWorking || reviewExpanded;
+
+  // Living row (README "The living row"): while the row is a live card
+  // (working / permission / unseen-review — the isWorkspaceLive set, which
+  // `isCard` mirrors), the title IS the work — the linked issue title, with
+  // the issue chip beside it — not the worktree name. The worktree/branch
+  // name stays on the mono git line (working cards) and, so it is never
+  // orphaned on the 2-line permission/review cards, in the row's title
+  // tooltip. Idle rows keep the worktree name (today's behavior); a renamed
+  // row falls back to the worktree name once its new work goes idle.
+  const displayTitle =
+    isCard && workspace.linked_issue
+      ? workspace.linked_issue.title
+      : workspace.title;
+  const titleTooltip =
+    isCard && workspace.linked_issue && workspace.git_branch
+      ? workspace.git_branch
+      : undefined;
+
+  // Idle-row "n shipped" tally: merged PRs promoted to history for this
+  // workspace. Only on settled one-liners — expanded cards let the issue chip
+  // carry the signal (README rule 4).
+  const shippedCount = shipped?.length ?? 0;
+  const showTally = !isCard && shippedCount > 0;
+  const showTitleMute =
+    isCard && workspace.notifications_muted;
+
+  // Git line: on working cards (line 3) and on idle rows (line 2), but only
+  // when there is something worth surfacing beyond a bare branch. Permission
+  // / done cards carry their own line 2 instead.
+  const gitLineHasContent =
+    !!workspace.git_branch ||
+    hasAheadBehind ||
+    hasDiff ||
+    !!tunnelKind ||
+    (!issueOnTitleLine &&
+      (!!workspace.linked_issue || workspace.notifications_muted));
+  const showGitLine = isWorking
+    ? gitLineHasContent
+    : !isCard &&
+      (isDirty ||
+        hasAheadBehind ||
+        !!tunnelKind ||
+        !!workspace.linked_issue ||
+        workspace.notifications_muted);
+
+  const prOpen = workspace.pr_state === "OPEN";
 
   return (
     <>
@@ -719,8 +887,16 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
             onClick={handleActivate}
             onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") handleActivate(); }}
             className={cn(
-              "group/row mx-1.5 flex pl-[18px] pr-2 py-1 text-sm cursor-pointer relative rounded-lg",
-              "hover:bg-muted/40 transition-colors",
+              "group/row mx-1.5 flex pl-[18px] pr-2 text-sm cursor-pointer relative transition-colors",
+              // Cards (working / needs-you / done) gain a soft container and a
+              // touch more vertical breathing room; idle rows keep today's
+              // compact one-liner treatment.
+              isCard
+                ? "py-1.5 rounded-[10px] border"
+                : "py-1 rounded-lg hover:bg-muted/40",
+              isWorking && "border-border/60 bg-muted/30",
+              isPermission && "border-status-attention/25 bg-status-attention/5",
+              reviewExpanded && "border-status-open/20 bg-status-open/5",
               isActive && "bg-muted",
             )}
           >
@@ -729,7 +905,10 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                 PR-state-colored button that opens the PR URL on click. */}
             <div className="relative size-5 flex items-center justify-center shrink-0 mr-2">
               {workspaceStatus === "working" ? (
-                <AsciiSpinner />
+                <WorkingIndicator
+                  variant={indicatorVariant}
+                  color={indicatorColor}
+                />
               ) : (
                 <>
                   {showWorkspaceIconAsPr ? (
@@ -778,47 +957,184 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
               )}
             </div>
 
+            {/* Leading project chip — only in the LIVE section ("gather on
+                top"), where a lifted row needs its project origin shown.
+                Aligned to the icon row so it sits on line 1. */}
+            {projectChip && (
+              <div className="flex size-5 items-center shrink-0 -ml-1 mr-1.5">
+                <ProjectAvatar
+                  name={projectChip.name}
+                  color={projectChip.color}
+                  size="sm"
+                  shape="square"
+                  className="font-bold"
+                />
+              </div>
+            )}
+
             <div className="flex-1 min-w-0">
-              {/* Line 1: title + notification badge (kept on top
-                  because notifications are a needs-attention signal
-                  the user should see at a glance). */}
+              {/* Line 1: title + inline chips + trailing signals. Cards read
+                  as work titles (slightly larger, semibold); idle rows keep
+                  today's exact styling. */}
               <div className="flex items-center gap-1.5">
-                <span className={cn(
-                  "truncate text-[13px] leading-tight",
-                  isActive ? "text-foreground font-medium" : "text-foreground/85",
+                <span
+                  title={titleTooltip}
+                  className={cn(
+                  "truncate leading-tight",
+                  isCard
+                    ? "text-[12.5px] font-semibold text-foreground"
+                    : cn(
+                        "text-[13px]",
+                        isActive
+                          ? "text-foreground font-medium"
+                          : "text-foreground/85",
+                      ),
                 )}>
-                  {workspace.title}
+                  {displayTitle}
                 </span>
 
-                {sidebarElapsedSec !== null && (
-                  <span
-                    title="Push/pull in progress — large workspaces can take a while."
-                    className="shrink-0 ml-auto rounded-full bg-muted/60 px-1.5 py-0 text-[10px] font-medium tabular-nums leading-[14px] text-muted-foreground/85"
-                  >
-                    {sidebarElapsedSec}s
-                  </span>
+                {/* Linked-issue chip rides the title line for working / done
+                    cards; idle rows keep it in the git line (below). */}
+                {issueOnTitleLine && workspace.linked_issue && (
+                  <IssueDetailPopover
+                    workspaceId={workspace.workspace_id}
+                    issue={workspace.linked_issue}
+                  />
                 )}
-                {workspace.notification_count > 0 && (
-                  <Badge
-                    variant="outline"
-                    className={cn(
-                      "shrink-0 text-[10px] tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px]",
-                      sidebarElapsedSec === null && "ml-auto",
-                      "transition-opacity group-hover/row:opacity-0",
+
+                {/* Muted bell — on the title line for cards (whose git line is
+                    absent or issue-free); idle rows keep it in the git line. */}
+                {showTitleMute && (
+                  <Tooltip>
+                    <TooltipTrigger asChild>
+                      <BellOff
+                        className="h-3 w-3 shrink-0 text-muted-foreground/60"
+                        aria-label="Notifications muted"
+                      />
+                    </TooltipTrigger>
+                    <TooltipContent side="bottom" sideOffset={4} className="text-xs">
+                      Agent notifications muted
+                    </TooltipContent>
+                  </Tooltip>
+                )}
+
+                {(showSettledCheck ||
+                  showTally ||
+                  sidebarElapsedSec !== null ||
+                  workspace.notification_count > 0) && (
+                  <span className="ml-auto flex items-center gap-1.5 shrink-0">
+                    {/* "n shipped" tally — merged PRs retired from this
+                        workspace. Interactive (hover → popover of past work),
+                        so it slides left to clear the hover-reveal archive
+                        button, mirroring the idle row's issue cluster, rather
+                        than fading like the non-interactive notification
+                        badge. */}
+                    {showTally && (
+                      <HoverCard openDelay={120} closeDelay={80}>
+                        <HoverCardTrigger asChild>
+                          <button
+                            type="button"
+                            onClick={(e) => e.stopPropagation()}
+                            aria-label={`${shippedCount} shipped`}
+                            className="flex items-center gap-1 font-mono text-[10.5px] leading-none tabular-nums text-muted-foreground select-none transition-transform group-hover/row:-translate-x-8"
+                          >
+                            <span className="text-status-open">✓</span>
+                            {shippedCount} shipped
+                          </button>
+                        </HoverCardTrigger>
+                        <HoverCardContent
+                          side="right"
+                          align="start"
+                          className="w-64 p-2"
+                        >
+                          <div className="mb-1.5 font-mono text-[9.5px] uppercase tracking-wide text-muted-foreground/70">
+                            Shipped from this workspace
+                          </div>
+                          <ul className="space-y-1">
+                            {shipped?.map((r) => (
+                              <li
+                                key={r.prNumber}
+                                className="flex items-baseline gap-1.5 text-xs"
+                              >
+                                <span className="shrink-0 font-mono text-muted-foreground tabular-nums">
+                                  #{r.issueNumber ?? r.prNumber}
+                                </span>
+                                {r.title && (
+                                  <span className="truncate text-foreground/80">
+                                    {r.title}
+                                  </span>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        </HoverCardContent>
+                      </HoverCard>
                     )}
-                  >
-                    {workspace.notification_count}
-                  </Badge>
+                    {/* Fading green ✓ on a just-finished / settled row — its
+                        opacity decays over ~1h, then it disappears. */}
+                    {showSettledCheck && (
+                      <span
+                        className="text-status-open text-[10.5px] leading-none tabular-nums select-none"
+                        style={{ opacity: settledOpacity }}
+                        aria-label="Recently finished"
+                      >
+                        ✓
+                      </span>
+                    )}
+                    {sidebarElapsedSec !== null && (
+                      <span
+                        title="Push/pull in progress — large workspaces can take a while."
+                        className="rounded-full bg-muted/60 px-1.5 py-0 text-[10px] font-medium tabular-nums leading-[14px] text-muted-foreground/85"
+                      >
+                        {sidebarElapsedSec}s
+                      </span>
+                    )}
+                    {workspace.notification_count > 0 && (
+                      <Badge
+                        variant="outline"
+                        className="text-[10px] tabular-nums text-warning bg-warning/15 border-transparent px-1.5 py-0 leading-[14px] h-[14px] transition-opacity group-hover/row:opacity-0"
+                      >
+                        {workspace.notification_count}
+                      </Badge>
+                    )}
+                  </span>
                 )}
               </div>
 
-              {/* Line 2: branch + ahead/behind + diff stats +
-                  indicators. Everything that's optional only renders
-                  when relevant — when none of these apply the row is
-                  one line, keeping the sidebar calm. */}
-              {showMetaLine &&
-                (workspace.git_branch || gitStatsVisible || tunnelKind) && (
-                <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground/60 font-mono leading-tight mt-0.5">
+              {/* Line 2 (cards): activity / blocker / done. No backend
+                  activity or permission text is reachable from the sidebar,
+                  so this uses the derived-status fallback with a local
+                  elapsed clock. */}
+              {isWorking && (
+                <div className="truncate text-[11px] text-muted-foreground leading-tight mt-0.5">
+                  Working · {statusElapsed}
+                </div>
+              )}
+              {isPermission && (
+                <div className="truncate text-[11px] text-status-attention leading-tight mt-0.5">
+                  {permissionBlockerText(workspace)} · {statusElapsed}
+                </div>
+              )}
+              {reviewExpanded && (
+                <div className="truncate text-[11px] leading-tight mt-0.5">
+                  <span className="text-status-open font-medium">Done</span>
+                  <span className="text-muted-foreground">
+                    {prOpen
+                      ? " · PR opened · review when ready"
+                      : " · review when ready"}
+                  </span>
+                </div>
+              )}
+
+              {/* Git line — line 3 on working cards, line 2 on dirty / idle
+                  rows. Mono branch + tunnel health + ahead/behind + diff,
+                  plus the interactive linked-issue / mute cluster for idle
+                  rows (with its hover-slide affordance). */}
+              {showGitLine && (
+                <div className={cn(
+                  "flex items-center gap-1.5 font-mono leading-tight text-muted-foreground/60",
+                  isWorking ? "text-[10px] mt-1" : "text-[11px] mt-0.5",
+                )}>
                   {workspace.git_branch && (
                     <span className="truncate min-w-0">{workspace.git_branch}</span>
                   )}
@@ -837,7 +1153,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                     </span>
                   )}
 
-                  {showGitStats && hasAheadBehind && (
+                  {hasAheadBehind && (
                     <span className={cn(
                       "flex items-center gap-1 shrink-0 tabular-nums",
                       // Fade out with the diff stats on hover so the issue
@@ -857,7 +1173,7 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                   {/* diff stats inline (no pill background) — fades on
                       hover so the hover-reveal archive button has its
                       slot. */}
-                  {showGitStats && hasDiff && (
+                  {hasDiff && (
                     <span className={cn(
                       "flex items-center gap-1 shrink-0 tabular-nums ml-auto",
                       "transition-opacity group-hover/row:opacity-0",
@@ -871,15 +1187,15 @@ export function SidebarWorkspaceRow({ workspace, isActive }: Props) {
                     </span>
                   )}
 
-                  {/* Indicator cluster — muted bell + linked issue.
-                      The PR signal moved entirely to the leading icon
-                      column (colored icon + tooltip with "#39 — click
-                      to open"), so this trailing slot no longer carries
-                      a PR number. */}
-                  {(workspace.linked_issue || workspace.notifications_muted) && (
+                  {/* Indicator cluster — muted bell + linked issue. Kept on
+                      idle rows; working cards surface the issue chip on the
+                      title line instead. The PR signal lives entirely on the
+                      leading icon column, so no PR number rides here. */}
+                  {!issueOnTitleLine &&
+                    (workspace.linked_issue || workspace.notifications_muted) && (
                     <div className={cn(
                       "flex items-center gap-1 shrink-0 rounded-md px-1",
-                      !gitStatsVisible && "ml-auto",
+                      !hasDiff && "ml-auto",
                       // The hover-reveal archive button is pinned at the
                       // right edge and overlays this slot. Unlike the diff
                       // stats / notification badge (which fade out on hover),

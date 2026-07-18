@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useMemo } from "react";
 import {
   SidebarGroup,
   SidebarGroupContent,
@@ -13,8 +13,17 @@ import {
 import { useUIStore } from "@/stores/ui-store";
 import { useHosts } from "@/stores/hosts-store";
 import { SidebarProjectGroup } from "./sidebar-project-group";
+import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
+import { SidebarLiveSection } from "./sidebar-live-section";
+import { computeLiveEntries } from "./sidebar-live-grouping";
 import { computeWorkspaceReorder } from "./workspace-reorder";
 import { reorderWorkspaces } from "@/tauri/commands";
+import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
+import {
+  useSettingsStore,
+  selectSidebarLiveAgents,
+} from "@/stores/settings-store";
+import { useCoarseClock } from "@/lib/use-coarse-clock";
 
 interface DragState {
   type: "workspace" | "project";
@@ -43,6 +52,37 @@ export function SidebarWorkspaceList() {
   const projectGroups = useProjectGroupedWorkspaces(allWorkspaces, homeDir, hosts);
   const activeWorkspaceId = appState?.active_workspace_id ?? "";
   const pendingWorkspaces = useUIStore((s) => s.pendingWorkspaces);
+
+  // "Gather on top" grouping: lift every live agent (working / permission /
+  // unseen-review) into a LIVE section above the project tree, sorted red →
+  // working → done. In "project" mode (default) this is all inert.
+  const liveAgents = useSettingsStore(selectSidebarLiveAgents);
+  const topMode = liveAgents === "top";
+  const paneStatuses = appState?.pane_statuses;
+  const settledAt = useSidebarDensityStore((s) => s.settledAt);
+  const lastSeenAt = useSidebarDensityStore((s) => s.lastSeenAt);
+  // A review row's liveness decays with time; keep the section current while
+  // top mode is on (coarse ~30s tick, no per-row timers).
+  const now = useCoarseClock(topMode);
+
+  const liveEntries = useMemo(
+    () =>
+      topMode && paneStatuses
+        ? computeLiveEntries(
+            projectGroups,
+            paneStatuses,
+            settledAt,
+            lastSeenAt,
+            now,
+          )
+        : [],
+    [topMode, paneStatuses, projectGroups, settledAt, lastSeenAt, now],
+  );
+
+  const hiddenWorkspaceIds = useMemo(
+    () => new Set(liveEntries.map((e) => e.workspace.workspace_id)),
+    [liveEntries],
+  );
 
   const [dragState, setDragState] = useState<DragState | null>(null);
   const [dropIndicatorY, setDropIndicatorY] = useState<number | null>(null);
@@ -306,6 +346,22 @@ export function SidebarWorkspaceList() {
   return (
     <SidebarGroup className="p-0">
       <SidebarGroupContent>
+        {/* Pinned "Needs you" strip — sits above the project tree and the
+            drag-and-drop list, so it never interferes with the DnD DOM
+            (which queries `[data-ws-id]` / `[data-drop-zone-project]`
+            inside `listRef`). Renders nothing unless a workspace is
+            waiting on the user. Hidden in "gather on top" mode — the reds
+            are already surfaced at the top of the LIVE section. */}
+        {!topMode && <SidebarNeedsYouStrip projectGroups={projectGroups} />}
+
+        {/* LIVE section — "gather on top" only. Sits outside `listRef` so its
+            mirror rows never enter the drag-and-drop DOM. */}
+        {topMode && (
+          <SidebarLiveSection
+            entries={liveEntries}
+            activeWorkspaceId={activeWorkspaceId}
+          />
+        )}
         <div
           ref={listRef}
           className="relative"
@@ -350,6 +406,7 @@ export function SidebarWorkspaceList() {
                 pendingWorkspaces={pendingWorkspaces.filter(
                   (pw) => pw.projectPath === group.projectPath,
                 )}
+                hiddenWorkspaceIds={topMode ? hiddenWorkspaceIds : undefined}
               />
             </div>
           ))}

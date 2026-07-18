@@ -68,14 +68,39 @@ dot without a tooltip fighting the HoverCard), the `AsciiSpinner`
   new-workspace action.
 - Project avatar custom colors/images carry into the rail.
 - Re-expanding restores the full sidebar (DnD reorder, diff stats, etc.) unchanged.
-- **Workspace-row density** is a real Appearance setting
-  (`sidebar.workspace_detail`: clean / branch / detailed, default clean —
-  segmented control in Settings → Appearance → Sidebar). Clean shows name +
-  status icon only; Branch adds the branch line; Detailed also shows ↑↓ and
-  diff numbers. The PR-state icon and working spinner stay in every mode.
-  The full labeled detail for the **active** workspace lives in the
-  **workspace context bar** at the bottom of the content area
-  (`docs/features/workspace-context-bar.md`), so Clean loses no information.
+- **Workspace-row density is state-driven** (the "living sidebar"): each row
+  derives its height from agent + git state instead of a global setting (the
+  old `sidebar.workspace_detail` Clean/Branch/Detailed control was removed).
+  Working → 3-line card (working indicator + work title + issue chip /
+  activity + elapsed / mono git line with branch, ↑↓, +/−); needs-input →
+  2-line red-tinted card with the blocker text; done (review) → 2-line
+  green-tinted card ("Done · review when ready") that collapses once the
+  workspace is opened or after ~1h; idle → one-liner (a dirty worktree keeps
+  its mono git line). A green ✓ on a settled row fades out over ~1h; a
+  `n shipped` mono tally (with history popover) appears on rows whose merged
+  PRs retired after new work started. Timestamps for elapsed/decay live in the
+  non-persisted `sidebar-density-store`. The full labeled detail for the
+  **active** workspace still lives in the **workspace context bar**
+  (`docs/features/workspace-context-bar.md`).
+- **Work-based row naming**: while a workspace's agent is live and a
+  linked issue exists, the row title is the issue title (+ `#n` chip); the
+  worktree/branch name moves to the mono git line. Idle rows keep the
+  worktree name.
+- **Pinned "Needs you" strip** at the top of the workspace tree while ≥1
+  workspace needs input (red-tinted, project chip + blocker + age); entries
+  are jump-links that activate the workspace, expanding its project group if
+  collapsed. Hidden in "Gather on top" mode.
+- **Live agents grouping** (Settings → Appearance → Agents,
+  `sidebar.live_agents`): "Stay in project" (default) keeps today's grouping;
+  "Gather on top" hoists all live rows (needs-input → working → done-unseen)
+  into a `LIVE` section above the project tree, each tagged with a project
+  chip, leaving idle one-liners in their groups.
+- **Configurable working indicator** (`sidebar.working_indicator`:
+  braille / ring / blink / sweep / typing, and
+  `sidebar.working_indicator_color`: amber / white / ember / green / sky /
+  violet — no red, reserved for needs-input). Rendered by
+  `src/components/ui/working-indicator.tsx` in the expanded rows and the rail
+  flyout; picked via the Agents section's tile picker + swatches.
 - **Duplicate project names are disambiguated** (PR #109): two project roots that
   share a basename (a local `~/projects/app` and the same app on a remote host, or
   sibling dirs) no longer collapse to identical labels. The host is preferred as the
@@ -107,7 +132,12 @@ dot without a tooltip fighting the HoverCard), the `AsciiSpinner`
 - `src/components/layout/use-project-appearance.ts` — shared avatar appearance loader
 - `src/components/ui/sidebar.tsx` — `SIDEBAR_WIDTH_ICON` (52px rail)
 - `src/components/ui/status-indicator.tsx` — `withTooltip` prop
-- `src/components/ui/ascii-spinner.tsx` — shared working spinner
+- `src/components/ui/ascii-spinner.tsx` — braille frames (color-configurable)
+- `src/components/ui/working-indicator.tsx` — configurable working indicator
+- `src/components/layout/sidebar-workspace-row.tsx` — state-driven row density
+- `src/components/layout/sidebar-needs-you-strip.tsx` — pinned "Needs you" strip
+- `src/components/layout/sidebar-live-section.tsx` + `sidebar-live-grouping.ts` — "Gather on top" LIVE section
+- `src/stores/sidebar-density-store.ts` — non-persisted elapsed/decay/work-history state
 - `src/lib/pane-status.ts` — `getProjectStatus` aggregate helper
 - `src/lib/path.ts` — `tailSegments` / `segmentCount` project-label helpers
 - `src/stores/app-store.ts` — duplicate-project-label disambiguation (host tag → path tail)

@@ -14,11 +14,6 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   ai_resolver_model: "",
   ai_resolver_strategy: "smart_merge",
   auto_mcp_config: "true",
-  // How much detail each project-sidebar workspace row shows:
-  //   "clean"    — icon + name + live status only (default — calmest)
-  //   "branch"   — also the git branch name
-  //   "detailed" — also ahead/behind + diff stats
-  "sidebar.workspace_detail": "clean",
   // Color palette variant — "cool" (neutral graphite, default) or "warm".
   // Applied via a `.theme-warm` class on the root that overrides the
   // surface tokens (see globals.css). Cool = the default token map.
@@ -26,16 +21,43 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // Spacing density — "comfortable" (default) or "compact". Scales card
   // padding, grid gaps, and group rhythm via the root `data-density` attr.
   "appearance.density": "comfortable",
+  // Sidebar grouping mode — "project" (default) keeps live agents in their
+  // project group; "top" gathers every live agent into a LIVE section above
+  // the project tree. See sidebar-workspace-list.tsx.
+  "sidebar.live_agents": "project",
+  // Working-indicator glyph shown while an agent is working — the animation
+  // variant and its token color. Rendered by the WorkingIndicator component
+  // in the sidebar row and rail flyout.
+  "sidebar.working_indicator": "braille",
+  "sidebar.working_indicator_color": "status-working",
 };
-
-/** Sidebar workspace-row detail level. */
-export type SidebarWorkspaceDetail = "clean" | "branch" | "detailed";
 
 /** Color palette variant. */
 export type AppearancePalette = "cool" | "warm";
 
 /** Spacing density mode. */
 export type AppearanceDensity = "comfortable" | "compact";
+
+/** Sidebar grouping mode for live agents. */
+export type SidebarLiveAgents = "project" | "top";
+
+/** Working-indicator animation variant. */
+export type WorkingIndicatorVariant =
+  | "braille"
+  | "ring"
+  | "blink"
+  | "sweep"
+  | "typing";
+
+/** Working-indicator color token. No red — that's reserved for the
+ *  needs-you dot. */
+export type WorkingIndicatorColor =
+  | "status-working"
+  | "foreground"
+  | "accent-ember"
+  | "status-open"
+  | "status-remote"
+  | "accent-violet";
 
 interface SettingsState {
   loaded: boolean;
@@ -115,12 +137,6 @@ export const selectTerminalColorTheme = (s: SettingsStore): string =>
 export const selectTerminalFontFamily = (s: SettingsStore): string =>
   s.settings["terminal.font_family"] ?? SETTINGS_DEFAULTS["terminal.font_family"]!;
 
-export const selectSidebarWorkspaceDetail = (
-  s: SettingsStore,
-): SidebarWorkspaceDetail =>
-  (s.settings["sidebar.workspace_detail"] ??
-    SETTINGS_DEFAULTS["sidebar.workspace_detail"]!) as SidebarWorkspaceDetail;
-
 export const selectPalette = (s: SettingsStore): AppearancePalette =>
   (s.settings["appearance.palette"] ??
     SETTINGS_DEFAULTS["appearance.palette"]!) as AppearancePalette;
@@ -128,3 +144,21 @@ export const selectPalette = (s: SettingsStore): AppearancePalette =>
 export const selectDensity = (s: SettingsStore): AppearanceDensity =>
   (s.settings["appearance.density"] ??
     SETTINGS_DEFAULTS["appearance.density"]!) as AppearanceDensity;
+
+export const selectSidebarLiveAgents = (s: SettingsStore): SidebarLiveAgents =>
+  (s.settings["sidebar.live_agents"] ??
+    SETTINGS_DEFAULTS["sidebar.live_agents"]!) as SidebarLiveAgents;
+
+export const selectWorkingIndicator = (
+  s: SettingsStore,
+): WorkingIndicatorVariant =>
+  (s.settings["sidebar.working_indicator"] ??
+    SETTINGS_DEFAULTS["sidebar.working_indicator"]!) as WorkingIndicatorVariant;
+
+export const selectWorkingIndicatorColor = (
+  s: SettingsStore,
+): WorkingIndicatorColor =>
+  (s.settings["sidebar.working_indicator_color"] ??
+    SETTINGS_DEFAULTS[
+      "sidebar.working_indicator_color"
+    ]!) as WorkingIndicatorColor;

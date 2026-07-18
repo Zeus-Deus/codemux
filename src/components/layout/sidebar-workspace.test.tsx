@@ -5,8 +5,12 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 const setShowNewWorkspaceDialogMock = vi.fn();
+const clearExpandProjectRequestMock = vi.fn();
 let enableAgentChatFlag = false;
 let enableLazyFlag = false;
+// Drives the mocked useUIStore's `expandProjectRequest`; tests flip it then
+// rerender to simulate the "Needs you" strip asking a group to expand.
+let expandProjectRequestValue: string | null = null;
 
 const mockOpenUrl = vi.fn().mockResolvedValue(undefined);
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -51,14 +55,20 @@ vi.mock("@/tauri/commands", () => ({
 // `useDefaultBranch` uses a module-level cache; reset between suites so a
 // mock return from a prior test doesn't leak in.
 import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
-import { useSettingsStore } from "@/stores/settings-store";
+import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 beforeEach(() => {
   __resetDefaultBranchCacheForTests();
-  // These suites assert on branch / git-stat / indicator rendering, so
-  // pin the sidebar row to "detailed" rather than the "clean" default.
-  useSettingsStore.setState({
-    settings: { "sidebar.workspace_detail": "detailed" },
+  // Row density is now derived from live agent + git state (the old
+  // Clean/Branch/Detailed setting is gone). Reset the non-persisted density
+  // store so seen/settled timestamps never leak between cases.
+  useSidebarDensityStore.setState({
+    statusSince: {},
+    settledAt: {},
+    lastSeenAt: {},
   });
+  // No pending expand request by default; the expand-on-request suite opts in.
+  expandProjectRequestValue = null;
+  clearExpandProjectRequestMock.mockClear();
 });
 
 // Flush pending microtasks + unmount before the next test so late-resolving
@@ -79,6 +89,8 @@ vi.mock("@/stores/ui-store", () => ({
     const state = {
       showNewWorkspaceDialog: false,
       setShowNewWorkspaceDialog: setShowNewWorkspaceDialogMock,
+      expandProjectRequest: expandProjectRequestValue,
+      clearExpandProjectRequest: clearExpandProjectRequestMock,
     };
     return selector(state);
   }),
@@ -101,6 +113,8 @@ import {
   activateWorkspace,
   agentChatCreatePane,
   createEmptyWorkspace,
+  dbGetUiState,
+  dbSetUiState,
 } from "@/tauri/commands";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 
@@ -322,6 +336,101 @@ describe("SidebarProjectGroup", () => {
         expect(useChatDraftStore.getState().activeDraftId).toBeNull();
       });
     });
+  });
+});
+
+describe("SidebarProjectGroup — expand on request (Needs-you jump)", () => {
+  const PATH = "/home/user/collapsed-proj";
+
+  const flush = async () => {
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  };
+
+  const renderGroup = (ws: WorkspaceSnapshot) =>
+    render(
+      <TooltipProvider>
+        <SidebarProjectGroup
+          projectName="Collapsed"
+          projectPath={PATH}
+          workspaces={[ws]}
+          activeWorkspaceId=""
+        />
+      </TooltipProvider>,
+    );
+
+  beforeEach(() => {
+    vi.mocked(dbGetUiState).mockReset();
+    // Group loads collapsed from persisted UI state; other keys resolve null.
+    vi.mocked(dbGetUiState).mockImplementation((key: string) =>
+      Promise.resolve(key === `collapsed:project:${PATH}` ? "true" : null),
+    );
+    vi.mocked(dbSetUiState).mockReset();
+    vi.mocked(dbSetUiState).mockResolvedValue(undefined);
+  });
+
+  it("expands + persists a collapsed group when a matching request arrives, then clears it", async () => {
+    const ws = makeWorkspace({ workspace_id: "ws-hidden", title: "Hidden Row" });
+    const utils = renderGroup(ws);
+    // Persisted collapsed state loads → the row is hidden.
+    await flush();
+    expect(screen.queryByText("Hidden Row")).not.toBeInTheDocument();
+
+    // A jump targets this group.
+    expandProjectRequestValue = PATH;
+    await act(async () => {
+      utils.rerender(
+        <TooltipProvider>
+          <SidebarProjectGroup
+            projectName="Collapsed"
+            projectPath={PATH}
+            workspaces={[ws]}
+            activeWorkspaceId=""
+          />
+        </TooltipProvider>,
+      );
+    });
+
+    // Group expands (row now rendered), persists the new state, and clears the
+    // one-shot request.
+    expect(screen.getByText("Hidden Row")).toBeInTheDocument();
+    expect(dbSetUiState).toHaveBeenCalledWith(
+      `collapsed:project:${PATH}`,
+      "false",
+    );
+    expect(clearExpandProjectRequestMock).toHaveBeenCalledWith(PATH);
+  });
+
+  it("ignores an expand request that targets a different project path", async () => {
+    const ws = makeWorkspace({ workspace_id: "ws-hidden", title: "Hidden Row" });
+    const utils = renderGroup(ws);
+    await flush();
+    expect(screen.queryByText("Hidden Row")).not.toBeInTheDocument();
+
+    // Request names a different group → this one stays collapsed and does not
+    // consume (clear) the request.
+    expandProjectRequestValue = "/home/user/some-other-proj";
+    await act(async () => {
+      utils.rerender(
+        <TooltipProvider>
+          <SidebarProjectGroup
+            projectName="Collapsed"
+            projectPath={PATH}
+            workspaces={[ws]}
+            activeWorkspaceId=""
+          />
+        </TooltipProvider>,
+      );
+    });
+
+    expect(screen.queryByText("Hidden Row")).not.toBeInTheDocument();
+    expect(dbSetUiState).not.toHaveBeenCalledWith(
+      `collapsed:project:${PATH}`,
+      "false",
+    );
+    expect(clearExpandProjectRequestMock).not.toHaveBeenCalled();
   });
 });
 

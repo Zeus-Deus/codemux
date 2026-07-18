@@ -63,13 +63,18 @@ import {
 import {
   useSettingsStore,
   selectTerminalColorTheme,
-  selectSidebarWorkspaceDetail,
   selectPalette,
   selectDensity,
-  type SidebarWorkspaceDetail,
+  selectSidebarLiveAgents,
+  selectWorkingIndicator,
+  selectWorkingIndicatorColor,
   type AppearancePalette,
   type AppearanceDensity,
+  type SidebarLiveAgents,
+  type WorkingIndicatorVariant,
+  type WorkingIndicatorColor,
 } from "@/stores/settings-store";
+import { WorkingIndicator } from "@/components/ui/working-indicator";
 import {
   detectEditors,
   setNotificationSoundEnabled,
@@ -406,6 +411,114 @@ function SegmentedControl<T extends string>({
           >
             {opt.label}
           </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Tile picker for the working-indicator animation variant. Each tile shows
+ *  a live preview (in the currently-selected color) + a label. */
+const INDICATOR_VARIANTS: { value: WorkingIndicatorVariant; label: string }[] = [
+  { value: "braille", label: "Braille" },
+  { value: "ring", label: "Ring" },
+  { value: "blink", label: "Blink" },
+  { value: "sweep", label: "Sweep" },
+  { value: "typing", label: "Typing" },
+];
+
+function WorkingIndicatorTiles({
+  value,
+  color,
+  onChange,
+}: {
+  value: WorkingIndicatorVariant;
+  color: WorkingIndicatorColor;
+  onChange: (value: WorkingIndicatorVariant) => void;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Working indicator"
+      className="flex gap-1.5"
+    >
+      {INDICATOR_VARIANTS.map((opt) => {
+        const active = opt.value === value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            aria-label={opt.label}
+            onClick={() => onChange(opt.value)}
+            className={cn(
+              "flex h-[60px] w-[72px] flex-col items-center justify-center gap-1.5 rounded-[10px] border transition-colors",
+              active
+                ? "border-accent-ember bg-accent-ember/8"
+                : "border-border/60 bg-muted/30 hover:bg-muted/50 hover:-translate-y-px",
+            )}
+          >
+            <span className="flex h-5 items-center justify-center">
+              <WorkingIndicator variant={opt.value} color={color} preview />
+            </span>
+            <span className="text-[10.5px] text-muted-foreground">
+              {opt.label}
+            </span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Round color swatches for the working-indicator color. Static token → class
+ *  maps (Tailwind can't compose dynamic names). No red — that tone is
+ *  reserved for the needs-you dot. */
+const INDICATOR_COLORS: {
+  value: WorkingIndicatorColor;
+  label: string;
+  dot: string;
+  ring: string;
+}[] = [
+  { value: "status-working", label: "Amber", dot: "bg-status-working", ring: "ring-status-working" },
+  { value: "foreground", label: "White", dot: "bg-foreground", ring: "ring-foreground" },
+  { value: "accent-ember", label: "Ember", dot: "bg-accent-ember", ring: "ring-accent-ember" },
+  { value: "status-open", label: "Green", dot: "bg-status-open", ring: "ring-status-open" },
+  { value: "status-remote", label: "Sky", dot: "bg-status-remote", ring: "ring-status-remote" },
+  { value: "accent-violet", label: "Violet", dot: "bg-accent-violet", ring: "ring-accent-violet" },
+];
+
+function IndicatorColorSwatches({
+  value,
+  onChange,
+}: {
+  value: WorkingIndicatorColor;
+  onChange: (value: WorkingIndicatorColor) => void;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label="Indicator color"
+      className="flex items-center gap-[9px]"
+    >
+      {INDICATOR_COLORS.map((opt) => {
+        const active = opt.value === value;
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            aria-label={opt.label}
+            onClick={() => onChange(opt.value)}
+            className={cn(
+              "size-5 rounded-full transition-transform",
+              opt.dot,
+              active &&
+                cn("ring-2 ring-offset-2 ring-offset-background", opt.ring),
+            )}
+          />
         );
       })}
     </div>
@@ -1231,9 +1344,11 @@ export function SettingsView() {
   const fontSize = useSyncedSettingsStore(selectTerminalFontSize);
   const baseBranch = useSyncedSettingsStore(selectDefaultBaseBranch);
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
-  const sidebarWorkspaceDetail = useSettingsStore(selectSidebarWorkspaceDetail);
   const palette = useSettingsStore(selectPalette);
   const density = useSettingsStore(selectDensity);
+  const liveAgents = useSettingsStore(selectSidebarLiveAgents);
+  const indicatorVariant = useSettingsStore(selectWorkingIndicator);
+  const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
 
   const authUser = useAuthStore((s) => s.user);
@@ -1605,27 +1720,68 @@ export function SettingsView() {
 
             <SectionGroup>
               <SubsectionHeader
-                title="Sidebar"
-                description="How much detail each project-sidebar workspace row shows."
+                title="Agents"
+                description="How working agents surface in the sidebar, and the glyph shown while an agent runs."
               />
               <div className="space-y-1">
                 <SettingRow
-                  label="Workspace rows"
-                  description="Clean keeps just the icon, name, and live status. Branch adds the git branch; Detailed also shows ahead/behind and diff stats."
+                  label="Live agents"
+                  description="Keep working agents in their project group, or gather every live agent into a LIVE section on top."
                 >
-                  <SegmentedControl<SidebarWorkspaceDetail>
-                    ariaLabel="Workspace row detail level"
-                    value={sidebarWorkspaceDetail}
-                    onChange={(value) =>
-                      storeSet("sidebar.workspace_detail", value)
-                    }
+                  <SegmentedControl<SidebarLiveAgents>
+                    ariaLabel="Live agents grouping"
+                    value={liveAgents}
+                    onChange={(value) => storeSet("sidebar.live_agents", value)}
                     options={[
-                      { value: "clean", label: "Clean" },
-                      { value: "branch", label: "Branch" },
-                      { value: "detailed", label: "Detailed" },
+                      { value: "project", label: "Stay in project" },
+                      { value: "top", label: "Gather on top" },
                     ]}
                   />
                 </SettingRow>
+                <SettingRow
+                  label="Working indicator"
+                  description="The animation that replaces a workspace's icon while its agent is working."
+                >
+                  <WorkingIndicatorTiles
+                    value={indicatorVariant}
+                    color={indicatorColor}
+                    onChange={(value) =>
+                      storeSet("sidebar.working_indicator", value)
+                    }
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Indicator color"
+                  description="Tint for the working indicator. Red is reserved for workspaces that need you."
+                >
+                  <IndicatorColorSwatches
+                    value={indicatorColor}
+                    onChange={(value) =>
+                      storeSet("sidebar.working_indicator_color", value)
+                    }
+                  />
+                </SettingRow>
+              </div>
+
+              {/* Live preview at the sidebar row's scale. */}
+              <div className="mt-4">
+                <p className="mb-1.5 font-mono text-[9.5px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/55">
+                  Preview
+                </p>
+                <div className="flex max-w-[300px] items-center gap-2 rounded-[10px] border border-border/60 bg-muted/30 px-2.5 py-2">
+                  <span className="flex size-5 items-center justify-center shrink-0">
+                    <WorkingIndicator
+                      variant={indicatorVariant}
+                      color={indicatorColor}
+                    />
+                  </span>
+                  <span className="text-[12.5px] font-semibold text-foreground">
+                    Fix scroll pinning on send
+                  </span>
+                  <span className="ml-auto font-mono text-[11px] text-muted-foreground">
+                    6m
+                  </span>
+                </div>
               </div>
             </SectionGroup>
           </div>
