@@ -90,9 +90,9 @@ titlebar tab share one implementation (see "Important Touch Points").
 - Single `h-10` titlebar for a real, non-OpenFlow chat workspace with the Beta
   flag on; legacy `h-9` chrome is byte-identical with the flag off.
 - Pill tabs with status dots, active-tab close, and a chat-tab chevron opening
-  the shared session-history dropdown (grouped sessions, active-session dot,
-  delete-on-hover, "+ New Chat", and a "Restore checkpoint" footer item when a
-  run-start checkpoint exists).
+  the shared session-history dropdown ("+ New Chat" and a "Restore checkpoint"
+  item at the top when a run-start checkpoint exists, then the grouped sessions
+  with active-session dot and delete-on-hover).
 - `+` launcher covering GUI chat presets, CLI agents (with Shift-split),
   Terminal/Browser panes, and Manage presets.
 - Inline ember chat favorite; rehomed right-panel toggle + RunButton. (The
