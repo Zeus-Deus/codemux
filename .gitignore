@@ -3,7 +3,7 @@
 Thumbs.db
 
 # Node/Svelte dependencies and build outputs
-node_modules/
+node_modules
 build/
 .svelte-kit/
 dist/
