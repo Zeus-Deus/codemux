@@ -2897,10 +2897,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               />
             </div>
           )}
-          {/* Composer region (design D10): a hairline lifts the whole
-              composer column — AskUserQuestion panel, debug banner, and
-              the composer card — off the scrolling transcript. */}
-          <div className="border-t border-border/50 pt-3.5">
+          {/* Composer region (design D10): groups the whole composer
+              column — AskUserQuestion panel, debug banner, and the
+              composer card — below the scrolling transcript. */}
+          <div className="pt-3.5">
             {pendingInputPanelEl}
             {debugBannerEl}
             {composerEl}
