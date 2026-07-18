@@ -507,6 +507,28 @@ pub async fn agent_chat_start_session(
         .to_str()
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty());
+    // Heal a `None` permission_mode to the provider default BEFORE anything
+    // else reads `input`: the provider launch below, the `config_for_persist`
+    // snapshot, and the record the frontend re-seeds its picker from all draw
+    // from `input.permission_mode`, so mutating it here is the single point
+    // that keeps them in lockstep. A frontend caller can pass `None` while its
+    // UI already shows "Full access" (the picker seeds to the provider default
+    // for a NULL row — see `fallback_permission_mode`), which would otherwise
+    // launch the CLI in `default` mode and prompt for every tool. This mirrors
+    // the resume-path heal in `ensure_live_session` (search
+    // `healed_permission_mode`) so BOTH session-minting entry points are immune
+    // to a null-passing caller. OpenCode has no permission modes, so its
+    // fallback is `None` and this is a no-op there.
+    if input.permission_mode.is_none() {
+        let healed = resolve_start_permission_mode(provider, input.permission_mode.take());
+        if let Some(mode) = healed.as_ref() {
+            eprintln!(
+                "[codemux::agent_chat] healing NULL permission_mode at start pane={pane_id} \
+                 provider={provider:?} -> {mode}"
+            );
+        }
+        input.permission_mode = healed;
+    }
     // Snapshot the per-thread chat configuration BEFORE the provider
     // consumes `input`, so it can be persisted onto the session row for
     // restart-resume (re-seeding the pickers) and read back by
@@ -515,7 +537,8 @@ pub async fn agent_chat_start_session(
     // column it simply doesn't know about, so map each plain
     // `Option<String>` through `keep_or_set` (`Some` → set, `None` →
     // leave untouched) rather than treating a `None` as an explicit
-    // clear.
+    // clear. After the heal above, a Claude/Codex row now persists the
+    // substituted default instead of NULL.
     let config_for_persist = AgentChatSessionConfig {
         model: AgentChatSessionConfig::keep_or_set(input.model.clone()),
         effort: AgentChatSessionConfig::keep_or_set(input.effort.clone()),
@@ -952,6 +975,36 @@ fn fallback_permission_mode(provider: ProviderKind) -> Option<&'static str> {
         ProviderKind::Claude => Some("bypassPermissions"),
         ProviderKind::Codex => Some("danger-full-access"),
         ProviderKind::OpenCode => None,
+    }
+}
+
+/// Resolve the permission mode a *starting* session should launch with,
+/// healing a `None` request to the provider default.
+///
+/// WHY: `agent_chat_start_session` is the PRIMARY path that mints a live
+/// session, yet a frontend caller can hand us `permission_mode: None`
+/// even though its UI is showing "Full access" — because the picker seeds
+/// itself to the provider default for a NULL persisted row (see
+/// `fallback_permission_mode`'s doc comment). If we forwarded that `None`
+/// straight to the provider the CLI would boot in `default` mode and
+/// prompt for every tool while the UI insists on Full access — the exact
+/// desync [`ensure_live_session`] already heals on the resume path
+/// (search `healed_permission_mode`). This mirrors that heal at the start
+/// path so BOTH entry points are immune to a null-passing caller: the
+/// provider launch, the persisted `agent_chat_sessions` row, and the
+/// frontend's record-seeding all agree on one mode.
+///
+/// A `Some` request is authoritative and passes through untouched (the
+/// user explicitly picked a mode). OpenCode's fallback is `None`, so a
+/// `None` request stays `None` — it has no permission modes and there is
+/// nothing to heal.
+fn resolve_start_permission_mode(
+    provider: ProviderKind,
+    requested: Option<String>,
+) -> Option<String> {
+    match requested {
+        Some(mode) => Some(mode),
+        None => fallback_permission_mode(provider).map(str::to_string),
     }
 }
 
@@ -3311,6 +3364,40 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── start-path permission_mode heal ──
+
+    #[test]
+    fn resolve_start_permission_mode_heals_null_to_provider_default() {
+        // A null-passing caller (UI shows "Full access") gets the provider
+        // default substituted so the launch matches the display.
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Claude, None),
+            Some("bypassPermissions".to_string())
+        );
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Codex, None),
+            Some("danger-full-access".to_string())
+        );
+        // OpenCode has no permission modes, so None stays None.
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::OpenCode, None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_start_permission_mode_passes_through_explicit_choice() {
+        // An explicit mode is authoritative and is never overwritten.
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Claude, Some("plan".to_string())),
+            Some("plan".to_string())
+        );
+        assert_eq!(
+            resolve_start_permission_mode(ProviderKind::Claude, Some("default".to_string())),
+            Some("default".to_string())
+        );
+    }
 
     #[test]
     fn first_line_title_takes_first_nonempty_line() {
