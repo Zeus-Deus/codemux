@@ -297,6 +297,152 @@ test("allow with empty updatedPermissions array (legacy AllowForSession) preserv
   }
 });
 
+// ────────────────────────────────────────────────────────────────────
+// Bypass-downgrade guard. When the session's intended mode is
+// `bypassPermissions` the CLI should never call `canUseTool` at all;
+// an invocation means the CLI silently downgraded the launch (boot-time
+// consent-read race). The bridge auto-allows to honor the user's Full
+// access choice and signals the session to attempt a live restore.
+// AskUserQuestion and ExitPlanMode stay on their interactive paths.
+// ────────────────────────────────────────────────────────────────────
+
+test("intended bypass + Bash auto-allows immediately without a prompt", async () => {
+  const { emit, events } = recorder();
+  const pending: PendingApprovals = new Map();
+  let downgrades = 0;
+  const cb = makeCanUseTool("thr", emit, pending, {
+    getPermissionMode: () => "bypassPermissions",
+    onBypassDowngradeDetected: () => {
+      downgrades += 1;
+    },
+  });
+  const originalInput = { command: "ls" };
+  const result = await cb("Bash", originalInput, mkOptions());
+
+  expect(result.behavior).toBe("allow");
+  if (result.behavior === "allow") {
+    expect(result.updatedInput).toEqual(originalInput);
+  }
+  // No prompt was surfaced and nothing was parked.
+  expect(events.find((e) => e.method === "request-opened")).toBeUndefined();
+  expect(pending.size).toBe(0);
+  expect(downgrades).toBe(1);
+});
+
+test("intended bypass + AskUserQuestion still prompts (user-input path)", async () => {
+  const { emit, events } = recorder();
+  const pending: PendingApprovals = new Map();
+  let downgrades = 0;
+  const cb = makeCanUseTool("thr", emit, pending, {
+    getPermissionMode: () => "bypassPermissions",
+    onBypassDowngradeDetected: () => {
+      downgrades += 1;
+    },
+  });
+  const promise = cb("AskUserQuestion", { questions: [] }, mkOptions());
+  await new Promise((r) => setTimeout(r, 0));
+
+  const opened = events.filter((e) => e.method === "request-opened");
+  expect(opened).toHaveLength(1);
+  expect((opened[0]?.params as { kind: string }).kind).toBe("user-input");
+  expect(pending.size).toBe(1);
+  expect(downgrades).toBe(0);
+
+  const requestId = [...pending.keys()][0] as string;
+  pending.get(requestId)?.({ behavior: "allow", updatedInput: { answers: [] } });
+  const result = await promise;
+  expect(result.behavior).toBe("allow");
+});
+
+test("intended bypass + ExitPlanMode still denies with plan-proposed", async () => {
+  const { emit, events } = recorder();
+  const pending: PendingApprovals = new Map();
+  let downgrades = 0;
+  const cb = makeCanUseTool("thr", emit, pending, {
+    getPermissionMode: () => "bypassPermissions",
+    onBypassDowngradeDetected: () => {
+      downgrades += 1;
+    },
+  });
+  const result = await cb("ExitPlanMode", { plan: "do X" }, mkOptions());
+  expect(result.behavior).toBe("deny");
+  if (result.behavior === "deny") {
+    expect(result.interrupt).toBe(true);
+  }
+  expect(events.find((e) => e.method === "plan-proposed")).toBeDefined();
+  // The bypass guard sits after the ExitPlanMode special case, so it
+  // never fires here.
+  expect(downgrades).toBe(0);
+});
+
+test("intended default + Bash uses the normal prompt path", async () => {
+  const { emit, events } = recorder();
+  const pending: PendingApprovals = new Map();
+  let downgrades = 0;
+  const cb = makeCanUseTool("thr", emit, pending, {
+    getPermissionMode: () => "default",
+    onBypassDowngradeDetected: () => {
+      downgrades += 1;
+    },
+  });
+  const promise = cb("Bash", { command: "ls" }, mkOptions());
+  await new Promise((r) => setTimeout(r, 0));
+  expect(events.find((e) => e.method === "request-opened")).toBeDefined();
+  expect(pending.size).toBe(1);
+  expect(downgrades).toBe(0);
+  const requestId = [...pending.keys()][0] as string;
+  pending.get(requestId)?.({ behavior: "allow" });
+  await promise;
+});
+
+test("undefined intended mode + Bash uses the normal prompt path", async () => {
+  const { emit, events } = recorder();
+  const pending: PendingApprovals = new Map();
+  const cb = makeCanUseTool("thr", emit, pending, {
+    getPermissionMode: () => undefined,
+  });
+  const promise = cb("Bash", { command: "ls" }, mkOptions());
+  await new Promise((r) => setTimeout(r, 0));
+  expect(events.find((e) => e.method === "request-opened")).toBeDefined();
+  expect(pending.size).toBe(1);
+  const requestId = [...pending.keys()][0] as string;
+  pending.get(requestId)?.({ behavior: "allow" });
+  await promise;
+});
+
+test("intended plan (post Plan-pill flip) + Bash uses the normal prompt path", async () => {
+  const { emit, events } = recorder();
+  const pending: PendingApprovals = new Map();
+  let downgrades = 0;
+  const cb = makeCanUseTool("thr", emit, pending, {
+    getPermissionMode: () => "plan",
+    onBypassDowngradeDetected: () => {
+      downgrades += 1;
+    },
+  });
+  const promise = cb("Bash", { command: "ls" }, mkOptions());
+  await new Promise((r) => setTimeout(r, 0));
+  expect(events.find((e) => e.method === "request-opened")).toBeDefined();
+  expect(pending.size).toBe(1);
+  expect(downgrades).toBe(0);
+  const requestId = [...pending.keys()][0] as string;
+  pending.get(requestId)?.({ behavior: "allow" });
+  await promise;
+});
+
+test("no context supplied falls back to the plain prompt path under any tool", async () => {
+  const { emit, events } = recorder();
+  const pending: PendingApprovals = new Map();
+  const cb = makeCanUseTool("thr", emit, pending);
+  const promise = cb("Bash", { command: "ls" }, mkOptions());
+  await new Promise((r) => setTimeout(r, 0));
+  expect(events.find((e) => e.method === "request-opened")).toBeDefined();
+  expect(pending.size).toBe(1);
+  const requestId = [...pending.keys()][0] as string;
+  pending.get(requestId)?.({ behavior: "allow" });
+  await promise;
+});
+
 test("classifies tool kinds coarsely for request-opened", async () => {
   const { emit, events } = recorder();
   const pending: PendingApprovals = new Map();

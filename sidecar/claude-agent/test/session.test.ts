@@ -628,3 +628,87 @@ test("allowDangerouslySkipPermissions only set when permissionMode=bypass", () =
   );
   expect(fake.capturedOptions?.allowDangerouslySkipPermissions).toBeUndefined();
 });
+
+// ────────────────────────────────────────────────────────────────────
+// Bypass-downgrade restore. The CLI can silently boot a
+// `bypassPermissions` launch in `default` mode when its consent read
+// loses a race with concurrent settings writers, which makes the SDK
+// call `canUseTool`. The session's canUseTool context auto-allows and
+// fires a single live `setPermissionMode("bypassPermissions")` restore.
+// Drive the captured `canUseTool` directly.
+// ────────────────────────────────────────────────────────────────────
+
+/** A never-aborting callbackOptions shim for the captured canUseTool. */
+function canUseToolOptions() {
+  return {
+    signal: new AbortController().signal,
+    toolUseID: "tu-restore",
+  } as unknown as Parameters<
+    NonNullable<import("@anthropic-ai/claude-agent-sdk").Options["canUseTool"]>
+  >[2];
+}
+
+test("intended-bypass downgrade auto-allows and attempts a single live restore", async () => {
+  const { emit } = recordingEmitter();
+  new ClaudeSession(
+    minimalInput({
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+    }),
+    emit,
+  );
+  const canUseTool = fake.capturedOptions?.canUseTool;
+  expect(canUseTool).toBeDefined();
+
+  // Three tool calls arrive while the session still intends bypass.
+  const r1 = await canUseTool!("Bash", { command: "ls" }, canUseToolOptions());
+  const r2 = await canUseTool!("Edit", { path: "/x" }, canUseToolOptions());
+  const r3 = await canUseTool!("Bash", { command: "pwd" }, canUseToolOptions());
+
+  // Every call is auto-allowed with its original input.
+  expect(r1.behavior).toBe("allow");
+  expect(r2.behavior).toBe("allow");
+  expect(r3.behavior).toBe("allow");
+  if (r1.behavior === "allow") expect(r1.updatedInput).toEqual({ command: "ls" });
+
+  // Only the FIRST call fires the live restore; the one-shot guard
+  // suppresses the rest.
+  expect(fake.setPermissionModeCalls).toEqual(["bypassPermissions"]);
+});
+
+test("downgrade restore re-arms after ensureLiveQuery rebuilds the query", async () => {
+  const { emit } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({
+      permissionMode: "bypassPermissions",
+      allowDangerouslySkipPermissions: true,
+    }),
+    emit,
+  );
+  const firstQuery = fake;
+  const canUseTool = firstQuery.capturedOptions?.canUseTool;
+
+  await canUseTool!("Bash", { command: "ls" }, canUseToolOptions());
+  await canUseTool!("Bash", { command: "ls" }, canUseToolOptions());
+  expect(firstQuery.setPermissionModeCalls).toEqual(["bypassPermissions"]);
+
+  // Emit a session id, interrupt to kill the query, then send a turn
+  // to trigger ensureLiveQuery rebuilding a fresh (resumed) query.
+  firstQuery.emit(mkAssistant("sess-1"));
+  await new Promise((r) => setTimeout(r, 10));
+  firstQuery.interruptError = abortLikeError();
+  await session.interrupt();
+  await session.sendTurn({ text: "again" });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // `fake` now points at the rebuilt query. Its canUseTool gets a fresh
+  // one-shot restore budget.
+  const rebuilt = fake;
+  expect(rebuilt).not.toBe(firstQuery);
+  const rebuiltCanUseTool = rebuilt.capturedOptions?.canUseTool;
+  await rebuiltCanUseTool!("Bash", { command: "ls" }, canUseToolOptions());
+  await rebuiltCanUseTool!("Bash", { command: "ls" }, canUseToolOptions());
+  expect(rebuilt.setPermissionModeCalls).toEqual(["bypassPermissions"]);
+
+  await session.close();
+});

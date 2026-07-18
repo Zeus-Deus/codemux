@@ -22,6 +22,8 @@ import type {
   PermissionUpdate,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import { logger } from "./logger.ts";
+
 /** Decisions the Rust side can hand back. Modelled on the SDK's
  *  `PermissionResult` but shaped for JSON transport. */
 export type ApprovalDecision =
@@ -86,17 +88,32 @@ export function classifyToolKind(
   return "other";
 }
 
+/** Extra context the bridge consults to detect a CLI bypass downgrade.
+ *  Supplied by `ClaudeSession`; optional so standalone/legacy callers
+ *  keep the plain prompt-every-call behavior. */
+export interface CanUseToolContext {
+  /** Current INTENDED permission mode for the session, kept current by
+   *  `setPermissionMode`. When this reads `"bypassPermissions"` the
+   *  user has explicitly chosen Full access. */
+  getPermissionMode: () => string | undefined;
+  /** Best-effort one-shot restore of real bypass on the live query,
+   *  invoked when a downgrade is detected. */
+  onBypassDowngradeDetected?: () => void;
+}
+
 /**
  * Build a `CanUseTool` callback suitable for the SDK's `Options.canUseTool`.
  *
  * @param threadId  - runtime-owned thread id, included on every event
  * @param emit      - event emitter that forwards notifications to stdout
  * @param pending   - the session's map of parked resolvers
+ * @param context   - optional hooks for bypass-downgrade detection
  */
 export function makeCanUseTool(
   threadId: string,
   emit: PermissionsEmitter,
   pending: PendingApprovals,
+  context?: CanUseToolContext,
 ): CanUseTool {
   return async (
     toolName,
@@ -122,6 +139,43 @@ export function makeCanUseTool(
         message:
           "Plan captured. Stop here and wait for the user's decision.",
         interrupt: true,
+      } satisfies PermissionResult;
+    }
+
+    // ── Bypass-downgrade guard ──────────────────────────────────────
+    // When the user picks Full access the session launches with
+    // `permissionMode: bypassPermissions`, under which the CLI
+    // short-circuits permission evaluation and NEVER calls this
+    // callback. So if we are invoked while the session's intended mode
+    // is still `bypassPermissions`, the launch was silently downgraded:
+    // the CLI re-checks its danger-mode consent state at process boot,
+    // and when that read transiently fails or looks absent — which
+    // happens when concurrent sessions are rewriting the shared
+    // settings/consent files at the same moment — it drops
+    // bypassPermissions and boots in `default` mode, warning only on
+    // stderr. The user still sees "Full access" in the composer, so a
+    // permission prompt here would violate their explicit choice.
+    //
+    // Honor that choice: auto-allow the call with its original input
+    // (no `request-opened`, no parked pending entry) and ask the
+    // session to attempt a one-shot live restore of real bypass.
+    //
+    // `AskUserQuestion` is exempt: it is a clarification form, not a
+    // permission gate. Auto-allowing it would hand the model an
+    // unanswered question, so it must keep flowing through the
+    // interactive prompt path even under intended bypass.
+    if (
+      toolName !== "AskUserQuestion" &&
+      context?.getPermissionMode() === "bypassPermissions"
+    ) {
+      context.onBypassDowngradeDetected?.();
+      logger.warn(
+        "canUseTool fired under intended bypassPermissions — CLI silently downgraded the session to default (consent-read race); auto-allowing to honor Full access",
+        { threadId, toolName },
+      );
+      return {
+        behavior: "allow",
+        updatedInput: toolInput as Record<string, unknown>,
       } satisfies PermissionResult;
     }
 
