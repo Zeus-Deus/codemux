@@ -394,6 +394,24 @@ Contract preserved from the pre-redesign renderer:
   imperceptible in both scroll directions. (An earlier build set a blanket
   `overflow-anchor: none`, which disabled anchoring everywhere and let
   those settles drift the viewport hundreds of px per wheel batch.)
+  **WebKit caveat — the anchoring shim.** WebKit engines never implemented
+  the `overflow-anchor` property, and (verified empirically on WebKitGTK
+  2.52.5, the Tauri Linux webview; WKWebView on macOS is the same family)
+  they perform **no implicit scroll anchoring at all** — while
+  `content-visibility` IS supported there, so the height settles do happen
+  with nothing absorbing them. That was the shipped Linux symptom: scrolling
+  up through cold history visibly jumped down and corrected. On those
+  engines `ScrollAnchoringShim` (`scroll-anchoring-shim.tsx`, mounted in
+  `MessageList` as a sibling of the viewport) reproduces native anchoring in
+  JS: an rAF-throttled scroll listener captures the topmost visible row and
+  its viewport offset; a ResizeObserver on the content element re-pins that
+  row by nudging `scrollTop` whenever a settle moves it — gated on the exact
+  same conditions as the CSS design (`data-scrollable` contains `end`, no
+  `data-autoscrolling`), so the engine still owns the tail while
+  pinned/following. Feature-detected via `CSS.supports("overflow-anchor",
+  "none")` — a strict no-op on Chromium/WebView2 — with a
+  `codemux:anchoring-shim` localStorage override (`"on"`/`"off"`) for manual
+  A/B testing, mirroring `codemux:transcript-fade`.
 - **Send re-pins to the tail (catch-up on send).** Sending a new prompt
   from the composer always snaps the transcript to the bottom and
   re-enters following-bottom mode — even when the reader had scrolled up
@@ -580,8 +598,15 @@ already Beta-gated pane and simply hides on short threads.
   scroll events, so the scroller engine's `following-bottom` mode unpins
   itself on the gesture — no extra coordination needed.
   The rail overlays the viewport's left gutter but is its **sibling**, so
-  its `<nav>` forwards `onWheel` to the viewport's `scrollTop` — otherwise
-  wheeling over that 28px strip would be a dead zone. Ticks are real `<button>`s (`Enter`/`Space`,
+  its `<nav>` forwards `onWheel` manually — otherwise wheeling over that
+  28px strip would be a dead zone. The forward is two steps, both
+  required: dispatch a real `wheel` event on the viewport (the engine's
+  stick-to-bottom unpin only listens for genuine user input on the
+  viewport; a bare `scrollTop` write fires only `scroll`, which the engine
+  treats as programmatic — an earlier build did exactly that, so wheeling
+  up over the rail mid-stream got snapped back to the tail on every
+  content mutation), then write `scrollTop` to perform the actual scroll
+  (a synthetic wheel event has no default scroll action). Ticks are real `<button>`s (`Enter`/`Space`,
   focus-visible, `aria-label` "Jump to turn N: …"); the rail is a
   `<nav aria-label="Conversation turns">`. Hovering a tick shows one
   shared preview card (prompt + reply start) after a short delay.
