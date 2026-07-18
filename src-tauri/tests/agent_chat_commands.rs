@@ -849,6 +849,18 @@ mod auto_resume {
         std::fs::create_dir_all(&cwd).unwrap();
         let wrapper = capture_wrapper(tmp.path(), &capture);
 
+        // The Claude resume preflight probes `$CLAUDE_CONFIG_DIR/projects`
+        // for the session's on-disk JSONL and drops the cursor only when it
+        // is DEFINITIVELY gone. Point the config at a temp dir whose file
+        // EXISTS so the cursor is treated as resumable (the on-disk-present
+        // case this test models); without this the preflight would see the
+        // real machine's `~/.claude` and drop a fake session id.
+        let config_dir = tmp.path().join("claude-config");
+        let proj = config_dir.join("projects").join("-workdir");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("sdk-uuid-123.jsonl"), b"{}").unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", &config_dir);
+
         // Managed state the command path touches. A fresh provider whose
         // session map is EMPTY models the post-restart process.
         let app = tauri::test::mock_app();

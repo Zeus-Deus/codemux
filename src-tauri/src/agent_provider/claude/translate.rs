@@ -331,6 +331,25 @@ pub fn translate_notification_with(
             thread_id: thread_id.clone(),
             resume_cursor: serde_json::json!({ "resume": session_id }),
         }],
+        SidecarNotification::ResumeFallback { .. } => vec![
+            // A `null` resume cursor is the "clear the persisted id"
+            // signal (the stale session's on-disk JSONL was gone). The
+            // persist path clears the DB column on exactly JSON null; the
+            // rebuilt query emits a fresh `sdk-session-id` shortly, which
+            // repopulates it.
+            ProviderRuntimeEvent::ResumeCursorUpdated {
+                thread_id: thread_id.clone(),
+                resume_cursor: serde_json::Value::Null,
+            },
+            // The `"resume-fallback: "` prefix is a contract with the
+            // frontend classifier, which promotes this warning to an
+            // inline transcript notice (the remainder after the prefix).
+            ProviderRuntimeEvent::RuntimeWarning {
+                thread_id: Some(thread_id.clone()),
+                message: "resume-fallback: Previous session context couldn't be restored, so this turn continues in a fresh session. Your chat history is preserved.".into(),
+                original_payload: None,
+            },
+        ],
         SidecarNotification::Unknown { method, params } => {
             vec![ProviderRuntimeEvent::RuntimeWarning {
                 thread_id: Some(thread_id.clone()),
@@ -2038,6 +2057,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn notification_resume_fallback_clears_cursor_and_warns() {
+        // The sidecar rebuilt a fresh query after a stale-session resume
+        // failure. Translation must emit exactly two events: a null
+        // resume cursor (clear the persisted id) and a `resume-fallback:`
+        // -prefixed warning the frontend promotes to an inline notice.
+        let n = SidecarNotification::ResumeFallback {
+            thread_id: "t".into(),
+            stale_session_id: Some("dead-uuid".into()),
+        };
+        let events = translate_notification(&tid(), n);
+        assert_eq!(events.len(), 2);
+        match &events[0] {
+            ProviderRuntimeEvent::ResumeCursorUpdated { resume_cursor, .. } => {
+                assert_eq!(*resume_cursor, serde_json::Value::Null);
+            }
+            _ => panic!("expected ResumeCursorUpdated(null)"),
+        }
+        match &events[1] {
+            ProviderRuntimeEvent::RuntimeWarning {
+                message,
+                original_payload,
+                ..
+            } => {
+                assert!(message.starts_with("resume-fallback: "));
+                assert_eq!(
+                    message,
+                    "resume-fallback: Previous session context couldn't be restored, so this turn continues in a fresh session. Your chat history is preserved."
+                );
+                assert!(original_payload.is_none());
+            }
+            _ => panic!("expected RuntimeWarning"),
+        }
     }
 
     #[test]

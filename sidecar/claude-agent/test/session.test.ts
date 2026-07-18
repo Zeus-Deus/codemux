@@ -70,6 +70,27 @@ function abortLikeError(): Error {
   return err;
 }
 
+/** A `result` message shaped like the SDK's stale-resume failure: an
+ *  error subtype whose `errors` array names the missing session. */
+function mkStaleResumeResult(sessionId: string): SDKMessage {
+  return {
+    type: "result",
+    subtype: "error_during_execution",
+    errors: [`No conversation found with session ID: ${sessionId}`],
+    session_id: "ignored",
+  } as unknown as SDKMessage;
+}
+
+/** A successful `result` message. */
+function mkSuccessResult(): SDKMessage {
+  return {
+    type: "result",
+    subtype: "success",
+    result: "done",
+    session_id: "s-ok",
+  } as unknown as SDKMessage;
+}
+
 let fake: FakeQuery;
 
 beforeEach(() => {
@@ -627,6 +648,243 @@ test("allowDangerouslySkipPermissions only set when permissionMode=bypass", () =
     e2,
   );
   expect(fake.capturedOptions?.allowDangerouslySkipPermissions).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// Stale-resume self-heal
+// ---------------------------------------------------------------------------
+
+test("stale-resume error result fires resume-fallback and replays the turn on a fresh query", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({ resume: "stale-xyz" }),
+    emit,
+  );
+  await session.sendTurn({ text: "hello there" });
+  await new Promise((r) => setTimeout(r, 10));
+  // The original query reports the resumed session's JSONL is gone.
+  fakes[0]?.emit(mkStaleResumeResult("stale-xyz"));
+  await new Promise((r) => setTimeout(r, 10));
+
+  // resume-fallback fired, naming the stale id, before any surface.
+  const fallback = events.find((e) => e.method === "resume-fallback");
+  expect(fallback).toBeDefined();
+  expect((fallback?.params as { threadId: string }).threadId).toBe("t-1");
+  expect(
+    (fallback?.params as { staleSessionId: string | null }).staleSessionId,
+  ).toBe("stale-xyz");
+
+  // The error result was NOT forwarded as an sdk-message.
+  const forwardedResults = events.filter(
+    (e) =>
+      e.method === "sdk-message" &&
+      (e.params as { message: { type?: string } }).message.type === "result",
+  );
+  expect(forwardedResults.length).toBe(0);
+
+  // A second query was built WITHOUT any resume / sessionId.
+  expect(fakes.length).toBe(2);
+  expect(fakes[1]?.capturedOptions?.resume).toBeUndefined();
+  expect(fakes[1]?.capturedOptions?.sessionId).toBeUndefined();
+
+  // The user's turn was replayed onto the new query's prompt.
+  expect(fakes[1]?.capturedPrompts.length).toBe(1);
+  expect(
+    (fakes[1]?.capturedPrompts[0] as { message: { content: unknown } }).message
+      .content,
+  ).toBe("hello there");
+  await session.close();
+});
+
+test("eager stale-resume error before any turn recovers without a replay", async () => {
+  // The CLI validates `--resume` EAGERLY: the stale-session error result
+  // can arrive right after session start, before any user turn exists.
+  // Recovery must still fire (rebuild fresh, clear resume state) — with
+  // nothing to replay — so the user's first send lands on the fresh query.
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({ resume: "stale-xyz" }),
+    emit,
+  );
+  // No sendTurn — the error result arrives straight away.
+  fakes[0]?.emit(mkStaleResumeResult("stale-xyz"));
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Recovery fired, naming the stale id; the error was suppressed.
+  const fallback = events.find((e) => e.method === "resume-fallback");
+  expect(fallback).toBeDefined();
+  expect(
+    (fallback?.params as { staleSessionId: string | null }).staleSessionId,
+  ).toBe("stale-xyz");
+  expect(
+    events.filter(
+      (e) =>
+        e.method === "sdk-message" &&
+        (e.params as { message: { type?: string } }).message.type === "result",
+    ).length,
+  ).toBe(0);
+  // No session teardown was announced — the session survives.
+  expect(events.some((e) => e.method === "session-ended")).toBe(false);
+  expect(events.some((e) => e.method === "session-error")).toBe(false);
+
+  // A fresh query exists with no resume and an EMPTY prompt (no replay).
+  expect(fakes.length).toBe(2);
+  expect(fakes[1]?.capturedOptions?.resume).toBeUndefined();
+  expect(fakes[1]?.capturedPrompts.length).toBe(0);
+
+  // The user's first send now lands on the fresh query.
+  await session.sendTurn({ text: "first message" });
+  await new Promise((r) => setTimeout(r, 10));
+  expect(fakes[1]?.capturedPrompts.length).toBe(1);
+  expect(
+    (fakes[1]?.capturedPrompts[0] as { message: { content: unknown } }).message
+      .content,
+  ).toBe("first message");
+  await session.close();
+});
+
+test("messages from the rebuilt query forward normally and re-emit sdk-session-id", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({ resume: "stale-xyz" }),
+    emit,
+  );
+  await session.sendTurn({ text: "hello" });
+  await new Promise((r) => setTimeout(r, 10));
+  fakes[0]?.emit(mkStaleResumeResult("stale-xyz"));
+  await new Promise((r) => setTimeout(r, 10));
+  // The fresh session yields its own id and completes successfully.
+  fakes[1]?.emit(mkAssistant("fresh-sess-9"));
+  fakes[1]?.emit(mkSuccessResult());
+  await new Promise((r) => setTimeout(r, 10));
+
+  const ids = events
+    .filter((e) => e.method === "sdk-session-id")
+    .map((e) => (e.params as { sessionId: string }).sessionId);
+  expect(ids).toEqual(["fresh-sess-9"]);
+
+  const successForwarded = events.some(
+    (e) =>
+      e.method === "sdk-message" &&
+      (e.params as { message: { subtype?: string } }).message.subtype ===
+        "success",
+  );
+  expect(successForwarded).toBe(true);
+  await session.close();
+});
+
+test("a second stale-resume error after recovery is forwarded (retry cap)", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({ resume: "stale-xyz" }),
+    emit,
+  );
+  await session.sendTurn({ text: "hello" });
+  await new Promise((r) => setTimeout(r, 10));
+  fakes[0]?.emit(mkStaleResumeResult("stale-xyz"));
+  await new Promise((r) => setTimeout(r, 10));
+  // The rebuilt query ALSO reports a stale resume — no more recovery.
+  fakes[1]?.emit(mkStaleResumeResult("stale-again"));
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Recovery fired exactly once; no third query built.
+  expect(events.filter((e) => e.method === "resume-fallback").length).toBe(1);
+  expect(fakes.length).toBe(2);
+  // The second stale-resume result was forwarded as a normal sdk-message.
+  const forwarded = events.some(
+    (e) =>
+      e.method === "sdk-message" &&
+      (e.params as { message: { type?: string } }).message.type === "result",
+  );
+  expect(forwarded).toBe(true);
+  await session.close();
+});
+
+test("an unrelated error_during_execution result is forwarded untouched", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({ resume: "stale-xyz" }),
+    emit,
+  );
+  await session.sendTurn({ text: "hello" });
+  await new Promise((r) => setTimeout(r, 10));
+  const unrelated = {
+    type: "result",
+    subtype: "error_during_execution",
+    errors: ["some other failure"],
+    session_id: "s",
+  } as unknown as SDKMessage;
+  fakes[0]?.emit(unrelated);
+  await new Promise((r) => setTimeout(r, 10));
+
+  expect(events.some((e) => e.method === "resume-fallback")).toBe(false);
+  expect(fakes.length).toBe(1);
+  const forwarded = events.some(
+    (e) =>
+      e.method === "sdk-message" &&
+      (e.params as { message: { subtype?: string } }).message.subtype ===
+        "error_during_execution",
+  );
+  expect(forwarded).toBe(true);
+  await session.close();
+});
+
+test("stale-resume error thrown from the iterator recovers without session-error", async () => {
+  const fakes: FakeQuery[] = [];
+  setQueryFactoryForTests((args) => {
+    const f = new FakeQuery(args);
+    fakes.push(f);
+    return asQuery(f);
+  });
+  const { emit, events } = recordingEmitter();
+  const session = new ClaudeSession(
+    minimalInput({ resume: "stale-xyz" }),
+    emit,
+  );
+  await session.sendTurn({ text: "hello" });
+  await new Promise((r) => setTimeout(r, 10));
+  // The failure surfaces as a thrown error rather than a result message.
+  fakes[0]?.errorStream(
+    new Error("No conversation found with session ID: stale-xyz"),
+  );
+  await new Promise((r) => setTimeout(r, 10));
+
+  expect(events.some((e) => e.method === "resume-fallback")).toBe(true);
+  expect(events.some((e) => e.method === "session-error")).toBe(false);
+  expect(fakes.length).toBe(2);
+  expect(fakes[1]?.capturedOptions?.resume).toBeUndefined();
+  expect(fakes[1]?.capturedPrompts.length).toBe(1);
+  await session.close();
 });
 
 // ────────────────────────────────────────────────────────────────────

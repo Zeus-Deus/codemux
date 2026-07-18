@@ -1402,6 +1402,17 @@ async fn mutate_state_from_notification(
             let mut state = session.state.lock().await;
             state.sdk_session_id = Some(session_id.clone());
         }
+        SidecarNotification::ResumeFallback { .. } => {
+            // The sidecar couldn't resume the persisted SDK session and
+            // rebuilt a fresh query, transparently replaying the same
+            // turn. Drop the stale cursor so we never try that dead id
+            // again — the rebuilt query emits a new `sdk-session-id`
+            // shortly, which repopulates this. Deliberately DON'T touch
+            // `active_turn` / `status`: the replayed turn is still in
+            // flight and stays `Running` until its real `result` lands.
+            let mut state = session.state.lock().await;
+            state.sdk_session_id = None;
+        }
         SidecarNotification::SdkMessage { message, .. } => {
             // The SDK's `result` message marks the end of a single
             // turn. The session stays alive (the prompt queue is
