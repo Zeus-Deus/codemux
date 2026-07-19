@@ -505,25 +505,26 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           cluster) leave room for a future inline workflow-status pill. */}
       <div data-tauri-drag-region className="flex-1 self-stretch" />
 
-      {/* Right cluster — rehomed right-panel toggle + Run split button,
-          then the standard monitor / IDE / window controls. */}
+      {/* Right cluster — Run split button, then the standard monitor /
+          IDE controls, with the right-panel toggle docked beside the
+          window controls (layout toggles live next to window chrome). */}
       <div
         className="flex shrink-0 items-center gap-1.5 pr-0.5"
         onPointerDown={(e) => e.stopPropagation()}
       >
-        {activeWorkspaceId && <RightPanelToggle workspaceId={activeWorkspaceId} />}
         {activeWorkspaceId && (
           <RunButton workspaceId={activeWorkspaceId} variant="split" />
         )}
         <ResourceMonitor />
         <IdeLauncher compact />
-        {/* The separator only divides the content cluster from the native
-            window controls — on the web remote client those controls render
-            nothing, so the separator would dangle at the right edge. Hide it
-            there. */}
+        {/* The separator divides the content cluster from the layout-toggle
+            + native window controls group — on the web remote client those
+            controls render nothing, so the separator would dangle next to a
+            lone toggle at the right edge. Hide it there. */}
         {!isRemoteClient() && (
           <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
         )}
+        {activeWorkspaceId && <RightPanelToggle workspaceId={activeWorkspaceId} />}
         <WindowControls />
         {/* Web remote client only: the connection chip takes the slot the
             hidden window controls free up. Quiet while connected; the loud
