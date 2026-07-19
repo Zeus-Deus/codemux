@@ -27,8 +27,12 @@ predicate lives in the shared `useGuiChrome()` hook
 (`src/hooks/use-gui-chrome.ts`) so other GUI-mode-only surfaces gate on the
 identical rule — currently the background-browser inline chip, context-bar
 indicator, and peek overlay (`docs/features/browser.md` § "Background
-browser in GUI mode"). When false it returns the byte-identical legacy
-`h-9` bar; when true it composes discrete slots left-to-right:
+browser in GUI mode"). A live lazy-creation draft renders the same `h-10`
+shell with **draft slots** instead, gated on the sibling
+`useDraftGuiChrome()` predicate (`enableAgentChat && lazyDraftActive` —
+mutually exclusive with `guiChrome`; see "Draft titlebar variant" below).
+When neither predicate holds it returns the byte-identical legacy `h-9`
+bar; in workspace GUI chrome it composes discrete slots left-to-right:
 
 `[sidebar-width cluster: sidebar toggle] | [tabs] [+ launcher] | [pinned preset tiles] …drag spacer… [right-panel toggle] [RunButton split] [ResourceMonitor] [IdeLauncher compact] [sep] [WindowControls]`
 
@@ -77,9 +81,26 @@ sidebar boundary so tabs start where the content pane starts (design:
   their legacy default rendering for the flag-off `PresetBar`, preserving
   the byte-identical contract.
 - **Row suppression** — `WorkspaceMain` (`workspace-main.tsx`) drops `TabBar`
-  and `PresetBar` when the flag is on; `PaneNode` (`isSurfaceRoot` +
-  `enableAgentChat`) suppresses `AgentChatPaneHeader` for a **sole-root**
-  `agent_chat` pane. Split panes keep their per-pane header.
+  and `PresetBar` when the flag is on (both on the real-workspace branch and
+  the draft branch); `PaneNode` (`isSurfaceRoot` + `enableAgentChat`)
+  suppresses `AgentChatPaneHeader` for a **sole-root** `agent_chat` pane.
+  Split panes keep their per-pane header. `DraftChatSurface` likewise
+  suppresses its placeholder `DraftSurfaceHeader` band in GUI mode.
+- **Draft titlebar variant** — while a lazy-creation draft is the active
+  surface (`useDraftGuiChrome()`), the `h-10` bar renders
+  `TitleBarDraftSlots` in place of the workspace slots: a single static
+  "Agent Chat" pill in the active-tab style plus `DraftAgentLauncher`
+  (`agent-launcher.tsx`) — a `+` popover whose GUI/CLI rows materialise the
+  draft via the shared `launchDraftWithPreset` helper
+  (`src/lib/agent-chat/draft-preset-launch.ts`, also used by the legacy
+  draft `PresetBar`). The launcher hides on a Home-target draft and disables
+  while a materialise is in flight, mirroring the legacy draft PresetBar's
+  rules. Workspace-scoped right-cluster controls (right-panel toggle,
+  `RunButton`, `IdeLauncher`) are suppressed — the backend's "active
+  workspace" during a draft is whatever was focused before the draft opened,
+  not what's on screen. This keeps the titlebar silhouette identical across
+  the draft → materialised transition, so pressing "+" no longer flashes the
+  legacy `h-9` bar + `PresetBar` rows.
 
 Session-switch / new-chat orchestration, checkpoint restore, and the
 session-history list are extracted so the legacy per-pane header and the
@@ -111,10 +132,12 @@ titlebar tab share one implementation (see "Important Touch Points").
 
 ## Current Constraints
 
-- **Draft (lazy-creation) workspaces keep legacy chrome.** A live chat draft
-  keeps the `TabBar`/`PresetBar` rows and the `h-9` bar so the draft surface's
-  own PresetBar stays coherent; GUI chrome is gated off while a draft is
-  active.
+- **Draft chrome is a reduced titlebar, not full workspace chrome.** A live
+  chat draft renders the GUI-styled `h-10` draft variant (static pill +
+  draft launcher), but `useGuiChrome()` itself still resolves `false` during
+  a draft — workspace-scoped GUI surfaces (titlebar tabs, background-browser
+  chip, context-bar indicator, right-cluster controls) stay off because the
+  backend's active workspace is not what's on screen.
 - **OpenFlow workspaces are untouched** — they keep their dedicated chrome.
 - **A sole-root chat pane loses its per-pane split/close buttons** (the
   suppressed `AgentChatPaneHeader`); splitting is done from the launcher
@@ -135,10 +158,14 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
 ## Important Touch Points
 
 - `src/hooks/use-gui-chrome.ts` — the shared `guiChrome` predicate (single
-  source of truth, extracted from `title-bar.tsx`).
-- `src/components/layout/title-bar.tsx` — consumes `useGuiChrome()` for the
-  slot-composition branch, `RightPanelToggle`, `PinnedChatFavorite`,
-  `TitleBarWorkspaceSlots`.
+  source of truth, extracted from `title-bar.tsx`) plus the sibling
+  `useDraftGuiChrome()` draft predicate.
+- `src/components/layout/title-bar.tsx` — consumes `useGuiChrome()` +
+  `useDraftGuiChrome()` for the slot-composition branch, `RightPanelToggle`,
+  `PinnedChatFavorite`, `TitleBarWorkspaceSlots`, `TitleBarDraftSlots`.
+- `src/lib/agent-chat/draft-preset-launch.ts` — shared
+  materialise-with-preset action behind both the legacy draft `PresetBar`
+  and `DraftAgentLauncher`.
 - `src/components/layout/title-bar-tabs.tsx` — pill tab strip + active chat tab
   (chevron dropdown, checkpoint dialog). The inline subagents pill that used to
   live here was removed by PR #143 — see `src/components/chat/SubagentActivityBar.tsx`.
