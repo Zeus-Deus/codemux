@@ -648,6 +648,7 @@ fn encode_rgba_to_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, S
 pub async fn paste_clipboard_image_to_file<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<String, String> {
+    crate::ensure_gui_mode(&app)?;
     tokio::task::spawn_blocking(move || {
         use tauri_plugin_clipboard_manager::ClipboardExt;
 
@@ -738,6 +739,7 @@ fn build_clipboard_image_payload(
 pub async fn paste_clipboard_image<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<ClipboardImagePayload, String> {
+    crate::ensure_gui_mode(&app)?;
     tokio::task::spawn_blocking(move || {
         use tauri_plugin_clipboard_manager::ClipboardExt;
 

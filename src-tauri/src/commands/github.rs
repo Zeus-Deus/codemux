@@ -213,8 +213,8 @@ pub async fn get_github_issue(
 }
 
 #[tauri::command]
-pub async fn link_workspace_issue(
-    app: tauri::AppHandle,
+pub async fn link_workspace_issue<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     issue_number: u64,
@@ -237,8 +237,8 @@ pub async fn link_workspace_issue(
 }
 
 #[tauri::command]
-pub fn unlink_workspace_issue(
-    app: tauri::AppHandle,
+pub fn unlink_workspace_issue<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
 ) -> Result<(), String> {
@@ -248,8 +248,8 @@ pub fn unlink_workspace_issue(
 }
 
 #[tauri::command]
-pub async fn refresh_workspace_issue(
-    app: tauri::AppHandle,
+pub async fn refresh_workspace_issue<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
 ) -> Result<(), String> {
@@ -285,8 +285,8 @@ pub async fn refresh_workspace_issue(
 }
 
 #[tauri::command]
-pub async fn refresh_workspace_pr(
-    app: tauri::AppHandle,
+pub async fn refresh_workspace_pr<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
 ) -> Result<(), String> {

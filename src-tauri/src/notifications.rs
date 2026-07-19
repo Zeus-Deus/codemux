@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use crate::state::AppStateStore;
 
@@ -30,7 +30,7 @@ const MACOS_COMPLETE: &str = "/System/Library/Sounds/Glass.aiff";
 /// already looking at the pane. Mirrors Superset's `shouldSuppressForVisiblePane`:
 /// suppress only if the window is focused AND the agent's pane is in the
 /// currently-active workspace.
-pub fn should_suppress(app: &AppHandle, pane_in_active_workspace: bool) -> bool {
+pub fn should_suppress<R: Runtime>(app: &AppHandle<R>, pane_in_active_workspace: bool) -> bool {
     let window_focused = app
         .get_webview_window("main")
         .and_then(|w| w.is_focused().ok())
@@ -41,13 +41,19 @@ pub fn should_suppress(app: &AppHandle, pane_in_active_workspace: bool) -> bool 
 /// Show a "agent finished" desktop notification and play the completion sound.
 /// Clicking the notification focuses the Codemux window (and on Hyprland,
 /// jumps to whichever workspace it lives on).
-pub fn dispatch_agent_complete(app: &AppHandle, workspace_title: &str) {
+pub fn dispatch_agent_complete<R: Runtime>(app: &AppHandle<R>, workspace_title: &str) {
     let payload = agent_complete_payload(workspace_title);
 
     // Native desktop path — byte-identical to before: same summary/body
-    // strings, same show + sound calls in the same order.
-    show_desktop_notification(app, &payload.title, &payload.body);
-    play_completion_sound(app);
+    // strings, same show + sound calls in the same order. Gated on GUI mode:
+    // under headless serve there is no notification daemon, focusable window,
+    // or audio device, so `notify-rust` + `play_completion_sound` + the
+    // click-to-`focus_app` handler are skipped. The global `notification`
+    // event below still fires unconditionally — the web client consumes it.
+    if crate::app_mode(app) == crate::AppMode::Gui {
+        show_desktop_notification(app, &payload.title, &payload.body);
+        play_completion_sound(app);
+    }
 
     // Web-remote bridge: mirror the same notification onto the global event
     // bus so a paired browser can raise an OS notification client-side (Stage
@@ -69,7 +75,7 @@ fn agent_complete_payload(workspace_title: &str) -> NotificationPayload {
     }
 }
 
-fn show_desktop_notification(app: &AppHandle, summary: &str, body: &str) {
+fn show_desktop_notification<R: Runtime>(app: &AppHandle<R>, summary: &str, body: &str) {
     let mut notification = notify_rust::Notification::new();
     notification.summary(summary).body(body);
 
@@ -125,7 +131,7 @@ fn show_desktop_notification(app: &AppHandle, summary: &str, body: &str) {
 
 /// Bring the Codemux window to the foreground. On Hyprland this includes
 /// jumping to whichever workspace the window currently lives on.
-fn focus_app(app: &AppHandle) {
+fn focus_app<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -144,7 +150,7 @@ fn focus_app(app: &AppHandle) {
     }
 }
 
-fn play_completion_sound(app: &AppHandle) {
+fn play_completion_sound<R: Runtime>(app: &AppHandle<R>) {
     let state: tauri::State<'_, AppStateStore> = app.state();
     if !state.snapshot().config.notification_sound_enabled {
         return;

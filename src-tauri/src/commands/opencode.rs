@@ -28,7 +28,7 @@
 //! defence-in-depth against future call sites that miss the picker
 //! check.
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 use crate::agent_provider::opencode::{
     check_opencode_availability, OpenCodeAvailability, OpenCodeClient, OpenCodeClientConfig,
@@ -45,8 +45,8 @@ use crate::observability::ObservabilityStore;
 /// boot does — the only Stage 1 caller that supplies a value is the
 /// (future) settings panel.
 #[tauri::command]
-pub async fn opencode_check_availability(
-    app: AppHandle,
+pub async fn opencode_check_availability<R: Runtime>(
+    app: AppHandle<R>,
     server_url: Option<String>,
 ) -> Result<OpenCodeAvailability, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
@@ -68,8 +68,8 @@ pub async fn opencode_check_availability(
 /// is always `"opencode"` per OpenCode's protocol). Passing `None` is
 /// fine for the no-password local-loopback case.
 #[tauri::command]
-pub async fn opencode_ping(
-    app: AppHandle,
+pub async fn opencode_ping<R: Runtime>(
+    app: AppHandle<R>,
     base_url: String,
     server_password: Option<String>,
 ) -> Result<(), String> {
@@ -101,8 +101,8 @@ pub async fn opencode_ping(
 ///   `"request_error: …"` — HTTP-level failures from
 ///   [`OpenCodeClient::list_models`].
 #[tauri::command]
-pub async fn opencode_list_models(
-    app: AppHandle,
+pub async fn opencode_list_models<R: Runtime>(
+    app: AppHandle<R>,
     manager: State<'_, std::sync::Arc<OpenCodeServerManager>>,
 ) -> Result<Vec<OpenCodeProviderEntry>, String> {
     let observability: State<'_, ObservabilityStore> = app.state();

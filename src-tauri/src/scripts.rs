@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 /// Default worktree include patterns when no `.codemuxinclude` file or project
 /// setting is configured.
@@ -262,11 +262,11 @@ struct WorktreeIncludesApplied {
 
 /// Run the full setup pipeline: worktree includes copy + setup scripts.
 /// Resolves config from file/DB.
-pub fn run_setup_scripts(
+pub fn run_setup_scripts<R: Runtime>(
     workspace_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
     db: Option<&DatabaseStore>,
     branch: Option<&str>,
     port: Option<u16>,
@@ -439,11 +439,11 @@ pub fn run_setup_commands(
 /// [`SetupEvent`] to the frontend as the events it has always listened
 /// for, with unchanged payload shapes.
 #[allow(clippy::too_many_arguments)]
-pub fn run_setup_scripts_with_config(
+pub fn run_setup_scripts_with_config<R: Runtime>(
     workspace_path: &Path,
     workspace_name: &str,
     workspace_id: &str,
-    app_handle: &AppHandle,
+    app_handle: &AppHandle<R>,
     config: &WorkspaceConfig,
     root_path: &Path,
     branch: Option<&str>,

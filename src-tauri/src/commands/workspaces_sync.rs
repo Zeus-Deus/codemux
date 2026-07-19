@@ -259,8 +259,8 @@ pub fn workspaces_sync_list(
 /// not an error in that case — matches the hosts and automations
 /// commands).
 #[tauri::command]
-pub async fn workspaces_sync_now(
-    app: tauri::AppHandle,
+pub async fn workspaces_sync_now<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
 ) -> Result<(), String> {
     // Snapshot + reconcile in a sync block so we don't carry the
     // State<'_> guard (which is not Send) across the await below.
@@ -340,8 +340,8 @@ pub(crate) fn resolve_open_on_host_cwd(
 /// this device (so the SSH tunnel can be established). Idempotent: opening
 /// the same host workspace twice re-activates the existing local view.
 #[tauri::command]
-pub async fn workspace_open_on_host(
-    app: tauri::AppHandle,
+pub async fn workspace_open_on_host<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     sync_row_id: i64,
 ) -> Result<OpenOnHostOutcome, String> {
     // Serialize concurrent opens of the same row (double-click) so they
@@ -509,8 +509,8 @@ pub struct AdoptOutcome {
 }
 
 #[tauri::command]
-pub fn workspaces_adoption_preview(
-    app: tauri::AppHandle,
+pub fn workspaces_adoption_preview<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     server_id: String,
 ) -> Result<AdoptionPreview, String> {
     let db: tauri::State<'_, DatabaseStore> = app.state();
@@ -769,8 +769,8 @@ fn detect_same_branch_project_conflict(
 /// "Pull back to this device" action — the recovery path is the
 /// same as a failed manual pull.
 #[tauri::command]
-pub async fn workspaces_adopt_synced(
-    app: tauri::AppHandle,
+pub async fn workspaces_adopt_synced<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
     // Serialize concurrent adopts of this same row (double-click, or poller
@@ -1061,8 +1061,8 @@ pub async fn workspaces_adopt_synced(
 ///      `~/.codemux/worktrees/<repo>/<branch>` path.
 ///   4. Register a local workspace pointing at the recreated worktree and
 ///      link the sync row.
-async fn adopt_worktree_via_repo_rsync(
-    app: tauri::AppHandle,
+async fn adopt_worktree_via_repo_rsync<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
     // ── resolve row + host + paths (no awaits) ──
@@ -1329,8 +1329,8 @@ async fn adopt_worktree_via_repo_rsync(
 /// (see `git_clone`'s rollback). No partial workspace shell is
 /// created until both clone + worktree-add succeed.
 #[tauri::command]
-pub async fn workspaces_adopt_via_clone(
-    app: tauri::AppHandle,
+pub async fn workspaces_adopt_via_clone<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     server_id: String,
 ) -> Result<AdoptOutcome, String> {
     // Same per-row serialization as the host-backed adopt path.
@@ -1547,8 +1547,8 @@ pub struct ProjectAdoptOutcome {
 /// shell. Worktree failures are collected; a root failure aborts (nothing can
 /// attach to a missing root).
 #[tauri::command]
-pub async fn workspaces_adopt_project(
-    app: tauri::AppHandle,
+pub async fn workspaces_adopt_project<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     project_uid: String,
 ) -> Result<ProjectAdoptOutcome, String> {
     // Gather the project's un-adopted, host-backed sync rows (sync scope —
@@ -1630,8 +1630,8 @@ pub async fn workspaces_adopt_project(
 /// unpushed commits, returning guidance, so a card never disappears while
 /// the user has work in flight.
 #[tauri::command]
-pub async fn workspaces_reconcile_copy(
-    app: tauri::AppHandle,
+pub async fn workspaces_reconcile_copy<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     workspace_id: String,
 ) -> Result<String, String> {
     // Resolve the copy's on-disk path from app_state (sync scope).

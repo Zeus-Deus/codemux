@@ -75,7 +75,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -98,7 +98,7 @@ const PER_HOST_BUDGET: Duration = Duration::from_secs(20);
 /// Spawn the background inventory poller. Must be called once during
 /// app setup. Like `hosts_upgrade`, it delays a few seconds so the
 /// app's initial paint isn't competing with us for resources.
-pub fn spawn(app: AppHandle) {
+pub fn spawn<R: Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         // Warm-up: let the UI settle, and give `hosts_upgrade::spawn`
         // (which fires at +5s) a head start so any host whose binary
@@ -116,7 +116,7 @@ pub fn spawn(app: AppHandle) {
 
 /// One pass over every configured host. Public so tests / debug
 /// surfaces can drive a single cycle without the loop.
-pub async fn run_once(app: &AppHandle) {
+pub async fn run_once<R: Runtime>(app: &AppHandle<R>) {
     let hosts = match app.try_state::<DatabaseStore>() {
         Some(state) => state.list_hosts(),
         None => {

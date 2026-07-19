@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::Message;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Listener};
+use tauri::{AppHandle, Listener, Runtime};
 
 use super::server::OutboundTx;
 
@@ -40,7 +40,7 @@ pub struct EventHub {
 impl EventHub {
     /// Subscribe `conn_id` to `event`, registering the backing desktop
     /// listener if this is the first subscriber for that event name.
-    pub fn subscribe(&self, app: &AppHandle, conn_id: u64, event: &str, out: OutboundTx) {
+    pub fn subscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str, out: OutboundTx) {
         let mut map = self.inner.lock().unwrap();
         let entry = map.entry(event.to_string()).or_insert_with(|| {
             let inner = self.inner.clone();
@@ -58,7 +58,7 @@ impl EventHub {
 
     /// Unsubscribe `conn_id` from `event`; tear the desktop listener down
     /// when the last subscriber leaves.
-    pub fn unsubscribe(&self, app: &AppHandle, conn_id: u64, event: &str) {
+    pub fn unsubscribe<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64, event: &str) {
         let mut map = self.inner.lock().unwrap();
         if let Some(entry) = map.get_mut(event) {
             entry.subscribers.remove(&conn_id);
@@ -71,7 +71,7 @@ impl EventHub {
 
     /// Drop every subscription held by a connection (WS closed). Any event
     /// left with no subscribers has its desktop listener removed.
-    pub fn remove_conn(&self, app: &AppHandle, conn_id: u64) {
+    pub fn remove_conn<R: Runtime>(&self, app: &AppHandle<R>, conn_id: u64) {
         let mut map = self.inner.lock().unwrap();
         let mut emptied = Vec::new();
         for (name, entry) in map.iter_mut() {

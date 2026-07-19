@@ -73,7 +73,7 @@ static SYNC_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Convenience wrapper used by Tauri commands. Resolves the database
 /// + token from the app state and calls `try_sync`. Returns Ok(()) if
 /// the user isn't signed in (sync isn't an error in that case).
-pub async fn try_sync_with_app(app: &tauri::AppHandle) -> Result<(), String> {
+pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
     let token = match valid_token(&db) {
         Some(t) => t,

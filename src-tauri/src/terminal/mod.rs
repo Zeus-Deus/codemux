@@ -18,7 +18,7 @@ type PollFd = ();
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
+use tauri::{ipc::Channel, AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::project::current_project_root;
 use crate::settings_sync;
@@ -600,8 +600,8 @@ pub(crate) fn is_runtime_owned_by_client(
 }
 
 #[cfg(unix)]
-pub(crate) fn emit_exited_if_client_owner(
-    app: &AppHandle,
+pub(crate) fn emit_exited_if_client_owner<R: Runtime>(
+    app: &AppHandle<R>,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     session_id: &str,
     client: &Arc<crate::pty_daemon::PtyDaemonClient>,
@@ -626,8 +626,8 @@ pub(crate) fn emit_exited_if_client_owner(
     );
 }
 
-fn emit_terminal_status(
-    app: &AppHandle,
+fn emit_terminal_status<R: Runtime>(
+    app: &AppHandle<R>,
     sessions: &Arc<Mutex<HashMap<String, SessionRuntime>>>,
     payload: TerminalStatusPayload,
 ) {
@@ -1338,7 +1338,7 @@ pub(crate) fn workspace_pty_env(ws: &crate::state::WorkspaceSnapshot) -> Vec<(St
     vars
 }
 
-pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
+pub fn spawn_pty_for_session<R: Runtime>(app: AppHandle<R>, session_id: String) {
     // Persistent path: every shell goes through the long-lived
     // `codemux pty-daemon` so closing the app doesn't kill it. The
     // agent commands the user later types into the shell inherit the
@@ -1447,8 +1447,8 @@ pub fn spawn_pty_for_session(app: AppHandle, session_id: String) {
 /// Used to gate the in-process fallback — local workspaces still
 /// fall back happily, remote ones must surface the real error.
 #[cfg(unix)]
-fn is_remote_workspace_for_session(
-    app: &AppHandle,
+fn is_remote_workspace_for_session<R: Runtime>(
+    app: &AppHandle<R>,
     session_id: &str,
 ) -> bool {
     let app_state: State<'_, AppStateStore> = app.state();
@@ -1458,7 +1458,7 @@ fn is_remote_workspace_for_session(
         .is_some()
 }
 
-fn spawn_pty_for_session_in_process(app: AppHandle, session_id: String) {
+fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: String) {
     let terminal_state: State<'_, PtyState> = app.state();
     let app_state: State<'_, AppStateStore> = app.state();
     let sessions = terminal_state.sessions.clone();
@@ -1892,7 +1892,7 @@ fn collect_workspace_session_ids(
 /// Idempotent: each `spawn_pty_for_session` call is gated by
 /// `try_reserve_session_spawn`, so re-calling this for an already-active
 /// workspace is a cheap no-op.
-pub fn spawn_missing_ptys_for_workspace(app: AppHandle, workspace_id: &str) {
+pub fn spawn_missing_ptys_for_workspace<R: Runtime>(app: AppHandle<R>, workspace_id: &str) {
     let app_state: State<'_, AppStateStore> = app.state();
     let snapshot = app_state.snapshot();
     let session_ids = collect_workspace_session_ids(&snapshot, workspace_id);
@@ -1925,7 +1925,7 @@ pub fn spawn_missing_ptys_for_workspace(app: AppHandle, workspace_id: &str) {
 /// Rides the same `last_status` plumbing as every other lifecycle emit, so a
 /// mid-migration workspace switch + return still shows the overlay
 /// (`get_terminal_status` replays `last_status`).
-pub fn emit_migrating_for_workspace(app: &AppHandle, workspace_id: &str, message: &str) {
+pub fn emit_migrating_for_workspace<R: Runtime>(app: &AppHandle<R>, workspace_id: &str, message: &str) {
     let app_state: State<'_, AppStateStore> = app.state();
     let pty_state: State<'_, PtyState> = app.state();
     let snapshot = app_state.snapshot();
@@ -1968,7 +1968,7 @@ pub fn emit_migrating_for_workspace(app: &AppHandle, workspace_id: &str, message
 /// Other workspaces' sessions are not lost: their persisted scrollback +
 /// metadata stays on disk, and `spawn_missing_ptys_for_workspace` rehydrates
 /// them on workspace switch.
-pub fn spawn_missing_ptys(app: AppHandle) {
+pub fn spawn_missing_ptys<R: Runtime>(app: AppHandle<R>) {
     let app_state: State<'_, AppStateStore> = app.state();
     let snapshot = app_state.snapshot();
     let active_workspace_id = snapshot.active_workspace_id.0.clone();
@@ -1984,8 +1984,8 @@ pub fn spawn_missing_ptys(app: AppHandle) {
 }
 
 #[tauri::command]
-pub fn create_terminal_session(
-    app: AppHandle,
+pub fn create_terminal_session<R: Runtime>(
+    app: AppHandle<R>,
     app_state: State<'_, AppStateStore>,
 ) -> Result<String, String> {
     let session_id = app_state.create_terminal_session()?;
@@ -1995,8 +1995,8 @@ pub fn create_terminal_session(
 }
 
 #[tauri::command]
-pub fn activate_terminal_session(
-    app: AppHandle,
+pub fn activate_terminal_session<R: Runtime>(
+    app: AppHandle<R>,
     app_state: State<'_, AppStateStore>,
     session_id: String,
 ) -> Result<(), String> {
@@ -2154,8 +2154,8 @@ pub(crate) fn terminate_pty_session(
 }
 
 #[tauri::command]
-pub fn close_terminal_session(
-    app: AppHandle,
+pub fn close_terminal_session<R: Runtime>(
+    app: AppHandle<R>,
     terminal_state: State<'_, PtyState>,
     app_state: State<'_, AppStateStore>,
     session_id: String,
@@ -2239,8 +2239,8 @@ pub(crate) fn terminate_pty_session_keep_channel(
 }
 
 #[tauri::command]
-pub fn restart_terminal_session(
-    app: AppHandle,
+pub fn restart_terminal_session<R: Runtime>(
+    app: AppHandle<R>,
     terminal_state: State<'_, PtyState>,
     session_id: String,
 ) -> Result<(), String> {
@@ -2728,8 +2728,8 @@ pub fn tail_pty_output(raw: &[u8], line_cap: usize) -> (String, usize, usize, bo
 }
 
 #[tauri::command]
-pub fn resize_pty(
-    _app: AppHandle,
+pub fn resize_pty<R: Runtime>(
+    _app: AppHandle<R>,
     terminal_state: State<'_, PtyState>,
     app_state: State<'_, AppStateStore>,
     rows: u16,
@@ -2837,7 +2837,7 @@ pub fn resize_pty(
 /// where an agent was processing — the agent stops but stays alive,
 /// so the PTY exit cleanup never fires.
 #[tauri::command]
-pub fn clear_agent_status(session_id: String, app_state: State<'_, AppStateStore>, app: AppHandle) {
+pub fn clear_agent_status<R: Runtime>(session_id: String, app_state: State<'_, AppStateStore>, app: AppHandle<R>) {
     app_state.clear_transient_pane_status_by_session(&session_id);
     state::emit_app_state(&app);
 }
@@ -2852,8 +2852,8 @@ pub fn clear_agent_status(session_id: String, app_state: State<'_, AppStateStore
 /// `argv` must be non-empty; the first element is the executable and the rest
 /// are arguments.  `extra_env` is a list of `(key, value)` pairs that will be
 /// set on the spawned process on top of the normal Codemux env vars.
-pub fn spawn_pty_for_agent(
-    app: AppHandle,
+pub fn spawn_pty_for_agent<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
     workspace_id: String,
     argv: Vec<String>,
@@ -2963,8 +2963,8 @@ fn daemon_path_viable() -> bool {
 /// In-process PTY spawn — the original behavior. Renamed so the public
 /// `spawn_pty_for_agent` can choose between this and the daemon-backed
 /// path based on settings.
-fn spawn_pty_for_agent_in_process(
-    app: AppHandle,
+fn spawn_pty_for_agent_in_process<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
     workspace_id: String,
     argv: Vec<String>,

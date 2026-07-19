@@ -3704,7 +3704,7 @@ fn collect_browser_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<BrowserI
     }
 }
 
-pub fn emit_app_state(app: &AppHandle) {
+pub fn emit_app_state<R: tauri::Runtime>(app: &AppHandle<R>) {
     let state: State<'_, AppStateStore> = app.state();
     let snapshot = state.snapshot();
     if let Err(error) = app.emit("app-state-changed", &snapshot) {
@@ -3738,15 +3738,23 @@ pub fn emit_app_state(app: &AppHandle) {
 /// window (one frame) and an emit instead of a disk write. Stores
 /// the latest AppHandle clone so the worker can call back into the
 /// Tauri runtime once the timer elapses.
-pub fn schedule_emit_app_state(app: &AppHandle) {
+pub fn schedule_emit_app_state<R: tauri::Runtime>(app: &AppHandle<R>) {
     emit_debouncer().schedule(app);
 }
 
 const EMIT_COALESCE_MS: u64 = 16;
 
+/// The process-wide [`EmitDebouncer`] lives in a `static`, which cannot be
+/// generic over the Tauri runtime `R`. To stay runtime-agnostic we type-erase
+/// the stashed handle into a boxed `emit` closure that captures the concrete
+/// `AppHandle<R>` — a single runtime is live per process, so the closure is
+/// monomorphised at the (generic) `schedule` call site and the static stays
+/// non-generic.
+type PendingEmit = Box<dyn Fn() + Send + 'static>;
+
 struct EmitDebouncer {
     pending: Arc<AtomicBool>,
-    app: Arc<Mutex<Option<AppHandle>>>,
+    app: Arc<Mutex<Option<PendingEmit>>>,
 }
 
 impl EmitDebouncer {
@@ -3760,10 +3768,11 @@ impl EmitDebouncer {
     /// Stash the AppHandle (always overwriting — the latest clone is
     /// what the worker will use) and, if no worker is in flight,
     /// spawn one that sleeps then emits.
-    fn schedule(&self, app: &AppHandle) {
+    fn schedule<R: tauri::Runtime>(&self, app: &AppHandle<R>) {
         {
+            let app = app.clone();
             let mut guard = self.app.lock().unwrap();
-            *guard = Some(app.clone());
+            *guard = Some(Box::new(move || emit_app_state(&app)));
         }
 
         // If a worker is already counting down, nothing more to do.
@@ -3783,14 +3792,14 @@ impl EmitDebouncer {
             // can slip through the pending.swap guard between the
             // flag clear and the emit. Any schedule() arriving AFTER
             // this point spawns a fresh worker for the next window.
-            let app = {
+            let emit = {
                 let mut guard = app_slot.lock().unwrap();
                 pending.store(false, Ordering::Release);
                 guard.take()
             };
 
-            if let Some(app) = app {
-                emit_app_state(&app);
+            if let Some(emit) = emit {
+                emit();
             }
         });
     }

@@ -3,8 +3,8 @@ use crate::state::AppStateStore;
 use std::path::PathBuf;
 use tauri::State;
 
-pub(crate) fn create_browser_pane_impl(
-    app: tauri::AppHandle,
+pub(crate) fn create_browser_pane_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     pane_id: String,
     url: Option<String>,
@@ -34,8 +34,8 @@ pub(crate) fn create_browser_pane_impl(
     Ok(new_pane_id.0)
 }
 
-pub(crate) fn browser_open_url_impl(
-    app: tauri::AppHandle,
+pub(crate) fn browser_open_url_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     browser_id: String,
     url: String,
@@ -46,8 +46,8 @@ pub(crate) fn browser_open_url_impl(
 }
 
 #[tauri::command]
-pub fn create_browser_pane(
-    app: tauri::AppHandle,
+pub fn create_browser_pane<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     pane_id: String,
     url: Option<String>,
@@ -56,8 +56,8 @@ pub fn create_browser_pane(
 }
 
 #[tauri::command]
-pub fn browser_open_url(
-    app: tauri::AppHandle,
+pub fn browser_open_url<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     browser_id: String,
     url: String,
@@ -66,8 +66,8 @@ pub fn browser_open_url(
 }
 
 #[tauri::command]
-pub fn browser_history_back(
-    app: tauri::AppHandle,
+pub fn browser_history_back<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     browser_id: String,
 ) -> Result<(), String> {
@@ -77,8 +77,8 @@ pub fn browser_history_back(
 }
 
 #[tauri::command]
-pub fn browser_history_forward(
-    app: tauri::AppHandle,
+pub fn browser_history_forward<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     browser_id: String,
 ) -> Result<(), String> {
@@ -88,8 +88,8 @@ pub fn browser_history_forward(
 }
 
 #[tauri::command]
-pub fn browser_reload(
-    app: tauri::AppHandle,
+pub fn browser_reload<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     browser_id: String,
 ) -> Result<(), String> {
@@ -99,8 +99,8 @@ pub fn browser_reload(
 }
 
 #[tauri::command]
-pub fn browser_set_loading_state(
-    app: tauri::AppHandle,
+pub fn browser_set_loading_state<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     browser_id: String,
     is_loading: bool,

@@ -232,7 +232,7 @@ pub fn get_feature_flags(
 /// graceful-shutdown hooks (window-close events, plugin teardown)
 /// before the process actually dies.
 #[tauri::command]
-pub fn quit_app(app: tauri::AppHandle) -> Result<(), String> {
+pub fn quit_app<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
     app.exit(0);
     Ok(())
 }
@@ -311,6 +311,7 @@ pub async fn pick_folder_dialog<R: Runtime>(
     app: tauri::AppHandle<R>,
     title: Option<String>,
 ) -> Result<Option<String>, String> {
+    crate::ensure_gui_mode(&app)?;
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
@@ -362,6 +363,7 @@ pub async fn pick_files_dialog<R: Runtime>(
     app: tauri::AppHandle<R>,
     title: Option<String>,
 ) -> Result<Vec<String>, String> {
+    crate::ensure_gui_mode(&app)?;
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
@@ -424,6 +426,7 @@ pub async fn pick_save_file_dialog<R: Runtime>(
     filter_name: Option<String>,
     filter_extensions: Option<Vec<String>>,
 ) -> Result<Option<String>, String> {
+    crate::ensure_gui_mode(&app)?;
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 
@@ -492,6 +495,7 @@ pub async fn pick_open_file_dialog<R: Runtime>(
     filter_name: Option<String>,
     filter_extensions: Option<Vec<String>>,
 ) -> Result<Option<String>, String> {
+    crate::ensure_gui_mode(&app)?;
     use tauri_plugin_dialog::DialogExt;
     use tokio::sync::oneshot;
 

@@ -43,6 +43,28 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Run Codemux headless as a web-remote server — no desktop GUI. Boots the
+    /// full backend, binds the web-remote server, and prints a scannable
+    /// pairing QR + link. Ideal over SSH: expose your desktop's UI to a phone
+    /// or laptop without a display attached. Long-lived: runs until Ctrl-C /
+    /// SIGTERM. Refuses to start if a GUI or another `serve` already holds the
+    /// control endpoint on this machine.
+    Serve {
+        /// Which interfaces to expose the server on: `all` (every interface),
+        /// `tailscale` (tailnet + loopback only), or `loopback` (this machine
+        /// only). Defaults to `all` on first run, or the persisted scope if
+        /// remote access was already configured.
+        #[arg(long, value_parser = ["all", "tailscale", "loopback"])]
+        scope: Option<String>,
+        /// Port to bind. Defaults to the persisted port (4377).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Also enable the from-anywhere iroh relay transport (end-to-end
+        /// encrypted), so a device off your LAN/tailnet can still reach this
+        /// instance.
+        #[arg(long)]
+        relay: bool,
+    },
     /// Print recent lines from the desktop app's log file
     Logs {
         /// Number of lines from the end of the log to print
@@ -88,6 +110,23 @@ pub enum RemoteCommand {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Turn web remote access on (binds the server), optionally selecting which
+    /// interfaces to expose it on and the port. Prints the resulting status and
+    /// the recommended endpoint so you can immediately run `codemux remote pair`.
+    /// Requires the desktop app to be running.
+    Enable {
+        /// Which interfaces to expose the server on: `all` (every interface),
+        /// `tailscale` (tailnet + loopback only), or `loopback` (this machine
+        /// only). Leave unset to keep the current scope.
+        #[arg(long, value_parser = ["all", "tailscale", "loopback"])]
+        scope: Option<String>,
+        /// Port to bind. Leave unset to keep the current port (default 4377).
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Turn web remote access off — unbinds the server and severs every live
+    /// connection immediately. Requires the desktop app to be running.
+    Disable,
 }
 
 #[derive(Subcommand)]
@@ -194,10 +233,48 @@ pub enum IndexCommand {
     },
 }
 
-pub async fn maybe_run_cli() -> Result<bool, String> {
+/// What `main` should do after parsing the CLI. `serve` is special: it is a
+/// long-lived foreground process that must run on the main thread, NOT a
+/// control-socket round-trip, so it is signalled back to `main` instead of
+/// being driven inside `maybe_run_cli`'s async body.
+pub enum CliOutcome {
+    /// The CLI fully handled the command; the process should exit cleanly.
+    Handled,
+    /// No subcommand (or `app`): fall through to launching the desktop GUI.
+    LaunchGui,
+    /// `codemux serve [...]`: run the headless web-remote server on the main
+    /// thread (see `codemux_lib::run_serve`).
+    RunServe(crate::web_remote::serve::ServeOptions),
+}
+
+pub async fn maybe_run_cli() -> Result<CliOutcome, String> {
     let cli = Cli::parse();
+    // `serve` never touches the control socket — hand it back to `main` so it
+    // can run the long-lived server on the main thread outside `block_on`.
+    if let Some(CommandSet::Serve { scope, port, relay }) = &cli.command {
+        return Ok(CliOutcome::RunServe(crate::web_remote::serve::ServeOptions {
+            scope: scope.clone(),
+            port: *port,
+            relay: *relay,
+        }));
+    }
+    match run_control_cli(cli).await? {
+        true => Ok(CliOutcome::Handled),
+        false => Ok(CliOutcome::LaunchGui),
+    }
+}
+
+/// Drive every control-socket / local CLI subcommand. Returns `Ok(true)` when
+/// the command was handled (process should exit) and `Ok(false)` when there is
+/// no subcommand and the GUI should launch. `serve` is intercepted by
+/// [`maybe_run_cli`] before this runs.
+async fn run_control_cli(cli: Cli) -> Result<bool, String> {
     match cli.command {
         None | Some(CommandSet::App) => Ok(false),
+        // Intercepted in `maybe_run_cli`; never reached here.
+        Some(CommandSet::Serve { .. }) => {
+            unreachable!("serve is handled by maybe_run_cli before run_control_cli")
+        }
         Some(CommandSet::Status) => {
             let response = send_control_request(ControlRequest {
                 command: "status".into(),
@@ -634,6 +711,42 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     }
                     print_pairing(&response.data.unwrap_or(json!(null)));
                 }
+                RemoteCommand::Enable { scope, port } => {
+                    let mut params = json!({});
+                    if let Some(ref s) = scope {
+                        params["scope"] = json!(s);
+                    }
+                    if let Some(p) = port {
+                        params["port"] = json!(p);
+                    }
+                    let response = send_control_request(ControlRequest {
+                        command: "web_remote_enable".into(),
+                        params,
+                    })
+                    .await?;
+                    if !response.ok {
+                        // Surface the handler's message (e.g. the tailscale
+                        // "No Tailscale address found" bind error) rather than a
+                        // bare `null`.
+                        return Err(response
+                            .error
+                            .unwrap_or_else(|| "Unknown error from control endpoint".to_string()));
+                    }
+                    print_enable_result(&response.data.unwrap_or(json!(null)));
+                }
+                RemoteCommand::Disable => {
+                    let response = send_control_request(ControlRequest {
+                        command: "web_remote_disable".into(),
+                        params: json!({}),
+                    })
+                    .await?;
+                    if !response.ok {
+                        return Err(response
+                            .error
+                            .unwrap_or_else(|| "Unknown error from control endpoint".to_string()));
+                    }
+                    println!("Web remote access disabled. Every live connection was severed.");
+                }
             }
             Ok(true)
         }
@@ -740,8 +853,14 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
                     "remote": {
                         "description": "Web remote-access operations",
                         "subcommands": {
+                            "enable": { "args": "[--scope all|tailscale|loopback] [--port N]", "description": "Turn web remote access on and print the reachable endpoint (requires the desktop app running)" },
+                            "disable": { "description": "Turn web remote access off, severing every live connection" },
                             "pair": { "args": "[--name <label>]", "description": "Mint a one-time web-remote pairing code + QR (requires remote access enabled)" }
                         }
+                    },
+                    "serve": {
+                        "args": "[--scope all|tailscale|loopback] [--port N] [--relay]",
+                        "description": "Run headless as a web-remote server (no GUI); prints a pairing QR + link and runs until Ctrl-C"
                     },
                     "status": { "description": "Show Codemux app status" },
                     "notify": { "args": "<message>", "description": "Send a notification to the user" },
@@ -768,7 +887,7 @@ pub async fn maybe_run_cli() -> Result<bool, String> {
 /// scannable QR of the pairing URL, then the link, token, endpoint, and
 /// expiry. The QR encodes the same `http://host:port/#pair=<token>` URL the
 /// link shows, so a phone camera can pair without any typing.
-fn print_pairing(data: &Value) {
+pub(crate) fn print_pairing(data: &Value) {
     let url = data["pairing_url"].as_str().unwrap_or_default();
     let token = data["token"].as_str().unwrap_or_default();
     let expires_at = data["expires_at"].as_str().unwrap_or_default();
@@ -797,6 +916,46 @@ fn print_pairing(data: &Value) {
     println!();
     println!("Scan the QR with your phone — or open the link in any browser on a");
     println!("device that can reach this machine — to pair it. One-time use.");
+}
+
+/// Print the outcome of `codemux remote enable`: the port + bind scope the
+/// server is now on, the recommended reachable endpoint, and a nudge toward
+/// `codemux remote pair`. Reads the `ControlEnableResult` JSON the
+/// `web_remote_enable` control command returns.
+fn print_enable_result(data: &Value) {
+    let status = &data["status"];
+    let port = status["port"].as_u64().unwrap_or(0);
+    let scope = status["bind_scope"].as_str().unwrap_or("all");
+    let already_running = data["already_running"].as_bool().unwrap_or(false);
+    let endpoint_url = data["endpoint_url"].as_str().unwrap_or_default();
+    let endpoint_host = data["endpoint_host"].as_str().unwrap_or_default();
+    let endpoint_kind = data["endpoint_kind"].as_str().unwrap_or_default();
+    let endpoint_secure = data["endpoint_secure"].as_bool().unwrap_or(false);
+
+    println!();
+    if already_running {
+        println!("Web remote access is already running.");
+    } else {
+        println!("Web remote access enabled.");
+    }
+    println!("Port:          {port}");
+    let scope_note = match scope {
+        "tailscale" => "tailnet + loopback only",
+        "loopback" => "this machine only",
+        _ => "every interface",
+    };
+    println!("Access scope:  {scope} ({scope_note})");
+    if !endpoint_host.is_empty() {
+        let secure = if endpoint_secure {
+            "secure context"
+        } else {
+            "plain HTTP — not a browser secure context"
+        };
+        println!("Reachable at:  {endpoint_url}");
+        println!("               {endpoint_host} ({endpoint_kind}, {secure})");
+    }
+    println!();
+    println!("Run `codemux remote pair` to mint a pairing code for a phone or laptop.");
 }
 
 /// Render `text` to a compact terminal QR using the pure-Rust `qrcode`
@@ -858,6 +1017,39 @@ mod tests {
             "endpoint_kind": "tailnet",
         });
         print_pairing(&data);
+    }
+
+    #[test]
+    fn print_enable_result_handles_a_full_control_result_without_panicking() {
+        // Mirrors the `ControlEnableResult` JSON the `web_remote_enable` control
+        // command returns, so the CLI's formatter is exercised end-to-end.
+        let data = json!({
+            "status": {
+                "enabled": true,
+                "running": true,
+                "port": 4377,
+                "require_approval": false,
+                "bind_scope": "tailscale",
+                "active_connections": 0,
+                "connected_sessions": 0,
+                "sessions": [],
+                "update_available": false,
+                "update_version": null,
+                "account_mode_enabled": false,
+                "trust_account_browsers": false,
+                "account_signed_in": false,
+                "relay_mode_enabled": false,
+                "iroh_node_id": null,
+                "device_registered": false,
+                "device_id": null,
+            },
+            "endpoint_url": "http://100.101.102.103:4377",
+            "endpoint_host": "100.101.102.103",
+            "endpoint_kind": "tailnet",
+            "endpoint_secure": false,
+            "already_running": false,
+        });
+        print_enable_result(&data);
     }
 }
 

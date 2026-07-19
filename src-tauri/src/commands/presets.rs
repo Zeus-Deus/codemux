@@ -58,8 +58,8 @@ pub(crate) fn list_presets_with_availability(
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn create_preset(
-    app: tauri::AppHandle,
+pub fn create_preset<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     name: String,
@@ -104,8 +104,8 @@ pub fn create_preset(
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-pub fn update_preset(
-    app: tauri::AppHandle,
+pub fn update_preset<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     id: String,
@@ -175,8 +175,8 @@ pub fn update_preset(
 }
 
 #[tauri::command]
-pub fn delete_preset(
-    app: tauri::AppHandle,
+pub fn delete_preset<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     id: String,
@@ -207,8 +207,8 @@ pub fn delete_preset(
 }
 
 #[tauri::command]
-pub fn set_preset_pinned(
-    app: tauri::AppHandle,
+pub fn set_preset_pinned<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     id: String,
@@ -238,8 +238,8 @@ pub fn set_preset_pinned(
 /// directly. Either way the server's job is the same: splice the
 /// preset to its new position and persist.
 #[tauri::command]
-pub fn reorder_presets(
-    app: tauri::AppHandle,
+pub fn reorder_presets<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     preset_id: String,
@@ -275,8 +275,8 @@ pub fn reorder_presets(
 }
 
 #[tauri::command]
-pub fn set_preset_bar_visible(
-    app: tauri::AppHandle,
+pub fn set_preset_bar_visible<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     presets: State<'_, PresetStoreState>,
     visible: bool,
@@ -291,8 +291,8 @@ pub fn set_preset_bar_visible(
 }
 
 #[tauri::command]
-pub fn apply_preset(
-    app: tauri::AppHandle,
+pub fn apply_preset<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     pty_state: State<'_, PtyState>,
     presets: State<'_, PresetStoreState>,

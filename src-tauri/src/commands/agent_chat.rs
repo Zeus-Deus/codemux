@@ -318,8 +318,8 @@ async fn lookup_provider(
 /// paths, where the chat IS the workspace and a fresh tab/surface is
 /// created automatically when surfaces are empty.
 #[tauri::command]
-pub fn agent_chat_create_pane(
-    app: AppHandle,
+pub fn agent_chat_create_pane<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppStateStore>,
     observability: State<'_, ObservabilityStore>,
     workspace_id: String,
@@ -340,8 +340,8 @@ pub fn agent_chat_create_pane(
 /// match the frontend's "closing an already-closed pane is fine"
 /// expectation; the feature-flag gate still applies.
 #[tauri::command]
-pub fn agent_chat_close_pane(
-    app: AppHandle,
+pub fn agent_chat_close_pane<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppStateStore>,
     observability: State<'_, ObservabilityStore>,
     pane_id: String,
@@ -390,8 +390,8 @@ pub fn agent_chat_close_pane(
 /// id to stderr so it's easy to read back from the browser
 /// devtools while smoke-testing.
 #[tauri::command]
-pub fn dev_agent_chat_spawn_test_pane(
-    app: AppHandle,
+pub fn dev_agent_chat_spawn_test_pane<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, AppStateStore>,
     observability: State<'_, ObservabilityStore>,
 ) -> Result<String, String> {
@@ -489,8 +489,8 @@ fn workspace_env_overlay(
 /// `agent_chat_sessions` row so the history dropdown can surface
 /// the session after a restart.
 #[tauri::command]
-pub async fn agent_chat_start_session(
-    app: AppHandle,
+pub async fn agent_chat_start_session<R: Runtime>(
+    app: AppHandle<R>,
     pane_id: String,
     provider: ProviderKind,
     mut input: StartSessionInput,
@@ -821,8 +821,8 @@ pub fn restore_run_checkpoint_blocking(
 /// `tauri::async_runtime::spawn` returns immediately and the git work
 /// happens on the blocking pool. Failures are logged, never surfaced:
 /// a checkpoint must not break (or slow) the chat it protects.
-fn spawn_run_checkpoint(
-    app: &AppHandle,
+fn spawn_run_checkpoint<R: Runtime>(
+    app: &AppHandle<R>,
     thread_id: String,
     workspace_id: String,
     cwd: String,
@@ -902,8 +902,8 @@ pub async fn agent_chat_get_checkpoint(
 /// Roll the workspace back to the checkpoint taken when this run
 /// started. Mutates the working tree — the UI confirms first.
 #[tauri::command]
-pub async fn agent_chat_restore_checkpoint(
-    app: AppHandle,
+pub async fn agent_chat_restore_checkpoint<R: Runtime>(
+    app: AppHandle<R>,
     thread_id: String,
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
@@ -1243,8 +1243,8 @@ pub struct SendTurnCommandInput {
 /// [`forward_event`]'s `QueuedTurnDispatched` handling) so chat history
 /// reflects real turn order.
 #[tauri::command]
-pub async fn agent_chat_send_turn(
-    app: AppHandle,
+pub async fn agent_chat_send_turn<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     input: SendTurnCommandInput,
 ) -> Result<crate::agent_provider::TurnStartResult, String> {
@@ -1348,8 +1348,8 @@ pub async fn agent_chat_send_turn(
 /// provider emits a `QueuedTurnCancelled` event so the UI removes the
 /// greyed bubble.
 #[tauri::command]
-pub async fn agent_chat_cancel_queued_turn(
-    app: AppHandle,
+pub async fn agent_chat_cancel_queued_turn<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
     queued_id: String,
@@ -1375,8 +1375,8 @@ pub async fn agent_chat_cancel_queued_turn(
 /// event (handled in [`forward_event`]) promotes the bubble and writes the
 /// deferred user-message envelope, attaching any `pending_queued_images`.
 #[tauri::command]
-pub async fn agent_chat_send_queued_turn_now(
-    app: AppHandle,
+pub async fn agent_chat_send_queued_turn_now<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
     queued_id: String,
@@ -1752,8 +1752,8 @@ struct StageChatImageJsonBody {
 /// `tokio::fs`; the returned absolute path is what the next
 /// `agent_chat_send_turn` references.
 #[tauri::command]
-pub async fn agent_chat_stage_image(
-    app: AppHandle,
+pub async fn agent_chat_stage_image<R: Runtime>(
+    app: AppHandle<R>,
     request: Request<'_>,
 ) -> Result<StagedChatImage, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
@@ -1863,8 +1863,8 @@ pub async fn sweep_stale_staged_images() {
 /// staging dir (security) so this can never be turned into an arbitrary
 /// file delete.
 #[tauri::command]
-pub async fn agent_chat_discard_staged_image(
-    app: AppHandle,
+pub async fn agent_chat_discard_staged_image<R: Runtime>(
+    app: AppHandle<R>,
     path: String,
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
@@ -1892,8 +1892,8 @@ pub async fn agent_chat_discard_staged_image(
 /// anything else is rejected. `tokio::fs::read`, media type inferred from
 /// the extension.
 #[tauri::command]
-pub async fn agent_chat_read_image(
-    app: AppHandle,
+pub async fn agent_chat_read_image<R: Runtime>(
+    app: AppHandle<R>,
     path: String,
 ) -> Result<ChatImageBytes, String> {
     let observability: State<'_, ObservabilityStore> = app.state();
@@ -1918,7 +1918,7 @@ pub async fn agent_chat_read_image(
 /// the registry's `prime_lock` serializes the two so they can't double-spawn
 /// (see [`crate::mcp::registry::McpRegistry`]).
 #[tauri::command]
-pub async fn agent_chat_prime_mcp(app: AppHandle) -> Result<(), String> {
+pub async fn agent_chat_prime_mcp<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
     // Prime against the active workspace's root when there is one so
@@ -2027,8 +2027,8 @@ fn first_line_title(text: &str) -> Option<String> {
 /// Interrupt deliberately does NOT auto-resume — restarting a session
 /// just to immediately interrupt it would be pointless.
 #[tauri::command]
-pub async fn agent_chat_interrupt_turn(
-    app: AppHandle,
+pub async fn agent_chat_interrupt_turn<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
     turn_id: Option<TurnId>,
@@ -2054,8 +2054,8 @@ pub async fn agent_chat_interrupt_turn(
 /// live session (e.g. after a restart) is correctly `false`. The frontend
 /// treats any error as `false`, so gating/lookup failures degrade safely.
 #[tauri::command]
-pub async fn agent_chat_turn_active(
-    app: AppHandle,
+pub async fn agent_chat_turn_active<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
 ) -> Result<bool, String> {
@@ -2068,8 +2068,8 @@ pub async fn agent_chat_turn_active(
 
 /// Respond to a pending approval / tool / input request.
 #[tauri::command]
-pub async fn agent_chat_respond_to_request(
-    app: AppHandle,
+pub async fn agent_chat_respond_to_request<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
     request_id: RequestId,
@@ -2100,8 +2100,8 @@ pub async fn agent_chat_respond_to_request(
 /// apply is swallowed into `Ok` — the value already took effect for the
 /// next resume.
 #[tauri::command]
-pub async fn agent_chat_set_model(
-    app: AppHandle,
+pub async fn agent_chat_set_model<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
     model: Option<String>,
@@ -2143,8 +2143,8 @@ pub async fn agent_chat_set_model(
 /// Non-`SessionNotFound` errors (e.g. a provider that rejects
 /// mid-session permission changes) still surface.
 #[tauri::command]
-pub async fn agent_chat_set_permission_mode(
-    app: AppHandle,
+pub async fn agent_chat_set_permission_mode<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
     mode: String,
@@ -2202,8 +2202,8 @@ pub async fn agent_chat_set_permission_mode(
 /// etc.) remains gated — the gate moved off "data discovery" and onto
 /// "actually using the chat", which is the correct level.
 #[tauri::command]
-pub async fn list_chat_provider_capabilities(
-    app: AppHandle,
+pub async fn list_chat_provider_capabilities<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     opencode_manager: tauri::State<
         '_,
@@ -2302,8 +2302,8 @@ pub async fn list_chat_slash_commands(
 
 /// Gracefully terminate a session. Idempotent on the provider side.
 #[tauri::command]
-pub async fn agent_chat_stop_session(
-    app: AppHandle,
+pub async fn agent_chat_stop_session<R: Runtime>(
+    app: AppHandle<R>,
     provider: ProviderKind,
     thread_id: ThreadId,
 ) -> Result<(), String> {
@@ -2325,8 +2325,8 @@ pub async fn agent_chat_stop_session(
 /// Skips the feature-flag gate intentionally: the gate guards new session
 /// creation, but already-running sessions must be reaped regardless of
 /// whether the flag has since been flipped off.
-pub fn shutdown_agent_chat_threads(
-    app: &AppHandle,
+pub fn shutdown_agent_chat_threads<R: Runtime>(
+    app: &AppHandle<R>,
     threads: Vec<(ProviderKind, String)>,
 ) {
     if threads.is_empty() {

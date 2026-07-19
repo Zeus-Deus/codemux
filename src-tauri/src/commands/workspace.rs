@@ -123,8 +123,8 @@ pub(crate) async fn populate_git_info_async(
 /// whichever thread drives the caller (the GTK main thread for the Tauri
 /// command, a Tokio worker for the control socket). Both callers are
 /// already async, so the `.await` plumbs straight through.
-pub(crate) async fn create_workspace_impl(
-    app: tauri::AppHandle,
+pub(crate) async fn create_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     cwd: Option<String>,
@@ -162,8 +162,8 @@ pub(crate) async fn create_workspace_impl(
     Ok(workspace_id.0)
 }
 
-pub(crate) fn split_pane_impl(
-    app: tauri::AppHandle,
+pub(crate) fn split_pane_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     pane_id: String,
     direction: String,
@@ -215,8 +215,8 @@ pub fn regenerate_mcp_config(
 // sync handler would block every other IPC call (and the UI) while they run.
 // Same pattern as `commands/git.rs` — see the note at the top of that file.
 #[tauri::command]
-pub async fn create_workspace(
-    app: tauri::AppHandle,
+pub async fn create_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     cwd: Option<String>,
@@ -242,8 +242,8 @@ pub struct WorkspaceCreated {
 // `async fn` so the git-info subprocesses run on the blocking pool instead
 // of the GTK main thread (same rationale as `create_workspace` above).
 #[tauri::command]
-pub async fn create_empty_workspace(
-    app: tauri::AppHandle,
+pub async fn create_empty_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     cwd: String,
@@ -294,8 +294,8 @@ pub async fn create_empty_workspace(
 /// `async fn` so the git-info subprocesses run on the blocking pool
 /// instead of the GTK main thread (same rationale as `create_workspace`).
 #[tauri::command]
-pub async fn get_or_create_home_workspace(
-    app: tauri::AppHandle,
+pub async fn get_or_create_home_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
 ) -> Result<String, String> {
     if let Some(existing) = state.find_home_workspace_id() {
@@ -320,8 +320,8 @@ pub async fn get_or_create_home_workspace(
 }
 
 #[tauri::command]
-pub fn create_openflow_workspace(
-    app: tauri::AppHandle,
+pub fn create_openflow_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     title: String,
     goal: String,
@@ -338,8 +338,8 @@ pub fn create_openflow_workspace(
 // `async fn` so the git-info subprocesses run on the blocking pool instead
 // of the GTK main thread (same rationale as `create_workspace` above).
 #[tauri::command]
-pub async fn create_workspace_with_preset(
-    app: tauri::AppHandle,
+pub async fn create_workspace_with_preset<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     cwd: Option<String>,
@@ -392,8 +392,8 @@ pub async fn create_workspace_with_preset(
 // `populate_git_info` shells out to 5-8 more git subprocesses for the new
 // workspace. With a sync handler all of that blocks every other IPC call.
 #[tauri::command]
-pub async fn create_worktree_workspace(
-    app: tauri::AppHandle,
+pub async fn create_worktree_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
@@ -441,8 +441,8 @@ pub async fn create_worktree_workspace(
 /// `.mcp.json` autoconfig, and the preset-launch-with-prompt-injection
 /// branch as one atomic operation.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn create_worktree_workspace_impl(
-    app: tauri::AppHandle,
+pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     pty_state: &crate::terminal::PtyState,
@@ -631,8 +631,8 @@ pub(crate) async fn create_worktree_workspace_impl(
 // blocking pool. The function itself adopts an already-on-disk worktree
 // (state ops are cheap), so the git-info gather is the only slow step.
 #[tauri::command]
-pub async fn import_worktree_workspace(
-    app: tauri::AppHandle,
+pub async fn import_worktree_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     worktree_path: String,
@@ -652,8 +652,8 @@ pub async fn import_worktree_workspace(
 /// than routing through `create_worktree_workspace_impl`, whose
 /// `git worktree add` at the conventional path would fail with "<branch>
 /// is already used by worktree at <that path>".
-pub(crate) async fn import_worktree_workspace_impl(
-    app: tauri::AppHandle,
+pub(crate) async fn import_worktree_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     worktree_path: String,
@@ -712,8 +712,8 @@ pub(crate) async fn import_worktree_workspace_impl(
 // process. Same pattern as `commands/git.rs` — see the note at the top of that
 // file.
 #[tauri::command]
-pub async fn close_workspace_with_worktree(
-    app: tauri::AppHandle,
+pub async fn close_workspace_with_worktree<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
@@ -759,7 +759,7 @@ pub async fn close_workspace_with_worktree(
 /// (the two close commands here, OpenFlow run teardown, and the
 /// workspaces-sync reconcile/rollback paths) shares the one
 /// implementation instead of drifting.
-pub(crate) fn reap_agent_browser_sessions(app: &tauri::AppHandle, names: Vec<String>) {
+pub(crate) fn reap_agent_browser_sessions<R: tauri::Runtime>(app: &tauri::AppHandle<R>, names: Vec<String>) {
     if names.is_empty() {
         return;
     }
@@ -797,8 +797,8 @@ pub(crate) fn reap_agent_browser_sessions(app: &tauri::AppHandle, names: Vec<Str
 /// no-op and the function reduces to the same operation as
 /// `close_workspace`. Keeping a single impl avoids the brain needing
 /// two MCP tools for "close" depending on workspace type.
-pub(crate) async fn close_workspace_with_worktree_impl(
-    app: tauri::AppHandle,
+pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: String,
@@ -1124,8 +1124,8 @@ pub(crate) fn archive_refusal_reason(
 /// is built BEFORE the close (the workspace is gone from state after)
 /// but added only AFTER the close succeeded, so a failed teardown never
 /// produces a phantom archive entry.
-pub(crate) async fn archive_workspace_impl(
-    app: tauri::AppHandle,
+pub(crate) async fn archive_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: String,
@@ -1168,8 +1168,8 @@ pub(crate) async fn archive_workspace_impl(
 ///
 /// The archive entry is only removed after the restore succeeded — any
 /// error path keeps it so the user can retry (or delete it explicitly).
-pub(crate) async fn unarchive_workspace_impl(
-    app: tauri::AppHandle,
+pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     pty_state: &crate::terminal::PtyState,
@@ -1335,8 +1335,8 @@ pub(crate) async fn unarchive_workspace_impl(
 /// force flag — force_delete=false keeps `git_remove_worktree`'s
 /// dirty/unpushed guard live, and its error keeps the entry so nothing
 /// is lost silently.
-pub(crate) async fn delete_archived_workspace_impl(
-    app: tauri::AppHandle,
+pub(crate) async fn delete_archived_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     archive_id: String,
     delete_worktree: bool,
@@ -1384,8 +1384,8 @@ pub(crate) async fn delete_archived_workspace_impl(
 // `async fn` so the close path's teardown scripts and git subprocesses
 // run off the GTK main thread — same rationale as `close_workspace`.
 #[tauri::command]
-pub async fn archive_workspace(
-    app: tauri::AppHandle,
+pub async fn archive_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
@@ -1396,8 +1396,8 @@ pub async fn archive_workspace(
 // `async fn` for the same reason as `create_worktree_workspace`: the
 // restore path can run `git worktree add` + the git-info gather.
 #[tauri::command]
-pub async fn unarchive_workspace(
-    app: tauri::AppHandle,
+pub async fn unarchive_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
@@ -1410,8 +1410,8 @@ pub async fn unarchive_workspace(
 // `async fn` because deleting a worktree is a recursive filesystem
 // delete — same rationale as `close_workspace_with_worktree`.
 #[tauri::command]
-pub async fn delete_archived_workspace(
-    app: tauri::AppHandle,
+pub async fn delete_archived_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     archive_id: String,
     delete_worktree: bool,
@@ -1430,8 +1430,8 @@ pub async fn delete_archived_workspace(
 }
 
 #[tauri::command]
-pub fn activate_workspace(
-    app: tauri::AppHandle,
+pub fn activate_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
@@ -1450,8 +1450,8 @@ pub fn activate_workspace(
 /// to push the new snapshot to any open UI, and the
 /// `db.set_ui_state("active_workspace", …)` write that restores the
 /// active workspace on next launch.
-pub(crate) fn activate_workspace_impl(
-    app: tauri::AppHandle,
+pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: String,
@@ -1528,8 +1528,8 @@ pub(crate) fn activate_workspace_impl(
 }
 
 #[tauri::command]
-pub fn rename_workspace(
-    app: tauri::AppHandle,
+pub fn rename_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     title: String,
@@ -1546,8 +1546,8 @@ pub fn rename_workspace(
 /// Suppresses only the OS popup — status pills (working spinner, review and
 /// permission dots) keep updating regardless.
 #[tauri::command]
-pub fn set_workspace_muted(
-    app: tauri::AppHandle,
+pub fn set_workspace_muted<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     muted: bool,
@@ -1561,8 +1561,8 @@ pub fn set_workspace_muted(
 }
 
 #[tauri::command]
-pub fn update_workspace_cwd(
-    app: tauri::AppHandle,
+pub fn update_workspace_cwd<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     cwd: String,
@@ -1581,8 +1581,8 @@ pub fn update_workspace_cwd(
 // and we'd rather not freeze the UI while one runs. Mirrors the fix in
 // `close_workspace_with_worktree`.
 #[tauri::command]
-pub async fn close_workspace(
-    app: tauri::AppHandle,
+pub async fn close_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
@@ -1713,8 +1713,8 @@ pub async fn close_workspace(
 }
 
 #[tauri::command]
-pub fn cycle_workspace(
-    app: tauri::AppHandle,
+pub fn cycle_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     step: isize,
 ) -> Result<String, String> {
@@ -1733,8 +1733,8 @@ pub fn cycle_workspace(
 }
 
 #[tauri::command]
-pub fn split_pane(
-    app: tauri::AppHandle,
+pub fn split_pane<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     pane_id: String,
     direction: String,
@@ -1743,8 +1743,8 @@ pub fn split_pane(
 }
 
 #[tauri::command]
-pub fn activate_pane(
-    app: tauri::AppHandle,
+pub fn activate_pane<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     pane_id: String,
 ) -> Result<(), String> {
@@ -1757,8 +1757,8 @@ pub fn activate_pane(
 }
 
 #[tauri::command]
-pub fn cycle_pane(
-    app: tauri::AppHandle,
+pub fn cycle_pane<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     step: isize,
 ) -> Result<String, String> {
@@ -1775,8 +1775,8 @@ pub fn cycle_pane(
 }
 
 #[tauri::command]
-pub fn close_pane(
-    app: tauri::AppHandle,
+pub fn close_pane<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     pane_id: String,
 ) -> Result<Option<String>, String> {
@@ -1794,8 +1794,8 @@ pub fn close_pane(
 /// cleared (or moved to the first remaining tab). No "auto-close the
 /// workspace when the last pane is gone" rule — the workspace persists
 /// empty until the brain (or user) explicitly closes it.
-pub(crate) fn close_pane_impl(
-    app: tauri::AppHandle,
+pub(crate) fn close_pane_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: &AppStateStore,
     pane_id: String,
 ) -> Result<Option<String>, String> {
@@ -1822,8 +1822,8 @@ pub(crate) fn close_pane_impl(
 }
 
 #[tauri::command]
-pub fn swap_panes(
-    app: tauri::AppHandle,
+pub fn swap_panes<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     source_pane_id: String,
     target_pane_id: String,
@@ -1834,8 +1834,8 @@ pub fn swap_panes(
 }
 
 #[tauri::command]
-pub fn resize_split(
-    app: tauri::AppHandle,
+pub fn resize_split<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     pane_id: String,
     child_sizes: Vec<f32>,
@@ -1846,8 +1846,8 @@ pub fn resize_split(
 }
 
 #[tauri::command]
-pub fn resize_active_pane(
-    app: tauri::AppHandle,
+pub fn resize_active_pane<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     delta: f32,
 ) -> Result<(), String> {
@@ -1857,8 +1857,8 @@ pub fn resize_active_pane(
 }
 
 #[tauri::command]
-pub fn notify_attention(
-    app: tauri::AppHandle,
+pub fn notify_attention<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     message: String,
     session_id: Option<String>,
@@ -1910,8 +1910,8 @@ pub fn notify_attention(
 }
 
 #[tauri::command]
-pub fn set_notification_sound_enabled(
-    app: tauri::AppHandle,
+pub fn set_notification_sound_enabled<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     enabled: bool,
 ) -> Result<(), String> {
@@ -1921,8 +1921,8 @@ pub fn set_notification_sound_enabled(
 }
 
 #[tauri::command]
-pub fn set_ai_commit_message_enabled(
-    app: tauri::AppHandle,
+pub fn set_ai_commit_message_enabled<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     enabled: bool,
 ) -> Result<(), String> {
@@ -1932,8 +1932,8 @@ pub fn set_ai_commit_message_enabled(
 }
 
 #[tauri::command]
-pub fn set_ai_commit_message_cli(
-    app: tauri::AppHandle,
+pub fn set_ai_commit_message_cli<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     cli: Option<String>,
 ) -> Result<(), String> {
@@ -1943,8 +1943,8 @@ pub fn set_ai_commit_message_cli(
 }
 
 #[tauri::command]
-pub fn set_ai_commit_message_model(
-    app: tauri::AppHandle,
+pub fn set_ai_commit_message_model<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     model: Option<String>,
 ) -> Result<(), String> {
@@ -1954,8 +1954,8 @@ pub fn set_ai_commit_message_model(
 }
 
 #[tauri::command]
-pub fn set_ai_resolver_enabled(
-    app: tauri::AppHandle,
+pub fn set_ai_resolver_enabled<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     enabled: bool,
 ) -> Result<(), String> {
@@ -1965,8 +1965,8 @@ pub fn set_ai_resolver_enabled(
 }
 
 #[tauri::command]
-pub fn set_ai_resolver_cli(
-    app: tauri::AppHandle,
+pub fn set_ai_resolver_cli<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     cli: Option<String>,
 ) -> Result<(), String> {
@@ -1976,8 +1976,8 @@ pub fn set_ai_resolver_cli(
 }
 
 #[tauri::command]
-pub fn set_ai_resolver_model(
-    app: tauri::AppHandle,
+pub fn set_ai_resolver_model<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     model: Option<String>,
 ) -> Result<(), String> {
@@ -1987,8 +1987,8 @@ pub fn set_ai_resolver_model(
 }
 
 #[tauri::command]
-pub fn set_ai_resolver_strategy(
-    app: tauri::AppHandle,
+pub fn set_ai_resolver_strategy<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     strategy: String,
 ) -> Result<(), String> {
@@ -1998,8 +1998,8 @@ pub fn set_ai_resolver_strategy(
 }
 
 #[tauri::command]
-pub fn create_tab(
-    app: tauri::AppHandle,
+pub fn create_tab<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     kind: String,
@@ -2023,8 +2023,8 @@ pub fn create_tab(
 }
 
 #[tauri::command]
-pub fn close_tab(
-    app: tauri::AppHandle,
+pub fn close_tab<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     tab_id: String,
@@ -2054,8 +2054,8 @@ pub fn close_tab(
 }
 
 #[tauri::command]
-pub fn activate_tab(
-    app: tauri::AppHandle,
+pub fn activate_tab<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     tab_id: String,
@@ -2066,8 +2066,8 @@ pub fn activate_tab(
 }
 
 #[tauri::command]
-pub fn rename_tab(
-    app: tauri::AppHandle,
+pub fn rename_tab<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     tab_id: String,
@@ -2082,8 +2082,8 @@ pub fn rename_tab(
 // blocking pool instead of the GTK main thread. Same pattern as
 // `commands/git.rs` — see the note at the top of that file.
 #[tauri::command]
-pub async fn refresh_workspace_git_info(
-    app: tauri::AppHandle,
+pub async fn refresh_workspace_git_info<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
 ) -> Result<(), String> {
@@ -2111,8 +2111,8 @@ pub async fn refresh_workspace_git_info(
 /// `async fn` so neither the checkout itself (which can be slow on large
 /// repos) nor the follow-up git-info gather runs on the GTK main thread.
 #[tauri::command]
-pub async fn checkout_default_branch_in_workspace(
-    app: tauri::AppHandle,
+pub async fn checkout_default_branch_in_workspace<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
 ) -> Result<String, String> {
@@ -2305,8 +2305,8 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
 
 /// Spawn setup scripts in a background thread so workspace creation isn't blocked.
 /// Runs the full pipeline: .codemuxinclude file copy + setup commands.
-fn spawn_setup_scripts(
-    app: &tauri::AppHandle,
+fn spawn_setup_scripts<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &AppStateStore,
     db: &crate::database::DatabaseStore,
     workspace_id: &str,
@@ -2385,8 +2385,8 @@ pub fn has_codemuxinclude(path: String) -> bool {
 }
 
 #[tauri::command]
-pub fn run_workspace_setup(
-    app: tauri::AppHandle,
+pub fn run_workspace_setup<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     workspace_id: String,
@@ -2408,8 +2408,8 @@ pub fn run_workspace_setup(
 }
 
 #[tauri::command]
-pub fn run_project_dev_command(
-    app: tauri::AppHandle,
+pub fn run_project_dev_command<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     db: State<'_, crate::database::DatabaseStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
@@ -2527,8 +2527,8 @@ pub fn run_project_dev_command(
 }
 
 #[tauri::command]
-pub fn reorder_workspaces(
-    app: tauri::AppHandle,
+pub fn reorder_workspaces<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_ids: Vec<String>,
 ) -> Result<(), String> {
@@ -2541,8 +2541,8 @@ pub fn reorder_workspaces(
 }
 
 #[tauri::command]
-pub fn reorder_tabs(
-    app: tauri::AppHandle,
+pub fn reorder_tabs<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     workspace_id: String,
     tab_ids: Vec<String>,
