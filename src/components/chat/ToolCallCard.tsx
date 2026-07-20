@@ -20,6 +20,7 @@ import {
   buildPermissionUpdate,
   type PermissionScope,
 } from "@/lib/agent-chat/permission-rules";
+import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import type {
@@ -81,7 +82,11 @@ export const ToolCallCard = memo(function ToolCallCard({
     item.tool_name === "Edit" ||
     item.tool_name === "MultiEdit" ||
     item.tool_name === "Write";
-  const defaultExpanded = isPendingApproval || isError || isDiffTool;
+  // A result carrying an image (e.g. a screenshot) is a visual payload
+  // meant to be seen — expand it inline like a diff rather than hiding
+  // it behind a chevron.
+  const hasImages = hasToolResultImages(item.result_content);
+  const defaultExpanded = isPendingApproval || isError || isDiffTool || hasImages;
   const [expanded, setExpanded] = useState(defaultExpanded);
 
   const Icon = toolIcon(item.tool_name);

@@ -176,6 +176,32 @@ The chat pane stack:
     (`agent_chat_read_image`, path validated inside the chat-image
     root) and renders a cached blob URL before surfacing the
     placeholder.
+  - **Agent-produced images render inline (not just user attachments).**
+    When a tool result carries an image — a screenshot from `Read` on a
+    PNG, or any browser/screenshot tool — the block is already forwarded
+    to the client verbatim (tool-result `content` is opaque JSON on the
+    Rust side, so nothing drops it). The renderers just never turned it
+    into an `<img>`: every tool body funnels `result_content` through a
+    `contentToString` helper whose only special case was `{text}`, so an
+    image block was `JSON.stringify`-ed into a base64 text dump. Fix is
+    frontend-only: `extractToolResultImages`
+    (`src/lib/agent-chat/tool-result-images.ts`) normalises the two wire
+    shapes — the Anthropic `{type:"image", source:{type:"base64",
+    media_type, data}}` block and the `{type:"image", source:{type:"url",
+    …}}` / OpenAI `{type:"image_url", …}` variants — into a renderable
+    `data:`/http `src` (rejecting non-image media types like PDFs and
+    unsafe URL schemes). `ToolCallBody` (`ToolCallBodies.tsx`) renders
+    those below the per-tool body as a thumbnail row + click-to-open
+    lightbox (`ToolResultImages.tsx`, mirroring the `UserMessage`
+    attachment lightbox), and both `contentToString` copies now filter
+    image blocks out (`isImageBlock`) so the same payload never
+    double-renders as base64 text. `ToolCallCard` auto-expands a result
+    that carries an image (`hasToolResultImages`) so a screenshot is
+    visible without a manual expand. Standalone assistant-authored image
+    blocks (not wrapped in a tool result) are still unsupported — they
+    would need a new backend `CompletedItem` variant. The dev mock seeds
+    an image `Read` tool result in the demo transcript
+    (`richChatTurnEnvelopes`).
 - **Slash command popup** with cross-provider parsing. Five groups:
   - **MODES** — `/plan`, `/ask`, `/debug` (state-only mode-pill
     activation, typed text stripped) plus `/default` (returns to

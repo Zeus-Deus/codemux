@@ -960,6 +960,14 @@ export function mockListDirectory(
  * TodoWrite with a todos array). Consumed by tauri-mock's
  * `mockChatTranscript`; shapes mirror `ProviderRuntimeEvent`.
  */
+/**
+ * A tiny banded PNG (base64) used as a demo "screenshot" so the mock
+ * transcript exercises the agent → user image render path (a `Read` on a
+ * PNG returns an Anthropic image block).
+ */
+const DEMO_SCREENSHOT_PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAMgAAAB4CAYAAAC3kr3rAAABJUlEQVR42u3ToRGAQAwAwS8LQRFoinidctBUEk1DoYHoqBXbwM3cOiIL6C0RwCBgEDAIGAQMAgYBg4BBwCCAQcAgYBAwCBgEDAIGAYOAQcAgQoBBwCBgEBgb5HqjgJ5BwCBgEDAIGAQMAgYBg4BBwCCAQcAgYBAwCBgEDAIGAYOAQcAgIoBBwCBgEJgb5HvOAnoGAYOAQcAgYBAwCBgEDAIGAYMABgGDgEHAIGAQMAgYBAwCBgGDiAAGAYOAQWBukLx3AT2DgEHAIGAQMAgYBAwCBgGDgEEAg4BBwCBgEDAIGAQMAgYBg4BBRACDgEHAIDA3SOwsoGcQMAgYBAwCBgGDgEHAIGAQMAhgEDAIGAQMAgYBg4BBwCBgEDCICGAQMAgYBMb8mqVc0Zmz1dEAAAAASUVORK5CYII=";
+
 export function richChatTurnEnvelopes(
   threadId: string,
   turnId: string,
@@ -979,6 +987,33 @@ export function richChatTurnEnvelopes(
       evt({
         type: "item_completed",
         item: { kind: "tool_result", tool_use_id: id, content: `// ${file}\n`, is_error: false },
+      }),
+    ];
+  };
+  const readScreenshot = (n: number, file: string): unknown[] => {
+    const id = `${turnId}-read-${n}`;
+    return [
+      evt({
+        type: "item_completed",
+        item: { kind: "tool_use", tool_name: "Read", tool_use_id: id, input: { file_path: file } },
+      }),
+      evt({
+        type: "item_completed",
+        item: {
+          kind: "tool_result",
+          tool_use_id: id,
+          content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: DEMO_SCREENSHOT_PNG_B64,
+              },
+            },
+          ],
+          is_error: false,
+        },
       }),
     ];
   };
@@ -1044,6 +1079,18 @@ export function richChatTurnEnvelopes(
       type: "item_completed",
       item: { kind: "tool_result", tool_use_id: todoId, content: "Todos updated", is_error: false },
     }),
+    // Image tool result: `Read` on a PNG returns an Anthropic image block
+    // (the shape a screenshot arrives as). Stands alone so it renders as
+    // its own auto-expanded tool card — an inline thumbnail + click-to-open
+    // lightbox, not a base64 text dump.
+    evt({
+      type: "item_completed",
+      item: {
+        kind: "assistant_text",
+        text: "Here's the dashboard before the fix — captured for the PR description:",
+      },
+    }),
+    ...readScreenshot(3, "docs/plans/assets/dashboard-before.png"),
     evt({
       type: "item_completed",
       item: {
