@@ -519,16 +519,17 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // `healed_permission_mode`) so BOTH session-minting entry points are immune
     // to a null-passing caller. OpenCode has no permission modes, so its
     // fallback is `None` and this is a no-op there.
-    if input.permission_mode.is_none() {
-        let healed = resolve_start_permission_mode(provider, input.permission_mode.take());
-        if let Some(mode) = healed.as_ref() {
-            eprintln!(
-                "[codemux::agent_chat] healing NULL permission_mode at start pane={pane_id} \
-                 provider={provider:?} -> {mode}"
-            );
-        }
-        input.permission_mode = healed;
+    let requested_permission_mode = input.permission_mode.take();
+    let resolved_permission_mode =
+        resolve_start_permission_mode(provider, requested_permission_mode.clone());
+    if resolved_permission_mode != requested_permission_mode {
+        eprintln!(
+            "[codemux::agent_chat] healing permission_mode at start pane={pane_id} \
+             provider={provider:?} requested={requested_permission_mode:?} \
+             resolved={resolved_permission_mode:?}"
+        );
     }
+    input.permission_mode = resolved_permission_mode;
     // Snapshot the per-thread chat configuration BEFORE the provider
     // consumes `input`, so it can be persisted onto the session row for
     // restart-resume (re-seeding the pickers) and read back by
@@ -1003,6 +1004,17 @@ fn resolve_start_permission_mode(
     requested: Option<String>,
 ) -> Option<String> {
     match requested {
+        // v0.14.2 could persist the other provider's Full-access protocol
+        // value after a frontend provider switch. Both strings represent the
+        // same explicit UI choice, so canonicalize that known cross-provider
+        // mismatch instead of forwarding an unsupported value that Codex
+        // silently omits from thread/start.
+        Some(mode) if provider == ProviderKind::Codex && mode == "bypassPermissions" => {
+            Some("danger-full-access".to_string())
+        }
+        Some(mode) if provider == ProviderKind::Claude && mode == "danger-full-access" => {
+            Some("bypassPermissions".to_string())
+        }
         Some(mode) => Some(mode),
         None => fallback_permission_mode(provider).map(str::to_string),
     }
@@ -1129,19 +1141,15 @@ pub async fn ensure_live_session<R: Runtime>(
         None => None,
     };
 
-    // Heal a NULL persisted permission_mode to the provider default the
-    // frontend already displays for such rows (see
-    // `fallback_permission_mode` for the WHY). `healed_permission_mode` is
-    // `Some` only when we actually substituted a default, so the
-    // best-effort persist below never rewrites a row that already carries a
-    // value.
-    let (permission_mode, healed_permission_mode) = match record.permission_mode.clone() {
-        Some(mode) => (Some(mode), None),
-        None => {
-            let fallback = fallback_permission_mode(provider_kind).map(str::to_string);
-            (fallback.clone(), fallback)
-        }
-    };
+    // Resolve both legacy NULL rows and the v0.14.2 cross-provider
+    // Full-access values through the same canonical start-path helper. The
+    // best-effort persist below runs only when the stored value changed.
+    let stored_permission_mode = record.permission_mode.clone();
+    let permission_mode =
+        resolve_start_permission_mode(provider_kind, stored_permission_mode.clone());
+    let healed_permission_mode = (permission_mode != stored_permission_mode)
+        .then(|| permission_mode.clone())
+        .flatten();
 
     if let Some(mode) = healed_permission_mode {
         // Best-effort heal the row so future rebuilds and the frontend's
@@ -1155,7 +1163,7 @@ pub async fn ensure_live_session<R: Runtime>(
         };
         if let Err(error) = db.update_agent_chat_session_config(&thread_id.0, &config) {
             eprintln!(
-                "[codemux::agent_chat] failed to heal NULL permission_mode for thread={}: {error}",
+                "[codemux::agent_chat] failed to heal permission_mode for thread={}: {error}",
                 thread_id.0,
             );
         }
@@ -3396,6 +3404,24 @@ mod tests {
         assert_eq!(
             resolve_start_permission_mode(ProviderKind::Claude, Some("default".to_string())),
             Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_start_permission_mode_canonicalizes_cross_provider_full_access() {
+        assert_eq!(
+            resolve_start_permission_mode(
+                ProviderKind::Codex,
+                Some("bypassPermissions".to_string())
+            ),
+            Some("danger-full-access".to_string())
+        );
+        assert_eq!(
+            resolve_start_permission_mode(
+                ProviderKind::Claude,
+                Some("danger-full-access".to_string())
+            ),
+            Some("bypassPermissions".to_string())
         );
     }
 

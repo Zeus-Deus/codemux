@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   capabilityDefaults,
   defaultModelId,
+  defaultPermissionModeForProvider,
   modelLabel,
   modelsForProvider,
 } from "./capability-defaults";
@@ -76,6 +77,30 @@ describe("capability-defaults", () => {
 
     it("falls back to the hardcoded Codex default when caps are unhydrated", () => {
       expect(defaultModelId("codex")).toBe("gpt-5.4");
+    });
+  });
+
+  describe("defaultPermissionModeForProvider", () => {
+    it("uses provider-native fallbacks before capabilities hydrate", () => {
+      expect(defaultPermissionModeForProvider("claude")).toBe(
+        "bypassPermissions",
+      );
+      expect(defaultPermissionModeForProvider("codex")).toBe(
+        "danger-full-access",
+      );
+      expect(defaultPermissionModeForProvider("opencode")).toBeNull();
+    });
+
+    it("prefers the provider capability's advertised default", () => {
+      useProviderCapabilities.setState({
+        codex: {
+          ...makeClaudeCaps([]),
+          default_permission_mode: "codex-runtime-default",
+        },
+      });
+      expect(defaultPermissionModeForProvider("codex")).toBe(
+        "codex-runtime-default",
+      );
     });
   });
 
@@ -202,6 +227,11 @@ describe("capability-defaults", () => {
       expect(defaults.effort).toBeNull();
       expect(defaults.contextWindow).toBeNull();
       expect(defaults.permissionMode).toBe("bypassPermissions");
+    });
+
+    it("seeds a Codex draft with Codex Full access, not Claude's value", () => {
+      const defaults = capabilityDefaults("codex", "gpt-5.4");
+      expect(defaults.permissionMode).toBe("danger-full-access");
     });
   });
 });

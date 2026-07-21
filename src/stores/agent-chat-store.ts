@@ -216,7 +216,7 @@ interface AgentChatStore {
   /** Set the mode the current SDK session was actually launched with.
    *  Called once per session-start, echoed from the start_session
    *  response to avoid drift. */
-  setSessionLaunchMode: (threadId: string, mode: string) => void;
+  setSessionLaunchMode: (threadId: string, mode: string | null) => void;
   /** Migrate an existing slice to a new thread id (used on silent
    *  restart: the new SDK session gets a new thread id but the
    *  transcript, model, and draft should persist). */

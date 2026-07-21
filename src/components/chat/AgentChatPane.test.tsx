@@ -1664,6 +1664,28 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     expect(setPermissionModeMock).toHaveBeenCalledWith("thread-x", "plan");
   });
 
+  it("restores a persisted Codex mode over the legacy Claude slice sentinel", async () => {
+    vi.mocked(agentChatGetSession).mockResolvedValue(
+      makeRecord({
+        provider: "codex",
+        model: "gpt-5.4",
+        permission_mode: "workspace-write",
+      }),
+    );
+    const codexPane = {
+      ...pane,
+      thread_id: "thread-x",
+      provider: "codex" as const,
+    };
+    render(<AgentChatPane pane={codexPane} />);
+    await waitFor(() =>
+      expect(setPermissionModeMock).toHaveBeenCalledWith(
+        "thread-x",
+        "workspace-write",
+      ),
+    );
+  });
+
   it("does not clobber a permission-mode change the user made during the in-flight fetch", async () => {
     // Finding 2: the post-fetch re-check must guard EACH field, not just
     // `model`. Here the slice's model is still null (so the effect

@@ -582,6 +582,16 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
              WHERE permission_mode IS NULL AND provider = 'claude'",
         "UPDATE agent_chat_sessions SET permission_mode = 'danger-full-access' \
              WHERE permission_mode IS NULL AND provider = 'codex'",
+        // v0.14.2's frontend null-mode fix used Claude's
+        // `bypassPermissions` constant for every provider. A Codex launch
+        // carrying that unsupported value omitted approvalPolicy/sandbox and
+        // fell back to prompting while the picker displayed Full access.
+        // Canonicalize already-persisted affected rows on upgrade. The reverse
+        // mapping protects the symmetric stale-provider case as well.
+        "UPDATE agent_chat_sessions SET permission_mode = 'danger-full-access' \
+             WHERE permission_mode = 'bypassPermissions' AND provider = 'codex'",
+        "UPDATE agent_chat_sessions SET permission_mode = 'bypassPermissions' \
+             WHERE permission_mode = 'danger-full-access' AND provider = 'claude'",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -3299,6 +3309,29 @@ mod tests {
             },
         )
         .unwrap();
+        // v0.14.2 could also persist the other provider's Full-access
+        // protocol value after a provider switch. These rows must be
+        // canonicalized without touching unrelated explicit modes.
+        db.upsert_agent_chat_session("t-codex-cross", "ws", Some("/tmp"), "codex")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t-codex-cross",
+            &AgentChatSessionConfig {
+                permission_mode: AgentChatSessionConfig::set("bypassPermissions"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
+        db.upsert_agent_chat_session("t-claude-cross", "ws", Some("/tmp"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t-claude-cross",
+            &AgentChatSessionConfig {
+                permission_mode: AgentChatSessionConfig::set("danger-full-access"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
 
         // Re-run the schema migrations (idempotent) to fire the backfill.
         {
@@ -3314,6 +3347,14 @@ mod tests {
         assert_eq!(mode("t-claude").as_deref(), Some("bypassPermissions"));
         assert_eq!(mode("t-codex").as_deref(), Some("danger-full-access"));
         assert_eq!(mode("t-opencode"), None, "opencode rows stay NULL");
+        assert_eq!(
+            mode("t-codex-cross").as_deref(),
+            Some("danger-full-access")
+        );
+        assert_eq!(
+            mode("t-claude-cross").as_deref(),
+            Some("bypassPermissions")
+        );
         assert_eq!(
             mode("t-claude-set").as_deref(),
             Some("plan"),

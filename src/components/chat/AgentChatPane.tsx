@@ -9,6 +9,7 @@ import {
   planPermissionModeChange,
   planSubmit,
 } from "@/lib/agent-chat/chat-pane-plans";
+import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
 import {
   buildAttachmentBlock,
   buildFileResolvedContent,
@@ -627,8 +628,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const activeTurnId = slice?.activeTurnId ?? null;
   const model = slice?.model ?? null;
+  const providerDefaultPermissionMode =
+    defaultPermissionModeForProvider(provider);
   const permissionMode =
-    slice?.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+    slice?.permissionMode ??
+    providerDefaultPermissionMode ??
+    DEFAULT_THREAD_PERMISSION_MODE;
   const effort = slice?.effort ?? null;
   const contextWindow = slice?.contextWindow ?? null;
   const mode = slice?.mode ?? "default";
@@ -655,10 +660,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // null is a legitimate reset value (provider with no modes).
       setStorePermissionMode(
         threadId,
-        plan.resetPermissionMode ?? DEFAULT_THREAD_PERMISSION_MODE,
+        plan.resetPermissionMode ??
+          providerDefaultPermissionMode ??
+          DEFAULT_THREAD_PERMISSION_MODE,
       );
     }
-  }, [threadId, capabilities, permissionMode, setStorePermissionMode]);
+  }, [
+    threadId,
+    capabilities,
+    permissionMode,
+    providerDefaultPermissionMode,
+    setStorePermissionMode,
+  ]);
 
   // Seed the slice's picker config from the persisted session row
   // whenever the slice exists (threadId set) but has no model yet.
@@ -745,7 +758,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (
           record.permission_mode != null &&
           (!current ||
-            current.permissionMode === DEFAULT_THREAD_PERMISSION_MODE)
+            // `emptySlice` predates multi-provider permission modes and
+            // still uses Claude's default as its unseeded sentinel. Accept
+            // either that legacy sentinel or this provider's native default
+            // so an app-restart fetch can restore a persisted Codex choice
+            // before capabilities hydrate.
+            current.permissionMode === DEFAULT_THREAD_PERMISSION_MODE ||
+            current.permissionMode ===
+              (providerDefaultPermissionMode ??
+                DEFAULT_THREAD_PERMISSION_MODE))
         )
           setStorePermissionMode(seedThreadId, record.permission_mode);
         // Resume cursor is independent of the model pick, so seed it even
@@ -963,7 +984,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       startAttempted.current = true;
       setStarting(true);
       const recoveryMode =
-        recoveryDraft.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+        recoveryDraft.permissionMode ?? providerDefaultPermissionMode;
       const startInput = {
         thread_id: recoveryDraft.threadId,
         cwd,
@@ -982,7 +1003,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           } else {
             setStoreModel(id, defaultModelForProvider(provider));
           }
-          setStorePermissionMode(id, recoveryMode);
+          if (recoveryMode !== null) {
+            setStorePermissionMode(id, recoveryMode);
+          }
           setSessionLaunchMode(id, recoveryMode);
           // Mark the draft as promoted so subsequent mounts take the
           // existing promotedDraftThreadId branch above instead of
@@ -1011,7 +1034,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStarting(true);
     const localThreadId = `chat-${pane.pane_id}-${Date.now()}`;
     // For a brand-new thread with no slice yet, use the default mode.
-    const startMode = DEFAULT_THREAD_PERMISSION_MODE;
+    const startMode = providerDefaultPermissionMode;
     const startInput = {
       thread_id: localThreadId,
       cwd,
@@ -1027,7 +1050,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setThreadId(id);
         ensureThread(id);
         setStoreModel(id, defaultModel);
-        setStorePermissionMode(id, startMode);
+        if (startMode !== null) {
+          setStorePermissionMode(id, startMode);
+        }
         setSessionLaunchMode(id, startMode);
       })
       .catch((err) => {
@@ -1047,6 +1072,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreModel,
     setStorePermissionMode,
     setSessionLaunchMode,
+    providerDefaultPermissionMode,
     markDraftPromoted,
     clearDraft,
   ]);
@@ -2165,6 +2191,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (currentSlice.mode === "plan" || currentSlice.mode === "ask") {
       const restore =
         currentSlice.modePriorPermissionMode ??
+        providerDefaultPermissionMode ??
         DEFAULT_THREAD_PERMISSION_MODE;
       // Snap the slice for immediate UI feedback (picker reappears,
       // pill drops). The restart sets sessionLaunchMode itself.
@@ -2198,6 +2225,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreMode,
     setStoreModePriorPermissionMode,
     restartSessionWith,
+    providerDefaultPermissionMode,
     confirmDebugExit,
     triggerDebugCleanup,
   ]);
@@ -2600,7 +2628,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             permissionMode:
               mode === "plan" || mode === "ask"
                 ? "plan"
-                : permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE,
+                : permissionMode ??
+                  providerDefaultPermissionMode ??
+                  DEFAULT_THREAD_PERMISSION_MODE,
             effort,
             contextWindow,
             mode,

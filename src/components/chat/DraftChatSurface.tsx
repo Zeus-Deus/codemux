@@ -25,6 +25,7 @@ import {
   beginImageStaging,
   discardStagedImage,
 } from "@/lib/agent-chat/image-staging";
+import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
 import {
   materializeAndSend,
   type MaterializePhase,
@@ -74,7 +75,6 @@ import type {
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
-import { DEFAULT_THREAD_PERMISSION_MODE } from "@/stores/agent-chat-store";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 
@@ -819,11 +819,13 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       if (next === draft.provider) return;
       updateDraftConfig(draft.draftId, {
         provider: next,
-        // Reset provider-specific config to null so pickers can
-        // re-seed from capabilities on next render.
+        // Reset provider-specific config and commit the next provider's
+        // native permission default. The picker can *display* a fallback
+        // for null/unknown values without mutating the draft, so leaving
+        // this null would make first-send launch state diverge from the
+        // visible "Full access" label.
         model: null,
-        permissionMode:
-          next === "claude" ? DEFAULT_THREAD_PERMISSION_MODE : null,
+        permissionMode: defaultPermissionModeForProvider(next),
         effort: null,
         contextWindow: null,
       });
