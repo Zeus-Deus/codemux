@@ -48,6 +48,7 @@ import {
   useChatDraftStore,
   type ChatDraft,
 } from "@/stores/chat-draft-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import {
   selectCapabilities,
   selectModel,
@@ -984,9 +985,16 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     />
   );
 
+  // GUI chrome (Agent Chat Beta) suppresses the placeholder header the
+  // same way it suppresses AgentChatPaneHeader for a sole-root chat
+  // pane — the titlebar's "Agent Chat" draft pill covers the label
+  // (see TitleBarDraftSlots in title-bar.tsx). Legacy chrome keeps the
+  // h-7 band so the draft doesn't look "naked" next to a real pane.
+  const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
+
   return (
     <div className="flex h-full w-full flex-col bg-background">
-      <DraftSurfaceHeader />
+      {!enableAgentChat && <DraftSurfaceHeader />}
       <div className="flex-1 min-h-0 overflow-hidden">
         {pending ? (
           <DraftPendingConversation pending={pending} composer={composerEl} />

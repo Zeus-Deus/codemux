@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 use super::Shared;
 use crate::database::DatabaseStore;
@@ -191,7 +191,7 @@ struct DeviceListResponse {
 /// Run one registration attempt: gather the node id + bearer + device id, POST,
 /// and update the status. Signed out (no bearer) or no node id → skip quietly
 /// (record the reason, don't error). Never panics.
-async fn register_once(app: &AppHandle, shared: &Arc<Shared>) {
+async fn register_once<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
     // Snapshot every input synchronously so no DB/State guard is held across
     // the network await below (mirrors the account-mode admission discipline).
     let (bearer, reg) = {
@@ -247,7 +247,7 @@ async fn register_once(app: &AppHandle, shared: &Arc<Shared>) {
 /// on [`REFRESH_INTERVAL`] until [`stop`]. Idempotent — a second call while the
 /// refresh task is live is a no-op. Non-blocking (the initial POST runs on the
 /// spawned task), so enabling relay mode never waits on the network.
-pub(crate) fn start(app: &AppHandle, shared: &Arc<Shared>) {
+pub(crate) fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
     if shared.registration.is_running() {
         return;
     }

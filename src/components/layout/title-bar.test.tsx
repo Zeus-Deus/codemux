@@ -24,6 +24,7 @@ vi.mock("./title-bar-tabs", () => ({
 }));
 vi.mock("./agent-launcher", () => ({
   AgentLauncher: () => <div data-testid="agent-launcher" />,
+  DraftAgentLauncher: () => <div data-testid="draft-agent-launcher" />,
 }));
 vi.mock("./run-button", () => ({
   RunButton: () => <div data-testid="run-button" />,
@@ -99,11 +100,30 @@ vi.mock("@/stores/app-store", () => ({
   ),
 }));
 
-vi.mock("@/stores/chat-draft-store", () => ({
-  useChatDraftStore: vi.fn((sel: (s: unknown) => unknown) =>
-    sel({ activeDraftId: state.activeDraftId }),
-  ),
-}));
+vi.mock("@/stores/chat-draft-store", () => {
+  interface MockDraftState {
+    activeDraftId: string | null;
+    draftsById: Record<string, unknown>;
+  }
+  const snapshot = (): MockDraftState => ({
+    activeDraftId: state.activeDraftId,
+    draftsById: state.activeDraftId
+      ? {
+          [state.activeDraftId]: {
+            draftId: state.activeDraftId,
+            target: { kind: "project", projectPath: "/p" },
+            promoting: false,
+          },
+        }
+      : {},
+  });
+  return {
+    useChatDraftStore: vi.fn((sel: (s: unknown) => unknown) => sel(snapshot())),
+    // Mirror the real selector so TitleBarDraftSlots resolves the draft.
+    selectActiveDraft: (s: MockDraftState) =>
+      s.activeDraftId ? s.draftsById[s.activeDraftId] ?? null : null,
+  };
+});
 
 vi.mock("@/stores/feature-flags", () => ({
   useFeatureFlags: vi.fn((sel: (s: unknown) => unknown) =>
@@ -223,11 +243,23 @@ describe("TitleBar chrome gating", () => {
 
   it("merges tabs + launcher into the bar when the Beta is ON", () => {
     state.enableAgentChat = true;
-    const { getByTestId, queryByTestId } = renderBar();
+    const { getByRole, getByTestId, queryByTestId } = renderBar();
     expect(getByTestId("titlebar-tabs")).toBeInTheDocument();
     expect(getByTestId("agent-launcher")).toBeInTheDocument();
     // Rehomed right cluster.
-    expect(getByTestId("run-button")).toBeInTheDocument();
+    const runButton = getByTestId("run-button");
+    const panelToggle = getByRole("button", { name: "Open panel" });
+    const windowControls = getByTestId("window-controls");
+    expect(runButton).toBeInTheDocument();
+    expect(panelToggle).toBeInTheDocument();
+    expect(
+      runButton.compareDocumentPosition(panelToggle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      panelToggle.compareDocumentPosition(windowControls) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     // Pinned tiles are opt-in (see the dedicated describe blocks below) —
     // the titlebar-pins store defaults empty, so no tile renders here even
     // though the fixture's chat preset has `pinned: true` (that flag is
@@ -243,12 +275,35 @@ describe("TitleBar chrome gating", () => {
     expect(queryByTestId("agent-launcher")).toBeNull();
   });
 
-  it("keeps the legacy bar while a lazy-creation draft is active", () => {
+  it("renders the GUI draft chrome (draft pill + draft launcher) while a lazy-creation draft is active", () => {
+    // Regression coverage: the draft used to fall back to the legacy
+    // h-9 bar + PresetBar rows, so pressing "+" flashed the old chrome
+    // until the first prompt materialised the workspace.
     state.enableAgentChat = true;
     state.enableLazy = true;
     state.activeDraftId = "draft-1";
-    const { queryByTestId } = renderBar();
+    const { getByTestId, queryByRole, queryByTestId } = renderBar();
+    expect(getByTestId("titlebar-draft-tab")).toBeInTheDocument();
+    expect(getByTestId("draft-agent-launcher")).toBeInTheDocument();
+    // Workspace slots + workspace-scoped controls stay off — the
+    // backend's "active workspace" is whatever was focused before the
+    // draft opened, which is not what's on screen.
     expect(queryByTestId("titlebar-tabs")).toBeNull();
+    expect(queryByTestId("agent-launcher")).toBeNull();
+    expect(queryByTestId("run-button")).toBeNull();
+    expect(queryByRole("button", { name: "Open panel" })).toBeNull();
+    // Shared shell bits still render.
+    expect(getByTestId("titlebar-sidebar-cluster")).toBeInTheDocument();
+    expect(getByTestId("window-controls")).toBeInTheDocument();
+  });
+
+  it("keeps the legacy bar for a draft when the Beta flag is off", () => {
+    state.enableAgentChat = false;
+    state.enableLazy = true;
+    state.activeDraftId = "draft-1";
+    const { queryByTestId } = renderBar();
+    expect(queryByTestId("titlebar-draft-tab")).toBeNull();
+    expect(queryByTestId("draft-agent-launcher")).toBeNull();
   });
 });
 

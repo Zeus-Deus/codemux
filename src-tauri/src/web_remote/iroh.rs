@@ -69,7 +69,7 @@ use iroh::endpoint::{presets, Connection, RecvStream, SendStream};
 use iroh::{Endpoint, SecretKey};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
@@ -698,7 +698,7 @@ impl IrohManager {
 
 /// Bind the desktop iroh endpoint and start accepting connections. Idempotent.
 /// Runs on the app's existing tokio runtime — no second runtime is spawned.
-pub(crate) async fn start(app: &AppHandle, shared: &Arc<Shared>) -> Result<(), String> {
+pub(crate) async fn start<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<(), String> {
     if shared.iroh.is_running() {
         return Ok(());
     }
@@ -762,7 +762,7 @@ pub(crate) fn stop(shared: &Arc<Shared>) {
 // ── Accept + connection bridge ──────────────────────────────────────
 
 /// Accept incoming iroh connections until the endpoint closes.
-async fn accept_loop(app: AppHandle, shared: Arc<Shared>, endpoint: Endpoint) {
+async fn accept_loop<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, endpoint: Endpoint) {
     while let Some(incoming) = endpoint.accept().await {
         let app = app.clone();
         let shared = shared.clone();
@@ -778,7 +778,7 @@ async fn accept_loop(app: AppHandle, shared: Arc<Shared>, endpoint: Endpoint) {
 /// One accepted iroh connection. A connection may carry several bi-streams;
 /// each bi-stream is an independent web-remote "socket" (its own handshake, its
 /// own registry entry), mirroring how each WS upgrade is one socket.
-async fn handle_connection(app: AppHandle, shared: Arc<Shared>, conn: Connection) {
+async fn handle_connection<R: Runtime>(app: AppHandle<R>, shared: Arc<Shared>, conn: Connection) {
     loop {
         match conn.accept_bi().await {
             Ok((send, recv)) => {
@@ -797,8 +797,8 @@ async fn handle_connection(app: AppHandle, shared: Arc<Shared>, conn: Connection
 /// is the iroh sibling of [`super::server`]'s `handle_socket`; the frame
 /// dispatch, channel routing, event fan-out, and registry teardown are all the
 /// same shared code.
-async fn handle_bi_stream(
-    app: AppHandle,
+async fn handle_bi_stream<R: Runtime>(
+    app: AppHandle<R>,
     shared: Arc<Shared>,
     mut send: SendStream,
     mut recv: RecvStream,

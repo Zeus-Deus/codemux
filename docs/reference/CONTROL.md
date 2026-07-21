@@ -45,7 +45,7 @@
 - browser control: `create_browser_pane`, `open_url`, `browser_automation`
 - memory and handoff: `get_project_memory`, `update_project_memory`, `add_project_memory_entry`, `generate_handoff`
 - indexing: `rebuild_index`, `index_status`, `search_index`
-- web remote access: `web_remote_pair` (mint a one-time pairing code; errors if remote access is disabled). Same-machine only — this is the SSH-in-and-pair path, no GUI needed.
+- web remote access: `web_remote_enable` (turn remote access on; optional `scope` = `all|tailscale|loopback` and `port`), `web_remote_disable` (turn it off, severing live connections), `web_remote_pair` (mint a one-time pairing code; errors if remote access is disabled). All same-machine only — the SSH-in path, no GUI needed. `web_remote_enable` returns the resulting status plus the recommended reachable endpoint, so you can immediately `web_remote_pair`.
 
 ## Boundary Notes
 
@@ -66,16 +66,47 @@ codemux browser snapshot
 codemux memory show
 codemux handoff
 codemux index build
+codemux remote enable
+codemux remote enable --scope tailscale --port 4377
+codemux remote disable
 codemux remote pair
 codemux remote pair --name "Kitchen iPad"
+codemux serve
+codemux serve --scope loopback --port 4377
+codemux serve --scope tailscale --relay
 codemux logs --tail 200
 codemux doctor
 ```
 
+`codemux remote enable [--scope all|tailscale|loopback] [--port N]` turns web
+remote access on (binding the server) and prints the resulting port, bind
+scope, and recommended reachable endpoint — so you can immediately run
+`codemux remote pair`. `--scope`/`--port` while it is already running rebind
+the listener (dropping live connections); with no flags on an already-running
+server it just reports the current status. `codemux remote disable` turns it
+off and severs every live connection. Both require the desktop app to be
+running (a clear "Failed to connect to Codemux control endpoint" error prints
+otherwise).
+
 `codemux remote pair` prints a scannable terminal QR of the pairing URL plus
 the raw link, token, and expiry — pair a phone/laptop over SSH without
-opening the desktop GUI. Requires remote access to be enabled in Settings
-first (`Settings → Remote Access`).
+opening the desktop GUI. Requires remote access to be enabled first (via
+`codemux remote enable` or `Settings → Remote Access`).
+
+`codemux serve [--scope all|tailscale|loopback] [--port N] [--relay]` runs
+Codemux headless as a web-remote server — **no desktop GUI**. Unlike the
+`remote *` subcommands (which are control-socket round-trips to a *running*
+desktop app), `serve` is itself a long-lived foreground process: it boots the
+full backend headless, binds the web-remote server through the same shared
+enable path, prints a scannable pairing QR + link, and runs until Ctrl-C /
+SIGTERM. Flags mirror `codemux remote enable` (`--scope` same three values);
+`--relay` also enables the from-anywhere iroh transport. Ideal over SSH on a
+machine with no display. It refuses to start (non-zero exit) if a GUI or
+another `serve` already holds this machine's control endpoint; the GUI
+reciprocally refuses while `serve` is running. Because `serve` runs its own
+control server, `codemux remote pair` from another SSH session mints fresh
+codes against it. See `docs/features/web-remote-access.md` §
+"Headless server mode".
 
 ## Local Diagnostics
 

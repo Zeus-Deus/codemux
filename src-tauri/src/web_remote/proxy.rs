@@ -46,7 +46,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures_util::{SinkExt, StreamExt};
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message as TungMessage;
 
@@ -77,8 +77,8 @@ fn has_control_char(s: &str) -> bool {
 // ── WebSocket proxy ─────────────────────────────────────────────────
 
 /// `GET /proxy/browser/:port/ws` — upgrade and bridge to the daemon socket.
-pub async fn ws_proxy(
-    State(app): State<AppHandle>,
+pub async fn ws_proxy<R: Runtime>(
+    State(app): State<AppHandle<R>>,
     Path(port): Path<u16>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -180,8 +180,8 @@ fn tungstenite_to_axum(msg: TungMessage) -> Option<AxumMessage> {
 
 /// `ANY /proxy/browser/:port/api/*rest` — forward the daemon's HTTP endpoints
 /// (`/api/status`, `/api/command`) with a minimal, credential-free request.
-pub async fn http_forward(
-    State(app): State<AppHandle>,
+pub async fn http_forward<R: Runtime>(
+    State(app): State<AppHandle<R>>,
     Path((port, rest)): Path<(u16, String)>,
     method: Method,
     uri: Uri,

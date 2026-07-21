@@ -19,9 +19,9 @@
 //!
 //! * Binary missing → [`HarvestError::NotInstalled`]; the picker shows
 //!   an install hint, mirroring the OpenCode empty state.
-//! * `account/read` reports `requires_openai_auth: true` →
-//!   [`HarvestError::NotAuthenticated`]; picker shows a "run codex
-//!   login" hint instead of an empty model list.
+//! * `account/read` reports no account while the active provider requires
+//!   OpenAI auth → [`HarvestError::NotAuthenticated`]; picker shows a "run
+//!   codex login" hint instead of an empty model list.
 //! * Any other RPC failure → [`HarvestError::HarvestFailed`] with the
 //!   underlying message — no static fallback, since drifting silently to
 //!   a stale model list is what Stage 8 already burned us with.
@@ -181,9 +181,11 @@ pub async fn harvest_codex_capabilities(
             message: format!("initialized notify failed: {err}"),
         })?;
 
-    // Auth gate. `requires_openai_auth: true` means the user has no
-    // credentials — surface as a clean unauth state instead of letting
-    // the model list call fail with a cryptic message.
+    // Auth gate. `requires_openai_auth` describes the active provider, not
+    // whether an account exists: the normal logged-in ChatGPT response has
+    // both `account: Some(...)` and `requires_openai_auth: true`. Only the
+    // combination of a missing account and a provider that requires OpenAI
+    // auth is an unauthenticated state.
     let account_resp = child
         .request("account/read", json!({}))
         .await
@@ -195,7 +197,7 @@ pub async fn harvest_codex_capabilities(
             message: format!("account/read decode failed: {err}"),
         }
     })?;
-    if account.requires_openai_auth {
+    if account.needs_login() {
         let _ = child.shutdown().await;
         return Err(HarvestError::NotAuthenticated {
             hint: "Run `codex login` and try again.".into(),

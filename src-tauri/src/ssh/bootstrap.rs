@@ -105,8 +105,8 @@ pub fn target_for_uname(uname: &str) -> Option<&'static str> {
 /// an empty/tiny candidate is treated as *not bundled* → the caller
 /// returns `BinaryNotBundled { wanted_target }` and a dev build fails
 /// loudly instead of silently shipping a placeholder to a host.
-pub fn bundled_binary_path(
-    app: Option<&tauri::AppHandle>,
+pub fn bundled_binary_path<R: tauri::Runtime>(
+    app: Option<&tauri::AppHandle<R>>,
     target: &str,
 ) -> Option<PathBuf> {
     // Tauri resource dir — the installed-mode path. Skipped in
@@ -206,7 +206,7 @@ fn target_matches_build_host(target: &str) -> bool {
     }
 }
 
-pub struct BootstrapOptions<'a> {
+pub struct BootstrapOptions<'a, R: tauri::Runtime> {
     pub ssh_target: &'a str,
     pub uname: &'a str,
     /// Remote install path. Defaults to `~/.local/bin/codemux-remote`
@@ -218,10 +218,10 @@ pub struct BootstrapOptions<'a> {
     /// can locate the binary in the app's resource_dir (installed
     /// mode). When None (tests, CLI paths), only the source-tree +
     /// sibling fallbacks are tried.
-    pub app: Option<&'a tauri::AppHandle>,
+    pub app: Option<&'a tauri::AppHandle<R>>,
 }
 
-impl<'a> BootstrapOptions<'a> {
+impl<'a, R: tauri::Runtime> BootstrapOptions<'a, R> {
     pub fn new(ssh_target: &'a str, uname: &'a str) -> Self {
         Self {
             ssh_target,
@@ -232,13 +232,13 @@ impl<'a> BootstrapOptions<'a> {
         }
     }
 
-    pub fn with_app(mut self, app: &'a tauri::AppHandle) -> Self {
+    pub fn with_app(mut self, app: &'a tauri::AppHandle<R>) -> Self {
         self.app = Some(app);
         self
     }
 }
 
-pub async fn bootstrap_remote(opts: BootstrapOptions<'_>) -> BootstrapResult {
+pub async fn bootstrap_remote<R: tauri::Runtime>(opts: BootstrapOptions<'_, R>) -> BootstrapResult {
     let target = match target_for_uname(opts.uname) {
         Some(t) => t,
         None => {

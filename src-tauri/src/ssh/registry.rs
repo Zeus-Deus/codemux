@@ -48,8 +48,8 @@ struct TunnelStatusEvent {
 /// installs a fresh supervisor (the old one is shut down and dropped),
 /// the old forwarder exits on its own — no explicit deregistration, no
 /// leak, and never two forwarders for one live supervisor.
-pub fn spawn_tunnel_status_forwarder(
-    app: tauri::AppHandle,
+pub fn spawn_tunnel_status_forwarder<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     workspace_id: String,
     supervisor: &Arc<TunnelSupervisor>,
 ) {
@@ -207,8 +207,8 @@ async fn workspace_clients() -> &'static Mutex<
 /// supervisor circuit-broken) — callers fall back to the
 /// in-process spawn path so the user still gets a working
 /// terminal.
-pub async fn client_for_workspace(
-    app: &tauri::AppHandle,
+pub async fn client_for_workspace<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     workspace_id: &str,
     host_id: Option<i64>,
 ) -> Result<

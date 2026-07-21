@@ -18,9 +18,9 @@ The per-agent event vocabularies and config formats were verified directly again
 
 **Four moving pieces**:
 
-1. **HTTP hook server** (`src-tauri/src/hooks.rs`) — a localhost TCP listener on a random port, bound at app startup via `start_hook_server(app)`. The port is stored in a `OnceLock<u16>` and injected into every PTY session as `CODEMUX_HOOK_PORT`. The server parses query-string GET requests of shape `/hook?sessionId={codemux_session}&eventType={event}&agentSessionId={agent_session}` and routes them through `map_event_type()` to state updates that emit `app-state-changed` events back to the React frontend.
+1. **HTTP hook server** (`src-tauri/src/hooks.rs`) — a localhost TCP listener on a random port, bound at app startup via `start_hook_server(app)`. The port is stored in a `OnceLock<u16>`, injected into every PTY session as `CODEMUX_HOOK_PORT`, and published to `~/.codemux/hooks/active-port` for already-running persistent PTYs. The server parses query-string GET requests of shape `/hook?sessionId={codemux_session}&eventType={event}&agentSessionId={agent_session}` and routes them through `map_event_type()` to state updates that emit `app-state-changed` events back to the React frontend.
 
-2. **Hook notification script** (`~/.codemux/hooks/notify.sh`, written by `ensure_hook_script()`) — a POSIX shell script that takes the event type as its `$1` arg, reads the agent's JSON blob on stdin, extracts `session_id` with `jq` if available, and makes a one-shot `curl` call to the hook server. It degrades gracefully: if `jq` is missing, the session ID capture is skipped but the event is still reported. If `CODEMUX_HOOK_PORT` or `CODEMUX_SESSION_ID` are unset (e.g. because the user is running the agent outside Codemux), the script exits 0 silently. A second script, `gemini-notify.sh`, exists for Gemini because its CLI blocks on the hook until it receives valid JSON on stdout.
+2. **Hook notification script** (`~/.codemux/hooks/notify.sh`, written by `ensure_hook_script()`) — a POSIX shell script that takes the event type as its `$1` arg, reads the agent's JSON blob on stdin, extracts `session_id` with `jq` if available, and makes a one-shot `curl` call to the hook server. It first tries the PTY's inherited `CODEMUX_HOOK_PORT`; if that listener is gone, it retries the current port from the adjacent `active-port` file. This matters because daemon-backed PTYs survive an app restart while their environment cannot be updated. It degrades gracefully: if `jq` is missing, the session ID capture is skipped but the event is still reported. If `CODEMUX_SESSION_ID` is unset (e.g. because the user is running the agent outside Codemux), the script exits 0 silently. A second script, `gemini-notify.sh`, exists for Gemini because its CLI blocks on the hook until it receives valid JSON on stdout; it uses the same port fallback after immediately returning valid JSON.
 
 3. **Per-agent registration** — at startup `lib.rs` calls one registration function per agent. Each writes into that agent's own config location (see table below). Codex/Gemini/OpenCode/Pi registration is gated on the agent's config directory already existing, so Codemux never creates config for a tool the user hasn't installed. Only the hook section is touched; all other user settings are preserved, and prior Codemux entries are replaced in place so repeated startups don't accumulate duplicates.
 
@@ -64,9 +64,10 @@ Claude Code's `Notification` event is overloaded: it fires both for a genuine pe
 - The working → needs-input → working transition: answering a question (or resolving a permission prompt) clears the red pulse instead of leaving it stuck
 - The red "needs attention" pulse for Claude (`PermissionRequest`/`Notification`), Codex (`PermissionRequest`), Gemini (`Notification`), and OpenCode (`permission.ask`)
 - Automatic session ID capture for Claude Code, powering adapter-based resume across restarts (see `docs/features/session-persistence.md`)
+- Status events self-heal after an app restart: a resumed or relaunched agent inside a persistent PTY can reach the new hook server even though its inherited port belongs to the previous app process
 - Startup registration is idempotent — running Codemux twice doesn't duplicate entries
 - Codex/Gemini/OpenCode/Pi registration only touches a tool's config if that tool is already installed
-- Graceful no-op if the hook environment variables are missing (safe for users who run an agent outside Codemux)
+- Graceful no-op if `CODEMUX_SESSION_ID` is missing; a missing or stale `CODEMUX_HOOK_PORT` falls back to the current app's published port
 - Graceful degradation if `jq` is not installed (status still works for Claude/Gemini via the arg; Codex/Pi need `jq` to read the event from stdin JSON)
 
 ## Current Constraints
@@ -80,7 +81,7 @@ Claude Code's `Notification` event is overloaded: it fires both for a genuine pe
 
 - `src-tauri/src/hooks.rs`:
   - `hook_port()` — reads the allocated port from the `OnceLock`
-  - `start_hook_server(app)` — binds the TCP listener, spawns the accept loop, returns the allocated port
+  - `start_hook_server(app)` — binds the TCP listener, publishes `~/.codemux/hooks/active-port`, spawns the accept loop, returns the allocated port
   - `map_event_type()` — canonical event-name → `PaneStatus` mapping for all agents
   - `ensure_hook_script()` / `write_hook_file()` — write hook artifacts into `~/.codemux/hooks/`, `chmod +x` on Unix
   - `merge_nested_hooks_file()` — shared read/merge/write for the nested hook-config format (Claude, Codex, Gemini)

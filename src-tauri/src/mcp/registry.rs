@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::{broadcast, Mutex};
 
 use super::codemux_self::codemux_self_config;
@@ -163,9 +163,9 @@ impl McpRegistry {
     /// Mirror the frontend's disabled-set into the registry. The next
     /// `prime_for_chat` call respects it; servers currently running but
     /// just-disabled get stopped.
-    pub async fn set_disabled_ids(
+    pub async fn set_disabled_ids<R: Runtime>(
         &self,
-        app: Option<&AppHandle>,
+        app: Option<&AppHandle<R>>,
         ids: Vec<String>,
     ) -> Result<(), String> {
         let mut to_stop: Vec<String> = Vec::new();
@@ -196,9 +196,9 @@ impl McpRegistry {
     /// Start the given config if not already running. Idempotent: a
     /// second call against an already-running id is a no-op. Emits
     /// `mcp-status-changed` on every transition.
-    pub async fn ensure_started(
+    pub async fn ensure_started<R: Runtime>(
         &self,
-        app: Option<&AppHandle>,
+        app: Option<&AppHandle<R>>,
         config: McpServerConfig,
     ) -> McpServerRuntime {
         let id = config.id.clone();
@@ -285,9 +285,9 @@ impl McpRegistry {
 
     /// Stop a server (graceful EOF then kill, 2s budget) and mark it
     /// Stopped. Idempotent: stopping an already-stopped server is fine.
-    pub async fn stop_server(
+    pub async fn stop_server<R: Runtime>(
         &self,
-        app: Option<&AppHandle>,
+        app: Option<&AppHandle<R>>,
         id: &str,
     ) -> Result<McpServerRuntime, String> {
         let child = {
@@ -322,9 +322,9 @@ impl McpRegistry {
 
     /// Stop then re-start. Used by the manual "Restart" affordance for
     /// servers in `Errored` state.
-    pub async fn restart_server(
+    pub async fn restart_server<R: Runtime>(
         &self,
-        app: Option<&AppHandle>,
+        app: Option<&AppHandle<R>>,
         id: &str,
     ) -> Result<McpServerRuntime, String> {
         let config = {
@@ -346,9 +346,9 @@ impl McpRegistry {
     /// Used by:
     ///   1. `agent_chat_start_session` — first chat session triggers spawn.
     ///   2. Settings → MCP Servers mount — so users can inspect status.
-    pub async fn prime_for_chat(
+    pub async fn prime_for_chat<R: Runtime>(
         &self,
-        app: Option<&AppHandle>,
+        app: Option<&AppHandle<R>>,
         project_root: Option<&std::path::Path>,
     ) {
         // Serialize concurrent primes so a warm-up prime and the
@@ -522,8 +522,8 @@ impl McpRegistry {
 /// listens here for dynamic-refresh pushes). `app` is optional so
 /// registry tests don't need a real Tauri app; `status_tx` is taken
 /// off the registry instance so the broadcast survives in tests too.
-fn emit_status_with_bus(
-    app: Option<&AppHandle>,
+fn emit_status_with_bus<R: Runtime>(
+    app: Option<&AppHandle<R>>,
     bus: &broadcast::Sender<McpServerRuntime>,
     row: &McpServerRuntime,
 ) {
@@ -611,7 +611,7 @@ mod tests {
     async fn ensure_started_marks_errored_on_bad_command() {
         let reg = McpRegistry::new();
         let cfg = make_config("bad", "bad", "/no/such/binary/at/all");
-        let row = reg.ensure_started(None, cfg).await;
+        let row = reg.ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, cfg).await;
         assert!(matches!(row.status, McpServerStatus::Errored { .. }));
         assert!(row.error_message.is_some());
     }
@@ -619,11 +619,11 @@ mod tests {
     #[tokio::test]
     async fn disabled_ids_short_circuit_ensure_started() {
         let reg = McpRegistry::new();
-        reg.set_disabled_ids(None, vec!["disabled-srv".into()])
+        reg.set_disabled_ids(None::<&tauri::AppHandle<tauri::Wry>>, vec!["disabled-srv".into()])
             .await
             .unwrap();
         let cfg = make_config("disabled-srv", "disabled", "/no/such/binary");
-        let row = reg.ensure_started(None, cfg).await;
+        let row = reg.ensure_started(None::<&tauri::AppHandle<tauri::Wry>>, cfg).await;
         assert!(matches!(row.status, McpServerStatus::Stopped));
         // No handle should have been inserted because we short-circuited.
         let listed = reg.list_runtime().await;
@@ -633,7 +633,7 @@ mod tests {
     #[tokio::test]
     async fn codemux_self_cannot_be_disabled() {
         let reg = McpRegistry::new();
-        reg.set_disabled_ids(None, vec!["codemux-self".into()])
+        reg.set_disabled_ids(None::<&tauri::AppHandle<tauri::Wry>>, vec!["codemux-self".into()])
             .await
             .unwrap();
         // The set should ignore the codemux-self id.
@@ -651,14 +651,14 @@ mod tests {
             h.status = McpServerStatus::Errored { message: "boom".into() };
             inner.handles.insert("x".into(), h);
         }
-        let row = reg.stop_server(None, "x").await.unwrap();
+        let row = reg.stop_server(None::<&tauri::AppHandle<tauri::Wry>>, "x").await.unwrap();
         assert!(matches!(row.status, McpServerStatus::Stopped));
     }
 
     #[tokio::test]
     async fn stop_server_unknown_id_errors() {
         let reg = McpRegistry::new();
-        let err = reg.stop_server(None, "nope").await.unwrap_err();
+        let err = reg.stop_server(None::<&tauri::AppHandle<tauri::Wry>>, "nope").await.unwrap_err();
         assert!(err.contains("no such server"));
     }
 
@@ -760,7 +760,7 @@ mod tests {
             h.status = McpServerStatus::Running { tool_count: 0 };
             inner.handles.insert("x".into(), h);
         }
-        reg.set_disabled_ids(None, vec!["x".into()]).await.unwrap();
+        reg.set_disabled_ids(None::<&tauri::AppHandle<tauri::Wry>>, vec!["x".into()]).await.unwrap();
         let rows = reg.list_runtime().await;
         let row = rows.iter().find(|r| r.id == "x").unwrap();
         assert!(matches!(row.status, McpServerStatus::Stopped));

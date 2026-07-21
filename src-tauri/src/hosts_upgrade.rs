@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::database::DatabaseStore;
 use crate::ssh::bootstrap::{bootstrap_remote, provision_serve, BootstrapOptions, BootstrapResult};
@@ -38,7 +38,7 @@ use crate::ssh::probe::{probe_host, ProbeOptions, ProbeOutcome};
 /// app setup. The task starts after a short delay so it doesn't
 /// race the UI for resources during the first second of app
 /// startup, then walks every host sequentially.
-pub fn spawn(app: AppHandle) {
+pub fn spawn<R: Runtime>(app: AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(5)).await;
         run_once(app).await;
@@ -48,7 +48,7 @@ pub fn spawn(app: AppHandle) {
 /// Walk every registered host and upgrade those whose
 /// `codemux-remote` version differs from our bundled one. Public so
 /// tests can drive it directly without the spawn delay.
-pub async fn run_once(app: AppHandle) {
+pub async fn run_once<R: Runtime>(app: AppHandle<R>) {
     let hosts = match app.try_state::<DatabaseStore>() {
         Some(state) => state.list_hosts(),
         None => {
@@ -109,8 +109,8 @@ enum UpgradeOutcome {
     Skipped { reason: String },
 }
 
-async fn check_and_upgrade(
-    app: &AppHandle,
+async fn check_and_upgrade<R: Runtime>(
+    app: &AppHandle<R>,
     host: &crate::database::HostRecord,
     our_version: &str,
 ) -> Result<UpgradeOutcome, String> {

@@ -7,7 +7,7 @@ use serde_json::Value;
 #[cfg(unix)]
 use std::fs;
 use std::path::PathBuf;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 // ---------------------------------------------------------------------------
@@ -306,7 +306,7 @@ pub fn control_server_is_running() -> bool {
 }
 
 /// Resolve "default" or empty browser_id to the first active browser session's actual ID.
-fn resolve_browser_id(app: &AppHandle, requested: &str) -> String {
+fn resolve_browser_id<R: Runtime>(app: &AppHandle<R>, requested: &str) -> String {
     if !requested.is_empty() && requested != "default" {
         return requested.to_string();
     }
@@ -319,7 +319,7 @@ fn resolve_browser_id(app: &AppHandle, requested: &str) -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
-pub fn spawn_control_server(app: AppHandle) {
+pub fn spawn_control_server<R: Runtime>(app: AppHandle<R>) {
     let Some(socket_path) = control_socket_path() else {
         crate::diagnostics::stderr_line(
             "[codemux::control] Control socket path unavailable, skipping control server",
@@ -468,7 +468,7 @@ pub fn spawn_control_server(app: AppHandle) {
     });
 }
 
-async fn handle_client<S>(app: AppHandle, stream: S) -> Result<(), String>
+async fn handle_client<R: Runtime, S>(app: AppHandle<R>, stream: S) -> Result<(), String>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
@@ -525,7 +525,7 @@ pub async fn send_control_request(request: ControlRequest) -> Result<ControlResp
     serde_json::from_str(&response).map_err(|error| format!("Invalid response JSON: {error}"))
 }
 
-async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlResponse {
+async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlRequest) -> ControlResponse {
     let result = match request.command.as_str() {
         "status" => {
             let state: State<'_, AppStateStore> = app.state();
@@ -1545,6 +1545,29 @@ async fn dispatch_request(app: &AppHandle, request: ControlRequest) -> ControlRe
             crate::web_remote::control_pair(app, name)
                 .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string()))
         }
+        // Enable web remote access from the terminal (`codemux remote enable`),
+        // optionally selecting the bind scope and port. Shares the exact
+        // bind/rollback + state-emission paths the Settings pane uses; returns
+        // the resulting status plus the recommended endpoint so the caller can
+        // immediately run `codemux remote pair`.
+        "web_remote_enable" => {
+            let scope = request
+                .params
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let port = request
+                .params
+                .get("port")
+                .and_then(Value::as_u64)
+                .and_then(|p| u16::try_from(p).ok());
+            crate::web_remote::control_enable(app, scope, port)
+                .await
+                .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string()))
+        }
+        // Disable web remote access from the terminal (`codemux remote disable`).
+        "web_remote_disable" => crate::web_remote::control_disable(app)
+            .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string())),
         _ => Err(format!("Unknown control command: {}", request.command)),
     };
 
@@ -1692,8 +1715,8 @@ fn cwd_is_within(cwd: &str, root: &str) -> bool {
 
 /// Resolve the repo path for control socket commands.
 /// Checks `repo_path` param first, then falls back to active workspace's project_root/cwd.
-fn resolve_control_repo_path(
-    _app: &AppHandle,
+fn resolve_control_repo_path<R: Runtime>(
+    _app: &AppHandle<R>,
     state: &State<'_, AppStateStore>,
     params: &Value,
 ) -> String {

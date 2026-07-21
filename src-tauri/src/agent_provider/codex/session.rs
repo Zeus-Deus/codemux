@@ -266,15 +266,15 @@ impl CodexSession {
                 });
             }
         }
-        // account/read is the canonical "are you logged in?" check. If
-        // `requires_openai_auth: true` the user has no credentials —
-        // surface as `NotAuthenticated` upfront instead of letting
-        // `thread/start` fail later with a cryptic message. RPC failure
-        // (binary error, not auth) is logged but tolerated; the session
-        // proceeds and turns will fail with the underlying error.
+        // account/read is the canonical "can this provider run?" check.
+        // `requires_openai_auth` describes the active provider and stays true
+        // for a logged-in ChatGPT/API-key account, so only gate when the
+        // account is also absent. RPC failure (binary error, not auth) is
+        // logged but tolerated; the session proceeds and turns will fail
+        // with the underlying error.
         match child.request("account/read", json!({})).await {
             Ok(resp) => match serde_json::from_value::<AccountReadResponse>(resp) {
-                Ok(info) if info.requires_openai_auth => {
+                Ok(info) if info.needs_login() => {
                     let _ = child.shutdown().await;
                     return Err(ProviderError::NotAuthenticated {
                         provider: crate::agent_provider::ProviderKind::Codex,

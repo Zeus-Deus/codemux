@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::Path;
 
 /// Check if auto-MCP config is enabled in settings (default: true).
-pub fn is_auto_mcp_enabled(app: &tauri::AppHandle) -> bool {
+pub fn is_auto_mcp_enabled<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> bool {
     use tauri::Manager;
     let db: tauri::State<'_, crate::database::DatabaseStore> = app.state();
     db.get_setting("auto_mcp_config")

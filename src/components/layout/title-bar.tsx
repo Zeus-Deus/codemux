@@ -4,13 +4,14 @@ import {
   ChevronDown,
   ExternalLink,
   FileDiff,
+  MessageSquare,
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { RemoteConnectionChip } from "@/components/remote/remote-connection-indicator";
 import { ResourceMonitor } from "./resource-monitor";
 import { TitleBarTabs } from "./title-bar-tabs";
-import { AgentLauncher } from "./agent-launcher";
+import { AgentLauncher, DraftAgentLauncher } from "./agent-launcher";
 import { RunButton } from "./run-button";
 import {
   DropdownMenu,
@@ -34,7 +35,11 @@ import {
   useActiveWorkspaceId,
   useAppStore,
 } from "@/stores/app-store";
-import { useGuiChrome } from "@/hooks/use-gui-chrome";
+import { useDraftGuiChrome, useGuiChrome } from "@/hooks/use-gui-chrome";
+import {
+  selectActiveDraft,
+  useChatDraftStore,
+} from "@/stores/chat-draft-store";
 import { usePresetStore } from "@/hooks/use-preset-store";
 import { useSidebarGapWidth } from "@/hooks/use-sidebar-gap-width";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
@@ -413,6 +418,36 @@ function TitleBarWorkspaceSlots() {
   );
 }
 
+// ── Draft slots (GUI chrome, lazy-creation draft) ──
+//
+// The draft counterpart of `TitleBarWorkspaceSlots`: while a chat draft
+// is the active surface there is no workspace (so no backend tabs to
+// pill-ify), just the one draft being composed. Render a single static
+// "Agent Chat" pill in the active-tab style plus the draft `+` launcher
+// (materialise-with-preset — the GUI replacement for the legacy draft
+// PresetBar row). Keeps the titlebar silhouette identical to the
+// post-materialise workspace chrome, so sending the first prompt no
+// longer swaps the whole top bar.
+function TitleBarDraftSlots() {
+  const draft = useChatDraftStore(selectActiveDraft);
+  if (!draft) return null;
+  return (
+    <div
+      className="flex min-w-0 items-center gap-1"
+      onPointerDown={(e) => e.stopPropagation()}
+    >
+      <div
+        data-testid="titlebar-draft-tab"
+        className="flex h-7 shrink-0 items-center gap-1.5 rounded-lg bg-background pl-2.5 pr-2.5 text-xs font-semibold text-foreground"
+      >
+        <MessageSquare className="h-3 w-3" />
+        <span>Agent Chat</span>
+      </div>
+      <DraftAgentLauncher draft={draft} />
+    </div>
+  );
+}
+
 // ── Title Bar ──
 
 interface TitleBarProps {
@@ -427,13 +462,15 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   const sidebarGapWidth = useSidebarGapWidth();
 
   // GUI chrome renders for a real, non-OpenFlow workspace when the Agent
-  // Chat Beta is on. A live lazy-creation draft (no workspace yet) keeps
-  // the legacy bar so the draft surface's own PresetBar stays coherent;
-  // OpenFlow keeps its dedicated chrome untouched. Shared with other
-  // GUI-mode-only surfaces via `useGuiChrome` (see hook doc comment).
+  // Chat Beta is on; a live lazy-creation draft renders the same h-10
+  // shell with draft slots instead (mutually exclusive predicates — see
+  // the hook doc comments). OpenFlow keeps its dedicated chrome
+  // untouched. Shared with other GUI-mode-only surfaces via
+  // `useGuiChrome`.
   const guiChrome = useGuiChrome();
+  const draftGuiChrome = useDraftGuiChrome();
 
-  if (!guiChrome) {
+  if (!guiChrome && !draftGuiChrome) {
     return (
       <div
         data-tauri-drag-region
@@ -493,8 +530,10 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         <SidebarToggleButton open={sidebarOpen} onToggle={onToggleSidebar} />
       </div>
 
-      {/* Workspace slots — tabs (scrollable) + launcher + pinned tiles */}
-      <TitleBarWorkspaceSlots />
+      {/* Workspace slots — tabs (scrollable) + launcher + pinned tiles.
+          Draft chrome renders its single "Agent Chat" pill + draft
+          launcher instead (no workspace, no backend tabs yet). */}
+      {guiChrome ? <TitleBarWorkspaceSlots /> : <TitleBarDraftSlots />}
 
       {/* Draggable spacer — the calm middle stays a window drag region.
           Tauri v2's injected mousedown handler only checks the direct
@@ -507,16 +546,20 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
 
       {/* Right cluster — Run split button, then the standard monitor /
           IDE controls, with the right-panel toggle docked beside the
-          window controls (layout toggles live next to window chrome). */}
+          window controls (layout toggles live next to window chrome).
+          The workspace-scoped controls (panel toggle / Run / IDE) are
+          suppressed in draft chrome: the backend's "active workspace"
+          is whatever was focused before the draft opened, which is NOT
+          what's on screen — acting on it here would be misleading. */}
       <div
         className="flex shrink-0 items-center gap-1.5 pr-0.5"
         onPointerDown={(e) => e.stopPropagation()}
       >
-        {activeWorkspaceId && (
+        {guiChrome && activeWorkspaceId && (
           <RunButton workspaceId={activeWorkspaceId} variant="split" />
         )}
         <ResourceMonitor />
-        <IdeLauncher compact />
+        {guiChrome && <IdeLauncher compact />}
         {/* The separator divides the content cluster from the layout-toggle
             + native window controls group — on the web remote client those
             controls render nothing, so the separator would dangle next to a
@@ -524,7 +567,9 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         {!isRemoteClient() && (
           <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
         )}
-        {activeWorkspaceId && <RightPanelToggle workspaceId={activeWorkspaceId} />}
+        {guiChrome && activeWorkspaceId && (
+          <RightPanelToggle workspaceId={activeWorkspaceId} />
+        )}
         <WindowControls />
         {/* Web remote client only: the connection chip takes the slot the
             hidden window controls free up. Quiet while connected; the loud

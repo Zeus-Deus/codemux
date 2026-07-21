@@ -1288,7 +1288,7 @@ const presetState: PresetStoreSnapshot = {
     mkPreset({
       id: "builtin-codex",
       name: "Codex",
-      commands: ["codex --full-auto"],
+      commands: ["codex --dangerously-bypass-approvals-and-sandbox"],
       icon: "codex",
       is_builtin: true,
     }),

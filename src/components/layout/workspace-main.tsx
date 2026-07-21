@@ -137,9 +137,11 @@ export function WorkspaceMain() {
 
   // Lazy-workspace-creation: when the flag is on and a client-side
   // chat draft is active, render the draft surface in place of the
-  // workspace pane tree. PresetBar sits ABOVE the branch so it's
-  // present on both drafts and real workspaces — a preset click on a
-  // draft materialises the workspace via `materializeWithPreset`.
+  // workspace pane tree. In legacy chrome the PresetBar sits above the
+  // draft (a preset click materialises the workspace via
+  // `materializeWithPreset`); in GUI chrome that row is dropped — the
+  // titlebar's draft variant hosts the same materialise-with-preset
+  // affordance via `DraftAgentLauncher` (see title-bar.tsx).
   const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
   // GUI chrome (Agent Chat Beta): the title bar absorbs the tab strip +
   // preset launcher, so those stacked rows drop here. Off ⇒ legacy chrome
@@ -152,11 +154,13 @@ export function WorkspaceMain() {
   if (lazyEnabled && activeDraftId && activeDraft) {
     return (
       <div className="flex-1 min-w-0 min-h-0 flex flex-col overflow-hidden">
-        <PresetBar
-          workspaceId={null}
-          draftId={activeDraft.draftId}
-          disabled={activeDraft.promoting}
-        />
+        {!enableAgentChat && (
+          <PresetBar
+            workspaceId={null}
+            draftId={activeDraft.draftId}
+            disabled={activeDraft.promoting}
+          />
+        )}
         <div className="flex-1 min-h-0 overflow-hidden">
           <DraftChatSurface />
         </div>

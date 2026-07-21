@@ -27,8 +27,8 @@ use crate::skills_sync::export::{
 use crate::skills_sync::{SyncEngine, SyncResult, SyncStateSnapshot};
 
 #[tauri::command]
-pub async fn skills_sync_now(
-    app: tauri::AppHandle,
+pub async fn skills_sync_now<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     engine: State<'_, SyncEngine>,
 ) -> Result<SyncResult, String> {

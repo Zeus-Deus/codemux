@@ -24,7 +24,7 @@ use crate::execution::ExecutionPolicy;
 use crate::pty_daemon::PtyDaemonClient;
 use crate::state::AppStateStore;
 use std::sync::Arc;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Manager, Runtime, State};
 
 /// Should `spawn_pty_for_session_via_daemon` synthesize a "relaunch this
 /// agent" command from the in-memory `original_command`?
@@ -150,8 +150,8 @@ pub(crate) fn remote_spawn_cwd(owning_ws: Option<&crate::state::WorkspaceSnapsho
 /// daemon can't be reached, the spawn failed, or the attach failed —
 /// callers fall back to the in-process path so the user still gets a
 /// working agent.
-pub async fn spawn_pty_for_agent_via_daemon(
-    app: AppHandle,
+pub async fn spawn_pty_for_agent_via_daemon<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
     workspace_id: String,
     argv: Vec<String>,
@@ -447,8 +447,8 @@ pub async fn spawn_pty_for_agent_via_daemon(
 /// so user-typed commands inside the shell get the same Codemux context
 /// AND reopening a previously-killed agent triggers the same
 /// `claude --continue` / adapter-driven resume the in-process path does.
-pub async fn spawn_pty_for_session_via_daemon(
-    app: AppHandle,
+pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
 ) -> Result<(), String> {
     let entry_ts = std::time::Instant::now();
