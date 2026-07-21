@@ -117,19 +117,13 @@ fn serve_headless_boots_and_dispatches_without_display() {
         "get_app_state snapshot should carry a workspaces field, got: {snapshot}"
     );
 
-    // ── Assertion 3: the embedded-asset resolver is queryable. In the
-    //    dev/debug profile (cargo test) tauri's codegen emits an EMPTY
-    //    EmbeddedAssets because tauri.conf.json configures a devUrl — the
-    //    desktop dev build serves the frontend from Vite rather than the
-    //    binary. Release builds embed `../dist`, so there `index.html`
-    //    resolves. Probe and degrade gracefully. ──
+    // ── Assertion 3: the embedded-asset resolver is queryable. A local
+    //    dev/debug test normally has no bundle because the desktop uses Vite,
+    //    while CI builds `../dist` before `cargo test` and can therefore embed
+    //    `index.html` even with debug assertions enabled. Both debug layouts
+    //    are valid; release builds must always carry the bundle. ──
     let index = app.asset_resolver().get("index.html".into());
-    if cfg!(debug_assertions) {
-        assert!(
-            index.is_none(),
-            "dev/debug profile serves the frontend from Vite (devUrl), so no asset is embedded"
-        );
-    } else {
+    if !cfg!(debug_assertions) {
         assert!(
             index.is_some(),
             "release build should serve the embedded frontend index.html"
