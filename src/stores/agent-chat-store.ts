@@ -119,6 +119,8 @@ export interface ChatThreadSlice extends ChatThreadState {
   /** Context-window selection (Claude-only today). `null` means "use
    *  the model default". */
   contextWindow: string | null;
+  /** Premium inference speed for models that advertise fast-mode support. */
+  fastMode: boolean;
   /** Composer-level Cursor-style mode pill. `default` means no pill. */
   mode: ChatMode;
   /** When Plan pill activates, we stash the prior `permissionMode`
@@ -158,6 +160,7 @@ function emptySlice(): ChatThreadSlice {
     resumeCursor: null,
     effort: null,
     contextWindow: null,
+    fastMode: false,
     mode: "default",
     modePriorPermissionMode: null,
     hasDebugActivity: false,
@@ -250,6 +253,8 @@ interface AgentChatStore {
   setEffort: (threadId: string, effort: string | null) => void;
   /** Set the thread's context-window selection. `null` clears. */
   setContextWindow: (threadId: string, contextWindow: string | null) => void;
+  /** Enable or disable the provider's premium speed tier. */
+  setFastMode: (threadId: string, fastMode: boolean) => void;
   /** Set the composer-level Cursor-style mode. */
   setMode: (threadId: string, mode: ChatMode) => void;
   /** Stash / clear the permissionMode value to restore when the
@@ -495,6 +500,13 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         slice.contextWindow === contextWindow
           ? slice
           : { ...slice, contextWindow },
+      ),
+    ),
+
+  setFastMode: (threadId, fastMode) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.fastMode === fastMode ? slice : { ...slice, fastMode },
       ),
     ),
 

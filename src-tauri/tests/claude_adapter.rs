@@ -113,6 +113,7 @@ fn start_input(thread_id: &str) -> StartSessionInput {
         permission_mode: None,
         effort: None,
         context_window: None,
+        fast_mode: false,
         additional_directories: vec![],
         env: None,
         extra: serde_json::Value::Null,

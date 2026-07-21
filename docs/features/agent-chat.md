@@ -117,6 +117,16 @@ The chat pane stack:
   + exit dialog.
 - **Mode pills**: Ask / Allow always / Plan / Debug, with Shift+Tab cycling
   and silent-restart on pill removal.
+- **Capability-gated speed picker**: models that advertise
+  `supports_fast_mode` show an explicit Standard / Fast picker beside the
+  reasoning control. Fast is a premium-usage choice, persists per thread,
+  and takes effect through a transcript-preserving silent restart. Claude
+  scopes the Agent SDK's `fastMode` setting to the current session with
+  `fastModePerSessionOptIn`; Codex launches/resumes the app-server thread with
+  `serviceTier: "fast"` (or explicit `null` for Standard, so a global fast
+  default cannot override the composer). Switching to a model without the
+  capability, including after a capability-catalog change, heals the thread
+  back to Standard. OpenCode does not advertise the capability today.
 - **Attachments** via `+` and `@`: files, folders, GitHub issues + PRs,
   images via paste / drop / picker. Inline chips, send-time injection,
   expand, caps, gif guard, chip tooltips. See
@@ -262,7 +272,7 @@ The chat pane stack:
   when the row carries one (falling back to a fresh session, whose
   transcript still hydrates from the DB, when it does not or when the
   resume-start fails). Each thread's picker config (`model`, `effort`,
-  `context_window`, `permission_mode`) is persisted on the session row —
+  `context_window`, `permission_mode`, `fast_mode`) is persisted on the session row —
   written at `agent_chat_start_session`, updated fire-and-forget by the
   picker handlers via `agent_chat_update_session_config`, always persisted
   by `agent_chat_set_model` / `agent_chat_set_permission_mode` (which now

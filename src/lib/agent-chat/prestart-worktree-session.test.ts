@@ -26,6 +26,7 @@ const setSessionLaunchModeMock = vi.fn();
 const setModelMock = vi.fn();
 const setEffortMock = vi.fn();
 const setContextWindowMock = vi.fn();
+const setFastModeMock = vi.fn();
 const setModeMock = vi.fn();
 vi.mock("@/stores/agent-chat-store", () => ({
   DEFAULT_THREAD_PERMISSION_MODE: "bypassPermissions",
@@ -37,6 +38,7 @@ vi.mock("@/stores/agent-chat-store", () => ({
       setModel: setModelMock,
       setEffort: setEffortMock,
       setContextWindow: setContextWindowMock,
+      setFastMode: setFastModeMock,
       setMode: setModeMock,
     }),
   },
@@ -58,6 +60,7 @@ describe("prestartWorktreeSession", () => {
     setModelMock.mockReset();
     setEffortMock.mockReset();
     setContextWindowMock.mockReset();
+    setFastModeMock.mockReset();
     setModeMock.mockReset();
     createPaneMock.mockResolvedValue("pane-1");
     startSessionMock.mockResolvedValue("thread-echo");
@@ -92,6 +95,7 @@ describe("prestartWorktreeSession", () => {
     expect(input.thread_id.length).toBeGreaterThan(0);
     expect(input.cwd).toBe("/tmp/worktree-feat");
     expect(input.permission_mode).toBe("bypassPermissions");
+    expect(input.fast_mode).toBe(false);
     expect(input.resume_cursor).toBeNull();
     expect(input.additional_directories).toEqual([]);
   });
@@ -188,6 +192,7 @@ describe("prestartWorktreeSession", () => {
       permissionMode: "plan",
       effort: "high",
       contextWindow: "1m",
+      fastMode: true,
       mode: "plan",
     });
     const [, , input] = startSessionMock.mock.calls[0];
@@ -195,10 +200,12 @@ describe("prestartWorktreeSession", () => {
     expect(input.permission_mode).toBe("plan");
     expect(input.effort).toBe("high");
     expect(input.context_window).toBe("1m");
+    expect(input.fast_mode).toBe(true);
     const tid = result!.threadId;
     expect(setModelMock).toHaveBeenCalledWith(tid, "claude-opus-4-7");
     expect(setEffortMock).toHaveBeenCalledWith(tid, "high");
     expect(setContextWindowMock).toHaveBeenCalledWith(tid, "1m");
+    expect(setFastModeMock).toHaveBeenCalledWith(tid, true);
     expect(setModeMock).toHaveBeenCalledWith(tid, "plan");
     expect(setPermissionModeMock).toHaveBeenCalledWith(tid, "plan");
     expect(setSessionLaunchModeMock).toHaveBeenCalledWith(tid, "plan");
@@ -231,9 +238,11 @@ describe("prestartWorktreeSession", () => {
     const [, , input] = startSessionMock.mock.calls[0];
     expect(input.model).toBeNull();
     expect(input.permission_mode).toBe("bypassPermissions");
+    expect(input.fast_mode).toBe(false);
     expect(setModelMock).not.toHaveBeenCalled();
     expect(setEffortMock).not.toHaveBeenCalled();
     expect(setContextWindowMock).not.toHaveBeenCalled();
+    expect(setFastModeMock).toHaveBeenCalledWith(input.thread_id, false);
     expect(setModeMock).not.toHaveBeenCalled();
   });
 });

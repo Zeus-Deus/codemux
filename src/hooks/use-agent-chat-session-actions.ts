@@ -128,6 +128,7 @@ export function useAgentChatSessionActions(
           permission_mode: resolvedMode,
           effort: record.effort,
           context_window: record.context_window,
+          fast_mode: record.fast_mode ?? false,
           additional_directories: [],
           env: null,
         });
@@ -140,6 +141,7 @@ export function useAgentChatSessionActions(
         store.setModel(newThreadId, resolvedModel);
         store.setEffort(newThreadId, record.effort);
         store.setContextWindow(newThreadId, record.context_window);
+        store.setFastMode(newThreadId, record.fast_mode ?? false);
         store.setPermissionMode(newThreadId, resolvedMode);
         store.setSessionLaunchMode(newThreadId, resolvedMode);
         toast.success(
@@ -178,6 +180,7 @@ export function useAgentChatSessionActions(
         model: null,
         resume_cursor: null,
         permission_mode: startMode,
+        fast_mode: false,
         additional_directories: [],
         env: null,
       });
@@ -189,6 +192,7 @@ export function useAgentChatSessionActions(
       store.ensureThread(newThreadId);
       store.setModel(newThreadId, startModel);
       store.setPermissionMode(newThreadId, startMode);
+      store.setFastMode(newThreadId, false);
       store.setSessionLaunchMode(newThreadId, startMode);
     } catch (error) {
       toast.error(`Failed to start new chat: ${error}`);

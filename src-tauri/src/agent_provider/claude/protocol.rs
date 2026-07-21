@@ -52,6 +52,8 @@ pub struct StartSessionParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub fast_mode: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_dangerously_skip_permissions: Option<bool>,
@@ -536,6 +538,7 @@ mod tests {
             cwd: "/tmp".into(),
             model: Some("claude-opus-4-7".into()),
             effort: None,
+            fast_mode: Some(true),
             permission_mode: None,
             allow_dangerously_skip_permissions: None,
             additional_directories: None,
@@ -551,6 +554,7 @@ mod tests {
         assert_eq!(v["pathToClaudeCodeExecutable"], "/usr/bin/claude");
         assert_eq!(v["model"], "claude-opus-4-7");
         assert!(v.get("effort").is_none());
+        assert_eq!(v["fastMode"], true);
         assert!(v.get("permissionMode").is_none());
     }
 

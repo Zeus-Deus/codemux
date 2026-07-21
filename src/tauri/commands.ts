@@ -1334,6 +1334,8 @@ export interface AgentChatStartSessionInput {
   effort?: string | null;
   /** Claude only — context-window selector (e.g. "1m" adds [1m] bracket). */
   context_window?: string | null;
+  /** Premium provider speed tier. Capability-gated by the active model. */
+  fast_mode?: boolean;
   additional_directories: string[];
   env: Record<string, string> | null;
   extra?: unknown;
@@ -1578,6 +1580,7 @@ export interface AgentChatSessionRecord {
   effort: string | null;
   context_window: string | null;
   permission_mode: string | null;
+  fast_mode?: boolean;
 }
 
 /** Partial per-thread config patch for
@@ -1589,6 +1592,7 @@ export interface AgentChatSessionConfigUpdate {
   effort?: string | null;
   context_window?: string | null;
   permission_mode?: string | null;
+  fast_mode?: boolean;
 }
 
 export const agentChatListSessions = (

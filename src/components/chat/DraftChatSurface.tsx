@@ -422,6 +422,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
           setSessionLaunchMode: chat.setSessionLaunchMode,
           setEffort: chat.setEffort,
           setContextWindow: chat.setContextWindow,
+          setFastMode: chat.setFastMode,
           setMode: chat.setMode,
         },
         skillBodies,
@@ -826,14 +827,23 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
           next === "claude" ? DEFAULT_THREAD_PERMISSION_MODE : null,
         effort: null,
         contextWindow: null,
+        fastMode: false,
       });
     },
     [draft.draftId, draft.provider, updateDraftConfig],
   );
 
   const handleModelChange = useCallback(
-    (next: string) => updateDraftConfig(draft.draftId, { model: next }),
-    [draft.draftId, updateDraftConfig],
+    (next: string) => {
+      const nextModel = capabilities?.models.find((item) => item.id === next);
+      updateDraftConfig(draft.draftId, {
+        model: next,
+        ...(draft.fastMode && nextModel && !nextModel.supports_fast_mode
+          ? { fastMode: false }
+          : {}),
+      });
+    },
+    [draft.draftId, draft.fastMode, capabilities, updateDraftConfig],
   );
   const handlePermissionModeChange = useCallback(
     (next: string) =>
@@ -847,6 +857,11 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const handleContextWindowChange = useCallback(
     (next: string) =>
       updateDraftConfig(draft.draftId, { contextWindow: next }),
+    [draft.draftId, updateDraftConfig],
+  );
+  const handleFastModeChange = useCallback(
+    (next: boolean) =>
+      updateDraftConfig(draft.draftId, { fastMode: next }),
     [draft.draftId, updateDraftConfig],
   );
 
@@ -930,6 +945,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       permissionMode={draft.permissionMode}
       effort={draft.effort}
       contextWindow={draft.contextWindow}
+      fastMode={draft.fastMode ?? false}
       activeModel={activeModel}
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
@@ -980,6 +996,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
+      onFastModeChange={handleFastModeChange}
       onModeActivate={handleModeActivate}
       onModeRemove={handleModeRemove}
     />

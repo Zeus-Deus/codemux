@@ -544,6 +544,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         effort: AgentChatSessionConfig::keep_or_set(input.effort.clone()),
         context_window: AgentChatSessionConfig::keep_or_set(input.context_window.clone()),
         permission_mode: AgentChatSessionConfig::keep_or_set(input.permission_mode.clone()),
+        fast_mode: Some(input.fast_mode),
     };
     // Trace the resume wire so the dev console shows whether a
     // resume_cursor actually reached the provider, and with what
@@ -1169,6 +1170,7 @@ pub async fn ensure_live_session<R: Runtime>(
         permission_mode: permission_mode.clone(),
         effort: record.effort.clone(),
         context_window: record.context_window.clone(),
+        fast_mode: record.fast_mode,
         additional_directories: vec![],
         env: env.clone(),
         extra: serde_json::Value::Null,

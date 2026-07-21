@@ -65,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode: None,
             effort: None,
             context_window: None,
+            fast_mode: false,
             additional_directories: vec![],
             env: None,
             extra: serde_json::Value::Null,

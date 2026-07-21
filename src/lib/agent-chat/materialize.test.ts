@@ -80,6 +80,7 @@ function makeActions(): SpyActions {
     setSessionLaunchMode: vi.fn(),
     setEffort: vi.fn(),
     setContextWindow: vi.fn(),
+    setFastMode: vi.fn(),
     setMode: vi.fn(),
   };
 }

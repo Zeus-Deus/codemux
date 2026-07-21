@@ -86,6 +86,8 @@ export interface MaterializeActions {
   setEffort: (threadId: string, effort: string | null) => void;
   /** Seed the slice's context-window selection. `null` clears. */
   setContextWindow: (threadId: string, contextWindow: string | null) => void;
+  /** Seed the slice's premium speed-tier choice. */
+  setFastMode: (threadId: string, fastMode: boolean) => void;
   /** Seed the slice's composer mode pill. Stage 3 onward. */
   setMode: (threadId: string, mode: ChatMode) => void;
 }
@@ -305,6 +307,7 @@ export async function materializeAndSend(
       permission_mode: effectivePermissionMode(draft),
       effort: draft.effort,
       context_window: draft.contextWindow,
+      fast_mode: draft.fastMode ?? false,
       additional_directories: [],
       env: null,
     });
@@ -490,6 +493,7 @@ export async function materializeWithPreset(
         permission_mode: effectivePermissionMode(draft),
         effort: draft.effort,
         context_window: draft.contextWindow,
+        fast_mode: draft.fastMode ?? false,
         additional_directories: [],
         env: null,
       });
@@ -592,6 +596,7 @@ function seedSliceFromDraft(
   if (draft.contextWindow) {
     actions.setContextWindow(draft.threadId, draft.contextWindow);
   }
+  actions.setFastMode(draft.threadId, draft.fastMode ?? false);
   actions.setMode(draft.threadId, draft.mode);
 }
 
