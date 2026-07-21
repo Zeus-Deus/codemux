@@ -12,7 +12,7 @@ Terminal presets are saved command templates that launch with one click from the
 
 ## Current Model
 
-Presets are stored in SQLite via the database layer. Fourteen builtin presets ship by default and are synced on every load. Users can create (via the **New preset** button in Settings > Presets or the preset-bar gear menu), edit, delete, pin, and reorder custom presets through Settings > Presets.
+Presets are stored in SQLite via the database layer. Fourteen builtin presets ship by default and are synced on every load. Versioned preset-store migrations update obsolete untouched builtin defaults while preserving customized commands; schema v2 replaces the legacy persisted Codex command `codex --full-auto` with the current interactive YOLO command. Users can create (via the **New preset** button in Settings > Presets or the preset-bar gear menu), edit, delete, pin, and reorder custom presets through Settings > Presets.
 
 A preset is either a **raw command** preset (a list of literal shell command lines, the original model) or a **structured "agent launcher"** preset (pick an agent + model + reasoning + a prompt). Both kinds are the same `TerminalPreset` under the hood and launch through the identical `apply_preset` pipeline; the structured kind additionally persists a `launch_config` so the editor can round-trip the pickers. The editor's **Type** selector switches a preset between the two modes.
 
@@ -55,7 +55,7 @@ On bar-launch, the preset's `model_selection` is passed to `apply_preset` (which
 | Name | Command | YOLO flag rationale | Pinned |
 |------|---------|---------------------|--------|
 | Claude Code | `claude --dangerously-skip-permissions` | skip all permission prompts | yes |
-| Codex | `codex --dangerously-bypass-approvals-and-sandbox` | skip all confirmation prompts and execute commands without sandboxing (verified against `codex --help`; the older `--full-auto` flag only exists on the `codex exec` subcommand) | yes |
+| Codex | `codex --dangerously-bypass-approvals-and-sandbox` | skip all confirmation prompts and execute commands without sandboxing (verified against `codex --help`; the older `--full-auto` flag is not accepted by the interactive CLI) | yes |
 | OpenCode | `opencode` | no CLI bypass flag | yes |
 | Gemini | `gemini --yolo` | auto-approve all | yes |
 | Antigravity | `agy --dangerously-skip-permissions` | auto-approve all tool permission requests | yes |

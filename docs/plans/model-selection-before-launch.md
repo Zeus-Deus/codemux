@@ -114,8 +114,10 @@ Post-review hardening (three fresh-context review agents, all "fixes only"):
   harvest resolved. Effective values now pass the stored value through
   while caps are loading; persistence stores the user's literal pick.
 - **Codex preset fixed** — `codex --full-auto` → `codex
-  --dangerously-bypass-approvals-and-sandbox` (the stale flag now only
-  exists on `codex exec`).
+  --dangerously-bypass-approvals-and-sandbox` (the stale flag is not accepted
+  by the interactive CLI). Preset-store schema v2 also migrates the exact old
+  builtin value already persisted by existing installations while preserving
+  customized Codex commands.
 - Minor: `strip_codex_reasoning` loop step-back, reset effect keyed on
   primitives (no clobber on a mid-dialog `presets` refresh), control
   socket logs a malformed `model_selection` instead of silently

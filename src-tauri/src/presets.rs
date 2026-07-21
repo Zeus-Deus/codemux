@@ -3,8 +3,11 @@ use std::sync::Mutex;
 
 use crate::database::DatabaseStore;
 
-const PRESET_SCHEMA_VERSION: u32 = 1;
+const PRESET_SCHEMA_VERSION: u32 = 2;
 const PRESET_STORE_KEY: &str = "preset_store";
+
+const LEGACY_CODEX_BUILTIN_COMMAND: &str = "codex --full-auto";
+const CODEX_BUILTIN_COMMAND: &str = "codex --dangerously-bypass-approvals-and-sandbox";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -148,7 +151,7 @@ fn builtin_presets() -> Vec<TerminalPreset> {
             id: "builtin-codex".into(),
             name: "Codex".into(),
             description: Some("Launch OpenAI Codex agent".into()),
-            commands: vec!["codex --dangerously-bypass-approvals-and-sandbox".into()],
+            commands: vec![CODEX_BUILTIN_COMMAND.into()],
             working_directory: None,
             launch_mode: LaunchMode::NewTab,
             icon: Some("codex".into()),
@@ -375,7 +378,9 @@ pub fn load_presets(db: &DatabaseStore) -> PresetStore {
     // Try SQLite first
     if let Some(json) = db.get_setting(PRESET_STORE_KEY) {
         if let Ok(mut store) = serde_json::from_str::<PresetStore>(&json) {
-            sync_builtins(&mut store);
+            if sync_builtins(&mut store) {
+                let _ = save_presets(db, &store);
+            }
             return store;
         }
     }
@@ -400,22 +405,50 @@ pub fn save_presets(db: &DatabaseStore, store: &PresetStore) -> Result<(), Strin
     db.set_setting(PRESET_STORE_KEY, &json)
 }
 
-/// Sync built-in presets: add missing ones, remove stale ones.
-fn sync_builtins(store: &mut PresetStore) {
+/// Sync built-in presets and run versioned migrations.
+/// Returns whether the caller needs to persist the updated store.
+fn sync_builtins(store: &mut PresetStore) -> bool {
+    let mut changed = false;
+
+    // Schema v2 repairs the stale Codex command shipped by older CodeMux
+    // versions. Only replace the exact former builtin default so a user who
+    // customized the builtin keeps their command intact.
+    if store.schema_version < 2 {
+        if let Some(codex) = store
+            .presets
+            .iter_mut()
+            .find(|preset| preset.id == "builtin-codex")
+        {
+            if codex.commands.len() == 1
+                && codex.commands[0] == LEGACY_CODEX_BUILTIN_COMMAND
+            {
+                codex.commands = vec![CODEX_BUILTIN_COMMAND.into()];
+            }
+        }
+
+        store.schema_version = PRESET_SCHEMA_VERSION;
+        changed = true;
+    }
+
     let builtins = builtin_presets();
     let builtin_ids: Vec<&str> = builtins.iter().map(|b| b.id.as_str()).collect();
 
     // Remove stale builtins whose IDs no longer exist
+    let previous_len = store.presets.len();
     store.presets.retain(|p| {
         !p.id.starts_with("builtin-") || builtin_ids.contains(&p.id.as_str())
     });
+    changed |= store.presets.len() != previous_len;
 
     // Add any missing builtins
     for builtin in &builtins {
         if !store.presets.iter().any(|p| p.id == builtin.id) {
             store.presets.push(builtin.clone());
+            changed = true;
         }
     }
+
+    changed
 }
 
 /// Try to load from the legacy ~/.config/codemux/presets.json file.
@@ -575,6 +608,69 @@ mod tests {
         // Load should re-add missing builtins
         let loaded = load_presets(&db);
         assert_eq!(loaded.presets.len(), 14);
+    }
+
+    #[test]
+    fn load_migrates_and_persists_legacy_codex_builtin_command() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.schema_version = 1;
+        store
+            .presets
+            .iter_mut()
+            .find(|preset| preset.id == "builtin-codex")
+            .unwrap()
+            .commands = vec![LEGACY_CODEX_BUILTIN_COMMAND.into()];
+        save_presets(&db, &store).unwrap();
+
+        let loaded = load_presets(&db);
+        let codex = loaded
+            .presets
+            .iter()
+            .find(|preset| preset.id == "builtin-codex")
+            .unwrap();
+        assert_eq!(loaded.schema_version, PRESET_SCHEMA_VERSION);
+        assert_eq!(codex.commands, vec![CODEX_BUILTIN_COMMAND]);
+
+        let persisted: PresetStore = serde_json::from_str(
+            &db.get_setting(PRESET_STORE_KEY)
+                .expect("migrated preset store should be persisted"),
+        )
+        .unwrap();
+        assert_eq!(persisted.schema_version, PRESET_SCHEMA_VERSION);
+        assert_eq!(
+            persisted
+                .presets
+                .iter()
+                .find(|preset| preset.id == "builtin-codex")
+                .unwrap()
+                .commands,
+            vec![CODEX_BUILTIN_COMMAND]
+        );
+    }
+
+    #[test]
+    fn codex_builtin_migration_preserves_custom_commands() {
+        let db = DatabaseStore::new_in_memory();
+        let mut store = default_store();
+        store.schema_version = 1;
+        let custom_command = "codex --full-auto --search";
+        store
+            .presets
+            .iter_mut()
+            .find(|preset| preset.id == "builtin-codex")
+            .unwrap()
+            .commands = vec![custom_command.into()];
+        save_presets(&db, &store).unwrap();
+
+        let loaded = load_presets(&db);
+        let codex = loaded
+            .presets
+            .iter()
+            .find(|preset| preset.id == "builtin-codex")
+            .unwrap();
+        assert_eq!(loaded.schema_version, PRESET_SCHEMA_VERSION);
+        assert_eq!(codex.commands, vec![custom_command]);
     }
 
     fn make_custom_preset(id: &str, name: &str) -> TerminalPreset {
