@@ -83,8 +83,17 @@ export interface CapabilityDefaults {
   model: string;
   effort: string | null;
   contextWindow: string | null;
-  permissionMode: string;
+  permissionMode: string | null;
 }
+
+const FALLBACK_PERMISSION_MODE_BY_PROVIDER: Record<
+  AgentChatProviderKind,
+  string | null
+> = {
+  claude: DEFAULT_THREAD_PERMISSION_MODE,
+  codex: "danger-full-access",
+  opencode: null,
+};
 
 /** Derive the full set of default session-config values for a given
  *  provider + model. Used by `makeDraft` in `chat-draft-store` so
@@ -94,8 +103,9 @@ export interface CapabilityDefaults {
  *  Capability-driven: `effort` picks the model's `default_effort`,
  *  `contextWindow` picks the option flagged `is_default` (or the first
  *  option when none is flagged). `permissionMode` defaults to the
- *  provider's own default (currently `bypassPermissions` for Claude
- *  via `DEFAULT_THREAD_PERMISSION_MODE`).
+ *  provider's own default. The small fallback table covers the brief
+ *  pre-hydration window without applying Claude's `bypassPermissions`
+ *  value to Codex or OpenCode.
  *
  *  Returns safe null-fallbacks when capabilities aren't hydrated — the
  *  slice setters accept null, so the draft still writes a valid shape.
@@ -117,6 +127,8 @@ export function capabilityDefaults(
     model: modelId,
     effort: model?.default_effort ?? null,
     contextWindow: defaultContextWindow,
-    permissionMode: DEFAULT_THREAD_PERMISSION_MODE,
+    permissionMode:
+      caps?.default_permission_mode ??
+      FALLBACK_PERMISSION_MODE_BY_PROVIDER[provider],
   };
 }

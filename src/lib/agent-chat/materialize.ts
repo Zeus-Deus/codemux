@@ -81,7 +81,7 @@ export interface MaterializeActions {
   /** Seed the slice's `sessionLaunchMode` — the permission mode the
    *  session was actually started under. Used by the restart
    *  detection (`sessionLaunchMode !== permissionMode` → restart). */
-  setSessionLaunchMode: (threadId: string, mode: string) => void;
+  setSessionLaunchMode: (threadId: string, mode: string | null) => void;
   /** Seed the slice's reasoning/effort level. `null` clears to default. */
   setEffort: (threadId: string, effort: string | null) => void;
   /** Seed the slice's context-window selection. `null` clears. */
@@ -585,8 +585,9 @@ function seedSliceFromDraft(
   actions: MaterializeActions,
 ): void {
   const effectiveMode = effectivePermissionMode(draft);
+  const displayMode = effectiveMode ?? DEFAULT_THREAD_PERMISSION_MODE;
   actions.setModel(draft.threadId, draft.model);
-  actions.setPermissionMode(draft.threadId, effectiveMode);
+  actions.setPermissionMode(draft.threadId, displayMode);
   actions.setSessionLaunchMode(draft.threadId, effectiveMode);
   if (draft.effort) actions.setEffort(draft.threadId, draft.effort);
   if (draft.contextWindow) {
@@ -602,9 +603,9 @@ function seedSliceFromDraft(
  *  per-turn prompt wrapper that nudges the model away from
  *  ExitPlanMode). The picker is hidden behind the pill while either
  *  is active. Debug remains a state-only flip until Stage 6. */
-export function effectivePermissionMode(draft: ChatDraft): string {
+export function effectivePermissionMode(draft: ChatDraft): string | null {
   if (draft.mode === "plan" || draft.mode === "ask") return "plan";
-  return draft.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+  return draft.permissionMode;
 }
 
 /** Create a fresh workspace rooted at the cached `$HOME`, then rename

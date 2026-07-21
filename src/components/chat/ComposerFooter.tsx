@@ -36,7 +36,10 @@ interface Props {
    *  textarea); the value is still needed here to disable the
    *  permission picker when a mode commandeers permissions. */
   mode: ChatMode;
-  onProviderChange: (provider: AgentChatProviderKind) => void;
+  onProviderModelChange: (
+    provider: AgentChatProviderKind,
+    model: string,
+  ) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
@@ -71,7 +74,7 @@ export function ComposerFooter({
   showProviderPicker,
   showStopButton = true,
   mode,
-  onProviderChange,
+  onProviderModelChange,
   onModelChange,
   onPermissionModeChange,
   onEffortChange,
@@ -123,21 +126,14 @@ export function ComposerFooter({
         {/* Step 12 Stage 4 — when the unified provider+model picker is
             enabled (chat panes with `ENABLE_PROVIDER_PICKER`), render
             the new `MultiProviderModelPicker` and skip the legacy
-            single-provider `ModelPicker`. The draft surface
-            (`DraftChatSurface`) still renders with `showProviderPicker
-            === false`, in which case we keep the legacy picker so a
-            user-without-an-active-session can pick a Claude model
-            without seeing a 3-provider rail they can't fully use yet. */}
+            single-provider `ModelPicker`. `ModelPicker` remains as the
+            fallback for callers that deliberately disable the unified
+            provider surface. */}
         {showProviderPicker ? (
           <MultiProviderModelPicker
             provider={provider}
             model={model}
-            onProviderModelChange={(nextProvider, nextModel) => {
-              if (nextProvider !== provider) {
-                onProviderChange(nextProvider);
-              }
-              onModelChange(nextModel);
-            }}
+            onProviderModelChange={onProviderModelChange}
             disabled={controlsDisabled}
             openSignal={modelPickerOpenSignal}
           />
@@ -222,4 +218,3 @@ export function ComposerFooter({
     </div>
   );
 }
-

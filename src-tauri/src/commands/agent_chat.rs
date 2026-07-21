@@ -533,17 +533,19 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // consumes `input`, so it can be persisted onto the session row for
     // restart-resume (re-seeding the pickers) and read back by
     // `ensure_live_session` when it silently restarts a dead session.
-    // Session start writes the exact launch selection but never CLEARS a
-    // column it simply doesn't know about, so map each plain
-    // `Option<String>` through `keep_or_set` (`Some` → set, `None` →
-    // leave untouched) rather than treating a `None` as an explicit
-    // clear. After the heal above, a Claude/Codex row now persists the
-    // substituted default instead of NULL.
+    // Session start carries the complete launch selection. Persist its
+    // nullable fields exactly so an in-place provider handoff does not
+    // retain configuration that only made sense to the previous adapter.
     let config_for_persist = AgentChatSessionConfig {
-        model: AgentChatSessionConfig::keep_or_set(input.model.clone()),
-        effort: AgentChatSessionConfig::keep_or_set(input.effort.clone()),
-        context_window: AgentChatSessionConfig::keep_or_set(input.context_window.clone()),
-        permission_mode: AgentChatSessionConfig::keep_or_set(input.permission_mode.clone()),
+        // A session start carries the complete launch configuration, so
+        // NULL means "use this provider/model's default" and must clear a
+        // value left by the previous provider. `keep_or_set` was unsafe for
+        // an in-place Claude -> Codex/OpenCode handoff because it preserved
+        // Claude-only effort/context/permission columns on the new session.
+        model: Some(input.model.clone()),
+        effort: Some(input.effort.clone()),
+        context_window: Some(input.context_window.clone()),
+        permission_mode: Some(input.permission_mode.clone()),
     };
     // Trace the resume wire so the dev console shows whether a
     // resume_cursor actually reached the provider, and with what
@@ -635,7 +637,11 @@ pub async fn agent_chat_start_session<R: Runtime>(
     }
     let session = impl_.start_session(input).await.map_err(provider_err)?;
     let state: State<'_, AppStateStore> = app.state();
-    state.set_agent_chat_thread_id(&pane_id, Some(session.thread_id.0.clone()));
+    // Session startup is authoritative for BOTH halves of the pane binding.
+    // This matters when the model picker hands an existing pane from Claude
+    // to Codex/OpenCode: persisting only `thread_id` would leave the pane's
+    // provider stale and route the next app-restart resume through Claude.
+    state.set_agent_chat_binding(&pane_id, provider, session.thread_id.0.clone());
     // Persist the session for the history dropdown. Scope is
     // (workspace_id, cwd): workspace lookup goes through the state
     // store because the command layer only knows the pane id.
@@ -646,6 +652,12 @@ pub async fn agent_chat_start_session<R: Runtime>(
             ProviderKind::Codex => "codex",
             ProviderKind::OpenCode => "opencode",
         };
+        // A CodeMux thread can keep its transcript while changing provider,
+        // but provider-native resume cursors are not portable. The upsert
+        // atomically clears the old cursor when `provider` changes, then the
+        // start-time persist below records any cursor returned by the new
+        // adapter. Keeping this inside one SQL statement avoids a second
+        // clear racing a new provider's cursor event.
         if let Err(error) = db.upsert_agent_chat_session(
             &session.thread_id.0,
             &workspace_id,
@@ -2311,7 +2323,10 @@ pub async fn agent_chat_stop_session<R: Runtime>(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    impl_.stop_session(thread_id).await.map_err(provider_err)
+    match impl_.stop_session(thread_id).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+        Err(err) => Err(provider_err(err)),
+    }
 }
 
 /// Fire-and-forget cleanup for chat sessions whose owning pane/tab/workspace

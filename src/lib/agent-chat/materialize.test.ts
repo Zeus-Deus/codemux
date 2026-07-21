@@ -426,7 +426,7 @@ describe("materializeAndSend", () => {
       );
     });
 
-    it("falls back to DEFAULT_THREAD_PERMISSION_MODE when draft.permissionMode is null", async () => {
+    it("keeps a null launch mode while using the display fallback", async () => {
       const actions = makeActions();
       const draft = makeDraft({ permissionMode: null });
 
@@ -438,7 +438,7 @@ describe("materializeAndSend", () => {
       );
       expect(actions.setSessionLaunchMode).toHaveBeenCalledWith(
         draft.threadId,
-        "bypassPermissions",
+        null,
       );
     });
 

@@ -1,9 +1,22 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import type { ComponentProps } from "react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
+
+vi.mock("./pickers/MultiProviderModelPicker", () => ({
+  MultiProviderModelPicker: ({
+    onProviderModelChange,
+  }: {
+    onProviderModelChange: (provider: "codex", model: string) => void;
+  }) => (
+    <button
+      data-testid="multi-provider-picker-stub"
+      onClick={() => onProviderModelChange("codex", "gpt-5.4")}
+    />
+  ),
+}));
 
 import { ComposerFooter } from "./ComposerFooter";
 
@@ -39,7 +52,7 @@ function baseProps(): FooterProps {
     canSubmit: true,
     showProviderPicker: false,
     mode: "default",
-    onProviderChange: vi.fn(),
+    onProviderModelChange: vi.fn(),
     onModelChange: vi.fn(),
     onPermissionModeChange: vi.fn(),
     onEffortChange: vi.fn(),
@@ -142,5 +155,20 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     renderFooter({ controlsDisabled: true, onAttachClick: vi.fn() });
     const attach = screen.getByTestId("composer-attach-button");
     expect(attach).toBeDisabled();
+  });
+
+  it("forwards a cross-provider model pick as one atomic selection", () => {
+    const onProviderModelChange = vi.fn();
+    const onModelChange = vi.fn();
+    renderFooter({
+      showProviderPicker: true,
+      onProviderModelChange,
+      onModelChange,
+    });
+
+    fireEvent.click(screen.getByTestId("multi-provider-picker-stub"));
+
+    expect(onProviderModelChange).toHaveBeenCalledWith("codex", "gpt-5.4");
+    expect(onModelChange).not.toHaveBeenCalled();
   });
 });
