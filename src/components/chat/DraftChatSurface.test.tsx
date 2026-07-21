@@ -246,6 +246,21 @@ describe("DraftChatSurface", () => {
       expect(header.className).toContain("border-b");
     });
 
+    it("suppresses the header band in GUI chrome (Agent Chat Beta ON) — the titlebar draft pill covers it", async () => {
+      const { useFeatureFlags } = await import("@/stores/feature-flags");
+      useFeatureFlags.setState({ enableAgentChat: true });
+      try {
+        const draft = useChatDraftStore.getState().getOrCreateHomeDraft();
+        useChatDraftStore.getState().setActiveDraft(draft.draftId);
+        const { queryByTestId, getByText } = renderSurface();
+        expect(queryByTestId("draft-surface-header")).toBeNull();
+        // The landing itself still renders.
+        expect(getByText("What should we do today?")).toBeInTheDocument();
+      } finally {
+        useFeatureFlags.setState({ enableAgentChat: false });
+      }
+    });
+
     it("the header band sits ABOVE the home landing in DOM order", () => {
       // Visual hierarchy: the header is the first child of the
       // surface root; the chat-home wrapper comes after. If these
