@@ -397,9 +397,9 @@ pub fn is_token_expired(expires_at: &str) -> bool {
 
 // ── Localhost callback server ────────────────────────────────────
 
-pub fn start_callback_server(
+pub fn start_callback_server<R: tauri::Runtime>(
     auth_state: std::sync::Arc<AuthState>,
-    app_handle: tauri::AppHandle,
+    app_handle: tauri::AppHandle<R>,
 ) -> Result<u16, String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("bind: {e}"))?;
@@ -563,7 +563,7 @@ pub fn start_callback_server(
     Ok(port)
 }
 
-fn emit_auth_state(app: &tauri::AppHandle, token: &str, expires_at: &str) {
+fn emit_auth_state<R: tauri::Runtime>(app: &tauri::AppHandle<R>, token: &str, expires_at: &str) {
     // Fetch user data from API to populate the event
     let base = api_base_url();
     let url = format!("{base}/api/auth/desktop/verify");

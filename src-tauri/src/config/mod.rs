@@ -186,7 +186,7 @@ fn clean_font_value(value: &str) -> String {
         .to_string()
 }
 
-pub fn watch_theme_file(app_handle: tauri::AppHandle) {
+pub fn watch_theme_file<R: tauri::Runtime>(app_handle: tauri::AppHandle<R>) {
     std::thread::spawn(move || {
         let (tx, rx) = channel();
         let mut watcher = match notify::RecommendedWatcher::new(tx, Config::default()) {

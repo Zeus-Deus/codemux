@@ -269,7 +269,7 @@ pub fn list_automation_runs_impl(
 /// other devices pick up the change within seconds. A failed sync is
 /// logged, not surfaced — the row stays `dirty` and the next sync
 /// retries. Mirrors `commands::hosts::schedule_background_sync`.
-pub fn schedule_automations_sync(app: tauri::AppHandle) {
+pub fn schedule_automations_sync<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         if let Err(error) = crate::automations_sync::try_sync_with_app(&app).await {
             eprintln!("[codemux::automations] background sync failed: {error}");
@@ -293,8 +293,8 @@ pub fn automations_get(
 }
 
 #[tauri::command]
-pub fn automations_create(
-    app: tauri::AppHandle,
+pub fn automations_create<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     input: AutomationInput,
 ) -> Result<AutomationView, String> {
@@ -304,8 +304,8 @@ pub fn automations_create(
 }
 
 #[tauri::command]
-pub fn automations_update(
-    app: tauri::AppHandle,
+pub fn automations_update<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     id: i64,
     input: AutomationInput,
@@ -316,8 +316,8 @@ pub fn automations_update(
 }
 
 #[tauri::command]
-pub fn automations_set_enabled(
-    app: tauri::AppHandle,
+pub fn automations_set_enabled<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     id: i64,
     enabled: bool,
@@ -328,8 +328,8 @@ pub fn automations_set_enabled(
 }
 
 #[tauri::command]
-pub fn automations_delete(
-    app: tauri::AppHandle,
+pub fn automations_delete<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     id: i64,
 ) -> Result<(), String> {

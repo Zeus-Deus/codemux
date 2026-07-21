@@ -39,7 +39,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 use super::auth;
 use super::{Shared, WebRemoteState};
@@ -164,29 +164,29 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener, String> {
 
 /// Build the axum router. State is the `AppHandle`, from which handlers
 /// reach both the managed [`WebRemoteState`] and the `DatabaseStore`.
-pub fn router(app: AppHandle) -> Router {
+pub fn router<R: Runtime>(app: AppHandle<R>) -> Router {
     Router::new()
-        .route("/api/health", get(health))
-        .route("/api/pair", post(pair))
+        .route("/api/health", get(health::<R>))
+        .route("/api/pair", post(pair::<R>))
         // Account-mode admission: sign into the desktop's Codemux account
         // instead of pasting a pairing code (Stage A).
-        .route("/api/pair-account", post(pair_account))
-        .route("/api/ws-ticket", post(ws_ticket))
+        .route("/api/pair-account", post(pair_account::<R>))
+        .route("/api/ws-ticket", post(ws_ticket::<R>))
         // Authenticated one-shot state bootstrap (versioned API surface).
-        .route("/api/snapshot", get(super::snapshot::serve))
+        .route("/api/snapshot", get(super::snapshot::serve::<R>))
         // Authenticated file streamer backing the shim's `convertFileSrc`.
-        .route("/api/assets", get(super::assets::serve))
+        .route("/api/assets", get(super::assets::serve::<R>))
         // Browser-pane proxy to the loopback agent-browser daemons.
-        .route("/proxy/browser/:port/ws", get(super::proxy::ws_proxy))
-        .route("/proxy/browser/:port/api/*rest", any(super::proxy::http_forward))
-        .route("/ws", get(ws_upgrade))
-        .fallback(static_asset)
+        .route("/proxy/browser/:port/ws", get(super::proxy::ws_proxy::<R>))
+        .route("/proxy/browser/:port/api/*rest", any(super::proxy::http_forward::<R>))
+        .route("/ws", get(ws_upgrade::<R>))
+        .fallback(static_asset::<R>)
         .with_state(app)
 }
 
 // ── HTTP handlers ───────────────────────────────────────────────────
 
-async fn health(State(app): State<AppHandle>) -> Response {
+async fn health<R: Runtime>(State(app): State<AppHandle<R>>) -> Response {
     let version = app.package_info().version.to_string();
     // Advertise whether account mode is on so the pre-app bootstrap knows to
     // offer the "sign in with your Codemux account" screen alongside the
@@ -214,8 +214,8 @@ struct PairBody {
     device_name: Option<String>,
 }
 
-async fn pair(
-    State(app): State<AppHandle>,
+async fn pair<R: Runtime>(
+    State(app): State<AppHandle<R>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<PairBody>,
@@ -303,8 +303,8 @@ struct PairAccountBody {
 /// [`pair`], then hands the account proof to [`super::account::verify_and_mint`]
 /// and, on success, returns `{session_id, session_token, approved}` + a
 /// `Set-Cookie` exactly like the pairing path.
-async fn pair_account(
-    State(app): State<AppHandle>,
+async fn pair_account<R: Runtime>(
+    State(app): State<AppHandle<R>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<PairAccountBody>,
@@ -388,7 +388,7 @@ fn account_pair_error_response(err: super::account::AccountPairError) -> Respons
     }
 }
 
-async fn ws_ticket(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+async fn ws_ticket<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderMap) -> Response {
     if !auth::origin_ok(&headers) {
         return error(StatusCode::FORBIDDEN, "origin_mismatch");
     }
@@ -412,8 +412,8 @@ async fn ws_ticket(State(app): State<AppHandle>, headers: HeaderMap) -> Response
     Json(json!({ "ticket": ticket })).into_response()
 }
 
-async fn ws_upgrade(
-    State(app): State<AppHandle>,
+async fn ws_upgrade<R: Runtime>(
+    State(app): State<AppHandle<R>>,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
@@ -449,7 +449,7 @@ async fn ws_upgrade(
 
 /// Serve a frontend asset. Missing route-looking paths fall back to
 /// `index.html` for client-side routing.
-async fn static_asset(State(app): State<AppHandle>, uri: Uri) -> Response {
+async fn static_asset<R: Runtime>(State(app): State<AppHandle<R>>, uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
     let rel = if path.is_empty() { "index.html" } else { path };
 
@@ -467,7 +467,7 @@ async fn static_asset(State(app): State<AppHandle>, uri: Uri) -> Response {
 
 /// Resolve `rel` (no leading slash) to `(bytes, mime, csp)` from the
 /// embedded bundle, falling back to the on-disk `dist/` in dev builds.
-fn resolve_asset(app: &AppHandle, rel: &str) -> Option<(Vec<u8>, String, Option<String>)> {
+fn resolve_asset<R: Runtime>(app: &AppHandle<R>, rel: &str) -> Option<(Vec<u8>, String, Option<String>)> {
     if let Some(asset) = app.asset_resolver().get(rel.to_string()) {
         return Some((asset.bytes, asset.mime_type, asset.csp_header));
     }
@@ -533,7 +533,7 @@ fn mime_for(path: &std::path::Path) -> String {
 
 // ── WebSocket lifecycle ─────────────────────────────────────────────
 
-async fn handle_socket(app: AppHandle, session_id: String, socket: WebSocket) {
+async fn handle_socket<R: Runtime>(app: AppHandle<R>, session_id: String, socket: WebSocket) {
     let shared = app.state::<WebRemoteState>().shared();
     app.state::<crate::database::DatabaseStore>()
         .web_remote_touch_session(&session_id);
@@ -644,8 +644,8 @@ async fn handle_socket(app: AppHandle, session_id: String, socket: WebSocket) {
 /// iroh bi-stream bridge ([`super::iroh`]) both feed decoded JSON control frames
 /// here, so invoke / listen / unlisten behave identically no matter which
 /// transport delivered the bytes.
-pub(super) fn handle_text_frame(
-    app: &AppHandle,
+pub(super) fn handle_text_frame<R: Runtime>(
+    app: &AppHandle<R>,
     shared: &Arc<Shared>,
     conn_id: u64,
     out: &OutboundTx,
@@ -786,8 +786,8 @@ fn gate_error_response(err: GateError) -> Response {
 
 /// Admission gate for the authenticated asset + proxy routes. Returns the
 /// approved session on success, or a ready-to-return error `Response`.
-pub(super) fn require_session(
-    app: &AppHandle,
+pub(super) fn require_session<R: Runtime>(
+    app: &AppHandle<R>,
     headers: &HeaderMap,
 ) -> Result<auth::AuthedSession, Response> {
     authorize_headers(&app.state::<crate::database::DatabaseStore>(), headers)

@@ -13,13 +13,13 @@ fn get_valid_token(db: &DatabaseStore) -> Option<String> {
     }
 }
 
-fn emit_settings_synced(app: &tauri::AppHandle, settings: &UserSettings) {
+fn emit_settings_synced<R: tauri::Runtime>(app: &tauri::AppHandle<R>, settings: &UserSettings) {
     let _ = app.emit("settings-synced", settings);
 }
 
 #[tauri::command]
-pub async fn get_synced_settings(
-    app: tauri::AppHandle,
+pub async fn get_synced_settings<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
 ) -> Result<UserSettings, String> {
     let token = match get_valid_token(&db) {
@@ -39,8 +39,8 @@ pub async fn get_synced_settings(
 }
 
 #[tauri::command]
-pub async fn update_synced_settings(
-    app: tauri::AppHandle,
+pub async fn update_synced_settings<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     settings: UserSettings,
 ) -> Result<UserSettings, String> {
@@ -61,8 +61,8 @@ pub async fn update_synced_settings(
 }
 
 #[tauri::command]
-pub async fn update_setting(
-    app: tauri::AppHandle,
+pub async fn update_setting<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     section: String,
     key: String,
@@ -103,8 +103,8 @@ pub async fn update_setting(
 }
 
 #[tauri::command]
-pub async fn reset_synced_settings(
-    app: tauri::AppHandle,
+pub async fn reset_synced_settings<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
 ) -> Result<UserSettings, String> {
     let defaults = UserSettings::default();

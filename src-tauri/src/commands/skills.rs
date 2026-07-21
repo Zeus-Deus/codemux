@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Runtime, State};
 
 use crate::skills::{
     paths::enumerate_scan_paths, scanner::scan_directory, watcher::SkillsWatcherState, Skill,
@@ -76,8 +76,8 @@ fn scope_rank(s: SkillScope) -> u8 {
 /// Returns the count of paths actually being watched (paths that
 /// don't exist on disk are skipped silently).
 #[tauri::command]
-pub async fn start_skills_watcher(
-    app: AppHandle,
+pub async fn start_skills_watcher<R: Runtime>(
+    app: AppHandle<R>,
     state: State<'_, SkillsWatcherState>,
     project_root: Option<String>,
     include_plugins: bool,

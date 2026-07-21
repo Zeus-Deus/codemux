@@ -580,8 +580,8 @@ fn parse_clone_progress(line: &str) -> Option<CloneProgress> {
 }
 
 #[tauri::command]
-pub async fn git_clone_repo(
-    app: tauri::AppHandle,
+pub async fn git_clone_repo<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     url: String,
     target_dir: String,
 ) -> Result<String, String> {

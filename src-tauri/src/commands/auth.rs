@@ -22,8 +22,8 @@ pub struct SyncStatus {
 }
 
 #[tauri::command]
-pub async fn start_oauth_flow(
-    app: tauri::AppHandle,
+pub async fn start_oauth_flow<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     auth_state: State<'_, AuthState>,
 ) -> Result<(), String> {
     let csrf_state = auth_state.generate_csrf_state();
@@ -53,8 +53,8 @@ pub async fn start_oauth_flow(
 }
 
 #[tauri::command]
-pub async fn signin_email(
-    app: tauri::AppHandle,
+pub async fn signin_email<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
     email: String,
@@ -171,8 +171,8 @@ pub async fn forgot_password(email: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn check_auth(
-    app: tauri::AppHandle,
+pub async fn check_auth<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
 ) -> Result<Option<AuthUser>, String> {
@@ -279,8 +279,8 @@ pub async fn check_auth(
 }
 
 #[tauri::command]
-pub fn sign_out(
-    app: tauri::AppHandle,
+pub fn sign_out<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     auth_state: State<'_, AuthState>,
 ) -> Result<(), String> {

@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 use crate::state::{self, AppStateStore, PaneStatus};
 
@@ -19,7 +19,7 @@ pub fn hook_port() -> Option<u16> {
 
 /// Start the agent hook notification server on a random localhost port.
 /// Returns the allocated port number.
-pub fn start_hook_server(app: AppHandle) -> u16 {
+pub fn start_hook_server<R: Runtime>(app: AppHandle<R>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind hook server");
     let port = listener.local_addr().unwrap().port();
     HOOK_PORT.set(port).ok();
@@ -136,7 +136,7 @@ fn map_event_type(event_type: &str) -> Option<PaneStatus> {
     }
 }
 
-fn handle_lifecycle_event(app: &AppHandle, session_id: &str, status: PaneStatus) {
+fn handle_lifecycle_event<R: Runtime>(app: &AppHandle<R>, session_id: &str, status: PaneStatus) {
     let state: tauri::State<'_, AppStateStore> = app.state();
 
     // For Stop events, check if the pane is in the active workspace+tab — if so, go idle
@@ -277,7 +277,7 @@ fn shell_is_foreground(_shell_pid: u32) -> bool {
 
 /// Start a background thread that monitors when an agent exits so that stuck
 /// Working/Permission status indicators can be cleared.
-fn start_agent_exit_monitor(app: AppHandle, session_id: String, shell_pid: u32) {
+fn start_agent_exit_monitor<R: Runtime>(app: AppHandle<R>, session_id: String, shell_pid: u32) {
     let monitors = monitor_sessions();
     let mut guard = monitors.lock().unwrap_or_else(|e| e.into_inner());
 

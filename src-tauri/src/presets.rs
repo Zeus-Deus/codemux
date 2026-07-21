@@ -483,7 +483,7 @@ pub fn snapshot_from_store(store: &PresetStore) -> PresetStoreSnapshot {
     }
 }
 
-pub fn emit_presets_changed(app: &tauri::AppHandle) {
+pub fn emit_presets_changed<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     use tauri::Emitter;
     use tauri::Manager;
 
