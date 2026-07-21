@@ -1086,6 +1086,24 @@ async fn start_session_resilient(
     provider.start_session(input).await
 }
 
+/// The short-lived capability-harvest process can hit the same Linux
+/// ETXTBSY race as session startup when the full test suite launches many
+/// fixture executables concurrently. Retry only that specific transient;
+/// protocol/auth failures must still surface immediately.
+async fn harvest_capabilities_resilient(
+    binary: &std::path::Path,
+) -> Result<codemux_lib::agent_provider::ProviderChatCapabilities, HarvestError> {
+    for _ in 0..10 {
+        match harvest_codex_capabilities(binary, None).await {
+            Err(HarvestError::HarvestFailed { message }) if message.contains("Text file busy") => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            result => return result,
+        }
+    }
+    harvest_codex_capabilities(binary, None).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_probe_installed_returns_version_when_codex_works() {
     let wrapper = write_bash_script(
@@ -1108,7 +1126,7 @@ async fn auth_probe_unauthenticated_matches_common_patterns() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_harvest_accepts_logged_in_account_when_provider_requires_openai_auth() {
-    let caps = harvest_codex_capabilities(&fixture_path(), None)
+    let caps = harvest_capabilities_resilient(&fixture_path())
         .await
         .expect("account object proves the user is logged in");
     assert_eq!(caps.models.len(), 1);
@@ -1118,8 +1136,11 @@ async fn capability_harvest_accepts_logged_in_account_when_provider_requires_ope
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_harvest_rejects_missing_account_when_provider_requires_openai_auth() {
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_UNAUTHENTICATED", "1")]);
-    let result = harvest_codex_capabilities(wrapper.path(), None).await;
-    assert!(matches!(result, Err(HarvestError::NotAuthenticated { .. })));
+    let result = harvest_capabilities_resilient(wrapper.path()).await;
+    assert!(
+        matches!(result, Err(HarvestError::NotAuthenticated { .. })),
+        "unexpected capability-harvest result: {result:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1406,4 +1427,3 @@ async fn shutdown_during_event_streaming_does_not_panic() {
     provider.stop_session(ThreadId("t-race".into())).await.unwrap();
     // If we get here without panic, we're good.
 }
-
