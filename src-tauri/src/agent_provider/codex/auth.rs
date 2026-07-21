@@ -133,10 +133,10 @@ pub async fn probe_installed(codex_binary: &Path) -> Result<Option<String>, Prov
     }
 }
 
-/// Run `codex auth status` and classify its output.
+/// Run `codex login status` and classify its output.
 pub async fn probe_authenticated(codex_binary: &Path) -> Result<AuthStatus, ProviderError> {
     let mut cmd = Command::new(codex_binary);
-    cmd.arg("auth").arg("status");
+    cmd.arg("login").arg("status");
     let result = tokio::time::timeout(PROBE_TIMEOUT, output_retrying_etxtbsy(cmd)).await;
     let output = match result {
         Ok(Ok(out)) => out,
@@ -148,13 +148,13 @@ pub async fn probe_authenticated(codex_binary: &Path) -> Result<AuthStatus, Prov
                 });
             }
             return Err(ProviderError::ProcessError {
-                message: "failed to run `codex auth status`".into(),
+                message: "failed to run `codex login status`".into(),
                 source: Some(err.to_string()),
             });
         }
         Err(_) => {
             return Err(ProviderError::Timeout {
-                operation: "codex auth status".into(),
+                operation: "codex login status".into(),
                 elapsed_ms: PROBE_TIMEOUT.as_millis() as u64,
             })
         }

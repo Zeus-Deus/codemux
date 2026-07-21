@@ -19,7 +19,7 @@ OpenCode is the federated arm: a single rail entry whose flat model list shows e
 | Driver | Transport | Adapter | Capabilities |
 |---|---|---|---|
 | Claude | JSON-RPC stdio (`claude-agent` sidecar bin) | `src-tauri/src/agent_provider/claude/mod.rs` | **Live harvest** via the sidecar's `list-models` RPC (SDK `supportedModels()`), merged with hand-maintained per-id metadata in `capabilities.rs`; `/v1/models` (API-key) and `claude_fallback_capabilities()` as fallbacks. Handles alias ids (`default`, `sonnet`, `haiku`) and pinned-window ids (`claude-fable-5[1m]`) via family inference; maintained entries of families the curated roster omits (currently Opus) are appended so they stay selectable via `--model`. Ultrathink prompt-injection effort level, 200k/1M context-window picker on bare flagship/Sonnet ids. |
-| Codex | JSON-RPC stdio (`codex app-server`) | `src-tauri/src/agent_provider/codex/mod.rs` | **Live harvest** via a short-lived `codex app-server` child (`initialize` → `account/read` → `model/list`); unauthenticated users get a clean error state, no static fallback. Sandbox-policy permission modes, per-turn effort. |
+| Codex | JSON-RPC stdio (`codex app-server`) | `src-tauri/src/agent_provider/codex/mod.rs` | **Live harvest** via a short-lived `codex app-server` child (`initialize` → `account/read` → `model/list`); unauthenticated users get a clean error state, no static fallback. Auth classification follows the app-server contract: `requiresOpenaiAuth` describes the active model provider, so login is missing only when that field is true **and** `account` is null. Sandbox-policy permission modes, per-turn effort. |
 | OpenCode | HTTP (Rust-direct `reqwest` against a managed `opencode serve` child) | `src-tauri/src/agent_provider/opencode/{server,manager,client,capabilities}.rs` | **Live harvest** at `harvest_opencode_capabilities` — calls `GET /provider`, flattens to per-model `ChatModelInfo` entries with `sub_provider` populated and connected-only filter applied. |
 
 OpenCode's server lifecycle is owned by `OpenCodeServerManager` (singleton, `kill_on_drop` on the underlying `tokio::process::Child`, idempotent `ensure_running()`). The server is spawned lazily on the first capabilities refresh, lives for the duration of the Codemux session, and is killed when the manager state is dropped. Generated 32-char `OPENCODE_SERVER_PASSWORD` is exported into the child's env at spawn, then attached as HTTP Basic auth (`opencode:<password>`) on every request.
@@ -28,7 +28,19 @@ OpenCode's server lifecycle is owned by `OpenCodeServerManager` (singleton, `kil
 
 `ChatModelInfo` is the canonical chat-side per-model record (`src-tauri/src/agent_provider/types.rs`). Step 12 added one field: `sub_provider: Option<String>`. For Claude/Codex it's `None` (the driver IS the provider); for OpenCode it carries the upstream provider id (`"openai"`, `"anthropic"`, `"openrouter"`, …). Slug shape for OpenCode is `${provider_id}/${model_id}` (e.g. `openai/gpt-5`, `anthropic/claude-sonnet-4-6`) so a model selection round-trips deterministically.
 
-The `list_chat_provider_capabilities` Tauri command dispatches by `ProviderKind`: Claude/Codex return their hand-maintained fallback bundles synchronously; OpenCode runs the live harvest through `OpenCodeServerManager`. Failures fall through to error strings on the frontend store's `opencodeError` slot — the Stage-1 placeholder bundle is no longer used.
+The `list_chat_provider_capabilities` Tauri command dispatches by `ProviderKind`: Claude uses its live-sidecar/API cascade with a maintained fallback, Codex performs a cached live app-server harvest, and OpenCode runs its live harvest through `OpenCodeServerManager`. Failures fall through to the matching frontend store error slot — Codex errors retain typed prefixes so the picker can distinguish missing CLI, missing login, and harvest failures.
+
+### Codex authentication classification
+
+`account/read` returns two independent facts. `account` is the current login (or null), while `requiresOpenaiAuth` says whether the active model provider needs OpenAI credentials. A normal logged-in ChatGPT account therefore returns an account object **and** `requiresOpenaiAuth: true`; the latter is not a login-status boolean. Both capability harvest and session startup use the same truth table:
+
+| `account` | `requiresOpenaiAuth` | Result |
+|---|---:|---|
+| present | `true` or `false` | Ready; a usable login/credential is present |
+| null | `true` | Not authenticated; show the `codex login` hint |
+| null | `false` | Ready; the local/custom provider does not require OpenAI login |
+
+The separate one-shot CLI probe uses the current `codex login status` command. Regression coverage drives the fake app-server with the real logged-in shape (`account` present plus `requiresOpenaiAuth: true`) through both capability harvesting and session startup.
 
 The frontend `provider-capabilities-store` (Zustand) has one slot per driver (`claude`, `codex`, `opencode`) plus matching `*Error` slots. `refreshAll` fires the three refreshes in parallel via `Promise.all`; each `refresh(provider)` swallows its own error so a single failure doesn't block the other slots. `selectCapabilities(state, kind)` is an exhaustive switch — adding a fourth provider is a TypeScript error on day one.
 

@@ -32,6 +32,8 @@
 //!   `thread/start` (default `"c-1"`).
 //! * `FAKE_CODEX_EXIT_AFTER=<method>` — exit the fixture 0 after
 //!   responding to the named method (used to simulate crashes).
+//! * `FAKE_CODEX_UNAUTHENTICATED=1` — return no account from `account/read`
+//!   while reporting that the active provider requires OpenAI auth.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -156,6 +158,7 @@ fn main() {
     let thread_id =
         std::env::var("FAKE_CODEX_THREAD_ID").unwrap_or_else(|_| "c-1".to_string());
     let exit_after = std::env::var("FAKE_CODEX_EXIT_AFTER").ok();
+    let unauthenticated = env_truthy("FAKE_CODEX_UNAUTHENTICATED");
 
     let pending_server_requests: Arc<Mutex<HashMap<String, Value>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -208,16 +211,41 @@ fn main() {
                     write_line(&json!({
                         "jsonrpc":"2.0",
                         "id": id,
-                        "result": {"models": []},
+                        "result": {
+                            "data": [{
+                                "id": "gpt-test",
+                                "model": "gpt-test",
+                                "displayName": "GPT Test",
+                                "description": "Fixture model",
+                                "hidden": false,
+                                "isDefault": true,
+                                "defaultReasoningEffort": "medium",
+                                "supportedReasoningEfforts": [{
+                                    "reasoningEffort": "medium",
+                                    "description": "Fixture effort"
+                                }],
+                                "inputModalities": ["text"],
+                                "additionalSpeedTiers": []
+                            }],
+                            "nextCursor": null
+                        },
                     }));
                 }
             }
             "account/read" => {
                 if let Some(id) = id {
+                    let account = if unauthenticated {
+                        Value::Null
+                    } else {
+                        json!({"type":"chatgpt","planType":"pro"})
+                    };
                     write_line(&json!({
                         "jsonrpc":"2.0",
                         "id": id,
-                        "result": {"type":"personal","planType":"pro","sparkEnabled":false},
+                        "result": {
+                            "account": account,
+                            "requiresOpenaiAuth": true
+                        },
                     }));
                 }
             }
