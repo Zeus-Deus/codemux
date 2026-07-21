@@ -1,4 +1,4 @@
-import { memo, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -88,6 +88,18 @@ export const ToolCallCard = memo(function ToolCallCard({
   const hasImages = hasToolResultImages(item.result_content);
   const defaultExpanded = isPendingApproval || isError || isDiffTool || hasImages;
   const [expanded, setExpanded] = useState(defaultExpanded);
+  const hasSeenImagesRef = useRef(hasImages);
+
+  // Tool cards usually mount while the call is still running, before
+  // `result_content` exists. Open once when a renderable image first arrives;
+  // tracking the transition prevents ordinary rerenders from undoing a user's
+  // later manual collapse.
+  useEffect(() => {
+    if (hasImages && !hasSeenImagesRef.current) {
+      setExpanded(true);
+      hasSeenImagesRef.current = true;
+    }
+  }, [hasImages]);
 
   const Icon = toolIcon(item.tool_name);
   const glyph = glyphForState({

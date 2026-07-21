@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   extractToolResultImages,
   hasToolResultImages,
-  isImageBlock,
+  isRenderableImageBlock,
 } from "./tool-result-images";
 
 describe("extractToolResultImages", () => {
@@ -106,11 +106,38 @@ describe("hasToolResultImages", () => {
   });
 });
 
-describe("isImageBlock", () => {
-  it("recognises image and image_url blocks", () => {
-    expect(isImageBlock({ type: "image" })).toBe(true);
-    expect(isImageBlock({ type: "image_url" })).toBe(true);
-    expect(isImageBlock({ type: "text", text: "x" })).toBe(false);
-    expect(isImageBlock("x")).toBe(false);
+describe("isRenderableImageBlock", () => {
+  it("is true only for blocks the image renderer accepts", () => {
+    expect(
+      isRenderableImageBlock({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "AAAA" },
+      }),
+    ).toBe(true);
+    expect(
+      isRenderableImageBlock({
+        type: "image_url",
+        image_url: { url: "https://example.com/screenshot.png" },
+      }),
+    ).toBe(true);
+    expect(isRenderableImageBlock({ type: "image" })).toBe(false);
+    expect(
+      isRenderableImageBlock({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: "application/pdf",
+          data: "PP",
+        },
+      }),
+    ).toBe(false);
+    expect(
+      isRenderableImageBlock({
+        type: "image_url",
+        image_url: { url: "javascript:alert(1)" },
+      }),
+    ).toBe(false);
+    expect(isRenderableImageBlock({ type: "text", text: "x" })).toBe(false);
+    expect(isRenderableImageBlock("x")).toBe(false);
   });
 });

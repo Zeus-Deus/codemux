@@ -48,15 +48,6 @@ function safeImageSrc(raw: string): string | null {
   return null;
 }
 
-/** True when a single content-array entry is an image block. */
-export function isImageBlock(entry: unknown): boolean {
-  if (!isRecord(entry)) return false;
-  const type = entry.type;
-  if (type === "image_url") return true;
-  if (type !== "image") return false;
-  return true;
-}
-
 /** Normalise one entry to a `ToolResultImage`, or `null` if it isn't a
  *  renderable image. */
 function imageFromEntry(entry: unknown): ToolResultImage | null {
@@ -94,6 +85,16 @@ function imageFromEntry(entry: unknown): ToolResultImage | null {
   }
 
   return null;
+}
+
+/**
+ * True only when an entry will actually render through
+ * `extractToolResultImages`. Callers use this to suppress the matching raw
+ * JSON fallback, so a malformed, unsafe, or non-image block must remain
+ * false or its payload would disappear from the transcript entirely.
+ */
+export function isRenderableImageBlock(entry: unknown): boolean {
+  return imageFromEntry(entry) !== null;
 }
 
 /**

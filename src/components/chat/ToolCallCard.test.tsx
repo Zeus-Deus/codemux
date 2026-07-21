@@ -254,6 +254,54 @@ describe("ToolCallCard", () => {
     expect(container.textContent).toContain("line1");
   });
 
+  it("opens when an image arrives asynchronously and respects a later manual collapse", () => {
+    const onDecide = vi.fn();
+    const { rerender } = render(
+      <ToolCallCard item={makeTool()} approval={null} onDecide={onDecide} />,
+    );
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+
+    const completed = makeTool({
+      status: "done",
+      result_content: [
+        {
+          type: "image",
+          source: {
+            type: "base64",
+            media_type: "image/png",
+            data: "AAAA",
+          },
+        },
+      ],
+    });
+    rerender(
+      <ToolCallCard item={completed} approval={null} onDecide={onDecide} />,
+    );
+
+    expect(screen.getByRole("img")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,AAAA",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+
+    rerender(
+      <ToolCallCard
+        item={makeTool({ status: "done", result_content: null })}
+        approval={null}
+        onDecide={onDecide}
+      />,
+    );
+    rerender(
+      <ToolCallCard
+        item={{ ...completed }}
+        approval={null}
+        onDecide={onDecide}
+      />,
+    );
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
   it("error state auto-expands the body and keeps the target text visible", () => {
     const item = makeTool({
       status: "error",

@@ -193,11 +193,14 @@ The chat pane stack:
     unsafe URL schemes). `ToolCallBody` (`ToolCallBodies.tsx`) renders
     those below the per-tool body as a thumbnail row + click-to-open
     lightbox (`ToolResultImages.tsx`, mirroring the `UserMessage`
-    attachment lightbox), and both `contentToString` copies now filter
-    image blocks out (`isImageBlock`) so the same payload never
-    double-renders as base64 text. `ToolCallCard` auto-expands a result
-    that carries an image (`hasToolResultImages`) so a screenshot is
-    visible without a manual expand. Standalone assistant-authored image
+    attachment lightbox), and both `contentToString` copies filter only
+    successfully normalised blocks (`isRenderableImageBlock`) so the same
+    payload never double-renders as base64 text; rejected PDF, malformed,
+    or unsafe-URL blocks remain visible in the raw fallback instead of
+    disappearing. `ToolCallCard` auto-expands when a result first gains a
+    renderable image (`hasToolResultImages`) so asynchronously arriving
+    screenshots become visible without a manual expand, while a later user
+    collapse remains respected. Standalone assistant-authored image
     blocks (not wrapped in a tool result) are still unsupported — they
     would need a new backend `CompletedItem` variant. The dev mock seeds
     an image `Read` tool result in the demo transcript

@@ -1,7 +1,7 @@
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 import {
   extractToolResultImages,
-  isImageBlock,
+  isRenderableImageBlock,
 } from "@/lib/agent-chat/tool-result-images";
 
 import { DiffView } from "./DiffView";
@@ -388,7 +388,7 @@ function contentToString(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .filter((entry) => !isImageBlock(entry))
+      .filter((entry) => !isRenderableImageBlock(entry))
       .map((entry) => {
         if (entry == null) return "";
         if (typeof entry === "string") return entry;
@@ -488,4 +488,3 @@ function extractTitle(result: string): string | null {
   if (firstLine.length > 120) return firstLine.slice(0, 119) + "…";
   return firstLine;
 }
-

@@ -1,6 +1,6 @@
 import { useState } from "react";
 
-import { isImageBlock } from "@/lib/agent-chat/tool-result-images";
+import { isRenderableImageBlock } from "@/lib/agent-chat/tool-result-images";
 import { cn } from "@/lib/utils";
 
 const PREVIEW_LINES = 12;
@@ -62,7 +62,7 @@ function contentToString(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
-      .filter((entry) => !isImageBlock(entry))
+      .filter((entry) => !isRenderableImageBlock(entry))
       .map((entry) => {
         if (entry == null) return "";
         if (typeof entry === "string") return entry;
