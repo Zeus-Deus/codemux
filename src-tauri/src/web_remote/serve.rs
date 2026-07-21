@@ -32,35 +32,32 @@ pub struct ServeOptions {
 
 /// Entry point for `codemux serve`. Runs on the main thread; blocks until a
 /// shutdown signal, then performs the same teardown the GUI does on exit and
-/// returns (the process exits cleanly). Exits non-zero — before booting — if
-/// another Codemux instance already holds this machine's control endpoint.
-pub fn run_serve(opts: ServeOptions) {
+/// returns. Returns an error — before booting — if another Codemux instance
+/// already holds this machine's control endpoint.
+pub fn run_serve(opts: ServeOptions) -> Result<(), String> {
     // 1. Mutual exclusion: never boot a second backend alongside a running GUI
     //    or serve instance (they would fight over the control socket, the DB,
     //    the PTY daemon, and the web-remote port).
     if crate::control::control_server_is_running() {
-        eprintln!(
+        return Err(
             "Codemux is already running on this machine (GUI or serve) — stop it first, \
              or use `codemux remote enable` to control the running instance."
+                .to_string(),
         );
-        std::process::exit(1);
     }
 
     // 2. Boot the full app headless (DB, state, control server, PTY warmup,
     //    web_remote restore_on_boot, every background loop) on MockRuntime.
     let app = match crate::build_headless_app() {
         Ok(app) => app,
-        Err(e) => {
-            eprintln!("[codemux serve] failed to boot the headless backend: {e}");
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("failed to boot the headless backend: {e}")),
     };
     let handle = app.handle().clone();
 
     // Everything from here is async: run it — and the signal wait — inside one
     // `block_on`. `app` stays owned in this scope so the backend lives for the
     // whole session; dropping it would tear the runtime down.
-    tauri::async_runtime::block_on(async move {
+    let result = tauri::async_runtime::block_on(async move {
         // 6. Debug-asset caveat: dev builds embed no frontend (devUrl), so the
         //    served UI only works when the source-tree `dist/` fallback exists.
         //    Warn once when neither is present (release builds embed it — no
@@ -90,13 +87,9 @@ pub fn run_serve(opts: ServeOptions) {
             (None, false) => Some("all".to_string()),   // first-run default
         };
 
-        let result = match web_remote::control_enable(&handle, scope, opts.port).await {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("[codemux serve] could not enable the web-remote server: {e}");
-                std::process::exit(1);
-            }
-        };
+        let result = web_remote::control_enable(&handle, scope, opts.port)
+            .await
+            .map_err(|e| format!("could not enable the web-remote server: {e}"))?;
 
         // `--relay`: flip relay mode on through the same config path the
         //  Settings pane uses; because the server is now running,
@@ -134,11 +127,15 @@ pub fn run_serve(opts: ServeOptions) {
         //    MockRuntime has no event loop to drive.
         wait_for_shutdown_signal().await;
         eprintln!("\n[codemux serve] shutting down…");
+        Ok::<(), String>(())
     });
 
-    // Graceful shutdown — mirror the `RunEvent::Exit` cleanup in `run()`.
+    // Mirror the GUI's `RunEvent::Exit` cleanup, then let `app` drop normally
+    // so managed provider/server state gets its destructors. A success-path
+    // `process::exit` would skip those destructors and leak child processes.
     crate::agent_browser::kill_stream_daemons();
-    std::process::exit(0);
+    drop(app);
+    result
 }
 
 /// Print the "server bound" portion of the startup banner: port, bind scope,

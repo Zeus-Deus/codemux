@@ -235,8 +235,8 @@ pub fn run() {
 /// through the shared enable path, prints a pairing QR + link, and blocks
 /// until SIGINT / SIGTERM. Dispatched from `main` (not `maybe_run_cli`)
 /// because it is a long-lived foreground process, not a control round-trip.
-pub fn run_serve(opts: web_remote::serve::ServeOptions) {
-    web_remote::serve::run_serve(opts);
+pub fn run_serve(opts: web_remote::serve::ServeOptions) -> Result<(), String> {
+    web_remote::serve::run_serve(opts)
 }
 
 /// Expand the embedded-asset context exactly once. `generate_context!`

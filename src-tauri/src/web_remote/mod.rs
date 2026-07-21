@@ -485,6 +485,7 @@ pub async fn control_enable<R: Runtime>(
 ) -> Result<ControlEnableResult, String> {
     let shared = app.state::<WebRemoteState>().shared();
     let already_enabled = shared.config.lock().unwrap().enabled;
+    let already_bound = shared.runtime.lock().unwrap().is_some();
 
     let (status, already_running) = if already_enabled {
         if scope.is_some() || port.is_some() {
@@ -493,8 +494,16 @@ pub async fn control_enable<R: Runtime>(
             let status =
                 set_config_core(app, &shared, port, None, scope, None, None, None).await?;
             (status, false)
-        } else {
+        } else if already_bound {
             (build_status(app, &shared), true)
+        } else {
+            // The persisted switch can be on while no listener exists: most
+            // notably headless serve mode deliberately leaves boot-time bind
+            // restoration to its awaited startup path, and the GUI can also
+            // reach this state after a prior restore failure. Treat the live
+            // runtime as authoritative and actually bind instead of reporting
+            // a config bit as "already running".
+            (enable_core(app, &shared).await?, false)
         }
     } else {
         // Was off. Capture the last-good scope/port so a failed bind (e.g.
@@ -729,6 +738,13 @@ pub fn restore_on_boot<R: Runtime>(app: &AppHandle<R>) {
     let cfg = load_config(app);
     let enabled = cfg.enabled;
     *shared.config.lock().unwrap() = cfg;
+    // `codemux serve` performs an awaited enable after the full headless app
+    // has built so startup can report bind failures synchronously. Spawning
+    // this normal GUI restore in parallel would race that enable and could
+    // make serve print a pairing URL before any listener exists.
+    if crate::app_mode(app) == crate::AppMode::ServeHeadless {
+        return;
+    }
     // In end-to-end test mode the dedicated `e2e_autostart` hook owns server
     // startup (it also mints the pairing token); starting here too would race
     // it on the bind. Yield to it.

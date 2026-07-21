@@ -200,7 +200,12 @@ fn main() {
                 chrono_timestamp(),
                 startup_id
             ));
-            codemux_lib::run_serve(opts);
+            if let Err(error) = codemux_lib::run_serve(opts) {
+                codemux_lib::diagnostics::stderr_line(&format!(
+                    "[codemux serve] {error}"
+                ));
+                std::process::exit(1);
+            }
             return;
         }
         Ok(codemux_lib::cli::CliOutcome::LaunchGui) => {

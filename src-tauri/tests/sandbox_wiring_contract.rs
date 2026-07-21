@@ -37,7 +37,10 @@ fn close_workspace_releases_virtual_display() {
     // Look for the function header and the release call appearing together.
     // We scope to the function by splitting on the signature.
     let (_, after_header) = src
-        .split_once("pub async fn close_workspace(")
+        // Runtime-generic Tauri commands spell this as
+        // `close_workspace<R: tauri::Runtime>(...)`; match the stable
+        // function name rather than pinning the signature punctuation.
+        .split_once("pub async fn close_workspace")
         .expect("close_workspace fn must exist");
 
     // Find where the next top-level pub fn starts, so we only look inside
@@ -66,7 +69,7 @@ fn close_workspace_releases_virtual_display() {
 fn close_workspace_with_worktree_releases_virtual_display() {
     let src = read("src/commands/workspace.rs");
     let (_, after_header) = src
-        .split_once("pub async fn close_workspace_with_worktree(")
+        .split_once("pub async fn close_workspace_with_worktree")
         .expect("close_workspace_with_worktree fn must exist");
     let body = after_header
         .split_once("#[tauri::command]")
@@ -145,7 +148,7 @@ fn lib_registers_quit_app_command() {
 fn quit_app_uses_tauri_graceful_exit() {
     let src = read("src/commands/mod.rs");
     let (_, after_fn) = src
-        .split_once("pub fn quit_app(")
+        .split_once("pub fn quit_app")
         .expect("quit_app fn must exist in commands/mod.rs");
     let body = after_fn
         .split_once("\npub fn ")
@@ -170,7 +173,7 @@ fn spawn_pty_for_agent_applies_env_unset_after_extra_env() {
 
     // Find the spawn_pty_for_agent function body.
     let (_, agent_body) = src
-        .split_once("pub fn spawn_pty_for_agent(")
+        .split_once("pub fn spawn_pty_for_agent")
         .expect("spawn_pty_for_agent fn must exist");
     let body = agent_body
         .split_once("pub fn ")
