@@ -298,18 +298,35 @@ pub struct ThreadRollbackParams {
 
 /// Response to `account/read`.
 ///
-/// Mirrors the canonical SDK shape (`V2GetAccountResponse`): account is
-/// optional, and `requires_openai_auth` is the unauthenticated signal.
+/// Mirrors the canonical SDK shape (`V2GetAccountResponse`). `account` is
+/// optional, while `requires_openai_auth` describes the active model
+/// provider rather than the current login state. A normal ChatGPT login, for
+/// example, returns both `account: Some(...)` and
+/// `requires_openai_auth: true`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountReadResponse {
     /// Account info — `None` when no user is logged in.
     #[serde(default)]
     pub account: Option<AccountInfo>,
-    /// `true` when Codex needs the user to log in before it can serve
-    /// requests. Surface as `ProviderError::NotAuthenticated` upstream.
+    /// Whether the active model provider needs OpenAI credentials. This is
+    /// not itself an authentication-status bit: it remains `true` after a
+    /// successful ChatGPT or API-key login.
     #[serde(default)]
     pub requires_openai_auth: bool,
+}
+
+impl AccountReadResponse {
+    /// Whether Codex cannot serve the active provider until the user logs in.
+    ///
+    /// The app-server contract deliberately represents three useful states:
+    ///
+    /// * account present + OpenAI auth required: logged in to ChatGPT/API key;
+    /// * no account + OpenAI auth required: login is missing;
+    /// * no account + OpenAI auth not required: local/custom provider usable.
+    pub fn needs_login(&self) -> bool {
+        self.requires_openai_auth && self.account.is_none()
+    }
 }
 
 /// Subset of the account info we care about. The SDK exposes much more
@@ -1095,6 +1112,36 @@ impl From<ApprovalDecision> for ApprovalResponse {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn account_with_openai_auth_required_is_logged_in() {
+        let response: AccountReadResponse = serde_json::from_value(json!({
+            "account": {"type": "chatgpt", "planType": "pro"},
+            "requiresOpenaiAuth": true
+        }))
+        .unwrap();
+        assert!(!response.needs_login());
+    }
+
+    #[test]
+    fn missing_account_with_openai_auth_required_needs_login() {
+        let response: AccountReadResponse = serde_json::from_value(json!({
+            "account": null,
+            "requiresOpenaiAuth": true
+        }))
+        .unwrap();
+        assert!(response.needs_login());
+    }
+
+    #[test]
+    fn provider_without_openai_auth_can_run_without_account() {
+        let response: AccountReadResponse = serde_json::from_value(json!({
+            "account": null,
+            "requiresOpenaiAuth": false
+        }))
+        .unwrap();
+        assert!(!response.needs_login());
+    }
 
     #[test]
     fn thread_start_response_parses_nested_shape() {
