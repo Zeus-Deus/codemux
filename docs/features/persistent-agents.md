@@ -107,6 +107,7 @@ The crash circuit prevents a broken daemon from turning into a tight respawn loo
 - **Default behavior:** no setting, no opt-in. Every shell goes through the daemon automatically.
 - Shells + agents inside them survive Codemux app close (verified end-to-end via `npm run tauri:dev`).
 - Fresh Codemux launch adopts the running daemon and reattaches to live sessions (`[codemux::terminal::daemon_backed] reattaching to live shell session ...`).
+- Agent status hooks rebind across that app restart: notifier scripts try the PTY's inherited hook-server port first, then retry the current port published in `~/.codemux/hooks/active-port`, so resumed Codex/Claude/Gemini/OpenCode/Pi work updates the sidebar instead of silently targeting the dead prior app process.
 - Pane-close from the UI properly tears the agent down via the daemon (no leaked PTYs).
 - Session-adapter resume wired for daemon-backed sessions: reopening a Claude pane auto-types `--resume <session_id>` (or `--continue` fallback) just like the in-process path.
 - Scrollback restoration: daemon-backed sessions use the same `~/.local/share/codemux[-dev]/scrollback/` cache.

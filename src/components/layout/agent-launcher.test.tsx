@@ -16,6 +16,12 @@ const mocks = vi.hoisted(() => ({
   createTab: vi.fn().mockResolvedValue("tab-new"),
   createBrowserPane: vi.fn().mockResolvedValue("pane-b"),
   setShowSettings: vi.fn(),
+  launchDraftWithPreset: vi.fn().mockResolvedValue({
+    success: true,
+    workspaceId: "ws-new",
+    paneId: "pane-new",
+    threadId: "thread-1",
+  }),
 }));
 
 vi.mock("@/hooks/use-preset-store", () => ({
@@ -29,6 +35,10 @@ vi.mock("@/tauri/commands", () => ({
   createBrowserPane: (...a: unknown[]) => mocks.createBrowserPane(...a),
 }));
 
+vi.mock("@/lib/agent-chat/draft-preset-launch", () => ({
+  launchDraftWithPreset: (...a: unknown[]) => mocks.launchDraftWithPreset(...a),
+}));
+
 vi.mock("@/lib/toast", () => ({
   toast: { error: vi.fn(), success: vi.fn(), info: vi.fn(), warning: vi.fn() },
 }));
@@ -40,7 +50,8 @@ vi.mock("@/stores/ui-store", () => ({
 }));
 
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
-import { AgentLauncher } from "./agent-launcher";
+import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
+import { AgentLauncher, DraftAgentLauncher } from "./agent-launcher";
 
 function mkPreset(p: Partial<TerminalPreset> & { id: string; name: string }): TerminalPreset {
   return {
@@ -94,6 +105,27 @@ function makeWorkspace(): WorkspaceSnapshot {
   };
 }
 
+function makeDraft(overrides: Partial<ChatDraft> = {}): ChatDraft {
+  return {
+    draftId: "draft-1" as DraftId,
+    createdAt: "2026-01-01T00:00:00.000Z",
+    target: { kind: "project", projectPath: "/p" },
+    provider: "claude",
+    model: null,
+    effort: null,
+    contextWindow: null,
+    permissionMode: null,
+    mode: "default",
+    inputDraft: "",
+    threadId: "thread-1",
+    promotedTo: null,
+    materializedTo: null,
+    promoting: false,
+    lastSendError: null,
+    ...overrides,
+  };
+}
+
 function openLauncher() {
   const trigger = screen.getByTestId("agent-launcher-trigger");
   act(() => {
@@ -122,6 +154,7 @@ beforeEach(() => {
   mocks.applyPreset.mockClear();
   mocks.createTab.mockClear();
   mocks.createBrowserPane.mockClear();
+  mocks.launchDraftWithPreset.mockClear();
   localStorage.clear();
   useTitlebarPinsStore.setState({ pinnedIds: [] });
 });
@@ -203,6 +236,77 @@ describe("AgentLauncher", () => {
       fireEvent.click(screen.getByText("Terminal"));
     });
     expect(mocks.createTab).toHaveBeenCalledWith("ws-1", "terminal");
+  });
+});
+
+// GUI draft chrome — the `+` launcher rendered in the titlebar's draft
+// variant. Picking a preset materialises the draft (shared
+// `launchDraftWithPreset` path with the legacy draft PresetBar).
+describe("DraftAgentLauncher", () => {
+  function openDraftLauncher() {
+    const trigger = screen.getByTestId("draft-agent-launcher-trigger");
+    act(() => {
+      fireEvent.pointerDown(trigger, { button: 0, pointerType: "mouse" });
+      fireEvent.click(trigger);
+    });
+  }
+
+  it("renders nothing for a Home-target draft (same rule as the legacy draft PresetBar)", () => {
+    const { container } = render(
+      <DraftAgentLauncher draft={makeDraft({ target: { kind: "home" } })} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it("lists GUI + CLI presets but no Panes section (no live surface yet)", () => {
+    render(<DraftAgentLauncher draft={makeDraft()} />);
+    openDraftLauncher();
+    expect(screen.getByText("GUI")).toBeInTheDocument();
+    expect(screen.getByText("CLI agents")).toBeInTheDocument();
+    expect(screen.getByText("Chat Agent")).toBeInTheDocument();
+    expect(screen.getByText("Claude Code")).toBeInTheDocument();
+    expect(screen.queryByText("Terminal")).toBeNull();
+    expect(screen.queryByText("Browser")).toBeNull();
+    expect(screen.getByText("Manage presets…")).toBeInTheDocument();
+  });
+
+  it("materialises the draft with the chosen CLI preset", () => {
+    render(<DraftAgentLauncher draft={makeDraft()} />);
+    openDraftLauncher();
+    act(() => {
+      fireEvent.click(screen.getByTestId("draft-launcher-cli-builtin-claude"));
+    });
+    expect(mocks.launchDraftWithPreset).toHaveBeenCalledTimes(1);
+    const [draftId, preset] = mocks.launchDraftWithPreset.mock.calls[0] as [
+      string,
+      TerminalPreset,
+    ];
+    expect(draftId).toBe("draft-1");
+    expect(preset.id).toBe("builtin-claude");
+    // Workspace-scoped launch paths must NOT fire from a draft.
+    expect(mocks.applyPreset).not.toHaveBeenCalled();
+    expect(mocks.agentChatCreatePane).not.toHaveBeenCalled();
+  });
+
+  it("materialises the draft with the chosen GUI preset", () => {
+    render(<DraftAgentLauncher draft={makeDraft()} />);
+    openDraftLauncher();
+    act(() => {
+      fireEvent.click(
+        screen.getByTestId("draft-launcher-gui-builtin-chat-agent"),
+      );
+    });
+    expect(mocks.launchDraftWithPreset).toHaveBeenCalledTimes(1);
+    const [, preset] = mocks.launchDraftWithPreset.mock.calls[0] as [
+      string,
+      TerminalPreset,
+    ];
+    expect(preset.id).toBe("builtin-chat-agent");
+  });
+
+  it("disables the trigger while the draft is promoting", () => {
+    render(<DraftAgentLauncher draft={makeDraft({ promoting: true })} />);
+    expect(screen.getByTestId("draft-agent-launcher-trigger")).toBeDisabled();
   });
 });
 

@@ -4,7 +4,6 @@
 
 1. Read `WORKFLOW.md` and `docs/INDEX.md` at the start of every session.
 2. Read the relevant canonical docs under `docs/core/`, `docs/features/`, `docs/plans/`, and `docs/reference/` before making assumptions.
-3. Read `AGENTS.md` for agent operating rules (browser automation, Codemux-specific behavior).
 
 ## Docs System
 
@@ -17,9 +16,21 @@
 - Default to `npm run verify` after meaningful changes.
 - Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
 
+## Visual Verification
+
+### Visual verification (UI work)
+
+When iterating on UI:
+
+1. `npm run dev` — boots Vite with the Tauri mock auto-installed.
+2. `codemux browser open http://localhost:1420` — the real Codemux UI loads with seed data.
+3. `codemux browser screenshot` — capture visual proof.
+
+The mock lives in `src/dev/` and only loads when no real Tauri runtime is detected. For real-IPC testing, use `npm run tauri:dev` (desktop window, not browser-pane-visible).
+
 ## UI & Feature Work
 
-- For visual and component work, read `docs/reference/DESIGN-SYSTEM.md` (color tokens, theming layers, the no-hardcoded-colors rule) and the relevant `docs/features/*` doc. (The former `/codemux-ui` skill was removed in PR #115; its theming rules now live in the design-system reference.)
+- For visual and component work, read `docs/reference/DESIGN-SYSTEM.md` (color tokens, theming layers, the no-hardcoded-colors rule) plus the relevant `docs/features/*` doc. (The `/codemux-ui` skill was removed in PR #115; its theming rules now live in the design-system reference.)
 
 ## Skills
 
@@ -33,13 +44,12 @@ This terminal runs inside Codemux. Check: `test -n "$CODEMUX"`
 ### Browser
 
 **Never** use `xdg-open` or system browsers. Use:
-
 - `codemux browser open <url>` — navigate browser pane
 - `codemux browser snapshot --dom` — list interactive elements with selectors
 - `codemux browser click "<selector>"` — click an element
 - `codemux browser fill "<selector>" "<text>"` — type into input
 - `codemux browser screenshot` — capture screenshot
-- `codemux browser viewport <mobile|tablet|desktop|...|WxH|reset>` — resize viewport for responsive testing (CSS media queries fire at the new width); use this instead of iframe-wrapping the page for mobile preview. `codemux browser viewport-presets` lists available presets.
+- `codemux browser viewport <mobile|tablet|desktop|...|WxH|reset>` — resize viewport for responsive testing (CSS media queries fire at the new width); `codemux browser viewport-presets` lists available presets
 
 Always get a snapshot before interacting so you know what elements exist.
 

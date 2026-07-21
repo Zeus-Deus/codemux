@@ -178,7 +178,7 @@ fn main() {
     }
 
     match tauri::async_runtime::block_on(codemux_lib::cli::maybe_run_cli()) {
-        Ok(true) => {
+        Ok(codemux_lib::cli::CliOutcome::Handled) => {
             #[cfg(debug_assertions)]
             codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
                 "[{}] startup_id={} outcome=cli_handled",
@@ -187,7 +187,28 @@ fn main() {
             ));
             return;
         }
-        Ok(false) => {
+        Ok(codemux_lib::cli::CliOutcome::RunServe(opts)) => {
+            // `codemux serve` is a long-lived foreground process, not a
+            // control round-trip. Run it on the main thread (mirroring how the
+            // GUI's `run()` is invoked below) — it boots the full backend
+            // headless and blocks until a shutdown signal, then exits. The
+            // OpenFlow-agent GUI guard does NOT apply: `serve` is an explicit
+            // CLI subcommand, exactly like `status`/`remote enable`.
+            #[cfg(debug_assertions)]
+            codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
+                "[{}] startup_id={} outcome=run_serve",
+                chrono_timestamp(),
+                startup_id
+            ));
+            if let Err(error) = codemux_lib::run_serve(opts) {
+                codemux_lib::diagnostics::stderr_line(&format!(
+                    "[codemux serve] {error}"
+                ));
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(codemux_lib::cli::CliOutcome::LaunchGui) => {
             if is_openflow_agent_context() {
                 let agent = openflow_agent_label();
                 codemux_lib::diagnostics::stderr_line(&format!(

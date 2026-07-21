@@ -84,8 +84,42 @@ pub mod trace;
 // frontend. See docs/plans/web-remote-access.md.
 pub mod web_remote;
 
+/// Which surface the app is booting. The GUI desktop build runs
+/// [`AppMode::Gui`] on Wry; the headless `codemux serve` daemon boots the
+/// same command surface on `tauri::test::MockRuntime` under
+/// [`AppMode::ServeHeadless`] with no display attached. The mode is managed
+/// state so commands and the setup closure can read it via
+/// `app.state::<AppMode>()`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AppMode {
+    Gui,
+    ServeHeadless,
+}
+
+/// Read the managed [`AppMode`]. Defaults to [`AppMode::Gui`] when the state
+/// was never managed (e.g. a lightweight test harness that builds a mock app
+/// without `.manage(mode)`), so behavior is unchanged for anything that does
+/// not explicitly opt into headless mode.
+pub fn app_mode<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AppMode {
+    app.try_state::<AppMode>()
+        .map(|state| *state.inner())
+        .unwrap_or(AppMode::Gui)
+}
+
+/// Guard for display-coupled commands (native dialogs, clipboard, updater)
+/// that have no headless implementation. Returns a clean `Err` under
+/// [`AppMode::ServeHeadless`] instead of reaching an unregistered plugin
+/// (which would panic).
+pub fn ensure_gui_mode<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
+    if app_mode(app) == AppMode::Gui {
+        Ok(())
+    } else {
+        Err("not available in headless serve mode".to_string())
+    }
+}
+
 /// Save window dimensions and position to SQLite before close.
-fn save_window_state(handle: &tauri::AppHandle) {
+fn save_window_state<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) {
     let db: tauri::State<'_, database::DatabaseStore> = handle.state();
     if let Some(w) = handle.get_webview_window("main") {
         let sf = w.scale_factor().unwrap_or(1.0);
@@ -157,18 +191,14 @@ pub fn run() {
         ));
     }
 
-    // Web-remote state must exist before the builder so the channel
-    // interceptor (registered below) and the WS dispatcher share one
-    // channel routing table. The interceptor reroutes a synthesized
-    // invoke's channel frames to the owning browser instead of the
-    // desktop webview.
-    let web_remote_state = web_remote::WebRemoteState::default();
-    let web_remote_channel_router = web_remote_state.channel_router();
-
-    tauri::Builder::default()
-        // This plugin should run before the rest of the app setup so duplicate
-        // launches are intercepted before a second GUI is created.
-        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+    // Single-instance guard is GUI-only and must initialize first so a
+    // duplicate launch is intercepted before any window is created.
+    // Registered here on the concrete Wry builder (rather than inside
+    // `build_core_app`) to preserve its historical first-plugin position;
+    // the headless serve app never registers it (its callback drives
+    // windows, which do not exist headless).
+    let builder = tauri::Builder::default().plugin(tauri_plugin_single_instance::init(
+        |app, args, cwd| {
             crate::diagnostics::stderr_line(&format!(
                 "[codemux::single-instance] Duplicate launch redirected args={args:?} cwd={}",
                 cwd
@@ -186,7 +216,62 @@ pub fn run() {
                 let _ = window.show();
                 let _ = window.set_focus();
             }
-        }))
+        },
+    ));
+
+    build_core_app(builder, AppMode::Gui)
+        .build(app_context())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::Exit = event {
+                // Kill agent-browser daemons so they don't persist across restarts.
+                agent_browser::kill_stream_daemons();
+            }
+        });
+}
+
+/// Run the headless `codemux serve` web-remote server on the main thread.
+/// Boots the full backend on `MockRuntime`, binds the web-remote server
+/// through the shared enable path, prints a pairing QR + link, and blocks
+/// until SIGINT / SIGTERM. Dispatched from `main` (not `maybe_run_cli`)
+/// because it is a long-lived foreground process, not a control round-trip.
+pub fn run_serve(opts: web_remote::serve::ServeOptions) -> Result<(), String> {
+    web_remote::serve::run_serve(opts)
+}
+
+/// Expand the embedded-asset context exactly once. `generate_context!`
+/// embeds the entire frontend bundle into the binary; expanding it in a
+/// single generic function (rather than at each `.build()` site) keeps the
+/// assets from being embedded twice. The macro expands to a generic
+/// `Context<R>`, so both the Wry GUI app and the MockRuntime headless app
+/// share this one expansion.
+fn app_context<R: tauri::Runtime>() -> tauri::Context<R> {
+    tauri::generate_context!()
+}
+
+/// Wire the full command surface — managed state, channel interceptor,
+/// plugins, setup closure, and invoke handler — onto `builder`. Shared
+/// verbatim by the GUI desktop app (`run`, on Wry) and the headless serve
+/// daemon (`build_headless_app`, on `MockRuntime`) so the ~350-command
+/// surface is byte-identical across both. Display-coupled pieces (native
+/// dialog/updater/clipboard plugins, window restore, close handling, the
+/// Hyprland float rule) are gated on `mode == AppMode::Gui`.
+fn build_core_app<R: tauri::Runtime>(
+    builder: tauri::Builder<R>,
+    mode: AppMode,
+) -> tauri::Builder<R> {
+    // Web-remote state must exist before the builder so the channel
+    // interceptor (registered below) and the WS dispatcher share one
+    // channel routing table. The interceptor reroutes a synthesized
+    // invoke's channel frames to the owning browser instead of the
+    // desktop webview.
+    let web_remote_state = web_remote::WebRemoteState::default();
+    let web_remote_channel_router = web_remote_state.channel_router();
+
+    let builder = builder
+        // Mode is managed state so commands and the setup closure can gate
+        // display-coupled behavior on it.
+        .manage(mode)
         .manage(state::AppStateStore::default())
         .manage(agent_browser::AgentBrowserManager::new_with_cleanup())
         .manage(indexing::ProjectIndexStore::default())
@@ -286,11 +371,25 @@ pub fn run() {
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
                 .build(),
         )
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_clipboard_manager::init())
-        .setup(|app| {
+        .plugin(tauri_plugin_process::init());
+
+    // Display-coupled plugins — skipped under headless serve, where no
+    // window/clipboard/updater backend exists. The matching commands
+    // (native dialogs, clipboard paste, updater) short-circuit via
+    // `ensure_gui_mode` so a headless caller gets a clean Err instead of
+    // reaching an unregistered plugin (which would panic). All three plugin
+    // inits are generic over `R: Runtime`; they are gated by mode, not by
+    // runtime, so the Wry GUI path registers them exactly as before.
+    let mut builder = builder;
+    if mode == AppMode::Gui {
+        builder = builder
+            .plugin(tauri_plugin_dialog::init())
+            .plugin(tauri_plugin_updater::Builder::new().build())
+            .plugin(tauri_plugin_clipboard_manager::init());
+    }
+
+    builder
+        .setup(move |app| {
             // Reap chat-image staging files leaked by a crash or an
             // abandoned draft (best-effort, off the startup path).
             tauri::async_runtime::spawn(
@@ -421,6 +520,12 @@ pub fn run() {
                 }
             }
 
+            // GUI-only display-coupled window wiring: size/position restore,
+            // the save-on-close serialization handshake, and the Hyprland
+            // file-dialog float rule. Headless serve has no real window to
+            // size, position, save, or float, so the whole block is skipped
+            // there.
+            if mode == AppMode::Gui {
             // Restore window size from SQLite
             {
                 let db: tauri::State<'_, database::DatabaseStore> = handle.state();
@@ -614,6 +719,7 @@ pub fn run() {
                     ])
                     .output();
             }
+            } // end GUI-only display-coupled window wiring
 
             let observability: tauri::State<'_, observability::ObservabilityStore> = handle.state();
             observability.increment_metric("startup_count");
@@ -1460,9 +1566,11 @@ pub fn run() {
             });
 
             // Window lifecycle breadcrumbs: this lets us tell whether a second process
-            // actually reached window creation or if it exited early.
+            // actually reached window creation or if it exited early. GUI-only —
+            // it registers an on_window_event listener on the main window, which
+            // only exists in the desktop build.
             #[cfg(debug_assertions)]
-            {
+            if mode == AppMode::Gui {
                 let pid = std::process::id();
                 let startup_id =
                     std::env::var("CODEMUX_STARTUP_ID").unwrap_or_else(|_| "<unset>".into());
@@ -1877,12 +1985,39 @@ pub fn run() {
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building tauri application")
-        .run(|_app, event| {
-            if let tauri::RunEvent::Exit = event {
-                // Kill agent-browser daemons so they don't persist across restarts.
-                agent_browser::kill_stream_daemons();
-            }
-        });
+}
+
+/// Boot the full Codemux command surface headless on `MockRuntime` with no
+/// display attached — the runtime backing the `codemux serve` daemon. Uses
+/// the same `build_core_app` wiring as the GUI `run()` path, so every one of
+/// the ~350 commands dispatches identically; only the display-coupled pieces
+/// (native dialog/updater/clipboard plugins, window restore, close handling,
+/// Hyprland float) are skipped via `AppMode::ServeHeadless`.
+///
+/// `Builder::<MockRuntime>::new()` is used rather than
+/// `tauri::test::mock_builder()` so production invoke semantics are kept: the
+/// app's own random invoke key is generated, not the test harness's fixed
+/// `INVOKE_KEY`. (`Builder::default()` is only implemented for `Builder<Wry>`
+/// when the `wry` feature is on — its generic `Default` impl is
+/// `#[cfg(not(feature = "wry"))]` — and `default()` merely delegates to
+/// `new()`, so `new()` is the identical, feature-independent constructor.)
+/// `web_remote::dispatch::dispatch_invoke` reads
+/// `app.invoke_key()` off this same app, so the WS dispatch path stays
+/// consistent.
+///
+/// After build we create the in-memory "main" webview so
+/// `get_webview_window("main")` resolves — the web-remote dispatcher, the
+/// notification bridge, and the background polling loops all look it up.
+/// `MockRuntime::create_window` is a pure in-memory stub, so this succeeds
+/// with no windowing system present.
+pub fn build_headless_app() -> tauri::Result<tauri::App<tauri::test::MockRuntime>> {
+    let app = build_core_app(
+        tauri::Builder::<tauri::test::MockRuntime>::new(),
+        AppMode::ServeHeadless,
+    )
+    .build(app_context())?;
+
+    tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
+
+    Ok(app)
 }

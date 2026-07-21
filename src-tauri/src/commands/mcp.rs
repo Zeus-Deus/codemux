@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Runtime, State};
 
 use crate::mcp::{
     codemux_self::codemux_self_config,
@@ -96,8 +96,8 @@ pub async fn get_mcp_runtime_status(
 /// on App mount and on every toggle. Disabled servers currently running
 /// get stopped here.
 #[tauri::command]
-pub async fn set_mcp_disabled_ids(
-    app: AppHandle,
+pub async fn set_mcp_disabled_ids<R: Runtime>(
+    app: AppHandle<R>,
     registry: State<'_, McpRegistry>,
     ids: Vec<String>,
 ) -> Result<(), String> {
@@ -112,8 +112,8 @@ pub async fn set_mcp_disabled_ids(
 ///   2. The first agent-chat session (lazy spawn — see
 ///      `agent_chat_start_session`).
 #[tauri::command]
-pub async fn prime_mcp_runtime(
-    app: AppHandle,
+pub async fn prime_mcp_runtime<R: Runtime>(
+    app: AppHandle<R>,
     registry: State<'_, McpRegistry>,
     project_root: Option<String>,
 ) -> Result<Vec<McpServerRuntime>, String> {
@@ -127,8 +127,8 @@ pub async fn prime_mcp_runtime(
 /// Start a single server by id. Used by the Settings toggle when the
 /// user re-enables a previously-disabled row.
 #[tauri::command]
-pub async fn start_mcp_server_cmd(
-    app: AppHandle,
+pub async fn start_mcp_server_cmd<R: Runtime>(
+    app: AppHandle<R>,
     registry: State<'_, McpRegistry>,
     id: String,
     project_root: Option<String>,
@@ -142,8 +142,8 @@ pub async fn start_mcp_server_cmd(
 /// Stop a server (graceful EOF then kill, 2s budget). Used by the
 /// Settings toggle when the user disables a row.
 #[tauri::command]
-pub async fn stop_mcp_server_cmd(
-    app: AppHandle,
+pub async fn stop_mcp_server_cmd<R: Runtime>(
+    app: AppHandle<R>,
     registry: State<'_, McpRegistry>,
     id: String,
 ) -> Result<McpServerRuntime, String> {
@@ -152,8 +152,8 @@ pub async fn stop_mcp_server_cmd(
 
 /// Manual restart, exposed for the "Restart" affordance on errored rows.
 #[tauri::command]
-pub async fn restart_mcp_server_cmd(
-    app: AppHandle,
+pub async fn restart_mcp_server_cmd<R: Runtime>(
+    app: AppHandle<R>,
     registry: State<'_, McpRegistry>,
     id: String,
 ) -> Result<McpServerRuntime, String> {

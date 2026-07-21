@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 
 use super::paths::enumerate_scan_paths;
 
@@ -55,9 +55,9 @@ impl SkillsWatcherState {
     /// Start (or restart) the watcher with paths derived from the
     /// current project root + plugin-toggle. Drops any existing
     /// watcher first — idempotent across repeated calls.
-    pub fn start(
+    pub fn start<R: Runtime>(
         &self,
-        app: AppHandle,
+        app: AppHandle<R>,
         project_root: Option<PathBuf>,
         include_plugins: bool,
     ) -> Result<usize, String> {

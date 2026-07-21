@@ -28,7 +28,7 @@ use axum::{
 };
 use axum::http::HeaderMap;
 use serde::Deserialize;
-use tauri::AppHandle;
+use tauri::{AppHandle, Runtime};
 
 #[derive(Deserialize)]
 pub struct AssetQuery {
@@ -36,8 +36,8 @@ pub struct AssetQuery {
 }
 
 /// `GET /api/assets?path=<absolute>` — auth-gated file streamer.
-pub async fn serve(
-    State(app): State<AppHandle>,
+pub async fn serve<R: Runtime>(
+    State(app): State<AppHandle<R>>,
     headers: HeaderMap,
     Query(query): Query<AssetQuery>,
 ) -> Response {

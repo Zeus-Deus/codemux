@@ -41,7 +41,7 @@ use axum::{
     Json,
 };
 use serde_json::{json, Value};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 use super::WebRemoteState;
 
@@ -51,7 +51,7 @@ use super::WebRemoteState;
 pub const API_VERSION: u32 = 1;
 
 /// `GET /api/snapshot` — authenticated one-shot state bootstrap.
-pub async fn serve(State(app): State<AppHandle>, headers: HeaderMap) -> Response {
+pub async fn serve<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderMap) -> Response {
     if let Err(resp) = super::server::require_session(&app, &headers) {
         return resp;
     }

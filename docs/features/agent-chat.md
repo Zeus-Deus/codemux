@@ -1162,8 +1162,12 @@ in the browser pane.
   functions from Codex notifications / server-initiated requests to
   `ProviderRuntimeEvent`.
 - `src-tauri/src/agent_provider/codex/session.rs` — per-thread session
-  state plus background tasks that forward events.
-- `src-tauri/src/agent_provider/codex/auth.rs` — auth/installed probes.
+  state plus background tasks that forward events. Its `account/read` gate
+  treats login as missing only when the active provider requires OpenAI auth
+  and the response has no account; `requiresOpenaiAuth` alone is provider
+  metadata and remains true for a valid ChatGPT login.
+- `src-tauri/src/agent_provider/codex/auth.rs` — installed and one-shot auth
+  probes (`codex --version`, `codex login status`).
 - `src-tauri/src/json_rpc_child/mod.rs` — the `JsonRpcChild` helper.
 - `src-tauri/tests/json_rpc_child.rs` — helper tests.
 - `src-tauri/tests/codex_adapter.rs` — Codex adapter integration tests.

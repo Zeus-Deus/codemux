@@ -97,7 +97,7 @@ fn host_maps(db: &DatabaseStore) -> (HashMap<i64, String>, HashMap<String, i64>)
 
 /// Resolve the local DB + token from app state and run pull-then-push.
 /// `Ok(())` when the user is not signed in — sync is not an error then.
-pub async fn try_sync_with_app(app: &tauri::AppHandle) -> Result<(), String> {
+pub async fn try_sync_with_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<(), String> {
     let db = app.state::<DatabaseStore>();
     let token = match valid_token(&db) {
         Some(t) => t,

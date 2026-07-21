@@ -46,8 +46,8 @@ pub fn hosts_list(db: State<'_, DatabaseStore>) -> Vec<HostView> {
 }
 
 #[tauri::command]
-pub fn hosts_add(
-    app: tauri::AppHandle,
+pub fn hosts_add<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     name: String,
     ssh_target: String,
@@ -72,8 +72,8 @@ pub fn hosts_add(
 }
 
 #[tauri::command]
-pub fn hosts_update(
-    app: tauri::AppHandle,
+pub fn hosts_update<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     id: i64,
     name: String,
@@ -93,8 +93,8 @@ pub fn hosts_update(
 }
 
 #[tauri::command]
-pub fn hosts_delete(
-    app: tauri::AppHandle,
+pub fn hosts_delete<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     id: i64,
 ) -> Result<(), String> {
@@ -108,8 +108,8 @@ pub fn hosts_delete(
 /// the host_id straight through to the in-memory `AppState`; the
 /// snapshot persists via the normal save path.
 #[tauri::command]
-pub fn set_workspace_host(
-    app: tauri::AppHandle,
+pub fn set_workspace_host<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     app_state: tauri::State<'_, crate::state::AppStateStore>,
     workspace_id: String,
     host_id: Option<i64>,
@@ -316,8 +316,8 @@ pub struct HostTestResult {
 /// Unix-only — the underlying `ssh::bootstrap` module is
 /// `#[cfg(unix)]`. On Windows we return an error message.
 #[tauri::command]
-pub async fn hosts_bootstrap_install(
-    app: tauri::AppHandle,
+pub async fn hosts_bootstrap_install<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     id: i64,
     uname: String,
@@ -459,8 +459,8 @@ pub struct HostBootstrapResult {
 /// Unix-only — the SSH bootstrap path is `#[cfg(unix)]`. On Windows we
 /// return a clear "not implemented" message.
 #[tauri::command]
-pub async fn hosts_reinstall_remote(
-    app: tauri::AppHandle,
+pub async fn hosts_reinstall_remote<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: State<'_, DatabaseStore>,
     id: i64,
 ) -> Result<HostBootstrapResult, String> {
@@ -519,8 +519,8 @@ pub async fn hosts_reinstall_remote(
 /// existing scrollback adapter mechanism. This is documented in
 /// `docs/features/remote-hosts.md`.
 #[tauri::command]
-pub async fn workspace_push_to_host(
-    app: tauri::AppHandle,
+pub async fn workspace_push_to_host<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     db: tauri::State<'_, DatabaseStore>,
     workspace_id: String,
     // The host to push to. The frontend passes host_id directly
@@ -901,8 +901,8 @@ pub async fn workspace_push_to_host(
 /// push flow: rsync remote → local, clear `host_id`. The user reopens
 /// panes locally and adapter-aware agents auto-resume.
 #[tauri::command]
-pub async fn workspace_pull_back(
-    app: tauri::AppHandle,
+pub async fn workspace_pull_back<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     _db: tauri::State<'_, DatabaseStore>,
     workspace_id: String,
 ) -> Result<WorkspacePullOutcome, String> {
@@ -924,8 +924,8 @@ pub async fn workspace_pull_back(
 /// `host_id` set; rsyncs the remote worktree to the local
 /// `worktree_path` (or `cwd` fallback); clears `host_id` on success;
 /// tears down the SSH tunnel; respawns each pane's PTY locally.
-pub async fn workspace_pull_back_impl(
-    app: tauri::AppHandle,
+pub async fn workspace_pull_back_impl<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     workspace_id: String,
 ) -> Result<WorkspacePullOutcome, String> {
     // Resolve State guards in a tight pre-await scope and capture
@@ -1269,7 +1269,7 @@ pub struct WorkspacePullOutcome {
 /// that's the user's mental model ("I added a host"). Sync failure is
 /// a soft, recoverable condition we surface elsewhere (Settings →
 /// Account → "Last synced N minutes ago").
-fn schedule_background_sync(app: tauri::AppHandle) {
+fn schedule_background_sync<R: tauri::Runtime>(app: tauri::AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         if let Err(error) = crate::hosts_sync::try_sync_with_app(&app).await {
             eprintln!("[codemux::hosts] background sync failed: {error}");
@@ -1496,8 +1496,8 @@ async fn pull_claude_projects(
 /// failed (network down, no bundled binary for the target uname, etc.).
 /// Caller decides whether to propagate or warn-and-continue.
 #[cfg(unix)]
-async fn ensure_remote_binary_current(
-    app: &tauri::AppHandle,
+async fn ensure_remote_binary_current<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     host: &crate::database::HostRecord,
 ) -> Result<(), String> {
     use std::process::Stdio;
@@ -1554,8 +1554,8 @@ async fn ensure_remote_binary_current(
 /// verify the bundled binary → restart the headless `serve` daemon.
 /// Returns the reported version on success.
 #[cfg(unix)]
-async fn force_reinstall_remote_binary(
-    app: &tauri::AppHandle,
+async fn force_reinstall_remote_binary<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     host: &crate::database::HostRecord,
 ) -> Result<String, String> {
     use std::process::Stdio;
@@ -1663,8 +1663,8 @@ async fn force_reinstall_remote_binary(
 /// shell/agent pane never inherits a stray capture. No-op when the
 /// workspace or its sessions can't be resolved.
 #[cfg(unix)]
-fn record_opencode_session_capture(
-    app: &tauri::AppHandle,
+fn record_opencode_session_capture<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     workspace_id: &str,
     oc_session_id: &str,
 ) {
@@ -1711,8 +1711,8 @@ fn record_opencode_session_capture(
 /// already routes the kill through the daemon — see
 /// `terminal::terminate_pty_session`.
 #[cfg(unix)]
-fn terminate_workspace_sessions(
-    app: &tauri::AppHandle,
+fn terminate_workspace_sessions<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     workspace_id: &str,
 ) {
     let app_state: tauri::State<'_, crate::state::AppStateStore> = app.state();

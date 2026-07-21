@@ -32,6 +32,7 @@ pub mod events;
 pub mod iroh;
 pub mod proxy;
 pub mod registration;
+pub mod serve;
 pub mod server;
 pub mod snapshot;
 
@@ -39,7 +40,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 /// Default bind port. Chosen to be memorable and unlikely to clash.
 pub const DEFAULT_PORT: u16 = 4377;
@@ -398,15 +399,161 @@ pub(crate) fn control_pair_from(
 /// `codemux remote pair` CLI over SSH). Reuses the shared [`mint_pairing`]
 /// token path and the endpoint enumeration, so the terminal flow and the
 /// GUI flow are the same code underneath.
-pub fn control_pair(
-    app: &AppHandle,
+pub fn control_pair<R: Runtime>(
+    app: &AppHandle<R>,
     suggested_name: Option<String>,
 ) -> Result<ControlPairing, String> {
     let shared = app.state::<WebRemoteState>().shared();
     control_pair_from(&shared, suggested_name)
 }
 
-fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
+/// Result of the `web_remote_enable` control-socket command (the
+/// `codemux remote enable` CLI over SSH): the resulting live status plus the
+/// recommended reachable endpoint, so the terminal can tell the user the port,
+/// bind scope, and where to point `codemux remote pair` next.
+#[derive(Debug, Clone, Serialize)]
+pub struct ControlEnableResult {
+    /// The live server + device status after the enable (or config change).
+    pub status: WebRemoteStatus,
+    /// The recommended endpoint's base URL (`http://<host>:<port>`) — the same
+    /// single `recommended` pick the Settings pane surfaces (MagicDNS → tailnet
+    /// → local network, falling back to loopback). `None` only if no endpoint
+    /// could be enumerated at all.
+    pub endpoint_url: Option<String>,
+    /// The recommended endpoint's host (IP literal or MagicDNS name).
+    pub endpoint_host: Option<String>,
+    /// The recommended endpoint kind (`magicdns` | `tailnet` | `lan` |
+    /// `loopback`), so the CLI can hint how far it reaches.
+    pub endpoint_kind: Option<String>,
+    /// Whether the recommended endpoint is a browser secure context (loopback).
+    pub endpoint_secure: bool,
+    /// True when the enable was a no-op because remote access was already on and
+    /// no scope/port change was requested — so the CLI can say "already running".
+    pub already_running: bool,
+}
+
+/// Validate an enable request's scope and fold it (plus the port) into `cfg`,
+/// flipping `enabled` on. Pure so the config side of [`control_enable`] is
+/// unit-testable without an `AppHandle`. On an unknown scope it returns a clear
+/// error and leaves `cfg` untouched (nothing is persisted).
+fn apply_enable_request(
+    cfg: &mut WebRemoteConfig,
+    scope: Option<String>,
+    port: Option<u16>,
+) -> Result<(), String> {
+    if let Some(ref s) = scope {
+        if !is_valid_bind_scope(s) {
+            return Err(format!("Unknown access scope: {s}"));
+        }
+    }
+    cfg.enabled = true;
+    if let Some(p) = port {
+        cfg.port = p;
+    }
+    if let Some(s) = scope {
+        cfg.bind_scope = s;
+    }
+    Ok(())
+}
+
+/// The recommended reachable endpoint for `port`: the single `recommended` pick
+/// from the endpoint enumeration, falling back to the first entry (loopback is
+/// always present) so a loopback-only host still yields a usable local URL.
+/// Mirrors [`control_pair_from`]'s endpoint choice.
+fn recommended_endpoint(port: u16) -> Option<endpoints::Endpoint> {
+    let eps = endpoints::list(port);
+    eps.iter()
+        .find(|e| e.recommended)
+        .or_else(|| eps.first())
+        .cloned()
+}
+
+/// Enable web remote access from the same-machine control socket (the
+/// `codemux remote enable` CLI over SSH). Shares the exact bind/rollback and
+/// `web-remote-state-changed` emission paths the Tauri commands use:
+///
+/// - Off → on: fold the requested `scope`/`port` into config, then run the same
+///   [`enable_core`] path (rolling `enabled` — and the scope/port — back on a
+///   bind failure such as `tailscale` with no tailnet address).
+/// - Already on with a `scope`/`port` flag: treat it as a config change and
+///   rebind through the same [`set_config_core`] path the Settings pane uses.
+/// - Already on with no flags: report it's already running with current status.
+pub async fn control_enable<R: Runtime>(
+    app: &AppHandle<R>,
+    scope: Option<String>,
+    port: Option<u16>,
+) -> Result<ControlEnableResult, String> {
+    let shared = app.state::<WebRemoteState>().shared();
+    let already_enabled = shared.config.lock().unwrap().enabled;
+    let already_bound = shared.runtime.lock().unwrap().is_some();
+
+    let (status, already_running) = if already_enabled {
+        if scope.is_some() || port.is_some() {
+            // A scope/port change while running rebinds via the same path a
+            // port change from the Settings pane uses (drops existing sockets).
+            let status =
+                set_config_core(app, &shared, port, None, scope, None, None, None).await?;
+            (status, false)
+        } else if already_bound {
+            (build_status(app, &shared), true)
+        } else {
+            // The persisted switch can be on while no listener exists: most
+            // notably headless serve mode deliberately leaves boot-time bind
+            // restoration to its awaited startup path, and the GUI can also
+            // reach this state after a prior restore failure. Treat the live
+            // runtime as authoritative and actually bind instead of reporting
+            // a config bit as "already running".
+            (enable_core(app, &shared).await?, false)
+        }
+    } else {
+        // Was off. Capture the last-good scope/port so a failed bind (e.g.
+        // `--scope tailscale` with no tailnet) restores them rather than
+        // leaving a bad scope persisted with the server off.
+        let (old_port, old_scope) = {
+            let cfg = shared.config.lock().unwrap();
+            (cfg.port, cfg.bind_scope.clone())
+        };
+        {
+            let mut cfg = shared.config.lock().unwrap();
+            apply_enable_request(&mut cfg, scope, port)?;
+        }
+        match enable_core(app, &shared).await {
+            Ok(status) => (status, false),
+            Err(e) => {
+                // `enable_core` already rolled `enabled` back to false; restore
+                // the previous scope/port too and persist the last-good config.
+                {
+                    let mut cfg = shared.config.lock().unwrap();
+                    cfg.port = old_port;
+                    cfg.bind_scope = old_scope;
+                }
+                persist_config(app, &shared);
+                return Err(e);
+            }
+        }
+    };
+
+    let ep = recommended_endpoint(status.port);
+    Ok(ControlEnableResult {
+        endpoint_url: ep.as_ref().map(|e| e.url.clone()),
+        endpoint_host: ep.as_ref().map(|e| e.host.clone()),
+        endpoint_kind: ep.as_ref().map(|e| e.kind.clone()),
+        endpoint_secure: ep.as_ref().map(|e| e.secure).unwrap_or(false),
+        status,
+        already_running,
+    })
+}
+
+/// Disable web remote access from the same-machine control socket (the
+/// `codemux remote disable` CLI over SSH). Shares the exact [`disable_core`]
+/// path the Tauri command uses: severs live sockets, tears the iroh endpoint
+/// down, stops registration, and emits `web-remote-state-changed`.
+pub fn control_disable<R: Runtime>(app: &AppHandle<R>) -> Result<WebRemoteStatus, String> {
+    let shared = app.state::<WebRemoteState>().shared();
+    disable_core(app, &shared)
+}
+
+fn build_status<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> WebRemoteStatus {
     let cfg = shared.config.lock().unwrap().clone();
     let running = shared.runtime.lock().unwrap().is_some();
     let active_connections = shared.connections.active_count();
@@ -455,7 +602,7 @@ fn build_status(app: &AppHandle, shared: &Arc<Shared>) -> WebRemoteStatus {
 
 /// Emit the current status on the global bus so desktop + web UIs
 /// live-update on every server/session state change.
-pub(crate) fn emit_state_changed(app: &AppHandle) {
+pub(crate) fn emit_state_changed<R: Runtime>(app: &AppHandle<R>) {
     let shared = app.state::<WebRemoteState>().shared();
     let status = build_status(app, &shared);
     let _ = app.emit(STATE_CHANGED_EVENT, status);
@@ -463,7 +610,7 @@ pub(crate) fn emit_state_changed(app: &AppHandle) {
 
 // ── Config persistence ──────────────────────────────────────────────
 
-fn persist_config(app: &AppHandle, shared: &Arc<Shared>) {
+fn persist_config<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
     let cfg = shared.config.lock().unwrap().clone();
     if let Ok(json) = serde_json::to_string(&cfg) {
         let _ = app
@@ -472,7 +619,7 @@ fn persist_config(app: &AppHandle, shared: &Arc<Shared>) {
     }
 }
 
-fn load_config(app: &AppHandle) -> WebRemoteConfig {
+fn load_config<R: Runtime>(app: &AppHandle<R>) -> WebRemoteConfig {
     app.state::<crate::database::DatabaseStore>()
         .get_setting(CONFIG_KEY)
         .and_then(|v| serde_json::from_str(&v).ok())
@@ -522,7 +669,7 @@ fn bind_addrs(scope: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     bind_addrs_from(scope, port, endpoints::tailnet_ips())
 }
 
-async fn start_server(app: &AppHandle, shared: &Arc<Shared>) -> Result<(), String> {
+async fn start_server<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<(), String> {
     // Idempotent: already bound → nothing to do.
     if shared.runtime.lock().unwrap().is_some() {
         return Ok(());
@@ -586,11 +733,18 @@ fn stop_server(shared: &Arc<Shared>) {
 /// Load persisted config on boot and, if the feature was left enabled,
 /// re-bind the server. Called once from the Tauri `setup` hook. A bind
 /// failure (port taken) is logged, not fatal — the desktop still runs.
-pub fn restore_on_boot(app: &AppHandle) {
+pub fn restore_on_boot<R: Runtime>(app: &AppHandle<R>) {
     let shared = app.state::<WebRemoteState>().shared();
     let cfg = load_config(app);
     let enabled = cfg.enabled;
     *shared.config.lock().unwrap() = cfg;
+    // `codemux serve` performs an awaited enable after the full headless app
+    // has built so startup can report bind failures synchronously. Spawning
+    // this normal GUI restore in parallel would race that enable and could
+    // make serve print a pairing URL before any listener exists.
+    if crate::app_mode(app) == crate::AppMode::ServeHeadless {
+        return;
+    }
     // In end-to-end test mode the dedicated `e2e_autostart` hook owns server
     // startup (it also mints the pairing token); starting here too would race
     // it on the bind. Yield to it.
@@ -645,7 +799,7 @@ pub fn restore_on_boot(app: &AppHandle) {
 /// Enable the server and publish a pairing URL for an automated harness. See
 /// the module-section comment above. No-op unless `CODEMUX_WEB_REMOTE_E2E=1`.
 #[cfg(debug_assertions)]
-pub fn e2e_autostart(app: &AppHandle) {
+pub fn e2e_autostart<R: Runtime>(app: &AppHandle<R>) {
     if std::env::var("CODEMUX_WEB_REMOTE_E2E").ok().as_deref() != Some("1") {
         return;
     }
@@ -698,60 +852,82 @@ fn write_pairing_file(path: &str, url: &str) -> std::io::Result<()> {
 // ── Tauri commands ──────────────────────────────────────────────────
 
 #[tauri::command]
-pub fn web_remote_status(app: AppHandle) -> WebRemoteStatus {
+pub fn web_remote_status<R: Runtime>(app: AppHandle<R>) -> WebRemoteStatus {
     let shared = app.state::<WebRemoteState>().shared();
     build_status(&app, &shared)
 }
 
-#[tauri::command]
-pub async fn web_remote_enable(app: AppHandle) -> Result<WebRemoteStatus, String> {
-    let shared = app.state::<WebRemoteState>().shared();
+/// Flip `enabled` on and, if binding fails, roll it back off — the shared body
+/// of the `web_remote_enable` Tauri command and the `codemux remote enable`
+/// control command, so both persist config, bind (with rollback), start the
+/// parallel iroh transport when relay mode is on, and emit `web-remote-state-
+/// changed` through the exact same path. Callers that want to change the scope
+/// or port first mutate `shared.config`, then call this.
+async fn enable_core<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<WebRemoteStatus, String> {
     shared.config.lock().unwrap().enabled = true;
-    persist_config(&app, &shared);
-    if let Err(e) = start_server(&app, &shared).await {
+    persist_config(app, shared);
+    if let Err(e) = start_server(app, shared).await {
         // Binding failed — e.g. the `tailscale` scope with no tailnet
         // address, or the port is already taken. Roll the master switch back
         // off so the UI never shows "enabled but not running", persist that,
         // and surface the reason. The server stays off.
         shared.config.lock().unwrap().enabled = false;
-        persist_config(&app, &shared);
-        emit_state_changed(&app);
+        persist_config(app, shared);
+        emit_state_changed(app);
         return Err(e);
     }
     // Bring the parallel iroh transport up too if relay mode was left enabled.
     // A failure here is logged but never fails the enable — iroh is strictly
     // additive over the primary `/ws` transport, which is already bound.
     if shared.config.lock().unwrap().relay_mode_enabled {
-        if let Err(e) = iroh::start(&app, &shared).await {
+        if let Err(e) = iroh::start(app, shared).await {
             eprintln!("[codemux::web_remote] iroh transport enable failed: {e}");
         }
         // Register this device with the account control plane so an account
         // browser can discover it (best-effort; skips when signed out).
-        registration::start(&app, &shared);
+        registration::start(app, shared);
     }
-    emit_state_changed(&app);
-    Ok(build_status(&app, &shared))
+    emit_state_changed(app);
+    Ok(build_status(app, shared))
 }
 
 #[tauri::command]
-pub fn web_remote_disable(app: AppHandle) -> Result<WebRemoteStatus, String> {
+pub async fn web_remote_enable<R: Runtime>(app: AppHandle<R>) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
-    shared.config.lock().unwrap().enabled = false;
-    persist_config(&app, &shared);
+    enable_core(&app, &shared).await
+}
+
+/// Flip `enabled` off in the config. The pure config-side of disable, shared by
+/// the Tauri command and the control socket so both persist the same state.
+fn mark_disabled(cfg: &mut WebRemoteConfig) {
+    cfg.enabled = false;
+}
+
+/// Turn every remote transport off — the shared body of the `web_remote_disable`
+/// Tauri command and the `codemux remote disable` control command.
+fn disable_core<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<WebRemoteStatus, String> {
+    mark_disabled(&mut shared.config.lock().unwrap());
+    persist_config(app, shared);
     // The master switch is the kill for *every* remote transport: `stop_server`
     // severs all live sockets (iroh sessions included, via the shared registry's
     // `close_all`), then tear the iroh endpoint down so it stops accepting and
     // stop refreshing this device's registration.
-    stop_server(&shared);
-    iroh::stop(&shared);
-    registration::stop(&shared);
-    emit_state_changed(&app);
-    Ok(build_status(&app, &shared))
+    stop_server(shared);
+    iroh::stop(shared);
+    registration::stop(shared);
+    emit_state_changed(app);
+    Ok(build_status(app, shared))
 }
 
 #[tauri::command]
-pub async fn web_remote_set_config(
-    app: AppHandle,
+pub fn web_remote_disable<R: Runtime>(app: AppHandle<R>) -> Result<WebRemoteStatus, String> {
+    let shared = app.state::<WebRemoteState>().shared();
+    disable_core(&app, &shared)
+}
+
+#[tauri::command]
+pub async fn web_remote_set_config<R: Runtime>(
+    app: AppHandle<R>,
     port: Option<u16>,
     require_approval: Option<bool>,
     bind_scope: Option<String>,
@@ -760,7 +936,32 @@ pub async fn web_remote_set_config(
     relay_mode_enabled: Option<bool>,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
+    set_config_core(
+        &app,
+        &shared,
+        port,
+        require_approval,
+        bind_scope,
+        account_mode_enabled,
+        trust_account_browsers,
+        relay_mode_enabled,
+    )
+    .await
+}
 
+/// The shared body of [`web_remote_set_config`], taking the shared state
+/// directly so the `codemux remote enable --scope/--port` change path can reuse
+/// the exact same rebind-with-rollback semantics the Settings pane uses.
+async fn set_config_core<R: Runtime>(
+    app: &AppHandle<R>,
+    shared: &Arc<Shared>,
+    port: Option<u16>,
+    require_approval: Option<bool>,
+    bind_scope: Option<String>,
+    account_mode_enabled: Option<bool>,
+    trust_account_browsers: Option<bool>,
+    relay_mode_enabled: Option<bool>,
+) -> Result<WebRemoteStatus, String> {
     // Reject an unknown scope before mutating anything, so we never persist a
     // value the bind logic can't honour.
     if let Some(ref s) = bind_scope {
@@ -806,15 +1007,15 @@ pub async fn web_remote_set_config(
             cfg.relay_mode_enabled != old_relay,
         )
     };
-    persist_config(&app, &shared);
+    persist_config(app, shared);
 
     // A port or scope change while running requires a rebind (the same
     // stop→start path a port change already used, which also drops existing
     // connections — they can't follow to a new port/interface).
     let running = shared.runtime.lock().unwrap().is_some();
     if running && (port_changed || scope_changed) {
-        stop_server(&shared);
-        if let Err(e) = start_server(&app, &shared).await {
+        stop_server(shared);
+        if let Err(e) = start_server(app, shared).await {
             // The new binding failed (e.g. switching to `tailscale` with no
             // tailnet address). Restore the previous config and rebind to it
             // so the server keeps running on its last-good address instead of
@@ -824,9 +1025,9 @@ pub async fn web_remote_set_config(
                 cfg.port = old_port;
                 cfg.bind_scope = old_scope;
             }
-            persist_config(&app, &shared);
-            let _ = start_server(&app, &shared).await;
-            emit_state_changed(&app);
+            persist_config(app, shared);
+            let _ = start_server(app, shared).await;
+            emit_state_changed(app);
             return Err(e);
         }
     }
@@ -838,30 +1039,30 @@ pub async fn web_remote_set_config(
     if relay_changed {
         if relay_target {
             if running {
-                if let Err(e) = iroh::start(&app, &shared).await {
+                if let Err(e) = iroh::start(app, shared).await {
                     eprintln!("[codemux::web_remote] iroh transport enable failed: {e}");
                 }
                 // Start device registration in lockstep with the endpoint.
-                registration::start(&app, &shared);
+                registration::start(app, shared);
             }
         } else {
-            iroh::stop(&shared);
-            registration::stop(&shared);
+            iroh::stop(shared);
+            registration::stop(shared);
         }
     }
 
-    emit_state_changed(&app);
-    Ok(build_status(&app, &shared))
+    emit_state_changed(app);
+    Ok(build_status(app, shared))
 }
 
 #[tauri::command]
-pub fn web_remote_create_pairing(app: AppHandle) -> PairingInfo {
+pub fn web_remote_create_pairing<R: Runtime>(app: AppHandle<R>) -> PairingInfo {
     let shared = app.state::<WebRemoteState>().shared();
     mint_pairing(&shared, None)
 }
 
 #[tauri::command]
-pub fn web_remote_list_endpoints(app: AppHandle) -> Vec<endpoints::Endpoint> {
+pub fn web_remote_list_endpoints<R: Runtime>(app: AppHandle<R>) -> Vec<endpoints::Endpoint> {
     let shared = app.state::<WebRemoteState>().shared();
     let (port, relay_mode_enabled) = {
         let cfg = shared.config.lock().unwrap();
@@ -885,7 +1086,7 @@ pub fn web_remote_list_endpoints(app: AppHandle) -> Vec<endpoints::Endpoint> {
 /// `None` until relay mode has been enabled at least once (the identity key is
 /// generated + persisted on first enable).
 #[tauri::command]
-pub fn web_remote_iroh_node_id(app: AppHandle) -> Option<String> {
+pub fn web_remote_iroh_node_id<R: Runtime>(app: AppHandle<R>) -> Option<String> {
     app.state::<WebRemoteState>().shared().iroh.node_id()
 }
 
@@ -897,18 +1098,18 @@ pub fn web_remote_iroh_node_id(app: AppHandle) -> Option<String> {
 /// `node_id`. Registration is best-effort and only runs while relay mode is on
 /// and the desktop is signed in.
 #[tauri::command]
-pub fn web_remote_registration_status(app: AppHandle) -> registration::RegistrationStatus {
+pub fn web_remote_registration_status<R: Runtime>(app: AppHandle<R>) -> registration::RegistrationStatus {
     app.state::<WebRemoteState>().shared().registration.status()
 }
 
 #[tauri::command]
-pub fn web_remote_list_sessions(app: AppHandle) -> Vec<SessionView> {
+pub fn web_remote_list_sessions<R: Runtime>(app: AppHandle<R>) -> Vec<SessionView> {
     let shared = app.state::<WebRemoteState>().shared();
     build_status(&app, &shared).sessions
 }
 
 #[tauri::command]
-pub fn web_remote_revoke_session(app: AppHandle, session_id: String) -> Result<WebRemoteStatus, String> {
+pub fn web_remote_revoke_session<R: Runtime>(app: AppHandle<R>, session_id: String) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
     app.state::<crate::database::DatabaseStore>()
         .web_remote_revoke_session(&session_id)?;
@@ -919,8 +1120,8 @@ pub fn web_remote_revoke_session(app: AppHandle, session_id: String) -> Result<W
 }
 
 #[tauri::command]
-pub fn web_remote_approve_session(
-    app: AppHandle,
+pub fn web_remote_approve_session<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
@@ -931,8 +1132,8 @@ pub fn web_remote_approve_session(
 }
 
 #[tauri::command]
-pub fn web_remote_reject_session(
-    app: AppHandle,
+pub fn web_remote_reject_session<R: Runtime>(
+    app: AppHandle<R>,
     session_id: String,
 ) -> Result<WebRemoteStatus, String> {
     let shared = app.state::<WebRemoteState>().shared();
@@ -962,8 +1163,8 @@ pub fn web_remote_reject_session(
 /// Publish the desktop updater's availability so paired web clients can offer a
 /// "desktop update available" prompt. Called by the desktop frontend only.
 #[tauri::command]
-pub fn web_remote_publish_update_available(
-    app: AppHandle,
+pub fn web_remote_publish_update_available<R: Runtime>(
+    app: AppHandle<R>,
     available: bool,
     version: Option<String>,
 ) {
@@ -979,7 +1180,7 @@ pub fn web_remote_publish_update_available(
 /// Ask the desktop to run its update + restart flow. Emits the global
 /// `web-remote-update-requested` event the desktop updater hook listens for.
 #[tauri::command]
-pub fn web_remote_request_update(app: AppHandle) {
+pub fn web_remote_request_update<R: Runtime>(app: AppHandle<R>) {
     let _ = app.emit(UPDATE_REQUESTED_EVENT, ());
 }
 
@@ -1224,6 +1425,88 @@ mod tests {
             !shared.pairing.consume(&res.token),
             "token is single-use — a second pair attempt fails"
         );
+    }
+
+    // ── Control-socket enable/disable (codemux remote enable/disable) ───
+
+    #[test]
+    fn apply_enable_request_flips_on_and_persists_scope_and_port() {
+        // The config side of `control_enable`'s off→on path: enable is set and
+        // the requested scope/port are folded in.
+        let mut cfg = WebRemoteConfig::default();
+        assert!(!cfg.enabled);
+        apply_enable_request(
+            &mut cfg,
+            Some(BIND_SCOPE_LOOPBACK.to_string()),
+            Some(5000),
+        )
+        .unwrap();
+        assert!(cfg.enabled, "enable flips the master switch on");
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_LOOPBACK);
+        assert_eq!(cfg.port, 5000);
+    }
+
+    #[test]
+    fn apply_enable_request_without_flags_keeps_current_scope_and_port() {
+        // `codemux remote enable` with no flags enables on the existing config.
+        let mut cfg = WebRemoteConfig {
+            port: 4400,
+            bind_scope: BIND_SCOPE_TAILSCALE.to_string(),
+            ..WebRemoteConfig::default()
+        };
+        apply_enable_request(&mut cfg, None, None).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.port, 4400, "port unchanged when no --port given");
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_TAILSCALE, "scope unchanged");
+    }
+
+    #[test]
+    fn apply_enable_request_rejects_unknown_scope_and_leaves_config_untouched() {
+        let mut cfg = WebRemoteConfig::default();
+        let err = apply_enable_request(&mut cfg, Some("wat".to_string()), None).unwrap_err();
+        assert!(err.contains("Unknown access scope"), "clear error: {err}");
+        // Nothing was mutated — the switch stays off, so nothing is persisted.
+        assert!(!cfg.enabled, "an invalid request never flips enable on");
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL);
+    }
+
+    #[test]
+    fn enable_requesting_tailscale_without_tailnet_would_fail_to_bind() {
+        // `apply_enable_request` accepts the scope (it's a valid value), but the
+        // actual enable binds through `bind_addrs`, which fails with the clear
+        // no-fallback error when there is no tailnet address — so a
+        // `codemux remote enable --scope tailscale` on a host off the mesh
+        // surfaces that reason and the control layer restores the last-good scope.
+        let mut cfg = WebRemoteConfig::default();
+        apply_enable_request(&mut cfg, Some(BIND_SCOPE_TAILSCALE.to_string()), None).unwrap();
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_TAILSCALE);
+        let err = bind_addrs_from(&cfg.bind_scope, cfg.port, vec![]).unwrap_err();
+        assert!(
+            err.contains("No Tailscale address found"),
+            "enable propagates the bind error: {err}"
+        );
+    }
+
+    #[test]
+    fn mark_disabled_turns_the_switch_off() {
+        // The config side of `control_disable`: flip enable off, which
+        // `disable_core` then persists and acts on (severing sockets).
+        let mut cfg = WebRemoteConfig {
+            enabled: true,
+            ..WebRemoteConfig::default()
+        };
+        mark_disabled(&mut cfg);
+        assert!(!cfg.enabled, "disable clears the master switch");
+    }
+
+    #[test]
+    fn enable_scope_strings_parse_as_valid_bind_scopes() {
+        // The three CLI `--scope` values the control layer accepts.
+        assert!(is_valid_bind_scope(BIND_SCOPE_ALL));
+        assert!(is_valid_bind_scope(BIND_SCOPE_TAILSCALE));
+        assert!(is_valid_bind_scope(BIND_SCOPE_LOOPBACK));
+        assert!(!is_valid_bind_scope("wan"));
+        assert!(!is_valid_bind_scope(""));
     }
 
     #[test]

@@ -292,7 +292,7 @@ pub struct FireOutcome {
 
 /// Run a short DB operation without holding the Tauri `State` borrow
 /// across an await point.
-fn with_db<R>(handle: &AppHandle, f: impl FnOnce(&DatabaseStore) -> R) -> R {
+fn with_db<RT: tauri::Runtime, R>(handle: &AppHandle<RT>, f: impl FnOnce(&DatabaseStore) -> R) -> R {
     let db: tauri::State<'_, DatabaseStore> = handle.state();
     f(&db)
 }
@@ -343,8 +343,8 @@ pub fn apply_outcome(db: &DatabaseStore, run_id: i64, outcome: &FireOutcome) {
 /// Desktop scheduler entry point: mark the run started, execute it, and
 /// record the outcome. The Tauri `State` borrow is re-acquired per DB
 /// touch via `with_db`, never held across the agent-process await.
-pub async fn execute_run(
-    handle: AppHandle,
+pub async fn execute_run<RT: tauri::Runtime>(
+    handle: AppHandle<RT>,
     automation: AutomationRecord,
     run: AutomationRunRecord,
 ) {

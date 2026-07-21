@@ -234,8 +234,8 @@ fn orchestration_state_from_cycle(
     }
 }
 
-fn ensure_agent_session_live(
-    app: &tauri::AppHandle,
+fn ensure_agent_session_live<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     app_state: &AppStateStore,
     agent_store: &AgentSessionStore,
     pty_state: &crate::terminal::PtyState,
@@ -495,8 +495,8 @@ pub fn list_thinking_modes_for_tool(tool_id: String) -> Result<Vec<ThinkingModeI
 }
 
 #[tauri::command]
-pub fn spawn_openflow_agents(
-    app: tauri::AppHandle,
+pub fn spawn_openflow_agents<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
     agent_store: State<'_, AgentSessionStore>,
     runtime: State<'_, OpenFlowRuntimeStore>,
@@ -747,8 +747,8 @@ pub fn inject_orchestrator_message(
 }
 
 /// Core orchestration cycle logic, shared by the background loop and the manual trigger command.
-async fn run_single_cycle(
-    app: &tauri::AppHandle,
+async fn run_single_cycle<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     runtime: &OpenFlowRuntimeStore,
     agent_store: &AgentSessionStore,
     pty_state: &crate::terminal::PtyState,
@@ -1691,8 +1691,8 @@ async fn run_single_cycle(
 /// Tauri command wrapper for manual orchestrator cycle triggers.
 /// The primary orchestration driver is now the background loop started by `spawn_openflow_agents`.
 #[tauri::command]
-pub async fn trigger_orchestrator_cycle(
-    app: tauri::AppHandle,
+pub async fn trigger_orchestrator_cycle<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     runtime: State<'_, OpenFlowRuntimeStore>,
     agent_store: State<'_, AgentSessionStore>,
     pty_state: State<'_, crate::terminal::PtyState>,
@@ -1705,7 +1705,7 @@ pub async fn trigger_orchestrator_cycle(
 
 /// Background orchestration loop that runs continuously for a given run.
 /// Replaces the frontend-driven polling model. Wakes immediately on user injection.
-pub async fn run_orchestration_loop(app: tauri::AppHandle, run_id: String) {
+pub async fn run_orchestration_loop<R: tauri::Runtime>(app: tauri::AppHandle<R>, run_id: String) {
     use std::sync::atomic::Ordering;
 
     let runtime = app.state::<OpenFlowRuntimeStore>();
@@ -1826,8 +1826,8 @@ pub fn apply_openflow_review_result(
 }
 
 #[tauri::command]
-pub fn stop_openflow_run(
-    app: tauri::AppHandle,
+pub fn stop_openflow_run<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     store: State<'_, OpenFlowRuntimeStore>,
     agent_store: State<'_, AgentSessionStore>,
     app_state: State<'_, AppStateStore>,

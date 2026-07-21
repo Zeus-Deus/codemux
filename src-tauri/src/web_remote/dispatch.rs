@@ -40,7 +40,7 @@ use axum::extract::ws::Message;
 use serde_json::{json, Value};
 use tauri::ipc::{CallbackFn, InvokeBody, InvokeResponse, InvokeResponseBody};
 use tauri::webview::InvokeRequest;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, Runtime};
 
 use super::server::OutboundTx;
 
@@ -178,8 +178,8 @@ fn rewrite_channel_markers(
 }
 
 /// Drive one invoke to completion and emit its response frame on `out`.
-pub async fn dispatch_invoke(
-    app: &AppHandle,
+pub async fn dispatch_invoke<R: Runtime>(
+    app: &AppHandle<R>,
     router: &Arc<ChannelRouter>,
     conn_id: u64,
     out: &OutboundTx,
