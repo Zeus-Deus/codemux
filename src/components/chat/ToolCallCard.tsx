@@ -1,4 +1,4 @@
-import { memo, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -20,6 +20,7 @@ import {
   buildPermissionUpdate,
   type PermissionScope,
 } from "@/lib/agent-chat/permission-rules";
+import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 import type {
@@ -81,8 +82,24 @@ export const ToolCallCard = memo(function ToolCallCard({
     item.tool_name === "Edit" ||
     item.tool_name === "MultiEdit" ||
     item.tool_name === "Write";
-  const defaultExpanded = isPendingApproval || isError || isDiffTool;
+  // A result carrying an image (e.g. a screenshot) is a visual payload
+  // meant to be seen — expand it inline like a diff rather than hiding
+  // it behind a chevron.
+  const hasImages = hasToolResultImages(item.result_content);
+  const defaultExpanded = isPendingApproval || isError || isDiffTool || hasImages;
   const [expanded, setExpanded] = useState(defaultExpanded);
+  const hasSeenImagesRef = useRef(hasImages);
+
+  // Tool cards usually mount while the call is still running, before
+  // `result_content` exists. Open once when a renderable image first arrives;
+  // tracking the transition prevents ordinary rerenders from undoing a user's
+  // later manual collapse.
+  useEffect(() => {
+    if (hasImages && !hasSeenImagesRef.current) {
+      setExpanded(true);
+      hasSeenImagesRef.current = true;
+    }
+  }, [hasImages]);
 
   const Icon = toolIcon(item.tool_name);
   const glyph = glyphForState({

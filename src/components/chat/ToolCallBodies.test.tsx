@@ -456,3 +456,71 @@ describe("GenericToolBody edge cases", () => {
     expect(container.firstChild).toBeNull();
   });
 });
+
+describe("Tool result images", () => {
+  it("renders a valid image block as a thumbnail without dumping its base64 payload", () => {
+    render(
+      <ToolCallBody
+        item={makeTool({
+          result_content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "image/png",
+                data: "AAAA",
+              },
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByRole("img")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,AAAA",
+    );
+    expect(screen.queryByText(/AAAA/)).not.toBeInTheDocument();
+  });
+
+  it("keeps a rejected non-image block visible in a specialised tool body", () => {
+    render(
+      <ToolCallBody
+        item={makeTool({
+          result_content: [
+            {
+              type: "image",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: "document-data",
+              },
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/application\/pdf/)).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+
+  it("keeps a rejected unsafe URL visible in the generic fallback", () => {
+    render(
+      <ToolCallBody
+        item={makeTool({
+          tool_name: "MysteryTool",
+          result_content: [
+            {
+              type: "image_url",
+              image_url: { url: "javascript:alert(1)" },
+            },
+          ],
+        })}
+      />,
+    );
+
+    expect(screen.getByText(/javascript:alert\(1\)/)).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  });
+});

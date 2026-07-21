@@ -1,7 +1,12 @@
 import type { ToolCallItem } from "@/lib/agent-chat/types";
+import {
+  extractToolResultImages,
+  isRenderableImageBlock,
+} from "@/lib/agent-chat/tool-result-images";
 
 import { DiffView } from "./DiffView";
 import { ToolCallBlock } from "./ToolCallBlock";
+import { ToolResultImages } from "./ToolResultImages";
 
 const BASH_TAIL_LINES = 10;
 const READ_PREVIEW_LINES = 5;
@@ -19,6 +24,28 @@ const GREP_PREVIEW_MATCHES = 5;
  */
 export function ToolCallBody({ item }: { item: ToolCallItem }) {
   const input = isRecord(item.input) ? item.input : null;
+  const body = renderToolBody(item, input);
+
+  // Images returned in the tool result (a screenshot from `Read` on a
+  // PNG, a browser/screenshot tool, …) render as thumbnails below the
+  // per-tool body instead of being stringified into a base64 dump. The
+  // per-tool `contentToString` skips image blocks, so the text body and
+  // the image row never double-render the same payload.
+  const images = extractToolResultImages(item.result_content);
+  if (images.length === 0) return body;
+
+  return (
+    <div className="space-y-2.5">
+      {body}
+      <ToolResultImages images={images} />
+    </div>
+  );
+}
+
+function renderToolBody(
+  item: ToolCallItem,
+  input: Record<string, unknown> | null,
+) {
   switch (item.tool_name) {
     case "Bash":
       return <BashToolBody item={item} input={input} />;
@@ -361,6 +388,7 @@ function contentToString(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
+      .filter((entry) => !isRenderableImageBlock(entry))
       .map((entry) => {
         if (entry == null) return "";
         if (typeof entry === "string") return entry;
@@ -460,4 +488,3 @@ function extractTitle(result: string): string | null {
   if (firstLine.length > 120) return firstLine.slice(0, 119) + "…";
   return firstLine;
 }
-

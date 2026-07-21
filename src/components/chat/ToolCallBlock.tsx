@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+import { isRenderableImageBlock } from "@/lib/agent-chat/tool-result-images";
 import { cn } from "@/lib/utils";
 
 const PREVIEW_LINES = 12;
@@ -19,6 +20,10 @@ interface Props {
 export function ToolCallBlock({ content, error, text }: Props) {
   const [expanded, setExpanded] = useState(false);
   const body = text ?? contentToString(content);
+  // An image-only tool result stringifies to nothing (image blocks are
+  // filtered out and rendered as thumbnails elsewhere). Render nothing
+  // rather than an empty recessed box.
+  if (body.trim() === "") return null;
   const lines = body.split("\n");
   const showToggle = lines.length > PREVIEW_LINES;
   const visible =
@@ -57,6 +62,7 @@ function contentToString(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
     return content
+      .filter((entry) => !isRenderableImageBlock(entry))
       .map((entry) => {
         if (entry == null) return "";
         if (typeof entry === "string") return entry;
