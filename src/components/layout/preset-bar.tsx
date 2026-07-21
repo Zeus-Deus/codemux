@@ -35,10 +35,7 @@ import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { RunButton } from "./run-button";
 import { cn } from "@/lib/utils";
-import { materializeWithPreset } from "@/lib/agent-chat/materialize";
-import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
-import { useAgentChatStore } from "@/stores/agent-chat-store";
-import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
+import { launchDraftWithPreset } from "@/lib/agent-chat/draft-preset-launch";
 import {
   useChatDraftStore,
   type DraftId,
@@ -326,48 +323,12 @@ function PresetBarImpl({
 
   const handleLaunchDraft = (preset: TerminalPreset) => {
     if (!draftId) return;
-    // Re-read fresh state at click time so same-tick composer
-    // keystrokes are captured as the initial prompt.
-    const state = useChatDraftStore.getState();
-    const draft = state.draftsById[draftId];
-    if (!draft) return;
-    const chat = useAgentChatStore.getState();
-
-    const skillBodies = resolveSkillBodies(
-      draft.inputDraft,
-      selectActiveSkills(useSkillsStore.getState()),
-    );
-
-    void materializeWithPreset(
-      draft,
-      preset,
-      draft.inputDraft,
-      {
-        markPromoting: state.markPromoting,
-        markMaterialized: state.markMaterialized,
-        markPromoted: state.markPromoted,
-        markSendFailed: state.markSendFailed,
-        ensureThread: chat.ensureThread,
-        appendUserMessage: chat.appendUserMessage,
-        removeUserMessageByNonce: chat.removeUserMessageByNonce,
-        setModel: chat.setModel,
-        setPermissionMode: chat.setPermissionMode,
-        setSessionLaunchMode: chat.setSessionLaunchMode,
-        setEffort: chat.setEffort,
-        setContextWindow: chat.setContextWindow,
-        setMode: chat.setMode,
-      },
-      skillBodies,
-    ).then((result) => {
-      if (result.success) {
-        // Same transition cleanup DraftChatSurface uses on composer
-        // submit: clear the active draft immediately so the router
-        // swaps to the live workspace; sweep the draft entry after
-        // the 5s grace period.
-        const draftIdToClear = draft.draftId;
-        state.setActiveDraft(null);
-        setTimeout(() => state.clearDraft(draftIdToClear), 5000);
-      } else {
+    // Shared with the GUI-chrome DraftAgentLauncher — reads fresh
+    // draft state at click time (same-tick composer keystrokes are
+    // captured as the initial prompt), materialises, then runs the
+    // same transition cleanup DraftChatSurface uses on submit.
+    void launchDraftWithPreset(draftId, preset).then((result) => {
+      if (!result.success) {
         toast.error(`${preset.name}: ${result.error ?? "Send failed"}`);
       }
     });

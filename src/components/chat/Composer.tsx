@@ -2352,7 +2352,19 @@ export function Composer({
               }
               rows={1}
               className={cn(
-                "relative w-full resize-none bg-transparent px-3 py-2.5",
+                // `block` is load-bearing: a `<textarea>` defaults to
+                // `inline-block`, so it sits on a line box and its
+                // vertical position is resolved via baseline alignment.
+                // The mirror behind it is an absolutely-positioned block
+                // pinned to the container top. Baseline-aligned inline
+                // boxes are computed differently across rendering engines
+                // (notably WebKitGTK, which powers the desktop build) than
+                // Chromium, which drifts the caret/selection off the
+                // painted text. Forcing `block` pins the textarea to the
+                // container top on every engine so the two layers stay
+                // glued, and drops the phantom line-box descent that
+                // otherwise made this box a few px too tall.
+                "relative block w-full resize-none bg-transparent px-3 py-2.5",
                 // Transparent text — the colored mirror behind shows
                 // through. Caret stays visible via `caret-foreground`.
                 "text-sm text-transparent caret-foreground",

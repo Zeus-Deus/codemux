@@ -11,6 +11,8 @@ use crate::state::{self, AppStateStore, PaneStatus};
 static HOOK_PORT: OnceLock<u16> = OnceLock::new();
 static MONITOR_SESSIONS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
 
+const ACTIVE_HOOK_PORT_FILE: &str = "active-port";
+
 pub fn hook_port() -> Option<u16> {
     HOOK_PORT.get().copied()
 }
@@ -21,6 +23,9 @@ pub fn start_hook_server<R: Runtime>(app: AppHandle<R>) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind hook server");
     let port = listener.local_addr().unwrap().port();
     HOOK_PORT.set(port).ok();
+    if write_active_hook_port(port).is_none() {
+        eprintln!("[codemux::hooks] Failed to publish active hook server port {port}");
+    }
 
     std::thread::spawn(move || {
         // Accept connections until the app exits
@@ -337,7 +342,6 @@ fn start_agent_exit_monitor<R: Runtime>(app: AppHandle<R>, session_id: String, s
 const HOOK_SCRIPT: &str = r#"#!/bin/sh
 # Codemux agent lifecycle hook — notifies the hook server of agent status changes.
 # Injected env: CODEMUX_HOOK_PORT, CODEMUX_SESSION_ID
-[ -z "$CODEMUX_HOOK_PORT" ] && exit 0
 [ -z "$CODEMUX_SESSION_ID" ] && exit 0
 
 # Event type comes from the first arg when the agent's hook config can pass
@@ -380,12 +384,28 @@ if [ "$EVENT_TYPE" = "Notification" ]; then
   esac
 fi
 
-URL="http://127.0.0.1:${CODEMUX_HOOK_PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
-if [ -n "$AGENT_SID" ]; then
-  URL="${URL}&agentSessionId=${AGENT_SID}"
-fi
+# Persistent PTYs survive Codemux restarts, but their process environment
+# cannot be updated: CODEMUX_HOOK_PORT can therefore point at the previous
+# app instance. Try the inherited port first (important if two app instances
+# coexist), then retry the port published by the current app. The retry lives
+# in the detached subshell so hooks stay non-blocking.
+send_hook() {
+  PORT="$1"
+  [ -n "$PORT" ] || return 1
+  URL="http://127.0.0.1:${PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
+  if [ -n "$AGENT_SID" ]; then
+    URL="${URL}&agentSessionId=${AGENT_SID}"
+  fi
+  curl -fsS --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1
+}
 
-curl -s --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1 || true &
+(
+  send_hook "$CODEMUX_HOOK_PORT" && exit 0
+  SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+  ACTIVE_PORT=$(cat "$SCRIPT_DIR/active-port" 2>/dev/null)
+  [ "$ACTIVE_PORT" = "$CODEMUX_HOOK_PORT" ] && exit 0
+  send_hook "$ACTIVE_PORT" || true
+) >/dev/null 2>&1 &
 exit 0
 "#;
 
@@ -396,7 +416,6 @@ exit 0
 const HOOK_SCRIPT_PS1: &str = r#"# Codemux agent lifecycle hook (Windows / PowerShell)
 # Injected env: CODEMUX_HOOK_PORT, CODEMUX_SESSION_ID
 $ErrorActionPreference = 'SilentlyContinue'
-if (-not $env:CODEMUX_HOOK_PORT)    { exit 0 }
 if (-not $env:CODEMUX_SESSION_ID)   { exit 0 }
 $eventType = if ($args.Count -gt 0) { $args[0] } else { '' }
 
@@ -429,11 +448,28 @@ if ($eventType -eq 'Notification') {
     if ($notifMsg -notmatch '(?i)permission|approval') { exit 0 }
 }
 
-$url = "http://127.0.0.1:$($env:CODEMUX_HOOK_PORT)/hook?sessionId=$($env:CODEMUX_SESSION_ID)&eventType=$eventType"
-if ($agentSid) { $url = "$url&agentSessionId=$agentSid" }
+function Send-CodemuxHook([string]$port) {
+    if (-not $port) { return $false }
+    $url = "http://127.0.0.1:$port/hook?sessionId=$($env:CODEMUX_SESSION_ID)&eventType=$eventType"
+    if ($agentSid) { $url = "$url&agentSessionId=$agentSid" }
+    try {
+        Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2 | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
 
-# Fire-and-forget; ignore failures so a network blip never kills the agent.
-try { Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 2 | Out-Null } catch {}
+# A daemon-backed PTY can outlive the app that supplied its environment.
+# Prefer that inherited app's port, then fall back to the port published by
+# the current Codemux process when the old listener is gone.
+if (-not (Send-CodemuxHook $env:CODEMUX_HOOK_PORT)) {
+    $activePort = ''
+    try { $activePort = (Get-Content (Join-Path $PSScriptRoot 'active-port') -Raw).Trim() } catch {}
+    if ($activePort -and $activePort -ne $env:CODEMUX_HOOK_PORT) {
+        [void](Send-CodemuxHook $activePort)
+    }
+}
 exit 0
 "#;
 
@@ -454,7 +490,6 @@ EVENT_TYPE="${1:-}"
 INPUT=$(cat)
 printf '{}\n'
 
-[ -z "$CODEMUX_HOOK_PORT" ] && exit 0
 [ -z "$CODEMUX_SESSION_ID" ] && exit 0
 [ -z "$EVENT_TYPE" ] && exit 0
 
@@ -463,12 +498,23 @@ if command -v jq >/dev/null 2>&1; then
   AGENT_SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)
 fi
 
-URL="http://127.0.0.1:${CODEMUX_HOOK_PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
-if [ -n "$AGENT_SID" ]; then
-  URL="${URL}&agentSessionId=${AGENT_SID}"
-fi
+send_hook() {
+  PORT="$1"
+  [ -n "$PORT" ] || return 1
+  URL="http://127.0.0.1:${PORT}/hook?sessionId=${CODEMUX_SESSION_ID}&eventType=${EVENT_TYPE}"
+  if [ -n "$AGENT_SID" ]; then
+    URL="${URL}&agentSessionId=${AGENT_SID}"
+  fi
+  curl -fsS --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1
+}
 
-curl -s --connect-timeout 1 --max-time 2 "$URL" >/dev/null 2>&1 || true &
+(
+  send_hook "$CODEMUX_HOOK_PORT" && exit 0
+  SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
+  ACTIVE_PORT=$(cat "$SCRIPT_DIR/active-port" 2>/dev/null)
+  [ "$ACTIVE_PORT" = "$CODEMUX_HOOK_PORT" ] && exit 0
+  send_hook "$ACTIVE_PORT" || true
+) >/dev/null 2>&1 &
 exit 0
 "#;
 
@@ -488,6 +534,26 @@ fn user_home_dir() -> Option<String> {
     {
         std::env::var("HOME").ok()
     }
+}
+
+/// Publish the current app instance's hook-server port next to the shared
+/// notifier scripts. Daemon-backed terminals retain the environment of the
+/// app instance that originally spawned them, so their inherited
+/// `CODEMUX_HOOK_PORT` becomes stale after an app restart. The scripts try
+/// that inherited port first, then read this file and retry against the
+/// current listener.
+fn write_active_hook_port(port: u16) -> Option<std::path::PathBuf> {
+    let home = user_home_dir()?;
+    write_active_hook_port_in(&std::path::PathBuf::from(home).join(".codemux/hooks"), port)
+}
+
+fn write_active_hook_port_in(hooks_dir: &std::path::Path, port: u16) -> Option<std::path::PathBuf> {
+    std::fs::create_dir_all(hooks_dir).ok()?;
+    let path = hooks_dir.join(ACTIVE_HOOK_PORT_FILE);
+    // One short write during startup. A failed write leaves the prior port in
+    // place, while fresh terminals still use their inherited env value.
+    std::fs::write(&path, format!("{port}\n")).ok()?;
+    Some(path)
 }
 
 /// Write a file into `~/.codemux/hooks/` with the given name and body,
@@ -1316,6 +1382,87 @@ mod tests {
             HOOK_SCRIPT.contains("EVENT_TYPE=\"${1:-}\""),
             "notify.sh must still accept the event type as the first arg"
         );
+    }
+
+    #[test]
+    fn active_hook_port_file_tracks_the_current_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_active_hook_port_in(dir.path(), 43123).unwrap();
+
+        assert_eq!(path, dir.path().join(ACTIVE_HOOK_PORT_FILE));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "43123\n");
+    }
+
+    #[test]
+    fn every_notifier_can_retry_the_published_active_port() {
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(HOOK_SCRIPT.contains("$SCRIPT_DIR/active-port"));
+            assert!(GEMINI_HOOK_SCRIPT.contains("$SCRIPT_DIR/active-port"));
+        }
+        #[cfg(target_os = "windows")]
+        assert!(HOOK_SCRIPT_PS1.contains("Join-Path $PSScriptRoot 'active-port'"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn notify_script_retries_the_current_port_after_a_stale_inherited_port() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("notify.sh");
+        std::fs::write(&script_path, HOOK_SCRIPT).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_active_hook_port_in(dir.path(), 43210).unwrap();
+
+        // Replace curl with a deterministic probe: the inherited port fails,
+        // the active-port retry succeeds, and both attempted URLs are logged.
+        let bin_dir = dir.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let fake_curl = bin_dir.join("curl");
+        std::fs::write(
+            &fake_curl,
+            r#"#!/bin/sh
+for ARG in "$@"; do
+  case "$ARG" in http://*) URL="$ARG" ;; esac
+done
+printf '%s\n' "$URL" >> "$HOOK_TEST_LOG"
+case "$URL" in *:43199/*) exit 7 ;; *) exit 0 ;; esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log_path = dir.path().join("curl.log");
+
+        let status = std::process::Command::new(&script_path)
+            .arg("UserPromptSubmit")
+            .env("CODEMUX_HOOK_PORT", "43199")
+            .env("CODEMUX_SESSION_ID", "session-resumed")
+            .env("HOOK_TEST_LOG", &log_path)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin_dir.display()))
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let log = loop {
+            let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+            if log.lines().count() >= 2 || std::time::Instant::now() >= deadline {
+                break log;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let attempts: Vec<_> = log.lines().collect();
+        assert_eq!(
+            attempts.len(),
+            2,
+            "expected inherited + active-port attempts: {log}"
+        );
+        assert!(attempts[0].contains(":43199/hook?"));
+        assert!(attempts[1].contains(":43210/hook?"));
+        assert!(attempts[1].contains("sessionId=session-resumed"));
+        assert!(attempts[1].contains("eventType=UserPromptSubmit"));
     }
 
     #[cfg(not(target_os = "windows"))]

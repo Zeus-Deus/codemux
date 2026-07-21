@@ -175,6 +175,29 @@ describe("WorkspaceMain chrome rows", () => {
   });
 });
 
+describe("WorkspaceMain draft branch chrome", () => {
+  it("renders the legacy PresetBar above the draft surface when the Beta is OFF", () => {
+    state.enableLazy = true;
+    state.activeDraftId = "draft-1";
+    state.enableAgentChat = false;
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("preset-bar")).toBeInTheDocument();
+    expect(getByTestId("draft-surface")).toBeInTheDocument();
+  });
+
+  it("drops the legacy PresetBar for a draft when the Beta is ON (the GUI draft titlebar owns preset launch)", () => {
+    // Regression coverage: the draft branch used to render PresetBar
+    // unconditionally, so pressing "+" in GUI mode flashed the legacy
+    // preset strip until the workspace materialised.
+    state.enableLazy = true;
+    state.activeDraftId = "draft-1";
+    state.enableAgentChat = true;
+    const { queryByTestId, getByTestId } = render(<WorkspaceMain />);
+    expect(queryByTestId("preset-bar")).toBeNull();
+    expect(getByTestId("draft-surface")).toBeInTheDocument();
+  });
+});
+
 describe("WorkspaceMain right-panel stale-tab guard", () => {
   it("coerces a persisted 'orchestration' tab to 'files' when no workflow run exists", () => {
     state.rightPanelTabs = { "ws-1": "orchestration" };
