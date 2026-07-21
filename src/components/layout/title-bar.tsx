@@ -544,9 +544,10 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           cluster) leave room for a future inline workflow-status pill. */}
       <div data-tauri-drag-region className="flex-1 self-stretch" />
 
-      {/* Right cluster — rehomed right-panel toggle + Run split button,
-          then the standard monitor / IDE / window controls. The
-          workspace-scoped controls (panel toggle / Run / IDE) are
+      {/* Right cluster — Run split button, then the standard monitor /
+          IDE controls, with the right-panel toggle docked beside the
+          window controls (layout toggles live next to window chrome).
+          The workspace-scoped controls (panel toggle / Run / IDE) are
           suppressed in draft chrome: the backend's "active workspace"
           is whatever was focused before the draft opened, which is NOT
           what's on screen — acting on it here would be misleading. */}
@@ -555,19 +556,19 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
         onPointerDown={(e) => e.stopPropagation()}
       >
         {guiChrome && activeWorkspaceId && (
-          <RightPanelToggle workspaceId={activeWorkspaceId} />
-        )}
-        {guiChrome && activeWorkspaceId && (
           <RunButton workspaceId={activeWorkspaceId} variant="split" />
         )}
         <ResourceMonitor />
         {guiChrome && <IdeLauncher compact />}
-        {/* The separator only divides the content cluster from the native
-            window controls — on the web remote client those controls render
-            nothing, so the separator would dangle at the right edge. Hide it
-            there. */}
+        {/* The separator divides the content cluster from the layout-toggle
+            + native window controls group — on the web remote client those
+            controls render nothing, so the separator would dangle next to a
+            lone toggle at the right edge. Hide it there. */}
         {!isRemoteClient() && (
           <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
+        )}
+        {guiChrome && activeWorkspaceId && (
+          <RightPanelToggle workspaceId={activeWorkspaceId} />
         )}
         <WindowControls />
         {/* Web remote client only: the connection chip takes the slot the

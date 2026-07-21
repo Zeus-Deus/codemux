@@ -34,7 +34,7 @@ mutually exclusive with `guiChrome`; see "Draft titlebar variant" below).
 When neither predicate holds it returns the byte-identical legacy `h-9`
 bar; in workspace GUI chrome it composes discrete slots left-to-right:
 
-`[sidebar-width cluster: sidebar toggle] | [tabs] [+ launcher] | [pinned preset tiles] …drag spacer… [right-panel toggle] [RunButton split] [ResourceMonitor] [IdeLauncher compact] [sep] [WindowControls]`
+`[sidebar-width cluster: sidebar toggle] | [tabs] [+ launcher] | [pinned preset tiles] …drag spacer… [RunButton split] [ResourceMonitor] [IdeLauncher compact] [sep] [right-panel toggle] [WindowControls]`
 
 The far-left cluster contains **only the sidebar toggle** and is sized to the
 live sidebar width (`useSidebarGapWidth()` in
@@ -74,7 +74,9 @@ sidebar boundary so tabs start where the content pane starts (design:
   tab; CLI = new tab, Shift-click = split via `applyPreset`).
 - **Rehomed controls** — the right-panel toggle (`FileDiff`, drives
   `rightPanelTabs`) and `RunButton` move from `TabBar`/`PresetBar` into the
-  titlebar right cluster. In GUI chrome the `RunButton` renders its
+  titlebar right cluster. The panel toggle is docked after the content-cluster
+  separator, immediately beside `WindowControls`; `RunButton` stays before
+  `ResourceMonitor` and the compact IDE launcher. In GUI chrome the `RunButton` renders its
   `variant="split"` form (main segment = green play + Run/Set Run, caret
   segment = configure; no standalone gear) and `IdeLauncher` renders
   `compact` (icon square + caret, combined tooltip). Both components keep
@@ -116,7 +118,8 @@ titlebar tab share one implementation (see "Important Touch Points").
   with active-session dot and delete-on-hover).
 - `+` launcher covering GUI chat presets, CLI agents (with Shift-split),
   Terminal/Browser panes, and Manage presets.
-- Inline ember chat favorite; rehomed right-panel toggle + RunButton. (The
+- Inline ember chat favorite; rehomed RunButton plus a right-panel toggle
+  docked beside the window controls. (The
   "N subagents running" status pill that originally rehomed next to the
   active chat tab was later removed — subagent status now lives in the
   docked `SubagentActivityBar` above the composer; see

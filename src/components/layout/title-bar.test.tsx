@@ -243,11 +243,23 @@ describe("TitleBar chrome gating", () => {
 
   it("merges tabs + launcher into the bar when the Beta is ON", () => {
     state.enableAgentChat = true;
-    const { getByTestId, queryByTestId } = renderBar();
+    const { getByRole, getByTestId, queryByTestId } = renderBar();
     expect(getByTestId("titlebar-tabs")).toBeInTheDocument();
     expect(getByTestId("agent-launcher")).toBeInTheDocument();
     // Rehomed right cluster.
-    expect(getByTestId("run-button")).toBeInTheDocument();
+    const runButton = getByTestId("run-button");
+    const panelToggle = getByRole("button", { name: "Open panel" });
+    const windowControls = getByTestId("window-controls");
+    expect(runButton).toBeInTheDocument();
+    expect(panelToggle).toBeInTheDocument();
+    expect(
+      runButton.compareDocumentPosition(panelToggle) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      panelToggle.compareDocumentPosition(windowControls) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
     // Pinned tiles are opt-in (see the dedicated describe blocks below) —
     // the titlebar-pins store defaults empty, so no tile renders here even
     // though the fixture's chat preset has `pinned: true` (that flag is
@@ -270,7 +282,7 @@ describe("TitleBar chrome gating", () => {
     state.enableAgentChat = true;
     state.enableLazy = true;
     state.activeDraftId = "draft-1";
-    const { getByTestId, queryByTestId } = renderBar();
+    const { getByTestId, queryByRole, queryByTestId } = renderBar();
     expect(getByTestId("titlebar-draft-tab")).toBeInTheDocument();
     expect(getByTestId("draft-agent-launcher")).toBeInTheDocument();
     // Workspace slots + workspace-scoped controls stay off — the
@@ -279,6 +291,7 @@ describe("TitleBar chrome gating", () => {
     expect(queryByTestId("titlebar-tabs")).toBeNull();
     expect(queryByTestId("agent-launcher")).toBeNull();
     expect(queryByTestId("run-button")).toBeNull();
+    expect(queryByRole("button", { name: "Open panel" })).toBeNull();
     // Shared shell bits still render.
     expect(getByTestId("titlebar-sidebar-cluster")).toBeInTheDocument();
     expect(getByTestId("window-controls")).toBeInTheDocument();
