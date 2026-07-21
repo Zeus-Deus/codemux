@@ -14,7 +14,7 @@
 - Lazy workspace creation (Beta-gated): sidebar `+` and boot-into-Home open a client-side chat draft; the draft is promoted on first message send
 - Switch workspaces via sidebar click or Ctrl+]/[
 - Rename workspaces by double-clicking the active workspace name in the sidebar
-- Close workspaces with all child sessions
+- Archive local workspaces non-destructively with all child sessions closed; attach-in-place and host-bound workspaces use non-destructive Close instead
 - Auto-transition to main workspace after merge+delete
 - Living sidebar — each workspace row's height is state-driven: working rows expand to a 3-line card (indicator + work title + issue/activity + elapsed + git line), needs-input rows to a red 2-line card with the blocker, done rows to a green 2-line card that decays after review or ~1h, idle rows stay one-liners (replacing the removed Clean/Branch/Detailed setting)
 - Work-based row naming — while an agent is live and an issue is linked, the row titles itself after the issue (+ `#n` chip) and moves the branch to the git line; a `n shipped` tally with a history popover appears once merged PRs retire
@@ -28,7 +28,7 @@
 
 ## Tabs
 
-- Multiple tabs per workspace (Terminal, Browser, Changes)
+- Multiple tabs per workspace (`terminal`, `browser`, full `diff`, and `editor`)
 - Terminal tabs each get their own independent pane surface with split support
 - Browser tabs open a full-pane embedded browser
 - Diff tabs with unified and split views, syntax highlighting, and section filtering
@@ -91,13 +91,18 @@
   - Codex via `codex app-server` JSON-RPC
   - OpenCode via Rust-direct HTTP against a managed `opencode serve` child (federates 100+ upstream providers behind one rail entry)
 - Streaming transcript with messages, tool approvals (per-tool body rendering), plan proposals (ExitPlanMode), AskUserQuestion panels, thinking indicator
+- Agent-produced images from supported tool-result blocks render as safe inline thumbnails with a lightbox; malformed, non-image, and unsafe-URL blocks remain visible as raw fallback content
 - Mode pills: Ask / Allow always / Plan / Debug, with Shift+Tab cycling
 - Attachments via `+` and `@`: files, folders, GitHub issues + PRs, images via paste / drop / picker
-- Slash command popup with cross-provider parsing
+- Slash command popup with cross-provider parsing, GUI-local `/model` and `/default`, Claude `/workflow`, skills, and live provider-native Claude command discovery
 - Cross-provider skill system (watcher, conflicts, disable, refined compat)
 - Server-side skills sync across devices (plaintext name/content, encrypted at rest; no client-held key, so OAuth/SSO users sync with no password prompt)
 - Permission settings page with per-tool body rendering and AllowAlways rule persistence
 - Session history selector + transcript persistence + replay on session resume
+- Cross-provider subagent card, docked live-activity bar, and read-only child-transcript drill-in
+- Claude workflow orchestration card + conditional right-panel phase/agent drill-in
+- Follow-up queueing with "Send now" steering, dead-run detection, and one-click interrupted-run continuation
+- Context Row under the composer plus detached background-browser status/peek/promotion in GUI mode
 - Run checkpoints (opt-in via Settings → Agent): background working-tree snapshot at session start, restore button in the pane header rolls the workspace back to the pre-run state
 - Permission-mode mid-session restart
 - Favorites on the model picker with `localStorage` persistence
@@ -197,12 +202,11 @@
 
 ## PR Integration
 
-- Right sidebar PR panel with header, reviews, checks, deployments, and merge controls
+- Right-sidebar Review panel with PR header, CI checks, and read-only review threads
 - PR creation with title, body, base branch, and draft toggle
-- Review submission: approve, request changes, or comment
-- Merge controls: squash, merge commit, or rebase with dual-confirmation
 - Incoming PRs list with fork checkout into worktree workspaces
 - PR badge display in sidebar workspace rows
+- Review submission, merge controls, deployments, and conflict-resolution entry points are intentionally absent from the current resting layout; their backend commands remain registered for a possible re-wire
 
 ## GitHub Issues
 
@@ -215,16 +219,15 @@
 
 ## AI Merge Resolver
 
-- AI-powered merge conflict resolution on temporary branches
+- Backend-complete AI merge conflict resolution on temporary branches, **currently unreachable from the UI** because both launch buttons were removed by the refined-minimal panel pass
 - Safety model: never touches real branches without explicit user approval
 - Temporary branch creation (`bot/merge-*`), resolution, diff review, approve/reject
 - Configurable CLI tool and model for the resolver agent
-- Entry points in Changes panel and PR panel
-- Full state machine: idle → creating_branch → resolving → review → applying
+- Full state machine and five registered Tauri commands remain intact; `src/stores/ai-merge-store.ts` currently has zero importers
 
 ## MCP Server (Codemux as server)
 
-- JSON-RPC 2.0 MCP server over stdio transport (**52 tools**)
+- JSON-RPC 2.0 MCP server over stdio transport (**55 tools**)
 - Three-tier browser automation: DOM selectors, CDP coordinates, OS-level input
 - Workspace, pane, notification, and git tools for agent self-orchestration
 - Browser viewport presets (`browser_viewport`, `browser_viewport_presets`)
@@ -232,6 +235,7 @@
 - Phase 1.5 vexis-agent tools: `worktree_create`, `preset_apply`, `preset_list`
 - Phase 1.6 vexis-agent lifecycle + issue tools: `workspace_close`, `pane_close`, `issue_list`, `issue_get`, `issue_link_workspace`
 - Automation tools: `automation_list`, `automation_get`, `automation_create`, `automation_update`, `automation_delete`, `automation_pause`, `automation_resume`, `automation_runs`
+- Workspace archive tools: `workspace_archive`, `workspace_unarchive`, `workspace_archive_list`
 - Auto-configuration for Claude Code and Claude Desktop
 - Launched via `codemux mcp`
 
@@ -272,6 +276,16 @@
 - File attachments appended to agent prompt — staged as chips with per-type badges (image thumbnails, "Pasted image" labels for clipboard pastes)
 - Project onboarding flow with package manager detection and setup script configuration
 - Orphan worktree detection and import
+- First-class non-git folder mode with git-only controls hidden and an opt-in bare `git init` action
+- Agent Chat first-send scope row for location/checkout/branch, with deferred worktree creation and automatic worktree naming
+
+## Workspace Archive
+
+- Primary sidebar lifecycle action for local workspaces: archives the row without deleting files, worktree, or branch
+- Undo toast plus Settings → Archive restore list, grouped by project with stale-entry hints
+- Protected repo roots can be archived but never deleted; dirty worktree deletion requires an explicit force escalation
+- Archive Project processes worktrees before the root and records entries only after each close succeeds
+- Archive state is device-local; attach-in-place and host-bound workspaces use Close because a lossless archive cannot preserve their binding
 
 ## Setup & Teardown Scripts
 
@@ -325,7 +339,7 @@
 ## Settings Panel
 
 - Centralized configuration overlay (Ctrl+,)
-- 15+ sections including Account, Appearance, Notifications, Shortcuts, Editor, Terminal, Presets, Projects, Git, Agent, Browser, Session Restore, Sync, Skills, MCP, Permissions, Beta Features
+- 15+ sections including Account, Appearance, Notifications, Shortcuts, Editor, Terminal, Presets, Projects, Git, Agent, Browser, Session Restore, Sync, Skills, MCP, Permissions, Archive, Remote Access, and Beta Features
 - Keyboard shortcut editor with conflict detection and search
 - Server-synced settings with offline cache
 - Workspace-level project config (setup/teardown scripts, worktree includes)
@@ -339,6 +353,15 @@
 - `WorkspaceSnapshot.host_id` model + shared `<DevicePicker>` pill component wired into the new-workspace dialog
 - **Push workspace to host** action (zero-touch): rsync the worktree, spawn the remote daemon, install + start a systemd user unit, drop a per-workspace `.mcp.json`, register the workspace in the daemon's registry, attach the local UI through an SSH-forwarded socket, and sync the Claude conversation across local/remote ends
 - **Background `hosts_upgrade` poller**: ~5 s after every app start, silently re-bootstraps any host whose `codemux-remote` version differs from the bundled binary (defers the restart while host agents are running so an upgrade never kills live work)
+
+## Web Remote Access
+
+- Default-off embedded HTTP+WebSocket server serves the real Codemux UI to another browser and forwards the same Tauri invoke/event/channel contract through a `__TAURI_INTERNALS__` shim
+- Pairing-token and opt-in same-account admission, revocable sessions, approval mode, and `all` / `tailscale` / `loopback` bind scopes
+- Mirror-mode multi-client terminal and Agent Chat fan-out; web-specific file picker, notifications, asset serving, browser-pane proxy, and update handoff
+- `codemux remote enable|disable|pair` controls a running GUI instance from the CLI
+- `codemux serve [--scope …] [--port N] [--relay]` boots the full backend headlessly on Tauri `MockRuntime`, prints a pairing QR/link, and runs until SIGINT/SIGTERM
+- Account/iroh/hosted-client code has landed default-off; `app.codemux.org` and the `api.codemux.org` device registry still require gated deployment
 
 ## Workspaces Overview & Cross-Device Sync
 
@@ -377,6 +400,7 @@
 - Supervisor adopts the running daemon on relaunch and reattaches live sessions (alt-screen TUIs and CLI agents resume in-place)
 - Default-on, no setting; `CODEMUX_DISABLE_PTY_DAEMON=1` is the only escape hatch
 - Graceful fallback to in-process portable-pty at every error site; 3-failures-in-60s crash circuit breaker
+- Hook notifications survive an app restart: stale inherited hook ports retry the current port published at `~/.codemux/hooks/active-port`
 - Unix only (Linux + macOS); Windows still uses the in-process path until the named-pipe IPC is wired
 
 ## Automations
@@ -396,6 +420,7 @@
 - JSON request/response protocol with command routing
 - Single-instance enforcement (checks for an already-live listener before starting a new one)
 - External tool integration (opencode, claude-cli, MCP server can send commands via the local transport)
+- Remote-access CLI controls (`codemux remote enable|disable|pair`) and full headless web-remote entrypoint (`codemux serve`)
 
 ## Important Touch Points
 

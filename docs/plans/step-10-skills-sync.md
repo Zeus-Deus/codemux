@@ -4,7 +4,7 @@
 
 - Purpose: Per-stage history + final state for Step 10. Current behavior lives in `docs/features/skills-sync.md`; this doc is the audit trail.
 - Audience: Anyone wanting to know what happened in each stage, plus the cumulative test counts and operator artifacts.
-- Authority: Closed plan. Future maintenance work goes in new plan docs (e.g. `docs/plans/step-10.5-project-scoped-sync.md` when 10.5 starts).
+- Authority: Closed plan. Future maintenance work belongs in a new plan created when that work starts.
 - Update when: A retrospective fact about what shipped is wrong; otherwise leave alone.
 - Read next: `docs/features/skills-sync.md` (canonical current behavior), `docs/plans/step-10-skills-sync-research.md` (design rationale), `docs/plans/step-10-ui-smoke-checklist.md` (operator UI smoke checklist).
 

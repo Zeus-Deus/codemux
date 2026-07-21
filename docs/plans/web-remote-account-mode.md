@@ -2,7 +2,7 @@
 
 - Purpose: Stage a concrete implementation design for two large future capabilities of web remote access — (1) **account-based reach-from-anywhere** ("sign in with your Codemux account, no Tailscale, drive a brand-new device from any browser") and (2) **headless server mode** (run the full web-remote backend with no GUI, started over SSH).
 - Audience: Anyone picking up the relay/account tier or a headless-serve mode. Read after you already know today's web-remote reality.
-- Authority: Active design/plan. **Design 1 Stages A, B, and C have landed on `main`** (default-off; the hosted `app.codemux.org` service + `api.codemux.org` device registry are gated human deploys, not yet live) — account-mode admission's current truth lives in `docs/features/web-remote-access.md` § "Account-mode admission", the from-anywhere iroh/hosted tier in § "From-anywhere tier", and its deploy runbook in `docs/plans/app-codemux-org-hosting.md`. **Design 2 (headless server mode) is still design-only.** The locked v1 contract is in `docs/plans/web-remote-access.md`.
+- Authority: Active design/history plan. **Design 1 Stages A, B, and C have landed on `main`** (default-off; the hosted `app.codemux.org` service + `api.codemux.org` device registry are gated human deploys, not yet live). **Design 2 has also landed** as `codemux serve`, using Tauri's `MockRuntime` rather than the Xvfb or `codemux_core` paths evaluated below. Current behavior lives in `docs/features/web-remote-access.md`; the hosted deploy runbook lives in `docs/plans/app-codemux-org-hosting.md`.
 - Update when: A stage lands (move it to the feature doc), an open question resolves, or a connectivity/identity decision is made.
 - Read next: `docs/features/web-remote-access.md`, `docs/plans/web-remote-access.md`, `docs/features/auth.md`, `docs/plans/mcp-on-remote.md` (the `Identity::Cloud` passthrough + relay layering this reuses), `docs/features/remote-hosts.md`, `docs/features/workspaces-sync.md` (the existing cloud-API sync shape both designs copy).
 
@@ -123,7 +123,9 @@ Today reachability = LAN + the user's own Tailscale. From a random coffee-shop n
 
 ---
 
-# Design 2 — Headless server mode
+# Design 2 — Headless server mode (implemented)
+
+> **Implementation update (issue #176 Phases 1–3):** the analysis below is retained as the pre-implementation decision record, but its assumed "webview is structurally required" blocker was disproved. The shipped path makes the backend generic over `tauri::Runtime`, boots it on `tauri::test::MockRuntime`, creates the in-memory `"main"` webview needed by the existing invoke dispatcher, and exposes the full command surface without a display, Xvfb, or a `codemux_core` extraction. `src-tauri/src/web_remote/serve.rs` owns `codemux serve`; `src-tauri/src/lib.rs` exposes `build_headless_app`; current truth and verification live in `docs/features/web-remote-access.md` § "Headless server mode". Sections 2.1–2.4 below describe the superseded options considered before that implementation was found.
 
 ## 2.1 What's entangled with the GUI, concretely
 
@@ -173,7 +175,7 @@ Headless server mode + account mode is the complete "brand-new device from anywh
 - **iroh browser/WASM transport maturity.** Needs a spike before committing Stage C: bundle size in the shim, connection-establishment latency, symmetric-NAT relay-fallback reliability. If it's not ready, the blind-forwarding Noise relay is the fallback design.
 - **PoP scope.** Is DPoP-style proof-of-possession worth the browser-keypair complexity at Stage A, or defer to the relay tier (Stage C)? Recommend defer, but keep the ticket path shaped for it.
 - **Org/team semantics.** Better Auth's `organization` plugin is enabled. Does account mode stay strictly single-user (a browser reaches only devices under its *own* `user_id`), or does it eventually allow org-scoped device sharing? Keep v1 single-user; the `Identity::Cloud { org_id, role }` fields already reserve the shape.
-- **Headless on macOS/Windows.** Path 2/3 leans on Xvfb + WebKitGTK (Linux). Is headless-serve a Linux-server-only feature for v1 (likely yes), with Path 1 the only route to display-free macOS/Windows?
+- **Headless platform validation.** The shipped MockRuntime path is display-free; Linux is covered by the GUI-free integration tests, while macOS/Windows packaging and live operator validation remain follow-up work.
 - **Device de-dup / naming.** `codemux_devices` cross-device identity and re-registration semantics (a reinstalled desktop, a rotated `NodeId`) — mirror the `origin_uid`/`server_id` discipline from `workspaces-sync.md`.
 - **Relay cost/scale.** An iroh relay that only forwards ciphertext on NAT-fallback is cheap (the mcp-on-remote estimate of thousands of idle connections fitting the existing Hetzner box applies), but PTY-heavy sessions that can't hole-punch will push real bytes through it. Budget/QoS is a product decision.
 
@@ -194,13 +196,15 @@ Account mode (control plane — gated VPS deploy, codemux-api repo):
 - `api/src/tests/preload.ts` + `api/src/tests/devices.test.ts` — DDL parity + auth/isolation/validation tests.
 - `docker-compose.yml` — new iroh-relay service (Stage C); Traefik/UDP wiring.
 
-Headless server mode:
-- `src-tauri/src/bin/codemux_remote.rs` — precedent + limits (12-tool daemon, no webview, no `AppStateStore`).
-- New `--serve-web[=port]` app entry (Path 2): hidden-window boot, enable web-remote, suppress tray/updater/native-notify → logs.
-- `src-tauri/src/ssh/bootstrap.rs` — Xvfb + systemd-user-unit provisioning for Path 3, alongside `provision_serve`.
-- (Path 1, deferred) `codemux_core` extraction per `docs/plans/mcp-on-remote.md` Steps 1 + 9 — `control.rs`, `state.rs`, `terminal/`, `mcp_server.rs`, `CoreContext`, `UiNotifier`, `Identity`.
+Headless server mode (landed):
+- `src-tauri/src/web_remote/serve.rs` — `ServeOptions`, `run_serve`, pairing banner, signal wait, and teardown.
+- `src-tauri/src/lib.rs` — runtime-generic builder plus `build_headless_app()` on `MockRuntime`.
+- `src-tauri/src/main.rs`, `src-tauri/src/cli.rs` — `CliOutcome::RunServe` and `codemux serve [--scope …] [--port N] [--relay]` dispatch.
+- `src-tauri/tests/serve_headless_dispatch.rs`, `serve_web_remote_roundtrip.rs` — GUI-free boot/dispatch and pair→connect→invoke coverage.
 
 ## Already Landed
+
+**Design 2 — headless server mode.** `codemux serve [--scope all|tailscale|loopback] [--port N] [--relay]` boots the full backend on Tauri `MockRuntime`, enables web remote through the shared control path, prints a pairing QR/link, and runs until SIGINT/SIGTERM. GUI/headless mutual exclusion, synchronous bind failure, and shutdown teardown are covered by dedicated integration tests. Current truth lives in `docs/features/web-remote-access.md` § "Headless server mode"; the locked implementation record lives in `docs/plans/web-remote-access.md`.
 
 **Design 1, Stage A — Account-verified session issuance.** Shipped: `POST /api/pair-account` on the desktop server (`web_remote::server::pair_account` → `web_remote::account::verify_and_mint`); the desktop-side `account_mode_enabled` master toggle (default off) + `trust_account_browsers` approval opt-out (approval default **on** for account sessions); the browser account-login screen in `src/remote/{bootstrap.tsx,account-pair.ts}`; the client-side `codemux-api-*` AuthSecret derivation (`src/remote/auth-derivation.ts`, golden-pinned byte-identical to the Rust/Vexis peer); same-user verification via `/api/auth/desktop/signin` + `load_cached_user`; `web_remote_sessions` rows tagged `source="account"` + `account_user_id`; the Settings → Remote Access "Account access" subsection (toggle, opt-out, signed-out warning, Account-vs-Paired device tags). Transport stays LAN/Tailscale. Current truth now lives in `docs/features/web-remote-access.md` § "Account-mode admission".
 
@@ -218,4 +222,4 @@ Foundation this builds on, already shipped on this branch:
 - Keep the `/ws` frame contract (`dispatch.rs`/`events.rs` ↔ `transport.ts`/`shim.ts`) as the stable seam: every connectivity substrate here (raw WS, iroh stream, relayed WS) is a transport swap *under* that contract, never a change *to* it. That invariant is what makes all of this additive.
 - Decision 9 ("no plaintext through any cloud service") is the load-bearing constraint. It rules out the easy tunnels and is the sole reason iroh (E2E, relay-sees-ciphertext) is the recommendation over `cloudflared`/ngrok.
 - Every VPS change is a gated, confirm-first production deploy — treat Stages B/C infra work as such.
-- This file is next-steps only. When a stage lands, move its behavior into `docs/features/web-remote-access.md` and trim it here.
+- This file is the design/history record plus remaining hosted-deploy questions. Current behavior belongs in `docs/features/web-remote-access.md`.

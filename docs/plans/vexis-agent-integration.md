@@ -1,5 +1,7 @@
 # vexis-agent ↔ Codemux Integration — Research
 
+> **Status:** historical pre-implementation research. The Phase 1 / 1.5 / 1.6 work described as gaps below has landed, and the desktop MCP catalog is now 55 tools. Use `docs/features/mcp-server.md` and `docs/reference/CONTROL.md` for current truth; keep the counts below as the baseline that informed the shipped work.
+
 - Purpose: Decide the integration shape between vexis-agent (Telegram-bridged brain runtime) and Codemux (ADE).
 - Authority: Research notes; not a build plan.
 - Read next: `docs/features/mcp-server.md`, `docs/reference/CONTROL.md`.
