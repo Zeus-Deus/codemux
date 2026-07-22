@@ -1,13 +1,10 @@
 import { useCallback } from "react";
 
 import { defaultModelForProvider } from "@/components/chat/pickers/ModelPicker";
-import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
+import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
 import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
-import {
-  DEFAULT_THREAD_PERMISSION_MODE,
-  useAgentChatStore,
-} from "@/stores/agent-chat-store";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import {
   agentChatListMessages,
@@ -119,19 +116,19 @@ export function useAgentChatSessionActions(
         // the pane's on-mount seed effect does; effort/context ride through
         // as-is (null means "use the model default").
         const resolvedModel = record.model ?? defaultModelForProvider(provider);
-        const resolvedLaunchMode =
+        // OpenCode has no chat-side permission picker: launch with null even
+        // if the record carries a stale cross-provider token.
+        const resolvedMode =
           provider === "opencode"
             ? null
             : (record.permission_mode ??
-              capabilityDefaults(provider, resolvedModel).permissionMode);
-        const resolvedDisplayMode =
-          resolvedLaunchMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+              defaultPermissionModeForProvider(provider));
         const newThreadId = await agentChatStartSession(paneId, provider, {
           thread_id: newLocalThreadId,
           cwd,
           model: record.model,
           resume_cursor: { resume: record.sdk_session_id },
-          permission_mode: resolvedLaunchMode,
+          permission_mode: resolvedMode,
           effort: record.effort,
           context_window: record.context_window,
           additional_directories: [],
@@ -146,8 +143,10 @@ export function useAgentChatSessionActions(
         store.setModel(newThreadId, resolvedModel);
         store.setEffort(newThreadId, record.effort);
         store.setContextWindow(newThreadId, record.context_window);
-        store.setPermissionMode(newThreadId, resolvedDisplayMode);
-        store.setSessionLaunchMode(newThreadId, resolvedLaunchMode);
+        if (resolvedMode !== null) {
+          store.setPermissionMode(newThreadId, resolvedMode);
+        }
+        store.setSessionLaunchMode(newThreadId, resolvedMode);
         toast.success(
           `Resumed "${sessionDisplayTitle(record)}" — agent has the full history`,
         );
@@ -176,19 +175,14 @@ export function useAgentChatSessionActions(
       // here would boot the provider in `default` (prompt-for-every-tool)
       // while the pill still reads "Full access", the drift this hook exists
       // to close.
+      const startMode = defaultPermissionModeForProvider(provider);
       const startModel = defaultModelForProvider(provider);
-      const startLaunchMode = capabilityDefaults(
-        provider,
-        startModel,
-      ).permissionMode;
-      const startDisplayMode =
-        startLaunchMode ?? DEFAULT_THREAD_PERMISSION_MODE;
       const newThreadId = await agentChatStartSession(paneId, provider, {
         thread_id: newLocalThreadId,
         cwd,
         model: null,
         resume_cursor: null,
-        permission_mode: startLaunchMode,
+        permission_mode: startMode,
         additional_directories: [],
         env: null,
       });
@@ -199,8 +193,10 @@ export function useAgentChatSessionActions(
       const store = useAgentChatStore.getState();
       store.ensureThread(newThreadId);
       store.setModel(newThreadId, startModel);
-      store.setPermissionMode(newThreadId, startDisplayMode);
-      store.setSessionLaunchMode(newThreadId, startLaunchMode);
+      if (startMode !== null) {
+        store.setPermissionMode(newThreadId, startMode);
+      }
+      store.setSessionLaunchMode(newThreadId, startMode);
     } catch (error) {
       toast.error(`Failed to start new chat: ${error}`);
     }

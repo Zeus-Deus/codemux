@@ -1,4 +1,3 @@
-import { DEFAULT_THREAD_PERMISSION_MODE } from "@/stores/agent-chat-store";
 import {
   selectCapabilities,
   useProviderCapabilities,
@@ -28,6 +27,25 @@ const FALLBACK_DEFAULT_MODEL_BY_PROVIDER: Record<AgentChatProviderKind, string> 
   opencode: "anthropic/claude-sonnet-4-6",
 };
 
+/**
+ * Provider-native permission defaults used before the asynchronous
+ * capabilities harvest completes. Permission-mode values are provider
+ * protocol identifiers, not shared UI enums: Claude's Full access value is
+ * `bypassPermissions`, while Codex expects `danger-full-access`.
+ *
+ * OpenCode intentionally stays null because it has no chat-side permission
+ * picker. Once capabilities are available their advertised
+ * `default_permission_mode` is authoritative over this bootstrap table.
+ */
+const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
+  AgentChatProviderKind,
+  string | null
+> = {
+  claude: "bypassPermissions",
+  codex: "danger-full-access",
+  opencode: null,
+};
+
 /** Synchronous accessor for the provider's default model id.
  *
  * Reads `provider-capabilities-store.getState()` (safe outside React —
@@ -40,6 +58,26 @@ export function defaultModelId(provider: AgentChatProviderKind): string {
     provider,
   );
   return caps?.models[0]?.id ?? FALLBACK_DEFAULT_MODEL_BY_PROVIDER[provider];
+}
+
+/** Resolve the active provider's native default permission-mode value.
+ *
+ * This is the single frontend source for launch defaults. Callers must not
+ * substitute a provider-agnostic value: an unknown mode is omitted by the
+ * Codex adapter, which makes the app-server fall back to prompting even when
+ * the picker visually says Full access.
+ */
+export function defaultPermissionModeForProvider(
+  provider: AgentChatProviderKind,
+): string | null {
+  const caps = selectCapabilities(
+    useProviderCapabilities.getState(),
+    provider,
+  );
+  return (
+    caps?.default_permission_mode ??
+    FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER[provider]
+  );
 }
 
 /** List the provider's models as `{ id, label, description }` for
@@ -86,15 +124,6 @@ export interface CapabilityDefaults {
   permissionMode: string | null;
 }
 
-const FALLBACK_PERMISSION_MODE_BY_PROVIDER: Record<
-  AgentChatProviderKind,
-  string | null
-> = {
-  claude: DEFAULT_THREAD_PERMISSION_MODE,
-  codex: "danger-full-access",
-  opencode: null,
-};
-
 /** Derive the full set of default session-config values for a given
  *  provider + model. Used by `makeDraft` in `chat-draft-store` so
  *  drafts start fully-configured — no null `effort` / `contextWindow`
@@ -103,9 +132,10 @@ const FALLBACK_PERMISSION_MODE_BY_PROVIDER: Record<
  *  Capability-driven: `effort` picks the model's `default_effort`,
  *  `contextWindow` picks the option flagged `is_default` (or the first
  *  option when none is flagged). `permissionMode` defaults to the
- *  provider's own default. The small fallback table covers the brief
- *  pre-hydration window without applying Claude's `bypassPermissions`
- *  value to Codex or OpenCode.
+ *  provider's own native default via `defaultPermissionModeForProvider`
+ *  (`bypassPermissions` for Claude, `danger-full-access` for Codex, and
+ *  null for OpenCode), covering the brief pre-hydration window without
+ *  applying one provider's value to another.
  *
  *  Returns safe null-fallbacks when capabilities aren't hydrated — the
  *  slice setters accept null, so the draft still writes a valid shape.
@@ -127,8 +157,6 @@ export function capabilityDefaults(
     model: modelId,
     effort: model?.default_effort ?? null,
     contextWindow: defaultContextWindow,
-    permissionMode:
-      caps?.default_permission_mode ??
-      FALLBACK_PERMISSION_MODE_BY_PROVIDER[provider],
+    permissionMode: defaultPermissionModeForProvider(provider),
   };
 }

@@ -824,6 +824,11 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       updateDraftConfig(draft.draftId, {
         provider: nextProvider,
         model: nextModel,
+        // Commit the next provider's native permission default (via
+        // capabilityDefaults → defaultPermissionModeForProvider). The
+        // picker can *display* a fallback for null/unknown values without
+        // mutating the draft, so leaving this null would make first-send
+        // launch state diverge from the visible "Full access" label.
         permissionMode: defaults.permissionMode,
         effort: defaults.effort,
         contextWindow: defaults.contextWindow,

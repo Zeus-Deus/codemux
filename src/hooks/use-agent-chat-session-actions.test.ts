@@ -133,7 +133,22 @@ describe("useAgentChatSessionActions — handleNewChat", () => {
     expect((input as { permission_mode: string | null }).permission_mode).toBe(
       "bypassPermissions",
     );
-    expect(DEFAULT_THREAD_PERMISSION_MODE).toBe("bypassPermissions");
+  });
+
+  it("starts a Codex New Chat in Codex Full access", async () => {
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "codex" })),
+    );
+    await result.current.handleNewChat();
+
+    const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(provider).toBe("codex");
+    expect((input as { permission_mode: string | null }).permission_mode).toBe(
+      "danger-full-access",
+    );
+    const slice = newestSlice();
+    expect(slice!.permissionMode).toBe("danger-full-access");
+    expect(slice!.sessionLaunchMode).toBe("danger-full-access");
   });
 
   it("seeds the slice with matching permissionMode and sessionLaunchMode", async () => {
@@ -220,6 +235,27 @@ describe("useAgentChatSessionActions — handleSelect (resume)", () => {
     expect(slice!.sessionLaunchMode).toBe("bypassPermissions");
     expect(slice!.permissionMode).toBe(slice!.sessionLaunchMode);
     expect(slice!.model).toBe(CLAUDE_DEFAULT_MODEL);
+  });
+
+  it("heals a NULL Codex record to Codex Full access", async () => {
+    const record = makeRecord({
+      provider: "codex",
+      permission_mode: null,
+      model: null,
+    });
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "codex" })),
+    );
+    await result.current.handleSelect(record);
+
+    const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(provider).toBe("codex");
+    expect((input as { permission_mode: string | null }).permission_mode).toBe(
+      "danger-full-access",
+    );
+    const slice = newestSlice();
+    expect(slice!.permissionMode).toBe("danger-full-access");
+    expect(slice!.sessionLaunchMode).toBe("danger-full-access");
   });
 
   it("resumes with the record's sdk_session_id as the cursor", async () => {

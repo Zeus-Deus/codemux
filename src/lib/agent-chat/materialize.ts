@@ -12,15 +12,13 @@ import {
   renameWorkspace,
   type WorkspaceCreateResult,
 } from "@/tauri/commands";
-import {
-  DEFAULT_THREAD_PERMISSION_MODE,
-  type ChatMode,
-} from "@/stores/agent-chat-store";
+import { type ChatMode } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
 
 import { deriveTitleFromFirstMessage } from "./derive-title";
+import { defaultPermissionModeForProvider } from "./capability-defaults";
 import { applyAllPrefixes } from "./mode-prefix";
 import type { UserMessageImage } from "./types";
 import { waitForWorkspaceCwd } from "./wait-for-workspace-cwd";
@@ -585,9 +583,10 @@ function seedSliceFromDraft(
   actions: MaterializeActions,
 ): void {
   const effectiveMode = effectivePermissionMode(draft);
-  const displayMode = effectiveMode ?? DEFAULT_THREAD_PERMISSION_MODE;
   actions.setModel(draft.threadId, draft.model);
-  actions.setPermissionMode(draft.threadId, displayMode);
+  if (effectiveMode !== null) {
+    actions.setPermissionMode(draft.threadId, effectiveMode);
+  }
   actions.setSessionLaunchMode(draft.threadId, effectiveMode);
   if (draft.effort) actions.setEffort(draft.threadId, draft.effort);
   if (draft.contextWindow) {
@@ -605,7 +604,9 @@ function seedSliceFromDraft(
  *  is active. Debug remains a state-only flip until Stage 6. */
 export function effectivePermissionMode(draft: ChatDraft): string | null {
   if (draft.mode === "plan" || draft.mode === "ask") return "plan";
-  return draft.permissionMode;
+  return (
+    draft.permissionMode ?? defaultPermissionModeForProvider(draft.provider)
+  );
 }
 
 /** Create a fresh workspace rooted at the cached `$HOME`, then rename

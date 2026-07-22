@@ -426,7 +426,7 @@ describe("materializeAndSend", () => {
       );
     });
 
-    it("keeps a null launch mode while using the display fallback", async () => {
+    it("falls back to the Claude default when a Claude draft mode is null", async () => {
       const actions = makeActions();
       const draft = makeDraft({ permissionMode: null });
 
@@ -438,8 +438,30 @@ describe("materializeAndSend", () => {
       );
       expect(actions.setSessionLaunchMode).toHaveBeenCalledWith(
         draft.threadId,
-        null,
+        "bypassPermissions",
       );
+    });
+
+    it("launches a provider-switched Codex draft with Codex Full access", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        provider: "codex",
+        model: "gpt-5.4",
+        permissionMode: null,
+      });
+
+      await materializeAndSend(draft, "hi", "/home/user", actions);
+
+      expect(actions.setPermissionMode).toHaveBeenCalledWith(
+        draft.threadId,
+        "danger-full-access",
+      );
+      expect(actions.setSessionLaunchMode).toHaveBeenCalledWith(
+        draft.threadId,
+        "danger-full-access",
+      );
+      const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(input.permission_mode).toBe("danger-full-access");
     });
 
     it("forwards effort and contextWindow only when the draft has them set", async () => {
