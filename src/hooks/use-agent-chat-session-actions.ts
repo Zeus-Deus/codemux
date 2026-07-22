@@ -1,12 +1,10 @@
 import { useCallback } from "react";
 
 import { defaultModelForProvider } from "@/components/chat/pickers/ModelPicker";
+import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
 import { sessionDisplayTitle } from "@/lib/agent-chat/session-history";
 import { toast } from "@/lib/toast";
-import {
-  DEFAULT_THREAD_PERMISSION_MODE,
-  useAgentChatStore,
-} from "@/stores/agent-chat-store";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import {
   agentChatListMessages,
@@ -117,9 +115,14 @@ export function useAgentChatSessionActions(
         // prevent. Model falls back to the provider default the same way
         // the pane's on-mount seed effect does; effort/context ride through
         // as-is (null means "use the model default").
-        const resolvedMode =
-          record.permission_mode ?? DEFAULT_THREAD_PERMISSION_MODE;
         const resolvedModel = record.model ?? defaultModelForProvider(provider);
+        // OpenCode has no chat-side permission picker: launch with null even
+        // if the record carries a stale cross-provider token.
+        const resolvedMode =
+          provider === "opencode"
+            ? null
+            : (record.permission_mode ??
+              defaultPermissionModeForProvider(provider));
         const newThreadId = await agentChatStartSession(paneId, provider, {
           thread_id: newLocalThreadId,
           cwd,
@@ -142,7 +145,9 @@ export function useAgentChatSessionActions(
         store.setEffort(newThreadId, record.effort);
         store.setContextWindow(newThreadId, record.context_window);
         store.setFastMode(newThreadId, record.fast_mode ?? false);
-        store.setPermissionMode(newThreadId, resolvedMode);
+        if (resolvedMode !== null) {
+          store.setPermissionMode(newThreadId, resolvedMode);
+        }
         store.setSessionLaunchMode(newThreadId, resolvedMode);
         toast.success(
           `Resumed "${sessionDisplayTitle(record)}" — agent has the full history`,
@@ -172,7 +177,7 @@ export function useAgentChatSessionActions(
       // here would boot the provider in `default` (prompt-for-every-tool)
       // while the pill still reads "Full access", the drift this hook exists
       // to close.
-      const startMode = DEFAULT_THREAD_PERMISSION_MODE;
+      const startMode = defaultPermissionModeForProvider(provider);
       const startModel = defaultModelForProvider(provider);
       const newThreadId = await agentChatStartSession(paneId, provider, {
         thread_id: newLocalThreadId,
@@ -191,7 +196,9 @@ export function useAgentChatSessionActions(
       const store = useAgentChatStore.getState();
       store.ensureThread(newThreadId);
       store.setModel(newThreadId, startModel);
-      store.setPermissionMode(newThreadId, startMode);
+      if (startMode !== null) {
+        store.setPermissionMode(newThreadId, startMode);
+      }
       store.setFastMode(newThreadId, false);
       store.setSessionLaunchMode(newThreadId, startMode);
     } catch (error) {

@@ -519,31 +519,34 @@ pub async fn agent_chat_start_session<R: Runtime>(
     // `healed_permission_mode`) so BOTH session-minting entry points are immune
     // to a null-passing caller. OpenCode has no permission modes, so its
     // fallback is `None` and this is a no-op there.
-    if input.permission_mode.is_none() {
-        let healed = resolve_start_permission_mode(provider, input.permission_mode.take());
-        if let Some(mode) = healed.as_ref() {
-            eprintln!(
-                "[codemux::agent_chat] healing NULL permission_mode at start pane={pane_id} \
-                 provider={provider:?} -> {mode}"
-            );
-        }
-        input.permission_mode = healed;
+    let requested_permission_mode = input.permission_mode.take();
+    let resolved_permission_mode =
+        resolve_start_permission_mode(provider, requested_permission_mode.clone());
+    if resolved_permission_mode != requested_permission_mode {
+        eprintln!(
+            "[codemux::agent_chat] healing permission_mode at start pane={pane_id} \
+             provider={provider:?} requested={requested_permission_mode:?} \
+             resolved={resolved_permission_mode:?}"
+        );
     }
+    input.permission_mode = resolved_permission_mode;
     // Snapshot the per-thread chat configuration BEFORE the provider
     // consumes `input`, so it can be persisted onto the session row for
     // restart-resume (re-seeding the pickers) and read back by
     // `ensure_live_session` when it silently restarts a dead session.
-    // Session start writes the exact launch selection but never CLEARS a
-    // column it simply doesn't know about, so map each plain
-    // `Option<String>` through `keep_or_set` (`Some` → set, `None` →
-    // leave untouched) rather than treating a `None` as an explicit
-    // clear. After the heal above, a Claude/Codex row now persists the
-    // substituted default instead of NULL.
+    // Session start carries the complete launch selection. Persist its
+    // nullable fields exactly so an in-place provider handoff does not
+    // retain configuration that only made sense to the previous adapter.
     let config_for_persist = AgentChatSessionConfig {
-        model: AgentChatSessionConfig::keep_or_set(input.model.clone()),
-        effort: AgentChatSessionConfig::keep_or_set(input.effort.clone()),
-        context_window: AgentChatSessionConfig::keep_or_set(input.context_window.clone()),
-        permission_mode: AgentChatSessionConfig::keep_or_set(input.permission_mode.clone()),
+        // A session start carries the complete launch configuration, so
+        // NULL means "use this provider/model's default" and must clear a
+        // value left by the previous provider. `keep_or_set` was unsafe for
+        // an in-place Claude -> Codex/OpenCode handoff because it preserved
+        // Claude-only effort/context/permission columns on the new session.
+        model: Some(input.model.clone()),
+        effort: Some(input.effort.clone()),
+        context_window: Some(input.context_window.clone()),
+        permission_mode: Some(input.permission_mode.clone()),
         fast_mode: Some(input.fast_mode),
     };
     // Trace the resume wire so the dev console shows whether a
@@ -636,7 +639,11 @@ pub async fn agent_chat_start_session<R: Runtime>(
     }
     let session = impl_.start_session(input).await.map_err(provider_err)?;
     let state: State<'_, AppStateStore> = app.state();
-    state.set_agent_chat_thread_id(&pane_id, Some(session.thread_id.0.clone()));
+    // Session startup is authoritative for BOTH halves of the pane binding.
+    // This matters when the model picker hands an existing pane from Claude
+    // to Codex/OpenCode: persisting only `thread_id` would leave the pane's
+    // provider stale and route the next app-restart resume through Claude.
+    state.set_agent_chat_binding(&pane_id, provider, session.thread_id.0.clone());
     // Persist the session for the history dropdown. Scope is
     // (workspace_id, cwd): workspace lookup goes through the state
     // store because the command layer only knows the pane id.
@@ -647,6 +654,12 @@ pub async fn agent_chat_start_session<R: Runtime>(
             ProviderKind::Codex => "codex",
             ProviderKind::OpenCode => "opencode",
         };
+        // A CodeMux thread can keep its transcript while changing provider,
+        // but provider-native resume cursors are not portable. The upsert
+        // atomically clears the old cursor when `provider` changes, then the
+        // start-time persist below records any cursor returned by the new
+        // adapter. Keeping this inside one SQL statement avoids a second
+        // clear racing a new provider's cursor event.
         if let Err(error) = db.upsert_agent_chat_session(
             &session.thread_id.0,
             &workspace_id,
@@ -1004,6 +1017,17 @@ fn resolve_start_permission_mode(
     requested: Option<String>,
 ) -> Option<String> {
     match requested {
+        // v0.14.2 could persist the other provider's Full-access protocol
+        // value after a frontend provider switch. Both strings represent the
+        // same explicit UI choice, so canonicalize that known cross-provider
+        // mismatch instead of forwarding an unsupported value that Codex
+        // silently omits from thread/start.
+        Some(mode) if provider == ProviderKind::Codex && mode == "bypassPermissions" => {
+            Some("danger-full-access".to_string())
+        }
+        Some(mode) if provider == ProviderKind::Claude && mode == "danger-full-access" => {
+            Some("bypassPermissions".to_string())
+        }
         Some(mode) => Some(mode),
         None => fallback_permission_mode(provider).map(str::to_string),
     }
@@ -1130,19 +1154,15 @@ pub async fn ensure_live_session<R: Runtime>(
         None => None,
     };
 
-    // Heal a NULL persisted permission_mode to the provider default the
-    // frontend already displays for such rows (see
-    // `fallback_permission_mode` for the WHY). `healed_permission_mode` is
-    // `Some` only when we actually substituted a default, so the
-    // best-effort persist below never rewrites a row that already carries a
-    // value.
-    let (permission_mode, healed_permission_mode) = match record.permission_mode.clone() {
-        Some(mode) => (Some(mode), None),
-        None => {
-            let fallback = fallback_permission_mode(provider_kind).map(str::to_string);
-            (fallback.clone(), fallback)
-        }
-    };
+    // Resolve both legacy NULL rows and the v0.14.2 cross-provider
+    // Full-access values through the same canonical start-path helper. The
+    // best-effort persist below runs only when the stored value changed.
+    let stored_permission_mode = record.permission_mode.clone();
+    let permission_mode =
+        resolve_start_permission_mode(provider_kind, stored_permission_mode.clone());
+    let healed_permission_mode = (permission_mode != stored_permission_mode)
+        .then(|| permission_mode.clone())
+        .flatten();
 
     if let Some(mode) = healed_permission_mode {
         // Best-effort heal the row so future rebuilds and the frontend's
@@ -1156,7 +1176,7 @@ pub async fn ensure_live_session<R: Runtime>(
         };
         if let Err(error) = db.update_agent_chat_session_config(&thread_id.0, &config) {
             eprintln!(
-                "[codemux::agent_chat] failed to heal NULL permission_mode for thread={}: {error}",
+                "[codemux::agent_chat] failed to heal permission_mode for thread={}: {error}",
                 thread_id.0,
             );
         }
@@ -2313,7 +2333,10 @@ pub async fn agent_chat_stop_session<R: Runtime>(
     feature_flag_on(&observability)?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    impl_.stop_session(thread_id).await.map_err(provider_err)
+    match impl_.stop_session(thread_id).await {
+        Ok(()) | Err(ProviderError::SessionNotFound { .. }) => Ok(()),
+        Err(err) => Err(provider_err(err)),
+    }
 }
 
 /// Fire-and-forget cleanup for chat sessions whose owning pane/tab/workspace
@@ -3398,6 +3421,24 @@ mod tests {
         assert_eq!(
             resolve_start_permission_mode(ProviderKind::Claude, Some("default".to_string())),
             Some("default".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_start_permission_mode_canonicalizes_cross_provider_full_access() {
+        assert_eq!(
+            resolve_start_permission_mode(
+                ProviderKind::Codex,
+                Some("bypassPermissions".to_string())
+            ),
+            Some("danger-full-access".to_string())
+        );
+        assert_eq!(
+            resolve_start_permission_mode(
+                ProviderKind::Claude,
+                Some("danger-full-access".to_string())
+            ),
+            Some("bypassPermissions".to_string())
         );
     }
 

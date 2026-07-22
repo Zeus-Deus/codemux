@@ -17,6 +17,7 @@ type SliceOverrides = {
   model?: string | null;
   effort?: string | null;
   contextWindow?: string | null;
+  resumeCursor?: Record<string, string> | null;
   hasDebugActivity?: boolean;
   debugActivityResolved?: boolean;
   /** Composer text — the Thread Scope deferred-worktree submit tests
@@ -164,7 +165,9 @@ vi.mock("./Composer", () => ({
     onModeRemove,
     onModeActivate,
     onModelChange,
+    onProviderModelChange,
     onContextWindowChange,
+    provider,
   }: {
     zone1Override?: React.ReactNode;
     belowComposerSlot?: React.ReactNode;
@@ -173,9 +176,11 @@ vi.mock("./Composer", () => ({
     onModeRemove: () => void;
     onModeActivate: (mode: "plan" | "ask" | "debug") => void;
     onModelChange: (model: string) => void;
+    onProviderModelChange: (provider: "claude" | "codex" | "opencode", model: string) => void;
     onContextWindowChange: (contextWindow: string) => void;
+    provider: "claude" | "codex" | "opencode";
   }) => (
-    <div data-testid="composer">
+    <div data-testid="composer" data-provider={provider}>
       <div data-testid="zone1">{zone1Override}</div>
       <div data-testid="below-composer">{belowComposerSlot}</div>
       <button data-testid="composer-submit" onClick={() => onSubmit()} />
@@ -202,6 +207,10 @@ vi.mock("./Composer", () => ({
       <button
         data-testid="model-change"
         onClick={() => onModelChange("claude-sonnet-4-6")}
+      />
+      <button
+        data-testid="provider-model-change"
+        onClick={() => onProviderModelChange("codex", "gpt-5.4")}
       />
       <button
         data-testid="context-window-change"
@@ -424,7 +433,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       permissionMode: overrides.permissionMode ?? "bypassPermissions",
       sessionLaunchMode:
         overrides.sessionLaunchMode ?? "bypassPermissions",
-      resumeCursor: null,
+      resumeCursor: overrides.resumeCursor ?? null,
       mode: overrides.mode ?? "default",
       modePriorPermissionMode: overrides.modePriorPermissionMode ?? null,
       effort: overrides.effort ?? null,
@@ -1669,6 +1678,28 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     expect(setPermissionModeMock).toHaveBeenCalledWith("thread-x", "plan");
   });
 
+  it("restores a persisted Codex mode over the legacy Claude slice sentinel", async () => {
+    vi.mocked(agentChatGetSession).mockResolvedValue(
+      makeRecord({
+        provider: "codex",
+        model: "gpt-5.4",
+        permission_mode: "workspace-write",
+      }),
+    );
+    const codexPane = {
+      ...pane,
+      thread_id: "thread-x",
+      provider: "codex" as const,
+    };
+    render(<AgentChatPane pane={codexPane} />);
+    await waitFor(() =>
+      expect(setPermissionModeMock).toHaveBeenCalledWith(
+        "thread-x",
+        "workspace-write",
+      ),
+    );
+  });
+
   it("does not clobber a permission-mode change the user made during the in-flight fetch", async () => {
     // Finding 2: the post-fetch re-check must guard EACH field, not just
     // `model`. Here the slice's model is still null (so the effect
@@ -1790,6 +1821,101 @@ describe("AgentChatPane picker-config persistence (design G)", () => {
         context_window: "1m",
       }),
     );
+  });
+});
+
+describe("AgentChatPane provider handoff", () => {
+  beforeEach(() => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = {
+      "thread-x": {
+        model: "claude-sonnet-4-6",
+        permissionMode: "bypassPermissions",
+        resumeCursor: { resume: "claude-sdk-session" },
+      },
+    };
+    workspaceIdForPaneOverride = "ws-home";
+    vi.mocked(agentChatGetSession).mockReset().mockResolvedValue(null);
+    vi.mocked(agentChatStartSession)
+      .mockReset()
+      .mockResolvedValue("thread-x");
+    vi.mocked(agentChatStopSession)
+      .mockReset()
+      .mockResolvedValue(undefined);
+    setModelMock.mockClear();
+    setEffortMock.mockClear();
+    setContextWindowMock.mockClear();
+    setResumeCursorMock.mockClear();
+    setPermissionModeMock.mockClear();
+  });
+
+  afterEach(() => cleanup());
+
+  it("atomically switches a restored pane to the selected provider and model", async () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+
+    fireEvent.click(
+      container.querySelector('[data-testid="provider-model-change"]')!,
+    );
+
+    await waitFor(() =>
+      expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1),
+    );
+    expect(vi.mocked(agentChatStopSession)).toHaveBeenCalledWith(
+      "claude",
+      "thread-x",
+    );
+    expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledWith(
+      "pane-1",
+      "codex",
+      expect.objectContaining({
+        thread_id: "thread-x",
+        cwd: "/home/user",
+        model: "gpt-5.4",
+        resume_cursor: null,
+        permission_mode: "danger-full-access",
+        effort: null,
+        context_window: null,
+      }),
+    );
+    await waitFor(() =>
+      expect(
+        container.querySelector('[data-testid="composer"]'),
+      ).toHaveAttribute("data-provider", "codex"),
+    );
+    expect(setModelMock).toHaveBeenCalledWith("thread-x", "gpt-5.4");
+    expect(setResumeCursorMock).toHaveBeenCalledWith("thread-x", null);
+  });
+
+  it("restores the previous provider when the selected provider cannot start", async () => {
+    vi.mocked(agentChatStartSession)
+      .mockRejectedValueOnce(new Error("codex unavailable"))
+      .mockResolvedValueOnce("thread-x");
+    const { container } = render(<AgentChatPane pane={pane} />);
+
+    fireEvent.click(
+      container.querySelector('[data-testid="provider-model-change"]')!,
+    );
+
+    await waitFor(() =>
+      expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(2),
+    );
+    expect(vi.mocked(agentChatStartSession).mock.calls[0][1]).toBe("codex");
+    expect(vi.mocked(agentChatStartSession).mock.calls[1]).toEqual([
+      "pane-1",
+      "claude",
+      expect.objectContaining({
+        thread_id: "thread-x",
+        model: "claude-sonnet-4-6",
+        resume_cursor: { resume: "claude-sdk-session" },
+        permission_mode: "bypassPermissions",
+      }),
+    ]);
+    expect(
+      container.querySelector('[data-testid="composer"]'),
+    ).toHaveAttribute("data-provider", "claude");
   });
 });
 

@@ -54,6 +54,7 @@ import {
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
+import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
   checkGhStatus,
   checkGithubRepo,
@@ -74,7 +75,6 @@ import type {
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
-import { DEFAULT_THREAD_PERMISSION_MODE } from "@/stores/agent-chat-store";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 
@@ -815,18 +815,26 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // just update the draft's recorded provider. A side effect: the
   // permission-mode default differs between providers, so we seed a
   // sensible default whenever the provider flips.
-  const handleProviderChange = useCallback(
-    (next: ChatDraft["provider"]) => {
-      if (next === draft.provider) return;
+  const handleProviderModelChange = useCallback(
+    (nextProvider: ChatDraft["provider"], nextModel: string) => {
+      if (nextProvider === draft.provider) {
+        updateDraftConfig(draft.draftId, { model: nextModel });
+        return;
+      }
+      const defaults = capabilityDefaults(nextProvider, nextModel);
       updateDraftConfig(draft.draftId, {
-        provider: next,
-        // Reset provider-specific config to null so pickers can
-        // re-seed from capabilities on next render.
-        model: null,
-        permissionMode:
-          next === "claude" ? DEFAULT_THREAD_PERMISSION_MODE : null,
-        effort: null,
-        contextWindow: null,
+        provider: nextProvider,
+        model: nextModel,
+        // Commit the next provider's native permission default (via
+        // capabilityDefaults → defaultPermissionModeForProvider). The
+        // picker can *display* a fallback for null/unknown values without
+        // mutating the draft, so leaving this null would make first-send
+        // launch state diverge from the visible "Full access" label.
+        permissionMode: defaults.permissionMode,
+        effort: defaults.effort,
+        contextWindow: defaults.contextWindow,
+        // Speed tiers are provider/model-scoped: never carry a Fast
+        // selection across a provider switch.
         fastMode: false,
       });
     },
@@ -991,7 +999,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}
       onStop={handleStop}
-      onProviderChange={handleProviderChange}
+      onProviderModelChange={handleProviderModelChange}
       onModelChange={handleModelChange}
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}

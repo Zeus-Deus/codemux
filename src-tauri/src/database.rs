@@ -592,6 +592,16 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
              WHERE permission_mode IS NULL AND provider = 'claude'",
         "UPDATE agent_chat_sessions SET permission_mode = 'danger-full-access' \
              WHERE permission_mode IS NULL AND provider = 'codex'",
+        // v0.14.2's frontend null-mode fix used Claude's
+        // `bypassPermissions` constant for every provider. A Codex launch
+        // carrying that unsupported value omitted approvalPolicy/sandbox and
+        // fell back to prompting while the picker displayed Full access.
+        // Canonicalize already-persisted affected rows on upgrade. The reverse
+        // mapping protects the symmetric stale-provider case as well.
+        "UPDATE agent_chat_sessions SET permission_mode = 'danger-full-access' \
+             WHERE permission_mode = 'bypassPermissions' AND provider = 'codex'",
+        "UPDATE agent_chat_sessions SET permission_mode = 'bypassPermissions' \
+             WHERE permission_mode = 'danger-full-access' AND provider = 'claude'",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -2431,6 +2441,9 @@ impl DatabaseStore {
     /// `agent_chat_start_session`: on a brand-new chat we INSERT, on a
     /// silent restart (same thread_id after migrate) the ON CONFLICT
     /// bumps `last_active_at` and preserves `sdk_session_id`/`title`.
+    /// A provider handoff keeps the human-facing title but atomically
+    /// clears `sdk_session_id`: provider-native resume cursors cannot be
+    /// passed between adapters.
     pub fn upsert_agent_chat_session(
         &self,
         thread_id: &str,
@@ -2446,6 +2459,10 @@ impl DatabaseStore {
              ON CONFLICT(thread_id) DO UPDATE SET
                  workspace_id = ?2,
                  cwd = ?3,
+                 sdk_session_id = CASE
+                     WHEN agent_chat_sessions.provider != ?4 THEN NULL
+                     ELSE agent_chat_sessions.sdk_session_id
+                 END,
                  provider = ?4,
                  last_active_at = datetime('now')",
             params![thread_id, workspace_id, cwd, provider],
@@ -3326,6 +3343,29 @@ mod tests {
             },
         )
         .unwrap();
+        // v0.14.2 could also persist the other provider's Full-access
+        // protocol value after a provider switch. These rows must be
+        // canonicalized without touching unrelated explicit modes.
+        db.upsert_agent_chat_session("t-codex-cross", "ws", Some("/tmp"), "codex")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t-codex-cross",
+            &AgentChatSessionConfig {
+                permission_mode: AgentChatSessionConfig::set("bypassPermissions"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
+        db.upsert_agent_chat_session("t-claude-cross", "ws", Some("/tmp"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t-claude-cross",
+            &AgentChatSessionConfig {
+                permission_mode: AgentChatSessionConfig::set("danger-full-access"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
 
         // Re-run the schema migrations (idempotent) to fire the backfill.
         {
@@ -3341,6 +3381,14 @@ mod tests {
         assert_eq!(mode("t-claude").as_deref(), Some("bypassPermissions"));
         assert_eq!(mode("t-codex").as_deref(), Some("danger-full-access"));
         assert_eq!(mode("t-opencode"), None, "opencode rows stay NULL");
+        assert_eq!(
+            mode("t-codex-cross").as_deref(),
+            Some("danger-full-access")
+        );
+        assert_eq!(
+            mode("t-claude-cross").as_deref(),
+            Some("bypassPermissions")
+        );
         assert_eq!(
             mode("t-claude-set").as_deref(),
             Some("plan"),
@@ -4144,7 +4192,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_chat_sessions_upsert_on_conflict_preserves_identity_bumps_activity() {
+    fn agent_chat_sessions_upsert_on_conflict_clears_cross_provider_cursor() {
         let db = init_test_database();
         db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
             .unwrap();
@@ -4152,15 +4200,27 @@ mod tests {
         db.set_agent_chat_sdk_session_id("t", "sdk-uuid-xyz")
             .unwrap();
 
-        // Re-upsert with a different provider — the row should
-        // continue to exist with its identity fields intact.
+        // A same-provider restart keeps the provider-native cursor.
+        db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("t")
+                .unwrap()
+                .sdk_session_id
+                .as_deref(),
+            Some("sdk-uuid-xyz")
+        );
+
+        // Re-upsert with a different provider — the row and its
+        // human-facing identity survive, but the Claude-native resume
+        // cursor must not be handed to Codex.
         db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "codex")
             .unwrap();
 
         let rec = db.get_agent_chat_session("t").unwrap();
         assert_eq!(rec.provider, "codex");
         assert_eq!(rec.title.as_deref(), Some("Original title"));
-        assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-uuid-xyz"));
+        assert_eq!(rec.sdk_session_id, None);
     }
 
     #[test]

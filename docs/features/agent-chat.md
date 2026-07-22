@@ -327,8 +327,7 @@ The chat pane stack:
     this guard cannot catch — when no mode is passed at launch the
     sidecar's intended mode reads `undefined`, not `bypassPermissions`,
     so the downgrade condition never matches.
-  - **Null-mode launch heal (the actual "Full access still prompts" root
-    cause)**: the session-history dropdown's New Chat and
+  - **Provider-native Full-access launch heal**: the session-history dropdown's New Chat and
     resume-a-past-chat flows (`src/hooks/use-agent-chat-session-actions.ts`)
     launched sessions with `permission_mode: null` (and no
     model/effort/context config), so the SDK booted the Claude CLI in
@@ -338,17 +337,26 @@ The chat pane stack:
     and the DB row's `permission_mode` stayed NULL (`keep_or_set(None)`
     never writes). This only hit long-lived main-workspace panes: every
     other launch path (fresh-pane mount, draft materialize, worktree
-    prestart) already passed a real mode. Two-layer fix: (1) the hook now
-    passes `DEFAULT_THREAD_PERMISSION_MODE` on New Chat and the record's
-    persisted config (mode NULL-healed to the provider default) on
-    resume, then seeds the slice's `permissionMode` AND
+    prestart) already passed a real mode. The original two-layer fix made
+    the hook pass a concrete mode and made `agent_chat_start_session`
+    heal NULL at the backend boundary. A follow-up closed the
+    multi-provider variant of the same drift: permission-mode strings are
+    provider protocol values, not shared UI enums — Claude Full access is
+    `bypassPermissions`, while Codex Full access is
+    `danger-full-access`. The frontend now resolves the active provider's
+    advertised `default_permission_mode` (with provider-native bootstrap
+    fallbacks) for New Chat, history resume, fresh/recovered panes, draft
+    materialization, provider switches, and mode restoration, then seeds
+    the slice's `permissionMode` AND
     `sessionLaunchMode` so the pill, restart detection, and the actual
-    launch agree; (2) `agent_chat_start_session` heals a `None`
-    `permission_mode` to `fallback_permission_mode(provider)` before the
-    provider consumes the input — same rationale as the
-    `ensure_live_session` heal — and persists the healed value, so no
-    future null-passing caller can ever launch a session in a mode the
-    UI doesn't display.
+    launch agree. At the backend boundary, both `agent_chat_start_session`
+    and `ensure_live_session` canonicalize the two known cross-provider
+    Full-access values as well as healing NULL before the provider consumes
+    the input. The schema-open migration repairs already-persisted Codex
+    rows carrying `bypassPermissions` (and the symmetric Claude mismatch).
+    This is required because the Codex adapter deliberately omits unknown
+    modes from `thread/start`; forwarding Claude's value therefore makes
+    Codex fall back to approvals while the picker still says Full access.
 - **Stale-resume self-heal (Claude)**: a persisted `sdk_session_id` can go
   stale — the CLI deletes old conversation JSONLs (cleanup, version
   updates), and resuming one fails every turn with
@@ -1528,9 +1536,10 @@ Pane creation is available on `AppStateStore::create_agent_chat_pane`,
 which inserts the new pane by splitting the workspace's currently
 active pane horizontally — the same insertion path
 `create_browser_pane` uses. `AppStateStore::agent_chat_thread_id` /
-`set_agent_chat_thread_id` read and assign the bound thread id so the
-Tauri command layer can write it back after `start_session` without
-another provider round-trip.
+`set_agent_chat_thread_id` read and assign an existing binding, while
+`set_agent_chat_binding` writes provider + thread together after
+`start_session` so a provider handoff cannot leave a pane snapshot routed
+through its previous adapter.
 
 The pane renderer at `src/components/chat/AgentChatPane.tsx` is now the
 full chat UI (transcript, composer with `+`/`@`/slash popups, mode pill,
@@ -1538,8 +1547,8 @@ streaming indicators, content blocks, inline approvals, plan proposal
 panel, AskUserQuestion panel, debug-mode banner). The pane header lives
 in `AgentChatPaneHeader.tsx` and surfaces session controls + the
 multi-provider model picker. The empty-state composer (before a session
-exists) lives in `DraftChatSurface.tsx`; the "no panes" home landing
-lives in `ChatHomeLanding.tsx`.
+exists) lives in `DraftChatSurface.tsx` and uses that same unified picker;
+the "no panes" home landing lives in `ChatHomeLanding.tsx`.
 
 ### Thread Scope (first-send scope controls)
 

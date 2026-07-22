@@ -133,7 +133,22 @@ describe("useAgentChatSessionActions — handleNewChat", () => {
     expect((input as { permission_mode: string | null }).permission_mode).toBe(
       "bypassPermissions",
     );
-    expect(DEFAULT_THREAD_PERMISSION_MODE).toBe("bypassPermissions");
+  });
+
+  it("starts a Codex New Chat in Codex Full access", async () => {
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "codex" })),
+    );
+    await result.current.handleNewChat();
+
+    const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(provider).toBe("codex");
+    expect((input as { permission_mode: string | null }).permission_mode).toBe(
+      "danger-full-access",
+    );
+    const slice = newestSlice();
+    expect(slice!.permissionMode).toBe("danger-full-access");
+    expect(slice!.sessionLaunchMode).toBe("danger-full-access");
   });
 
   it("seeds the slice with matching permissionMode and sessionLaunchMode", async () => {
@@ -150,6 +165,19 @@ describe("useAgentChatSessionActions — handleNewChat", () => {
     // triggers a spurious silent restart.
     expect(slice!.permissionMode).toBe(slice!.sessionLaunchMode);
     expect(slice!.model).toBe(CLAUDE_DEFAULT_MODEL);
+  });
+
+  it("keeps OpenCode's provider-native launch mode null", async () => {
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "opencode" })),
+    );
+    await result.current.handleNewChat();
+
+    const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect((input as { permission_mode: string | null }).permission_mode).toBeNull();
+    const slice = newestSlice();
+    expect(slice!.permissionMode).toBe(DEFAULT_THREAD_PERMISSION_MODE);
+    expect(slice!.sessionLaunchMode).toBeNull();
   });
 });
 
@@ -209,6 +237,27 @@ describe("useAgentChatSessionActions — handleSelect (resume)", () => {
     expect(slice!.model).toBe(CLAUDE_DEFAULT_MODEL);
   });
 
+  it("heals a NULL Codex record to Codex Full access", async () => {
+    const record = makeRecord({
+      provider: "codex",
+      permission_mode: null,
+      model: null,
+    });
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "codex" })),
+    );
+    await result.current.handleSelect(record);
+
+    const [, provider, input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect(provider).toBe("codex");
+    expect((input as { permission_mode: string | null }).permission_mode).toBe(
+      "danger-full-access",
+    );
+    const slice = newestSlice();
+    expect(slice!.permissionMode).toBe("danger-full-access");
+    expect(slice!.sessionLaunchMode).toBe("danger-full-access");
+  });
+
   it("resumes with the record's sdk_session_id as the cursor", async () => {
     const { result } = renderHook(() =>
       useAgentChatSessionActions(makePane()),
@@ -218,5 +267,18 @@ describe("useAgentChatSessionActions — handleSelect (resume)", () => {
     expect((input as { resume_cursor: unknown }).resume_cursor).toEqual({
       resume: "sdk-42",
     });
+  });
+
+  it("does not reuse a stale permission token when resuming OpenCode", async () => {
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "opencode" })),
+    );
+    await result.current.handleSelect(
+      makeRecord({ provider: "opencode", permission_mode: "bypassPermissions" }),
+    );
+
+    const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect((input as { permission_mode: string | null }).permission_mode).toBeNull();
+    expect(newestSlice()!.sessionLaunchMode).toBeNull();
   });
 });
