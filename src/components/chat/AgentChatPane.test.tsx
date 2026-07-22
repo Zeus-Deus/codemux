@@ -54,6 +54,7 @@ const setDebugActivityResolvedMock = vi.fn();
 // picker fields the pane restored from the persisted session row.
 const setEffortMock = vi.fn();
 const setContextWindowMock = vi.fn();
+const setFastModeMock = vi.fn();
 const setResumeCursorMock = vi.fn();
 // Hoisted mock for the bug/chat-agent-empty regression test (an
 // unmount/remount that lands on an existing thread should pull the
@@ -437,6 +438,7 @@ vi.mock("@/stores/agent-chat-store", () => {
       modePriorPermissionMode: overrides.modePriorPermissionMode ?? null,
       effort: overrides.effort ?? null,
       contextWindow: overrides.contextWindow ?? null,
+      fastMode: false,
       hasDebugActivity: overrides.hasDebugActivity ?? false,
       debugActivityResolved: overrides.debugActivityResolved ?? false,
     };
@@ -469,6 +471,7 @@ vi.mock("@/stores/agent-chat-store", () => {
         setSessionLaunchMode: vi.fn(),
         setEffort: setEffortMock,
         setContextWindow: setContextWindowMock,
+        setFastMode: setFastModeMock,
         setResumeCursor: setResumeCursorMock,
         setMode: setModeMock,
         setModePriorPermissionMode: setModePriorMock,
@@ -500,6 +503,7 @@ vi.mock("@/stores/agent-chat-store", () => {
         setModel: setModelMock,
         setEffort: setEffortMock,
         setContextWindow: setContextWindowMock,
+        setFastMode: setFastModeMock,
         setMode: setModeMock,
         // Thread Scope deferred-worktree submit seeds the NEW thread's
         // optimistic user bubble through getState().
@@ -1609,6 +1613,7 @@ describe("AgentChatPane mount-seed effect (design F)", () => {
     setModelMock.mockClear();
     setEffortMock.mockClear();
     setContextWindowMock.mockClear();
+    setFastModeMock.mockClear();
     setResumeCursorMock.mockClear();
     setPermissionModeMock.mockClear();
     vi.mocked(agentChatStartSession).mockClear();

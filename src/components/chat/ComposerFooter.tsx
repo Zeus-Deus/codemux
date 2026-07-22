@@ -12,6 +12,7 @@ import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
+import { SpeedPicker } from "./pickers/SpeedPicker";
 
 interface Props {
   provider: AgentChatProviderKind;
@@ -19,6 +20,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
+  fastMode?: boolean;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -44,6 +46,7 @@ interface Props {
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
+  onFastModeChange?: (fastMode: boolean) => void;
   onSubmit: () => void;
   onStop: () => void;
   controlsDisabled: boolean;
@@ -65,6 +68,7 @@ export function ComposerFooter({
   permissionMode,
   effort,
   contextWindow,
+  fastMode = false,
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -79,6 +83,7 @@ export function ComposerFooter({
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
+  onFastModeChange = () => {},
   onSubmit,
   onStop,
   controlsDisabled,
@@ -154,6 +159,12 @@ export function ComposerFooter({
           ultrathinkInBodyText={ultrathinkInBodyText}
           onEffortChange={onEffortChange}
           onContextWindowChange={onContextWindowChange}
+          disabled={controlsDisabled}
+        />
+        <SpeedPicker
+          model={activeModel}
+          value={fastMode}
+          onChange={onFastModeChange}
           disabled={controlsDisabled}
         />
         {/* Permission picker stays visible when a mode pill is

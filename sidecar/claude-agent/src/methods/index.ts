@@ -61,6 +61,14 @@ function optString(v: unknown, field: string): string | undefined {
   return v;
 }
 
+function optBoolean(v: unknown, field: string): boolean | undefined {
+  if (v === undefined || v === null) return undefined;
+  if (typeof v !== "boolean") {
+    throw new InvalidParamsError(`${field} must be a boolean when present`);
+  }
+  return v;
+}
+
 function optArray(v: unknown, field: string): unknown[] | undefined {
   if (v === undefined || v === null) return undefined;
   if (!Array.isArray(v)) {
@@ -115,6 +123,8 @@ function makeStartSession(emit: EventEmitter): MethodHandler {
     if (model !== undefined) input.model = model;
     const effort = optString(p["effort"], "effort");
     if (effort !== undefined) input.effort = effort;
+    const fastMode = optBoolean(p["fastMode"], "fastMode");
+    if (fastMode !== undefined) input.fastMode = fastMode;
     const permissionMode = optString(p["permissionMode"], "permissionMode");
     if (permissionMode !== undefined) {
       input.permissionMode = permissionMode as PermissionMode;

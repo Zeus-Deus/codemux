@@ -63,6 +63,10 @@ export interface SessionStartInput {
    *  values like `"xhigh"` / `"max"` even if a future SDK release
    *  tightens the union. */
   effort?: string;
+  /** Premium inference speed for this session. The companion
+   *  `fastModePerSessionOptIn` flag prevents this UI choice from leaking into
+   *  the user's next standalone Claude Code session. */
+  fastMode?: boolean;
   /** Initial permission mode. */
   permissionMode?: PermissionMode;
   /** Must be `true` when `permissionMode === "bypassPermissions"`. */
@@ -216,8 +220,13 @@ function buildQueryOptions(
     opts.allowDangerouslySkipPermissions =
       input.allowDangerouslySkipPermissions ?? true;
   }
-  if (input.settings && Object.keys(input.settings).length > 0) {
-    opts.settings = input.settings as unknown as NonNullable<Options["settings"]>;
+  const flagSettings = { ...(input.settings ?? {}) };
+  if (input.fastMode !== undefined) {
+    flagSettings.fastMode = input.fastMode;
+    flagSettings.fastModePerSessionOptIn = true;
+  }
+  if (Object.keys(flagSettings).length > 0) {
+    opts.settings = flagSettings as unknown as NonNullable<Options["settings"]>;
   }
   if (input.resume !== undefined) opts.resume = input.resume;
   if (input.sessionId !== undefined) opts.sessionId = input.sessionId;

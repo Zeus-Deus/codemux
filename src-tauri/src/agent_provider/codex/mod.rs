@@ -204,6 +204,7 @@ impl AgentProvider for CodexAgentProvider {
             input.model,
             input.permission_mode,
             input.effort,
+            input.fast_mode,
             input.resume_cursor.clone(),
             input.env,
             self.spawn_config(),

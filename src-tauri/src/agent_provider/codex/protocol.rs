@@ -113,9 +113,10 @@ pub struct ThreadStartParams {
     /// Model identifier to bind to this session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Service tier override (e.g. `"business"`). Provider-specific.
+    /// Service-tier override. The outer option controls omission; the inner
+    /// option lets callers send an explicit JSON null to clear a global tier.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
+    pub service_tier: Option<Option<String>>,
     /// Working directory for the new thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
@@ -147,7 +148,7 @@ pub struct ThreadResumeParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub service_tier: Option<String>,
+    pub service_tier: Option<Option<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1155,6 +1156,27 @@ mod tests {
         let v = json!({ "threadId": "t-456" });
         let r: ThreadStartResponse = serde_json::from_value(v).unwrap();
         assert_eq!(r.thread_id(), "t-456");
+    }
+
+    #[test]
+    fn thread_start_fast_tier_serializes_as_explicit_override() {
+        let params = ThreadStartParams {
+            service_tier: Some(Some("fast".into())),
+            ..ThreadStartParams::default()
+        };
+        let value = serde_json::to_value(params).unwrap();
+        assert_eq!(value["serviceTier"], "fast");
+    }
+
+    #[test]
+    fn thread_start_standard_tier_serializes_as_explicit_null() {
+        let params = ThreadStartParams {
+            service_tier: Some(None),
+            ..ThreadStartParams::default()
+        };
+        let value = serde_json::to_value(params).unwrap();
+        assert!(value.get("serviceTier").is_some());
+        assert!(value["serviceTier"].is_null());
     }
 
     #[test]

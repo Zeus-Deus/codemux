@@ -499,7 +499,7 @@ const MOCK_CHAT_MODEL: ChatModelInfo = {
   context_window_options: [],
   supports_adaptive_thinking: false,
   supports_thinking_toggle: false,
-  supports_fast_mode: false,
+  supports_fast_mode: true,
   supports_images: false,
   sub_provider: null,
   is_free: false,

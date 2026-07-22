@@ -191,6 +191,7 @@ impl CodexSession {
         model: Option<String>,
         permission_mode: Option<String>,
         effort: Option<String>,
+        fast_mode: bool,
         resume_cursor: Option<Value>,
         caller_env: Option<HashMap<String, String>>,
         spawn: CodexSpawnConfig,
@@ -317,7 +318,7 @@ impl CodexSession {
                         let params = ThreadResumeParams {
                             thread_id: rid.clone(),
                             model: model.clone(),
-                            service_tier: None,
+                            service_tier: Some(fast_mode.then(|| "fast".to_string())),
                             cwd: Some(cwd.clone()),
                             collaboration_mode: None,
                             approval_policy,
@@ -345,7 +346,7 @@ impl CodexSession {
                                     ),
                                     original_payload: None,
                                 });
-                                start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone()).await?
+                                start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode).await?
                             }
                             Err(e) => {
                                 return Err(ProviderError::RpcError {
@@ -354,10 +355,10 @@ impl CodexSession {
                             }
                         }
                     }
-                    None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone()).await?,
+                    None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode).await?,
                 }
             }
-            None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone()).await?,
+            None => start_fresh_thread(&child, cwd.clone(), model.clone(), permission_mode.clone(), fast_mode).await?,
         };
 
         // --- assemble session handle ----------------------------------------
@@ -862,6 +863,7 @@ async fn start_fresh_thread(
     cwd: PathBuf,
     model: Option<String>,
     permission_mode: Option<String>,
+    fast_mode: bool,
 ) -> Result<String, ProviderError> {
     let (approval_policy, sandbox) =
         match codex_permission_mode_to_policy_pair(permission_mode.as_deref()) {
@@ -870,7 +872,9 @@ async fn start_fresh_thread(
         };
     let params = ThreadStartParams {
         model,
-        service_tier: None,
+        // `Some(None)` deliberately serializes as JSON null: it clears a
+        // user-level fast default so the composer's Standard choice is honest.
+        service_tier: Some(fast_mode.then(|| "fast".to_string())),
         cwd: Some(cwd),
         collaboration_mode: None,
         approval_policy,

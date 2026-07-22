@@ -21,6 +21,7 @@ export interface PrestartSessionConfig {
   permissionMode?: string;
   effort?: string | null;
   contextWindow?: string | null;
+  fastMode?: boolean;
   /** Composer mode pill to mirror onto the new slice. Callers that
    *  need `permissionMode: "plan"` for plan/ask compute that
    *  themselves — this field only seeds the slice's pill state. */
@@ -106,6 +107,7 @@ export async function prestartWorktreeSession(
     permission_mode: permissionMode,
     effort: config.effort ?? null,
     context_window: config.contextWindow ?? null,
+    fast_mode: config.fastMode ?? false,
     additional_directories: [],
     env: null,
   });
@@ -125,6 +127,7 @@ export async function prestartWorktreeSession(
   if (config.contextWindow != null) {
     chat.setContextWindow(threadId, config.contextWindow);
   }
+  chat.setFastMode(threadId, config.fastMode ?? false);
   if (config.mode != null && config.mode !== "default") {
     chat.setMode(threadId, config.mode);
   }
