@@ -48,8 +48,10 @@ function resetCaps() {
   useProviderCapabilities.setState({
     claude: null,
     codex: null,
+    opencode: null,
     claudeError: null,
     codexError: null,
+    opencodeError: null,
     loaded: false,
   });
 }
@@ -202,6 +204,28 @@ describe("capability-defaults", () => {
       expect(defaults.effort).toBeNull();
       expect(defaults.contextWindow).toBeNull();
       expect(defaults.permissionMode).toBe("bypassPermissions");
+    });
+
+    it("uses provider-specific permission fallbacks before capabilities hydrate", () => {
+      expect(capabilityDefaults("codex", "gpt-5.4").permissionMode).toBe(
+        "danger-full-access",
+      );
+      expect(
+        capabilityDefaults("opencode", "openai/gpt-5").permissionMode,
+      ).toBeNull();
+    });
+
+    it("prefers the provider capability's declared permission default", () => {
+      useProviderCapabilities.setState({
+        codex: {
+          ...makeClaudeCaps([makeModel({ id: "gpt-5.4" })]),
+          default_permission_mode: "workspace-write",
+        },
+      });
+
+      expect(capabilityDefaults("codex", "gpt-5.4").permissionMode).toBe(
+        "workspace-write",
+      );
     });
   });
 });

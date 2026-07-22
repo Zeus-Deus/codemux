@@ -1554,6 +1554,33 @@ impl AppStateStore {
         false
     }
 
+    /// Atomically bind an agent-chat pane to the provider + thread that
+    /// actually owns its live session. Provider switches must update both
+    /// fields together: persisting only the new thread id leaves the pane
+    /// snapshot on its previous adapter, so an app restart routes the thread
+    /// through the wrong provider even though session startup succeeded.
+    pub fn set_agent_chat_binding(
+        &self,
+        pane_id: &str,
+        provider: crate::agent_provider::ProviderKind,
+        thread_id: String,
+    ) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        for workspace in &mut snapshot.workspaces {
+            for surface in &mut workspace.surfaces {
+                if assign_agent_chat_binding(
+                    &mut surface.root,
+                    pane_id,
+                    provider,
+                    &thread_id,
+                ) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn rename_workspace(&self, workspace_id: &str, title: String) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(workspace) = snapshot
@@ -3961,6 +3988,31 @@ fn assign_agent_chat_thread(
         PaneNodeSnapshot::Split { children, .. } => children
             .iter_mut()
             .any(|child| assign_agent_chat_thread(child, target_pane_id, new_thread_id)),
+        _ => false,
+    }
+}
+
+/// Assign the live provider and thread id as one pane-tree mutation.
+fn assign_agent_chat_binding(
+    root: &mut PaneNodeSnapshot,
+    target_pane_id: &str,
+    new_provider: crate::agent_provider::ProviderKind,
+    new_thread_id: &str,
+) -> bool {
+    match root {
+        PaneNodeSnapshot::AgentChat {
+            pane_id,
+            provider,
+            thread_id,
+            ..
+        } if pane_id.0 == target_pane_id => {
+            *provider = Some(new_provider);
+            *thread_id = Some(new_thread_id.to_string());
+            true
+        }
+        PaneNodeSnapshot::Split { children, .. } => children.iter_mut().any(|child| {
+            assign_agent_chat_binding(child, target_pane_id, new_provider, new_thread_id)
+        }),
         _ => false,
     }
 }
@@ -7012,6 +7064,33 @@ mod tests {
         assert_eq!(
             store.agent_chat_thread_id(&pane_id.0),
             Some("thread-xyz".into())
+        );
+    }
+
+    #[test]
+    fn set_agent_chat_binding_updates_provider_and_thread_together() {
+        use crate::agent_provider::ProviderKind;
+
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(
+                &workspace_id.0,
+                Some(ProviderKind::Claude),
+                None,
+                None,
+            )
+            .unwrap();
+        store.set_agent_chat_thread_id(&pane_id.0, Some("thread-claude".into()));
+
+        assert!(store.set_agent_chat_binding(
+            &pane_id.0,
+            ProviderKind::Codex,
+            "thread-codex".into(),
+        ));
+        assert_eq!(
+            store.agent_chat_pane_thread(&pane_id.0),
+            Some((ProviderKind::Codex, "thread-codex".to_string()))
         );
     }
 

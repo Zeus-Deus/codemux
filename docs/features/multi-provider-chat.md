@@ -51,7 +51,7 @@ The frontend `provider-capabilities-store` (Zustand) has one slot per driver (`c
 - **Provider rail (48px)**: icon-only buttons, one per driver. Active provider gets a 2px-wide vertical bar at the right edge as the selected indicator. Tooltip on hover.
 - **Search + model list**: cmdk `Command` with `shouldFilter={false}` (we own the filter via `matchesQuery`); typing in the search input collapses provider grouping and returns a flat result list across all three drivers. Clearing search snaps back to "show only the rail-selected provider's models." Empty states cover (a) no-match-for-query, (b) OpenCode-not-installed, (c) OpenCode-installed-but-no-connected-upstreams.
 
-Pane creation threads `provider: AgentChatProviderKind | null` through `agentChatCreatePane`. The picker swaps a pane's provider mid-conversation by emitting `(provider, model)` to the composer, which routes through `agentChatStartSession` for the new selection.
+Pane creation threads `provider: AgentChatProviderKind | null` through `agentChatCreatePane`. Both draft and live-pane pickers emit `(provider, model)` as one atomic selection. Drafts store the selected provider, model, and provider-specific defaults before launch. A live pane stops its previous adapter, starts the selected provider on the same Codemux thread (preserving the visible transcript), clears the provider-native resume cursor, and persists the pane's provider/thread binding together. If the new adapter cannot start, Codemux best-effort restores the previous provider session.
 
 ### Favorites
 
@@ -70,13 +70,12 @@ Stale favorites for a now-disconnected provider stay in storage and are silently
 - OpenCode-not-installed empty state (with install hint).
 - OpenCode-installed-but-no-connected-providers empty state (with `opencode auth login` hint).
 - `kill_on_drop` reaps the OpenCode server on Codemux shutdown — no zombie `opencode serve` processes.
-- `DraftChatSurface` (the empty-state composer before a session exists) keeps the legacy single-provider `ModelPicker` so a user without an active pane still picks a Claude model the simple way.
+- `DraftChatSurface` uses the same unified provider/model picker as a live pane, so the first session launches directly on the selected adapter.
 
 ## Current Constraints
 
 - **Single instance per provider.** A user with multiple Codex accounts or multiple OpenCode connections sees them collapsed under one rail entry. The `ProviderInstanceId` shim is in place (`src-tauri/src/agent_provider/instance.rs`) for forward-compat — multi-instance lifts the singleton without changing the wire format.
 - **No keyboard shortcuts on the picker.** `Ctrl+1..9` collide with workspace switching. Slot-based jumps are deferred until we decide on a non-colliding namespace (likely `Cmd+Shift+1..N` or in-popover-only).
-- **Picker only on active panes.** The empty-state `DraftChatSurface` retains the legacy single-provider `ModelPicker`. Switching providers from a draft requires materialising the chat first.
 - **No "favorites only" filter** in the rail — favorites bubble up via sort, not via a dedicated filter mode.
 - **No favorites sync across devices.** Codemux doesn't sync UI prefs; favorites live in `localStorage` only.
 - **OpenCode credential management lives in OpenCode.** Codemux never reads or writes upstream API keys (OpenAI / Anthropic / etc.). `opencode auth login` is the one entry point; settings panel only shows the connected/disconnected state.
