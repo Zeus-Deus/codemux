@@ -38,14 +38,14 @@ import {
   getTerminalFontFamily,
   getDefaultEditor,
   getDefaultBaseBranch,
-  selectSidebarLiveAgents,
+  selectSidebarShowGitStats,
   selectWorkingIndicator,
   selectWorkingIndicatorColor,
 } from "./settings-store";
 
 function stateWith(settings: Record<string, string>) {
   return { loaded: true, settings } as Parameters<
-    typeof selectSidebarLiveAgents
+    typeof selectSidebarShowGitStats
   >[0];
 }
 
@@ -88,7 +88,7 @@ describe("settings-store", () => {
       expect(SETTINGS_DEFAULTS["ai_commit_message_enabled"]).toBe("true");
       expect(SETTINGS_DEFAULTS["auto_mcp_config"]).toBe("true");
       // Sidebar / working-indicator keys present
-      expect(SETTINGS_DEFAULTS["sidebar.live_agents"]).toBe("project");
+      expect(SETTINGS_DEFAULTS["sidebar.show_git_stats"]).toBe("true");
       expect(SETTINGS_DEFAULTS["sidebar.working_indicator"]).toBe("braille");
       expect(SETTINGS_DEFAULTS["sidebar.working_indicator_color"]).toBe(
         "status-working",
@@ -105,14 +105,16 @@ describe("settings-store", () => {
   // ── Sidebar / working-indicator selectors ──
 
   describe("sidebar selectors", () => {
-    it("selectSidebarLiveAgents defaults to 'project'", () => {
-      expect(selectSidebarLiveAgents(stateWith({}))).toBe("project");
+    it("selectSidebarShowGitStats defaults to true", () => {
+      expect(selectSidebarShowGitStats(stateWith({}))).toBe(true);
     });
 
-    it("selectSidebarLiveAgents reflects a stored 'top' value", () => {
+    it("selectSidebarShowGitStats reflects a stored 'false' value", () => {
       expect(
-        selectSidebarLiveAgents(stateWith({ "sidebar.live_agents": "top" })),
-      ).toBe("top");
+        selectSidebarShowGitStats(
+          stateWith({ "sidebar.show_git_stats": "false" }),
+        ),
+      ).toBe(false);
     });
 
     it("selectWorkingIndicator defaults to 'braille'", () => {

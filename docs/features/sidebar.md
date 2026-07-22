@@ -1,34 +1,76 @@
 # Left Sidebar
 
-- Purpose: Describe the left sidebar shell and its collapse-to-icon-rail behavior.
+- Purpose: Describe the left sidebar shell — the flat workspace inbox (expanded) and the collapse-to-icon-rail behavior.
 - Audience: Anyone working on sidebar layout, navigation, or workspace presentation.
 - Authority: Canonical feature-level reality doc for the left sidebar.
-- Update when: The sidebar layout, collapse model, or rail rendering changes.
+- Update when: The sidebar layout, inbox model, collapse model, or rail rendering changes.
 - Read next: `docs/reference/SHORTCUTS.md`, `docs/features/notifications.md`
 
 ## What This Feature Is
 
-The left sidebar is the primary navigation surface: top action row (New agent, Add
-repository, Automations, Workspaces overview), the project-grouped workspace list
-(per-workspace agent status, notifications, git/PR state), and a footer (app menu +
-ports). It can be **collapsed to a narrow icon rail** instead of being hidden
-entirely.
+The left sidebar is the primary navigation surface. Expanded, it is a **flat
+workspace inbox**: a search affordance + new-agent button, a horizontal repo
+filter-chip row, one multi-line card per active workspace, and a "Settled"
+section of swept-aside one-line rows. Collapsed, it is a narrow icon rail.
 
 ## Current Model
 
 The sidebar uses the shadcn `Sidebar` primitive in **`collapsible="icon"`** mode.
 There are exactly two states, toggled by the title-bar button and `Ctrl+B`:
 
-- **Expanded** — full sidebar (resizable 180–400px, default 256px).
+- **Expanded** — the workspace inbox (resizable 180–400px, default **288px** —
+  widened from 256 so the card meta line fits).
 - **Icon rail** — a 52px (`SIDEBAR_WIDTH_ICON = 3.25rem`) vertical rail of icons.
   The rail is **always visible**; the sidebar never fully disappears.
 
-State is the `sidebarOpen` boolean in `app-shell.tsx` fed into `SidebarProvider`
-(`open ? "expanded" : "collapsed"`). Each sidebar section reads `useSidebar().state`
-and renders a dedicated rail variant when `collapsed`, rather than relying on the
-primitive's CSS-hide classes (the custom sections aren't built for raw clipping).
+### The workspace inbox (expanded)
 
-### Rail rendering
+Replaced the nested project tree (project groups, drag-reorder, the pinned
+"Needs you" strip, and the "Gather on top" LIVE section) with one flat list:
+
+- **Header** (`sidebar-action-row.tsx` expanded variant): a search box-shaped
+  button that opens the command palette (shows the resolved `⌘K` keybind) and
+  an ember-accented new-agent button (same click/shift-click semantics as
+  before). Add repository moved into the chip row; Automations and Workspaces
+  moved into the footer app menu.
+- **Repo filter chips** (`sidebar-inbox.tsx`): `All` · one chip per project
+  (mini avatar + dedup'd project name from `useProjectGroupedWorkspaces`) ·
+  a dashed `+` add-repo chip (Open project / New project dropdown). The active
+  chip is ember-tinted. Chips filter **both** the active cards and the settled
+  rows; a filtered-empty list shows "Nothing active in `<repo>`". The filter is
+  session-only. The chip row is sticky above the scrolling list.
+- **Workspace cards** (`sidebar-inbox-card.tsx`): each active workspace is a
+  card — repo avatar + name eyebrow; work title (linked-issue title while an
+  agent is live, worktree name when idle) + issue chip; a red blocker line
+  (needs-you only); and a mono meta line (branch · `↑ahead` · `+/−` diff · PR
+  chip (`PR #n` green / `merged` violet, opens the PR) · remote cloud icon ·
+  notification badge). The right side of the eyebrow shows the agent state —
+  Working (configurable `WorkingIndicator`, amber text) / Needs you (pulsing
+  red dot) / Done · review (green ✓) / elapsed time for idle — and swaps to a
+  **"✓ Settle"** button on hover or focus (CSS-only swap). The selected card
+  gets an ember-tinted border + slightly lighter background; needs-you cards a
+  red-tinted border. Click activates; the right-click context menu is the same
+  `WorkspaceContextMenuItems` (rename, editors, move-to-host, archive, delete)
+  shared with the old row, including the delete/push-confirm dialogs.
+- **Settle / un-settle** (`sidebar-inbox-store.ts`): Settle collapses the card
+  (~200ms height/opacity), then moves it below a "Settled" divider as a compact
+  one-line row (repo avatar · violet merge icon when its PR merged · title ·
+  elapsed-since-settle). Hover/focus reveals **Un-settle**, which reverses it
+  (the returning card eases back in via the shared `rise-in` keyframe).
+  Settling is **visual only** — nothing is archived, closed, or deleted. The
+  settled list persists via UI-state key `sidebar.inbox.settled` (JSON
+  `{id, at}[]`), pruned when a workspace vanishes.
+- **Status derivation**: agent state comes from `getWorkspaceStatus`
+  (pane-status) — covering terminal and Agent Chat panes alike; elapsed labels
+  come from the non-persisted `sidebar-density-store` status observations.
+- **Settings** (Settings → Appearance → Sidebar): **Show git stats**
+  (`sidebar.show_git_stats`, default on) hides the `↑ahead` and `+/−` numbers
+  on cards when off; the branch name always shows. The `sidebar.live_agents`
+  grouping setting was removed with the tree; the working-indicator settings
+  (`sidebar.working_indicator`, `sidebar.working_indicator_color`) remain and
+  drive the card's working glyph.
+
+### Rail rendering (collapsed — unchanged)
 
 - **Action row** (`sidebar-action-row.tsx`): vertical icon buttons (New agent —
   accented; Add repository dropdown; Automations; Workspaces) with right-side
@@ -39,112 +81,66 @@ primitive's CSS-hide classes (the custom sections aren't built for raw clipping)
   needs-input (red) > notification count (amber) > working (amber pulse) >
   ready-for-review (green). The active project's avatar is highlighted.
 - **Hover flyout**: hovering a project avatar opens a `HoverCard` (side="right")
-  listing that project's workspaces with **live per-workspace status** (working
-  spinner / status dot), notification counts, branch, active-row highlight, and a
-  "+ New workspace" action. Each row is clickable to switch workspace — so the rail
-  is fully operable without expanding. This answers "can I still see agents working
-  and completion notifications when collapsed?" — yes.
+  listing that project's workspaces with live per-workspace status, notification
+  counts, branch, active-row highlight, and a "+ New workspace" action.
 - **Footer** (`sidebar-footer-bar.tsx`): app menu + ports popover stacked vertically.
-- **Setup banner** (`sidebar-setup-banner.tsx`): hidden in the rail (it is a wide,
-  text-heavy card with no place at 52px).
-
-The expanded project group, the expanded workspace row, and the rail flyout share
-`StatusIndicator` (which gained a `withTooltip` prop so the rail can render a bare
-dot without a tooltip fighting the HoverCard), the `AsciiSpinner`
-(`src/components/ui/ascii-spinner.tsx`), and the project avatar appearance loader
-(`use-project-appearance.ts`).
+  The app menu now also carries **Automations** and **Workspaces** entries (their
+  expanded-header buttons were removed with the inbox).
+- **Setup banner** (`sidebar-setup-banner.tsx`): hidden in the rail.
 
 ## What Works Today
 
-- Two-state toggle (expanded ↔ icon rail) via title-bar button and `Ctrl+B`.
-- Rail shows nav icons, project avatars, and footer icons; never fully hides.
-- Live aggregate agent status + notification badges on collapsed project avatars.
-- Per-workspace agent status covers **both terminal and Agent Chat (Beta)
-  agents** — chat sessions publish into the same `pane_statuses` snapshot
-  via `set_pane_status_by_thread` (see `docs/features/agent-chat.md`
-  § "Sidebar status indicators"), so a chat workspace shows the same
-  working/needs-input/review indicator in every density mode.
-- Per-project hover flyout with live per-workspace status, notifications, switch, and
-  new-workspace action.
-- Project avatar custom colors/images carry into the rail.
-- Re-expanding restores the full sidebar (DnD reorder, diff stats, etc.) unchanged.
-- **Workspace-row density is state-driven** (the "living sidebar"): each row
-  derives its height from agent + git state instead of a global setting (the
-  old `sidebar.workspace_detail` Clean/Branch/Detailed control was removed).
-  Working → 3-line card (working indicator + work title + issue chip /
-  activity + elapsed / mono git line with branch, ↑↓, +/−); needs-input →
-  2-line red-tinted card with the blocker text; done (review) → 2-line
-  green-tinted card ("Done · review when ready") that collapses once the
-  workspace is opened or after ~1h; idle → one-liner (a dirty worktree keeps
-  its mono git line). A green ✓ on a settled row fades out over ~1h; a
-  `n shipped` mono tally (with history popover) appears on rows whose merged
-  PRs retired after new work started. Timestamps for elapsed/decay live in the
-  non-persisted `sidebar-density-store`. The full labeled detail for the
-  **active** workspace still lives in the **workspace context bar**
-  (`docs/features/workspace-context-bar.md`).
-- **Work-based row naming**: while a workspace's agent is live and a
-  linked issue exists, the row title is the issue title (+ `#n` chip); the
-  worktree/branch name moves to the mono git line. Idle rows keep the
-  worktree name.
-- **Pinned "Needs you" strip** at the top of the workspace tree while ≥1
-  workspace needs input (red-tinted, project chip + blocker + age); entries
-  are jump-links that activate the workspace, expanding its project group if
-  collapsed. Hidden in "Gather on top" mode.
-- **Live agents grouping** (Settings → Appearance → Agents,
-  `sidebar.live_agents`): "Stay in project" (default) keeps today's grouping;
-  "Gather on top" hoists all live rows (needs-input → working → done-unseen)
-  into a `LIVE` section above the project tree, each tagged with a project
-  chip, leaving idle one-liners in their groups.
-- **Configurable working indicator** (`sidebar.working_indicator`:
-  braille / ring / blink / sweep / typing, and
-  `sidebar.working_indicator_color`: amber / white / ember / green / sky /
-  violet — no red, reserved for needs-input). Rendered by
-  `src/components/ui/working-indicator.tsx` in the expanded rows and the rail
-  flyout; picked via the Agents section's tile picker + swatches.
-- **Duplicate project names are disambiguated** (PR #109): two project roots that
-  share a basename (a local `~/projects/app` and the same app on a remote host, or
-  sibling dirs) no longer collapse to identical labels. The host is preferred as the
-  distinguishing tag — the local copy keeps its clean basename, each remote copy is
-  suffixed with ` · <host>`; when the host can't separate them (both local, same
-  host, or host names unavailable) the label grows its trailing path tail until every
-  label is unique. Wired through the sidebar, the project picker, and the automations
-  project dropdown.
+- Two-state toggle (expanded inbox ↔ icon rail) via title-bar button and `Ctrl+B`.
+- Flat inbox cards with live agent state, blocker lines, git/PR/issue/remote/
+  notification detail, and work-based titling while an agent is live.
+- Repo chips filtering active + settled lists; add-repo chip; sticky chip row.
+- Settle/un-settle with ~200ms motion, persisted across restarts, prune-safe.
+- Search affordance opening the command palette; accented new-agent button.
+- Show git stats toggle (Settings → Appearance → Sidebar).
+- Rail: nav icons, project avatars with aggregate status, hover flyout, footer.
+- Per-workspace agent status covers both terminal and Agent Chat (Beta) agents
+  (chat sessions publish into the same `pane_statuses` snapshot).
 
 ## Current Constraints
 
 - The collapsed/expanded choice is **not persisted across app restarts** (the app
-  boots expanded), matching the pre-existing offcanvas behavior. Persisting it is a
-  possible follow-up.
+  boots expanded), matching the pre-existing behavior.
 - The rail is desktop-only; on the mobile breakpoint the sidebar still uses the
   off-canvas `Sheet`.
-- Aggregate status shows a single corner indicator by priority; the full per-state
-  detail lives in the flyout.
-- Drag-and-drop reordering is an expanded-only affordance.
+- Drag-and-drop workspace/project reordering was an affordance of the removed
+  project tree and does not exist in the inbox (cards keep the stored
+  workspace order).
+- Idle cards show elapsed time only when a status transition was observed this
+  session (no backend status timestamps exist).
+- The superseded tree components (`sidebar-project-group.tsx`,
+  `sidebar-needs-you-strip.tsx`, `sidebar-live-section.tsx`,
+  `sidebar-live-grouping.ts`, and the `SidebarWorkspaceRow` component) are still
+  in the repo but **unmounted** — kept because `sidebar-workspace-row.tsx` still
+  exports the shared `WorkspaceContextMenuItems`/`DeleteWorktreeDialog` the
+  inbox card reuses (and their test suites cover that machinery). Removing the
+  dead remainder is a pending cleanup.
 
 ## Important Touch Points
 
 - `src/components/layout/app-sidebar.tsx` — `collapsible="icon"`, rail overflow override
-- `src/components/layout/sidebar-action-row.tsx` — collapsed action rail
+- `src/components/layout/sidebar-workspace-list.tsx` — expanded → inbox, collapsed → rail
+- `src/components/layout/sidebar-inbox.tsx` — chips, card list, settled section, settle motion
+- `src/components/layout/sidebar-inbox-card.tsx` — the workspace card + context menu wiring
+- `src/stores/sidebar-inbox-store.ts` — persisted settled list + session repo filter
+- `src/components/layout/sidebar-action-row.tsx` — expanded search/new-agent header + collapsed action rail
 - `src/components/layout/sidebar-rail-projects.tsx` — collapsed project rail + flyout
-- `src/components/layout/sidebar-workspace-list.tsx` — branches to the rail when collapsed
-- `src/components/layout/sidebar-footer-bar.tsx` — collapsed footer
-- `src/components/layout/sidebar-setup-banner.tsx` — hidden in rail
+- `src/components/layout/sidebar-footer-bar.tsx` — footer; app menu with Automations/Workspaces
+- `src/components/layout/sidebar-workspace-row.tsx` — shared `WorkspaceContextMenuItems` + `DeleteWorktreeDialog` (the row component itself is unmounted)
 - `src/components/layout/use-project-appearance.ts` — shared avatar appearance loader
-- `src/components/ui/sidebar.tsx` — `SIDEBAR_WIDTH_ICON` (52px rail)
-- `src/components/ui/status-indicator.tsx` — `withTooltip` prop
-- `src/components/ui/ascii-spinner.tsx` — braille frames (color-configurable)
+- `src/components/ui/sidebar.tsx` — width defaults (288px expanded, 52px rail)
 - `src/components/ui/working-indicator.tsx` — configurable working indicator
-- `src/components/layout/sidebar-workspace-row.tsx` — state-driven row density
-- `src/components/layout/sidebar-needs-you-strip.tsx` — pinned "Needs you" strip
-- `src/components/layout/sidebar-live-section.tsx` + `sidebar-live-grouping.ts` — "Gather on top" LIVE section
-- `src/stores/sidebar-density-store.ts` — non-persisted elapsed/decay/work-history state
-- `src/lib/pane-status.ts` — `getProjectStatus` aggregate helper
-- `src/lib/path.ts` — `tailSegments` / `segmentCount` project-label helpers
-- `src/stores/app-store.ts` — duplicate-project-label disambiguation (host tag → path tail)
+- `src/stores/sidebar-density-store.ts` — non-persisted status-transition timestamps
+- `src/lib/pane-status.ts` — `getWorkspaceStatus` / `getProjectStatus` helpers
+- `src/stores/app-store.ts` — project grouping + duplicate-label disambiguation
 
 ## Notes
 
 - Keep this file about current truth, not future plans.
-- Adapted from the Superset icon-rail sidebar; Codemux maps Superset's per-workspace
-  rail items onto project avatars + a hover flyout, which fits Codemux's
-  project-grouped model better than a flat workspace rail.
+- The inbox was implemented from the `Sidebar Inbox.dc.html` design handoff
+  (flat inbox of workspace cards); colors map to the existing status/accent
+  tokens — no hardcoded palette values.

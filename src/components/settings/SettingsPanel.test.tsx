@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, beforeAll } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within } from "@testing-library/react";
 
 // Polyfill ResizeObserver for jsdom (used by Radix Slider)
 beforeAll(() => {
@@ -53,7 +53,7 @@ vi.mock("@/stores/settings-store", () => {
     auto_mcp_config: "true",
     "appearance.palette": "cool",
     "appearance.density": "comfortable",
-    "sidebar.live_agents": "project",
+    "sidebar.show_git_stats": "true",
     "sidebar.working_indicator": "braille",
     "sidebar.working_indicator_color": "status-working",
   };
@@ -67,7 +67,7 @@ vi.mock("@/stores/settings-store", () => {
     selectTerminalColorTheme: () => "app",
     selectPalette: () => "cool",
     selectDensity: () => "comfortable",
-    selectSidebarLiveAgents: () => "project",
+    selectSidebarShowGitStats: () => true,
     selectWorkingIndicator: () => "braille",
     selectWorkingIndicatorColor: () => "status-working",
   };
@@ -394,10 +394,9 @@ describe("SettingsPanel — Appearance Agents section", () => {
     fireEvent.click(appearanceButtons[0]);
   }
 
-  it("renders the Agents subsection with all three controls", () => {
+  it("renders the Agents subsection with both indicator controls", () => {
     openAppearance();
     expect(screen.getAllByText("Agents").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Live agents").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Working indicator").length).toBeGreaterThan(0);
     expect(screen.getAllByText("Indicator color").length).toBeGreaterThan(0);
     // Tile picker + swatch groups are present.
@@ -409,11 +408,18 @@ describe("SettingsPanel — Appearance Agents section", () => {
     ).toBeGreaterThan(0);
   });
 
-  it("choosing 'Gather on top' writes sidebar.live_agents", () => {
+  it("renders the Sidebar subsection and toggling Show git stats writes sidebar.show_git_stats", () => {
     openAppearance();
-    const [gather] = screen.getAllByRole("radio", { name: /Gather on top/i });
-    fireEvent.click(gather);
-    expect(mockSettingsSet).toHaveBeenCalledWith("sidebar.live_agents", "top");
+    expect(screen.getAllByText("Show git stats").length).toBeGreaterThan(0);
+    const row = screen
+      .getAllByText("Show git stats")[0]
+      .closest("div")!.parentElement!;
+    const toggle = within(row).getByRole("switch");
+    fireEvent.click(toggle);
+    expect(mockSettingsSet).toHaveBeenCalledWith(
+      "sidebar.show_git_stats",
+      "false",
+    );
   });
 
   it("choosing a working-indicator tile writes sidebar.working_indicator", () => {

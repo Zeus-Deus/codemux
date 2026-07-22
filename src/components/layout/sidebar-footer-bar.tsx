@@ -21,7 +21,9 @@ import {
   Keyboard,
   BookOpen,
   Bug,
+  CalendarClock,
   Info,
+  LayoutGrid,
   LogOut,
   ExternalLink,
 } from "lucide-react";
@@ -39,6 +41,10 @@ function ShortcutHint({ actionId }: { actionId: string }) {
 function AppMenu() {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const toggleCommandPalette = useUIStore((s) => s.toggleCommandPalette);
+  const setShowAutomations = useUIStore((s) => s.setShowAutomations);
+  const setShowWorkspacesOverview = useUIStore(
+    (s) => s.setShowWorkspacesOverview,
+  );
   const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
@@ -78,6 +84,18 @@ function AppMenu() {
         <DropdownMenuItem onClick={() => setShowSettings(true, "shortcuts")}>
           <Keyboard className="h-4 w-4" />
           <span>Keyboard shortcuts</span>
+        </DropdownMenuItem>
+        <DropdownMenuSeparator />
+        {/* Automations + Workspaces overview live here since the expanded
+            sidebar header became the inbox's search + new-agent row (they
+            keep their dedicated icon buttons in the collapsed rail). */}
+        <DropdownMenuItem onClick={() => setShowAutomations(true)}>
+          <CalendarClock className="h-4 w-4" />
+          <span>Automations</span>
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => setShowWorkspacesOverview(true)}>
+          <LayoutGrid className="h-4 w-4" />
+          <span>Workspaces</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem

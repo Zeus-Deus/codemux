@@ -65,12 +65,11 @@ import {
   selectTerminalColorTheme,
   selectPalette,
   selectDensity,
-  selectSidebarLiveAgents,
+  selectSidebarShowGitStats,
   selectWorkingIndicator,
   selectWorkingIndicatorColor,
   type AppearancePalette,
   type AppearanceDensity,
-  type SidebarLiveAgents,
   type WorkingIndicatorVariant,
   type WorkingIndicatorColor,
 } from "@/stores/settings-store";
@@ -1346,7 +1345,7 @@ export function SettingsView() {
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
   const palette = useSettingsStore(selectPalette);
   const density = useSettingsStore(selectDensity);
-  const liveAgents = useSettingsStore(selectSidebarLiveAgents);
+  const showGitStats = useSettingsStore(selectSidebarShowGitStats);
   const indicatorVariant = useSettingsStore(selectWorkingIndicator);
   const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
@@ -1720,24 +1719,30 @@ export function SettingsView() {
 
             <SectionGroup>
               <SubsectionHeader
-                title="Agents"
-                description="How working agents surface in the sidebar, and the glyph shown while an agent runs."
+                title="Sidebar"
+                description="What the workspace inbox shows on each card."
               />
               <div className="space-y-1">
                 <SettingRow
-                  label="Live agents"
-                  description="Keep working agents in their project group, or gather every live agent into a LIVE section on top."
+                  label="Show git stats"
+                  description="Show the ↑ahead and +/− diff numbers on workspace cards. The branch name always shows."
                 >
-                  <SegmentedControl<SidebarLiveAgents>
-                    ariaLabel="Live agents grouping"
-                    value={liveAgents}
-                    onChange={(value) => storeSet("sidebar.live_agents", value)}
-                    options={[
-                      { value: "project", label: "Stay in project" },
-                      { value: "top", label: "Gather on top" },
-                    ]}
+                  <Switch
+                    checked={showGitStats}
+                    onCheckedChange={(checked) =>
+                      storeSet("sidebar.show_git_stats", checked ? "true" : "false")
+                    }
                   />
                 </SettingRow>
+              </div>
+            </SectionGroup>
+
+            <SectionGroup>
+              <SubsectionHeader
+                title="Agents"
+                description="The glyph shown in the sidebar while an agent runs."
+              />
+              <div className="space-y-1">
                 <SettingRow
                   label="Working indicator"
                   description="The animation that replaces a workspace's icon while its agent is working."

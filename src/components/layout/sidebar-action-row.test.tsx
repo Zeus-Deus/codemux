@@ -24,6 +24,7 @@ if (typeof window !== "undefined" && !window.matchMedia) {
 
 const setShowDialogMock = vi.fn();
 const setShowNewProjectScreenMock = vi.fn();
+const setShowCommandPaletteMock = vi.fn();
 const openProjectMock = vi.fn();
 let enableAgentChatFlag = false;
 let enableLazyFlag = false;
@@ -34,6 +35,7 @@ vi.mock("@/stores/ui-store", () => ({
       showNewWorkspaceDialog: false,
       setShowNewWorkspaceDialog: setShowDialogMock,
       setShowNewProjectScreen: setShowNewProjectScreenMock,
+      setShowCommandPalette: setShowCommandPaletteMock,
     };
     return selector(state);
   }),
@@ -70,10 +72,10 @@ function renderRow() {
   const newAgent = utils.container.querySelector(
     'button[aria-label="New agent"]',
   ) as HTMLElement;
-  const addRepo = utils.container.querySelector(
-    'button[aria-label="Add repository"]',
+  const search = utils.container.querySelector(
+    'button[aria-label="Search"]',
   ) as HTMLElement;
-  return { ...utils, newAgent, addRepo };
+  return { ...utils, newAgent, search };
 }
 
 describe("SidebarActionRow — New agent button", () => {
@@ -153,17 +155,15 @@ describe("SidebarActionRow — New agent button", () => {
   });
 });
 
-describe("SidebarActionRow — Add repository button", () => {
+describe("SidebarActionRow — Search affordance", () => {
   beforeEach(() => {
-    setShowDialogMock.mockClear();
-    setShowNewProjectScreenMock.mockClear();
-    openProjectMock.mockClear();
-    enableAgentChatFlag = true;
-    enableLazyFlag = true;
+    setShowCommandPaletteMock.mockClear();
   });
 
-  it("renders an Add repository trigger button", () => {
-    const { addRepo } = renderRow();
-    expect(addRepo).not.toBeNull();
+  it("renders a search button that opens the command palette", () => {
+    const { search } = renderRow();
+    expect(search).not.toBeNull();
+    fireEvent.click(search);
+    expect(setShowCommandPaletteMock).toHaveBeenCalledWith(true);
   });
 });

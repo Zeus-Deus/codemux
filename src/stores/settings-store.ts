@@ -21,10 +21,9 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // Spacing density — "comfortable" (default) or "compact". Scales card
   // padding, grid gaps, and group rhythm via the root `data-density` attr.
   "appearance.density": "comfortable",
-  // Sidebar grouping mode — "project" (default) keeps live agents in their
-  // project group; "top" gathers every live agent into a LIVE section above
-  // the project tree. See sidebar-workspace-list.tsx.
-  "sidebar.live_agents": "project",
+  // Whether the sidebar inbox cards show the ↑ahead and +/− diff numbers on
+  // their mono meta line. The branch name always shows. See sidebar-inbox.tsx.
+  "sidebar.show_git_stats": "true",
   // Working-indicator glyph shown while an agent is working — the animation
   // variant and its token color. Rendered by the WorkingIndicator component
   // in the sidebar row and rail flyout.
@@ -37,9 +36,6 @@ export type AppearancePalette = "cool" | "warm";
 
 /** Spacing density mode. */
 export type AppearanceDensity = "comfortable" | "compact";
-
-/** Sidebar grouping mode for live agents. */
-export type SidebarLiveAgents = "project" | "top";
 
 /** Working-indicator animation variant. */
 export type WorkingIndicatorVariant =
@@ -145,9 +141,9 @@ export const selectDensity = (s: SettingsStore): AppearanceDensity =>
   (s.settings["appearance.density"] ??
     SETTINGS_DEFAULTS["appearance.density"]!) as AppearanceDensity;
 
-export const selectSidebarLiveAgents = (s: SettingsStore): SidebarLiveAgents =>
-  (s.settings["sidebar.live_agents"] ??
-    SETTINGS_DEFAULTS["sidebar.live_agents"]!) as SidebarLiveAgents;
+export const selectSidebarShowGitStats = (s: SettingsStore): boolean =>
+  (s.settings["sidebar.show_git_stats"] ??
+    SETTINGS_DEFAULTS["sidebar.show_git_stats"]!) !== "false";
 
 export const selectWorkingIndicator = (
   s: SettingsStore,

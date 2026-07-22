@@ -125,7 +125,7 @@ interface Props {
  *  verbatim in the warning box, and the button flips to "Force delete",
  *  which reissues the same call with `forceDelete: true`. Any other
  *  rejection surfaces as an error toast and closes the dialog. */
-function DeleteWorktreeDialog({
+export function DeleteWorktreeDialog({
   workspace,
   open,
   onOpenChange,

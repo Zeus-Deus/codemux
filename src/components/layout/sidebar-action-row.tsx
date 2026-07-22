@@ -14,7 +14,15 @@ import {
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
-import { Plus, FolderPlus, FolderOpen, CalendarClock, LayoutGrid } from "lucide-react";
+import {
+  Plus,
+  FolderPlus,
+  FolderOpen,
+  CalendarClock,
+  LayoutGrid,
+  Search as SearchIcon,
+  SquarePen,
+} from "lucide-react";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 
@@ -22,6 +30,8 @@ export function SidebarActionRow() {
   const { state } = useSidebar();
   const { getKeysForAction } = useResolvedKeybinds();
   const newAgentKeys = getKeysForAction("newAgent");
+  const paletteKeys = getKeysForAction("commandPalette");
+  const setShowCommandPalette = useUIStore((s) => s.setShowCommandPalette);
   const setShowNewWorkspaceDialog = useUIStore((s) => s.setShowNewWorkspaceDialog);
   const setShowNewProjectScreen = useUIStore((s) => s.setShowNewProjectScreen);
   const setShowAutomations = useUIStore((s) => s.setShowAutomations);
@@ -148,92 +158,42 @@ export function SidebarActionRow() {
     );
   }
 
+  // Expanded inbox header: a search affordance (opens the command palette)
+  // + the accented new-agent button. Add repository moved into the inbox's
+  // repo-chip row; Automations / Workspaces moved into the footer app menu.
   return (
     <ShadcnSidebarHeader className="gap-0 p-0">
-      <div className="flex items-center gap-1 px-2 py-1.5">
+      <div className="flex items-center gap-[7px] px-3 pb-2.5 pt-3">
+        <button
+          type="button"
+          aria-label="Search"
+          onClick={() => setShowCommandPalette(true)}
+          className="flex h-[29px] flex-1 cursor-text items-center gap-2 rounded-lg border border-border/60 bg-foreground/[0.03] px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
+        >
+          <SearchIcon className="h-3 w-3 shrink-0" />
+          <span className="flex-1 text-left text-xs">Search</span>
+          {paletteKeys && (
+            <kbd className="rounded border border-border/60 px-1 py-px font-mono text-[9.5px]">
+              {paletteKeys}
+            </kbd>
+          )}
+        </button>
         <Tooltip>
           <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
+            <button
+              type="button"
               aria-label="New agent"
-              className="flex-1 justify-start gap-2 h-8 px-2 text-[13px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
               onClick={handleNewAgent}
+              className="flex size-[29px] shrink-0 items-center justify-center rounded-lg border border-accent-ember/35 bg-accent-ember/[0.13] text-accent-ember transition-colors duration-150 hover:bg-accent-ember/20"
             >
-              <Plus className="size-[18px]" />
-              <span>New agent</span>
-            </Button>
+              <SquarePen className="size-[13px]" />
+            </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4} className="text-xs">
             New chat in home directory{newAgentKeys ? ` · ${newAgentKeys}` : ""} · Shift+click for workspace dialog
           </TooltipContent>
         </Tooltip>
-
-        <DropdownMenu>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-xs"
-                  aria-label="Add repository"
-                  className="h-8 w-8 text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-                >
-                  <FolderPlus className="size-[18px] text-muted-foreground group-hover/button:text-sidebar-accent-foreground" />
-                </Button>
-              </DropdownMenuTrigger>
-            </TooltipTrigger>
-            <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-              Add repository
-            </TooltipContent>
-          </Tooltip>
-          <DropdownMenuContent side="bottom" align="end">
-            <DropdownMenuItem onClick={() => openProject()} className="text-xs">
-              <FolderOpen className="mr-2 h-3.5 w-3.5" />
-              Open project
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => setShowNewProjectScreen(true)}
-              className="text-xs"
-            >
-              <FolderPlus className="mr-2 h-3.5 w-3.5" />
-              New project
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
       </div>
-
-      {/* Automations — a first-class destination under "New agent",
-          above the project list, matching where Codex and Superset
-          place it. Opens the full-screen Automations view. */}
-      <div className="px-2 pb-1">
-        <Button
-          variant="ghost"
-          aria-label="Automations"
-          className="w-full justify-start gap-2 h-8 px-2 text-[13px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-          onClick={() => setShowAutomations(true)}
-        >
-          <CalendarClock className="size-[18px]" />
-          <span>Automations</span>
-        </Button>
-      </div>
-
-      {/* Workspaces — a single pane that lists every workspace this
-          device knows about (local + every host it has pushed to),
-          with filters, search, and per-row push/pull/open actions.
-          Same full-screen overlay shape as Automations. */}
-      <div className="px-2 pb-1.5">
-        <Button
-          variant="ghost"
-          aria-label="Workspaces"
-          className="w-full justify-start gap-2 h-8 px-2 text-[13px] text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground"
-          onClick={() => setShowWorkspacesOverview(true)}
-        >
-          <LayoutGrid className="size-[18px]" />
-          <span>Workspaces</span>
-        </Button>
-      </div>
-
-      <SidebarSeparator />
     </ShadcnSidebarHeader>
   );
 }
