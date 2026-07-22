@@ -25,7 +25,6 @@ import {
   beginImageStaging,
   discardStagedImage,
 } from "@/lib/agent-chat/image-staging";
-import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
 import {
   materializeAndSend,
   type MaterializePhase,
@@ -55,6 +54,7 @@ import {
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
+import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
   checkGhStatus,
   checkGithubRepo,
@@ -814,20 +814,24 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // just update the draft's recorded provider. A side effect: the
   // permission-mode default differs between providers, so we seed a
   // sensible default whenever the provider flips.
-  const handleProviderChange = useCallback(
-    (next: ChatDraft["provider"]) => {
-      if (next === draft.provider) return;
+  const handleProviderModelChange = useCallback(
+    (nextProvider: ChatDraft["provider"], nextModel: string) => {
+      if (nextProvider === draft.provider) {
+        updateDraftConfig(draft.draftId, { model: nextModel });
+        return;
+      }
+      const defaults = capabilityDefaults(nextProvider, nextModel);
       updateDraftConfig(draft.draftId, {
-        provider: next,
-        // Reset provider-specific config and commit the next provider's
-        // native permission default. The picker can *display* a fallback
-        // for null/unknown values without mutating the draft, so leaving
-        // this null would make first-send launch state diverge from the
-        // visible "Full access" label.
-        model: null,
-        permissionMode: defaultPermissionModeForProvider(next),
-        effort: null,
-        contextWindow: null,
+        provider: nextProvider,
+        model: nextModel,
+        // Commit the next provider's native permission default (via
+        // capabilityDefaults → defaultPermissionModeForProvider). The
+        // picker can *display* a fallback for null/unknown values without
+        // mutating the draft, so leaving this null would make first-send
+        // launch state diverge from the visible "Full access" label.
+        permissionMode: defaults.permissionMode,
+        effort: defaults.effort,
+        contextWindow: defaults.contextWindow,
       });
     },
     [draft.draftId, draft.provider, updateDraftConfig],
@@ -977,7 +981,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}
       onStop={handleStop}
-      onProviderChange={handleProviderChange}
+      onProviderModelChange={handleProviderModelChange}
       onModelChange={handleModelChange}
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}

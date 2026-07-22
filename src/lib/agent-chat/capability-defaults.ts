@@ -132,8 +132,10 @@ export interface CapabilityDefaults {
  *  Capability-driven: `effort` picks the model's `default_effort`,
  *  `contextWindow` picks the option flagged `is_default` (or the first
  *  option when none is flagged). `permissionMode` defaults to the
- *  provider's own native default (`bypassPermissions` for Claude,
- *  `danger-full-access` for Codex, and null for OpenCode).
+ *  provider's own native default via `defaultPermissionModeForProvider`
+ *  (`bypassPermissions` for Claude, `danger-full-access` for Codex, and
+ *  null for OpenCode), covering the brief pre-hydration window without
+ *  applying one provider's value to another.
  *
  *  Returns safe null-fallbacks when capabilities aren't hydrated — the
  *  slice setters accept null, so the draft still writes a valid shape.

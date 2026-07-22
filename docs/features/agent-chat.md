@@ -1526,9 +1526,10 @@ Pane creation is available on `AppStateStore::create_agent_chat_pane`,
 which inserts the new pane by splitting the workspace's currently
 active pane horizontally — the same insertion path
 `create_browser_pane` uses. `AppStateStore::agent_chat_thread_id` /
-`set_agent_chat_thread_id` read and assign the bound thread id so the
-Tauri command layer can write it back after `start_session` without
-another provider round-trip.
+`set_agent_chat_thread_id` read and assign an existing binding, while
+`set_agent_chat_binding` writes provider + thread together after
+`start_session` so a provider handoff cannot leave a pane snapshot routed
+through its previous adapter.
 
 The pane renderer at `src/components/chat/AgentChatPane.tsx` is now the
 full chat UI (transcript, composer with `+`/`@`/slash popups, mode pill,
@@ -1536,8 +1537,8 @@ streaming indicators, content blocks, inline approvals, plan proposal
 panel, AskUserQuestion panel, debug-mode banner). The pane header lives
 in `AgentChatPaneHeader.tsx` and surfaces session controls + the
 multi-provider model picker. The empty-state composer (before a session
-exists) lives in `DraftChatSurface.tsx`; the "no panes" home landing
-lives in `ChatHomeLanding.tsx`.
+exists) lives in `DraftChatSurface.tsx` and uses that same unified picker;
+the "no panes" home landing lives in `ChatHomeLanding.tsx`.
 
 ### Thread Scope (first-send scope controls)
 

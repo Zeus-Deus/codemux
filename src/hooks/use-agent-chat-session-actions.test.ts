@@ -57,7 +57,10 @@ import {
   agentChatStopSession,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
-import { useAgentChatStore } from "@/stores/agent-chat-store";
+import {
+  DEFAULT_THREAD_PERMISSION_MODE,
+  useAgentChatStore,
+} from "@/stores/agent-chat-store";
 
 type AgentChatPane = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 
@@ -163,6 +166,19 @@ describe("useAgentChatSessionActions — handleNewChat", () => {
     expect(slice!.permissionMode).toBe(slice!.sessionLaunchMode);
     expect(slice!.model).toBe(CLAUDE_DEFAULT_MODEL);
   });
+
+  it("keeps OpenCode's provider-native launch mode null", async () => {
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "opencode" })),
+    );
+    await result.current.handleNewChat();
+
+    const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect((input as { permission_mode: string | null }).permission_mode).toBeNull();
+    const slice = newestSlice();
+    expect(slice!.permissionMode).toBe(DEFAULT_THREAD_PERMISSION_MODE);
+    expect(slice!.sessionLaunchMode).toBeNull();
+  });
 });
 
 describe("useAgentChatSessionActions — handleSelect (resume)", () => {
@@ -251,5 +267,18 @@ describe("useAgentChatSessionActions — handleSelect (resume)", () => {
     expect((input as { resume_cursor: unknown }).resume_cursor).toEqual({
       resume: "sdk-42",
     });
+  });
+
+  it("does not reuse a stale permission token when resuming OpenCode", async () => {
+    const { result } = renderHook(() =>
+      useAgentChatSessionActions(makePane({ provider: "opencode" })),
+    );
+    await result.current.handleSelect(
+      makeRecord({ provider: "opencode", permission_mode: "bypassPermissions" }),
+    );
+
+    const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
+    expect((input as { permission_mode: string | null }).permission_mode).toBeNull();
+    expect(newestSlice()!.sessionLaunchMode).toBeNull();
   });
 });

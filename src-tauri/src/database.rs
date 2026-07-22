@@ -2431,6 +2431,9 @@ impl DatabaseStore {
     /// `agent_chat_start_session`: on a brand-new chat we INSERT, on a
     /// silent restart (same thread_id after migrate) the ON CONFLICT
     /// bumps `last_active_at` and preserves `sdk_session_id`/`title`.
+    /// A provider handoff keeps the human-facing title but atomically
+    /// clears `sdk_session_id`: provider-native resume cursors cannot be
+    /// passed between adapters.
     pub fn upsert_agent_chat_session(
         &self,
         thread_id: &str,
@@ -2446,6 +2449,10 @@ impl DatabaseStore {
              ON CONFLICT(thread_id) DO UPDATE SET
                  workspace_id = ?2,
                  cwd = ?3,
+                 sdk_session_id = CASE
+                     WHEN agent_chat_sessions.provider != ?4 THEN NULL
+                     ELSE agent_chat_sessions.sdk_session_id
+                 END,
                  provider = ?4,
                  last_active_at = datetime('now')",
             params![thread_id, workspace_id, cwd, provider],
@@ -4158,7 +4165,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_chat_sessions_upsert_on_conflict_preserves_identity_bumps_activity() {
+    fn agent_chat_sessions_upsert_on_conflict_clears_cross_provider_cursor() {
         let db = init_test_database();
         db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
             .unwrap();
@@ -4166,15 +4173,27 @@ mod tests {
         db.set_agent_chat_sdk_session_id("t", "sdk-uuid-xyz")
             .unwrap();
 
-        // Re-upsert with a different provider — the row should
-        // continue to exist with its identity fields intact.
+        // A same-provider restart keeps the provider-native cursor.
+        db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("t")
+                .unwrap()
+                .sdk_session_id
+                .as_deref(),
+            Some("sdk-uuid-xyz")
+        );
+
+        // Re-upsert with a different provider — the row and its
+        // human-facing identity survive, but the Claude-native resume
+        // cursor must not be handed to Codex.
         db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "codex")
             .unwrap();
 
         let rec = db.get_agent_chat_session("t").unwrap();
         assert_eq!(rec.provider, "codex");
         assert_eq!(rec.title.as_deref(), Some("Original title"));
-        assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-uuid-xyz"));
+        assert_eq!(rec.sdk_session_id, None);
     }
 
     #[test]

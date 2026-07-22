@@ -115,9 +115,14 @@ export function useAgentChatSessionActions(
         // prevent. Model falls back to the provider default the same way
         // the pane's on-mount seed effect does; effort/context ride through
         // as-is (null means "use the model default").
-        const resolvedMode =
-          record.permission_mode ?? defaultPermissionModeForProvider(provider);
         const resolvedModel = record.model ?? defaultModelForProvider(provider);
+        // OpenCode has no chat-side permission picker: launch with null even
+        // if the record carries a stale cross-provider token.
+        const resolvedMode =
+          provider === "opencode"
+            ? null
+            : (record.permission_mode ??
+              defaultPermissionModeForProvider(provider));
         const newThreadId = await agentChatStartSession(paneId, provider, {
           thread_id: newLocalThreadId,
           cwd,
