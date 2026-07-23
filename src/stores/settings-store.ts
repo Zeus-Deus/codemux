@@ -29,6 +29,11 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // in the sidebar row and rail flyout.
   "sidebar.working_indicator": "braille",
   "sidebar.working_indicator_color": "status-working",
+  // How many days a workspace card may sit without agent activity before the
+  // inbox sweeps it into the Settled section on its own. "off" disables the
+  // idle sweep (merged/closed-PR cards still auto-settle once idle). See
+  // sidebar-inbox.tsx.
+  "sidebar.auto_settle_days": "3",
 };
 
 /** Color palette variant. */
@@ -36,6 +41,10 @@ export type AppearancePalette = "cool" | "warm";
 
 /** Spacing density mode. */
 export type AppearanceDensity = "comfortable" | "compact";
+
+/** Idle-sweep window for the inbox auto-settle. "off" disables the
+ *  inactivity rule; the numeric values are day counts. */
+export type AutoSettleDays = "off" | "1" | "3" | "7" | "14";
 
 /** Working-indicator animation variant. */
 export type WorkingIndicatorVariant =
@@ -144,6 +153,16 @@ export const selectDensity = (s: SettingsStore): AppearanceDensity =>
 export const selectSidebarShowGitStats = (s: SettingsStore): boolean =>
   (s.settings["sidebar.show_git_stats"] ??
     SETTINGS_DEFAULTS["sidebar.show_git_stats"]!) !== "false";
+
+/** Idle-sweep window in days, or null when the inactivity rule is off. */
+export const selectSidebarAutoSettleDays = (s: SettingsStore): number | null => {
+  const raw =
+    s.settings["sidebar.auto_settle_days"] ??
+    SETTINGS_DEFAULTS["sidebar.auto_settle_days"]!;
+  if (raw === "off") return null;
+  const days = Number(raw);
+  return Number.isFinite(days) && days > 0 ? days : null;
+};
 
 export const selectWorkingIndicator = (
   s: SettingsStore,

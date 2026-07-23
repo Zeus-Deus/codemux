@@ -266,11 +266,15 @@ describe("SidebarInbox — cards", () => {
       }),
       makeWorkspace({
         worktree_path: "/wt/b",
+        surfaces: surfaceWithPane("p1"),
         pr_number: 203,
         pr_state: "MERGED",
         pr_url: "https://github.com/u/r/pull/203",
       }),
     ];
+    // A "review" status keeps the merged card active (idle merged-PR cards
+    // auto-settle) so its meta-line chip stays on screen.
+    paneStatuses = { p1: "review" };
     await renderInbox();
     expect(screen.getByText("PR #87")).toBeInTheDocument();
     expect(screen.getByText("merged")).toBeInTheDocument();
@@ -528,6 +532,135 @@ describe("SidebarInbox — settle / un-settle", () => {
       container.querySelector('[data-settled-row="ws-1"]'),
     ).not.toBeNull();
     expect(screen.getByText("Settled")).toBeInTheDocument();
+  });
+
+  it("auto-settles an idle merged-PR card on render (persisted)", async () => {
+    workspaces = [
+      makeWorkspace({
+        title: "Merged and idle",
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    const { container } = await renderInbox();
+    // Flush the background settle store update.
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Settled")).toBeInTheDocument();
+    expect(
+      container.querySelector('[data-settled-row="ws-1"]'),
+    ).not.toBeNull();
+    const { dbSetUiState } = await import("@/tauri/commands");
+    expect(dbSetUiState).toHaveBeenCalledWith(
+      "sidebar.inbox.settled",
+      expect.any(String),
+    );
+  });
+
+  it("does NOT auto-settle a merged-PR card while its agent is working", async () => {
+    workspaces = [
+      makeWorkspace({
+        title: "Merged but working",
+        surfaces: surfaceWithPane("p1"),
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    paneStatuses = { p1: "working" };
+    const { container } = await renderInbox();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+  });
+
+  it("keeps a merged-PR card active after the user un-settles it (keep-active pin)", async () => {
+    workspaces = [
+      makeWorkspace({
+        title: "Kept active",
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    const { container, rerender } = await renderInbox();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // It auto-settles first…
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+
+    // …the user un-settles it, pinning it active.
+    fireEvent.click(
+      within(row).getByRole("button", { name: 'Un-settle "Kept active"' }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+
+    // A later render must NOT re-settle it — the pin holds.
+    rerender(
+      <TooltipProvider>
+        <SidebarInbox />
+      </TooltipProvider>,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+  });
+
+  it("auto-settles a card left idle past the auto-settle window", async () => {
+    const old = Date.now() - 4 * 86_400_000; // 4 days ago, past the 3-day default
+    persistedSettled = JSON.stringify({
+      settled: [],
+      keepActive: [],
+      activity: { "ws-1": old },
+    });
+    workspaces = [makeWorkspace({ title: "Stale idle work" })];
+    const { container } = await renderInbox();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Settled")).toBeInTheDocument();
+    expect(
+      container.querySelector('[data-settled-row="ws-1"]'),
+    ).not.toBeNull();
+  });
+
+  it("does not idle-settle when Auto-settle idle work is off", async () => {
+    useSettingsStore.setState({
+      loaded: true,
+      settings: { "sidebar.auto_settle_days": "off" },
+    });
+    const old = Date.now() - 4 * 86_400_000;
+    persistedSettled = JSON.stringify({
+      settled: [],
+      keepActive: [],
+      activity: { "ws-1": old },
+    });
+    workspaces = [makeWorkspace({ title: "Stale idle work" })];
+    const { container } = await renderInbox();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
   });
 
   it("a persisted settled workspace renders as a settled row on load", async () => {

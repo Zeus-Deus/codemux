@@ -62,6 +62,7 @@ import {
 } from "@/stores/synced-settings-store";
 import {
   useSettingsStore,
+  SETTINGS_DEFAULTS,
   selectTerminalColorTheme,
   selectPalette,
   selectDensity,
@@ -70,6 +71,7 @@ import {
   selectWorkingIndicatorColor,
   type AppearancePalette,
   type AppearanceDensity,
+  type AutoSettleDays,
   type WorkingIndicatorVariant,
   type WorkingIndicatorColor,
 } from "@/stores/settings-store";
@@ -1346,6 +1348,11 @@ export function SettingsView() {
   const palette = useSettingsStore(selectPalette);
   const density = useSettingsStore(selectDensity);
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
+  const autoSettleDays = useSettingsStore(
+    (s) =>
+      (s.settings["sidebar.auto_settle_days"] ??
+        SETTINGS_DEFAULTS["sidebar.auto_settle_days"]!) as AutoSettleDays,
+  );
   const indicatorVariant = useSettingsStore(selectWorkingIndicator);
   const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
@@ -1732,6 +1739,25 @@ export function SettingsView() {
                     onCheckedChange={(checked) =>
                       storeSet("sidebar.show_git_stats", checked ? "true" : "false")
                     }
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Auto-settle idle work"
+                  description="Sweep a workspace card into the Settled section after this many days without agent activity. Cards whose PR merges or closes settle as soon as the agent is idle. Un-settling a card keeps it active until its agent runs again."
+                >
+                  <SegmentedControl<AutoSettleDays>
+                    ariaLabel="Auto-settle idle work"
+                    value={autoSettleDays}
+                    onChange={(value) =>
+                      storeSet("sidebar.auto_settle_days", value)
+                    }
+                    options={[
+                      { value: "off", label: "Off" },
+                      { value: "1", label: "1d" },
+                      { value: "3", label: "3d" },
+                      { value: "7", label: "7d" },
+                      { value: "14", label: "14d" },
+                    ]}
                   />
                 </SettingRow>
               </div>

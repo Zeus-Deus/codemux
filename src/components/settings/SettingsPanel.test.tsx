@@ -54,10 +54,12 @@ vi.mock("@/stores/settings-store", () => {
     "appearance.palette": "cool",
     "appearance.density": "comfortable",
     "sidebar.show_git_stats": "true",
+    "sidebar.auto_settle_days": "3",
     "sidebar.working_indicator": "braille",
     "sidebar.working_indicator_color": "status-working",
   };
   return {
+    SETTINGS_DEFAULTS: defaults,
     useSettingsStore: (sel: (s: Record<string, unknown>) => unknown) =>
       sel({
         set: mockSettingsSet,
@@ -68,6 +70,7 @@ vi.mock("@/stores/settings-store", () => {
     selectPalette: () => "cool",
     selectDensity: () => "comfortable",
     selectSidebarShowGitStats: () => true,
+    selectSidebarAutoSettleDays: () => 3,
     selectWorkingIndicator: () => "braille",
     selectWorkingIndicatorColor: () => "status-working",
   };
@@ -419,6 +422,16 @@ describe("SettingsPanel — Appearance Agents section", () => {
     expect(mockSettingsSet).toHaveBeenCalledWith(
       "sidebar.show_git_stats",
       "false",
+    );
+  });
+
+  it("choosing an auto-settle window writes sidebar.auto_settle_days", () => {
+    openAppearance();
+    const [sevenDay] = screen.getAllByRole("radio", { name: /^7d$/i });
+    fireEvent.click(sevenDay);
+    expect(mockSettingsSet).toHaveBeenCalledWith(
+      "sidebar.auto_settle_days",
+      "7",
     );
   });
 

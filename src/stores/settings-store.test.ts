@@ -39,6 +39,7 @@ import {
   getDefaultEditor,
   getDefaultBaseBranch,
   selectSidebarShowGitStats,
+  selectSidebarAutoSettleDays,
   selectWorkingIndicator,
   selectWorkingIndicatorColor,
 } from "./settings-store";
@@ -93,6 +94,7 @@ describe("settings-store", () => {
       expect(SETTINGS_DEFAULTS["sidebar.working_indicator_color"]).toBe(
         "status-working",
       );
+      expect(SETTINGS_DEFAULTS["sidebar.auto_settle_days"]).toBe("3");
       // Per-user keys NOT present
       expect(SETTINGS_DEFAULTS["terminal.font_size"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["terminal.cursor_style"]).toBeUndefined();
@@ -115,6 +117,26 @@ describe("settings-store", () => {
           stateWith({ "sidebar.show_git_stats": "false" }),
         ),
       ).toBe(false);
+    });
+
+    it("selectSidebarAutoSettleDays defaults to 3 days", () => {
+      expect(selectSidebarAutoSettleDays(stateWith({}))).toBe(3);
+    });
+
+    it("selectSidebarAutoSettleDays returns null when set to 'off'", () => {
+      expect(
+        selectSidebarAutoSettleDays(
+          stateWith({ "sidebar.auto_settle_days": "off" }),
+        ),
+      ).toBeNull();
+    });
+
+    it("selectSidebarAutoSettleDays reflects a stored day count", () => {
+      expect(
+        selectSidebarAutoSettleDays(
+          stateWith({ "sidebar.auto_settle_days": "14" }),
+        ),
+      ).toBe(14);
     });
 
     it("selectWorkingIndicator defaults to 'braille'", () => {

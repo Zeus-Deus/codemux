@@ -20,6 +20,7 @@ import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import {
   useSettingsStore,
   selectSidebarShowGitStats,
+  selectSidebarAutoSettleDays,
 } from "@/stores/settings-store";
 import { formatElapsed } from "@/stores/sidebar-density-store";
 import { getWorkspaceStatus } from "@/lib/pane-status";
@@ -189,13 +190,20 @@ export function SidebarInbox() {
   const { openProject } = useProjectActions();
 
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
+  const autoSettleDays = useSettingsStore(selectSidebarAutoSettleDays);
 
   const load = useSidebarInboxStore((s) => s.load);
   const loaded = useSidebarInboxStore((s) => s.loaded);
   const settled = useSidebarInboxStore((s) => s.settled);
+  const keepActive = useSidebarInboxStore((s) => s.keepActive);
+  const activity = useSidebarInboxStore((s) => s.activity);
   const filter = useSidebarInboxStore((s) => s.filter);
   const setFilter = useSidebarInboxStore((s) => s.setFilter);
   const prune = useSidebarInboxStore((s) => s.prune);
+
+  // One coarse (~30s) clock for every elapsed label in the list, and the tick
+  // the activity + auto-settle effects re-run on.
+  const now = useCoarseClock(true);
 
   useEffect(() => {
     void load();
@@ -239,7 +247,23 @@ export function SidebarInbox() {
   };
 
   const handleUnsettle = (workspaceId: string) => {
-    useSidebarInboxStore.getState().unsettle(workspaceId);
+    // The settled-row button is an explicit "keep this active" — pin it so the
+    // idle/PR auto-settle rules leave it alone until its agent runs again.
+    useSidebarInboxStore.getState().unsettle(workspaceId, "user");
+    setJustUnsettledId(workspaceId);
+    timeoutsRef.current.push(
+      window.setTimeout(
+        () => setJustUnsettledId((cur) => (cur === workspaceId ? null : cur)),
+        ROW_IN_MS,
+      ),
+    );
+  };
+
+  // Un-settle a workspace because its live agent resurfaced it (not a user
+  // gesture): clear any keep-active pin via reason "activity", then run the
+  // same rise-in animation the manual path uses.
+  const resurface = (workspaceId: string) => {
+    useSidebarInboxStore.getState().unsettle(workspaceId, "activity");
     setJustUnsettledId(workspaceId);
     timeoutsRef.current.push(
       window.setTimeout(
@@ -262,10 +286,85 @@ export function SidebarInbox() {
       if (!ws) continue;
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
       if (status === "working" || status === "permission") {
-        handleUnsettle(entry.id);
+        resurface(entry.id);
       }
     }
   }, [loaded, paneStatuses, settled, allWorkspaces]);
+
+  // Activity observation: keep a client-side "last active" stamp per workspace
+  // so the inactivity auto-settle rule has something to measure against (the
+  // backend stamps none). We stamp when the agent is doing something (non-null
+  // status), when it's the focused workspace, or when we've never recorded it
+  // (first-seen baseline — without this a fresh install would mass-settle
+  // everything the moment the idle window first elapsed). Re-runs on the
+  // coarse tick so a long-running agent keeps refreshing its stamp; the
+  // store's 60s write-throttle keeps that cheap. noteActivity also clears any
+  // keep-active pin, so a resurfacing agent un-pins itself here.
+  useEffect(() => {
+    if (!loaded || !paneStatuses) return;
+    const noteActivity = useSidebarInboxStore.getState().noteActivity;
+    const at = Date.now();
+    for (const ws of allWorkspaces) {
+      const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
+      const isActiveWs = ws.workspace_id === activeWorkspaceId;
+      const unseen = activity[ws.workspace_id] === undefined;
+      if (status !== null || isActiveWs || unseen) {
+        noteActivity(ws.workspace_id, at);
+      }
+    }
+  }, [loaded, paneStatuses, allWorkspaces, activeWorkspaceId, activity, now]);
+
+  // Auto-settle: sweep an active card under the divider on its own once it is
+  // safely idle — either its PR has merged/closed, or it has gone untouched
+  // past the user's idle window. No leaving animation (this is a background
+  // sweep, not a gesture); we do set the justSettled marker so the arriving
+  // settled row still eases in.
+  //
+  // Anti-fight invariants — these three guards make oscillation impossible:
+  //   • auto-settle ONLY fires at status null (never live / blocked / review);
+  //   • the auto-un-settle safety net above ONLY fires at working/permission;
+  //   • a keep-active pin blocks auto-settle until noteActivity (a non-null
+  //     status) clears it.
+  // So the two effects can never act on the same workspace at the same status,
+  // and a user-kept card stays put until its agent genuinely runs again.
+  useEffect(() => {
+    if (!loaded || !paneStatuses) return;
+    const store = useSidebarInboxStore.getState();
+    const settledSet = new Set(settled.map((e) => e.id));
+    for (const ws of allWorkspaces) {
+      const id = ws.workspace_id;
+      if (settledSet.has(id)) continue;
+      if (keepActive[id]) continue;
+      const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
+      if (status !== null) continue;
+      const prState = normalizePrState(ws.pr_state);
+      const prDone = prState === "merged" || prState === "closed";
+      const stamp = activity[id];
+      const idleSwept =
+        autoSettleDays !== null &&
+        stamp !== undefined &&
+        now - stamp > autoSettleDays * 86_400_000;
+      if (prDone || idleSwept) {
+        store.settle(id);
+        setJustSettledId(id);
+        timeoutsRef.current.push(
+          window.setTimeout(
+            () => setJustSettledId((cur) => (cur === id ? null : cur)),
+            ROW_IN_MS,
+          ),
+        );
+      }
+    }
+  }, [
+    loaded,
+    paneStatuses,
+    allWorkspaces,
+    settled,
+    keepActive,
+    activity,
+    autoSettleDays,
+    now,
+  ]);
 
   // workspace_id → repo (project) identity, from the same grouping pipeline
   // the rest of the app uses (dedup'd names, Home labeling, host suffixes).
@@ -308,9 +407,6 @@ export function SidebarInbox() {
   const filteredPending = filter
     ? pendingWorkspaces.filter((pw) => pw.projectPath === filter)
     : pendingWorkspaces;
-
-  // One coarse (~30s) clock for every elapsed label in the list.
-  const now = useCoarseClock(true);
 
   // Vertical wheel → horizontal scroll on the chip strip. The strip is the
   // only horizontal scroller in the sidebar and most mice have no tilt
