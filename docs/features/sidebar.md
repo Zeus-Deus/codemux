@@ -106,22 +106,34 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   (`sidebar.working_indicator`, `sidebar.working_indicator_color`) remain and
   drive the card's working glyph.
 
-### Rail rendering (collapsed — unchanged)
+### Footer nav (fixed chrome, both states)
 
-- **Action row** (`sidebar-action-row.tsx`): vertical icon buttons (New agent —
-  accented; Add repository dropdown; Automations; Workspaces) with right-side
-  tooltips.
-- **Project list** (`sidebar-rail-projects.tsx`): one **project avatar** per project
-  group. An aggregate **status dot / notification badge** overlays the avatar so
-  agent activity stays visible while collapsed. Corner-indicator priority:
-  needs-input (red) > notification count (amber) > working (amber pulse) >
-  ready-for-review (green). The active project's avatar is highlighted.
-- **Hover flyout**: hovering a project avatar opens a `HoverCard` (side="right")
-  listing that project's workspaces with live per-workspace status, notification
-  counts, branch, active-row highlight, and a "+ New workspace" action.
-- **Footer** (`sidebar-footer-bar.tsx`): app menu + ports popover stacked vertically.
-  The app menu now also carries **Automations** and **Workspaces** entries (their
-  expanded-header buttons were removed with the inbox).
+`sidebar-footer-bar.tsx` is a slim app-destination row — never inside the
+scrolling list. Expanded: **Automations** and **Workspaces** as equal-width
+labeled ghost buttons (28px, 7px radius, transparent with a subtle hover
+fill), then icon-only **Ports** (`SidebarPortsPopover`, keeps its count
+badge) and the **Settings gear** (the app-menu dropdown — Settings, command
+palette, shortcuts, docs, version, sign out; its old Automations/Workspaces
+items were removed since they're visible buttons now). Collapsed: the same
+four, restacked vertically in the same order with right-side tooltips.
+
+### Rail rendering (collapsed — 52px workspace strip)
+
+Replaced the old project-avatar rail (aggregate dots + hover flyout,
+`sidebar-rail-projects.tsx`, deleted):
+
+- **Header** (`sidebar-action-row.tsx` collapsed variant): the accented
+  new-agent square + a search icon (opens the command palette), then a slim
+  centered divider. Add repository lives only in the expanded chip row.
+- **Workspace strip** (`sidebar-rail-workspaces.tsx`): one 28px button per
+  **active (unsettled) workspace** — repo avatar with that workspace's own
+  status dot (red pulse = needs you, amber = working, green = done-review,
+  none = idle), right-side tooltip = workspace title. Clicking selects the
+  workspace **without expanding**; the selected button gets the ember border
+  + tint. The strip scrolls (scrollbar hidden); settled workspaces never
+  appear; the repo filter does not apply here.
+- **Footer**: Automations, Workspaces, Ports (badge), Settings — same order
+  as the expanded footer row.
 - **Setup banner** (`sidebar-setup-banner.tsx`): hidden in the rail.
 
 ## What Works Today
@@ -133,7 +145,8 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
 - Settle/un-settle with ~200ms motion, persisted across restarts, prune-safe.
 - Search affordance opening the command palette; accented new-agent button.
 - Show git stats toggle (Settings → Appearance → Sidebar).
-- Rail: nav icons, project avatars with aggregate status, hover flyout, footer.
+- Rail: per-active-workspace avatar buttons with individual status dots,
+  select-without-expand, and the shared footer destinations.
 - Per-workspace agent status covers both terminal and Agent Chat (Beta) agents
   (chat sessions publish into the same `pane_statuses` snapshot).
 
@@ -163,9 +176,9 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
 - `src/components/layout/sidebar-inbox.tsx` — chips, card list, settled section, settle motion
 - `src/components/layout/sidebar-inbox-card.tsx` — the workspace card + context menu wiring
 - `src/stores/sidebar-inbox-store.ts` — persisted settled list + session repo filter
-- `src/components/layout/sidebar-action-row.tsx` — expanded search/new-agent header + collapsed action rail
-- `src/components/layout/sidebar-rail-projects.tsx` — collapsed project rail + flyout
-- `src/components/layout/sidebar-footer-bar.tsx` — footer; app menu with Automations/Workspaces
+- `src/components/layout/sidebar-action-row.tsx` — expanded search/new-agent header + collapsed rail header
+- `src/components/layout/sidebar-rail-workspaces.tsx` — collapsed per-workspace strip
+- `src/components/layout/sidebar-footer-bar.tsx` — footer nav (Automations/Workspaces/Ports/app menu)
 - `src/components/layout/sidebar-workspace-row.tsx` — shared `WorkspaceContextMenuItems` + `DeleteWorktreeDialog` (the row component itself is unmounted)
 - `src/components/layout/use-project-appearance.ts` — shared avatar appearance loader
 - `src/components/ui/sidebar.tsx` — width defaults (288px expanded, 52px rail)

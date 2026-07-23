@@ -3,7 +3,7 @@ import {
   SidebarGroupContent,
   useSidebar,
 } from "@/components/ui/sidebar";
-import { SidebarRailProjects } from "./sidebar-rail-projects";
+import { SidebarRailWorkspaces } from "./sidebar-rail-workspaces";
 import { SidebarInbox } from "./sidebar-inbox";
 
 /** The sidebar's workspace area.
@@ -12,14 +12,15 @@ import { SidebarInbox } from "./sidebar-inbox";
  *    + one card per active workspace + the "Settled" section. This replaced
  *    the nested project tree (project groups, drag-reorder, the pinned
  *    "Needs you" strip and the LIVE "gather on top" section).
- *  - Collapsed: the icon rail — one project avatar per group with aggregate
- *    status dots and a hover flyout (unchanged).
+ *  - Collapsed: the icon rail — one avatar button per active workspace with a
+ *    per-workspace status dot (`SidebarRailWorkspaces`), mirroring the inbox
+ *    order.
  */
 export function SidebarWorkspaceList() {
   const { state } = useSidebar();
 
   if (state === "collapsed") {
-    return <SidebarRailProjects />;
+    return <SidebarRailWorkspaces />;
   }
 
   return (

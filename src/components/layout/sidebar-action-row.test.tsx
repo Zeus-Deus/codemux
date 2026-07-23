@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { SidebarProvider } from "@/components/ui/sidebar";
 
@@ -65,6 +65,25 @@ function renderRow() {
   const utils = render(
     <TooltipProvider>
       <SidebarProvider>
+        <SidebarActionRow />
+      </SidebarProvider>
+    </TooltipProvider>,
+  );
+  const newAgent = utils.container.querySelector(
+    'button[aria-label="New agent"]',
+  ) as HTMLElement;
+  const search = utils.container.querySelector(
+    'button[aria-label="Search"]',
+  ) as HTMLElement;
+  return { ...utils, newAgent, search };
+}
+
+// SidebarProvider defaults to expanded; `defaultOpen={false}` renders the
+// collapsed icon-rail variant of the header.
+function renderCollapsedRow() {
+  const utils = render(
+    <TooltipProvider>
+      <SidebarProvider defaultOpen={false}>
         <SidebarActionRow />
       </SidebarProvider>
     </TooltipProvider>,
@@ -165,5 +184,46 @@ describe("SidebarActionRow — Search affordance", () => {
     expect(search).not.toBeNull();
     fireEvent.click(search);
     expect(setShowCommandPaletteMock).toHaveBeenCalledWith(true);
+  });
+});
+
+describe("SidebarActionRow — collapsed icon rail", () => {
+  beforeEach(() => {
+    setShowDialogMock.mockClear();
+    setShowCommandPaletteMock.mockClear();
+    enableAgentChatFlag = false;
+    enableLazyFlag = false;
+    cleanup();
+  });
+
+  it("shows only New agent + Search, centered", () => {
+    const { newAgent, search } = renderCollapsedRow();
+    expect(newAgent).not.toBeNull();
+    expect(search).not.toBeNull();
+  });
+
+  it("Search opens the command palette", () => {
+    const { search } = renderCollapsedRow();
+    fireEvent.click(search);
+    expect(setShowCommandPaletteMock).toHaveBeenCalledWith(true);
+  });
+
+  it("New agent still creates a workspace (agent_chat OFF → dialog)", () => {
+    const { newAgent } = renderCollapsedRow();
+    fireEvent.click(newAgent);
+    expect(setShowDialogMock).toHaveBeenCalledWith(true);
+  });
+
+  it("drops the retired Add repository / Automations / Workspaces buttons", () => {
+    const { container } = renderCollapsedRow();
+    expect(
+      container.querySelector('button[aria-label="Add repository"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('button[aria-label="Automations"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('button[aria-label="Workspaces"]'),
+    ).toBeNull();
   });
 });
