@@ -38,13 +38,13 @@ function ShortcutHint({ actionId }: { actionId: string }) {
   return <kbd className="ml-auto text-[10px] text-muted-foreground">{keys}</kbd>;
 }
 
-function AppMenu() {
+function AppMenu({
+  tooltipSide = "top",
+}: {
+  tooltipSide?: "top" | "right";
+}) {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
   const toggleCommandPalette = useUIStore((s) => s.toggleCommandPalette);
-  const setShowAutomations = useUIStore((s) => s.setShowAutomations);
-  const setShowWorkspacesOverview = useUIStore(
-    (s) => s.setShowWorkspacesOverview,
-  );
   const [version, setVersion] = useState<string | null>(null);
 
   useEffect(() => {
@@ -60,13 +60,13 @@ function AppMenu() {
               variant="ghost"
               size="icon-xs"
               aria-label="Menu"
-              className="h-7 w-7 text-muted-foreground hover:text-foreground hover:bg-sidebar-accent"
+              className="h-7 w-7 rounded-[7px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
             >
               <Settings className="size-[18px]" />
             </Button>
           </DropdownMenuTrigger>
         </TooltipTrigger>
-        <TooltipContent side="top" sideOffset={4} className="text-xs">
+        <TooltipContent side={tooltipSide} sideOffset={4} className="text-xs">
           Menu
         </TooltipContent>
       </Tooltip>
@@ -84,18 +84,6 @@ function AppMenu() {
         <DropdownMenuItem onClick={() => setShowSettings(true, "shortcuts")}>
           <Keyboard className="h-4 w-4" />
           <span>Keyboard shortcuts</span>
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        {/* Automations + Workspaces overview live here since the expanded
-            sidebar header became the inbox's search + new-agent row (they
-            keep their dedicated icon buttons in the collapsed rail). */}
-        <DropdownMenuItem onClick={() => setShowAutomations(true)}>
-          <CalendarClock className="h-4 w-4" />
-          <span>Automations</span>
-        </DropdownMenuItem>
-        <DropdownMenuItem onClick={() => setShowWorkspacesOverview(true)}>
-          <LayoutGrid className="h-4 w-4" />
-          <span>Workspaces</span>
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem
@@ -137,14 +125,53 @@ function AppMenu() {
 
 export function SidebarFooterBar() {
   const { state } = useSidebar();
+  const setShowAutomations = useUIStore((s) => s.setShowAutomations);
+  const setShowWorkspacesOverview = useUIStore(
+    (s) => s.setShowWorkspacesOverview,
+  );
 
   if (state === "collapsed") {
+    // Same destinations as the expanded row, restacked vertically as an
+    // icon rail. Order matches the expanded row left-to-right so the two
+    // layouts stay muscle-memory compatible.
     return (
       <>
         <SidebarSeparator />
-        <div className="flex flex-col items-center gap-1 px-1 py-1.5">
-          <AppMenu />
+        <div className="flex flex-col items-center gap-0.5 px-1 py-1.5">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Automations"
+                onClick={() => setShowAutomations(true)}
+                className="size-7 rounded-[7px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
+              >
+                <CalendarClock className="size-[18px]" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="right" sideOffset={4} className="text-xs">
+              Automations
+            </TooltipContent>
+          </Tooltip>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="Workspaces"
+                onClick={() => setShowWorkspacesOverview(true)}
+                className="size-7 rounded-[7px] text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]"
+              >
+                <LayoutGrid className="size-[18px]" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="right" sideOffset={4} className="text-xs">
+              Workspaces
+            </TooltipContent>
+          </Tooltip>
           <SidebarPortsPopover />
+          <AppMenu tooltipSide="right" />
         </div>
       </>
     );
@@ -154,10 +181,28 @@ export function SidebarFooterBar() {
     // Fixed 42px with a border-top (instead of SidebarSeparator + padding)
     // so its top edge lands on the exact same pixel row as the workspace
     // context bar's border-top — the two read as one continuous line
-    // across the bottom of the app.
-    <div className="flex h-[42px] items-center justify-between gap-1 border-t border-sidebar-border px-2">
-      <AppMenu />
+    // across the bottom of the app. 28px controls + 7px vertical padding.
+    <div className="flex h-[42px] items-center gap-0.5 border-t border-sidebar-border px-2">
+      <button
+        type="button"
+        aria-label="Automations"
+        onClick={() => setShowAutomations(true)}
+        className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-[7px] bg-transparent text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
+      >
+        <CalendarClock className="size-[13px]" />
+        <span className="text-[11.5px] font-medium">Automations</span>
+      </button>
+      <button
+        type="button"
+        aria-label="Workspaces"
+        onClick={() => setShowWorkspacesOverview(true)}
+        className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-[7px] bg-transparent text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
+      >
+        <LayoutGrid className="size-[13px]" />
+        <span className="text-[11.5px] font-medium">Workspaces</span>
+      </button>
       <SidebarPortsPopover />
+      <AppMenu />
     </div>
   );
 }
