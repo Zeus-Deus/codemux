@@ -664,6 +664,60 @@ describe("SidebarInbox — settle / un-settle", () => {
     expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
   });
 
+  it("settled rows have the workspace context menu with Un-settle on top", async () => {
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: Date.now() }],
+      keepActive: [],
+      activity: {},
+    });
+    workspaces = [makeWorkspace({ title: "Swept aside" })];
+    await renderInbox();
+
+    const row = screen
+      .getByText("Swept aside")
+      .closest("[data-settled-row]") as HTMLElement;
+    fireEvent.contextMenu(row);
+
+    // Un-settle entry plus the standard workspace actions.
+    expect(await screen.findByText("Un-settle workspace")).toBeInTheDocument();
+    expect(screen.getByText("Rename workspace")).toBeInTheDocument();
+    expect(screen.getByText("Archive Workspace")).toBeInTheDocument();
+
+    // Choosing Un-settle returns the row to the active card list.
+    fireEvent.click(screen.getByText("Un-settle workspace"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(
+      screen.getByText("Swept aside").closest("[data-inbox-card]"),
+    ).not.toBeNull();
+  });
+
+  it("card context menu offers Settle only when the guardrail allows it", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Idle card" }),
+      makeWorkspace({
+        title: "Busy card",
+        surfaces: surfaceWithPane("p1"),
+      }),
+    ];
+    paneStatuses = { p1: "working" };
+    await renderInbox();
+
+    fireEvent.contextMenu(
+      screen.getByText("Idle card").closest("[data-inbox-card]") as HTMLElement,
+    );
+    expect(await screen.findByText("Settle workspace")).toBeInTheDocument();
+    // Close the menu before opening the next one.
+    fireEvent.keyDown(document.body, { key: "Escape" });
+
+    fireEvent.contextMenu(
+      screen.getByText("Busy card").closest("[data-inbox-card]") as HTMLElement,
+    );
+    expect(await screen.findByText("Rename workspace")).toBeInTheDocument();
+    expect(screen.queryByText("Settle workspace")).not.toBeInTheDocument();
+  });
+
   it("a persisted settled workspace renders as a settled row on load", async () => {
     persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
     workspaces = [

@@ -1,11 +1,7 @@
-import { startTransition, useEffect, useState } from "react";
+import { startTransition, useEffect } from "react";
 import { Check, Cloud } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
-import {
-  ContextMenu,
-  ContextMenuTrigger,
-} from "@/components/ui/context-menu";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { WorkingIndicator } from "@/components/ui/working-indicator";
@@ -14,24 +10,8 @@ import {
   PR_CHIP_TONE,
   normalizePrState,
 } from "@/components/github/pr-status-icon";
-import {
-  WorkspaceContextMenuItems,
-  DeleteWorktreeDialog,
-} from "./sidebar-workspace-row";
-import {
-  ConfirmPushDialog,
-} from "@/components/overlays/confirm-push-dialog";
-import {
-  activateWorkspace,
-  archiveWorkspace,
-  closeWorkspace,
-  closeWorkspaceWithWorktree,
-  unarchiveWorkspace,
-  workspacePullBack,
-  workspacePushToHost,
-  type HostView,
-} from "@/tauri/commands";
-import { toast } from "@/lib/toast";
+import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
+import { activateWorkspace } from "@/tauri/commands";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
   useSettingsStore,
@@ -91,9 +71,6 @@ export function SidebarInboxCard({
   jumpHint,
   onSettle,
 }: Props) {
-  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
-  const [pendingPushHost, setPendingPushHost] = useState<HostView | null>(null);
-
   const indicatorVariant = useSettingsStore(selectWorkingIndicator);
   const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
   const appearance = useProjectAppearance(repo.path);
@@ -115,80 +92,7 @@ export function SidebarInboxCard({
     });
   };
 
-  const isAttachOrRemote =
-    workspace.attach_only === true || workspace.host_id != null;
   const isRemote = workspace.host_id !== null && workspace.host_id !== undefined;
-  const isPrimary = !workspace.worktree_path;
-  const canDelete =
-    !isPrimary && workspace.protected !== true && !isAttachOrRemote;
-
-  // Same non-destructive removal semantics as the workspace context menu
-  // everywhere else: local rows archive (restorable, undoable), attach/remote
-  // rows close (the backend refuses to archive them).
-  const handleArchiveOrClose = async () => {
-    try {
-      if (isAttachOrRemote) {
-        if (workspace.worktree_path) {
-          await closeWorkspaceWithWorktree(
-            workspace.workspace_id,
-            false,
-            false,
-            false,
-          );
-        } else {
-          await closeWorkspace(workspace.workspace_id, false);
-        }
-        toast.success(
-          `Closed "${workspace.title}" — it stays available on its host in the Workspaces Overview`,
-        );
-      } else {
-        const archiveId = await archiveWorkspace(workspace.workspace_id);
-        toast.undoable({
-          message: `Archived "${workspace.title}"`,
-          description: "Restore anytime from Settings → Archive.",
-          onUndo: async () => {
-            await unarchiveWorkspace(archiveId);
-          },
-        });
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      toast.error(
-        isAttachOrRemote ? "Close failed" : "Archive failed",
-        { description: message },
-      );
-    }
-  };
-
-  const performPushToHost = async (host: HostView) => {
-    try {
-      const result = await workspacePushToHost(workspace.workspace_id, host.id);
-      if (result.ok) {
-        toast.undoable({
-          message: `Pushed to ${host.name}`,
-          description: "Tap Undo within 10s to pull it back.",
-          onUndo: async () => {
-            const undoResult = await workspacePullBack(workspace.workspace_id);
-            if (undoResult.ok) {
-              toast.success(`Pulled back from ${host.name}`);
-            } else {
-              toast.error("Pull back failed", {
-                description: undoResult.message,
-              });
-            }
-          },
-        });
-      } else {
-        toast.error(`Push to ${host.name} failed`, {
-          description: result.message,
-        });
-      }
-    } catch (err) {
-      toast.error("Push failed", {
-        description: err instanceof Error ? err.message : String(err),
-      });
-    }
-  };
 
   const isWorking = status === "working";
   const isNeeds = status === "permission";
@@ -262,16 +166,21 @@ export function SidebarInboxCard({
   );
 
   return (
-    <>
-      <ContextMenu>
-        <ContextMenuTrigger asChild>
-          <div
-            className={cn(
-              "overflow-hidden transition-[max-height,opacity] duration-200 ease-out",
-              leaving ? "max-h-0 opacity-0" : "max-h-40 opacity-100",
-              justUnsettled && "rise-in",
-            )}
-          >
+    <WorkspaceInboxMenu
+      workspace={workspace}
+      settleAction={
+        canSettle && !leaving
+          ? { kind: "settle", onAction: () => onSettle(workspace.workspace_id) }
+          : undefined
+      }
+    >
+      <div
+        className={cn(
+          "overflow-hidden transition-[max-height,opacity] duration-200 ease-out",
+          leaving ? "max-h-0 opacity-0" : "max-h-40 opacity-100",
+          justUnsettled && "rise-in",
+        )}
+      >
             <div
               role="button"
               tabIndex={0}
@@ -433,33 +342,7 @@ export function SidebarInboxCard({
                 )}
               </div>
             </div>
-          </div>
-        </ContextMenuTrigger>
-        <WorkspaceContextMenuItems
-          workspace={workspace}
-          onArchiveRequest={() => void handleArchiveOrClose()}
-          onDeleteRequest={() => setShowDeleteDialog(true)}
-          onRequestPushConfirm={(host) => setPendingPushHost(host)}
-        />
-      </ContextMenu>
-      {canDelete && (
-        <DeleteWorktreeDialog
-          workspace={workspace}
-          open={showDeleteDialog}
-          onOpenChange={setShowDeleteDialog}
-        />
-      )}
-      <ConfirmPushDialog
-        open={pendingPushHost !== null}
-        workspaceTitle={workspace.title}
-        host={pendingPushHost}
-        onConfirm={() => {
-          if (pendingPushHost) void performPushToHost(pendingPushHost);
-        }}
-        onOpenChange={(open) => {
-          if (!open) setPendingPushHost(null);
-        }}
-      />
-    </>
+      </div>
+    </WorkspaceInboxMenu>
   );
 }

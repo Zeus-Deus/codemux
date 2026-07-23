@@ -28,6 +28,7 @@ import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useProjectAppearance } from "./use-project-appearance";
 import { SidebarInboxCard, type InboxRepo } from "./sidebar-inbox-card";
+import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import { activateWorkspace } from "@/tauri/commands";
 import { normalizePrState } from "@/components/github/pr-status-icon";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
@@ -125,6 +126,16 @@ function SettledRow({
   };
 
   return (
+    // Same right-click menu as the active cards (with Un-settle on top), so
+    // a settled row keeps every workspace action — archive, rename, delete,
+    // move-to-host — without having to un-settle it first.
+    <WorkspaceInboxMenu
+      workspace={workspace}
+      settleAction={{
+        kind: "unsettle",
+        onAction: () => onUnsettle(workspace.workspace_id),
+      }}
+    >
     <div
       role="button"
       tabIndex={0}
@@ -181,6 +192,7 @@ function SettledRow({
         Un-settle
       </button>
     </div>
+    </WorkspaceInboxMenu>
   );
 }
 

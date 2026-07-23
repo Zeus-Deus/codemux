@@ -58,8 +58,13 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   elapsed-since-settle). Hover/focus reveals **Un-settle**, which reverses it
   (the returning card eases back in via the shared `rise-in` keyframe).
   Settling is **visual only** — nothing is archived, closed, or deleted. The
-  settled list persists via UI-state key `sidebar.inbox.settled` (JSON
-  `{id, at}[]`), pruned when a workspace vanishes.
+  settled list persists via UI-state key `sidebar.inbox.settled`, pruned when
+  a workspace vanishes. The settled list is **flat and recency-ordered** —
+  repo identity is carried by each row's avatar, not by project grouping.
+  Both row shapes share the full workspace right-click menu via
+  `workspace-inbox-menu.tsx`: cards get a "Settle workspace" entry (guardrail
+  permitting), settled rows get "Un-settle workspace" on top, and both keep
+  rename / archive / delete / move-to-host.
 - **Settle safety net**: live work can never be buried. A card whose agent is
   working or blocked ("needs you") offers no Settle button (its state cluster
   stays visible on hover), and a *settled* workspace whose agent becomes
