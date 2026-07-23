@@ -39,6 +39,11 @@ const SETTLE_ANIM_MS = 200;
  *  before the marker clears. */
 const ROW_IN_MS = 400;
 
+/** Settled-tail paging: show a short head on first paint, then reveal a larger
+ *  page at a time so the settled section can never dominate the sidebar. */
+const SETTLED_INITIAL_COUNT = 10;
+const SETTLED_PAGE_COUNT = 25;
+
 interface RepoChipProps {
   label: string;
   projectPath: string | null;
@@ -220,6 +225,16 @@ export function SidebarInbox() {
   const [leavingId, setLeavingId] = useState<string | null>(null);
   const [justSettledId, setJustSettledId] = useState<string | null>(null);
   const [justUnsettledId, setJustUnsettledId] = useState<string | null>(null);
+
+  // Settled-tail paging window. Reset to the short head whenever the repo
+  // filter changes so a newly-scoped list starts collapsed again. Settle /
+  // unsettle deliberately don't reset it — the slice just shows fewer rows.
+  const [settledVisibleCount, setSettledVisibleCount] = useState(
+    SETTLED_INITIAL_COUNT,
+  );
+  useEffect(() => {
+    setSettledVisibleCount(SETTLED_INITIAL_COUNT);
+  }, [filter]);
   const timeoutsRef = useRef<number[]>([]);
   useEffect(
     () => () => {
@@ -548,7 +563,7 @@ export function SidebarInbox() {
               </span>
               <span className="h-px flex-1 bg-border/60" />
             </div>
-            {settledRows.map(({ entry, workspace }) => {
+            {settledRows.slice(0, settledVisibleCount).map(({ entry, workspace }) => {
               const repo = repoByWorkspace.get(workspace.workspace_id);
               if (!repo) return null;
               return (
@@ -563,6 +578,24 @@ export function SidebarInbox() {
                 />
               );
             })}
+            {settledRows.length > settledVisibleCount &&
+              (() => {
+                const hidden = settledRows.length - settledVisibleCount;
+                const next = Math.min(SETTLED_PAGE_COUNT, hidden);
+                return (
+                  <button
+                    type="button"
+                    data-settled-more
+                    aria-label={`Show ${next} more settled workspaces (${hidden} hidden)`}
+                    onClick={() =>
+                      setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
+                    }
+                    className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-[10.5px] text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
+                  >
+                    {`Show ${next} more (${hidden} hidden)`}
+                  </button>
+                );
+              })()}
           </>
         )}
       </div>

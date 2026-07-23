@@ -684,3 +684,65 @@ describe("SidebarInbox — settle / un-settle", () => {
     expect(within(row).getByLabelText("PR merged")).toBeInTheDocument();
   });
 });
+
+describe("SidebarInbox — settled-tail pagination", () => {
+  it("collapses a long settled list to a head with a Show-more button", async () => {
+    const at = Date.now();
+    workspaces = Array.from({ length: 14 }, () => makeWorkspace());
+    persistedSettled = JSON.stringify({
+      settled: workspaces.map((w) => ({ id: w.workspace_id, at })),
+      keepActive: [],
+      activity: {},
+    });
+    const { container } = await renderInbox();
+
+    // Only the initial head renders; the tail hides behind the button.
+    expect(container.querySelectorAll("[data-settled-row]").length).toBe(10);
+    const more = screen.getByRole("button", {
+      name: /Show 4 more settled workspaces \(4 hidden\)/,
+    });
+    expect(more).toHaveTextContent("Show 4 more (4 hidden)");
+
+    // Clicking reveals the rest and retires the button.
+    fireEvent.click(more);
+    expect(container.querySelectorAll("[data-settled-row]").length).toBe(14);
+    expect(container.querySelector("[data-settled-more]")).toBeNull();
+  });
+
+  it("drops the button when a repo filter scopes down, and resets paging on filter change", async () => {
+    const at = Date.now();
+    const myapp = Array.from({ length: 8 }, () => makeWorkspace());
+    const vexis = Array.from({ length: 4 }, () =>
+      makeWorkspace({
+        cwd: "/home/u/projects/vexis",
+        project_root: "/home/u/projects/vexis",
+      }),
+    );
+    workspaces = [...myapp, ...vexis];
+    persistedSettled = JSON.stringify({
+      settled: workspaces.map((w) => ({ id: w.workspace_id, at })),
+      keepActive: [],
+      activity: {},
+    });
+    const { container } = await renderInbox();
+
+    // All (12 settled): the head plus a Show-more button.
+    expect(container.querySelectorAll("[data-settled-row]").length).toBe(10);
+    fireEvent.click(
+      container.querySelector("[data-settled-more]") as HTMLElement,
+    );
+    expect(container.querySelectorAll("[data-settled-row]").length).toBe(12);
+
+    // Filtering to a repo with ≤ head settled rows removes the button entirely.
+    fireEvent.click(screen.getByRole("button", { name: "Filter by vexis" }));
+    expect(container.querySelectorAll("[data-settled-row]").length).toBe(4);
+    expect(container.querySelector("[data-settled-more]")).toBeNull();
+
+    // Switching filters resets paging: back on All only the head renders again.
+    fireEvent.click(
+      screen.getByRole("button", { name: "Show all repositories" }),
+    );
+    expect(container.querySelectorAll("[data-settled-row]").length).toBe(10);
+    expect(container.querySelector("[data-settled-more]")).not.toBeNull();
+  });
+});
