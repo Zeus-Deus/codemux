@@ -163,17 +163,19 @@ export function SidebarActionRow() {
   // repo-chip row; Automations / Workspaces moved into the footer app menu.
   return (
     <ShadcnSidebarHeader className="gap-0 p-0">
-      <div className="flex items-center gap-[7px] px-3 pb-2.5 pt-3">
+      {/* Same insets + gap as the repo-chip row below, and every control in
+          both rows is h-6 / rounded-[7px], so the two read as equal rows. */}
+      <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-3">
         <button
           type="button"
           aria-label="Search"
           onClick={() => setShowCommandPalette(true)}
-          className="flex h-[29px] flex-1 cursor-text items-center gap-2 rounded-lg border border-border/60 bg-foreground/[0.03] px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
+          className="flex h-6 flex-1 cursor-text items-center gap-1.5 rounded-[7px] border border-border/60 bg-foreground/[0.03] px-2 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
         >
           <SearchIcon className="h-3 w-3 shrink-0" />
-          <span className="flex-1 text-left text-xs">Search</span>
+          <span className="flex-1 text-left text-[11.5px]">Search</span>
           {paletteKeys && (
-            <kbd className="rounded border border-border/60 px-1 py-px font-mono text-[9.5px]">
+            <kbd className="rounded border border-border/60 px-1 py-0 font-mono text-[9px]">
               {paletteKeys}
             </kbd>
           )}
@@ -184,7 +186,7 @@ export function SidebarActionRow() {
               type="button"
               aria-label="New agent"
               onClick={handleNewAgent}
-              className="flex size-[29px] shrink-0 items-center justify-center rounded-lg border border-accent-ember/35 bg-accent-ember/[0.13] text-accent-ember transition-colors duration-150 hover:bg-accent-ember/20"
+              className="flex size-6 shrink-0 items-center justify-center rounded-[7px] border border-accent-ember/35 bg-accent-ember/[0.13] text-accent-ember transition-colors duration-150 hover:bg-accent-ember/20"
             >
               <SquarePen className="size-[13px]" />
             </button>

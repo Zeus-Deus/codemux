@@ -302,22 +302,24 @@ export function SidebarInbox() {
     <div className="flex flex-col">
       {/* Repo filter chips — sticky so the filter stays reachable while the
           card list scrolls beneath it. */}
-      <div className="sticky top-0 z-10 flex items-center gap-1.5 overflow-x-auto bg-sidebar px-2.5 pb-2.5 pt-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-        <RepoChip
-          label="All"
-          projectPath={null}
-          active={filter === null}
-          onClick={() => setFilter(null)}
-        />
-        {projectGroups.map((group) => (
+      <div className="sticky top-0 z-10 flex items-center gap-1.5 bg-sidebar px-2.5 pb-2.5 pt-0.5 min-w-0">
+        <div className="flex-1 min-w-0 flex items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           <RepoChip
-            key={group.projectPath}
-            label={group.projectName}
-            projectPath={group.projectPath}
-            active={filter === group.projectPath}
-            onClick={() => setFilter(group.projectPath)}
+            label="All"
+            projectPath={null}
+            active={filter === null}
+            onClick={() => setFilter(null)}
           />
-        ))}
+          {projectGroups.map((group) => (
+            <RepoChip
+              key={group.projectPath}
+              label={group.projectName}
+              projectPath={group.projectPath}
+              active={filter === group.projectPath}
+              onClick={() => setFilter(group.projectPath)}
+            />
+          ))}
+        </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button

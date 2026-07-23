@@ -268,12 +268,12 @@ export function SidebarInboxCard({
                 isActive
                   ? "border-accent-ember/45 bg-foreground/[0.08]"
                   : isNeeds
-                    ? "border-status-attention/30 bg-foreground/[0.03] hover:bg-foreground/[0.055]"
-                    : "border-border/60 bg-foreground/[0.03] hover:bg-foreground/[0.055] focus-visible:border-border",
+                    ? "border-status-attention/30 bg-background/60 hover:bg-foreground/[0.04]"
+                    : "border-border/60 bg-background/60 hover:bg-foreground/[0.04] focus-visible:border-border",
               )}
             >
               {/* Eyebrow: repo identity + agent state / Settle swap */}
-              <div className="flex min-h-[18px] items-center gap-1.5">
+              <div className="flex min-h-5 items-center gap-1.5">
                 <ProjectAvatar
                   name={repo.name}
                   color={appearance.customColor}
