@@ -249,6 +249,24 @@ export function SidebarInbox() {
     );
   };
 
+  // Settle safety net: a settled workspace whose agent goes live ("working")
+  // or blocked ("permission") resurfaces into the active list automatically,
+  // so live or blocked work can never stay buried under the divider. Finished
+  // ("review") and idle settled rows stay put — only fresh activity resurfaces
+  // them. Unsettle removes the entry from `settled`, so re-runs converge; we
+  // iterate a snapshot and skip ids that aren't currently settled.
+  useEffect(() => {
+    if (!loaded || !paneStatuses) return;
+    for (const entry of settled) {
+      const ws = allWorkspaces.find((w) => w.workspace_id === entry.id);
+      if (!ws) continue;
+      const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
+      if (status === "working" || status === "permission") {
+        handleUnsettle(entry.id);
+      }
+    }
+  }, [loaded, paneStatuses, settled, allWorkspaces]);
+
   // workspace_id → repo (project) identity, from the same grouping pipeline
   // the rest of the app uses (dedup'd names, Home labeling, host suffixes).
   const repoByWorkspace = useMemo(() => {

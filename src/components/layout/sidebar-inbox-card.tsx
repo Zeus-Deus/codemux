@@ -189,6 +189,11 @@ export function SidebarInboxCard({
   const isNeeds = status === "permission";
   const isDone = status === "review";
 
+  // Settle safety net: a live or blocked agent can never be swept out of
+  // sight. Only finished ("review") and idle cards offer Settle — sweeping
+  // completed work aside is the whole point of the gesture.
+  const canSettle = status !== "working" && status !== "permission";
+
   // While an agent is live and a linked issue exists, the card title IS the
   // work (issue title); the worktree name stays reachable via the branch on
   // the meta line + the title tooltip. Idle cards keep the workspace name.
@@ -224,8 +229,10 @@ export function SidebarInboxCard({
       className={cn(
         "flex shrink-0 items-center gap-1.5 text-[11px]",
         // The hover/focus swap: state hides, Settle shows. CSS-only so no
-        // re-render churn on pointer moves.
-        "group-hover/card:hidden group-focus-within/card:hidden",
+        // re-render churn on pointer moves. Only hide when a Settle button
+        // will actually take its place — a guardrailed card keeps its state
+        // visible on hover/focus since there is nothing to swap to.
+        canSettle && "group-hover/card:hidden group-focus-within/card:hidden",
         isWorking && "font-semibold text-status-working",
         isNeeds && "font-semibold text-status-attention",
         isDone && "font-semibold text-status-open",
@@ -294,23 +301,25 @@ export function SidebarInboxCard({
                 </span>
                 <span className="flex-1" />
                 {stateCluster}
-                <button
-                  type="button"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onSettle(workspace.workspace_id);
-                  }}
-                  aria-label={`Settle "${workspace.title}"`}
-                  className={cn(
-                    "hidden h-5 shrink-0 items-center gap-1 rounded-md border border-border bg-muted px-2",
-                    "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
-                    "hover:border-muted-foreground/50 hover:text-foreground",
-                    "group-hover/card:inline-flex group-focus-within/card:inline-flex",
-                  )}
-                >
-                  <Check className="h-2.5 w-2.5" strokeWidth={2.5} />
-                  Settle
-                </button>
+                {canSettle && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSettle(workspace.workspace_id);
+                    }}
+                    aria-label={`Settle "${workspace.title}"`}
+                    className={cn(
+                      "hidden h-5 shrink-0 items-center gap-1 rounded-md border border-border bg-muted px-2",
+                      "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
+                      "hover:border-muted-foreground/50 hover:text-foreground",
+                      "group-hover/card:inline-flex group-focus-within/card:inline-flex",
+                    )}
+                  >
+                    <Check className="h-2.5 w-2.5" strokeWidth={2.5} />
+                    Settle
+                  </button>
+                )}
               </div>
 
               {/* Title line: work title + linked-issue chip */}

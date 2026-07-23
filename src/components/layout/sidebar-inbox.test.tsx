@@ -456,6 +456,80 @@ describe("SidebarInbox — settle / un-settle", () => {
     }
   });
 
+  it("hides the Settle button for live / blocked cards, keeps it for idle / review", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Working card", surfaces: surfaceWithPane("p1") }),
+      makeWorkspace({ title: "Blocked card", surfaces: surfaceWithPane("p2") }),
+      makeWorkspace({ title: "Idle card" }),
+      makeWorkspace({ title: "Review card", surfaces: surfaceWithPane("p3") }),
+    ];
+    paneStatuses = { p1: "working", p2: "permission", p3: "review" };
+    await renderInbox();
+
+    // Live and blocked agents can never be swept out of sight — no button.
+    expect(
+      screen.queryByRole("button", { name: /^Settle "Working card"/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^Settle "Blocked card"/ }),
+    ).not.toBeInTheDocument();
+    // Idle and finished ("review") cards keep the Settle affordance (CSS-hidden
+    // at rest, but present in the DOM).
+    expect(
+      screen.getByRole("button", { name: /^Settle "Idle card"/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^Settle "Review card"/ }),
+    ).toBeInTheDocument();
+  });
+
+  it("auto-un-settles a settled workspace whose agent becomes live (persisted)", async () => {
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({ title: "Resurfacing work", surfaces: surfaceWithPane("p1") }),
+    ];
+    paneStatuses = { p1: "working" };
+    const { container } = await renderInbox();
+    // Let the auto-un-settle effect run + flush its store update.
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Back in the active list, no longer a settled row, divider gone.
+    expect(
+      container.querySelector('[data-inbox-card="ws-1"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-settled-row="ws-1"]'),
+    ).toBeNull();
+    expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+    // The removal was persisted to the settled UI-state key.
+    const { dbSetUiState } = await import("@/tauri/commands");
+    expect(dbSetUiState).toHaveBeenCalledWith(
+      "sidebar.inbox.settled",
+      expect.any(String),
+    );
+  });
+
+  it("keeps a settled 'review' (done) workspace settled — only live work resurfaces", async () => {
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({ title: "Finished work", surfaces: surfaceWithPane("p1") }),
+    ];
+    paneStatuses = { p1: "review" };
+    const { container } = await renderInbox();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // A finished card must stick under the divider — otherwise the guardrail
+    // and auto-un-settle would fight each other.
+    expect(
+      container.querySelector('[data-settled-row="ws-1"]'),
+    ).not.toBeNull();
+    expect(screen.getByText("Settled")).toBeInTheDocument();
+  });
+
   it("a persisted settled workspace renders as a settled row on load", async () => {
     persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
     workspaces = [

@@ -60,6 +60,16 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   Settling is **visual only** — nothing is archived, closed, or deleted. The
   settled list persists via UI-state key `sidebar.inbox.settled` (JSON
   `{id, at}[]`), pruned when a workspace vanishes.
+- **Settle safety net**: live work can never be buried. A card whose agent is
+  working or blocked ("needs you") offers no Settle button (its state cluster
+  stays visible on hover), and a *settled* workspace whose agent becomes
+  working/blocked is **auto-un-settled** (persistently, with the rise-in
+  ease). Finished ("review") and idle cards settle normally and stay settled —
+  sweeping completed work aside is the point of the gesture.
+- **Provider marks**: each card's meta line shows the official logo of every
+  agent-chat provider active in that workspace (Claude / Codex / OpenCode) via
+  `ProviderLogo` + `getWorkspaceProviders` (pane-status). Terminal-only agent
+  panes carry no provider metadata and contribute nothing.
 - **Status derivation**: agent state comes from `getWorkspaceStatus`
   (pane-status) — covering terminal and Agent Chat panes alike; elapsed labels
   come from the non-persisted `sidebar-density-store` status observations.
