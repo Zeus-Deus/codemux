@@ -294,6 +294,27 @@ export function SidebarInbox() {
   // One coarse (~30s) clock for every elapsed label in the list.
   const now = useCoarseClock(true);
 
+  // Vertical wheel → horizontal scroll on the chip strip. The strip is the
+  // only horizontal scroller in the sidebar and most mice have no tilt
+  // wheel, so plain wheel motion should move it. Native non-passive
+  // listener (React's onWheel can't preventDefault) so the same gesture
+  // doesn't also scroll the card list underneath.
+  const chipStripRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = chipStripRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (el.scrollWidth <= el.clientWidth) return; // nothing to scroll
+      // A genuine horizontal wheel (tilt / trackpad swipe) already works —
+      // only translate when the motion is predominantly vertical.
+      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+      el.scrollLeft += e.deltaY;
+      e.preventDefault();
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
   const filterName = filter
     ? projectGroups.find((g) => g.projectPath === filter)?.projectName ?? null
     : null;
@@ -303,7 +324,11 @@ export function SidebarInbox() {
       {/* Repo filter chips — sticky so the filter stays reachable while the
           card list scrolls beneath it. */}
       <div className="sticky top-0 z-10 flex items-center gap-1.5 bg-sidebar px-2.5 pb-2.5 pt-0.5 min-w-0">
-        <div className="flex-1 min-w-0 flex items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+        <div
+          ref={chipStripRef}
+          data-chip-strip
+          className="flex-1 min-w-0 flex items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        >
           <RepoChip
             label="All"
             projectPath={null}

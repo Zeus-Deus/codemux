@@ -311,6 +311,48 @@ describe("SidebarInbox — repo filter chips", () => {
     expect(screen.queryByText("Settled")).not.toBeInTheDocument();
   });
 
+  it("translates vertical wheel motion into horizontal chip-strip scroll", async () => {
+    workspaces = [
+      makeWorkspace(),
+      makeWorkspace({
+        cwd: "/home/u/projects/vexis",
+        project_root: "/home/u/projects/vexis",
+      }),
+    ];
+    const { container } = await renderInbox();
+    const strip = container.querySelector("[data-chip-strip]") as HTMLElement;
+    expect(strip).not.toBeNull();
+
+    // jsdom has no layout — simulate an overflowing strip.
+    Object.defineProperty(strip, "scrollWidth", { value: 400, configurable: true });
+    Object.defineProperty(strip, "clientWidth", { value: 200, configurable: true });
+    strip.scrollLeft = 0;
+
+    // Vertical wheel → horizontal scroll, and the event is consumed so the
+    // card list underneath doesn't scroll too.
+    const down = new WheelEvent("wheel", {
+      deltaY: 40,
+      deltaX: 0,
+      bubbles: true,
+      cancelable: true,
+    });
+    strip.dispatchEvent(down);
+    expect(strip.scrollLeft).toBe(40);
+    expect(down.defaultPrevented).toBe(true);
+
+    // Predominantly-horizontal wheel (tilt / trackpad) is left to native
+    // scrolling untouched.
+    const sideways = new WheelEvent("wheel", {
+      deltaY: 2,
+      deltaX: 30,
+      bubbles: true,
+      cancelable: true,
+    });
+    strip.dispatchEvent(sideways);
+    expect(strip.scrollLeft).toBe(40);
+    expect(sideways.defaultPrevented).toBe(false);
+  });
+
   it("shows the filtered empty state when a repo has nothing active", async () => {
     workspaces = [
       makeWorkspace({ title: "In myapp" }),
