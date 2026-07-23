@@ -7,6 +7,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
+import { ProviderLogo } from "@/components/chat/provider-logo";
 import { WorkingIndicator } from "@/components/ui/working-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import {
@@ -43,6 +44,7 @@ import {
   permissionBlockerText,
 } from "@/stores/sidebar-density-store";
 import { useProjectAppearance } from "./use-project-appearance";
+import { getWorkspaceProviders } from "@/lib/pane-status";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 
 export interface InboxRepo {
@@ -213,6 +215,10 @@ export function SidebarInboxCard({
     if (workspace.pr_url) openUrl(workspace.pr_url).catch(console.error);
   };
 
+  // The official mark of each agent provider chatting in this workspace
+  // (Claude / Codex / OpenCode), shown on the meta line's right cluster.
+  const providers = getWorkspaceProviders(workspace.surfaces);
+
   const stateCluster = (
     <span
       className={cn(
@@ -375,6 +381,13 @@ export function SidebarInboxCard({
                   </button>
                 )}
                 <span className="flex-1" />
+                {providers.map((p) => (
+                  <ProviderLogo
+                    key={p}
+                    provider={p}
+                    className="h-[13px] w-[13px] opacity-80"
+                  />
+                ))}
                 {isRemote && (
                   <Cloud
                     aria-label="Runs on a remote host"

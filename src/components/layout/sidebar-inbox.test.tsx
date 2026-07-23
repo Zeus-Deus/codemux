@@ -276,6 +276,40 @@ describe("SidebarInbox — cards", () => {
     expect(screen.getByText("merged")).toBeInTheDocument();
   });
 
+  it("shows the provider logo for agent-chat panes in the workspace", async () => {
+    workspaces = [
+      makeWorkspace({
+        title: "Chatting with Claude",
+        surfaces: [
+          {
+            root: {
+              kind: "agent_chat",
+              pane_id: "p1",
+              title: "Agent Chat",
+              thread_id: "t1",
+              provider: "claude",
+              cwd: null,
+            },
+          },
+        ] as unknown as SurfaceSnapshot[],
+      }),
+      makeWorkspace({ title: "No chat here" }),
+    ];
+    await renderInbox();
+
+    const claudeCard = screen
+      .getByText("Chatting with Claude")
+      .closest("[data-inbox-card]") as HTMLElement;
+    expect(
+      within(claudeCard).getByAltText("Claude"),
+    ).toBeInTheDocument();
+
+    const plainCard = screen
+      .getByText("No chat here")
+      .closest("[data-inbox-card]") as HTMLElement;
+    expect(within(plainCard).queryByAltText("Claude")).not.toBeInTheDocument();
+  });
+
   it("clicking a card activates its workspace", async () => {
     workspaces = [makeWorkspace({ title: "Open me" })];
     await renderInbox();
