@@ -114,6 +114,7 @@ import { __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 import { activateWorkspace } from "@/tauri/commands";
+import { getJumpTarget } from "./sidebar-inbox-jump";
 
 let wsCounter = 0;
 function makeWorkspace(
@@ -682,6 +683,58 @@ describe("SidebarInbox — settle / un-settle", () => {
     expect(row).not.toBeNull();
     // Merged-PR settled rows carry the violet merge glyph.
     expect(within(row).getByLabelText("PR merged")).toBeInTheDocument();
+  });
+});
+
+describe("SidebarInbox — jump-to-card shortcuts", () => {
+  it("publishes the visible active-card ids to the jump module in view order, scoped by the filter", async () => {
+    workspaces = [
+      makeWorkspace({ title: "First" }),
+      makeWorkspace({
+        title: "Second",
+        cwd: "/home/u/projects/vexis",
+        project_root: "/home/u/projects/vexis",
+      }),
+      makeWorkspace({ title: "Third" }),
+    ];
+    await renderInbox();
+
+    // Targets mirror the on-screen active-card order.
+    expect(getJumpTarget(1)).toBe("ws-1");
+    expect(getJumpTarget(2)).toBe("ws-2");
+    expect(getJumpTarget(3)).toBe("ws-3");
+    expect(getJumpTarget(4)).toBeNull();
+
+    // Filtering to a repo shrinks the target list to that repo's cards.
+    fireEvent.click(screen.getByRole("button", { name: "Filter by vexis" }));
+    expect(getJumpTarget(1)).toBe("ws-2");
+    expect(getJumpTarget(2)).toBeNull();
+  });
+
+  it("shows a numbered badge on each visible card while the modifier is held, and hides it on release", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Alpha" }),
+      makeWorkspace({ title: "Beta" }),
+    ];
+    await renderInbox();
+
+    // No badges at rest.
+    expect(screen.queryByText("1")).not.toBeInTheDocument();
+    expect(screen.queryByText("2")).not.toBeInTheDocument();
+
+    // Holding the jump modifier reveals a 1..N badge per visible card.
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Alt" }));
+    });
+    expect(screen.getByText("1")).toBeInTheDocument();
+    expect(screen.getByText("2")).toBeInTheDocument();
+
+    // Releasing it hides them again — no stuck-open state.
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keyup", { key: "Alt" }));
+    });
+    expect(screen.queryByText("1")).not.toBeInTheDocument();
+    expect(screen.queryByText("2")).not.toBeInTheDocument();
   });
 });
 

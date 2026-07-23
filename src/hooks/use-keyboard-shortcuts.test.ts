@@ -1,7 +1,25 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+
+vi.mock("@/tauri/commands", () => ({
+  activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  cycleWorkspace: vi.fn().mockResolvedValue(undefined),
+  splitPane: vi.fn().mockResolvedValue(undefined),
+  closePane: vi.fn().mockResolvedValue(undefined),
+  createTab: vi.fn().mockResolvedValue(undefined),
+  closeTab: vi.fn().mockResolvedValue(undefined),
+  activateTab: vi.fn().mockResolvedValue(undefined),
+  createEmptyWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
+  runProjectDevCommand: vi.fn().mockResolvedValue(undefined),
+}));
+
 import { dispatch } from "./use-keyboard-shortcuts";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
+import { activateWorkspace } from "@/tauri/commands";
+import {
+  setJumpTargets,
+} from "@/components/layout/sidebar-inbox-jump";
 
 // A fake KeyboardEvent — dispatch only uses the second arg when it needs to
 // call preventDefault via the caller, not inside dispatch itself, so a stub
@@ -154,6 +172,27 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       const handled = dispatch("showShortcuts", FAKE_EVENT);
       expect(handled).toBe(true);
       expect(useUIStore.getState().showSettings).toBe(true);
+    });
+  });
+
+  describe("workspace jump shortcuts", () => {
+    beforeEach(() => {
+      vi.mocked(activateWorkspace).mockClear();
+      setJumpTargets([]);
+    });
+
+    it("activates the Nth visible sidebar-inbox card (runs before the appState guard)", () => {
+      setJumpTargets(["ws-a", "ws-b", "ws-c"]);
+      const handled = dispatch("workspaceJump2", FAKE_EVENT);
+      expect(handled).toBe(true);
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-b");
+    });
+
+    it("consumes the combo but activates nothing when the slot is empty", () => {
+      setJumpTargets(["ws-a"]);
+      const handled = dispatch("workspaceJump5", FAKE_EVENT);
+      expect(handled).toBe(true);
+      expect(activateWorkspace).not.toHaveBeenCalled();
     });
   });
 });

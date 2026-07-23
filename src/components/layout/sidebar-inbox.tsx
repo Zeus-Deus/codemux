@@ -30,7 +30,16 @@ import { useProjectAppearance } from "./use-project-appearance";
 import { SidebarInboxCard, type InboxRepo } from "./sidebar-inbox-card";
 import { activateWorkspace } from "@/tauri/commands";
 import { normalizePrState } from "@/components/github/pr-status-icon";
+import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
+import { parseKeyCombo } from "@/lib/keybind-utils";
+import {
+  setJumpTargets,
+  DEFAULT_JUMP_MODIFIER,
+} from "./sidebar-inbox-jump";
 import type { WorkspaceSnapshot } from "@/tauri/types";
+
+/** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
+const MAX_JUMP_HINTS = 9;
 
 /** How long the settle collapse runs before the card actually moves below
  *  the divider. Matches the card wrapper's `duration-200`. */
@@ -423,6 +432,57 @@ export function SidebarInbox() {
     ? pendingWorkspaces.filter((pw) => pw.projectPath === filter)
     : pendingWorkspaces;
 
+  // ── Jump-to-card shortcuts ──
+  // Publish the visible active-card ids (view order, filter-scoped) so the
+  // window-level keyboard handler can resolve "jump to workspace N" without
+  // coupling to React. Settled rows are never jump targets. Keyed on a joined
+  // string so the effect only re-runs when the visible set actually changes.
+  const activeCardIdsKey = activeCards.map((ws) => ws.workspace_id).join(" ");
+  useEffect(() => {
+    setJumpTargets(activeCardIdsKey ? activeCardIdsKey.split(" ") : []);
+  }, [activeCardIdsKey]);
+  useEffect(() => () => setJumpTargets([]), []);
+
+  // Which physical modifier reveals the jump badges. Respect the user's actual
+  // resolved binding for slot 1 (so a rebind to Ctrl/Alt tracks the right key);
+  // fall back to the default modifier. A rebind to a non-Alt/Ctrl chord (e.g.
+  // Shift-only) simply shows no held-modifier hints.
+  const { keybindMap } = useResolvedKeybinds();
+  const jumpModifierKey = useMemo(() => {
+    const keys =
+      keybindMap.get("workspaceJump1")?.activeKeys ??
+      `${DEFAULT_JUMP_MODIFIER}+1`;
+    const parsed = parseKeyCombo(keys);
+    if (parsed.ctrl) return "Control";
+    if (parsed.alt) return "Alt";
+    return null;
+  }, [keybindMap]);
+
+  // Show the badges only while the modifier is physically held. Clear on keyup,
+  // blur, and visibilitychange so the hints can never get stuck open.
+  const [jumpHintsVisible, setJumpHintsVisible] = useState(false);
+  useEffect(() => {
+    if (!jumpModifierKey) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === jumpModifierKey) setJumpHintsVisible(true);
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === jumpModifierKey) setJumpHintsVisible(false);
+    };
+    const clear = () => setJumpHintsVisible(false);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", clear);
+    document.addEventListener("visibilitychange", clear);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", clear);
+      document.removeEventListener("visibilitychange", clear);
+      setJumpHintsVisible(false);
+    };
+  }, [jumpModifierKey]);
+
   // Vertical wheel → horizontal scroll on the chip strip. The strip is the
   // only horizontal scroller in the sidebar and most mice have no tilt
   // wheel, so plain wheel motion should move it. Native non-passive
@@ -513,7 +573,7 @@ export function SidebarInbox() {
           </div>
         )}
 
-        {activeCards.map((ws) => {
+        {activeCards.map((ws, index) => {
           const repo = repoByWorkspace.get(ws.workspace_id);
           if (!repo) return null;
           return (
@@ -531,6 +591,9 @@ export function SidebarInbox() {
               now={now}
               leaving={leavingId === ws.workspace_id}
               justUnsettled={justUnsettledId === ws.workspace_id}
+              jumpHint={
+                jumpHintsVisible && index < MAX_JUMP_HINTS ? index + 1 : null
+              }
               onSettle={handleSettle}
             />
           );

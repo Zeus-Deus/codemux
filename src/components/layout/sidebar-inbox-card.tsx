@@ -67,6 +67,10 @@ interface Props {
   leaving: boolean;
   /** True briefly after an un-settle so the returning card eases back in. */
   justUnsettled: boolean;
+  /** 1-9 digit shown as an overlay badge while the jump modifier is held, or
+   *  null when no hint should show. Rendered as an overlay so it never shifts
+   *  the card layout. */
+  jumpHint?: number | null;
   onSettle: (workspaceId: string) => void;
 }
 
@@ -84,6 +88,7 @@ export function SidebarInboxCard({
   now,
   leaving,
   justUnsettled,
+  jumpHint,
   onSettle,
 }: Props) {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -276,7 +281,7 @@ export function SidebarInboxCard({
                 if (e.key === "Enter" || e.key === " ") handleActivate();
               }}
               className={cn(
-                "group/card mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
+                "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
                 "outline-none transition-colors duration-150",
                 isActive
                   ? "border-accent-ember/45 bg-foreground/[0.08]"
@@ -285,6 +290,24 @@ export function SidebarInboxCard({
                     : "border-border/60 bg-background/60 hover:bg-foreground/[0.04] focus-visible:border-border",
               )}
             >
+              {/* Jump-shortcut hint: the digit that activates this card while
+                  the jump modifier is held. Absolutely positioned so it
+                  overlays the top-right corner without shifting layout. */}
+              {jumpHint != null && (
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    // Hangs off the card's corner so it never covers the
+                    // state label at the row's right edge.
+                    "absolute -right-1 -top-1 z-10 flex h-4 min-w-4 items-center justify-center",
+                    "rounded border border-border bg-muted px-1",
+                    "font-mono text-[9px] text-muted-foreground",
+                  )}
+                >
+                  {jumpHint}
+                </span>
+              )}
+
               {/* Eyebrow: repo identity + agent state / Settle swap */}
               <div className="flex min-h-5 items-center gap-1.5">
                 <ProjectAvatar

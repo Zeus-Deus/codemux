@@ -66,6 +66,27 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   working/blocked is **auto-un-settled** (persistently, with the rise-in
   ease). Finished ("review") and idle cards settle normally and stay settled —
   sweeping completed work aside is the point of the gesture.
+- **Auto-settle** — the Settled section fills itself. A fully idle card
+  (status null — never working/blocked/review) auto-settles when its PR is
+  **merged or closed**, or after **N days without agent activity**
+  (Settings → Appearance → Sidebar → "Auto-settle idle work":
+  Off / 1d / 3d / 7d / 14d, `sidebar.auto_settle_days`, default 3d).
+  **Un-settling sets a keep-active pin** that suppresses auto-settle until
+  the agent runs again (explicit settle or new activity clears it). Activity
+  is stamped client-side into the persisted blob (60s write-throttle;
+  first-seen baseline so a fresh install never mass-settles). The persisted
+  UI-state value is now `{settled, keepActive, activity}` with transparent
+  migration from the older bare-array shape. Anti-oscillation invariants:
+  auto-settle fires only at idle, auto-un-settle only at working/blocked,
+  the pin gates the middle.
+- **Settled-tail pagination**: 10 settled rows render initially; a quiet mono
+  "Show N more (X hidden)" button appends 25 per click. Paging resets when
+  the repo filter changes.
+- **Keyboard jumps**: `Alt+1`–`Alt+9` (rebindable `workspaceJump1..9`
+  registry actions) activate the Nth visible active card — filter-scoped,
+  settled rows excluded. Holding Alt overlays index badges on the first nine
+  cards (`sidebar-inbox-jump.ts` holds the visual-order targets for the
+  central keyboard handler). `Ctrl+1..9` remain terminal-tab switching.
 - **Provider marks**: each card's meta line shows the official logo of every
   agent-chat provider active in that workspace (Claude / Codex / OpenCode) via
   `ProviderLogo` + `getWorkspaceProviders` (pane-status). Terminal-only agent
