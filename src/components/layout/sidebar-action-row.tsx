@@ -94,19 +94,19 @@ export function SidebarActionRow() {
   // repo-chip row; Automations / Workspaces moved into the footer app menu.
   return (
     <ShadcnSidebarHeader className="gap-0 p-0">
-      {/* Same insets + gap as the repo-chip row below, and every control in
-          both rows is h-6 / rounded-[7px], so the two read as equal rows. */}
+      {/* Same insets + gap as the project-filter row below, and every control
+          in both rows is h-8 / rounded-[7px], so the two read as equal rows. */}
       <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-3">
         <button
           type="button"
           aria-label="Search"
           onClick={() => setShowCommandPalette(true)}
-          className="flex h-6 flex-1 cursor-text items-center gap-1.5 rounded-[7px] border border-border/60 bg-foreground/[0.03] px-2 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
+          className="flex h-8 flex-1 cursor-text items-center gap-2 rounded-[7px] border border-border/60 bg-foreground/[0.03] px-2.5 text-muted-foreground/70 transition-colors duration-150 hover:border-border hover:text-muted-foreground"
         >
-          <SearchIcon className="h-3 w-3 shrink-0" />
-          <span className="flex-1 text-left text-[11.5px]">Search</span>
+          <SearchIcon className="h-3.5 w-3.5 shrink-0" />
+          <span className="flex-1 text-left text-xs">Search</span>
           {paletteKeys && (
-            <kbd className="rounded border border-border/60 px-1 py-0 font-mono text-[9px]">
+            <kbd className="rounded border border-border/60 px-1 py-px font-mono text-[9.5px]">
               {paletteKeys}
             </kbd>
           )}
@@ -117,9 +117,9 @@ export function SidebarActionRow() {
               type="button"
               aria-label="New agent"
               onClick={handleNewAgent}
-              className="flex size-6 shrink-0 items-center justify-center rounded-[7px] border border-border/60 bg-foreground/[0.03] text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
+              className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-border/60 bg-foreground/[0.03] text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
             >
-              <SquarePen className="size-[13px]" />
+              <SquarePen className="size-[15px]" />
             </button>
           </TooltipTrigger>
           <TooltipContent side="bottom" sideOffset={4} className="text-xs">

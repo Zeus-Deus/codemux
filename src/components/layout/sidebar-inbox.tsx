@@ -104,7 +104,7 @@ function ProjectFilterItem({
       onClick={onSelect}
       aria-label={name}
       className={cn(
-        "h-[29px] gap-1.5 rounded-[7px] px-2 text-[11.5px] font-semibold",
+        "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
         active && "bg-foreground/[0.08] text-foreground",
       )}
     >
@@ -552,13 +552,13 @@ export function SidebarInbox() {
               aria-label="Filter by project"
               data-project-filter
               className={cn(
-                "flex h-6 min-w-0 flex-1 items-center gap-1.5 rounded-[7px] px-2",
-                "border border-transparent bg-transparent text-[11.5px] font-semibold text-foreground/80",
+                "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[7px] px-2.5",
+                "border border-transparent bg-transparent text-xs font-semibold text-foreground/80",
                 "transition-colors duration-150 hover:border-border/60 hover:bg-foreground/[0.04]",
               )}
             >
               {filter === null ? (
-                <Folder className="size-3 shrink-0 text-muted-foreground" />
+                <Folder className="size-3.5 shrink-0 text-muted-foreground" />
               ) : (
                 <ProjectMiniAvatar name={filterName ?? ""} path={filter} />
               )}
@@ -567,7 +567,7 @@ export function SidebarInbox() {
               </span>
               <ChevronDown
                 className={cn(
-                  "size-[11px] shrink-0 text-muted-foreground transition-transform duration-150",
+                  "size-3 shrink-0 text-muted-foreground transition-transform duration-150",
                   filterMenuOpen && "rotate-180",
                 )}
               />
@@ -578,11 +578,11 @@ export function SidebarInbox() {
               onClick={() => setFilter(null)}
               aria-label="All projects"
               className={cn(
-                "h-[29px] gap-1.5 rounded-[7px] px-2 text-[11.5px] font-semibold",
+                "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
                 filter === null && "bg-foreground/[0.08] text-foreground",
               )}
             >
-              <Folder className="size-3 shrink-0 text-muted-foreground" />
+              <Folder className="size-3.5 shrink-0 text-muted-foreground" />
               <span className="min-w-0 flex-1 truncate">All projects</span>
               <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
                 {projectCounts.total}
@@ -605,7 +605,7 @@ export function SidebarInbox() {
             <button
               type="button"
               aria-label="Add repository"
-              className="flex size-6 shrink-0 items-center justify-center rounded-[7px] border border-dashed border-border text-[13px] leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
+              className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-dashed border-border text-sm leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
             >
               +
             </button>
