@@ -9,9 +9,13 @@
 ## What This Feature Is
 
 The left sidebar is the primary navigation surface. Expanded, it is a **flat
-workspace inbox**: a search affordance + new-agent button, a horizontal repo
-filter-chip row, one multi-line card per active workspace, and a "Settled"
+workspace inbox**: a search affordance + new-agent button, a project-filter
+dropdown row, one multi-line card per active workspace, and a "Settled"
 section of swept-aside one-line rows. Collapsed, it is a narrow icon rail.
+The sidebar surface is **darker than the main pane** (a `--sidebar` override
+in the custom-token layer of `globals.css`), so cards sit flat/transparent
+at rest and selection reads as lightness — no accent-colored selection
+anywhere; the only colored border is the needs-you red.
 
 ## Current Model
 
@@ -30,15 +34,20 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
 
 - **Header** (`sidebar-action-row.tsx` expanded variant): a search box-shaped
   button that opens the command palette (shows the resolved `⌘K` keybind) and
-  an ember-accented new-agent button (same click/shift-click semantics as
-  before). Add repository moved into the chip row; Automations and Workspaces
+  a neutral-ghost new-agent button (same click/shift-click semantics as
+  before). Add repository moved into the filter row; Automations and Workspaces
   moved into the footer app menu.
-- **Repo filter chips** (`sidebar-inbox.tsx`): `All` · one chip per project
-  (mini avatar + dedup'd project name from `useProjectGroupedWorkspaces`) ·
-  a dashed `+` add-repo chip (Open project / New project dropdown). The active
-  chip is ember-tinted. Chips filter **both** the active cards and the settled
-  rows; a filtered-empty list shows "Nothing active in `<repo>`". The filter is
-  session-only. The chip row is sticky above the scrolling list.
+- **Project filter dropdown** (`sidebar-inbox.tsx`): one 24px sticky row —
+  a flex-1 trigger showing the current filter (Folder icon + "All projects",
+  or the repo's mini avatar + name) with a rotating chevron, plus the dashed
+  `+` add-repo button pinned right (Open project / New project dropdown).
+  The panel lists **All projects** + one row per project (avatar, dedup'd
+  name, right-aligned **active-workspace count** — unsettled only; All shows
+  the total); the current filter's row is highlighted; picking sets the
+  filter and closes. The filter applies to **both** the active cards and the
+  settled rows and resets settled-tail paging; a filtered-empty list shows
+  "Nothing active in `<repo>`". Session-only. (Replaced the earlier
+  horizontal filter-chip strip and its wheel-scroll handling.)
 - **Workspace cards** (`sidebar-inbox-card.tsx`): each active workspace is a
   card — repo avatar + name eyebrow; work title (linked-issue title while an
   agent is live, worktree name when idle) + issue chip; a red blocker line
@@ -48,7 +57,9 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   Working (configurable `WorkingIndicator`, amber text) / Needs you (pulsing
   red dot) / Done · review (green ✓) / elapsed time for idle — and swaps to a
   **"✓ Settle"** button on hover or focus (CSS-only swap). The selected card
-  gets an ember-tinted border + slightly lighter background; needs-you cards a
+  gets a neutral border + clearly lighter fill (selection is lightness, not
+  accent color — the sidebar surface is darker than the main pane, so cards
+  sit flat/transparent at rest and lift on hover); needs-you cards a
   red-tinted border. Click activates; the right-click context menu is the same
   `WorkspaceContextMenuItems` (rename, editors, move-to-host, archive, delete)
   shared with the old row, including the delete/push-confirm dialogs.
@@ -124,13 +135,13 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 
 - **Header** (`sidebar-action-row.tsx` collapsed variant): the accented
   new-agent square + a search icon (opens the command palette), then a slim
-  centered divider. Add repository lives only in the expanded chip row.
+  centered divider. Add repository lives only in the expanded filter row.
 - **Workspace strip** (`sidebar-rail-workspaces.tsx`): one 28px button per
   **active (unsettled) workspace** — repo avatar with that workspace's own
   status dot (red pulse = needs you, amber = working, green = done-review,
   none = idle), right-side tooltip = workspace title. Clicking selects the
-  workspace **without expanding**; the selected button gets the ember border
-  + tint. The strip scrolls (scrollbar hidden); settled workspaces never
+  workspace **without expanding**; the selected button gets the neutral
+  border + lighter fill. The strip scrolls (scrollbar hidden); settled workspaces never
   appear; the repo filter does not apply here.
 - **Footer**: Automations, Workspaces, Ports (badge), Settings — same order
   as the expanded footer row.
@@ -141,7 +152,8 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - Two-state toggle (expanded inbox ↔ icon rail) via title-bar button and `Ctrl+B`.
 - Flat inbox cards with live agent state, blocker lines, git/PR/issue/remote/
   notification detail, and work-based titling while an agent is live.
-- Repo chips filtering active + settled lists; add-repo chip; sticky chip row.
+- Project dropdown filtering active + settled lists (with active counts);
+  pinned add-repo button; sticky filter row.
 - Settle/un-settle with ~200ms motion, persisted across restarts, prune-safe.
 - Search affordance opening the command palette; accented new-agent button.
 - Show git stats toggle (Settings → Appearance → Sidebar).
@@ -173,7 +185,7 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 
 - `src/components/layout/app-sidebar.tsx` — `collapsible="icon"`, rail overflow override
 - `src/components/layout/sidebar-workspace-list.tsx` — expanded → inbox, collapsed → rail
-- `src/components/layout/sidebar-inbox.tsx` — chips, card list, settled section, settle motion
+- `src/components/layout/sidebar-inbox.tsx` — filter dropdown, card list, settled section, settle motion
 - `src/components/layout/sidebar-inbox-card.tsx` — the workspace card + context menu wiring
 - `src/stores/sidebar-inbox-store.ts` — persisted settled list + session repo filter
 - `src/components/layout/sidebar-action-row.tsx` — expanded search/new-agent header + collapsed rail header

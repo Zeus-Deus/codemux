@@ -1,5 +1,14 @@
 import { startTransition, useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, FolderOpen, FolderPlus, GitMerge, Loader2, Undo2 } from "lucide-react";
+import {
+  AlertCircle,
+  ChevronDown,
+  Folder,
+  FolderOpen,
+  FolderPlus,
+  GitMerge,
+  Loader2,
+  Undo2,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -54,46 +63,57 @@ const ROW_IN_MS = 400;
 const SETTLED_INITIAL_COUNT = 10;
 const SETTLED_PAGE_COUNT = 25;
 
-interface RepoChipProps {
-  label: string;
-  projectPath: string | null;
-  active: boolean;
-  onClick: () => void;
+/** A project's mini square avatar, resolving its customised appearance. Kept
+ *  as a per-item component so the appearance hook always runs unconditionally
+ *  (each avatar owns its own hook rather than looping hooks in the parent). */
+function ProjectMiniAvatar({ name, path }: { name: string; path: string }) {
+  const appearance = useProjectAppearance(path);
+  return (
+    <ProjectAvatar
+      name={name}
+      color={appearance.customColor}
+      imageUrl={appearance.imageUrl}
+      cacheBust={appearance.imageVersion}
+      size="sm"
+      shape="square"
+      className="font-bold"
+    />
+  );
 }
 
-function RepoChip({ label, projectPath, active, onClick }: RepoChipProps) {
-  // Hooks must run unconditionally; the "All" chip just passes a blank path
-  // and renders no avatar.
-  const appearance = useProjectAppearance(projectPath ?? "");
+interface ProjectFilterItemProps {
+  name: string;
+  path: string;
+  /** Number of active (unsettled) workspaces in this project. */
+  count: number;
+  active: boolean;
+  onSelect: () => void;
+}
+
+/** One project row in the filter dropdown: mini avatar, name, and its active
+ *  workspace count. */
+function ProjectFilterItem({
+  name,
+  path,
+  count,
+  active,
+  onSelect,
+}: ProjectFilterItemProps) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
-      aria-label={
-        projectPath !== null ? `Filter by ${label}` : "Show all repositories"
-      }
+    <DropdownMenuItem
+      onClick={onSelect}
+      aria-label={name}
       className={cn(
-        "flex h-6 shrink-0 items-center gap-1.5 rounded-[7px] border px-2 text-[11px] font-semibold",
-        "transition-colors duration-150",
-        active
-          ? "border-accent-ember/40 bg-accent-ember/10 text-foreground"
-          : "border-border/60 bg-transparent text-muted-foreground hover:border-border hover:text-foreground",
+        "h-[29px] gap-1.5 rounded-[7px] px-2 text-[11.5px] font-semibold",
+        active && "bg-foreground/[0.08] text-foreground",
       )}
     >
-      {projectPath !== null && (
-        <ProjectAvatar
-          name={label}
-          color={appearance.customColor}
-          imageUrl={appearance.imageUrl}
-          cacheBust={appearance.imageVersion}
-          size="sm"
-          shape="square"
-          className="font-bold"
-        />
-      )}
-      {label}
-    </button>
+      <ProjectMiniAvatar name={name} path={path} />
+      <span className="min-w-0 flex-1 truncate">{name}</span>
+      <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+        {count}
+      </span>
+    </DropdownMenuItem>
   );
 }
 
@@ -197,7 +217,7 @@ function SettledRow({
 }
 
 /** The flat workspace inbox that replaces the nested project tree in the
- *  expanded sidebar: a repo filter-chip row, one multi-line card per active
+ *  expanded sidebar: a project filter dropdown, one multi-line card per active
  *  workspace, and a "Settled" section of one-line rows the user has swept
  *  aside. Settling is visual only — nothing is archived or deleted. */
 export function SidebarInbox() {
@@ -495,26 +515,26 @@ export function SidebarInbox() {
     };
   }, [jumpModifierKey]);
 
-  // Vertical wheel → horizontal scroll on the chip strip. The strip is the
-  // only horizontal scroller in the sidebar and most mice have no tilt
-  // wheel, so plain wheel motion should move it. Native non-passive
-  // listener (React's onWheel can't preventDefault) so the same gesture
-  // doesn't also scroll the card list underneath.
-  const chipStripRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    const el = chipStripRef.current;
-    if (!el) return;
-    const onWheel = (e: WheelEvent) => {
-      if (el.scrollWidth <= el.clientWidth) return; // nothing to scroll
-      // A genuine horizontal wheel (tilt / trackpad swipe) already works —
-      // only translate when the motion is predominantly vertical.
-      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
-      el.scrollLeft += e.deltaY;
-      e.preventDefault();
-    };
-    el.addEventListener("wheel", onWheel, { passive: false });
-    return () => el.removeEventListener("wheel", onWheel);
-  }, []);
+  // Whether the project filter dropdown is open — drives the trigger chevron
+  // rotation.
+  const [filterMenuOpen, setFilterMenuOpen] = useState(false);
+
+  // Active (unsettled) workspace count per project, plus the grand total for
+  // the "All projects" row. Derived from the same grouping + settled data the
+  // lists use, so the badges always match what the filter would show.
+  const projectCounts = useMemo(() => {
+    const map = new Map<string, number>();
+    let total = 0;
+    for (const group of projectGroups) {
+      let count = 0;
+      for (const ws of group.workspaces) {
+        if (!settledIds.has(ws.workspace_id)) count += 1;
+      }
+      map.set(group.projectPath, count);
+      total += count;
+    }
+    return { map, total };
+  }, [projectGroups, settledIds]);
 
   const filterName = filter
     ? projectGroups.find((g) => g.projectPath === filter)?.projectName ?? null
@@ -522,30 +542,64 @@ export function SidebarInbox() {
 
   return (
     <div className="flex flex-col">
-      {/* Repo filter chips — sticky so the filter stays reachable while the
-          card list scrolls beneath it. */}
+      {/* Project filter — sticky so the filter stays reachable while the card
+          list scrolls beneath it. */}
       <div className="sticky top-0 z-10 flex items-center gap-1.5 bg-sidebar px-2.5 pb-2.5 pt-0.5 min-w-0">
-        <div
-          ref={chipStripRef}
-          data-chip-strip
-          className="flex-1 min-w-0 flex items-center gap-1.5 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
-        >
-          <RepoChip
-            label="All"
-            projectPath={null}
-            active={filter === null}
-            onClick={() => setFilter(null)}
-          />
-          {projectGroups.map((group) => (
-            <RepoChip
-              key={group.projectPath}
-              label={group.projectName}
-              projectPath={group.projectPath}
-              active={filter === group.projectPath}
-              onClick={() => setFilter(group.projectPath)}
-            />
-          ))}
-        </div>
+        <DropdownMenu open={filterMenuOpen} onOpenChange={setFilterMenuOpen}>
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="Filter by project"
+              data-project-filter
+              className={cn(
+                "flex h-6 min-w-0 flex-1 items-center gap-1.5 rounded-[7px] px-2",
+                "border border-transparent bg-transparent text-[11.5px] font-semibold text-foreground/80",
+                "transition-colors duration-150 hover:border-border/60 hover:bg-foreground/[0.04]",
+              )}
+            >
+              {filter === null ? (
+                <Folder className="size-3 shrink-0 text-muted-foreground" />
+              ) : (
+                <ProjectMiniAvatar name={filterName ?? ""} path={filter} />
+              )}
+              <span className="min-w-0 flex-1 truncate text-left">
+                {filter === null ? "All projects" : filterName}
+              </span>
+              <ChevronDown
+                className={cn(
+                  "size-[11px] shrink-0 text-muted-foreground transition-transform duration-150",
+                  filterMenuOpen && "rotate-180",
+                )}
+              />
+            </button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent side="bottom" align="start" className="w-[248px]">
+            <DropdownMenuItem
+              onClick={() => setFilter(null)}
+              aria-label="All projects"
+              className={cn(
+                "h-[29px] gap-1.5 rounded-[7px] px-2 text-[11.5px] font-semibold",
+                filter === null && "bg-foreground/[0.08] text-foreground",
+              )}
+            >
+              <Folder className="size-3 shrink-0 text-muted-foreground" />
+              <span className="min-w-0 flex-1 truncate">All projects</span>
+              <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                {projectCounts.total}
+              </span>
+            </DropdownMenuItem>
+            {projectGroups.map((group) => (
+              <ProjectFilterItem
+                key={group.projectPath}
+                name={group.projectName}
+                path={group.projectPath}
+                count={projectCounts.map.get(group.projectPath) ?? 0}
+                active={filter === group.projectPath}
+                onSelect={() => setFilter(group.projectPath)}
+              />
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button

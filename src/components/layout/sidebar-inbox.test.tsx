@@ -8,6 +8,7 @@ import {
   cleanup,
   within,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type {
   AppStateSnapshot,
@@ -169,6 +170,20 @@ async function renderInbox() {
   return utils;
 }
 
+/** Open the project filter dropdown. Radix menus react to pointer events, so
+ *  use userEvent rather than fireEvent. */
+async function openFilterMenu() {
+  await userEvent.click(
+    screen.getByRole("button", { name: "Filter by project" }),
+  );
+}
+
+/** Open the filter dropdown and pick a project (or "All projects") by name. */
+async function pickFilter(name: string) {
+  await openFilterMenu();
+  await userEvent.click(await screen.findByRole("menuitem", { name }));
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   __resetSidebarInboxStoreForTests();
@@ -207,12 +222,14 @@ describe("SidebarInbox — cards", () => {
 
     expect(screen.getByText("Fix scroll pinning")).toBeInTheDocument();
     expect(screen.getByText("Client connection overhaul")).toBeInTheDocument();
-    // Repo eyebrows (once per card) + repo filter chips (once per repo).
-    expect(screen.getAllByText("myapp").length).toBe(2);
-    expect(screen.getAllByText("vexis").length).toBe(2);
+    // One repo eyebrow per card; the project names live in the (closed) filter
+    // dropdown, not inline, so each appears exactly once.
+    expect(screen.getAllByText("myapp").length).toBe(1);
+    expect(screen.getAllByText("vexis").length).toBe(1);
+    // The filter defaults to All projects.
     expect(
-      screen.getByRole("button", { name: "Show all repositories" }),
-    ).toBeInTheDocument();
+      screen.getByRole("button", { name: "Filter by project" }),
+    ).toHaveTextContent("All projects");
   });
 
   it("shows agent state on the right: Working / Needs you / Done · review", async () => {
@@ -323,8 +340,53 @@ describe("SidebarInbox — cards", () => {
   });
 });
 
-describe("SidebarInbox — repo filter chips", () => {
-  it("filters both active cards and settled rows by repo", async () => {
+describe("SidebarInbox — project filter", () => {
+  it("defaults to All projects and shows the picked project on the trigger", async () => {
+    workspaces = [
+      makeWorkspace({ title: "In myapp" }),
+      makeWorkspace({
+        title: "In vexis",
+        cwd: "/home/u/projects/vexis",
+        project_root: "/home/u/projects/vexis",
+      }),
+    ];
+    await renderInbox();
+
+    const trigger = screen.getByRole("button", { name: "Filter by project" });
+    expect(trigger).toHaveTextContent("All projects");
+
+    await pickFilter("vexis");
+    expect(trigger).toHaveTextContent("vexis");
+  });
+
+  it("lists each project's active workspace count (and a total on All)", async () => {
+    // myapp: 2 active + 1 settled; vexis: 1 active → 2 / 1, All = 3.
+    persistedSettled = JSON.stringify([{ id: "ws-3", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({ title: "myapp one" }),
+      makeWorkspace({ title: "myapp two" }),
+      makeWorkspace({ title: "myapp settled" }),
+      makeWorkspace({
+        title: "vexis one",
+        cwd: "/home/u/projects/vexis",
+        project_root: "/home/u/projects/vexis",
+      }),
+    ];
+    await renderInbox();
+
+    await openFilterMenu();
+    expect(
+      await screen.findByRole("menuitem", { name: "All projects" }),
+    ).toHaveTextContent("3");
+    expect(screen.getByRole("menuitem", { name: "myapp" })).toHaveTextContent(
+      "2",
+    );
+    expect(screen.getByRole("menuitem", { name: "vexis" })).toHaveTextContent(
+      "1",
+    );
+  });
+
+  it("filters both active cards and settled rows by project", async () => {
     persistedSettled = JSON.stringify([{ id: "ws-3", at: Date.now() }]);
     workspaces = [
       makeWorkspace({ title: "In myapp" }),
@@ -343,53 +405,11 @@ describe("SidebarInbox — repo filter chips", () => {
     expect(screen.getByText("Settled myapp thing")).toBeInTheDocument();
 
     // Filter to vexis → myapp card + myapp settled row disappear.
-    fireEvent.click(screen.getByRole("button", { name: "Filter by vexis" }));
+    await pickFilter("vexis");
     expect(screen.queryByText("In myapp")).not.toBeInTheDocument();
     expect(screen.getByText("In vexis")).toBeInTheDocument();
     expect(screen.queryByText("Settled myapp thing")).not.toBeInTheDocument();
     expect(screen.queryByText("Settled")).not.toBeInTheDocument();
-  });
-
-  it("translates vertical wheel motion into horizontal chip-strip scroll", async () => {
-    workspaces = [
-      makeWorkspace(),
-      makeWorkspace({
-        cwd: "/home/u/projects/vexis",
-        project_root: "/home/u/projects/vexis",
-      }),
-    ];
-    const { container } = await renderInbox();
-    const strip = container.querySelector("[data-chip-strip]") as HTMLElement;
-    expect(strip).not.toBeNull();
-
-    // jsdom has no layout — simulate an overflowing strip.
-    Object.defineProperty(strip, "scrollWidth", { value: 400, configurable: true });
-    Object.defineProperty(strip, "clientWidth", { value: 200, configurable: true });
-    strip.scrollLeft = 0;
-
-    // Vertical wheel → horizontal scroll, and the event is consumed so the
-    // card list underneath doesn't scroll too.
-    const down = new WheelEvent("wheel", {
-      deltaY: 40,
-      deltaX: 0,
-      bubbles: true,
-      cancelable: true,
-    });
-    strip.dispatchEvent(down);
-    expect(strip.scrollLeft).toBe(40);
-    expect(down.defaultPrevented).toBe(true);
-
-    // Predominantly-horizontal wheel (tilt / trackpad) is left to native
-    // scrolling untouched.
-    const sideways = new WheelEvent("wheel", {
-      deltaY: 2,
-      deltaX: 30,
-      bubbles: true,
-      cancelable: true,
-    });
-    strip.dispatchEvent(sideways);
-    expect(strip.scrollLeft).toBe(40);
-    expect(sideways.defaultPrevented).toBe(false);
   });
 
   it("shows the filtered empty state when a repo has nothing active", async () => {
@@ -404,7 +424,7 @@ describe("SidebarInbox — repo filter chips", () => {
     persistedSettled = JSON.stringify([{ id: "ws-2", at: Date.now() }]);
     await renderInbox();
 
-    fireEvent.click(screen.getByRole("button", { name: "Filter by vexis" }));
+    await pickFilter("vexis");
     expect(screen.getByText(/Nothing active/)).toBeInTheDocument();
     // The settled vexis row still shows under the divider.
     expect(screen.getByText("In vexis")).toBeInTheDocument();
@@ -760,7 +780,7 @@ describe("SidebarInbox — jump-to-card shortcuts", () => {
     expect(getJumpTarget(4)).toBeNull();
 
     // Filtering to a repo shrinks the target list to that repo's cards.
-    fireEvent.click(screen.getByRole("button", { name: "Filter by vexis" }));
+    await pickFilter("vexis");
     expect(getJumpTarget(1)).toBe("ws-2");
     expect(getJumpTarget(2)).toBeNull();
   });
@@ -841,14 +861,12 @@ describe("SidebarInbox — settled-tail pagination", () => {
     expect(container.querySelectorAll("[data-settled-row]").length).toBe(12);
 
     // Filtering to a repo with ≤ head settled rows removes the button entirely.
-    fireEvent.click(screen.getByRole("button", { name: "Filter by vexis" }));
+    await pickFilter("vexis");
     expect(container.querySelectorAll("[data-settled-row]").length).toBe(4);
     expect(container.querySelector("[data-settled-more]")).toBeNull();
 
     // Switching filters resets paging: back on All only the head renders again.
-    fireEvent.click(
-      screen.getByRole("button", { name: "Show all repositories" }),
-    );
+    await pickFilter("All projects");
     expect(container.querySelectorAll("[data-settled-row]").length).toBe(10);
     expect(container.querySelector("[data-settled-more]")).not.toBeNull();
   });
