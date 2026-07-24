@@ -114,6 +114,11 @@ pub struct StartSessionInput {
     /// id before the SDK call.
     #[serde(default)]
     pub context_window: Option<String>,
+    /// Whether to request the provider's premium fast inference tier.
+    /// Capability gating happens in the UI; providers that do not expose
+    /// fast mode ignore this field.
+    #[serde(default)]
+    pub fast_mode: bool,
     /// Optional list of extra directories the agent should be allowed to
     /// access beyond `cwd`.
     pub additional_directories: Vec<PathBuf>,

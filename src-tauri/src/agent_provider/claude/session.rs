@@ -257,6 +257,7 @@ impl ClaudeSession {
             cwd: input.cwd.clone(),
             model: resolved_model,
             effort: resolved_effort,
+            fast_mode: Some(input.fast_mode),
             permission_mode: input.permission_mode.clone(),
             allow_dangerously_skip_permissions: match input.permission_mode.as_deref() {
                 Some("bypassPermissions") => Some(true),

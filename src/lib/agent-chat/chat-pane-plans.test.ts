@@ -254,6 +254,7 @@ describe("planModelChange", () => {
     expect(plan).toEqual({
       resetEffort: undefined,
       resetContextWindow: undefined,
+      resetFastMode: undefined,
     });
   });
 
@@ -303,6 +304,16 @@ describe("planModelChange", () => {
       currentContextWindow: null,
     });
     expect(plan.resetEffort).toBeUndefined();
+  });
+
+  it("turns fast mode off when the new model does not support it", () => {
+    const plan = planModelChange({
+      newModel: HAIKU,
+      currentEffort: null,
+      currentContextWindow: null,
+      currentFastMode: true,
+    });
+    expect(plan.resetFastMode).toBe(false);
   });
 });
 

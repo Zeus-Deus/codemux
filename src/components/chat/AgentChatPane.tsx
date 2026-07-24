@@ -9,6 +9,7 @@ import {
   planPermissionModeChange,
   planSubmit,
 } from "@/lib/agent-chat/chat-pane-plans";
+import { defaultPermissionModeForProvider } from "@/lib/agent-chat/capability-defaults";
 import {
   buildAttachmentBlock,
   buildFileResolvedContent,
@@ -92,6 +93,7 @@ import {
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
 import { createDeferredWorktree } from "@/lib/agent-chat/materialize";
 import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
+import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
   AgentChatProviderKind,
@@ -295,6 +297,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     }
   }, [pane.thread_id, threadId]);
 
+  // Session startup persists provider + thread as one backend binding. Keep
+  // the pane-local router in sync with that authoritative snapshot so a
+  // successful provider handoff (or an external state refresh immediately
+  // after it) cannot leave callbacks closed over the previous adapter.
+  useEffect(() => {
+    if (pane.provider) {
+      setProvider(pane.provider);
+    }
+  }, [pane.provider]);
+
   // Stage C race fix (belt to the above suspender): if `pane.thread_id`
   // is still null at mount but a promoted draft claims this workspace,
   // use the draft's pre-minted thread id directly. Materialize already
@@ -356,6 +368,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         permissionMode: match.permissionMode,
         effort: match.effort,
         contextWindow: match.contextWindow,
+        fastMode: match.fastMode ?? false,
       };
     }),
   );
@@ -411,6 +424,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const setStoreEffort = useAgentChatStore((s) => s.setEffort);
   const setStoreContextWindow = useAgentChatStore((s) => s.setContextWindow);
+  const setStoreFastMode = useAgentChatStore((s) => s.setFastMode);
   const setStoreResumeCursor = useAgentChatStore((s) => s.setResumeCursor);
   const setStoreMode = useAgentChatStore((s) => s.setMode);
   const setStoreModePriorPermissionMode = useAgentChatStore(
@@ -627,10 +641,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
   const activeTurnId = slice?.activeTurnId ?? null;
   const model = slice?.model ?? null;
+  const providerDefaultPermissionMode =
+    defaultPermissionModeForProvider(provider);
   const permissionMode =
-    slice?.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+    slice?.permissionMode ??
+    providerDefaultPermissionMode ??
+    DEFAULT_THREAD_PERMISSION_MODE;
   const effort = slice?.effort ?? null;
   const contextWindow = slice?.contextWindow ?? null;
+  const fastMode = slice?.fastMode ?? false;
   const mode = slice?.mode ?? "default";
   const hasDebugActivity = slice?.hasDebugActivity ?? false;
   const debugActivityResolved = slice?.debugActivityResolved ?? false;
@@ -655,10 +674,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // null is a legitimate reset value (provider with no modes).
       setStorePermissionMode(
         threadId,
-        plan.resetPermissionMode ?? DEFAULT_THREAD_PERMISSION_MODE,
+        plan.resetPermissionMode ??
+          providerDefaultPermissionMode ??
+          DEFAULT_THREAD_PERMISSION_MODE,
       );
     }
-  }, [threadId, capabilities, permissionMode, setStorePermissionMode]);
+  }, [
+    threadId,
+    capabilities,
+    permissionMode,
+    providerDefaultPermissionMode,
+    setStorePermissionMode,
+  ]);
 
   // Seed the slice's picker config from the persisted session row
   // whenever the slice exists (threadId set) but has no model yet.
@@ -741,11 +768,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             (!current || current.contextWindow === null)
           )
             setStoreContextWindow(seedThreadId, record.context_window);
+          if (!current || current.fastMode === false)
+            setStoreFastMode(seedThreadId, record.fast_mode ?? false);
         }
         if (
           record.permission_mode != null &&
           (!current ||
-            current.permissionMode === DEFAULT_THREAD_PERMISSION_MODE)
+            // `emptySlice` predates multi-provider permission modes and
+            // still uses Claude's default as its unseeded sentinel. Accept
+            // either that legacy sentinel or this provider's native default
+            // so an app-restart fetch can restore a persisted Codex choice
+            // before capabilities hydrate.
+            current.permissionMode === DEFAULT_THREAD_PERMISSION_MODE ||
+            current.permissionMode ===
+              (providerDefaultPermissionMode ??
+                DEFAULT_THREAD_PERMISSION_MODE))
         )
           setStorePermissionMode(seedThreadId, record.permission_mode);
         // Resume cursor is independent of the model pick, so seed it even
@@ -774,6 +811,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreModel,
     setStoreEffort,
     setStoreContextWindow,
+    setStoreFastMode,
     setStorePermissionMode,
     setStoreResumeCursor,
   ]);
@@ -962,14 +1000,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       recoveryAttempted.current = true;
       startAttempted.current = true;
       setStarting(true);
+      // OpenCode deliberately launches with a null permission mode;
+      // feeding it Claude's bypass token would persist invalid
+      // cross-provider configuration.
       const recoveryMode =
-        recoveryDraft.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+        provider === "opencode"
+          ? null
+          : (recoveryDraft.permissionMode ?? providerDefaultPermissionMode);
       const startInput = {
         thread_id: recoveryDraft.threadId,
         cwd,
         model: recoveryDraft.model,
         resume_cursor: null,
         permission_mode: recoveryMode,
+        effort: recoveryDraft.effort,
+        context_window: recoveryDraft.contextWindow,
+        fast_mode: recoveryDraft.fastMode ?? false,
         additional_directories: [],
         env: null,
       };
@@ -982,7 +1028,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           } else {
             setStoreModel(id, defaultModelForProvider(provider));
           }
-          setStorePermissionMode(id, recoveryMode);
+          if (recoveryMode !== null) {
+            setStorePermissionMode(id, recoveryMode);
+          }
+          setStoreEffort(id, recoveryDraft.effort);
+          setStoreContextWindow(id, recoveryDraft.contextWindow);
+          setStoreFastMode(id, recoveryDraft.fastMode ?? false);
           setSessionLaunchMode(id, recoveryMode);
           // Mark the draft as promoted so subsequent mounts take the
           // existing promotedDraftThreadId branch above instead of
@@ -1010,24 +1061,30 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     startAttempted.current = true;
     setStarting(true);
     const localThreadId = `chat-${pane.pane_id}-${Date.now()}`;
-    // For a brand-new thread with no slice yet, use the default mode.
-    const startMode = DEFAULT_THREAD_PERMISSION_MODE;
+    // For a brand-new thread with no slice yet, use this provider's
+    // native default. OpenCode deliberately launches with a null
+    // permission mode; feeding it Claude's bypass token would persist
+    // invalid cross-provider configuration.
+    const defaultModel = defaultModelForProvider(provider);
+    const startMode = providerDefaultPermissionMode;
     const startInput = {
       thread_id: localThreadId,
       cwd,
       model: null,
       resume_cursor: null,
       permission_mode: startMode,
+      fast_mode: false,
       additional_directories: [],
       env: null,
     };
-    const defaultModel = defaultModelForProvider(provider);
     agentChatStartSession(pane.pane_id, provider, startInput)
       .then((id) => {
         setThreadId(id);
         ensureThread(id);
         setStoreModel(id, defaultModel);
-        setStorePermissionMode(id, startMode);
+        if (startMode !== null) {
+          setStorePermissionMode(id, startMode);
+        }
         setSessionLaunchMode(id, startMode);
       })
       .catch((err) => {
@@ -1046,7 +1103,11 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ensureThread,
     setStoreModel,
     setStorePermissionMode,
+    setStoreEffort,
+    setStoreContextWindow,
+    setStoreFastMode,
     setSessionLaunchMode,
+    providerDefaultPermissionMode,
     markDraftPromoted,
     clearDraft,
   ]);
@@ -1795,16 +1856,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             cwd,
             model: currentSlice.model,
             resume_cursor: currentSlice.resumeCursor,
-            permission_mode: currentSlice.permissionMode,
+            permission_mode:
+              provider === "opencode" ? null : currentSlice.permissionMode,
             effort: currentSlice.effort,
             context_window: currentSlice.contextWindow,
+            fast_mode: currentSlice.fastMode,
             additional_directories: [],
             env: null,
           },
         );
         migrateThreadId(threadId, newId);
         setThreadId(newId);
-        setSessionLaunchMode(newId, currentSlice.permissionMode);
+        setSessionLaunchMode(
+          newId,
+          provider === "opencode" ? null : currentSlice.permissionMode,
+        );
       } catch (err) {
         toast.error(`Failed to restart session after stop: ${err}`);
       } finally {
@@ -1895,6 +1961,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       permissionMode?: string;
       effort?: string | null;
       contextWindow?: string | null;
+      model?: string | null;
+      fastMode?: boolean;
     }) => {
       if (!threadId) return;
       const currentSlice = useAgentChatStore.getState().threads[threadId];
@@ -1903,13 +1971,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       setRestarting(true);
       const resumeCursor = currentSlice.resumeCursor;
       const newLocalThreadId = `chat-${pane.pane_id}-${Date.now()}`;
-      const nextMode = updates.permissionMode ?? currentSlice.permissionMode;
+      const nextMode =
+        provider === "opencode"
+          ? null
+          : (updates.permissionMode ?? currentSlice.permissionMode);
       const nextEffort =
         updates.effort !== undefined ? updates.effort : currentSlice.effort;
       const nextContext =
         updates.contextWindow !== undefined
           ? updates.contextWindow
           : currentSlice.contextWindow;
+      const nextModel =
+        updates.model !== undefined ? updates.model : currentSlice.model;
+      const nextFastMode =
+        updates.fastMode !== undefined
+          ? updates.fastMode
+          : currentSlice.fastMode;
       void (async () => {
         try {
           await agentChatStopSession(provider, threadId);
@@ -1920,11 +1997,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           const newId = await agentChatStartSession(pane.pane_id, provider, {
             thread_id: newLocalThreadId,
             cwd: cwd ?? "",
-            model: currentSlice.model,
+            model: nextModel,
             resume_cursor: resumeCursor,
             permission_mode: nextMode,
             effort: nextEffort,
             context_window: nextContext,
+            fast_mode: nextFastMode,
             additional_directories: [],
             env: null,
           });
@@ -2165,6 +2243,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (currentSlice.mode === "plan" || currentSlice.mode === "ask") {
       const restore =
         currentSlice.modePriorPermissionMode ??
+        providerDefaultPermissionMode ??
         DEFAULT_THREAD_PERMISSION_MODE;
       // Snap the slice for immediate UI feedback (picker reappears,
       // pill drops). The restart sets sessionLaunchMode itself.
@@ -2198,6 +2277,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreMode,
     setStoreModePriorPermissionMode,
     restartSessionWith,
+    providerDefaultPermissionMode,
     confirmDebugExit,
     triggerDebugCleanup,
   ]);
@@ -2235,6 +2315,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         newModel: nextModel,
         currentEffort: effort,
         currentContextWindow: contextWindow,
+        currentFastMode: fastMode,
       });
       // Fold the model change and any compat-driven effort/context
       // resets into a single persisted patch so a restart doesn't
@@ -2248,10 +2329,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         setStoreContextWindow(threadId, plan.resetContextWindow);
         configPatch.context_window = plan.resetContextWindow;
       }
+      if (plan.resetFastMode !== undefined) {
+        setStoreFastMode(threadId, plan.resetFastMode);
+        configPatch.fast_mode = plan.resetFastMode;
+      }
       persistSessionConfig(configPatch);
-      agentChatSetModel(provider, threadId, next).catch((err) => {
-        toast.error(`Failed to set model: ${err}`);
-      });
+      if (plan.resetFastMode !== undefined) {
+        restartSessionWith({ model: next, fastMode: plan.resetFastMode });
+      } else {
+        agentChatSetModel(provider, threadId, next).catch((err) => {
+          toast.error(`Failed to set model: ${err}`);
+        });
+      }
     },
     [
       threadId,
@@ -2259,10 +2348,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       capabilities,
       effort,
       contextWindow,
+      fastMode,
       setStoreModel,
       setStoreEffort,
       setStoreContextWindow,
+      setStoreFastMode,
       persistSessionConfig,
+      restartSessionWith,
     ],
   );
 
@@ -2363,18 +2455,153 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ],
   );
 
-  const handleProviderChange = useCallback(
-    (next: AgentChatProviderKind) => {
-      // Step 2: provider swap is not safe once a session exists (the
-      // thread is bound to a single adapter). Hide the picker by
-      // default and fall back to a toast if it ever fires.
-      if (threadId) {
-        toast.warning("Provider cannot be changed after a session starts.");
+  const handleFastModeChange = useCallback(
+    (next: boolean) => {
+      if (!threadId || (next && !activeModel?.supports_fast_mode)) return;
+      const current = useAgentChatStore.getState().threads[threadId];
+      if (!current || current.fastMode === next) return;
+      setStoreFastMode(threadId, next);
+      persistSessionConfig({ fast_mode: next });
+      // Both providers bind speed to the session/thread launch. A silent
+      // restart keeps transcript + resume state while making the choice take
+      // effect before the next turn.
+      restartSessionWith({ fastMode: next });
+    },
+    [
+      threadId,
+      activeModel,
+      setStoreFastMode,
+      persistSessionConfig,
+      restartSessionWith,
+    ],
+  );
+
+  // Capability payloads can change between app launches. If a persisted
+  // Fast choice is no longer valid for the resolved model, heal it back to
+  // Standard instead of keeping a hidden premium-tier override alive.
+  useEffect(() => {
+    if (fastMode && activeModel && !activeModel.supports_fast_mode) {
+      handleFastModeChange(false);
+    }
+  }, [fastMode, activeModel, handleFastModeChange]);
+
+  const handleProviderModelChange = useCallback(
+    (nextProvider: AgentChatProviderKind, nextModel: string) => {
+      // A model pick inside the current provider is the cheap live setter.
+      if (nextProvider === provider) {
+        handleModelChange(nextModel);
         return;
       }
-      setProvider(next);
+      if (!threadId || !cwd || restarting) return;
+
+      const currentSlice = useAgentChatStore.getState().threads[threadId];
+      if (!currentSlice) return;
+      const defaults = capabilityDefaults(nextProvider, nextModel);
+      const nextLaunchMode = defaults.permissionMode;
+      const nextDisplayMode =
+        nextLaunchMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+      const oldProvider = provider;
+      const oldThreadId = threadId;
+      const oldLaunchMode =
+        oldProvider === "opencode"
+          ? null
+          : (currentSlice.sessionLaunchMode ?? currentSlice.permissionMode);
+      setRestarting(true);
+
+      void (async () => {
+        try {
+          // Stop first so provider events for the shared thread id cannot
+          // race: an old Claude `closed` arriving after Codex `ready` would
+          // otherwise make the new session look dead. SessionNotFound is an
+          // idempotent success in the backend, covering restored panes whose
+          // provider process has not been rebuilt yet.
+          await agentChatStopSession(oldProvider, oldThreadId);
+
+          const startedThreadId = await agentChatStartSession(
+            pane.pane_id,
+            nextProvider,
+            {
+              thread_id: oldThreadId,
+              cwd,
+              model: nextModel,
+              // Provider-native cursors are not portable. The visible
+              // transcript stays on the same CodeMux thread, while the new
+              // adapter starts with clean provider-side context.
+              resume_cursor: null,
+              permission_mode: nextLaunchMode,
+              effort: defaults.effort,
+              context_window: defaults.contextWindow,
+              // Speed tiers are provider/model-scoped: never carry a Fast
+              // selection across a provider switch.
+              fast_mode: false,
+              additional_directories: [],
+              env: null,
+            },
+          );
+
+          if (startedThreadId !== oldThreadId) {
+            migrateThreadId(oldThreadId, startedThreadId);
+            setThreadId(startedThreadId);
+          }
+          const targetThreadId = startedThreadId;
+          setProvider(nextProvider);
+          setStoreModel(targetThreadId, nextModel);
+          setStoreEffort(targetThreadId, defaults.effort);
+          setStoreContextWindow(targetThreadId, defaults.contextWindow);
+          setStorePermissionMode(targetThreadId, nextDisplayMode);
+          setSessionLaunchMode(targetThreadId, nextLaunchMode);
+          setStoreFastMode(targetThreadId, false);
+          setStoreResumeCursor(targetThreadId, null);
+          // Provider-specific transient modes cannot safely cross adapters.
+          setStoreMode(targetThreadId, "default");
+          setStoreModePriorPermissionMode(targetThreadId, null);
+        } catch (switchError) {
+          // The old DB row and pane binding are unchanged until the new
+          // provider starts successfully. Best-effort rebuild the stopped
+          // adapter so a failed switch leaves the existing chat usable.
+          try {
+            await agentChatStartSession(pane.pane_id, oldProvider, {
+              thread_id: oldThreadId,
+              cwd,
+              model: currentSlice.model,
+              resume_cursor: currentSlice.resumeCursor,
+              permission_mode: oldLaunchMode,
+              effort: currentSlice.effort,
+              context_window: currentSlice.contextWindow,
+              fast_mode: currentSlice.fastMode ?? false,
+              additional_directories: [],
+              env: null,
+            });
+          } catch (recoveryError) {
+            console.error(
+              "[agent-chat] failed to recover previous provider after switch error",
+              recoveryError,
+            );
+          }
+          toast.error(`Failed to switch provider: ${switchError}`);
+        } finally {
+          setRestarting(false);
+        }
+      })();
     },
-    [threadId],
+    [
+      provider,
+      threadId,
+      cwd,
+      restarting,
+      pane.pane_id,
+      handleModelChange,
+      migrateThreadId,
+      setStoreModel,
+      setStoreEffort,
+      setStoreContextWindow,
+      setStorePermissionMode,
+      setSessionLaunchMode,
+      setStoreFastMode,
+      setStoreResumeCursor,
+      setStoreMode,
+      setStoreModePriorPermissionMode,
+    ],
   );
 
   const sessionReady = threadId != null && !starting && !restarting;
@@ -2600,7 +2827,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
             permissionMode:
               mode === "plan" || mode === "ask"
                 ? "plan"
-                : permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE,
+                : permissionMode ??
+                  providerDefaultPermissionMode ??
+                  DEFAULT_THREAD_PERMISSION_MODE,
             effort,
             contextWindow,
             mode,
@@ -2780,6 +3009,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       permissionMode={permissionMode}
       effort={effort}
       contextWindow={contextWindow}
+      fastMode={fastMode}
       activeModel={activeModel}
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
@@ -2823,11 +3053,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }}
       onSubmit={composerOnSubmit}
       onStop={handleStop}
-      onProviderChange={handleProviderChange}
+      onProviderModelChange={handleProviderModelChange}
       onModelChange={handleModelChange}
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
+      onFastModeChange={handleFastModeChange}
       onModeActivate={handleModeActivate}
       onModeRemove={handleModeRemove}
     />

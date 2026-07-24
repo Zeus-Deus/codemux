@@ -61,6 +61,10 @@ pub struct AgentChatSessionRecord {
     /// Per-thread permission mode (`default` / `acceptEdits` / …).
     #[serde(default)]
     pub permission_mode: Option<String>,
+    /// Per-thread premium speed-tier choice. A missing database value maps to
+    /// `false` for rows created before this column existed.
+    #[serde(default)]
+    pub fast_mode: bool,
 }
 
 /// Per-thread chat configuration written alongside an
@@ -91,6 +95,10 @@ pub struct AgentChatSessionConfig {
     pub context_window: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_tristate")]
     pub permission_mode: Option<Option<String>>,
+    /// Unlike the nullable string fields, fast mode has a concrete standard
+    /// state, so a plain optional boolean can express leave/set-false/set-true.
+    #[serde(default)]
+    pub fast_mode: Option<bool>,
 }
 
 /// Deserialize a present field (whether `null` or a value) into the
@@ -272,7 +280,8 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             model TEXT,
             effort TEXT,
             context_window TEXT,
-            permission_mode TEXT
+            permission_mode TEXT,
+            fast_mode INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_agent_chat_sessions_workspace
@@ -558,6 +567,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
         "ALTER TABLE agent_chat_sessions ADD COLUMN effort TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN context_window TEXT",
         "ALTER TABLE agent_chat_sessions ADD COLUMN permission_mode TEXT",
+        "ALTER TABLE agent_chat_sessions ADD COLUMN fast_mode INTEGER",
         // Web-remote account mode (Stage A): how a session was admitted and,
         // for account-minted sessions, the verified Codemux account user id.
         // `source` defaults to 'pair' so every pre-existing (pairing-token) row
@@ -582,6 +592,16 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
              WHERE permission_mode IS NULL AND provider = 'claude'",
         "UPDATE agent_chat_sessions SET permission_mode = 'danger-full-access' \
              WHERE permission_mode IS NULL AND provider = 'codex'",
+        // v0.14.2's frontend null-mode fix used Claude's
+        // `bypassPermissions` constant for every provider. A Codex launch
+        // carrying that unsupported value omitted approvalPolicy/sandbox and
+        // fell back to prompting while the picker displayed Full access.
+        // Canonicalize already-persisted affected rows on upgrade. The reverse
+        // mapping protects the symmetric stale-provider case as well.
+        "UPDATE agent_chat_sessions SET permission_mode = 'danger-full-access' \
+             WHERE permission_mode = 'bypassPermissions' AND provider = 'codex'",
+        "UPDATE agent_chat_sessions SET permission_mode = 'bypassPermissions' \
+             WHERE permission_mode = 'danger-full-access' AND provider = 'claude'",
     ] {
         if let Err(e) = conn.execute(stmt, []) {
             let msg = e.to_string();
@@ -2421,6 +2441,9 @@ impl DatabaseStore {
     /// `agent_chat_start_session`: on a brand-new chat we INSERT, on a
     /// silent restart (same thread_id after migrate) the ON CONFLICT
     /// bumps `last_active_at` and preserves `sdk_session_id`/`title`.
+    /// A provider handoff keeps the human-facing title but atomically
+    /// clears `sdk_session_id`: provider-native resume cursors cannot be
+    /// passed between adapters.
     pub fn upsert_agent_chat_session(
         &self,
         thread_id: &str,
@@ -2436,6 +2459,10 @@ impl DatabaseStore {
              ON CONFLICT(thread_id) DO UPDATE SET
                  workspace_id = ?2,
                  cwd = ?3,
+                 sdk_session_id = CASE
+                     WHEN agent_chat_sessions.provider != ?4 THEN NULL
+                     ELSE agent_chat_sessions.sdk_session_id
+                 END,
                  provider = ?4,
                  last_active_at = datetime('now')",
             params![thread_id, workspace_id, cwd, provider],
@@ -2487,6 +2514,10 @@ impl DatabaseStore {
                  permission_mode = COALESCE(
                      (SELECT permission_mode FROM agent_chat_sessions WHERE thread_id = ?1),
                      permission_mode
+                 ),
+                 fast_mode = COALESCE(
+                     (SELECT fast_mode FROM agent_chat_sessions WHERE thread_id = ?1),
+                     fast_mode
                  )
              WHERE thread_id = ?2",
             params![old_thread_id, new_thread_id],
@@ -2582,11 +2613,15 @@ impl DatabaseStore {
                 None => Value::Null,
             })
         }
+        fn bind_bool(field: Option<bool>) -> Option<Value> {
+            field.map(|value| Value::Integer(i64::from(value)))
+        }
         let columns = [
             ("model", bind(&config.model)),
             ("effort", bind(&config.effort)),
             ("context_window", bind(&config.context_window)),
             ("permission_mode", bind(&config.permission_mode)),
+            ("fast_mode", bind_bool(config.fast_mode)),
         ];
         let mut set_clauses: Vec<String> = Vec::new();
         let mut binds: Vec<Value> = Vec::new();
@@ -2684,6 +2719,7 @@ impl DatabaseStore {
                 effort: row.get(9)?,
                 context_window: row.get(10)?,
                 permission_mode: row.get(11)?,
+                fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
             })
         };
         // Only surface rows that actually have an sdk_session_id —
@@ -2695,7 +2731,7 @@ impl DatabaseStore {
         // silent restarts that never got interacted with.
         if let Some(cwd) = cwd {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND cwd = ?2 AND sdk_session_id IS NOT NULL
                  ORDER BY last_active_at DESC LIMIT ?3",
@@ -2708,7 +2744,7 @@ impl DatabaseStore {
                 .unwrap_or_default()
         } else {
             let mut stmt = match conn.prepare(
-                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode
+                "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
                  FROM agent_chat_sessions
                  WHERE workspace_id = ?1 AND sdk_session_id IS NOT NULL
                  ORDER BY last_active_at DESC LIMIT ?2",
@@ -2751,11 +2787,11 @@ impl DatabaseStore {
         // Merge identity + config fields onto the survivor: keep the
         // earliest created_at, and carry forward any non-null title /
         // per-thread config (model / effort / context_window /
-        // permission_mode) across the whole set. The survivor is the
+        // permission_mode / fast_mode) across the whole set. The survivor is the
         // most-recently-active row — for a resume that's the freshly
         // minted thread whose config columns are still NULL — so
         // without this backfill the user's persisted per-thread model /
-        // effort / context / permission-mode selection would be lost
+        // effort / context / permission-mode / speed selection would be lost
         // when the original row is DELETEd below. Each config column
         // prefers the survivor's own non-null value, then the
         // most-recently-active non-null value across the group.
@@ -2795,6 +2831,13 @@ impl DatabaseStore {
                      (SELECT permission_mode FROM agent_chat_sessions
                       WHERE sdk_session_id = ?1 AND permission_mode IS NOT NULL
                       ORDER BY last_active_at DESC LIMIT 1)
+                 ),
+                 fast_mode = COALESCE(
+                     fast_mode,
+                     (SELECT fast_mode FROM agent_chat_sessions
+                      WHERE sdk_session_id = ?1 AND fast_mode IS NOT NULL
+                      ORDER BY last_active_at DESC LIMIT 1),
+                     0
                  )
              WHERE thread_id = ?2",
             params![sdk_session_id, survivor],
@@ -2842,7 +2885,7 @@ impl DatabaseStore {
     ) -> Option<AgentChatSessionRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode
+            "SELECT thread_id, sdk_session_id, workspace_id, cwd, provider, title, created_at, last_active_at, model, effort, context_window, permission_mode, fast_mode
              FROM agent_chat_sessions WHERE thread_id = ?1",
             params![thread_id],
             |row| {
@@ -2859,6 +2902,7 @@ impl DatabaseStore {
                     effort: row.get(9)?,
                     context_window: row.get(10)?,
                     permission_mode: row.get(11)?,
+                    fast_mode: row.get::<_, Option<i64>>(12)?.unwrap_or(0) != 0,
                 })
             },
         )
@@ -3299,6 +3343,29 @@ mod tests {
             },
         )
         .unwrap();
+        // v0.14.2 could also persist the other provider's Full-access
+        // protocol value after a provider switch. These rows must be
+        // canonicalized without touching unrelated explicit modes.
+        db.upsert_agent_chat_session("t-codex-cross", "ws", Some("/tmp"), "codex")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t-codex-cross",
+            &AgentChatSessionConfig {
+                permission_mode: AgentChatSessionConfig::set("bypassPermissions"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
+        db.upsert_agent_chat_session("t-claude-cross", "ws", Some("/tmp"), "claude")
+            .unwrap();
+        db.update_agent_chat_session_config(
+            "t-claude-cross",
+            &AgentChatSessionConfig {
+                permission_mode: AgentChatSessionConfig::set("danger-full-access"),
+                ..AgentChatSessionConfig::default()
+            },
+        )
+        .unwrap();
 
         // Re-run the schema migrations (idempotent) to fire the backfill.
         {
@@ -3314,6 +3381,14 @@ mod tests {
         assert_eq!(mode("t-claude").as_deref(), Some("bypassPermissions"));
         assert_eq!(mode("t-codex").as_deref(), Some("danger-full-access"));
         assert_eq!(mode("t-opencode"), None, "opencode rows stay NULL");
+        assert_eq!(
+            mode("t-codex-cross").as_deref(),
+            Some("danger-full-access")
+        );
+        assert_eq!(
+            mode("t-claude-cross").as_deref(),
+            Some("bypassPermissions")
+        );
         assert_eq!(
             mode("t-claude-set").as_deref(),
             Some("plan"),
@@ -4117,7 +4192,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_chat_sessions_upsert_on_conflict_preserves_identity_bumps_activity() {
+    fn agent_chat_sessions_upsert_on_conflict_clears_cross_provider_cursor() {
         let db = init_test_database();
         db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
             .unwrap();
@@ -4125,15 +4200,27 @@ mod tests {
         db.set_agent_chat_sdk_session_id("t", "sdk-uuid-xyz")
             .unwrap();
 
-        // Re-upsert with a different provider — the row should
-        // continue to exist with its identity fields intact.
+        // A same-provider restart keeps the provider-native cursor.
+        db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "claude")
+            .unwrap();
+        assert_eq!(
+            db.get_agent_chat_session("t")
+                .unwrap()
+                .sdk_session_id
+                .as_deref(),
+            Some("sdk-uuid-xyz")
+        );
+
+        // Re-upsert with a different provider — the row and its
+        // human-facing identity survive, but the Claude-native resume
+        // cursor must not be handed to Codex.
         db.upsert_agent_chat_session("t", "ws-1", Some("/a"), "codex")
             .unwrap();
 
         let rec = db.get_agent_chat_session("t").unwrap();
         assert_eq!(rec.provider, "codex");
         assert_eq!(rec.title.as_deref(), Some("Original title"));
-        assert_eq!(rec.sdk_session_id.as_deref(), Some("sdk-uuid-xyz"));
+        assert_eq!(rec.sdk_session_id, None);
     }
 
     #[test]
@@ -4307,9 +4394,9 @@ mod tests {
             conn.execute(
                 "INSERT INTO agent_chat_sessions
                      (thread_id, sdk_session_id, workspace_id, provider, created_at, last_active_at,
-                      model, effort, context_window, permission_mode)
+                      model, effort, context_window, permission_mode, fast_mode)
                  VALUES ('original', 'sdk-xyz', 'ws', 'claude', '2025-01-01', '2025-01-01',
-                         'claude-opus-4-8', 'high', '1m', 'acceptEdits')",
+                         'claude-opus-4-8', 'high', '1m', 'acceptEdits', 1)",
                 [],
             )
             .unwrap();
@@ -4334,6 +4421,7 @@ mod tests {
         assert_eq!(survivor.effort.as_deref(), Some("high"));
         assert_eq!(survivor.context_window.as_deref(), Some("1m"));
         assert_eq!(survivor.permission_mode.as_deref(), Some("acceptEdits"));
+        assert!(survivor.fast_mode);
     }
 
     #[test]
@@ -4454,11 +4542,12 @@ mod tests {
         db.upsert_agent_chat_session("t", "ws", Some("/p"), "claude")
             .unwrap();
         let rec = db.get_agent_chat_session("t").expect("row exists");
-        // A brand-new row has no config yet — all four columns are NULL.
+        // A brand-new row has no nullable config yet and uses Standard speed.
         assert_eq!(rec.model, None);
         assert_eq!(rec.effort, None);
         assert_eq!(rec.context_window, None);
         assert_eq!(rec.permission_mode, None);
+        assert!(!rec.fast_mode);
     }
 
     #[test]
@@ -4476,6 +4565,7 @@ mod tests {
                 effort: AgentChatSessionConfig::set("high"),
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("acceptEdits"),
+                fast_mode: Some(true),
             },
         )
         .unwrap();
@@ -4488,6 +4578,7 @@ mod tests {
         assert_eq!(rec.effort.as_deref(), Some("high"));
         assert_eq!(rec.context_window.as_deref(), Some("1m"));
         assert_eq!(rec.permission_mode.as_deref(), Some("acceptEdits"));
+        assert!(rec.fast_mode);
     }
 
     #[test]
@@ -4502,6 +4593,7 @@ mod tests {
                 effort: AgentChatSessionConfig::set("high"),
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("default"),
+                fast_mode: Some(true),
             },
         )
         .unwrap();
@@ -4530,6 +4622,7 @@ mod tests {
             Some("default"),
             "permission_mode preserved"
         );
+        assert!(rec.fast_mode, "fast_mode preserved");
     }
 
     #[test]
@@ -4563,6 +4656,7 @@ mod tests {
                 effort: Some(None),
                 context_window: Some(None),
                 permission_mode: None,
+                fast_mode: None,
             },
         )
         .unwrap();
@@ -4629,6 +4723,7 @@ mod tests {
                 effort: AgentChatSessionConfig::set("xhigh"),
                 context_window: AgentChatSessionConfig::set("1m"),
                 permission_mode: AgentChatSessionConfig::set("bypassPermissions"),
+                fast_mode: Some(true),
             },
         )
         .unwrap();
@@ -4642,6 +4737,7 @@ mod tests {
         assert_eq!(rec.effort.as_deref(), Some("xhigh"));
         assert_eq!(rec.context_window.as_deref(), Some("1m"));
         assert_eq!(rec.permission_mode.as_deref(), Some("bypassPermissions"));
+        assert!(rec.fast_mode);
     }
 
     #[test]
@@ -4655,6 +4751,7 @@ mod tests {
             &AgentChatSessionConfig {
                 model: AgentChatSessionConfig::set("claude-opus-4-8"),
                 effort: AgentChatSessionConfig::set("high"),
+                fast_mode: Some(true),
                 ..AgentChatSessionConfig::default()
             },
         )
@@ -4663,6 +4760,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(rows[0].effort.as_deref(), Some("high"));
+        assert!(rows[0].fast_mode);
     }
 
     #[test]

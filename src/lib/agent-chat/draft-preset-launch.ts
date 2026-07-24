@@ -55,6 +55,7 @@ export async function launchDraftWithPreset(
       setSessionLaunchMode: chat.setSessionLaunchMode,
       setEffort: chat.setEffort,
       setContextWindow: chat.setContextWindow,
+      setFastMode: chat.setFastMode,
       setMode: chat.setMode,
     },
     skillBodies,

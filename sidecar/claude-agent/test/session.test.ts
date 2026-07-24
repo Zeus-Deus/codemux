@@ -125,6 +125,22 @@ test("session starts with minimal options and emits session-configured", () => {
   expect(fake.capturedOptions?.includePartialMessages).toBe(true);
 });
 
+test("fast mode is scoped to the current session and wins over raw settings", () => {
+  const { emit } = recordingEmitter();
+  new ClaudeSession(
+    minimalInput({
+      fastMode: true,
+      settings: { fastMode: false, theme: "dark" },
+    }),
+    emit,
+  );
+  expect(fake.capturedOptions?.settings).toEqual({
+    fastMode: true,
+    fastModePerSessionOptIn: true,
+    theme: "dark",
+  });
+});
+
 test("sendTurn enqueues a user message that the fake query receives", async () => {
   const { emit } = recordingEmitter();
   const session = new ClaudeSession(minimalInput(), emit);

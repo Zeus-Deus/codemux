@@ -56,7 +56,7 @@ function baseProps(): ComposerProps {
     onDraftChange: vi.fn(),
     onSubmit: vi.fn(),
     onStop: vi.fn(),
-    onProviderChange: vi.fn(),
+    onProviderModelChange: vi.fn(),
     onModelChange: vi.fn(),
     onPermissionModeChange: vi.fn(),
     onEffortChange: vi.fn(),

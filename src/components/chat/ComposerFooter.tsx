@@ -12,6 +12,7 @@ import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
 import { ReasoningPicker } from "./pickers/ReasoningPicker";
+import { SpeedPicker } from "./pickers/SpeedPicker";
 
 interface Props {
   provider: AgentChatProviderKind;
@@ -19,6 +20,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
+  fastMode?: boolean;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -36,11 +38,15 @@ interface Props {
    *  textarea); the value is still needed here to disable the
    *  permission picker when a mode commandeers permissions. */
   mode: ChatMode;
-  onProviderChange: (provider: AgentChatProviderKind) => void;
+  onProviderModelChange: (
+    provider: AgentChatProviderKind,
+    model: string,
+  ) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
+  onFastModeChange?: (fastMode: boolean) => void;
   onSubmit: () => void;
   onStop: () => void;
   controlsDisabled: boolean;
@@ -62,6 +68,7 @@ export function ComposerFooter({
   permissionMode,
   effort,
   contextWindow,
+  fastMode = false,
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -71,11 +78,12 @@ export function ComposerFooter({
   showProviderPicker,
   showStopButton = true,
   mode,
-  onProviderChange,
+  onProviderModelChange,
   onModelChange,
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
+  onFastModeChange = () => {},
   onSubmit,
   onStop,
   controlsDisabled,
@@ -123,21 +131,14 @@ export function ComposerFooter({
         {/* Step 12 Stage 4 — when the unified provider+model picker is
             enabled (chat panes with `ENABLE_PROVIDER_PICKER`), render
             the new `MultiProviderModelPicker` and skip the legacy
-            single-provider `ModelPicker`. The draft surface
-            (`DraftChatSurface`) still renders with `showProviderPicker
-            === false`, in which case we keep the legacy picker so a
-            user-without-an-active-session can pick a Claude model
-            without seeing a 3-provider rail they can't fully use yet. */}
+            single-provider `ModelPicker`. `ModelPicker` remains as the
+            fallback for callers that deliberately disable the unified
+            provider surface. */}
         {showProviderPicker ? (
           <MultiProviderModelPicker
             provider={provider}
             model={model}
-            onProviderModelChange={(nextProvider, nextModel) => {
-              if (nextProvider !== provider) {
-                onProviderChange(nextProvider);
-              }
-              onModelChange(nextModel);
-            }}
+            onProviderModelChange={onProviderModelChange}
             disabled={controlsDisabled}
             openSignal={modelPickerOpenSignal}
           />
@@ -158,6 +159,12 @@ export function ComposerFooter({
           ultrathinkInBodyText={ultrathinkInBodyText}
           onEffortChange={onEffortChange}
           onContextWindowChange={onContextWindowChange}
+          disabled={controlsDisabled}
+        />
+        <SpeedPicker
+          model={activeModel}
+          value={fastMode}
+          onChange={onFastModeChange}
           disabled={controlsDisabled}
         />
         {/* Permission picker stays visible when a mode pill is
@@ -222,4 +229,3 @@ export function ComposerFooter({
     </div>
   );
 }
-

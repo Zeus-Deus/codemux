@@ -80,6 +80,7 @@ function makeActions(): SpyActions {
     setSessionLaunchMode: vi.fn(),
     setEffort: vi.fn(),
     setContextWindow: vi.fn(),
+    setFastMode: vi.fn(),
     setMode: vi.fn(),
   };
 }
@@ -426,7 +427,7 @@ describe("materializeAndSend", () => {
       );
     });
 
-    it("falls back to DEFAULT_THREAD_PERMISSION_MODE when draft.permissionMode is null", async () => {
+    it("falls back to the Claude default when a Claude draft mode is null", async () => {
       const actions = makeActions();
       const draft = makeDraft({ permissionMode: null });
 
@@ -440,6 +441,28 @@ describe("materializeAndSend", () => {
         draft.threadId,
         "bypassPermissions",
       );
+    });
+
+    it("launches a provider-switched Codex draft with Codex Full access", async () => {
+      const actions = makeActions();
+      const draft = makeDraft({
+        provider: "codex",
+        model: "gpt-5.4",
+        permissionMode: null,
+      });
+
+      await materializeAndSend(draft, "hi", "/home/user", actions);
+
+      expect(actions.setPermissionMode).toHaveBeenCalledWith(
+        draft.threadId,
+        "danger-full-access",
+      );
+      expect(actions.setSessionLaunchMode).toHaveBeenCalledWith(
+        draft.threadId,
+        "danger-full-access",
+      );
+      const [, , input] = vi.mocked(agentChatStartSession).mock.calls[0];
+      expect(input.permission_mode).toBe("danger-full-access");
     });
 
     it("forwards effort and contextWindow only when the draft has them set", async () => {

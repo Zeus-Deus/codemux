@@ -118,6 +118,7 @@ interface Props {
   permissionMode: string | null;
   effort: string | null;
   contextWindow: string | null;
+  fastMode?: boolean;
   activeModel: ChatModelInfo | null;
   effortLabelMap: Record<string, string>;
   permissionModes: PermissionModeOption[] | null;
@@ -233,11 +234,15 @@ interface Props {
   onDraftChange: (draft: string) => void;
   onSubmit: () => void;
   onStop: () => void;
-  onProviderChange: (provider: AgentChatProviderKind) => void;
+  onProviderModelChange: (
+    provider: AgentChatProviderKind,
+    model: string,
+  ) => void;
   onModelChange: (model: string) => void;
   onPermissionModeChange: (mode: string) => void;
   onEffortChange: (effort: string) => void;
   onContextWindowChange: (value: string) => void;
+  onFastModeChange?: (fastMode: boolean) => void;
   onModeActivate: (mode: ActivePillMode) => void;
   onModeRemove: () => void;
 }
@@ -252,6 +257,7 @@ export function Composer({
   permissionMode,
   effort,
   contextWindow,
+  fastMode = false,
   activeModel,
   effortLabelMap,
   permissionModes,
@@ -283,11 +289,12 @@ export function Composer({
   onDraftChange,
   onSubmit,
   onStop,
-  onProviderChange,
+  onProviderModelChange,
   onModelChange,
   onPermissionModeChange,
   onEffortChange,
   onContextWindowChange,
+  onFastModeChange = () => {},
   onModeActivate,
   onModeRemove,
 }: Props) {
@@ -2385,6 +2392,7 @@ export function Composer({
             permissionMode={permissionMode}
             effort={effort}
             contextWindow={contextWindow}
+            fastMode={fastMode}
             activeModel={activeModel}
             effortLabelMap={effortLabelMap}
             permissionModes={permissionModes}
@@ -2394,11 +2402,12 @@ export function Composer({
             showProviderPicker={showProviderPicker}
             showStopButton={showStopButton}
             mode={mode}
-            onProviderChange={onProviderChange}
+            onProviderModelChange={onProviderModelChange}
             onModelChange={onModelChange}
             onPermissionModeChange={onPermissionModeChange}
             onEffortChange={onEffortChange}
             onContextWindowChange={onContextWindowChange}
+            onFastModeChange={onFastModeChange}
             onSubmit={onSubmit}
             onStop={onStop}
             controlsDisabled={!sessionReady}

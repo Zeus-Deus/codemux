@@ -54,6 +54,7 @@ import {
   selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
+import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
   checkGhStatus,
   checkGithubRepo,
@@ -74,7 +75,6 @@ import type {
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
-import { DEFAULT_THREAD_PERMISSION_MODE } from "@/stores/agent-chat-store";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
 
@@ -422,6 +422,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
           setSessionLaunchMode: chat.setSessionLaunchMode,
           setEffort: chat.setEffort,
           setContextWindow: chat.setContextWindow,
+          setFastMode: chat.setFastMode,
           setMode: chat.setMode,
         },
         skillBodies,
@@ -814,26 +815,43 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // just update the draft's recorded provider. A side effect: the
   // permission-mode default differs between providers, so we seed a
   // sensible default whenever the provider flips.
-  const handleProviderChange = useCallback(
-    (next: ChatDraft["provider"]) => {
-      if (next === draft.provider) return;
+  const handleProviderModelChange = useCallback(
+    (nextProvider: ChatDraft["provider"], nextModel: string) => {
+      if (nextProvider === draft.provider) {
+        updateDraftConfig(draft.draftId, { model: nextModel });
+        return;
+      }
+      const defaults = capabilityDefaults(nextProvider, nextModel);
       updateDraftConfig(draft.draftId, {
-        provider: next,
-        // Reset provider-specific config to null so pickers can
-        // re-seed from capabilities on next render.
-        model: null,
-        permissionMode:
-          next === "claude" ? DEFAULT_THREAD_PERMISSION_MODE : null,
-        effort: null,
-        contextWindow: null,
+        provider: nextProvider,
+        model: nextModel,
+        // Commit the next provider's native permission default (via
+        // capabilityDefaults → defaultPermissionModeForProvider). The
+        // picker can *display* a fallback for null/unknown values without
+        // mutating the draft, so leaving this null would make first-send
+        // launch state diverge from the visible "Full access" label.
+        permissionMode: defaults.permissionMode,
+        effort: defaults.effort,
+        contextWindow: defaults.contextWindow,
+        // Speed tiers are provider/model-scoped: never carry a Fast
+        // selection across a provider switch.
+        fastMode: false,
       });
     },
     [draft.draftId, draft.provider, updateDraftConfig],
   );
 
   const handleModelChange = useCallback(
-    (next: string) => updateDraftConfig(draft.draftId, { model: next }),
-    [draft.draftId, updateDraftConfig],
+    (next: string) => {
+      const nextModel = capabilities?.models.find((item) => item.id === next);
+      updateDraftConfig(draft.draftId, {
+        model: next,
+        ...(draft.fastMode && nextModel && !nextModel.supports_fast_mode
+          ? { fastMode: false }
+          : {}),
+      });
+    },
+    [draft.draftId, draft.fastMode, capabilities, updateDraftConfig],
   );
   const handlePermissionModeChange = useCallback(
     (next: string) =>
@@ -847,6 +865,11 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   const handleContextWindowChange = useCallback(
     (next: string) =>
       updateDraftConfig(draft.draftId, { contextWindow: next }),
+    [draft.draftId, updateDraftConfig],
+  );
+  const handleFastModeChange = useCallback(
+    (next: boolean) =>
+      updateDraftConfig(draft.draftId, { fastMode: next }),
     [draft.draftId, updateDraftConfig],
   );
 
@@ -930,6 +953,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       permissionMode={draft.permissionMode}
       effort={draft.effort}
       contextWindow={draft.contextWindow}
+      fastMode={draft.fastMode ?? false}
       activeModel={activeModel}
       effortLabelMap={effortLabelMap}
       permissionModes={permissionModes}
@@ -975,11 +999,12 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}
       onStop={handleStop}
-      onProviderChange={handleProviderChange}
+      onProviderModelChange={handleProviderModelChange}
       onModelChange={handleModelChange}
       onPermissionModeChange={handlePermissionModeChange}
       onEffortChange={handleEffortChange}
       onContextWindowChange={handleContextWindowChange}
+      onFastModeChange={handleFastModeChange}
       onModeActivate={handleModeActivate}
       onModeRemove={handleModeRemove}
     />

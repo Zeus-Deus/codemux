@@ -12,15 +12,13 @@ import {
   renameWorkspace,
   type WorkspaceCreateResult,
 } from "@/tauri/commands";
-import {
-  DEFAULT_THREAD_PERMISSION_MODE,
-  type ChatMode,
-} from "@/stores/agent-chat-store";
+import { type ChatMode } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import type { ChatDraft, DraftId } from "@/stores/chat-draft-store";
 import type { TerminalPreset } from "@/tauri/types";
 
 import { deriveTitleFromFirstMessage } from "./derive-title";
+import { defaultPermissionModeForProvider } from "./capability-defaults";
 import { applyAllPrefixes } from "./mode-prefix";
 import type { UserMessageImage } from "./types";
 import { waitForWorkspaceCwd } from "./wait-for-workspace-cwd";
@@ -81,11 +79,13 @@ export interface MaterializeActions {
   /** Seed the slice's `sessionLaunchMode` — the permission mode the
    *  session was actually started under. Used by the restart
    *  detection (`sessionLaunchMode !== permissionMode` → restart). */
-  setSessionLaunchMode: (threadId: string, mode: string) => void;
+  setSessionLaunchMode: (threadId: string, mode: string | null) => void;
   /** Seed the slice's reasoning/effort level. `null` clears to default. */
   setEffort: (threadId: string, effort: string | null) => void;
   /** Seed the slice's context-window selection. `null` clears. */
   setContextWindow: (threadId: string, contextWindow: string | null) => void;
+  /** Seed the slice's premium speed-tier choice. */
+  setFastMode: (threadId: string, fastMode: boolean) => void;
   /** Seed the slice's composer mode pill. Stage 3 onward. */
   setMode: (threadId: string, mode: ChatMode) => void;
 }
@@ -305,6 +305,7 @@ export async function materializeAndSend(
       permission_mode: effectivePermissionMode(draft),
       effort: draft.effort,
       context_window: draft.contextWindow,
+      fast_mode: draft.fastMode ?? false,
       additional_directories: [],
       env: null,
     });
@@ -490,6 +491,7 @@ export async function materializeWithPreset(
         permission_mode: effectivePermissionMode(draft),
         effort: draft.effort,
         context_window: draft.contextWindow,
+        fast_mode: draft.fastMode ?? false,
         additional_directories: [],
         env: null,
       });
@@ -586,12 +588,15 @@ function seedSliceFromDraft(
 ): void {
   const effectiveMode = effectivePermissionMode(draft);
   actions.setModel(draft.threadId, draft.model);
-  actions.setPermissionMode(draft.threadId, effectiveMode);
+  if (effectiveMode !== null) {
+    actions.setPermissionMode(draft.threadId, effectiveMode);
+  }
   actions.setSessionLaunchMode(draft.threadId, effectiveMode);
   if (draft.effort) actions.setEffort(draft.threadId, draft.effort);
   if (draft.contextWindow) {
     actions.setContextWindow(draft.threadId, draft.contextWindow);
   }
+  actions.setFastMode(draft.threadId, draft.fastMode ?? false);
   actions.setMode(draft.threadId, draft.mode);
 }
 
@@ -602,9 +607,11 @@ function seedSliceFromDraft(
  *  per-turn prompt wrapper that nudges the model away from
  *  ExitPlanMode). The picker is hidden behind the pill while either
  *  is active. Debug remains a state-only flip until Stage 6. */
-export function effectivePermissionMode(draft: ChatDraft): string {
+export function effectivePermissionMode(draft: ChatDraft): string | null {
   if (draft.mode === "plan" || draft.mode === "ask") return "plan";
-  return draft.permissionMode ?? DEFAULT_THREAD_PERMISSION_MODE;
+  return (
+    draft.permissionMode ?? defaultPermissionModeForProvider(draft.provider)
+  );
 }
 
 /** Create a fresh workspace rooted at the cached `$HOME`, then rename

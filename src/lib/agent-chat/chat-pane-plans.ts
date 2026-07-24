@@ -116,12 +116,14 @@ export function planEffortChange(
 export interface ModelChangePlan {
   resetEffort: string | null | undefined;
   resetContextWindow: string | null | undefined;
+  resetFastMode: false | undefined;
 }
 
 export interface PlanModelChangeInput {
   newModel: ChatModelInfo | null;
   currentEffort: string | null;
   currentContextWindow: string | null;
+  currentFastMode?: boolean;
 }
 
 export function planModelChange(
@@ -129,7 +131,11 @@ export function planModelChange(
 ): ModelChangePlan {
   const { newModel, currentEffort, currentContextWindow } = input;
   if (!newModel) {
-    return { resetEffort: undefined, resetContextWindow: undefined };
+    return {
+      resetEffort: undefined,
+      resetContextWindow: undefined,
+      resetFastMode: undefined,
+    };
   }
   const resolvedEffort = resolveEffort(newModel, currentEffort);
   const resolvedCtx = resolveContextWindow(newModel, currentContextWindow);
@@ -138,6 +144,10 @@ export function planModelChange(
       resolvedEffort !== currentEffort ? resolvedEffort : undefined,
     resetContextWindow:
       resolvedCtx !== currentContextWindow ? resolvedCtx : undefined,
+    resetFastMode:
+      input.currentFastMode && !newModel.supports_fast_mode
+        ? false
+        : undefined,
   };
 }
 

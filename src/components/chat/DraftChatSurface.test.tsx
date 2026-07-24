@@ -675,10 +675,7 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
 
-      // Reach into the draft surface's handleProviderChange via the
-      // Composer's onProviderChange prop. Dispatching it directly is
-      // the simplest path: we know the draft surface wires it to
-      // updateDraftConfig.
+      // Mirror the atomic provider+model patch dispatched by the composer.
       useChatDraftStore.getState().updateDraftConfig(draft.draftId, {
         provider: "codex",
         model: null,

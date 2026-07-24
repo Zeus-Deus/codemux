@@ -25,6 +25,7 @@ export interface ChatDraft {
   model: string | null;
   effort: string | null;
   contextWindow: string | null;
+  fastMode?: boolean;
   permissionMode: string | null;
   /** Composer mode pill carried through draft → slice on materialise.
    *  `default` renders no pill. Drafts can pre-select a mode before
@@ -136,6 +137,7 @@ export interface ChatDraftStore {
         | "model"
         | "effort"
         | "contextWindow"
+        | "fastMode"
         | "permissionMode"
         | "mode"
         | "checkoutMode"
@@ -236,6 +238,7 @@ function makeDraft(
     model: defaults.model,
     effort: defaults.effort,
     contextWindow: defaults.contextWindow,
+    fastMode: false,
     permissionMode: defaults.permissionMode,
     mode: "default",
     inputDraft: "",
