@@ -43,8 +43,8 @@ export function SidebarActionRow() {
   };
 
   // Collapsed icon rail header: just the two create/find affordances,
-  // centered and each labelled by a right-side tooltip. New agent is accented
-  // to match the expanded header's pencil; Search opens the command palette.
+  // centered and each labelled by a right-side tooltip. New agent is a neutral
+  // ghost matching the expanded header's pencil; Search opens the command palette.
   // Automations / Workspaces now live in the footer, and Add repository lives
   // in the expanded inbox's repo-chip row — none of them belong here anymore.
   if (state === "collapsed") {
@@ -57,7 +57,7 @@ export function SidebarActionRow() {
                 type="button"
                 aria-label="New agent"
                 onClick={handleNewAgent}
-                className="flex size-7 items-center justify-center rounded-lg border border-accent-ember/35 bg-accent-ember/[0.13] text-accent-ember transition-colors duration-150 hover:bg-accent-ember/20"
+                className="flex size-7 items-center justify-center rounded-lg border border-border/60 bg-foreground/[0.03] text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
               >
                 <SquarePen className="size-[13px]" />
               </button>
@@ -90,7 +90,7 @@ export function SidebarActionRow() {
   }
 
   // Expanded inbox header: a search affordance (opens the command palette)
-  // + the accented new-agent button. Add repository moved into the inbox's
+  // + the neutral-ghost new-agent button. Add repository moved into the inbox's
   // repo-chip row; Automations / Workspaces moved into the footer app menu.
   return (
     <ShadcnSidebarHeader className="gap-0 p-0">
@@ -117,7 +117,7 @@ export function SidebarActionRow() {
               type="button"
               aria-label="New agent"
               onClick={handleNewAgent}
-              className="flex size-6 shrink-0 items-center justify-center rounded-[7px] border border-accent-ember/35 bg-accent-ember/[0.13] text-accent-ember transition-colors duration-150 hover:bg-accent-ember/20"
+              className="flex size-6 shrink-0 items-center justify-center rounded-[7px] border border-border/60 bg-foreground/[0.03] text-muted-foreground transition-colors duration-150 hover:border-border hover:text-foreground"
             >
               <SquarePen className="size-[13px]" />
             </button>

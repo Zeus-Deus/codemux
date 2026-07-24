@@ -193,10 +193,10 @@ export function SidebarInboxCard({
                 "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
                 "outline-none transition-colors duration-150",
                 isActive
-                  ? "border-accent-ember/45 bg-foreground/[0.08]"
+                  ? "border-border bg-foreground/[0.09]"
                   : isNeeds
-                    ? "border-status-attention/30 bg-background/60 hover:bg-foreground/[0.04]"
-                    : "border-border/60 bg-background/60 hover:bg-foreground/[0.04] focus-visible:border-border",
+                    ? "border-status-attention/30 bg-transparent hover:bg-foreground/[0.05]"
+                    : "border-transparent bg-transparent hover:bg-foreground/[0.05] focus-visible:border-border",
               )}
             >
               {/* Jump-shortcut hint: the digit that activates this card while

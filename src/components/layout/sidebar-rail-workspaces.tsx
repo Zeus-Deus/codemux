@@ -72,7 +72,7 @@ function RailWorkspaceItem({
           className={cn(
             "relative flex size-7 items-center justify-center rounded-lg border transition-colors duration-150",
             isActive
-              ? "border-accent-ember/45 bg-accent-ember/10"
+              ? "border-border bg-foreground/[0.09]"
               : "border-transparent hover:bg-foreground/[0.04]",
           )}
         >

@@ -58,6 +58,10 @@ These are **not** theme colors and are left literal on purpose:
      preset ships a saturated-blue sidebar accent (also the terminal cursor),
      but Codemux has no blue brand color, so it is routed to ember. This
      override survives a preset re-apply.
+   - `--sidebar` is overridden per scheme (light/dark/warm) to sit **slightly
+     darker than `--background`** — the sidebar recedes so the workspace-inbox
+     cards can be flat/transparent at rest with lightness-only selection.
+     Like all custom-layer overrides, it survives a preset re-apply.
 3. **Radius scale** (`@theme inline`) — `--radius-sm..4xl` derive from the
    preset's `--radius`, so every rounded utility re-skins from one value.
 
