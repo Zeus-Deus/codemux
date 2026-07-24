@@ -174,35 +174,26 @@ describe("ThreadScopeRow", () => {
   });
 
   describe("home target", () => {
-    it("renders only the location control and the home scope hint — no checkout/branch controls", () => {
+    it("renders only the location control — no checkout/branch controls", () => {
       renderRow({ draftTarget: { kind: "home" }, projectPath: null });
       expect(screen.getByText("Home")).toBeInTheDocument();
       expect(screen.queryByText("Current checkout")).toBeNull();
       expect(screen.queryByText("New worktree")).toBeNull();
       expect(screen.queryByText(/^from$/)).toBeNull();
-      expect(
-        screen.getByText(/runs on your machine in the home directory/i),
-      ).toBeInTheDocument();
     });
   });
 
   describe("project target — current checkout", () => {
-    it("renders location, checkout, and branch controls with the current-checkout hint", () => {
+    it("renders location, checkout, and branch controls", () => {
       renderRow();
       expect(screen.getByText("foo")).toBeInTheDocument();
       expect(screen.getByText("Current checkout")).toBeInTheDocument();
       expect(screen.getByText("main")).toBeInTheDocument();
-      expect(
-        screen.getByText(/current checkout on main/i),
-      ).toBeInTheDocument();
     });
 
-    it("checkout mode renders the deferred-worktree hint when checkoutMode is 'worktree'", () => {
+    it("renders the worktree checkout control when checkoutMode is 'worktree'", () => {
       renderRow({ checkoutMode: "worktree", baseBranch: "develop" });
       expect(screen.getByText("New worktree")).toBeInTheDocument();
-      expect(
-        screen.getByText(/isolated worktree off develop in foo/i),
-      ).toBeInTheDocument();
     });
 
     it("hides checkout/branch controls when projectPath hasn't resolved yet", () => {
@@ -351,22 +342,16 @@ describe("ThreadScopeRow", () => {
   });
 
   describe("workspace mode (AgentChatPane empty state)", () => {
-    it("project pane renders location + checkout + branch controls with the project scope hint", () => {
+    it("project pane renders location + checkout + branch controls", () => {
       renderWorkspaceRow();
       expect(screen.getByText("foo")).toBeInTheDocument();
       expect(screen.getByText("Current checkout")).toBeInTheDocument();
-      expect(
-        screen.getByText(/current checkout on main/i),
-      ).toBeInTheDocument();
     });
 
-    it("home-rooted pane renders only the location control + home hint", () => {
+    it("home-rooted pane renders only the location control", () => {
       renderWorkspaceRow({ isHome: true });
       expect(screen.getByText("Home")).toBeInTheDocument();
       expect(screen.queryByText("Current checkout")).toBeNull();
-      expect(
-        screen.getByText(/runs on your machine in the home directory/i),
-      ).toBeInTheDocument();
     });
 
     it("picking a DIFFERENT project calls onSelectProject with its path", async () => {
