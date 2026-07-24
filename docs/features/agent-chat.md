@@ -120,13 +120,21 @@ The chat pane stack:
 - **Capability-gated speed picker**: models that advertise
   `supports_fast_mode` show an explicit Standard / Fast picker beside the
   reasoning control. Fast is a premium-usage choice, persists per thread,
-  and takes effect through a transcript-preserving silent restart. Claude
-  scopes the Agent SDK's `fastMode` setting to the current session with
-  `fastModePerSessionOptIn`; Codex launches/resumes the app-server thread with
-  `serviceTier: "fast"` (or explicit `null` for Standard, so a global fast
-  default cannot override the composer). Switching to a model without the
-  capability, including after a capability-catalog change, heals the thread
-  back to Standard. OpenCode does not advertise the capability today.
+  and takes effect through a transcript-preserving silent restart. Codex
+  launches/resumes the app-server thread with `serviceTier: "fast"` (or
+  explicit `null` for Standard, so a global fast default cannot override
+  the composer). Switching to a model without the capability, including
+  after a capability-catalog change, heals the thread back to Standard.
+  OpenCode does not advertise the capability today. **Claude no longer
+  advertises it either**: `merge_sdk_with_maintained`
+  (`agent_provider/claude/capabilities.rs`) clamps `supports_fast_mode`
+  to `false` even when the SDK reports `supportsFastMode` (observed on
+  Opus 5). The SDK flag is a capability advertisement, not an entitlement
+  check — on accounts without Extra Usage the server silently serves
+  `usage.speed: "standard"` while the pill claims Fast, so the picker is
+  withheld until an entitlement-feedback loop exists (re-enable path in
+  `docs/research/opus-5-agent-chat-support.md`; the sidecar's
+  `fastModePerSessionOptIn` plumbing remains in place, unused).
 - **Attachments** via `+` and `@`: files, folders, GitHub issues + PRs,
   images via paste / drop / picker. Inline chips, send-time injection,
   expand, caps, gif guard, chip tooltips. See
