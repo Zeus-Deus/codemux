@@ -140,7 +140,9 @@ fn models() -> Vec<ChatModelInfo> {
             sub_provider: None,
             is_free: false,
         },
-        // Opus 4.6 — default effort is high, supports fast mode + ultrathink + 1M.
+        // Opus 4.6 — default effort is high, supports ultrathink + 1M.
+        // (Fast mode existed on this model but is no longer surfaced —
+        // see the fast-mode note in `merge_sdk_with_maintained`.)
         ChatModelInfo {
             id: "claude-opus-4-6".into(),
             label: "Claude Opus 4.6".into(),
@@ -156,7 +158,7 @@ fn models() -> Vec<ChatModelInfo> {
             context_window_options: vec![ctx_200k(), ctx_1m_default()],
             supports_adaptive_thinking: true,
             supports_thinking_toggle: false,
-            supports_fast_mode: true,
+            supports_fast_mode: false,
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -177,7 +179,7 @@ fn models() -> Vec<ChatModelInfo> {
             context_window_options: vec![],
             supports_adaptive_thinking: false,
             supports_thinking_toggle: false,
-            supports_fast_mode: true,
+            supports_fast_mode: false,
             supports_images: true,
             sub_provider: None,
             is_free: false,
@@ -638,6 +640,12 @@ struct SdkModelInfo {
     supported_effort_levels: Vec<String>,
     #[serde(default, rename = "supportsAdaptiveThinking")]
     supports_adaptive_thinking: Option<bool>,
+    /// Reported by the SDK but deliberately ignored: fast mode is
+    /// clamped off for Claude in `merge_sdk_with_maintained` (the flag
+    /// is a capability advertisement, not an entitlement check — see
+    /// the note there). Kept so the wire shape stays documented and a
+    /// future re-enable is a one-line change.
+    #[allow(dead_code)]
     #[serde(default, rename = "supportsFastMode")]
     supports_fast_mode: Option<bool>,
 }
@@ -932,12 +940,16 @@ fn merge_sdk_with_maintained(
             .as_ref()
             .map(|k| k.supports_thinking_toggle)
             .unwrap_or(inferred.supports_thinking_toggle),
-        supports_fast_mode: sdk.supports_fast_mode.unwrap_or_else(|| {
-            known
-                .as_ref()
-                .map(|k| k.supports_fast_mode)
-                .unwrap_or(inferred.supports_fast_mode)
-        }),
+        // Fast mode is deliberately NOT surfaced for Claude, even when the
+        // SDK reports `supportsFastMode` (observed on Opus 5, 2026-07).
+        // The SDK flag is a capability advertisement, not an entitlement
+        // check: on accounts without Extra Usage the server silently
+        // serves `usage.speed: "standard"` while the UI claims Fast — a
+        // pill that overpromises. Re-enabling requires closing that loop
+        // first (pick-time `accountInfo` entitlement gate + post-turn
+        // `usage.speed` heal) — see
+        // docs/research/opus-5-agent-chat-support.md.
+        supports_fast_mode: false,
         supports_images: true,
         sub_provider: None,
         is_free: false,
@@ -1551,7 +1563,11 @@ mod tests {
             default.context_window_options.is_empty(),
             "`default` must not offer a context-window picker"
         );
-        assert!(default.supports_fast_mode);
+        // Fast mode is clamped off for Claude even though the SDK
+        // reported `supportsFastMode: Some(true)` for this row — the
+        // advertisement is not an entitlement check (silent standard
+        // fallback without Extra Usage), so the picker never shows it.
+        assert!(!default.supports_fast_mode);
         let sonnet = caps.models.iter().find(|m| m.id == "sonnet").unwrap();
         assert_eq!(sonnet.default_effort.as_deref(), Some("high"));
         let haiku = caps.models.iter().find(|m| m.id == "haiku").unwrap();

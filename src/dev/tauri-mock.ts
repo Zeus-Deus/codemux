@@ -499,7 +499,11 @@ const MOCK_CHAT_MODEL: ChatModelInfo = {
   context_window_options: [],
   supports_adaptive_thinking: false,
   supports_thinking_toggle: false,
-  supports_fast_mode: true,
+  // Mirrors the real Claude backend: fast mode is clamped off (the SDK
+  // capability flag is not an entitlement check — silent standard
+  // fallback without Extra Usage), so dev never shows the speed picker
+  // for Claude rows either.
+  supports_fast_mode: false,
   supports_images: false,
   sub_provider: null,
   is_free: false,
