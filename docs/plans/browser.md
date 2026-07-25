@@ -5,6 +5,7 @@
 - Authority: Active browser work plan, not current truth.
 - Update when: Browser priorities, unresolved questions, or likely touch points change.
 - Read next: `docs/features/browser.md`, `docs/core/STATUS.md`
+- Status: ACTIVE — pane and automation ship; the richer console-log stream and OpenFlow browser surface are still open.
 
 ## Active Priorities
 

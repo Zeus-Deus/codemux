@@ -17,14 +17,14 @@ The tree uses lazy loading — only the root directory is fetched on mount, and 
 ## What Works Today
 
 - Lazy-loaded directory expansion with loading spinners
-- Recursive tree rendering with depth-based indentation (8 + depth * 16px)
+- Recursive tree rendering with depth-based indentation (8 + depth * 14px)
 - File type icons via `FileTypeIcon` component (extension-based)
-- File size display (KB or B)
+- File size display (`K` suffix for KiB, bare number for bytes)
 - Gitignored items shown with reduced opacity (not hidden)
 - Hidden files toggle (persisted in synced settings `file_tree.show_hidden_files`)
 - Refresh button to clear cache and reload tree
 - Click file to open in built-in CodeMirror editor tab
-- Empty directory placeholder ("(empty)")
+- Empty directory placeholder (`empty`); an empty root renders `No files`
 - Folder and chevron icons for directories (chevron rotates on expand)
 - ScrollArea for overflow handling
 

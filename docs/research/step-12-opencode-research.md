@@ -1,10 +1,15 @@
 # Step 12 Research Deliverable — OpenCode as a Third Chat Provider
 
+> **RESEARCH NOTE.** Pre-implementation research or a spike. Some conclusions
+> here were later revised or reversed by what actually shipped — read it as
+> reasoning history, never as current behavior. Current truth lives in
+> `docs/features/*`.
+
 - Purpose: Locked research notes on how a reference multi-provider client implements its chat surface, with concrete file:line evidence, captured before scoping the Codemux build.
 - Audience: Anyone reviewing or implementing Step 12.
-- Authority: Read-only research checkpoint. Implementation decisions live in `docs/plans/step-12-opencode-implementation-plan.md`.
+- Authority: Read-only research checkpoint. Implementation decisions live in `docs/archive/step-12-opencode-implementation-plan.md`.
 - Update when: A factual claim here is wrong; otherwise leave alone.
-- Read next: `docs/plans/step-12-opencode-implementation-plan.md`.
+- Read next: `docs/archive/step-12-opencode-implementation-plan.md`.
 
 Research was performed against a shallow clone of a reference multi-provider client at `/tmp/<reference>` (cloned 2026-04-30). Three parallel agent investigations covered model registry + provider integration, picker UI, and capability propagation. Findings reconciled below.
 

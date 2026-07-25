@@ -1,5 +1,9 @@
 # Subagent View (cross-provider)
 
+> **ARCHIVED.** This plan's work has landed; it is kept as the implementation
+> record and reasoning trail, not as current truth. For how this behaves today
+> read the relevant `docs/features/*` doc (see `docs/INDEX.md`).
+
 - Purpose: Locked implementation plan for the cross-provider subagent view in
   Agent Chat — see when subagents launch / work / finish, and enter one to
   watch its own transcript.

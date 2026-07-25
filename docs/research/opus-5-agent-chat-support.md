@@ -4,6 +4,15 @@
   the agent chat GUI (picker, effort, speed, defaults) correctly.
 - Audience: The session that implements the change.
 - Status: Research complete, implementation not started.
+- ⚠️ **Read the fast-mode resolution below before the fast-mode passages above
+  it.** Fast mode for Claude was resolved *after* most of this note was
+  written: `merge_sdk_with_maintained` now hard-clamps `supports_fast_mode`
+  to `false` for every Claude model, so the speed picker can never render for
+  Claude. Passages framed as "the merge promotes it to `true` when the CLI
+  reports `supportsFastMode`" describe the pre-clamp code and are retained
+  only as the rationale trail. Line numbers cited throughout are from the
+  pre-clamp `capabilities.rs` and are stale (the file grew ~440 lines on the
+  same branch) — navigate by symbol name, not by line.
 - Read next: `docs/features/agent-chat.md`, `docs/features/multi-provider-chat.md`.
 
 ## Model facts (Anthropic API, verified against the claude-api reference)
@@ -17,7 +26,7 @@
 | Max output | 128K | No Codemux surface |
 | Effort | Full ladder `low / medium / high / xhigh / max`; API default `high` | Matches the existing flagship effort vocabulary exactly — **no new effort token** |
 | Thinking | **On by default** (omitting `thinking` runs adaptive). `disabled` only valid at effort ≤ `high` (400 with `xhigh`/`max`) | CLI/SDK-side; Codemux has `supports_thinking_toggle: false` for Claude, so no UI constraint needed |
-| Fast mode | Supported (research preview, Claude API only, beta `fast-mode-2026-02-01`) | `supports_fast_mode` capability → Standard/Fast speed picker |
+| Fast mode | Supported by the model (research preview, Claude API only, beta `fast-mode-2026-02-01`) | **Not surfaced.** `supports_fast_mode` is clamped to `false` for all Claude models, so no Standard/Fast speed picker — see the resolution section |
 | Rate limits | Separate bucket from the combined Opus 4.x pool | None (user-facing note at most) |
 | Safety | Can return `stop_reason: "refusal"`; server-side fallbacks route cyber refusals to Opus 4.8 | Handled entirely by the Claude CLI/SDK; no Codemux change |
 | Prompt cache | 512-token minimum (halved from 4.8's 1024) | None |
@@ -38,14 +47,17 @@ The model *list* the picker shows comes from
 `src-tauri/src/agent_provider/claude/capabilities.rs` (the single Claude
 model registry), through three paths that merge:
 
-1. **Maintained roster** — `models()` (l. 69–219), ordered; **index 0 is the
-   recommended default** (drives the frontend `defaultModelId()` and the
-   `caps.models[0]` test pin at l. 984).
+1. **Maintained roster** — `models()`, ordered; **index 0 is the recommended
+   default** (drives the frontend `defaultModelId()` and the `caps.models[0]`
+   test pin). Note this holds for the *fallback* path only: on the SDK-harvest
+   path `build_capabilities_from_sdk` reorders, because `dedupe_default_alias`
+   folds the `default` alias row into its concrete twin and moves that twin to
+   index 0 with a `Recommended · ` description prefix.
 2. **SDK harvest** — the sidecar's `list-models` (`supportedModels()`)
    returns the deployed CLI's roster; `merge_sdk_with_maintained()`
-   (l. 836–945) lets SDK effort vocabulary and `supportsFastMode` win, with
-   maintained metadata as fallback, and strips `[1m]` context-suffix ids
-   before lookup.
+   lets SDK effort vocabulary win, with maintained metadata as fallback, and
+   strips `[1m]` context-suffix ids before lookup. It no longer lets
+   `supportsFastMode` win — that field is now clamped to `false` (see below).
 3. **`/v1/models` harvest** — only when `ANTHROPIC_API_KEY` is set.
 
 Unknown ids fall back to family inference (`ClaudeFamily::from_id`,
@@ -92,11 +104,11 @@ Notes on the values:
 - **Effort**: identical vocabulary to 4.8/4.7/Fable — no
   `claude_effort_label_map()` change, no `ReasoningPicker`
   `DEFAULT_EFFORT_DESCRIPTIONS` change (both already cover `xhigh`/`max`).
-- **Fast mode**: Opus 5 supports it on the Claude API, but the maintained
-  roster deliberately keeps `false` for models where the *deployed CLI*
-  gates availability (Opus 4.8 is maintained `false` for the same reason);
-  `merge_sdk_with_maintained` promotes it to `true` the moment the CLI
-  reports `supportsFastMode`. Follow that pattern.
+- **Fast mode**: leave the maintained flag `false` and expect no picker.
+  `merge_sdk_with_maintained` clamps `supports_fast_mode` to `false` for
+  every Claude model regardless of what the CLI advertises, so nothing about
+  adding Opus 5 can surface a speed picker. (Historically the merge promoted
+  the flag on an SDK report; that is the behavior the clamp replaced.)
 - **Context options**: keep the `[200k, 1M-default]` pair. 1M is already
   the server-side default for Opus 5, but the CLI's bracket-suffix
   convention (`resolve_claude_api_model_id` appends `[1m]` when the user
@@ -182,13 +194,13 @@ keeping "Best for everyday, complex tasks" on both is fine short-term).
    Opus generation" once the CLI does. Alternative Opus 5 blurb if we want
    differentiation: "Strongest for deep reasoning and long-horizon agentic
    work".
-4. **Fast mode maintained flag** — RESOLVED (observed in-app, 2026-07-24):
-   the deployed CLI reports `supportsFastMode` for Opus 5, so the merge
-   surfaces the Standard/Fast speed picker with the maintained flag still
-   `false`. Keep `false` (SDK-report wins), matching the 4.8 precedent.
-   ⚠️ **`supportsFastMode` is a capability advertisement, NOT an
-   entitlement check** — see "Fast mode: silent-fallback feedback gap"
-   below for the observed consequence and the required fix.
+4. **Fast mode maintained flag** — RESOLVED (owner decision, 2026-07-24):
+   the deployed CLI does report `supportsFastMode` for Opus 5, which is
+   exactly what surfaced the problem — ⚠️ **`supportsFastMode` is a
+   capability advertisement, NOT an entitlement check.** The outcome was to
+   clamp the flag to `false` for all Claude models rather than trust the
+   report; see "Fast mode: silent-fallback feedback gap" and the resolution
+   that follows it.
 
 ## Fast mode: silent-fallback feedback gap (observed 2026-07-24)
 
@@ -242,9 +254,9 @@ capability-change heal paths (`AgentChatPane` / `chat-pane-plans` /
 3. Manual smoke (real `claude` CLI + auth): open chat → picker shows
    "Claude Opus 5" at the top with blurb; start a session, confirm
    `--effort xhigh` works and a turn streams; flip context 200k ↔ 1M;
-   check the speed picker appears only if the CLI reports fast-mode
-   support; restart the app and confirm the persisted model re-seeds the
-   pill (post-restart "reset to Opus" regression guard).
+   confirm **no** speed picker appears (Claude fast mode is clamped off);
+   restart the app and confirm the persisted model re-seeds the pill
+   (post-restart "reset to Opus" regression guard).
 4. OpenFlow new-run dialog lists the new model.
 5. Fast-mode removal (already implemented on this branch): confirm no
    Claude model shows the Standard/Fast picker, and that a thread with a

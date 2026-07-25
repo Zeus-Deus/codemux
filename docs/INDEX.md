@@ -25,9 +25,14 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - `docs/core/*`: durable project truth
 - `docs/features/*`: current subsystem capability and constraints
 - `docs/reference/*`: stable protocol and command references
-- `docs/plans/*`: active implementation notes and next steps
-- `docs/research/*`: supporting research feeding a specific plan in `docs/plans/`
-- `docs/archive/*`: superseded notes kept for context
+- `docs/plans/*`: **active** implementation notes and real next steps. A plan whose
+  work has fully landed does not stay here — it moves to `docs/archive/`, and the
+  current behavior it describes lives in `docs/features/*`.
+- `docs/research/*`: research, spikes, and pre-implementation notes — including
+  ones whose recommendations were later reversed. Read as historical reasoning,
+  never as current truth.
+- `docs/archive/*`: closed plans, superseded design notes, operator smoke
+  checklists for shipped work, and historical release notes.
 
 ## Current Entry Points
 
@@ -37,21 +42,21 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Tool permissions (Settings → Permissions — read/remove the agent's `allow`/`deny`/`ask` rules across the user/project/local `settings.json` scopes; Agent Chat Beta only): `docs/features/permissions.md`
 - Agent Chat (Beta-gated chat pane, providers, sidecar, attachments): `docs/features/agent-chat.md`
 - Claude Opus 5 chat-model support (research complete, implementation pending — capability-registry touchpoints, alias/default decision, test impact): `docs/research/opus-5-agent-chat-support.md`
-- Subagent view (cross-provider Subagents orchestration card + read-only drill-in — Claude / Codex / OpenCode; PR #125, shipped `v0.11.0`; the docked per-thread `SubagentActivityBar` that replaced the pane-header/titlebar "N subagents running" pills landed in PR #143, shipped `v0.13.0`): `docs/features/agent-chat.md` (§ Subagent view (cross-provider), § Docked live activity bar); locked plan + implementation record at `docs/plans/subagent-view.md`
+- Subagent view (cross-provider Subagents orchestration card + read-only drill-in — Claude / Codex / OpenCode; PR #125, shipped `v0.11.0`; the docked per-thread `SubagentActivityBar` that replaced the pane-header/titlebar "N subagents running" pills landed in PR #143, shipped `v0.13.0`): `docs/features/agent-chat.md` (§ Subagent view (cross-provider), § Docked live activity bar); locked plan + implementation record at `docs/archive/subagent-view.md`
 - Agent run checkpoints (issue #80 — opt-in background rollback snapshot at run start + restore): `docs/features/agent-chat.md` (§ Run checkpoints); design note at `docs/plans/agent-run-checkpoint.md`
 - Thread Scope (first-send scope controls moved below the composer on BOTH the draft surface and the pane's new-thread empty state — location/checkout/branch `ThreadScopeRow`, deferred + auto-named worktree creation on first send, Home draft hides the preset bar; PR #142, shipped `v0.13.0`): `docs/features/agent-chat.md` (§ Thread Scope (first-send scope controls))
 - Workflow orchestration (Claude-only — `Workflow` tool_use tap → in-thread `WorkflowRunCard` approval/progress/summary + conditional Orchestration right-panel tab with per-phase agent drill-in + `/workflow` slash command; PR #137, shipped `v0.12.0`): `docs/features/workflow-orchestration.md`
-- Multi-provider chat (Step 12): `docs/features/multi-provider-chat.md`; plan + final-state summary at `docs/plans/step-12-opencode-implementation-plan.md`; research at `docs/plans/step-12-opencode-research.md`; operator UI smoke at `docs/plans/step-12-ui-smoke-checklist.md`
-- Skills sync (server-side, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/plans/step-10-skills-sync.md`; research at `docs/plans/step-10-skills-sync-research.md`; operator UI smoke at `docs/plans/step-10-ui-smoke-checklist.md`
-- Attachments + context system (Step 8): `docs/plans/step-8-attachments.md` (research + locked plan)
-- MCP host runtime (Step 9 — Codemux as MCP host/client for chat): current behavior in `docs/features/agent-chat.md` (§ MCP host runtime) + `docs/features/mcp-server.md`; research at `docs/plans/step-9-mcp-servers.md`; Codex MCP gateway feasibility spike (future Step 11) at `docs/plans/step-9-codex-mcp-spike.md`
-- Beta Features toggle (Step 13): `docs/plans/step-13-beta-toggle-research.md`; operator UI smoke at `docs/plans/step-13-ui-smoke-checklist.md`
+- Multi-provider chat (Step 12): `docs/features/multi-provider-chat.md`; plan + final-state summary at `docs/archive/step-12-opencode-implementation-plan.md`; research at `docs/research/step-12-opencode-research.md`; operator UI smoke at `docs/archive/step-12-ui-smoke-checklist.md`
+- Skills sync (server-side, Step 10): `docs/features/skills-sync.md`; plan + per-stage history at `docs/archive/step-10-skills-sync.md`; research at `docs/research/step-10-skills-sync-research.md`; operator UI smoke at `docs/archive/step-10-ui-smoke-checklist.md`
+- Attachments + context system (Step 8): `docs/research/step-8-attachments.md` (research + locked plan)
+- MCP host runtime (Step 9 — Codemux as MCP host/client for chat): current behavior in `docs/features/agent-chat.md` (§ MCP host runtime) + `docs/features/mcp-server.md`; research at `docs/research/step-9-mcp-servers.md`; Codex MCP gateway feasibility spike (future Step 11) at `docs/research/step-9-codex-mcp-spike.md`
+- Beta Features toggle (Step 13): `docs/archive/step-13-beta-toggle-research.md`; operator UI smoke at `docs/archive/step-13-ui-smoke-checklist.md`
 - Setup/teardown scripts: `docs/features/setup-teardown.md`
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md` (browser stream stability fix archived at `docs/archive/browser-stream-fix.md`)
 - Background browser in Agent Chat GUI mode (agent-opened browser runs detached instead of splitting the chat — inline chip + context-bar indicator + floating `BrowserPeekOverlay` with promote-to-pane; PR #138, shipped `v0.12.0`; run-finished `LIVE` release (PR #139) + opt-in desktop-size peek viewport `agent_chat.background_browser_desktop_viewport` (PR #140), both shipped `v0.13.0`): `docs/features/browser.md` (§ Background browser in GUI mode, § Run-finished release, § Desktop-size peek viewport)
 - OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
-- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/plans/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`; **MCP-on-remote** (headless `codemux-remote serve` + 12-tool stdio MCP bridge — landed in `v0.6.2`, `worktree_create` added in `v0.7.5`) plan at `docs/plans/mcp-on-remote.md`; the `v0.7.5` agent-created-workspace pull/adoption fix is tracked at `docs/plans/remote-workspace-pull-fix.md`
+- MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/research/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`; **MCP-on-remote** (headless `codemux-remote serve` + 12-tool stdio MCP bridge — landed in `v0.6.2`, `worktree_create` added in `v0.7.5`) plan at `docs/plans/mcp-on-remote.md`; the `v0.7.5` agent-created-workspace pull/adoption fix is tracked at `docs/archive/remote-workspace-pull-fix.md`
 - File editor: `docs/features/file-editor.md`
 - Diff viewer: `docs/features/diff-viewer.md`
 - File tree: `docs/features/file-tree.md`
@@ -67,7 +72,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Remote hosts (DevicePicker + `codemux-remote` binary + SSH transport + zero-touch workspace push + headless `serve` MCP daemon + background version-upgrade poller + **`v0.7.9` SSH tunnel-health UI pill + defer-upgrade-restart-while-agents-run** + **post-`v0.9.5` "Reinstall agent on host" button + cloud-push migration overlay**): `docs/features/remote-hosts.md`; deferred desktop pieces (Steps 1/5/6/9) tracked in `docs/plans/mcp-on-remote.md`
 - OpenCode conversation sync across cloud-push (issue #16 — `opencode export`/`import` so a pushed/pulled OpenCode pane continues the same session; sibling of the Claude JSONL sync): `docs/features/opencode-conversation-sync.md`
 - Operate a remote workspace in place — **"Open on host"** (attach-in-place: terminal/agent runs on the host with no local copy; detached pty-daemon survives app close and reattaches on reopen; overview action + `attach_only`/`remote_cwd` snapshot fields): `docs/features/remote-in-place.md`
-- Automations (scheduled host-side agent runs): `docs/features/automations.md`; roadmap at `docs/plans/automations.md`; Phase 2 (sync + remote-host) detailed plan at `docs/plans/automations-sync.md`; Superset research at `docs/research/superset-automations.md`
+- Automations (scheduled host-side agent runs): `docs/features/automations.md`; roadmap at `docs/plans/automations.md`; Phase 2 (sync + remote-host) detailed plan at `docs/archive/automations-sync.md`; Superset research at `docs/research/superset-automations.md`
 - Agent hooks: `docs/features/hooks.md`
 - Execution backends / sandboxing: `docs/features/execution.md`
 - Observability (flags, metrics, safety config + native log file / `codemux logs` / `codemux doctor` + opt-in cloud-push diagnostic tracing via `CODEMUX_TRACE_CLOUD_PUSH`): `docs/features/observability.md`
@@ -77,7 +82,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Code indexing: `docs/features/code-indexing.md`
 - Project memory: `docs/features/project-memory.md`
 - Command palette: `docs/features/command-palette.md`
-- Workspace creation: `docs/features/workspace-creation.md`; model-selection-at-launch plan at `docs/plans/model-selection-before-launch.md`
+- Workspace creation: `docs/features/workspace-creation.md`; model-selection-at-launch plan at `docs/archive/model-selection-before-launch.md`
 - Non-git projects (plain-folder mode — `is_git` snapshot flag, opt-in "Initialize Git" bare-`git init` affordance in the context bar / Context Row cluster / Changes panel, worktree controls hidden in Thread Scope, no add-path git gate; PRs #147/#148, shipped `v0.13.1`): `docs/features/workspace-creation.md` (§ Non-Git Projects)
 - Workspaces overview (full-screen device-grouped list with filters, sibling-device adoption, confirm-before-push + undo, divergence chip, elapsed-time pill): `docs/features/workspaces-overview.md`
 - Workspace archive (one-click non-destructive archive replacing the sidebar X/Hide flow, Settings → Archive restore panel, Rust-enforced protected-root delete refusal, honest force semantics for dirty-worktree deletes): `docs/features/workspace-archive.md`
@@ -101,6 +106,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Feature inventory: `docs/reference/FEATURES.md`
 - Control and automation work: `docs/reference/CONTROL.md`
 - Docs cleanup and recovery work: `docs/reference/DOCS_REINDEX.md`
+- Historical release notes (`v0.6.1`–`v0.13.2`, moved out of `docs/core/STATUS.md`): `docs/archive/release-notes-v0.6-v0.13.md`
 - Agent behavior rules: `AGENTS.md`
 - Website docs: https://docs.codemux.org — source lives in ~/projects/codemux-sitev2/ (Next.js + Fumadocs). New doc pages go in the content/docs/ directory of that repo.
 

@@ -48,7 +48,7 @@ On bar-launch, the preset's `model_selection` is passed to `apply_preset` (which
 - agent context injection: preset commands for supported tools (Claude, Codex, Pi, Gemini) are automatically wrapped with the host shell's env-var expansion (`$CODEMUX_AGENT_CONTEXT` on Unix, `$env:CODEMUX_AGENT_CONTEXT` on Windows PowerShell) so agents receive Codemux-aware instructions at launch. The Gemini path writes its system prompt to a temp file under `std::env::temp_dir()` and sets `GEMINI_SYSTEM_MD` (Unix uses `printf '%s'` then env-prefix on the same line; Windows uses `Set-Content -NoNewline` then `$env:GEMINI_SYSTEM_MD = '<path>'`)
 - Droid YOLO injection: interactive `droid` (Factory) has no skip-permissions CLI flag — full autonomy is only settable via a settings file. `inject_agent_context` rewrites the bare `droid` preset command to first write `{"sessionDefaultSettings":{"autonomyLevel":"high"}}` to a temp file under `std::env::temp_dir()` and then launch `droid --settings <path>` (same cross-platform inline-write split as Gemini). A `droid` command that already carries `--settings` is left untouched.
 - preset failures surface as toast notifications: `applyPreset` rejections (e.g. CLI not installed) are routed through the sonner toast wrapper as `toast.error("Preset Name: {error}")` instead of being silently swallowed by `console.error`
-- Windows-only line terminator fix: preset commands typed into the terminal use `\r` on Windows so PowerShell actually executes the command on submit (Unix uses `\n`)
+- Windows-only line terminator fix: preset commands typed into the terminal use `\r` on every platform so PowerShell actually executes the command on submit (not just Windows — the constant is unconditional)
 
 ## Builtin Presets
 

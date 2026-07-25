@@ -36,8 +36,9 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   button that opens the command palette (shows the resolved `⌘K` keybind) and
   a neutral-ghost new-agent button (same click/shift-click semantics as
   before). Add repository moved into the filter row; Automations and Workspaces
-  moved into the footer app menu.
-- **Project filter dropdown** (`sidebar-inbox.tsx`): one 24px sticky row —
+  moved into the footer nav row (see "Footer" below).
+- **Project filter dropdown** (`sidebar-inbox.tsx`): one 32px sticky row
+  (`h-8` trigger + `size-8` add-repo button, matching the action row above) —
   a flex-1 trigger showing the current filter (Folder icon + "All projects",
   or the repo's mini avatar + name) with a rotating chevron, plus the dashed
   `+` add-repo button pinned right (Open project / New project dropdown).
@@ -46,16 +47,25 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   the total); the current filter's row is highlighted; picking sets the
   filter and closes. The filter applies to **both** the active cards and the
   settled rows and resets settled-tail paging; a filtered-empty list shows
-  "Nothing active in `<repo>`". Session-only. (Replaced the earlier
-  horizontal filter-chip strip and its wheel-scroll handling.)
+  "Nothing active in `<repo>`". Session-only, and self-healing — if the
+  filtered project disappears (its last workspace archived or deleted) the
+  filter resets itself to "All projects". (Replaced the earlier horizontal
+  filter-chip strip and its wheel-scroll handling.)
+- **Pending workspaces**: workspaces still being created render above the
+  cards as their own rows — a spinner "creating" row, or a red `AlertCircle`
+  "failed" row. They are filter-scoped like everything else and suppress the
+  "Nothing active" empty state while present.
 - **Workspace cards** (`sidebar-inbox-card.tsx`): each active workspace is a
   card — repo avatar + name eyebrow; work title (linked-issue title while an
   agent is live, worktree name when idle) + issue chip; a red blocker line
   (needs-you only); and a mono meta line (branch · `↑ahead` · `+/−` diff · PR
   chip (`PR #n` green / `merged` violet, opens the PR) · remote cloud icon ·
-  notification badge). The right side of the eyebrow shows the agent state —
-  Working (configurable `WorkingIndicator`, amber text) / Needs you (pulsing
-  red dot) / Done · review (green ✓) / elapsed time for idle — and swaps to a
+  notification badge). The blocker line is a fixed string
+  (`permissionBlockerText()` always returns "Waiting for your input" — it does
+  not surface the agent's actual question). The right side of the eyebrow shows
+  the agent state — Working (configurable `WorkingIndicator`, amber text) /
+  Needs you (pulsing red dot) / Done · review (green ✓) / elapsed since the
+  workspace last settled into review — and swaps to a
   **"✓ Settle"** button on hover or focus (CSS-only swap). The selected card
   gets a neutral border + clearly lighter fill (selection is lightness, not
   accent color — the sidebar surface is darker than the main pane, so cards
@@ -66,11 +76,16 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
 - **Settle / un-settle** (`sidebar-inbox-store.ts`): Settle collapses the card
   (~200ms height/opacity), then moves it below a "Settled" divider as a compact
   one-line row (repo avatar · violet merge icon when its PR merged · title ·
-  elapsed-since-settle). Hover/focus reveals **Un-settle**, which reverses it
-  (the returning card eases back in via the shared `rise-in` keyframe).
-  Settling is **visual only** — nothing is archived, closed, or deleted. The
-  settled list persists via UI-state key `sidebar.inbox.settled`, pruned when
-  a workspace vanishes. The settled list is **flat and recency-ordered** —
+  elapsed-since-settle). A settled row is itself a button — click or Enter/Space
+  activates that workspace without un-settling it. Hover/focus reveals
+  **Un-settle**, which reverses it (the returning card eases back in via the
+  shared `rise-in` keyframe). Settling is **visual only** — nothing is archived,
+  closed, or deleted; a settle still mid-animation is flushed to the store on
+  unmount, so collapsing the sidebar mid-gesture doesn't drop it. The settled
+  list persists via UI-state key `sidebar.inbox.settled`, pruned when a
+  workspace vanishes (both the inbox and the collapsed rail run the prune, so a
+  session spent entirely collapsed still trims the blob). The list is
+  **flat and recency-ordered** —
   repo identity is carried by each row's avatar, not by project grouping.
   Both row shapes share the full workspace right-click menu via
   `workspace-inbox-menu.tsx`: cards get a "Settle workspace" entry (guardrail
@@ -100,9 +115,13 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   the repo filter changes.
 - **Keyboard jumps**: `Alt+1`–`Alt+9` (rebindable `workspaceJump1..9`
   registry actions) activate the Nth visible active card — filter-scoped,
-  settled rows excluded. Holding Alt overlays index badges on the first nine
-  cards (`sidebar-inbox-jump.ts` holds the visual-order targets for the
-  central keyboard handler). `Ctrl+1..9` remain terminal-tab switching.
+  settled rows excluded. Holding the modifier overlays index badges on the
+  first nine cards; the badge hint reads the user's *actual* resolved
+  `workspaceJump1` binding rather than hardcoding Alt (rebinding to Ctrl makes
+  Ctrl reveal the badges; a chord using neither Alt nor Ctrl shows no badges at
+  all), and hints clear on `blur`/`visibilitychange`. `sidebar-inbox-jump.ts`
+  holds the visual-order targets for the central keyboard handler.
+  `Ctrl+1..9` remain terminal-tab switching.
 - **Provider marks**: each card's meta line shows the official logo of every
   agent-chat provider active in that workspace (Claude / Codex / OpenCode) via
   `ProviderLogo` + `getWorkspaceProviders` (pane-status). Terminal-only agent
@@ -124,18 +143,21 @@ scrolling list. Expanded: **Automations** and **Workspaces** as equal-width
 labeled ghost buttons (28px, 7px radius, transparent with a subtle hover
 fill), then icon-only **Ports** (`SidebarPortsPopover`, keeps its count
 badge) and the **Settings gear** (the app-menu dropdown — Settings, command
-palette, shortcuts, docs, version, sign out; its old Automations/Workspaces
-items were removed since they're visible buttons now). Collapsed: the same
-four, restacked vertically in the same order with right-side tooltips.
+palette, shortcuts, documentation, report issue, version, sign out; its old
+Automations/Workspaces items were removed since they're visible buttons now).
+Collapsed: the same four, restacked vertically in the same order — Automations,
+Workspaces, and the app menu get right-side tooltips; `SidebarPortsPopover`
+hardcodes `side="top"` for both its tooltip and its popover in both states.
 
 ### Rail rendering (collapsed — 52px workspace strip)
 
 Replaced the old project-avatar rail (aggregate dots + hover flyout,
 `sidebar-rail-projects.tsx`, deleted):
 
-- **Header** (`sidebar-action-row.tsx` collapsed variant): the accented
-  new-agent square + a search icon (opens the command palette), then a slim
-  centered divider. Add repository lives only in the expanded filter row.
+- **Header** (`sidebar-action-row.tsx` collapsed variant): the neutral-ghost
+  new-agent square (same treatment as the expanded header's pencil — no accent
+  fill) + a search icon (opens the command palette), then a slim centered
+  divider. Add repository lives only in the expanded filter row.
 - **Workspace strip** (`sidebar-rail-workspaces.tsx`): one 28px button per
   **active (unsettled) workspace** — repo avatar with that workspace's own
   status dot (red pulse = needs you, amber = working, green = done-review,
@@ -155,7 +177,7 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - Project dropdown filtering active + settled lists (with active counts);
   pinned add-repo button; sticky filter row.
 - Settle/un-settle with ~200ms motion, persisted across restarts, prune-safe.
-- Search affordance opening the command palette; accented new-agent button.
+- Search affordance opening the command palette; neutral-ghost new-agent button.
 - Show git stats toggle (Settings → Appearance → Sidebar).
 - Rail: per-active-workspace avatar buttons with individual status dots,
   select-without-expand, and the shared footer destinations.
@@ -171,18 +193,31 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - Drag-and-drop workspace/project reordering was an affordance of the removed
   project tree and does not exist in the inbox (cards keep the stored
   workspace order).
-- Idle cards show elapsed time only when a status transition was observed this
-  session (no backend status timestamps exist).
+- Unmounting the project tree also took two **project-level** surfaces offline,
+  since both hung off its context menu and have no inbox equivalent yet:
+  **Archive Project** (`docs/features/workspace-archive.md`) and **project
+  avatar image/color customization** (`docs/features/project-avatars.md`).
+  Saved avatars still render; they just can't be changed. Re-homing both is
+  outstanding work.
+- Elapsed time on an idle card comes from `settledAt` in the non-persisted
+  `sidebar-density-store`, which is stamped **only on a transition into
+  `review`** — so a workspace that went working → idle without ever reaching
+  review, or any workspace after an app restart, shows no elapsed label. No
+  backend status timestamps exist to fix this properly.
 - The collapsed rail intentionally shows only each workspace's agent-status
   dot — the old project-avatar rail's notification-count badges were not
   carried over (notification detail lives on the expanded cards).
 - The superseded tree components (`sidebar-project-group.tsx`,
   `sidebar-needs-you-strip.tsx`, `sidebar-live-section.tsx`,
   `sidebar-live-grouping.ts`, and the `SidebarWorkspaceRow` component) are still
-  in the repo but **unmounted** — kept because `sidebar-workspace-row.tsx` still
-  exports the shared `WorkspaceContextMenuItems`/`DeleteWorktreeDialog` the
-  inbox card reuses (and their test suites cover that machinery). Removing the
-  dead remainder is a pending cleanup.
+  in the repo but **unmounted**. Only `sidebar-workspace-row.tsx` is load-bearing:
+  the inbox menu (`workspace-inbox-menu.tsx`) imports its `WorkspaceContextMenuItems`
+  / `DeleteWorktreeDialog` and its `SettleMenuAction` type + "Settle workspace" /
+  "Un-settle workspace" entries — the `SidebarWorkspaceRow` *component* in that
+  module is itself unmounted. The other four files (`sidebar-project-group.tsx`,
+  `sidebar-needs-you-strip.tsx`, `sidebar-live-section.tsx`,
+  `sidebar-live-grouping.ts`) are pure dead code kept only alongside their test
+  suites. Removing them is a pending cleanup.
 
 ## Important Touch Points
 
@@ -190,6 +225,10 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - `src/components/layout/sidebar-workspace-list.tsx` — expanded → inbox, collapsed → rail
 - `src/components/layout/sidebar-inbox.tsx` — filter dropdown, card list, settled section, settle motion
 - `src/components/layout/sidebar-inbox-card.tsx` — the workspace card + context menu wiring
+- `src/components/layout/workspace-inbox-menu.tsx` — the shared right-click menu for cards and settled rows
+- `src/components/layout/sidebar-inbox-jump.ts` — visual-order jump targets for Alt+1..9
+- `src/lib/keybind-registry.ts` — `workspaceJump1..9` actions (default `Alt+1..9`)
+- `src/components/settings/settings-view.tsx` — the Appearance → Sidebar subsection
 - `src/stores/sidebar-inbox-store.ts` — persisted settled list + session repo filter
 - `src/components/layout/sidebar-action-row.tsx` — expanded search/new-agent header + collapsed rail header
 - `src/components/layout/sidebar-rail-workspaces.tsx` — collapsed per-workspace strip

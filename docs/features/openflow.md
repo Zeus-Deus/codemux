@@ -1,5 +1,27 @@
 # OpenFlow Capability
 
+> ## ⚠️ OpenFlow is currently unreachable from a cold start
+>
+> The sidebar rewrite (PR #198, and the earlier `c11a3fc` that deleted the
+> sidebar OpenFlow section) removed the only trigger for the New Run dialog.
+> The dialog itself is still mounted globally — `src/components/layout/app-sidebar.tsx`
+> renders `<NewRunDialog />` with a comment noting its trigger "used to live inside
+> the (now removed) sidebar section" — but the only two callers of
+> `setNewRunDialogOpen(true)` are `openflow-workspace.tsx` and
+> `orchestration-header.tsx`, both of which render **only when an `open_flow`
+> workspace is already active**. `createOpenflowWorkspace` has exactly one caller:
+> the dialog itself.
+>
+> So you need an OpenFlow workspace to open the dialog that creates an OpenFlow
+> workspace. There is no CLI, control-socket, or MCP escape hatch, and OpenFlow
+> workspaces are deliberately never persisted (`state_impl.rs`: "Never persist
+> OpenFlow workspaces or their terminal sessions"), so any surviving run is gone
+> after an app restart — making the deadlock permanent.
+>
+> Everything below describes a runtime that still works once a run exists; it is
+> the entry point that is missing. Re-homing one trigger (command palette entry,
+> `+` launcher item, or footer nav) restores the whole feature.
+
 - Purpose: Describe what OpenFlow is in Codemux and what currently works.
 - Audience: Anyone working on orchestration, agent workflows, or OpenFlow UX.
 - Authority: Canonical OpenFlow capability and constraints document.
@@ -34,8 +56,8 @@ It must remain project-agnostic: web apps are only one test case, not the produc
 - **Blocked phase is now recoverable**: user messages can transition a Blocked run back to Replanning
 - **WaitingApproval now actually waits**: the run stays in WaitingApproval until the user explicitly approves, instead of auto-completing on the next cycle
 - **implicit completion removed**: only explicit `DONE:` markers from agents trigger phase advancement; error output and log noise no longer falsely mark agents as done
-- **stuck detection thresholds raised**: probe at ~50s, rescue at ~60s (active) / ~90s (planning), giving agents time to work
-- **wrapper script hardened**: uses `eval` instead of `bash -lc` to avoid extra quoting, and gracefully handles command failures instead of crashing
+- **stuck detection thresholds**: probe at ~120s (`STUCK_PROBE_MIN_CYCLES = 24` at the 5s loop interval), rescue at ~60s active (`ACTIVE_STUCK_RESCUE_CYCLES = 12`) / ~90s planning (`PLANNING_STUCK_RESCUE_CYCLES = 18`), giving agents time to work
+- **wrapper script hardened**: the opencode wrapper invokes `opencode run "$message" --model "$MODEL"` directly and assembles follow-ups with a bash array rather than a re-quoted shell string (neither `eval` nor `bash -lc` is used), and gracefully handles command failures instead of crashing
 - **conflicting phase systems unified**: the `run_autonomous_loop` / `advance_run_phase` auto-advance path has been removed; all phase logic goes through `determine_next_phase` driven by comm log analysis
 
 - **Claude Code CLI adapter implemented**: full adapter with dedicated wrapper script supporting `claude -p` with `--system-prompt`, `--resume` for session continuation, `--output-format json` for session ID capture, and `--permission-mode bypassPermissions`; works with any Claude model (haiku, sonnet, opus)

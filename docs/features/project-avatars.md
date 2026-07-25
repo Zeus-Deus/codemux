@@ -10,9 +10,11 @@
 
 Every project group in the left sidebar renders a small avatar (`ProjectAvatar`). By default it shows the project's first letter; users can customize it per project with an image (logo or website favicon) and/or an accent color from the project group's context menu. The same avatar component renders in the project picker overlay.
 
+> **Customization is currently unreachable from the UI.** The only entry point is the project-group context menu in `sidebar-project-group.tsx`, and PR #198 (the sidebar workspace inbox) unmounted the project tree — that module now has zero non-test importers. Stored avatars still *render* everywhere (inbox cards, rail, project picker) because `ProjectAvatar` + the `dbGetUiState` reads are untouched, but nothing in the shipping UI can set or clear one. Re-homing the palette + image dialog onto an inbox-reachable surface is outstanding work; see `docs/features/sidebar.md` § "Current Constraints".
+
 ## Current Model
 
-- Right-click a sidebar project group → the context menu offers a fixed 12-color palette (Red, Orange, Yellow, Lime, Green, Teal, Cyan, Blue, Indigo, Purple, Pink, Slate — `PROJECT_COLORS` in `sidebar-project-group.tsx`) plus an image entry that opens `ProjectImageDialog`.
+- Right-click a sidebar project group (**unmounted — see the note above**) → the context menu offers a fixed 12-color palette (Red, Orange, Yellow, Lime, Green, Teal, Cyan, Blue, Indigo, Purple, Pink, Slate — `PROJECT_COLORS` in `sidebar-project-group.tsx`) plus an image entry that opens `ProjectImageDialog`.
 - The dialog accepts three input shapes, classified by `resolveImageUrl` in `src/lib/project-image.ts`:
   - a **direct image URL** (recognized by extension: png/jpe?g/gif/svg/webp/ico/avif/bmp) — passed through untouched
   - a **`data:` URL** — passed through untouched
@@ -23,6 +25,8 @@ Every project group in the left sidebar renders a small avatar (`ProjectAvatar`)
 
 ## What Works Today
 
+- Rendering of already-saved avatars (image → color disc → letter) on every surface
+- The entries below are implemented and tested but currently have no reachable entry point:
 - Per-project custom image via direct URL, data URL, or domain-derived favicon
 - Per-project accent color from a 12-color palette; color also tints the letter fallback
 - Re-saving (or re-opening the picker for) a website image re-fetches the favicon via the `&v=` cache-bust token
@@ -35,12 +39,13 @@ Every project group in the left sidebar renders a small avatar (`ProjectAvatar`)
 - The color palette is fixed (no custom hex input)
 - Persistence is device-local UI state; avatars do not sync across devices
 - No local image file picker — input is URL/domain text only (data URLs work but must be pasted)
+- **The whole customization surface is unreachable** until the context menu is re-homed off the unmounted project tree
 
 ## Important Touch Points
 
 - `src/lib/project-image.ts` — `resolveImageUrl(input, cacheBust)` classification + favicon derivation
 - `src/components/ui/project-avatar.tsx` — `ProjectAvatar` render component (image/color/letter precedence, retry-on-URL-change)
-- `src/components/layout/sidebar-project-group.tsx` — context menu, `PROJECT_COLORS`, save/clear handlers, `dbGetUiState`/`dbSetUiState` persistence
+- `src/components/layout/sidebar-project-group.tsx` — context menu, `PROJECT_COLORS`, save/clear handlers, `dbGetUiState`/`dbSetUiState` persistence (**unmounted**: zero non-test importers since PR #198)
 - `src/components/overlays/project-image-dialog.tsx` — image/URL input dialog with live preview
 - `src/components/overlays/project-picker.tsx` — second render surface for the avatar
 

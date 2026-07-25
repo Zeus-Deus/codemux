@@ -2,7 +2,7 @@
 
 > **Status:** historical code audit captured before the Phase 1 / 1.5 / 1.6, Automations, and workspace-archive MCP expansions. Counts, line numbers, and gaps below intentionally describe that baseline and are not current truth. The live desktop catalog is pinned at **55 tools** in `src-tauri/src/mcp_server.rs`; use `docs/features/mcp-server.md` and `docs/reference/CONTROL.md` for current behavior.
 
-Read-only audit feeding `docs/plans/vexis-agent-integration.md`. Citations are
+Read-only audit feeding `docs/research/vexis-agent-integration.md`. Citations are
 `path:line`. Where the plan doc contradicts code I tag it `DOC SAYS X / CODE
 SAYS Y`.
 

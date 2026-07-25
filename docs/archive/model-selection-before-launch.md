@@ -1,5 +1,9 @@
 # Plan: Model Selection in the Workspace-Creation Dialog
 
+> **ARCHIVED.** This plan's work has landed; it is kept as the implementation
+> record and reasoning trail, not as current truth. For how this behaves today
+> read the relevant `docs/features/*` doc (see `docs/INDEX.md`).
+
 - Purpose: Implementation plan for adding model / reasoning / context
   selection to the CLI launch path (the New Workspace dialog), sourced
   dynamically and extensible to future presets.

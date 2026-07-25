@@ -8,15 +8,15 @@
 
 ## Global Shortcuts
 
-These work anywhere in the app. All require **Ctrl**.
+These work anywhere in the app. Most are Ctrl-based, but not all — the workspace jumps use **Alt**, and `Escape` / `F5` are bare keys.
 
-Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, and `src/components/layout/app-shell.tsx`.
+Registered in `src/lib/keybind-registry.ts` and dispatched from `src/hooks/use-keyboard-shortcuts.ts`; `src/lib/app-shortcuts.ts` holds the interception list that keeps these keys from reaching xterm.js.
 
 | Shortcut | Action | Notes |
 |----------|--------|-------|
 | Ctrl+K | Command palette | Fuzzy search for any action |
 | Ctrl+B | Toggle sidebar | Collapse the left sidebar to an icon rail / expand it (see `docs/features/sidebar.md`) |
-| Ctrl+Shift+B | Toggle right panel | Show/hide the right panel (Files, Changes, Review) for the active workspace |
+| Ctrl+Shift+B | Toggle right panel | Show/hide the right panel (Files, Changes, Review, Orchestration) for the active workspace |
 | Ctrl+, | Open settings | Opens the settings panel |
 | Ctrl+Shift+? | Keyboard shortcuts | Opens Settings to the keyboard-shortcuts page (press Ctrl+Shift+/) |
 | Ctrl+O | Open project | Opens a folder picker to add an existing project |
@@ -34,8 +34,12 @@ Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, an
 | Ctrl+Shift+D | Split active pane right | Horizontal split |
 | Ctrl+Shift+E | Split active pane down | Vertical split |
 | Ctrl+Shift+W | Close active pane | |
+| Escape | Close overlay | `closeOverlay` — dismisses the topmost open overlay |
+| Ctrl+R | (blocked) | `blockReload` — swallowed so the WebView can't reload the app out from under live sessions |
+| Ctrl+Shift+R | (blocked) | `blockHardReload` — same rationale |
+| F5 | (blocked) | `blockF5Reload` — same rationale |
 
-All shortcuts are rebindable in **Settings → Keyboard shortcuts** (rendered from `src/lib/keybind-registry.ts`).
+The registry defines 41 actions in total; the table above covers the app-global ones. All are rebindable in **Settings → Keyboard shortcuts** (rendered by `src/components/settings/keybind-editor.tsx`, the only consumer of `KEYBIND_REGISTRY` in settings).
 
 ## Terminal Shortcuts
 
@@ -54,8 +58,9 @@ These work in specific UI contexts.
 
 | Shortcut | Action | Context | Source |
 |----------|--------|---------|--------|
+| Ctrl+1 – Ctrl+9 (Cmd on macOS) | Jump to Nth model row | Agent Chat model picker popover open | `MultiProviderModelPicker.tsx` — capture-phase listener scoped to the open popover, so it overrides the global tab jump without rebinding it |
 | Enter | Navigate to URL | Browser address bar focused | `BrowserToolbar.tsx` |
-| Enter / Space | Activate workspace | Workspace row focused | `sidebar-workspace-row.tsx` |
+| Enter / Space | Activate workspace | Sidebar inbox card or settled row focused | `sidebar-inbox-card.tsx`, `sidebar-inbox.tsx` |
 | Enter / Space | Activate pane | Pane header focused | `PaneNode.tsx` |
 | Enter | Activate tab | Tab focused via keyboard | `tab-bar.tsx` |
 
@@ -71,6 +76,6 @@ These work in specific UI contexts.
 - `src/hooks/use-keyboard-shortcuts.ts` — global shortcuts (Ctrl+Shift+D, Ctrl+T, Ctrl+W, Ctrl+Shift+G, etc.)
 - `src/lib/app-shortcuts.ts` — shortcut interception list (blocks keys from reaching xterm.js)
 - `src/components/terminal/TerminalPane.tsx` — `customKeyEventHandler()` (terminal shortcuts)
-- `src/components/layout/app-shell.tsx` — Ctrl+K command palette handler
 - `src/components/layout/tab-bar.tsx` — tab keyboard navigation
-- `src/components/settings/settings-view.tsx` — shortcut display in settings
+- `src/components/layout/sidebar-inbox-jump.ts` — visual-order targets for the Alt+1..9 workspace jumps
+- `src/components/settings/keybind-editor.tsx` — shortcut display + rebinding UI in settings

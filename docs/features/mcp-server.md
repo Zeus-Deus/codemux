@@ -49,8 +49,9 @@ for the host runtime.
 > the desktop's Unix-socket control transport. Same wire protocol,
 > different tool set, different control transport. The desktop's push
 > flow auto-registers it into user-level agent configs on the host
-> (`~/.claude.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`)
-> on every `serve` startup. See `docs/features/remote-hosts.md` for
+> on every `serve` startup. `remote/mcp_register.rs` writes exactly two
+> targets: `~/.claude.json`, and `~/.vexis/mcp-servers.yaml` when
+> `~/.vexis` exists — **not** `~/.codex/config.toml` or `~/.cursor/mcp.json`. See `docs/features/remote-hosts.md` for
 > the daemon, manifest, auth, and provisioning details, and
 > `docs/plans/mcp-on-remote.md` for the design rationale and the
 > deferred desktop-side steps (extract `codemux_core`, pull-workspace
@@ -59,8 +60,9 @@ for the host runtime.
 ### Auto-Configuration
 
 On startup, Codemux can automatically write its MCP server config into
-`~/.claude/claude_desktop_config.json` and Claude Code's MCP settings so
-agents discover it without manual setup. This is controlled by the
+`<workspace_dir>/.mcp.json` so agents discover it without manual setup.
+That file is the only thing `upsert_mcp_config` writes — there is no
+`claude_desktop_config.json` writer anywhere in the repo. This is controlled by the
 `auto_mcp_config` setting (default: enabled). Users can toggle it in
 Settings → Editor & Workflow → Agent.
 
@@ -77,8 +79,8 @@ to `git` in the workspace directory. The workspace is resolved from
 
 The Phase 1 / 1.5 / 1.6 vexis-agent integration tools (terminal,
 workspace lifecycle, ports, worktree, presets, issues) and the eight
-`automation_*` tools are checked into the registry. The test guard at
-`mcp_server.rs:1785` pins the count — bump it whenever a tool is
+`automation_*` tools are checked into the registry. A test guard in `mcp_server.rs`
+(`assert_eq!(tools.len(), 55)`) pins the count — bump it whenever a tool is
 added or removed.
 
 | Category | Count | Tools |
@@ -102,7 +104,7 @@ added or removed.
 
 ### Architecture
 
-Per the locked decisions in `docs/plans/step-9-mcp-servers.md` and the
+Per the locked decisions in `docs/research/step-9-mcp-servers.md` and the
 implementation across Stages 1–6:
 
 ```
@@ -289,7 +291,7 @@ Settings, so toggling from either place is consistent. A bottom row
   `type: "sdk"` mechanism is the path; Codex doesn't expose a runtime
   tool-injection API in `codex app-server`. Codex MCP is planned for
   Step 11 via an HTTP gateway approach — see
-  `docs/plans/step-9-codex-mcp-spike.md`.
+  `docs/research/step-9-codex-mcp-spike.md`.
 - **Stdio transport only** for spawning user-installed MCPs. HTTP /
   SSE transports are parsed and surfaced in Settings (so users see
   their HTTP MCPs listed) but `start_mcp_server` rejects them with
@@ -375,5 +377,5 @@ Settings, so toggling from either place is consistent. A bottom row
   one localhost HTTP MCP server, writes `[mcp_servers.codemux] url =
   "..."` to `~/.codex/config.toml`, hot-reloads via
   `config/mcpServer/reload`. Reuses the entire Step 9 registry +
-  dispatcher. See `docs/plans/step-9-codex-mcp-spike.md` for the spike
+  dispatcher. See `docs/research/step-9-codex-mcp-spike.md` for the spike
   research and staging proposal.

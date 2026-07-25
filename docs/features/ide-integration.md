@@ -56,7 +56,7 @@ Editors without a dedicated icon asset (Windsurf, Trae, Fleet, Lapce, JetBrains 
 - **Workspace context menu** — Right-click workspace in sidebar shows "Open in {editor}" (single editor) or submenu with all editors (multiple detected).
 - **File tree** — Files opened in built-in editor by default, but the external editor button is accessible from the title bar.
 
-The title-bar launcher and context-menu submenu partition entries into labelled sections — **VS Code family** (VS Code, Cursor, VSCodium), **Modern editors** (Zed, Windsurf, Trae, Fleet, Lapce), **JetBrains** (IntelliJ IDEA, PyCharm, PhpStorm, WebStorm, GoLand, RubyMine, CLion, Rider, DataGrip, Android Studio), and **Other** (Sublime Text). Section headers only render when more than one family is detected (no lonely headers). Within each section the backend's canonical detection order is preserved. The grouping function lives in `src/lib/editor-groups.ts` (with `src/lib/editor-groups.test.ts` covering the partitioning).
+The title-bar launcher and context-menu submenu partition entries into labelled sections — **VS Code family** (VS Code, Cursor, VSCodium), **Modern editors** (Zed, Lapce — Windsurf and Trae group under VS Code as forks; Fleet groups under JetBrains), **JetBrains** (IntelliJ IDEA, PyCharm, PhpStorm, WebStorm, GoLand, RubyMine, CLion, Rider, DataGrip, Android Studio), and **Other** (Sublime Text). Section headers only render when more than one family is detected (no lonely headers). Within each section the backend's canonical detection order is preserved. The grouping function lives in `src/lib/editor-groups.ts` (with `src/lib/editor-groups.test.ts` covering the partitioning).
 
 ### Behavior
 

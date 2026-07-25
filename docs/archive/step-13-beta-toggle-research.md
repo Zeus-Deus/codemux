@@ -1,5 +1,9 @@
 # Step 13 — Agent Chat Beta Toggle: Pre-Merge Scoping
 
+> **ARCHIVED.** This plan's work has landed; it is kept as the implementation
+> record and reasoning trail, not as current truth. For how this behaves today
+> read the relevant `docs/features/*` doc (see `docs/INDEX.md`).
+
 - Purpose: Scope a single Settings toggle "Agent Chat (Beta)" that
   controls every Step 6–12 GUI surface so the merge to `main` can ship
   with the new behaviour OFF by default and the legacy behaviour
@@ -466,7 +470,7 @@ visible row) than to interleave hidden rows into an existing group.
 3. Add a `update_feature_flags` integration test that flips the
    toggle and asserts `feature_flag_on` returns the disabled error.
 4. Manual UI smoke checklist: a new doc at
-   `docs/plans/step-13-ui-smoke-checklist.md` patterned after
+   `docs/archive/step-13-ui-smoke-checklist.md` patterned after
    `step-12-ui-smoke-checklist.md` covering: fresh-install boot
    shows EmptyState; flip toggle on → agent surfaces appear; flip
    off → surfaces disappear without crashing; pane-tree placeholder

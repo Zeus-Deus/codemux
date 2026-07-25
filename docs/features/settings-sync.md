@@ -93,7 +93,7 @@ Serde default annotations ensure backward compatibility — missing fields deser
 
 ## Settings UI
 
-Opened via the settings button or command palette. The Settings panel has 12 sections:
+Opened via the settings button or command palette. The Settings panel has 19 sections (`ALL_SECTION_IDS` in `settings-view.tsx`; `docs/features/settings.md` is the canonical per-section list). The table below covers only the sync-relevant ones:
 
 | Section | Category | What It Controls | Synced |
 |---------|----------|-----------------|--------|

@@ -8,7 +8,7 @@
 
 ## What This Feature Is
 
-A CPU-chip icon in the title bar (right of the sidebar toggle) that opens a
+A CPU-chip icon in the title bar (in the title bar's right cluster, immediately left of the IDE launcher) that opens a
 popover showing how much CPU and memory Codemux itself and every live terminal
 process tree are using, grouped by project and workspace.
 
@@ -60,8 +60,9 @@ process tree are using, grouped by project and workspace.
 - PSS accounting is Linux-only; macOS/Windows use sysinfo's RSS/working-set,
   which still overcounts shared memory (a native `phys_footprint` shim would
   close this gap on macOS).
-- `web_view` classification is name-based (`webkit*`, `*webprocess`,
-  `msedgewebview*`); helpers with unusual names fall into `other`.
+- `web_view` classification is name-based — a substring match on `webkit`,
+  `webprocess`, `webengine`, or `msedgewebview`; helpers with unusual names
+  fall into `other`.
 - Project grouping derives from `WorkspaceSnapshot.project_root` (falling back to
   `cwd`); there is no separate project entity.
 - Only **workspaces with live terminal PTYs** appear. A parked workspace whose

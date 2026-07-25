@@ -5,6 +5,7 @@
 - Authority: Active work plan only. Behavior that lands moves to `docs/features/remote-hosts.md`.
 - Update when: Any of the steps below lands or an open question is resolved.
 - Read next: `docs/features/remote-hosts.md`, `docs/features/automations.md`, `src-tauri/src/control.rs`, `src-tauri/src/mcp_server.rs`.
+- Status: MOSTLY LANDED — Steps 2/3/4/7/8 shipped in `v0.6.2`; Step 5 shipped later (see below). Genuinely deferred: Step 1 (`codemux_core` extraction), Step 6 (`--host` CLI flag), Step 9 (HTTP+manifest control endpoint).
 
 ## Goal
 
@@ -347,7 +348,7 @@ automated. They never see the words "manifest" or "systemd."
 ## Explicitly deferred to follow-up PRs
 
 - **Step 1 (extract codemux_core)** and **Step 9 (migrate desktop transport)** — the desktop's `control.rs`/`mcp_server.rs`/state stores are not touched in this branch. Reconnaissance showed ~98K LOC of Rust across ~143 files with ~403 occurrences of Tauri couplings; doing it cleanly is a multi-PR effort. The headless daemon ships *without* needing it because it has its own self-contained registry, server, and tools. Code-sharing dedup becomes a future refactor when the two implementations have actually diverged enough to be worth merging.
-- **Step 5 (desktop pull workspace)** — desktop UI for "pull from host" is unbuilt; the existing rsync push path is unchanged. The wire protocol it needs (HTTP `workspace_list` + `workspace_info`) is already up and tested on the daemon side. Adding the desktop pull-flow code is mostly UI + an SSH-tunnel wrapper around an already-working HTTP client.
+- ~~**Step 5 (desktop pull workspace)**~~ — **SHIPPED, no longer deferred.** The `workspace_pull_back` command is implemented and wired into the UI at `src/components/layout/workspace-inbox-menu.tsx` (the live sidebar inbox menu), `src/components/workspaces-overview/workspace-overview-row.tsx`, and the retained `sidebar-workspace-row.tsx`, via the `workspacePullBack` wrapper in `src/tauri/commands.ts`. See `docs/features/workspaces-sync.md` and `docs/features/remote-hosts.md` for current behavior.
 - **Step 6 (desktop CLI --host flag)** — same gating: the daemon side is done, the desktop CLI wiring is the missing piece.
 - **Phone control without SSH** — v1 recommends Tailscale (documented in `docs/features/remote-hosts.md`). The optional cloud relay (paid tier) is deferred as a separate v2 project; the four design constraints listed above (HTTP transport, `Identity` passthrough, nullable `owner_id`, no Better-Auth coupling) keep that future path additive.
 

@@ -5,6 +5,7 @@
 - Authority: Active operational runbook for the hosted client. The transport/handshake design it rests on lives in `docs/plans/web-remote-account-mode.md` (Design 1, Stage C); the shipped LAN/mesh contract is in `docs/plans/web-remote-access.md`.
 - Update when: The build flags, the static-serve topology, the DNS target, or the API-side CORS/registry dependency changes.
 - Read next: `docs/plans/web-remote-account-mode.md`, `docs/features/web-remote-access.md`, and — for the control-plane half — the API repo's `DEPLOY-DEVICE-REGISTRY.md`.
+- Status: ACTIVE — code landed on `main`; the `app.codemux.org` static host and `api.codemux.org` device-registry endpoints are gated human deploys, not yet live.
 
 > **Do not deploy from this document automatically.** Every step below is run by a human with VPS + DNS access. The VPS is never touched by tooling in this repo.
 

@@ -5,6 +5,7 @@
 - Authority: Active design/history plan. **Design 1 Stages A, B, and C have landed on `main`** (default-off; the hosted `app.codemux.org` service + `api.codemux.org` device registry are gated human deploys, not yet live). **Design 2 has also landed** as `codemux serve`, using Tauri's `MockRuntime` rather than the Xvfb or `codemux_core` paths evaluated below. Current behavior lives in `docs/features/web-remote-access.md`; the hosted deploy runbook lives in `docs/plans/app-codemux-org-hosting.md`.
 - Update when: A stage lands (move it to the feature doc), an open question resolves, or a connectivity/identity decision is made.
 - Read next: `docs/features/web-remote-access.md`, `docs/plans/web-remote-access.md`, `docs/features/auth.md`, `docs/plans/mcp-on-remote.md` (the `Identity::Cloud` passthrough + relay layering this reuses), `docs/features/remote-hosts.md`, `docs/features/workspaces-sync.md` (the existing cloud-API sync shape both designs copy).
+- Status: ACTIVE — Stages A–C code landed on `main`; the hosted deploy is gated and 8 design questions are unresolved.
 
 ## Goal
 

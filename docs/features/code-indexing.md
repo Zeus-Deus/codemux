@@ -8,7 +8,7 @@
 
 ## What This Feature Is
 
-The indexing system creates a searchable local index of project source files. It enables full-text keyword search across the workspace codebase via CLI, socket API, or the search UI.
+The indexing system creates a searchable local index of project source files. It enables full-text keyword search across the workspace codebase via CLI and the control socket. **There is no frontend surface**: `rebuild_project_index` / `get_project_index_status` / `search_project_index` are registered in `lib.rs` but have no wrapper in `src/tauri/commands.ts` and no caller anywhere in `src/`. The Ctrl+Shift+P / Ctrl+Shift+F search dialogs use ripgrep/fd directly and never touch the index (see `docs/features/search.md`).
 
 ## Current Model
 

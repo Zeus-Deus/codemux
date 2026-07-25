@@ -128,6 +128,30 @@ codemux browser screenshot      # tablet screenshot
 codemux browser viewport reset
 ```
 
+### Coordinate and OS-level input
+
+These have full CLI parity with the socket actions of the same name but are
+worth reaching for only when a selector won't do — a canvas, a native file
+dialog, a drag handle, or an element the CDP DOM can't address.
+
+| Command | Purpose |
+|---|---|
+| `codemux browser click-at <x> <y> [--click-type left\|right\|middle\|double]` | CDP click at viewport coordinates |
+| `codemux browser type-at <text> [--x <x> --y <y>]` | Type text, optionally clicking a coordinate first to focus |
+| `codemux browser scroll-at <x> <y> [--direction up\|down\|left\|right] [--amount N]` | Scroll the element under a coordinate (default `down`, amount `3`) |
+| `codemux browser key-press <key>` | Send a single key (e.g. `Enter`, `Tab`, `Escape`) |
+| `codemux browser drag <start_x> <start_y> <end_x> <end_y>` | Press, move, release — drag handles and sliders |
+| `codemux browser click-os <x> <y>` | **OS-level** click via real input injection — escapes the page sandbox (native dialogs, browser chrome) |
+| `codemux browser type-os <text> [--x <x> --y <y>]` | **OS-level** typing via real input injection |
+
+Every one of these accepts a trailing optional `browser_id` (defaults to the
+workspace's session). Prefer the selector-based `click` / `fill` whenever the
+element is addressable — coordinates break the moment layout shifts.
+
+Three more capabilities exist on the socket API with no CLI wrapper: `wait`
+(wait conditions), `evaluate` (run JS and return the result), and `get_styles`
+(computed CSS inspection). See the socket actions below.
+
 ## Socket API Commands
 
 These actions are available via the Codemux control socket. They cover additional functionality not exposed as CLI subcommands.

@@ -39,12 +39,21 @@
 
 ## Command Families
 
-- app and workspace state: `status`, `get_app_state`, `create_workspace`, `split_pane`
-- terminal control: `write_terminal`
+`control.rs` dispatches 41 commands. `codemux capabilities` prints the authoritative
+machine-readable listing — prefer it over this table when scripting.
+
+- app and workspace state: `status`, `get_app_state`, `create_workspace`, `create_worktree_workspace`, `activate_workspace`, `close_workspace`, `split_pane`, `close_pane`
+- workspace archive: `archive_workspace`, `unarchive_workspace`, `list_archived_workspaces`
+- terminal control: `write_terminal`, `read_terminal`
+- presets: `get_presets`, `apply_preset`
 - notifications: `notify`
 - browser control: `create_browser_pane`, `open_url`, `browser_automation`
 - memory and handoff: `get_project_memory`, `update_project_memory`, `add_project_memory_entry`, `generate_handoff`
 - indexing: `rebuild_index`, `index_status`, `search_index`
+- ports: `port_list`
+- GitHub issues: `list_github_issues`, `get_github_issue`, `link_workspace_issue`
+- setup scripts: `rerun_setup`
+- automations: `automation_list`, `automation_get`, `automation_create`, `automation_update`, `automation_set_enabled`, `automation_delete`, `automation_runs` (note: the socket uses `automation_set_enabled`; the MCP surface instead exposes `automation_pause`/`automation_resume`)
 - web remote access: `web_remote_enable` (turn remote access on; optional `scope` = `all|tailscale|loopback` and `port`), `web_remote_disable` (turn it off, severing live connections), `web_remote_pair` (mint a one-time pairing code; errors if remote access is disabled). All same-machine only — the SSH-in path, no GUI needed. `web_remote_enable` returns the resulting status plus the recommended reachable endpoint, so you can immediately `web_remote_pair`.
 
 ## Boundary Notes
@@ -77,6 +86,16 @@ codemux serve --scope tailscale --relay
 codemux logs --tail 200
 codemux doctor
 ```
+
+The examples above are a sampler, not the full surface. Other subcommands:
+`codemux capabilities` (JSON listing of every command — the authoritative
+source), `codemux app`, `codemux mcp` (stdio MCP server), `codemux pty-daemon
+--socket <path>`, `codemux workspace rerun-setup [workspace_id]`, `codemux
+issue list|view|link`, `codemux memory set|add`, `codemux index status|search`,
+and the full `codemux browser` set beyond `create|open|snapshot`: `click`,
+`fill`, `screenshot`, `console-logs`, `click-at`, `type-at`, `scroll-at`,
+`key-press`, `drag`, `click-os`, `type-os`, `viewport`, `viewport-presets`
+(documented in `docs/reference/BROWSER-AGENT-COMMANDS.md`).
 
 `codemux remote enable [--scope all|tailscale|loopback] [--port N]` turns web
 remote access on (binding the server) and prints the resulting port, bind

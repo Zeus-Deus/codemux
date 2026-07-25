@@ -165,7 +165,7 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
   `useDraftGuiChrome()` draft predicate.
 - `src/components/layout/title-bar.tsx` — consumes `useGuiChrome()` +
   `useDraftGuiChrome()` for the slot-composition branch, `RightPanelToggle`,
-  `PinnedChatFavorite`, `TitleBarWorkspaceSlots`, `TitleBarDraftSlots`.
+  `PinnedPresetTiles`, `TitleBarWorkspaceSlots`, `TitleBarDraftSlots`.
 - `src/lib/agent-chat/draft-preset-launch.ts` — shared
   materialise-with-preset action behind both the legacy draft `PresetBar`
   and `DraftAgentLauncher`.
@@ -187,7 +187,7 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
 - `src/components/layout/PaneNode.tsx` / `pane-container.tsx` — `isSurfaceRoot`
   header suppression.
 - Tests: `title-bar.test.tsx`, `title-bar-tabs.test.tsx`,
-  `agent-launcher.test.tsx`, `workspace-main.test.tsx` (~14 Vitest cases).
+  `agent-launcher.test.tsx`, `workspace-main.test.tsx` (~49 Vitest cases).
 
 ## Notes
 

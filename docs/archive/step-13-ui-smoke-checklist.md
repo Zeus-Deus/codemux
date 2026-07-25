@@ -1,10 +1,14 @@
 # Step 13 — Agent Chat Beta Toggle: UI Smoke Checklist
 
+> **ARCHIVED.** This plan's work has landed; it is kept as the implementation
+> record and reasoning trail, not as current truth. For how this behaves today
+> read the relevant `docs/features/*` doc (see `docs/INDEX.md`).
+
 - Purpose: Operator verification of Step 13's master Beta toggle. Run
   this end-to-end before declaring the merge-readiness gate green.
 - Audience: The operator booting the dev build to verify the toggle.
 - Authority: Follow this list verbatim before push to `main`.
-- Read next: `docs/plans/step-13-beta-toggle-research.md` for the
+- Read next: `docs/archive/step-13-beta-toggle-research.md` for the
   scoping rationale, `docs/archive/main-merge-plan.md` for the merge
   context this gate sat behind (now landed in commit `a58c3d9`).
 

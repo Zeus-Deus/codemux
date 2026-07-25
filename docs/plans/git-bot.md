@@ -5,6 +5,7 @@
 - Authority: Active work plan, not current truth. See `docs/features/merge-resolver.md` for current capability.
 - Update when: Priorities, open questions, or hardening targets change.
 - Read next: `docs/features/merge-resolver.md`, `docs/core/STATUS.md`
+- Status: ACTIVE — blocked on the Changes-panel regression: `ai.rs::resolve_conflicts_with_agent` is still a single-shot batch call with no per-file loop or progress events, and the UI entry points remain unwired.
 
 ## Goal
 

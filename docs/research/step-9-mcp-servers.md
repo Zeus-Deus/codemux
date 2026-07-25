@@ -1,5 +1,10 @@
 > Step 9 implementation research, completed 2026-04-28. Locked design decisions plus concrete file:line evidence for the cross-provider MCP server runtime that follows Step 8 (attachments). No code changes in this checkpoint — research only.
 
+> **RESEARCH NOTE.** Pre-implementation research or a spike. Some conclusions
+> here were later revised or reversed by what actually shipped — read it as
+> reasoning history, never as current behavior. Current truth lives in
+> `docs/features/*`.
+
 # Step 9 Research Deliverable — Cross-Provider MCP Servers
 
 This document is the research deliverable for Step 9 of the agent-chat track. The work mirrors Step 7 (skills) in shape — a Settings section listing user-installed integrations with toggles, tool counts, and live status — but inverts Codemux's existing relationship with MCP. Today Codemux **is** an MCP server (`docs/features/mcp-server.md:9`); Step 9 makes it an MCP **host/client** that spawns user-installed servers and routes their tools into Claude and (eventually) Codex chat sessions.
@@ -462,7 +467,7 @@ Estimate: **1.5–2× Step 7's effort.** Step 8 (attachments) was probably the c
 
 ## Critical risks
 
-1. **Codex has no MCP host API.** Stage 5 likely resolves to "Claude-only ships, Codex deferred / config-rewritten only." Half of "cross-provider" collapses for v1. **(Resolved 2026-04-28.)** The Stage 5 spike at `docs/plans/step-9-codex-mcp-spike.md` reconfirmed that Codex still has no runtime tool-injection RPC, but identified two material changes since the original research: streamable HTTP MCP transport landed stable in Codex (PR #4317, Sept 2025) and `config/mcpServer/reload` lets Codemux hot-reload Codex's config without bouncing the session. Recommendation: Step 11 ships an HTTP MCP gateway in Codemux that Codex consumes as a single MCP entry, reusing the Step 9 registry. Estimated 40-50% of Stage 3's complexity.
+1. **Codex has no MCP host API.** Stage 5 likely resolves to "Claude-only ships, Codex deferred / config-rewritten only." Half of "cross-provider" collapses for v1. **(Resolved 2026-04-28.)** The Stage 5 spike at `docs/research/step-9-codex-mcp-spike.md` reconfirmed that Codex still has no runtime tool-injection RPC, but identified two material changes since the original research: streamable HTTP MCP transport landed stable in Codex (PR #4317, Sept 2025) and `config/mcpServer/reload` lets Codemux hot-reload Codex's config without bouncing the session. Recommendation: Step 11 ships an HTTP MCP gateway in Codemux that Codex consumes as a single MCP entry, reusing the Step 9 registry. Estimated 40-50% of Stage 3's complexity.
 2. **SDK in-process MCP server semantics may have undocumented edges.** Path B in Task 7 assumes the SDK's `Options.mcpServers["x"] = { type: "sdk", instance: McpServer }` accepts an in-process JS object whose tool callbacks forward async to Rust. The `browser-sdk.d.ts` types confirm the surface but real-world behavior on tool errors, concurrent calls, and large tool lists needs Stage 3 dogfooding before locking the architecture. Fallback: spawn a tiny stdio shim binary per Claude session that proxies to Rust over a unix socket — workable but adds a binary to the build.
 3. **Tool count bloat hits the model's instruction-following.** Even with the 50-cap, 29 native + ~20 MCP tools is a lot. Plan dogfooding on a real chat with at least 3 MCPs enabled before flipping the user-visible flag in Stage 3.
 4. **Pooling the MCP child across chat threads serializes calls within one server.** A slow `mcp__playwright__navigate` blocks every other thread's playwright call. Acceptable for v1 but add a per-server in-flight gauge to telemetry from day one.

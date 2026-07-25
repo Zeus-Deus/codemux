@@ -1,7 +1,7 @@
 # Phase 1.5 — vexis-agent ↔ Codemux gap analysis
 
 - Purpose: Identify the MCP gaps that block a Telegram-driven brain from materializing real work in Codemux (worktree + workspace + agent + prompt → working agent visible in sidebar).
-- Authority: Research notes; not a build plan. Read after `docs/plans/vexis-agent-integration.md`.
+- Authority: Research notes; not a build plan. Read after `docs/research/vexis-agent-integration.md`.
 
 ## 1. workspace_create reality check
 

@@ -35,7 +35,7 @@ Settings are organized into three nav groups (`buildNavGroups` in `settings-view
 - **Permissions** (Agent Chat Beta only): view and manage agent tool-permission rules (allow / deny / ask) flattened across the user / project-shared / project-local scopes (see `docs/features/permissions.md`)
 - **Skills** (Agent Chat Beta only): skills sync management (see `docs/features/skills-sync.md`)
 - **MCP Servers** (Agent Chat Beta only): MCP host/server configuration (see `docs/features/mcp-server.md`)
-- **Browser**: browser profile storage size display, clear cookies/site data, clear all browser data
+- **Browser**: **Default viewport** for agent browser sessions (a synced `browser.default_viewport` setting; the panel offers four canned sizes — Default 1280×800 / 1920×1080 / 2560×1440 / 3840×2160 — and surfaces any other value set from another device or by hand as an extra option), browser profile storage size display, clear cookies/site data, clear all browser data
 - **Devices**: remote hosts / cloud-push targets — test connection, reinstall agent, upgrade status (see `docs/features/remote-hosts.md`)
 - **Remote Access**: expose this desktop to a browser on another device — default-off master toggle, bind scope, pairing (see `docs/features/web-remote-access.md`)
 - **Session Restore**: save/restore terminal scrollback on restart, scrollback line limit (1000-50000), max disk usage (10-500 MB)

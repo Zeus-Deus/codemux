@@ -20,7 +20,7 @@ layers still to come.
 ## Current Model
 
 - **Persistence** — `automations` and `automation_runs` tables in the
-  local SQLite database (`database.rs`, schema v6). They carry the same
+  local SQLite database (`database.rs`; `SCHEMA_VERSION` is currently 9). They carry the same
   `server_id` / `deleted_at` / `dirty` columns as `hosts`, so the
   account-sync layer can be added with no migration.
 - **Recurrence** — an automation's `schedule` is a complete RFC 5545
@@ -127,7 +127,7 @@ layers still to come.
   driven by its most recent run — green healthy, amber if the last run
   failed, grey when paused. A misconfigured host self-heals: fix its
   credentials and the next run clears the dot, no button required.
-- Coverage — 1471 Rust unit tests (recurrence, scheduler + tick + host
+- Coverage — ~2290 Rust unit tests repo-wide (recurrence, scheduler + tick + host
   routing, the executor incl. real-git clone/fetch/worktree-base,
   account sync, reconciler, service units, the preflight probe, database
   CRUD / migration / run lifecycle) + 263 server tests for the
@@ -172,7 +172,7 @@ layers still to come.
 - `src-tauri/src/lib.rs` — the once-a-minute desktop scheduler task.
 - `src/components/automations/automations-view.tsx` +
   `automations-section.tsx` — the full-screen Automations view.
-- `src/components/layout/sidebar-action-row.tsx` — the sidebar entry.
+- `src/components/layout/sidebar-footer-bar.tsx` — the sidebar entry (expanded: labeled button; collapsed: icon).
 - `src/hooks/use-automation-fire-toast.ts` — the fire-event toast.
 
 ## Notes

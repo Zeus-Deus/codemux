@@ -1,5 +1,9 @@
 # Step 12 — Multi-Provider Chat UI Smoke Checklist
 
+> **ARCHIVED.** This plan's work has landed; it is kept as the implementation
+> record and reasoning trail, not as current truth. For how this behaves today
+> read the relevant `docs/features/*` doc (see `docs/INDEX.md`).
+
 - Purpose: Operator-driven manual smoke for the multi-provider chat picker. Run after a fresh `npm run tauri:dev` build, or against a published release once Step 12 ships.
 - Audience: Whoever is verifying Step 12 end-to-end before declaring it daily-drivable.
 - Authority: The unit test suite covers component-level behaviour; this checklist is the missing live-app validation pass that unit tests can't capture (provider startup, real Tauri IPC, real session creation, real OpenCode harvest).
@@ -90,4 +94,4 @@ This checklist exists because the picker is a single React surface that touches:
 
 - This checklist deliberately does NOT cover keyboard shortcuts. `Ctrl+1..9` collides with workspace switching and was deferred per the locked Step 12 scope; v2 picks a non-colliding namespace.
 - Multi-instance per provider is also deferred. If you have multiple Codex accounts or multiple OpenCode connections, they collapse under one rail entry today.
-- If a step fails, capture: which step, what you saw, the OpenCode version (`opencode --version`), and the relevant errors from `Settings → Diagnostics`. File the report against `docs/plans/step-12-opencode-implementation-plan.md` follow-ups.
+- If a step fails, capture: which step, what you saw, the OpenCode version (`opencode --version`), and the relevant errors from `Settings → Diagnostics`. File the report against `docs/archive/step-12-opencode-implementation-plan.md` follow-ups.

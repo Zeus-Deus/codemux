@@ -1,5 +1,9 @@
 # Plan: Automations — Account Sync & Remote-Host Execution (Phase 2)
 
+> **ARCHIVED.** This plan's work has landed; it is kept as the implementation
+> record and reasoning trail, not as current truth. For how this behaves today
+> read the relevant `docs/features/*` doc (see `docs/INDEX.md`).
+
 - Purpose: Detailed implementation plan for the second phase of
   Automations — account sync and running automations on remote hosts.
 - Audience: Whoever implements this phase.

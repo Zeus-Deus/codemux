@@ -1,8 +1,13 @@
 > Step 9 Stage 5 research-only spike, completed 2026-04-28. Investigates whether Codemux's MCP runtime can be extended to Codex sessions. Outcome: **GO with HTTP MCP gateway (Option C)** as a future Step 11 — the ground has shifted since the original Step 9 research and a tractable workaround now exists. No code changes in this checkpoint.
 
+> **RESEARCH NOTE.** Pre-implementation research or a spike. Some conclusions
+> here were later revised or reversed by what actually shipped — read it as
+> reasoning history, never as current behavior. Current truth lives in
+> `docs/features/*`.
+
 # Step 9 Stage 5 — Codex MCP feasibility spike
 
-The original Step 9 research (`docs/plans/step-9-mcp-servers.md`, locked 2026-04-28) concluded that Codex's `app-server` exposes no runtime tool-injection RPC, ruling out the in-process facade pattern (Path B) used for Claude. Stage 5 re-validates that conclusion six weeks later and explores workarounds that have become viable since the original write-up.
+The original Step 9 research (`docs/research/step-9-mcp-servers.md`, locked 2026-04-28) concluded that Codex's `app-server` exposes no runtime tool-injection RPC, ruling out the in-process facade pattern (Path B) used for Claude. Stage 5 re-validates that conclusion six weeks later and explores workarounds that have become viable since the original write-up.
 
 **Bottom line:** Codex still has no runtime tool-injection API, but two complementary changes since the original research make a thin **HTTP MCP gateway** approach feasible — Codex now consumes streamable HTTP MCP servers reliably (PR #4317, stable since Sept 2025) AND exposes a `config/mcpServer/reload` JSON-RPC method (so Codemux can rewrite-and-reload Codex's config without bouncing the session).
 
@@ -251,7 +256,7 @@ Estimated complexity: **40-50% of Stage 3** (Claude facade). Reuses dispatcher, 
 This spike's outcome should be reflected in:
 
 1. **`docs/features/mcp-server.md`** — add a "Codex support (planned, Step 11)" section noting the HTTP gateway approach is the chosen path.
-2. **`docs/plans/step-9-mcp-servers.md`** — update the "Critical risk #1: Codex has no MCP host API" callout with a forward reference to this spike.
+2. **`docs/research/step-9-mcp-servers.md`** — update the "Critical risk #1: Codex has no MCP host API" callout with a forward reference to this spike.
 3. **`docs/core/PLAN.md`** — if there's a backlog of step numbers, add Step 11 with this spike as the source.
 
 (Not done in this checkpoint — those updates land alongside Step 11's actual implementation. This spike's job is to inform the decision, not to ship doc changes.)

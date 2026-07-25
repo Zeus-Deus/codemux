@@ -5,6 +5,7 @@
 - Authority: Active OpenFlow work plan, not current truth.
 - Update when: Priorities, unresolved questions, or likely touch points change.
 - Read next: `docs/features/openflow.md`, `docs/core/STATUS.md`
+- Status: ACTIVE — the largest remaining stability gap. Orchestration runs; large-run reliability, the intervention flow, the Windows bash-wrapper rewrite, and the browser surface are all open.
 
 ## Active Priorities
 

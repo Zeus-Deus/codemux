@@ -163,6 +163,21 @@ Codemux detects this automatically: if the terminal was in alternate buffer mode
 - resume constructs the full command as `{original_preset_command} {resume_args}` — no support for command rewriting
 - no per-adapter timeout configuration (global 200 lines / 60s)
 
+## Builtin adapters and config versioning
+
+There are **two** builtin adapters, not one. Alongside `claude-code`,
+`default_config()` inserts an **`opencode`** adapter: `detect_pattern = "opencode"`,
+`resume_args = "--session {opencode_session_id}"`, `resume_label = "Resume OpenCode
+session"`, `fallback_resume_args = "--continue"`. Its session id does not come from
+output scanning — it is read from OpenCode's SQLite DB at push/pull time by
+`ssh::opencode_db_sync`.
+
+The adapters file is also **versioned and self-migrating**: `AdaptersFile` carries a
+`config_version`, and `load_adapters()` re-applies the builtin defaults when the
+on-disk version is older (e.g. when `claude-code` switched from `--resume` to
+`--continue`), while preserving user-added adapters. So "delete the file to
+regenerate" is rarely necessary — a stale builtin heals itself on load.
+
 ## Important Touch Points
 
 - `src-tauri/src/scrollback.rs` — scrollback file I/O, cleanup, disk limits, `ScrollbackCache`, `flush_cache_to_disk`, `refresh_stale_scrollback_metadata`
@@ -171,7 +186,7 @@ Codemux detects this automatically: if the terminal was in alternate buffer mode
 - `src-tauri/src/terminal/mod.rs` — scanner wiring in PTY read loop
 - `src-tauri/src/settings_sync.rs` — `SessionRestoreSettings` struct (defaults: `enabled=true`, `scrollback_lines=10000`, `max_total_mb=100`)
 - `src-tauri/src/state/state_impl.rs` — `original_command` field on `TerminalSessionSnapshot`
-- `src-tauri/src/commands/presets.rs` — sets `original_command` when applying presets
+- `src-tauri/src/commands/presets.rs` — calls `update_terminal_session_command(...)` when applying presets; the `original_command` field and its setter live in `src-tauri/src/state/state_impl.rs`, and `commands/workspace.rs` is a second writer
 - `src/components/terminal/TerminalPane.tsx` — serialize addon and scrollback restore; `buildScrollbackPayload` (accepts an idle-precomputed buffer) + `buildFreshOrCached` fresh-if-clean reuse on unmount/close
 - `src/components/terminal/scrollback-idle-serializer.ts` — per-pane idle serializer that pre-serializes a clean buffer while the pane is quiet so the unmount/close path can skip the synchronous serialize (issue #128); falls back to a fresh serialize when dirty
 - `src/hooks/use-scrollback-serializer.ts` — global serialization coordinator

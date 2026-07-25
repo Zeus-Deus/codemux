@@ -1,5 +1,10 @@
 > Step 8 implementation research, completed 2026-04-26. See `docs/plans/` for index.
 
+> **RESEARCH NOTE.** Pre-implementation research or a spike. Some conclusions
+> here were later revised or reversed by what actually shipped — read it as
+> reasoning history, never as current behavior. Current truth lives in
+> `docs/features/*`.
+
 # Step 8 Research Deliverable — Attachments + Context System
 
 This document is the locked research for the attachment system added in Step 8

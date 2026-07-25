@@ -4,7 +4,7 @@
 - Audience: Anyone working on the chat composer, the model picker, or adding a new chat provider.
 - Authority: Canonical feature-level reality doc for the picker + capability harvest stack.
 - Update when: A provider is added/removed, the picker layout changes, the capabilities harvest pipeline changes, or the federation slug shape changes.
-- Read next: `docs/features/agent-chat.md`, `docs/plans/step-12-opencode-research.md`, `docs/plans/step-12-opencode-implementation-plan.md`, `docs/plans/step-12-ui-smoke-checklist.md`.
+- Read next: `docs/features/agent-chat.md`, `docs/research/step-12-opencode-research.md`, `docs/archive/step-12-opencode-implementation-plan.md`, `docs/archive/step-12-ui-smoke-checklist.md`.
 
 ## What This Feature Is
 
@@ -18,7 +18,7 @@ OpenCode is the federated arm: a single rail entry whose flat model list shows e
 
 | Driver | Transport | Adapter | Capabilities |
 |---|---|---|---|
-| Claude | JSON-RPC stdio (`claude-agent` sidecar bin) | `src-tauri/src/agent_provider/claude/mod.rs` | **Live harvest** via the sidecar's `list-models` RPC (SDK `supportedModels()`), merged with hand-maintained per-id metadata in `capabilities.rs`; `/v1/models` (API-key) and `claude_fallback_capabilities()` as fallbacks. Handles alias ids (`default`, `sonnet`, `haiku`) and pinned-window ids (`claude-fable-5[1m]`) via family inference; maintained entries of families the curated roster omits (currently Opus) are appended so they stay selectable via `--model`. Ultrathink prompt-injection effort level, 200k/1M context-window picker on bare flagship/Sonnet ids. |
+| Claude | JSON-RPC stdio (`claude-agent` sidecar bin) | `src-tauri/src/agent_provider/claude/mod.rs` | **Live harvest** via the sidecar's `list-models` RPC (SDK `supportedModels()`), merged with hand-maintained per-id metadata in `capabilities.rs`; `/v1/models` (API-key) and `claude_fallback_capabilities()` as fallbacks. Handles alias ids (`default`, `sonnet`, `haiku`) and pinned-window ids (`claude-fable-5[1m]`) via family inference. **Alias folding + label promotion:** `dedupe_default_alias` drops the `default` row whenever a concrete twin exists — the twin absorbs it, moves to index 0, and takes a `"Recommended · …"` description prefix — and alias/nickname rows render promoted concrete names ("Claude Opus 4.8") parsed from the live version-bearing description, falling back to the maintained catalog. So index 0 is the recommended default on the fallback path, and the *folded twin* leads on the SDK-harvest path. For persistence compat, `selectModel` (`provider-capabilities-store.ts`) deliberately breaks strict-id matching for the literal id `"default"` and resolves it to `models[0]`, so drafts and threads persisted before the fold still resolve a real model (and so still get the right trigger label, tooltip, active-row highlight, and reasoning/speed picker availability); maintained entries of families the curated roster omits (currently Opus) are appended so they stay selectable via `--model`. Ultrathink prompt-injection effort level, 200k/1M context-window picker on bare flagship/Sonnet ids. |
 | Codex | JSON-RPC stdio (`codex app-server`) | `src-tauri/src/agent_provider/codex/mod.rs` | **Live harvest** via a short-lived `codex app-server` child (`initialize` → `account/read` → `model/list`); unauthenticated users get a clean error state, no static fallback. Auth classification follows the app-server contract: `requiresOpenaiAuth` describes the active model provider, so login is missing only when that field is true **and** `account` is null. Sandbox-policy permission modes, per-turn effort. |
 | OpenCode | HTTP (Rust-direct `reqwest` against a managed `opencode serve` child) | `src-tauri/src/agent_provider/opencode/{server,manager,client,capabilities}.rs` | **Live harvest** at `harvest_opencode_capabilities` — calls `GET /provider`, flattens to per-model `ChatModelInfo` entries with `sub_provider` populated and connected-only filter applied. |
 
@@ -75,7 +75,7 @@ Stale favorites for a now-disconnected provider stay in storage and are silently
 ## Current Constraints
 
 - **Single instance per provider.** A user with multiple Codex accounts or multiple OpenCode connections sees them collapsed under one rail entry. The `ProviderInstanceId` shim is in place (`src-tauri/src/agent_provider/instance.rs`) for forward-compat — multi-instance lifts the singleton without changing the wire format.
-- **No keyboard shortcuts on the picker.** `Ctrl+1..9` collide with workspace switching. Slot-based jumps are deferred until we decide on a non-colliding namespace (likely `Cmd+Shift+1..N` or in-popover-only).
+- **Row-jump shortcuts inside the picker.** While the popover is open, `Ctrl+1..9` (`Cmd+1..9` on macOS) activates the Nth row of the *filtered* list. A window capture-phase `keydown` listener is registered only while the popover is open and calls `preventDefault` + `stopPropagation`, so there is no collision with the global tab/workspace bindings that own the same chord — the earlier "deferred until we find a non-colliding namespace" constraint was resolved by scoping rather than renaming. Each row renders its own kbd chip (`JUMP_MOD_LABEL`).
 - **No "favorites only" filter** in the rail — favorites bubble up via sort, not via a dedicated filter mode.
 - **No favorites sync across devices.** Codemux doesn't sync UI prefs; favorites live in `localStorage` only.
 - **OpenCode credential management lives in OpenCode.** Codemux never reads or writes upstream API keys (OpenAI / Anthropic / etc.). `opencode auth login` is the one entry point; settings panel only shows the connected/disconnected state.
@@ -105,19 +105,19 @@ Stale favorites for a now-disconnected provider stay in storage and are silently
 - `src/stores/provider-capabilities-store.ts` — three-slot store, exhaustive `selectCapabilities` / `selectError`.
 - `src/stores/picker-favorites-store.ts` — `usePickerFavorites` (zustand + persist), `pickerFavoriteKey()` helper.
 - `src/components/chat/pickers/MultiProviderModelPicker.tsx` — the picker.
-- `src/components/chat/pickers/ModelPicker.tsx` — legacy single-provider picker (kept for `DraftChatSurface`).
-- `src/components/chat/ComposerFooter.tsx` — switches between `MultiProviderModelPicker` (when `showProviderPicker={true}`) and the legacy `ModelPicker` (drafts).
+- `src/components/chat/pickers/ModelPicker.tsx` — legacy single-provider picker. No longer used by `DraftChatSurface` (which passes `showProviderPicker={true}`); retained for any surface that opts out of the unified picker.
+- `src/components/chat/ComposerFooter.tsx` — switches between `MultiProviderModelPicker` (when `showProviderPicker={true}` — the path both the pane and the draft surface take today) and the legacy `ModelPicker`.
 - `src/components/chat/AgentChatPane.tsx:103` — `ENABLE_PROVIDER_PICKER = true` flag.
 
 ### Docs
 
-- `docs/plans/step-12-opencode-research.md` — locked research notes from a reference multi-provider client.
-- `docs/plans/step-12-opencode-implementation-plan.md` — original scoping doc; final-state summary added in Stage 7.
-- `docs/plans/step-12-ui-smoke-checklist.md` — operator-driven manual smoke.
+- `docs/research/step-12-opencode-research.md` — locked research notes from a reference multi-provider client.
+- `docs/archive/step-12-opencode-implementation-plan.md` — original scoping doc; final-state summary added in Stage 7.
+- `docs/archive/step-12-ui-smoke-checklist.md` — operator-driven manual smoke.
 
 ## Notes
 
 - **The legacy single-provider `ProviderPicker.tsx` was deleted in Stage 7 cleanup.** Stage 4 replaced it with `MultiProviderModelPicker` and Stage 4's wiring left zero callers; the file was kept around through Stage 6 as a paranoia hedge and removed once dead-code audit confirmed no remaining imports.
 - **OpenFlow capabilities convergence is future cleanup, not a regression.** OpenFlow's `list_models_for_tool` Tauri command has its own model registry that pre-dates the agent-chat capabilities harvest. The Codex fallback file already cross-references this duplication (`src-tauri/src/agent_provider/codex/capabilities.rs:33`). Converging would let Codemux drop two parity-by-comment dependencies, but it's a meaningful refactor that touches OpenFlow's CLI-launcher invariants.
 - **Multi-instance per provider is planned for v2.** `ProviderInstanceId` already exists; the wire format already serializes as a bare provider slug (`"claude"` / `"codex"` / `"opencode"`). The lift is mostly settings UI + capability-harvest fan-out.
-- **Picker keyboard shortcuts deferred.** `Ctrl+1..9` is owned by workspace switching; we'll revisit with a non-colliding namespace.
+- **Picker keyboard shortcuts shipped** as in-popover-only row jumps (see above); the deferred cross-app namespace question is moot.

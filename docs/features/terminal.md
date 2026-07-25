@@ -40,7 +40,7 @@ For ordinary shells the exposure is the reverse: a deep scrollback makes `serial
 - PTY resize on pane/window resize
 - xterm.js WebGL renderer (GPU glyph rendering) gated by a once-per-session probe: DOM renderer on **software-rendered WebGL** (SwiftShader/llvmpipe-class stacks) and on **Linux WebKitGTK** (masked renderer strings + input-lag history; `localStorage["codemux:terminal-renderer"]` overrides), with the existing fallbacks on GPU context loss or missing WebGL2 support, plus kitty keyboard protocol support
 - terminal theme reads dynamically from CSS variables via MutationObserver
-- session state tracking (running, exited, error)
+- session state tracking — `TerminalLifecycleState { Starting, Migrating, Ready, Exited, Failed }` and the persisted `TerminalSessionState { Starting, Ready, Exited, Failed }`
 - environment injection: `CODEMUX`, `CODEMUX_VERSION`, `CODEMUX_WORKSPACE_ID`, `CODEMUX_BROWSER_CMD`, `BROWSER`, `CODEMUX_AGENT_CONTEXT`
 - working directory set to workspace root on creation
 - comm log support for OpenFlow agent communication tracking
@@ -55,9 +55,7 @@ For ordinary shells the exposure is the reverse: a deep scrollback makes `serial
 
 ## Windows-Specific Notes
 
-- **`portable-pty` is pinned to a fork** (`Zeus-Deus/portable-pty`, branch `codemux-0.8.1-no-window`). Upstream `portable-pty 0.8.1` omits both `CREATE_NO_WINDOW` and `STARTF_USESHOWWINDOW + SW_HIDE` from `dwCreationFlags` in `psuedocon.rs`, which makes every PTY spawn flash a visible `cmd.exe` console window on the taskbar before being attached to a pseudoconsole. The fork ORs the flags in. Pinning instead of upgrading to 0.9.x avoids the `0.9.0` upstream regression #6783 (reader returns garbage output on Windows).
-- **`spawn_pty_for_agent` PATH joining** uses the cross-platform `prepend_shim_to_path()` helper (`;` separator on Windows, `:` on Unix). A previous version hardcoded `:` and broke shim lookup on Windows.
-- **Preset command line terminator** is `\r` on Windows so PowerShell actually executes the typed-in command on submit (Unix uses `\n`).
+- **`portable-pty` is upstream `0.8.1`, not a fork.** Codemux briefly pinned `Zeus-Deus/portable-pty@codemux-0.8.1-no-window` to force `STARTF_USESHOWWINDOW + SW_HIDE`, but commit `06c0301` reverted to the crates.io release because `CREATE_NO_WINDOW` broke ConPTY pipe IO (blank panes). The console window is now suppressed instead by an `AllocConsole` + `SW_HIDE` on the *parent* process, gated `#[cfg(all(target_os = "windows", not(debug_assertions)))]`.
 
 ## Current Constraints
 
@@ -75,7 +73,7 @@ Note: terminal scrollback is saved and restored across app restarts. See `docs/f
 - `src/components/terminal/terminal-write-pump.ts` — **the live freeze fix + back-pressure source**: ordered, byte-budgeted write queue that throttles scrollback restore + reattach replay + live output across macrotasks; also tracks total queued bytes and fires HIGH/LOW watermark callbacks (16 MiB / 4 MiB, with hysteresis) so the live path can signal the producer; unit-tested in `terminal-write-pump.test.ts`
 - `src-tauri/src/terminal/mod.rs` — PTY spawning, read/write, session management, comm log locks, `attach_pty_output` (replays the full `pending_output` ring on attach — the reattach replay the write pump throttles; clears `flow_paused` as a self-heal), dropped-chunk observability counter, `pause_pty_output` / `resume_pty_output` flow-control commands, and the **in-process `flow_paused` gate** in `batched_reader_loop` (`set_pty_flow_paused` flips a per-session `Arc<AtomicBool>` the reader polls, with a `FLOW_MAX_PARK` backstop). In-process flow-control tests: `test_in_process_flow_control_pauses_and_resumes_reader`, `test_firehose_backpressure_bounds_backend_with_consumer_attached`
 - `src-tauri/src/pty_daemon/{protocol,client,server}.rs` — `SetFlowPaused` wire request + per-session `flow_paused` flag gating the daemon read loop (with `Attach`/`Close`/max-park fail-safes); invoked by the live `TerminalPane` path for daemon-backed sessions (the in-process path uses `mod.rs`'s own `flow_paused` gate)
-- `src-tauri/src/commands/workspace.rs` — `create_terminal_session`, `write_to_pty`, `resize_pty`, `attach_pty_output`
+- `src-tauri/src/terminal/mod.rs` — `create_terminal_session`, `write_to_pty`, `resize_pty`, `attach_pty_output` (registered in `lib.rs` as `terminal::*`; `commands/workspace.rs` only reaches PTYs via `write_to_pty_by_session`)
 - `src/components/terminal/terminal-cache.ts` — **DISABLED / not wired** (see file banner): module-level persistent Terminal cache, parking node, attach/detach/dispose API, `pumpWrites` + HIGH/LOW watermark pause/resume. Retained for a possible future flag-gated revival; inert in production. Its watermark constants/approach were reused on the live `TerminalPane`/`terminal-write-pump.ts` path (do NOT resurrect this file — see issue #73 pitfalls).
 - `src/hooks/use-terminal-cache-gc.ts`, `src/hooks/use-terminal-theme-sync.ts` — operate on the disabled cache's empty map; no-ops today
 - `src/lib/app-shortcuts.ts` — terminal-specific keyboard shortcuts

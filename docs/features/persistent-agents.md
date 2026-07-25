@@ -29,7 +29,7 @@ This is **step 1** of the wider "push workspace to cloud" feature: it solves "ag
                 │ codemux pty-daemon (detached subprocess)
                 │  - holds master PTY fds
                 │  - per-session broadcast channel + replay buffer
-                │  - writes manifest with {pid, socket_path, version}
+                │  - writes manifest with `{pid, socket_path, daemon_version, protocol_version, started_at}`
                 │  ┌──────────────────────┐   │
                 │  │ bash / zsh shells    │ ◀─┼── agents (claude, codex, ...)
                 │  │ (children of daemon) │   │     run inside the shell as usual
@@ -74,7 +74,7 @@ The first call caches the connected client in a `OnceCell`; every subsequent `en
 
 JSON-lines over a stream socket. One message per line, base64-encoded payloads for PTY data so line framing is binary-safe. Two channels are multiplexed:
 
-- **Request/response** correlated by `request_id`: `Hello`, `Spawn`, `Attach`, `Detach`, `Write`, `Resize`, `Close`, `List`, `Shutdown`.
+- **Request/response** correlated by `request_id`: `Hello`, `Spawn`, `Attach`, `Detach`, `Write`, `Resize`, `Close`, `List`, `Shutdown`, and (added in `PROTOCOL_VERSION = 2`) `SetFlowPaused` / `FlowPaused`.
 - **Push events** from daemon to client: `Output { session_id, data_b64 }`, `Exited { session_id, exit_code }`.
 
 `Frame::Response` and `Frame::Event` are the two top-level wire variants. Both define their own `type` discriminator so a `nc`-style debugging session reads naturally.
@@ -89,7 +89,7 @@ The only escape hatch is the env var **`CODEMUX_DISABLE_PTY_DAEMON=1`**, which f
 
 ## Graceful Fallback
 
-The daemon path is **always safe**. Every error route falls back to the in-process PTY path so the user always gets a working terminal:
+The daemon path is **almost always safe**. Every error route falls back to the in-process PTY path so the user always gets a working terminal:
 
 | Failure | Behavior |
 |---|---|

@@ -12,7 +12,9 @@ Codemux is one Tauri desktop app repo, not a separate web frontend plus network 
 
 - `src/`: React + Tailwind + shadcn UI and Tauri IPC callers
 - `src-tauri/`: Rust domain/runtime, Tauri command surface, CLI, socket control, PTY and browser runtime integration
-- `sidecar/`: Bun-compiled TypeScript subprocesses Codemux spawns — currently just `sidecar/claude-agent/`, which hosts Anthropic's Claude Agent SDK and speaks JSON-RPC to the Rust side
+- `sidecar/`: Bun-compiled TypeScript subprocesses Codemux spawns — currently just `sidecar/claude-agent/`, which hosts Anthropic's Claude Agent SDK and speaks JSON-RPC to the Rust side (it has its own Bun test suite, not covered by `npm run verify`)
+- `iroh-wasm/`: a separate Rust crate compiled to WebAssembly (`npm run build:iroh-wasm`) that gives the hosted browser client an iroh QUIC endpoint — the relay/from-anywhere transport in `docs/features/web-remote-access.md`
+- `scripts/`: build helpers and the manual `scripts/e2e/*.sh` Docker harnesses
 - `docs/`: canonical project docs
 
 ## Frontend Layer
@@ -24,7 +26,7 @@ The frontend is React + Tailwind v4 + shadcn (preset b3kIbNYVW). State managemen
 - terminal integration: `src/components/terminal/TerminalPane.tsx` (the live terminal component — per-mount xterm lifecycle: constructs its own xterm.js Terminal + addons on mount, disposes on unmount; only the active workspace/surface is rendered, so switches unmount/remount) + `src/components/terminal/terminal-write-pump.ts` (ordered, byte-budgeted throttle that drains scrollback restore + the `attach_pty_output` reattach replay + live output across macrotasks so switching doesn't freeze the renderer). The module-level persistent cache `src/components/terminal/terminal-cache.ts` (and `src/hooks/use-terminal-cache-gc.ts` / `use-terminal-theme-sync.ts`) is **disabled / not wired** — shipped in `14735bf`, rolled back in `2baa42f`; retained behind its file banner for a possible future flag-gated revival.
 - React hooks: `src/hooks/` (useTauriEvent, useAppStateInit, useKeyboardShortcuts, useThemeColors)
 - zustand stores: `src/stores/` (app-store.ts for AppStateSnapshot, ui-store.ts for local UI state)
-- Tauri bridge: `src/tauri/commands.ts` (120+ typed invoke wrappers), `src/tauri/events.ts` (12 event helpers), `src/tauri/types.ts` (all shared types)
+- Tauri bridge: `src/tauri/commands.ts` (~320 typed invoke wrappers), `src/tauri/events.ts` (18 event helpers), `src/tauri/types.ts` (all shared types)
 - CSS variables: `src/globals.css` (oklch color tokens in :root and .dark, custom --success/--danger/--warning)
 
 The frontend talks to Rust through typed wrappers in `src/tauri/commands.ts` plus the `app-state-changed` event stream. Components never import from `@tauri-apps/api` directly.
@@ -41,17 +43,24 @@ Rust owns the durable app domain and runtime integration.
 - JSON-RPC stdio helper: `src-tauri/src/json_rpc_child/` (shared framing + routing for long-lived subprocesses both provider adapters use)
 - control server: `src-tauri/src/control.rs` (Unix socket on Linux/macOS via `tokio::net::UnixListener`, named pipe on Windows via `tokio::net::windows::named_pipe::ServerOptions`)
 - CLI entrypoint: `src-tauri/src/cli.rs`
-- browser runtime: `src-tauri/src/agent_browser.rs` (agent-browser v0.24.0, pure Rust, direct CDP)
+- browser runtime: `src-tauri/src/agent_browser.rs` — spawns and supervises the **external** `agent-browser` binary (v0.24.0, pure Rust, direct CDP). It is not a Cargo dependency; Codemux shells out to it.
+- remote compute transport: `src-tauri/src/ssh/` (push/pull, tunnels, bootstrap) + `src-tauri/src/remote/` (the headless daemon + 12-tool MCP catalog) + `src-tauri/src/pty_daemon/` (the persistent PTY daemon) + the second binary `src-tauri/src/bin/codemux_remote.rs`
+- remote UI transport: `src-tauri/src/web_remote/` (embedded axum HTTP+WS server, channel router, event hub, iroh endpoint + device registration)
+- scheduled runs: `src-tauri/src/automations/`
+- MCP: `src-tauri/src/mcp/` (Codemux as MCP host) and `src-tauri/src/mcp_server.rs` (Codemux as MCP server, 55 tools)
+- skills: `src-tauri/src/skills/` + `src-tauri/src/skills_sync/`
+- auth: `src-tauri/src/auth/`; sandboxing/backends: `src-tauri/src/execution/`; config: `src-tauri/src/config/`
 - Tauri command modules: `src-tauri/src/commands/`
 
 ## Command Surface
 
 The Tauri command layer is split by domain.
 
-- workspace and pane commands: `src-tauri/src/commands/workspace.rs`
-- browser commands: `src-tauri/src/commands/browser.rs`
-- OpenFlow commands: `src-tauri/src/commands/openflow.rs`
-- memory, indexing, observability, and dialogs: `src-tauri/src/commands/mod.rs`
+`src-tauri/src/commands/` holds 26 modules, one per domain: `agent_chat`, `ai`, `auth`, `automations`,
+`branch_name`, `browser`, `database`, `files`, `gemini`, `git`, `github`, `hosts`, `mcp`, `opencode`,
+`openflow`, `package_detect`, `permissions`, `presets`, `project_files`, `settings_sync`, `skills`,
+`skills_sync`, `update`, `virtual_display`, `workspace`, `workspaces_sync`. Memory, indexing,
+observability, and dialog commands live directly in `commands/mod.rs`.
 
 These command names stay stable at the Tauri boundary even when the internal module layout changes.
 

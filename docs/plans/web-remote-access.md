@@ -5,6 +5,7 @@
 - Authority: Locked design contract + remaining-work tracker. Current behavior is canonical in `docs/features/web-remote-access.md`.
 - Update when: A contract changes, a deferred item is picked up, or an open question is resolved.
 - Read next: `docs/features/web-remote-access.md`, `docs/features/remote-hosts.md`, `docs/features/dev-mock-runtime.md`, `docs/features/terminal.md`, `docs/features/agent-chat.md`
+- Status: ACTIVE — v1 LAN/pairing base shipped in `v0.14.0`. Deferred: per-client (non-mirrored) views, per-command ACL scopes, live browser screencast, and updater follow-ups.
 
 ## Goal
 

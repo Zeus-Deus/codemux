@@ -5,6 +5,7 @@
 - Authority: Active work plan only, not current truth.
 - Update when: Priorities, open questions, or likely touch points change.
 - Read next: `docs/features/<feature>.md`, `docs/core/STATUS.md`
+- Status: ACTIVE | MOSTLY LANDED (n items left) | SHIPPED
 
 ## Goal
 
@@ -34,6 +35,10 @@ Write the current goal in one short paragraph.
 
 ## Notes
 
+- Keep the `Status:` line current — it is the first thing a new session reads,
+  and a plan that silently finishes is the main way this directory rots.
+- Once `Status: SHIPPED` and nothing is left in Active Priorities, move the
+  file to `docs/archive/` and point `docs/INDEX.md` at the feature doc instead.
 - Keep this file about next steps, unresolved work, and active cleanup.
 - If a note stops driving implementation, move it to `docs/archive/` or remove it.
 - Do not turn this file into the source of truth for current behavior; that belongs in `docs/features/` or `docs/core/STATUS.md`.

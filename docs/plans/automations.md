@@ -5,6 +5,7 @@
 - Authority: Active work plan only, not current truth.
 - Update when: Priorities, open questions, or likely touch points change.
 - Read next: `docs/research/superset-automations.md`, `docs/features/remote-hosts.md`, `docs/core/STATUS.md`
+- Status: MOSTLY LANDED — Phases 1 and 2 shipped. Remaining: no `automation_run` MCP tool, no run-retention prune, no notification wiring.
 
 ## Goal
 
@@ -19,7 +20,7 @@ Let a user define an Automation — a named prompt + agent + recurrence — that
 - **Fire flow:** the scheduler creates a fresh workspace + worktree itself (deterministic, same code path as `workspace_push_to_host`), branch `slug-<timestamp>` off the project default branch, then spawns the chosen agent inside it with the prompt. The agent does not self-create the workspace via MCP — workspace creation is infrastructure.
 - **Offline:** host off → no tick → a `skipped_offline` run row is written on next boot. No cloud worker needed.
 - **Sidebar:** automation run-workspaces never auto-appear in the main project sidebar. They render only in the Automations panel. A sidebar entry appears only when the user explicitly brings one in.
-- **Remote-host repo transport:** GitHub (or any git remote) is the backbone — the host clones the project's remote with its own git credentials; runs produce branches the agent pushes; the desktop `git fetch`es a run's branch to bring it home. Detailed in `docs/plans/automations-sync.md` Phase F. (An earlier rsync/SSH-mirror idea was dropped — see that doc's "Design correction".)
+- **Remote-host repo transport:** GitHub (or any git remote) is the backbone — the host clones the project's remote with its own git credentials; runs produce branches the agent pushes; the desktop `git fetch`es a run's branch to bring it home. Detailed in `docs/archive/automations-sync.md` Phase F. (An earlier rsync/SSH-mirror idea was dropped — see that doc's "Design correction".)
 - **MCP:** full CRUD + run — 11 tools, mirroring Superset's surface.
 - **Run model:** fresh workspace per fire.
 - **Retention:** keep the last 10 *completed* run-workspaces per automation on the host (plus any currently-running one); auto-prune older worktrees. Never prune a run the user has synced locally. `automation_runs` log rows are kept regardless — history survives worktree pruning.
@@ -37,7 +38,7 @@ including the Phase F GitHub-backbone repo transport — the
 `/api/automations` endpoints are live on `api.codemux.org`, the desktop
 syncs against them, host bootstrap provisions the remote scheduler, and
 a remote host obtains the repo by cloning the project's git remote. See
-`docs/plans/automations-sync.md`. What remains is hardening and polish:
+`docs/archive/automations-sync.md`. What remains is hardening and polish:
 
 1. **Scoped scheduler tokens.** The host scheduler currently uses a copy
    of the desktop's account token; a per-host scoped token would limit
@@ -118,7 +119,7 @@ Phase 2 — account sync + remote-host execution (this branch):
 Account sync + remote scheduler also shipped since: the
 `/api/automations` endpoints are deployed on `api.codemux.org`, and
 host bootstrap provisions the scheduler token + service. What is still
-open (see `docs/plans/automations-sync.md`): Phase F — the
+open (see `docs/archive/automations-sync.md`): Phase F — the
 GitHub-backbone repo transport that lets a remote host obtain the
 project repo.
 

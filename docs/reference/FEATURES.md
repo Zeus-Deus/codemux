@@ -62,7 +62,6 @@
 
 - Split panes horizontally or vertically from pane header buttons
 - Resize splits by dragging the handle between panes
-- Resize active pane via keyboard (Ctrl+Alt+arrow keys or Ctrl+Alt+H/J/K/L)
 - Cycle between panes via command palette (Focus Next Pane / Focus Previous Pane)
 - Drag pane headers to swap panes (visual drop target highlighting)
 - Close panes from header X button
@@ -222,7 +221,7 @@
 
 - Backend-complete AI merge conflict resolution on temporary branches, **currently unreachable from the UI** because both launch buttons were removed by the refined-minimal panel pass
 - Safety model: never touches real branches without explicit user approval
-- Temporary branch creation (`bot/merge-*`), resolution, diff review, approve/reject
+- Temporary branch creation (`bot/resolve-<branch>-into-<base>-<n>`), resolution, diff review, approve/reject
 - Configurable CLI tool and model for the resolver agent
 - Full state machine and five registered Tauri commands remain intact; `src/stores/ai-merge-store.ts` currently has zero importers
 
@@ -340,7 +339,7 @@
 ## Settings Panel
 
 - Centralized configuration overlay (Ctrl+,)
-- 15+ sections including Account, Appearance, Notifications, Shortcuts, Editor, Terminal, Presets, Projects, Git, Agent, Browser, Session Restore, Sync, Skills, MCP, Permissions, Archive, Remote Access, and Beta Features
+- 19 sections (`ALL_SECTION_IDS` in `settings-view.tsx`): Beta Features, Account, Appearance, Editor, Terminal, Presets, Projects, Archive, Git, Agent, Permissions, Skills, MCP, Hosts (labeled "Devices"), Remote Access, Browser, Shortcuts, Notifications, Session Restore. Sync is a subsection inside Account, not a section of its own
 - Keyboard shortcut editor with conflict detection and search
 - Server-synced settings with offline cache
 - Workspace-level project config (setup/teardown scripts, worktree includes)
@@ -388,7 +387,7 @@
 ## MCP-on-Remote (Headless Codemux Daemon)
 
 - `codemux-remote serve` runs an axum HTTP server on loopback with a bearer-token manifest at `<state-dir>/manifest.json` (mode `0600`)
-- 12-tool stdio MCP catalog (smaller than the desktop's 52 — no panes, no browser, no global notifications): `workspace_{create,list,info,update,close}`, `worktree_create`, `terminal_{spawn,write,read,list,close}`, `app_status`
+- 12-tool stdio MCP catalog (smaller than the desktop's 55 — no panes, no browser, no global notifications): `workspace_{create,list,info,update,close}`, `worktree_create`, `terminal_{spawn,write,read,list,close}`, `app_status`
 - `codemux-remote mcp` bridges agent CLIs on the host to the daemon over HTTP — drop-in MCP server entry for Claude Code / Codex / Cursor on the remote
 - On every `serve` startup, idempotently writes a `codemux` MCP entry into every supported user-level agent config it finds (`~/.claude.json`, `~/.codex/config.toml`, `~/.cursor/mcp.json`)
 - `Identity` enum on every dispatch carries `Local` today and reserves `Cloud { user_id, org_id, role }` for a future optional paid-tier relay — purely additive
@@ -413,7 +412,7 @@
 - Account-synced across devices via `automations_sync` against the live `/api/automations` endpoints; `automation_runs` stay per-device
 - Host routing: the desktop runs `host_id IS NULL` automations; `codemux-remote scheduler` (a systemd user service provisioned at host bootstrap) runs host-targeted ones; a stuck-run reconciler fails crashed runs at startup
 - GitHub backbone: a remote host clones/fetches the project's git remote with its own credentials; per-repo `git ls-remote` preflight flags an unreachable repo at setup
-- Surface: seven `automations_*` Tauri commands + `automations_check_repo_access`, eight `automation_*` MCP / control-socket tools
+- Surface: seven `automations_*` Tauri commands + `automations_check_repo_access`, eight `automation_*` MCP tools, and seven control-socket commands (`automation_list/get/create/update/set_enabled/delete/runs` — the socket has no `automation_pause`/`automation_resume`)
 
 ## CLI / Socket Control
 
@@ -430,7 +429,7 @@
 - `src/components/terminal/TerminalPane.tsx` — xterm.js terminal with PTY connection
 - `src/components/ui/` — shadcn primitives (sidebar, tabs, resizable, etc.)
 - `src/stores/app-store.ts` — zustand global state from Tauri backend
-- `src/tauri/commands.ts` — typed Tauri invoke wrappers (120+ commands)
+- `src/tauri/commands.ts` — typed Tauri invoke wrappers (~320 commands)
 - `src/hooks/use-keyboard-shortcuts.ts` — global keyboard shortcuts
 - `src-tauri/src/state/state_impl.rs` — Backend state management
 - `src-tauri/src/commands/workspace.rs` — Tauri command handlers

@@ -3,11 +3,11 @@
 - Status: **LANDED — archived.** The merge executed and the feature-branch work landed on `main` in commit `a58c3d9` ("Merge branch 'feature/agent-chat' into main"). The agent-chat surface is currently shipping gated behind the Step 13 Beta Features toggle.
 - Purpose: Historical record of the pre-merge investigation and risk plan.
 - Audience: Anyone needing context on how the feature-branch divergence was reconciled.
-- Read next: `docs/features/auth.md`, `docs/plans/step-13-beta-toggle-research.md`.
+- Read next: `docs/features/auth.md`, `docs/archive/step-13-beta-toggle-research.md`.
 
 ## 1. Pre-merge backup tag
 
-Working tree is clean (only the untracked research file `docs/plans/step-13-beta-toggle-research.md`).
+Working tree is clean (only the untracked research file `docs/archive/step-13-beta-toggle-research.md`).
 
 Tag the current `feature/agent-chat` HEAD before any merge attempt:
 

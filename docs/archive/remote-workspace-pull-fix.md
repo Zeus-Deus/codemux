@@ -1,5 +1,9 @@
 # Remote workspace pull/adoption fix (passpage empty-worktree investigation)
 
+> **ARCHIVED.** This plan's work has landed; it is kept as the implementation
+> record and reasoning trail, not as current truth. For how this behaves today
+> read the relevant `docs/features/*` doc (see `docs/INDEX.md`).
+
 - Purpose: Track the fix for agent-created workspaces on a `codemux-remote` host that pull as EMPTY worktrees on the desktop, plus the supporting tool/skill gaps surfaced by the same investigation.
 - Audience: Anyone touching the remote daemon tool surface, the hosts-inventory poller, workspaces-sync, or the SSH pull/adoption path.
 - Authority: Active work plan. Behavior that lands moves to `docs/features/remote-hosts.md` / `docs/features/workspaces-sync.md`.

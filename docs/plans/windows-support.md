@@ -1,9 +1,15 @@
 # Windows Support Tracking
 
-Status: Shipping. Foundation merged in `cc9b946`, released in `v0.1.20` and `v0.1.21`. Currently 8 commits past `v0.1.21` with post-release Windows hardening.
+- Purpose: Master checklist for Windows platform support and the remaining gaps before a polished Windows v1.
+- Audience: Anyone touching platform-conditional code, the release pipeline, or Windows-only bugs.
+- Authority: Active work plan only. Current Windows reality lives in `docs/core/STATUS.md` § "Windows Support".
+- Update when: A checklist item lands, or the gating list for Windows v1 changes.
+- Read next: `docs/core/STATUS.md`, `docs/features/terminal.md`
+- Status: ACTIVE — Windows ships in every release since `v0.1.20`. Still gating a polished v1: Authenticode code signing, the OpenFlow bash-wrapper rewrite, and full PTY/worktree/agent-spawn integration tests on a live Windows runner. (Tier-3 `SendInput` input injection was on this list and has since landed — see the superseded note in the Tier 3 section.)
+
 Branch: `feature/windows-support` (merged); `main` carries all foundation work + post-release fixes
 Created: 2026-04-12
-Last updated: 2026-04-15
+Last updated: 2026-07-25
 
 ## How to Use This File
 
@@ -278,6 +284,16 @@ Web research conducted 2026-04-12 on the three unknowns that gate the Windows ef
 > **Scope:** `src-tauri/src/os_input.rs` is entirely Linux-specific. Every item below needs a `#[cfg(target_os = "windows")]` twin implementation using Win32 `SendInput` (via the `windows` crate or `enigo`).
 >
 > **Compile-gate pass (2026-04-12)**: the entire contents of `os_input.rs` are now inside `#[cfg(target_os = "linux")] mod linux_impl { ... }`, with a non-linux stub for `handle_os_action` that returns `"OS input not supported on this platform"`. The module compiles on Windows — the items below still track the Win32 `SendInput` implementation that will replace the stub.
+>
+> **SUPERSEDED — Tier 3 was implemented after this note was written.**
+> `src-tauri/src/os_input.rs` now contains a complete `mod windows_impl`
+> using Win32 `SendInput`, `EnumWindows` + `GetWindowRect` for viewport→screen
+> conversion, and Bezier-path mouse approach — exactly the work the deferral
+> below scoped out. The 7 unchecked items in this section are therefore stale;
+> they are left unchecked only to preserve the original record. `STATUS.md`
+> § "Windows Support" lists Tier-3 SendInput as in place.
+>
+> Original note follows.
 >
 > **Deferred (2026-04-13)**: **entire Tier 3 section deferred from Windows v1.** Tier 1 (DOM-based automation via `agent-browser`) and Tier 2 (coordinate-based automation via `stream_input.rs`) are sufficient for Windows MVP. Tier 3 (`SendInput` / viewport→screen conversion / Bezier mouse paths) is a reliability fallback used only when Tier 1/2 both fail, and implementing it on Windows requires adding the `windows` or `enigo` crate plus parallel Win32 key/mouse code — not worth the scope for v1. All 7 items below are deferred with this shared reason; they remain unchecked so `grep "[ ]"` still surfaces them if we revisit Tier 3 later.
 

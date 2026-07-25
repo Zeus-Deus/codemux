@@ -80,7 +80,7 @@ Each tab initializes its state in the diff store on mount if none exists for tha
 - File-level navigation with `1/N` counter
 - Focus mode with inline section selector
 - Edit-file button that opens the file in the built-in editor
-- Auto-refreshing file list (5s polling on top of `app-state-changed`)
+- Auto-refreshing file list (a bare 5s `setInterval` in `DiffPane.tsx`; it does **not** subscribe to `app-state-changed`)
 - Parse and render ANSI-free unified diff output from `git diff`
 - Per-tab state persisted to `localStorage` (survives reloads)
 
@@ -101,6 +101,6 @@ Each tab initializes its state in the diff store on mount if none exists for tha
 - `src/components/diff/DiffSplitView.tsx` — split-view renderer
 - `src/stores/diff-store.ts` — zustand store with per-tab persisted state
 - `src/lib/diff-parser.ts` — `parseDiff()` converts `git diff` output into `DiffLine[]`
-- `src-tauri/src/git.rs` — backend diff commands (`get_git_diff`, `get_base_branch_diff`, `get_base_branch_file_diff`)
+- `src-tauri/src/git.rs` — backend diff commands (implementations `git_diff`, `git_diff_base_branch`, `git_diff_base_branch_file` (the `get_*` names are their Tauri wrappers in `commands/git.rs`))
 - `src-tauri/src/commands/git.rs` — Tauri command wrappers
 - `src/lib/open-editor-tab.ts` — opens the selected file in the CodeMirror editor

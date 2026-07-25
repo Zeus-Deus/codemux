@@ -22,7 +22,7 @@ A built-in code editor using CodeMirror 6 that opens files directly inside Codem
 
 ### Language Support
 
-Language detection is path-based. Supported languages include:
+Language detection is path-based. Actual coverage (`LANG_MAP` in `src/lib/editor-languages.ts` — 8 language packages across 25 extension keys): JavaScript/TypeScript (js, ts, jsx, tsx, mjs, cjs), Rust, JSON (json, jsonc), CSS (css, scss, less), HTML (html, htm, svelte, vue), Markdown (md, mdx), Python, Go, and YAML (yaml, yml). There is **no** C, C++, Java, PHP, XML, TOML, SQL, or Shell/Bash mode — those open as plain text.
 JavaScript, TypeScript, JSX, TSX, HTML, CSS, JSON, Markdown, Python, Rust, Go, C, C++, Java, PHP, XML, YAML, TOML, SQL, Shell/Bash, and more.
 
 ### Markdown Preview
@@ -42,23 +42,23 @@ The file tree panel lists directories with `.gitignore` awareness. Clicking a fi
 ## What Works Today
 
 - Open files from file tree or search results as editor tabs
-- Syntax highlighting for 20+ languages via CodeMirror
+- Syntax highlighting via 8 CodeMirror language packages via CodeMirror
 - Markdown rendered preview
 - Dirty state tracking (modified indicator on tab)
 - Save files back to disk via write command
 - Custom dark theme matching Codemux shell
 - File tree with gitignore filtering and common directory exclusion
 - Search in files (via `rg` with `grep` fallback) and file name search (via `fd` with `find` fallback)
-- Reveal file in system file manager
+- Reveal in system file manager (**project folder only**, from the sidebar project group — `revealInFileManager`'s sole caller passes `projectPath`; there is no reveal-this-file action in the editor or file tree)
 
 ## Current Constraints
 
 - No multi-cursor or advanced refactoring features
 - No LSP integration (no autocomplete, go-to-definition, or diagnostics)
 - 2 MB file size limit
-- Binary files cannot be opened
+- Binary files cannot be opened, **except images** — `ImageViewer.tsx` renders 9 formats (incl. svg/avif) when `isImageExtension()` matches
 - No file rename or delete from within the editor
-- Editor tabs cleared from persistence on app reload (files must be re-opened)
+- Editor tabs and their file paths **survive restart** — `editor-store.ts`'s `partialize` keeps `filePath` (blanking only `baselineContent`/`isDirty`), and `save_persisted_state` does not strip `TabKind::Editor`
 
 ## Important Touch Points
 

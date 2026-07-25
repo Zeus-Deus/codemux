@@ -16,6 +16,8 @@
 
 Default to `npm run verify` after meaningful work. Use the narrower commands when iterating on one layer.
 
+`npm run verify` is exactly `cargo check && cargo test && npm run check && npm run test` — it does **not** cover the Claude sidecar. The sidecar is a separate Bun package with its own suite (`sidecar/claude-agent/test/*.test.ts`: session, permissions, MCP bridge, respond-to-request, ping, real-tools). Run it directly with `bun test` from `sidecar/claude-agent/` whenever you touch `sidecar/claude-agent/src/` — the session-lifecycle, permission-mode, and stale-resume recovery behavior documented in `docs/features/agent-chat.md` is enforced there and nowhere else.
+
 ## Visual Verification (UI work)
 
 When iterating on UI, verify visually against the real React UI running in a browser pane:
@@ -29,6 +31,7 @@ The mock lives in `src/dev/` and only loads when no real Tauri runtime is detect
 ## Testing Layers
 
 - Rust domain tests for workspaces, pane trees, terminal lifecycle, persistence, notifications, memory, indexing, and OpenFlow runtime logic
+- Bun tests in `sidecar/claude-agent/test/` for the Claude Agent SDK sidecar (not run by `npm run verify`)
 - frontend interaction tests for important workspace, pane, and browser flows
 - focused end-to-end coverage later for a few critical workflows rather than every UI detail
 

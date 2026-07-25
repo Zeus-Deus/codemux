@@ -4,7 +4,7 @@
 - Audience: Anyone touching skills, the codemux-api `/api/skills` routes, or the Settings → Sync UI.
 - Authority: Canonical feature reality doc for Step 10.
 - Update when: Behavior, storage model, sync target, or wire format changes.
-- Read next: `docs/plans/step-10-skills-sync.md` (per-stage history), `~/.claude/skills/codemux-api-infrastructure` (server-side reference).
+- Read next: `docs/archive/step-10-skills-sync.md` (per-stage history), `~/.claude/skills/codemux-api-infrastructure` (server-side reference).
 
 ## What This Feature Is
 

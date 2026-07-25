@@ -1,10 +1,14 @@
 # Step 12 — OpenCode Integration Implementation Plan
 
+> **ARCHIVED.** This plan's work has landed; it is kept as the implementation
+> record and reasoning trail, not as current truth. For how this behaves today
+> read the relevant `docs/features/*` doc (see `docs/INDEX.md`).
+
 - Purpose: Concrete scoping deliverable answering nine GO/MODIFY/DEFER questions for adding OpenCode as a third chat provider in Codemux's GUI.
 - Audience: Decision-maker reviewing whether to commit to Step 12 now, modify the scope, or defer.
 - Authority: Pre-build planning checkpoint + post-shipping summary. The body below was the original scoping doc; the **Final State** header at the top reflects what actually shipped.
 - Update when: A scoping fact below is wrong, a deferred follow-up gets reactivated, or the multi-provider feature needs a re-scoping pass.
-- Read next: `docs/features/multi-provider-chat.md` for the current behaviour, `docs/plans/step-12-opencode-research.md` for the reference-impl research backing this plan, `docs/plans/step-12-ui-smoke-checklist.md` for the operator smoke.
+- Read next: `docs/features/multi-provider-chat.md` for the current behaviour, `docs/research/step-12-opencode-research.md` for the reference-impl research backing this plan, `docs/archive/step-12-ui-smoke-checklist.md` for the operator smoke.
 
 ## Final State (2026-05-02)
 
@@ -348,7 +352,7 @@ Seven stages. Pattern matches Step 9/10 cadence — research locked first, demoa
 - Replaces both `ProviderPicker` and `ModelPicker` triggers in ComposerFooter behind the unified picker.
 - Per-instance accent badges scaffolded but unused (forward-compat for v2).
 
-**Verification:** Operator UI smoke checklist (mirror Step 10 pattern): all three providers' models appear, search ranks favorites first, switching providers in the rail filters the list, loading + error states render. ~30-40 Vitest cases, ~5 hand-driven smoke checks documented in `docs/plans/step-12-ui-smoke-checklist.md`.
+**Verification:** Operator UI smoke checklist (mirror Step 10 pattern): all three providers' models appear, search ranks favorites first, switching providers in the rail filters the list, loading + error states render. ~30-40 Vitest cases, ~5 hand-driven smoke checks documented in `docs/archive/step-12-ui-smoke-checklist.md`.
 
 **Dependencies:** Stages 3-4.
 
@@ -375,8 +379,8 @@ Seven stages. Pattern matches Step 9/10 cadence — research locked first, demoa
 - Per-status indicator on the OpenCode rail icon (running / probing / error) reusing Step 9 status-dot patterns.
 - New canonical doc describing the integration (shipped as `docs/features/multi-provider-chat.md`, with conversation-sync split into `docs/features/opencode-conversation-sync.md`).
 - Update `docs/INDEX.md`, `docs/core/STATUS.md`, `docs/core/PLAN.md`.
-- Live cross-environment smoke against three real upstream provider keys (OpenAI, Anthropic, Google) on dev machine. Document checklist in `docs/plans/step-12-ui-smoke-checklist.md`.
-- `docs/plans/step-12-opencode-implementation-plan.md` (this doc) closed out with per-stage deltas.
+- Live cross-environment smoke against three real upstream provider keys (OpenAI, Anthropic, Google) on dev machine. Document checklist in `docs/archive/step-12-ui-smoke-checklist.md`.
+- `docs/archive/step-12-opencode-implementation-plan.md` (this doc) closed out with per-stage deltas.
 
 **Verification:** Smoke checklist passes. Doc cross-refs intact. Step 12 row added to STATUS+PLAN.
 
@@ -464,7 +468,7 @@ Seven stages. Pattern matches Step 9/10 cadence — research locked first, demoa
 
 - Reference clone + 3 parallel investigation agents: **~2 hours**.
 - Codemux state mapping agent + this scoping doc: **~2 hours**.
-- **Total research: ~4 hours.** Locked in `docs/plans/step-12-opencode-research.md` and this doc.
+- **Total research: ~4 hours.** Locked in `docs/research/step-12-opencode-research.md` and this doc.
 
 ### 8.2 Implementation by stage
 
@@ -526,7 +530,7 @@ If Stage 3.5 ships and the OpenCode picker pull is real, Stages 4-7 become an ob
 **After.** Honest ordering:
 
 1. **Step 10.5 — project-scoped skills sync.** ~3-5 days per `docs/core/PLAN.md`. Additive migration, ships value to existing paying users. Tiny risk.
-2. **Step 11 — Codex MCP via HTTP gateway.** Per `docs/plans/step-9-codex-mcp-spike.md`, ~40-50% of Step 9 Stage 3's complexity. Unblocks the existing Codex-chat surface for MCP, which is a discoverability gap users hit every day they switch to Codex.
+2. **Step 11 — Codex MCP via HTTP gateway.** Per `docs/research/step-9-codex-mcp-spike.md`, ~40-50% of Step 9 Stage 3's complexity. Unblocks the existing Codex-chat surface for MCP, which is a discoverability gap users hit every day they switch to Codex.
 3. **Step 12 — OpenCode.** Bigger lift, broadens the funnel rather than unblocking existing flows.
 
 Step 12 is genuinely ambitious and a strategic bet. Step 11 is duty work that closes an open gap. Step 10.5 is a quick value ship. Doing them in 10.5 → 11 → 12 order respects compound-interest math: each step makes the next's user base wider.

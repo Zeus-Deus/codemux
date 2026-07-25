@@ -96,9 +96,40 @@ Common use case: update `.env` in the main worktree, then re-run setup to push c
 2. `.codemuxinclude` files copied from main worktree
 3. Setup scripts run with environment variables set
 
+
+## Where worktree-include patterns come from
+
+`process_worktree_includes()` (`src-tauri/src/scripts.rs`) resolves patterns from
+the **first** of three sources — this is the single most surprising behavior in
+this area:
+
+1. a `.codemuxinclude` file in the project root (`IncludeSource::File`)
+2. otherwise, the `worktree_includes` project setting (Settings → Projects, also
+   valid as a `worktree_includes` key in `.codemux/config.json`) (`IncludeSource::Setting`)
+3. otherwise, the hardcoded `DEFAULT_WORKTREE_INCLUDES = [".env", ".env.*", ".env.local"]`
+   (`IncludeSource::Defaults`)
+
+**Consequence: every new worktree gets your `.env` files copied in by default,
+even with no `.codemuxinclude` file and no configured setting.** That is
+usually what you want (a worktree that can actually run), but it means secrets
+propagate into every worktree automatically. To opt out, create a
+`.codemuxinclude` that does not match them — an empty file is enough, since an
+existing file wins over the defaults.
+
+Whichever source is used is emitted as a `worktree-includes-applied` event
+(`{workspace_id, source, copied}`) and surfaced as a toast by
+`src/hooks/use-worktree-include-toast.ts`, so the UI tells you which of the
+three fired.
+
+**Same-path guard:** when the workspace root and the worktree path resolve to the
+same directory (i.e. a workspace opened at the repo root, not a worktree), the
+whole include step short-circuits — otherwise `fs::copy(src, src)` would truncate
+the file to zero bytes. So the copy step is silently a no-op for non-worktree
+workspaces, including on an explicit "re-run setup".
+
 ## Important Touch Points
 
-- `src-tauri/src/scripts.rs` — `process_codemuxinclude()`, `script_env()`, `allocate_workspace_port()`
+- `src-tauri/src/scripts.rs` — `process_worktree_includes()`, `script_env()`, `allocate_workspace_port()`
 - `src-tauri/src/commands/workspace.rs` — `spawn_setup_scripts()`, `run_workspace_setup()`
 - `src-tauri/src/config/workspace_config.rs` — `find_git_root()` (resolves worktree to main repo)
 - `src-tauri/src/control.rs` — `rerun_setup` socket command

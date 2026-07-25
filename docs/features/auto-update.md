@@ -18,7 +18,7 @@ The flow depends on the package format:
 - **AppImage**: full in-app update — download with progress bar, then restart to apply
 - **Other formats**: directs the user to the GitHub releases page for manual download
 
-Dismissals are per-version (stored in localStorage), so dismissing v0.1.13 won't suppress the notification for v0.1.14.
+Dismissals are per-version and deliberately **in-memory only** (a `useRef` in `use-update-checker.ts`, not localStorage), so dismissing v0.1.13 won't suppress v0.1.14 — and a dismissed toast reappears on the next app launch.
 
 ## What Works Today
 

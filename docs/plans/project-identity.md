@@ -3,7 +3,9 @@
 - Purpose: Track the work to give Codemux a first-class, stable project identity and an explicit `main | worktree` workspace kind, modelled on Superset but adapted to Codemux's REST + SQLite + SSH-daemon stack.
 - Audience: Anyone changing the workspace registry, sync layer, daemon, or the Workspaces overview.
 - Authority: Active work plan only. Current behavior lives in `docs/features/workspaces-sync.md` and `docs/features/workspaces-overview.md`.
+- Update when: A phase lands, or the remaining Phase 3 scope changes.
 - Read next: `docs/features/workspaces-sync.md`, `docs/features/workspaces-overview.md`
+- Status: MOSTLY LANDED — Phases 1, 2, and the cloud round-trip are done. Only the optional Phase 3 (a first-class `projects` table keyed by `project_uid`) remains; `database.rs` still carries the old path-keyed `projects` table.
 
 ## Goal
 

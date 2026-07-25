@@ -187,6 +187,12 @@ frames/screenshots scale ~linearly with pixel count, and model-side vision
 downscales past ~1.15 MP anyway, so agent token cost is unchanged.
 
 The value is a `browser_viewport::parse_spec` string — preset name or `WxH`.
+The **Settings panel only offers four canned `WxH` sizes** (Default 1280×800,
+1920×1080, 2560×1440, 3840×2160); preset names and other dimensions can only
+arrive from another device or a hand-edited value, and such a value is
+surfaced back as an extra option in the select. Note that preset names also
+don't parse in the peek overlay (`parseViewportString` is `WxH`-only), so a
+preset-name value is best avoided in practice.
 Consumption points (all lenient — an invalid synced value degrades to the
 1280×800 baseline, never errors):
 

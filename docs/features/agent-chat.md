@@ -9,8 +9,8 @@
 - Read next: `docs/features/multi-provider-chat.md`,
   `docs/features/skills-sync.md`, `docs/features/mcp-server.md`,
   `docs/features/workflow-orchestration.md`,
-  `docs/plans/step-8-attachments.md`,
-  `docs/plans/step-13-beta-toggle-research.md`.
+  `docs/research/step-8-attachments.md`,
+  `docs/archive/step-13-beta-toggle-research.md`.
 
 ## What This Feature Is
 
@@ -39,8 +39,8 @@ intact across the legacy/Beta UI swap. The legacy main-branch experience
 (preset bar, terminal panes, empty-state splash) is byte-identical when
 both flags are off.
 
-See `docs/plans/step-13-beta-toggle-research.md` for the toggle scoping and
-`docs/plans/step-13-ui-smoke-checklist.md` for the operator-verified gate.
+See `docs/archive/step-13-beta-toggle-research.md` for the toggle scoping and
+`docs/archive/step-13-ui-smoke-checklist.md` for the operator-verified gate.
 
 ## Current Model
 
@@ -97,7 +97,29 @@ The chat pane stack:
     subtitle renders `<driver> · <description>` (truncated, full text in a
     `title` tooltip), e.g. `Claude · Opus 4.8 with 1M context · Best for
     everyday, complex tasks`; the trigger pill mirrors label + description
-    into its tooltip. Backend guarantees every Claude row carries a
+    into its tooltip.
+  - **Row-jump shortcuts.** While the popover is open, `Ctrl+1..9`
+    (`Cmd+1..9` on macOS) activates the Nth row of the *filtered* list. The
+    capture-phase `keydown` listener is registered only while the popover is
+    open and calls `preventDefault` + `stopPropagation`, so the global
+    tab/workspace bindings that own the same chord are unaffected — the
+    collision was resolved by scoping, not by rebinding. Each row renders its
+    own kbd chip (`JUMP_MOD_LABEL`).
+  - **Alias folding + label promotion (Claude).** Alias rows
+    (`default`/`opus`/`fable`/`sonnet`/`haiku`) and full-id rows whose label
+    is a nickname now render **promoted concrete names** ("Claude Opus 4.8"),
+    parsed from the live version-bearing description with the maintained
+    catalog as fallback. The `default` row itself is folded away by
+    `dedupe_default_alias` whenever a concrete twin exists: the twin absorbs
+    it, moves to index 0, and its description takes a `Recommended · ` prefix
+    — so the lead row reads e.g. label `Claude Opus 4.8`, subtitle
+    `Claude · Recommended · Best for everyday, complex tasks`, not the
+    worked example above. For persistence compat, `selectModel`
+    (`src/stores/provider-capabilities-store.ts`) deliberately breaks the
+    strict-id-match rule for the literal id `"default"` and falls back to
+    `models[0]`, so drafts and threads persisted before the fold still
+    resolve a real model — which is what keeps their trigger label, tooltip,
+    active-row highlight, and reasoning/speed picker availability correct. Backend guarantees every Claude row carries a
     description: SDK-provided string verbatim when the CLI supplies one →
     maintained blurb for known full ids (blurb-only; the label already
     carries the version) → alias backfill (`ALIAS_CANONICAL_IDS` in
@@ -138,7 +160,7 @@ The chat pane stack:
 - **Attachments** via `+` and `@`: files, folders, GitHub issues + PRs,
   images via paste / drop / picker. Inline chips, send-time injection,
   expand, caps, gif guard, chip tooltips. See
-  `docs/plans/step-8-attachments.md`.
+  `docs/research/step-8-attachments.md`.
   - **Ctrl+V image paste has a Linux clipboard fallback.** WebKit2GTK
     strips image payloads from the JS `paste` event, so `Composer`'s
     handler tries `e.clipboardData.items` first (works in the browser
@@ -704,7 +726,7 @@ When a provider session delegates to subagents, the chat pane shows a
 **enter** a subagent for a read-only, in-pane drill-in of its own stream.
 One canonical model drives all three providers. Design spec:
 `docs/plans/assets/Subagents.dc.html`; locked decisions:
-`docs/plans/subagent-view.md`.
+`docs/archive/subagent-view.md`.
 
 ### Canonical event model (`agent_provider/events.rs`)
 
@@ -1159,8 +1181,6 @@ in the browser pane.
   multiple OpenCode connections sees them collapsed under one rail entry.
   Multi-instance lifting is planned for v2 (the `ProviderInstanceId` shim
   already exists at `src-tauri/src/agent_provider/instance.rs`).
-- **No keyboard shortcuts on the picker.** `Ctrl+1..9` collides with
-  workspace switching; deferred until a non-colliding namespace is decided.
 - The event broadcaster uses a bounded channel (default 1024) — slow
   subscribers lose old events. This is deliberate; downstream UI must
   treat the stream as live-only.
@@ -1576,16 +1596,16 @@ to the surface's target / `checkoutMode`:
 
 - **Project · current checkout** — a `location · checkout` group on the
   left (ghost text buttons, each opening a popover) and a `from ⑂
-  <branch>` control on the right, plus a centered muted hint below
-  ("Runs in `<project>`'s current checkout on `<branch>`. Changes land
-  directly in your working copy.").
+  <branch>` control on the right. (The centered muted scope-hint line that
+  originally sat below the row was removed in `a003467`; the only surviving
+  hints are inside the checkout popover.)
 - **Project · worktree** — the checkout popover's "New worktree" option
   reveals an optional mono name input ("name — leave empty to
   auto-name") with a hint that empty names auto-derive from the first
   message, like the CLI.
 - **Home** — only the location control renders (no checkout/branch —
-  there's no project to scope); the hint reads "No project — this agent
-  runs on your machine in the home directory (~)…". `PresetBar` returns
+  there's no project to scope); its hint line was removed with the others.
+  `PresetBar` returns
   `null` outright for a home draft (previously it rendered fully
   disabled) via an early-return on the pre-existing `isHomeDraft` check.
 
@@ -2256,81 +2276,53 @@ discovery → backend runtime → SDK facade → polish → Codex spike →
 cleanup) all shipped on this branch.
 
 See `docs/features/mcp-server.md` for the canonical feature description
-and `docs/plans/step-9-mcp-servers.md` for the original research +
+and `docs/research/step-9-mcp-servers.md` for the original research +
 locked design decisions. The Stage 5 spike at
-`docs/plans/step-9-codex-mcp-spike.md` recommends Step 11 as the path
+`docs/research/step-9-codex-mcp-spike.md` recommends Step 11 as the path
 to extend MCP host support to Codex via an HTTP gateway.
 
 ## Roadmap (next steps)
 
-- **Step 10 — Skills sync** (LANDED, Stages 1-6). See
-  `docs/features/skills-sync.md`.
-- **Step 10.5 — Project-scoped skills sync** (PLANNED, ~3-5 days).
-  Sync skills tied to specific git repos in addition to the user-global
-  ones already shipping. Schema is additive (`project_remote_url_hash`).
-  Trickiest piece is URL canonicalization.
-- **Step 11 — Codex MCP via HTTP gateway** (PLANNED). Codemux exposes
-  a localhost streamable HTTP MCP endpoint, writes
-  `[mcp_servers.codemux] url = "..."` into `~/.codex/config.toml`, and
-  hot-reloads via the `config/mcpServer/reload` RPC when the registry
-  changes. Reuses the entire Stage 1–4 stack. Spike at
-  `docs/plans/step-9-codex-mcp-spike.md`.
-- **Step 12 — Multi-provider chat** (LANDED, Stages 1-9). See
-  `docs/features/multi-provider-chat.md`.
-- **Step 13 — Agent Chat Beta toggle** (LANDED). See
-  `docs/plans/step-13-beta-toggle-research.md`.
-- **Promote agent-chat from Beta to default-on** once dogfooding
-  settles. Both feature flags would default to `true`; the legacy paths
-  stay in tree as a fallback for a release cycle before being removed.
+Roadmap and build order live in `docs/core/PLAN.md` § "Cross-Cutting Steps"
+(Steps 6–13 plus the Step 10.5 / Step 11 planned work) and § "Immediate
+Priority Order" (which carries the "promote agent-chat from Beta to
+default-on" item). This doc stays about current behavior; the duplicate
+step list that used to sit here has been removed rather than kept in sync
+in two places.
 
 ## Known follow-ups
 
+Verified outstanding as of this pass. Items that were listed here and have
+since shipped (Claude image attachments end-to-end, `respond-to-user-input`
+plumbing / the AskUserQuestion answer flow, and the `supportedModels` /
+`supportedCommands` RPCs) have been removed — see § "Attachments",
+§ "AskUserQuestion answer reply (PR #165)", and § "Slash command popup".
+
 - **Recoverable thread-resume snippets.** The substring list in
-  `agent_provider/codex/protocol.rs` (`RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS`)
-  is inferred from an upstream reference and should be verified against
-  real `codex app-server` error output. A mismatch degrades gracefully —
-  the resume simply fails instead of falling back to a fresh start — but
-  refining the list will give a nicer UX.
-- **Turn-start parameter plumbing.** `CodexAgentProvider::send_turn`
-  currently populates only the `model` field on the wire. The
-  `TurnStartParams` struct already models `service_tier`, `effort`, and
-  `collaboration_mode`; the adapter's public API needs matching
-  overrides once the UI wants to expose them.
-- **`JsonRpcChild::shutdown` is now `&self` and idempotent.** All
-  callers can share the handle via `Arc<JsonRpcChild>` and invoke
-  shutdown without ownership gymnastics. The first call runs the full
-  EOF-then-kill sequence; subsequent calls short-circuit via an internal
-  `AtomicBool` and return `Ok(())` immediately.
-- **Image attachments in `send-turn`.** The sidecar RPC currently
-  accepts only `text` and an optional `modelOverride`. When the UI
-  needs multi-modal input, extend the RPC with an `images` array and
-  build `SDKUserMessage.content` with `tool_result`-style image blocks.
-- **Full AskUserQuestion UX.** The side-channel
-  `user-input-requested` notification surfaces the questions, and
-  `respond-to-user-input` accepts answers, but the translation to a
-  richer UI shape ships with the real chat pane. The current
-  implementation allows the SDK to continue with the given answers as
-  `updatedInput`.
-- **Unused SDK `Query` methods.** 16 methods are deliberately not
-  exposed as RPCs (`setMaxThinkingTokens`, `applyFlagSettings`,
-  `supportedCommands`, `supportedModels`, `supportedAgents`,
-  `mcpServerStatus`, `getContextUsage`, `reloadPlugins`, `accountInfo`,
-  `rewindFiles`, `seedReadState`, `reconnectMcpServer`,
-  `toggleMcpServer`, `setMcpServers`, `streamInput`, `stopTask`). Add
-  them piecemeal as UI features require.
-- **Claude image attachments.** `ClaudeAgentProvider::send_turn`
-  only forwards `text` and optional `modelOverride` to the sidecar's
-  `send-turn`. The `SendTurnInput.images: Vec<ImageInput>` field
-  exists on the trait but is currently ignored. Wire it when the UI
-  needs multi-modal input.
-- **Claude AskUserQuestion full flow.** The adapter surfaces
-  `plan-proposed` and `user-input-requested` as
-  `RequestOpened { request_kind: "plan" | "user-input" }`. Answering
-  plan mode and filling in structured AskUserQuestion answers
-  requires UI-side work plus `respond-to-user-input` RPC plumbing —
-  the sidecar method is implemented, but nothing calls it yet.
-- **Claude dogfood testing.** Before shipping the Claude provider,
-  run the `claude_real_session` ignored test end-to-end on a
-  developer machine with a logged-in `claude` CLI. The test covers
-  a real content-delta round-trip. Add it to the release checklist
-  for any user-facing Claude changes.
+  `agent_provider/codex/protocol.rs`
+  (`RECOVERABLE_THREAD_RESUME_ERROR_SNIPPETS`) is inferred from an upstream
+  reference and has not been verified against real `codex app-server` error
+  output. A mismatch degrades gracefully — the resume fails instead of
+  falling back to a fresh start — but refining the list would improve UX.
+- **Codex turn-start parameters still unplumbed.** `TurnStartParams` models
+  `service_tier`, `effort`, and `collaboration_mode`. `send_turn`
+  (`codex/session.rs`) now populates `model` and `effort`; `service_tier`
+  and `collaboration_mode` are still hardcoded `None`. Note the Codex speed
+  picker drives fast mode through the *session launch* settings, not through
+  this per-turn field.
+- **Unused SDK `Query` methods.** A number of SDK query methods are still
+  not exposed as sidecar RPCs (`setMaxThinkingTokens`, `applyFlagSettings`,
+  `supportedAgents`, `mcpServerStatus`, `getContextUsage`, `reloadPlugins`,
+  `accountInfo`, `rewindFiles`, `seedReadState`, `reconnectMcpServer`,
+  `toggleMcpServer`, `setMcpServers`, `streamInput`, `stopTask`). Add them
+  piecemeal as UI features require. (`supportedModels` and
+  `supportedCommands` were on this list and are now live as the
+  `list-models` / `list-commands` RPCs.)
+- **Claude dogfood testing.** The ignored `claude_real_session` test covers
+  a real content-delta round-trip and needs a logged-in `claude` CLI. Keep
+  it on the release checklist for user-facing Claude changes.
+- **Fast mode is withheld for Claude.** `merge_sdk_with_maintained` clamps
+  `supports_fast_mode` to `false` for every Claude model because the SDK
+  flag is a capability advertisement, not an entitlement check. Re-enabling
+  requires an entitlement-feedback loop first — see
+  `docs/research/opus-5-agent-chat-support.md`.
