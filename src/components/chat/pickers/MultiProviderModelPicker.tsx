@@ -37,6 +37,7 @@ import type {
 
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { FOOTER_TRIGGER } from "./footer-trigger";
 
 /**
  * Step 12 Stage 4 — unified provider + model picker.
@@ -183,6 +184,12 @@ interface ResolvedRow {
  *  uniform. */
 type RailKey = AgentChatProviderKind | "favorites";
 
+/** Platform check for the jump-shortcut modifier and its chip label
+ *  ("⌘1" on macOS, "Ctrl+1" elsewhere). */
+const IS_MAC =
+  typeof navigator !== "undefined" && /mac/i.test(navigator.platform);
+const JUMP_MOD_LABEL = IS_MAC ? "⌘" : "Ctrl+";
+
 export function MultiProviderModelPicker({
   provider,
   model,
@@ -320,6 +327,35 @@ export function MultiProviderModelPicker({
     });
   }, [query, railKey, rowsByProvider, favoritesSet, visibleProviders]);
 
+  // mod+1..9 jump shortcuts — bound to the first nine rows of the
+  // CURRENT list (search filter, rail tab, and favorites sort all
+  // respected, since `visibleRows` is the exact array the list
+  // renders). Window capture-phase listener so the shortcut fires
+  // even while the search input holds focus; registered only while
+  // the popover is open. Selecting closes the picker, same as a click.
+  const jumpRowsRef = useRef<ResolvedRow[]>([]);
+  jumpRowsRef.current = visibleRows.slice(0, 9);
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.repeat) return;
+      const mod = IS_MAC
+        ? event.metaKey && !event.ctrlKey
+        : event.ctrlKey && !event.metaKey;
+      if (!mod || event.shiftKey || event.altKey) return;
+      if (!/^[1-9]$/.test(event.key)) return;
+      const row = jumpRowsRef.current[Number(event.key) - 1];
+      if (!row) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onProviderModelChange(row.provider, row.model.id);
+      setOpen(false);
+      setQuery("");
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [open, onProviderModelChange]);
+
   const selectedKey = `${provider}::${model ?? ""}`;
   const triggerLabel = useMemo(() => {
     const caps =
@@ -369,16 +405,11 @@ export function MultiProviderModelPicker({
           disabled={disabled}
           data-testid="multi-provider-model-picker-trigger"
           title={triggerTitle}
-          className={cn(
-            // Composer footer pill: bordered card chip on the base
-            // surface (design's model/effort/permission pills), the
-            // leading ProviderLogo standing in for the design's tinted
-            // dot. Rounded-lg + border distinguishes these session-
-            // config pills from the rounded-full scope pills above.
-            "inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1 text-xs font-medium",
-            "text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground",
-            "outline-none disabled:opacity-50",
-          )}
+          // Composer footer control: quiet ghost text (shared
+          // FOOTER_TRIGGER recipe), the leading ProviderLogo standing
+          // in for a tinted dot. Hairline pipes between footer
+          // controls — not per-pill borders — carry the separation.
+          className={FOOTER_TRIGGER}
         >
           <ProviderLogo provider={provider} className="h-3 w-3" />
           <span className="max-w-[180px] truncate">
@@ -398,11 +429,17 @@ export function MultiProviderModelPicker({
         </button>
       </PopoverTrigger>
       <PopoverContent
-        className="w-[600px] max-w-[calc(100vw-2rem)] p-0"
+        // Compact popup: 400px wide (48px provider rail + fluid list),
+        // 384px tall — a scannable column instead of a wide panel.
+        className="w-[400px] max-w-[calc(100vw-2rem)] p-0"
         align="start"
         onOpenAutoFocus={focusCmdkRootOnOpen}
       >
-        <div className="grid grid-cols-[48px_1fr] h-[400px] overflow-hidden">
+        {/* `minmax(0,1fr)` (not bare `1fr`): grid items default to
+            min-width auto, so a long unbreakable subtitle line would
+            otherwise force the list column past the popup width and
+            clip the rows against the rail. */}
+        <div className="grid grid-cols-[48px_minmax(0,1fr)] h-[384px] overflow-hidden">
           <ProviderRail
             providers={visibleProviders}
             selected={railKey}
@@ -414,7 +451,7 @@ export function MultiProviderModelPicker({
               setQuery("");
             }}
           />
-          <div className="flex min-h-0 flex-col">
+          <div className="flex min-h-0 min-w-0 flex-col">
             <Command shouldFilter={false}>
               <CommandInput
                 placeholder="Search models..."
@@ -455,7 +492,7 @@ export function MultiProviderModelPicker({
                     query={query}
                   />
                 ) : (
-                  visibleRows.map((row) => {
+                  visibleRows.map((row, index) => {
                     const isActive =
                       row.provider === provider && row.model.id === model;
                     const key = pickerFavoriteKey(row.provider, row.model.id);
@@ -465,6 +502,9 @@ export function MultiProviderModelPicker({
                         row={row}
                         isActive={isActive}
                         isFavorite={favoritesSet.has(key)}
+                        jumpLabel={
+                          index < 9 ? `${JUMP_MOD_LABEL}${index + 1}` : null
+                        }
                         onSelect={() => {
                           onProviderModelChange(row.provider, row.model.id);
                           setOpen(false);
@@ -664,12 +704,16 @@ function ModelRow({
   row,
   isActive,
   isFavorite,
+  jumpLabel,
   onSelect,
   onToggleFavorite,
 }: {
   row: ResolvedRow;
   isActive: boolean;
   isFavorite: boolean;
+  /** "⌘N" / "Ctrl+N" chip for the first nine rows of the current
+   *  list, `null` beyond them. */
+  jumpLabel?: string | null;
   onSelect: () => void;
   onToggleFavorite: () => void;
 }) {
@@ -714,6 +758,15 @@ function ModelRow({
           </span>
         </div>
       </div>
+      {jumpLabel ? (
+        <kbd
+          aria-hidden
+          data-testid="model-row-jump-chip"
+          className="pointer-events-none mt-0.5 inline-flex h-4 shrink-0 select-none items-center self-start rounded-sm bg-muted px-1.5 font-sans text-[10px] font-medium text-muted-foreground"
+        >
+          {jumpLabel}
+        </kbd>
+      ) : null}
       {model.is_free ? (
         <span
           data-testid="model-row-free-badge"
@@ -737,16 +790,24 @@ function ModelRow({
         onPointerDown={(e) => e.stopPropagation()}
         onMouseDown={(e) => e.stopPropagation()}
         data-testid="model-row-favorite-toggle"
+        // The base CommandItem appends an invisible trailing CheckIcon
+        // (16px + flex gap) to every row unless the row carries its own
+        // trailing UI, detected via this slot — without it every row
+        // drags a ~24px phantom gutter on its right edge.
+        data-slot="command-shortcut"
         data-favorite={isFavorite || undefined}
         aria-pressed={isFavorite}
         aria-label={
           isFavorite ? "Remove from favorites" : "Add to favorites"
         }
         className={cn(
-          "shrink-0 rounded p-1 transition-opacity hover:bg-accent",
+          // Always visible (not hover-revealed): a dim outline star on
+          // every row keeps the favoriting affordance discoverable and
+          // the row layout stable.
+          "shrink-0 rounded p-1 transition-colors hover:bg-accent",
           isFavorite
-            ? "text-status-working opacity-100"
-            : "opacity-0 hover:opacity-100 group-hover:opacity-60 focus-visible:opacity-100",
+            ? "text-status-working"
+            : "text-muted-foreground/40 hover:text-foreground focus-visible:text-foreground",
         )}
       >
         <Star

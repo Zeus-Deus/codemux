@@ -94,8 +94,8 @@ export function ComposerFooter({
   const modeIsActive = mode !== "default";
 
   return (
-    <div className="flex items-center gap-1.5 px-3 pb-2 pt-1">
-      <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+    <div className="flex items-center gap-1.5 px-2 pb-2 pt-1">
+      <div className="flex flex-wrap items-center gap-1 min-w-0">
         {onAttachClick && (
           <button
             type="button"
@@ -108,7 +108,7 @@ export function ComposerFooter({
               // diameter, same icon weight. Subtle muted fill so
               // the bold filled Send still reads as the primary
               // action on the right.
-              "inline-flex h-7 w-7 items-center justify-center rounded-full",
+              "inline-flex h-8 w-8 items-center justify-center rounded-full",
               // Transparent base border keeps the circle diameter fixed
               // (border-box) so the open state can add an ember border
               // without a 1px layout shift.
@@ -124,7 +124,7 @@ export function ComposerFooter({
             aria-expanded={attachOpen}
             title="Attach (file, folder, mode, …)"
           >
-            <Plus className="h-3.5 w-3.5" strokeWidth={2.5} />
+            <Plus className="h-4 w-4" strokeWidth={2.25} />
           </button>
         )}
 
@@ -160,12 +160,14 @@ export function ComposerFooter({
           onEffortChange={onEffortChange}
           onContextWindowChange={onContextWindowChange}
           disabled={controlsDisabled}
+          withSeparator
         />
         <SpeedPicker
           model={activeModel}
           value={fastMode}
           onChange={onFastModeChange}
           disabled={controlsDisabled}
+          withSeparator
         />
         {/* Permission picker stays visible when a mode pill is
             active — kept on-screen for discoverability — but goes
@@ -178,6 +180,7 @@ export function ComposerFooter({
           value={permissionMode}
           onChange={onPermissionModeChange}
           disabled={controlsDisabled || modeIsActive}
+          withSeparator
         />
         {/* Host (Local / Remote) is a *workspace* property, not a
             chat-session property: pushing a workspace to a remote
@@ -201,8 +204,9 @@ export function ComposerFooter({
               // as the one destructive action in the row. Distinct from
               // the neutral near-white Send so an in-flight turn is
               // obvious at a glance.
-              "inline-flex h-7 w-7 items-center justify-center rounded-full",
-              "bg-destructive text-destructive-foreground hover:bg-destructive/90",
+              "inline-flex h-8 w-8 items-center justify-center rounded-full",
+              "bg-destructive/90 text-destructive-foreground shadow-xs shadow-destructive/25",
+              "transition-all duration-150 hover:scale-105 hover:bg-destructive active:scale-100",
             )}
             aria-label="Stop"
             title="Stop"
@@ -215,14 +219,18 @@ export function ComposerFooter({
             onClick={onSubmit}
             disabled={!canSubmit || streaming}
             className={cn(
-              "inline-flex h-7 w-7 items-center justify-center rounded-full",
-              "bg-foreground text-background hover:bg-foreground/90",
-              "disabled:opacity-40 disabled:cursor-not-allowed",
+              // Primary action: near-white filled circle with a soft
+              // tinted glow, a 150ms hover lift (scale) and a plain
+              // opacity fade when there's nothing to send.
+              "inline-flex h-8 w-8 items-center justify-center rounded-full",
+              "bg-primary/90 text-primary-foreground shadow-xs shadow-primary/25",
+              "transition-all duration-150 hover:scale-105 hover:bg-primary active:scale-100",
+              "disabled:opacity-30 disabled:shadow-none disabled:cursor-not-allowed disabled:hover:scale-100",
             )}
             aria-label="Send"
             title="Send"
           >
-            <ArrowUp className="h-3.5 w-3.5" strokeWidth={2.5} />
+            <ArrowUp className="h-4 w-4" strokeWidth={2.25} />
           </button>
         )}
       </div>

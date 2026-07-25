@@ -16,12 +16,17 @@ import { cn } from "@/lib/utils";
 import type { ChatModelInfo } from "@/tauri/types";
 
 import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { FOOTER_TRIGGER } from "./footer-trigger";
 
 interface Props {
   model: ChatModelInfo | null;
   value: boolean;
   onChange: (fastMode: boolean) => void;
   disabled?: boolean;
+  /** Render a leading hairline pipe. Lives inside the picker (not the
+   *  footer) so the pipe disappears together with the control when the
+   *  capability gate hides it — no orphaned separators. */
+  withSeparator?: boolean;
 }
 
 const OPTIONS = [
@@ -43,26 +48,38 @@ const OPTIONS = [
  * menu instead of a one-click toggle. The control only exists for models whose
  * live capability payload advertises support.
  */
-export function SpeedPicker({ model, value, onChange, disabled }: Props) {
+export function SpeedPicker({
+  model,
+  value,
+  onChange,
+  disabled,
+  withSeparator,
+}: Props) {
   const [open, setOpen] = useState(false);
 
   if (!model?.supports_fast_mode) return null;
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          disabled={disabled}
-          data-testid="speed-picker-trigger"
-          className={cn(
-            "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-xs font-medium transition-colors outline-none disabled:opacity-50",
-            value
-              ? "border-accent-ember/45 bg-accent-ember/15 text-accent-ember hover:bg-accent-ember/20"
-              : "border-border bg-background text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-          )}
-          aria-label={`Speed: ${value ? "Fast" : "Standard"}`}
-        >
+    <>
+      {withSeparator && (
+        <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 self-center bg-border" />
+      )}
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button
+            type="button"
+            disabled={disabled}
+            data-testid="speed-picker-trigger"
+            className={cn(
+              FOOTER_TRIGGER,
+              // Fast mode is a billing-affecting state — keep the ember
+              // tint so an armed premium speed stays visible even in
+              // the quiet ghost row.
+              value &&
+                "bg-accent-ember/15 text-accent-ember hover:bg-accent-ember/20 hover:text-accent-ember",
+            )}
+            aria-label={`Speed: ${value ? "Fast" : "Standard"}`}
+          >
           <Zap className="h-3 w-3" fill={value ? "currentColor" : "none"} />
           <span>{value ? "Fast" : "Standard"}</span>
           <ChevronDown className="h-2.5 w-2.5 opacity-40" />
@@ -105,7 +122,8 @@ export function SpeedPicker({ model, value, onChange, disabled }: Props) {
             </CommandGroup>
           </CommandList>
         </Command>
-      </PopoverContent>
-    </Popover>
+        </PopoverContent>
+      </Popover>
+    </>
   );
 }

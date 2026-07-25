@@ -255,7 +255,7 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
     return (
       <div className="w-full px-4 pb-2">
         <div className="mx-auto w-full max-w-[760px]">
-          <div className="rounded-[15px] border border-border bg-muted/40 shadow-sm px-4 py-3 text-xs text-muted-foreground">
+          <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3 text-xs text-muted-foreground">
             AskUserQuestion with no questions.
           </div>
         </div>
@@ -270,7 +270,7 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
   return (
     <div className="w-full px-4 pb-2">
       <div className="mx-auto w-full max-w-[760px]">
-        <div className="rounded-[15px] border border-border bg-muted/40 shadow-sm px-4 py-3 space-y-3">
+        <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3 space-y-3">
           {/* Header row: optional uppercase header on the left, pagination on the right. */}
           <div className="flex items-center gap-2">
             <span className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">

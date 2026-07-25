@@ -50,7 +50,18 @@ import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
 const EMPTY_WORKSPACES: WorkspaceSnapshot[] = [];
 
 const GHOST_BTN =
-  "inline-flex h-[27px] shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-semibold text-foreground/90 outline-none transition-colors hover:bg-foreground/[0.07] disabled:cursor-not-allowed disabled:opacity-50";
+  "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium text-muted-foreground outline-none transition-colors hover:bg-foreground/[0.06] hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
+
+/** Scope-strip shell — the bar tucked under the composer card. Inset on
+ *  both sides by the card's 20px corner radius (so its edges land on the
+ *  card's bottom tangent points), bottom-only rounding, and one tonal
+ *  step less elevated than the card, which makes it read as a second
+ *  layer sliding out from beneath the composer rather than a floating
+ *  row. Shared with the running-thread Context Row so the layered
+ *  silhouette survives the first send. */
+export const SCOPE_STRIP_INSET = "w-full px-5";
+export const SCOPE_STRIP =
+  "flex w-full items-center justify-between gap-2.5 rounded-b-[14px] border border-t-0 border-border/70 bg-muted/20 px-2 py-1";
 
 function formatRelativeTime(unixSeconds: number): string {
   const now = Math.floor(Date.now() / 1000);
@@ -126,10 +137,9 @@ export interface ThreadScopeRowProps {
 }
 
 /**
- * Thread Scope redesign — the borderless scope row rendered BELOW the
- * composer (`Composer`'s `belowComposerSlot`): location · checkout on
- * the left, "from ⑂ branch" on the right, and a centered muted hint
- * underneath spelling out what a first send will do.
+ * Thread Scope redesign — the scope strip rendered BELOW the composer
+ * (`Composer`'s `belowComposerSlot`, attached flush via `SCOPE_STRIP`):
+ * location · checkout on the left, "from ⑂ branch" on the right.
  *
  * Rendered by BOTH first-send surfaces (see `ThreadScopeLocation`):
  * `DraftChatSurface` and `AgentChatPane`'s new-thread empty state.
@@ -226,9 +236,10 @@ export function ThreadScopeRow({
   }, [projectIsGit, checkoutMode, onChangeCheckoutMode]);
 
   return (
-    <div className="rise-in flex flex-col items-center gap-3 px-1">
-      <div className="flex w-full items-center justify-between gap-2.5">
-        <div className="flex min-w-0 items-center gap-0.5">
+    <div className="rise-in flex w-full flex-col items-center gap-3">
+      <div className={SCOPE_STRIP_INSET}>
+        <div className={SCOPE_STRIP}>
+          <div className="flex min-w-0 items-center gap-0.5">
           <LocationControl
             location={location}
             isHome={isHome}
@@ -248,21 +259,22 @@ export function ThreadScopeRow({
             </>
           )}
         </div>
-        {(showProjectControls || trailing) && (
-          <div className="flex shrink-0 items-center gap-1.5">
-            {showProjectControls && projectIsGit && projectPath && (
-              <BranchControl
-                projectPath={projectPath}
-                checkoutMode={checkoutMode}
-                baseBranch={baseBranch}
-                disabled={disabled}
-                onChangeCheckoutMode={onChangeCheckoutMode}
-                onChangeBaseBranch={onChangeBaseBranch}
-              />
-            )}
-            {trailing}
-          </div>
-        )}
+          {(showProjectControls || trailing) && (
+            <div className="flex shrink-0 items-center gap-1.5">
+              {showProjectControls && projectIsGit && projectPath && (
+                <BranchControl
+                  projectPath={projectPath}
+                  checkoutMode={checkoutMode}
+                  baseBranch={baseBranch}
+                  disabled={disabled}
+                  onChangeCheckoutMode={onChangeCheckoutMode}
+                  onChangeBaseBranch={onChangeBaseBranch}
+                />
+              )}
+              {trailing}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

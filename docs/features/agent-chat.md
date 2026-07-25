@@ -1563,8 +1563,12 @@ the "no panes" home landing lives in `ChatHomeLanding.tsx`.
 BOTH first-send surfaces — `DraftChatSurface` (lazy-creation draft) and
 `AgentChatPane`'s new-thread empty state (`messages.length === 0` on a
 real workspace's pane) — render their scope controls **below** the
-composer as one shared borderless `ThreadScopeRow`
-(`src/components/chat/pickers/ThreadScopeRow.tsx`), threaded through
+composer as one shared `ThreadScopeRow`
+(`src/components/chat/pickers/ThreadScopeRow.tsx`) — rendered as a
+**scope strip**: a narrower bar attached flush under the composer card
+(inset each side by the card's 20px corner radius, bottom-only
+rounding, one tonal step less elevated — the shared `SCOPE_STRIP` /
+`SCOPE_STRIP_INSET` class constants), threaded through
 `Composer`'s `belowComposerSlot` prop (a sibling of `zone1Override`,
 which both surfaces now pass `null` while a project root resolves — the
 cwd label moved into the row's location control). Three states, matched
@@ -1757,8 +1761,9 @@ title-bar chat tab). See `docs/features/gui-chrome.md`.
 
 Design: `.design-import/Context Row.dc.html` (claude.ai/design handoff).
 Once a thread has messages, `AgentChatPane`'s `belowComposerSlot` swaps
-`ThreadScopeRow` for a read-only **Context Row** — the same outer
-layout (`flex justify-between px-1`), but scope is committed (the first
+`ThreadScopeRow` for a read-only **Context Row** — the same tucked
+scope-strip shell (`SCOPE_STRIP` / `SCOPE_STRIP_INSET` exported from
+`ThreadScopeRow.tsx`), but scope is committed (the first
 send locked it in) so the left side is no longer clickable:
 
 - **Left** — static ghost-styled spans: folder icon (home icon +

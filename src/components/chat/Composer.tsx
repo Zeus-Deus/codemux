@@ -247,7 +247,13 @@ interface Props {
   onModeRemove: () => void;
 }
 
-const MAX_ROWS_APPROX_PX = 32 + 7 * 20; // ~8 rows
+const MAX_ROWS_APPROX_PX = 20 + 10 * 20; // ~10 rows (200px of text + py-2.5)
+
+/** Resting height of the (empty) textarea box, padding included. Reserves
+ *  ~4 lines of space so the idle composer reads as a spacious prompt card
+ *  (140px tall with the 32px-control footer row) instead of a single-line
+ *  strip. The auto-grow effect only ever grows past this, never below it. */
+const MIN_TEXTAREA_PX = 94;
 
 export function Composer({
   draft,
@@ -313,7 +319,7 @@ export function Composer({
   // Kept hidden so the visible affordance stays the popup row.
   const imageInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Auto-grow textarea up to ~8 rows.
+  // Auto-grow textarea from the resting min up to ~10 rows.
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -1966,11 +1972,13 @@ export function Composer({
           onDrop={handleDrop}
           className={cn(
             "relative",
-            // Composer card (design D10): 15px radius, a real hairline
-            // border on the slightly-elevated surface, and a soft
-            // shadow so the card lifts off the pane background. Focus
-            // sharpens the border rather than stacking a ring.
-            "rounded-[15px] border border-border bg-muted/40 shadow-sm",
+            // Composer card: soft 20px radius, a hairline border on
+            // the slightly-elevated surface, and a deep low-opacity
+            // shadow so the card lifts off the pane background and
+            // the scope strip below reads as a layer tucked under it.
+            // Focus sharpens the border rather than stacking a ring.
+            "rounded-[20px] border border-border/80 bg-muted/40",
+            "shadow-[0_12px_28px_-18px_rgba(0,0,0,0.45)]",
             // Composer is mounted for the entire chat session and re-
             // renders frequently as the draft / attachments change.
             // `transition-all` would animate every property change;
@@ -2378,7 +2386,13 @@ export function Composer({
                 "placeholder:text-muted-foreground/60",
                 "outline-none",
               )}
-              style={{ maxHeight: `${MAX_ROWS_APPROX_PX}px` }}
+              // min-height (rather than a floor in the auto-grow effect)
+              // so the imperative `style.height` can never shrink the box
+              // below the resting size.
+              style={{
+                minHeight: `${MIN_TEXTAREA_PX}px`,
+                maxHeight: `${MAX_ROWS_APPROX_PX}px`,
+              }}
             />
           </div>
           {showQueueHint ? (
@@ -2416,9 +2430,11 @@ export function Composer({
             modelPickerOpenSignal={modelPickerOpenSignal}
           />
         </div>
-        {belowComposerSlot ? (
-          <div className="pt-1.5">{belowComposerSlot}</div>
-        ) : null}
+        {/* No gap here — the scope strip / context strip attaches
+            flush to the card's bottom edge so it reads as a layer
+            sliding out from beneath the card. Slot content owns any
+            spacing it needs below itself. */}
+        {belowComposerSlot ?? null}
       </div>
     </div>
   );
