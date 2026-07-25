@@ -2006,34 +2006,35 @@ mod tests {
             sdk_model("haiku", "Haiku", &[], None, None),
         ];
         let caps = build_capabilities_from_sdk(live);
-        let desc = |id: &str| {
+        let row = |id: &str| {
             caps.models
                 .iter()
                 .find(|m| m.id == id)
                 .unwrap_or_else(|| panic!("{id} row must exist"))
-                .description
-                .clone()
-                .unwrap_or_else(|| panic!("{id} row must carry a description"))
         };
-        // `default` and `opus` both resolve to Opus 4.8, which defaults to
-        // the 1M context window → the "with 1M context" qualifier.
+        // The backfilled version now lives in the promoted LABEL; the
+        // description keeps only the blurb. `default` resolves to the
+        // same concrete model as `opus`, so it folds into that twin,
+        // which leads the list with the Recommended marker.
+        assert!(caps.models.iter().all(|m| m.id != "default"));
+        assert_eq!(caps.models[0].id, "opus");
+        assert_eq!(caps.models[0].label, "Claude Opus 4.8");
         assert_eq!(
-            desc("default"),
-            "Opus 4.8 with 1M context · Best for everyday, complex tasks"
+            caps.models[0].description.as_deref(),
+            Some("Recommended · Best for everyday, complex tasks"),
         );
+        assert_eq!(row("fable").label, "Claude Fable 5");
         assert_eq!(
-            desc("opus"),
-            "Opus 4.8 with 1M context · Best for everyday, complex tasks"
+            row("fable").description.as_deref(),
+            Some("Most capable for the hardest, longest-running tasks"),
         );
-        // Fable/Sonnet also default to the 1M window in the maintained
-        // table, so they carry the qualifier too.
+        assert_eq!(row("sonnet").label, "Claude Sonnet 4.6");
+        assert_eq!(row("sonnet").description.as_deref(), Some("Fast and capable"));
+        assert_eq!(row("haiku").label, "Claude Haiku 4.5");
         assert_eq!(
-            desc("fable"),
-            "Fable 5 with 1M context · Most capable for the hardest, longest-running tasks"
+            row("haiku").description.as_deref(),
+            Some("Fastest and cheapest"),
         );
-        assert_eq!(desc("sonnet"), "Sonnet 4.6 with 1M context · Fast and capable");
-        // Haiku has no context-window options → no qualifier, blurb only.
-        assert_eq!(desc("haiku"), "Haiku 4.5 · Fastest and cheapest");
     }
 
     #[test]
@@ -2071,7 +2072,10 @@ mod tests {
     fn sdk_description_wins_verbatim_over_backfill() {
         // When the deployed CLI supplies its own description (the common
         // case — it packs the resolved version + blurb in there), that
-        // string wins verbatim over any maintained / alias backfill.
+        // string wins over any maintained / alias backfill as the SOURCE:
+        // the promoted label carries the CLI's version ("Opus 4.9" — NOT
+        // the canonical map's stale 4.8), and the description keeps the
+        // CLI's blurb.
         let sdk = SdkModelInfo {
             value: "opus".into(),
             display_name: "Opus".into(),
@@ -2082,9 +2086,10 @@ mod tests {
         };
         let caps = build_capabilities_from_sdk(vec![sdk]);
         let opus = caps.models.iter().find(|m| m.id == "opus").unwrap();
+        assert_eq!(opus.label, "Claude Opus 4.9");
         assert_eq!(
             opus.description.as_deref(),
-            Some("Opus 4.9 with 1M context · Freshest blurb from the CLI")
+            Some("Freshest blurb from the CLI")
         );
     }
 
