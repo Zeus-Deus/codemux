@@ -1762,21 +1762,52 @@ impl AgentBrowserManager {
         Ok(())
     }
 
+    /// Record that a command is about to run and return whether the daemon
+    /// was already considered running.
+    ///
+    /// For every action except "close" this marks the session running BEFORE
+    /// the blocking CLI call. The CLI auto-starts the daemon on first
+    /// invocation, so it's effectively "running" as soon as we call it.
+    /// Setting this early prevents a concurrent start_stream (from
+    /// BrowserPane mounting) from killing the daemon mid-command. The prior
+    /// flag is returned so the fresh-launch viewport default in run_command
+    /// fires exactly once per daemon lifetime.
+    ///
+    /// "close" only reads the flag: the early-mark exists to protect a
+    /// daemon we want alive, which is pointless when we're about to kill it
+    /// ourselves — and marking it running would leave a stale `true` behind.
+    async fn note_action_start(&self, browser_id: &str, action: &str) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get_mut(browser_id) {
+            Some(s) => {
+                if action == "close" {
+                    s.running
+                } else {
+                    std::mem::replace(&mut s.running, true)
+                }
+            }
+            None => false,
+        }
+    }
+
+    /// Reset session state after a "close" action so the next command sees a
+    /// fresh daemon (and re-applies the default viewport). Called
+    /// unconditionally — even if the close reported an error the daemon
+    /// state is unknown at worst, and both consumers of `running` tolerate a
+    /// stale `false`: start_stream re-probes the socket, and a redundant
+    /// viewport apply on a still-live daemon is harmless right after the
+    /// agent chose to close it. The port allocation / map entry stays intact.
+    async fn note_close_finished(&self, browser_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(s) = sessions.get_mut(browser_id) {
+            s.running = false;
+            s.pid = None;
+        }
+    }
+
     pub async fn run_command(&self, browser_id: &str, action: &str, params: serde_json::Value) -> Result<BrowserAutomationResult, String> {
         let port = self.allocate_port(browser_id).await?;
-        // Mark running BEFORE the blocking CLI call. The CLI auto-starts the
-        // daemon on first invocation, so it's effectively "running" as soon as
-        // we call it. Setting this early prevents a concurrent start_stream
-        // (from BrowserPane mounting) from killing the daemon mid-command.
-        // Capture the prior flag so the fresh-launch viewport default below
-        // fires exactly once per daemon lifetime.
-        let was_running = {
-            let mut sessions = self.sessions.lock().await;
-            match sessions.get_mut(browser_id) {
-                Some(s) => std::mem::replace(&mut s.running, true),
-                None => false,
-            }
-        };
+        let was_running = self.note_action_start(browser_id, action).await;
 
         // User-configured default viewport (`browser.default_viewport`,
         // synced settings): apply it to a freshly launched daemon BEFORE the
@@ -1802,13 +1833,22 @@ impl AgentBrowserManager {
 
         // Run the (timeout-bounded) CLI work on a blocking thread so a slow
         // agent-browser round-trip never stalls the async executor.
-        let browser_id = browser_id.to_string();
-        let action = action.to_string();
-        tokio::task::spawn_blocking(move || {
-            execute_agent_browser_action(&browser_id, &action, params, port)
+        let owned_browser_id = browser_id.to_string();
+        let owned_action = action.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            execute_agent_browser_action(&owned_browser_id, &owned_action, params, port)
         })
         .await
-        .map_err(|e| format!("agent-browser action task failed: {e}"))?
+        .map_err(|e| format!("agent-browser action task failed: {e}"))?;
+
+        // The agent-facing "close" goes through this path (not close()), so
+        // reset the state here — otherwise the entry keeps running = true and
+        // a later open on the fresh daemon would skip the default viewport.
+        if action == "close" {
+            self.note_close_finished(browser_id).await;
+        }
+
+        result
     }
 
     pub async fn get_screenshot(&self, browser_id: &str) -> Result<String, String> {
@@ -2710,6 +2750,41 @@ mod tests {
         let p1 = mgr.allocate_port("workspace-x").await.unwrap();
         let p2 = mgr.allocate_port("workspace-x").await.unwrap();
         assert_eq!(p1, p2, "Same session key must return same port");
+    }
+
+    /// Regression test for the open→close→open gap: the agent-facing
+    /// "close" runs through run_command (not close()), so the session entry
+    /// used to keep running = true after a close. The second open then
+    /// skipped the fresh-launch default-viewport apply even though it booted
+    /// a brand-new daemon. Locks in the state transitions via the helpers
+    /// run_command itself calls, without shelling out to agent-browser.
+    #[tokio::test]
+    async fn close_resets_running_so_reopen_reapplies_default_viewport() {
+        let mgr = AgentBrowserManager::new();
+        mgr.allocate_port("ws-reopen").await.unwrap();
+
+        // First command on a fresh daemon: not yet running → default
+        // viewport would be applied.
+        assert!(!mgr.note_action_start("ws-reopen", "open").await);
+        // Second command on the running daemon: no re-apply.
+        assert!(mgr.note_action_start("ws-reopen", "open").await);
+        // Close sees a running daemon and must NOT flip the flag itself.
+        assert!(mgr.note_action_start("ws-reopen", "close").await);
+        assert!(
+            mgr.note_action_start("ws-reopen", "close").await,
+            "close must only read the running flag, not modify it",
+        );
+        // After the close action completes, state resets...
+        mgr.note_close_finished("ws-reopen").await;
+        {
+            let sessions = mgr.sessions.lock().await;
+            let s = sessions.get("ws-reopen").expect("entry survives close");
+            assert!(!s.running);
+            assert!(s.pid.is_none());
+        }
+        // ...so the next open counts as a fresh daemon again and the
+        // default viewport would be re-applied.
+        assert!(!mgr.note_action_start("ws-reopen", "open").await);
     }
 
     #[tokio::test]

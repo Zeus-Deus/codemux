@@ -100,32 +100,36 @@ pub const PRESETS: &[Preset] = &[
 /// reset lands on that instead — see [`configured_default_spec`].
 pub const RESET_SPEC: ViewportSpec = ViewportSpec::new(1280, 800, 1.0);
 
-/// Resolve the user's `browser.default_viewport` setting string into a
-/// concrete spec, falling back to [`RESET_SPEC`] when unset or invalid.
+/// Resolve a raw `browser.default_viewport` setting string into a spec,
+/// or `None` when the value is unset or unusable.
 ///
-/// Pure — takes the raw setting value so it stays unit-testable without
-/// touching the on-disk settings cache. `"reset"` is rejected here (it
-/// would be self-referential as a *default*), and any parse failure
-/// falls back silently: the setting syncs across devices, so a bad
-/// value must degrade to the baseline rather than break startup.
-pub fn resolve_default(raw: Option<&str>) -> ViewportSpec {
+/// This is the single source of truth for interpreting the setting —
+/// pure, so it stays unit-testable without touching the on-disk settings
+/// cache. Empty/whitespace values and a literal `"reset"` (which would
+/// be self-referential as a *default*) count as unset; any parse
+/// failure also yields `None`: the setting syncs across devices, so a
+/// bad value must degrade silently rather than break startup.
+pub fn resolve_default_setting(raw: Option<&str>) -> Option<ViewportSpec> {
     raw.map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("reset"))
         .and_then(|s| parse_spec(s, None).ok())
-        .unwrap_or(RESET_SPEC)
 }
 
-/// The user-configured default viewport from the synced-settings cache,
-/// or `None` when unset/invalid. `Some` means the user explicitly chose
-/// a default (e.g. `"2560x1440"` to match their monitor) — fresh
-/// agent-browser daemons get it applied at launch.
+/// Convenience over [`resolve_default_setting`]: same resolution, but
+/// falls back to the built-in [`RESET_SPEC`] baseline when the setting
+/// is unset or invalid — documenting the fallback contract in one place.
+pub fn resolve_default(raw: Option<&str>) -> ViewportSpec {
+    resolve_default_setting(raw).unwrap_or(RESET_SPEC)
+}
+
+/// Cache-reading wrapper around [`resolve_default_setting`]: reads the
+/// user's `browser.default_viewport` from the synced-settings cache and
+/// resolves it. `Some` means the user explicitly chose a default (e.g.
+/// `"2560x1440"` to match their monitor) — fresh agent-browser daemons
+/// get it applied at launch.
 pub fn configured_default_viewport() -> Option<ViewportSpec> {
-    let raw = crate::settings_sync::load_cache()?.browser.default_viewport?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("reset") {
-        return None;
-    }
-    parse_spec(trimmed, None).ok()
+    let cached = crate::settings_sync::load_cache()?;
+    resolve_default_setting(cached.browser.default_viewport.as_deref())
 }
 
 /// The spec `viewport reset` should return to: the user-configured
@@ -363,6 +367,27 @@ mod tests {
         assert_eq!(resolve_default(Some("not-a-preset")), RESET_SPEC);
         assert_eq!(resolve_default(Some("0x0")), RESET_SPEC);
         assert_eq!(resolve_default(Some("reset")), RESET_SPEC);
+    }
+
+    /// Exercises the shared pure core directly — `resolve_default`,
+    /// `configured_default_viewport`, and `configured_default_spec` all
+    /// delegate here, so this covers the logic that actually ships.
+    #[test]
+    fn resolve_default_setting_some_or_none() {
+        let spec = resolve_default_setting(Some("2560x1440")).expect("custom WxH should resolve");
+        assert_eq!((spec.width, spec.height, spec.dpr), (2560, 1440, 1.0));
+
+        let spec = resolve_default_setting(Some("desktop-large")).expect("preset should resolve");
+        assert_eq!((spec.width, spec.height), (1920, 1080));
+
+        // Unset, blank, self-referential "reset", and unparseable values
+        // all count as "no configured default".
+        assert_eq!(resolve_default_setting(None), None);
+        assert_eq!(resolve_default_setting(Some("")), None);
+        assert_eq!(resolve_default_setting(Some("   ")), None);
+        assert_eq!(resolve_default_setting(Some("reset")), None);
+        assert_eq!(resolve_default_setting(Some("not-a-preset")), None);
+        assert_eq!(resolve_default_setting(Some("0x0")), None);
     }
 
     #[test]

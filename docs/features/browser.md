@@ -196,7 +196,12 @@ Consumption points (all lenient — an invalid synced value degrades to the
   first-command screenshot renders at the user's size. Fires once per daemon
   lifetime and only when the setting is present; skipped for `viewport`
   (explicit size wins) and `close` (don't boot a daemon to resize it). An
-  agent's own later `viewport` calls are never stomped.
+  agent's own later `viewport` calls are never stomped. A `close` action
+  resets the session's `running`/`pid` state (the agent-facing `close`
+  routes through `run_command`, not `AgentBrowserManager::close`, so the
+  session-map entry outlives the daemon) — this keeps the once-per-daemon
+  guarantee honest across an agent's open → close → open sequence: the
+  reopened daemon gets the default re-applied.
 - **`viewport reset`** (CLI `codemux browser viewport reset` + MCP
   `browser_viewport {preset: "reset"}`): resolves through
   `browser_viewport::parse_spec_configured`, which lands on the configured
