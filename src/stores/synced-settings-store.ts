@@ -22,6 +22,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   file_tree: { show_hidden_files: false },
   session_restore: { enabled: true, scrollback_lines: 10_000, max_total_mb: 100 },
   agent_chat: { checkpoints_enabled: false, background_browser_desktop_viewport: true },
+  browser: { default_viewport: null },
 };
 
 export interface SyncedSettingsState {
@@ -179,3 +180,24 @@ export const selectAgentCheckpointsEnabled = (s: SyncedSettingsState): boolean =
 
 export const selectBackgroundBrowserDesktopViewport = (s: SyncedSettingsState): boolean =>
   s.settings.agent_chat?.background_browser_desktop_viewport ?? true;
+
+/** Raw `browser.default_viewport` spec string (`"2560x1440"` etc.), or
+ *  null for the built-in baseline. Returns the primitive so zustand's
+ *  reference equality works — parse with `parseViewportString`. */
+export const selectBrowserDefaultViewport = (s: SyncedSettingsState): string | null =>
+  s.settings.browser?.default_viewport ?? null;
+
+/** Parse a `"WxH"` viewport string into dimensions. Returns null for
+ *  anything else (unset, preset names, garbage from another device) so
+ *  callers fall back to their own baseline — mirrors the lenient
+ *  degrade-to-default behavior of `browser_viewport::resolve_default`
+ *  on the Rust side. */
+export function parseViewportString(raw: string | null): { width: number; height: number } | null {
+  if (!raw) return null;
+  const m = /^(\d{2,4})x(\d{2,4})$/.exec(raw.trim().toLowerCase());
+  if (!m) return null;
+  const width = Number(m[1]);
+  const height = Number(m[2]);
+  if (width < 10 || height < 10 || width > 7680 || height > 7680) return null;
+  return { width, height };
+}

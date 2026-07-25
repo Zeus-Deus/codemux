@@ -41,6 +41,7 @@ const FULL_CUSTOM: UserSettings = {
   file_tree: { show_hidden_files: true },
   session_restore: { enabled: false, scrollback_lines: 5000, max_total_mb: 50 },
   agent_chat: { checkpoints_enabled: true, background_browser_desktop_viewport: false },
+  browser: { default_viewport: null },
 };
 
 // ── Setup ──

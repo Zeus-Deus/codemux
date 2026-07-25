@@ -1768,7 +1768,38 @@ impl AgentBrowserManager {
         // daemon on first invocation, so it's effectively "running" as soon as
         // we call it. Setting this early prevents a concurrent start_stream
         // (from BrowserPane mounting) from killing the daemon mid-command.
-        self.sessions.lock().await.entry(browser_id.to_string()).and_modify(|s| s.running = true);
+        // Capture the prior flag so the fresh-launch viewport default below
+        // fires exactly once per daemon lifetime.
+        let was_running = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get_mut(browser_id) {
+                Some(s) => std::mem::replace(&mut s.running, true),
+                None => false,
+            }
+        };
+
+        // User-configured default viewport (`browser.default_viewport`,
+        // synced settings): apply it to a freshly launched daemon BEFORE the
+        // requested action, so even a first-command screenshot renders at
+        // the user's preferred size (e.g. 2560×1440 to match their monitor)
+        // instead of the agent-browser built-in. Only when the setting is
+        // present — unset keeps today's behavior byte-for-byte. Skipped for:
+        // - "viewport": the caller is setting an explicit size anyway;
+        // - "close": don't boot a daemon just to resize-then-kill it.
+        // Never re-applied to a running daemon, so an agent's own viewport
+        // choice survives subsequent commands. Best-effort: a failure here
+        // must not block the real action.
+        if !was_running && action != "viewport" && action != "close" {
+            if let Some(spec) = crate::browser_viewport::configured_default_viewport() {
+                let bid = browser_id.to_string();
+                let vp_params = crate::browser_viewport::socket_action(spec);
+                let _ = tokio::task::spawn_blocking(move || {
+                    execute_agent_browser_action(&bid, "viewport", vp_params, port)
+                })
+                .await;
+            }
+        }
+
         // Run the (timeout-bounded) CLI work on a blocking thread so a slow
         // agent-browser round-trip never stalls the async executor.
         let browser_id = browser_id.to_string();

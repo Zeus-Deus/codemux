@@ -24,6 +24,8 @@ import {
   selectNotificationSoundEnabled,
   selectDesktopNotificationsEnabled,
   selectBackgroundBrowserDesktopViewport,
+  selectBrowserDefaultViewport,
+  parseViewportString,
 } from "./synced-settings-store";
 import type { UserSettings } from "@/tauri/types";
 
@@ -37,6 +39,7 @@ const DARK_SETTINGS: UserSettings = {
   file_tree: { show_hidden_files: true },
   session_restore: { enabled: true, scrollback_lines: 10000, max_total_mb: 100 },
   agent_chat: { checkpoints_enabled: true, background_browser_desktop_viewport: false },
+  browser: { default_viewport: "2560x1440" },
 };
 
 describe("synced-settings-store", () => {
@@ -276,6 +279,30 @@ describe("synced-settings-store", () => {
 
     it("selectBackgroundBrowserDesktopViewport defaults to true", () => {
       expect(selectBackgroundBrowserDesktopViewport(useSyncedSettingsStore.getState())).toBe(true);
+    });
+
+    it("selectBrowserDefaultViewport returns the raw spec string", () => {
+      useSyncedSettingsStore.setState({ settings: DARK_SETTINGS });
+      expect(selectBrowserDefaultViewport(useSyncedSettingsStore.getState())).toBe("2560x1440");
+    });
+
+    it("selectBrowserDefaultViewport defaults to null", () => {
+      expect(selectBrowserDefaultViewport(useSyncedSettingsStore.getState())).toBe(null);
+    });
+  });
+
+  describe("parseViewportString", () => {
+    it("parses WxH strings", () => {
+      expect(parseViewportString("2560x1440")).toEqual({ width: 2560, height: 1440 });
+      expect(parseViewportString(" 1920X1080 ")).toEqual({ width: 1920, height: 1080 });
+    });
+
+    it("returns null for unset, preset names, and garbage", () => {
+      expect(parseViewportString(null)).toBe(null);
+      expect(parseViewportString("")).toBe(null);
+      expect(parseViewportString("desktop-large")).toBe(null);
+      expect(parseViewportString("0x0")).toBe(null);
+      expect(parseViewportString("99999x99999")).toBe(null);
     });
   });
 

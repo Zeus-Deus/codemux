@@ -49,7 +49,9 @@ UserSettings
     max_total_mb: number       (default: 100)
   agent_chat
     checkpoints_enabled: boolean                 (default: false, run-start rollback checkpoint — issue #80)
-    background_browser_desktop_viewport: boolean (default: true — serde default_true, so blobs missing the field get ON while an explicitly saved false is kept; pin GUI-mode background-browser peek to 1280×800 — docs/features/browser.md)
+    background_browser_desktop_viewport: boolean (default: true — serde default_true, so blobs missing the field get ON while an explicitly saved false is kept; pin GUI-mode background-browser peek to the default viewport — docs/features/browser.md)
+  browser
+    default_viewport: string | null              (default: null — preferred starting viewport for agent-browser sessions, a "WxH" string like "2560x1440" or a preset name; applied to freshly launched daemons and used as the `viewport reset` target so agent screenshots match the user's screen. Invalid values degrade to the built-in 1280×800 baseline, never error — docs/features/browser.md)
 ```
 
 ### Offline Cache
@@ -105,7 +107,7 @@ Opened via the settings button or command palette. The Settings panel has 12 sec
 | Projects | Editor & Workflow | Setup/teardown/run scripts | No (local) |
 | Git | Editor & Workflow | Default base branch | Yes |
 | Agent | Editor & Workflow | AI commit/resolver config + auto-MCP toggle | No (local except auto-MCP) |
-| Browser | Editor & Workflow | Browser data management (clear cookies / all data) | No |
+| Browser | Editor & Workflow | Default agent-browser viewport + browser data management (clear cookies / all data) | Partial (default_viewport syncs) |
 | Session Restore | Editor & Workflow | Enable/disable, scrollback lines, disk limit | Yes |
 
 The `file_tree.show_hidden_files` setting is synced but is **not exposed in the Settings panel** — the toggle lives directly in the right-sidebar file tree panel header (`file-tree-panel.tsx`). It still syncs across devices via `synced-settings-store`.

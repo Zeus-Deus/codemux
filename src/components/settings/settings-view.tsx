@@ -59,6 +59,7 @@ import {
   selectTerminalCursorStyle,
   selectDefaultEditor,
   selectDefaultBaseBranch,
+  selectBrowserDefaultViewport,
 } from "@/stores/synced-settings-store";
 import {
   useSettingsStore,
@@ -563,10 +564,23 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(k, i)).toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
 }
 
+/** Options for the default agent-browser viewport. "default" maps to
+ *  null (built-in 1280×800 baseline); other values are `WxH` spec
+ *  strings stored verbatim in `browser.default_viewport` and consumed
+ *  by the Rust side (fresh-daemon apply + `viewport reset` target). */
+const DEFAULT_VIEWPORT_OPTIONS = [
+  { value: "default", label: "Default (1280×800)" },
+  { value: "1920x1080", label: "Full HD (1920×1080)" },
+  { value: "2560x1440", label: "QHD (2560×1440)" },
+  { value: "3840x2160", label: "4K (3840×2160)" },
+] as const;
+
 function BrowserSection() {
   const [dataSize, setDataSize] = useState<number | null>(null);
   const [clearing, setClearing] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const defaultViewport = useSyncedSettingsStore(selectBrowserDefaultViewport);
+  const updateSyncedSetting = useSyncedSettingsStore((s) => s.updateSetting);
 
   const refreshSize = () => {
     getBrowserDataSize().then(setDataSize).catch(() => setDataSize(0));
@@ -611,6 +625,40 @@ function BrowserSection() {
         description="Manage the built-in browser profile used by agents and browser panes."
       />
       <div className="space-y-1">
+        <SettingRow
+          label="Default viewport"
+          description="Starting page size for agent browser sessions and the 'viewport reset' target. Match your monitor so agent screenshots look like your own browser."
+        >
+          <Select
+            value={defaultViewport ?? "default"}
+            onValueChange={(v) => {
+              updateSyncedSetting(
+                "browser",
+                "default_viewport",
+                v === "default" ? null : v,
+              ).catch(console.error);
+            }}
+          >
+            <SelectTrigger className="w-48 h-9">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {DEFAULT_VIEWPORT_OPTIONS.map((o) => (
+                <SelectItem key={o.value} value={o.value}>
+                  {o.label}
+                </SelectItem>
+              ))}
+              {/* A custom value set elsewhere (CLI, another device) that
+                  isn't one of the canned options still renders instead of
+                  showing an empty trigger. */}
+              {defaultViewport !== null &&
+                !DEFAULT_VIEWPORT_OPTIONS.some((o) => o.value === defaultViewport) && (
+                  <SelectItem value={defaultViewport}>{defaultViewport}</SelectItem>
+                )}
+            </SelectContent>
+          </Select>
+        </SettingRow>
+        <Separator />
         <SettingRow
           label="Profile storage"
           description="Total size of cached browser data, screenshots, and session files."
@@ -2147,7 +2195,7 @@ export function SettingsView() {
                       GUI-chrome surface. */}
                   <SettingRow
                     label="Desktop-size background browser"
-                    description="Start the agent's background browser at a real desktop viewport (1280×800) so pages render at full size in the peek popover, scaled to fit."
+                    description="Pin the agent's background browser to a real desktop viewport (the Browser section's default viewport, 1280×800 out of the box) so pages render at full size in the peek popover, scaled to fit."
                   >
                     <Switch
                       checked={syncedSettings.agent_chat?.background_browser_desktop_viewport ?? true}

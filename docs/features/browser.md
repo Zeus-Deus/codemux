@@ -171,7 +171,46 @@ existing frame-draw letterbox scales the full-size frame down to fit. Input
 mapping needs no changes — `mapToViewport` already routes clicks through the
 canvas rect + draw rect into viewport coordinates. Applies only to the peek
 overlay; normal browser panes (and the peek with the setting toggled off) keep
-the container-sync behavior unchanged.
+the container-sync behavior unchanged. When a user default viewport is
+configured (next section), the peek pins to that instead of 1280×800 —
+`DESKTOP_PEEK_VIEWPORT` is only the fallback.
+
+## User default viewport (`browser.default_viewport`)
+
+Settings → Browser → "Default viewport" (`UserSettings.browser
+.default_viewport`, synced settings, default unset). Motivation: the built-in
+1280×800 baseline reads as "zoomed in" to users on larger monitors — agent
+screenshots for PRs/issues show the narrow-desktop responsive layout instead
+of what the user sees in their own browser. Setting e.g. QHD (2560×1440) makes
+agent screenshots match the user's screen proportions. Cosmetic cost only:
+frames/screenshots scale ~linearly with pixel count, and model-side vision
+downscales past ~1.15 MP anyway, so agent token cost is unchanged.
+
+The value is a `browser_viewport::parse_spec` string — preset name or `WxH`.
+Consumption points (all lenient — an invalid synced value degrades to the
+1280×800 baseline, never errors):
+
+- **Fresh daemon launch** (`AgentBrowserManager::run_command`): when the
+  session's `running` flag flips false→true, the configured viewport is
+  applied via a `set viewport` command BEFORE the requested action, so even a
+  first-command screenshot renders at the user's size. Fires once per daemon
+  lifetime and only when the setting is present; skipped for `viewport`
+  (explicit size wins) and `close` (don't boot a daemon to resize it). An
+  agent's own later `viewport` calls are never stomped.
+- **`viewport reset`** (CLI `codemux browser viewport reset` + MCP
+  `browser_viewport {preset: "reset"}`): resolves through
+  `browser_viewport::parse_spec_configured`, which lands on the configured
+  default (`configured_default_spec`) instead of the hard-coded `RESET_SPEC`.
+  Both `viewport-presets` listings report the actual reset target. The CLI is
+  the same binary as the app, so it reads the same on-disk settings cache.
+- **Peek overlay pin** (`BrowserPeekOverlay.tsx`): with "Desktop-size
+  background browser" ON, the `fixedViewport` prop uses
+  `parseViewportString(browser.default_viewport)` (WxH strings only on the
+  frontend) with `DESKTOP_PEEK_VIEWPORT` (1280×800) as fallback, keeping the
+  peek consistent with what the agent's screenshots show.
+
+Visible browser panes still sync the viewport to their container size —
+the default only governs headless/background sessions and the reset target.
 
 ## Session reaping during app lifetime (issue #126)
 

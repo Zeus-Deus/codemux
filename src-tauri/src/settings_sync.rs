@@ -26,6 +26,27 @@ pub struct UserSettings {
     pub session_restore: SessionRestoreSettings,
     #[serde(default)]
     pub agent_chat: AgentChatSettings,
+    #[serde(default)]
+    pub browser: BrowserSettings,
+}
+
+/// Agent-browser behavior knobs.
+///
+/// `default_viewport` is the user's preferred starting viewport for
+/// agent-browser sessions, as a spec string accepted by
+/// `browser_viewport::parse_spec` — a preset name (`"desktop-large"`)
+/// or custom `"WxH"` (`"2560x1440"`). When set, a freshly launched
+/// agent-browser daemon gets this viewport applied before its first
+/// action, and `viewport reset` returns to it instead of the built-in
+/// `RESET_SPEC` baseline — so screenshots the agent takes match the
+/// user's own screen proportions. `None` (the default) keeps today's
+/// behavior everywhere (1280×800 baseline). Invalid strings are
+/// treated as unset rather than erroring — settings blobs sync across
+/// devices and a bad value must never break browser startup.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct BrowserSettings {
+    #[serde(default)]
+    pub default_viewport: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -543,6 +564,9 @@ mod tests {
                 checkpoints_enabled: true,
                 background_browser_desktop_viewport: false,
             },
+            browser: BrowserSettings {
+                default_viewport: Some("2560x1440".into()),
+            },
         };
 
         let json = serde_json::to_string(&s).unwrap();
@@ -565,6 +589,21 @@ mod tests {
         assert_eq!(back.session_restore.max_total_mb, 50);
         assert!(back.agent_chat.checkpoints_enabled);
         assert!(!back.agent_chat.background_browser_desktop_viewport);
+        assert_eq!(back.browser.default_viewport.as_deref(), Some("2560x1440"));
+    }
+
+    /// A settings blob saved before the `browser` section existed still
+    /// deserializes — `default_viewport` stays unset (built-in baseline).
+    #[test]
+    #[serial]
+    fn missing_browser_section_defaults_to_no_viewport() {
+        let legacy = r#"{"appearance":{"theme":"dark"}}"#;
+        let parsed: UserSettings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.browser.default_viewport, None);
+
+        let explicit = r#"{"browser":{"default_viewport":"1920x1080"}}"#;
+        let parsed: UserSettings = serde_json::from_str(explicit).unwrap();
+        assert_eq!(parsed.browser.default_viewport.as_deref(), Some("1920x1080"));
     }
 
     /// A settings blob saved before the agent_chat section existed

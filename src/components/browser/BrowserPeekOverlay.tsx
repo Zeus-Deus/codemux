@@ -12,16 +12,22 @@ import { cn } from "@/lib/utils";
 import { useActiveWorkspaceId, useAppStore } from "@/stores/app-store";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
 import {
+  parseViewportString,
   selectBackgroundBrowserDesktopViewport,
+  selectBrowserDefaultViewport,
   useSyncedSettingsStore,
 } from "@/stores/synced-settings-store";
 import { createBrowserPane } from "@/tauri/commands";
 
-/** Pinned viewport for the "Desktop-size background browser" setting.
- *  Matches the `desktop` preset / `RESET_SPEC` in
+/** Fallback pinned viewport for the "Desktop-size background browser"
+ *  setting when no `browser.default_viewport` is configured. Matches
+ *  the `desktop` preset / `RESET_SPEC` in
  *  `src-tauri/src/browser_viewport.rs` (1280×800 @ 1× DPR), so the peek
  *  shows pages at the same baseline agents get from
- *  `codemux browser viewport reset`. */
+ *  `codemux browser viewport reset`. With a configured default (e.g.
+ *  `"2560x1440"` to match the user's monitor) the peek pins to that
+ *  instead — same size the backend applies to fresh daemons — so the
+ *  peek and the agent's screenshots stay consistent. */
 const DESKTOP_PEEK_VIEWPORT = { width: 1280, height: 800 };
 
 /**
@@ -60,6 +66,9 @@ export function BrowserPeekOverlay() {
   const desktopViewport = useSyncedSettingsStore(
     selectBackgroundBrowserDesktopViewport,
   );
+  const defaultViewportRaw = useSyncedSettingsStore(selectBrowserDefaultViewport);
+  const pinnedViewport =
+    parseViewportString(defaultViewportRaw) ?? DESKTOP_PEEK_VIEWPORT;
   const panelRef = useRef<HTMLDivElement>(null);
 
   const open = guiChrome && isOpen && !!session && !!activeWorkspaceId;
@@ -171,7 +180,7 @@ export function BrowserPeekOverlay() {
           focused={false}
           visible={open}
           hideToolbar
-          fixedViewport={desktopViewport ? DESKTOP_PEEK_VIEWPORT : undefined}
+          fixedViewport={desktopViewport ? pinnedViewport : undefined}
         />
       </div>
     </div>

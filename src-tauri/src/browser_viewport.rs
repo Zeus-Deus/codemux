@@ -93,11 +93,66 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
-/// The "reset" target — back to the safe default viewport. This matches
-/// the in-app default that `BrowserPane.tsx` initialises with, so issuing
-/// `viewport reset` leaves the page rendering at the same baseline as a
-/// fresh browser pane.
+/// The built-in "reset" baseline. This matches the in-app default that
+/// `BrowserPane.tsx` initialises with, so issuing `viewport reset` leaves
+/// the page rendering at the same baseline as a fresh browser pane.
+/// When the user configured `browser.default_viewport` (synced settings),
+/// reset lands on that instead — see [`configured_default_spec`].
 pub const RESET_SPEC: ViewportSpec = ViewportSpec::new(1280, 800, 1.0);
+
+/// Resolve the user's `browser.default_viewport` setting string into a
+/// concrete spec, falling back to [`RESET_SPEC`] when unset or invalid.
+///
+/// Pure — takes the raw setting value so it stays unit-testable without
+/// touching the on-disk settings cache. `"reset"` is rejected here (it
+/// would be self-referential as a *default*), and any parse failure
+/// falls back silently: the setting syncs across devices, so a bad
+/// value must degrade to the baseline rather than break startup.
+pub fn resolve_default(raw: Option<&str>) -> ViewportSpec {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("reset"))
+        .and_then(|s| parse_spec(s, None).ok())
+        .unwrap_or(RESET_SPEC)
+}
+
+/// The user-configured default viewport from the synced-settings cache,
+/// or `None` when unset/invalid. `Some` means the user explicitly chose
+/// a default (e.g. `"2560x1440"` to match their monitor) — fresh
+/// agent-browser daemons get it applied at launch.
+pub fn configured_default_viewport() -> Option<ViewportSpec> {
+    let raw = crate::settings_sync::load_cache()?.browser.default_viewport?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("reset") {
+        return None;
+    }
+    parse_spec(trimmed, None).ok()
+}
+
+/// The spec `viewport reset` should return to: the user-configured
+/// default when present, the built-in [`RESET_SPEC`] baseline otherwise.
+pub fn configured_default_spec() -> ViewportSpec {
+    configured_default_viewport().unwrap_or(RESET_SPEC)
+}
+
+/// [`parse_spec`], except `"reset"` resolves to the user-configured
+/// default viewport ([`configured_default_spec`]) instead of the
+/// hard-coded baseline. Use this at the CLI / MCP surfaces where
+/// "reset" means "back to *my* default"; keep `parse_spec` for pure,
+/// setting-independent parsing (and tests).
+pub fn parse_spec_configured(
+    input: &str,
+    dpr_override: Option<f64>,
+) -> Result<ViewportSpec, ParseError> {
+    if input.trim().eq_ignore_ascii_case("reset") {
+        let mut spec = configured_default_spec();
+        if let Some(dpr) = dpr_override {
+            validate_dpr(dpr)?;
+            spec.dpr = dpr;
+        }
+        return Ok(spec);
+    }
+    parse_spec(input, dpr_override)
+}
 
 /// Errors `parse_spec` can surface back to the CLI.
 #[derive(Debug, PartialEq)]
@@ -279,6 +334,35 @@ mod tests {
         let total = names.len();
         names.dedup();
         assert_eq!(names.len(), total, "duplicate preset name in PRESETS");
+    }
+
+    #[test]
+    fn resolve_default_unset_falls_back_to_reset_spec() {
+        assert_eq!(resolve_default(None), RESET_SPEC);
+        assert_eq!(resolve_default(Some("")), RESET_SPEC);
+        assert_eq!(resolve_default(Some("   ")), RESET_SPEC);
+    }
+
+    #[test]
+    fn resolve_default_parses_custom_dimensions() {
+        let spec = resolve_default(Some("2560x1440"));
+        assert_eq!((spec.width, spec.height, spec.dpr), (2560, 1440, 1.0));
+    }
+
+    #[test]
+    fn resolve_default_accepts_preset_names() {
+        let spec = resolve_default(Some("desktop-large"));
+        assert_eq!((spec.width, spec.height), (1920, 1080));
+    }
+
+    /// Bad synced values (typos, other-device garbage) must degrade to
+    /// the baseline, never error — and a literal "reset" would be
+    /// self-referential as a default, so it's treated as unset too.
+    #[test]
+    fn resolve_default_invalid_or_reset_falls_back() {
+        assert_eq!(resolve_default(Some("not-a-preset")), RESET_SPEC);
+        assert_eq!(resolve_default(Some("0x0")), RESET_SPEC);
+        assert_eq!(resolve_default(Some("reset")), RESET_SPEC);
     }
 
     #[test]
