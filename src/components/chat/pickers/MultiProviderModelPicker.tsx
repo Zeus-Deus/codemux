@@ -27,6 +27,7 @@ import {
 } from "@/stores/picker-favorites-store";
 import {
   selectError,
+  selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
 import type {
@@ -343,8 +344,15 @@ export function MultiProviderModelPicker({
         ? event.metaKey && !event.ctrlKey
         : event.ctrlKey && !event.metaKey;
       if (!mod || event.shiftKey || event.altKey) return;
-      if (!/^[1-9]$/.test(event.key)) return;
-      const row = jumpRowsRef.current[Number(event.key) - 1];
+      // Detect digits via `event.code` (physical key), not `event.key`
+      // (produced character): on layouts where the digit row is
+      // shifted, the unshifted keys emit non-digit characters — and
+      // Shift is rejected above — so a character-based check made the
+      // shortcut unreachable. `Digit1`..`Digit9` / `Numpad1`..`Numpad9`
+      // name the physical keys regardless of layout.
+      const digitMatch = /^(?:Digit|Numpad)([1-9])$/.exec(event.code);
+      if (!digitMatch) return;
+      const row = jumpRowsRef.current[Number(digitMatch[1]) - 1];
       if (!row) return;
       event.preventDefault();
       event.stopPropagation();
@@ -357,45 +365,43 @@ export function MultiProviderModelPicker({
   }, [open, onProviderModelChange]);
 
   const selectedKey = `${provider}::${model ?? ""}`;
+
+  // Caps bundle for the active provider, then a single roster
+  // resolution of the stored model id. Routed through `selectModel`
+  // (rather than a raw `find`) so a persisted `"default"` alias id —
+  // written back when the roster still led with that row, now folded
+  // out by the backend — resolves to the concrete `models[0]` row.
+  // The trigger label/subtitle/tooltip and the active-row highlight
+  // all derive from this one resolution so they can't disagree.
+  const capsForCurrentProvider =
+    provider === "claude"
+      ? claudeCaps
+      : provider === "codex"
+      ? codexCaps
+      : opencodeCaps;
+  const resolvedModel = useMemo(
+    () => selectModel(capsForCurrentProvider, model),
+    [capsForCurrentProvider, model],
+  );
+  const resolvedModelId = resolvedModel?.id ?? model;
+
   const triggerLabel = useMemo(() => {
-    const caps =
-      provider === "claude"
-        ? claudeCaps
-        : provider === "codex"
-        ? codexCaps
-        : opencodeCaps;
-    if (!caps && !model) return "Loading…";
-    const found = caps?.models.find((m) => m.id === model);
-    if (found) return found.label;
+    if (!capsForCurrentProvider && !model) return "Loading…";
+    if (resolvedModel) return resolvedModel.label;
     if (model) return model;
     return "Select model";
-  }, [provider, model, claudeCaps, codexCaps, opencodeCaps]);
+  }, [capsForCurrentProvider, model, resolvedModel]);
 
-  const triggerSubtitle = useMemo(() => {
-    const caps =
-      provider === "claude"
-        ? claudeCaps
-        : provider === "codex"
-        ? codexCaps
-        : opencodeCaps;
-    return caps?.models.find((m) => m.id === model)?.sub_provider ?? null;
-  }, [provider, model, claudeCaps, codexCaps, opencodeCaps]);
+  const triggerSubtitle = resolvedModel?.sub_provider ?? null;
 
   // The active model's resolved-version blurb, surfaced only in the
   // trigger's tooltip so the pill itself stays compact. Combines the
   // visible label with the description (e.g.
   // "Opus · Opus 4.8 with 1M context · Best for everyday, complex tasks").
   const triggerTitle = useMemo(() => {
-    const caps =
-      provider === "claude"
-        ? claudeCaps
-        : provider === "codex"
-        ? codexCaps
-        : opencodeCaps;
-    const description =
-      caps?.models.find((m) => m.id === model)?.description ?? null;
+    const description = resolvedModel?.description ?? null;
     return description ? `${triggerLabel} · ${description}` : triggerLabel;
-  }, [provider, model, claudeCaps, codexCaps, opencodeCaps, triggerLabel]);
+  }, [resolvedModel, triggerLabel]);
 
   return (
     <Popover open={open} onOpenChange={(v) => !disabled && setOpen(v)}>
@@ -493,8 +499,12 @@ export function MultiProviderModelPicker({
                   />
                 ) : (
                   visibleRows.map((row, index) => {
+                    // Compare against the resolved id (not the raw
+                    // stored one) so a persisted "default" alias
+                    // highlights the concrete row it resolved to.
                     const isActive =
-                      row.provider === provider && row.model.id === model;
+                      row.provider === provider &&
+                      row.model.id === resolvedModelId;
                     const key = pickerFavoriteKey(row.provider, row.model.id);
                     return (
                       <ModelRow

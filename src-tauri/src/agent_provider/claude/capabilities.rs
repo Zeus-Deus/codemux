@@ -764,6 +764,10 @@ fn base_model_name(label: &str) -> &str {
 /// frontend's default selection, so new drafts default to the twin —
 /// a real roster id resolving to the same model). When no twin exists
 /// the promoted `default` row is kept so nothing launchable is lost.
+///
+/// Must run AFTER [`append_missing_maintained_families`]: when the CLI
+/// demotes a family into `default` (alias present, no concrete row),
+/// the twin only exists once the maintained entry has been appended.
 fn dedupe_default_alias(merged: &mut Vec<ChatModelInfo>) {
     let Some(default_idx) = merged
         .iter()
@@ -812,8 +816,15 @@ fn build_capabilities_from_sdk(
         .filter(|m| !m.value.is_empty())
         .map(|sdk| merge_sdk_with_maintained(sdk, &maintained))
         .collect();
-    dedupe_default_alias(&mut merged);
+    // Order matters: append the missing maintained families FIRST, then
+    // fold the `default` alias. The append exists precisely for the
+    // roster shape where the CLI demoted a family into its `default`
+    // alias (alias present, no concrete row) — deduping first would keep
+    // the promoted alias row and the append would then re-add the same
+    // concrete model, recreating the duplicate pair the dedupe exists to
+    // remove.
     append_missing_maintained_families(&mut merged);
+    dedupe_default_alias(&mut merged);
     ProviderChatCapabilities {
         models: merged,
         effort_granularity: EffortGranularity::PerSession,
@@ -1857,17 +1868,22 @@ mod tests {
             sdk_model("haiku", "Haiku", &[], None, None),
         ];
         let caps = build_capabilities_from_sdk(live);
-        let default = caps.models.iter().find(|m| m.id == "default").unwrap();
-        assert_eq!(default.default_effort.as_deref(), Some("high"));
+        // The `default` alias (no concrete Opus row live) folds into the
+        // appended maintained Opus entry, which leads the list with the
+        // Recommended marker — alias-effort resolution is covered by the
+        // surviving alias rows below.
+        assert!(caps.models.iter().all(|m| m.id != "default"));
+        assert_eq!(caps.models[0].id, "claude-opus-4-8");
         assert!(
-            default.context_window_options.is_empty(),
-            "`default` must not offer a context-window picker"
+            caps.models[0]
+                .description
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Recommended")),
         );
-        // Fast mode is clamped off for Claude even though the SDK
-        // reported `supportsFastMode: Some(true)` for this row — the
-        // advertisement is not an entitlement check (silent standard
-        // fallback without Extra Usage), so the picker never shows it.
-        assert!(!default.supports_fast_mode);
+        // Fast mode stays clamped off for Claude — the SDK advertised
+        // `supportsFastMode: Some(true)` on the alias row, but neither
+        // the merge path nor the maintained twin surfaces it.
+        assert!(!caps.models[0].supports_fast_mode);
         let sonnet = caps.models.iter().find(|m| m.id == "sonnet").unwrap();
         assert_eq!(sonnet.default_effort.as_deref(), Some("high"));
         let haiku = caps.models.iter().find(|m| m.id == "haiku").unwrap();
@@ -1907,24 +1923,42 @@ mod tests {
         ];
         let caps = build_capabilities_from_sdk(live);
         let ids: Vec<&str> = caps.models.iter().map(|m| m.id.as_str()).collect();
-        // Live entries first, in the CLI's order. The pinned Fable id is
-        // normalized to its base id (`claude-fable-5`).
-        assert_eq!(&ids[..4], &["default", "claude-fable-5", "sonnet", "haiku"]);
-        // Every maintained Opus version appended afterwards.
+        // Regression for the append/dedupe ordering: the append runs
+        // FIRST, so the `default` alias (which resolves to Opus 4.8 via
+        // its canonical backfill) finds the appended maintained entry as
+        // its concrete twin and folds into it — one Opus 4.8 row, led by
+        // the Recommended marker, instead of a promoted alias row AND an
+        // appended duplicate with the same concrete name.
+        assert!(!ids.contains(&"default"));
+        assert_eq!(ids[0], "claude-opus-4-8");
+        // Remaining live entries keep the CLI's order. The pinned Fable
+        // id is normalized to its base id (`claude-fable-5`).
+        assert_eq!(&ids[1..4], &["claude-fable-5", "sonnet", "haiku"]);
+        // Every maintained Opus version stays selectable.
         for opus in ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"] {
             assert!(ids.contains(&opus), "{opus} should be appended");
         }
+        assert_eq!(
+            ids.iter().filter(|id| **id == "claude-opus-4-8").count(),
+            1,
+            "the alias fold must not leave a duplicate Opus 4.8 row"
+        );
         // Families already live must NOT be duplicated from the
         // maintained list (the maintained `claude-sonnet-4-6` /
         // `claude-haiku-4-5` ids stay out because the alias rows cover
         // those families).
         assert!(!ids.contains(&"claude-sonnet-4-6"));
         assert!(!ids.contains(&"claude-haiku-4-5"));
-        // Appended Opus keeps its precise maintained metadata.
+        // The folded twin keeps its precise maintained metadata and
+        // inherits the Recommended marker from the alias it absorbed.
         let opus48 = caps.models.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
         assert_eq!(opus48.label, "Claude Opus 4.8");
         assert_eq!(opus48.default_effort.as_deref(), Some("high"));
         assert!(opus48.context_window_options.iter().any(|o| o.value == "1m"));
+        assert_eq!(
+            opus48.description.as_deref(),
+            Some("Recommended · Best for everyday, complex tasks"),
+        );
     }
 
     #[test]

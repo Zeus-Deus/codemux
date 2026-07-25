@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type {
@@ -168,6 +168,22 @@ describe("MultiProviderModelPicker — trigger", () => {
     renderPicker({ provider: "claude", model: "claude-future-9000" });
     expect(screen.getByTestId("multi-provider-model-picker-trigger"))
       .toHaveTextContent("claude-future-9000");
+  });
+
+  it("resolves a dangling stored 'default' id to the first roster model", () => {
+    // Persisted drafts/threads from before the backend folded the
+    // "default" alias row out of the roster still carry that id. When
+    // the alias is absent, models[0] is the concrete model it resolved
+    // to — the trigger must show that model's label (and description
+    // tooltip), not the raw "default" string.
+    renderPicker({ provider: "claude", model: "default" });
+    const trigger = screen.getByTestId("multi-provider-model-picker-trigger");
+    expect(trigger).toHaveTextContent("Claude Opus 4.7");
+    expect(trigger).not.toHaveTextContent("default");
+    expect(trigger).toHaveAttribute(
+      "title",
+      "Claude Opus 4.7 · Opus 4.8 with 1M context · Best for everyday, complex tasks",
+    );
   });
 
   it("does not open when disabled", async () => {
@@ -605,6 +621,35 @@ describe("MultiProviderModelPicker — selection", () => {
     });
   });
 
+  it("highlights the first roster row when the stored id is a dangling 'default'", async () => {
+    // Same alias-fold scenario as the trigger test: the active-row
+    // comparison must run against the RESOLVED id, so the row for
+    // models[0] carries data-active instead of nothing highlighting.
+    const user = userEvent.setup();
+    renderPicker({ provider: "claude", model: "default" });
+    await openPicker(user);
+
+    const rows = screen.getAllByTestId("multi-provider-model-row");
+    const activeRows = rows.filter(
+      (r) => r.getAttribute("data-active") === "true",
+    );
+    expect(activeRows).toHaveLength(1);
+    expect(activeRows[0]?.textContent).toContain("Claude Opus 4.7");
+  });
+
+  it("does not highlight any row for a genuinely unknown stored id", async () => {
+    // The resolution fallback is scoped to the literal "default"
+    // alias — an unknown id must not silently claim models[0].
+    const user = userEvent.setup();
+    renderPicker({ provider: "claude", model: "claude-future-9000" });
+    await openPicker(user);
+
+    const rows = screen.getAllByTestId("multi-provider-model-row");
+    expect(
+      rows.filter((r) => r.getAttribute("data-active") === "true"),
+    ).toHaveLength(0);
+  });
+
   it("selecting an OpenCode federated model passes the namespaced slug", async () => {
     const user = userEvent.setup();
     const { onProviderModelChange } = renderPicker();
@@ -967,5 +1012,88 @@ describe("MultiProviderModelPicker — openSignal", () => {
     );
     await screen.findByPlaceholderText("Search models...");
     expect(isOpen()).toBe(true);
+  });
+});
+
+describe("MultiProviderModelPicker — jump shortcuts", () => {
+  // The handler is a window capture-phase listener, so we dispatch
+  // raw keydown events at the window. Digit detection is based on
+  // `event.code` (physical key), which lets us simulate layouts
+  // where the digit row is shifted: the produced `key` is then a
+  // non-digit character even though `code` is still "Digit1".
+  it("selects the Nth row via Ctrl+digit using event.code", async () => {
+    const user = userEvent.setup();
+    const { onProviderModelChange } = renderPicker({
+      provider: "claude",
+      model: "claude-opus-4-7",
+    });
+    await openPicker(user);
+
+    fireEvent.keyDown(window, { key: "2", code: "Digit2", ctrlKey: true });
+
+    expect(onProviderModelChange).toHaveBeenCalledWith(
+      "claude",
+      "claude-haiku-4-5",
+    );
+  });
+
+  it("fires even when the produced key is a non-digit character (shifted-digit layouts)", async () => {
+    const user = userEvent.setup();
+    const { onProviderModelChange } = renderPicker({
+      provider: "claude",
+      model: "claude-opus-4-7",
+    });
+    await openPicker(user);
+
+    // Layouts with a shifted digit row emit e.g. "&" for the physical
+    // 1 key when Shift is up; only `code` identifies the digit.
+    fireEvent.keyDown(window, { key: "&", code: "Digit1", ctrlKey: true });
+
+    expect(onProviderModelChange).toHaveBeenCalledWith(
+      "claude",
+      "claude-opus-4-7",
+    );
+  });
+
+  it("accepts numpad digits", async () => {
+    const user = userEvent.setup();
+    const { onProviderModelChange } = renderPicker({
+      provider: "claude",
+      model: "claude-opus-4-7",
+    });
+    await openPicker(user);
+
+    fireEvent.keyDown(window, { key: "2", code: "Numpad2", ctrlKey: true });
+
+    expect(onProviderModelChange).toHaveBeenCalledWith(
+      "claude",
+      "claude-haiku-4-5",
+    );
+  });
+
+  it("still rejects the shortcut when extra modifiers are held", async () => {
+    const user = userEvent.setup();
+    const { onProviderModelChange } = renderPicker({
+      provider: "claude",
+      model: "claude-opus-4-7",
+    });
+    await openPicker(user);
+
+    fireEvent.keyDown(window, {
+      key: "1",
+      code: "Digit1",
+      ctrlKey: true,
+      shiftKey: true,
+    });
+    fireEvent.keyDown(window, {
+      key: "1",
+      code: "Digit1",
+      ctrlKey: true,
+      altKey: true,
+    });
+    // No modifier at all: plain digit typing must reach the search box.
+    fireEvent.keyDown(window, { key: "1", code: "Digit1" });
+
+    expect(onProviderModelChange).not.toHaveBeenCalled();
   });
 });

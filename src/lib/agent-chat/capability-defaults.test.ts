@@ -147,6 +147,29 @@ describe("capability-defaults", () => {
     it("falls back to the raw id when caps are unhydrated", () => {
       expect(modelLabel("claude", "anything")).toBe("anything");
     });
+
+    it("resolves a dangling 'default' id to the first model's label", () => {
+      // Persisted drafts from before the alias fold store the id
+      // "default"; the roster no longer carries that row when a
+      // concrete twin exists, and models[0] is the model the alias
+      // resolved to.
+      useProviderCapabilities.setState({
+        claude: makeClaudeCaps([
+          makeModel({ id: "claude-opus-4-8", label: "Claude Opus 4.8" }),
+          makeModel({ id: "claude-haiku-4-5", label: "Claude Haiku 4.5" }),
+        ]),
+      });
+      expect(modelLabel("claude", "default")).toBe("Claude Opus 4.8");
+    });
+
+    it("does not remap other unknown ids to the first model", () => {
+      useProviderCapabilities.setState({
+        claude: makeClaudeCaps([
+          makeModel({ id: "claude-opus-4-8", label: "Claude Opus 4.8" }),
+        ]),
+      });
+      expect(modelLabel("claude", "mystery")).toBe("mystery");
+    });
   });
 
   describe("capabilityDefaults", () => {

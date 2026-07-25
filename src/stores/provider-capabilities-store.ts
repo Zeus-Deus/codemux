@@ -121,13 +121,27 @@ export function selectError(
   }
 }
 
-/** Convenience selector: find a model by id within a provider's list. */
+/** Convenience selector: find a model by id within a provider's list.
+ *
+ *  One deliberate exception to the strict-match rule: the literal id
+ *  `"default"`. The roster used to lead with a `"default"` alias row,
+ *  so persisted drafts and thread records commonly store that id. The
+ *  backend now folds the alias out of the roster whenever a concrete
+ *  twin exists (`dedupe_default_alias`), which would leave those
+ *  persisted ids dangling. When `"default"` is absent, `models[0]` is
+ *  guaranteed to be the concrete model the alias resolved to, so we
+ *  fall back to it. Any other unknown id still returns `null` — only
+ *  the historical alias gets this treatment. */
 export function selectModel(
   caps: ProviderChatCapabilities | null,
   modelId: string | null | undefined,
 ) {
   if (!caps || !modelId) return null;
-  return caps.models.find((m) => m.id === modelId) ?? null;
+  const found = caps.models.find((m) => m.id === modelId) ?? null;
+  if (!found && modelId === "default") {
+    return caps.models[0] ?? null;
+  }
+  return found;
 }
 
 // ── Internal: per-provider state-update helpers ─────────────────────

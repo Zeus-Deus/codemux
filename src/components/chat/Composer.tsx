@@ -1978,7 +1978,9 @@ export function Composer({
             // the scope strip below reads as a layer tucked under it.
             // Focus sharpens the border rather than stacking a ring.
             "rounded-[20px] border border-border/80 bg-muted/40",
-            "shadow-[0_12px_28px_-18px_rgba(0,0,0,0.45)]",
+            // Geometry and color split so the tint stays a themeable
+            // utility rather than a baked-in rgba literal.
+            "shadow-[0_12px_28px_-18px] shadow-black/40",
             // Composer is mounted for the entire chat session and re-
             // renders frequently as the draft / attachments change.
             // `transition-all` would animate every property change;
