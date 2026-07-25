@@ -154,7 +154,6 @@ export function ThreadScopeRow({
       ? location.target.kind === "home"
       : location.isHome;
   const showProjectControls = !isHome && projectPath !== null;
-  const projectName = projectPath ? basename(projectPath) : "";
 
   // Non-git projects can't have worktrees or base branches — hide the
   // checkout + branch controls instead of letting a "New worktree" send
@@ -226,16 +225,6 @@ export function ThreadScopeRow({
     }
   }, [projectIsGit, checkoutMode, onChangeCheckoutMode]);
 
-  const scopeHint = isHome
-    ? "No project — this agent runs on your machine in the home directory (~). Just chat, run commands, or point it at files anywhere."
-    : !showProjectControls
-      ? null
-      : !projectIsGit
-        ? `Runs directly in ${projectName}’s folder. Not a git repository — initialize one to unlock isolated worktrees.`
-        : checkoutMode === "worktree"
-          ? `Creates an isolated worktree off ${baseBranch || "…"} in ${projectName}. Leave the name empty and it’s auto-named from your first message.`
-          : `Runs in ${projectName}’s current checkout on ${baseBranch || "…"}. Changes land directly in your working copy.`;
-
   return (
     <div className="rise-in flex flex-col items-center gap-3 px-1">
       <div className="flex w-full items-center justify-between gap-2.5">
@@ -275,11 +264,6 @@ export function ThreadScopeRow({
           </div>
         )}
       </div>
-      {scopeHint && (
-        <p className="text-center text-[11.5px] leading-[1.5] text-muted-foreground">
-          {scopeHint}
-        </p>
-      )}
     </div>
   );
 }
