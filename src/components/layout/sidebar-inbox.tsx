@@ -162,7 +162,10 @@ function SettledRow({
       data-settled-row={workspace.workspace_id}
       onClick={handleActivate}
       onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") handleActivate();
+        if (e.key !== "Enter" && e.key !== " ") return;
+        // Space would otherwise scroll the sidebar as it activates the row.
+        if (e.key === " ") e.preventDefault();
+        handleActivate();
       }}
       className={cn(
         "group/settled flex h-[30px] cursor-pointer items-center gap-2 rounded-lg px-2",
@@ -277,17 +280,28 @@ export function SidebarInbox() {
     setSettledVisibleCount(SETTLED_INITIAL_COUNT);
   }, [filter]);
   const timeoutsRef = useRef<number[]>([]);
+  // The workspace whose settle is still waiting behind the collapse animation.
+  // Unmounting (e.g. collapsing the sidebar) cancels the timer, so the pending
+  // settle is flushed here instead of being silently dropped.
+  const pendingSettleRef = useRef<string | null>(null);
   useEffect(
     () => () => {
       timeoutsRef.current.forEach((t) => window.clearTimeout(t));
+      const pendingId = pendingSettleRef.current;
+      if (pendingId !== null) {
+        pendingSettleRef.current = null;
+        useSidebarInboxStore.getState().settle(pendingId);
+      }
     },
     [],
   );
 
   const handleSettle = (workspaceId: string) => {
     setLeavingId(workspaceId);
+    pendingSettleRef.current = workspaceId;
     timeoutsRef.current.push(
       window.setTimeout(() => {
+        pendingSettleRef.current = null;
         useSidebarInboxStore.getState().settle(workspaceId);
         setLeavingId(null);
         setJustSettledId(workspaceId);
@@ -354,8 +368,12 @@ export function SidebarInbox() {
   // (first-seen baseline — without this a fresh install would mass-settle
   // everything the moment the idle window first elapsed). Re-runs on the
   // coarse tick so a long-running agent keeps refreshing its stamp; the
-  // store's 60s write-throttle keeps that cheap. noteActivity also clears any
-  // keep-active pin, so a resurfacing agent un-pins itself here.
+  // store's 60s write-throttle keeps that cheap.
+  //
+  // Only a non-null status counts as genuine agent activity, so only that path
+  // passes `clearPin` — a keep-active pin must survive merely selecting the
+  // workspace (or its first-seen baseline), otherwise the auto-settle sweep
+  // below would immediately re-settle a card the user just kept active.
   useEffect(() => {
     if (!loaded || !paneStatuses) return;
     const noteActivity = useSidebarInboxStore.getState().noteActivity;
@@ -365,7 +383,7 @@ export function SidebarInbox() {
       const isActiveWs = ws.workspace_id === activeWorkspaceId;
       const unseen = activity[ws.workspace_id] === undefined;
       if (status !== null || isActiveWs || unseen) {
-        noteActivity(ws.workspace_id, at);
+        noteActivity(ws.workspace_id, at, { clearPin: status !== null });
       }
     }
   }, [loaded, paneStatuses, allWorkspaces, activeWorkspaceId, activity, now]);
@@ -379,8 +397,9 @@ export function SidebarInbox() {
   // Anti-fight invariants — these three guards make oscillation impossible:
   //   • auto-settle ONLY fires at status null (never live / blocked / review);
   //   • the auto-un-settle safety net above ONLY fires at working/permission;
-  //   • a keep-active pin blocks auto-settle until noteActivity (a non-null
-  //     status) clears it.
+  //   • a keep-active pin blocks auto-settle until the agent shows real
+  //     activity (a non-null status un-pins via noteActivity's clearPin);
+  //     selecting the workspace is not activity and leaves the pin standing.
   // So the two effects can never act on the same workspace at the same status,
   // and a user-kept card stays put until its agent genuinely runs again.
   useEffect(() => {
@@ -539,6 +558,15 @@ export function SidebarInbox() {
   const filterName = filter
     ? projectGroups.find((g) => g.projectPath === filter)?.projectName ?? null
     : null;
+
+  // The filtered project can disappear underneath us (its last workspace was
+  // archived / deleted). Without this the trigger would render a blank label
+  // and the list an unexplained empty state, so fall back to "All projects".
+  useEffect(() => {
+    if (!appState || filter === null) return;
+    if (projectGroups.some((g) => g.projectPath === filter)) return;
+    setFilter(null);
+  }, [appState, filter, projectGroups, setFilter]);
 
   return (
     <div className="flex flex-col">

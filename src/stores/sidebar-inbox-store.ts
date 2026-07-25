@@ -59,11 +59,20 @@ interface SidebarInboxStore {
    *  sets a keep-active pin so auto-settle leaves it alone until its agent
    *  runs again; "activity" (a live agent resurfaced it) clears any pin. */
   unsettle: (workspaceId: string, reason: "user" | "activity") => void;
-  /** Record that a workspace showed activity at `at` (ms epoch). Also clears
-   *  the workspace's keep-active pin. Throttled: a no-op unless `at` exceeds
-   *  the stored stamp by more than a minute, so it stays cheap to call from
-   *  per-tick render effects. */
-  noteActivity: (workspaceId: string, at: number) => void;
+  /** Record that a workspace showed activity at `at` (ms epoch). The stamp is
+   *  throttled: it only moves when `at` exceeds the stored stamp by more than
+   *  a minute, so it stays cheap to call from per-tick render effects.
+   *
+   *  The keep-active pin is cleared ONLY with `opts.clearPin` — reserved for
+   *  genuine agent activity (a non-null status). Merely selecting a workspace,
+   *  or laying down a first-seen baseline, just stamps and leaves the pin
+   *  intact, so a card the user kept active stays active. The pin still clears
+   *  when `clearPin` is set even if the stamp itself is throttled. */
+  noteActivity: (
+    workspaceId: string,
+    at: number,
+    opts?: { clearPin?: boolean },
+  ) => void;
   setFilter: (projectPath: string | null) => void;
   /** Drop settled entries — plus keep-active pins and activity stamps — whose
    *  workspace no longer exists (archived / deleted / closed) so the persisted
@@ -199,10 +208,13 @@ export const useSidebarInboxStore = create<SidebarInboxStore>((set, get) => ({
     persist({ settled: nextSettled, keepActive: nextKeepActive, activity });
   },
 
-  noteActivity: (workspaceId, at) => {
+  noteActivity: (workspaceId, at, opts) => {
     const { settled, keepActive, activity } = get();
     const prev = activity[workspaceId];
-    const pinned = keepActive[workspaceId] === true;
+    // Only genuine agent activity un-pins a kept-active card; selection and
+    // first-seen baselines merely stamp.
+    const clearPin = opts?.clearPin === true;
+    const pinned = clearPin && keepActive[workspaceId] === true;
     // Write-throttle: only persist when the stamp jumps by more than a minute
     // (or on first observation). A pin still clears if it's set even when the
     // stamp itself is throttled, so a resurfacing agent always un-pins.

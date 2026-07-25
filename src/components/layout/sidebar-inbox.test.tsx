@@ -111,10 +111,13 @@ vi.mock("@/stores/app-store", () => {
 });
 
 import { SidebarInbox } from "./sidebar-inbox";
-import { __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
+import {
+  __resetSidebarInboxStoreForTests,
+  useSidebarInboxStore,
+} from "@/stores/sidebar-inbox-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
-import { activateWorkspace } from "@/tauri/commands";
+import { activateWorkspace, dbSetUiState } from "@/tauri/commands";
 import { getJumpTarget } from "./sidebar-inbox-jump";
 
 let wsCounter = 0;
@@ -429,6 +432,37 @@ describe("SidebarInbox — project filter", () => {
     // The settled vexis row still shows under the divider.
     expect(screen.getByText("In vexis")).toBeInTheDocument();
   });
+
+  it("falls back to All projects when the filtered project disappears", async () => {
+    workspaces = [
+      makeWorkspace({ title: "In myapp" }),
+      makeWorkspace({
+        title: "In vexis",
+        cwd: "/home/u/projects/vexis",
+        project_root: "/home/u/projects/vexis",
+      }),
+    ];
+    const { rerender } = await renderInbox();
+
+    await pickFilter("vexis");
+    const trigger = screen.getByRole("button", { name: "Filter by project" });
+    expect(trigger).toHaveTextContent("vexis");
+
+    // That project's last workspace goes away (archived / deleted). Leaving
+    // the filter pointed at it would render a blank label over an empty list.
+    workspaces = workspaces.filter((w) => w.workspace_id !== "ws-2");
+    rerender(
+      <TooltipProvider>
+        <SidebarInbox />
+      </TooltipProvider>,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(trigger).toHaveTextContent("All projects");
+    expect(screen.getByText("In myapp")).toBeInTheDocument();
+  });
 });
 
 describe("SidebarInbox — settle / un-settle", () => {
@@ -642,6 +676,95 @@ describe("SidebarInbox — settle / un-settle", () => {
     });
     expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
     expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+  });
+
+  it("keeps the pin on an un-settled card that is also the selected workspace", async () => {
+    // Regression: selecting a workspace is not agent activity. If the
+    // selection stamp cleared the keep-active pin, the auto-settle sweep
+    // would yank the card the user just kept back under the divider.
+    workspaces = [
+      makeWorkspace({
+        title: "Kept active",
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    activeWorkspaceId = "ws-1";
+    const { container, rerender } = await renderInbox();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // It auto-settles first…
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+
+    // …the user un-settles it, pinning it active.
+    fireEvent.click(
+      within(row).getByRole("button", { name: 'Un-settle "Kept active"' }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBe(true);
+
+    // A fresh status snapshot re-runs the activity + auto-settle effects the
+    // same way the coarse clock tick does. The pin — and the card — must hold.
+    paneStatuses = { ...paneStatuses };
+    rerender(
+      <TooltipProvider>
+        <SidebarInbox />
+      </TooltipProvider>,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+    expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBe(true);
+  });
+
+  it("flushes a settle that is still animating when the inbox unmounts", async () => {
+    vi.useFakeTimers();
+    try {
+      workspaces = [makeWorkspace({ title: "Ship it" })];
+      const { unmount } = render(
+        <TooltipProvider>
+          <SidebarInbox />
+        </TooltipProvider>,
+      );
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      fireEvent.click(
+        screen.getByRole("button", { name: 'Settle "Ship it"' }),
+      );
+      // Collapsing the sidebar inside the ~200ms collapse window must not
+      // silently discard the settle.
+      unmount();
+
+      expect(
+        useSidebarInboxStore.getState().settled.map((e) => e.id),
+      ).toEqual(["ws-1"]);
+      const blobs = vi
+        .mocked(dbSetUiState)
+        .mock.calls.filter(([key]) => key === "sidebar.inbox.settled")
+        .map(
+          ([, value]) =>
+            JSON.parse(value) as { settled: { id: string }[] },
+        );
+      const lastBlob = blobs[blobs.length - 1];
+      expect(lastBlob.settled.map((e) => e.id)).toEqual(["ws-1"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("auto-settles a card left idle past the auto-settle window", async () => {

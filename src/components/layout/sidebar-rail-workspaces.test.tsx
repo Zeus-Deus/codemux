@@ -66,7 +66,10 @@ vi.mock("@/stores/app-store", () => {
 });
 
 import { SidebarRailWorkspaces } from "./sidebar-rail-workspaces";
-import { __resetSidebarInboxStoreForTests } from "@/stores/sidebar-inbox-store";
+import {
+  __resetSidebarInboxStoreForTests,
+  useSidebarInboxStore,
+} from "@/stores/sidebar-inbox-store";
 import { activateWorkspace } from "@/tauri/commands";
 
 let wsCounter = 0;
@@ -216,6 +219,26 @@ describe("SidebarRailWorkspaces", () => {
     for (const btn of container.querySelectorAll("[data-rail-ws]")) {
       expect(btn.className).not.toMatch(/accent-ember/);
     }
+  });
+
+  it("prunes persisted entries whose workspace no longer exists", async () => {
+    // A session spent entirely in the collapsed rail must still trim the
+    // persisted blob, otherwise it grows without bound.
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-gone", at: Date.now() }],
+      keepActive: ["ws-gone"],
+      activity: { "ws-gone": 1_000 },
+    });
+    workspaces = [makeWorkspace({ title: "Alpha" })];
+    await renderRail();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const state = useSidebarInboxStore.getState();
+    expect(state.settled).toEqual([]);
+    expect(state.keepActive).toEqual({});
+    expect(state.activity).toEqual({});
   });
 
   it("clicking a button activates its workspace", async () => {

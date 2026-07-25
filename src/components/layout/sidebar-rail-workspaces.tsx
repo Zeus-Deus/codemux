@@ -124,11 +124,21 @@ export function SidebarRailWorkspaces() {
   );
 
   const load = useSidebarInboxStore((s) => s.load);
+  const loaded = useSidebarInboxStore((s) => s.loaded);
   const settled = useSidebarInboxStore((s) => s.settled);
+  const prune = useSidebarInboxStore((s) => s.prune);
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Same prune the expanded inbox runs: drop persisted entries whose workspace
+  // vanished (archived / deleted). Mirrored here so a session spent entirely
+  // in the collapsed rail still trims the blob.
+  useEffect(() => {
+    if (!loaded || !appState) return;
+    prune(new Set(allWorkspaces.map((w) => w.workspace_id)));
+  }, [loaded, appState, allWorkspaces, prune]);
 
   // workspace_id → project identity, from the same grouping pipeline the
   // expanded inbox uses (dedup'd names, Home labeling, host suffixes).

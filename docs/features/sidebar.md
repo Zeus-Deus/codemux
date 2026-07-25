@@ -173,6 +173,9 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   workspace order).
 - Idle cards show elapsed time only when a status transition was observed this
   session (no backend status timestamps exist).
+- The collapsed rail intentionally shows only each workspace's agent-status
+  dot — the old project-avatar rail's notification-count badges were not
+  carried over (notification detail lives on the expanded cards).
 - The superseded tree components (`sidebar-project-group.tsx`,
   `sidebar-needs-you-strip.tsx`, `sidebar-live-section.tsx`,
   `sidebar-live-grouping.ts`, and the `SidebarWorkspaceRow` component) are still

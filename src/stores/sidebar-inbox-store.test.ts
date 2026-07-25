@@ -163,7 +163,7 @@ describe("sidebar-inbox-store", () => {
     expect(useSidebarInboxStore.getState().keepActive).toEqual({});
   });
 
-  it("noteActivity() stamps, clears any pin, and throttles rapid re-stamps", () => {
+  it("noteActivity() stamps and throttles rapid re-stamps", () => {
     useSidebarInboxStore.getState().noteActivity("ws-1", 1_000_000);
     expect(useSidebarInboxStore.getState().activity["ws-1"]).toBe(1_000_000);
     expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
@@ -180,23 +180,45 @@ describe("sidebar-inbox-store", () => {
     expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
   });
 
-  it("noteActivity() clears a pin even when the stamp itself is throttled", () => {
+  it("noteActivity({ clearPin: true }) clears a pin even when the stamp is throttled", () => {
     useSidebarInboxStore.getState().noteActivity("ws-1", 1_000_000);
     useSidebarInboxStore.getState().unsettle("ws-1", "user");
     expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-1": true });
     mockDbSetUiState.mockClear();
 
     // Throttled stamp (within 60s) but the pin still clears + persists.
-    useSidebarInboxStore.getState().noteActivity("ws-1", 1_010_000);
+    useSidebarInboxStore
+      .getState()
+      .noteActivity("ws-1", 1_010_000, { clearPin: true });
     expect(useSidebarInboxStore.getState().keepActive).toEqual({});
     expect(useSidebarInboxStore.getState().activity["ws-1"]).toBe(1_000_000);
     expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
   });
 
+  it("noteActivity() without clearPin stamps but leaves the keep-active pin", () => {
+    useSidebarInboxStore.getState().unsettle("ws-1", "user");
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-1": true });
+    mockDbSetUiState.mockClear();
+
+    // Merely selecting a workspace (or a first-seen baseline) is not agent
+    // activity: the stamp lands, the pin survives.
+    useSidebarInboxStore.getState().noteActivity("ws-1", 1_000_000);
+    expect(useSidebarInboxStore.getState().activity["ws-1"]).toBe(1_000_000);
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-1": true });
+
+    // An explicit clearPin: false behaves the same, and a throttled re-stamp
+    // stays a full no-op rather than dropping the pin.
+    mockDbSetUiState.mockClear();
+    useSidebarInboxStore
+      .getState()
+      .noteActivity("ws-1", 1_010_000, { clearPin: false });
+    expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-1": true });
+    expect(mockDbSetUiState).not.toHaveBeenCalled();
+  });
+
   it("prune() also drops keep-active pins and activity stamps", () => {
     useSidebarInboxStore.getState().settle("ws-1");
     useSidebarInboxStore.getState().noteActivity("ws-1", 1_000_000);
-    // Pin a doomed workspace last so noteActivity can't clear the pin.
     useSidebarInboxStore.getState().unsettle("ws-gone", "user"); // pin only
     mockDbSetUiState.mockClear();
 

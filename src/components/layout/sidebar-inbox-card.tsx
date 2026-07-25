@@ -187,7 +187,11 @@ export function SidebarInboxCard({
               data-inbox-card={workspace.workspace_id}
               onClick={handleActivate}
               onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") handleActivate();
+                if (e.key !== "Enter" && e.key !== " ") return;
+                // Space would otherwise scroll the sidebar as it activates
+                // the card.
+                if (e.key === " ") e.preventDefault();
+                handleActivate();
               }}
               className={cn(
                 "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
