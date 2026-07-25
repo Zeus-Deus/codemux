@@ -93,11 +93,70 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
-/// The "reset" target — back to the safe default viewport. This matches
-/// the in-app default that `BrowserPane.tsx` initialises with, so issuing
-/// `viewport reset` leaves the page rendering at the same baseline as a
-/// fresh browser pane.
+/// The built-in "reset" baseline. This matches the in-app default that
+/// `BrowserPane.tsx` initialises with, so issuing `viewport reset` leaves
+/// the page rendering at the same baseline as a fresh browser pane.
+/// When the user configured `browser.default_viewport` (synced settings),
+/// reset lands on that instead — see [`configured_default_spec`].
 pub const RESET_SPEC: ViewportSpec = ViewportSpec::new(1280, 800, 1.0);
+
+/// Resolve a raw `browser.default_viewport` setting string into a spec,
+/// or `None` when the value is unset or unusable.
+///
+/// This is the single source of truth for interpreting the setting —
+/// pure, so it stays unit-testable without touching the on-disk settings
+/// cache. Empty/whitespace values and a literal `"reset"` (which would
+/// be self-referential as a *default*) count as unset; any parse
+/// failure also yields `None`: the setting syncs across devices, so a
+/// bad value must degrade silently rather than break startup.
+pub fn resolve_default_setting(raw: Option<&str>) -> Option<ViewportSpec> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("reset"))
+        .and_then(|s| parse_spec(s, None).ok())
+}
+
+/// Convenience over [`resolve_default_setting`]: same resolution, but
+/// falls back to the built-in [`RESET_SPEC`] baseline when the setting
+/// is unset or invalid — documenting the fallback contract in one place.
+pub fn resolve_default(raw: Option<&str>) -> ViewportSpec {
+    resolve_default_setting(raw).unwrap_or(RESET_SPEC)
+}
+
+/// Cache-reading wrapper around [`resolve_default_setting`]: reads the
+/// user's `browser.default_viewport` from the synced-settings cache and
+/// resolves it. `Some` means the user explicitly chose a default (e.g.
+/// `"2560x1440"` to match their monitor) — fresh agent-browser daemons
+/// get it applied at launch.
+pub fn configured_default_viewport() -> Option<ViewportSpec> {
+    let cached = crate::settings_sync::load_cache()?;
+    resolve_default_setting(cached.browser.default_viewport.as_deref())
+}
+
+/// The spec `viewport reset` should return to: the user-configured
+/// default when present, the built-in [`RESET_SPEC`] baseline otherwise.
+pub fn configured_default_spec() -> ViewportSpec {
+    configured_default_viewport().unwrap_or(RESET_SPEC)
+}
+
+/// [`parse_spec`], except `"reset"` resolves to the user-configured
+/// default viewport ([`configured_default_spec`]) instead of the
+/// hard-coded baseline. Use this at the CLI / MCP surfaces where
+/// "reset" means "back to *my* default"; keep `parse_spec` for pure,
+/// setting-independent parsing (and tests).
+pub fn parse_spec_configured(
+    input: &str,
+    dpr_override: Option<f64>,
+) -> Result<ViewportSpec, ParseError> {
+    if input.trim().eq_ignore_ascii_case("reset") {
+        let mut spec = configured_default_spec();
+        if let Some(dpr) = dpr_override {
+            validate_dpr(dpr)?;
+            spec.dpr = dpr;
+        }
+        return Ok(spec);
+    }
+    parse_spec(input, dpr_override)
+}
 
 /// Errors `parse_spec` can surface back to the CLI.
 #[derive(Debug, PartialEq)]
@@ -279,6 +338,56 @@ mod tests {
         let total = names.len();
         names.dedup();
         assert_eq!(names.len(), total, "duplicate preset name in PRESETS");
+    }
+
+    #[test]
+    fn resolve_default_unset_falls_back_to_reset_spec() {
+        assert_eq!(resolve_default(None), RESET_SPEC);
+        assert_eq!(resolve_default(Some("")), RESET_SPEC);
+        assert_eq!(resolve_default(Some("   ")), RESET_SPEC);
+    }
+
+    #[test]
+    fn resolve_default_parses_custom_dimensions() {
+        let spec = resolve_default(Some("2560x1440"));
+        assert_eq!((spec.width, spec.height, spec.dpr), (2560, 1440, 1.0));
+    }
+
+    #[test]
+    fn resolve_default_accepts_preset_names() {
+        let spec = resolve_default(Some("desktop-large"));
+        assert_eq!((spec.width, spec.height), (1920, 1080));
+    }
+
+    /// Bad synced values (typos, other-device garbage) must degrade to
+    /// the baseline, never error — and a literal "reset" would be
+    /// self-referential as a default, so it's treated as unset too.
+    #[test]
+    fn resolve_default_invalid_or_reset_falls_back() {
+        assert_eq!(resolve_default(Some("not-a-preset")), RESET_SPEC);
+        assert_eq!(resolve_default(Some("0x0")), RESET_SPEC);
+        assert_eq!(resolve_default(Some("reset")), RESET_SPEC);
+    }
+
+    /// Exercises the shared pure core directly — `resolve_default`,
+    /// `configured_default_viewport`, and `configured_default_spec` all
+    /// delegate here, so this covers the logic that actually ships.
+    #[test]
+    fn resolve_default_setting_some_or_none() {
+        let spec = resolve_default_setting(Some("2560x1440")).expect("custom WxH should resolve");
+        assert_eq!((spec.width, spec.height, spec.dpr), (2560, 1440, 1.0));
+
+        let spec = resolve_default_setting(Some("desktop-large")).expect("preset should resolve");
+        assert_eq!((spec.width, spec.height), (1920, 1080));
+
+        // Unset, blank, self-referential "reset", and unparseable values
+        // all count as "no configured default".
+        assert_eq!(resolve_default_setting(None), None);
+        assert_eq!(resolve_default_setting(Some("")), None);
+        assert_eq!(resolve_default_setting(Some("   ")), None);
+        assert_eq!(resolve_default_setting(Some("reset")), None);
+        assert_eq!(resolve_default_setting(Some("not-a-preset")), None);
+        assert_eq!(resolve_default_setting(Some("0x0")), None);
     }
 
     #[test]

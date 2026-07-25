@@ -620,8 +620,11 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     // Resolve preset / WxH locally first so we can surface
                     // a friendly error (with the full preset list) instead
                     // of letting the socket call return a generic "Unknown
-                    // action" message.
-                    let resolved = crate::browser_viewport::parse_spec(&spec, dpr)
+                    // action" message. The `_configured` variant makes
+                    // `reset` land on the user's `browser.default_viewport`
+                    // setting (read from the settings cache — the CLI is
+                    // the same binary) instead of the hard-coded baseline.
+                    let resolved = crate::browser_viewport::parse_spec_configured(&spec, dpr)
                         .map_err(|e| e.to_string())?;
                     // Shared socket-action builder — keeps CLI and MCP
                     // payloads byte-identical so a future field bump
@@ -656,12 +659,15 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                             "description": p.description,
                         }))
                         .collect();
+                    // `reset` reports the *actual* reset target — the
+                    // user's configured default viewport when set.
+                    let reset_spec = crate::browser_viewport::configured_default_spec();
                     Ok::<_, String>(json!({
                         "presets": json_presets,
                         "reset": {
-                            "width": crate::browser_viewport::RESET_SPEC.width,
-                            "height": crate::browser_viewport::RESET_SPEC.height,
-                            "dpr": crate::browser_viewport::RESET_SPEC.dpr,
+                            "width": reset_spec.width,
+                            "height": reset_spec.height,
+                            "dpr": reset_spec.dpr,
                         },
                         "custom": "Use `WxH` like `390x844` for a custom viewport, plus `--dpr N` for retina.",
                     }))

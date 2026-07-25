@@ -1034,10 +1034,12 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
         "browser_viewport" => {
             // Validate locally so an agent gets a typed error with the
             // preset list instead of a generic "Unknown action" bounce
-            // from the agent-browser subprocess.
+            // from the agent-browser subprocess. The `_configured`
+            // variant resolves 'reset' to the user's
+            // `browser.default_viewport` setting when present.
             let preset_arg = arguments.get("preset").and_then(Value::as_str).unwrap_or("");
             let dpr = arguments.get("dpr").and_then(Value::as_f64);
-            match crate::browser_viewport::parse_spec(preset_arg, dpr) {
+            match crate::browser_viewport::parse_spec_configured(preset_arg, dpr) {
                 Ok(spec) => {
                     // Shared socket-action builder — see cli.rs for the
                     // matching call site. Both surfaces MUST go through
@@ -1075,12 +1077,15 @@ async fn handle_tool_call(id: Value, params: Value) -> JsonRpcResponse {
                     })
                 })
                 .collect();
+            // `reset` reports the *actual* reset target — the user's
+            // configured `browser.default_viewport` when set.
+            let reset_spec = crate::browser_viewport::configured_default_spec();
             Ok(json!({
                 "presets": json_presets,
                 "reset": {
-                    "width": crate::browser_viewport::RESET_SPEC.width,
-                    "height": crate::browser_viewport::RESET_SPEC.height,
-                    "dpr": crate::browser_viewport::RESET_SPEC.dpr,
+                    "width": reset_spec.width,
+                    "height": reset_spec.height,
+                    "dpr": reset_spec.dpr,
                 },
                 "custom": "Pass a 'WxH' string like '390x844' to browser_viewport for custom dimensions.",
             }))

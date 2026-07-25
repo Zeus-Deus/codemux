@@ -61,6 +61,17 @@ export interface AgentChatSyncSettings {
   background_browser_desktop_viewport: boolean;
 }
 
+/** Mirrors src-tauri/src/settings_sync.rs:BrowserSettings.
+ *  `default_viewport` is the preferred starting viewport for
+ *  agent-browser sessions — a `"WxH"` string like `"2560x1440"` (or a
+ *  preset name) applied to freshly launched daemons and used as the
+ *  `viewport reset` target, so agent screenshots match the user's own
+ *  screen proportions. `null` (default) keeps the built-in 1280×800
+ *  baseline. */
+export interface BrowserSyncSettings {
+  default_viewport: string | null;
+}
+
 export interface UserSettings {
   appearance: AppearanceSettings;
   editor: EditorSettings;
@@ -71,6 +82,7 @@ export interface UserSettings {
   file_tree: FileTreeSyncSettings;
   session_restore: SessionRestoreSettings;
   agent_chat: AgentChatSyncSettings;
+  browser: BrowserSyncSettings;
 }
 
 // ── Resource Monitor ──
