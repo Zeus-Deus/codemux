@@ -43,6 +43,20 @@ describe("keybind-registry", () => {
     expect(getRegistryEntry("nonExistentAction")).toBeUndefined();
   });
 
+  it("registers workspace jump shortcuts 1-9 on Alt+digit (Ctrl+digit is tabs)", () => {
+    for (let n = 1; n <= 9; n++) {
+      const entry = getRegistryEntry(`workspaceJump${n}`);
+      expect(entry, `workspaceJump${n} missing`).toBeDefined();
+      expect(entry!.defaultKeys).toBe(`Alt+${n}`);
+      expect(entry!.label).toBe(`Jump to workspace ${n}`);
+      expect(entry!.category).toBe("workspaces");
+    }
+    // The digit jumps must not collide with the terminal tab switches.
+    for (let n = 1; n <= 9; n++) {
+      expect(getRegistryEntry(`switchTab${n}`)!.defaultKeys).toBe(`Ctrl+${n}`);
+    }
+  });
+
   it("registers reload-blocking shortcuts", () => {
     const blockReload = getRegistryEntry("blockReload");
     expect(blockReload).toBeDefined();

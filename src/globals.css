@@ -201,6 +201,26 @@
 }
 
 /*
+ * Sidebar surface inversion (design handoff). The shadcn stone preset ships
+ * the sidebar surface LIGHTER than the main background; the design flips that
+ * so the sidebar recedes as the DARKER surface. Because the rail is darker at
+ * rest, the inbox cards can stay transparent until hover/selection — the
+ * surface itself carries the contrast, no per-card fill needed. These live in
+ * the custom-token layer (not the preset block) so a preset re-apply keeps the
+ * inversion. --sidebar differs per theme, so it's split out of the shared
+ * :root,.dark block above.
+ */
+:root {
+  /* Background is pure white (1.0); nudge the sidebar a touch past the preset's
+   * 0.985 so the darker-than-background relationship reads in light mode. */
+  --sidebar: oklch(0.972 0.001 106.4);
+}
+.dark {
+  /* A hair darker than --background (0.147), same stone hue family. */
+  --sidebar: oklch(0.13 0.004 49);
+}
+
+/*
  * Warm palette variant — opt-in via a `.theme-warm` class on the root.
  * Overrides only the surface/role tokens with warm-grey oklch values; the
  * primary stays near-white (white buttons), and the status tokens are
@@ -225,7 +245,9 @@
   --border: oklch(0.315 0.006 55);
   --input: oklch(0.315 0.006 55);
   --ring: oklch(0.55 0.009 56);
-  --sidebar: oklch(0.206 0.006 50);
+  /* Inverted the same way: slightly darker than this palette's --background
+   * (0.178) so the warm sidebar recedes too. */
+  --sidebar: oklch(0.165 0.006 50);
   --sidebar-foreground: oklch(0.935 0.004 67);
   /* --sidebar-primary intentionally inherits the ember accent from the
    * CodeMux custom-token block (no blue, consistent across palettes). */

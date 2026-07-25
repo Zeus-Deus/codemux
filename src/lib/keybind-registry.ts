@@ -39,6 +39,17 @@ export const KEYBIND_REGISTRY: readonly KeybindEntry[] = [
   { id: "nextWorkspace", label: "Next workspace", category: "workspaces", defaultKeys: "Ctrl+]" },
   { id: "prevWorkspace", label: "Previous workspace", category: "workspaces", defaultKeys: "Ctrl+[" },
   { id: "runDevCommand", label: "Run dev command", category: "workspaces", defaultKeys: "Ctrl+Shift+G" },
+  // Jump straight to the Nth visible sidebar-inbox card. Alt (not Ctrl) because
+  // Ctrl+1..9 are the terminal tab switches above.
+  { id: "workspaceJump1", label: "Jump to workspace 1", category: "workspaces", defaultKeys: "Alt+1" },
+  { id: "workspaceJump2", label: "Jump to workspace 2", category: "workspaces", defaultKeys: "Alt+2" },
+  { id: "workspaceJump3", label: "Jump to workspace 3", category: "workspaces", defaultKeys: "Alt+3" },
+  { id: "workspaceJump4", label: "Jump to workspace 4", category: "workspaces", defaultKeys: "Alt+4" },
+  { id: "workspaceJump5", label: "Jump to workspace 5", category: "workspaces", defaultKeys: "Alt+5" },
+  { id: "workspaceJump6", label: "Jump to workspace 6", category: "workspaces", defaultKeys: "Alt+6" },
+  { id: "workspaceJump7", label: "Jump to workspace 7", category: "workspaces", defaultKeys: "Alt+7" },
+  { id: "workspaceJump8", label: "Jump to workspace 8", category: "workspaces", defaultKeys: "Alt+8" },
+  { id: "workspaceJump9", label: "Jump to workspace 9", category: "workspaces", defaultKeys: "Alt+9" },
 
   // ── Tabs ──
   { id: "newTab", label: "New terminal tab", category: "tabs", defaultKeys: "Ctrl+T" },

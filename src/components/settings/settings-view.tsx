@@ -62,15 +62,16 @@ import {
 } from "@/stores/synced-settings-store";
 import {
   useSettingsStore,
+  SETTINGS_DEFAULTS,
   selectTerminalColorTheme,
   selectPalette,
   selectDensity,
-  selectSidebarLiveAgents,
+  selectSidebarShowGitStats,
   selectWorkingIndicator,
   selectWorkingIndicatorColor,
   type AppearancePalette,
   type AppearanceDensity,
-  type SidebarLiveAgents,
+  type AutoSettleDays,
   type WorkingIndicatorVariant,
   type WorkingIndicatorColor,
 } from "@/stores/settings-store";
@@ -1346,7 +1347,12 @@ export function SettingsView() {
   const terminalThemeMode = useSettingsStore(selectTerminalColorTheme);
   const palette = useSettingsStore(selectPalette);
   const density = useSettingsStore(selectDensity);
-  const liveAgents = useSettingsStore(selectSidebarLiveAgents);
+  const showGitStats = useSettingsStore(selectSidebarShowGitStats);
+  const autoSettleDays = useSettingsStore(
+    (s) =>
+      (s.settings["sidebar.auto_settle_days"] ??
+        SETTINGS_DEFAULTS["sidebar.auto_settle_days"]!) as AutoSettleDays,
+  );
   const indicatorVariant = useSettingsStore(selectWorkingIndicator);
   const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
   const autoMcpConfig = storeGet("auto_mcp_config") !== "false";
@@ -1720,24 +1726,49 @@ export function SettingsView() {
 
             <SectionGroup>
               <SubsectionHeader
-                title="Agents"
-                description="How working agents surface in the sidebar, and the glyph shown while an agent runs."
+                title="Sidebar"
+                description="What the workspace inbox shows on each card."
               />
               <div className="space-y-1">
                 <SettingRow
-                  label="Live agents"
-                  description="Keep working agents in their project group, or gather every live agent into a LIVE section on top."
+                  label="Show git stats"
+                  description="Show the ↑ahead and +/− diff numbers on workspace cards. The branch name always shows."
                 >
-                  <SegmentedControl<SidebarLiveAgents>
-                    ariaLabel="Live agents grouping"
-                    value={liveAgents}
-                    onChange={(value) => storeSet("sidebar.live_agents", value)}
+                  <Switch
+                    checked={showGitStats}
+                    onCheckedChange={(checked) =>
+                      storeSet("sidebar.show_git_stats", checked ? "true" : "false")
+                    }
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Auto-settle idle work"
+                  description="Sweep a workspace card into the Settled section after this many days without agent activity. Cards whose PR merges or closes settle as soon as the agent is idle. Un-settling a card keeps it active until its agent runs again."
+                >
+                  <SegmentedControl<AutoSettleDays>
+                    ariaLabel="Auto-settle idle work"
+                    value={autoSettleDays}
+                    onChange={(value) =>
+                      storeSet("sidebar.auto_settle_days", value)
+                    }
                     options={[
-                      { value: "project", label: "Stay in project" },
-                      { value: "top", label: "Gather on top" },
+                      { value: "off", label: "Off" },
+                      { value: "1", label: "1d" },
+                      { value: "3", label: "3d" },
+                      { value: "7", label: "7d" },
+                      { value: "14", label: "14d" },
                     ]}
                   />
                 </SettingRow>
+              </div>
+            </SectionGroup>
+
+            <SectionGroup>
+              <SubsectionHeader
+                title="Agents"
+                description="The glyph shown in the sidebar while an agent runs."
+              />
+              <div className="space-y-1">
                 <SettingRow
                   label="Working indicator"
                   description="The animation that replaces a workspace's icon while its agent is working."

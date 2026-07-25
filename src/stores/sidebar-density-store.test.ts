@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
   useSidebarDensityStore,
+  formatElapsed,
   isRetiredPr,
   type WorkObservation,
 } from "./sidebar-density-store";
@@ -112,5 +113,32 @@ describe("sidebar density store — living-row work history", () => {
     observe(id, { prNumber: 128, prState: "merged", issueNumber: 20, issueTitle: "Next" });
     const rec = shipped(id).find((r) => r.prNumber === 128);
     expect(rec).toEqual({ prNumber: 128 });
+  });
+});
+
+describe("formatElapsed", () => {
+  const sec = 1000;
+  const min = 60 * sec;
+  const hour = 60 * min;
+  const day = 24 * hour;
+
+  it("reads in seconds, then minutes, then hours", () => {
+    expect(formatElapsed(0)).toBe("0s");
+    expect(formatElapsed(-5 * sec)).toBe("0s");
+    expect(formatElapsed(45 * sec)).toBe("45s");
+    expect(formatElapsed(6 * min)).toBe("6m");
+    expect(formatElapsed(59 * min)).toBe("59m");
+    expect(formatElapsed(hour)).toBe("1h");
+    expect(formatElapsed(hour + 12 * min)).toBe("1h12m");
+    expect(formatElapsed(23 * hour + 59 * min)).toBe("23h59m");
+  });
+
+  it("switches to days past 24h rather than a three-digit hour count", () => {
+    expect(formatElapsed(day)).toBe("1d");
+    expect(formatElapsed(day + 30 * min)).toBe("1d");
+    expect(formatElapsed(day + 3 * hour)).toBe("1d3h");
+    expect(formatElapsed(4 * day + 3 * hour + 40 * min)).toBe("4d3h");
+    // The old cap rendered this as "96h".
+    expect(formatElapsed(4 * day)).toBe("4d");
   });
 });

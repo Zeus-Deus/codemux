@@ -26,6 +26,7 @@ Defined in `src/hooks/use-keyboard-shortcuts.ts`, `src/lib/app-shortcuts.ts`, an
 | Ctrl+Shift+N | New workspace in current project | Quick-create a workspace/agent in the active workspace's project |
 | Ctrl+] | Next workspace | Cycles through sidebar workspace list |
 | Ctrl+[ | Previous workspace | |
+| Alt+1 through Alt+9 | Jump to workspace by position | Nth visible inbox card (filter-scoped, settled rows excluded); holding Alt shows index badges on the cards |
 | Ctrl+Shift+G | Run dev command | Runs the project's configured dev server command |
 | Ctrl+T | New terminal tab | Standard workspaces only (not OpenFlow) |
 | Ctrl+W | Close active tab | Only when workspace has more than one tab |

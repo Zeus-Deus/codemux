@@ -38,14 +38,15 @@ import {
   getTerminalFontFamily,
   getDefaultEditor,
   getDefaultBaseBranch,
-  selectSidebarLiveAgents,
+  selectSidebarShowGitStats,
+  selectSidebarAutoSettleDays,
   selectWorkingIndicator,
   selectWorkingIndicatorColor,
 } from "./settings-store";
 
 function stateWith(settings: Record<string, string>) {
   return { loaded: true, settings } as Parameters<
-    typeof selectSidebarLiveAgents
+    typeof selectSidebarShowGitStats
   >[0];
 }
 
@@ -88,11 +89,12 @@ describe("settings-store", () => {
       expect(SETTINGS_DEFAULTS["ai_commit_message_enabled"]).toBe("true");
       expect(SETTINGS_DEFAULTS["auto_mcp_config"]).toBe("true");
       // Sidebar / working-indicator keys present
-      expect(SETTINGS_DEFAULTS["sidebar.live_agents"]).toBe("project");
+      expect(SETTINGS_DEFAULTS["sidebar.show_git_stats"]).toBe("true");
       expect(SETTINGS_DEFAULTS["sidebar.working_indicator"]).toBe("braille");
       expect(SETTINGS_DEFAULTS["sidebar.working_indicator_color"]).toBe(
         "status-working",
       );
+      expect(SETTINGS_DEFAULTS["sidebar.auto_settle_days"]).toBe("3");
       // Per-user keys NOT present
       expect(SETTINGS_DEFAULTS["terminal.font_size"]).toBeUndefined();
       expect(SETTINGS_DEFAULTS["terminal.cursor_style"]).toBeUndefined();
@@ -105,14 +107,36 @@ describe("settings-store", () => {
   // ── Sidebar / working-indicator selectors ──
 
   describe("sidebar selectors", () => {
-    it("selectSidebarLiveAgents defaults to 'project'", () => {
-      expect(selectSidebarLiveAgents(stateWith({}))).toBe("project");
+    it("selectSidebarShowGitStats defaults to true", () => {
+      expect(selectSidebarShowGitStats(stateWith({}))).toBe(true);
     });
 
-    it("selectSidebarLiveAgents reflects a stored 'top' value", () => {
+    it("selectSidebarShowGitStats reflects a stored 'false' value", () => {
       expect(
-        selectSidebarLiveAgents(stateWith({ "sidebar.live_agents": "top" })),
-      ).toBe("top");
+        selectSidebarShowGitStats(
+          stateWith({ "sidebar.show_git_stats": "false" }),
+        ),
+      ).toBe(false);
+    });
+
+    it("selectSidebarAutoSettleDays defaults to 3 days", () => {
+      expect(selectSidebarAutoSettleDays(stateWith({}))).toBe(3);
+    });
+
+    it("selectSidebarAutoSettleDays returns null when set to 'off'", () => {
+      expect(
+        selectSidebarAutoSettleDays(
+          stateWith({ "sidebar.auto_settle_days": "off" }),
+        ),
+      ).toBeNull();
+    });
+
+    it("selectSidebarAutoSettleDays reflects a stored day count", () => {
+      expect(
+        selectSidebarAutoSettleDays(
+          stateWith({ "sidebar.auto_settle_days": "14" }),
+        ),
+      ).toBe(14);
     });
 
     it("selectWorkingIndicator defaults to 'braille'", () => {

@@ -70,7 +70,9 @@ function SidebarProvider({
 }) {
   const isMobile = useIsMobile()
   const [openMobile, setOpenMobile] = React.useState(false)
-  const [widthPx, setWidthPx] = React.useState(256) // 16rem = 256px
+  // 288px default (was 256): the inbox card's mono meta line (branch ·
+  // ↑ahead · +/− · PR chip · remote/notifs) needs the extra room.
+  const [widthPx, setWidthPx] = React.useState(288)
 
   // This is the internal state of the sidebar.
   // We use openProp and setOpenProp for control from outside the component.

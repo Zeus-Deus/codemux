@@ -16,10 +16,11 @@
 - Rename workspaces by double-clicking the active workspace name in the sidebar
 - Archive local workspaces non-destructively with all child sessions closed; attach-in-place and host-bound workspaces use non-destructive Close instead
 - Auto-transition to main workspace after merge+delete
-- Living sidebar — each workspace row's height is state-driven: working rows expand to a 3-line card (indicator + work title + issue/activity + elapsed + git line), needs-input rows to a red 2-line card with the blocker, done rows to a green 2-line card that decays after review or ~1h, idle rows stay one-liners (replacing the removed Clean/Branch/Detailed setting)
-- Work-based row naming — while an agent is live and an issue is linked, the row titles itself after the issue (+ `#n` chip) and moves the branch to the git line; a `n shipped` tally with a history popover appears once merged PRs retire
-- Pinned "Needs you" strip at the top of the workspace tree while any workspace waits for input (jump-links that activate the workspace)
-- Live-agents grouping (Settings → Appearance → Agents): "Stay in project" or "Gather on top" (all live rows hoisted into a LIVE section above the tree)
+- Sidebar workspace inbox — the expanded sidebar is one flat list of workspace cards (repo eyebrow · work title + issue chip · blocker line when the agent needs you · mono meta line with branch/↑ahead/+−/PR chip/remote/notifications) with agent state on the right (working indicator / pulsing "Needs you" / "Done · review" / idle time)
+- Project filter dropdown (All projects + per-repo rows with active-workspace counts, pinned add-repo button) above the inbox filters both active cards and settled rows; search box opens the command palette
+- Settle/un-settle — hover a card for "✓ Settle" to sweep it into a persisted one-line "Settled" section (violet merge icon for merged PRs); hover a settled row to Un-settle. Purely visual: nothing is archived or deleted
+- Work-based card naming — while an agent is live and an issue is linked, the card titles itself after the issue (+ `#n` chip) and keeps the branch on the meta line
+- Show git stats toggle (Settings → Appearance → Sidebar) to hide the ↑ahead and +/− numbers on cards
 - "Checkout default branch" workspace action
 - Derivative-branch picker with icons, recency, and worktree tab
 - Notification count badges per workspace in the sidebar

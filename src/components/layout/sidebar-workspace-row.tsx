@@ -125,7 +125,7 @@ interface Props {
  *  verbatim in the warning box, and the button flips to "Force delete",
  *  which reissues the same call with `forceDelete: true`. Any other
  *  rejection surfaces as an error toast and closes the dialog. */
-function DeleteWorktreeDialog({
+export function DeleteWorktreeDialog({
   workspace,
   open,
   onOpenChange,
@@ -227,13 +227,23 @@ function DeleteWorktreeDialog({
   );
 }
 
+/** Optional Settle / Un-settle entry surfaced at the top of the workspace
+ *  context menu — the sidebar inbox's card and settled-row shapes pass it so
+ *  the right-click menu mirrors their hover affordance. */
+export interface SettleMenuAction {
+  kind: "settle" | "unsettle";
+  onAction: () => void;
+}
+
 export function WorkspaceContextMenuItems({
   workspace,
+  settleAction,
   onArchiveRequest,
   onDeleteRequest,
   onRequestPushConfirm,
 }: {
   workspace: WorkspaceSnapshot;
+  settleAction?: SettleMenuAction;
   /** Remove the row non-destructively. For local workspaces this
    *  archives (restorable from Settings → Archive); for attach-in-place
    *  and remote (host-backed) workspaces — which the backend refuses to
@@ -402,6 +412,16 @@ export function WorkspaceContextMenuItems({
 
   return (
     <ContextMenuContent>
+      {settleAction && (
+        <>
+          <ContextMenuItem onClick={settleAction.onAction}>
+            {settleAction.kind === "settle"
+              ? "Settle workspace"
+              : "Un-settle workspace"}
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+        </>
+      )}
       <ContextMenuItem onClick={handleRename}>
         Rename workspace
       </ContextMenuItem>

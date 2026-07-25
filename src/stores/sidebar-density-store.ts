@@ -226,13 +226,20 @@ export function isRetiredPr(
   return shipped.some((r) => r.prNumber === prNumber);
 }
 
-/** Human-friendly elapsed label: `45s` / `6m` / `1h12m`. */
+/** Human-friendly elapsed label: `45s` / `6m` / `1h12m` / `4d3h`. Settled rows
+ *  can sit for days, so anything past 24h reads in days rather than a
+ *  three-digit hour count. */
 export function formatElapsed(ms: number): string {
   const totalSec = Math.max(0, Math.floor(ms / 1000));
   if (totalSec < 60) return `${totalSec}s`;
   const totalMin = Math.floor(totalSec / 60);
   if (totalMin < 60) return `${totalMin}m`;
-  const hours = Math.floor(totalMin / 60);
-  const mins = totalMin % 60;
-  return mins > 0 ? `${hours}h${mins}m` : `${hours}h`;
+  const totalHours = Math.floor(totalMin / 60);
+  if (totalHours < 24) {
+    const mins = totalMin % 60;
+    return mins > 0 ? `${totalHours}h${mins}m` : `${totalHours}h`;
+  }
+  const days = Math.floor(totalHours / 24);
+  const hours = totalHours % 24;
+  return hours > 0 ? `${days}d${hours}h` : `${days}d`;
 }

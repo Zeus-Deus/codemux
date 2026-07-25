@@ -1,4 +1,10 @@
-import type { PaneStatus, ActivePaneStatus, PaneNodeSnapshot, SurfaceSnapshot } from "@/tauri/types";
+import type {
+  PaneStatus,
+  ActivePaneStatus,
+  AgentChatProviderKind,
+  PaneNodeSnapshot,
+  SurfaceSnapshot,
+} from "@/tauri/types";
 
 const STATUS_PRIORITY: Record<PaneStatus, number> = {
   idle: 0,
@@ -45,6 +51,33 @@ export function getWorkspaceStatus(
     collectPaneIds(s.root).map((id) => paneStatuses[id]),
   );
   return getHighestPriorityStatus(statuses);
+}
+
+function collectProviders(
+  node: PaneNodeSnapshot,
+  out: AgentChatProviderKind[],
+): void {
+  if (node.kind === "split") {
+    for (const child of node.children) collectProviders(child, out);
+    return;
+  }
+  if (node.kind === "agent_chat" && node.provider && !out.includes(node.provider)) {
+    out.push(node.provider);
+  }
+}
+
+/**
+ * The distinct agent-chat providers active in a workspace, in first-seen
+ * order. Drives the provider logos on the sidebar inbox card — a workspace
+ * chatting with Claude shows the Claude mark, etc. Terminal-only agent
+ * panes carry no provider metadata, so they contribute nothing.
+ */
+export function getWorkspaceProviders(
+  surfaces: SurfaceSnapshot[],
+): AgentChatProviderKind[] {
+  const out: AgentChatProviderKind[] = [];
+  for (const s of surfaces) collectProviders(s.root, out);
+  return out;
 }
 
 /**
