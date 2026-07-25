@@ -118,7 +118,11 @@ import {
 } from "./ComposerPendingInputPanel";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
-import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
+import {
+  SCOPE_STRIP,
+  SCOPE_STRIP_INSET,
+  ThreadScopeRow,
+} from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
 import { useUIStore } from "@/stores/ui-store";
 
@@ -2704,37 +2708,39 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // status cluster on the right that the old bottom
       // `WorkspaceContextBar` used to show (now hidden for this pane —
       // see `useAgentChatPaneActive`).
-      <div className="flex w-full items-center justify-between gap-2.5 px-1">
-        <div className="flex min-w-0 items-center gap-0.5 text-xs font-semibold text-foreground/90">
-          <span
-            className="inline-flex h-[27px] shrink-0 items-center gap-1.5 rounded-md px-2"
-            title={workspaceProjectRoot}
-          >
-            {isHomeWorkspace ? (
-              <Home className="size-3.5 text-status-remote" />
-            ) : (
-              <Folder className="size-3.5 text-muted-foreground" />
-            )}
-            <span className="max-w-[140px] truncate">
-              {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
-            </span>
-          </span>
-          {paneWorkspaceBranch && (
-            <>
-              <span className="select-none text-muted-foreground/50">·</span>
-              <span
-                className="inline-flex h-[27px] shrink-0 items-center gap-1.5 rounded-md px-2 font-mono"
-                title={`Branch: ${paneWorkspaceBranch}`}
-              >
-                <GitBranch className="size-3 text-muted-foreground" />
-                <span className="max-w-[160px] truncate">
-                  {paneWorkspaceBranch}
-                </span>
+      <div className={SCOPE_STRIP_INSET}>
+        <div className={SCOPE_STRIP}>
+          <div className="flex min-w-0 items-center gap-0.5 text-xs font-medium text-muted-foreground">
+            <span
+              className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2"
+              title={workspaceProjectRoot}
+            >
+              {isHomeWorkspace ? (
+                <Home className="size-3.5 text-status-remote" />
+              ) : (
+                <Folder className="size-3.5 text-muted-foreground" />
+              )}
+              <span className="max-w-[140px] truncate">
+                {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
               </span>
-            </>
-          )}
+            </span>
+            {paneWorkspaceBranch && (
+              <>
+                <span className="select-none text-muted-foreground/50">·</span>
+                <span
+                  className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 font-mono"
+                  title={`Branch: ${paneWorkspaceBranch}`}
+                >
+                  <GitBranch className="size-3 text-muted-foreground" />
+                  <span className="max-w-[160px] truncate">
+                    {paneWorkspaceBranch}
+                  </span>
+                </span>
+              </>
+            )}
+          </div>
+          <WorkspaceStatusCluster />
         </div>
-        <WorkspaceStatusCluster />
       </div>
     ) : undefined;
 

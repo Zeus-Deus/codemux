@@ -95,17 +95,17 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     expect(btn).toBeInTheDocument();
   });
 
-  it("the + button matches the Send button shape (h-7 w-7 circle)", () => {
+  it("the + button matches the Send button shape (h-8 w-8 circle)", () => {
     renderFooter({ onAttachClick: vi.fn() });
     const attach = screen.getByTestId("composer-attach-button");
     const send = screen.getByRole("button", { name: "Send" });
     // Both share the same fixed circle dimensions; identical shape
     // is what makes them read as a visual pair.
-    expect(attach.className).toContain("h-7");
-    expect(attach.className).toContain("w-7");
+    expect(attach.className).toContain("h-8");
+    expect(attach.className).toContain("w-8");
     expect(attach.className).toContain("rounded-full");
-    expect(send.className).toContain("h-7");
-    expect(send.className).toContain("w-7");
+    expect(send.className).toContain("h-8");
+    expect(send.className).toContain("w-8");
     expect(send.className).toContain("rounded-full");
   });
 

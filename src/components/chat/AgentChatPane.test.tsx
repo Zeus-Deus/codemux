@@ -245,6 +245,9 @@ type ThreadScopeRowStubProps = {
 };
 let lastThreadScopeRowProps: ThreadScopeRowStubProps | null = null;
 vi.mock("./pickers/ThreadScopeRow", () => ({
+  // Class-string constants consumed by the Context Row's strip shell.
+  SCOPE_STRIP: "scope-strip-stub",
+  SCOPE_STRIP_INSET: "scope-strip-inset-stub",
   ThreadScopeRow: (props: ThreadScopeRowStubProps) => {
     lastThreadScopeRowProps = props;
     return (

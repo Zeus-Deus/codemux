@@ -1,5 +1,6 @@
 import {
   selectCapabilities,
+  selectModel,
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
 import type { AgentChatProviderKind } from "@/tauri/types";
@@ -105,7 +106,10 @@ export function modelsForProvider(
 
 /** Look up a model's display label by id. Falls back to the raw id
  *  when the model is not in the capabilities payload (or caps haven't
- *  hydrated). */
+ *  hydrated). Routed through `selectModel` so a persisted `"default"`
+ *  id from before the alias fold resolves to `models[0]`'s label — the
+ *  concrete model the alias pointed at — instead of showing the raw
+ *  string. */
 export function modelLabel(
   provider: AgentChatProviderKind,
   modelId: string,
@@ -114,7 +118,7 @@ export function modelLabel(
     useProviderCapabilities.getState(),
     provider,
   );
-  return caps?.models.find((m) => m.id === modelId)?.label ?? modelId;
+  return selectModel(caps, modelId)?.label ?? modelId;
 }
 
 export interface CapabilityDefaults {

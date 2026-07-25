@@ -17,6 +17,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { ChatModelInfo } from "@/tauri/types";
 import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { FOOTER_TRIGGER } from "./footer-trigger";
 
 // Short description lines for each effort level. Verbs match
 // PermissionModePicker's density (two-line rows).
@@ -50,6 +51,10 @@ interface Props {
   /** Fires when the user picks a context-window row. */
   onContextWindowChange: (nextValue: string) => void;
   disabled?: boolean;
+  /** Render a leading hairline pipe. Lives inside the picker (not the
+   *  footer) so the pipe disappears together with the control when the
+   *  capability gate hides it — no orphaned separators. */
+  withSeparator?: boolean;
 }
 
 function effortLabel(labelMap: Record<string, string>, id: string): string {
@@ -91,6 +96,7 @@ export function ReasoningPicker({
   onEffortChange,
   onContextWindowChange,
   disabled,
+  withSeparator,
 }: Props) {
   const [open, setOpen] = useState(false);
 
@@ -147,13 +153,13 @@ export function ReasoningPicker({
   })();
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          disabled={disabled}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground outline-none disabled:opacity-50"
-        >
+    <>
+      {withSeparator && (
+        <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 self-center bg-border" />
+      )}
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button type="button" disabled={disabled} className={FOOTER_TRIGGER}>
           <Brain className="h-3 w-3" />
           <span className="max-w-[200px] truncate">{pillLabel}</span>
           <ChevronDown className="h-2.5 w-2.5 opacity-40" />
@@ -254,7 +260,8 @@ export function ReasoningPicker({
             )}
           </CommandList>
         </Command>
-      </PopoverContent>
-    </Popover>
+        </PopoverContent>
+      </Popover>
+    </>
   );
 }

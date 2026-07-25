@@ -16,6 +16,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { PermissionModeOption } from "@/tauri/types";
 import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { FOOTER_TRIGGER } from "./footer-trigger";
 
 /**
  * Capability-driven permission-mode picker.
@@ -35,6 +36,10 @@ interface Props {
   value: string | null;
   onChange: (mode: string) => void;
   disabled?: boolean;
+  /** Render a leading hairline pipe. Lives inside the picker (not the
+   *  footer) so the pipe disappears together with the control when the
+   *  capability gate hides it — no orphaned separators. */
+  withSeparator?: boolean;
 }
 
 function modeLabel(modes: PermissionModeOption[], value: string): string {
@@ -46,6 +51,7 @@ export function PermissionModePicker({
   value,
   onChange,
   disabled,
+  withSeparator,
 }: Props) {
   const [open, setOpen] = useState(false);
 
@@ -59,13 +65,13 @@ export function PermissionModePicker({
   const label = modeLabel(modes, current);
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          disabled={disabled}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground outline-none disabled:opacity-50"
-        >
+    <>
+      {withSeparator && (
+        <span aria-hidden className="mx-0.5 h-4 w-px shrink-0 self-center bg-border" />
+      )}
+      <Popover open={open} onOpenChange={setOpen}>
+        <PopoverTrigger asChild>
+          <button type="button" disabled={disabled} className={FOOTER_TRIGGER}>
           <Lock className="h-3 w-3" />
           <span className="max-w-[140px] truncate">{label}</span>
           <ChevronDown className="h-2.5 w-2.5 opacity-40" />
@@ -109,7 +115,8 @@ export function PermissionModePicker({
             </CommandGroup>
           </CommandList>
         </Command>
-      </PopoverContent>
-    </Popover>
+        </PopoverContent>
+      </Popover>
+    </>
   );
 }

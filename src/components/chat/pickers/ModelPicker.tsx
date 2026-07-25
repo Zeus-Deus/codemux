@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "../provider-logo";
 import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { FOOTER_TRIGGER } from "./footer-trigger";
 
 // The model list + default-model / label helpers moved to
 // `@/lib/agent-chat/capability-defaults` in the Stage C Effort-lock
@@ -98,7 +99,7 @@ export function ModelPicker({
         <button
           type="button"
           disabled={disabled}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 py-1 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/50 hover:text-foreground outline-none disabled:opacity-50"
+          className={FOOTER_TRIGGER}
         >
           <ProviderLogo provider={provider} className="h-3 w-3" />
           <span className="max-w-[140px] truncate">

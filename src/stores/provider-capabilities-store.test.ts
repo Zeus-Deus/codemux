@@ -189,6 +189,43 @@ describe("provider-capabilities-store", () => {
     expect(selectModel(caps, null)).toBeNull();
   });
 
+  it("selectModel resolves a dangling 'default' id to models[0]", () => {
+    // Persisted drafts/threads from before the backend folded the
+    // `"default"` alias row out of the roster still carry that id.
+    // When the alias is absent, models[0] is the concrete model it
+    // resolved to — selectModel must fall back to it rather than
+    // returning null and stranding the UI on a raw "default" string.
+    const caps = makeCaps("claude-opus-4-8");
+    expect(selectModel(caps, "default")?.id).toBe("claude-opus-4-8");
+  });
+
+  it("selectModel still prefers an actual 'default' roster row when present", () => {
+    // If the roster DOES contain a "default" row (concrete twin
+    // absent, so the backend kept the alias), exact match wins — the
+    // fallback only kicks in when the id is dangling.
+    const caps: ProviderChatCapabilities = {
+      ...makeCaps("claude-opus-4-8"),
+      models: [
+        ...makeCaps("claude-opus-4-8").models,
+        ...makeCaps("default").models,
+      ],
+    };
+    expect(selectModel(caps, "default")?.id).toBe("default");
+  });
+
+  it("selectModel does NOT fall back for other unknown ids", () => {
+    // The fallback is scoped to the literal historical alias. A
+    // genuinely unknown id must stay null so callers can surface it
+    // as unresolved instead of silently remapping to models[0].
+    const caps = makeCaps("claude-opus-4-8");
+    expect(selectModel(caps, "claude-future-9000")).toBeNull();
+  });
+
+  it("selectModel('default') on an empty roster returns null", () => {
+    const caps: ProviderChatCapabilities = { ...makeCaps("x"), models: [] };
+    expect(selectModel(caps, "default")).toBeNull();
+  });
+
   it("OpenCode model has sub_provider populated when injected", () => {
     // Pin the wire-shape contract: OpenCode entries must round-trip
     // `sub_provider` through the store untouched. The store doesn't

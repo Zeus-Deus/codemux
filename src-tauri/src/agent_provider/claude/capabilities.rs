@@ -747,10 +747,63 @@ fn append_missing_maintained_families(merged: &mut Vec<ChatModelInfo>) {
     }
 }
 
+/// A promoted label without its qualifier — `"Claude Opus 5 (1M
+/// context)"` → `"Claude Opus 5"`. Used to detect when two picker rows
+/// resolve to the same concrete model.
+fn base_model_name(label: &str) -> &str {
+    label.split(" (").next().unwrap_or(label).trim()
+}
+
+/// Drop the `default` alias row when the roster already lists the
+/// concrete model it resolves to. The CLI's `default` tracks the user's
+/// configured default, which (after label promotion) renders as the
+/// same concrete name as its twin — two rows both titled
+/// "Claude Opus 5" read as a duplicate, and the picker contract is to
+/// list concrete models only. The twin inherits the "Recommended"
+/// marker and moves to the front of the list (`models[0]` feeds the
+/// frontend's default selection, so new drafts default to the twin —
+/// a real roster id resolving to the same model). When no twin exists
+/// the promoted `default` row is kept so nothing launchable is lost.
+///
+/// Must run AFTER [`append_missing_maintained_families`]: when the CLI
+/// demotes a family into `default` (alias present, no concrete row),
+/// the twin only exists once the maintained entry has been appended.
+fn dedupe_default_alias(merged: &mut Vec<ChatModelInfo>) {
+    let Some(default_idx) = merged
+        .iter()
+        .position(|m| m.id.eq_ignore_ascii_case("default"))
+    else {
+        return;
+    };
+    let default_base = base_model_name(&merged[default_idx].label).to_string();
+    let twin_idx = merged.iter().enumerate().position(|(i, m)| {
+        i != default_idx && base_model_name(&m.label) == default_base
+    });
+    let Some(twin_idx) = twin_idx else { return };
+
+    merged.remove(default_idx);
+    let twin_pos = if twin_idx > default_idx { twin_idx - 1 } else { twin_idx };
+    let twin = &mut merged[twin_pos];
+    let already_marked = twin
+        .description
+        .as_deref()
+        .is_some_and(|d| d.starts_with("Recommended"));
+    if !already_marked {
+        twin.description = Some(match twin.description.take() {
+            Some(d) => format!("Recommended · {d}"),
+            None => "Recommended".to_string(),
+        });
+    }
+    let twin_row = merged.remove(twin_pos);
+    merged.insert(0, twin_row);
+}
+
 /// Build a `ProviderChatCapabilities` bundle from the SDK's live model
-/// list, merging with hand-maintained per-id metadata. Models the live
-/// roster omits but the CLI still launches are appended afterwards —
-/// see [`append_missing_maintained_families`].
+/// list, merging with hand-maintained per-id metadata. The `default`
+/// alias row is folded into its concrete twin — see
+/// [`dedupe_default_alias`] — and models the live roster omits but the
+/// CLI still launches are appended afterwards — see
+/// [`append_missing_maintained_families`].
 fn build_capabilities_from_sdk(
     sdk_models: Vec<SdkModelInfo>,
 ) -> ProviderChatCapabilities {
@@ -763,7 +816,15 @@ fn build_capabilities_from_sdk(
         .filter(|m| !m.value.is_empty())
         .map(|sdk| merge_sdk_with_maintained(sdk, &maintained))
         .collect();
+    // Order matters: append the missing maintained families FIRST, then
+    // fold the `default` alias. The append exists precisely for the
+    // roster shape where the CLI demoted a family into its `default`
+    // alias (alias present, no concrete row) — deduping first would keep
+    // the promoted alias row and the append would then re-add the same
+    // concrete model, recreating the duplicate pair the dedupe exists to
+    // remove.
     append_missing_maintained_families(&mut merged);
+    dedupe_default_alias(&mut merged);
     ProviderChatCapabilities {
         models: merged,
         effort_granularity: EffortGranularity::PerSession,
@@ -830,6 +891,112 @@ fn alias_description_from_canonical(canonical: &ChatModelInfo) -> Option<String>
         version.to_string()
     };
     Some(format!("{prefix} · {blurb}"))
+}
+
+/// Derive the concrete `"Claude <Family> <Version>"` name an alias row
+/// resolves to from its version-bearing description — i.e. the leading
+/// segment of `"Opus 4.8 with 1M context · Best for everyday, complex
+/// tasks"` → `"Claude Opus 4.8"`. Parsing the description (live SDK
+/// data) rather than only the hardcoded alias table keeps the promoted
+/// label correct the day a newer CLI re-points an alias at a model the
+/// maintained list hasn't been bumped for. Returns `None` unless the
+/// segment is exactly a capitalized family word plus a numeric version,
+/// so free-form descriptions never get mangled into a fake model name.
+fn concrete_name_from_description(description: &str) -> Option<String> {
+    let first = description.split(" · ").next()?.trim();
+    let stripped = first.strip_suffix(" with 1M context").unwrap_or(first);
+    let mut words = stripped.split_whitespace();
+    let family = words.next()?;
+    let version = words.next()?;
+    if words.next().is_some() {
+        return None;
+    }
+    let family_ok = family
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_uppercase())
+        && family.chars().all(|c| c.is_ascii_alphabetic());
+    let version_ok = version.chars().any(|c| c.is_ascii_digit())
+        && version.chars().all(|c| c.is_ascii_digit() || c == '.');
+    (family_ok && version_ok).then(|| format!("Claude {family} {version}"))
+}
+
+/// Promote an alias row's picker presentation from the CLI's bare
+/// nickname to the concrete model name it resolves to. The CLI reports
+/// alias rows as `"Default (recommended)"` / `"Opus (1M context)"` /
+/// `"Fable"` — cryptic next to the concrete versioned names every other
+/// provider surfaces. After promotion:
+///
+///   default → `"Claude Opus 4.8"` + `"Recommended · <blurb>"`
+///   opus    → `"Claude Opus 4.8 (1M context)"` + `"<blurb>"`
+///   fable   → `"Claude Fable 5"` + `"<blurb>"`
+///
+/// The concrete name comes from the row's version-bearing description
+/// (see [`concrete_name_from_description`]), falling back to the
+/// canonical maintained entry's label. Non-alias rows and alias rows
+/// with no resolvable concrete name pass through untouched. The version
+/// segment promoted into the label is dropped from the description so
+/// the subtitle doesn't repeat it; the `default` alias keeps its
+/// "recommended" signal as a description prefix instead of a label
+/// suffix, while other qualifiers (`(1M context)`) stay on the label so
+/// twin rows resolving to the same concrete model remain telling apart.
+fn promote_alias_row(
+    base_id: &str,
+    label: String,
+    description: Option<String>,
+    maintained: &HashMap<String, ChatModelInfo>,
+) -> (String, Option<String>) {
+    let alias_canonical = canonical_id_for_alias(base_id);
+    // The CLI also reports FULL ids with nickname display names (e.g.
+    // id `claude-fable-5`, displayName "Fable"). A label with no digit
+    // carries no version, so it needs the same promotion; a label that
+    // already names a version ("Claude Opus 4.8") passes through.
+    let label_is_versionless = !label.chars().any(|c| c.is_ascii_digit());
+    if alias_canonical.is_none() && !label_is_versionless {
+        return (label, description);
+    }
+    let from_desc = description
+        .as_deref()
+        .and_then(concrete_name_from_description);
+    let desc_carries_name = from_desc.is_some();
+    let Some(concrete) = from_desc.or_else(|| {
+        alias_canonical
+            .and_then(|cid| maintained.get(cid))
+            .or_else(|| maintained.get(base_id))
+            .map(|c| c.label.clone())
+    }) else {
+        return (label, description);
+    };
+    let qualifier = label.find('(').map(|i| label[i..].trim().to_string());
+    let recommended = base_id.eq_ignore_ascii_case("default")
+        || qualifier
+            .as_deref()
+            .is_some_and(|q| q.eq_ignore_ascii_case("(recommended)"));
+    let promoted_label = match &qualifier {
+        Some(q) if !recommended => format!("{concrete} {q}"),
+        _ => concrete,
+    };
+    let blurb = description
+        .as_deref()
+        .map(|d| {
+            if desc_carries_name {
+                d.split_once(" · ")
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or_default()
+            } else {
+                d.to_string()
+            }
+        })
+        .filter(|s| !s.is_empty());
+    let promoted_description = if recommended {
+        Some(match blurb {
+            Some(b) => format!("Recommended · {b}"),
+            None => "Recommended".to_string(),
+        })
+    } else {
+        blurb
+    };
+    (promoted_label, promoted_description)
 }
 
 /// Merge a single SDK model record with hand-maintained metadata. The
@@ -921,6 +1088,9 @@ fn merge_sdk_with_maintained(
             .and_then(|cid| maintained.get(cid))
             .and_then(alias_description_from_canonical)
     };
+    // Alias rows render as concrete model names (see `promote_alias_row`);
+    // full-id rows keep the SDK label + description untouched.
+    let (label, description) = promote_alias_row(&base_id, label, description, maintained);
 
     ChatModelInfo {
         id: base_id,
@@ -1399,6 +1569,147 @@ mod tests {
     }
 
     #[test]
+    fn concrete_name_parses_only_version_segments() {
+        assert_eq!(
+            concrete_name_from_description("Opus 4.8 with 1M context · Best for everyday, complex tasks")
+                .as_deref(),
+            Some("Claude Opus 4.8"),
+        );
+        assert_eq!(
+            concrete_name_from_description("Haiku 4.5 · Fastest for quick answers").as_deref(),
+            Some("Claude Haiku 4.5"),
+        );
+        assert_eq!(
+            concrete_name_from_description("Fable 5 · Most capable for your hardest tasks")
+                .as_deref(),
+            Some("Claude Fable 5"),
+        );
+        // Free-form descriptions must never be mangled into a model name.
+        assert!(concrete_name_from_description("Best for everyday, complex tasks").is_none());
+        assert!(concrete_name_from_description("Fast responses").is_none());
+        assert!(concrete_name_from_description("").is_none());
+    }
+
+    #[test]
+    fn sdk_merge_promotes_alias_rows_to_concrete_names() {
+        // The deployed CLI reports aliases with nickname display names
+        // and version-bearing descriptions. The picker must render the
+        // concrete model name (parsed from the LIVE description, so a
+        // CLI that re-points an alias at a newer model than the
+        // maintained list knows stays correct), with the alias
+        // qualifier preserved.
+        let efforts = &["low", "medium", "high", "xhigh", "max"];
+        let mut default_row =
+            sdk_model("default", "Default (recommended)", efforts, Some(true), Some(false));
+        default_row.description =
+            "Opus 5 with 1M context · Best for everyday, complex tasks".into();
+        let mut opus_row = sdk_model("opus", "Opus (1M context)", efforts, Some(true), Some(false));
+        opus_row.description = "Opus 5 with 1M context · Best for everyday, complex tasks".into();
+        let mut fable_row = sdk_model("fable", "Fable", efforts, Some(true), None);
+        fable_row.description =
+            "Fable 5 · Most capable for your hardest and longest-running tasks".into();
+
+        let caps = build_capabilities_from_sdk(vec![default_row, opus_row, fable_row]);
+
+        // The `default` alias resolves to the same concrete model as the
+        // `opus` row, so it folds into that twin: no duplicate row, the
+        // twin leads the list (feeds the frontend default) and inherits
+        // the "Recommended" marker.
+        assert!(caps.models.iter().all(|m| m.id != "default"));
+        let opus_m = &caps.models[0];
+        assert_eq!(opus_m.id, "opus");
+        assert_eq!(opus_m.label, "Claude Opus 5 (1M context)");
+        assert_eq!(
+            opus_m.description.as_deref(),
+            Some("Recommended · Best for everyday, complex tasks"),
+        );
+
+        let fable_m = caps.models.iter().find(|m| m.id == "fable").unwrap();
+        assert_eq!(fable_m.label, "Claude Fable 5");
+        assert_eq!(
+            fable_m.description.as_deref(),
+            Some("Most capable for your hardest and longest-running tasks"),
+        );
+    }
+
+    #[test]
+    fn sdk_merge_promotes_full_id_rows_with_nickname_labels() {
+        // The CLI can report a FULL id with a bare nickname displayName
+        // (id `claude-fable-5`, displayName "Fable"). The versionless
+        // label promotes exactly like an alias row.
+        let mut fable = sdk_model(
+            "claude-fable-5",
+            "Fable",
+            &["low", "medium", "high", "xhigh", "max"],
+            Some(true),
+            None,
+        );
+        fable.description =
+            "Fable 5 · Most capable for your hardest and longest-running tasks".into();
+        let caps = build_capabilities_from_sdk(vec![fable]);
+        let m = caps.models.iter().find(|m| m.id == "claude-fable-5").unwrap();
+        assert_eq!(m.label, "Claude Fable 5");
+        assert_eq!(
+            m.description.as_deref(),
+            Some("Most capable for your hardest and longest-running tasks"),
+        );
+    }
+
+    #[test]
+    fn dedupe_keeps_default_row_when_no_twin_exists() {
+        // A roster where the configured default resolves to a model no
+        // other row lists: the promoted `default` row stays so the
+        // launchable selection isn't lost.
+        let mut default_row = sdk_model(
+            "default",
+            "Default (recommended)",
+            &["low", "medium", "high"],
+            Some(true),
+            None,
+        );
+        default_row.description = "Opus 5 with 1M context · Best for everyday, complex tasks".into();
+        let mut haiku = sdk_model("haiku", "Haiku", &["low"], Some(false), None);
+        haiku.description = "Haiku 4.5 · Fastest for quick answers".into();
+        let caps = build_capabilities_from_sdk(vec![default_row, haiku]);
+        let m = caps.models.iter().find(|m| m.id == "default").unwrap();
+        assert_eq!(m.label, "Claude Opus 5");
+        assert_eq!(
+            m.description.as_deref(),
+            Some("Recommended · Best for everyday, complex tasks"),
+        );
+    }
+
+    #[test]
+    fn sdk_merge_promotes_description_less_alias_from_canonical() {
+        // An alias row the SDK gave no description: the tier-3 backfill
+        // synthesizes a version-bearing description from the canonical
+        // maintained entry, and the promotion then lifts that same
+        // version into the label.
+        let sonnet = sdk_model("sonnet", "Sonnet", &["low", "medium", "high"], Some(true), None);
+        let caps = build_capabilities_from_sdk(vec![sonnet]);
+        let m = caps.models.iter().find(|m| m.id == "sonnet").unwrap();
+        assert_eq!(m.label, "Claude Sonnet 4.6");
+        // Blurb only — the version lives in the label now.
+        assert_eq!(m.description.as_deref(), Some("Fast and capable"));
+    }
+
+    #[test]
+    fn sdk_merge_leaves_full_id_rows_unpromoted() {
+        let mut row = sdk_model(
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            &["low", "medium", "high", "xhigh", "max"],
+            Some(true),
+            Some(true),
+        );
+        row.description = "Best for everyday, complex tasks".into();
+        let caps = build_capabilities_from_sdk(vec![row]);
+        let m = caps.models.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
+        assert_eq!(m.label, "Claude Opus 4.8");
+        assert_eq!(m.description.as_deref(), Some("Best for everyday, complex tasks"));
+    }
+
+    #[test]
     fn sdk_merge_uses_sdk_effort_levels_for_a_known_id() {
         // SDK reports an effort vocabulary with levels the maintained
         // Opus 4.7 entry doesn't list (`ultracode`, `newlevel`) — the
@@ -1557,17 +1868,22 @@ mod tests {
             sdk_model("haiku", "Haiku", &[], None, None),
         ];
         let caps = build_capabilities_from_sdk(live);
-        let default = caps.models.iter().find(|m| m.id == "default").unwrap();
-        assert_eq!(default.default_effort.as_deref(), Some("high"));
+        // The `default` alias (no concrete Opus row live) folds into the
+        // appended maintained Opus entry, which leads the list with the
+        // Recommended marker — alias-effort resolution is covered by the
+        // surviving alias rows below.
+        assert!(caps.models.iter().all(|m| m.id != "default"));
+        assert_eq!(caps.models[0].id, "claude-opus-4-8");
         assert!(
-            default.context_window_options.is_empty(),
-            "`default` must not offer a context-window picker"
+            caps.models[0]
+                .description
+                .as_deref()
+                .is_some_and(|d| d.starts_with("Recommended")),
         );
-        // Fast mode is clamped off for Claude even though the SDK
-        // reported `supportsFastMode: Some(true)` for this row — the
-        // advertisement is not an entitlement check (silent standard
-        // fallback without Extra Usage), so the picker never shows it.
-        assert!(!default.supports_fast_mode);
+        // Fast mode stays clamped off for Claude — the SDK advertised
+        // `supportsFastMode: Some(true)` on the alias row, but neither
+        // the merge path nor the maintained twin surfaces it.
+        assert!(!caps.models[0].supports_fast_mode);
         let sonnet = caps.models.iter().find(|m| m.id == "sonnet").unwrap();
         assert_eq!(sonnet.default_effort.as_deref(), Some("high"));
         let haiku = caps.models.iter().find(|m| m.id == "haiku").unwrap();
@@ -1607,24 +1923,42 @@ mod tests {
         ];
         let caps = build_capabilities_from_sdk(live);
         let ids: Vec<&str> = caps.models.iter().map(|m| m.id.as_str()).collect();
-        // Live entries first, in the CLI's order. The pinned Fable id is
-        // normalized to its base id (`claude-fable-5`).
-        assert_eq!(&ids[..4], &["default", "claude-fable-5", "sonnet", "haiku"]);
-        // Every maintained Opus version appended afterwards.
+        // Regression for the append/dedupe ordering: the append runs
+        // FIRST, so the `default` alias (which resolves to Opus 4.8 via
+        // its canonical backfill) finds the appended maintained entry as
+        // its concrete twin and folds into it — one Opus 4.8 row, led by
+        // the Recommended marker, instead of a promoted alias row AND an
+        // appended duplicate with the same concrete name.
+        assert!(!ids.contains(&"default"));
+        assert_eq!(ids[0], "claude-opus-4-8");
+        // Remaining live entries keep the CLI's order. The pinned Fable
+        // id is normalized to its base id (`claude-fable-5`).
+        assert_eq!(&ids[1..4], &["claude-fable-5", "sonnet", "haiku"]);
+        // Every maintained Opus version stays selectable.
         for opus in ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-opus-4-5"] {
             assert!(ids.contains(&opus), "{opus} should be appended");
         }
+        assert_eq!(
+            ids.iter().filter(|id| **id == "claude-opus-4-8").count(),
+            1,
+            "the alias fold must not leave a duplicate Opus 4.8 row"
+        );
         // Families already live must NOT be duplicated from the
         // maintained list (the maintained `claude-sonnet-4-6` /
         // `claude-haiku-4-5` ids stay out because the alias rows cover
         // those families).
         assert!(!ids.contains(&"claude-sonnet-4-6"));
         assert!(!ids.contains(&"claude-haiku-4-5"));
-        // Appended Opus keeps its precise maintained metadata.
+        // The folded twin keeps its precise maintained metadata and
+        // inherits the Recommended marker from the alias it absorbed.
         let opus48 = caps.models.iter().find(|m| m.id == "claude-opus-4-8").unwrap();
         assert_eq!(opus48.label, "Claude Opus 4.8");
         assert_eq!(opus48.default_effort.as_deref(), Some("high"));
         assert!(opus48.context_window_options.iter().any(|o| o.value == "1m"));
+        assert_eq!(
+            opus48.description.as_deref(),
+            Some("Recommended · Best for everyday, complex tasks"),
+        );
     }
 
     #[test]
@@ -1706,34 +2040,35 @@ mod tests {
             sdk_model("haiku", "Haiku", &[], None, None),
         ];
         let caps = build_capabilities_from_sdk(live);
-        let desc = |id: &str| {
+        let row = |id: &str| {
             caps.models
                 .iter()
                 .find(|m| m.id == id)
                 .unwrap_or_else(|| panic!("{id} row must exist"))
-                .description
-                .clone()
-                .unwrap_or_else(|| panic!("{id} row must carry a description"))
         };
-        // `default` and `opus` both resolve to Opus 4.8, which defaults to
-        // the 1M context window → the "with 1M context" qualifier.
+        // The backfilled version now lives in the promoted LABEL; the
+        // description keeps only the blurb. `default` resolves to the
+        // same concrete model as `opus`, so it folds into that twin,
+        // which leads the list with the Recommended marker.
+        assert!(caps.models.iter().all(|m| m.id != "default"));
+        assert_eq!(caps.models[0].id, "opus");
+        assert_eq!(caps.models[0].label, "Claude Opus 4.8");
         assert_eq!(
-            desc("default"),
-            "Opus 4.8 with 1M context · Best for everyday, complex tasks"
+            caps.models[0].description.as_deref(),
+            Some("Recommended · Best for everyday, complex tasks"),
         );
+        assert_eq!(row("fable").label, "Claude Fable 5");
         assert_eq!(
-            desc("opus"),
-            "Opus 4.8 with 1M context · Best for everyday, complex tasks"
+            row("fable").description.as_deref(),
+            Some("Most capable for the hardest, longest-running tasks"),
         );
-        // Fable/Sonnet also default to the 1M window in the maintained
-        // table, so they carry the qualifier too.
+        assert_eq!(row("sonnet").label, "Claude Sonnet 4.6");
+        assert_eq!(row("sonnet").description.as_deref(), Some("Fast and capable"));
+        assert_eq!(row("haiku").label, "Claude Haiku 4.5");
         assert_eq!(
-            desc("fable"),
-            "Fable 5 with 1M context · Most capable for the hardest, longest-running tasks"
+            row("haiku").description.as_deref(),
+            Some("Fastest and cheapest"),
         );
-        assert_eq!(desc("sonnet"), "Sonnet 4.6 with 1M context · Fast and capable");
-        // Haiku has no context-window options → no qualifier, blurb only.
-        assert_eq!(desc("haiku"), "Haiku 4.5 · Fastest and cheapest");
     }
 
     #[test]
@@ -1771,7 +2106,10 @@ mod tests {
     fn sdk_description_wins_verbatim_over_backfill() {
         // When the deployed CLI supplies its own description (the common
         // case — it packs the resolved version + blurb in there), that
-        // string wins verbatim over any maintained / alias backfill.
+        // string wins over any maintained / alias backfill as the SOURCE:
+        // the promoted label carries the CLI's version ("Opus 4.9" — NOT
+        // the canonical map's stale 4.8), and the description keeps the
+        // CLI's blurb.
         let sdk = SdkModelInfo {
             value: "opus".into(),
             display_name: "Opus".into(),
@@ -1782,9 +2120,10 @@ mod tests {
         };
         let caps = build_capabilities_from_sdk(vec![sdk]);
         let opus = caps.models.iter().find(|m| m.id == "opus").unwrap();
+        assert_eq!(opus.label, "Claude Opus 4.9");
         assert_eq!(
             opus.description.as_deref(),
-            Some("Opus 4.9 with 1M context · Freshest blurb from the CLI")
+            Some("Freshest blurb from the CLI")
         );
     }
 

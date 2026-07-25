@@ -94,7 +94,18 @@ vi.mock("@/stores/provider-capabilities-store", () => ({
     state: typeof capsState,
     provider: "claude" | "codex",
   ) => state[provider],
-  selectModel: () => null,
+  // Mirror the real selector: exact id match, with the persisted
+  // `"default"` alias falling back to the roster's first row.
+  selectModel: (
+    caps: { models: Array<{ id: string }> } | null,
+    modelId: string | null,
+  ) => {
+    if (!caps || !modelId) return null;
+    return (
+      caps.models.find((m) => m.id === modelId) ??
+      (modelId === "default" ? caps.models[0] ?? null : null)
+    );
+  },
 }));
 
 afterEach(() => {
