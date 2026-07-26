@@ -5151,6 +5151,8 @@ mod tests {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            last_active_at: None,
+            last_visited_at: None,
         }
     }
 

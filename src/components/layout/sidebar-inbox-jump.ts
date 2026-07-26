@@ -1,11 +1,15 @@
 /**
  * Module-level holder for the sidebar inbox's jump targets: the ordered list
  * of visible active-card workspace ids, in the exact order the user sees them
- * (filter-scoped, non-settled). SidebarInbox writes this from an effect; the
+ * (filter-scoped, unparked). SidebarInbox writes this from an effect; the
  * window-level keyboard handler reads it so a "jump to workspace N" shortcut
  * can resolve the Nth card without the handler having to reach into React.
  *
- * Settled rows are never jump targets — only the `activeCards` list feeds here.
+ * Parked rows — settled or snoozed — are never jump targets; only the
+ * `activeCards` list feeds here. That list is newest-workspace-first and its
+ * order is static (it changes only when a card is opened, settled, or
+ * snoozed), which is what lets these shortcuts become muscle memory: slot 1 is
+ * the newest card and stays the newest card while agents start and stop.
  */
 
 /** The default modifier the jump shortcuts bind to (Ctrl+1..9 are the terminal

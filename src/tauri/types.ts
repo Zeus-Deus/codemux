@@ -845,6 +845,20 @@ export interface WorkspaceSnapshot {
    *  host badge and offers only "Close (detach)" — never delete/push.
    *  Defaults to false on older snapshots. */
   attach_only?: boolean;
+  /** Ms epoch of the last time an agent genuinely did something in this
+   *  workspace — stamped by the backend whenever one of its panes goes
+   *  non-idle (working / permission / review), and at create time. This
+   *  is the timestamp the idle sweep must measure against: it is
+   *  persisted, so it survives reinstalls instead of restarting the
+   *  clock. `null` means "unknown" (nothing on disk could date the
+   *  checkout) and must never be treated as "idle since forever".
+   *  Optional in TS because older snapshots persisted without it. */
+  last_active_at?: number | null;
+  /** Ms epoch of the last time the user had this workspace focused.
+   *  Deliberately separate from `last_active_at` — a glance is not agent
+   *  work, so it must not keep dead work out of the idle sweep.
+   *  Optional for the same backward-compat reason. */
+  last_visited_at?: number | null;
 }
 
 /** A workspace that was archived out of the sidebar. The entry records

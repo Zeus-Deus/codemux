@@ -414,7 +414,15 @@ function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
       data-slot="sidebar-content"
       data-sidebar="content"
       className={cn(
-        "no-scrollbar flex min-h-0 flex-1 flex-col gap-0 overflow-auto group-data-[collapsible=icon]:overflow-hidden",
+        // `scrollbar-gutter: stable` reserves the scrollbar's track whether or
+        // not it is currently showing. Without it, parking or un-parking a
+        // workspace across the scroll threshold makes the whole list jog
+        // sideways as the scrollbar appears and disappears. Platforms with
+        // overlay scrollbars never showed the jog; ones with classic scrollbars
+        // do, which is why it is easy to miss in development.
+        // Only applies while this element actually scrolls, so the collapsed
+        // icon rail (overflow-hidden below) keeps its full 52px.
+        "no-scrollbar flex min-h-0 flex-1 flex-col gap-0 overflow-auto [scrollbar-gutter:stable] group-data-[collapsible=icon]:overflow-hidden",
         className
       )}
       {...props}

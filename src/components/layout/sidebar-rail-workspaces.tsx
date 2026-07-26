@@ -103,10 +103,11 @@ function RailWorkspaceItem({
 
 /**
  * Collapsed (icon-rail) rendering of the workspace inbox: a centered vertical
- * strip with one avatar button per ACTIVE (unsettled) workspace, in the same
- * order as the expanded inbox. The repo filter never applies here — the rail
- * always shows every active workspace — and each button's corner dot mirrors
- * that workspace's own agent status so activity stays visible while collapsed.
+ * strip with one avatar button per ACTIVE workspace — neither settled nor
+ * snoozed — in the same order as the expanded inbox. The repo filter never
+ * applies here (the rail always shows every active workspace), and each
+ * button's corner dot mirrors that workspace's own agent status so activity
+ * stays visible while collapsed.
  */
 export function SidebarRailWorkspaces() {
   const appState = useAppStore((s) => s.appState);
@@ -126,6 +127,7 @@ export function SidebarRailWorkspaces() {
   const load = useSidebarInboxStore((s) => s.load);
   const loaded = useSidebarInboxStore((s) => s.loaded);
   const settled = useSidebarInboxStore((s) => s.settled);
+  const snoozed = useSidebarInboxStore((s) => s.snoozed);
   const prune = useSidebarInboxStore((s) => s.prune);
 
   useEffect(() => {
@@ -155,18 +157,28 @@ export function SidebarRailWorkspaces() {
     return map;
   }, [projectGroups]);
 
-  const settledIds = useMemo(
-    () => new Set(settled.map((e) => e.id)),
-    [settled],
+  // Both parking lifecycles hide a workspace here, exactly as they do in the
+  // expanded inbox. Excluding only `settled` would let a snoozed workspace
+  // keep its rail button — the deferred work the user just pushed out of
+  // sight would still be sitting there, which is the whole gesture undone.
+  const parkedIds = useMemo(
+    () => new Set([...settled.map((e) => e.id), ...snoozed.map((e) => e.id)]),
+    [settled, snoozed],
   );
 
-  const activeWorkspaces = allWorkspaces.filter(
-    (ws) => !settledIds.has(ws.workspace_id),
+  // …with the inbox's one exception: the workspace the user is *in* never
+  // hides, whichever shelf it is parked on. The expanded inbox force-renders
+  // its row; here the button's selection fill is the only "you are here" the
+  // collapsed sidebar has, and dropping it would leave the rail claiming the
+  // user is nowhere.
+  const railWorkspaces = allWorkspaces.filter(
+    (ws) =>
+      !parkedIds.has(ws.workspace_id) || ws.workspace_id === activeWorkspaceId,
   );
 
   return (
     <div className="flex flex-1 min-h-0 flex-col items-center gap-1.5 overflow-y-auto py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
-      {activeWorkspaces.map((ws) => {
+      {railWorkspaces.map((ws) => {
         const repo = repoByWorkspace.get(ws.workspace_id);
         if (!repo) return null;
         return (

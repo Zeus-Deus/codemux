@@ -1791,7 +1791,7 @@ export function SettingsView() {
                 </SettingRow>
                 <SettingRow
                   label="Auto-settle idle work"
-                  description="Sweep a workspace card into the Settled section after this many days without agent activity. Cards whose PR merges or closes settle as soon as the agent is idle. Un-settling a card keeps it active until its agent runs again."
+                  description="Sweep a workspace card into the Settled section after this many days without agent activity. Cards whose PR merges or closes settle once the agent has also been idle for an hour, so follow-up work stays visible while it is warm. Un-settling a card keeps it active until its agent runs again."
                 >
                   <SegmentedControl<AutoSettleDays>
                     ariaLabel="Auto-settle idle work"

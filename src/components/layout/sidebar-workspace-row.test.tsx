@@ -1324,3 +1324,107 @@ describe("Living row — work titles + shipped tally", () => {
     ).toEqual([{ prNumber: 200, issueNumber: 11, title: "First shipped work" }]);
   });
 });
+
+describe("Lifecycle context-menu block (settle / snooze / unread)", () => {
+  it("puts the bring-it-back entries above the deferral ones", async () => {
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ worktree_path: null })}
+        settleAction={{ kind: "unsettle", onAction: () => {} }}
+        snoozeAction={{
+          kind: "wake",
+          offered: false,
+          onSnooze: () => {},
+          onWake: () => {},
+        }}
+        unreadAction={{ onMarkUnread: () => {} }}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    const labels = screen
+      .getAllByRole("menuitem")
+      .map((el) => el.textContent)
+      .slice(0, 3);
+    expect(labels).toEqual([
+      "Un-settle workspace",
+      "Wake now",
+      "Mark unread",
+    ]);
+  });
+
+  it("resolves its own wake times rather than taking them from the caller", async () => {
+    const onSnooze = vi.fn();
+    const mountedAt = Date.now();
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ worktree_path: null })}
+        settleAction={{ kind: "settle", onAction: () => {} }}
+        snoozeAction={{
+          kind: "snooze",
+          offered: true,
+          onSnooze,
+          onWake: () => {},
+        }}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    await userEvent.click(screen.getByText("Snooze until…"));
+    await userEvent.click(await screen.findByText("In 1 hour"));
+
+    // Nothing upstream hands this menu a clock any more: the wake time is an
+    // hour past the moment the menu itself came into existence.
+    expect(onSnooze).toHaveBeenCalledTimes(1);
+    expect(onSnooze.mock.calls[0][0]).toBeGreaterThanOrEqual(
+      mountedAt + 3_600_000,
+    );
+  });
+
+  it("names the concrete wake time beside each relative label", async () => {
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ worktree_path: null })}
+        snoozeAction={{
+          kind: "snooze",
+          offered: true,
+          onSnooze: () => {},
+          onWake: () => {},
+        }}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    await userEvent.click(screen.getByText("Snooze until…"));
+    const nextWeek = await screen.findByText("Next week");
+    // The row the user actually reads: "Next week" plus the Monday it lands on.
+    expect(nextWeek.closest('[role="menuitem"]')?.textContent).toMatch(
+      /Next week.+0?9[:.]00/,
+    );
+  });
+
+  it("renders no Snooze submenu when the caller's guardrail withholds it", async () => {
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ worktree_path: null })}
+        snoozeAction={{
+          kind: "snooze",
+          offered: false,
+          onSnooze: () => {},
+          onWake: () => {},
+        }}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    expect(screen.queryByText("Snooze until…")).not.toBeInTheDocument();
+  });
+});

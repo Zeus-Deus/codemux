@@ -18,7 +18,7 @@ const STATE_TO_ICON: Record<PrStatusState, IconSpec> = {
 
 /** Tinted background + text-color pair for the sidebar PR pill — matches
  *  the icon color at low opacity so the row reads "this PR is merged/open/…"
- *  at a glance. Mirrors Superset's color-coded badge style. */
+ *  at a glance. */
 const STATE_TO_TONE: Record<PrStatusState, string> = {
   merged: "text-accent-violet bg-accent-violet/15",
   open: "text-status-open bg-status-open/15",
