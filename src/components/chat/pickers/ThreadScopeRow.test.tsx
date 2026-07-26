@@ -257,6 +257,157 @@ describe("ThreadScopeRow", () => {
     });
   });
 
+  describe("location control — type-to-filter", () => {
+    /** Three sibling projects, so a query has something to narrow. */
+    function seedProjects() {
+      currentWorkspaces = [
+        makeWs({
+          workspace_id: "ws-bar",
+          cwd: "/projects/bar",
+          project_root: "/projects/bar",
+        }),
+        makeWs({
+          workspace_id: "ws-codemux",
+          cwd: "/projects/codemux",
+          project_root: "/projects/codemux",
+        }),
+        makeWs({
+          workspace_id: "ws-site",
+          cwd: "/projects/codemux-sitev2",
+          project_root: "/projects/codemux-sitev2",
+        }),
+      ];
+    }
+
+    async function openPicker() {
+      const user = userEvent.setup();
+      const rendered = renderRow();
+      await user.click(screen.getByText("foo"));
+      const input = await screen.findByPlaceholderText("Search projects…");
+      return { user, input, ...rendered };
+    }
+
+    it("focuses the search input when the popover opens", async () => {
+      seedProjects();
+      const { input } = await openPicker();
+      await waitFor(() => expect(input).toHaveFocus());
+    });
+
+    it("narrows the list to fuzzy matches and hides the rest", async () => {
+      seedProjects();
+      const { user } = await openPicker();
+      await user.keyboard("codemux");
+      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
+      expect(screen.getByText("codemux")).toBeInTheDocument();
+      expect(screen.getByText("codemux-sitev2")).toBeInTheDocument();
+      expect(screen.queryByText("Home directory (~)")).toBeNull();
+    });
+
+    it("switches to path matching once the query contains a slash", async () => {
+      currentWorkspaces = [
+        makeWs({
+          workspace_id: "ws-a",
+          cwd: "/work/alpha/app",
+          project_root: "/work/alpha/app",
+        }),
+        makeWs({
+          workspace_id: "ws-b",
+          cwd: "/work/beta/app",
+          project_root: "/work/beta/app",
+        }),
+      ];
+      const { user, onChangeTarget } = await openPicker();
+      await user.keyboard("beta/");
+      await user.keyboard("{Enter}");
+      expect(onChangeTarget).toHaveBeenCalledWith({
+        kind: "project",
+        projectPath: "/work/beta/app",
+      });
+    });
+
+    it("does not let long paths defeat name filtering", async () => {
+      currentWorkspaces = [
+        makeWs({
+          workspace_id: "ws-deep",
+          cwd: "/home/user/dev/scratch/bar",
+          project_root: "/home/user/dev/scratch/bar",
+        }),
+        makeWs({
+          workspace_id: "ws-vexis",
+          cwd: "/projects/vexis",
+          project_root: "/projects/vexis",
+        }),
+      ];
+      const { user } = await openPicker();
+      // "ve" is a subsequence of `/home/user/dev/…` — name-only
+      // matching is what keeps that row out.
+      await user.keyboard("ve");
+      await waitFor(() => expect(screen.getByText("vexis")).toBeInTheDocument());
+      expect(screen.queryByText("bar")).toBeNull();
+    });
+
+    it("matches on scattered characters, not just prefixes", async () => {
+      seedProjects();
+      const { user } = await openPicker();
+      await user.keyboard("cdx");
+      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
+      expect(screen.getByText("codemux")).toBeInTheDocument();
+    });
+
+    it("Enter picks the top match without touching the mouse", async () => {
+      seedProjects();
+      const { user, onChangeTarget } = await openPicker();
+      await user.keyboard("codemux");
+      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
+      await user.keyboard("{Enter}");
+      expect(onChangeTarget).toHaveBeenCalledWith({
+        kind: "project",
+        projectPath: "/projects/codemux",
+      });
+    });
+
+    it("arrow keys move the highlight before Enter commits", async () => {
+      seedProjects();
+      const { user, onChangeTarget } = await openPicker();
+      await user.keyboard("codemux");
+      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
+      await user.keyboard("{ArrowDown}{Enter}");
+      expect(onChangeTarget).toHaveBeenCalledWith({
+        kind: "project",
+        projectPath: "/projects/codemux-sitev2",
+      });
+    });
+
+    it("keeps Home reachable by name", async () => {
+      seedProjects();
+      const { user, onChangeTarget } = await openPicker();
+      await user.keyboard("home");
+      await waitFor(() => expect(screen.queryByText("codemux")).toBeNull());
+      await user.keyboard("{Enter}");
+      expect(onChangeTarget).toHaveBeenCalledWith({ kind: "home" });
+    });
+
+    it("shows an empty state but keeps the open-project escape hatch", async () => {
+      seedProjects();
+      const { user } = await openPicker();
+      await user.keyboard("zzzz");
+      await waitFor(() =>
+        expect(screen.getByText(/No projects match/)).toBeInTheDocument(),
+      );
+      expect(screen.getByText("Open another project…")).toBeInTheDocument();
+    });
+
+    it("resets the query so the next open starts from the full list", async () => {
+      seedProjects();
+      const { user } = await openPicker();
+      await user.keyboard("codemux");
+      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
+      await user.keyboard("{Escape}");
+      await user.click(screen.getByText("foo"));
+      expect(await screen.findByText("bar")).toBeInTheDocument();
+    });
+  });
+
   describe("checkout control", () => {
     it("selecting 'New worktree' calls onChangeCheckoutMode('worktree')", async () => {
       const user = userEvent.setup();

@@ -1635,6 +1635,27 @@ discriminated `location` prop so one component serves both surfaces:
   `onSelectHomeWorkspace` — the location popover never creates hidden
   workspaces.
 
+**Location popover is keyboard-first.** The "Run in" popover is a cmdk
+`Command` with `shouldFilter={false}` plus a `CommandInput`
+("Search projects…"), so opening it focuses the search field and the
+whole flow is type → `Enter` with no mouse. Radix's default
+auto-focus is deliberately NOT overridden here (unlike the checkout /
+branch popovers, which use `focusCmdkRootOnOpen`) — the input is the
+first focusable child and forwards arrow/Enter to cmdk itself.
+Filtering + ranking is `fuzzyFilter` from `src/lib/fuzzy.ts` (shared
+scored subsequence matcher, also used by the GitHub issue/PR pickers):
+prefix beats substring beats scattered subsequence, word-boundary and
+camelCase hits score like initials (`hap` → `hermes-agent-personal`),
+shorter candidates win ties. The haystack is the display name; a query
+containing `/` switches it to the full project path, which is how two
+checkouts of the same repo are disambiguated. Matching name AND path
+at once was tried and reverted — a short query is a subsequence of
+nearly every long path, so the list stops narrowing. "Home directory
+(~)" is filtered as a row like any other (it matches `home` and `~`),
+while "Open another project…" sits outside `CommandList` and is never
+filtered — it has to stay reachable exactly when nothing matched. The
+query resets on close so the next open starts from the full list.
+
 **Pane-surface state + branch display.** `AgentChatPane` keeps
 `checkoutMode`/`worktreeName`/`baseBranch` as pane-local `useState`
 (per-pane lifetime; there is no draft to persist into), and seeds
