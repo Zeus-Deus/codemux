@@ -321,6 +321,46 @@ describe("TitleBarTabs", () => {
     expect(scroller.scrollLeft).toBe(120);
   });
 
+  it("scales a line-mode wheel delta and consumes the gesture", () => {
+    mocks.listSessions.mockResolvedValue([]);
+    render(<TitleBarTabs workspace={makeWorkspace(chatPane("thread-1"))} />);
+    const scroller = screen.getByTestId("titlebar-tabs-scroll");
+    Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+    Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+    Object.defineProperty(scroller, "scrollLeft", { value: 0, writable: true, configurable: true });
+
+    // A notched mouse reports deltas in LINES, not pixels — applied raw, one
+    // notch would move the bar 3px. The event is also consumed so the
+    // gesture doesn't scroll an ancestor at the same time.
+    const lineWheel = new WheelEvent("wheel", {
+      deltaY: 3,
+      deltaMode: 1 /* DOM_DELTA_LINE */,
+      bubbles: true,
+      cancelable: true,
+    });
+    scroller.dispatchEvent(lineWheel);
+    expect(scroller.scrollLeft).toBe(48);
+    expect(lineWheel.defaultPrevented).toBe(true);
+  });
+
+  it("leaves the wheel gesture to the ancestor once the strip is at its end", () => {
+    mocks.listSessions.mockResolvedValue([]);
+    render(<TitleBarTabs workspace={makeWorkspace(chatPane("thread-1"))} />);
+    const scroller = screen.getByTestId("titlebar-tabs-scroll");
+    Object.defineProperty(scroller, "scrollWidth", { value: 800, configurable: true });
+    Object.defineProperty(scroller, "clientWidth", { value: 400, configurable: true });
+    Object.defineProperty(scroller, "scrollLeft", { value: 400, writable: true, configurable: true });
+
+    const wheel = new WheelEvent("wheel", {
+      deltaY: 120,
+      bubbles: true,
+      cancelable: true,
+    });
+    scroller.dispatchEvent(wheel);
+    expect(scroller.scrollLeft).toBe(400);
+    expect(wheel.defaultPrevented).toBe(false);
+  });
+
   it("activates an inactive tab on click", () => {
     mocks.listSessions.mockResolvedValue([]);
     const ws = makeWorkspace(chatPane("thread-1"), {

@@ -150,7 +150,15 @@ export function LaunchReasoningPicker({
         onOpenAutoFocus={focusCmdkRootOnOpen}
       >
         <Command shouldFilter={false}>
-          <CommandList className="max-h-[340px]">
+          {/* This popover is portaled outside the enclosing modal Dialog, so
+              its wheel events land outside that dialog's scroll-lock
+              (`react-remove-scroll`) and get swallowed — freezing the list.
+              Stopping propagation keeps them from reaching the lock. Same
+              fix `launch-model-picker.tsx` uses for its sibling list. */}
+          <CommandList
+            className="max-h-[340px]"
+            onWheel={(e) => e.stopPropagation()}
+          >
             {hasEffort ? (
               <CommandGroup heading="Reasoning">
                 {reasoningOptions.map((opt) =>

@@ -104,7 +104,14 @@ export function WorkingIndicator({
           aria-label={label}
         >
           <span
-            className={cn("cm-sweep absolute top-0 h-1 w-[40%] rounded-full", bg)}
+            className={cn(
+              // 40% wide, so the `cm-sweep` travel (expressed in the
+              // segment's own width) is retuned from the 38% defaults:
+              // -38% of the track = -95% of the segment, and 100% of the
+              // track = 250% of it.
+              "cm-sweep absolute top-0 left-0 h-1 w-[40%] rounded-full [--cm-sweep-from:-95%] [--cm-sweep-to:250%]",
+              bg,
+            )}
           />
         </span>
       );

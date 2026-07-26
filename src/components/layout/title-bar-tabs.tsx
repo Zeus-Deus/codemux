@@ -27,6 +27,7 @@ import { useAgentChatCheckpointRestore } from "@/hooks/use-agent-chat-checkpoint
 import { useAgentChatSessionActions } from "@/hooks/use-agent-chat-session-actions";
 import { getHighestPriorityStatus } from "@/lib/pane-status";
 import { cn } from "@/lib/utils";
+import { useHorizontalWheelScroll } from "@/lib/wheel";
 import { useAppStore } from "@/stores/app-store";
 import { activateTab, closeTab, reorderTabs } from "@/tauri/commands";
 import type {
@@ -311,27 +312,31 @@ export function TitleBarTabs({ workspace }: TitleBarTabsProps) {
     if (highest) tabStatusMap.set(tab.tab_id, highest);
   }
 
-  // Translate a vertical mouse-wheel delta into horizontal scrolling, same
-  // fix as the old PresetBar: `overflow-x: auto` only responds to native
-  // horizontal wheel/trackpad input on its own, not a plain vertical wheel
-  // (verified on the WebKit webview — a vertical wheel over the bar moved
-  // `scrollLeft` by 0). Lets tabs scroll with a normal mouse wheel once
-  // they overflow instead of only reacting to trackpad panning.
-  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    const el = e.currentTarget;
-    if (el.scrollWidth <= el.clientWidth || e.deltaY === 0) return;
-    el.scrollLeft += e.deltaY;
-  };
-
   const { containerRef, dragTabId, dropIndicatorLeft, getPillProps } =
     useTabReorder(workspace);
 
+  // Let tabs scroll with a normal vertical mouse wheel once they overflow,
+  // same fix as the preset bar: `overflow-x: auto` only responds to native
+  // horizontal wheel/trackpad input on its own (verified on the WebKit
+  // webview — a vertical wheel over the bar moved `scrollLeft` by 0).
+  // Attached natively so the gesture can be consumed rather than also
+  // scrolling an ancestor. See `@/lib/wheel`.
+  const attachWheelScroll = useHorizontalWheelScroll<HTMLDivElement>();
+  // The scroller is also the reorder hook's measurement container, so both
+  // consumers are fed from one ref callback.
+  const setScrollerNode = useCallback(
+    (node: HTMLDivElement | null) => {
+      containerRef.current = node;
+      attachWheelScroll(node);
+    },
+    [attachWheelScroll, containerRef],
+  );
+
   return (
     <div
-      ref={containerRef}
+      ref={setScrollerNode}
       className="relative flex min-w-0 items-center gap-1 overflow-x-auto"
       style={{ scrollbarWidth: "none" }}
-      onWheel={handleWheel}
       data-testid="titlebar-tabs-scroll"
     >
       {/* Drop indicator — vertical mirror of the sidebar's leading-dot +

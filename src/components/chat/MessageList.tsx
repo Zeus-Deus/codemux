@@ -5,6 +5,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useSyncExternalStore,
   type CSSProperties,
 } from "react";
 
@@ -43,7 +44,10 @@ import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
 import { ScrollAnchoringShim } from "./scroll-anchoring-shim";
-import { transcriptFadeEnabled } from "./transcript-fade";
+import {
+  subscribeTranscriptFade,
+  transcriptFadeEnabled,
+} from "./transcript-fade";
 import {
   buildTranscriptSlots,
   reuseTranscriptSlots,
@@ -192,6 +196,17 @@ export function MessageList({
     workspaceType !== "open_flow" &&
     !!backgroundBrowserSession;
 
+  // Viewport edge fade. Read through an external store rather than called
+  // inline: the decision depends on the renderer mode, which the backend
+  // reports asynchronously at boot (see use-renderer-mode.ts), so a transcript
+  // mounted before that lands has to pick the answer up when it arrives. The
+  // getter is cached, so this settles to a stable value immediately.
+  const fadeEnabled = useSyncExternalStore(
+    subscribeTranscriptFade,
+    transcriptFadeEnabled,
+    transcriptFadeEnabled,
+  );
+
   // Sort by seq so order is a property of the data, not of React
   // reconciliation or store-update timing (stable id tiebreak).
   const ordered = useMemo(() => {
@@ -268,7 +283,7 @@ export function MessageList({
             the shared scroller root like MessageTrail. */}
         <ScrollAnchoringShim />
         <MessageScrollerViewport
-          style={transcriptFadeEnabled() ? WS_FADE_STYLE : undefined}
+          style={fadeEnabled ? WS_FADE_STYLE : undefined}
         >
           <MessageScrollerContent
             aria-busy={showThinking || undefined}
@@ -389,13 +404,12 @@ function ScrollToBottomOnSend({ signal }: { signal?: number }) {
  *  background. The installed shadcn build ships no `scroll-fade` utility,
  *  so this is applied inline.
  *
- *  Gated off on Linux WebKitGTK (issue #129, see `transcript-fade.ts`): the
- *  app forces that engine into non-composited (CPU) mode via the
- *  `WEBKIT_DISABLE_COMPOSITING_MODE` / `WEBKIT_DISABLE_DMABUF_RENDERER` env
- *  vars in `src-tauri/src/lib.rs`, where this mask forces a full-viewport CPU
- *  re-rasterization on every scroll frame. The design intent is kept on every
- *  composited platform (macOS / Windows / dev-mock Chromium — byte-identical),
- *  and the `codemux:transcript-fade` localStorage override re-enables it. */
+ *  On by default wherever the webview is composited — including Linux
+ *  WebKitGTK, which runs accelerated again (issue #129, see
+ *  `transcript-fade.ts`). It switches itself off when the backend reports the
+ *  compatibility (CPU) renderer, where the mask forces a full-viewport
+ *  re-rasterization on every scroll frame, and the `codemux:transcript-fade`
+ *  localStorage override still forces it either way. */
 const WS_FADE_STYLE: CSSProperties = {
   maskImage:
     "linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 20px), transparent 100%)",

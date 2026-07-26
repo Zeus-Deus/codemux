@@ -213,7 +213,9 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
         className="relative flex h-11 cursor-pointer items-center gap-2.5 overflow-hidden rounded-xl border border-status-working/30 bg-status-working/10 py-0 pl-3.5 pr-1.5 hover:bg-status-working/[0.15]"
       >
         <div className="absolute inset-x-0 top-0 h-0.5 overflow-hidden bg-status-working/15">
-          <div className="cm-sweep absolute top-0 h-0.5 w-[38%] rounded-full bg-status-working" />
+          {/* 38% wide — matches the `cm-sweep` keyframe defaults, so no
+              travel overrides are needed here. */}
+          <div className="cm-sweep absolute top-0 left-0 h-0.5 w-[38%] rounded-full bg-status-working" />
         </div>
         <span className="flex h-5 w-5 shrink-0 items-center justify-center">
           <LoaderCircle

@@ -21,6 +21,11 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // Spacing density — "comfortable" (default) or "compact". Scales card
   // padding, grid gaps, and group rhythm via the root `data-density` attr.
   "appearance.density": "comfortable",
+  // Animated (kinetic) mouse-wheel scrolling in the webview. Machine-local
+  // because it only has an effect on the Linux WebKitGTK webview, where the
+  // scroll animation lags behind high-resolution wheels. Off by default, which
+  // matches the native default — see `set_smooth_scrolling` in src-tauri.
+  "appearance.smooth_scrolling": "false",
   // Whether the sidebar inbox cards show the ↑ahead and +/− diff numbers on
   // their mono meta line. The branch name always shows. See sidebar-inbox.tsx.
   "sidebar.show_git_stats": "true",
@@ -149,6 +154,11 @@ export const selectPalette = (s: SettingsStore): AppearancePalette =>
 export const selectDensity = (s: SettingsStore): AppearanceDensity =>
   (s.settings["appearance.density"] ??
     SETTINGS_DEFAULTS["appearance.density"]!) as AppearanceDensity;
+
+/** Animated wheel scrolling. Defaults to off (the native default). */
+export const selectSmoothScrolling = (s: SettingsStore): boolean =>
+  (s.settings["appearance.smooth_scrolling"] ??
+    SETTINGS_DEFAULTS["appearance.smooth_scrolling"]!) === "true";
 
 export const selectSidebarShowGitStats = (s: SettingsStore): boolean =>
   (s.settings["sidebar.show_git_stats"] ??

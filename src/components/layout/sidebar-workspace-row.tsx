@@ -1227,7 +1227,13 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       // + shadow, mirroring the archive button) so it reads as
                       // a distinct pill sitting cleanly over the branch name
                       // it now overlaps, instead of colliding glyph-on-glyph.
-                      "transition-all group-hover/row:-translate-x-8 group-hover/row:bg-muted group-hover/row:shadow-sm",
+                      // Only the three properties the hover state actually
+                      // changes are transitioned (duration/easing stay the
+                      // defaults `transition-all` used). `transition-all`
+                      // would also watch layout properties, so every row in
+                      // the sidebar scroller pays for hover work it never
+                      // does.
+                      "transition-[transform,background-color,box-shadow] group-hover/row:-translate-x-8 group-hover/row:bg-muted group-hover/row:shadow-sm",
                     )}>
                       {workspace.notifications_muted && (
                         <Tooltip>

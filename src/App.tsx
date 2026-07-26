@@ -9,6 +9,8 @@ import { useTerminalCacheGc } from "@/hooks/use-terminal-cache-gc";
 import { useTerminalThemeSync } from "@/hooks/use-terminal-theme-sync";
 import { useAutomationFireToast } from "@/hooks/use-automation-fire-toast";
 import { useWebNotifications } from "@/hooks/use-web-notifications";
+import { useSmoothScrollingInit } from "@/hooks/use-smooth-scrolling";
+import { useRendererModeInit } from "@/hooks/use-renderer-mode";
 import { AppShell } from "@/components/layout/app-shell";
 import { RemotePathPicker } from "@/components/remote/remote-path-picker";
 import { RemoteConnectionBanner } from "@/components/remote/remote-connection-indicator";
@@ -74,6 +76,13 @@ function App() {
   useTerminalCacheGc();
   useTerminalThemeSync();
   useAutomationFireToast();
+  // Re-apply a persisted "smooth scrolling: on" to the fresh webview once the
+  // machine-local settings have loaded. Off is the native default — no-op.
+  useSmoothScrollingInit();
+  // Ask the backend which renderer it ended up on, so composited-only UI
+  // effects (the transcript edge-fade) switch themselves off when the webview
+  // is running CPU-rendered.
+  useRendererModeInit();
   // Web remote client only: bridge backend `notification` events into the
   // browser (Web Notifications API with a toast fallback). No-op on desktop.
   useWebNotifications();
