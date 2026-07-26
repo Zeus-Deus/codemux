@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import {
   ChevronsUpDown,
   CircleDot,
@@ -100,6 +101,45 @@ function estimateTokens(att: Attachment): number {
   return 0;
 }
 
+/** Object URL for a staged image's in-memory bytes, so an image chip can
+ *  show the actual picture instead of a generic icon — two pasted
+ *  screenshots are otherwise indistinguishable in the strip.
+ *
+ *  The bytes already live on the attachment (`resolvedImage`, kept in
+ *  memory for the optimistic user bubble), so this costs no IPC. Returns
+ *  null when the bytes haven't resolved yet, the attachment isn't an
+ *  image, or the environment has no object-URL support (jsdom under
+ *  vitest) — callers fall back to the icon. The URL is revoked on
+ *  unmount / bytes change so removing a chip doesn't leak it. */
+function useImagePreviewUrl(attachment: Attachment): string | null {
+  const image =
+    attachment.kind === "image" ? attachment.resolvedImage : undefined;
+  const [url, setUrl] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!image || typeof URL.createObjectURL !== "function") {
+      setUrl(null);
+      return;
+    }
+    let objectUrl: string;
+    try {
+      objectUrl = URL.createObjectURL(
+        new Blob([image.bytes], { type: image.mime }),
+      );
+    } catch {
+      setUrl(null);
+      return;
+    }
+    setUrl(objectUrl);
+    return () => {
+      URL.revokeObjectURL(objectUrl);
+      setUrl(null);
+    };
+  }, [image]);
+
+  return url;
+}
+
 interface AttachmentChipProps {
   attachment: Attachment;
   onRemove: (id: string) => void;
@@ -144,6 +184,14 @@ export function AttachmentChip({
     ? "Show filenames only"
     : "Show full diff";
 
+  // Image chips lead with a live thumbnail of the pasted/picked image.
+  // `previewFailed` covers a decode error on an otherwise-valid blob so a
+  // bad image degrades to the icon rather than a broken-image glyph.
+  const previewUrl = useImagePreviewUrl(attachment);
+  const [previewFailed, setPreviewFailed] = useState(false);
+  const showPreview =
+    previewUrl !== null && !previewFailed && !metadata.isLoading;
+
   const chip = (
     <div
       className={cn(
@@ -151,7 +199,14 @@ export function AttachmentChip({
         // each staged ref the card look the design applies to the
         // green issue chip; the per-kind tint below sets both fill and
         // border colour.
-        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs",
+        "inline-flex items-center border text-xs",
+        // With a thumbnail the chip drops the full pill radius and insets
+        // the preview by 3px — a rounded rect reads as "this is a
+        // picture", and a 22px-tall thumbnail inside a pill would poke
+        // through the corner arc.
+        showPreview
+          ? "gap-2 rounded-md py-[3px] pl-[3px] pr-2"
+          : "gap-1.5 rounded-full px-2.5 py-1",
         classNameForAttachment(attachment),
       )}
       role="status"
@@ -159,12 +214,22 @@ export function AttachmentChip({
       data-attachment-kind={attachment.kind}
       data-truncated={isTruncatedFile || undefined}
       data-expanded={expandActive || undefined}
+      data-preview={showPreview || undefined}
     >
       {metadata.isLoading ? (
         <Loader2
           className="h-3 w-3 animate-spin"
           aria-hidden
           data-testid="attachment-chip-spinner"
+        />
+      ) : showPreview ? (
+        <img
+          src={previewUrl}
+          alt=""
+          aria-hidden
+          data-testid="attachment-chip-thumbnail"
+          className="h-[22px] w-[30px] shrink-0 rounded-[3px] border border-foreground/10 object-cover"
+          onError={() => setPreviewFailed(true)}
         />
       ) : (
         <Icon className="h-3 w-3" aria-hidden />
@@ -235,6 +300,17 @@ export function AttachmentChip({
           data-testid="attachment-chip-tooltip"
           className="flex-col items-start gap-0.5 py-2"
         >
+          {/* The 30px chip thumbnail only carries colour/shape; hover
+              gives a preview big enough to actually read. */}
+          {showPreview && (
+            <img
+              src={previewUrl}
+              alt=""
+              aria-hidden
+              data-testid="attachment-chip-tooltip-preview"
+              className="mb-1 max-h-[180px] max-w-[260px] rounded border border-foreground/10 object-contain"
+            />
+          )}
           <div className="font-mono text-[11px] truncate max-w-[260px]">
             {metadata.label}
           </div>
