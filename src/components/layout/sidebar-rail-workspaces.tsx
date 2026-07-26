@@ -1,10 +1,6 @@
 import { startTransition, useEffect, useMemo } from "react";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { WorkspaceHoverCard } from "./workspace-hover-card";
 import {
   useAppStore,
   useHomeDir,
@@ -61,9 +57,11 @@ function RailWorkspaceItem({
     review: "bg-status-open",
   };
 
+  // Collapsed to a 28px avatar, the rail shows nothing but a status dot — so
+  // the same hover card the expanded inbox uses is the only way to tell two
+  // workspaces of one project apart without expanding the sidebar.
   return (
-    <Tooltip delayDuration={300}>
-      <TooltipTrigger asChild>
+    <WorkspaceHoverCard workspace={workspace} repo={repo} status={status}>
         <button
           type="button"
           data-rail-ws={workspace.workspace_id}
@@ -93,11 +91,7 @@ function RailWorkspaceItem({
             />
           )}
         </button>
-      </TooltipTrigger>
-      <TooltipContent side="right" className="text-xs">
-        {workspace.title}
-      </TooltipContent>
-    </Tooltip>
+    </WorkspaceHoverCard>
   );
 }
 

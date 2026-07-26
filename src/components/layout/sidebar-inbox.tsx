@@ -51,6 +51,7 @@ import {
   formatTimeUntil,
   type SnoozePreset,
 } from "./sidebar-snooze";
+import { WorkspaceHoverCard } from "./workspace-hover-card";
 import { activateWorkspace } from "@/tauri/commands";
 import {
   normalizePrState,
@@ -456,6 +457,11 @@ function SettledRow({
         onMarkUnread: () => onMarkUnread(workspace.workspace_id),
       }}
     >
+    {/* Settled rows show only a title, so the hover card carries even more
+        weight here than on an active card. Nested one level in so it never
+        shares a node with the ContextMenuTrigger above. */}
+    <div>
+    <WorkspaceHoverCard workspace={workspace} repo={repo} status={null}>
     <div
       role="button"
       tabIndex={0}
@@ -527,6 +533,8 @@ function SettledRow({
         <Undo2 className="h-2.5 w-2.5" />
         Un-settle
       </button>
+    </div>
+    </WorkspaceHoverCard>
     </div>
     </WorkspaceInboxMenu>
   );

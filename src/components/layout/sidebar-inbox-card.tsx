@@ -17,6 +17,7 @@ import {
   normalizePrState,
 } from "@/components/github/pr-status-icon";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
+import { WorkspaceHoverCard } from "./workspace-hover-card";
 import { activateWorkspace } from "@/tauri/commands";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import {
@@ -177,15 +178,11 @@ export function SidebarInboxCard({
 
   // While an agent is live and a linked issue exists, the card title IS the
   // work (issue title); the worktree name stays reachable via the branch on
-  // the meta line + the title tooltip. Idle cards keep the workspace name.
+  // the meta line + the hover card. Idle cards keep the workspace name.
   const displayTitle =
     status !== null && workspace.linked_issue
       ? workspace.linked_issue.title
       : workspace.title;
-  const titleTooltip =
-    status !== null && workspace.linked_issue && workspace.git_branch
-      ? workspace.git_branch
-      : undefined;
 
   const prState = normalizePrState(workspace.pr_state);
   const prMerged = prState === "merged";
@@ -313,6 +310,10 @@ export function SidebarInboxCard({
           justUnsettled && "rise-in",
         )}
       >
+        {/* Hover details live on the inner card, not on the animation wrapper
+            above — that wrapper is already the ContextMenuTrigger, and two
+            `asChild` triggers must not compose onto the same node. */}
+        <WorkspaceHoverCard workspace={workspace} repo={repo} status={status}>
             <div
               role="button"
               tabIndex={0}
@@ -483,7 +484,6 @@ export function SidebarInboxCard({
                   />
                 )}
                 <span
-                  title={titleTooltip}
                   className={cn(
                     "truncate text-[13px] leading-[1.35] text-foreground",
                     // The extra weight is what makes an unread card readable
@@ -574,6 +574,7 @@ export function SidebarInboxCard({
                 )}
               </div>
             </div>
+        </WorkspaceHoverCard>
       </div>
     </WorkspaceInboxMenu>
   );
