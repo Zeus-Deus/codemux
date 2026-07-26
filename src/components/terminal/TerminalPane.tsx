@@ -42,6 +42,10 @@ import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer"
 import { createWritePump } from "./terminal-write-pump";
 import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
 import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
+import {
+  useTerminalCwdStore,
+  parseOsc7,
+} from "@/stores/terminal-cwd-store";
 import { onTerminalStatus } from "@/tauri/events";
 // TODO: re-enable as "system theme" option in settings
 // import { useThemeColors } from "@/hooks/use-theme-colors";
@@ -470,6 +474,26 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     };
     containerEl.addEventListener("input", blockNewline, true);
     blockNewlineRef.current = blockNewline;
+
+    // ── OSC 7: shell-reported working directory ──
+    // Shells with integration (fish, vte-patched bash, kitty/zsh setups)
+    // emit `ESC ] 7 ; file://host/path ST` on every prompt. Tapping it here
+    // is free — the sequence already arrives on the wire and xterm silently
+    // drops it today — and it's the only cwd source that works for
+    // remote/SSH panes, where the shell's pid lives on another machine.
+    // Sessions whose shell stays quiet are covered by the `/proc` poller
+    // instead (see `use-terminal-cwd-poll.ts`).
+    //
+    // Returning false lets xterm continue its default handling of the
+    // sequence rather than swallowing it, keeping us a passive observer.
+    const osc7Disposable = term.parser.registerOscHandler(7, (payload) => {
+      const cwd = parseOsc7(payload);
+      // `getState()` rather than a subscribed selector: this pane must not
+      // re-render when its own cwd changes — only the header in `PaneNode`
+      // subscribes, and a `cd` shouldn't churn the xterm instance.
+      if (cwd) useTerminalCwdStore.getState().setCwd(sid, cwd, "osc7");
+      return false;
+    });
 
     // ── User input handler ──
     let pendingInput = "";
@@ -973,6 +997,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
       resizeDisposable.dispose();
       writeParsedDisposable.dispose();
+      osc7Disposable.dispose();
 
       containerEl.removeEventListener("input", blockNewline, true);
       blockNewlineRef.current = null;

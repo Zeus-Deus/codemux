@@ -2437,6 +2437,85 @@ pub fn pause_pty_output(
     Ok(())
 }
 
+/// Resolve the *live* working directory of each requested session's shell.
+///
+/// This is the fallback half of the terminal-header cwd feature. The
+/// preferred source is OSC 7, which the shell pushes on every prompt — but
+/// that needs shell integration the user may not have (a bare zsh commonly
+/// emits nothing). Reading `/proc/<pid>/cwd` needs no shell cooperation at
+/// all, so between the two every local session gets a directory.
+///
+/// The pid is the session's **shell**, not whatever is running in the
+/// foreground, which is exactly what we want: `cd` moves the shell, and a
+/// long-running child (a build, an agent) leaves the shell's cwd alone, so
+/// the header stays stable instead of following a subprocess around.
+///
+/// Sessions with no entry in the response are simply unknown to this source
+/// and are left to OSC 7:
+/// - **remote/SSH panes** — the pid lives on another machine, and reading a
+///   local `/proc` entry for it would report an unrelated process's
+///   directory. Those sessions have no local `child_pid`, so they drop out
+///   here rather than reporting a wrong path.
+/// - **non-Linux hosts** — no `/proc`; the whole body compiles out.
+/// - **dead or exited sessions** — the readlink fails and is skipped.
+///
+/// Returns a map rather than erroring per-session so one dead pid in a
+/// batch can't fail the poll for every other pane.
+#[tauri::command]
+pub fn terminal_session_cwds(
+    terminal_state: State<'_, PtyState>,
+    session_ids: Vec<String>,
+) -> HashMap<String, String> {
+    if session_ids.is_empty() {
+        return HashMap::new();
+    }
+    read_cwds_for_sessions(&terminal_state.get_session_pids(), &session_ids)
+}
+
+/// Resolve `session_id -> cwd` for the requested sessions given a
+/// `session_id -> pid` map. Split out from the command so it can be unit
+/// tested without a Tauri `State`.
+///
+/// Sessions with no pid, or whose pid can't be read, are omitted rather
+/// than reported with a placeholder — the caller keeps its previous value,
+/// which is strictly better than blanking a header on a transient failure.
+fn read_cwds_for_sessions(
+    pids: &HashMap<String, u32>,
+    session_ids: &[String],
+) -> HashMap<String, String> {
+    let mut out = HashMap::with_capacity(session_ids.len());
+    for session_id in session_ids {
+        let Some(pid) = pids.get(session_id).copied() else {
+            continue;
+        };
+        if let Some(cwd) = read_process_cwd(pid) {
+            out.insert(session_id.clone(), cwd);
+        }
+    }
+    out
+}
+
+/// The working directory of a live process, or None when it can't be read
+/// (process gone, or a platform without `/proc`).
+fn read_process_cwd(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        // `/proc/<pid>/cwd` is a symlink to the process's working directory.
+        // readlink is a single cheap syscall and needs no ptrace-level
+        // privilege for a process we own.
+        std::fs::read_link(format!("/proc/{pid}/cwd"))
+            .ok()?
+            .to_str()
+            .map(str::to_string)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No `/proc`; OSC 7 is the only cwd source on these platforms.
+        let _ = pid;
+        None
+    }
+}
+
 /// Resume one subscriber's view of a session's PTY output. `None` resumes every
 /// subscriber for the session. See `pause_pty_output`. Idempotent.
 #[tauri::command]
@@ -3527,6 +3606,51 @@ mod tests {
                 .retain(|s| s.generation != generation);
             recompute_flow_paused(runtime);
         });
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_cwds_for_sessions_resolves_live_pids_and_skips_the_rest() {
+        // The test process is a live pid we know the cwd of, so it stands in
+        // for a session's shell without spawning one.
+        let self_pid = std::process::id();
+        let expected = std::env::current_dir()
+            .expect("cwd")
+            .to_str()
+            .expect("utf8 cwd")
+            .to_string();
+
+        let mut pids = HashMap::new();
+        pids.insert("live".to_string(), self_pid);
+        // A pid that cannot exist — `/proc/<pid>/cwd` readlink fails.
+        pids.insert("dead".to_string(), u32::MAX);
+
+        let requested = vec![
+            "live".to_string(),
+            "dead".to_string(),
+            // No pid at all: the remote/SSH case, where the shell runs on
+            // another machine. Must be omitted, never guessed at from a
+            // local /proc entry.
+            "remote".to_string(),
+        ];
+        let out = read_cwds_for_sessions(&pids, &requested);
+
+        assert_eq!(out.get("live"), Some(&expected));
+        assert!(!out.contains_key("dead"), "unreadable pid must be omitted");
+        assert!(
+            !out.contains_key("remote"),
+            "session with no local pid must be omitted"
+        );
+    }
+
+    #[test]
+    fn read_cwds_for_sessions_only_answers_what_was_asked() {
+        let mut pids = HashMap::new();
+        pids.insert("asked".to_string(), std::process::id());
+        pids.insert("not_asked".to_string(), std::process::id());
+
+        let out = read_cwds_for_sessions(&pids, &["asked".to_string()]);
+        assert!(!out.contains_key("not_asked"));
     }
 
     #[test]

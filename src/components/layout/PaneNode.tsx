@@ -10,7 +10,13 @@ import { cn } from "@/lib/utils";
 import { splitPane, closePane, activatePane, resizeSplit, swapPanes } from "@/tauri/commands";
 import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
 import type { PaneNodeSnapshot, PaneStatus } from "@/tauri/types";
-import { useAppStore } from "@/stores/app-store";
+import {
+  useAppStore,
+  useHomeDir,
+  useWorkspaceCwdForSession,
+} from "@/stores/app-store";
+import { useTerminalCwd } from "@/stores/terminal-cwd-store";
+import { formatCwdHint } from "@/lib/terminal-cwd";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
 
@@ -214,6 +220,18 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
   );
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
 
+  // Terminal pane cwd hint. Hoisted above the split branch with the other
+  // hooks (#127) — non-terminal nodes pass an id no session can match, so
+  // every selector returns null and the hint is skipped.
+  const terminalSessionId = node.kind === "terminal" ? node.session_id : "";
+  const sessionCwd = useTerminalCwd(terminalSessionId);
+  const workspaceCwd = useWorkspaceCwdForSession(terminalSessionId);
+  const homeDir = useHomeDir();
+  const cwdHint = React.useMemo(
+    () => formatCwdHint(sessionCwd, workspaceCwd, homeDir),
+    [sessionCwd, workspaceCwd, homeDir],
+  );
+
   if (node.kind === "split") {
     const sizes = normalizeChildSizes(node.child_sizes, node.children.length);
     const sizesFr = sizes.map((s) => `${Math.max(s, 0.05)}fr`);
@@ -269,13 +287,32 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
           className={cn("flex h-7 shrink-0 items-center gap-1 border-b border-border/30 px-2 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
-          <span className="flex items-center gap-1.5 flex-1 truncate text-xs text-muted-foreground">
+          <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs text-muted-foreground">
             {PRESET_TITLE_TO_ICON[node.title] && (
               <PresetIcon icon={PRESET_TITLE_TO_ICON[node.title]} className="h-3 w-3" />
             )}
-            {node.title}
+            {/* `shrink-0`: the title is drawn from a fixed, short set
+                ("Terminal", "Claude Code", …) and is the pane's identity —
+                the cwd hint beside it absorbs any truncation instead. */}
+            <span className="shrink-0">{node.title}</span>
+            {/* Live working directory, rendered only when it differs from the
+                workspace root (see `formatCwdHint`). Mono per the design
+                system's rule that path-like metadata is code-like. The
+                untrimmed path is on the tooltip since the label elides its
+                head to keep the meaningful tail. */}
+            {cwdHint && (
+              <span
+                className="min-w-0 truncate font-mono text-[11px] text-muted-foreground/60"
+                title={cwdHint.full}
+                data-pane-cwd={cwdHint.full}
+              >
+                {cwdHint.label}
+              </span>
+            )}
             {paneStatus && paneStatus !== "idle" && (
-              <StatusIndicator status={paneStatus} />
+              <span className="shrink-0">
+                <StatusIndicator status={paneStatus} />
+              </span>
             )}
           </span>
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
