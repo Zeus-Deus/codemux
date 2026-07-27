@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { SidebarWorkspaceRow } from "./sidebar-workspace-row";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { ProjectImageDialog } from "@/components/overlays/project-image-dialog";
+import { PROJECT_COLORS } from "./project-appearance-menu";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -45,21 +46,6 @@ import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
 import type { WorkspaceSnapshot, PendingWorkspace } from "@/tauri/types";
-
-const PROJECT_COLORS = [
-  { name: "Red", value: "#ef4444" },
-  { name: "Orange", value: "#f97316" },
-  { name: "Yellow", value: "#eab308" },
-  { name: "Lime", value: "#84cc16" },
-  { name: "Green", value: "#22c55e" },
-  { name: "Teal", value: "#14b8a6" },
-  { name: "Cyan", value: "#06b6d4" },
-  { name: "Blue", value: "#3b82f6" },
-  { name: "Indigo", value: "#6366f1" },
-  { name: "Purple", value: "#a855f7" },
-  { name: "Pink", value: "#ec4899" },
-  { name: "Slate", value: "#64748b" },
-];
 
 interface Props {
   projectName: string;

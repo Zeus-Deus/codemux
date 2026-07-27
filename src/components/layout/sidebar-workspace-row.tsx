@@ -298,6 +298,7 @@ export function WorkspaceContextMenuItems({
   settleAction,
   snoozeAction,
   unreadAction,
+  projectMenu,
   onArchiveRequest,
   onDeleteRequest,
   onRequestPushConfirm,
@@ -309,6 +310,11 @@ export function WorkspaceContextMenuItems({
    *  meaningful — an already-unread card passes nothing rather than offering
    *  an item that would do nothing. */
   unreadAction?: { onMarkUnread: () => void };
+  /** Optional project-level section (avatar image + accent color) for the
+   *  project this workspace belongs to. Passed in as a slot rather than built
+   *  here so this module stays workspace-scoped and free of project-appearance
+   *  concerns. */
+  projectMenu?: React.ReactNode;
   /** Remove the row non-destructively. For local workspaces this
    *  archives (restorable from Settings → Archive); for attach-in-place
    *  and remote (host-backed) workspaces — which the backend refuses to
@@ -580,6 +586,13 @@ export function WorkspaceContextMenuItems({
           ? "Unmute notifications"
           : "Mute notifications"}
       </ContextMenuItem>
+
+      {projectMenu && (
+        <>
+          <ContextMenuSeparator />
+          {projectMenu}
+        </>
+      )}
 
       <ContextMenuSeparator />
       {isRemote ? (

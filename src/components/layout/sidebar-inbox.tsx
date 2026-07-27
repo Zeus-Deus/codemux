@@ -454,6 +454,7 @@ function SettledRow({
     // move-to-host — without having to un-settle it first.
     <WorkspaceInboxMenu
       workspace={workspace}
+      repo={repo}
       settleAction={{
         kind: "unsettle",
         onAction: () => onUnsettle(workspace.workspace_id),
@@ -590,6 +591,7 @@ function SnoozeRow({
   return (
     <WorkspaceInboxMenu
       workspace={workspace}
+      repo={repo}
       snoozeAction={{
         // A snoozed row can only come back — re-deferring it is the "Snooze
         // until…" gesture of an *active* card, so no presets are needed here.

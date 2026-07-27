@@ -258,6 +258,7 @@ export function SidebarInboxCard({
   return (
     <WorkspaceInboxMenu
       workspace={workspace}
+      repo={repo}
       settleAction={
         canSettle && !leaving
           ? { kind: "settle", onAction: () => onSettle(workspace.workspace_id) }
