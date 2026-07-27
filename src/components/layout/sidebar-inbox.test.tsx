@@ -1703,6 +1703,51 @@ describe("SidebarInbox — multi-select + bulk actions", () => {
     expect(await screen.findByText("Settle (2)")).toBeInTheDocument();
   });
 
+  it("collapses a multi-selection when a settled row is activated by keyboard", async () => {
+    const base = Date.now();
+    workspaces = Array.from({ length: 3 }, () => makeWorkspace());
+    persistInbox({
+      settled: workspaces.map((w, i) => ({
+        id: w.workspace_id,
+        at: base - i * 1000,
+      })),
+    });
+    const { container } = await flushRender();
+
+    const rows = [...container.querySelectorAll("[data-settled-row]")];
+    clickRow(rows[0], { ctrlKey: true });
+    clickRow(rows[1], { ctrlKey: true });
+    expect(container.querySelectorAll("[data-selected]")).toHaveLength(2);
+
+    // Enter behaves exactly like a plain click: navigate AND collapse the
+    // selection, so the next bulk gesture cannot act on rows the user
+    // forgot were still ticked behind their navigation.
+    fireEvent.keyDown(rows[2], { key: "Enter" });
+    expect(container.querySelectorAll("[data-selected]")).toHaveLength(0);
+  });
+
+  it("collapses a multi-selection when a snoozed row is activated by keyboard", async () => {
+    const base = Date.now();
+    workspaces = Array.from({ length: 3 }, () => makeWorkspace());
+    persistInbox({
+      snoozed: workspaces.map((w) => ({
+        id: w.workspace_id,
+        at: base,
+        until: base + 7 * 86_400_000,
+      })),
+    });
+    const { container } = await flushRender();
+
+    fireEvent.click(screen.getByRole("button", { name: "Snoozed (3)" }));
+    const rows = [...container.querySelectorAll("[data-snoozed-row]")];
+    clickRow(rows[0], { ctrlKey: true });
+    clickRow(rows[1], { ctrlKey: true });
+    expect(container.querySelectorAll("[data-selected]")).toHaveLength(2);
+
+    fireEvent.keyDown(rows[2], { key: " " });
+    expect(container.querySelectorAll("[data-selected]")).toHaveLength(0);
+  });
+
   it("clears the selection when the project filter changes", async () => {
     const base = Date.now();
     workspaces = [
@@ -2081,7 +2126,7 @@ describe("SidebarInbox — bulk actions across cards", () => {
     ).toEqual(["ws-1", "ws-2"]);
   });
 
-  it("withholds bulk Snooze when any selected workspace is live", async () => {
+  it("withholds bulk Settle and Snooze when any selected workspace is live", async () => {
     workspaces = [
       makeWorkspace({ title: "Idle one" }),
       makeWorkspace({ title: "Busy one", surfaces: surfaceWithPane("p1") }),
@@ -2094,9 +2139,40 @@ describe("SidebarInbox — bulk actions across cards", () => {
     fireEvent.click(cards[1], { ctrlKey: true });
     fireEvent.contextMenu(cards[0]);
 
-    // A bulk action that silently skipped the busy half would make its own
-    // count a lie.
-    expect(await screen.findByText("Settle (2)")).toBeInTheDocument();
+    // Settle rides the same guardrail as the per-row action and as Snooze:
+    // live or blocked work can never be parked, and a bulk action that
+    // silently skipped the busy half would make its own count a lie. With
+    // both verbs withheld, the menu explains itself rather than rendering
+    // empty.
+    expect(
+      await screen.findByText(
+        "Selection includes working or blocked workspaces",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Settle (2)")).not.toBeInTheDocument();
     expect(screen.queryByText("Snooze (2)")).not.toBeInTheDocument();
+    expect(useSidebarInboxStore.getState().settled).toEqual([]);
+  });
+
+  it("withholds bulk Settle when a selected workspace is blocked on a permission prompt", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Idle one" }),
+      makeWorkspace({ title: "Blocked one", surfaces: surfaceWithPane("p1") }),
+    ];
+    paneStatuses = { p1: "permission" };
+    const { container } = await flushRender();
+
+    const cards = [...container.querySelectorAll("[data-inbox-card]")];
+    fireEvent.click(cards[0], { ctrlKey: true });
+    fireEvent.click(cards[1], { ctrlKey: true });
+    fireEvent.contextMenu(cards[0]);
+
+    expect(
+      await screen.findByText(
+        "Selection includes working or blocked workspaces",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Settle (2)")).not.toBeInTheDocument();
+    expect(useSidebarInboxStore.getState().settled).toEqual([]);
   });
 });

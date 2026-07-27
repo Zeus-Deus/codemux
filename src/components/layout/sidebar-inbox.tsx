@@ -466,6 +466,10 @@ function SettledRow({
         if (e.key !== "Enter" && e.key !== " ") return;
         // Space would otherwise scroll the sidebar as it activates the row.
         if (e.key === " ") e.preventDefault();
+        // Collapse any multi-select first, exactly like a plain click —
+        // keyboard navigation must not leave an invisible selection behind
+        // for the next bulk action to act on.
+        onSelect(workspace.workspace_id, "single");
         activateFromSidebar(workspace.workspace_id);
       }}
       className={cn(
@@ -587,6 +591,8 @@ function SnoozeRow({
         onKeyDown={(e) => {
           if (e.key !== "Enter" && e.key !== " ") return;
           if (e.key === " ") e.preventDefault();
+          // Same selection collapse as a plain click (see `SettledRow`).
+          onSelect(workspace.workspace_id, "single");
           activateFromSidebar(workspace.workspace_id);
         }}
         className={cn(
@@ -1055,10 +1061,18 @@ export function SidebarInbox() {
       const ws = workspaceById.get(id);
       return ws !== undefined && isSnoozeable(statusOf(ws));
     });
+  // Settle rides the same guardrail as Snooze (see `isSnoozeable` — the
+  // per-row `canSettle` is the same predicate): a working or
+  // permission-blocked workspace can never be parked, and a bulk gesture is
+  // not a license to do in a batch what no single row offers.
+  const canBulkSettle = canBulkSnooze;
 
   const closeBulkMenu = () => setBulkMenuAt(null);
 
   const handleBulkSettle = () => {
+    // The menu hides Settle for unsettleable selections; this guard is the
+    // seatbelt for any other route into the handler.
+    if (!canBulkSettle) return;
     const store = useSidebarInboxStore.getState();
     navigateAfterPark(selection);
     for (const id of selection) {
@@ -1631,9 +1645,21 @@ export function SidebarInbox() {
             />
           </DropdownMenuTrigger>
           <DropdownMenuContent side="bottom" align="start">
-            <DropdownMenuItem onClick={handleBulkSettle} className="text-xs">
-              {`Settle (${selection.length})`}
-            </DropdownMenuItem>
+            {/* Hidden, not disabled, when the selection contains live or
+                blocked work — same treatment as Snooze below, so the two
+                parking verbs can't drift apart. Since both verbs share one
+                guardrail, hiding them empties the menu; the disabled line
+                says why instead of leaving a blank popover. */}
+            {!canBulkSettle && (
+              <DropdownMenuItem disabled className="text-xs">
+                Selection includes working or blocked workspaces
+              </DropdownMenuItem>
+            )}
+            {canBulkSettle && (
+              <DropdownMenuItem onClick={handleBulkSettle} className="text-xs">
+                {`Settle (${selection.length})`}
+              </DropdownMenuItem>
+            )}
             {canBulkSnooze && (
               <DropdownMenuSub
                 onOpenChange={(open) => {
