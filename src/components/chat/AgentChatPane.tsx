@@ -46,7 +46,6 @@ import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
 import {
   findWorkspaceIdForPane,
-  groupWorkspacesByProject,
   useAppStore,
   useHomeDir,
 } from "@/stores/app-store";
@@ -63,7 +62,6 @@ import {
   useProviderCapabilities,
 } from "@/stores/provider-capabilities-store";
 import {
-  activateWorkspace,
   agentChatCancelQueuedTurn,
   agentChatSendQueuedTurnNow,
   agentChatGetSession,
@@ -91,8 +89,6 @@ import {
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
-import { createDeferredWorktree } from "@/lib/agent-chat/materialize";
-import { prestartWorktreeSession } from "@/lib/agent-chat/prestart-worktree-session";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
@@ -118,13 +114,8 @@ import {
 } from "./ComposerPendingInputPanel";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
-import {
-  SCOPE_STRIP,
-  SCOPE_STRIP_INSET,
-  ThreadScopeRow,
-} from "./pickers/ThreadScopeRow";
+import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
 import { WorkspaceStatusCluster } from "./WorkspaceStatusCluster";
-import { useUIStore } from "@/stores/ui-store";
 
 // Kept for parity with Step 1's export shape. The pane tree renderer
 // passes the pane snapshot verbatim; nothing else imports this type.
@@ -405,9 +396,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     );
     return ws?.git_branch ?? null;
   });
-  const setShowNewWorkspaceDialog = useUIStore(
-    (s) => s.setShowNewWorkspaceDialog,
-  );
 
   const ensureThread = useAgentChatStore((s) => s.ensureThread);
   const setInputDraft = useAgentChatStore((s) => s.setInputDraft);
@@ -2612,345 +2600,72 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   // ── Thread Scope (new-thread empty state) ──
   //
-  // Pane-local scope state, per-pane lifetime (there is no draft to
-  // persist into — this pane is bound to a real workspace). Mirrors
-  // the draft surface's `checkoutMode`/`worktreeName`/`baseBranch`
-  // draft fields:
-  //  - "current" (default): keep chatting in this pane's workspace.
-  //  - "worktree": the FIRST submit creates a sibling worktree
-  //    (deferred; auto-named from the first message when the name is
-  //    empty), routes the message into the new worktree's session,
-  //    and activates it — see `handleDeferredWorktreeSubmit`.
-  const [checkoutMode, setCheckoutMode] = useState<"current" | "worktree">(
-    "current",
-  );
-  const [worktreeName, setWorktreeName] = useState("");
-  // Seed lazily from the workspace's actual checked-out branch when
-  // it's already hydrated at mount; the fill-if-empty effect below
-  // covers late hydration. A user pick (or the branch popover's
-  // main/master fallback seed) makes the value non-empty and is never
-  // clobbered.
-  const [baseBranch, setBaseBranch] = useState<string>(
-    () => paneWorkspaceBranch ?? "",
-  );
-  useEffect(() => {
-    if (!paneWorkspaceBranch) return;
-    setBaseBranch((prev) => (prev === "" ? paneWorkspaceBranch : prev));
-  }, [paneWorkspaceBranch]);
+  // This pane is bound to a REAL workspace, which owns exactly one
+  // project root and one checkout (`cwd` / `worktree_path`), shared by
+  // every tab and pane inside it. Nothing about a thread's scope is
+  // therefore choosable here, so the row below the composer is the
+  // read-only Context Row from the FIRST render — no interactive
+  // `ThreadScopeRow`, which now serves `DraftChatSurface` alone.
+  //
+  // Both retired controls had the same defect: they looked like
+  // per-thread settings and were actually app-wide relocations.
+  // "New worktree" created a SECOND workspace off the parent repo
+  // mid-send and moved the user into it (re-asking on every extra chat
+  // tab, including tabs of an already worktree-backed workspace); the
+  // location picker activated another project's workspace, abandoning
+  // whatever the user had typed here. Creating worktrees belongs to
+  // surfaces honest about creating a workspace (`DraftChatSurface`, the
+  // sidebar worktree flow); switching project/workspace belongs to the
+  // sidebar. See `docs/features/agent-chat.md` § Thread Scope.
 
-  // Zone 1 — nothing renders above the composer anymore: the scope
-  // lives BELOW it (`belowComposerSlot`) — `ThreadScopeRow` while the
-  // thread is empty, the Context Row once it has messages (see below).
-  // `undefined` (no resolvable project root) keeps the Composer's
-  // default cwd label as before.
+  // Zone 1 — nothing renders above the composer anymore: scope lives
+  // BELOW it (`belowComposerSlot`). `undefined` (no resolvable project
+  // root) keeps the Composer's default cwd label as before.
   const zone1Override = workspaceProjectRoot ? null : undefined;
 
-  // Old ProjectPicker onChange behavior, verbatim: clear any active
-  // draft (Stage C Bug-2 pattern — a draft pinned to this slot would
-  // otherwise re-render on top of the activated workspace), then
-  // activate the picked project's first workspace, else open the
-  // new-workspace dialog seeded with the path.
-  const handleScopeSelectProject = useCallback(
-    (targetProjectPath: string) => {
-      useChatDraftStore.getState().setActiveDraft(null);
-      const snapshot = useAppStore.getState().appState;
-      const groups = snapshot
-        ? groupWorkspacesByProject(snapshot.workspaces, homeDir)
-        : [];
-      const targetGroup = groups.find(
-        (g) => g.projectPath === targetProjectPath,
-      );
-      const target = targetGroup?.workspaces[0];
-      if (target) {
-        activateWorkspace(target.workspace_id).catch(console.error);
-      } else {
-        setShowNewWorkspaceDialog(true, targetProjectPath);
-      }
-    },
-    [homeDir, setShowNewWorkspaceDialog],
-  );
-
-  const handleScopeSelectHomeWorkspace = useCallback((wsId: string) => {
-    useChatDraftStore.getState().setActiveDraft(null);
-    activateWorkspace(wsId).catch(console.error);
-  }, []);
-
-  const belowComposerSlot =
-    messages.length === 0 && workspaceProjectRoot ? (
-      <ThreadScopeRow
-        location={{
-          kind: "workspace",
-          isHome: isHomeWorkspace,
-          onSelectHomeWorkspace: handleScopeSelectHomeWorkspace,
-          onSelectProject: handleScopeSelectProject,
-        }}
-        // `null` for a home-rooted pane — no project, so the checkout +
-        // branch controls hide and the home scope hint renders.
-        projectPath={isHomeWorkspace ? null : workspaceProjectRoot}
-        checkoutMode={checkoutMode}
-        worktreeName={worktreeName}
-        baseBranch={baseBranch}
-        disabled={isSending}
-        onChangeCheckoutMode={setCheckoutMode}
-        onChangeWorktreeName={setWorktreeName}
-        onChangeBaseBranch={setBaseBranch}
-        // Real workspace on this surface — the status cluster has a
-        // git branch to report from its first render, unlike
-        // `DraftChatSurface`, which has no workspace yet and doesn't
-        // pass this.
-        trailing={<WorkspaceStatusCluster />}
-      />
-    ) : messages.length > 0 && workspaceProjectRoot ? (
-      // Context Row (design: `.design-import/Context Row.dc.html`) —
-      // once the thread has messages, scope is committed (the first
-      // send locked it in), so this half turns read-only: static
-      // project/branch labels on the left, the same passive git/PR
-      // status cluster on the right that the old bottom
-      // `WorkspaceContextBar` used to show (now hidden for this pane —
-      // see `useAgentChatPaneActive`).
-      <div className={SCOPE_STRIP_INSET}>
-        <div className={SCOPE_STRIP}>
-          <div className="flex min-w-0 items-center gap-0.5 text-xs font-medium text-muted-foreground">
-            <span
-              className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2"
-              title={workspaceProjectRoot}
-            >
-              {isHomeWorkspace ? (
-                <Home className="size-3.5 text-status-remote" />
-              ) : (
-                <Folder className="size-3.5 text-muted-foreground" />
-              )}
-              <span className="max-w-[140px] truncate">
-                {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
-              </span>
-            </span>
-            {paneWorkspaceBranch && (
-              <>
-                <span className="select-none text-muted-foreground/50">·</span>
-                <span
-                  className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 font-mono"
-                  title={`Branch: ${paneWorkspaceBranch}`}
-                >
-                  <GitBranch className="size-3 text-muted-foreground" />
-                  <span className="max-w-[160px] truncate">
-                    {paneWorkspaceBranch}
-                  </span>
-                </span>
-              </>
+  const belowComposerSlot = workspaceProjectRoot ? (
+    // Context Row (design: `.design-import/Context Row.dc.html`) —
+    // static project/branch labels on the left, the same passive
+    // git/PR status cluster on the right that the old bottom
+    // `WorkspaceContextBar` used to show (now hidden for this pane —
+    // see `useAgentChatPaneActive`). Rendered at every message count:
+    // an empty thread has nothing to choose either (see above), so the
+    // strip never changes shape across the first send.
+    <div className={SCOPE_STRIP_INSET}>
+      <div className={SCOPE_STRIP}>
+        <div className="flex min-w-0 items-center gap-0.5 text-xs font-medium text-muted-foreground">
+          <span
+            className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2"
+            title={workspaceProjectRoot}
+          >
+            {isHomeWorkspace ? (
+              <Home className="size-3.5 text-status-remote" />
+            ) : (
+              <Folder className="size-3.5 text-muted-foreground" />
             )}
-          </div>
-          <WorkspaceStatusCluster />
+            <span className="max-w-[140px] truncate">
+              {isHomeWorkspace ? "Home" : basename(workspaceProjectRoot)}
+            </span>
+          </span>
+          {paneWorkspaceBranch && (
+            <>
+              <span className="select-none text-muted-foreground/50">·</span>
+              <span
+                className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md px-2 font-mono"
+                title={`Branch: ${paneWorkspaceBranch}`}
+              >
+                <GitBranch className="size-3 text-muted-foreground" />
+                <span className="max-w-[160px] truncate">
+                  {paneWorkspaceBranch}
+                </span>
+              </span>
+            </>
+          )}
         </div>
+        <WorkspaceStatusCluster />
       </div>
-    ) : undefined;
-
-  /** Thread Scope deferred-worktree first send. Replaces `handleSubmit`
-   *  ONLY while the thread is empty AND the checkout control is set to
-   *  "New worktree" (see `composerOnSubmit` below) — every other send
-   *  goes through the unmodified `handleSubmit`.
-   *
-   *  Order of operations (mirrors `materializeAndSend`'s worktree arm):
-   *   1. Create the sibling worktree via the shared
-   *      `createDeferredWorktree` (name precedence: typed name →
-   *      `generateBranchName(firstMessage)` → random fallback) off the
-   *      selected base branch.
-   *   2. `prestartWorktreeSession` — attach a chat pane + start a
-   *      session on the NEW workspace before anything else, so the
-   *      first turn below can't land ahead of the adapter registering
-   *      the thread (`session_not_found`). Carries this pane's picker
-   *      config so the new session matches what the user configured.
-   *   3. Send the first turn into the new thread with the same
-   *      skills/attachment-block/mode-prefix/image pipeline
-   *      `handleSubmit` uses. Attachments staged on THIS pane's thread
-   *      are injected into the turn's text/images (their chips stay
-   *      keyed to the old thread and are cleared below — the content
-   *      travels, the chip UI does not).
-   *      Limitation vs `handleSubmit`: the stale GitHub-detail
-   *      re-fetch pass is skipped — acceptable for a first turn, the
-   *      chips were fetched moments ago on this same surface.
-   *   4. Clear this pane's composer + chips and activate the new
-   *      workspace.
-   *
-   *  Failure policy: worktree/session resources created by earlier
-   *  steps are not rolled back (same as materialize); the composer
-   *  text stays in THIS pane so the user can retry. */
-  const handleDeferredWorktreeSubmit = useCallback(() => {
-    if (sendInFlightRef.current) return;
-    if (!workspaceProjectRoot) return;
-    const rawText = draft.trim();
-    if (!rawText) return;
-    const plan = planSubmit({ rawText, provider, effort });
-    sendInFlightRef.current = true;
-    setIsSending(true);
-
-    // Instant feedback (Bug 2 fix): mirror the warm-send pattern — build
-    // the display thumbnails, append the optimistic user bubble into THIS
-    // pane's thread, and clear the composer BEFORE the multi-second
-    // worktree-create + session-start work. Previously the composer sat
-    // dead (text still visible, no bubble) until all of that finished.
-    // A client nonce lets us roll the bubble back on failure; on success
-    // we drop it here and let the freshly-prestarted thread's own
-    // optimistic bubble carry over as the pane flips.
-    const snapshotAttachments = threadId
-      ? useAgentChatStore.getState().threads[threadId]?.stagedAttachments ?? []
-      : [];
-    const imageDisplaySources = buildImageDisplaySources(snapshotAttachments);
-    const clientNonce =
-      typeof crypto !== "undefined" && "randomUUID" in crypto
-        ? crypto.randomUUID()
-        : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    if (threadId) {
-      appendUserMessage(threadId, plan.text, clientNonce, imageDisplaySources);
-      setInputDraft(threadId, "");
-      requestScrollToBottom();
-    }
-
-    /** Roll the optimistic bubble back and restore the composer text so a
-     *  failed first send never strands an orphan bubble or eats the
-     *  user's prompt. Mirrors the warm-send / Continue-run rollback. */
-    const rollback = () => {
-      if (threadId) {
-        removeUserMessageByNonce(threadId, clientNonce);
-        setInputDraft(threadId, rawText);
-      }
-    };
-
-    void (async () => {
-      try {
-        const created = await createDeferredWorktree(
-          workspaceProjectRoot,
-          worktreeName,
-          baseBranch,
-          rawText,
-        );
-        const prestarted = await prestartWorktreeSession(
-          created.workspaceId,
-          {
-            model,
-            // Same plan/ask coupling as materialize's
-            // `effectivePermissionMode`: both modes boot the SDK with
-            // writes locked off.
-            permissionMode:
-              mode === "plan" || mode === "ask"
-                ? "plan"
-                : permissionMode ??
-                  providerDefaultPermissionMode ??
-                  DEFAULT_THREAD_PERMISSION_MODE,
-            effort,
-            contextWindow,
-            mode,
-          },
-          // Skip the `waitForWorkspaceCwd` poll when the create response
-          // already carries the new worktree's cwd.
-          created.cwd,
-        );
-        if (!prestarted) {
-          // Degenerate: the new workspace hasn't hydrated into the
-          // store (event-delivery reordering). The worktree exists but
-          // there is no session to send into — restore the composer text
-          // (and drop the optimistic bubble) and just flip over; the
-          // user can re-send in the new pane (its mount-effect starts the
-          // session).
-          rollback();
-          toast.warning(
-            "Worktree created — send your message again in the new workspace.",
-          );
-          useChatDraftStore.getState().setActiveDraft(null);
-          activateWorkspace(created.workspaceId).catch(console.error);
-          return;
-        }
-        const skillBodies = resolveSkillBodies(rawText, skillsRegistry);
-        // Images staged at attach time; await only stragglers, then read
-        // fresh so staging patches (new attachment objects) are visible.
-        const imageIds = imageAttachmentIds(snapshotAttachments);
-        if (imageIds.length > 0) await awaitImageStaging(imageIds);
-        const freshAttachments = threadId
-          ? useAgentChatStore.getState().threads[threadId]?.stagedAttachments ??
-            []
-          : [];
-        const unstaged = unstagedImageAttachments(freshAttachments);
-        if (unstaged.length > 0) {
-          rollback();
-          toast.error(
-            "An attached image failed to upload — remove it and try again.",
-          );
-          return;
-        }
-        const attachmentBlock = buildAttachmentBlock(
-          activeAttachments(rawText, freshAttachments),
-        );
-        const imageRefs = buildImageRefs(freshAttachments);
-        const sdkText = applyAllPrefixes(
-          rawText,
-          mode,
-          effort,
-          skillBodies,
-          attachmentBlock,
-        );
-        // Optimistic echo into the NEW thread's slice so the pane that
-        // mounts on activation renders the user bubble immediately.
-        useAgentChatStore
-          .getState()
-          .appendUserMessage(
-            prestarted.threadId,
-            plan.text,
-            undefined,
-            imageDisplaySources,
-          );
-        await agentChatSendTurn(provider, {
-          thread_id: prestarted.threadId,
-          text: sdkText,
-          images: imageRefs,
-          model_override: null,
-          effort_override: plan.effortOverride,
-          permission_mode_override: null,
-        });
-        // Success — drop this pane's optimistic bubble + chips (the new
-        // thread carries its own bubble now) and flip to the new
-        // workspace.
-        if (threadId) {
-          removeUserMessageByNonce(threadId, clientNonce);
-          clearStagedAttachments(threadId);
-        }
-        useChatDraftStore.getState().setActiveDraft(null);
-        activateWorkspace(created.workspaceId).catch(console.error);
-      } catch (err) {
-        rollback();
-        toast.error(`Failed to start in a new worktree: ${err}`);
-      } finally {
-        sendInFlightRef.current = false;
-        setIsSending(false);
-      }
-    })();
-  }, [
-    workspaceProjectRoot,
-    draft,
-    provider,
-    effort,
-    mode,
-    model,
-    permissionMode,
-    contextWindow,
-    threadId,
-    worktreeName,
-    baseBranch,
-    skillsRegistry,
-    appendUserMessage,
-    removeUserMessageByNonce,
-    requestScrollToBottom,
-    setInputDraft,
-    clearStagedAttachments,
-  ]);
-
-  // Intercept ONLY the empty-thread + worktree-mode first send;
-  // everything else stays on the unmodified `handleSubmit` path.
-  const composerOnSubmit =
-    messages.length === 0 &&
-    checkoutMode === "worktree" &&
-    !isHomeWorkspace &&
-    workspaceProjectRoot !== null
-      ? handleDeferredWorktreeSubmit
-      : handleSubmit;
+    </div>
+  ) : undefined;
 
   // AskUserQuestion prompts render as a composer-attached panel
   // (one-question-per-card pattern, similar to Claude.ai) rather
@@ -3057,7 +2772,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (!threadId) return;
         setInputDraft(threadId, next);
       }}
-      onSubmit={composerOnSubmit}
+      onSubmit={handleSubmit}
       onStop={handleStop}
       onProviderModelChange={handleProviderModelChange}
       onModelChange={handleModelChange}

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -80,47 +80,15 @@ function formatRelativeTime(unixSeconds: number): string {
   return `${years}y`;
 }
 
-/** How the location control binds to its surface. One component, two
- *  consumers:
- *
- *  - `"draft"` — `DraftChatSurface`: locations retarget the client-side
- *    draft (`updateDraftTarget`); nothing is created until first send.
- *  - `"workspace"` — `AgentChatPane`'s new-thread empty state: the pane
- *    is bound to a REAL workspace, so locations navigate between
- *    existing workspaces (or open the new-workspace dialog) instead of
- *    mutating a draft. The location popover never creates hidden
- *    workspaces: "Home directory (~)" only renders when a home-rooted
- *    workspace already exists (or the pane itself is home-rooted), and
- *    picking a project fires `onSelectProject`, whose call site keeps
- *    the old ProjectPicker onChange behavior (activate the project's
- *    first workspace, else open the new-workspace dialog). */
-export type ThreadScopeLocation =
-  | {
-      kind: "draft";
-      target: DraftTarget;
-      onChangeTarget: (target: DraftTarget) => void;
-    }
-  | {
-      kind: "workspace";
-      /** True when the pane's workspace is home-rooted
-       *  (`project_root === $HOME`). */
-      isHome: boolean;
-      /** Activate an EXISTING home-rooted workspace. Only ever called
-       *  with a workspace id that is already in the app-state. */
-      onSelectHomeWorkspace: (workspaceId: string) => void;
-      /** The user picked a different project (from the list or via
-       *  "Open another project…"). Call-site decides activate-vs-dialog. */
-      onSelectProject: (projectPath: string) => void;
-    };
-
 export interface ThreadScopeRowProps {
-  /** Location-control binding — see `ThreadScopeLocation`. */
-  location: ThreadScopeLocation;
+  /** The draft's current target; the location popover retargets it
+   *  (`updateDraftTarget`) — nothing is created until first send. */
+  target: DraftTarget;
+  onChangeTarget: (target: DraftTarget) => void;
   /** Resolved project root the checkout + branch controls scope to,
-   *  or `null` when there is no project (home draft / home-rooted
-   *  pane, or an `existing_workspace` draft target whose workspace
-   *  hasn't hydrated into app-state yet) — the row then shows only
-   *  the location control. */
+   *  or `null` when there is no project (home draft, or an
+   *  `existing_workspace` target whose workspace hasn't hydrated into
+   *  app-state yet) — the row then shows only the location control. */
   projectPath: string | null;
   checkoutMode: "current" | "worktree";
   worktreeName: string;
@@ -129,27 +97,27 @@ export interface ThreadScopeRowProps {
   onChangeCheckoutMode: (mode: "current" | "worktree") => void;
   onChangeWorktreeName: (name: string) => void;
   onChangeBaseBranch: (branch: string) => void;
-  /** Rendered after `BranchControl`, right-aligned — `AgentChatPane`
-   *  passes `<WorkspaceStatusCluster />` here so the empty-thread row
-   *  carries the same passive git/PR status as the running-thread
-   *  Context Row (`docs/features/agent-chat.md` "Context Row"). Omitted
-   *  by `DraftChatSurface`, which has no real workspace yet. */
-  trailing?: ReactNode;
 }
 
 /**
  * Thread Scope redesign — the scope strip rendered BELOW the composer
  * (`Composer`'s `belowComposerSlot`, attached flush via `SCOPE_STRIP`):
  * location · checkout on the left, "from ⑂ branch" on the right.
- *
- * Rendered by BOTH first-send surfaces (see `ThreadScopeLocation`):
- * `DraftChatSurface` and `AgentChatPane`'s new-thread empty state.
  * Replaces the old above-composer `WorktreePicker` +
  * `DerivativeBranchPicker` pill pair and the home-state
- * `ProjectPicker` those surfaces used to put in `zone1Override`.
+ * `ProjectPicker` the draft surface used to put in `zone1Override`.
+ *
+ * **`DraftChatSurface` only.** Every control here answers "what should
+ * the first send CREATE?", which is a question only a draft can be
+ * asked: nothing exists yet. A pane bound to a real workspace has no
+ * such freedom — its workspace owns one project root and one checkout,
+ * shared by every tab and pane inside it — so `AgentChatPane` renders
+ * the read-only Context Row on an empty thread instead of this row.
+ * See `docs/features/agent-chat.md` § Thread Scope.
  */
 export function ThreadScopeRow({
-  location,
+  target,
+  onChangeTarget,
   projectPath,
   checkoutMode,
   worktreeName,
@@ -158,12 +126,8 @@ export function ThreadScopeRow({
   onChangeCheckoutMode,
   onChangeWorktreeName,
   onChangeBaseBranch,
-  trailing,
 }: ThreadScopeRowProps) {
-  const isHome =
-    location.kind === "draft"
-      ? location.target.kind === "home"
-      : location.isHome;
+  const isHome = target.kind === "home";
   const showProjectControls = !isHome && projectPath !== null;
 
   // Non-git projects can't have worktrees or base branches — hide the
@@ -241,38 +205,35 @@ export function ThreadScopeRow({
       <div className={SCOPE_STRIP_INSET}>
         <div className={SCOPE_STRIP}>
           <div className="flex min-w-0 items-center gap-0.5">
-          <LocationControl
-            location={location}
-            isHome={isHome}
-            activeProjectPath={projectPath}
-            disabled={disabled}
-          />
-          {showProjectControls && projectIsGit && (
-            <>
-              <span className="select-none text-muted-foreground/50">·</span>
-              <CheckoutControl
-                checkoutMode={checkoutMode}
-                worktreeName={worktreeName}
-                disabled={disabled}
-                onChangeCheckoutMode={onChangeCheckoutMode}
-                onChangeWorktreeName={onChangeWorktreeName}
-              />
-            </>
-          )}
-        </div>
-          {(showProjectControls || trailing) && (
-            <div className="flex shrink-0 items-center gap-1.5">
-              {showProjectControls && projectIsGit && projectPath && (
-                <BranchControl
-                  projectPath={projectPath}
+            <LocationControl
+              onChangeTarget={onChangeTarget}
+              isHome={isHome}
+              activeProjectPath={projectPath}
+              disabled={disabled}
+            />
+            {showProjectControls && projectIsGit && (
+              <>
+                <span className="select-none text-muted-foreground/50">·</span>
+                <CheckoutControl
                   checkoutMode={checkoutMode}
-                  baseBranch={baseBranch}
+                  worktreeName={worktreeName}
                   disabled={disabled}
                   onChangeCheckoutMode={onChangeCheckoutMode}
-                  onChangeBaseBranch={onChangeBaseBranch}
+                  onChangeWorktreeName={onChangeWorktreeName}
                 />
-              )}
-              {trailing}
+              </>
+            )}
+          </div>
+          {showProjectControls && projectIsGit && projectPath && (
+            <div className="flex shrink-0 items-center gap-1.5">
+              <BranchControl
+                projectPath={projectPath}
+                checkoutMode={checkoutMode}
+                baseBranch={baseBranch}
+                disabled={disabled}
+                onChangeCheckoutMode={onChangeCheckoutMode}
+                onChangeBaseBranch={onChangeBaseBranch}
+              />
             </div>
           )}
         </div>
@@ -291,12 +252,12 @@ interface ProjectAvatarState {
 const EMPTY_AVATAR: ProjectAvatarState = { color: null, image: null, imageVersion: null };
 
 function LocationControl({
-  location,
+  onChangeTarget,
   isHome,
   activeProjectPath,
   disabled,
 }: {
-  location: ThreadScopeLocation;
+  onChangeTarget: (target: DraftTarget) => void;
   isHome: boolean;
   /** The currently-active project root (`null` when home / unresolved). */
   activeProjectPath: string | null;
@@ -339,18 +300,6 @@ function LocationControl({
     };
   }, [open, groups]);
 
-  // Workspace mode — first existing home-rooted workspace, if any.
-  // Drives both the Home row's visibility (never offer a location we
-  // would have to create a workspace for) and its click target.
-  const firstHomeWorkspaceId = useMemo(() => {
-    if (homeDir === null) return null;
-    const homeGroup = groups.find((g) => g.projectPath === homeDir);
-    return homeGroup?.workspaces[0]?.workspace_id ?? null;
-  }, [groups, homeDir]);
-
-  const showHomeOption =
-    location.kind === "draft" || isHome || firstHomeWorkspaceId !== null;
-
   // Type-to-filter: rank by fuzzy score so `cdx` or the initials of a
   // hyphenated name land on the right row without reaching for the
   // mouse. A query containing `/` switches the haystack from the
@@ -368,8 +317,7 @@ function LocationControl({
       (g) => (byPath ? g.projectPath : g.projectName),
     );
   }, [groups, homeDir, query]);
-  const homeVisible =
-    showHomeOption && fuzzyMatch("home directory ~", query.trim());
+  const homeVisible = fuzzyMatch("home directory ~", query.trim());
   const noMatches = !homeVisible && projectRows.length === 0;
 
   const handleOpenChange = (next: boolean) => {
@@ -381,31 +329,12 @@ function LocationControl({
 
   const handleSelectHome = () => {
     handleOpenChange(false);
-    if (location.kind === "draft") {
-      location.onChangeTarget({ kind: "home" });
-      return;
-    }
-    // Workspace mode: already home → no-op; otherwise hop to the
-    // existing home-rooted workspace (the row only renders when one
-    // exists — see `showHomeOption`).
-    if (location.isHome) return;
-    if (firstHomeWorkspaceId) {
-      location.onSelectHomeWorkspace(firstHomeWorkspaceId);
-    }
+    onChangeTarget({ kind: "home" });
   };
 
   const handleSelectProject = (targetProjectPath: string) => {
     handleOpenChange(false);
-    if (location.kind === "draft") {
-      location.onChangeTarget({
-        kind: "project",
-        projectPath: targetProjectPath,
-      });
-      return;
-    }
-    // Workspace mode: picking the already-active project is a no-op.
-    if (targetProjectPath === activeProjectPath) return;
-    location.onSelectProject(targetProjectPath);
+    onChangeTarget({ kind: "project", projectPath: targetProjectPath });
   };
 
   const label = isHome

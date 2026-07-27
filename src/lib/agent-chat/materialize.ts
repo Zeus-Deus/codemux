@@ -691,8 +691,7 @@ export async function createDeferredWorktree(
     name,
     true,
     // "empty" layout — no terminal/PTY surfaces; the caller attaches
-    // the chat pane afterward (materialize step 2, or
-    // `prestartWorktreeSession` on the pane surface).
+    // the chat pane afterward (materialize step 2).
     "empty",
     baseBranch || null,
     null,

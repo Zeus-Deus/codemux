@@ -1611,29 +1611,62 @@ the "no panes" home landing lives in `ChatHomeLanding.tsx`.
 
 ### Thread Scope (first-send scope controls)
 
-BOTH first-send surfaces — `DraftChatSurface` (lazy-creation draft) and
-`AgentChatPane`'s new-thread empty state (`messages.length === 0` on a
-real workspace's pane) — render their scope controls **below** the
-composer as one shared `ThreadScopeRow`
-(`src/components/chat/pickers/ThreadScopeRow.tsx`) — rendered as a
-**scope strip**: a narrower bar attached flush under the composer card
-(inset each side by the card's 20px corner radius, bottom-only
-rounding, one tonal step less elevated — the shared `SCOPE_STRIP` /
-`SCOPE_STRIP_INSET` class constants), threaded through
-`Composer`'s `belowComposerSlot` prop (a sibling of `zone1Override`,
-which both surfaces now pass `null` while a project root resolves — the
-cwd label moved into the row's location control). Three states, matched
-to the surface's target / `checkoutMode`:
+`DraftChatSurface` (the lazy-creation draft) renders its scope controls
+**below** the composer as `ThreadScopeRow`
+(`src/components/chat/pickers/ThreadScopeRow.tsx`) — a **scope strip**:
+a narrower bar attached flush under the composer card (inset each side
+by the card's 20px corner radius, bottom-only rounding, one tonal step
+less elevated — the shared `SCOPE_STRIP` / `SCOPE_STRIP_INSET` class
+constants), threaded through `Composer`'s `belowComposerSlot` prop (a
+sibling of `zone1Override`, which both surfaces pass `null` while a
+project root resolves — the cwd label moved into the row's location
+control). `AgentChatPane` fills the same slot with the read-only
+Context Row — see below for why.
 
-- **Project · current checkout** — a `location · checkout` group on the
-  left (ghost text buttons, each opening a popover) and a `from ⑂
-  <branch>` control on the right. (The centered muted scope-hint line that
-  originally sat below the row was removed in `a003467`; the only surviving
-  hints are inside the checkout popover.)
-- **Project · worktree** — the checkout popover's "New worktree" option
-  reveals an optional mono name input ("name — leave empty to
-  auto-name") with a hint that empty names auto-derive from the first
-  message, like the CLI.
+**One surface, not two: `ThreadScopeRow` is `DraftChatSurface`-only.**
+Every control in this row answers "what should the first send
+CREATE?" — a question only a draft can be asked, because a draft has
+nothing behind it yet. `AgentChatPane` is bound to a real workspace,
+which owns exactly ONE project root and ONE checkout (`cwd` /
+`worktree_path`) shared by every tab, surface and pane inside it, so
+none of those answers are the pane's to give. The pane renders the
+read-only Context Row from its FIRST render instead (see "Context Row"
+below) — same strip shape at every message count, so scope never
+appears to change across the first send.
+
+Until `v0.15.x` the pane rendered the full row, and both of its
+controls were app-wide relocations wearing per-thread clothing:
+
+- **"New worktree"** did not rescope the thread. It created a SECOND
+  workspace off the parent repo mid-send and moved the user into it —
+  and since the row renders on every `messages.length === 0` thread, it
+  re-asked on each additional chat tab, including tabs of a workspace
+  that was *already* worktree-backed, offering a choice that workspace
+  could not honour.
+- **The location picker** activated a different project's first
+  workspace (or opened the new-workspace dialog), abandoning whatever
+  the user had typed in the pane they were looking at.
+
+Creating a worktree now belongs to the surfaces that are honest about
+creating a workspace (this draft surface, the sidebar worktree flow);
+switching project or workspace belongs to the sidebar. Deleted with the
+change: `AgentChatPane`'s `handleDeferredWorktreeSubmit`,
+`src/lib/agent-chat/prestart-worktree-session.ts`, the row's
+`ThreadScopeLocation` / `ThreadScope` discriminated props (flat props
+again, one consumer), its `trailing` slot, and the workspace-mode
+branches of `LocationControl`.
+
+States, matched to the draft's target / `checkoutMode`:
+
+- **Project · current checkout** — a `location · checkout`
+  group on the left (ghost text buttons, each opening a popover) and a
+  `from ⑂ <branch>` control on the right. (The centered muted scope-hint
+  line that originally sat below the row was removed in `a003467`; the
+  only surviving hints are inside the checkout popover.)
+- **Project · worktree** — the checkout popover's "New
+  worktree" option reveals an optional mono name input ("name — leave
+  empty to auto-name") with a hint that empty names auto-derive from the
+  first message, like the CLI.
 - **Home** — only the location control renders (no checkout/branch —
   there's no project to scope); its hint line was removed with the others.
   `PresetBar` returns
@@ -1650,21 +1683,13 @@ of "the project's current checked-out branch"; seeded from the
 main/master/first-branch heuristic once the branch list loads, since a
 draft has no workspace snapshot to ask).
 
-**Location binding (`ThreadScopeLocation`).** The row takes a
-discriminated `location` prop so one component serves both surfaces:
-
-- `{ kind: "draft", target, onChangeTarget }` — locations retarget the
-  client-side draft; nothing is created before first send.
-- `{ kind: "workspace", isHome, onSelectHomeWorkspace, onSelectProject }`
-  — the pane is bound to a REAL workspace, so locations navigate:
-  picking a project fires `onSelectProject`, whose `AgentChatPane` call
-  site keeps the retired `ProjectPicker`'s onChange behavior verbatim
-  (clear the active draft, activate the project's first workspace, else
-  open the new-workspace dialog seeded with the path); "Home directory
-  (~)" only renders when a home-rooted workspace already exists (or the
-  pane itself is home-rooted) and hops to it via
-  `onSelectHomeWorkspace` — the location popover never creates hidden
-  workspaces.
+**Location binding.** The row takes `target` + `onChangeTarget` and
+does exactly one thing with them: retarget the client-side draft (Home
+/ any known project / "Open another project…"). Nothing is created
+before first send, and nothing navigates — the popover has no way to
+activate a workspace, which is what made the retired workspace-mode
+binding (`onSelectProject` / `onSelectHomeWorkspace`) a relocation
+disguised as a scope control.
 
 **Location popover is keyboard-first.** The "Run in" popover is a cmdk
 `Command` with `shouldFilter={false}` plus a `CommandInput`
@@ -1687,17 +1712,12 @@ while "Open another project…" sits outside `CommandList` and is never
 filtered — it has to stay reachable exactly when nothing matched. The
 query resets on close so the next open starts from the full list.
 
-**Pane-surface state + branch display.** `AgentChatPane` keeps
-`checkoutMode`/`worktreeName`/`baseBranch` as pane-local `useState`
-(per-pane lifetime; there is no draft to persist into), and seeds
-`baseBranch` from the workspace snapshot's `git_branch` — the real
-checked-out branch — falling back to the heuristic only when the
-snapshot has none. The row renders only while `messages.length === 0`
-and a project root resolves; on `AgentChatPane` it additionally passes
-`trailing={<WorkspaceStatusCluster />}` (see "Context Row" below), so
-the passive git/PR status sits right of the branch control even before
-the first send. Once the conversation has messages, scope is read-only
-and the row is replaced by the Context Row.
+**Pane-surface state.** `AgentChatPane` holds no scope state at all —
+no `checkoutMode`, no `worktreeName`, no `baseBranch`, no scope
+callbacks. Its `belowComposerSlot` is the Context Row whenever a
+project root resolves, at every message count, reading
+`workspaceProjectRoot` + the snapshot's `git_branch` directly (the
+branch chip hides while that's `null`, e.g. a home-rooted pane).
 
 **Deferred worktree creation.** The old immediate-create "+ New
 worktree…" row is gone — picking "New worktree" only sets
@@ -1713,7 +1733,8 @@ non-zero exit, empty output — is logged via `log::warn!` to the native
 log instead of failing silently) → `generateRandomBranchName(projectPath)`
 on error/empty, then
 `createWorktreeWorkspace` off the row's `baseBranch` with the `"empty"`
-layout. The two surfaces route it differently:
+layout. Only ONE surface routes it (the pane arm was removed — see
+"Scope binding" above):
 
 - **Draft surface** — `materializeAndSend` takes an optional
   `worktreeProjectPath` (resolved by `DraftChatSurface`:
@@ -1739,30 +1760,9 @@ layout. The two surfaces route it differently:
   `agent_chat_prime_mcp` on mount so MCP warmup overlaps typing (the
   registry's `prime_lock` serializes it against the start-session
   backstop prime so children can't double-spawn).
-- **Pane empty state** — `AgentChatPane`'s `handleDeferredWorktreeSubmit`
-  intercepts the composer submit ONLY while `messages.length === 0 &&
-  checkoutMode === "worktree"` (everything else stays on the unmodified
-  `handleSubmit`): it appends a client-nonce'd optimistic bubble into
-  THIS pane's thread and clears the composer FIRST (rolled back on any
-  failure, and dropped on success once the new thread's own bubble takes
-  over), then calls `createDeferredWorktree`, then
-  `prestartWorktreeSession(wsId, config, knownCwd)` — extended to return
-  `{ paneId, threadId } | null`, to take an optional session config
-  (model / permissionMode / effort / contextWindow / mode) so the new
-  session launches with the pane's picker values, and to skip the cwd
-  poll when the create response already carried the cwd — then sends the
-  first turn into the returned `threadId` with the same
-  skills/attachment-block/mode-prefix/images pipeline `handleSubmit`
-  uses (attachment CONTENT staged on the old thread is injected into
-  the turn; the chip UI stays behind and is cleared), appends the
-  optimistic user bubble to the new thread, and activates the new
-  workspace. The stale GitHub-detail re-fetch pass is deliberately
-  skipped on this path. `prestartWorktreeSession` resolves its cwd via
-  `waitForWorkspaceCwd` when no `knownCwd` arrives, so it succeeds on
-  first send instead of returning `null` on a routine store miss; it
-  keeps the `null` contract only for a genuine timeout, in which case
-  the text stays in the old composer, a warning toast fires, and the new
-  workspace is activated anyway.
+- **Pane empty state** — no longer participates. Every submit on a
+  workspace-bound pane goes through the unmodified `handleSubmit` and
+  stays in that pane's own workspace.
 
 **CWD-resolution invariant.** A freshly-created worktree
 workspace only reaches the Zustand app-store via the async
@@ -1788,13 +1788,29 @@ only the fallback when it's somehow absent. **Hard invariant:** a
 `checkoutMode === "worktree"` submit must NEVER create the pane or start
 the session at the parent/project-root cwd — on timeout,
 `materializeAndSend` fails the send via `markSendFailed` (draft text
-preserved) rather than proceeding, and `prestartWorktreeSession` returns
-`null` (mount-effect fallback).
+preserved) rather than proceeding.
 
-`checkoutMode === "current"` (the default) is unchanged from before the
-redesign on both surfaces — no worktree, no new Tauri calls.
+`checkoutMode === "current"` (the draft surface's default) is unchanged
+from before the redesign — no worktree, no new Tauri calls.
 
-**Branch control ↔ checkout mode coupling.** The branch popover
+**Backend adopt-don't-duplicate guard.** `git_create_worktree` can
+return an EXISTING worktree path without creating anything (the
+path-reuse short-circuit in `git.rs`, when the dir is already registered
+to the same branch). `create_worktree_workspace_impl` therefore looks
+for a live LOCAL workspace already claiming the resolved path
+(`find_live_workspace_for_worktree_path` — `worktree_path` first, `cwd`
+as fallback, canonicalized comparison, remote/attach-only rows skipped)
+and adopts it: activate + return that id, instead of leaving two
+workspaces — and two agents — on a single checkout. The adopt path
+deliberately skips everything the create path would re-run on a live
+workspace (PTY spawn, setup scripts, `.mcp.json` rewrite, preset
+launch), and DROPS `initial_prompt` / `agent_preset_id` rather than
+injecting them into a session someone else is already using. Archived
+workspaces live in `archived_workspaces`, so they neither block creation
+nor get silently un-archived.
+
+**Branch control ↔ checkout mode coupling** (editable scope only — the
+pane surface has no checkout mode to couple to)**.** The branch popover
 (`ThreadScopeRow`'s `BranchControl` — search, All/Worktrees tabs, kind
 icons, mono ages, amber WORKTREE badge on rows with a worktree on this
 device) shares one `baseBranch` value for both "the checked-out branch"

@@ -428,6 +428,60 @@ pub async fn create_worktree_workspace<R: tauri::Runtime>(
     Ok(WorkspaceCreated { workspace_id, cwd })
 }
 
+/// Compare two paths for filesystem identity: canonicalize both sides
+/// (resolving symlinks, `.`/`..`, and macOS's `/private` prefix) and fall
+/// back to a raw comparison when either side doesn't exist on disk. Same
+/// shape as the helper in `scripts.rs`; kept local because that one is
+/// private to its module.
+fn worktree_paths_equal(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ac), Ok(bc)) => ac == bc,
+        _ => a == b,
+    }
+}
+
+/// Find a live workspace that is already checked out at `worktree_path`,
+/// returning its id.
+///
+/// A workspace claims a checkout via `worktree_path` (set by
+/// `set_workspace_worktree` for every worktree-backed workspace); a plain
+/// workspace opened directly at that directory carries no `worktree_path`
+/// but the same `cwd`, and it collides just as badly, so `cwd` is the
+/// fallback probe.
+///
+/// Archived workspaces are deliberately NOT considered: archived entries
+/// live in the separate `AppStateSnapshot::archived_workspaces` vec (they
+/// are removed from `workspaces` on archive — see
+/// `ArchivedWorkspaceSnapshot` in `state/state_impl.rs`), so they are
+/// invisible here by construction. That is the behavior we want: an
+/// archived workspace has no live panes, PTYs, or agent sessions to
+/// collide with, so re-creating a workspace over the same on-disk
+/// worktree is safe and matches how unarchive/restore already treats
+/// those directories (it adopts them explicitly via
+/// `import_worktree_workspace_impl`). Silently un-archiving someone's
+/// archived workspace as a side effect of "create a worktree" would be a
+/// surprising, hard-to-undo mutation, so we don't.
+pub(crate) fn find_live_workspace_for_worktree_path(
+    snapshot: &AppStateSnapshot,
+    worktree_path: &Path,
+) -> Option<String> {
+    snapshot
+        .workspaces
+        .iter()
+        .find(|w| {
+            // Remote workspaces are excluded: their `cwd`/`worktree_path` are
+            // paths on the REMOTE host, not this machine, so a string match
+            // against a local worktree directory would be a coincidence, not
+            // a collision. `git worktree add` only ever produces local paths.
+            if w.host_id.is_some() || w.attach_only {
+                return false;
+            }
+            let claimed = w.worktree_path.as_deref().unwrap_or(w.cwd.as_str());
+            !claimed.is_empty() && worktree_paths_equal(Path::new(claimed), worktree_path)
+        })
+        .map(|w| w.workspace_id.0.clone())
+}
+
 /// Shared implementation behind both the Tauri command (frontend "+
 /// New worktree" / branch-picker "Fork" flow) and the
 /// `create_worktree_workspace` control-socket command exposed via the
@@ -496,6 +550,48 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
         .map_err(|e| format!("git_create_worktree task join failed: {e}"))??
     };
     let wt_path_buf = PathBuf::from(&worktree_path);
+
+    // ADOPT-EXISTING GUARD. `git_create_worktree` does not always create
+    // something: when the conventional path is already on disk and
+    // `git worktree list` maps it to the SAME branch, it short-circuits and
+    // returns that existing checkout (see the path-reuse block in
+    // `git::git_create_worktree`). Falling through to
+    // `create_workspace_with_layout` there mints a SECOND workspace over one
+    // on-disk worktree — two agents editing the same files, two PTYs, two
+    // `.mcp.json` owners. So if a live workspace already claims this path,
+    // adopt it: focus it and return its id, exactly as the unarchive flow
+    // does for an already-open workspace.
+    //
+    // Everything the create path does downstream is deliberately skipped for
+    // an adopted workspace, because it already ran when that workspace was
+    // first created and re-running it would disturb a live session: PTY
+    // spawn, setup scripts, `.mcp.json` rewrite, and preset launch.
+    //
+    // `initial_prompt` and `agent_preset_id` are DROPPED on the adopt path,
+    // by design. The adopted workspace already has live panes with (likely)
+    // a running agent in them; injecting a prompt or launching a second
+    // preset would type into somebody else's in-flight session — a
+    // destructive, unrecoverable side effect. Dropping the request is the
+    // strictly safer failure mode: the caller still gets a valid workspace
+    // id and the user sees the branch they asked for, focused.
+    //
+    // Archived workspaces do not participate — see
+    // `find_live_workspace_for_worktree_path` for why they are neither a
+    // blocker nor auto-unarchived here.
+    if let Some(existing_id) = find_live_workspace_for_worktree_path(&state.snapshot(), &wt_path_buf)
+    {
+        // Focus the adopted workspace so the frontend flips to it exactly as
+        // it would for a freshly-created one (`create_workspace_with_layout`
+        // sets `active_workspace_id` itself). `activate_workspace_impl` is
+        // the same call the unarchive flow uses for an already-open
+        // workspace, and it emits app state itself — no second emit needed.
+        // `create_worktree_workspace` resolves the returned id's `cwd` from
+        // the snapshot afterwards, and the adopted workspace is in that
+        // snapshot, so the wrapper's cwd lookup keeps working unchanged.
+        activate_workspace_impl(app.clone(), state, db, existing_id.clone())?;
+        return Ok(existing_id);
+    }
+
     let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
 
     state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch.clone());
@@ -3392,6 +3488,183 @@ mod archive_guard_tests {
         assert!(
             archive_refusal_reason(&ws).is_none(),
             "an ordinary local workspace must be archivable"
+        );
+    }
+}
+
+#[cfg(test)]
+mod worktree_adopt_tests {
+    //! Coverage for the adopt-existing guard in
+    //! [`create_worktree_workspace_impl`].
+    //!
+    //! `git_create_worktree` short-circuits and returns an ALREADY-EXISTING
+    //! checkout when the conventional path is on disk and registered to the
+    //! same branch. Before the guard, the impl still called
+    //! `create_workspace_with_layout` unconditionally, producing two
+    //! workspaces over one worktree directory (two agents, one checkout).
+    //!
+    //! The impl itself takes an `AppHandle` (out of reach for a unit test —
+    //! same constraint the Phase 1.6 close tests and archive guards
+    //! document), so the decision is factored into the pure
+    //! [`find_live_workspace_for_worktree_path`] lookup and pinned here. The
+    //! impl calls it verbatim and returns its `Some(id)` early, so a
+    //! regression in the lookup fails these tests immediately.
+
+    use super::*;
+    use crate::state::{build_archive_entry, AppStateStore, WorkspacePresetLayout};
+    use tempfile::TempDir;
+
+    /// Build a worktree-backed workspace the way
+    /// `create_worktree_workspace_impl` does: create at the worktree path,
+    /// then stamp `worktree_path` via `set_workspace_worktree`.
+    fn worktree_workspace(store: &AppStateStore, path: &Path, branch: &str) -> String {
+        let id = store.create_workspace_with_layout(path.to_path_buf(), WorkspacePresetLayout::Single);
+        store.set_workspace_worktree(&id.0, path.display().to_string(), branch.to_string());
+        id.0
+    }
+
+    #[test]
+    fn second_create_at_same_worktree_path_adopts_instead_of_duplicating() {
+        let tmp = TempDir::new().expect("tempdir");
+        let wt = tmp.path().join("repo-feature");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+
+        let store = AppStateStore::default();
+        let first_id = worktree_workspace(&store, &wt, "feature");
+        let count_after_first = store.snapshot().workspaces.len();
+
+        // This is the exact call the impl makes right after
+        // `git_create_worktree` hands back the reused path.
+        let adopted = find_live_workspace_for_worktree_path(&store.snapshot(), &wt)
+            .expect("a live workspace already claims this worktree path");
+
+        assert_eq!(
+            adopted, first_id,
+            "the second worktree_create for the same path must resolve to the \
+             FIRST workspace's id, not mint a new one"
+        );
+        assert_eq!(
+            store.snapshot().workspaces.len(),
+            count_after_first,
+            "the adopt path must not add a workspace — two workspaces over one \
+             on-disk worktree means two agents writing the same files"
+        );
+    }
+
+    #[test]
+    fn distinct_worktree_paths_still_create() {
+        let tmp = TempDir::new().expect("tempdir");
+        let first = tmp.path().join("repo-feature");
+        let second = tmp.path().join("repo-other");
+        std::fs::create_dir_all(&first).expect("mkdir first");
+        std::fs::create_dir_all(&second).expect("mkdir second");
+
+        let store = AppStateStore::default();
+        worktree_workspace(&store, &first, "feature");
+
+        assert!(
+            find_live_workspace_for_worktree_path(&store.snapshot(), &second).is_none(),
+            "a different branch's worktree must not be adopted — creation \
+             has to proceed normally for it"
+        );
+    }
+
+    #[test]
+    fn adopt_matches_through_non_canonical_path_spelling() {
+        let tmp = TempDir::new().expect("tempdir");
+        let wt = tmp.path().join("repo-feature");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+
+        let store = AppStateStore::default();
+        let id = worktree_workspace(&store, &wt, "feature");
+
+        // Same directory, different spelling. String equality would miss it
+        // and duplicate the workspace; canonicalized comparison must not.
+        let round_trip = wt.join("..").join("repo-feature");
+
+        assert_eq!(
+            find_live_workspace_for_worktree_path(&store.snapshot(), &round_trip),
+            Some(id),
+            "path identity must be resolved by canonicalization, not raw string \
+             comparison"
+        );
+    }
+
+    #[test]
+    fn plain_workspace_opened_at_the_path_is_adopted_via_cwd() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("plain");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let store = AppStateStore::default();
+        // No `set_workspace_worktree` — this is a plain workspace the user
+        // opened directly at the directory. It has no `worktree_path`, but it
+        // collides with a new worktree workspace just as badly.
+        let id = store.create_workspace_at_path(dir.clone());
+
+        assert_eq!(
+            find_live_workspace_for_worktree_path(&store.snapshot(), &dir),
+            Some(id.0),
+            "the `cwd` fallback must catch a plain workspace already sitting on \
+             the checkout"
+        );
+    }
+
+    #[test]
+    fn remote_workspace_with_the_same_path_string_is_not_adopted() {
+        let tmp = TempDir::new().expect("tempdir");
+        let wt = tmp.path().join("repo-feature");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+
+        let store = AppStateStore::default();
+        // An attach-only workspace whose `cwd` is a path on ANOTHER machine
+        // that happens to spell the same as ours. Adopting it would hand the
+        // caller a workspace that can't run anything locally.
+        store.create_remote_attach_workspace(
+            "remote".into(),
+            7,
+            wt.display().to_string(),
+            Some("feature".into()),
+            None,
+            None,
+            Some("worktree".into()),
+        );
+
+        assert!(
+            find_live_workspace_for_worktree_path(&store.snapshot(), &wt).is_none(),
+            "a remote/attach-only workspace's host path must never match a \
+             local worktree directory"
+        );
+    }
+
+    #[test]
+    fn archived_workspace_at_same_path_does_not_block_creation() {
+        let tmp = TempDir::new().expect("tempdir");
+        let wt = tmp.path().join("repo-feature");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+
+        let store = AppStateStore::default();
+        let id = worktree_workspace(&store, &wt, "feature");
+        let ws = store.find_workspace(&id).expect("workspace exists");
+
+        // Archiving removes the workspace from `workspaces` and parks a copy
+        // in `archived_workspaces`, so the lookup can't see it. That is the
+        // intended policy: an archived workspace has no live panes or PTYs to
+        // collide with, so creation must proceed rather than adopt (or
+        // silently un-archive) it.
+        store.add_archived_workspace(build_archive_entry(&ws));
+        store.close_workspace(&id).expect("close the now-archived workspace");
+
+        assert_eq!(
+            store.snapshot().archived_workspaces.len(),
+            1,
+            "pre-condition: the archived entry is parked and still points at \
+             this worktree path"
+        );
+        assert!(
+            find_live_workspace_for_worktree_path(&store.snapshot(), &wt).is_none(),
+            "an archived workspace must not be adopted — worktree_create has to \
+             build a fresh workspace over the directory"
         );
     }
 }

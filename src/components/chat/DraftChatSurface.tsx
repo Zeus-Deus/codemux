@@ -921,11 +921,8 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
 
   const belowComposerSlot = (
     <ThreadScopeRow
-      location={{
-        kind: "draft",
-        target: draft.target,
-        onChangeTarget: handleChangeTarget,
-      }}
+      target={draft.target}
+      onChangeTarget={handleChangeTarget}
       projectPath={scopeProjectPath}
       checkoutMode={draft.checkoutMode ?? "current"}
       worktreeName={draft.worktreeName ?? ""}

@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect, vi, beforeEach } from "vitest";
-import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 
 let currentMessages: unknown[] = [];
 // Overridable per-test: thread -> messages map so the new race-fix
@@ -235,13 +235,13 @@ type ThreadScopeRowStubProps = {
       }
     | { kind: "draft" };
   projectPath: string | null;
-  checkoutMode: "current" | "worktree";
-  worktreeName: string;
-  baseBranch: string;
+  // A workspace-bound pane always passes a FIXED scope — its workspace
+  // has one checkout that every pane in it shares, so there is no
+  // per-thread worktree choice to make here.
+  scope:
+    | { kind: "fixed"; branch: string | null }
+    | { kind: "editable"; checkoutMode: "current" | "worktree" };
   disabled?: boolean;
-  onChangeCheckoutMode: (mode: "current" | "worktree") => void;
-  onChangeWorktreeName: (name: string) => void;
-  onChangeBaseBranch: (branch: string) => void;
 };
 let lastThreadScopeRowProps: ThreadScopeRowStubProps | null = null;
 vi.mock("./pickers/ThreadScopeRow", () => ({
@@ -260,8 +260,10 @@ vi.mock("./pickers/ThreadScopeRow", () => ({
             : "false"
         }
         data-project-path={props.projectPath ?? ""}
-        data-checkout-mode={props.checkoutMode}
-        data-base-branch={props.baseBranch}
+        data-scope-kind={props.scope.kind}
+        data-base-branch={
+          props.scope.kind === "fixed" ? props.scope.branch ?? "" : ""
+        }
       />
     );
   },
@@ -497,9 +499,8 @@ vi.mock("@/stores/agent-chat-store", () => {
       getState: () => ({
         threads: buildThreads(),
         applyEvent: vi.fn(),
-        // prestartWorktreeSession reads these to seed the agent-chat
-        // slice after start_session resolves (the optional config
-        // setters only fire when the caller provides a value).
+        // Session bring-up seeds the agent-chat slice through these
+        // after start_session resolves.
         ensureThread: vi.fn(),
         setPermissionMode: vi.fn(),
         setSessionLaunchMode: vi.fn(),
@@ -1041,7 +1042,26 @@ describe("AgentChatPane Stage C race fix", () => {
   });
 });
 
-describe("AgentChatPane Thread Scope — empty-state scope row", () => {
+describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen", () => {
+  // A chat pane is bound to a REAL workspace, and that workspace owns
+  // exactly one project root and one checkout, shared by every tab and
+  // pane inside it. Nothing about a thread's scope is choosable here, so
+  // the strip below the composer is the read-only Context Row from the
+  // first render — the interactive `ThreadScopeRow` belongs to
+  // `DraftChatSurface` alone.
+  //
+  // Both retired controls were app-wide relocations wearing per-thread
+  // clothing: "New worktree" created a SECOND workspace off the parent
+  // repo mid-send and moved the user into it (re-asking on every extra
+  // chat tab, including tabs of an already worktree-backed workspace),
+  // and the location picker activated another project's workspace,
+  // abandoning whatever had been typed in this one.
+
+  /** The below-composer strip, or null when none renders. */
+  function strip(container: HTMLElement) {
+    return container.querySelector('[data-testid="below-composer"] .scope-strip-stub');
+  }
+
   beforeEach(() => {
     currentMessages = [];
     currentThreadsMap = {};
@@ -1054,27 +1074,9 @@ describe("AgentChatPane Thread Scope — empty-state scope row", () => {
     Object.assign(mockAppState, HOME_APP_STATE);
   });
 
-  it("home-rooted empty pane renders the ThreadScopeRow below the composer with isHome + no project scope", () => {
-    Object.assign(mockAppState, HOME_APP_STATE);
-    workspaceIdForPaneOverride = "ws-home";
-    const { container } = render(<AgentChatPane pane={pane} />);
-    const stub = container.querySelector(
-      '[data-testid="thread-scope-row-stub"]',
-    ) as HTMLElement | null;
-    expect(stub).not.toBeNull();
-    expect(stub!.dataset.locationKind).toBe("workspace");
-    expect(stub!.dataset.isHome).toBe("true");
-    // Home pane has no project — checkout/branch controls hide inside
-    // the row (its own tests cover that); the pane passes null.
-    expect(stub!.dataset.projectPath).toBe("");
-    // The row renders in the below-composer slot, not Zone 1.
-    const below = container.querySelector('[data-testid="below-composer"]');
-    expect(below!.contains(stub)).toBe(true);
-    const zone1 = container.querySelector('[data-testid="zone1"]');
-    expect(zone1!.childElementCount).toBe(0);
-  });
-
-  it("project pane renders the ThreadScopeRow scoped to the project root, below the composer", () => {
+  function seedProjectWorkspace(
+    overrides: Record<string, unknown> = {},
+  ) {
     mockAppState.appState = {
       active_workspace_id: "ws-foo",
       workspaces: [
@@ -1083,273 +1085,134 @@ describe("AgentChatPane Thread Scope — empty-state scope row", () => {
           workspace_type: "standard",
           project_root: "/projects/foo",
           cwd: "/projects/foo",
+          ...overrides,
         },
       ],
     };
     workspaceIdForPaneOverride = "ws-foo";
-    const projectPane = {
+    return {
       ...pane,
       pane_id: "pane-foo",
       thread_id: "thread-x",
-      cwd: "/projects/foo",
+      cwd: (overrides.cwd as string) ?? "/projects/foo",
     };
-    const { container } = render(<AgentChatPane pane={projectPane} />);
-    const stub = container.querySelector(
-      '[data-testid="thread-scope-row-stub"]',
-    ) as HTMLElement | null;
-    expect(stub).not.toBeNull();
-    expect(stub!.dataset.isHome).toBe("false");
-    expect(stub!.dataset.projectPath).toBe("/projects/foo");
-    expect(stub!.dataset.checkoutMode).toBe("current");
-    const zone1 = container.querySelector('[data-testid="zone1"]');
-    expect(zone1!.childElementCount).toBe(0);
-  });
+  }
 
-  it("seeds the branch display from the workspace's actual checked-out branch (git_branch), not the main heuristic", () => {
-    mockAppState.appState = {
-      active_workspace_id: "ws-foo",
-      workspaces: [
-        {
-          workspace_id: "ws-foo",
-          workspace_type: "standard",
-          project_root: "/projects/foo",
-          cwd: "/projects/foo",
-          git_branch: "feat/login",
-        },
-      ],
-    };
-    workspaceIdForPaneOverride = "ws-foo";
-    const projectPane = {
-      ...pane,
-      pane_id: "pane-foo",
-      thread_id: "thread-x",
-      cwd: "/projects/foo",
-    };
+  it("renders NO interactive scope row on an empty thread — only the read-only Context Row", () => {
+    const projectPane = seedProjectWorkspace({ git_branch: "feat/login" });
     const { container } = render(<AgentChatPane pane={projectPane} />);
-    const stub = container.querySelector(
-      '[data-testid="thread-scope-row-stub"]',
-    ) as HTMLElement | null;
-    expect(stub!.dataset.baseBranch).toBe("feat/login");
-  });
-
-  it("replaces the scope row with the read-only Context Row once the conversation has messages", () => {
-    mockAppState.appState = {
-      active_workspace_id: "ws-foo",
-      workspaces: [
-        {
-          workspace_id: "ws-foo",
-          workspace_type: "standard",
-          project_root: "/projects/foo",
-          cwd: "/projects/foo",
-          git_branch: "feat/login",
-        },
-      ],
-    };
-    workspaceIdForPaneOverride = "ws-foo";
-    currentMessages = [{ kind: "user_message", id: "m1" }];
-    const projectPane = {
-      ...pane,
-      pane_id: "pane-foo",
-      thread_id: "thread-x",
-      cwd: "/projects/foo",
-    };
-    // This describe block doesn't call `afterEach(cleanup)`, so prior
-    // tests' DOM trees can still be mounted in `document.body` —
-    // `within(container)` (not the bare `getByText` RTL normally
-    // returns, which is bound to `baseElement`/`document.body`) keeps
-    // these assertions scoped to THIS render.
-    const { container } = render(<AgentChatPane pane={projectPane} />);
-    const scoped = within(container);
-    // The interactive empty-state scope row is gone...
     expect(
       container.querySelector('[data-testid="thread-scope-row-stub"]'),
     ).toBeNull();
-    // Zone 1 stays empty — scope now lives below the composer.
-    const zone1 = container.querySelector('[data-testid="zone1"]');
-    expect(zone1!.childElementCount).toBe(0);
-    // ...replaced by the read-only Context Row: static project/branch
-    // labels plus the same status cluster the scope row's `trailing`
-    // slot carries.
+    expect(lastThreadScopeRowProps).toBeNull();
+    const scoped = within(container);
     expect(scoped.getByText("foo")).toBeInTheDocument();
     expect(scoped.getByText("feat/login")).toBeInTheDocument();
+    // Zone 1 stays empty — scope lives below the composer.
+    const zone1 = container.querySelector('[data-testid="zone1"]');
+    expect(zone1!.childElementCount).toBe(0);
     const below = container.querySelector('[data-testid="below-composer"]');
     expect(
       below!.querySelector('[data-testid="workspace-status-cluster-stub"]'),
     ).not.toBeNull();
   });
 
-  it("Context Row omits the branch span when the workspace has no git branch (e.g. a home pane)", () => {
-    mockAppState.appState = {
-      active_workspace_id: "ws-home",
-      workspaces: [
-        {
-          workspace_id: "ws-home",
-          workspace_type: "standard",
-          project_root: "/home/user",
-          cwd: "/home/user",
-          git_branch: null,
-        },
-      ],
-    };
-    workspaceIdForPaneOverride = "ws-home";
+  it("keeps the SAME strip once the conversation has messages (scope never appears to change on first send)", () => {
+    const projectPane = seedProjectWorkspace({ git_branch: "feat/login" });
+    const empty = render(<AgentChatPane pane={projectPane} />);
+    const beforeSend = strip(empty.container)!.innerHTML;
+    cleanup();
     currentMessages = [{ kind: "user_message", id: "m1" }];
+    const withMessages = render(<AgentChatPane pane={projectPane} />);
+    expect(strip(withMessages.container)!.innerHTML).toBe(beforeSend);
+  });
+
+  it("a worktree-backed workspace's extra chat tab gets the same read-only strip (the reported bug)", () => {
+    // `project_root` is the PARENT repo, `cwd` the linked worktree —
+    // the exact shape that used to re-offer "New worktree" per tab.
+    const wtPane = seedProjectWorkspace({
+      cwd: "/worktrees/foo/fix-login",
+      git_branch: "fix-login",
+    });
+    const { container } = render(<AgentChatPane pane={wtPane} />);
+    expect(
+      container.querySelector('[data-testid="thread-scope-row-stub"]'),
+    ).toBeNull();
+    const scoped = within(container);
+    expect(scoped.getByText("fix-login")).toBeInTheDocument();
+  });
+
+  it("home-rooted pane shows Home with no branch and no project picker", () => {
+    Object.assign(mockAppState, HOME_APP_STATE);
+    workspaceIdForPaneOverride = "ws-home";
     const { container } = render(<AgentChatPane pane={pane} />);
     const scoped = within(container);
     expect(scoped.getByText("Home")).toBeInTheDocument();
     expect(scoped.queryByText("·")).not.toBeInTheDocument();
-  });
-
-  it("onSelectProject activates the first workspace of the picked project (old ProjectPicker behavior)", async () => {
-    mockAppState.appState = {
-      active_workspace_id: "ws-home",
-      workspaces: [
-        {
-          workspace_id: "ws-home",
-          workspace_type: "standard",
-          project_root: "/home/user",
-          cwd: "/home/user",
-        },
-        {
-          workspace_id: "ws-bar-main",
-          workspace_type: "standard",
-          project_root: "/projects/bar",
-          cwd: "/projects/bar",
-        },
-      ],
-    };
-    workspaceIdForPaneOverride = "ws-home";
-    render(<AgentChatPane pane={pane} />);
-    expect(lastThreadScopeRowProps).not.toBeNull();
-    const location = lastThreadScopeRowProps!.location;
-    if (location.kind !== "workspace") throw new Error("expected workspace");
-    const { activateWorkspace } = await import("@/tauri/commands");
-    vi.mocked(activateWorkspace).mockClear();
-    location.onSelectProject("/projects/bar");
-    expect(setActiveDraftMock).toHaveBeenCalledWith(null);
-    expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-bar-main");
-    expect(setShowNewWorkspaceDialogMock).not.toHaveBeenCalled();
-  });
-
-  it("onSelectProject opens NewWorkspaceDialog when the picked project has no workspaces yet", async () => {
-    Object.assign(mockAppState, HOME_APP_STATE);
-    workspaceIdForPaneOverride = "ws-home";
-    render(<AgentChatPane pane={pane} />);
-    expect(lastThreadScopeRowProps).not.toBeNull();
-    const location = lastThreadScopeRowProps!.location;
-    if (location.kind !== "workspace") throw new Error("expected workspace");
-    const { activateWorkspace } = await import("@/tauri/commands");
-    vi.mocked(activateWorkspace).mockClear();
-    location.onSelectProject("/projects/bar");
-    expect(setActiveDraftMock).toHaveBeenCalledWith(null);
-    expect(vi.mocked(activateWorkspace)).not.toHaveBeenCalled();
-    expect(setShowNewWorkspaceDialogMock).toHaveBeenCalledWith(
-      true,
-      "/projects/bar",
-    );
-  });
-
-  it("onSelectHomeWorkspace clears the active draft and activates the home workspace", async () => {
-    mockAppState.appState = {
-      active_workspace_id: "ws-foo",
-      workspaces: [
-        {
-          workspace_id: "ws-foo",
-          workspace_type: "standard",
-          project_root: "/projects/foo",
-          cwd: "/projects/foo",
-        },
-        {
-          workspace_id: "ws-home",
-          workspace_type: "standard",
-          project_root: "/home/user",
-          cwd: "/home/user",
-        },
-      ],
-    };
-    workspaceIdForPaneOverride = "ws-foo";
-    const projectPane = {
-      ...pane,
-      pane_id: "pane-foo",
-      thread_id: "thread-x",
-      cwd: "/projects/foo",
-    };
-    render(<AgentChatPane pane={projectPane} />);
-    const location = lastThreadScopeRowProps!.location;
-    if (location.kind !== "workspace") throw new Error("expected workspace");
-    const { activateWorkspace } = await import("@/tauri/commands");
-    vi.mocked(activateWorkspace).mockClear();
-    location.onSelectHomeWorkspace("ws-home");
-    expect(setActiveDraftMock).toHaveBeenCalledWith(null);
-    expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-home");
-  });
-
-  it("renders no scope row when appState is null (early-boot fallback)", () => {
-    mockAppState.appState = null;
-    workspaceIdForPaneOverride = null;
-    const { container } = render(<AgentChatPane pane={pane} />);
-    expect(
-      container.querySelector('[data-testid="composer"]'),
-    ).not.toBeNull();
     expect(
       container.querySelector('[data-testid="thread-scope-row-stub"]'),
     ).toBeNull();
   });
 
-  it("scope projectPath comes from project_root, not cwd, when they differ", () => {
-    mockAppState.appState = {
-      active_workspace_id: "ws-foo-feat",
-      workspaces: [
-        {
-          workspace_id: "ws-foo-feat",
-          workspace_type: "standard",
-          project_root: "/projects/foo",
-          cwd: "/projects/foo-feat-x",
-        },
-      ],
+  it("first send stays in THIS pane's thread — no worktree, no workspace, no relocation", async () => {
+    const projectPane = seedProjectWorkspace({
+      cwd: "/worktrees/foo/fix-login",
+      git_branch: "fix-login",
+    });
+    currentSliceOverrides = {
+      "thread-x": { inputDraft: "fix the login bug" },
     };
-    workspaceIdForPaneOverride = "ws-foo-feat";
-    const featPane = {
-      ...pane,
-      pane_id: "pane-foo-feat",
-      thread_id: "thread-x",
-      cwd: "/projects/foo-feat-x",
-    };
-    const { container } = render(<AgentChatPane pane={featPane} />);
-    const stub = container.querySelector(
-      '[data-testid="thread-scope-row-stub"]',
-    ) as HTMLElement | null;
-    expect(stub).not.toBeNull();
-    expect(stub!.dataset.projectPath).toBe("/projects/foo");
-  });
-
-  it("falls back to active_workspace_id project_root when workspaceIdForPane is null", () => {
-    mockAppState.appState = {
-      active_workspace_id: "ws-foo",
-      workspaces: [
-        {
-          workspace_id: "ws-foo",
-          workspace_type: "standard",
-          project_root: "/projects/foo",
-          cwd: "/projects/foo",
-        },
-      ],
-    };
-    workspaceIdForPaneOverride = null;
-    const projectPane = {
-      ...pane,
-      pane_id: "pane-foo",
-      thread_id: "thread-x",
-      cwd: "/projects/foo",
-    };
+    const {
+      activateWorkspace,
+      agentChatSendTurn,
+      createWorktreeWorkspaceResult,
+      generateBranchName,
+    } = await import("@/tauri/commands");
+    vi.mocked(activateWorkspace).mockClear();
+    vi.mocked(createWorktreeWorkspaceResult).mockClear();
+    vi.mocked(generateBranchName).mockClear();
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
+      turn_id: "turn-1",
+      queued_id: null,
+    } as never);
     const { container } = render(<AgentChatPane pane={projectPane} />);
-    const stub = container.querySelector(
-      '[data-testid="thread-scope-row-stub"]',
-    ) as HTMLElement | null;
-    expect(stub).not.toBeNull();
-    expect(stub!.dataset.projectPath).toBe("/projects/foo");
+    fireEvent.click(
+      container.querySelector('[data-testid="composer-submit"]')!,
+    );
+    await waitFor(() => {
+      expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
+    });
+    const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
+    expect(sendInput.thread_id).toBe("thread-x");
+    expect(vi.mocked(createWorktreeWorkspaceResult)).not.toHaveBeenCalled();
+    expect(vi.mocked(generateBranchName)).not.toHaveBeenCalled();
+    expect(vi.mocked(activateWorkspace)).not.toHaveBeenCalled();
   });
 
-  it("project_root null on the workspace falls back to cwd for scope", () => {
+  it("renders no strip at all when appState is null (early-boot fallback)", () => {
+    mockAppState.appState = null;
+    workspaceIdForPaneOverride = null;
+    const { container } = render(<AgentChatPane pane={pane} />);
+    expect(container.querySelector('[data-testid="composer"]')).not.toBeNull();
+    expect(strip(container)).toBeNull();
+  });
+
+  it("labels the strip from project_root, not cwd, when they differ", () => {
+    const featPane = seedProjectWorkspace({ cwd: "/projects/foo-feat-x" });
+    const { container } = render(<AgentChatPane pane={featPane} />);
+    expect(strip(container)!.querySelector("span[title]")!.getAttribute("title")).toBe(
+      "/projects/foo",
+    );
+  });
+
+  it("falls back to active_workspace_id's project_root when workspaceIdForPane is null", () => {
+    const projectPane = seedProjectWorkspace();
+    workspaceIdForPaneOverride = null;
+    const { container } = render(<AgentChatPane pane={projectPane} />);
+    expect(within(container).getByText("foo")).toBeInTheDocument();
+  });
+
+  it("project_root null on the workspace falls back to cwd", () => {
     mockAppState.appState = {
       active_workspace_id: "ws-adhoc",
       workspaces: [
@@ -1369,211 +1232,7 @@ describe("AgentChatPane Thread Scope — empty-state scope row", () => {
       cwd: "/tmp/adhoc",
     };
     const { container } = render(<AgentChatPane pane={adhocPane} />);
-    const stub = container.querySelector(
-      '[data-testid="thread-scope-row-stub"]',
-    ) as HTMLElement | null;
-    expect(stub).not.toBeNull();
-    expect(stub!.dataset.projectPath).toBe("/tmp/adhoc");
-  });
-});
-
-describe("AgentChatPane Thread Scope — deferred worktree first send", () => {
-  function seedProjectPaneState() {
-    // The pane's project workspace, plus the NEW worktree workspace
-    // (`ws-new`, the id createWorktreeWorkspaceResult resolves to) so
-    // prestartWorktreeSession can read its cwd — in production
-    // emit_app_state fires inside create_worktree_workspace before the
-    // invoke resolves.
-    mockAppState.appState = {
-      active_workspace_id: "ws-foo",
-      workspaces: [
-        {
-          workspace_id: "ws-foo",
-          workspace_type: "standard",
-          project_root: "/projects/foo",
-          cwd: "/projects/foo",
-        },
-        {
-          workspace_id: "ws-new",
-          workspace_type: "standard",
-          project_root: "/projects/foo",
-          cwd: "/projects/foo-worktree",
-        },
-      ],
-    };
-    workspaceIdForPaneOverride = "ws-foo";
-  }
-
-  const projectPane = {
-    ...pane,
-    pane_id: "pane-foo",
-    thread_id: "thread-x",
-    cwd: "/projects/foo",
-  };
-
-  beforeEach(async () => {
-    currentMessages = [];
-    currentThreadsMap = {};
-    currentSliceOverrides = {
-      "thread-x": { inputDraft: "fix the login bug" },
-    };
-    currentDraftsById = {};
-    setActiveDraftMock.mockClear();
-    appendUserMessageMock.mockClear();
-    lastThreadScopeRowProps = null;
-    seedProjectPaneState();
-    const {
-      activateWorkspace,
-      agentChatCreatePane,
-      agentChatSendTurn,
-      agentChatStartSession,
-      createWorktreeWorkspaceResult,
-      generateBranchName,
-      generateRandomBranchName,
-    } = await import("@/tauri/commands");
-    vi.mocked(activateWorkspace).mockClear();
-    vi.mocked(agentChatCreatePane).mockClear().mockResolvedValue("pane-new");
-    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
-      turn_id: "turn-1",
-      queued_id: null,
-    } as never);
-    vi.mocked(agentChatStartSession)
-      .mockClear()
-      .mockResolvedValue("thread-echo");
-    vi.mocked(createWorktreeWorkspaceResult)
-      .mockClear()
-      .mockResolvedValue({ workspaceId: "ws-new", cwd: null });
-    vi.mocked(generateBranchName)
-      .mockClear()
-      .mockResolvedValue("ai-named-branch");
-    vi.mocked(generateRandomBranchName)
-      .mockClear()
-      .mockResolvedValue("random-branch");
-  });
-
-  it("worktree mode first send: creates the worktree (auto-named), prestarts, routes the turn to the NEW thread, then activates", async () => {
-    const { container } = render(<AgentChatPane pane={projectPane} />);
-    // Flip the checkout mode through the row's callback (pane-local
-    // useState → re-render swaps the composer's onSubmit).
-    act(() => {
-      lastThreadScopeRowProps!.onChangeCheckoutMode("worktree");
-    });
-    const {
-      activateWorkspace,
-      agentChatCreatePane,
-      agentChatSendTurn,
-      agentChatStartSession,
-      createWorktreeWorkspaceResult,
-      generateBranchName,
-    } = await import("@/tauri/commands");
-    fireEvent.click(
-      container.querySelector('[data-testid="composer-submit"]')!,
-    );
-    await waitFor(() => {
-      expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-new");
-    });
-    // 1. Worktree created off the base branch, auto-named from the
-    //    first message (empty name field → generateBranchName).
-    expect(vi.mocked(generateBranchName)).toHaveBeenCalledWith(
-      "fix the login bug",
-      "/projects/foo",
-    );
-    expect(vi.mocked(createWorktreeWorkspaceResult)).toHaveBeenCalledWith(
-      "/projects/foo",
-      "ai-named-branch",
-      true,
-      "empty",
-      null, // baseBranch state is "" (no git_branch on ws-foo) → null
-      null,
-      null,
-    );
-    // 2. Prestart: pane + session on the NEW worktree's cwd.
-    expect(vi.mocked(agentChatCreatePane)).toHaveBeenCalledWith(
-      "ws-new",
-      "claude",
-      "/projects/foo-worktree",
-    );
-    expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1);
-    const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
-    expect(startInput.cwd).toBe("/projects/foo-worktree");
-    // 3. First turn routed into the prestarted thread — NOT thread-x.
-    expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
-    const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
-    expect(sendInput.thread_id).toBe(startInput.thread_id);
-    expect(sendInput.thread_id).not.toBe("thread-x");
-    expect(sendInput.text).toBe("fix the login bug");
-    // Optimistic echo landed on the new thread too.
-    expect(appendUserMessageMock).toHaveBeenCalledWith(
-      startInput.thread_id,
-      "fix the login bug",
-      undefined,
-      [],
-    );
-    // 4. Draft cleared so the new pane mounts solo.
-    expect(setActiveDraftMock).toHaveBeenCalledWith(null);
-  });
-
-  it("uses the typed worktree name verbatim (no auto-naming)", async () => {
-    const { container } = render(<AgentChatPane pane={projectPane} />);
-    act(() => {
-      lastThreadScopeRowProps!.onChangeCheckoutMode("worktree");
-      lastThreadScopeRowProps!.onChangeWorktreeName("my-feature");
-      lastThreadScopeRowProps!.onChangeBaseBranch("develop");
-    });
-    const { activateWorkspace, createWorktreeWorkspaceResult, generateBranchName } =
-      await import("@/tauri/commands");
-    fireEvent.click(
-      container.querySelector('[data-testid="composer-submit"]')!,
-    );
-    await waitFor(() => {
-      expect(vi.mocked(activateWorkspace)).toHaveBeenCalledWith("ws-new");
-    });
-    expect(vi.mocked(generateBranchName)).not.toHaveBeenCalled();
-    expect(vi.mocked(createWorktreeWorkspaceResult)).toHaveBeenCalledWith(
-      "/projects/foo",
-      "my-feature",
-      true,
-      "empty",
-      "develop",
-      null,
-      null,
-    );
-  });
-
-  it("current mode (default) submit is untouched: sends to the pane's own thread, no worktree calls", async () => {
-    const { container } = render(<AgentChatPane pane={projectPane} />);
-    const { agentChatSendTurn, createWorktreeWorkspaceResult, generateBranchName } =
-      await import("@/tauri/commands");
-    fireEvent.click(
-      container.querySelector('[data-testid="composer-submit"]')!,
-    );
-    await waitFor(() => {
-      expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
-    });
-    const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
-    expect(sendInput.thread_id).toBe("thread-x");
-    expect(vi.mocked(createWorktreeWorkspaceResult)).not.toHaveBeenCalled();
-    expect(vi.mocked(generateBranchName)).not.toHaveBeenCalled();
-  });
-
-  it("worktree mode with a conversation already running does NOT intercept (guard on messages.length)", async () => {
-    currentMessages = [{ kind: "user_message", id: "m1" }];
-    const { container } = render(<AgentChatPane pane={projectPane} />);
-    // No scope row when messages exist; but even a stale worktree mode
-    // (state left from before the first message) must not intercept.
-    // The composerOnSubmit gate re-derives per render.
-    const { agentChatSendTurn, createWorktreeWorkspaceResult } = await import(
-      "@/tauri/commands"
-    );
-    fireEvent.click(
-      container.querySelector('[data-testid="composer-submit"]')!,
-    );
-    await waitFor(() => {
-      expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
-    });
-    const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
-    expect(sendInput.thread_id).toBe("thread-x");
-    expect(vi.mocked(createWorktreeWorkspaceResult)).not.toHaveBeenCalled();
+    expect(within(container).getByText("adhoc")).toBeInTheDocument();
   });
 });
 
