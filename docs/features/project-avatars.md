@@ -42,7 +42,7 @@ Every workspace row in the left sidebar renders a small project avatar (`Project
 - Persistence is device-local UI state; avatars do not sync across devices
 - No local image file picker — input is URL/domain text only (data URLs work but must be pasted)
 - A project with no workspace in the inbox has no right-click surface, so its avatar can't be customized until one exists
-- Persisted values are only re-read on mount; an external write to the `ui_state` table while the app runs is not observed
+- Persisted values are read once per project per app session (the store dedupes the load and never re-reads); an external write to the `ui_state` table while the app runs is not observed
 
 ## Important Touch Points
 

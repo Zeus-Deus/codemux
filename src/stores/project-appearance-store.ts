@@ -42,6 +42,20 @@ interface ProjectAppearanceStore {
  *  bookkeeping, not rendered state — mutating it must never trigger a render. */
 const loadStarted = new Set<string>();
 
+/** Per-project set of fields a setter has explicitly written. `load` consults
+ *  this to merge field-by-field: written fields keep their in-store value,
+ *  everything else takes the persisted value. A dirty-field set (not a
+ *  null-coalescing merge) because `null` is a legitimate written value —
+ *  clearing the color must survive a load resolving afterwards. Kept outside
+ *  the store for the same reason as `loadStarted`. */
+const writtenFields = new Map<string, Set<keyof ProjectAppearance>>();
+
+function markWritten(projectPath: string, ...fields: (keyof ProjectAppearance)[]) {
+  const set = writtenFields.get(projectPath) ?? new Set();
+  for (const field of fields) set.add(field);
+  writtenFields.set(projectPath, set);
+}
+
 /**
  * Per-project avatar appearance (image + accent color), shared by every
  * surface that renders a `ProjectAvatar`.
@@ -66,25 +80,39 @@ export const useProjectAppearanceStore = create<ProjectAppearanceStore>(
         dbGetUiState(imageVersionKey(projectPath)).catch(() => null),
       ]);
       set((s) => {
-        // A write that landed while this read was in flight wins — the user's
-        // just-picked color must never be clobbered by the stale stored value.
-        if (s.byPath[projectPath]) return s;
-        return {
-          byPath: {
-            ...s.byPath,
-            [projectPath]: {
-              // Cleared values are persisted as "" rather than deleted, so
-              // normalise falsy to null.
-              customColor: color || null,
-              imageUrl: image || null,
-              imageVersion: version || null,
-            },
-          },
+        // Merge field-by-field: a write that landed while this read was in
+        // flight wins for the field it wrote — the user's just-picked color
+        // must never be clobbered by the stale stored value — but fields the
+        // user has not touched still take their persisted values. Discarding
+        // the whole read on any prior write would drop the persisted image
+        // when a color pick raced the load (and vice versa).
+        const existing = s.byPath[projectPath] ?? EMPTY_APPEARANCE;
+        const written = writtenFields.get(projectPath);
+        const merged: ProjectAppearance = {
+          // Cleared values are persisted as "" rather than deleted, so
+          // normalise falsy to null.
+          customColor: written?.has("customColor")
+            ? existing.customColor
+            : color || null,
+          imageUrl: written?.has("imageUrl") ? existing.imageUrl : image || null,
+          imageVersion: written?.has("imageVersion")
+            ? existing.imageVersion
+            : version || null,
         };
+        if (
+          merged.customColor === existing.customColor &&
+          merged.imageUrl === existing.imageUrl &&
+          merged.imageVersion === existing.imageVersion &&
+          s.byPath[projectPath]
+        ) {
+          return s; // Nothing changed — keep the snapshot reference stable.
+        }
+        return { byPath: { ...s.byPath, [projectPath]: merged } };
       });
     },
 
     setColor: (projectPath, color) => {
+      markWritten(projectPath, "customColor");
       set((s) => ({
         byPath: {
           ...s.byPath,
@@ -102,6 +130,7 @@ export const useProjectAppearanceStore = create<ProjectAppearanceStore>(
       // a site whose icon changed picks up the new one instead of the cached
       // bytes. Direct/data URLs ignore it (see `resolveImageUrl`).
       const version = value ? String(Date.now()) : null;
+      markWritten(projectPath, "imageUrl", "imageVersion");
       set((s) => ({
         byPath: {
           ...s.byPath,
@@ -120,8 +149,10 @@ export const useProjectAppearanceStore = create<ProjectAppearanceStore>(
   }),
 );
 
-/** Test-only reset — clears both cached state and the load-dedupe set. */
+/** Test-only reset — clears cached state, the load-dedupe set, and the
+ *  dirty-field bookkeeping. */
 export function __resetProjectAppearanceStoreForTests() {
   loadStarted.clear();
+  writtenFields.clear();
   useProjectAppearanceStore.setState({ byPath: {} });
 }

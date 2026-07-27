@@ -254,4 +254,45 @@ describe("project appearance propagation", () => {
 
     expect(screen.getByTestId("card")).toHaveAttribute("data-color", "#3b82f6");
   });
+
+  it("keeps the persisted image when a color pick races the initial load", async () => {
+    // Only the color was written while the read was in flight — the untouched
+    // persisted image (and its cache-bust token) must still come through, not
+    // be dropped because "an entry already exists".
+    persisted[`project.color:${PATH}`] = "#ef4444";
+    persisted[`project.image:${PATH}`] = "codemux.com";
+    persisted[`project.image.v:${PATH}`] = "123";
+    render(<AppearanceProbe testId="card" />);
+
+    act(() => {
+      useProjectAppearanceStore.getState().setColor(PATH, "#3b82f6");
+    });
+    await flushLoad();
+
+    const card = screen.getByTestId("card");
+    expect(card).toHaveAttribute("data-color", "#3b82f6");
+    expect(card).toHaveAttribute("data-image", "codemux.com");
+    expect(card).toHaveAttribute("data-version", "123");
+  });
+
+  it("keeps the persisted color when an image change races the initial load", async () => {
+    // Inverse direction: the image (and token) were written mid-load; the
+    // untouched persisted color must still be restored.
+    persisted[`project.color:${PATH}`] = "#14b8a6";
+    persisted[`project.image:${PATH}`] = "old.example";
+    persisted[`project.image.v:${PATH}`] = "123";
+    render(<AppearanceProbe testId="card" />);
+
+    act(() => {
+      useProjectAppearanceStore.getState().setImage(PATH, "new.example");
+    });
+    await flushLoad();
+
+    const card = screen.getByTestId("card");
+    expect(card).toHaveAttribute("data-image", "new.example");
+    // The fresh token from the write wins over the stale persisted one.
+    expect(card.getAttribute("data-version")).toMatch(/^\d+$/);
+    expect(card.getAttribute("data-version")).not.toBe("123");
+    expect(card).toHaveAttribute("data-color", "#14b8a6");
+  });
 });
