@@ -1119,6 +1119,16 @@ export const pausePtyOutput = (sessionId: string, generation?: number) =>
 export const resumePtyOutput = (sessionId: string, generation?: number) =>
   invoke("resume_pty_output", { sessionId, generation });
 
+/** Resolve the live working directory of each session's shell by reading
+ *  `/proc/<pid>/cwd`. The fallback source for the terminal pane header's
+ *  cwd hint, used for sessions whose shell doesn't emit OSC 7.
+ *
+ *  Sessions absent from the response are unknown to this source (remote/SSH
+ *  panes, non-Linux hosts, exited shells) — callers should keep whatever
+ *  they already had rather than clearing. See `terminal_session_cwds`. */
+export const terminalSessionCwds = (sessionIds: string[]) =>
+  invoke<Record<string, string>>("terminal_session_cwds", { sessionIds });
+
 /** Attach an output subscriber to a session's PTY stream. Resolves with the
  *  subscriber generation token, which must be handed to `detachPtyOutput` /
  *  `pausePtyOutput` / `resumePtyOutput`. The real desktop backend, the

@@ -257,6 +257,28 @@ export function useSessionWorkspaceIndex(): Map<string, string> {
   return useAppStore((s) => getCachedSessionWorkspaceIndex(s.appState));
 }
 
+/** The cwd of the workspace owning a given terminal session, or null.
+ *
+ *  Used by the terminal pane header to decide whether a session's live
+ *  directory is worth showing: at the workspace root it says nothing.
+ *  Resolves through the session→workspace index rather than assuming the
+ *  active workspace, so it stays correct for any pane tree that renders
+ *  outside the active-workspace path. Returns a primitive so subscribers
+ *  don't churn on unrelated snapshot rebuilds. */
+export function useWorkspaceCwdForSession(sessionId: string): string | null {
+  return useAppStore((s) => {
+    if (!s.appState) return null;
+    const workspaceId = getCachedSessionWorkspaceIndex(s.appState).get(
+      sessionId,
+    );
+    if (!workspaceId) return null;
+    return (
+      s.appState.workspaces.find((w) => w.workspace_id === workspaceId)?.cwd ??
+      null
+    );
+  });
+}
+
 /** Find the workspace id that owns a given pane, if any.
  *
  *  Used by `AgentChatPane`'s draft-aware mount guard: when the pane's

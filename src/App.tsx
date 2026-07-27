@@ -7,6 +7,7 @@ import { useSkillsSync } from "@/hooks/use-skills-sync";
 import { useScrollbackSerializer } from "@/hooks/use-scrollback-serializer";
 import { useTerminalCacheGc } from "@/hooks/use-terminal-cache-gc";
 import { useTerminalThemeSync } from "@/hooks/use-terminal-theme-sync";
+import { useTerminalCwdPoll } from "@/hooks/use-terminal-cwd-poll";
 import { useAutomationFireToast } from "@/hooks/use-automation-fire-toast";
 import { useWebNotifications } from "@/hooks/use-web-notifications";
 import { useSmoothScrollingInit } from "@/hooks/use-smooth-scrolling";
@@ -75,6 +76,7 @@ function App() {
   useEnsureDraftWhenEmpty();
   useTerminalCacheGc();
   useTerminalThemeSync();
+  useTerminalCwdPoll();
   useAutomationFireToast();
   // Re-apply a persisted "smooth scrolling: on" to the fresh webview once the
   // machine-local settings have loaded. Off is the native default — no-op.

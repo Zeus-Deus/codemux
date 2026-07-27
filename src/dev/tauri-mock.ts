@@ -352,6 +352,32 @@ function buildScrollbackRestore(entry: MockScrollbackDiskEntry): ScrollbackResto
 let floodCounter = 0;
 
 /**
+ * Emit an OSC 7 "current working directory" sequence into one attached PTY
+ * channel — or every attached channel when `sessionId` is omitted.
+ *
+ * This is how a real shell with integration reports `cd`, so pushing it
+ * through the mock's normal output path drives the genuine production
+ * handler in `TerminalPane` (parse → store → header hint) rather than
+ * poking app state from the side. It's the only way to see the pane
+ * header's cwd hint in plain-browser dev, where there is no shell.
+ *
+ *   window.__codemuxTerminalMock.emitOsc7("/home/zeus/proj/src-tauri")
+ */
+function emitOsc7(cwd: string, sessionId?: string): void {
+  // `ESC ] 7 ; file://<host>/<path> BEL` — the form vte, fish, and
+  // kitty's shell integration all emit.
+  const seq = `\x1b]7;file://mock${encodeURI(cwd)}\x07`;
+  const targets = sessionId ? [sessionId] : [...ptyChannels.keys()];
+  for (const id of targets) {
+    const entry = ptyChannels.get(id);
+    if (entry) ptyChannelPush(entry, seq);
+  }
+  console.info(
+    `[mock::terminal] osc7 cwd=${cwd} sessions=${targets.length}`,
+  );
+}
+
+/**
  * Push `lines` numbered lines through EVERY currently-attached PTY output
  * channel, ending with a distinctive `MOCK-FLOOD-END <n>` marker so the
  * e2e run can wait for the tail. Delivered in ~64 KiB chunks, a few
@@ -1228,11 +1254,13 @@ function interruptMockRun(threadId: string = MOCK_CHAT_THREAD_ID): void {
     __codemuxTerminalMock: {
       flood: typeof floodTerminals;
       emitSerializeBuffers: typeof emitSerializeBuffers;
+      emitOsc7: typeof emitOsc7;
     };
   }
 ).__codemuxTerminalMock = {
   flood: floodTerminals,
   emitSerializeBuffers,
+  emitOsc7,
 };
 
 // CLI-drivable triggers: the browser is driven by `codemux browser
@@ -2246,6 +2274,23 @@ const handlers: Record<string, Handler> = {
   },
   pause_pty_output: () => undefined,
   resume_pty_output: () => undefined,
+  // Twin of `terminal_session_cwds`: the real backend readlinks
+  // `/proc/<pid>/cwd` for each session's shell. There is no shell here, so
+  // the faithful answer is the session's own recorded directory — sessions
+  // the mock doesn't know are omitted, exactly as the real command omits
+  // remote/exited ones. To see a non-root cwd hint in the dev UI, push an
+  // OSC 7 sequence through the pty stream (see `mockEmitOsc7` below); that
+  // exercises the real production handler rather than a mock shortcut.
+  terminal_session_cwds: (a) => {
+    const ids = new Set((a.sessionIds as string[]) ?? []);
+    const out: Record<string, string> = {};
+    for (const session of appState.terminal_sessions) {
+      if (ids.has(session.session_id) && session.cwd) {
+        out[session.session_id] = session.cwd;
+      }
+    }
+    return out;
+  },
   clear_agent_status: () => undefined,
 
   // ── Terminal scrollback (issue #128) — faithful two-store twin of
