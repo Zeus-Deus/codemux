@@ -1,8 +1,14 @@
-import { startTransition, useEffect } from "react";
-import { Check, Cloud } from "lucide-react";
+import { startTransition, useEffect, useState } from "react";
+import { AlarmClock, Check, Cloud } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import { WorkingIndicator } from "@/components/ui/working-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
@@ -25,6 +31,7 @@ import {
 } from "@/stores/sidebar-density-store";
 import { useProjectAppearance } from "./use-project-appearance";
 import { getWorkspaceProviders } from "@/lib/pane-status";
+import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 
 export interface InboxRepo {
@@ -52,6 +59,16 @@ interface Props {
    *  the card layout. */
   jumpHint?: number | null;
   onSettle: (workspaceId: string) => void;
+  onSnooze: (workspaceId: string, until: number) => void;
+  /** The agent finished here since the user last opened this workspace. */
+  unread: boolean;
+  /** Recently returned from a snooze. The list order is static, so a woken
+   *  card reappears in its old position — this badge is what carries the
+   *  signal that it is back. */
+  woke: boolean;
+  selected: boolean;
+  onSelect: (workspaceId: string, mode: "single" | "toggle" | "range") => void;
+  onMarkUnread: (workspaceId: string) => void;
 }
 
 /** One active-workspace card in the flat sidebar inbox: repo eyebrow, work
@@ -70,6 +87,12 @@ export function SidebarInboxCard({
   justUnsettled,
   jumpHint,
   onSettle,
+  onSnooze,
+  unread,
+  woke,
+  selected,
+  onSelect,
+  onMarkUnread,
 }: Props) {
   const indicatorVariant = useSettingsStore(selectWorkingIndicator);
   const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
@@ -85,11 +108,52 @@ export function SidebarInboxCard({
     (s) => s.settledAt[workspace.workspace_id],
   );
 
+  // Radix portals the open Snooze menu out of this card, so once it opens the
+  // pointer is no longer over the card and focus no longer sits inside it —
+  // the CSS-only hover/focus swap below would hide the trigger mid-interaction
+  // and Radix would close the menu it is anchored to. Tracking the open state
+  // lets us pin the action cluster on for exactly as long as the menu lives.
+  const [snoozeMenuOpen, setSnoozeMenuOpen] = useState(false);
+
+  // Wake times are resolved the moment the menu opens, never while the list
+  // renders. Sharing the inbox's coarse (~30s) clock made "In 1 hour" mean "an
+  // hour from up to half a minute ago" by the time it was clicked, and it made
+  // every card in the sidebar re-render on every tick to keep a menu fresh that
+  // nobody had opened — the exact cost that shows up with many workspaces.
+  const [snoozePresets, setSnoozePresets] = useState<SnoozePreset[]>([]);
+  const handleSnoozeMenuOpenChange = (open: boolean) => {
+    if (open) setSnoozePresets(computeSnoozePresets(Date.now()));
+    setSnoozeMenuOpen(open);
+  };
+
   const handleActivate = () => {
     useChatDraftStore.getState().setActiveDraft(null);
     startTransition(() => {
       activateWorkspace(workspace.workspace_id).catch(console.error);
     });
+  };
+
+  /** A plain activation (click, Enter, Space) also collapses any multi-select
+   *  down to this card — otherwise navigating away would leave an invisible
+   *  selection behind that the next bulk action would silently act on. */
+  const selectAndActivate = () => {
+    onSelect(workspace.workspace_id, "single");
+    handleActivate();
+  };
+
+  const handleClick = (e: React.MouseEvent) => {
+    const mode = e.metaKey || e.ctrlKey ? "toggle" : e.shiftKey ? "range" : null;
+    if (mode) {
+      // A modified click is a selection gesture, not navigation: activating
+      // here would yank the user into a workspace they were only ticking off
+      // for a bulk action. preventDefault also keeps the shift-click from
+      // painting a text selection across the cards it spans.
+      e.preventDefault();
+      e.stopPropagation();
+      onSelect(workspace.workspace_id, mode);
+      return;
+    }
+    selectAndActivate();
   };
 
   const isRemote = workspace.host_id !== null && workspace.host_id !== undefined;
@@ -102,6 +166,14 @@ export function SidebarInboxCard({
   // sight. Only finished ("review") and idle cards offer Settle — sweeping
   // completed work aside is the whole point of the gesture.
   const canSettle = status !== "working" && status !== "permission";
+
+  // Snooze hides the card just as thoroughly as Settle does, so it rides the
+  // same guardrail rather than restating it — a second copy of the condition
+  // is exactly how a later edit to one of them quietly opens a hole that lets
+  // live or blocked work be buried. This is now the *only* thing gating the
+  // Snooze trigger: the preset list no longer doubles as an offered/not-offered
+  // signal, because it does not exist until the menu opens.
+  const canSnooze = canSettle;
 
   // While an agent is live and a linked issue exists, the card title IS the
   // work (issue title); the worktree name stays reachable via the branch on
@@ -133,15 +205,36 @@ export function SidebarInboxCard({
   // (Claude / Codex / OpenCode), shown on the meta line's right cluster.
   const providers = getWorkspaceProviders(workspace.surfaces);
 
+  // With the Snooze menu open the swap can no longer be driven by hover/focus
+  // (both have left the card for the portal), so it is driven by state
+  // instead — the actions stay up and the state cluster stays down until the
+  // menu closes and Radix returns focus to the trigger inside the card.
+  const actionsPinned = snoozeMenuOpen;
+
+  /** Shared shape for the eyebrow's hover-revealed actions: identical height,
+   *  border, radius and type scale, so Settle and Snooze read as one control
+   *  pair rather than two buttons that happen to sit together. */
+  const eyebrowActionClass = cn(
+    "h-5 shrink-0 items-center gap-1 rounded-md border border-border bg-muted px-2",
+    "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
+    "hover:border-muted-foreground/50 hover:text-foreground",
+    actionsPinned
+      ? "inline-flex"
+      : "hidden group-hover/card:inline-flex group-focus-within/card:inline-flex",
+  );
+
   const stateCluster = (
     <span
       className={cn(
         "flex shrink-0 items-center gap-1.5 text-[11px]",
-        // The hover/focus swap: state hides, Settle shows. CSS-only so no
-        // re-render churn on pointer moves. Only hide when a Settle button
+        // The hover/focus swap: state hides, Settle/Snooze show. CSS-only so
+        // no re-render churn on pointer moves. Only hide when an action button
         // will actually take its place — a guardrailed card keeps its state
         // visible on hover/focus since there is nothing to swap to.
-        canSettle && "group-hover/card:hidden group-focus-within/card:hidden",
+        canSettle &&
+          (actionsPinned
+            ? "hidden"
+            : "group-hover/card:hidden group-focus-within/card:hidden"),
         isWorking && "font-semibold text-status-working",
         isNeeds && "font-semibold text-status-attention",
         isDone && "font-semibold text-status-open",
@@ -173,10 +266,49 @@ export function SidebarInboxCard({
           ? { kind: "settle", onAction: () => onSettle(workspace.workspace_id) }
           : undefined
       }
+      snoozeAction={
+        canSnooze && !leaving
+          ? {
+              kind: "snooze",
+              offered: true,
+              onSnooze: (until) => onSnooze(workspace.workspace_id, until),
+              // An active card can only defer, never wake — waking belongs to
+              // the snoozed row shape, which passes kind: "wake" instead.
+              onWake: () => {},
+            }
+          : undefined
+      }
+      unreadAction={
+        // Offering "Mark unread" on a card that already reads as unread would
+        // be a menu entry that visibly does nothing.
+        unread
+          ? undefined
+          : { onMarkUnread: () => onMarkUnread(workspace.workspace_id) }
+      }
     >
       <div
         className={cn(
           "overflow-hidden transition-[max-height,opacity] duration-200 ease-out",
+          // Off-screen cards stop costing layout and paint. At 50+ workspaces
+          // the inbox is several viewports tall and every card was laying out
+          // and painting on each coarse tick even when nowhere near the
+          // scrollport. `content-visibility: auto` skips exactly that work and
+          // nothing else.
+          //
+          // Deliberately NOT a virtualizer: these rows stay mounted, so in-page
+          // find, focus and tab order, the Alt+1..9 jump targets, the forced
+          // "you are here" row, and every per-row effect keep working. A
+          // virtualizer would break all of those to win nothing on a list that
+          // is normally well under a few hundred rows.
+          //
+          // The intrinsic size is the wrapper's real resting height (card box +
+          // its 6px bottom margin, measured in the running app: 86.7px for a
+          // plain card, 89.4px with a PR chip). A hint that is wrong in either
+          // direction makes the scrollbar jump as rows are realised, so it is
+          // set at the median rather than the extremes; the `auto` keyword then
+          // replaces it with the row's true size once it has been rendered
+          // once.
+          "[content-visibility:auto] [contain-intrinsic-size:auto_88px]",
           leaving ? "max-h-0 opacity-0" : "max-h-40 opacity-100",
           justUnsettled && "rise-in",
         )}
@@ -185,22 +317,32 @@ export function SidebarInboxCard({
               role="button"
               tabIndex={0}
               data-inbox-card={workspace.workspace_id}
-              onClick={handleActivate}
+              data-selected={selected || undefined}
+              onClick={handleClick}
               onKeyDown={(e) => {
                 if (e.key !== "Enter" && e.key !== " ") return;
                 // Space would otherwise scroll the sidebar as it activates
                 // the card.
                 if (e.key === " ") e.preventDefault();
-                handleActivate();
+                selectAndActivate();
               }}
               className={cn(
                 "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
-                "outline-none transition-colors duration-150",
+                // select-none: a shift-click range gesture would otherwise
+                // drag a text highlight across every card it spans.
+                "select-none outline-none transition-colors duration-150",
                 isActive
                   ? "border-border bg-foreground/[0.09]"
                   : isNeeds
                     ? "border-status-attention/30 bg-transparent hover:bg-foreground/[0.05]"
                     : "border-transparent bg-transparent hover:bg-foreground/[0.05] focus-visible:border-border",
+                // Multi-select layers a ring over whatever the card already
+                // is, so "checked for a bulk action" never has to compete with
+                // "this is the workspace you're looking at" for the same
+                // pixels. Ember is the one accent reserved for selection; the
+                // resting/active treatments stay pure lightness.
+                selected &&
+                  "border-transparent bg-accent-ember/[0.08] ring-1 ring-accent-ember/55",
               )}
             >
               {/* Jump-shortcut hint: the digit that activates this card while
@@ -230,12 +372,34 @@ export function SidebarInboxCard({
                   cacheBust={appearance.imageVersion}
                   size="sm"
                   shape="square"
-                  className="font-bold"
+                  className="shrink-0 font-bold"
                 />
-                <span className="truncate text-[11px] font-semibold tracking-[0.01em] text-muted-foreground/80">
+                <span className="min-w-0 truncate text-[11px] font-semibold tracking-[0.01em] text-muted-foreground/80">
                   {repo.name}
                 </span>
                 <span className="flex-1" />
+                {/* "Woke": the list keeps a stable order, so a card returning
+                    from a snooze slots back where it was and nothing about its
+                    position says it moved. This pill is the only signal. Green
+                    rather than red — it came back on schedule, it is not a
+                    problem. Everything here is shrink-0 and the repo name
+                    truncates, so a woke + hovered card squeezes the name
+                    instead of pushing the actions off the card. */}
+                {woke && (
+                  <span
+                    role="img"
+                    aria-label={`"${workspace.title}" woke from snooze`}
+                    title="Returned from snooze"
+                    className={cn(
+                      "flex shrink-0 items-center gap-0.5 rounded-full px-1.5",
+                      "border border-status-open/25 bg-status-open/10",
+                      "text-[9.5px] font-semibold leading-[15px] text-status-open",
+                    )}
+                  >
+                    <AlarmClock className="h-2.5 w-2.5" strokeWidth={2.5} />
+                    Woke
+                  </span>
+                )}
                 {stateCluster}
                 {canSettle && (
                   <button
@@ -245,24 +409,88 @@ export function SidebarInboxCard({
                       onSettle(workspace.workspace_id);
                     }}
                     aria-label={`Settle "${workspace.title}"`}
-                    className={cn(
-                      "hidden h-5 shrink-0 items-center gap-1 rounded-md border border-border bg-muted px-2",
-                      "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
-                      "hover:border-muted-foreground/50 hover:text-foreground",
-                      "group-hover/card:inline-flex group-focus-within/card:inline-flex",
-                    )}
+                    className={eyebrowActionClass}
                   >
                     <Check className="h-2.5 w-2.5" strokeWidth={2.5} />
                     Settle
                   </button>
                 )}
+                {canSnooze && (
+                  <DropdownMenu
+                    open={snoozeMenuOpen}
+                    onOpenChange={handleSnoozeMenuOpenChange}
+                  >
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        onClick={(e) => e.stopPropagation()}
+                        aria-label={`Snooze "${workspace.title}"`}
+                        className={eyebrowActionClass}
+                      >
+                        <AlarmClock className="h-2.5 w-2.5" strokeWidth={2.5} />
+                        Snooze
+                      </button>
+                    </DropdownMenuTrigger>
+                    {/* Radix portals this into document.body, but React events
+                        still bubble along the *component* tree — without these
+                        stoppers every preset click and every Enter inside the
+                        menu would also hit the card's activate handlers and
+                        navigate away while snoozing. The width override undoes
+                        the default "match the trigger", which here is a 60px
+                        button. */}
+                    <DropdownMenuContent
+                      align="end"
+                      className="w-auto min-w-[132px]"
+                      onClick={(e) => e.stopPropagation()}
+                      onKeyDown={(e) => e.stopPropagation()}
+                    >
+                      {snoozePresets.map((preset) => (
+                        <DropdownMenuItem
+                          key={preset.id}
+                          className="gap-4 text-xs"
+                          onSelect={() =>
+                            onSnooze(workspace.workspace_id, preset.at)
+                          }
+                        >
+                          <span className="flex-1">{preset.label}</span>
+                          {/* The relative label says how far, never when.
+                              "Next week" without this is a deferral the user
+                              has to guess the length of. */}
+                          <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+                            {preset.whenLabel}
+                          </span>
+                        </DropdownMenuItem>
+                      ))}
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                )}
               </div>
 
               {/* Title line: work title + linked-issue chip */}
               <div className="mt-1 flex min-w-0 items-center gap-1.5">
+                {/* Unread dot. Deliberately ember and deliberately NOT on the
+                    eyebrow: "the agent finished and you haven't looked" is a
+                    different claim from "Done · review" (which a card keeps
+                    long after it has been read), so it must not borrow the
+                    green those states own, and it must survive a hover that
+                    swaps the eyebrow's right side out. */}
+                {unread && (
+                  <span
+                    role="img"
+                    aria-label={`Unread — "${workspace.title}"`}
+                    title="New agent output since you last opened this workspace"
+                    className="size-1.5 shrink-0 rounded-full bg-accent-ember"
+                  />
+                )}
                 <span
                   title={titleTooltip}
-                  className="truncate text-[13px] font-semibold leading-[1.35] text-foreground"
+                  className={cn(
+                    "truncate text-[13px] leading-[1.35] text-foreground",
+                    // The extra weight is what makes an unread card readable
+                    // as unread at a glance down a scrolling list, where a
+                    // 6px dot alone is easy to sweep past.
+                    unread ? "font-bold" : "font-semibold",
+                  )}
                 >
                   {displayTitle}
                 </span>

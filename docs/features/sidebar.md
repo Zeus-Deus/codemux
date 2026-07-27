@@ -3,19 +3,23 @@
 - Purpose: Describe the left sidebar shell — the flat workspace inbox (expanded) and the collapse-to-icon-rail behavior.
 - Audience: Anyone working on sidebar layout, navigation, or workspace presentation.
 - Authority: Canonical feature-level reality doc for the left sidebar.
-- Update when: The sidebar layout, inbox model, collapse model, or rail rendering changes.
+- Update when: The sidebar layout, inbox model, park (settle/snooze) lifecycle, collapse model, or rail rendering changes.
 - Read next: `docs/reference/SHORTCUTS.md`, `docs/features/notifications.md`
 
 ## What This Feature Is
 
 The left sidebar is the primary navigation surface. Expanded, it is a **flat
 workspace inbox**: a search affordance + new-agent button, a project-filter
-dropdown row, one multi-line card per active workspace, and a "Settled"
-section of swept-aside one-line rows. Collapsed, it is a narrow icon rail.
+dropdown row, one multi-line card per active workspace (with a "Wrapping up"
+tier of winding-down cards below a static divider), a collapsible
+"Snoozed" shelf of deferred rows, and a collapsible "Settled" shelf of
+swept-aside one-line rows. Collapsed, it is a narrow icon rail.
 The sidebar surface is **darker than the main pane** (a `--sidebar` override
 in the custom-token layer of `globals.css`), so cards sit flat/transparent
-at rest and selection reads as lightness — no accent-colored selection
-anywhere; the only colored border is the needs-you red.
+at rest and *which workspace you are in* reads as lightness — no accent color
+for that. Accent is reserved for the claims lightness can't make: the
+needs-you red border, the ember unread dot, the ember ring that marks a row as
+checked for a bulk action, and the green "Woke" pill.
 
 ## Current Model
 
@@ -30,7 +34,12 @@ There are exactly two states, toggled by the title-bar button and `Ctrl+B`:
 ### The workspace inbox (expanded)
 
 Replaced the nested project tree (project groups, drag-reorder, the pinned
-"Needs you" strip, and the "Gather on top" LIVE section) with one flat list:
+"Needs you" strip, and the "Gather on top" LIVE section) with one flat list.
+A workspace is in exactly one of four states — **active** (a card), **settled**
+(a row on the Settled shelf), **snoozed** (a row on the Snoozed shelf), or
+**pinned-active** (a card carrying a keep-active pin that auto-settle must not
+touch). "Parking" is the shared verb for settling or snoozing; parking is
+visual only — nothing is archived, closed, or deleted.
 
 - **Header** (`sidebar-action-row.tsx` expanded variant): a search box-shaped
   button that opens the command palette (shows the resolved `⌘K` keybind) and
@@ -43,8 +52,8 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   or the repo's mini avatar + name) with a rotating chevron, plus the dashed
   `+` add-repo button pinned right (Open project / New project dropdown).
   The panel lists **All projects** + one row per project (avatar, dedup'd
-  name, right-aligned **active-workspace count** — unsettled only; All shows
-  the total); the current filter's row is highlighted; picking sets the
+  name, right-aligned **active-workspace count** — unsettled and unsnoozed
+  only, so a wrapping-up card still counts as active; All shows the total); the current filter's row is highlighted; picking sets the
   filter and closes. The filter applies to **both** the active cards and the
   settled rows and resets settled-tail paging; a filtered-empty list shows
   "Nothing active in `<repo>`". Session-only, and self-healing — if the
@@ -55,67 +64,319 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   cards as their own rows — a spinner "creating" row, or a red `AlertCircle`
   "failed" row. They are filter-scoped like everything else and suppress the
   "Nothing active" empty state while present.
+- **Card order — newest first, and static** (`compareNewestFirst` in
+  `sidebar-inbox.tsx`): cards sort by **stored snapshot index, descending**.
+  The backend has no `created_at`, but it appends new workspaces to the
+  snapshot array, so a later stored index is a newer workspace. The order is
+  derived from that index *only* — never from status, activity, or
+  notification counts — so a row holds its position from the moment it opens
+  until the user settles or snoozes it. That is what makes `Alt+1..9` muscle
+  memory: **`Alt+1` is the newest workspace**, not the oldest. Status is
+  carried by each card's own state cluster instead.
+- **The "Wrapping up" tier** (`isWrappingUp` in `sidebar-inbox.tsx`): the active
+  list is partitioned into two tiers — everything else on top, winding-down
+  cards under a **static "Wrapping up" divider**. A card is wrapping up when
+  **all** of: its PR state normalizes to **`open`** (explicitly *not* `draft` —
+  a draft PR is work the author still owns — and not `merged`/`closed`, which
+  belong to auto-settle and its 1-hour idle guard); its status is **null**; and
+  it is **not unread**. Opening a PR is a *wind-down* signal, not a completion
+  one: the card keeps every affordance (Settle, Snooze, context menu, jump
+  target, selection) and nothing is hidden or collapsed — it just stops
+  occupying the top of the list. The unread condition is the load-bearing one:
+  unread means the agent produced output the user has not looked at, and
+  demoting that buries exactly what they opened the sidebar to find. The status
+  condition is what makes "reopen the PR workspace and send a follow-up" work
+  with no extra state — the follow-up makes the agent work, status goes
+  non-null, and the card returns to the top tier by itself. Each tier is sorted
+  by the same `compareNewestFirst`, so newest-first still holds *within* a
+  tier, and membership flips only on durable lifecycle events (a PR opening, an
+  agent run the user caused, the user reading the result) — never on transient
+  status churn, which is what keeps this consistent with the static-order rule
+  above. The divider is a plain label + hairline (`WrappingUpDivider`),
+  deliberately **not** the collapsible `ShelfHeader`: a chevron and
+  `aria-expanded` would promise these rows can be folded away, and hiding
+  live-but-nearly-done work is the failure mode the tier exists to avoid. No
+  qualifying card means no divider at all.
 - **Workspace cards** (`sidebar-inbox-card.tsx`): each active workspace is a
   card — repo avatar + name eyebrow; work title (linked-issue title while an
   agent is live, worktree name when idle) + issue chip; a red blocker line
   (needs-you only); and a mono meta line (branch · `↑ahead` · `+/−` diff · PR
-  chip (`PR #n` green / `merged` violet, opens the PR) · remote cloud icon ·
-  notification badge). The blocker line is a fixed string
+  chip (`PR #n` green / `merged` violet, opens the PR) · provider logos ·
+  remote cloud icon · notification badge). The blocker line is a fixed string
   (`permissionBlockerText()` always returns "Waiting for your input" — it does
   not surface the agent's actual question). The right side of the eyebrow shows
   the agent state — Working (configurable `WorkingIndicator`, amber text) /
   Needs you (pulsing red dot) / Done · review (green ✓) / elapsed since the
-  workspace last settled into review — and swaps to a
-  **"✓ Settle"** button on hover or focus (CSS-only swap). The selected card
+  workspace last settled into review — and swaps to a **"✓ Settle"** +
+  **"Snooze"** action pair on hover or focus (CSS-only swap, plus a pinned-on
+  state while the Snooze dropdown is open, since Radix portals the menu out of
+  the card and would otherwise lose its own trigger). The selected card
   gets a neutral border + clearly lighter fill (selection is lightness, not
   accent color — the sidebar surface is darker than the main pane, so cards
   sit flat/transparent at rest and lift on hover); needs-you cards a
-  red-tinted border. Click activates; the right-click context menu is the same
-  `WorkspaceContextMenuItems` (rename, editors, move-to-host, archive, delete)
-  shared with the old row, including the delete/push-confirm dialogs.
+  red-tinted border; multi-selected cards an **ember ring** layered over
+  whatever the card already is. Click activates; the right-click context menu
+  is the same `WorkspaceContextMenuItems` (rename, editors, move-to-host,
+  archive, delete) shared with the old row, including the delete/push-confirm
+  dialogs.
 - **Settle / un-settle** (`sidebar-inbox-store.ts`): Settle collapses the card
-  (~200ms height/opacity), then moves it below a "Settled" divider as a compact
+  (~200ms height/opacity), then moves it onto the "Settled" shelf as a compact
   one-line row (repo avatar · violet merge icon when its PR merged · title ·
-  elapsed-since-settle). A settled row is itself a button — click or Enter/Space
-  activates that workspace without un-settling it. Hover/focus reveals
-  **Un-settle**, which reverses it (the returning card eases back in via the
-  shared `rise-in` keyframe). Settling is **visual only** — nothing is archived,
-  closed, or deleted; a settle still mid-animation is flushed to the store on
-  unmount, so collapsing the sidebar mid-gesture doesn't drop it. The settled
-  list persists via UI-state key `sidebar.inbox.settled`, pruned when a
+  elapsed-since-work-ended). A settled row is itself a button — click or
+  Enter/Space activates that workspace without un-settling it. Hover/focus
+  reveals **Un-settle**, which reverses it (the returning card eases back in
+  via the shared `rise-in` keyframe). Settling is **visual only** — nothing is
+  archived, closed, or deleted; a settle still mid-animation is flushed to the
+  store on unmount, so collapsing the sidebar mid-gesture doesn't drop it. The
+  shelf persists via UI-state key `sidebar.inbox.settled`, pruned when a
   workspace vanishes (both the inbox and the collapsed rail run the prune, so a
-  session spent entirely collapsed still trims the blob). The list is
-  **flat and recency-ordered** —
+  session spent entirely collapsed still trims the blob). The list is flat —
   repo identity is carried by each row's avatar, not by project grouping.
-  Both row shapes share the full workspace right-click menu via
-  `workspace-inbox-menu.tsx`: cards get a "Settle workspace" entry (guardrail
-  permitting), settled rows get "Un-settle workspace" on top, and both keep
-  rename / archive / delete / move-to-host.
+  All three row shapes (card, snoozed row, settled row) share the full workspace
+  right-click menu via `workspace-inbox-menu.tsx`. Its lifecycle block is
+  ordered so the entries that bring work *back* come first — Un-settle, Wake
+  now, then Settle, "Snooze until…", Mark unread — since a user who right-clicks
+  a hidden row is usually there to undo the hiding. Every shape keeps
+  rename / archive / delete / move-to-host below that.
+- **Settled shelf ordering — by when work ENDED**: a settled entry records both
+  `at` (when the sweep happened) and, when the caller knows it, `workEndedAt`
+  (the workspace's backend `last_active_at` at settle time).
+  `resolveSettledTimestamp(entry)` returns `workEndedAt ?? at` and is the *only*
+  key used for both the sort and the elapsed label, so a row can never sit in
+  one place while claiming a different time — manually sweeping aside a
+  month-old workspace files it under last month, not at the top of history.
+- **Snooze** (`sidebar-snooze.ts` + the Snoozed shelf): a second parking
+  lifecycle beside Settle. A card's **Snooze** button (and the "Snooze until…"
+  context submenu) offers wake-time presets — **In 1 hour / This evening
+  (18:00) / Tomorrow (09:00) / Next week (next Monday 09:00)**. "This evening"
+  is conditional: it is dropped unless it is at least an hour away, so it can
+  never resolve to a time in the past or fire while the menu is still open.
+  "Next week" is conditional the same way, against a different neighbour: on a
+  Sunday the coming Monday *is* tomorrow, so the preset is dropped unless it
+  lands at least a calendar day past "Tomorrow" — two entries resolving to one
+  wake instant would read as a menu bug.
+  Presets are built from **local date components**, not by adding
+  `86_400_000ms`, so a "Tomorrow" taken the night before a DST change still
+  wakes at 09:00 local. `computeSnoozePresets(now)` is pure and clock-free —
+  the caller passes `now` — so the menu and the wake sweep can never disagree
+  about an instant. Each preset also carries a **`whenLabel`**
+  (`formatWakeLabel`): the wall-clock instant it actually fires, rendered muted
+  and mono beside the relative label — `18:00` for later today,
+  `Tomorrow 09:00` for the next day, `Mon 09:00` beyond that, all through
+  `Intl`/`toLocale*` so a 12-hour locale reads "6:00 PM". Without it "Next
+  week" is a deferral whose end the user has to guess, and "In 1 hour" taken
+  at 23:30 doesn't say it lands on another day. The day prefix is decided by
+  comparing **local day starts**, so the two 23/25-hour days a year still read
+  as "Tomorrow".
+- **Presets are resolved when a menu opens, never when the list renders.** The
+  three owners each call `computeSnoozePresets(Date.now())` for themselves: the
+  card's Snooze dropdown in its `onOpenChange`, the shared context menu's
+  `SnoozeUntilSubmenu` (its own component precisely so Radix mounting the menu
+  content *is* the resolve), and the bulk menu's Snooze submenu in its
+  `onOpenChange`. This replaced one array recomputed on the inbox's coarse
+  clock and passed down to every row, which made "In 1 hour" mean "an hour from
+  up to a tick ago" by the time it was clicked and pushed a fresh array
+  identity through the whole list on every tick.
+- **Snoozed shelf**: sits above Settled, **collapsed by default** (its rows are
+  by definition work the user said they did not want to see; re-showing them
+  each launch would undo the gesture). Rows are ordered soonest-wake-first and
+  deliberately share the settled row's one-line silhouette — both are "parked".
+  Each shows **time-until-wake** (`formatTimeUntil`: `45s` / `12m` / `3h20m` /
+  `2d4h`, and `now` once due, never a negative duration) plus a hover-revealed
+  **Wake now**. Snoozes persist in the same blob (`snoozed: [{id, at, until}]`).
+- **Wake paths**: three, and only three. (1) The **wake sweep** on the coarse
+  ~30s clock wakes anything whose `until` has passed. (2) A **precise timer**
+  armed at the soonest `until` covers the gap the coarse clock would leave (an
+  "In 1 hour" returning at 1h00m29s reads as a broken promise); its delay is
+  passed through `clampTimerDelay`, because `setTimeout` stores the delay as a
+  signed 32-bit int and a "Next week" snooze would otherwise overflow negative
+  and fire *immediately* — clamping re-arms at the ceiling and the effect
+  schedules the remainder on its next pass. A nonce re-arms the timer after
+  each fire so a queue of wakes is walked one boundary at a time. (3) The
+  **hand-raise**: a snoozed workspace whose agent goes `working` or
+  `permission` wakes at once, wake time or not — a snooze defers waiting, it
+  must never hide an agent blocked on a question. Timer/hand-raise wakes badge
+  the returning card with a green **"Woke"** pill (the list order is static, so
+  a woken card slots back where it was and nothing about its position says it
+  moved); an explicit "Wake now" gets no badge, and the badge clears on visit.
 - **Settle safety net**: live work can never be buried. A card whose agent is
-  working or blocked ("needs you") offers no Settle button (its state cluster
-  stays visible on hover), and a *settled* workspace whose agent becomes
-  working/blocked is **auto-un-settled** (persistently, with the rise-in
-  ease). Finished ("review") and idle cards settle normally and stay settled —
-  sweeping completed work aside is the point of the gesture.
-- **Auto-settle** — the Settled section fills itself. A fully idle card
-  (status null — never working/blocked/review) auto-settles when its PR is
-  **merged or closed**, or after **N days without agent activity**
-  (Settings → Appearance → Sidebar → "Auto-settle idle work":
-  Off / 1d / 3d / 7d / 14d, `sidebar.auto_settle_days`, default 3d).
-  **Un-settling sets a keep-active pin** that suppresses auto-settle until
-  the agent runs again (explicit settle or new activity clears it). Activity
-  is stamped client-side into the persisted blob (60s write-throttle;
-  first-seen baseline so a fresh install never mass-settles). The persisted
-  UI-state value is now `{settled, keepActive, activity}` with transparent
-  migration from the older bare-array shape. Anti-oscillation invariants:
-  auto-settle fires only at idle, auto-un-settle only at working/blocked,
-  the pin gates the middle.
-- **Settled-tail pagination**: 10 settled rows render initially; a quiet mono
-  "Show N more (X hidden)" button appends 25 per click. Paging resets when
-  the repo filter changes.
+  working or blocked ("needs you") offers neither Settle nor Snooze (its state
+  cluster stays visible on hover — `isSnoozeable` mirrors the card's `canSettle`
+  rather than restating the condition), and a *settled* workspace whose agent
+  becomes working/blocked is **auto-un-settled** (persistently, with the
+  rise-in ease). Finished ("review") and idle cards park normally and stay
+  parked — sweeping completed work aside is the point of the gesture.
+- **Backend activity stamps** (`WorkspaceSnapshot.last_active_at` /
+  `last_visited_at`, ms epoch, persisted in `layout.json`, both additive serde
+  fields that deserialize as `None` on old state):
+  - `last_active_at` is stamped by `stamp_workspace_activity` whenever any pane
+    in the workspace transitions to a **non-idle** status (working / permission
+    / review) — via `set_pane_status`, `set_pane_status_by_session`, and
+    `set_pane_status_by_thread` alike, so terminal and Agent Chat panes both
+    feed it. Idle is deliberately **not** stamped: going quiet is the absence of
+    work. Chat panes stamp below the change-guard, so a token stream that
+    re-asserts `Working` doesn't write per token. Also stamped at workspace
+    creation.
+  - `last_visited_at` is stamped **only by `record_workspace_switch`** — the
+    one private helper every path that moves `active_workspace_id` calls:
+    `activate_workspace` (sidebar click, palette, keyboard jump, control
+    socket) unconditionally, and `activate_terminal_session` /
+    `activate_pane` (jump-to-session navigation, pane focus) whenever the
+    pane being focused lives in a *different* workspace. A same-workspace
+    focus move does not stamp — a glance is not agent work, which is why the
+    two stamps stay separate: collapsing them would let merely looking at a
+    workspace keep dead work permanently unswept. The helper stamps **both
+    edges of a switch** — the workspace being entered *and* the one being
+    left. A visit that ends now lasted until now, and stamping only the entry
+    edge marked work the user sat and watched finish as unread the moment
+    they switched away (the pane writers stamp `last_active_at` even while
+    the workspace is focused, so `last_active_at > last_visited_at` came out
+    true for the one workspace the user had definitely seen). Re-activating
+    the already-open workspace has no outgoing side and stamps only itself.
+  - **Boot backfill** (`backfill_workspace_activity`): workspaces persisted
+    before the field existed are dated from their checkout's **last git commit**
+    (`git log -1 --format=%ct`), else the **directory mtime**, else left `null`.
+    It never invents `now` — a fabricated "just active" stamp would exempt
+    genuinely stale work from the sweep forever, while `null` reads as "unknown"
+    and the frontend declines to sweep on it. Backfill quality therefore
+    depends on the workspace being a git repository: a non-git checkout falls
+    to the mtime fallback, and a directory's mtime is often close to "now". It only probes workspaces still
+    missing a stamp (so it goes empty on the next launch), skips host-backed and
+    attach-only workspaces (their paths name directories on another machine),
+    and re-checks `is_none()` under the lock before writing, since the git work
+    runs unlocked and a live agent may have stamped a real value meanwhile.
+    The host-backed skip is why an **adopted** workspace is dated one launch
+    after its pull rather than never: adoption clears `host_id` as soon as the
+    files are local, so the next boot pass sees an ordinary unstamped local
+    checkout and reads the git history that came across with it.
+  - This replaced a client-side `Date.now()` first-seen baseline that reset
+    every workspace's idle clock on each app update.
+- **`effectiveActivityAt(backendAt, clientAt)`**: the idle sweep measures
+  against `last_active_at`, falling back to the client `activity` map only when
+  the backend has no stamp at all. **The client map must never win.** Installs
+  predating `last_active_at` wrote a synthetic `Date.now()` baseline into that
+  map for every workspace they had; those stamps are indistinguishable from real
+  activity, so honouring them would make a machine full of month-old work look
+  brand new for a full idle window after every update — the exact bug the
+  backend field exists to kill. Preferring the backend retires the polluted
+  state without a migration pass.
+- **Auto-settle** — the Settled shelf fills itself. It keys off **merged /
+  closed** PRs only; an **open** PR never settles a card, it demotes it into
+  the "Wrapping up" tier described above. A card auto-settles when it
+  is at status **null** (never working / blocked / review) *and* either:
+  - its PR is **merged or closed** *and* it has **also been idle for an hour**
+    (`MERGED_PR_SETTLE_IDLE_MS = 3_600_000`). Without the extra idle window the
+    merge signal is permanent: returning to a merged workspace for a review
+    comment or a revert un-settles it only until the agent stops, then it snaps
+    back out of sight taking the conversation the user was reading with it; or
+  - it has gone untouched past the user's idle window
+    (Settings → Appearance → Sidebar → "Auto-settle idle work":
+    Off / 1d / 3d / 7d / 14d, `sidebar.auto_settle_days`, default 3d).
+
+  Both rules require a known stamp — `undefined` never sweeps. The sweep runs
+  no leaving animation and performs **no forward navigation** (a background
+  sweep must never move the user), and it settles with
+  `workEndedAt = last_active_at` so the row files under when work ended.
+  **Un-settling sets a keep-active pin** that suppresses auto-settle until the
+  agent runs again. The persisted UI-state value is
+  `{settled, snoozed, keepActive, activity}`, with transparent migration from
+  the older bare-array and pre-snooze object shapes; the key name
+  (`sidebar.inbox.settled`) predates snooze and is kept so existing installs
+  don't lose their shelf.
+- **The anti-oscillation invariant.** Four states (active / settled / snoozed /
+  pinned-active) and five park-mutating effects (auto-settle, the auto-un-settle
+  safety net, the snooze hand-raise, the wake sweep, the precise wake timer)
+  share one list, so the guards are what keep a row from being fought over. Each
+  effect is keyed to a status band no other effect touches:
+  - auto-settle fires **only at status null**, and additionally skips the
+    **focused** workspace outright. That used to fall out of the client stamp
+    being refreshed every tick for the focused row; now that the backend stamp
+    is authoritative it is an explicit guard, or the open workspace could settle
+    underneath its own main pane while the user reads it.
+  - the settle safety net (auto-un-settle) fires **only at working/permission**.
+  - the snooze hand-raise fires **only at working/permission**; the wake sweep
+    fires only on an elapsed wake time. Neither can fire at status null, which
+    is the only status auto-settle acts on.
+  - auto-settle skips snoozed ids entirely (they are not in `activeCards`), so
+    a snoozed workspace can't be settled out from under its own wake timer; the
+    store enforces the same exclusivity from the other side by dropping a
+    snooze when a settle lands (and a settled entry when a snooze lands).
+  - a **keep-active pin** blocks auto-settle until the agent shows real
+    activity. Only a non-null status clears it (`noteActivity`'s `clearPin`) —
+    selecting a workspace or laying down a first-seen baseline stamps but leaves
+    the pin standing, and a *timer* wake touches no pin at all (a clock expiring
+    says nothing about what the user wants). `unsettle`/`unsnooze` with reason
+    `"user"` sets the pin; `"activity"` clears it; `"timer"` leaves it alone.
+
+  - the **"Wrapping up" tier is not a fifth state.** It mutates nothing — it is
+    a pure partition of the cards auto-settle already left alone, so it can
+    neither park a row nor be fought over by anything that can. Its PR
+    condition (`open`) is also disjoint from auto-settle's (`merged`/`closed`),
+    so the two rules can never claim the same card.
+
+  So no two of these effects can act on the same workspace at the same status,
+  and a user-kept or user-deferred card stays put until its agent genuinely runs
+  again.
+- **Unread marker**: derived, not stored. `isWorkspaceUnread` reports unread
+  when `last_active_at > last_visited_at` (or when the workspace has been
+  active but never visited); a workspace the backend has never seen active is
+  never unread, because absence of history is not news. The card renders it as
+  an **ember dot + bold title** on the title line — deliberately not on the
+  eyebrow, since "the agent finished and you haven't looked" is a different
+  claim from "Done · review", and it must survive the hover swap. The focused
+  workspace is never unread whatever the stamps say. A **"Mark unread"** context
+  entry adds a session-only override (there is no read flag to flip), offered
+  only on cards that don't already read as unread; a real visit — which moves
+  `last_visited_at` — is what clears it, so the override can't outlive the truth
+  it overrides.
+- **Multi-select and bulk parking**: Cmd/Ctrl-click toggles a row into the
+  selection; Shift-click selects the range **over rendered rows only**
+  (`selectRange` walks the visible id list — active cards in rendered order,
+  i.e. top tier then wrapping-up tier, then the shelves — so rows behind "Show
+  more" or inside a collapsed shelf are never silently included and a bulk menu's "Settle (12)"
+  can't lie about what is on screen; a stale anchor degrades to the clicked
+  row). Cards, snoozed rows, and settled rows all participate. A plain click
+  activates *and* collapses the selection; the shelf chrome (a "Snoozed" /
+  "Settled" disclosure header, "Show N more") is **not** a click on the list and
+  leaves the ticks alone — a user reaching for either is looking for more rows
+  to add. Collapsing a shelf still drops its rows out of `renderedIds`, so a
+  bulk count stays honest about what is on screen, and re-opening the shelf
+  brings those ticks straight back. Right-clicking inside a selection of
+  two or more is intercepted in the **capture phase** — otherwise the row's own
+  workspace menu opens first and quietly narrows the gesture back to one row —
+  and opens a bulk menu anchored at the pointer offering **Settle (n)** and
+  **Snooze (n)** (with the shared presets) — each only when *every* selected
+  workspace can take it. Both verbs ride the per-row guardrail (`isSnoozeable`,
+  the same predicate as the card's `canSettle`): a selection containing a
+  working or permission-blocked workspace offers neither, and the menu shows a
+  disabled line saying why instead of rendering empty — a bulk gesture is not a
+  license to park in a batch what no single row offers, and a bulk action that
+  silently skipped the busy half would make its own count a lie. Changing the
+  repo filter clears the selection.
+- **Forward navigation on park**: settling or snoozing the workspace you are
+  *looking at* moves you to the next surviving active card (wrapping past the
+  end) — `nextWorkspaceAfterPark`. Parking a **background** workspace navigates
+  nowhere; so does a background auto-settle sweep. A manual settle navigates
+  immediately rather than after the 200ms collapse.
+- **Settled-tail pagination and forced visibility**: 10 settled rows render
+  initially; a quiet mono "Show N more (X hidden)" button appends 25 per click.
+  Paging resets when the repo filter changes. Both shelves are **collapsible**
+  via a keyboard-reachable disclosure header (Settled always shows its count;
+  Snoozed shows its count only while collapsed) — Settled starts open, Snoozed
+  starts closed. Whatever shelf the **currently-open workspace** lands on, its
+  row is force-rendered even when the shelf is collapsed or the row is past the
+  paging window (appended rather than spliced, so the head keeps its honest
+  recency order): its highlight is the user's only "you are here", and its
+  Un-settle / Wake button is the only way back out.
 - **Keyboard jumps**: `Alt+1`–`Alt+9` (rebindable `workspaceJump1..9`
   registry actions) activate the Nth visible active card — filter-scoped,
-  settled rows excluded. Holding the modifier overlays index badges on the
+  parked (settled *and* snoozed) rows excluded. The target list is the
+  rendered order **across both tiers** (`[...topTier, ...wrappingUp]`), and
+  the overlay badges are numbered from the same list, so a digit always
+  matches the badge the user is looking at even when a card sits below the
+  "Wrapping up" divider. Because the card order is
+  newest-first and static, `Alt+1` is the **newest** workspace and holds that
+  slot while agents start and stop. Holding the modifier overlays index badges on the
   first nine cards; the badge hint reads the user's *actual* resolved
   `workspaceJump1` binding rather than hardcoding Alt (rebinding to Ctrl makes
   Ctrl reveal the badges; a chord using neither Alt nor Ctrl shows no badges at
@@ -127,8 +388,15 @@ Replaced the nested project tree (project groups, drag-reorder, the pinned
   `ProviderLogo` + `getWorkspaceProviders` (pane-status). Terminal-only agent
   panes carry no provider metadata and contribute nothing.
 - **Status derivation**: agent state comes from `getWorkspaceStatus`
-  (pane-status) — covering terminal and Agent Chat panes alike; elapsed labels
-  come from the non-persisted `sidebar-density-store` status observations.
+  (pane-status) — covering terminal and Agent Chat panes alike. The **card's**
+  idle elapsed label still comes from the non-persisted `sidebar-density-store`
+  status observations; the **shelves'** labels do not (settled rows read
+  `resolveSettledTimestamp`, snoozed rows `formatTimeUntil`).
+- **Clocks**: one shared `useCoarseClock` (~30s, `Date.now()` at render time)
+  drives every elapsed label plus the activity, auto-settle, and wake-sweep
+  effects. The only finer timer is the snooze wake boundary described above.
+  Snooze *presets* deliberately no longer ride this clock — they read
+  `Date.now()` directly, at menu-open time.
 - **Settings** (Settings → Appearance → Sidebar): **Show git stats**
   (`sidebar.show_git_stats`, default on) hides the `↑ahead` and `+/−` numbers
   on cards when off; the branch name always shows. The `sidebar.live_agents`
@@ -163,8 +431,13 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   status dot (red pulse = needs you, amber = working, green = done-review,
   none = idle), right-side tooltip = workspace title. Clicking selects the
   workspace **without expanding**; the selected button gets the neutral
-  border + lighter fill. The strip scrolls (scrollbar hidden); settled workspaces never
-  appear; the repo filter does not apply here.
+  border + lighter fill. The strip scrolls (scrollbar hidden); the repo filter
+  does not apply here. **Both** parking lifecycles hide a button — settled and
+  snoozed alike, matching the expanded inbox, since a snoozed workspace still
+  holding a rail button is the deferral undone. The one exception is also the
+  inbox's: the **currently-open** workspace keeps its button whichever shelf it
+  is parked on, because the selection fill is the collapsed sidebar's only
+  "you are here".
 - **Footer**: Automations, Workspaces, Ports (badge), Settings — same order
   as the expanded footer row.
 - **Setup banner** (`sidebar-setup-banner.tsx`): hidden in the rail.
@@ -174,13 +447,27 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - Two-state toggle (expanded inbox ↔ icon rail) via title-bar button and `Ctrl+B`.
 - Flat inbox cards with live agent state, blocker lines, git/PR/issue/remote/
   notification detail, and work-based titling while an agent is live.
-- Project dropdown filtering active + settled lists (with active counts);
-  pinned add-repo button; sticky filter row.
+- Project dropdown filtering active + snoozed + settled lists (with active
+  counts); pinned add-repo button; sticky filter row.
+- A "Wrapping up" tier that demotes (never hides) an open-PR card once its
+  agent is idle and the user has read it, and returns it to the top tier the
+  moment a follow-up puts the agent back to work.
 - Settle/un-settle with ~200ms motion, persisted across restarts, prune-safe.
+- Snooze with DST-safe presets resolved at menu-open time and labelled with the
+  concrete local wake instant, a persisted wake time, an overflow-clamped wake
+  timer, an early hand-raise wake on working/permission, and a "Woke" badge.
+- Off-screen rows skipped for layout and paint (`content-visibility: auto`) on
+  all three repeating shapes, with the rows still mounted.
+- Backend-owned `last_active_at` / `last_visited_at` stamps that survive
+  restarts and reinstalls, with a one-time boot backfill from git history.
+- Unread markers derived from those stamps, plus a "Mark unread" override.
+- Cmd/Ctrl-click and Shift-click multi-select with a bulk Settle/Snooze menu.
+- Forward navigation when parking the workspace you are currently viewing.
 - Search affordance opening the command palette; neutral-ghost new-agent button.
 - Show git stats toggle (Settings → Appearance → Sidebar).
-- Rail: per-active-workspace avatar buttons with individual status dots,
-  select-without-expand, and the shared footer destinations.
+- Rail: one avatar button per active (neither settled nor snoozed) workspace,
+  with individual status dots, select-without-expand, and the shared footer
+  destinations.
 - Per-workspace agent status covers both terminal and Agent Chat (Beta) agents
   (chat sessions publish into the same `pane_statuses` snapshot).
 - The done-review checkmark **survives an app restart**. `save_persisted_state`
@@ -198,49 +485,171 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - The rail is desktop-only; on the mobile breakpoint the sidebar still uses the
   off-canvas `Sheet`.
 - Drag-and-drop workspace/project reordering was an affordance of the removed
-  project tree and does not exist in the inbox (cards keep the stored
-  workspace order).
+  project tree and does not exist in the inbox. Card order is fixed:
+  newest-first by stored snapshot index within each tier, with no user control
+  over it and no way to opt a card out of (or into) the "Wrapping up" tier
+  other than by working in it.
 - Unmounting the project tree also took two **project-level** surfaces offline,
   since both hung off its context menu and have no inbox equivalent yet:
   **Archive Project** (`docs/features/workspace-archive.md`) and **project
   avatar image/color customization** (`docs/features/project-avatars.md`).
   Saved avatars still render; they just can't be changed. Re-homing both is
   outstanding work.
-- Elapsed time on an idle card comes from `settledAt` in the non-persisted
-  `sidebar-density-store`, which is stamped **only on a transition into
-  `review`** — so a workspace that went working → idle without ever reaching
-  review, or any workspace after an app restart, shows no elapsed label. No
-  backend status timestamps exist to fix this properly.
+- The **card's** idle elapsed label still comes from `settledAt` in the
+  non-persisted `sidebar-density-store`, which is stamped only on a transition
+  into `review` — so a workspace that went working → idle without ever reaching
+  review, or any workspace after an app restart, shows no elapsed label on its
+  card. The backend now persists `last_active_at`, which would fix this; the
+  card just doesn't read it yet (the settled shelf does, via `workEndedAt`).
+- Shelf collapse state (Settled open, Snoozed closed) and the settled paging
+  window are **component state** — not persisted, and reset on every mount.
+- Multi-selection is session-only and cleared by a plain click, an activation,
+  or a filter change; there is no select-all and no keyboard entry into it.
+- `manualUnread` ("Mark unread") is session-only for the same reason unread is
+  derived rather than stored — nothing persists it across a restart.
+- Backend stamps are **device-local**. Ordinary creation paths write
+  `last_active_at = now`, which is honest — the workspace really is new here.
+  The **adoption shells** (`create_synced_workspace_shell` /
+  `create_synced_root_shell`) are the exception and leave it `None`, since a
+  workspace pulled from another device has a history that simply happened
+  elsewhere; the backfill then dates the arrived checkout from its own git
+  log. That correction lands **a launch late**: the shell carries `host_id`
+  until its pull succeeds, and the backfill skips host-backed workspaces, so
+  it is the *next* boot pass that dates it. Until then the stamp is `null`,
+  which reads as "unknown" and never auto-sweeps.
+- **Attach-only and still-remote workspaces never get a stamp at all.** Their
+  paths name directories on another machine, so the backfill declines to probe
+  them; they stay `null` and therefore never auto-sweep.
 - The collapsed rail intentionally shows only each workspace's agent-status
   dot — the old project-avatar rail's notification-count badges were not
   carried over (notification detail lives on the expanded cards).
+- The rail carries no snooze, unread, or "Woke" affordance — parking state
+  reaches it only as an absence (the button is gone), never as a marker.
 - The superseded tree components (`sidebar-project-group.tsx`,
   `sidebar-needs-you-strip.tsx`, `sidebar-live-section.tsx`,
   `sidebar-live-grouping.ts`, and the `SidebarWorkspaceRow` component) are still
   in the repo but **unmounted**. Only `sidebar-workspace-row.tsx` is load-bearing:
   the inbox menu (`workspace-inbox-menu.tsx`) imports its `WorkspaceContextMenuItems`
-  / `DeleteWorktreeDialog` and its `SettleMenuAction` type + "Settle workspace" /
-  "Un-settle workspace" entries — the `SidebarWorkspaceRow` *component* in that
+  / `DeleteWorktreeDialog` and its `SettleMenuAction` / `SnoozeMenuAction` types
+  plus the lifecycle block those drive (Un-settle / Wake now / Settle /
+  "Snooze until…" / Mark unread, ordered so the entries that bring work *back*
+  come first) — the `SidebarWorkspaceRow` *component* in that
   module is itself unmounted. The other four files (`sidebar-project-group.tsx`,
   `sidebar-needs-you-strip.tsx`, `sidebar-live-section.tsx`,
   `sidebar-live-grouping.ts`) are pure dead code kept only alongside their test
   suites. Removing them is a pending cleanup.
 
+## Load-Bearing Assumptions
+
+Things that look incidental and are not. Breaking any of these breaks the inbox
+quietly rather than loudly.
+
+- **`last_visited_at` is stamped only by `record_workspace_switch`** — which
+  stamps both the incoming and the outgoing workspace, and which every mover of
+  `active_workspace_id` (`activate_workspace`, plus `activate_terminal_session`
+  and `activate_pane` on *cross-workspace* switches) calls. Not by
+  same-workspace pane focus, not by rendering. Adding a writer that fires on
+  every pane focus would silently disable the unread marker, since unread is
+  `last_active_at > last_visited_at`; dropping the outgoing stamp brings back
+  "you get marked unread for work you just watched"; and moving
+  `active_workspace_id` anywhere *without* the helper reopens the hole where a
+  jump-to-session switch left the visit ledger untouched.
+- **Idle never stamps `last_active_at`.** `set_pane_status(Idle)` removes the
+  pane entry and writes nothing. If idle ever stamped, the idle sweep would
+  measure "time since the agent stopped stopping" and nothing would ever settle.
+- **`backfill_workspace_activity` runs once, on a background thread, chained
+  onto `backfill_workspace_protection`.** It shells out to `git` per workspace,
+  so it must never move onto the app-startup path; it shares that one boot
+  thread deliberately (both passes walk every checkout and then take the state
+  lock, so back-to-back costs one thread instead of two contending). It is
+  self-limiting — it only probes workspaces still missing a stamp — and it
+  re-checks `is_none()` under the lock before writing, because a live agent may
+  have stamped a real value while the git work ran unlocked.
+- **`derive_last_activity_ms` returns `None`, never `now`.** `null` means
+  "unknown" and the frontend refuses to sweep on it. Making it fall back to
+  `now` would exempt every stale workspace from the idle sweep for a full window
+  after each update — the bug the backend field was added to kill.
+- **The backend stamp must keep winning in `effectiveActivityAt`.** Flipping the
+  precedence resurrects the synthetic first-seen baselines left in the client
+  `activity` map by pre-`last_active_at` installs.
+- **`SnoozeMenuAction.offered` is the "snooze not offered" signal.** It replaced
+  "an empty preset array means not offered", which stopped being expressible the
+  moment presets started being resolved inside the menu — there is no array left
+  to be empty. The card sets it from `canSnooze`; a snoozed row passes `false`
+  (its entry is "Wake now", which needs no presets). A caller that hardcodes
+  `true` would surface a Snooze trigger in states where snoozing is guardrailed
+  off.
+- **`canSnooze` is derived from `canSettle`, not restated.** A second copy of
+  the working/permission condition is exactly how a later edit opens a hole that
+  lets live or blocked work be buried. It is now the *only* gate on the card's
+  Snooze trigger, since the preset list no longer doubles as one.
+- **The repeating row shapes are CSS-contained, not virtualized.** The card
+  wrapper, the snoozed row, and the settled row each carry
+  `content-visibility: auto` with a `contain-intrinsic-size` hint (88px for the
+  card wrapper — its measured resting height including the 6px gap; 30px exactly
+  for both shelf rows, which is their literal `h-[30px]` with no margin). Rows
+  stay **mounted**, so in-page find, focus and tab order, the `Alt+1..9` jump
+  targets, the forced-visible "you are here" row and every per-row effect keep
+  working — a virtualizer would break all of those for a list that is normally
+  well under a few hundred rows. The intrinsic sizes are load-bearing: a hint
+  that disagrees with the real height makes the scrollbar jump as rows are
+  realised on the way down, so re-measure before changing card padding, the
+  meta line, or the row height.
+- **The hand-raise needs no staleness check, and `SnoozeEntry.at` is not one.**
+  Nothing reads `at` — it is only the record of when the deferral was made.
+  What makes a "wake on activity that predates the snooze" unreachable is
+  `isSnoozeable` (a working or blocked workspace cannot be snoozed in the first
+  place) plus `pane_statuses` being runtime-only — the backend clears the map
+  before persisting, so no stale status survives a restart. Any
+  working/permission a *snoozed* workspace shows is therefore a transition that
+  happened after the snooze. Weakening either of those makes an instant re-wake
+  reachable, and the hand-raise would then need a real timestamp comparison.
+- **`resolveSettledTimestamp` is the single key for both the shelf's sort and
+  its label.** Splitting them lets a row sit in one place while claiming a
+  different time.
+- **The settle timer is flushed on unmount.** `pendingSettleRef` exists because
+  collapsing the sidebar mid-gesture cancels the 200ms timeout; without the
+  flush the settle is silently dropped.
+- **`sidebar.inbox.settled` is a historical key name.** It now holds snooze
+  state too. Renaming it strands every existing install's shelf.
+- **`isWrappingUp` must keep all three conditions.** Dropping the unread check
+  buries the one card the user came to the sidebar for; dropping the status
+  check breaks "send a follow-up and it comes back up"; accepting `draft`
+  demotes work the author has explicitly marked as still in progress; accepting
+  `merged`/`closed` puts it in a tug-of-war with auto-settle over the same card.
+- **The jump targets and range selection read `orderedActiveCards`, not
+  `activeCards`.** Both describe positions the user can *see*, so they must be
+  `[...topTier, ...wrappingUp]`. Reverting either to the unpartitioned list
+  makes `Alt+3` land on a different card than the badge shows and lets a
+  shift-click range cover rows the user never dragged across.
+- **The "Wrapping up" divider is not a `ShelfHeader`.** These are active,
+  actionable cards; giving the section a disclosure control would offer to hide
+  work that is nearly-but-not-done, which is precisely what the tier exists to
+  avoid doing.
+- **Bulk actions resolve against `renderedIds`.** Selection, ranges, and the
+  menu's counts all describe rows currently on screen; widening them to the full
+  list would let a bulk action hit workspaces the user never saw.
+
 ## Important Touch Points
 
 - `src/components/layout/app-sidebar.tsx` — `collapsible="icon"`, rail overflow override
 - `src/components/layout/sidebar-workspace-list.tsx` — expanded → inbox, collapsed → rail
-- `src/components/layout/sidebar-inbox.tsx` — filter dropdown, card list, settled section, settle motion
-- `src/components/layout/sidebar-inbox-card.tsx` — the workspace card + context menu wiring
-- `src/components/layout/workspace-inbox-menu.tsx` — the shared right-click menu for cards and settled rows
+- `src/components/layout/sidebar-inbox.tsx` — filter dropdown, card list, the two active tiers (`isWrappingUp` + `WrappingUpDivider`), both shelves, the settle/snooze/wake/auto-settle effects and their invariants, multi-select, park navigation
+- `src/components/layout/sidebar-inbox-card.tsx` — the workspace card + Settle/Snooze action pair + unread/Woke markers + context menu wiring
+- `src/components/layout/sidebar-snooze.ts` — pure, clock-free wake presets + `formatWakeLabel` + `formatTimeUntil`
+- `src/components/layout/workspace-inbox-menu.tsx` — the shared right-click menu for all three row shapes
 - `src/components/layout/sidebar-inbox-jump.ts` — visual-order jump targets for Alt+1..9
 - `src/lib/keybind-registry.ts` — `workspaceJump1..9` actions (default `Alt+1..9`)
+- `src/lib/use-coarse-clock.ts` — the single ~30s clock behind every elapsed label and sweep
 - `src/components/settings/settings-view.tsx` — the Appearance → Sidebar subsection
-- `src/stores/sidebar-inbox-store.ts` — persisted settled list + session repo filter
+- `src/stores/sidebar-inbox-store.ts` — persisted `{settled, snoozed, keepActive, activity}` blob, pin rules, `resolveSettledTimestamp`, session repo filter
+- `src/tauri/types.ts` — `WorkspaceSnapshot.last_active_at` / `last_visited_at`
+- `src-tauri/src/state/state_impl.rs` — `stamp_workspace_activity` (non-idle pane transitions), `record_workspace_switch` (the only `last_visited_at` writer, shared by `activate_workspace` / `activate_terminal_session` / `activate_pane`), `backfill_workspace_activity` / `derive_last_activity_ms`
+- `src-tauri/src/lib.rs` — the boot thread that runs `backfill_workspace_protection`, which chains the activity backfill
 - `src/components/layout/sidebar-action-row.tsx` — expanded search/new-agent header + collapsed rail header
 - `src/components/layout/sidebar-rail-workspaces.tsx` — collapsed per-workspace strip
 - `src/components/layout/sidebar-footer-bar.tsx` — footer nav (Automations/Workspaces/Ports/app menu)
-- `src/components/layout/sidebar-workspace-row.tsx` — shared `WorkspaceContextMenuItems` + `DeleteWorktreeDialog` (the row component itself is unmounted)
+- `src/components/layout/sidebar-workspace-row.tsx` — shared `WorkspaceContextMenuItems` + `DeleteWorktreeDialog` + `SettleMenuAction` / `SnoozeMenuAction` (the row component itself is unmounted)
 - `src/components/layout/use-project-appearance.ts` — shared avatar appearance loader
 - `src/components/ui/sidebar.tsx` — width defaults (288px expanded, 52px rail)
 - `src/components/ui/working-indicator.tsx` — configurable working indicator

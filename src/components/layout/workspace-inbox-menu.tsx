@@ -19,7 +19,10 @@ import {
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import type { WorkspaceSnapshot } from "@/tauri/types";
-import type { SettleMenuAction } from "./sidebar-workspace-row";
+import type {
+  SettleMenuAction,
+  SnoozeMenuAction,
+} from "./sidebar-workspace-row";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -27,6 +30,12 @@ interface Props {
    *  the inbox card passes "settle" (when settleable), a settled row passes
    *  "unsettle", so the right-click menu mirrors the hover affordance. */
   settleAction?: SettleMenuAction;
+  /** Optional Snooze / Wake entry, the deferral sibling of `settleAction` —
+   *  a card passes "snooze" with its resolved presets, a snoozed row passes
+   *  "wake". */
+  snoozeAction?: SnoozeMenuAction;
+  /** Optional "Mark unread" entry. */
+  unreadAction?: { onMarkUnread: () => void };
   children: React.ReactNode;
 }
 
@@ -36,7 +45,13 @@ interface Props {
  *  archive/close/push semantics as everywhere else — local rows archive
  *  (undoable), attach-in-place/remote rows close (the backend refuses to
  *  archive them). */
-export function WorkspaceInboxMenu({ workspace, settleAction, children }: Props) {
+export function WorkspaceInboxMenu({
+  workspace,
+  settleAction,
+  snoozeAction,
+  unreadAction,
+  children,
+}: Props) {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [pendingPushHost, setPendingPushHost] = useState<HostView | null>(null);
 
@@ -117,6 +132,8 @@ export function WorkspaceInboxMenu({ workspace, settleAction, children }: Props)
         <WorkspaceContextMenuItems
           workspace={workspace}
           settleAction={settleAction}
+          snoozeAction={snoozeAction}
+          unreadAction={unreadAction}
           onArchiveRequest={() => void handleArchiveOrClose()}
           onDeleteRequest={() => setShowDeleteDialog(true)}
           onRequestPushConfirm={(host) => setPendingPushHost(host)}

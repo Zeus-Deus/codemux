@@ -11,8 +11,24 @@ vi.mock("@/tauri/commands", () => ({
 import {
   useSidebarInboxStore,
   SETTLED_UI_STATE_KEY,
+  resolveSettledTimestamp,
   __resetSidebarInboxStoreForTests,
 } from "./sidebar-inbox-store";
+
+/** The persisted blob shape, as the tests read it back out of the mock. */
+interface PersistedBlob {
+  settled: { id: string; at: number; workEndedAt?: number }[];
+  snoozed: { id: string; at: number; until: number }[];
+  keepActive: string[];
+  activity: Record<string, number>;
+}
+
+function lastPersistedBlob(): PersistedBlob {
+  const calls = mockDbSetUiState.mock.calls;
+  const [key, value] = calls[calls.length - 1] as [string, string];
+  expect(key).toBe(SETTLED_UI_STATE_KEY);
+  return JSON.parse(value) as PersistedBlob;
+}
 
 describe("sidebar-inbox-store", () => {
   beforeEach(() => {
@@ -233,5 +249,221 @@ describe("sidebar-inbox-store", () => {
     mockDbSetUiState.mockClear();
     useSidebarInboxStore.getState().prune(new Set(["ws-1"]));
     expect(mockDbSetUiState).not.toHaveBeenCalled();
+  });
+
+  describe("settled sort key", () => {
+    it("resolveSettledTimestamp() prefers workEndedAt and falls back to at", () => {
+      expect(resolveSettledTimestamp({ id: "a", at: 500 })).toBe(500);
+      expect(
+        resolveSettledTimestamp({ id: "a", at: 500, workEndedAt: 100 }),
+      ).toBe(100);
+      // A zero work-end time is still a known time, not "unknown".
+      expect(
+        resolveSettledTimestamp({ id: "a", at: 500, workEndedAt: 0 }),
+      ).toBe(0);
+    });
+
+    it("settle() stores workEndedAt when given and omits it otherwise", () => {
+      useSidebarInboxStore.getState().settle("ws-old", 111);
+      useSidebarInboxStore.getState().settle("ws-unknown");
+
+      const settled = useSidebarInboxStore.getState().settled;
+      const old = settled.find((e) => e.id === "ws-old");
+      const unknown = settled.find((e) => e.id === "ws-unknown");
+      expect(old?.workEndedAt).toBe(111);
+      expect(unknown?.workEndedAt).toBeUndefined();
+      // The unknown row still resolves to something sortable.
+      expect(resolveSettledTimestamp(unknown!)).toBe(unknown!.at);
+
+      expect(
+        lastPersistedBlob().settled.find((e) => e.id === "ws-old")?.workEndedAt,
+      ).toBe(111);
+    });
+  });
+
+  describe("snooze", () => {
+    it("snooze()/unsnooze() round-trips, persisting once per mutation", () => {
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      const entry = useSidebarInboxStore.getState().snoozed[0];
+      expect(entry?.id).toBe("ws-1");
+      expect(entry?.until).toBe(5_000);
+      expect(typeof entry?.at).toBe("number");
+      expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
+      expect(lastPersistedBlob().snoozed).toEqual([
+        { id: "ws-1", at: entry!.at, until: 5_000 },
+      ]);
+
+      mockDbSetUiState.mockClear();
+      useSidebarInboxStore.getState().unsnooze("ws-1", "timer");
+      expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+      expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
+      expect(lastPersistedBlob().snoozed).toEqual([]);
+
+      // Unknown id, no pin to touch — no state change, no persist.
+      mockDbSetUiState.mockClear();
+      useSidebarInboxStore.getState().unsnooze("ws-404", "timer");
+      expect(mockDbSetUiState).not.toHaveBeenCalled();
+    });
+
+    it("re-snoozing replaces the entry rather than duplicating it", () => {
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      useSidebarInboxStore.getState().snooze("ws-1", 9_000);
+      const snoozed = useSidebarInboxStore.getState().snoozed;
+      expect(snoozed.map((e) => e.id)).toEqual(["ws-1"]);
+      expect(snoozed[0]?.until).toBe(9_000);
+    });
+
+    it("the two shelves are mutually exclusive in both directions", () => {
+      useSidebarInboxStore.getState().settle("ws-1");
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      expect(useSidebarInboxStore.getState().settled).toEqual([]);
+      expect(
+        useSidebarInboxStore.getState().snoozed.map((e) => e.id),
+      ).toEqual(["ws-1"]);
+
+      mockDbSetUiState.mockClear();
+      useSidebarInboxStore.getState().settle("ws-1");
+      expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+      expect(
+        useSidebarInboxStore.getState().settled.map((e) => e.id),
+      ).toEqual(["ws-1"]);
+      expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
+      const blob = lastPersistedBlob();
+      expect(blob.snoozed).toEqual([]);
+      expect(blob.settled.map((e) => e.id)).toEqual(["ws-1"]);
+    });
+
+    it("snooze() clears a keep-active pin", () => {
+      useSidebarInboxStore.getState().unsettle("ws-1", "user");
+      expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-1": true });
+
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      expect(useSidebarInboxStore.getState().keepActive).toEqual({});
+      expect(lastPersistedBlob().keepActive).toEqual([]);
+    });
+
+    it("unsnooze('user') pins keep-active; 'activity' clears it; 'timer' leaves it alone", () => {
+      // Explicit wake-now behaves like unsettle("user").
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      useSidebarInboxStore.getState().unsnooze("ws-1", "user");
+      expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-1": true });
+      expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+
+      // The agent resurfacing is the signal a pin waits for.
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      useSidebarInboxStore.getState().unsnooze("ws-1", "activity");
+      expect(useSidebarInboxStore.getState().keepActive).toEqual({});
+      expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+
+      // The clock expiring says nothing about the pin either way.
+      useSidebarInboxStore.getState().unsettle("ws-2", "user");
+      useSidebarInboxStore.getState().snooze("ws-3", 5_000);
+      useSidebarInboxStore.getState().unsnooze("ws-3", "timer");
+      expect(useSidebarInboxStore.getState().keepActive).toEqual({ "ws-2": true });
+      expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+
+      // ...and a timer wake on an unpinned, unsnoozed id is a full no-op.
+      mockDbSetUiState.mockClear();
+      useSidebarInboxStore.getState().unsnooze("ws-3", "timer");
+      expect(mockDbSetUiState).not.toHaveBeenCalled();
+    });
+
+    it("prune() drops snoozed entries for vanished workspaces", () => {
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      useSidebarInboxStore.getState().snooze("ws-gone", 5_000);
+      mockDbSetUiState.mockClear();
+
+      useSidebarInboxStore.getState().prune(new Set(["ws-1"]));
+      expect(
+        useSidebarInboxStore.getState().snoozed.map((e) => e.id),
+      ).toEqual(["ws-1"]);
+      expect(mockDbSetUiState).toHaveBeenCalledTimes(1);
+      expect(lastPersistedBlob().snoozed.map((e) => e.id)).toEqual(["ws-1"]);
+
+      // A snooze-only change still counts as a change; nothing left → no persist.
+      mockDbSetUiState.mockClear();
+      useSidebarInboxStore.getState().prune(new Set(["ws-1"]));
+      expect(mockDbSetUiState).not.toHaveBeenCalled();
+    });
+
+    it("load() round-trips snoozed entries and drops malformed ones", async () => {
+      mockDbGetUiState.mockResolvedValue(
+        JSON.stringify({
+          settled: [{ id: "ws-1", at: 500, workEndedAt: 100 }],
+          snoozed: [
+            { id: "ws-2", at: 1, until: 2 },
+            { id: "ws-3", at: 1 }, // no `until`
+            { id: 42, at: 1, until: 2 },
+            "nope",
+            null,
+          ],
+          keepActive: [],
+          activity: {},
+        }),
+      );
+      await useSidebarInboxStore.getState().load();
+      const s = useSidebarInboxStore.getState();
+      expect(s.settled).toEqual([{ id: "ws-1", at: 500, workEndedAt: 100 }]);
+      expect(s.snoozed).toEqual([{ id: "ws-2", at: 1, until: 2 }]);
+    });
+
+    it("load() back-compat: both older persisted shapes yield an empty snooze shelf", async () => {
+      // Oldest shape: a bare array of settled entries.
+      mockDbGetUiState.mockResolvedValue(
+        JSON.stringify([{ id: "ws-1", at: 500 }]),
+      );
+      await useSidebarInboxStore.getState().load();
+      let s = useSidebarInboxStore.getState();
+      expect(s.settled).toEqual([{ id: "ws-1", at: 500 }]);
+      expect(s.snoozed).toEqual([]);
+      expect(s.keepActive).toEqual({});
+      expect(s.activity).toEqual({});
+
+      // Pre-snooze object shape: {settled, keepActive, activity}, no `snoozed`.
+      __resetSidebarInboxStoreForTests();
+      mockDbGetUiState.mockResolvedValue(
+        JSON.stringify({
+          settled: [{ id: "ws-1", at: 500 }],
+          keepActive: ["ws-2"],
+          activity: { "ws-3": 12345 },
+        }),
+      );
+      await useSidebarInboxStore.getState().load();
+      s = useSidebarInboxStore.getState();
+      expect(s.settled).toEqual([{ id: "ws-1", at: 500 }]);
+      expect(s.snoozed).toEqual([]);
+      expect(s.keepActive).toEqual({ "ws-2": true });
+      expect(s.activity).toEqual({ "ws-3": 12345 });
+    });
+
+    it("mutations of the other shelves carry the snooze list through untouched", () => {
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      const at = useSidebarInboxStore.getState().snoozed[0]!.at;
+
+      useSidebarInboxStore.getState().settle("ws-2");
+      expect(lastPersistedBlob().snoozed).toEqual([
+        { id: "ws-1", at, until: 5_000 },
+      ]);
+
+      useSidebarInboxStore.getState().unsettle("ws-2", "user");
+      expect(lastPersistedBlob().snoozed).toEqual([
+        { id: "ws-1", at, until: 5_000 },
+      ]);
+
+      useSidebarInboxStore.getState().noteActivity("ws-2", 1_000_000);
+      expect(lastPersistedBlob().snoozed).toEqual([
+        { id: "ws-1", at, until: 5_000 },
+      ]);
+      expect(useSidebarInboxStore.getState().snoozed.map((e) => e.id)).toEqual([
+        "ws-1",
+      ]);
+    });
+
+    it("__resetSidebarInboxStoreForTests() clears the snooze shelf too", () => {
+      useSidebarInboxStore.getState().snooze("ws-1", 5_000);
+      expect(useSidebarInboxStore.getState().snoozed).toHaveLength(1);
+      __resetSidebarInboxStoreForTests();
+      expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+    });
   });
 });

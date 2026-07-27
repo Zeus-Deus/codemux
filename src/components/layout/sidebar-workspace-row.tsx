@@ -96,6 +96,7 @@ import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
 import { useForceDelete } from "@/hooks/use-force-delete";
 import { useDefaultBranch } from "./default-branch-cache";
+import { computeSnoozePresets } from "./sidebar-snooze";
 
 /** Attach-in-place and remote (pushed-to-host) workspaces can't be
  *  archived — the backend refuses — so their removal affordance is the
@@ -235,15 +236,79 @@ export interface SettleMenuAction {
   onAction: () => void;
 }
 
+/** Optional Snooze / Wake entry for the workspace context menu, mirroring
+ *  {@link SettleMenuAction}. A snoozed row passes `kind: "wake"`; an active
+ *  card passes `kind: "snooze"`. */
+export interface SnoozeMenuAction {
+  kind: "snooze" | "wake";
+  /** Whether deferral is on offer at all — the caller's settle/snooze
+   *  guardrail, which is the only thing that may withhold the submenu. Read
+   *  only for `kind: "snooze"`.
+   *
+   *  This replaced "an empty preset array means not offered". Presets are now
+   *  resolved when the submenu opens rather than by whoever renders the list,
+   *  so there is no array left to be empty and the guardrail has to say so in
+   *  its own words. */
+  offered: boolean;
+  onSnooze: (until: number) => void;
+  onWake: () => void;
+}
+
+/** The "Snooze until…" submenu.
+ *
+ *  Its own component purely so the wake times are resolved at the right moment:
+ *  Radix does not render a context menu's content until the menu opens, so this
+ *  mounts on open and `useState`'s initialiser runs exactly once, right then.
+ *  Resolving them where the *row* renders — which is what passing a preset
+ *  array down did — meant "In 1 hour" could be up to a full coarse tick (~30s)
+ *  in the past by the time it was clicked, and it made every row in the sidebar
+ *  re-render on every tick to keep a menu current that nobody had opened. */
+function SnoozeUntilSubmenu({
+  onSnooze,
+}: {
+  onSnooze: (until: number) => void;
+}) {
+  const [presets] = useState(() => computeSnoozePresets(Date.now()));
+  return (
+    <ContextMenuSub>
+      <ContextMenuSubTrigger>Snooze until…</ContextMenuSubTrigger>
+      <ContextMenuSubContent>
+        {presets.map((preset) => (
+          <ContextMenuItem
+            key={preset.id}
+            className="gap-4"
+            onClick={() => onSnooze(preset.at)}
+          >
+            <span className="flex-1">{preset.label}</span>
+            {/* The relative label says how far away a wake is and never when:
+                "Next week" is a deferral the user would have to guess the end
+                of. */}
+            <span className="shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground">
+              {preset.whenLabel}
+            </span>
+          </ContextMenuItem>
+        ))}
+      </ContextMenuSubContent>
+    </ContextMenuSub>
+  );
+}
+
 export function WorkspaceContextMenuItems({
   workspace,
   settleAction,
+  snoozeAction,
+  unreadAction,
   onArchiveRequest,
   onDeleteRequest,
   onRequestPushConfirm,
 }: {
   workspace: WorkspaceSnapshot;
   settleAction?: SettleMenuAction;
+  snoozeAction?: SnoozeMenuAction;
+  /** Optional "Mark unread" entry. The caller decides when re-marking is
+   *  meaningful — an already-unread card passes nothing rather than offering
+   *  an item that would do nothing. */
+  unreadAction?: { onMarkUnread: () => void };
   /** Remove the row non-destructively. For local workspaces this
    *  archives (restorable from Settings → Archive); for attach-in-place
    *  and remote (host-backed) workspaces — which the backend refuses to
@@ -258,6 +323,10 @@ export function WorkspaceContextMenuItems({
   onRequestPushConfirm?: (host: HostView) => void;
 }) {
   const [editors, setEditors] = useState<EditorInfo[]>([]);
+  // Const alias so the discriminant narrowing survives into the preset map's
+  // callbacks — TypeScript drops narrowing on a (mutable) parameter binding
+  // the moment it is read inside a closure.
+  const snooze = snoozeAction;
   const isWorktree = !!workspace.worktree_path;
   const isAttachOrRemote = isAttachOrRemoteWorkspace(workspace);
   // Mirror of the row's `canDelete` gate: destructive deletion is only
@@ -412,13 +481,36 @@ export function WorkspaceContextMenuItems({
 
   return (
     <ContextMenuContent>
-      {settleAction && (
+      {/* Lifecycle block. Ordered so the entries that BRING WORK BACK sit
+          first: a user who right-clicked a hidden row is almost always there
+          to undo the hiding, and burying "Wake now" under the deferral
+          options would make the common case the slower one. */}
+      {(settleAction || snooze || unreadAction) && (
         <>
-          <ContextMenuItem onClick={settleAction.onAction}>
-            {settleAction.kind === "settle"
-              ? "Settle workspace"
-              : "Un-settle workspace"}
-          </ContextMenuItem>
+          {settleAction?.kind === "unsettle" && (
+            <ContextMenuItem onClick={settleAction.onAction}>
+              Un-settle workspace
+            </ContextMenuItem>
+          )}
+          {snooze?.kind === "wake" && (
+            <ContextMenuItem onClick={snooze.onWake}>Wake now</ContextMenuItem>
+          )}
+          {settleAction?.kind === "settle" && (
+            <ContextMenuItem onClick={settleAction.onAction}>
+              Settle workspace
+            </ContextMenuItem>
+          )}
+          {/* `offered` is the guardrail (a working or blocked workspace is
+              never deferrable). The wake times themselves belong to
+              `SnoozeUntilSubmenu`, which only exists while the menu is open. */}
+          {snooze?.kind === "snooze" && snooze.offered && (
+            <SnoozeUntilSubmenu onSnooze={snooze.onSnooze} />
+          )}
+          {unreadAction && (
+            <ContextMenuItem onClick={unreadAction.onMarkUnread}>
+              Mark unread
+            </ContextMenuItem>
+          )}
           <ContextMenuSeparator />
         </>
       )}

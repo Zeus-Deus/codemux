@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -457,6 +457,37 @@ pub struct WorkspaceSnapshot {
     /// deserialize as `false`.
     #[serde(default)]
     pub attach_only: bool,
+    /// Ms epoch of the last time an agent in this workspace genuinely did
+    /// something — stamped when any of its panes transitions to a
+    /// non-idle status (working / waiting on permission / finished
+    /// review), and at create time.
+    ///
+    /// It is deliberately backend-owned and persisted: the sidebar's
+    /// idle sweep decides whether to hide a workspace after N days of
+    /// silence, and a stamp invented by the frontend the first time it
+    /// laid eyes on a workspace resets that clock on every reinstall and
+    /// throws away the real history it is supposed to be measuring.
+    ///
+    /// Workspaces persisted before this field existed get a one-time
+    /// boot backfill (`backfill_workspace_activity`); `None` survives
+    /// only when nothing on disk can date the checkout, and the frontend
+    /// reads `None` as "unknown" and refuses to sweep on it. Additive;
+    /// old persisted state deserializes as `None`.
+    #[serde(default)]
+    pub last_active_at: Option<i64>,
+    /// Ms epoch of the last time the user had this workspace focused.
+    /// Stamped on both edges of a switch — when the workspace becomes
+    /// active, and again when the user switches away from it, since a
+    /// visit that ends now is a visit that lasted until now. Stamping
+    /// only the entry edge would mark work the user watched finish as
+    /// unread the moment they leave it.
+    ///
+    /// Kept apart from `last_active_at` on purpose — looking at a
+    /// workspace is not the agent working in it, so collapsing the two
+    /// would let a glance keep dead work permanently unswept. Additive;
+    /// old persisted state deserializes as `None`.
+    #[serde(default)]
+    pub last_visited_at: Option<i64>,
 }
 
 /// A workspace the user archived: the workspace itself is closed (no
@@ -686,21 +717,104 @@ impl AppStateStore {
         session_id_for_pane(&surface.root, &surface.active_pane_id)
     }
 
-    pub fn activate_terminal_session(&self, session_id: &str) -> bool {
-        let mut snapshot = self.inner.lock().unwrap();
-
-        for workspace in &mut snapshot.workspaces {
-            for surface in &mut workspace.surfaces {
-                if let Some(pane_id) = find_terminal_pane_id(&surface.root, session_id) {
-                    workspace.active_surface_id = surface.surface_id.clone();
-                    surface.active_pane_id = pane_id;
-                    snapshot.active_workspace_id = workspace.workspace_id.clone();
-                    return true;
+    /// The bookkeeping every workspace switch owes, whatever surface the
+    /// switch came in through — sidebar click, palette, keyboard jump,
+    /// control socket, or a pane/session activation that happens to live
+    /// in another workspace. Centralised so no activation path can move
+    /// `active_workspace_id` while forgetting the ledger around it:
+    ///
+    /// - Leaving a workspace counts as having visited it up to this
+    ///   moment. Without this, work the user sat and watched finish turns
+    ///   bold-unread the instant they switch away: the pane writers stamp
+    ///   `last_active_at` even while the workspace is focused, and only
+    ///   the incoming side used to move `last_visited_at`, so
+    ///   `last_active_at > last_visited_at` came out true for the one
+    ///   workspace the user had definitely seen.
+    /// - The incoming workspace's notifications are marked read, its
+    ///   badge count cleared, its active surface's Review statuses
+    ///   dropped, and its own visit stamped.
+    ///
+    /// Callers must have verified that `workspace_id` names an existing
+    /// workspace.
+    fn record_workspace_switch(snapshot: &mut AppStateSnapshot, workspace_id: &str) {
+        let previous_id = snapshot.active_workspace_id.0.clone();
+        if previous_id != workspace_id {
+            if let Some(previous) = snapshot
+                .workspaces
+                .iter_mut()
+                .find(|workspace| workspace.workspace_id.0 == previous_id)
+            {
+                previous.last_visited_at = Some(current_time_ms_signed());
+            }
+        }
+        snapshot.active_workspace_id = WorkspaceId(workspace_id.to_string());
+        for notification in snapshot.notifications.iter_mut() {
+            if notification.workspace_id.0 == workspace_id {
+                notification.read = true;
+            }
+        }
+        // Clear review statuses only for the active tab's panes (not all tabs)
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        {
+            let active_surface_id = workspace.active_surface_id.clone();
+            if let Some(surface) = workspace
+                .surfaces
+                .iter()
+                .find(|s| s.surface_id == active_surface_id)
+            {
+                let pane_ids = collect_pane_ids_from_node(&surface.root);
+                for pid in pane_ids {
+                    if snapshot.pane_statuses.get(&pid) == Some(&PaneStatus::Review) {
+                        snapshot.pane_statuses.remove(&pid);
+                    }
                 }
             }
         }
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        {
+            workspace.notification_count = 0;
+            workspace.last_visited_at = Some(current_time_ms_signed());
+        }
+    }
 
-        false
+    pub fn activate_terminal_session(&self, session_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+
+        // Locate first, mutate after: the switch bookkeeping needs the
+        // whole snapshot, so the target has to be named by index rather
+        // than held as a borrow into the workspace list.
+        let mut target: Option<(usize, usize, PaneId)> = None;
+        'search: for (workspace_index, workspace) in snapshot.workspaces.iter().enumerate() {
+            for (surface_index, surface) in workspace.surfaces.iter().enumerate() {
+                if let Some(pane_id) = find_terminal_pane_id(&surface.root, session_id) {
+                    target = Some((workspace_index, surface_index, pane_id));
+                    break 'search;
+                }
+            }
+        }
+        let Some((workspace_index, surface_index, pane_id)) = target else {
+            return false;
+        };
+
+        let workspace = &mut snapshot.workspaces[workspace_index];
+        let workspace_id = workspace.workspace_id.clone();
+        workspace.active_surface_id = workspace.surfaces[surface_index].surface_id.clone();
+        workspace.surfaces[surface_index].active_pane_id = pane_id;
+        // A session can be focused from another workspace (jump-to-session
+        // navigation): that is a workspace switch and owes the same visit
+        // bookkeeping as an explicit activation. Within the already-active
+        // workspace it is only a focus move — re-stamping would clear
+        // Review badges the user hasn't looked at.
+        if snapshot.active_workspace_id != workspace_id {
+            Self::record_workspace_switch(&mut snapshot, &workspace_id.0);
+        }
+        true
     }
 
     pub fn activate_workspace(&self, workspace_id: &str) -> bool {
@@ -710,39 +824,7 @@ impl AppStateStore {
             .iter()
             .any(|workspace| workspace.workspace_id.0 == workspace_id)
         {
-            snapshot.active_workspace_id = WorkspaceId(workspace_id.to_string());
-            for notification in snapshot.notifications.iter_mut() {
-                if notification.workspace_id.0 == workspace_id {
-                    notification.read = true;
-                }
-            }
-            // Clear review statuses only for the active tab's panes (not all tabs)
-            if let Some(workspace) = snapshot
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.workspace_id.0 == workspace_id)
-            {
-                let active_surface_id = workspace.active_surface_id.clone();
-                if let Some(surface) = workspace
-                    .surfaces
-                    .iter()
-                    .find(|s| s.surface_id == active_surface_id)
-                {
-                    let pane_ids = collect_pane_ids_from_node(&surface.root);
-                    for pid in pane_ids {
-                        if snapshot.pane_statuses.get(&pid) == Some(&PaneStatus::Review) {
-                            snapshot.pane_statuses.remove(&pid);
-                        }
-                    }
-                }
-            }
-            if let Some(workspace) = snapshot
-                .workspaces
-                .iter_mut()
-                .find(|workspace| workspace.workspace_id.0 == workspace_id)
-            {
-                workspace.notification_count = 0;
-            }
+            Self::record_workspace_switch(&mut snapshot, workspace_id);
             return true;
         }
         false
@@ -751,18 +833,31 @@ impl AppStateStore {
     pub fn activate_pane(&self, pane_id: &str) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
 
-        for workspace in &mut snapshot.workspaces {
-            for surface in &mut workspace.surfaces {
+        // Same locate-then-mutate shape as `activate_terminal_session`,
+        // for the same borrow reason.
+        let mut target: Option<(usize, usize)> = None;
+        'search: for (workspace_index, workspace) in snapshot.workspaces.iter().enumerate() {
+            for (surface_index, surface) in workspace.surfaces.iter().enumerate() {
                 if pane_tree_contains_pane(&surface.root, pane_id) {
-                    workspace.active_surface_id = surface.surface_id.clone();
-                    surface.active_pane_id = PaneId(pane_id.to_string());
-                    snapshot.active_workspace_id = workspace.workspace_id.clone();
-                    return true;
+                    target = Some((workspace_index, surface_index));
+                    break 'search;
                 }
             }
         }
+        let Some((workspace_index, surface_index)) = target else {
+            return false;
+        };
 
-        false
+        let workspace = &mut snapshot.workspaces[workspace_index];
+        let workspace_id = workspace.workspace_id.clone();
+        workspace.active_surface_id = workspace.surfaces[surface_index].surface_id.clone();
+        workspace.surfaces[surface_index].active_pane_id = PaneId(pane_id.to_string());
+        // Cross-workspace pane focus is a workspace switch; same-workspace
+        // focus is not (see `activate_terminal_session`).
+        if snapshot.active_workspace_id != workspace_id {
+            Self::record_workspace_switch(&mut snapshot, &workspace_id.0);
+        }
+        true
     }
 
     pub fn create_workspace(&self) -> WorkspaceId {
@@ -833,6 +928,8 @@ impl AppStateStore {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            last_active_at: Some(current_time_ms_signed()),
+            last_visited_at: Some(current_time_ms_signed()),
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -956,6 +1053,8 @@ impl AppStateStore {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            last_active_at: Some(current_time_ms_signed()),
+            last_visited_at: Some(current_time_ms_signed()),
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -1038,6 +1137,14 @@ impl AppStateStore {
             host_id: Some(host_id),
             remote_cwd: None,
             attach_only: false,
+            // Adoption is not activity. This workspace has a history — it
+            // just happened on another device — so stamping `now` would tell
+            // the idle sweep a month-old checkout is brand new, and the boot
+            // backfill could never correct it because it only fills `None`.
+            // Left unknown, the sweep declines to act until the backfill
+            // dates the pulled checkout from its own git history.
+            last_active_at: None,
+            last_visited_at: Some(current_time_ms_signed()),
         });
 
         // We deliberately do NOT set this as the active workspace.
@@ -1099,6 +1206,11 @@ impl AppStateStore {
             host_id: Some(host_id),
             remote_cwd: None,
             attach_only: false,
+            // Same as [`create_synced_workspace_shell`]: an adopted root
+            // carries history from the device that made it, so it is left
+            // unknown for the backfill to date rather than faked as `now`.
+            last_active_at: None,
+            last_visited_at: Some(current_time_ms_signed()),
         });
 
         workspace_id
@@ -1209,6 +1321,8 @@ impl AppStateStore {
             host_id: Some(host_id),
             remote_cwd: Some(remote_cwd),
             attach_only: true,
+            last_active_at: Some(current_time_ms_signed()),
+            last_visited_at: Some(current_time_ms_signed()),
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -1341,6 +1455,8 @@ impl AppStateStore {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            last_active_at: Some(current_time_ms_signed()),
+            last_visited_at: Some(current_time_ms_signed()),
         });
 
         snapshot.active_workspace_id = workspace_id.clone();
@@ -1808,6 +1924,9 @@ impl AppStateStore {
     /// (a background thread). Skips remote (host-backed) workspaces —
     /// their files may not exist locally and they're never protected on
     /// this device.
+    ///
+    /// Also chains [`Self::backfill_workspace_activity`] — see the note
+    /// at the call site for why the two share one background pass.
     pub fn backfill_workspace_protection(&self) {
         // Snapshot the inputs (id, checkout path, branch) under a brief
         // lock so the git work below runs unlocked.
@@ -1848,6 +1967,85 @@ impl AppStateStore {
             {
                 w.protected = protected;
                 w.divergent_copy = divergent_copy;
+            }
+        }
+        drop(snapshot);
+
+        // Ride along on this same off-boot pass rather than claiming a
+        // second startup thread: both backfills walk every workspace's
+        // checkout with git subprocesses and then take the state lock, so
+        // running them back to back costs one thread and one lock
+        // hand-off instead of two threads contending during startup.
+        self.backfill_workspace_activity();
+    }
+
+    /// Boot backfill for `last_active_at` on workspaces persisted before
+    /// that field existed. Without it every pre-existing workspace would
+    /// read as "unknown" forever and the idle sweep would never act on
+    /// the history that is actually sitting on disk.
+    ///
+    /// Shells out to git per workspace, so it inherits
+    /// `backfill_workspace_protection`'s rule: never on the app-startup
+    /// path. Cost is bounded — only workspaces still missing the stamp
+    /// are probed, so this is a one-time pass that goes empty on the
+    /// next launch.
+    ///
+    /// Skips host-backed and attach-only workspaces: their paths name
+    /// directories on another machine, so probing them locally would
+    /// either miss or, worse, date an unrelated same-named directory on
+    /// this device.
+    ///
+    /// That skip is why adopted workspaces
+    /// ([`Self::create_synced_workspace_shell`] /
+    /// [`Self::create_synced_root_shell`]) are dated a launch late rather
+    /// than never: the shell carries `host_id` only until its pull lands,
+    /// and adoption clears it as soon as the files are local, so the next
+    /// boot pass sees an ordinary local checkout with no stamp and reads
+    /// its real date out of the git history that came across with it.
+    /// Until then it stays `None`, which the frontend treats as unknown
+    /// and refuses to sweep on — the honest state for a workspace whose
+    /// files have not arrived yet.
+    pub fn backfill_workspace_activity(&self) {
+        let inputs: Vec<(String, String)> = {
+            let snapshot = self.inner.lock().unwrap();
+            snapshot
+                .workspaces
+                .iter()
+                .filter(|w| w.last_active_at.is_none() && w.host_id.is_none() && !w.attach_only)
+                .map(|w| {
+                    let checkout = w
+                        .worktree_path
+                        .clone()
+                        .or_else(|| w.project_root.clone())
+                        .unwrap_or_else(|| w.cwd.clone());
+                    (w.workspace_id.0.clone(), checkout)
+                })
+                .collect()
+        };
+        if inputs.is_empty() {
+            return;
+        }
+
+        let computed: Vec<(String, i64)> = inputs
+            .into_iter()
+            .filter_map(|(id, checkout)| {
+                derive_last_activity_ms(Path::new(&checkout)).map(|ms| (id, ms))
+            })
+            .collect();
+
+        let mut snapshot = self.inner.lock().unwrap();
+        for (id, derived) in computed {
+            if let Some(w) = snapshot
+                .workspaces
+                .iter_mut()
+                .find(|w| w.workspace_id.0 == id)
+            {
+                // The lock was released for the git work above, so an
+                // agent may have stamped a real, newer timestamp in the
+                // meantime — a derived guess must never overwrite it.
+                if w.last_active_at.is_none() {
+                    w.last_active_at = Some(derived);
+                }
             }
         }
     }
@@ -3125,28 +3323,41 @@ impl AppStateStore {
     }
 
     /// Set agent status for a pane. Idle removes the entry.
+    ///
+    /// A non-idle status is the one trustworthy "an agent is doing
+    /// something here" signal the backend sees, so it doubles as the
+    /// activity stamp the idle sweep reads. Idle is deliberately not
+    /// stamped — going quiet is the absence of work, not work.
     pub fn set_pane_status(&self, pane_id: &str, status: PaneStatus) {
         let mut snapshot = self.inner.lock().unwrap();
         if status == PaneStatus::Idle {
             snapshot.pane_statuses.remove(pane_id);
         } else {
             snapshot.pane_statuses.insert(pane_id.to_string(), status);
+            if let Some(workspace_id) = find_workspace_id_for_pane(&snapshot.workspaces, pane_id) {
+                stamp_workspace_activity(&mut snapshot, &workspace_id);
+            }
         }
     }
 
     /// Resolve session_id to pane_id and set status. Returns true if found.
     pub fn set_pane_status_by_session(&self, session_id: &str, status: PaneStatus) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
-        let pane_id = snapshot.workspaces.iter().find_map(|ws| {
+        // The owning workspace is captured alongside the pane during the
+        // same walk — the tree has already been searched, and re-finding
+        // the workspace by pane id afterwards would just walk it twice.
+        let resolved = snapshot.workspaces.iter().find_map(|ws| {
             ws.surfaces
                 .iter()
                 .find_map(|s| find_terminal_pane_id(&s.root, session_id))
+                .map(|pane_id| (ws.workspace_id.clone(), pane_id))
         });
-        if let Some(pane_id) = pane_id {
+        if let Some((workspace_id, pane_id)) = resolved {
             if status == PaneStatus::Idle {
                 snapshot.pane_statuses.remove(&pane_id.0);
             } else {
                 snapshot.pane_statuses.insert(pane_id.0, status);
+                stamp_workspace_activity(&mut snapshot, &workspace_id);
             }
             true
         } else {
@@ -3167,12 +3378,13 @@ impl AppStateStore {
     /// entry, mirroring the session-keyed variant.
     pub fn set_pane_status_by_thread(&self, thread_id: &str, status: PaneStatus) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
-        let pane_id = snapshot.workspaces.iter().find_map(|ws| {
+        let resolved = snapshot.workspaces.iter().find_map(|ws| {
             ws.surfaces
                 .iter()
                 .find_map(|s| find_agent_chat_pane_id(&s.root, thread_id))
+                .map(|pane_id| (ws.workspace_id.clone(), pane_id))
         });
-        let Some(pane_id) = pane_id else {
+        let Some((workspace_id, pane_id)) = resolved else {
             return false;
         };
         if status == PaneStatus::Idle {
@@ -3182,6 +3394,10 @@ impl AppStateStore {
             return false;
         }
         snapshot.pane_statuses.insert(pane_id.0, status);
+        // Stamped below the change-guard on purpose: the `content_delta`
+        // stream re-asserts `Working` for every token, and re-stamping on
+        // each one would be a write per token for no added fidelity.
+        stamp_workspace_activity(&mut snapshot, &workspace_id);
         true
     }
 
@@ -4175,6 +4391,8 @@ fn default_app_state() -> AppStateSnapshot {
             host_id: None,
             remote_cwd: None,
             attach_only: false,
+            last_active_at: Some(current_time_ms_signed()),
+            last_visited_at: Some(current_time_ms_signed()),
         }],
         terminal_sessions: vec![TerminalSessionSnapshot {
             session_id,
@@ -4580,6 +4798,72 @@ fn current_time_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Signed ms epoch for the workspace activity stamps. They are `i64`
+/// rather than `u64` because the boot backfill derives them from git
+/// commit times, which git itself reports as signed seconds.
+fn current_time_ms_signed() -> i64 {
+    current_time_ms() as i64
+}
+
+/// Record that an agent just did real work in `workspace_id`.
+///
+/// Kept as a free function taking `&mut AppStateSnapshot` so the pane
+/// status writers can call it while already holding the state lock —
+/// re-entering the mutex from a `&self` method would deadlock.
+fn stamp_workspace_activity(snapshot: &mut AppStateSnapshot, workspace_id: &WorkspaceId) {
+    if let Some(workspace) = snapshot
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.workspace_id == *workspace_id)
+    {
+        workspace.last_active_at = Some(current_time_ms_signed());
+    }
+}
+
+/// Best-effort "when did anything last happen in this checkout", used
+/// only to seed `last_active_at` for workspaces persisted before that
+/// field existed.
+///
+/// Prefers the checkout's last commit (git's own record of real work,
+/// and stable across clones/reinstalls) and falls back to the
+/// directory's mtime. Returns `None` — never `now` — when the path is
+/// gone, is not a repo, or git fails: a fabricated "just active" stamp
+/// would quietly exempt genuinely stale work from the idle sweep
+/// forever, whereas `None` reads as "unknown" and simply declines to
+/// sweep.
+fn derive_last_activity_ms(path: &Path) -> Option<i64> {
+    if !path.is_dir() {
+        return None;
+    }
+    last_commit_ms(path).or_else(|| directory_mtime_ms(path))
+}
+
+/// Commit time of `HEAD` in ms. A non-repo, an unborn `HEAD`, or a
+/// missing git binary all surface as `None` rather than an error,
+/// because the only caller is a best-effort backfill that must never
+/// take the app down with it.
+fn last_commit_ms(path: &Path) -> Option<i64> {
+    let output = std::process::Command::new("git")
+        .args(["log", "-1", "--format=%ct"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let seconds: i64 = String::from_utf8_lossy(&output.stdout).trim().parse().ok()?;
+    seconds.checked_mul(1000)
+}
+
+fn directory_mtime_ms(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let millis = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(millis).ok()
 }
 
 fn normalize_url(url: &str) -> String {
@@ -7592,5 +7876,550 @@ mod archived_workspace_tests {
         assert_eq!(entry.worktree_path.as_deref(), Some("/tmp/repo/wt"));
         assert_eq!(entry.git_branch.as_deref(), Some("feature/x"));
         assert_eq!(entry.archived_at, 1_700_000_000);
+    }
+}
+
+/// Coverage for the backend-owned workspace activity stamps
+/// (`last_active_at` / `last_visited_at`) that the sidebar's idle sweep
+/// reads: who stamps them, that they persist, and that the boot backfill
+/// dates old workspaces without ever inventing a timestamp.
+#[cfg(test)]
+mod workspace_activity_tests {
+    use super::*;
+
+    /// Initialize a repo whose single commit is dated `unix_seconds`, so a
+    /// test can tell a commit-derived stamp apart from the directory mtime
+    /// (which is unavoidably "now").
+    fn init_repo_committed_at(dir: &Path, unix_seconds: i64) {
+        let date = format!("{unix_seconds} +0000");
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_DATE", &date)
+                .env("GIT_COMMITTER_DATE", &date)
+                .output()
+                .expect("git is available in tests");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init"]);
+        run(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@test.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "seed",
+        ]);
+    }
+
+    /// The active workspace of a freshly built default store, cloned out
+    /// so assertions don't hold the state lock.
+    fn active_workspace_of(store: &AppStateStore) -> WorkspaceSnapshot {
+        let snapshot = store.snapshot();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == snapshot.active_workspace_id)
+            .cloned()
+            .expect("the default store always has an active workspace")
+    }
+
+    /// A store holding two workspaces with the first one active, so a
+    /// switch has both an incoming and an outgoing side. Every creation
+    /// path activates what it creates, hence the explicit switch back.
+    fn store_with_two_workspaces() -> (AppStateStore, WorkspaceId, WorkspaceId) {
+        let store = AppStateStore::default();
+        let first = store.snapshot().active_workspace_id.clone();
+        let second = store.create_empty_workspace_at_path(PathBuf::from("/tmp"));
+        assert!(store.activate_workspace(&first.0));
+        (store, first, second)
+    }
+
+    /// Wipe every visit stamp so an assertion can only pass on a stamp the
+    /// call under test wrote.
+    fn clear_visit_stamps(store: &AppStateStore) {
+        let mut snapshot = store.snapshot();
+        for workspace in snapshot.workspaces.iter_mut() {
+            workspace.last_visited_at = None;
+        }
+        store.replace_snapshot(snapshot);
+    }
+
+    /// Point the default store's single workspace at `cwd` with no
+    /// activity stamp — the shape a workspace persisted before the field
+    /// existed loads in.
+    fn store_with_unstamped_workspace(cwd: &str) -> AppStateStore {
+        let store = AppStateStore::default();
+        let mut snapshot = store.snapshot();
+        snapshot.workspaces[0].cwd = cwd.to_string();
+        snapshot.workspaces[0].worktree_path = None;
+        snapshot.workspaces[0].project_root = None;
+        snapshot.workspaces[0].last_active_at = None;
+        store.replace_snapshot(snapshot);
+        store
+    }
+
+    #[test]
+    fn non_idle_pane_status_stamps_workspace_activity() {
+        let store = AppStateStore::default();
+        let pane_id = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id
+            .clone();
+
+        // Start from "never active" so the assertion cannot pass on the
+        // create-time stamp.
+        let mut snapshot = store.snapshot();
+        snapshot.workspaces[0].last_active_at = None;
+        store.replace_snapshot(snapshot);
+
+        // Idle is the absence of work — it must not stamp.
+        store.set_pane_status(&pane_id.0, PaneStatus::Idle);
+        assert_eq!(active_workspace_of(&store).last_active_at, None);
+
+        let before = current_time_ms_signed();
+        store.set_pane_status(&pane_id.0, PaneStatus::Working);
+        let stamped = active_workspace_of(&store)
+            .last_active_at
+            .expect("working must stamp the owning workspace");
+        assert!(stamped >= before);
+
+        // Permission and Review are equally "the agent did something".
+        for status in [PaneStatus::Permission, PaneStatus::Review] {
+            let mut snapshot = store.snapshot();
+            snapshot.workspaces[0].last_active_at = None;
+            store.replace_snapshot(snapshot);
+            store.set_pane_status(&pane_id.0, status.clone());
+            assert!(
+                active_workspace_of(&store).last_active_at.is_some(),
+                "{status:?} must stamp activity"
+            );
+        }
+    }
+
+    #[test]
+    fn thread_status_transition_stamps_workspace_activity() {
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+        let pane_id = store
+            .create_agent_chat_pane(&workspace_id.0, None, None, None)
+            .unwrap();
+        store.set_agent_chat_thread_id(&pane_id.0, Some("thread-activity".into()));
+
+        let mut snapshot = store.snapshot();
+        snapshot.workspaces[0].last_active_at = None;
+        store.replace_snapshot(snapshot);
+
+        assert!(store.set_pane_status_by_thread("thread-activity", PaneStatus::Working));
+        assert!(
+            active_workspace_of(&store).last_active_at.is_some(),
+            "a chat pane going to work must stamp its workspace"
+        );
+    }
+
+    #[test]
+    fn activating_a_workspace_stamps_last_visited() {
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+
+        let mut snapshot = store.snapshot();
+        snapshot.workspaces[0].last_visited_at = None;
+        snapshot.workspaces[0].last_active_at = None;
+        store.replace_snapshot(snapshot);
+
+        let before = current_time_ms_signed();
+        assert!(store.activate_workspace(&workspace_id.0));
+
+        let workspace = active_workspace_of(&store);
+        assert!(
+            workspace.last_visited_at.expect("visit must stamp") >= before,
+            "activating must record the visit"
+        );
+        assert_eq!(
+            workspace.last_active_at, None,
+            "looking at a workspace is not the agent working in it"
+        );
+    }
+
+    #[test]
+    fn switching_away_stamps_the_outgoing_workspace_as_visited() {
+        // The workspace you just watched must not turn unread the instant
+        // you leave it: the pane writers stamp `last_active_at` while it is
+        // focused, so the visit has to be extended to the moment of leaving.
+        let (store, first, second) = store_with_two_workspaces();
+        clear_visit_stamps(&store);
+
+        let before = current_time_ms_signed();
+        assert!(store.activate_workspace(&second.0));
+
+        let snapshot = store.snapshot();
+        let outgoing = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == first)
+            .expect("the workspace we switched away from");
+        assert!(
+            outgoing.last_visited_at.expect("leaving must stamp") >= before,
+            "switching away has to close out the visit on the workspace being left"
+        );
+        let incoming = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == second)
+            .expect("the workspace we switched to");
+        assert!(incoming.last_visited_at.is_some());
+    }
+
+    #[test]
+    fn reactivating_the_open_workspace_stamps_it_once_and_leaves_others_alone() {
+        let (store, first, second) = store_with_two_workspaces();
+        clear_visit_stamps(&store);
+
+        // Activating the already-active workspace has no outgoing side —
+        // it must not stamp the workspace the user is *not* in.
+        assert!(store.activate_workspace(&first.0));
+        let snapshot = store.snapshot();
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == first)
+                .unwrap()
+                .last_visited_at
+                .is_some(),
+            "the workspace being activated is always stamped"
+        );
+        assert_eq!(
+            snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == second)
+                .unwrap()
+                .last_visited_at,
+            None,
+            "a re-activation must not backdate a visit to some other workspace"
+        );
+    }
+
+    #[test]
+    fn activating_with_no_previous_workspace_stamps_only_the_target() {
+        // First activation of a session (or after the active id was cleared)
+        // names no outgoing workspace — the lookup must simply find nothing.
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id.clone();
+        let mut snapshot = store.snapshot();
+        snapshot.active_workspace_id = WorkspaceId(String::new());
+        snapshot.workspaces[0].last_visited_at = None;
+        store.replace_snapshot(snapshot);
+
+        assert!(store.activate_workspace(&workspace_id.0));
+        assert!(active_workspace_of(&store).last_visited_at.is_some());
+    }
+
+    /// Two workspaces that each own one terminal pane, first active — the
+    /// pane- and session-addressed activation paths need a real pane in a
+    /// *non-active* workspace to aim at.
+    fn store_with_two_terminal_workspaces() -> (AppStateStore, WorkspaceId, WorkspaceId) {
+        let store = AppStateStore::default();
+        let mut snapshot = store.snapshot();
+        let first = snapshot.active_workspace_id.clone();
+        let second = WorkspaceId("workspace-second".into());
+
+        let mut second_workspace = snapshot.workspaces[0].clone();
+        second_workspace.workspace_id = second.clone();
+        second_workspace.title = "Workspace 2".into();
+        let surface_id = SurfaceId("surface-second".into());
+        let pane_id = PaneId("pane-second".into());
+        second_workspace.active_surface_id = surface_id.clone();
+        second_workspace.surfaces = vec![SurfaceSnapshot {
+            surface_id,
+            title: "Main Surface".into(),
+            active_pane_id: pane_id.clone(),
+            root: PaneNodeSnapshot::Terminal {
+                pane_id,
+                session_id: SessionId("session-second".into()),
+                title: "Terminal".into(),
+            },
+        }];
+        snapshot.workspaces.push(second_workspace);
+        store.replace_snapshot(snapshot);
+        (store, first, second)
+    }
+
+    #[test]
+    fn activating_a_terminal_session_across_workspaces_stamps_the_switch() {
+        // Jump-to-session navigation activates by session id, not
+        // workspace id — it must still close the outgoing visit and stamp
+        // the incoming one, or the sidebar's unread state lies after every
+        // such jump.
+        let (store, first, second) = store_with_two_terminal_workspaces();
+        clear_visit_stamps(&store);
+
+        let before = current_time_ms_signed();
+        assert!(store.activate_terminal_session("session-second"));
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.active_workspace_id, second);
+        let outgoing = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == first)
+            .expect("the workspace we switched away from");
+        assert!(
+            outgoing.last_visited_at.expect("leaving must stamp") >= before,
+            "a session-addressed switch has to close out the outgoing visit"
+        );
+        let incoming = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == second)
+            .expect("the workspace we switched to");
+        assert!(incoming.last_visited_at.is_some());
+    }
+
+    #[test]
+    fn activating_a_pane_across_workspaces_stamps_the_switch() {
+        let (store, first, second) = store_with_two_terminal_workspaces();
+        clear_visit_stamps(&store);
+
+        let before = current_time_ms_signed();
+        assert!(store.activate_pane("pane-second"));
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.active_workspace_id, second);
+        let outgoing = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == first)
+            .expect("the workspace we switched away from");
+        assert!(
+            outgoing.last_visited_at.expect("leaving must stamp") >= before,
+            "a pane-addressed switch has to close out the outgoing visit"
+        );
+        let incoming = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == second)
+            .expect("the workspace we switched to");
+        assert!(incoming.last_visited_at.is_some());
+    }
+
+    #[test]
+    fn activating_a_pane_inside_the_active_workspace_stamps_nothing() {
+        // Focus moves within the workspace the user is already looking at
+        // are not visits — stamping them would also clear Review badges
+        // for panes the user never glanced at.
+        let (store, first, _second) = store_with_two_terminal_workspaces();
+        let pane_id = {
+            let snapshot = store.snapshot();
+            snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == first)
+                .unwrap()
+                .surfaces[0]
+                .active_pane_id
+                .clone()
+        };
+        clear_visit_stamps(&store);
+
+        assert!(store.activate_pane(&pane_id.0));
+
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.active_workspace_id, first);
+        assert!(
+            snapshot
+                .workspaces
+                .iter()
+                .all(|w| w.last_visited_at.is_none()),
+            "a same-workspace focus move must not write any visit stamp"
+        );
+    }
+
+    #[test]
+    fn adoption_shells_leave_activity_unknown_for_the_backfill() {
+        // A workspace adopted from another device has a real history that
+        // simply happened elsewhere. Stamping `now` would present a
+        // month-old checkout as brand new AND lock the backfill out of it,
+        // since the backfill only fills `None`.
+        let store = AppStateStore::default();
+        let worktree = store.create_synced_workspace_shell(
+            "codemux/feature-x".into(),
+            42,
+            Some("/home/zeus/projects/codemux".into()),
+            "/home/zeus/.codemux/worktrees/codemux/feature-x".into(),
+            Some("feature-x".into()),
+        );
+        let root = store.create_synced_root_shell(
+            "codemux".into(),
+            42,
+            "/home/zeus/.codemux/projects/codemux".into(),
+            Some("main".into()),
+        );
+
+        let snapshot = store.snapshot();
+        for id in [&worktree, &root] {
+            let workspace = snapshot
+                .workspaces
+                .iter()
+                .find(|w| &w.workspace_id == id)
+                .expect("shell must be registered");
+            assert_eq!(
+                workspace.last_active_at, None,
+                "adoption is not activity — {id:?} must stay datable",
+            );
+        }
+    }
+
+    #[test]
+    fn activity_backfill_dates_an_adopted_workspace_once_its_pull_clears_host_id() {
+        // The backfill skips host-backed workspaces, and an adoption shell
+        // carries `host_id` until its files land. Adoption clears it as soon
+        // as the pull succeeds, so the next boot pass reads the real date out
+        // of the git history that came across with the checkout.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let commit_seconds = 1_609_459_200_i64;
+        init_repo_committed_at(dir.path(), commit_seconds);
+        let checkout = dir.path().display().to_string();
+
+        let store = AppStateStore::default();
+        let workspace_id = store.create_synced_workspace_shell(
+            "codemux/feature-x".into(),
+            42,
+            None,
+            checkout,
+            Some("feature-x".into()),
+        );
+
+        let dated = |store: &AppStateStore| {
+            store
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == workspace_id)
+                .expect("shell must be registered")
+                .last_active_at
+        };
+
+        // Still host-backed: the path names a directory on the other device
+        // as far as this pass knows, so it is left alone.
+        store.backfill_workspace_activity();
+        assert_eq!(dated(&store), None, "a pending pull must not be dated");
+
+        store
+            .set_workspace_host_id(&workspace_id.0, None)
+            .expect("pull-back clears host_id");
+        store.backfill_workspace_activity();
+        assert_eq!(
+            dated(&store),
+            Some(commit_seconds * 1000),
+            "once local, the adopted checkout is dated from its own history",
+        );
+    }
+
+    #[test]
+    fn activity_backfill_prefers_commit_time_over_directory_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 2021-01-01T00:00:00Z — far enough in the past that it cannot be
+        // confused with the directory's just-created mtime.
+        let commit_seconds = 1_609_459_200_i64;
+        init_repo_committed_at(dir.path(), commit_seconds);
+
+        let store = store_with_unstamped_workspace(&dir.path().display().to_string());
+        store.backfill_workspace_activity();
+
+        assert_eq!(
+            store.snapshot().workspaces[0].last_active_at,
+            Some(commit_seconds * 1000),
+            "the checkout's last commit is the truest available date"
+        );
+    }
+
+    #[test]
+    fn activity_backfill_falls_back_to_directory_mtime_for_non_git_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = store_with_unstamped_workspace(&dir.path().display().to_string());
+        store.backfill_workspace_activity();
+
+        let stamped = store.snapshot().workspaces[0]
+            .last_active_at
+            .expect("a plain directory still has an mtime");
+        assert!(stamped > 0);
+        assert!(stamped <= current_time_ms_signed());
+    }
+
+    #[test]
+    fn activity_backfill_tolerates_a_missing_checkout_path() {
+        let missing = std::env::temp_dir().join("codemux-activity-backfill-does-not-exist");
+        let store = store_with_unstamped_workspace(&missing.display().to_string());
+
+        // Must not panic, and must not invent "now" — an unknown date has
+        // to stay unknown so the idle sweep declines to act on it.
+        store.backfill_workspace_activity();
+        assert_eq!(store.snapshot().workspaces[0].last_active_at, None);
+        assert_eq!(derive_last_activity_ms(&missing), None);
+    }
+
+    #[test]
+    fn activity_backfill_never_overwrites_a_real_stamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_committed_at(dir.path(), 1_609_459_200);
+
+        let store = store_with_unstamped_workspace(&dir.path().display().to_string());
+        let mut snapshot = store.snapshot();
+        snapshot.workspaces[0].last_active_at = Some(1_900_000_000_000);
+        store.replace_snapshot(snapshot);
+
+        store.backfill_workspace_activity();
+        assert_eq!(
+            store.snapshot().workspaces[0].last_active_at,
+            Some(1_900_000_000_000),
+            "a derived guess must never clobber observed activity"
+        );
+    }
+
+    #[test]
+    fn old_snapshot_without_activity_stamps_deserializes_and_persists_new_ones() {
+        // Old layout.json files have neither key. Simulate one by
+        // serializing a current snapshot and deleting them.
+        let snapshot = default_app_state();
+        let mut value = serde_json::to_value(&snapshot).expect("serialize snapshot");
+        let workspace = value["workspaces"][0]
+            .as_object_mut()
+            .expect("workspace serializes to object");
+        assert!(
+            workspace.remove("last_active_at").is_some()
+                && workspace.remove("last_visited_at").is_some(),
+            "current snapshots must serialize both stamps (so they persist)"
+        );
+
+        let restored: AppStateSnapshot =
+            serde_json::from_value(value).expect("old-shape snapshot must deserialize");
+        assert_eq!(restored.workspaces[0].last_active_at, None);
+        assert_eq!(restored.workspaces[0].last_visited_at, None);
+
+        // And a stamped workspace survives the persistence round trip —
+        // these are durable history, not runtime state like pane_statuses.
+        let mut stamped = restored;
+        stamped.workspaces[0].last_active_at = Some(1_700_000_000_000);
+        stamped.workspaces[0].last_visited_at = Some(1_700_000_001_000);
+        let json = serde_json::to_string(&stamped).expect("serialize");
+        let round_tripped: AppStateSnapshot = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            round_tripped.workspaces[0].last_active_at,
+            Some(1_700_000_000_000)
+        );
+        assert_eq!(
+            round_tripped.workspaces[0].last_visited_at,
+            Some(1_700_000_001_000)
+        );
     }
 }

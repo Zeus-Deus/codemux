@@ -181,6 +181,55 @@ describe("SidebarRailWorkspaces", () => {
     expect(ids).toEqual(["ws-1", "ws-3"]);
   });
 
+  it("excludes snoozed workspaces the same way it excludes settled ones", async () => {
+    // A snooze that still leaves a rail button is the gesture undone: the
+    // deferred work is out of the inbox but back in the user's face.
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-2", at: Date.now() }],
+      snoozed: [{ id: "ws-3", at: Date.now(), until: Date.now() + 3_600_000 }],
+      keepActive: [],
+      activity: {},
+    });
+    workspaces = [
+      makeWorkspace({ title: "Active" }),
+      makeWorkspace({ title: "Settled" }),
+      makeWorkspace({ title: "Snoozed" }),
+      makeWorkspace({ title: "Also active" }),
+    ];
+    const { container } = await renderRail();
+
+    const ids = [...container.querySelectorAll("[data-rail-ws]")].map((b) =>
+      b.getAttribute("data-rail-ws"),
+    );
+    expect(ids).toEqual(["ws-1", "ws-4"]);
+  });
+
+  it("keeps the currently-open workspace visible even while it is parked", async () => {
+    // Matches the expanded inbox's forced-visible row: the button's selection
+    // fill is the collapsed sidebar's only "you are here".
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-2", at: Date.now() }],
+      snoozed: [{ id: "ws-3", at: Date.now(), until: Date.now() + 3_600_000 }],
+      keepActive: [],
+      activity: {},
+    });
+    workspaces = [
+      makeWorkspace({ title: "Active" }),
+      makeWorkspace({ title: "Settled" }),
+      makeWorkspace({ title: "Snoozed and open" }),
+    ];
+    activeWorkspaceId = "ws-3";
+    const { container } = await renderRail();
+
+    const ids = [...container.querySelectorAll("[data-rail-ws]")].map((b) =>
+      b.getAttribute("data-rail-ws"),
+    );
+    expect(ids).toEqual(["ws-1", "ws-3"]);
+    expect(container.querySelector('[data-rail-ws="ws-3"]')).toHaveClass(
+      "bg-foreground/[0.09]",
+    );
+  });
+
   it("shows a per-workspace status dot (needs-you / working / review), none when idle", async () => {
     workspaces = [
       makeWorkspace({ title: "Needs", surfaces: surfaceWithPane("p1") }),
