@@ -70,6 +70,15 @@ describe("formatCwdHint", () => {
       expect(formatCwdHint("/", ROOT, HOME)?.label).toBe("/");
     });
 
+    it("keeps the leading slash on a two-segment absolute path", () => {
+      // `var/log` would read as workspace-relative; the absolute form
+      // must survive untrimmed.
+      expect(formatCwdHint("/var/log", ROOT, HOME)?.label).toBe("/var/log");
+      expect(formatCwdHint("/opt/tools", ROOT, HOME)?.label).toBe(
+        "/opt/tools",
+      );
+    });
+
     it("elides a deep absolute path outside $HOME", () => {
       expect(formatCwdHint("/var/lib/docker/volumes", ROOT, HOME)?.label).toBe(
         "…/docker/volumes",

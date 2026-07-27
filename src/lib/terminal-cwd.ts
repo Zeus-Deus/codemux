@@ -104,10 +104,11 @@ export function formatCwdHint(
     return { label: trimTail(relative, "~"), full };
   }
 
-  // Fully outside: an absolute path, trimmed to its tail. A single-segment
-  // path (`/etc`, `/`) is short enough to show as-is.
-  if (path === "/") return { label: "/", full };
+  // Fully outside: an absolute path, trimmed to its tail. When the whole
+  // path already fits the segment budget it is shown as-is — crucially
+  // *keeping* its absolute form, because a trimmed `/var/log` rendered as
+  // `var/log` would be indistinguishable from a workspace-relative path.
   const parts = path.split("/").filter(Boolean);
-  if (parts.length === 1) return { label: `/${parts[0]}`, full };
+  if (parts.length <= MAX_TAIL_SEGMENTS) return { label: path, full };
   return { label: trimTail(path, ""), full };
 }

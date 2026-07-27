@@ -48,6 +48,12 @@ interface TerminalCwdStore {
   setPolledCwds: (entries: Record<string, string>) => void;
   /** Forget a session (pane/tab/workspace closed). */
   clearCwd: (sessionId: string) => void;
+  /** Forget every session NOT in `liveIds`, in a single store write —
+   *  closing a workspace with N terminals costs one render pass, not N.
+   *  Returns the identical state object when nothing was pruned, so the
+   *  steady state stays subscriber-silent (same contract as
+   *  `setPolledCwds`). */
+  pruneCwds: (liveIds: ReadonlySet<string>) => void;
   /** Session ids that have reported via OSC 7 and therefore never need
    *  polling. Read by the poller to build its request set. */
   osc7SessionIds: () => Set<string>;
@@ -94,6 +100,20 @@ export const useTerminalCwdStore = create<TerminalCwdStore>((set, get) => ({
       return { cwds };
     }),
 
+  pruneCwds: (liveIds) =>
+    set((state) => {
+      let changed = false;
+      const cwds: Record<string, SessionCwd> = {};
+      for (const [sessionId, entry] of Object.entries(state.cwds)) {
+        if (liveIds.has(sessionId)) {
+          cwds[sessionId] = entry;
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? { cwds } : state;
+    }),
+
   osc7SessionIds: () => {
     const ids = new Set<string>();
     for (const [sessionId, entry] of Object.entries(get().cwds)) {
@@ -129,7 +149,11 @@ export function parseOsc7(payload: string): string | null {
     const afterScheme = payload.slice("file://".length);
     // Everything up to the first `/` is the authority (host), which we
     // ignore — an SSH'd shell reports the remote hostname here, and the
-    // path is still the one the user cares about.
+    // path is still the one the user cares about. A UNC path serialized
+    // with an empty authority (`file:////server/share`) keeps its `//`
+    // prefix intact: the first `/` is at index 0, so nothing is dropped
+    // and the `//server/share/…` form flows through to the formatter,
+    // which normalizes all Windows paths to forward slashes anyway.
     const slash = afterScheme.indexOf("/");
     if (slash === -1) return null;
     path = afterScheme.slice(slash);
@@ -139,11 +163,22 @@ export function parseOsc7(payload: string): string | null {
     return null;
   }
 
+  let decoded: string;
   try {
-    return decodeURIComponent(path);
+    decoded = decodeURIComponent(path);
   } catch {
     // Malformed percent-encoding — better to keep the previous value than
     // to render mojibake in the header.
     return null;
   }
+
+  // A Windows drive path round-trips through a file URI as `/C:/Users/…`:
+  // the URI's path component must begin with `/`, so the drive letter
+  // picks up a leading slash that was never part of the filesystem path.
+  // Strip it, otherwise the formatter can't match the cwd against a
+  // `C:\Users\…` workspace root and treats every Windows terminal as
+  // living outside its workspace.
+  if (/^\/[A-Za-z]:([\\/]|$)/.test(decoded)) return decoded.slice(1);
+
+  return decoded;
 }

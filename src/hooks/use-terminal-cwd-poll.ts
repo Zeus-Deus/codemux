@@ -79,9 +79,7 @@ export function useTerminalCwdPoll(): void {
           for (const id of ids) live.add(id);
         }
       }
-      for (const id of Object.keys(cwdStore.cwds)) {
-        if (!live.has(id)) cwdStore.clearCwd(id);
-      }
+      cwdStore.pruneCwds(live);
 
       if (needed.length === 0) return;
 

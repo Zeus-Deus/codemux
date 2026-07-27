@@ -86,6 +86,39 @@ describe("terminal cwd store", () => {
       expect(useTerminalCwdStore.getState().cwds).toBe(before);
     });
   });
+
+  describe("pruneCwds", () => {
+    it("drops every dead session in a single store write", () => {
+      store().setCwd("live1", "/a", "osc7");
+      store().setCwd("dead1", "/b", "proc");
+      store().setCwd("dead2", "/c", "osc7");
+      store().setCwd("live2", "/d", "proc");
+
+      let notifications = 0;
+      const unsubscribe = useTerminalCwdStore.subscribe(() => {
+        notifications += 1;
+      });
+      store().pruneCwds(new Set(["live1", "live2"]));
+      unsubscribe();
+
+      expect(notifications).toBe(1);
+      expect(Object.keys(store().cwds).sort()).toEqual(["live1", "live2"]);
+      expect(store().cwds.live1).toEqual({ cwd: "/a", source: "osc7" });
+    });
+
+    it("keeps the same state object when every session is live", () => {
+      store().setCwd("s1", "/a", "proc");
+      const before = useTerminalCwdStore.getState().cwds;
+      store().pruneCwds(new Set(["s1", "also-not-stored"]));
+      expect(useTerminalCwdStore.getState().cwds).toBe(before);
+    });
+
+    it("empties the store when no sessions are live", () => {
+      store().setCwd("s1", "/a", "proc");
+      store().pruneCwds(new Set());
+      expect(store().cwds).toEqual({});
+    });
+  });
 });
 
 describe("parseOsc7", () => {
@@ -104,6 +137,22 @@ describe("parseOsc7", () => {
 
   it("accepts a bare absolute path (off-spec shells)", () => {
     expect(parseOsc7("/home/zeus")).toBe("/home/zeus");
+  });
+
+  it("strips the URI-artifact slash from a windows drive path", () => {
+    expect(parseOsc7("file:///C:/Users/z/proj")).toBe("C:/Users/z/proj");
+    // Same with a hostname authority, and with a bare drive root.
+    expect(parseOsc7("file://laptop/C:/Users/z/proj")).toBe("C:/Users/z/proj");
+    expect(parseOsc7("file:///C:")).toBe("C:");
+    // A unix path whose first segment is merely drive-letter-shaped but
+    // has no colon is untouched.
+    expect(parseOsc7("file:///C3/users")).toBe("/C3/users");
+  });
+
+  it("preserves the // prefix of a UNC path with an empty authority", () => {
+    expect(parseOsc7("file:////server/share/proj")).toBe(
+      "//server/share/proj",
+    );
   });
 
   it("returns null for a file URI with no path", () => {

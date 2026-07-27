@@ -2461,15 +2461,24 @@ pub fn pause_pty_output(
 ///
 /// Returns a map rather than erroring per-session so one dead pid in a
 /// batch can't fail the poll for every other pane.
+///
+/// Async + `spawn_blocking` because this is a polled path doing filesystem
+/// I/O: a sync command would run the readlink loop on the GTK main thread
+/// every tick (see the invariant note in `commands/files.rs`). The pid
+/// snapshot is taken before handing off so the mutex guard never crosses
+/// into the blocking task.
 #[tauri::command]
-pub fn terminal_session_cwds(
+pub async fn terminal_session_cwds(
     terminal_state: State<'_, PtyState>,
     session_ids: Vec<String>,
-) -> HashMap<String, String> {
+) -> Result<HashMap<String, String>, String> {
     if session_ids.is_empty() {
-        return HashMap::new();
+        return Ok(HashMap::new());
     }
-    read_cwds_for_sessions(&terminal_state.get_session_pids(), &session_ids)
+    let pids = terminal_state.get_session_pids();
+    tokio::task::spawn_blocking(move || read_cwds_for_sessions(&pids, &session_ids))
+        .await
+        .map_err(|e| format!("terminal_session_cwds task join failed: {e}"))
 }
 
 /// Resolve `session_id -> cwd` for the requested sessions given a
