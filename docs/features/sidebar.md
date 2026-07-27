@@ -151,6 +151,10 @@ visual only — nothing is archived, closed, or deleted.
   (18:00) / Tomorrow (09:00) / Next week (next Monday 09:00)**. "This evening"
   is conditional: it is dropped unless it is at least an hour away, so it can
   never resolve to a time in the past or fire while the menu is still open.
+  "Next week" is conditional the same way, against a different neighbour: on a
+  Sunday the coming Monday *is* tomorrow, so the preset is dropped unless it
+  lands at least a calendar day past "Tomorrow" — two entries resolving to one
+  wake instant would read as a menu bug.
   Presets are built from **local date components**, not by adding
   `86_400_000ms`, so a "Tomorrow" taken the night before a DST change still
   wakes at 09:00 local. `computeSnoozePresets(now)` is pure and clock-free —
@@ -160,10 +164,10 @@ visual only — nothing is archived, closed, or deleted.
   and mono beside the relative label — `18:00` for later today,
   `Tomorrow 09:00` for the next day, `Mon 09:00` beyond that, all through
   `Intl`/`toLocale*` so a 12-hour locale reads "6:00 PM". Without it "Next
-  week" is a deferral whose end the user has to guess (on a Sunday it is
-  tomorrow), and "In 1 hour" taken at 23:30 doesn't say it lands on another
-  day. The day prefix is decided by comparing **local day starts**, so the two
-  23/25-hour days a year still read as "Tomorrow".
+  week" is a deferral whose end the user has to guess, and "In 1 hour" taken
+  at 23:30 doesn't say it lands on another day. The day prefix is decided by
+  comparing **local day starts**, so the two 23/25-hour days a year still read
+  as "Tomorrow".
 - **Presets are resolved when a menu opens, never when the list renders.** The
   three owners each call `computeSnoozePresets(Date.now())` for themselves: the
   card's Snooze dropdown in its `onOpenChange`, the shared context menu's
@@ -213,25 +217,30 @@ visual only — nothing is archived, closed, or deleted.
     work. Chat panes stamp below the change-guard, so a token stream that
     re-asserts `Working` doesn't write per token. Also stamped at workspace
     creation.
-  - `last_visited_at` is stamped **only by `activate_workspace`** — the one
-    funnel every switch surface (sidebar click, palette, keyboard jump, control
-    socket) passes through. `activate_pane` does not stamp it. A glance is not
-    agent work, which is why the two stamps stay separate: collapsing them
-    would let merely looking at a workspace keep dead work permanently unswept.
-    That one funnel stamps **both edges of a switch** — the workspace being
-    entered *and* the one being left. A visit that ends now lasted until now,
-    and stamping only the entry edge marked work the user sat and watched
-    finish as unread the moment they switched away (the pane writers stamp
-    `last_active_at` even while the workspace is focused, so
-    `last_active_at > last_visited_at` came out true for the one workspace the
-    user had definitely seen). Re-activating the already-open workspace has no
-    outgoing side and stamps only itself.
+  - `last_visited_at` is stamped **only by `record_workspace_switch`** — the
+    one private helper every path that moves `active_workspace_id` calls:
+    `activate_workspace` (sidebar click, palette, keyboard jump, control
+    socket) unconditionally, and `activate_terminal_session` /
+    `activate_pane` (jump-to-session navigation, pane focus) whenever the
+    pane being focused lives in a *different* workspace. A same-workspace
+    focus move does not stamp — a glance is not agent work, which is why the
+    two stamps stay separate: collapsing them would let merely looking at a
+    workspace keep dead work permanently unswept. The helper stamps **both
+    edges of a switch** — the workspace being entered *and* the one being
+    left. A visit that ends now lasted until now, and stamping only the entry
+    edge marked work the user sat and watched finish as unread the moment
+    they switched away (the pane writers stamp `last_active_at` even while
+    the workspace is focused, so `last_active_at > last_visited_at` came out
+    true for the one workspace the user had definitely seen). Re-activating
+    the already-open workspace has no outgoing side and stamps only itself.
   - **Boot backfill** (`backfill_workspace_activity`): workspaces persisted
     before the field existed are dated from their checkout's **last git commit**
     (`git log -1 --format=%ct`), else the **directory mtime**, else left `null`.
     It never invents `now` — a fabricated "just active" stamp would exempt
     genuinely stale work from the sweep forever, while `null` reads as "unknown"
-    and the frontend declines to sweep on it. It only probes workspaces still
+    and the frontend declines to sweep on it. Backfill quality therefore
+    depends on the workspace being a git repository: a non-git checkout falls
+    to the mtime fallback, and a directory's mtime is often close to "now". It only probes workspaces still
     missing a stamp (so it goes empty on the next launch), skips host-backed and
     attach-only workspaces (their paths name directories on another machine),
     and re-checks `is_none()` under the lock before writing, since the git work
@@ -335,9 +344,15 @@ visual only — nothing is archived, closed, or deleted.
   brings those ticks straight back. Right-clicking inside a selection of
   two or more is intercepted in the **capture phase** — otherwise the row's own
   workspace menu opens first and quietly narrows the gesture back to one row —
-  and opens a bulk menu anchored at the pointer offering **Settle (n)** and,
-  only when *every* selected workspace is snoozeable, **Snooze (n)** with the
-  shared presets. Changing the repo filter clears the selection.
+  and opens a bulk menu anchored at the pointer offering **Settle (n)** and
+  **Snooze (n)** (with the shared presets) — each only when *every* selected
+  workspace can take it. Both verbs ride the per-row guardrail (`isSnoozeable`,
+  the same predicate as the card's `canSettle`): a selection containing a
+  working or permission-blocked workspace offers neither, and the menu shows a
+  disabled line saying why instead of rendering empty — a bulk gesture is not a
+  license to park in a batch what no single row offers, and a bulk action that
+  silently skipped the busy half would make its own count a lie. Changing the
+  repo filter clears the selection.
 - **Forward navigation on park**: settling or snoozing the workspace you are
   *looking at* moves you to the next surviving active card (wrapping past the
   end) — `nextWorkspaceAfterPark`. Parking a **background** workspace navigates
@@ -522,12 +537,16 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 Things that look incidental and are not. Breaking any of these breaks the inbox
 quietly rather than loudly.
 
-- **`last_visited_at` is stamped only by `activate_workspace`** — which stamps
-  both the incoming and the outgoing workspace. Not by `activate_pane`, not by
-  rendering. Adding a *third* writer (especially one that fires on pane focus)
-  would silently disable the unread marker, since unread is
+- **`last_visited_at` is stamped only by `record_workspace_switch`** — which
+  stamps both the incoming and the outgoing workspace, and which every mover of
+  `active_workspace_id` (`activate_workspace`, plus `activate_terminal_session`
+  and `activate_pane` on *cross-workspace* switches) calls. Not by
+  same-workspace pane focus, not by rendering. Adding a writer that fires on
+  every pane focus would silently disable the unread marker, since unread is
   `last_active_at > last_visited_at`; dropping the outgoing stamp brings back
-  "you get marked unread for work you just watched".
+  "you get marked unread for work you just watched"; and moving
+  `active_workspace_id` anywhere *without* the helper reopens the hole where a
+  jump-to-session switch left the visit ledger untouched.
 - **Idle never stamps `last_active_at`.** `set_pane_status(Idle)` removes the
   pane entry and writes nothing. If idle ever stamped, the idle sweep would
   measure "time since the agent stopped stopping" and nothing would ever settle.
@@ -618,7 +637,7 @@ quietly rather than loudly.
 - `src/components/settings/settings-view.tsx` — the Appearance → Sidebar subsection
 - `src/stores/sidebar-inbox-store.ts` — persisted `{settled, snoozed, keepActive, activity}` blob, pin rules, `resolveSettledTimestamp`, session repo filter
 - `src/tauri/types.ts` — `WorkspaceSnapshot.last_active_at` / `last_visited_at`
-- `src-tauri/src/state/state_impl.rs` — `stamp_workspace_activity` (non-idle pane transitions), `activate_workspace` (the only `last_visited_at` writer), `backfill_workspace_activity` / `derive_last_activity_ms`
+- `src-tauri/src/state/state_impl.rs` — `stamp_workspace_activity` (non-idle pane transitions), `record_workspace_switch` (the only `last_visited_at` writer, shared by `activate_workspace` / `activate_terminal_session` / `activate_pane`), `backfill_workspace_activity` / `derive_last_activity_ms`
 - `src-tauri/src/lib.rs` — the boot thread that runs `backfill_workspace_protection`, which chains the activity backfill
 - `src/components/layout/sidebar-action-row.tsx` — expanded search/new-agent header + collapsed rail header
 - `src/components/layout/sidebar-rail-workspaces.tsx` — collapsed per-workspace strip
