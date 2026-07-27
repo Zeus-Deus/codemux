@@ -157,16 +157,18 @@ export function computeSnoozePresets(now: number): SnoozePreset[] {
     presets.push(at("this-evening", "This evening", evening));
   }
 
-  presets.push(
-    at("tomorrow", "Tomorrow", atLocalTimeOnDay(now, 1, MORNING_HOUR)),
-  );
-  presets.push(
-    at(
-      "next-week",
-      "Next week",
-      atLocalTimeOnDay(now, daysToNextMonday(now), MORNING_HOUR),
-    ),
-  );
+  const tomorrow = atLocalTimeOnDay(now, 1, MORNING_HOUR);
+  presets.push(at("tomorrow", "Tomorrow", tomorrow));
+
+  // "Next week" is conditional for the same reason "This evening" is, just
+  // against a different neighbour: on a Sunday the next Monday IS tomorrow,
+  // so the preset would resolve to the exact instant "Tomorrow" already
+  // offers — two menu entries, one wake time. Only offer it when it lands a
+  // full calendar day past the tomorrow preset.
+  const nextWeek = atLocalTimeOnDay(now, daysToNextMonday(now), MORNING_HOUR);
+  if (localDaysBetween(tomorrow, nextWeek) >= 1) {
+    presets.push(at("next-week", "Next week", nextWeek));
+  }
 
   return presets;
 }

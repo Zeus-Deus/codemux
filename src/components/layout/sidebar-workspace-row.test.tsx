@@ -1386,27 +1386,38 @@ describe("Lifecycle context-menu block (settle / snooze / unread)", () => {
   });
 
   it("names the concrete wake time beside each relative label", async () => {
-    render(
-      <WorkspaceContextMenuItems
-        workspace={makeWorkspace({ worktree_path: null })}
-        snoozeAction={{
-          kind: "snooze",
-          offered: true,
-          onSnooze: () => {},
-          onWake: () => {},
-        }}
-        onArchiveRequest={() => {}}
-        onDeleteRequest={() => {}}
-      />,
-    );
-    await flushDefaultBranchFetch();
+    // Pinned to a Wednesday: on Sundays the "Next week" preset is
+    // deliberately withheld (it would duplicate "Tomorrow"), and this test
+    // is about the label, not that rule.
+    const nowSpy = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(new Date(2026, 5, 10, 12, 0, 0).getTime());
+    try {
+      render(
+        <WorkspaceContextMenuItems
+          workspace={makeWorkspace({ worktree_path: null })}
+          snoozeAction={{
+            kind: "snooze",
+            offered: true,
+            onSnooze: () => {},
+            onWake: () => {},
+          }}
+          onArchiveRequest={() => {}}
+          onDeleteRequest={() => {}}
+        />,
+      );
+      await flushDefaultBranchFetch();
 
-    await userEvent.click(screen.getByText("Snooze until…"));
-    const nextWeek = await screen.findByText("Next week");
-    // The row the user actually reads: "Next week" plus the Monday it lands on.
-    expect(nextWeek.closest('[role="menuitem"]')?.textContent).toMatch(
-      /Next week.+0?9[:.]00/,
-    );
+      await userEvent.click(screen.getByText("Snooze until…"));
+      const nextWeek = await screen.findByText("Next week");
+      // The row the user actually reads: "Next week" plus the Monday it
+      // lands on.
+      expect(nextWeek.closest('[role="menuitem"]')?.textContent).toMatch(
+        /Next week.+0?9[:.]00/,
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it("renders no Snooze submenu when the caller's guardrail withholds it", async () => {

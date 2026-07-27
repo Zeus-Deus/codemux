@@ -188,15 +188,27 @@ describe("SidebarInboxCard — snooze affordance", () => {
   });
 
   it("names the concrete wake time beside each relative label", async () => {
-    renderCard();
-    await userEvent.click(screen.getByRole("button", { name: 'Snooze "Ship it"' }));
+    // Pinned to a Wednesday: on Sundays the "Next week" preset is
+    // deliberately withheld (it would duplicate "Tomorrow"), and this test
+    // is about the label, not that rule.
+    const nowSpy = vi
+      .spyOn(Date, "now")
+      .mockReturnValue(new Date(2026, 5, 10, 12, 0, 0).getTime());
+    try {
+      renderCard();
+      await userEvent.click(
+        screen.getByRole("button", { name: 'Snooze "Ship it"' }),
+      );
 
-    const nextWeek = await screen.findByText("Next week");
-    // "Next week" alone never says which day or hour; the absolute half is what
-    // stops a deferral being a guess.
-    expect(nextWeek.closest('[role="menuitem"]')?.textContent).toMatch(
-      /Next week.+0?9[:.]00/,
-    );
+      const nextWeek = await screen.findByText("Next week");
+      // "Next week" alone never says which day or hour; the absolute half is
+      // what stops a deferral being a guess.
+      expect(nextWeek.closest('[role="menuitem"]')?.textContent).toMatch(
+        /Next week.+0?9[:.]00/,
+      );
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it("keeps the hover cluster pinned open while the snooze menu is open", async () => {

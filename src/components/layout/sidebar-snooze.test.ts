@@ -123,6 +123,35 @@ describe("computeSnoozePresets", () => {
     expect(nextWeek?.at).toBe(local(2026, 6, 15, 9));
     expect(new Date(nextWeek!.at).getDay()).toBe(1);
   });
+
+  it("drops 'next week' on a Sunday, when the coming Monday IS tomorrow", () => {
+    // Sunday 2026-06-14: next Monday is the 15th — the same wake instant the
+    // "Tomorrow" preset already offers. Two entries resolving to one moment
+    // would read as a menu bug ("Next week · Tomorrow 09:00"), so the
+    // redundant one is withheld.
+    const now = local(2026, 6, 14, 10);
+    const presets = computeSnoozePresets(now);
+    expect(presets.map((p) => p.id)).toEqual([
+      "one-hour",
+      "this-evening",
+      "tomorrow",
+    ]);
+    expect(byId(now).get("tomorrow")?.at).toBe(local(2026, 6, 15, 9));
+  });
+
+  it("keeps 'next week' distinct from 'tomorrow' on every other weekday", () => {
+    // 2026-06-08 is a Monday; each subsequent day through Saturday must keep
+    // both presets, at least a calendar day apart.
+    for (let day = 8; day <= 13; day++) {
+      const now = local(2026, 6, day, 10);
+      const at = byId(now);
+      const tomorrow = at.get("tomorrow");
+      const nextWeek = at.get("next-week");
+      expect(tomorrow).toBeDefined();
+      expect(nextWeek).toBeDefined();
+      expect(nextWeek!.at - tomorrow!.at).toBeGreaterThanOrEqual(NAIVE_DAY - HOUR);
+    }
+  });
 });
 
 // The suite does not pin a locale (the helper deliberately follows the user's),
