@@ -4480,6 +4480,37 @@ fn persisted_layout_path() -> Option<PathBuf> {
     Some(base.join(crate::APP_DIR_NAME).join("layout.json"))
 }
 
+/// Drop the pane statuses that mean nothing after a restart, keeping the ones
+/// that do.
+///
+/// `Working` and `Permission` describe a live process. The agent is dead once
+/// the app exits, so restoring a spinner or a permission badge would show the
+/// user a state that no process backs — the reason this whole map used to be
+/// cleared wholesale.
+///
+/// `Review` is a different kind of fact: it means "this agent finished and you
+/// have not looked at the result yet", which is just as true after a restart as
+/// it was before. Persisting it is what keeps the sidebar's done-checkmark
+/// alive across a quit; clearing it made every finished workspace come back
+/// looking like the user had already reviewed it.
+///
+/// Entries whose pane no longer exists are dropped too. Nothing removes a
+/// status when its pane goes away (`close_pane` leaves the key behind, and the
+/// openflow/browser strips above delete panes wholesale), so without this the
+/// map would grow forever now that it survives restarts.
+fn retain_persistable_pane_statuses(snapshot: &mut AppStateSnapshot) {
+    let live_panes: std::collections::HashSet<String> = snapshot
+        .workspaces
+        .iter()
+        .flat_map(|workspace| workspace.surfaces.iter())
+        .flat_map(|surface| collect_pane_ids_from_node(&surface.root))
+        .collect();
+
+    snapshot
+        .pane_statuses
+        .retain(|pane_id, status| *status == PaneStatus::Review && live_panes.contains(pane_id));
+}
+
 fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
     let Some(path) = persisted_layout_path() else {
         return Ok(());
@@ -4497,8 +4528,8 @@ fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
     snapshot = strip_browser_panes_from_snapshot(snapshot);
     // Detected ports are runtime-only state — never persist them.
     snapshot.detected_ports.clear();
-    // Pane statuses are runtime-only — agents are dead after restart.
-    snapshot.pane_statuses.clear();
+    // Keep only the review checkmarks; working/permission are runtime-only.
+    retain_persistable_pane_statuses(&mut snapshot);
     // Agent browser sessions are runtime-only — pane_id/browser_id/user_dismissed
     // become stale after restart and block auto-creation.
     snapshot.agent_browser_sessions.clear();
@@ -7202,6 +7233,65 @@ mod tests {
 
         // Unknown thread never resolves.
         assert!(!store.set_pane_status_by_thread("does-not-exist", PaneStatus::Working));
+    }
+
+    /// The sidebar's "Done · review" checkmark is `PaneStatus::Review`, and it
+    /// has to still be there tomorrow morning. Persisting it is the whole point
+    /// of the filter — the map used to be cleared wholesale, so every finished
+    /// workspace came back from a restart looking already-reviewed.
+    #[test]
+    fn review_status_survives_persistence_but_live_process_statuses_do_not() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let reviewed = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        let working = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        let prompting = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+
+        store.set_pane_status(&reviewed.0, PaneStatus::Review);
+        store.set_pane_status(&working.0, PaneStatus::Working);
+        store.set_pane_status(&prompting.0, PaneStatus::Permission);
+
+        let mut snapshot = store.snapshot();
+        retain_persistable_pane_statuses(&mut snapshot);
+
+        assert_eq!(
+            snapshot.pane_statuses.get(&reviewed.0),
+            Some(&PaneStatus::Review),
+            "a finished agent's review checkmark must survive a restart",
+        );
+        // Working/Permission describe a process that is dead after the quit —
+        // restoring them would render a spinner nothing is driving.
+        assert_eq!(snapshot.pane_statuses.get(&working.0), None);
+        assert_eq!(snapshot.pane_statuses.get(&prompting.0), None);
+    }
+
+    /// Nothing removes a status when its pane goes away, so the filter has to
+    /// drop orphans itself — otherwise the map grows without bound now that it
+    /// is written to disk instead of cleared.
+    #[test]
+    fn persisted_pane_statuses_drop_entries_whose_pane_is_gone() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        store.set_pane_status(&pane.0, PaneStatus::Review);
+        store.set_pane_status("pane-that-never-existed", PaneStatus::Review);
+
+        let mut snapshot = store.snapshot();
+        retain_persistable_pane_statuses(&mut snapshot);
+
+        assert_eq!(
+            snapshot.pane_statuses.get(&pane.0),
+            Some(&PaneStatus::Review)
+        );
+        assert_eq!(snapshot.pane_statuses.get("pane-that-never-existed"), None);
     }
 
     #[test]
