@@ -13,11 +13,18 @@
  * before the round trip finished still drops the mask. Off Linux the command
  * answers `"accelerated"`; in the dev mock it is absent, and the default
  * `"accelerated"` stands.
+ *
+ * Web remote client: never probed. The command answers for the *desktop
+ * host's* webview, but the remote UI renders in the user's own browser —
+ * always composited — so a compatibility-rendered host must not switch
+ * composited-only effects off in the remote page. The accelerated default
+ * simply stands there.
  */
 import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { setRendererMode } from "@/components/chat/transcript-fade";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 
 /**
  * Probe the backend and cache the result. Failures are swallowed — a missing
@@ -33,9 +40,11 @@ export async function loadRendererMode(): Promise<void> {
   }
 }
 
-/** Boot hook: run the probe once per app session. */
+/** Boot hook: run the probe once per app session. Desktop only — a remote
+ *  client's browser is composited regardless of what the host reports. */
 export function useRendererModeInit(): void {
   useEffect(() => {
+    if (isRemoteClient()) return;
     void loadRendererMode();
   }, []);
 }

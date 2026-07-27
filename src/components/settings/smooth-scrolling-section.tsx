@@ -1,12 +1,15 @@
 // Settings → Appearance → "Scrolling" subsection.
 //
-// Linux-only surface: the toggle drives a WebKitGTK webview setting, so it
-// renders nothing on the platforms where it would be inert (macOS WKWebView,
-// Windows WebView2, the dev-mock Chromium). The preference is machine-local
-// (`appearance.smooth_scrolling` in the settings store) rather than synced —
-// it describes the webview on *this* machine, not a user's taste that should
-// follow them to a Mac.
+// Linux-desktop-only surface: the toggle drives a WebKitGTK webview setting,
+// so it renders nothing on the platforms where it would be inert (macOS
+// WKWebView, Windows WebView2, the dev-mock Chromium) — and never on the web
+// remote client, where the command would reconfigure the *desktop host's*
+// webview rather than the browser the user is looking at. The preference is
+// machine-local (`appearance.smooth_scrolling` in the settings store) rather
+// than synced — it describes the webview on *this* machine, not a user's
+// taste that should follow them to a Mac.
 
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { Switch } from "@/components/ui/switch";
 import { applySmoothScrolling } from "@/hooks/use-smooth-scrolling";
 import { isLinuxWebKitGtk } from "@/lib/webkit";
@@ -17,7 +20,7 @@ export function SmoothScrollingSection() {
   const setSetting = useSettingsStore((s) => s.set);
 
   const userAgent = typeof navigator !== "undefined" ? navigator.userAgent : "";
-  if (!isLinuxWebKitGtk(userAgent)) return null;
+  if (isRemoteClient() || !isLinuxWebKitGtk(userAgent)) return null;
 
   const handleToggle = (next: boolean) => {
     // Persist first so the choice survives even if the webview call fails,

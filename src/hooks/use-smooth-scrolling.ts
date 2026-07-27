@@ -12,6 +12,7 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 import { useSettingsStore, selectSmoothScrolling } from "@/stores/settings-store";
 
 /**
@@ -32,6 +33,9 @@ export async function applySmoothScrolling(enabled: boolean): Promise<void> {
  * "on" to the fresh webview. Off is the native default, so it needs no call.
  * Runs at most once per app session — later changes are pushed by the Settings
  * toggle itself.
+ *
+ * Desktop only: on the web remote client the command would reconfigure the
+ * *desktop host's* webview, not the browser the user is scrolling in.
  */
 export function useSmoothScrollingInit(): void {
   const loaded = useSettingsStore((s) => s.loaded);
@@ -39,6 +43,7 @@ export function useSmoothScrollingInit(): void {
   const applied = useRef(false);
 
   useEffect(() => {
+    if (isRemoteClient()) return;
     if (!loaded || applied.current) return;
     applied.current = true;
     if (!enabled) return;

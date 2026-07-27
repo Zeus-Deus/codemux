@@ -85,14 +85,12 @@ export function subscribeTranscriptFade(listener: () => void): () => void {
  * Pure fade decision. Override wins first (both directions); otherwise the
  * fade is on wherever the webview is composited and off on the compatibility
  * (CPU) renderer, where a full-viewport mask forces a re-rasterization every
- * scroll frame. The `userAgent` argument is kept so the decision stays
- * engine-injectable if a future engine ever needs gating again. Injectable
- * inputs with production defaults so it is unit-testable.
+ * scroll frame. The renderer mode is the only engine axis: it can only ever
+ * say "compatibility" on the Linux desktop webview (remote clients skip the
+ * probe — their browser is composited), so no user-agent input is needed.
+ * Injectable inputs with production defaults so it is unit-testable.
  */
 export function decideTranscriptFade(
-  _userAgent: string = typeof navigator !== "undefined"
-    ? navigator.userAgent
-    : "",
   override: "on" | "off" | null = readTranscriptFadeOverride(),
   mode: RendererMode = rendererMode,
 ): boolean {
@@ -113,11 +111,7 @@ let cachedFade: boolean | null = null;
 export function transcriptFadeEnabled(): boolean {
   if (cachedFade !== null) return cachedFade;
   const override = readTranscriptFadeOverride();
-  cachedFade = decideTranscriptFade(
-    typeof navigator !== "undefined" ? navigator.userAgent : "",
-    override,
-    rendererMode,
-  );
+  cachedFade = decideTranscriptFade(override, rendererMode);
   if (override !== null && import.meta.env?.MODE !== "test") {
     console.info(
       `[codemux::transcript] edge-fade mask ${

@@ -65,6 +65,15 @@ const STAMPED_VALUE: &str = "1";
 #[cfg(target_os = "linux")]
 const MAX_CONSECUTIVE_FAILURES: u32 = 2;
 
+/// Minimum WebKitGTK version whose renderer understands
+/// [`FORCE_SHM_ENV`]. The DMA-BUF backing store — and with it the
+/// shared-memory transport this module's accelerated default relies on —
+/// landed in WebKitGTK 2.40. Older runtimes silently ignore the variable, so
+/// defaulting to it there would reintroduce the very crashes the legacy
+/// compositing-disable flags papered over.
+#[cfg(target_os = "linux")]
+const FORCE_SHM_MIN_WEBKIT: (u32, u32) = (2, 40);
+
 /// File name of the crash sentinel, stored under the app data dir.
 #[cfg(target_os = "linux")]
 const SENTINEL_FILE: &str = "webview-renderer.sentinel";
@@ -72,8 +81,9 @@ const SENTINEL_FILE: &str = "webview-renderer.sentinel";
 /// Persisted crash-sentinel state.
 ///
 /// The counter is incremented before the webview is created and cleared once
-/// the main window reports a finished page load, so a startup that dies
-/// inside WebKit's renderer init leaves the increment behind.
+/// the main window reports a finished page load — or on a graceful run-loop
+/// exit ([`mark_clean_exit`]) — so only a startup that dies hard inside
+/// WebKit's renderer init leaves the increment behind.
 #[cfg(target_os = "linux")]
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RendererSentinel {
@@ -152,6 +162,45 @@ pub fn scrub_decision(codemux_set: bool, name: &str, value: &str) -> bool {
     codemux_set && RENDERER_ENV_VARS.contains(&name) && value == STAMPED_VALUE
 }
 
+/// Does a `WEBKIT_DISABLE_*` env value actually disable at the WebKit level?
+///
+/// WebKit treats only the literal `0` as an opt-out; any other present value
+/// (including empty) disables. This mirrors the semantics [`scrub_decision`]
+/// already honours — a user's `WEBKIT_DISABLE_COMPOSITING_MODE=0` is a
+/// deliberate "do NOT disable" and must not be read as CPU rendering.
+///
+/// Pure so the decision is testable without mutating the process env.
+#[cfg(target_os = "linux")]
+pub fn env_value_disables(value: Option<&std::ffi::OsStr>) -> bool {
+    match value {
+        None => false,
+        Some(value) => value != "0",
+    }
+}
+
+/// Should the accelerated `FORCE_SHM` default be used on this WebKitGTK
+/// version? Below [`FORCE_SHM_MIN_WEBKIT`] the variable is unrecognized and
+/// the legacy compatibility flags are the only safe renderer choice.
+///
+/// Pure so the floor is testable without a WebKit runtime.
+#[cfg(target_os = "linux")]
+pub fn webkit_supports_force_shm(major: u32, minor: u32) -> bool {
+    (major, minor) >= FORCE_SHM_MIN_WEBKIT
+}
+
+/// Version of the WebKitGTK library this process is linked against. Plain
+/// accessors for the loaded library's version constants — no GTK/WebKit
+/// initialisation involved, so this is safe at the very top of `run()`.
+#[cfg(target_os = "linux")]
+fn runtime_webkit_version() -> (u32, u32) {
+    unsafe {
+        (
+            webkit2gtk::ffi::webkit_get_major_version(),
+            webkit2gtk::ffi::webkit_get_minor_version(),
+        )
+    }
+}
+
 /// Drop renderer env vars inherited from a parent Codemux process.
 ///
 /// Without this, a dev or release build launched from a Codemux terminal sees
@@ -226,15 +275,22 @@ fn enable_compatibility_renderer() {
 /// [`scrub_decision`]. `CODEMUX_WEBKIT_COMPAT=1` is the explicit, never-
 /// scrubbed way to ask for the legacy renderer.
 ///
+/// Version floor: `WEBKIT_DMABUF_RENDERER_FORCE_SHM` only exists on WebKitGTK
+/// builds that have the DMA-BUF backing store (2.40+). Below that floor the
+/// variable is a silent no-op, so the legacy compatibility flags are applied
+/// directly instead of letting the old crashes come back.
+///
 /// Compatibility fallback: hardware where even the accelerated+SHM path dies
 /// during startup is detected with a small on-disk sentinel. The counter is
 /// bumped before the webview is built and cleared when the main window
-/// finishes loading, so `MAX_CONSECUTIVE_FAILURES` crashed startups in a row
-/// flip this process onto the legacy `WEBKIT_DISABLE_*` flags. That fallback
-/// is sticky (the counter is deliberately not cleared while it is active) so
-/// affected machines do not alternate between a working and a crashing
-/// renderer on every other launch; deleting the sentinel file re-arms the
-/// accelerated path.
+/// finishes loading — or when the process exits its run loop gracefully
+/// ([`mark_clean_exit`]), which a renderer crash never does — so
+/// `MAX_CONSECUTIVE_FAILURES` crashed startups in a row flip this process
+/// onto the legacy `WEBKIT_DISABLE_*` flags. That fallback is sticky (the
+/// counter is deliberately not cleared while it is active) so affected
+/// machines do not alternate between a working and a crashing renderer on
+/// every other launch; deleting the sentinel file re-arms the accelerated
+/// path.
 #[cfg(target_os = "linux")]
 pub fn configure_renderer_env() {
     // Unambiguous opt-in to the legacy renderer. Checked first and never
@@ -259,10 +315,28 @@ pub fn configure_renderer_env() {
     {
         // A surviving override that disables compositing means this process
         // renders on the CPU, whatever set it. Report that honestly so the UI
-        // drops composited-only effects.
-        let non_composited = std::env::var_os(DISABLE_DMABUF_ENV).is_some()
-            || std::env::var_os(DISABLE_COMPOSITING_ENV).is_some();
+        // drops composited-only effects. Value-aware like the rest of the
+        // module: `=0` is WebKit's own "do NOT disable" and stays accelerated.
+        let non_composited = env_value_disables(std::env::var_os(DISABLE_DMABUF_ENV).as_deref())
+            || env_value_disables(std::env::var_os(DISABLE_COMPOSITING_ENV).as_deref());
         COMPAT_MODE.store(non_composited, Ordering::Release);
+        return;
+    }
+
+    // Old WebKitGTK has no DMA-BUF renderer: `FORCE_SHM` is unrecognized
+    // there, so the accelerated default would neither force shared memory nor
+    // set the legacy flags — reintroducing the dual-GPU startup crashes. Go
+    // straight to the compatibility renderer below the floor, no sentinel
+    // bookkeeping needed.
+    let (major, minor) = runtime_webkit_version();
+    if !webkit_supports_force_shm(major, minor) {
+        crate::diagnostics::stderr_line(&format!(
+            "[codemux::webview] WebKitGTK {major}.{minor} predates the DMA-BUF renderer \
+             (needs {}.{}) — using the legacy compatibility renderer ({DISABLE_DMABUF_ENV}=1 / \
+             {DISABLE_COMPOSITING_ENV}=1, CPU rendering, slower scrolling).",
+            FORCE_SHM_MIN_WEBKIT.0, FORCE_SHM_MIN_WEBKIT.1,
+        ));
+        enable_compatibility_renderer();
         return;
     }
 
@@ -290,6 +364,24 @@ pub fn configure_renderer_env() {
     unsafe { std::env::set_var(FORCE_SHM_ENV, "1") };
 }
 
+/// What the on-disk sentinel should become when this process disarms it.
+/// `None` means "leave it alone": the process never armed the sentinel —
+/// manual renderer overrides, the sticky compatibility fallback, or a second
+/// instance that must not clear the first instance's counter.
+///
+/// Pure so the ownership gate is testable without touching the filesystem.
+#[cfg(target_os = "linux")]
+pub fn disarm_sentinel_update(owned: bool) -> Option<RendererSentinel> {
+    owned.then(RendererSentinel::default)
+}
+
+#[cfg(target_os = "linux")]
+fn disarm_owned_sentinel() {
+    if let Some(state) = disarm_sentinel_update(SENTINEL_OWNED.load(Ordering::Acquire)) {
+        write_sentinel(state);
+    }
+}
+
 /// Clear the crash sentinel: this process reached a state that proves the
 /// renderer it picked works. Called from the page-load hook for the main
 /// window, and from the duplicate-launch handler — a duplicate launch
@@ -300,9 +392,25 @@ pub fn configure_renderer_env() {
 /// compatibility fallback sticky.
 pub fn mark_startup_successful() {
     #[cfg(target_os = "linux")]
-    if SENTINEL_OWNED.load(Ordering::Acquire) {
-        write_sentinel(RendererSentinel::default());
-    }
+    disarm_owned_sentinel();
+}
+
+/// Clear the crash sentinel on a graceful run-loop exit (`RunEvent::Exit`).
+///
+/// The counter is incremented before the webview exists and, without this,
+/// was only cleared by a finished main-window page load — so a startup that
+/// exited cleanly *before* that point (quit during boot, a window closed
+/// immediately, a dev run interrupted mid-load) left the increment behind,
+/// and two of those in a row pinned the machine to CPU rendering. A renderer
+/// crash never reaches a graceful run-loop exit, so disarming here cannot
+/// mask a real failure.
+///
+/// Same ownership gate as [`mark_startup_successful`]: no-op unless this
+/// process armed the sentinel, which keeps the sticky compatibility fallback
+/// sticky and stops a second instance clearing the first's counter.
+pub fn mark_clean_exit() {
+    #[cfg(target_os = "linux")]
+    disarm_owned_sentinel();
 }
 
 /// Which renderer this process actually ended up on: `"accelerated"` (GPU
@@ -446,6 +554,48 @@ mod tests {
         assert!(!scrub_decision(true, COMPAT_MODE_ENV, "1"));
         assert!(!scrub_decision(true, "GDK_BACKEND", "1"));
         assert!(!scrub_decision(true, "CODEMUX", "1"));
+    }
+
+    #[test]
+    fn compat_probe_honours_webkit_opt_out_values() {
+        use std::ffi::OsStr;
+        // Absent, or WebKit's own `0` opt-out: compositing stays on, so the
+        // process must not be reported as CPU-rendered.
+        assert!(!env_value_disables(None));
+        assert!(!env_value_disables(Some(OsStr::new("0"))));
+        // Any other present value disables at the WebKit level.
+        assert!(env_value_disables(Some(OsStr::new("1"))));
+        assert!(env_value_disables(Some(OsStr::new("true"))));
+        assert!(env_value_disables(Some(OsStr::new(""))));
+    }
+
+    #[test]
+    fn force_shm_floor_is_webkitgtk_2_40() {
+        assert!(!webkit_supports_force_shm(2, 38));
+        assert!(!webkit_supports_force_shm(2, 39));
+        assert!(webkit_supports_force_shm(2, 40));
+        assert!(webkit_supports_force_shm(2, 46));
+        assert!(webkit_supports_force_shm(3, 0));
+        assert!(!webkit_supports_force_shm(1, 99));
+    }
+
+    #[test]
+    fn clean_exit_disarms_an_owned_sentinel() {
+        // The process armed the sentinel this run, so a graceful exit clears
+        // the increment — an interrupted-but-clean startup is not a renderer
+        // crash and must not count toward the CPU fallback threshold.
+        assert_eq!(
+            disarm_sentinel_update(true),
+            Some(RendererSentinel::default())
+        );
+    }
+
+    #[test]
+    fn clean_exit_leaves_an_unowned_sentinel_alone() {
+        // Not owned: manual renderer overrides, the sticky compatibility
+        // fallback, and a second instance that must never clear the first
+        // instance's counter.
+        assert_eq!(disarm_sentinel_update(false), None);
     }
 
     #[test]

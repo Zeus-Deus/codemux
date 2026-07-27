@@ -243,6 +243,12 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
+                // A graceful run-loop exit is not a renderer crash: disarm the
+                // renderer crash sentinel even when the main window never
+                // finished a page load (e.g. the app was quit mid-startup).
+                // Ownership-gated inside, so the sticky compatibility
+                // fallback stays sticky.
+                webview_tuning::mark_clean_exit();
                 // Kill agent-browser daemons so they don't persist across restarts.
                 agent_browser::kill_stream_daemons();
             }

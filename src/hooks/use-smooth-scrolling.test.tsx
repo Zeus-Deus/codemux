@@ -63,6 +63,24 @@ describe("useSmoothScrollingInit", () => {
 
     expect(invokeMock).not.toHaveBeenCalled();
   });
+
+  it("never touches the webview from the web remote client", () => {
+    // On the remote client `set_smooth_scrolling` would reconfigure the
+    // desktop host's webview, not the browser the user is scrolling in.
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    try {
+      useSettingsStore.setState({
+        settings: { "appearance.smooth_scrolling": "true" },
+        loaded: true,
+      });
+
+      renderHook(() => useSmoothScrollingInit());
+
+      expect(invokeMock).not.toHaveBeenCalled();
+    } finally {
+      delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+    }
+  });
 });
 
 describe("applySmoothScrolling", () => {

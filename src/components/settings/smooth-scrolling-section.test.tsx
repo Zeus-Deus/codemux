@@ -122,6 +122,19 @@ describe("SmoothScrollingSection", () => {
     expect(screen.getByRole("switch")).toHaveAttribute("data-state", "checked");
   });
 
+  it("renders nothing on the web remote client — the toggle would drive the host's webview", () => {
+    // The remote UI runs in the user's own browser; `set_smooth_scrolling`
+    // executes on the desktop host. Even a Linux WebKitGTK-looking UA
+    // (Epiphany) must not surface a toggle that changes another machine.
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    try {
+      const { container } = render(<SmoothScrollingSection />);
+      expect(container).toBeEmptyDOMElement();
+    } finally {
+      delete (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__;
+    }
+  });
+
   it("renders nothing outside Linux WebKitGTK (the setting is inert there)", () => {
     stubUserAgent(
       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
