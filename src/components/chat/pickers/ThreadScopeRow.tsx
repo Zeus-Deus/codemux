@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/popover";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { useProjectActions } from "@/hooks/use-project-actions";
+import { fuzzyFilter, fuzzyMatch } from "@/lib/fuzzy";
 import { basename } from "@/lib/path";
 import { cn } from "@/lib/utils";
 import {
@@ -302,6 +303,7 @@ function LocationControl({
   disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
   const [projectAvatars, setProjectAvatars] = useState<
     Record<string, ProjectAvatarState>
   >({});
@@ -349,8 +351,36 @@ function LocationControl({
   const showHomeOption =
     location.kind === "draft" || isHome || firstHomeWorkspaceId !== null;
 
+  // Type-to-filter: rank by fuzzy score so `cdx` or the initials of a
+  // hyphenated name land on the right row without reaching for the
+  // mouse. A query containing `/` switches the haystack from the
+  // display name to the full path — that's how you disambiguate two
+  // checkouts of the same repo. (Matching name AND path unconditionally
+  // does not narrow: a short query is a subsequence of nearly every
+  // long path.) Home matches its own synonyms ("home", "~") and always
+  // sorts first when it survives — it is a fixed destination, not a
+  // project.
+  const projectRows = useMemo(() => {
+    const byPath = query.includes("/");
+    return fuzzyFilter(
+      groups.filter((g) => g.projectPath !== homeDir),
+      query,
+      (g) => (byPath ? g.projectPath : g.projectName),
+    );
+  }, [groups, homeDir, query]);
+  const homeVisible =
+    showHomeOption && fuzzyMatch("home directory ~", query.trim());
+  const noMatches = !homeVisible && projectRows.length === 0;
+
+  const handleOpenChange = (next: boolean) => {
+    setOpen(next);
+    // Every open starts from the full list — a stale query from last
+    // time would silently hide projects.
+    if (!next) setQuery("");
+  };
+
   const handleSelectHome = () => {
-    setOpen(false);
+    handleOpenChange(false);
     if (location.kind === "draft") {
       location.onChangeTarget({ kind: "home" });
       return;
@@ -365,7 +395,7 @@ function LocationControl({
   };
 
   const handleSelectProject = (targetProjectPath: string) => {
-    setOpen(false);
+    handleOpenChange(false);
     if (location.kind === "draft") {
       location.onChangeTarget({
         kind: "project",
@@ -385,7 +415,7 @@ function LocationControl({
       : "Project";
 
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={handleOpenChange}>
       <PopoverTrigger asChild>
         <button type="button" disabled={disabled} className={GHOST_BTN}>
           {isHome ? (
@@ -397,70 +427,99 @@ function LocationControl({
           <ChevronDown className="size-2.5 opacity-45" />
         </button>
       </PopoverTrigger>
-      <PopoverContent
-        className="w-[250px] p-1.5"
-        align="start"
-        side="top"
-        onOpenAutoFocus={focusCmdkRootOnOpen}
-      >
-        <div className="px-2 pb-1 pt-1 font-mono text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">
-          Run in
-        </div>
-        {showHomeOption && (
-          <button
-            type="button"
-            onClick={handleSelectHome}
-            className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground transition-colors hover:bg-foreground/[0.08]"
+      {/* No `onOpenAutoFocus` override here (unlike the sibling
+          controls): this popover owns a `CommandInput`, so Radix's
+          default auto-focus lands on the input — which is exactly
+          what we want, since it both takes the query and forwards
+          arrow/Enter to cmdk. */}
+      <PopoverContent className="w-[250px] p-0" align="start" side="top">
+        {/* `shouldFilter={false}`: cmdk's built-in scorer ranks by its
+            own rules; we filter with `fuzzyFilter` so a project's
+            path is a (penalized) second haystack and initials-style
+            queries win. cmdk still owns highlight + Enter. */}
+        <Command shouldFilter={false} loop>
+          <div className="px-2.5 pb-1 pt-2 font-mono text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Run in
+          </div>
+          <CommandInput
+            placeholder="Search projects…"
+            value={query}
+            onValueChange={setQuery}
+            className="text-xs"
+          />
+          <CommandList
+            className="max-h-[280px] overflow-y-auto p-1.5 pb-0 [scrollbar-width:thin]"
+            onWheel={(e) => e.stopPropagation()}
           >
-            <span className="flex size-5 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-              <Home className="size-3" />
-            </span>
-            <span className="min-w-0 flex-1 truncate">Home directory (~)</span>
-            {isHome && (
-              <Check className="size-3.5 shrink-0 text-accent-ember" />
+            {noMatches && (
+              <div className="px-2 py-3 text-center text-[11.5px] text-muted-foreground">
+                No projects match “{query.trim()}”
+              </div>
             )}
-          </button>
-        )}
-        {groups
-          .filter((g) => g.projectPath !== homeDir)
-          .map((g) => {
-            const active = g.projectPath === activeProjectPath;
-            const avatar = projectAvatars[g.projectPath] ?? EMPTY_AVATAR;
-            return (
-              <button
-                key={g.projectPath}
-                type="button"
-                onClick={() => handleSelectProject(g.projectPath)}
-                className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground transition-colors hover:bg-foreground/[0.08]"
+            {homeVisible && (
+              <CommandItem
+                value="home-directory"
+                onSelect={handleSelectHome}
+                className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground"
               >
-                <ProjectAvatar
-                  name={g.projectName}
-                  color={avatar.color}
-                  imageUrl={avatar.image}
-                  cacheBust={avatar.imageVersion}
-                  size="md"
-                  shape="square"
-                />
-                <span className="min-w-0 flex-1 truncate">{g.projectName}</span>
-                {active && <Check className="size-3.5 shrink-0 text-accent-ember" />}
-              </button>
-            );
-          })}
-        <div className="my-1 h-px bg-border" />
-        <button
-          type="button"
-          onClick={async () => {
-            setOpen(false);
-            const result = await openProject();
-            if (result.success && result.path) {
-              handleSelectProject(result.path);
-            }
-          }}
-          className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[11.5px] text-muted-foreground transition-colors hover:bg-foreground/[0.08] hover:text-foreground"
-        >
-          <FolderPlus className="size-3.5" />
-          Open another project…
-        </button>
+                <span className="flex size-5 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
+                  <Home className="size-3" />
+                </span>
+                <span className="min-w-0 flex-1 truncate">
+                  Home directory (~)
+                </span>
+                {isHome && (
+                  <Check className="size-3.5 shrink-0 text-accent-ember" />
+                )}
+              </CommandItem>
+            )}
+            {projectRows.map((g) => {
+              const active = g.projectPath === activeProjectPath;
+              const avatar = projectAvatars[g.projectPath] ?? EMPTY_AVATAR;
+              return (
+                <CommandItem
+                  key={g.projectPath}
+                  value={g.projectPath}
+                  onSelect={() => handleSelectProject(g.projectPath)}
+                  className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-xs font-medium text-foreground"
+                >
+                  <ProjectAvatar
+                    name={g.projectName}
+                    color={avatar.color}
+                    imageUrl={avatar.image}
+                    cacheBust={avatar.imageVersion}
+                    size="md"
+                    shape="square"
+                  />
+                  <span className="min-w-0 flex-1 truncate">
+                    {g.projectName}
+                  </span>
+                  {active && (
+                    <Check className="size-3.5 shrink-0 text-accent-ember" />
+                  )}
+                </CommandItem>
+              );
+            })}
+          </CommandList>
+          {/* Outside the list, and never filtered: the escape hatch has
+              to stay reachable precisely when nothing matched. */}
+          <div className="mt-1.5 border-t border-border p-1.5">
+            <button
+              type="button"
+              onClick={async () => {
+                handleOpenChange(false);
+                const result = await openProject();
+                if (result.success && result.path) {
+                  handleSelectProject(result.path);
+                }
+              }}
+              className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[11.5px] text-muted-foreground transition-colors hover:bg-foreground/[0.08] hover:text-foreground"
+            >
+              <FolderPlus className="size-3.5" />
+              Open another project…
+            </button>
+          </div>
+        </Command>
       </PopoverContent>
     </Popover>
   );

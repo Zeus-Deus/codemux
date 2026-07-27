@@ -4,6 +4,7 @@ import { Search, Loader2 } from "lucide-react";
 import { PrStatusIcon, type PrStatusState } from "@/components/github/pr-status-icon";
 import { listPullRequests, getGithubPrByPath } from "@/tauri/commands";
 import type { PullRequestInfo } from "@/tauri/types";
+import { fuzzyMatch } from "@/lib/fuzzy";
 
 /**
  * Pull-request picker, mirroring `IssuePickerPanel`.
@@ -20,16 +21,6 @@ import type { PullRequestInfo } from "@/tauri/types";
  * GitPullRequest, draft → muted GitPullRequestDraft, closed → red
  * GitPullRequestClosed.
  */
-
-function fuzzyMatch(text: string, query: string): boolean {
-  const lower = text.toLowerCase();
-  const q = query.toLowerCase();
-  let qi = 0;
-  for (let i = 0; i < lower.length && qi < q.length; i++) {
-    if (lower[i] === q[qi]) qi++;
-  }
-  return qi === q.length;
-}
 
 /** Collapse the `state` string + `is_draft` flag into the single
  *  state token `PrStatusIcon` understands. A draft only matters while
