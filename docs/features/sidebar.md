@@ -183,6 +183,13 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   select-without-expand, and the shared footer destinations.
 - Per-workspace agent status covers both terminal and Agent Chat (Beta) agents
   (chat sessions publish into the same `pane_statuses` snapshot).
+- The done-review checkmark **survives an app restart**. `save_persisted_state`
+  keeps `PaneStatus::Review` entries in `layout.json` and drops
+  `Working`/`Permission` (dead processes after a quit) plus entries whose pane
+  no longer exists — see `retain_persistable_pane_statuses` in
+  `src-tauri/src/state/state_impl.rs`. Previously the whole map was cleared on
+  every save, so finished workspaces came back looking already-reviewed. The
+  badge still clears the normal way, on activating the workspace/tab.
 
 ## Current Constraints
 
