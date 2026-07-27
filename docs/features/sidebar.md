@@ -137,7 +137,8 @@ visual only — nothing is archived, closed, or deleted.
   It reuses the `DetailRow` label/value shape from the context bar's popover
   (`WorkspaceStatusCluster`), and needs **no new Tauri command** — every field
   is already on `WorkspaceSnapshot` or in `appState.detected_ports`. The card
-  is `pointer-events-none` (a detail surface, not an interactive one) and its
+  keeps pointer events enabled so the path and branch can be selected and
+  copied (Radix holds it open while the cursor crosses into it), and its
   body is a separate component so Radix's unmount-when-closed keeps a sidebar
   of N workspaces from subscribing N× to the ports/hosts stores at rest. It
   mounts *inside* `WorkspaceInboxMenu` on a different node than

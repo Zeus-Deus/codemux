@@ -1,6 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup } from "@testing-library/react";
+import { render, screen, cleanup, act } from "@testing-library/react";
+import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 import type {
   AppStateSnapshot,
   PortInfoSnapshot,
@@ -10,6 +11,7 @@ import type { HostView } from "@/tauri/commands";
 
 let detectedPorts: PortInfoSnapshot[] = [];
 let hosts: HostView[] = [];
+let homeDir: string | null = "/home/u";
 
 vi.mock("@/stores/app-store", () => {
   const state = () =>
@@ -21,7 +23,7 @@ vi.mock("@/stores/app-store", () => {
       vi.fn((selector: (s: unknown) => unknown) => selector(state())),
       { getState: state },
     ),
-    useHomeDir: () => "/home/u",
+    useHomeDir: () => homeDir,
   };
 });
 
@@ -104,6 +106,7 @@ function valueFor(label: string): string {
 beforeEach(() => {
   detectedPorts = [];
   hosts = [];
+  homeDir = "/home/u";
 });
 
 afterEach(cleanup);
@@ -151,6 +154,29 @@ describe("WorkspaceHoverCardBody — header", () => {
 
     renderBody(makeWorkspace(), null);
     expect(screen.getByText("Idle")).toBeInTheDocument();
+  });
+
+  it("ticks the elapsed label on the coarse clock while the card stays open", () => {
+    // Regression: elapsed was stamped once per mount, so "Working 1m" froze
+    // for as long as the pointer rested on the card.
+    vi.useFakeTimers();
+    try {
+      useSidebarDensityStore.setState({
+        statusSince: {
+          "ws-1": { status: "working", at: Date.now() - 60_000 },
+        },
+      });
+      renderBody(makeWorkspace(), "working");
+      expect(screen.getByText("1m")).toBeInTheDocument();
+
+      act(() => {
+        vi.advanceTimersByTime(4 * 60_000);
+      });
+      expect(screen.getByText("5m")).toBeInTheDocument();
+    } finally {
+      useSidebarDensityStore.setState({ statusSince: {} });
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -300,6 +326,25 @@ describe("WorkspaceHoverCardBody — location, mute, path", () => {
     expect(
       screen.getByText("~/.codemux/worktrees/myapp/feat-x"),
     ).toBeInTheDocument();
+  });
+
+  it("keeps a sibling-prefix path absolute (home /home/u vs /home/u2)", () => {
+    // Regression: a bare startsWith(homeDir) shortened /home/u2/project to
+    // "~2/project". Only a real path-separator boundary counts as home.
+    renderBody(makeWorkspace({ cwd: "/home/u2/project" }));
+    expect(screen.getByText("/home/u2/project")).toBeInTheDocument();
+    expect(screen.queryByText("~2/project")).not.toBeInTheDocument();
+  });
+
+  it("collapses a path that IS the home dir to a bare ~", () => {
+    renderBody(makeWorkspace({ cwd: "/home/u" }));
+    expect(screen.getByText("~")).toBeInTheDocument();
+  });
+
+  it("shortens under a home dir reported with a trailing separator", () => {
+    homeDir = "/home/u/";
+    renderBody(makeWorkspace({ cwd: "/home/u/projects/myapp" }));
+    expect(screen.getByText("~/projects/myapp")).toBeInTheDocument();
   });
 
   it("falls back to the remote cwd for an attach-in-place workspace", () => {

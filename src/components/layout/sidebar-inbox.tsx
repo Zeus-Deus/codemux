@@ -412,6 +412,10 @@ interface SettledRowProps {
   repo: InboxRepo;
   isActive: boolean;
   selected: boolean;
+  /** Live agent status for the hover card — a settled workspace can still be
+   *  running (e.g. a "review" agent stays settled), so the row must not hard-
+   *  code idle. */
+  status: ActivePaneStatus | null;
   /** Elapsed-since-work-ended label ("2h"), or null when unknown. */
   time: string | null;
   justSettled: boolean;
@@ -425,6 +429,7 @@ function SettledRow({
   repo,
   isActive,
   selected,
+  status,
   time,
   justSettled,
   onUnsettle,
@@ -458,10 +463,12 @@ function SettledRow({
       }}
     >
     {/* Settled rows show only a title, so the hover card carries even more
-        weight here than on an active card. Nested one level in so it never
-        shares a node with the ContextMenuTrigger above. */}
+        weight here than on an active card. The bare div is intentional: it
+        takes the ContextMenuTrigger's `asChild` so the hover trigger below
+        never composes onto the same node, and the settled list is a plain
+        block container, so the extra block wrapper is layout-neutral. */}
     <div>
-    <WorkspaceHoverCard workspace={workspace} repo={repo} status={null}>
+    <WorkspaceHoverCard workspace={workspace} repo={repo} status={status}>
     <div
       role="button"
       tabIndex={0}
@@ -1604,6 +1611,11 @@ export function SidebarInbox() {
                   repo={repo}
                   isActive={workspace.workspace_id === activeWorkspaceId}
                   selected={selectedIds.has(workspace.workspace_id)}
+                  status={
+                    paneStatuses
+                      ? getWorkspaceStatus(workspace.surfaces, paneStatuses)
+                      : null
+                  }
                   time={formatElapsed(now - resolveSettledTimestamp(entry))}
                   justSettled={justSettledId === workspace.workspace_id}
                   onUnsettle={handleUnsettle}

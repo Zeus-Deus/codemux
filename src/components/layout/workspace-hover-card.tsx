@@ -13,6 +13,7 @@ import {
 import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
 import { getWorkspaceProviders } from "@/lib/pane-status";
+import { useCoarseClock } from "@/lib/use-coarse-clock";
 import {
   formatElapsed,
   useSidebarDensityStore,
@@ -31,8 +32,8 @@ export interface HoverCardRepo {
 interface Props {
   workspace: WorkspaceSnapshot;
   repo: HoverCardRepo;
-  /** Derived agent status, when the caller already subscribes to it. The rail
-   *  and the inbox card both have it; settled rows pass null. */
+  /** Derived agent status. Every caller — rail, inbox card, settled row —
+   *  computes it from the live pane statuses; null means genuinely idle. */
   status: ActivePaneStatus | null;
   children: React.ReactNode;
 }
@@ -44,10 +45,21 @@ const OPEN_DELAY_MS = 350;
 const CLOSE_DELAY_MS = 120;
 
 /** Collapse `$HOME` to `~` so long worktree paths stay readable in the narrow
- *  card. Falls back to the raw path when the home dir isn't known yet. */
+ *  card. Only a real home-directory boundary counts: with home `/home/u`, a
+ *  sibling like `/home/u2/project` must stay absolute, so the character after
+ *  the prefix has to be a path separator (or the path IS home). Accepts both
+ *  `/` and `\` since remote workspaces can live on Windows hosts. Falls back
+ *  to the raw path when the home dir isn't known yet. */
 function shortenPath(path: string, homeDir: string | null): string {
-  if (!homeDir || !path.startsWith(homeDir)) return path;
-  return `~${path.slice(homeDir.length)}`;
+  if (!homeDir) return path;
+  // A reported home dir may carry a trailing separator ("/home/u/"); strip it
+  // so the boundary check below sees the bare prefix.
+  const home = homeDir.replace(/[/\\]+$/, "");
+  if (home.length === 0 || !path.startsWith(home)) return path;
+  const next = path[home.length];
+  if (next === undefined) return "~"; // the path IS the home dir
+  if (next !== "/" && next !== "\\") return path; // sibling prefix, not home
+  return `~${path.slice(home.length)}`;
 }
 
 const STATUS_LABEL: Record<ActivePaneStatus, string> = {
@@ -86,10 +98,11 @@ export function WorkspaceHoverCard({
         side="right"
         align="start"
         sideOffset={10}
-        // Not interactive: the card is a read-only detail surface, so let
-        // pointer events fall through to whatever is underneath rather than
-        // trapping the cursor on the way to the content area.
-        className="pointer-events-none w-[290px] p-0"
+        // Pointer events stay enabled so the path and branch can be selected
+        // and copied. Radix keeps the card open while the cursor crosses into
+        // it (closeDelay), and side="right" floats it over the main pane —
+        // never between the cursor and another sidebar row.
+        className="w-[290px] p-0"
       >
         <WorkspaceHoverCardBody
           workspace={workspace}
@@ -141,10 +154,13 @@ export function WorkspaceHoverCardBody({
 
   // Elapsed since the current state began. Stamped client-side (the backend
   // sends no status-changed-at), so it reads "just now" after an app restart.
-  // Read at open time rather than off a ticking clock — the card is short-lived.
+  // Ticks on the shared coarse (~30s) clock so a pointer resting on the card
+  // never shows a frozen "4m" — and since Radix unmounts closed content, the
+  // interval only runs while a card is actually open.
   const stateSince =
     status !== null ? (statusSince?.at ?? null) : (settledAt ?? null);
-  const elapsed = stateSince != null ? formatElapsed(Date.now() - stateSince) : null;
+  const now = useCoarseClock(stateSince != null);
+  const elapsed = stateSince != null ? formatElapsed(now - stateSince) : null;
 
   const isGit = workspace.is_git !== false;
   const hasUncommitted =
