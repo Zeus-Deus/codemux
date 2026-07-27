@@ -1798,16 +1798,26 @@ return an EXISTING worktree path without creating anything (the
 path-reuse short-circuit in `git.rs`, when the dir is already registered
 to the same branch). `create_worktree_workspace_impl` therefore looks
 for a live LOCAL workspace already claiming the resolved path
-(`find_live_workspace_for_worktree_path` — `worktree_path` first, `cwd`
-as fallback, canonicalized comparison, remote/attach-only rows skipped)
-and adopts it: activate + return that id, instead of leaving two
-workspaces — and two agents — on a single checkout. The adopt path
-deliberately skips everything the create path would re-run on a live
-workspace (PTY spawn, setup scripts, `.mcp.json` rewrite, preset
+(`find_live_workspace_for_worktree_path` — `worktree_path` claim on path
+identity alone; `cwd` fallback additionally requires the workspace's
+`git_branch` to equal the requested branch, since a bare path match
+would adopt across branches; canonicalized comparison,
+remote/attach-only rows skipped) and adopts it: activate + return that
+id, instead of leaving two workspaces — and two agents — on a single
+checkout. Lookup and insert are ONE atomic operation under the state
+lock (`AppStateStore::adopt_or_create_worktree_workspace`, which also
+stamps the new workspace's `worktree_path` claim before releasing), so
+two concurrent creates for the same path can't both miss the probe and
+both insert; the slow `git worktree add` stays outside the lock. The
+adopt path deliberately skips everything the create path would re-run on
+a live workspace (PTY spawn, setup scripts, `.mcp.json` rewrite, preset
 launch), and DROPS `initial_prompt` / `agent_preset_id` rather than
-injecting them into a session someone else is already using. Archived
-workspaces live in `archived_workspaces`, so they neither block creation
-nor get silently un-archived.
+injecting them into a session someone else is already using — the
+command returns `adopted: true` (`WorkspaceCreated { workspace_id, cwd,
+adopted }`; also in the control-socket JSON), and the new-workspace
+dialog toasts "…switched to it. Your prompt wasn't sent." so the drop is
+never silent. Archived workspaces live in `archived_workspaces`, so they
+neither block creation nor get silently un-archived.
 
 **Branch control ↔ checkout mode coupling** (editable scope only — the
 pane surface has no checkout mode to couple to)**.** The branch popover

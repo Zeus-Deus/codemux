@@ -22,7 +22,7 @@ vi.mock("@/tauri/commands", () => ({
   // store subscription (`waitForWorkspaceCwd` fallback), unchanged.
   createWorktreeWorkspaceResult: vi
     .fn()
-    .mockResolvedValue({ workspaceId: "ws-worktree", cwd: null }),
+    .mockResolvedValue({ workspaceId: "ws-worktree", cwd: null, adopted: false }),
   generateBranchName: vi.fn().mockResolvedValue("ai-named-branch"),
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
@@ -122,7 +122,7 @@ describe("materializeAndSend", () => {
       );
     vi.mocked(createWorktreeWorkspaceResult)
       .mockClear()
-      .mockResolvedValue({ workspaceId: "ws-worktree", cwd: null });
+      .mockResolvedValue({ workspaceId: "ws-worktree", cwd: null, adopted: false });
     vi.mocked(generateBranchName).mockClear().mockResolvedValue("ai-named-branch");
     vi.mocked(generateRandomBranchName)
       .mockClear()

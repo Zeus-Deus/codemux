@@ -723,7 +723,15 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                     pr_number,
                 )
                 .await
-                .map(|workspace_id| serde_json::json!({ "workspace_id": workspace_id })),
+                // `adopted` is additive: true when a live workspace already
+                // claimed the worktree path and was focused instead of a new
+                // one being created (any initial_prompt was dropped).
+                .map(|created| {
+                    serde_json::json!({
+                        "workspace_id": created.workspace_id,
+                        "adopted": created.adopted,
+                    })
+                }),
                 (Err(e), _) | (_, Err(e)) => Err(e),
             }
         }

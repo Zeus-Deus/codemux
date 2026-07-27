@@ -14,8 +14,10 @@ use crate::state::{
     TabKind,
     WorkspacePresetLayout,
     WorkspaceType,
+    WorktreeWorkspaceClaim,
 };
 use crate::terminal;
+use crate::workspace_paths::paths_equal;
 use notify_rust::Notification;
 use serde::Serialize;
 use std::io::Write;
@@ -233,10 +235,18 @@ pub async fn create_workspace<R: tauri::Runtime>(
 /// read the cwd. `workspace_id` is the exact value these commands returned
 /// as a bare string before this struct existed, so callers only need to
 /// unwrap one field to preserve the old behavior.
+///
+/// `adopted` is true when no workspace was created because a live one
+/// already claimed the target worktree path and was focused instead (see
+/// the adopt-existing guard in `create_worktree_workspace_impl`). On that
+/// path any `initial_prompt`/`agent_preset_id` were dropped, so the
+/// frontend uses the flag to tell the user their prompt wasn't sent.
+/// Always false for `create_empty_workspace`.
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceCreated {
     pub workspace_id: String,
     pub cwd: String,
+    pub adopted: bool,
 }
 
 // `async fn` so the git-info subprocesses run on the blocking pool instead
@@ -279,6 +289,7 @@ pub async fn create_empty_workspace<R: tauri::Runtime>(
         // `cwd` is the tilde-expanded absolute path resolved above, i.e. the
         // exact directory the workspace was anchored at.
         cwd,
+        adopted: false,
     })
 }
 
@@ -408,13 +419,13 @@ pub async fn create_worktree_workspace<R: tauri::Runtime>(
     model_selection: Option<crate::agent_capability::ModelSelection>,
     pr_number: Option<u32>,
 ) -> Result<WorkspaceCreated, String> {
-    let workspace_id = create_worktree_workspace_impl(
+    let created = create_worktree_workspace_impl(
         app, &state, &db, &pty_state, &presets,
         repo_path, branch, new_branch, base, layout,
         initial_prompt, agent_preset_id, model_selection, pr_number,
     )
     .await?;
-    // Resolve the new workspace's cwd (the worktree checkout path) from the
+    // Resolve the workspace's cwd (the worktree checkout path) from the
     // snapshot the impl already populated + emitted, so the frontend gets it
     // without polling app-state. Empty string only if the workspace somehow
     // vanished between create and lookup (it never should).
@@ -422,32 +433,31 @@ pub async fn create_worktree_workspace<R: tauri::Runtime>(
         .snapshot()
         .workspaces
         .iter()
-        .find(|w| w.workspace_id.0 == workspace_id)
+        .find(|w| w.workspace_id.0 == created.workspace_id)
         .map(|w| w.cwd.clone())
         .unwrap_or_default();
-    Ok(WorkspaceCreated { workspace_id, cwd })
+    Ok(WorkspaceCreated {
+        workspace_id: created.workspace_id,
+        cwd,
+        adopted: created.adopted,
+    })
 }
 
-/// Compare two paths for filesystem identity: canonicalize both sides
-/// (resolving symlinks, `.`/`..`, and macOS's `/private` prefix) and fall
-/// back to a raw comparison when either side doesn't exist on disk. Same
-/// shape as the helper in `scripts.rs`; kept local because that one is
-/// private to its module.
-fn worktree_paths_equal(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(ac), Ok(bc)) => ac == bc,
-        _ => a == b,
-    }
-}
-
-/// Find a live workspace that is already checked out at `worktree_path`,
-/// returning its id.
+/// Find a live workspace that is already checked out at `worktree_path`
+/// for `branch`, returning its id.
 ///
 /// A workspace claims a checkout via `worktree_path` (set by
-/// `set_workspace_worktree` for every worktree-backed workspace); a plain
-/// workspace opened directly at that directory carries no `worktree_path`
-/// but the same `cwd`, and it collides just as badly, so `cwd` is the
-/// fallback probe.
+/// `set_workspace_worktree` for every worktree-backed workspace); for
+/// such a claim, path identity is the whole test — the claim was made
+/// expressly for this checkout. A plain workspace opened directly at
+/// that directory carries no `worktree_path` but the same `cwd`, and it
+/// collides just as badly, so `cwd` is the fallback probe — but a bare
+/// path match there would adopt the workspace regardless of what it has
+/// checked out (`git_create_worktree` only reuses a path when git maps
+/// it to the SAME branch; this guard must be no wider). So the fallback
+/// additionally requires the workspace's known `git_branch` to equal the
+/// requested `branch`; an unknown branch (`None`, git info not yet
+/// populated) is not adoptable because the match can't be verified.
 ///
 /// Archived workspaces are deliberately NOT considered: archived entries
 /// live in the separate `AppStateSnapshot::archived_workspaces` vec (they
@@ -464,6 +474,7 @@ fn worktree_paths_equal(a: &Path, b: &Path) -> bool {
 pub(crate) fn find_live_workspace_for_worktree_path(
     snapshot: &AppStateSnapshot,
     worktree_path: &Path,
+    branch: &str,
 ) -> Option<String> {
     snapshot
         .workspaces
@@ -476,10 +487,29 @@ pub(crate) fn find_live_workspace_for_worktree_path(
             if w.host_id.is_some() || w.attach_only {
                 return false;
             }
-            let claimed = w.worktree_path.as_deref().unwrap_or(w.cwd.as_str());
-            !claimed.is_empty() && worktree_paths_equal(Path::new(claimed), worktree_path)
+            match w.worktree_path.as_deref() {
+                Some(claimed) => {
+                    !claimed.is_empty()
+                        && paths_equal(Path::new(claimed), worktree_path)
+                }
+                None => {
+                    !w.cwd.is_empty()
+                        && w.git_branch.as_deref() == Some(branch)
+                        && paths_equal(Path::new(&w.cwd), worktree_path)
+                }
+            }
         })
         .map(|w| w.workspace_id.0.clone())
+}
+
+/// Result of [`create_worktree_workspace_impl`]: the resolved workspace id
+/// plus whether it was ADOPTED (a live workspace already claimed the
+/// worktree path, so `initial_prompt`/`agent_preset_id` were dropped and no
+/// create-side effects ran) rather than freshly created. Callers surface
+/// `adopted` so the frontend can tell the user their prompt wasn't sent.
+pub(crate) struct CreatedWorktreeWorkspace {
+    pub workspace_id: String,
+    pub adopted: bool,
 }
 
 /// Shared implementation behind both the Tauri command (frontend "+
@@ -510,7 +540,7 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     agent_preset_id: Option<String>,
     model_selection: Option<crate::agent_capability::ModelSelection>,
     pr_number: Option<u32>,
-) -> Result<String, String> {
+) -> Result<CreatedWorktreeWorkspace, String> {
     let layout = match layout.as_str() {
         "single" => WorkspacePresetLayout::Single,
         "pair" => WorkspacePresetLayout::Pair,
@@ -555,12 +585,20 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     // something: when the conventional path is already on disk and
     // `git worktree list` maps it to the SAME branch, it short-circuits and
     // returns that existing checkout (see the path-reuse block in
-    // `git::git_create_worktree`). Falling through to
-    // `create_workspace_with_layout` there mints a SECOND workspace over one
-    // on-disk worktree — two agents editing the same files, two PTYs, two
-    // `.mcp.json` owners. So if a live workspace already claims this path,
-    // adopt it: focus it and return its id, exactly as the unarchive flow
-    // does for an already-open workspace.
+    // `git::git_create_worktree`). Falling through to an unconditional
+    // create there mints a SECOND workspace over one on-disk worktree — two
+    // agents editing the same files, two PTYs, two `.mcp.json` owners. So if
+    // a live workspace already claims this path, adopt it: focus it and
+    // return its id, exactly as the unarchive flow does for an already-open
+    // workspace.
+    //
+    // Lookup and insert happen as ONE atomic operation under the state lock
+    // (`adopt_or_create_worktree_workspace`), which also stamps the new
+    // workspace's `worktree_path` claim before releasing. With separate
+    // lock acquisitions, two concurrent creates for the same worktree could
+    // both probe empty and both insert — the exact duplicate this guard
+    // prevents. The slow `git worktree add` above deliberately stays
+    // outside the lock.
     //
     // Everything the create path does downstream is deliberately skipped for
     // an adopted workspace, because it already ran when that workspace was
@@ -573,28 +611,41 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     // preset would type into somebody else's in-flight session — a
     // destructive, unrecoverable side effect. Dropping the request is the
     // strictly safer failure mode: the caller still gets a valid workspace
-    // id and the user sees the branch they asked for, focused.
+    // id and the user sees the branch they asked for, focused. The returned
+    // `adopted` flag lets the frontend tell the user the prompt wasn't sent.
     //
     // Archived workspaces do not participate — see
     // `find_live_workspace_for_worktree_path` for why they are neither a
     // blocker nor auto-unarchived here.
-    if let Some(existing_id) = find_live_workspace_for_worktree_path(&state.snapshot(), &wt_path_buf)
-    {
-        // Focus the adopted workspace so the frontend flips to it exactly as
-        // it would for a freshly-created one (`create_workspace_with_layout`
-        // sets `active_workspace_id` itself). `activate_workspace_impl` is
-        // the same call the unarchive flow uses for an already-open
-        // workspace, and it emits app state itself — no second emit needed.
-        // `create_worktree_workspace` resolves the returned id's `cwd` from
-        // the snapshot afterwards, and the adopted workspace is in that
-        // snapshot, so the wrapper's cwd lookup keeps working unchanged.
-        activate_workspace_impl(app.clone(), state, db, existing_id.clone())?;
-        return Ok(existing_id);
-    }
+    let claim = state.adopt_or_create_worktree_workspace(
+        wt_path_buf.clone(),
+        layout,
+        worktree_path.clone(),
+        // The worktree claim titles the workspace after its branch, exactly
+        // as the previous separate `set_workspace_worktree` call did.
+        branch.clone(),
+        |snapshot| find_live_workspace_for_worktree_path(snapshot, &wt_path_buf, &branch),
+    );
+    let workspace_id = match claim {
+        WorktreeWorkspaceClaim::Adopted(existing_id) => {
+            // Focus the adopted workspace so the frontend flips to it exactly
+            // as it would for a freshly-created one (the create path sets
+            // `active_workspace_id` itself). `activate_workspace_impl` is
+            // the same call the unarchive flow uses for an already-open
+            // workspace, and it emits app state itself — no second emit
+            // needed. `create_worktree_workspace` resolves the returned id's
+            // `cwd` from the snapshot afterwards, and the adopted workspace
+            // is in that snapshot, so the wrapper's cwd lookup keeps working
+            // unchanged.
+            activate_workspace_impl(app.clone(), state, db, existing_id.clone())?;
+            return Ok(CreatedWorktreeWorkspace {
+                workspace_id: existing_id,
+                adopted: true,
+            });
+        }
+        WorktreeWorkspaceClaim::Created(id) => id,
+    };
 
-    let workspace_id = state.create_workspace_with_layout(wt_path_buf.clone(), layout);
-
-    state.set_workspace_worktree(&workspace_id.0, worktree_path.clone(), branch.clone());
     state.set_workspace_project_root(&workspace_id.0, repo_path.clone());
 
     populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
@@ -720,7 +771,10 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     }
 
     crate::state::emit_app_state(&app);
-    Ok(workspace_id.0)
+    Ok(CreatedWorktreeWorkspace {
+        workspace_id: workspace_id.0,
+        adopted: false,
+    })
 }
 
 // `async fn` so `populate_git_info_async`'s 5-8 git subprocesses run on the
@@ -1398,6 +1452,7 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
                 None,
             )
             .await?
+            .workspace_id
         };
         // The creation/adoption path titles the workspace after its
         // branch; restore whatever the user had (possibly a rename).
@@ -3507,8 +3562,11 @@ mod worktree_adopt_tests {
     //! same constraint the Phase 1.6 close tests and archive guards
     //! document), so the decision is factored into the pure
     //! [`find_live_workspace_for_worktree_path`] lookup and pinned here. The
-    //! impl calls it verbatim and returns its `Some(id)` early, so a
-    //! regression in the lookup fails these tests immediately.
+    //! impl passes it verbatim as the probe of
+    //! `AppStateStore::adopt_or_create_worktree_workspace` (one atomic
+    //! check+insert under the state lock — covered by the concurrent test
+    //! below) and returns early on `Adopted`, so a regression in the lookup
+    //! fails these tests immediately.
 
     use super::*;
     use crate::state::{build_archive_entry, AppStateStore, WorkspacePresetLayout};
@@ -3533,9 +3591,9 @@ mod worktree_adopt_tests {
         let first_id = worktree_workspace(&store, &wt, "feature");
         let count_after_first = store.snapshot().workspaces.len();
 
-        // This is the exact call the impl makes right after
+        // This is the exact probe the impl runs right after
         // `git_create_worktree` hands back the reused path.
-        let adopted = find_live_workspace_for_worktree_path(&store.snapshot(), &wt)
+        let adopted = find_live_workspace_for_worktree_path(&store.snapshot(), &wt, "feature")
             .expect("a live workspace already claims this worktree path");
 
         assert_eq!(
@@ -3563,7 +3621,7 @@ mod worktree_adopt_tests {
         worktree_workspace(&store, &first, "feature");
 
         assert!(
-            find_live_workspace_for_worktree_path(&store.snapshot(), &second).is_none(),
+            find_live_workspace_for_worktree_path(&store.snapshot(), &second, "other").is_none(),
             "a different branch's worktree must not be adopted — creation \
              has to proceed normally for it"
         );
@@ -3583,7 +3641,7 @@ mod worktree_adopt_tests {
         let round_trip = wt.join("..").join("repo-feature");
 
         assert_eq!(
-            find_live_workspace_for_worktree_path(&store.snapshot(), &round_trip),
+            find_live_workspace_for_worktree_path(&store.snapshot(), &round_trip, "feature"),
             Some(id),
             "path identity must be resolved by canonicalization, not raw string \
              comparison"
@@ -3599,14 +3657,67 @@ mod worktree_adopt_tests {
         let store = AppStateStore::default();
         // No `set_workspace_worktree` — this is a plain workspace the user
         // opened directly at the directory. It has no `worktree_path`, but it
-        // collides with a new worktree workspace just as badly.
+        // collides with a new worktree workspace just as badly. Its git info
+        // reports the requested branch (populated the way
+        // `populate_git_info` does after every create).
         let id = store.create_workspace_at_path(dir.clone());
+        store.update_workspace_git_info(&id.0, true, Some("feature".into()), 0, 0, 0, 0, 0);
 
         assert_eq!(
-            find_live_workspace_for_worktree_path(&store.snapshot(), &dir),
+            find_live_workspace_for_worktree_path(&store.snapshot(), &dir, "feature"),
             Some(id.0),
             "the `cwd` fallback must catch a plain workspace already sitting on \
              the checkout"
+        );
+    }
+
+    #[test]
+    fn cwd_fallback_does_not_adopt_across_branches() {
+        let tmp = TempDir::new().expect("tempdir");
+        let dir = tmp.path().join("plain");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let store = AppStateStore::default();
+        let id = store.create_workspace_at_path(dir.clone());
+
+        // The workspace sits on the directory but has ANOTHER branch checked
+        // out. `git_create_worktree` only reuses a path that git maps to the
+        // requested branch, so adopting here would silently hand the caller
+        // a workspace on the wrong branch — the guard must stay no wider
+        // than the reuse it protects against.
+        store.update_workspace_git_info(&id.0, true, Some("other".into()), 0, 0, 0, 0, 0);
+        assert!(
+            find_live_workspace_for_worktree_path(&store.snapshot(), &dir, "feature").is_none(),
+            "a cwd-matched workspace on a different branch must not be adopted"
+        );
+
+        // Unknown branch (git info not yet populated): the match can't be
+        // verified, so the fallback must decline rather than guess.
+        store.update_workspace_git_info(&id.0, true, None, 0, 0, 0, 0, 0);
+        assert!(
+            find_live_workspace_for_worktree_path(&store.snapshot(), &dir, "feature").is_none(),
+            "a cwd-matched workspace with an unknown branch must not be adopted"
+        );
+    }
+
+    #[test]
+    fn explicit_worktree_claim_adopts_without_branch_probe() {
+        let tmp = TempDir::new().expect("tempdir");
+        let wt = tmp.path().join("repo-feature");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+
+        let store = AppStateStore::default();
+        let id = worktree_workspace(&store, &wt, "feature");
+
+        // A `worktree_path` claim was made expressly for this checkout by
+        // `set_workspace_worktree`; path identity is the whole test there.
+        // `git_branch` may lag or be unpopulated (populate_git_info is
+        // async) and must not defeat adoption of the workspace that owns
+        // the checkout.
+        assert_eq!(
+            find_live_workspace_for_worktree_path(&store.snapshot(), &wt, "feature"),
+            Some(id),
+            "an explicit worktree_path claim must adopt on path identity alone"
         );
     }
 
@@ -3631,7 +3742,7 @@ mod worktree_adopt_tests {
         );
 
         assert!(
-            find_live_workspace_for_worktree_path(&store.snapshot(), &wt).is_none(),
+            find_live_workspace_for_worktree_path(&store.snapshot(), &wt, "feature").is_none(),
             "a remote/attach-only workspace's host path must never match a \
              local worktree directory"
         );
@@ -3662,9 +3773,91 @@ mod worktree_adopt_tests {
              this worktree path"
         );
         assert!(
-            find_live_workspace_for_worktree_path(&store.snapshot(), &wt).is_none(),
+            find_live_workspace_for_worktree_path(&store.snapshot(), &wt, "feature").is_none(),
             "an archived workspace must not be adopted — worktree_create has to \
              build a fresh workspace over the directory"
         );
+    }
+
+    /// The adopt guard's probe and insert must be one atomic operation.
+    /// Two concurrent `create_worktree_workspace` calls for the same
+    /// worktree path race between "no workspace claims this path yet" and
+    /// "insert mine"; with separate lock acquisitions both could probe
+    /// empty and both insert. `adopt_or_create_worktree_workspace` holds
+    /// the state lock across probe+insert (and stamps the `worktree_path`
+    /// claim before releasing), so exactly one create wins and the loser
+    /// adopts the winner's workspace.
+    #[test]
+    fn concurrent_creates_for_same_worktree_yield_one_workspace() {
+        use crate::state::WorktreeWorkspaceClaim;
+        use std::sync::{Arc, Barrier};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let wt = tmp.path().join("repo-feature");
+        std::fs::create_dir_all(&wt).expect("mkdir worktree");
+
+        let store = Arc::new(AppStateStore::default());
+        let barrier = Arc::new(Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                let barrier = Arc::clone(&barrier);
+                let wt = wt.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.adopt_or_create_worktree_workspace(
+                        wt.clone(),
+                        WorkspacePresetLayout::Single,
+                        wt.display().to_string(),
+                        "feature".to_string(),
+                        |snapshot| {
+                            find_live_workspace_for_worktree_path(snapshot, &wt, "feature")
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread panicked"))
+            .collect();
+
+        let claimants: Vec<String> = store
+            .snapshot()
+            .workspaces
+            .iter()
+            .filter(|w| w.worktree_path.as_deref() == Some(wt.display().to_string().as_str()))
+            .map(|w| w.workspace_id.0.clone())
+            .collect();
+        assert_eq!(
+            claimants.len(),
+            1,
+            "exactly ONE workspace may claim the worktree path after a race — \
+             found {claimants:?}"
+        );
+
+        let created: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                WorktreeWorkspaceClaim::Created(id) => Some(id.0.as_str()),
+                WorktreeWorkspaceClaim::Adopted(_) => None,
+            })
+            .collect();
+        let adopted: Vec<&str> = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                WorktreeWorkspaceClaim::Adopted(id) => Some(id.as_str()),
+                WorktreeWorkspaceClaim::Created(_) => None,
+            })
+            .collect();
+        assert_eq!(created.len(), 1, "one racer must win the create");
+        assert_eq!(adopted.len(), 1, "the other racer must adopt");
+        assert_eq!(
+            created[0], adopted[0],
+            "the adopter must resolve to the creator's workspace id"
+        );
+        assert_eq!(created[0], claimants[0]);
     }
 }

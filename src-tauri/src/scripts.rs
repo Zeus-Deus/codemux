@@ -93,15 +93,7 @@ pub struct IncludeResult {
     pub source: IncludeSource,
 }
 
-/// Compare two paths for filesystem equality. Prefers canonicalized comparison
-/// (resolves symlinks, `.`, `..`) and falls back to direct path comparison if
-/// canonicalization fails (e.g., a path doesn't exist yet).
-fn paths_equal(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(ac), Ok(bc)) => ac == bc,
-        _ => a == b,
-    }
-}
+use crate::workspace_paths::paths_equal;
 
 /// Process worktree includes: copy gitignored files matching patterns from the
 /// main worktree into the new worktree.

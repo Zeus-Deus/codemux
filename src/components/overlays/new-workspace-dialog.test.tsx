@@ -37,7 +37,9 @@ vi.mock("@/tauri/commands", () => ({
   }),
   pickFolderDialog: vi.fn().mockResolvedValue(null),
   createWorkspace: vi.fn().mockResolvedValue("ws-new"),
-  createWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
+  createWorktreeWorkspaceResult: vi
+    .fn()
+    .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false }),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   applyPreset: vi.fn().mockResolvedValue(undefined),
@@ -97,7 +99,7 @@ import {
   checkIsGitRepo,
   gitFetchPrune,
   getGitBranchInfo,
-  createWorktreeWorkspace,
+  createWorktreeWorkspaceResult,
   activateWorkspace,
   generateBranchName,
   generateRandomBranchName,
@@ -367,7 +369,7 @@ describe("Submit flow", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => {
-      expect(createWorktreeWorkspace).toHaveBeenCalledWith(
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalledWith(
         "/path/to/project",
         "my-feature",
         true,
@@ -430,11 +432,11 @@ describe("Submit flow", () => {
     fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
 
     await waitFor(() => {
-      expect(createWorktreeWorkspace).toHaveBeenCalled();
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalled();
     });
     // 9th arg is the launch-time ModelSelection — the remembered pick,
     // intact (not dropped despite capabilities never loading).
-    const call = (createWorktreeWorkspace as Mock).mock.calls[0];
+    const call = (createWorktreeWorkspaceResult as Mock).mock.calls[0];
     expect(call[8]).toEqual({
       model: "claude-sonnet-4-6",
       reasoning: "high",
@@ -472,7 +474,7 @@ describe("Submit flow", () => {
       expect(activateWorkspace).toHaveBeenCalledWith("ws-extra-0");
     });
 
-    expect(createWorktreeWorkspace).not.toHaveBeenCalled();
+    expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
     // The dedup must not be silent — that's what made re-linking an issue
     // look like "nothing happened" and quietly dropped the typed message.
     expect(toast.info).toHaveBeenCalledWith(
@@ -511,7 +513,53 @@ describe("Submit flow", () => {
       expect(activateWorkspace).toHaveBeenCalledWith("ws-extra-0");
     });
     expect(onOpenChange).toHaveBeenCalledWith(false);
-    expect(createWorktreeWorkspace).not.toHaveBeenCalled();
+    expect(createWorktreeWorkspaceResult).not.toHaveBeenCalled();
+  });
+
+  it("tells the user their prompt wasn't sent when the backend adopts an existing workspace", async () => {
+    // The backend's adopt-existing guard: a live workspace already claims
+    // the worktree path, so instead of creating a duplicate it focuses the
+    // existing one and DROPS the typed prompt (injecting into an in-flight
+    // session would be worse). That must not be silent.
+    (createWorktreeWorkspaceResult as Mock).mockResolvedValueOnce({
+      workspaceId: "ws-existing",
+      cwd: "/path/to/wt",
+      adopted: true,
+    });
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    const textarea = within(dialog).getByPlaceholderText(
+      "What do you want to do?",
+    );
+    fireEvent.change(textarea, { target: { value: "Fix the login bug" } });
+
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-existing");
+    });
+    expect(toast.info).toHaveBeenCalledWith(
+      expect.stringContaining("prompt wasn't sent"),
+    );
+  });
+
+  it("does not show the adoption notice for a freshly created workspace", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("What do you want to do?"),
+      { target: { value: "Fix the login bug" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-new");
+    });
+    expect(toast.info).not.toHaveBeenCalled();
   });
 });
 

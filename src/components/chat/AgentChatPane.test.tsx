@@ -337,7 +337,7 @@ vi.mock("@/tauri/commands", () => ({
   // matching the pre-fix path these tests assert on.
   createWorktreeWorkspaceResult: vi
     .fn()
-    .mockResolvedValue({ workspaceId: "ws-new", cwd: null }),
+    .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false }),
   generateBranchName: vi.fn().mockResolvedValue("ai-named-branch"),
   generateRandomBranchName: vi.fn().mockResolvedValue("random-branch"),
   getHomeDir: vi.fn().mockResolvedValue("/home/user"),
