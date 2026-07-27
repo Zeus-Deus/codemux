@@ -161,6 +161,18 @@ The chat pane stack:
   images via paste / drop / picker. Inline chips, send-time injection,
   expand, caps, gif guard, chip tooltips. See
   `docs/research/step-8-attachments.md`.
+  - **Image chips show the image, not a generic icon.** `AttachmentChip`
+    builds an object URL from the attachment's in-memory
+    `resolvedImage.bytes` (already kept for the optimistic user bubble,
+    so this costs no IPC) and renders a 30×22px thumbnail in the icon
+    slot; the chip swaps from the pill radius to `rounded-md` with a 3px
+    inset so the preview reads as a picture, and the hover tooltip adds a
+    ≤260×180px preview above the filename/token lines. Two pasted
+    screenshots were previously indistinguishable — both chips read
+    `pasted-image.png` behind the same icon. The URL is revoked on
+    unmount; missing bytes, an image that fails to decode, or an
+    environment without `URL.createObjectURL` (jsdom) all fall back to
+    the original icon pill.
   - **Ctrl+V image paste has a Linux clipboard fallback.** WebKit2GTK
     strips image payloads from the JS `paste` event, so `Composer`'s
     handler tries `e.clipboardData.items` first (works in the browser

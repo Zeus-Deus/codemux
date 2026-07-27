@@ -237,6 +237,95 @@ describe("AttachmentChip", () => {
     });
   });
 
+  describe("image thumbnail preview", () => {
+    /** jsdom implements neither half of the object-URL API, so patch both
+     *  onto the real `URL` and assert the created URL is used and revoked. */
+    function stubObjectUrls() {
+      const created: Blob[] = [];
+      const revoked: string[] = [];
+      URL.createObjectURL = vi.fn((blob: Blob) => {
+        created.push(blob);
+        return `blob:mock-${created.length}`;
+      });
+      URL.revokeObjectURL = vi.fn((url: string) => void revoked.push(url));
+      return { created, revoked };
+    }
+
+    afterEach(() => {
+      // Unmount before dropping the stubs — the cleanup effect calls
+      // revokeObjectURL, and this hook runs before the file-level cleanup.
+      cleanup();
+      Reflect.deleteProperty(URL, "createObjectURL");
+      Reflect.deleteProperty(URL, "revokeObjectURL");
+    });
+
+    const imageAttachment = () =>
+      makeAttachment({
+        kind: "image",
+        ref: "image:att-1",
+        metadata: { label: "pasted-image.png", bytes: 2048 },
+        resolvedImage: {
+          mime: "image/png",
+          bytes: new Uint8Array([1, 2, 3, 4]),
+        },
+      });
+
+    it("renders the actual image instead of the generic icon", () => {
+      const { created } = stubObjectUrls();
+      const { getByTestId } = render(
+        <AttachmentChip attachment={imageAttachment()} onRemove={vi.fn()} />,
+      );
+      const thumb = getByTestId("attachment-chip-thumbnail");
+      expect(thumb).toHaveAttribute("src", "blob:mock-1");
+      expect(created[0].type).toBe("image/png");
+    });
+
+    it("switches the chip to the rounded-rect preview shape", () => {
+      stubObjectUrls();
+      const { getByRole } = render(
+        <AttachmentChip attachment={imageAttachment()} onRemove={vi.fn()} />,
+      );
+      const chip = getByRole("status");
+      expect(chip).toHaveAttribute("data-preview", "true");
+      expect(chip.className).toContain("rounded-md");
+      expect(chip.className).not.toContain("rounded-full");
+    });
+
+    it("revokes the object URL on unmount so removed chips don't leak", () => {
+      const { revoked } = stubObjectUrls();
+      const { unmount } = render(
+        <AttachmentChip attachment={imageAttachment()} onRemove={vi.fn()} />,
+      );
+      unmount();
+      expect(revoked).toEqual(["blob:mock-1"]);
+    });
+
+    it("falls back to the icon chip when the image fails to decode", () => {
+      stubObjectUrls();
+      const { getByTestId, queryByTestId, getByRole } = render(
+        <AttachmentChip attachment={imageAttachment()} onRemove={vi.fn()} />,
+      );
+      fireEvent.error(getByTestId("attachment-chip-thumbnail"));
+      expect(queryByTestId("attachment-chip-thumbnail")).toBeNull();
+      expect(getByRole("status").className).toContain("rounded-full");
+    });
+
+    it("keeps the icon while the bytes are still resolving", () => {
+      stubObjectUrls();
+      const { getByTestId, queryByTestId } = render(
+        <AttachmentChip
+          attachment={makeAttachment({
+            kind: "image",
+            metadata: { label: "pasted-image.png", isLoading: true },
+          })}
+          onRemove={vi.fn()}
+        />,
+      );
+      expect(getByTestId("attachment-chip-spinner")).toBeInTheDocument();
+      expect(queryByTestId("attachment-chip-thumbnail")).toBeNull();
+    });
+  });
+
   it("exposes the kind via data-attachment-kind for parent styling", () => {
     const { container } = render(
       <AttachmentChip attachment={makeAttachment()} onRemove={vi.fn()} />,
