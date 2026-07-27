@@ -35,6 +35,7 @@ import { Button } from "@/components/ui/button";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { RunButton } from "./run-button";
 import { cn } from "@/lib/utils";
+import { useHorizontalWheelScroll } from "@/lib/wheel";
 import { launchDraftWithPreset } from "@/lib/agent-chat/draft-preset-launch";
 import {
   useChatDraftStore,
@@ -194,6 +195,13 @@ function PresetBarImpl({
       coordinateGetter: sortableKeyboardCoordinates,
     }),
   );
+
+  // Pan the bar with a plain vertical wheel when many pinned presets
+  // overflow a narrow window (`overflow-x: auto` ignores a vertical wheel
+  // on its own — verified on the WebKit webview, where it moved
+  // `scrollLeft` by 0). Native listener, so the gesture can be consumed
+  // instead of also scrolling an ancestor. See `@/lib/wheel`.
+  const scrollerRef = useHorizontalWheelScroll<HTMLDivElement>();
 
   if (!presetStore || !presetStore.bar_visible) return null;
 
@@ -379,23 +387,11 @@ function PresetBarImpl({
   const setShowSettings = useUIStore.getState().setShowSettings;
   const requestNewPreset = useUIStore.getState().requestNewPreset;
 
-  // Translate a vertical mouse-wheel delta into horizontal scrolling so
-  // the bar can be panned with a plain wheel when many pinned presets
-  // overflow a narrow window. `overflow-x: auto` only responds to
-  // horizontal wheel / trackpad input on its own (verified on the
-  // WebKit webview — a vertical wheel over the bar moved `scrollLeft`
-  // by 0). `deltaX` is left to that native horizontal-scroll path.
-  const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
-    const el = e.currentTarget;
-    if (el.scrollWidth <= el.clientWidth || e.deltaY === 0) return;
-    el.scrollLeft += e.deltaY;
-  };
-
   return (
     <div
+      ref={scrollerRef}
       className="flex items-center h-8 border-b border-border bg-background px-2 gap-0.5 shrink-0 overflow-x-auto"
       style={{ scrollbarWidth: "none" }}
-      onWheel={handleWheel}
     >
       {/* Settings gear */}
       <DropdownMenu>

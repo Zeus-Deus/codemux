@@ -61,7 +61,7 @@ Run `bash scripts/check-deps.sh` to verify all required and optional dependencie
 npm run tauri:dev
 ```
 
-This starts the Vite dev server on port 1420 and launches the Tauri desktop window with hot reload. The `WEBKIT_DISABLE_DMABUF_RENDERER=1` env var is set automatically to work around Wayland GPU rendering issues.
+This starts the Vite dev server on port 1420 and launches the Tauri desktop window with hot reload. The WebKitGTK renderer is selected by the app itself (`src-tauri/src/webview_tuning.rs`), not by the dev script.
 
 ### Dev Mode (X11 Fallback)
 
@@ -113,7 +113,7 @@ These are not required to build or run Codemux but enable additional features. A
 ## Known Gotchas
 
 - **WebKit2GTK version**: Must be 4.1 specifically, not 4.0 or 6.0. The package name varies by distro.
-- **Wayland GPU rendering**: `WEBKIT_DISABLE_DMABUF_RENDERER=1` is set automatically in `tauri:dev` scripts. If you see GPU errors, this is the fix.
+- **Wayland GPU rendering**: the app sets `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1` itself, which keeps accelerated compositing while avoiding the GBM/EGL and Wayland protocol errors. If startup still dies in the renderer, run with `CODEMUX_WEBKIT_COMPAT=1` for the legacy CPU path (slower scrolling) and report it.
 - **X11 fallback**: Some Wayland compositors need `GDK_BACKEND=x11`. Use `npm run tauri:dev:x11`.
 - **agent-browser sidecar**: The `agent-browser` binary is bundled as a Tauri sidecar. Run `bash scripts/copy-agent-browser.sh` after `npm install` to copy it into `src-tauri/binaries/`. If browser automation breaks after a package update, re-run the copy script.
 - **Stale CLI binary**: `npm run build:cli` copies the binary to `~/.local/bin/codemux`. This can shadow the dev build if you forget it's there. Remove it with `rm ~/.local/bin/codemux` when you don't need it.

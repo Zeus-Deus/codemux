@@ -79,6 +79,9 @@ pub mod terminal;
 // Opt-in cloud-push diagnostic tracing. Defines the crate-wide
 // `trace_cloud_push!` macro (gated on `CODEMUX_TRACE_CLOUD_PUSH`).
 pub mod trace;
+// WebKitGTK renderer transport + smooth-scrolling tuning (Linux). Also owns
+// the startup crash sentinel that picks the renderer flags for this process.
+pub mod webview_tuning;
 // Embedded web remote-access server (default-off HTTP+WebSocket). Lets a
 // browser on another device drive this running instance as a second
 // frontend. See docs/plans/web-remote-access.md.
@@ -159,20 +162,30 @@ fn save_window_state<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Set WebKitGTK env vars before any GTK/Tauri initialization.
-    // WEBKIT_DISABLE_DMABUF_RENDERER: fixes "Could not create GBM EGL display" crash
-    // on certain GPU/driver combos.
-    // WEBKIT_DISABLE_COMPOSITING_MODE: fixes "Error 71 (Protocol error) dispatching
-    // to Wayland display" crash on dual-GPU systems (e.g. NVIDIA + AMD iGPU).
+    //
+    // Renderer transport: `webview_tuning::configure_renderer_env` sets
+    // WEBKIT_DMABUF_RENDERER_FORCE_SHM=1, which keeps accelerated compositing
+    // (and WebKit's threaded scrolling) enabled while routing the final
+    // compositor buffer handoff through shared memory. That avoids the
+    // "Error 71 (Protocol error) dispatching to Wayland display" crash on
+    // dual-GPU systems and the "Could not create GBM EGL display" failure on
+    // some driver stacks — both come from the hardware/GBM buffer transport
+    // this removes — without the app-wide scroll jank the old
+    // WEBKIT_DISABLE_DMABUF_RENDERER + WEBKIT_DISABLE_COMPOSITING_MODE pair
+    // caused by forcing CPU rendering (~56 ms per scroll frame vs ~16 ms
+    // accelerated). See WebKit bug 280210. Any of those three env vars set by
+    // the user wins (`WEBKIT_DMABUF_RENDERER_FORCE_SHM=0` is WebKit's own
+    // opt-out), and a crash sentinel falls back to the legacy compatibility
+    // flags on hardware where accelerated startup keeps dying. Renderer vars
+    // inherited from a parent Codemux terminal are scrubbed first so they are
+    // not mistaken for a user override; `CODEMUX_WEBKIT_COMPAT=1` is the
+    // explicit opt-in to the legacy CPU renderer.
+    //
     // GDK_BACKEND: forces Wayland-native when available, preventing XWayland fallback
     // (which triggers unintended Hyprland window rules on AppImage builds).
     #[cfg(target_os = "linux")]
     {
-        if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
-            unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
-        }
-        if std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").is_err() {
-            unsafe { std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1") };
-        }
+        webview_tuning::configure_renderer_env();
         if std::env::var("GDK_BACKEND").is_err() {
             unsafe { std::env::set_var("GDK_BACKEND", "wayland,x11") };
         }
@@ -212,6 +225,12 @@ pub fn run() {
                     cwd
                 ));
             }
+            // A duplicate launch bumps the renderer crash sentinel in a
+            // process that exits before it ever builds a window. This
+            // instance is demonstrably healthy, so clear that increment
+            // rather than let repeated duplicate launches look like repeated
+            // renderer crashes.
+            crate::webview_tuning::mark_startup_successful();
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -224,6 +243,12 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|_app, event| {
             if let tauri::RunEvent::Exit = event {
+                // A graceful run-loop exit is not a renderer crash: disarm the
+                // renderer crash sentinel even when the main window never
+                // finished a page load (e.g. the app was quit mid-startup).
+                // Ownership-gated inside, so the sticky compatibility
+                // fallback stays sticky.
+                webview_tuning::mark_clean_exit();
                 // Kill agent-browser daemons so they don't persist across restarts.
                 agent_browser::kill_stream_daemons();
             }
@@ -389,6 +414,24 @@ fn build_core_app<R: tauri::Runtime>(
     }
 
     builder
+        // Every finished page load re-applies the current smooth-scrolling
+        // preference, so windows created after `setup` (and any reload) get
+        // it without a separate window-created hook — each webview owns its
+        // own WebKitSettings object.
+        //
+        // A finished load on the main window is also the app's first proof
+        // that the webview came up, which clears the renderer crash sentinel
+        // armed before GTK init. `mode` is `Copy`, so the setup closure below
+        // still captures it too.
+        .on_page_load(move |webview, payload| {
+            if !matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                return;
+            }
+            webview_tuning::apply_to_webview(webview);
+            if mode == AppMode::Gui && webview.label() == "main" {
+                webview_tuning::mark_startup_successful();
+            }
+        })
         .setup(move |app| {
             // Reap chat-image staging files leaked by a crash or an
             // abandoned draft (best-effort, off the startup path).
@@ -526,6 +569,14 @@ fn build_core_app<R: tauri::Runtime>(
             // size, position, save, or float, so the whole block is skipped
             // there.
             if mode == AppMode::Gui {
+            // Turn WebKitGTK's smooth-scrolling animation off for every window
+            // that already exists. Its 200 ms eased retarget restarts on each
+            // high-resolution wheel event, so a fast flick scrolls *less* than
+            // a slow one (WebKit bug 258926). Windows created later pick the
+            // same setting up from the page-load hook, and the frontend can
+            // flip it at runtime via the `set_smooth_scrolling` command.
+            webview_tuning::refresh_all(&handle);
+
             // Restore window size from SQLite
             {
                 let db: tauri::State<'_, database::DatabaseStore> = handle.state();
@@ -1984,6 +2035,11 @@ fn build_core_app<R: tauri::Runtime>(
             web_remote::web_remote_request_update,
             web_remote::web_remote_iroh_node_id,
             web_remote::web_remote_registration_status,
+            // WebKitGTK smooth-scrolling toggle (Linux; no-op elsewhere).
+            webview_tuning::set_smooth_scrolling,
+            // Which renderer this process ended up on, so the UI can drop
+            // composited-only effects when running CPU-rendered.
+            webview_tuning::get_renderer_mode,
         ])
 }
 

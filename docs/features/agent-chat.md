@@ -581,26 +581,37 @@ Contract preserved from the pre-redesign renderer:
 
 ### Perf on Linux WebKitGTK (issue #129)
 
-Three transcript-scroll fixes for the Linux app webview (all
-frontend-only; no Rust change):
+Transcript-scroll behavior on the Linux app webview. The original round
+was frontend-only workarounds for a CPU-rendered webview; the webview now
+runs with accelerated compositing (`src-tauri/src/webview_tuning.rs`), so
+the gates below have been lifted and the remaining items are the
+structural wins:
 
-- **Viewport edge-fade mask gated off on Linux WebKitGTK.** The design
-  edge fade (`WS_FADE_STYLE`) is a CSS `mask-image` on the scroll
-  viewport. On Linux the app forces WebKitGTK into **non-composited
-  (CPU) mode** — `src-tauri/src/lib.rs` sets
-  `WEBKIT_DISABLE_COMPOSITING_MODE=1` and
-  `WEBKIT_DISABLE_DMABUF_RENDERER=1` — where a viewport mask forces a
-  **full-viewport CPU re-rasterization on every scroll frame** (the
-  scroll jank in the issue). So the mask is disabled on Linux WebKitGTK
-  and kept everywhere it composites (macOS / Windows / dev-mock Chromium
-  — byte-identical rendering). The decision is a pure, injectable helper
+- **Viewport edge-fade mask — on everywhere (re-enabled on Linux).** The
+  design edge fade (`WS_FADE_STYLE`) is a CSS `mask-image` on the scroll
+  viewport. It was originally gated off on Linux WebKitGTK, where the app
+  ran the webview in non-composited (CPU) mode and a viewport mask forced
+  a full-viewport re-rasterization on every scroll frame. Accelerated
+  compositing is now restored on Linux (SHM buffer transport, see
+  `src-tauri/src/webview_tuning.rs`) and the mask measures as free — ~16ms
+  frames with and without it — so the fade is on by default on every
+  platform. The decision stays a pure, injectable helper
   (`transcript-fade.ts`, `decideTranscriptFade`), cached once per session,
-  and honors a `localStorage["codemux:transcript-fade"] = "on" | "off"`
-  override first (live A/B escape hatch for profiling, mirroring the
-  terminal renderer override); the WebKitGTK check itself moved to the
-  shared `@/lib/webkit` `isLinuxWebKitGtk` (re-exported from
-  `webgl-renderer-probe.ts`). A one-time `console.info` states the verdict
-  only when the fade is disabled or overridden.
+  and still honors a `localStorage["codemux:transcript-fade"] = "on" |
+  "off"` override (escape hatch for a driver stack where it still hurts);
+  a one-time `console.info` states the verdict only when an override is in
+  play. The shared `isLinuxWebKitGtk` check lives in `@/lib/webkit` and is
+  still used by the terminal renderer probe and the smooth-scrolling
+  setting.
+- **Animated wheel scrolling is off by default on Linux** (Settings →
+  Appearance → Scrolling re-enables it). The webview's kinetic scroll
+  animation runs on a fixed timeline, so a high-resolution wheel that
+  emits many small deltas per flick queues animations and the transcript
+  moves *slower* the faster you scroll. The preference is machine-local
+  (`appearance.smooth_scrolling` in the settings store) and is pushed to
+  the webview via the `set_smooth_scrolling` command
+  (`smooth-scrolling-section.tsx`, `use-smooth-scrolling.ts`); the toggle
+  only renders on Linux WebKitGTK, where it has an effect.
 - **Slot-object reuse + a memoized whole-row wrapper** (see "Stable keys
   + two-level memo rows" above): `reuseTranscriptSlots` preserves an
   untouched slot's object identity across the per-token rebuild, so with
@@ -614,9 +625,17 @@ frontend-only; no Rust change):
   "auto")` once and `console.warn`s (grep-able on `content-visibility`) if
   it is unsupported (suppressed under vitest). Diagnostic only — no
   behavior change.
-- **DMABUF renderer hypothesis** from the issue is already handled by the
-  `lib.rs` env defaults above (`WEBKIT_DISABLE_DMABUF_RENDERER=1`), so no
-  additional change is needed for it.
+- **DMABUF renderer hypothesis** from the issue is handled natively:
+  `configure_renderer_env` defaults to `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1`
+  (accelerated compositing, SHM buffer handoff, ~16ms scroll frames vs
+  ~56ms on the old CPU path), with a crash-sentinel fallback to the legacy
+  `WEBKIT_DISABLE_*` flags for hardware that cannot start on it. The
+  `tauri:dev` scripts no longer hardcode `WEBKIT_DISABLE_DMABUF_RENDERER=1`,
+  and renderer vars inherited from a parent Codemux terminal are scrubbed so
+  they are not mistaken for a user override; `CODEMUX_WEBKIT_COMPAT=1` opts
+  into the legacy renderer explicitly. Whichever renderer wins is reported to
+  the UI by the `get_renderer_mode` command, and the transcript edge-fade mask
+  disables itself automatically in compatibility (CPU) mode.
 
 ### Activity block (Activity Stream)
 

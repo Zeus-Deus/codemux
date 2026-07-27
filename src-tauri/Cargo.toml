@@ -144,6 +144,13 @@ tauri-plugin-dialog = { version = "2", default-features = false, features = ["xd
 # then silently resolves as if cancelled (issue #95). zbus is already
 # in the tree via rfd -> ashpd, so this adds no new build cost.
 zbus = "5"
+# Direct handle on the WebKitGTK settings object behind each webview
+# (`webview_tuning.rs`), reached through Tauri's `with_webview` escape
+# hatch. Pinned to the exact version + feature set wry already depends on
+# so Cargo unifies them into one crate — `PlatformWebview::inner()` hands
+# back a `webkit2gtk::WebView` from *that* build, and a mismatch would not
+# type-check.
+webkit2gtk = { version = "=2.0.2", features = ["v2_38"] }
 
 [target.'cfg(windows)'.dependencies]
 tauri-plugin-dialog = { version = "2" }

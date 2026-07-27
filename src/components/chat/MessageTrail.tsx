@@ -13,6 +13,7 @@ import {
   useMessageScrollerVisibility,
 } from "@/components/ui/message-scroller";
 import { cn } from "@/lib/utils";
+import { normalizeWheelDelta } from "@/lib/wheel";
 
 import {
   buildTrailEntries,
@@ -204,7 +205,11 @@ function TrailRail({
   //    a concern: the rail is a sibling of the viewport, so the dispatched
   //    event never bubbles back through this handler.)
   // 2. Mutate `scrollTop` to perform the actual scroll — a synthetic wheel
-  //    event carries no default scroll action of its own.
+  //    event carries no default scroll action of its own. The delta is
+  //    normalized to pixels first: line-mode mice report one notch as a
+  //    delta of `1`, which would otherwise scroll the transcript a single
+  //    pixel per notch. (The dispatched event keeps the original
+  //    delta/deltaMode pair so the engine sees the input unaltered.)
   const forwardWheel = useCallback(
     (e: React.WheelEvent) => {
       const viewport = resolveViewport();
@@ -218,7 +223,7 @@ function TrailRail({
           cancelable: true,
         }),
       );
-      viewport.scrollTop += e.deltaY;
+      viewport.scrollTop += normalizeWheelDelta(e.deltaY, e.deltaMode);
     },
     [resolveViewport],
   );

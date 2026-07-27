@@ -1298,6 +1298,20 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Remove the WebKitGTK renderer transport vars from a child's environment.
+///
+/// Those vars configure how *this* process hands composited frames to the
+/// compositor; they are meaningless to a shell and actively harmful to any
+/// GTK/WebKit app launched from one (including another Codemux, which would
+/// read the inherited values as a user override and drop to CPU rendering).
+/// `GDK_BACKEND` and the `CODEMUX*` vars are deliberately left in place —
+/// children are expected to inherit those.
+pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
+    for key in crate::webview_tuning::RENDERER_ENV_VARS {
+        cmd.env_remove(key);
+    }
+}
+
 /// Build worktree environment variables and dynamic agent context for a PTY session.
 /// Used by both `spawn_pty_for_session()` and `spawn_pty_for_agent()` to ensure
 /// consistent env var injection across user shells and agent processes.
@@ -1620,6 +1634,9 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
     }
+
+    // Renderer transport flags are an app-process concern only.
+    strip_renderer_env(&mut cmd);
 
     let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,
@@ -3160,6 +3177,9 @@ fn spawn_pty_for_agent_in_process<R: Runtime>(
     for (key, val) in &prepared.env_set {
         cmd.env(key, val);
     }
+
+    // Renderer transport flags are an app-process concern only.
+    strip_renderer_env(&mut cmd);
 
     let child = match pty_pair.slave.spawn_command(cmd) {
         Ok(child) => child,

@@ -204,6 +204,13 @@ async fn spawn_daemon_detached() -> Result<PathBuf, PtyDaemonError> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
+    // The WebKitGTK renderer transport vars configure the app's own webview;
+    // the daemon has no webview and every PTY child it spawns would inherit
+    // them. Strip here so the whole daemon subtree starts clean.
+    for key in crate::webview_tuning::RENDERER_ENV_VARS {
+        cmd.env_remove(key);
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;

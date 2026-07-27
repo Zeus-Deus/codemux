@@ -1,18 +1,23 @@
-import { isLinuxWebKitGtk } from "@/lib/webkit";
-
 /**
  * Should the transcript viewport's edge-fade mask (`WS_FADE_STYLE` in
  * `MessageList.tsx`) be applied? (issue #129)
  *
  * The fade is a CSS `mask-image` on the scroll viewport. On a COMPOSITED
- * webview the mask is a cheap GPU layer effect, so it stays on (macOS
- * WKWebView, Windows WebView2, the dev-mock Chromium — byte-identical
- * rendering). But on Linux the app forces WebKitGTK into NON-COMPOSITED (CPU)
- * mode via `WEBKIT_DISABLE_COMPOSITING_MODE=1` / `WEBKIT_DISABLE_DMABUF_RENDERER=1`
- * (`src-tauri/src/lib.rs`), where a viewport mask forces a full-viewport CPU
- * re-rasterization on every scroll frame — the transcript-scroll jank in the
- * issue. So the fade is gated OFF on Linux WebKitGTK; the design intent is
- * kept everywhere it is composited.
+ * webview the mask is a cheap GPU layer effect. It used to be gated off on
+ * Linux, where the app ran WebKitGTK in non-composited (CPU) mode and a
+ * viewport mask forced a full-viewport re-rasterization on every scroll frame.
+ * Accelerated compositing is now restored on Linux (see the webview env setup
+ * in `src-tauri/src/lib.rs`), and profiling shows the mask costs no measurable
+ * frame time there — same ~16ms frames with and without it. So the fade is on
+ * by default everywhere; the localStorage override below stays as the escape
+ * hatch for anyone on a driver stack where it still hurts.
+ *
+ * The one automatic exception is the compatibility (CPU) renderer — the crash
+ * sentinel fallback or `CODEMUX_WEBKIT_COMPAT=1`. There is no compositor to
+ * hand the mask to, so it costs roughly double the frame time and is switched
+ * off. The backend reports which renderer it picked through the
+ * `get_renderer_mode` command; `use-renderer-mode.ts` pushes the answer into
+ * the module cache below at boot.
  */
 
 /**
@@ -36,58 +41,91 @@ export function readTranscriptFadeOverride(): "on" | "off" | null {
 }
 
 /**
+ * Which renderer the backend picked for this process. `"accelerated"` until
+ * `get_renderer_mode` says otherwise — the accelerated path is both the
+ * default and the only mode that exists off Linux, so an unanswered probe
+ * (dev mock, missing command) leaves the design intent intact.
+ */
+export type RendererMode = "accelerated" | "compatibility";
+
+let rendererMode: RendererMode = "accelerated";
+
+/** Consumers re-reading the decision when the renderer mode lands. */
+const fadeListeners = new Set<() => void>();
+
+/**
+ * Record the renderer the backend actually ended up on. Invalidates the
+ * cached decision and notifies subscribers, so a mode that arrives after the
+ * transcript has mounted still turns the mask off.
+ */
+export function setRendererMode(mode: RendererMode): void {
+  if (mode === rendererMode) return;
+  rendererMode = mode;
+  cachedFade = null;
+  for (const listener of fadeListeners) listener();
+}
+
+/** Current renderer mode as last reported by the backend. */
+export function getRendererMode(): RendererMode {
+  return rendererMode;
+}
+
+/**
+ * `useSyncExternalStore` subscribe half; `transcriptFadeEnabled` is the
+ * matching snapshot getter (cached, so it is referentially stable).
+ */
+export function subscribeTranscriptFade(listener: () => void): () => void {
+  fadeListeners.add(listener);
+  return () => {
+    fadeListeners.delete(listener);
+  };
+}
+
+/**
  * Pure fade decision. Override wins first (both directions); otherwise the
- * fade is off on Linux WebKitGTK and on everywhere else. Injectable inputs
- * with production defaults so it is unit-testable.
+ * fade is on wherever the webview is composited and off on the compatibility
+ * (CPU) renderer, where a full-viewport mask forces a re-rasterization every
+ * scroll frame. The renderer mode is the only engine axis: it can only ever
+ * say "compatibility" on the Linux desktop webview (remote clients skip the
+ * probe — their browser is composited), so no user-agent input is needed.
+ * Injectable inputs with production defaults so it is unit-testable.
  */
 export function decideTranscriptFade(
-  userAgent: string = typeof navigator !== "undefined"
-    ? navigator.userAgent
-    : "",
   override: "on" | "off" | null = readTranscriptFadeOverride(),
+  mode: RendererMode = rendererMode,
 ): boolean {
   if (override === "on") return true;
   if (override === "off") return false;
-  return !isLinuxWebKitGtk(userAgent);
+  return mode !== "compatibility";
 }
 
 let cachedFade: boolean | null = null;
 
 /**
  * Cached production entry point: decide once per app session (the webview
- * engine doesn't change at runtime). Logs the verdict once — but only when
- * the fade is disabled or overridden, so the default composited path stays
- * quiet. Mirrors `shouldLoadWebglAddon`'s one-time logging style.
+ * engine doesn't change at runtime; the renderer mode is settled once, at
+ * boot, and invalidates this cache when it lands). Logs the verdict once —
+ * but only when an override is in play, so the default path stays quiet.
+ * Mirrors `shouldLoadWebglAddon`'s one-time logging style.
  */
 export function transcriptFadeEnabled(): boolean {
   if (cachedFade !== null) return cachedFade;
   const override = readTranscriptFadeOverride();
-  cachedFade = decideTranscriptFade(
-    typeof navigator !== "undefined" ? navigator.userAgent : "",
-    override,
-  );
-  // Suppress the log under vitest: jsdom's UA (`AppleWebKit/… jsdom/…`, no
-  // Chrome/Mac token) classifies as WebKitGTK, so the "disabled" branch would
-  // otherwise fire on every test run.
-  if ((!cachedFade || override !== null) && import.meta.env?.MODE !== "test") {
+  cachedFade = decideTranscriptFade(override, rendererMode);
+  if (override !== null && import.meta.env?.MODE !== "test") {
     console.info(
       `[codemux::transcript] edge-fade mask ${
         cachedFade ? "enabled" : "disabled"
-      } — ${
-        override !== null
-          ? `forced by localStorage["${TRANSCRIPT_FADE_STORAGE_KEY}"]="${override}"`
-          : `Linux WebKitGTK runs non-composited (see src-tauri/src/lib.rs), where the ` +
-            `viewport mask forces a full-viewport CPU re-rasterization per scroll frame; ` +
-            `set localStorage["${TRANSCRIPT_FADE_STORAGE_KEY}"]="on" to force it`
-      }`,
+      } — forced by localStorage["${TRANSCRIPT_FADE_STORAGE_KEY}"]="${override}"`,
     );
   }
   return cachedFade;
 }
 
-/** Test hook: clear the module-level fade cache. */
+/** Test hook: clear the module-level fade cache and renderer mode. */
 export function resetTranscriptFadeCacheForTests(): void {
   cachedFade = null;
+  rendererMode = "accelerated";
 }
 
 /**

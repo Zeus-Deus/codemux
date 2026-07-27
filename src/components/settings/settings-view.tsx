@@ -233,6 +233,7 @@ import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
 import { PermissionsSection } from "./permissions-section";
 import { SkillsSection } from "./skills-section";
+import { SmoothScrollingSection } from "./smooth-scrolling-section";
 import { SyncSection } from "./sync-section";
 import { useFeatureFlags } from "@/stores/feature-flags";
 
@@ -1771,6 +1772,9 @@ export function SettingsView() {
                 </SettingRow>
               </div>
             </SectionGroup>
+
+            {/* Linux WebKitGTK only — renders null everywhere else. */}
+            <SmoothScrollingSection />
 
             <SectionGroup>
               <SubsectionHeader

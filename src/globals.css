@@ -509,13 +509,26 @@ body.pane-resizing iframe {
  * (design wsSweep) — a thin bar-within-a-bar that slides left→right while
  * any subagent runs, reading as ambient progress rather than a discrete
  * loading percentage. Honours reduced-motion. Apply via `cm-sweep` to the
- * absolutely-positioned inner segment (the outer track just clips it). */
+ * absolutely-positioned inner segment pinned at `left: 0` (the outer track
+ * just clips it).
+ *
+ * The travel is a transform, not `left`: this animation runs infinitely
+ * for as long as work is in flight, and animating `left` re-runs layout on
+ * every frame — inside a scrolling transcript that is exactly the kind of
+ * per-frame layout cost that makes scrolling stutter. `translateX`
+ * composites instead.
+ *
+ * Percentages in `translateX` resolve against the segment's OWN width
+ * (unlike `left`, which resolves against the track), so the endpoints are
+ * exposed as custom properties. Defaults match a 38%-wide segment sweeping
+ * from just off the track's left edge to its right edge; a segment of a
+ * different width overrides them (own-width % = track % ÷ segment %). */
 @keyframes cm-sweep {
   0% {
-    left: -38%;
+    transform: translateX(var(--cm-sweep-from, -100%));
   }
   100% {
-    left: 100%;
+    transform: translateX(var(--cm-sweep-to, 263%));
   }
 }
 .cm-sweep {
