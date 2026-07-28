@@ -34,6 +34,11 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   // idle sweep (merged/closed-PR cards still auto-settle once idle). See
   // sidebar-inbox.tsx.
   "sidebar.auto_settle_days": "3",
+  // Whether fenced code blocks in chat soft-wrap long lines. Off keeps each
+  // line intact behind a horizontal scroll (better for diffs and tables of
+  // output); on trades that for no sideways scrolling. Applied as a
+  // `data-code-wrap` attr on the chat markdown root — see globals.css.
+  "chat.code_wrap": "false",
 };
 
 /** Color palette variant. */
@@ -163,6 +168,10 @@ export const selectSidebarAutoSettleDays = (s: SettingsStore): number | null => 
   const days = Number(raw);
   return Number.isFinite(days) && days > 0 ? days : null;
 };
+
+export const selectChatCodeWrap = (s: SettingsStore): boolean =>
+  (s.settings["chat.code_wrap"] ?? SETTINGS_DEFAULTS["chat.code_wrap"]!) ===
+  "true";
 
 export const selectWorkingIndicator = (
   s: SettingsStore,

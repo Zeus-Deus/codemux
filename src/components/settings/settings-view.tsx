@@ -67,6 +67,7 @@ import {
   selectTerminalColorTheme,
   selectPalette,
   selectDensity,
+  selectChatCodeWrap,
   selectSidebarShowGitStats,
   selectWorkingIndicator,
   selectWorkingIndicatorColor,
@@ -1396,6 +1397,7 @@ export function SettingsView() {
   const palette = useSettingsStore(selectPalette);
   const density = useSettingsStore(selectDensity);
   const showGitStats = useSettingsStore(selectSidebarShowGitStats);
+  const chatCodeWrap = useSettingsStore(selectChatCodeWrap);
   const autoSettleDays = useSettingsStore(
     (s) =>
       (s.settings["sidebar.auto_settle_days"] ??
@@ -1767,6 +1769,17 @@ export function SettingsView() {
                       { value: "comfortable", label: "Comfortable" },
                       { value: "compact", label: "Compact" },
                     ]}
+                  />
+                </SettingRow>
+                <SettingRow
+                  label="Wrap code in chat"
+                  description="Soft-wrap long lines in agent chat code blocks. Off keeps each line intact behind a horizontal scroll, which is easier to read for diffs and command output."
+                >
+                  <Switch
+                    checked={chatCodeWrap}
+                    onCheckedChange={(checked) =>
+                      storeSet("chat.code_wrap", checked ? "true" : "false")
+                    }
                   />
                 </SettingRow>
               </div>

@@ -82,6 +82,59 @@ The chat pane stack:
   Assistant markdown renders through **Streamdown**
   (`parseIncompleteMarkdown` keeps mid-stream fences/emphasis clean).
 
+### Code blocks in chat
+
+`ChatMarkdown.tsx` is the single place chat markdown is configured.
+
+- **Syntax highlighting** is Streamdown's Shiki `code` plugin
+  (`@streamdown/code`), enabled via `plugins={{ code }}`. Token colors come
+  from a theme built out of the **terminal ANSI palette**
+  (`src/lib/shiki-chat-theme.ts`), whose scope map mirrors the Lezer tag map
+  in `src/lib/codemirror-theme.ts` — so a keyword is the same color in chat,
+  the file editor, and the terminal. Keep the two maps in sync.
+- The plugin is supplied by `useChatCodePlugin()`
+  (`src/hooks/use-chat-code-plugin.ts`), a **module-level store** rather than
+  a per-component hook: a transcript mounts one `ChatMarkdown` per assistant
+  message, so a per-hook fetch would fire one `get_current_theme` IPC call and
+  one `theme-changed` listener per message. The plugin instance is memoized on
+  palette identity because Shiki's highlighter and token caches live inside it.
+- Shiki's highlighter cache in `@streamdown/code` is keyed by theme **name**,
+  not content, so `buildChatCodeThemes` hashes the palette into the name. A
+  fixed name would serve stale colors after a terminal-theme switch.
+- **Streamdown owns the card.** It renders its own container, header,
+  copy/download pill, and body whether or not the `code` plugin is installed —
+  fenced blocks are *not* a bare `<pre>`. The `prose-pre:*` / `prose-code:*`
+  chain in `ChatMarkdown.tsx` therefore only *neutralizes* the typography
+  plugin's defaults; the card is styled by `.chat-markdown` rules in
+  `globals.css`. Styling `pre` there again stacks a third border/background
+  inside the card.
+- **Line numbers are off** (`lineNumbers={false}`) — chat snippets are quotes,
+  not files. Streamdown only gives each line span `display: block` as part of
+  its line-number class, so `globals.css` restores the line box explicitly;
+  without that rule every line collapses onto one.
+- **Word wrap** is the `chat.code_wrap` setting (default off), applied as
+  `data-code-wrap` on the markdown root. Off keeps lines intact behind a
+  horizontal scroll.
+- Streamdown's fence meta only supports `startLine=` and `noLineNumbers`;
+  there is no filename/title slot, so the header shows the language only.
+
+Card styling (all in `globals.css`, all on design tokens):
+
+- A fence with **no language** (plain command output) still renders a header
+  element with an empty label, which otherwise reserves an empty strip at the
+  top of the block. It's hidden via `[data-language=""]`, and the body takes
+  over the block's top padding in that case.
+- The copy/download pill is **revealed on hover/focus** — a transcript can hold
+  dozens of blocks and always-lit icons are a lot of standing chrome. A
+  `@media (hover: none)` fallback keeps it visible where hover doesn't exist.
+- Streamdown positions that pill by pulling a sticky spacer row up over the
+  header (`-mt-10`), hard-coupling it to the header's height — so hiding the
+  header would fling the pill outside the card. The spacer (the only child div
+  with no `data-streamdown` attribute) is collapsed and the pill is anchored to
+  the card instead.
+- The language caption is a small uppercase tracked label with no divider rule;
+  the fill change against surrounding prose is enough separation.
+
 ## What Works Today
 
 - **Three end-to-end providers** behind one unified picker:

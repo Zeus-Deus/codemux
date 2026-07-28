@@ -1,7 +1,10 @@
+import { useMemo } from "react";
 import remarkGfm from "remark-gfm";
 import { Streamdown } from "streamdown";
 
+import { useChatCodePlugin } from "@/hooks/use-chat-code-plugin";
 import { cn } from "@/lib/utils";
+import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
 
 /**
  * Shared markdown renderer for chat surfaces (assistant messages,
@@ -12,9 +15,19 @@ import { cn } from "@/lib/utils";
  * closes unterminated fences / emphasis / lists mid-stream so a
  * half-arrived token never flashes broken markup. We keep the same
  * `remarkGfm`-only plugin set the previous react-markdown renderer used
- * (no math/KaTeX) and skip streamdown's shiki `code` plugin, so fenced
- * blocks render as plain `<pre>` styled by the prose chain below — no
- * async highlighter, identical DOM semantics.
+ * (no math/KaTeX).
+ *
+ * Fenced code blocks are syntax-highlighted by streamdown's shiki `code`
+ * plugin, themed from the terminal ANSI palette via `useChatCodePlugin`
+ * so chat code matches the file editor and terminal panes.
+ *
+ * Note that streamdown renders its own code-block card (container, header,
+ * copy/download pill, optional line numbers) whether or not the `code`
+ * plugin is installed — it is not a bare `<pre>`. The prose chain below
+ * therefore *neutralizes* the typography plugin's `pre`/`code` defaults
+ * instead of styling them; the card itself is styled by design tokens in
+ * `globals.css` under `.chat-markdown`. Styling `pre` here again would
+ * stack a third border/background/padding inside that card.
  *
  * Built on `@tailwindcss/typography` (registered as a `@plugin` in
  * `globals.css`). The `prose` class provides a typography stack;
@@ -60,13 +73,15 @@ const proseClasses = [
   // and muted-foreground tones them down.
   "prose-ul:pl-6 prose-ol:pl-6",
   "marker:text-muted-foreground",
-  // Inline code — typography plugin wraps inline code in backticks
-  // by default (ugh). Override to subtle muted pill, strip the
-  // quotes via the ::before/::after reset.
-  "prose-code:font-mono prose-code:text-[0.85em] prose-code:bg-muted prose-code:text-foreground prose-code:rounded prose-code:px-1.5 prose-code:py-0.5 prose-code:border prose-code:border-border/60 prose-code:before:content-none prose-code:after:content-none",
-  // Fenced code blocks — bordered card, muted fill, tight line
-  // height so ASCII diagrams stay visually continuous.
-  "prose-pre:my-3 prose-pre:rounded-md prose-pre:border prose-pre:border-border prose-pre:bg-muted prose-pre:text-foreground prose-pre:p-3 prose-pre:text-[0.8em] prose-pre:leading-snug prose-pre:overflow-x-auto",
+  // Inline code — the typography plugin wraps inline code in literal
+  // backticks and bolds it; strip both. The pill itself (muted fill,
+  // border, padding) is streamdown's `inline-code` element, styled in
+  // `globals.css` — don't restate it here or the two stack.
+  "prose-code:before:content-none prose-code:after:content-none prose-code:font-normal",
+  // Fenced code blocks — neutralize the typography plugin's `pre`
+  // defaults (dark slab, padding, radius). Streamdown's card provides
+  // the real surface; see `.chat-markdown` in `globals.css`.
+  "prose-pre:m-0 prose-pre:p-0 prose-pre:bg-transparent prose-pre:text-inherit prose-pre:rounded-none prose-pre:border-0 prose-pre:leading-snug",
   // Tables — plugin-default spacing is loose; pull in for chat.
   "prose-table:my-3 prose-table:text-[0.9em]",
   "prose-th:px-3 prose-th:py-1.5 prose-th:bg-muted/60 prose-th:font-semibold prose-th:text-foreground prose-th:border prose-th:border-border/70",
@@ -77,13 +92,28 @@ const proseClasses = [
   "[&_*]:break-words",
 ].join(" ");
 
+// Line numbers are an editor affordance; chat snippets are quotes, not
+// files, and the gutter competes with the prose column. Tables keep their
+// full control set — only the code block's chrome is trimmed.
+const controls = {
+  code: { copy: true, download: true },
+  table: { copy: true, download: true, fullscreen: true },
+} as const;
+
 export function ChatMarkdown({ children }: { children: string }) {
+  const code = useChatCodePlugin();
+  const plugins = useMemo(() => ({ code }), [code]);
+  const wrap = useSettingsStore(selectChatCodeWrap);
+
   return (
-    <div className={cn(proseClasses)}>
+    <div className={cn("chat-markdown", proseClasses)} data-code-wrap={wrap}>
       <Streamdown
         parseIncompleteMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[]}
+        plugins={plugins}
+        controls={controls}
+        lineNumbers={false}
       >
         {children}
       </Streamdown>
