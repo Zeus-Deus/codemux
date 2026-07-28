@@ -16,7 +16,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { AgentChatProviderKind } from "@/tauri/types";
 import { ProviderLogo } from "../provider-logo";
-import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import { FOOTER_TRIGGER } from "./footer-trigger";
 
 // The model list + default-model / label helpers moved to
@@ -111,7 +111,7 @@ export function ModelPicker({
       <PopoverContent
         className="w-[300px] p-0"
         align="start"
-        onOpenAutoFocus={focusCmdkRootOnOpen}
+        onOpenAutoFocus={focusCmdkOnOpen}
       >
         <Command>
           <CommandList className="max-h-[300px]">

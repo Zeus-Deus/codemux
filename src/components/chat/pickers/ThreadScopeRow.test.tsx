@@ -66,6 +66,7 @@ vi.mock("@/hooks/use-project-actions", () => ({
 
 vi.mock("@/tauri/commands", () => ({
   dbGetUiState: vi.fn().mockResolvedValue(null),
+  dbSetUiState: vi.fn().mockResolvedValue(undefined),
   listBranchesDetailed: vi.fn(),
   // Probe fallback used by ThreadScopeRow when no workspace row carries
   // the project's `is_git` flag. Defaults to true (git repo) so the
@@ -75,7 +76,46 @@ vi.mock("@/tauri/commands", () => ({
 }));
 
 import { ThreadScopeRow, type ThreadScopeRowProps } from "./ThreadScopeRow";
-import { listBranchesDetailed } from "@/tauri/commands";
+import {
+  dbGetUiState,
+  dbSetUiState,
+  listBranchesDetailed,
+} from "@/tauri/commands";
+import {
+  SETTLED_UI_STATE_KEY,
+  __resetSidebarInboxStoreForTests,
+  type SettledEntry,
+  type SnoozeEntry,
+} from "@/stores/sidebar-inbox-store";
+import { SETTLED_COLLAPSED_COUNT } from "./project-scope-list";
+
+/** Seed the persisted sidebar-inbox blob the picker loads on mount. Keyed so
+ *  the per-project avatar reads (same command, different keys) still get null. */
+function seedInbox(opts: {
+  settled?: SettledEntry[];
+  snoozed?: SnoozeEntry[];
+  activity?: Record<string, number>;
+}) {
+  const blob = JSON.stringify({
+    settled: opts.settled ?? [],
+    snoozed: opts.snoozed ?? [],
+    keepActive: [],
+    activity: opts.activity ?? {},
+  });
+  vi.mocked(dbGetUiState).mockImplementation((key: string) =>
+    Promise.resolve(key === SETTLED_UI_STATE_KEY ? blob : null),
+  );
+}
+
+/** Project roots listed in the open "Run in" popover, in DOM order. Reads the
+ *  row's `data-project-path` rather than its text, which is prefixed by the
+ *  avatar's initial glyph. Excludes the pinned Home row and the "Show N more"
+ *  affordance, neither of which carries the attribute. */
+function listedProjects(): string[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>("[data-project-path]"),
+  ).map((el) => el.dataset.projectPath ?? "");
+}
 
 afterEach(() => cleanup());
 
@@ -127,6 +167,9 @@ function renderRow(
 describe("ThreadScopeRow", () => {
   beforeEach(() => {
     currentWorkspaces = [];
+    __resetSidebarInboxStoreForTests();
+    vi.mocked(dbGetUiState).mockReset().mockResolvedValue(null);
+    vi.mocked(dbSetUiState).mockReset().mockResolvedValue(undefined);
     mockOpenProject.mockReset().mockResolvedValue({ success: false });
     vi.mocked(listBranchesDetailed).mockReset().mockResolvedValue([
       branch("main", { last_commit_unix: NOW - 3600 }),
@@ -254,6 +297,19 @@ describe("ThreadScopeRow", () => {
       await waitFor(() => expect(input).toHaveFocus());
     });
 
+    it("types straight into the focused input — no click needed first", async () => {
+      seedProjects();
+      const { user, input } = await openPicker();
+      // Deliberately NO click: keystrokes go wherever focus already is.
+      // The popover's open-autofocus must land on the input itself — cmdk's
+      // root only handles navigation keys, so if focus sat anywhere else
+      // these printable keystrokes would go nowhere.
+      await user.keyboard("codemux");
+      expect(input).toHaveValue("codemux");
+      await waitFor(() => expect(screen.queryByText("bar")).toBeNull());
+      expect(screen.getByText("codemux")).toBeInTheDocument();
+    });
+
     it("narrows the list to fuzzy matches and hides the rest", async () => {
       seedProjects();
       const { user } = await openPicker();
@@ -305,6 +361,17 @@ describe("ThreadScopeRow", () => {
       await user.keyboard("ve");
       await waitFor(() => expect(screen.getByText("vexis")).toBeInTheDocument());
       expect(screen.queryByText("bar")).toBeNull();
+    });
+
+    it("does not let a query grazing the shared path prefix match every row", async () => {
+      // Every row's path starts with "/projects/" — because a slash-less
+      // query matches display names only, typing the shared prefix must
+      // match NOTHING rather than everything at the same score.
+      seedProjects();
+      const { user } = await openPicker();
+      await user.keyboard("projects");
+      await waitFor(() => expect(listedProjects()).toEqual([]));
+      expect(screen.getByText(/No projects match/)).toBeInTheDocument();
     });
 
     it("matches on scattered characters, not just prefixes", async () => {
@@ -366,6 +433,222 @@ describe("ThreadScopeRow", () => {
       await user.keyboard("{Escape}");
       await user.click(screen.getByText("foo"));
       expect(await screen.findByText("bar")).toBeInTheDocument();
+    });
+  });
+
+  // The picker lists every project that has a live workspace, which on a
+  // long-lived install is a lot of projects — settling a workspace parks its
+  // sidebar card but closes nothing, so it stays a valid "Run in" target
+  // forever. These cover the sectioning that keeps that list legible.
+  describe("location picker — Active / Settled sections", () => {
+    function projectWs(name: string, id?: string) {
+      return makeWs({
+        workspace_id: id ?? `ws-${name}`,
+        cwd: `/projects/${name}`,
+        project_root: `/projects/${name}`,
+      });
+    }
+
+    async function openPicker() {
+      const user = userEvent.setup();
+      renderRow();
+      await user.click(screen.getByText("foo"));
+      await screen.findByText("Run in");
+      return user;
+    }
+
+    it("stays a flat, heading-free list when nothing is settled", async () => {
+      currentWorkspaces = [projectWs("foo"), projectWs("bar")];
+      await openPicker();
+      expect(screen.queryByText("Active")).toBeNull();
+      expect(screen.queryByText(/Settled/)).toBeNull();
+    });
+
+    it("splits settled projects into their own labelled section", async () => {
+      currentWorkspaces = [projectWs("foo"), projectWs("bar")];
+      seedInbox({ settled: [{ id: "ws-bar", at: 1_000 }] });
+      await openPicker();
+      await waitFor(() => expect(screen.getByText("Active")).toBeInTheDocument());
+      // The heading says the part a bare "Settled" label would leave the user
+      // guessing about — these projects are parked, not closed.
+      expect(screen.getByText(/still open/)).toBeInTheDocument();
+      expect(screen.getByText("bar")).toBeInTheDocument();
+    });
+
+    it("keeps a project Active while any of its worktrees is unsettled", async () => {
+      currentWorkspaces = [
+        projectWs("foo"),
+        projectWs("bar", "ws-bar-main"),
+        projectWs("bar", "ws-bar-wt"),
+      ];
+      seedInbox({ settled: [{ id: "ws-bar-wt", at: 1_000 }] });
+      await openPicker();
+      await waitFor(() => expect(screen.getByText("bar")).toBeInTheDocument());
+      expect(screen.queryByText(/still open/)).toBeNull();
+    });
+
+    it("parks a project whose every workspace is snoozed — snooze folds into the partition", async () => {
+      currentWorkspaces = [projectWs("foo"), projectWs("napping")];
+      seedInbox({
+        snoozed: [{ id: "ws-napping", at: 1_000, until: 999_999_999 }],
+      });
+      await openPicker();
+      // The fully-snoozed project must not read as Active: it lands in the
+      // parked section alongside settled projects.
+      await waitFor(() => expect(screen.getByText("Active")).toBeInTheDocument());
+      expect(screen.getByText(/still open/)).toBeInTheDocument();
+      expect(screen.getByText("napping")).toBeInTheDocument();
+      expect(listedProjects()).toEqual([
+        "/projects/foo",
+        "/projects/napping",
+      ]);
+    });
+
+    it("orders Active projects most-recently-active first", async () => {
+      currentWorkspaces = [
+        projectWs("stale"),
+        projectWs("foo"),
+        projectWs("fresh"),
+      ];
+      seedInbox({
+        activity: { "ws-stale": 1_000, "ws-foo": 5_000, "ws-fresh": 9_000 },
+      });
+      await openPicker();
+      await waitFor(() =>
+        expect(listedProjects()).toEqual([
+          "/projects/fresh",
+          "/projects/foo",
+          "/projects/stale",
+        ]),
+      );
+    });
+
+    it("collapses a long settled tail behind 'Show N more'", async () => {
+      const settledCount = SETTLED_COLLAPSED_COUNT + 3;
+      currentWorkspaces = [
+        projectWs("foo"),
+        ...Array.from({ length: settledCount }, (_, i) => projectWs(`old${i}`)),
+      ];
+      seedInbox({
+        settled: Array.from({ length: settledCount }, (_, i) => ({
+          id: `ws-old${i}`,
+          at: 1_000 + i,
+        })),
+      });
+      const user = await openPicker();
+      const showMore = await screen.findByText(
+        `Show ${settledCount - SETTLED_COLLAPSED_COUNT} more`,
+      );
+      // foo (active) + the collapsed settled head.
+      expect(listedProjects()).toHaveLength(1 + SETTLED_COLLAPSED_COUNT);
+      await user.click(showMore);
+      await waitFor(() =>
+        expect(listedProjects()).toHaveLength(1 + settledCount),
+      );
+    });
+
+    it("never hides the targeted project in the collapsed settled tail", async () => {
+      const settledCount = SETTLED_COLLAPSED_COUNT + 3;
+      // Newest-settled first, so "foo" (settled longest ago) lands last.
+      currentWorkspaces = [
+        projectWs("foo"),
+        ...Array.from({ length: settledCount }, (_, i) => projectWs(`old${i}`)),
+      ];
+      seedInbox({
+        settled: [
+          ...Array.from({ length: settledCount }, (_, i) => ({
+            id: `ws-old${i}`,
+            at: 5_000 + i,
+          })),
+          { id: "ws-foo", at: 1_000 },
+        ],
+      });
+      await openPicker();
+      await waitFor(() => expect(listedProjects()).toContain("/projects/foo"));
+      expect(listedProjects()).toHaveLength(SETTLED_COLLAPSED_COUNT + 1);
+    });
+
+    it("search reaches a project buried in the collapsed settled tail", async () => {
+      const settledCount = SETTLED_COLLAPSED_COUNT + 4;
+      currentWorkspaces = [
+        projectWs("foo"),
+        ...Array.from({ length: settledCount }, (_, i) => projectWs(`old${i}`)),
+      ];
+      seedInbox({
+        settled: Array.from({ length: settledCount }, (_, i) => ({
+          id: `ws-old${i}`,
+          at: 1_000 + i,
+        })),
+      });
+      const user = await openPicker();
+      // Settled sorts newest-settled first, so the EARLIEST-settled project
+      // (old0) is the one that falls into the hidden tail.
+      const buried = "old0";
+      await waitFor(() =>
+        expect(listedProjects()).not.toContain(`/projects/${buried}`),
+      );
+      await user.type(screen.getByPlaceholderText("Search projects…"), buried);
+      await waitFor(() =>
+        expect(listedProjects()).toEqual([`/projects/${buried}`]),
+      );
+      // The "Show N more" affordance must not leak into search results —
+      // a non-empty query reveals the whole section instead.
+      expect(screen.queryByText(/Show \d+ more/)).toBeNull();
+    });
+
+    it("selecting a settled project does not un-settle it (first send resurfaces it)", async () => {
+      currentWorkspaces = [projectWs("foo"), projectWs("bar")];
+      seedInbox({ settled: [{ id: "ws-bar", at: 1_000 }] });
+      const user = await openPicker();
+      await waitFor(() => expect(screen.getByText("bar")).toBeInTheDocument());
+      await user.click(screen.getByText("bar"));
+      expect(vi.mocked(dbSetUiState)).not.toHaveBeenCalled();
+    });
+
+    it("only loads avatars for rows on screen, not every known project", async () => {
+      const settledCount = SETTLED_COLLAPSED_COUNT + 5;
+      currentWorkspaces = [
+        projectWs("foo"),
+        ...Array.from({ length: settledCount }, (_, i) => projectWs(`old${i}`)),
+      ];
+      seedInbox({
+        settled: Array.from({ length: settledCount }, (_, i) => ({
+          id: `ws-old${i}`,
+          at: 1_000 + i,
+        })),
+      });
+      const user = await openPicker();
+      await waitFor(() =>
+        expect(listedProjects()).toHaveLength(1 + SETTLED_COLLAPSED_COUNT),
+      );
+
+      const avatarKeys = () =>
+        new Set(
+          vi
+            .mocked(dbGetUiState)
+            .mock.calls.map(([key]) => key)
+            .filter((key) => key.startsWith("project.color:")),
+        );
+      // Only the active row + the collapsed settled head — the buried tail
+      // costs nothing until it is revealed.
+      expect(avatarKeys().size).toBe(1 + SETTLED_COLLAPSED_COUNT);
+      expect(avatarKeys()).not.toContain(
+        `project.color:/projects/old${settledCount - 1 - SETTLED_COLLAPSED_COUNT}`,
+      );
+
+      await user.click(
+        screen.getByText(`Show ${settledCount - SETTLED_COLLAPSED_COUNT} more`),
+      );
+      await waitFor(() => expect(avatarKeys().size).toBe(1 + settledCount));
+    });
+
+    it("keeps 'Open another project…' reachable outside the scrolling list", async () => {
+      currentWorkspaces = Array.from({ length: 20 }, (_, i) => projectWs(`p${i}`))
+        .concat(projectWs("foo"));
+      await openPicker();
+      const action = screen.getByText("Open another project…");
+      expect(action).toBeInTheDocument();
+      expect(action.closest("[data-slot='command-list']")).toBeNull();
     });
   });
 

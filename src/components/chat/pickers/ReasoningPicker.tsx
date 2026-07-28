@@ -16,7 +16,7 @@ import {
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import type { ChatModelInfo } from "@/tauri/types";
-import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import { FOOTER_TRIGGER } from "./footer-trigger";
 
 // Short description lines for each effort level. Verbs match
@@ -168,7 +168,7 @@ export function ReasoningPicker({
       <PopoverContent
         className="w-[340px] p-0"
         align="start"
-        onOpenAutoFocus={focusCmdkRootOnOpen}
+        onOpenAutoFocus={focusCmdkOnOpen}
       >
         <Command>
           {hasEffortSection && ultrathinkInBodyText ? (

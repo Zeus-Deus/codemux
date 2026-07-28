@@ -37,7 +37,7 @@ import type {
 } from "@/tauri/types";
 
 import { ProviderLogo } from "../provider-logo";
-import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import { FOOTER_TRIGGER } from "./footer-trigger";
 
 /**
@@ -439,7 +439,7 @@ export function MultiProviderModelPicker({
         // 384px tall — a scannable column instead of a wide panel.
         className="w-[400px] max-w-[calc(100vw-2rem)] p-0"
         align="start"
-        onOpenAutoFocus={focusCmdkRootOnOpen}
+        onOpenAutoFocus={focusCmdkOnOpen}
       >
         {/* `minmax(0,1fr)` (not bare `1fr`): grid items default to
             min-width auto, so a long unbreakable subtitle line would

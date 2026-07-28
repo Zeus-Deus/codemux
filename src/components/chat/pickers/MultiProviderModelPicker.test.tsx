@@ -381,6 +381,31 @@ describe("MultiProviderModelPicker — provider rail", () => {
 });
 
 describe("MultiProviderModelPicker — search", () => {
+  it("focuses the search box on open so typing filters without a click", async () => {
+    const user = userEvent.setup();
+    renderPicker();
+    await openPicker(user);
+
+    // The provider rail's buttons precede the input in the DOM, so a
+    // default first-tabbable autofocus would land on the rail — the
+    // open-autofocus handler must aim at the input itself.
+    const input = screen.getByPlaceholderText("Search models...");
+    expect(input).toHaveFocus();
+
+    // Deliberately NO click — keystrokes go wherever focus already is.
+    await user.keyboard("gpt");
+    expect(input).toHaveValue("gpt");
+    await waitFor(() => {
+      const rows = screen.getAllByTestId("multi-provider-model-row");
+      expect(rows.some((r) => r.textContent?.includes("GPT-5.4 (Codex)"))).toBe(
+        true,
+      );
+      expect(
+        rows.some((r) => r.textContent?.includes("Claude Opus 4.7")),
+      ).toBe(false);
+    });
+  });
+
   it("filtering by query collapses provider grouping into a flat list", async () => {
     const user = userEvent.setup();
     renderPicker({ provider: "claude" });

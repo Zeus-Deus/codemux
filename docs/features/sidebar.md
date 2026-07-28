@@ -162,6 +162,13 @@ visual only — nothing is archived, closed, or deleted.
   now, then Settle, "Snooze until…", Mark unread — since a user who right-clicks
   a hidden row is usually there to undo the hiding. Every shape keeps
   rename / archive / delete / move-to-host below that.
+  Because a parked (settled or snoozed) workspace is still fully open, it also
+  stays a valid target in agent chat's "Run in" location picker, which reads
+  this same store to split its list into **Active** and **Settled · still
+  open** sections — both parked lifecycles fold into the parked side (see
+  `docs/features/agent-chat.md` → "Thread Scope"). The picker never writes the
+  store: selecting a parked project doesn't un-settle or wake it, because the
+  safety nets here already resurface it once its agent runs.
 - **Settled shelf ordering — by when work ENDED**: a settled entry records both
   `at` (when the sweep happened) and, when the caller knows it, `workEndedAt`
   (the workspace's backend `last_active_at` at settle time).
