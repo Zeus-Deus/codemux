@@ -2,6 +2,7 @@ import { BookOpen } from "lucide-react";
 
 import type { Skill } from "@/tauri/commands";
 
+import { dedupeSkillsByName } from "./skill-groups";
 import type { SlashCommandItem } from "./slash-commands";
 
 interface BuildSkillCommandsArgs {
@@ -20,12 +21,17 @@ interface BuildSkillCommandsArgs {
  * Items are returned in the order the backend produced them
  * (provider → scope → name) so the popup mirrors the order the user
  * sees in Settings.
+ *
+ * Same-named skills collapse to one row via `dedupeSkillsByName` —
+ * every copy would insert the same `/name` text, and the send-time
+ * resolver in `skill-tokens.ts` applies the identical first-wins rule,
+ * so the row shown is guaranteed to be the body that gets injected.
  */
 export function buildSkillCommands({
   skills,
   onInvoke,
 }: BuildSkillCommandsArgs): SlashCommandItem[] {
-  return skills.map((skill) => ({
+  return dedupeSkillsByName(skills).map((skill) => ({
     id: `skill:${skill.id}`,
     label: skill.name,
     description: formatSkillDescription(skill),

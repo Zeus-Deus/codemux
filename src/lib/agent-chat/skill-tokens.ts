@@ -42,8 +42,15 @@ export function parseSkillTokens(text: string, skills: Skill[]): SkillTokenMatch
 
   // Build a fast lookup once per call. Skill lists are small (≤50 in
   // practice) so a Map is sufficient — no need to memoize across calls.
+  //
+  // FIRST-wins, matching the popup's `dedupeSkillsByName`. A plain
+  // `set` loop would be last-wins, which silently disagreed with the
+  // menu: picking the top `/omarchy` row inserted text that resolved
+  // to the *lowest*-priority copy's body at send time.
   const byName = new Map<string, Skill>();
-  for (const s of skills) byName.set(s.name, s);
+  for (const s of skills) {
+    if (!byName.has(s.name)) byName.set(s.name, s);
+  }
 
   const matches: SkillTokenMatch[] = [];
   // Reset stateful regex's lastIndex per call — `g` flag mutates the

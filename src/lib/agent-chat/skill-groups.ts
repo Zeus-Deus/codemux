@@ -76,6 +76,48 @@ export function detectConflicts(skills: Skill[]): Map<string, Skill[]> {
 }
 
 /**
+ * Collapse same-named skills down to the one the composer will
+ * actually use, preserving input order.
+ *
+ * A skill is addressed in the draft purely by name — typing
+ * `/omarchy` cannot express "the Codex copy". So when the same name
+ * is reachable through several roots (very common: `~/.claude/skills`,
+ * `~/.codex/skills`, and `~/.agents/skills` are frequently symlinks to
+ * one source, and a real directory may exist under `~/.codemux/skills`
+ * as well) every copy inserts byte-identical text. Listing them all
+ * offers a choice that does not exist, and — because rows are keyed by
+ * skill id — copies reached through symlinks share an id, producing
+ * duplicate React keys and colliding menu values.
+ *
+ * First-wins. The backend sorts provider → scope → name, so the
+ * winner is the highest-priority provider at the narrowest scope,
+ * which is the copy a user would expect to take precedence.
+ *
+ * Matching is case-SENSITIVE, deliberately. `parseSkillTokens` resolves
+ * `/name` case-sensitively so that `/Plan` never silently expands to a
+ * skill called `plan`, which makes names differing only in case two
+ * genuinely distinct, separately addressable skills. Folding case here
+ * would hide one of them from the menu while leaving it reachable by
+ * typing — the exact popup/send-time drift this helper exists to
+ * prevent. Real duplicates come from one source reached through
+ * several roots, so their names match exactly anyway.
+ *
+ * This is deliberately NOT applied to the Settings list: seeing every
+ * install location is the point there, and `detectConflicts` above
+ * surfaces exactly these clashes so they stay discoverable.
+ */
+export function dedupeSkillsByName(skills: Skill[]): Skill[] {
+  const seen = new Set<string>();
+  const out: Skill[] = [];
+  for (const skill of skills) {
+    if (seen.has(skill.name)) continue;
+    seen.add(skill.name);
+    out.push(skill);
+  }
+  return out;
+}
+
+/**
  * Bucket skills by their group heading, returning groups in
  * `GROUP_ORDER`. Within each group skills are sorted alphabetically
  * by name (case-insensitive). Empty groups are dropped.

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Skill } from "@/tauri/commands";
 
+import { buildSkillCommands } from "./skill-commands";
 import {
   parseSkillTokens,
   resolveSkillBodies,
@@ -133,6 +134,69 @@ describe("resolveSkillBodies", () => {
   it("skips skills with empty / whitespace-only body", () => {
     const empty = makeSkill("blank", "   \n  ");
     expect(resolveSkillBodies("/blank", [empty])).toBeNull();
+  });
+
+  it("resolves a duplicated name to the FIRST copy, matching the popup", () => {
+    // Regression: the name lookup used to be last-wins while the popup
+    // was first-wins, so picking the top `/omarchy` row injected the
+    // last copy's body.
+    const duplicated = [
+      makeSkill("omarchy", "CLAUDE COPY"),
+      { ...makeSkill("omarchy", "CODEX COPY"), id: "id-omarchy-codex" },
+    ];
+    expect(resolveSkillBodies("/omarchy", duplicated)).toBe("CLAUDE COPY");
+  });
+});
+
+describe("popup / send-time agreement", () => {
+  it("injects the body of exactly the skill the popup offered", () => {
+    // The two surfaces must not drift: whatever single row the menu
+    // shows for a duplicated name is the body the model receives.
+    const duplicated = [
+      makeSkill("omarchy", "CLAUDE COPY"),
+      { ...makeSkill("omarchy", "CODEX COPY"), id: "id-omarchy-codex" },
+      { ...makeSkill("omarchy", "CODEMUX COPY"), id: "id-omarchy-codemux" },
+    ];
+
+    const rows = buildSkillCommands({
+      skills: duplicated,
+      onInvoke: () => {},
+    });
+    const omarchyRows = rows.filter((r) => r.command === "/omarchy");
+    expect(omarchyRows).toHaveLength(1);
+
+    const offeredId = omarchyRows[0].id.replace(/^skill:/, "");
+    const [resolved] = parseSkillTokens("/omarchy", duplicated);
+    expect(resolved.skill.id).toBe(offeredId);
+    expect(resolveSkillBodies("/omarchy", duplicated)).toBe("CLAUDE COPY");
+  });
+
+  it("keeps case-variant names reachable from both surfaces", () => {
+    // The dedupe must not fold case, because the resolver does not.
+    const variants = [
+      { ...makeSkill("Deploy", "UPPER BODY"), id: "id-Deploy" },
+      { ...makeSkill("deploy", "lower body"), id: "id-deploy" },
+    ];
+    const rows = buildSkillCommands({ skills: variants, onInvoke: () => {} });
+    expect(rows).toHaveLength(2);
+    expect(resolveSkillBodies("/Deploy", variants)).toBe("UPPER BODY");
+    expect(resolveSkillBodies("/deploy", variants)).toBe("lower body");
+  });
+
+  it("gives every popup row a unique id so menu keys cannot collide", () => {
+    // Symlinked copies share a canonical path, hence the same skill id
+    // — duplicate React keys / menu values before the dedupe.
+    const symlinked = [
+      makeSkill("omarchy", "BODY"),
+      makeSkill("omarchy", "BODY"),
+    ];
+    expect(symlinked[0].id).toBe(symlinked[1].id);
+
+    const ids = buildSkillCommands({
+      skills: symlinked,
+      onInvoke: () => {},
+    }).map((r) => r.id);
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });
 
