@@ -141,7 +141,7 @@ afterEach(async () => {
 });
 
 describe("SidebarRailWorkspaces", () => {
-  it("renders one button per active workspace, in appState order", async () => {
+  it("renders one button per active workspace, newest first", async () => {
     workspaces = [
       makeWorkspace({ title: "Alpha" }),
       makeWorkspace({ title: "Beta" }),
@@ -149,16 +149,19 @@ describe("SidebarRailWorkspaces", () => {
     ];
     const { container } = await renderRail();
 
+    // appState.workspaces is creation order; the rail sorts by stored index
+    // descending (the inbox's `compareNewestFirst`) so the newest workspace
+    // sits at the top, matching the expanded inbox.
     const buttons = [...container.querySelectorAll("[data-rail-ws]")];
     expect(buttons.map((b) => b.getAttribute("data-rail-ws"))).toEqual([
-      "ws-1",
-      "ws-2",
       "ws-3",
+      "ws-2",
+      "ws-1",
     ]);
     expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([
-      "Alpha",
-      "Beta",
       "Gamma",
+      "Beta",
+      "Alpha",
     ]);
   });
 
@@ -178,7 +181,7 @@ describe("SidebarRailWorkspaces", () => {
     const ids = [...container.querySelectorAll("[data-rail-ws]")].map((b) =>
       b.getAttribute("data-rail-ws"),
     );
-    expect(ids).toEqual(["ws-1", "ws-3"]);
+    expect(ids).toEqual(["ws-3", "ws-1"]);
   });
 
   it("excludes snoozed workspaces the same way it excludes settled ones", async () => {
@@ -201,7 +204,7 @@ describe("SidebarRailWorkspaces", () => {
     const ids = [...container.querySelectorAll("[data-rail-ws]")].map((b) =>
       b.getAttribute("data-rail-ws"),
     );
-    expect(ids).toEqual(["ws-1", "ws-4"]);
+    expect(ids).toEqual(["ws-4", "ws-1"]);
   });
 
   it("keeps the currently-open workspace visible even while it is parked", async () => {
@@ -224,7 +227,7 @@ describe("SidebarRailWorkspaces", () => {
     const ids = [...container.querySelectorAll("[data-rail-ws]")].map((b) =>
       b.getAttribute("data-rail-ws"),
     );
-    expect(ids).toEqual(["ws-1", "ws-3"]);
+    expect(ids).toEqual(["ws-3", "ws-1"]);
     expect(container.querySelector('[data-rail-ws="ws-3"]')).toHaveClass(
       "bg-foreground/[0.09]",
     );

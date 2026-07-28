@@ -316,6 +316,92 @@ describe("SidebarNeedsYouStrip", () => {
     );
   });
 
+  it("orders entries oldest-blocked-first so the longest-waiting blocker survives the cap", () => {
+    // Creation (tree) order is A→E, but they got blocked in the REVERSE
+    // order: E has been waiting longest, A shortest. With five blockers and a
+    // four-row cap, tree order would hide E — the one blocker the user most
+    // needs to unblock — behind "+1 more below".
+    const now = Date.now();
+    useSidebarDensityStore.setState({
+      statusSince: {
+        "ws-a": { status: "permission", at: now - 10 * 60_000 },
+        "ws-b": { status: "permission", at: now - 20 * 60_000 },
+        "ws-c": { status: "permission", at: now - 30 * 60_000 },
+        "ws-d": { status: "permission", at: now - 40 * 60_000 },
+        "ws-e": { status: "permission", at: now - 50 * 60_000 },
+      },
+      settledAt: {},
+      lastSeenAt: {},
+    });
+    setPaneStatuses({
+      "p-a": "permission",
+      "p-b": "permission",
+      "p-c": "permission",
+      "p-d": "permission",
+      "p-e": "permission",
+    });
+    const groups = [
+      group("Alpha", "/home/user/projects/alpha", [
+        makeWorkspace({ workspace_id: "ws-a", title: "A", surfaces: [surfaceWithPane("p-a")] }),
+        makeWorkspace({ workspace_id: "ws-b", title: "B", surfaces: [surfaceWithPane("p-b")] }),
+        makeWorkspace({ workspace_id: "ws-c", title: "C", surfaces: [surfaceWithPane("p-c")] }),
+        makeWorkspace({ workspace_id: "ws-d", title: "D", surfaces: [surfaceWithPane("p-d")] }),
+        makeWorkspace({ workspace_id: "ws-e", title: "E", surfaces: [surfaceWithPane("p-e")] }),
+      ]),
+    ];
+    render(<SidebarNeedsYouStrip projectGroups={groups} />);
+
+    // Header count reports all five blockers…
+    expect(screen.getByText(/NEEDS YOU · 5/)).toBeInTheDocument();
+    // …the visible rows run oldest-blocked-first…
+    const links = screen.getAllByRole("button", {
+      name: /waiting for your input/i,
+    });
+    expect(links.map((l) => l.getAttribute("aria-label"))).toEqual([
+      "Jump to E — waiting for your input",
+      "Jump to D — waiting for your input",
+      "Jump to C — waiting for your input",
+      "Jump to B — waiting for your input",
+    ]);
+    // …and the row the cap hides is the NEWEST blocker (A), never the oldest.
+    expect(screen.getByText("+1 more below")).toBeInTheDocument();
+  });
+
+  it("ranks a blocker without a seeded timestamp as newest, ties in tree order", () => {
+    // Only B has an observed block time; A and C are fresh blockers whose
+    // timestamps haven't been stamped yet. B (the only one known to have
+    // waited) must sort first; the unseeded pair keeps stable tree order.
+    useSidebarDensityStore.setState({
+      statusSince: {
+        "ws-b": { status: "permission", at: Date.now() - 30 * 60_000 },
+      },
+      settledAt: {},
+      lastSeenAt: {},
+    });
+    setPaneStatuses({
+      "p-a": "permission",
+      "p-b": "permission",
+      "p-c": "permission",
+    });
+    const groups = [
+      group("Alpha", "/home/user/projects/alpha", [
+        makeWorkspace({ workspace_id: "ws-a", title: "A", surfaces: [surfaceWithPane("p-a")] }),
+        makeWorkspace({ workspace_id: "ws-b", title: "B", surfaces: [surfaceWithPane("p-b")] }),
+        makeWorkspace({ workspace_id: "ws-c", title: "C", surfaces: [surfaceWithPane("p-c")] }),
+      ]),
+    ];
+    render(<SidebarNeedsYouStrip projectGroups={groups} />);
+
+    const links = screen.getAllByRole("button", {
+      name: /waiting for your input/i,
+    });
+    expect(links.map((l) => l.getAttribute("aria-label"))).toEqual([
+      "Jump to B — waiting for your input",
+      "Jump to A — waiting for your input",
+      "Jump to C — waiting for your input",
+    ]);
+  });
+
   it("sources the project chip color from the project.color UI-state key", () => {
     mockDbGetUiState.mockResolvedValue("#ef4444");
     setPaneStatuses({ "p-perm": "permission" });

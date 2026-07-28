@@ -45,6 +45,7 @@ import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { useProjectActions } from "@/hooks/use-project-actions";
 import { useProjectAppearance } from "./use-project-appearance";
 import { SidebarInboxCard, type InboxRepo } from "./sidebar-inbox-card";
+import { SidebarNeedsYouStrip } from "./sidebar-needs-you-strip";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import {
   computeSnoozePresets,
@@ -1446,88 +1447,103 @@ export function SidebarInbox() {
 
   return (
     <div className="flex flex-col">
-      {/* Project filter — sticky so the filter stays reachable while the card
-          list scrolls beneath it. */}
-      <div className="sticky top-0 z-10 flex items-center gap-1.5 bg-sidebar px-2.5 pb-2.5 pt-0.5 min-w-0">
-        <DropdownMenu open={filterMenuOpen} onOpenChange={setFilterMenuOpen}>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              aria-label="Filter by project"
-              data-project-filter
-              className={cn(
-                "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[7px] px-2.5",
-                "border border-transparent bg-transparent text-xs font-semibold text-foreground/80",
-                "transition-colors duration-150 hover:border-border/60 hover:bg-foreground/[0.04]",
-              )}
-            >
-              {filter === null ? (
-                <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-              ) : (
-                <ProjectMiniAvatar name={filterName ?? ""} path={filter} />
-              )}
-              <span className="min-w-0 flex-1 truncate text-left">
-                {filter === null ? "All projects" : filterName}
-              </span>
-              <ChevronDown
+      {/* Sticky header block: the project filter plus the "needs you" strip.
+          Both stay put while the card list scrolls beneath them, so blocked
+          work is reachable from anywhere in a long list — that reachability
+          is what lets the list below keep its static, status-blind order. */}
+      <div className="sticky top-0 z-10 bg-sidebar">
+        <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-0.5 min-w-0">
+          <DropdownMenu open={filterMenuOpen} onOpenChange={setFilterMenuOpen}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label="Filter by project"
+                data-project-filter
                 className={cn(
-                  "size-3 shrink-0 text-muted-foreground transition-transform duration-150",
-                  filterMenuOpen && "rotate-180",
+                  "flex h-8 min-w-0 flex-1 items-center gap-2 rounded-[7px] px-2.5",
+                  "border border-transparent bg-transparent text-xs font-semibold text-foreground/80",
+                  "transition-colors duration-150 hover:border-border/60 hover:bg-foreground/[0.04]",
                 )}
-              />
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent side="bottom" align="start" className="w-[248px]">
-            <DropdownMenuItem
-              onClick={() => setFilter(null)}
-              aria-label="All projects"
-              className={cn(
-                "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
-                filter === null && "bg-foreground/[0.08] text-foreground",
-              )}
-            >
-              <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-              <span className="min-w-0 flex-1 truncate">All projects</span>
-              <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
-                {projectCounts.total}
-              </span>
-            </DropdownMenuItem>
-            {projectGroups.map((group) => (
-              <ProjectFilterItem
-                key={group.projectPath}
-                name={group.projectName}
-                path={group.projectPath}
-                count={projectCounts.map.get(group.projectPath) ?? 0}
-                active={filter === group.projectPath}
-                onSelect={() => setFilter(group.projectPath)}
-              />
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <button
-              type="button"
-              aria-label="Add repository"
-              className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-dashed border-border text-sm leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
-            >
-              +
-            </button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent side="bottom" align="start">
-            <DropdownMenuItem onClick={() => openProject()} className="text-xs">
-              <FolderOpen className="mr-2 h-3.5 w-3.5" />
-              Open project
-            </DropdownMenuItem>
-            <DropdownMenuItem
-              onClick={() => setShowNewProjectScreen(true)}
-              className="text-xs"
-            >
-              <FolderPlus className="mr-2 h-3.5 w-3.5" />
-              New project
-            </DropdownMenuItem>
-          </DropdownMenuContent>
-        </DropdownMenu>
+              >
+                {filter === null ? (
+                  <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+                ) : (
+                  <ProjectMiniAvatar name={filterName ?? ""} path={filter} />
+                )}
+                <span className="min-w-0 flex-1 truncate text-left">
+                  {filter === null ? "All projects" : filterName}
+                </span>
+                <ChevronDown
+                  className={cn(
+                    "size-3 shrink-0 text-muted-foreground transition-transform duration-150",
+                    filterMenuOpen && "rotate-180",
+                  )}
+                />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent side="bottom" align="start" className="w-[248px]">
+              <DropdownMenuItem
+                onClick={() => setFilter(null)}
+                aria-label="All projects"
+                className={cn(
+                  "h-8 gap-2 rounded-[7px] px-2 text-xs font-semibold",
+                  filter === null && "bg-foreground/[0.08] text-foreground",
+                )}
+              >
+                <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1 truncate">All projects</span>
+                <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                  {projectCounts.total}
+                </span>
+              </DropdownMenuItem>
+              {projectGroups.map((group) => (
+                <ProjectFilterItem
+                  key={group.projectPath}
+                  name={group.projectName}
+                  path={group.projectPath}
+                  count={projectCounts.map.get(group.projectPath) ?? 0}
+                  active={filter === group.projectPath}
+                  onSelect={() => setFilter(group.projectPath)}
+                />
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label="Add repository"
+                className="flex size-8 shrink-0 items-center justify-center rounded-[7px] border border-dashed border-border text-sm leading-none text-muted-foreground transition-colors duration-150 hover:border-muted-foreground/60 hover:text-foreground"
+              >
+                +
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent side="bottom" align="start">
+              <DropdownMenuItem onClick={() => openProject()} className="text-xs">
+                <FolderOpen className="mr-2 h-3.5 w-3.5" />
+                Open project
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={() => setShowNewProjectScreen(true)}
+                className="text-xs"
+              >
+                <FolderPlus className="mr-2 h-3.5 w-3.5" />
+                New project
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </div>
+
+        {/* Pinned "needs you" strip. Sits above the list rather than
+            reordering it: blocked work is duplicated as a jump-link, so it is
+            always one click away no matter how far down its card sits, while
+            every card keeps its position. This is the whole reason the list
+            can afford to be status-blind. Renders nothing when no agent is
+            waiting. */}
+        <SidebarNeedsYouStrip
+          projectGroups={projectGroups}
+          filterPath={filter}
+        />
       </div>
 
       <div className="px-2.5 pb-2.5" onContextMenuCapture={handleListContextMenuCapture}>
