@@ -444,6 +444,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const markRequestResponding = useAgentChatStore(
     (s) => s.markRequestResponding,
   );
+  const markRequestPending = useAgentChatStore((s) => s.markRequestPending);
   const markRequestResolved = useAgentChatStore(
     (s) => s.markRequestResolved,
   );
@@ -1923,16 +1924,31 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
 
   const handleRespond = useCallback(
-    (requestId: string, decision: ApprovalDecision) => {
-      if (!threadId) return;
+    (
+      requestId: string,
+      decision: ApprovalDecision,
+      propagateFailure = false,
+    ) => {
+      if (!threadId) return Promise.resolve();
+      const tid = threadId;
       markRequestResponding(threadId, requestId, decision);
-      agentChatRespondToRequest(provider, threadId, requestId, decision).catch(
-        (err) => {
-          toast.error(`Failed to send decision: ${err}`);
-        },
-      );
+      return agentChatRespondToRequest(
+        provider,
+        threadId,
+        requestId,
+        decision,
+      ).catch((err) => {
+        markRequestPending(tid, requestId);
+        toast.error(`Failed to send decision: ${err}`);
+        if (propagateFailure) throw err;
+      });
     },
-    [threadId, provider, markRequestResponding],
+    [
+      threadId,
+      provider,
+      markRequestResponding,
+      markRequestPending,
+    ],
   );
 
   /**
@@ -2689,12 +2705,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleSubmitUserInput = useCallback(
     (output: AskUserQuestionOutput) => {
       if (!pendingUserInput || pendingUserInput.kind !== "permission_request") {
-        return;
+        return Promise.resolve();
       }
-      handleRespond(pendingUserInput.request_id, {
-        decision: "allow",
-        updated_input: output,
-      });
+      return handleRespond(
+        pendingUserInput.request_id,
+        {
+          decision: "allow",
+          updated_input: output,
+        },
+        true,
+      );
     },
     [pendingUserInput, handleRespond],
   );

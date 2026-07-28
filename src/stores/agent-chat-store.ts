@@ -5,6 +5,7 @@ import {
   applyEvent,
   appendUserMessage,
   createEmptyThreadState,
+  markRequestPending,
   markRequestResolved,
   markRequestResponding,
   removeUserMessageByNonce,
@@ -202,6 +203,8 @@ interface AgentChatStore {
     requestId: string,
     decision: ApprovalDecision,
   ) => void;
+  /** Restore an in-flight request after a retryable response failure. */
+  markRequestPending: (threadId: string, requestId: string) => void;
   /** Locally mark a permission request resolved (no sidecar round-trip).
    *  Used for plan accept/reject — the sidecar denied+interrupted the
    *  ExitPlanMode tool, so no `request-resolved` notification will fire. */
@@ -375,6 +378,14 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       updateSlice(state, threadId, (slice) => ({
         ...slice,
         ...markRequestResponding(slice, requestId, decision),
+      })),
+    ),
+
+  markRequestPending: (threadId, requestId) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) => ({
+        ...slice,
+        ...markRequestPending(slice, requestId),
       })),
     ),
 

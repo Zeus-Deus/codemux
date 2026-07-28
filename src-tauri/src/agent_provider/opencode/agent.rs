@@ -260,6 +260,14 @@ impl AgentProvider for OpenCodeAgentProvider {
         session.respond_to_request(request_id, decision).await
     }
 
+    fn pending_requests_survive_session_restart(&self) -> bool {
+        // OpenCode stores permission requests in its HTTP server and accepts
+        // replies by session/request id. Re-adopting the server-side session
+        // can therefore preserve an outstanding request across a Codemux
+        // process restart, unlike Claude/Codex's in-process callbacks.
+        true
+    }
+
     async fn set_model(&self, thread_id: ThreadId, model: String) -> Result<(), ProviderError> {
         let session = self.lookup(&thread_id).await?;
         session.set_model(model).await;

@@ -54,6 +54,7 @@ interface Props {
  *
  *   pending_approval  approval=pending           → header + expanded input + Allow/Deny
  *   responding        approval=responding        → header + "Submitting decision…"
+ *   expired           approval=failed            → error header + expiry explanation
  *   denied            approval=resolved & deny   → header with strike-through + one-liner
  *   executing         no approval & status=running → header + spinner, body collapsed
  *   success           status=done                → header + check, body collapsed, expandable
@@ -67,9 +68,15 @@ export const ToolCallCard = memo(function ToolCallCard({
   const resolution = approval?.resolution;
   const isPendingApproval = resolution?.state === "pending";
   const isResponding = resolution?.state === "responding";
+  const isRequestFailed = resolution?.state === "failed";
   const isDenied =
     resolution?.state === "resolved" && resolution.decision.decision !== "allow";
-  const isExecuting = !isPendingApproval && !isResponding && !isDenied && item.status === "running";
+  const isExecuting =
+    !isPendingApproval &&
+    !isResponding &&
+    !isRequestFailed &&
+    !isDenied &&
+    item.status === "running";
   const isSuccess = item.status === "done";
   const isError = item.status === "error";
 
@@ -181,6 +188,12 @@ export const ToolCallCard = memo(function ToolCallCard({
       {isResponding && (
         <div className="border-t border-border/60 px-3 py-2 text-xs text-muted-foreground/70">
           Submitting decision…
+        </div>
+      )}
+
+      {isRequestFailed && resolution?.state === "failed" && (
+        <div className="border-t border-border/60 px-3 py-2 text-xs text-muted-foreground">
+          {resolution.message}
         </div>
       )}
 

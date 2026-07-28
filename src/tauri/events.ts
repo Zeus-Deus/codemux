@@ -343,6 +343,13 @@ export type ProviderRuntimeEvent =
       decision: ApprovalDecision;
     }
   | {
+      type: "request_response_failed";
+      thread_id: string;
+      request_id: string;
+      reason: "stale_provider_callback";
+      message: string;
+    }
+  | {
       type: "session_state_changed";
       thread_id: string;
       status: SessionStatus;

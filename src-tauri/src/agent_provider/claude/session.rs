@@ -812,14 +812,9 @@ impl ClaudeSession {
                 Ok(())
             }
             Err(crate::json_rpc_child::RpcChildError::RpcError(err))
-                if err.code == -32602 =>
+                if is_request_not_pending_rpc(&err) =>
             {
-                Err(ProviderError::ValidationError {
-                    message: format!(
-                        "request {} not found or already resolved",
-                        request_id.0
-                    ),
-                })
+                Err(ProviderError::RequestNotPending { request_id })
             }
             Err(e) => Err(ProviderError::RpcError {
                 message: format!("respond-to-request RPC failed: {e}"),
@@ -920,6 +915,21 @@ impl ClaudeSession {
             state.pending_approvals.clear();
         }
     }
+}
+
+/// The sidecar now reports a missing callback as InvalidParams (`-32602`),
+/// but older bundled sidecars threw a plain `Error`, which the dispatcher
+/// surfaced as InternalError (`-32603`). Match both only when the message is
+/// the known missing-request diagnostic so unrelated invalid params/internal
+/// failures retain their real classification.
+fn is_request_not_pending_rpc(err: &crate::json_rpc_child::RpcError) -> bool {
+    if err.code != -32602 && err.code != -32603 {
+        return false;
+    }
+    let message = err.message.to_ascii_lowercase();
+    message.contains("not found or already resolved")
+        || message.contains("unknown pending")
+        || message.contains("no pending approval")
 }
 
 /// Replace an empty [`TurnId`] on an event with the session's
@@ -1492,6 +1502,33 @@ mod tests {
             "alreadyClosed": true
         })));
         assert!(!stop_response_indicates_already_closed(&json!({})));
+    }
+
+    #[test]
+    fn missing_request_rpc_classifier_accepts_old_and_new_sidecar_codes_only() {
+        for code in [-32602, -32603] {
+            assert!(is_request_not_pending_rpc(
+                &crate::json_rpc_child::RpcError {
+                    code,
+                    message: "request req-1 not found or already resolved".into(),
+                    data: None,
+                }
+            ));
+        }
+        assert!(!is_request_not_pending_rpc(
+            &crate::json_rpc_child::RpcError {
+                code: -32603,
+                message: "database exploded".into(),
+                data: None,
+            }
+        ));
+        assert!(!is_request_not_pending_rpc(
+            &crate::json_rpc_child::RpcError {
+                code: -32000,
+                message: "request req-1 not found or already resolved".into(),
+                data: None,
+            }
+        ));
     }
 
     /// Build a bare `QueuedTurn` with a given id for reorder tests. The

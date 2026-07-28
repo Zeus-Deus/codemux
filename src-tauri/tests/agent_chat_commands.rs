@@ -34,9 +34,9 @@ use codemux_lib::agent_provider::{
     SendTurnInput, StartSessionInput, ThreadId, TurnId,
 };
 use codemux_lib::commands::agent_chat::{
-    feature_flag_on, forward_event, thread_id_for_event, AgentChatChannelRegistry,
-    AgentChatEventPayload, ProviderRegistry, RunActivityTracker, SubagentTracker,
-    AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
+    agent_chat_respond_to_request, feature_flag_on, forward_event, thread_id_for_event,
+    AgentChatChannelRegistry, AgentChatEventPayload, ProviderRegistry, RunActivityTracker,
+    SubagentTracker, AGENT_CHAT_EVENT, FEATURE_DISABLED_ERROR,
 };
 use codemux_lib::database::DatabaseStore;
 use codemux_lib::observability::{FeatureFlags, ObservabilityStore};
@@ -285,6 +285,71 @@ async fn respond_to_request_forwards_to_provider() {
             RequestId("req-1".into()),
         )]
     );
+}
+
+#[tokio::test]
+async fn response_on_dead_nonresumable_session_persists_terminal_stale_event() {
+    let app = tauri::test::mock_app();
+    let handle = app.handle().clone();
+    let db = DatabaseStore::new_in_memory();
+    db.upsert_agent_chat_session(
+        "thread-stale",
+        "workspace-stale",
+        Some("/tmp/codemux-test"),
+        "claude",
+    )
+    .unwrap();
+    app.manage(db);
+    app.manage(test_observability(true));
+    app.manage(AppStateStore::default());
+    app.manage(ProviderRegistry::new());
+    app.manage(AgentChatChannelRegistry::default());
+    app.manage(SubagentTracker::default());
+    app.manage(RunActivityTracker::default());
+
+    let claude_mock = Arc::new(MockAgentProvider::new(ProviderKind::Claude));
+    {
+        let registry: State<'_, ProviderRegistry> = handle.state();
+        registry.set_claude(claude_mock.clone() as _).await;
+    }
+
+    agent_chat_respond_to_request(
+        handle.clone(),
+        ProviderKind::Claude,
+        ThreadId("thread-stale".into()),
+        RequestId("req-stale".into()),
+        ApprovalDecision::Allow {
+            updated_input: Some(serde_json::json!({ "answers": {} })),
+            updated_permissions: None,
+        },
+    )
+    .await
+    .expect("stale response is handled as a durable terminal outcome");
+
+    assert!(
+        claude_mock.calls.snapshot().is_empty(),
+        "a dead callback must not spawn/resume a session or attempt a response"
+    );
+    let db: State<'_, DatabaseStore> = handle.state();
+    let payloads = db.list_agent_chat_messages("thread-stale");
+    assert_eq!(payloads.len(), 1);
+    let event: ProviderRuntimeEvent = serde_json::from_str(&payloads[0]).unwrap();
+    match event {
+        ProviderRuntimeEvent::RequestResponseFailed {
+            request_id,
+            reason,
+            message,
+            ..
+        } => {
+            assert_eq!(request_id.0, "req-stale");
+            assert_eq!(
+                reason,
+                codemux_lib::agent_provider::RequestResponseFailureReason::StaleProviderCallback
+            );
+            assert!(message.contains("expired"));
+        }
+        other => panic!("expected terminal request failure, got {other:?}"),
+    }
 }
 
 #[tokio::test]

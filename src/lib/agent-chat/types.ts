@@ -164,7 +164,12 @@ export interface PermissionRequestItem {
   resolution:
     | { state: "pending" }
     | { state: "responding"; decision: ApprovalDecision }
-    | { state: "resolved"; decision: ApprovalDecision };
+    | { state: "resolved"; decision: ApprovalDecision }
+    | {
+        state: "failed";
+        reason: "stale_provider_callback";
+        message: string;
+      };
 }
 
 export interface TurnEndedItem {

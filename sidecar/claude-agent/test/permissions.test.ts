@@ -3,6 +3,7 @@
 // a full session.
 
 import { describe, expect, test } from "bun:test";
+import type { PermissionUpdate } from "@anthropic-ai/claude-agent-sdk";
 
 import type { EventEmitter } from "../src/session.ts";
 import {
@@ -218,7 +219,7 @@ test("allow with updatedPermissions surfaces the array on PermissionResult", asy
       behavior: "allow",
       destination: "localSettings",
     },
-  ];
+  ] satisfies PermissionUpdate[];
   pending.get(requestId)?.({
     behavior: "allow",
     updatedPermissions: ruleArray,

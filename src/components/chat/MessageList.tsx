@@ -709,6 +709,13 @@ function renderAssistantBody(
               </div>
             );
           }
+          if (item.resolution.state === "failed") {
+            return (
+              <div className="py-0.5 text-xs text-muted-foreground">
+                {item.resolution.message}
+              </div>
+            );
+          }
           // Resolved: echo the user's selection as a reply bubble so the
           // transcript actually shows that they answered.
           return <UserInputAnswer item={item} />;

@@ -36,6 +36,19 @@ pub enum SubagentStatus {
     Stopped,
 }
 
+/// Why a response to a provider request could not be delivered.
+///
+/// Kept separate from [`ApprovalDecision`]: a failed response is not a
+/// denial/cancellation by the user, and must never be rendered as though the
+/// provider received their decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestResponseFailureReason {
+    /// Conversation history was resumed, but the provider's process-local
+    /// callback for this request no longer exists.
+    StaleProviderCallback,
+}
+
 /// A merge-able state snapshot for one subagent.
 ///
 /// Providers dribble a subagent's identity out across many events (its
@@ -307,6 +320,15 @@ pub enum ProviderRuntimeEvent {
         thread_id: ThreadId,
         request_id: RequestId,
         decision: ApprovalDecision,
+    },
+    /// A response could not be delivered and the request is terminal from
+    /// Codemux's perspective. Persisting this event prevents transcript
+    /// hydration from resurrecting an orphaned approval/question forever.
+    RequestResponseFailed {
+        thread_id: ThreadId,
+        request_id: RequestId,
+        reason: RequestResponseFailureReason,
+        message: String,
     },
     /// The session lifecycle phase changed (starting → ready → running …).
     SessionStateChanged {

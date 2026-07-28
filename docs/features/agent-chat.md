@@ -308,7 +308,7 @@ The chat pane stack:
   empty on every launch (no startup rehydration), so the backend
   `ensure_live_session` choke point in `commands/agent_chat.rs` rebuilds a
   dead session from its `agent_chat_sessions` row on the next
-  `agent_chat_send_turn` / `agent_chat_respond_to_request` — reusing the
+  `agent_chat_send_turn` — reusing the
   SAME `thread_id` (keeping the attached Channel, pane snapshot, and store
   slice valid) and passing `resume_cursor: {"resume": sdk_session_id}`
   when the row carries one (falling back to a fresh session, whose
@@ -325,6 +325,19 @@ The chat pane stack:
   pickers + resume cursor from the row, falling back to the provider
   default model only when no row (or no persisted model) exists —
   fixing the post-restart "reset to Opus" regression.
+  - **Pending requests are not conversation history.** Claude/Codex keep
+    approval and `AskUserQuestion` callbacks only in the live
+    sidecar/app-server process. Resuming the transcript cannot reconstruct
+    those callbacks, so `agent_chat_respond_to_request` never starts a new
+    Claude/Codex session merely to answer an old request. It persists
+    `request_response_failed { reason: "stale_provider_callback" }` instead;
+    reducer replay terminalizes the request and explains that the user should
+    Continue so the agent can repeat it. Hydration applies the same terminal
+    state to an unresolved persisted request whenever the backend confirms no
+    turn is live, while preserving requests across an ordinary workspace
+    switch when their original turn is still running. OpenCode is the
+    exception: its permission state lives in the external HTTP server, so its
+    adapter explicitly opts into request resume.
   - **NULL `permission_mode` heal**: rows created before the
     `permission_mode` column existed read back NULL. The frontend seeds its
     permission picker to the provider default ("Full access" =
@@ -2052,7 +2065,7 @@ surfacing a `feature_disabled` string.
 | `agent_chat_send_turn` | Queue a user turn on a thread. Auto-resumes a dead session (rebuilt from its persisted row) before the turn, so a pane reopened after an app restart never sees `session_not_found`. |
 | `agent_chat_interrupt_turn` | Halt the currently-running turn. On a live session the turn ends as `TurnCompleted(interrupted)` and the session stays `Ready` (the sidecar keeps the thread alive and the next `send_turn` rebuilds a resumed query). A `SessionNotFound` (nothing to interrupt on an already-dead session) is swallowed into `Ok`; unlike `send_turn` it does NOT auto-resume a dead session just to interrupt it. |
 | `agent_chat_turn_active` | Cheap in-memory liveness probe: `true` iff a live (non-dead) session is bound to the thread and its `active_turn` is set (Running or WaitingApproval). Never touches the subprocess and never auto-resumes. Used by the remount hydrate path to suppress the false "Run interrupted" divider on a healthy mid-flight run (see "Live-run guard on hydrate"). |
-| `agent_chat_respond_to_request` | Resolve a pending approval / input request. Auto-resumes a dead session first (same choke point as `send_turn`). |
+| `agent_chat_respond_to_request` | Resolve a pending approval / input request. Claude/Codex only respond on the original live session; if its process-local callback is gone, a durable `request_response_failed` event expires the control instead of starting a replacement session that cannot know the request. OpenCode may resume its server-backed pending permission first. |
 | `agent_chat_set_model` | Swap a thread's model. Persist-always, apply-if-live: writes the model to the session row unconditionally, then applies to the live session if one exists; a `SessionNotFound` from the apply is swallowed into `Ok` (the value takes effect on the next auto-resume). |
 | `agent_chat_set_permission_mode` | Swap a thread's permission mode. Same persist-always, apply-if-live contract as `agent_chat_set_model`. |
 | `agent_chat_stop_session` | Gracefully close a session. Idempotent. |

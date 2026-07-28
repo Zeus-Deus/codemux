@@ -406,6 +406,54 @@ describe("agent-chat reducer", () => {
     expect(state.pendingRequestIds).toEqual([]);
   });
 
+  it("terminalizes a stale request response and settles its linked tool", () => {
+    let state = runEvents([
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: {
+          kind: "tool_use",
+          tool_name: "Bash",
+          input: { command: "pwd" },
+          tool_use_id: "tool-1",
+        },
+      },
+      {
+        type: "request_opened",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        request_id: "req-stale",
+        request_kind: "tool-permission",
+        payload: { tool_name: "Bash" },
+        tool_use_id: "tool-1",
+      },
+    ]);
+
+    state = applyEvent(state, {
+      type: "request_response_failed",
+      thread_id: "t1",
+      request_id: "req-stale",
+      reason: "stale_provider_callback",
+      message: "Question expired.",
+    });
+
+    const request = state.messages.find(
+      (m): m is PermissionRequestItem =>
+        m.kind === "permission_request" && m.request_id === "req-stale",
+    );
+    expect(request?.resolution).toEqual({
+      state: "failed",
+      reason: "stale_provider_callback",
+      message: "Question expired.",
+    });
+    const tool = state.messages.find(
+      (m) => m.kind === "tool_call" && m.tool_use_id === "tool-1",
+    );
+    expect(tool?.kind === "tool_call" && tool.status).toBe("error");
+    expect(state.pendingRequestIds).toEqual([]);
+  });
+
   it("passes through unknown event variants and warns once", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const base = createEmptyThreadState();

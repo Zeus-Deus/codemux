@@ -19,8 +19,11 @@ import {
  * shapes the design calls for.
  */
 describe("workflow demo fixtures", () => {
-  function replay(envelopes: unknown[]): ReturnType<typeof replayPayloads> {
-    return replayPayloads(envelopes.map((e) => JSON.stringify(e)));
+  function replay(
+    envelopes: unknown[],
+    runLive = false,
+  ): ReturnType<typeof replayPayloads> {
+    return replayPayloads(envelopes.map((e) => JSON.stringify(e)), { runLive });
   }
 
   function soleWorkflow(state: ReturnType<typeof replayPayloads>): WorkflowRunItem {
@@ -36,7 +39,7 @@ describe("workflow demo fixtures", () => {
   }
 
   it("approval thread: pending_approval with planned phases, script, and a linked open request", () => {
-    const state = replay(workflowApprovalEnvelopes("t-approval"));
+    const state = replay(workflowApprovalEnvelopes("t-approval"), true);
     const wf = soleWorkflow(state);
 
     expect(wf.status).toBe("pending_approval");

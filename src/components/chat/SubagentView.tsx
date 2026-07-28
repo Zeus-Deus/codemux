@@ -131,7 +131,11 @@ function SubItem({ item }: { item: ChatViewItem }) {
     case "permission_request":
       return (
         <div className="rounded-[9px] border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          Approval requested — respond in the orchestrator.
+          {item.resolution.state === "failed"
+            ? item.resolution.message
+            : item.resolution.state === "pending"
+              ? "Approval requested — respond in the orchestrator."
+              : "Approval handled in the orchestrator."}
         </div>
       );
     default:

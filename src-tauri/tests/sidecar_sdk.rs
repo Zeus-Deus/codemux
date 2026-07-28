@@ -282,17 +282,10 @@ async fn respond_to_request_with_unknown_request_id_returns_invalid_params() {
         .unwrap_err();
     match err {
         RpcChildError::RpcError(e) => {
-            // -32603 (internal) or -32602 (invalid params) are both
-            // acceptable since respondToRequest throws a plain Error
-            // inside the session, which the dispatcher surfaces as
-            // internal. The important thing is that the sidecar
-            // stays alive and the error is structured.
-            assert!(
-                e.code == -32602 || e.code == -32603,
-                "unexpected error code {}: {}",
-                e.code,
-                e.message,
-            );
+            // Missing callbacks are a caller-visible stale request, not an
+            // internal sidecar crash. Keep this code stable so the Rust
+            // adapter can classify it without relying on prose alone.
+            assert_eq!(e.code, -32602, "unexpected error: {}", e.message);
             assert!(
                 e.message.contains("does-not-exist")
                     || e.message.contains("not found")

@@ -382,6 +382,14 @@ impl OpenCodeSession {
             })?;
         let status = response.status();
         if !status.is_success() {
+            if matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND
+                    | reqwest::StatusCode::CONFLICT
+                    | reqwest::StatusCode::GONE
+            ) {
+                return Err(ProviderError::RequestNotPending { request_id });
+            }
             return Err(ProviderError::RpcError {
                 message: format!("permission_http_status_{}", status.as_u16()),
             });
