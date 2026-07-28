@@ -140,6 +140,95 @@ fn discovers_skills_across_all_provider_directories() {
     );
 }
 
+/// Regression: a Codex skill in a project's `.agents/skills/` is listed
+/// by the Codex CLI but was invisible in the Codemux slash popup, because
+/// project-scope enumeration only covered `.codex/skills`. The user-scope
+/// enumeration had both Codex roots; project scope had one.
+#[test]
+fn discovers_project_scoped_codex_skill_under_agents_root() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let agents_project = project.path().join(".agents").join("skills");
+    fs::create_dir_all(&agents_project).unwrap();
+    write_skill(
+        &agents_project,
+        "update-personal-desktop",
+        "---\nname: update-personal-desktop\ndescription: Update the fork and rebuild\n---\nBody.",
+    );
+
+    let skills = collect_skills(home.path(), Some(project.path()), false);
+
+    let found = skills
+        .iter()
+        .find(|s| s.name == "update-personal-desktop")
+        .expect("project-scope .agents/skills skill not discovered");
+    assert_eq!(found.provider, SkillProvider::Codex);
+    assert_eq!(found.scope, SkillScope::Project);
+}
+
+/// Both Codex project roots are scanned, and a skill in each shows up
+/// exactly once — no accidental double-listing when a repo populates
+/// both conventions with different skills.
+#[test]
+fn both_codex_project_roots_are_scanned_independently() {
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let codex_project = project.path().join(".codex").join("skills");
+    fs::create_dir_all(&codex_project).unwrap();
+    write_skill(
+        &codex_project,
+        "legacy-root",
+        "---\nname: legacy-root\ndescription: x\n---\nBody.",
+    );
+
+    let agents_project = project.path().join(".agents").join("skills");
+    fs::create_dir_all(&agents_project).unwrap();
+    write_skill(
+        &agents_project,
+        "new-root",
+        "---\nname: new-root\ndescription: x\n---\nBody.",
+    );
+
+    let skills = collect_skills(home.path(), Some(project.path()), false);
+    let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+
+    assert_eq!(names.iter().filter(|n| **n == "legacy-root").count(), 1);
+    assert_eq!(names.iter().filter(|n| **n == "new-root").count(), 1);
+}
+
+/// When a repo symlinks `.agents/skills` at `.codex/skills` to serve both
+/// conventions from one directory, the skill must be listed once. Listing
+/// it twice would trip the name-based conflict detector in Settings for
+/// what is a single file on disk.
+#[cfg(unix)]
+#[test]
+fn aliased_codex_project_roots_yield_one_listing() {
+    use std::os::unix::fs::symlink;
+
+    let home = TempDir::new().unwrap();
+    let project = TempDir::new().unwrap();
+
+    let codex_project = project.path().join(".codex").join("skills");
+    fs::create_dir_all(&codex_project).unwrap();
+    write_skill(
+        &codex_project,
+        "shared",
+        "---\nname: shared\ndescription: x\n---\nBody.",
+    );
+    fs::create_dir_all(project.path().join(".agents")).unwrap();
+    symlink(&codex_project, project.path().join(".agents").join("skills")).unwrap();
+
+    let skills = collect_skills(home.path(), Some(project.path()), false);
+    assert_eq!(
+        skills.iter().filter(|s| s.name == "shared").count(),
+        1,
+        "aliased roots should not double-list: {:?}",
+        skills.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn include_plugins_false_hides_plugin_pool() {
     let home = TempDir::new().unwrap();
