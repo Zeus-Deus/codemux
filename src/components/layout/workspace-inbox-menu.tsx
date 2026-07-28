@@ -8,6 +8,10 @@ import {
   DeleteWorktreeDialog,
 } from "./sidebar-workspace-row";
 import { ConfirmPushDialog } from "@/components/overlays/confirm-push-dialog";
+import { ProjectImageDialog } from "@/components/overlays/project-image-dialog";
+import { ProjectAppearanceMenu } from "./project-appearance-menu";
+import { useProjectAppearance } from "./use-project-appearance";
+import { useProjectAppearanceStore } from "@/stores/project-appearance-store";
 import {
   archiveWorkspace,
   closeWorkspace,
@@ -26,6 +30,11 @@ import type {
 
 interface Props {
   workspace: WorkspaceSnapshot;
+  /** The project this workspace belongs to (name + absolute root path).
+   *  Carries the project-level avatar actions into the menu — every inbox row
+   *  shape already resolves it for its avatar, so right-clicking any workspace
+   *  can reach the settings for its owning project. */
+  repo: { name: string; path: string };
   /** Optional Settle / Un-settle entry surfaced at the top of the menu —
    *  the inbox card passes "settle" (when settleable), a settled row passes
    *  "unsettle", so the right-click menu mirrors the hover affordance. */
@@ -47,6 +56,7 @@ interface Props {
  *  archive them). */
 export function WorkspaceInboxMenu({
   workspace,
+  repo,
   settleAction,
   snoozeAction,
   unreadAction,
@@ -54,6 +64,9 @@ export function WorkspaceInboxMenu({
 }: Props) {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [pendingPushHost, setPendingPushHost] = useState<HostView | null>(null);
+  const [showImageDialog, setShowImageDialog] = useState(false);
+  const { imageUrl } = useProjectAppearance(repo.path);
+  const setProjectImage = useProjectAppearanceStore((s) => s.setImage);
 
   const isAttachOrRemote =
     workspace.attach_only === true || workspace.host_id != null;
@@ -134,11 +147,28 @@ export function WorkspaceInboxMenu({
           settleAction={settleAction}
           snoozeAction={snoozeAction}
           unreadAction={unreadAction}
+          projectMenu={
+            <ProjectAppearanceMenu
+              projectName={repo.name}
+              projectPath={repo.path}
+              onRequestImageDialog={() => setShowImageDialog(true)}
+            />
+          }
           onArchiveRequest={() => void handleArchiveOrClose()}
           onDeleteRequest={() => setShowDeleteDialog(true)}
           onRequestPushConfirm={(host) => setPendingPushHost(host)}
         />
       </ContextMenu>
+
+      {/* Sits outside the ContextMenu subtree: selecting the menu item
+          unmounts the menu, which would tear the dialog down with it. */}
+      <ProjectImageDialog
+        open={showImageDialog}
+        onOpenChange={setShowImageDialog}
+        projectName={repo.name}
+        initialValue={imageUrl}
+        onSave={(value) => setProjectImage(repo.path, value)}
+      />
       {canDelete && (
         <DeleteWorktreeDialog
           workspace={workspace}

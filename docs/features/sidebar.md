@@ -143,6 +143,16 @@ visual only — nothing is archived, closed, or deleted.
   of N workspaces from subscribing N× to the ports/hosts stores at rest. It
   mounts *inside* `WorkspaceInboxMenu` on a different node than
   `ContextMenuTrigger`, so the two `asChild` triggers never collide.
+- **Project section of the workspace menu** (`project-appearance-menu.tsx`): all
+  three row shapes' right-click menus (active card, settled row, snoozed row)
+  carry a `Project "<name>"` submenu between the
+  workspace actions and the device actions — an image entry (opens
+  `ProjectImageDialog`) plus the 12-color accent palette, applying to the whole
+  project the row belongs to. This is the re-homed project-avatar customization
+  that lost its entry point when the project tree was unmounted; writes go
+  through `src/stores/project-appearance-store.ts`, so every card, settled row,
+  rail button, and filter-dropdown entry of that project repaints at once.
+  See `docs/features/project-avatars.md`.
 - **Settle / un-settle** (`sidebar-inbox-store.ts`): Settle collapses the card
   (~200ms height/opacity), then moves it onto the "Settled" shelf as a compact
   one-line row (repo avatar · violet merge icon when its PR merged · title ·
@@ -525,12 +535,12 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   newest-first by stored snapshot index within each tier, with no user control
   over it and no way to opt a card out of (or into) the "Wrapping up" tier
   other than by working in it.
-- Unmounting the project tree also took two **project-level** surfaces offline,
-  since both hung off its context menu and have no inbox equivalent yet:
-  **Archive Project** (`docs/features/workspace-archive.md`) and **project
-  avatar image/color customization** (`docs/features/project-avatars.md`).
-  Saved avatars still render; they just can't be changed. Re-homing both is
-  outstanding work.
+- Unmounting the project tree took two **project-level** surfaces offline, since
+  both hung off its context menu. **Project avatar image/color customization**
+  has since been re-homed onto the workspace context menu (see "Project section"
+  under the inbox model above, and `docs/features/project-avatars.md`).
+  **Archive Project** (`docs/features/workspace-archive.md`) is still offline and
+  has no inbox equivalent — re-homing it is outstanding work.
 - The **card's** idle elapsed label still comes from `settledAt` in the
   non-persisted `sidebar-density-store`, which is stamped only on a transition
   into `review` — so a workspace that went working → idle without ever reaching
@@ -677,6 +687,8 @@ quietly rather than loudly.
 - `src/components/layout/sidebar-snooze.ts` — pure, clock-free wake presets + `formatWakeLabel` + `formatTimeUntil`
 - `src/components/layout/workspace-inbox-menu.tsx` — the shared right-click menu for all three row shapes
 - `src/components/layout/workspace-hover-card.tsx` — the shared hover-details card for cards, settled/snoozed rows, and rail avatars
+- `src/components/layout/project-appearance-menu.tsx` — the `Project "<name>"` submenu (image + accent color)
+- `src/stores/project-appearance-store.ts` — shared project avatar appearance (one writer, many readers)
 - `src/components/layout/sidebar-inbox-jump.ts` — visual-order jump targets for Alt+1..9
 - `src/lib/keybind-registry.ts` — `workspaceJump1..9` actions (default `Alt+1..9`)
 - `src/lib/use-coarse-clock.ts` — the single ~30s clock behind every elapsed label and sweep
