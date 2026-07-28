@@ -15,7 +15,7 @@ import {
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
 import type { PermissionModeOption } from "@/tauri/types";
-import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import { FOOTER_TRIGGER } from "./footer-trigger";
 
 /**
@@ -80,7 +80,7 @@ export function PermissionModePicker({
       <PopoverContent
         className="w-[340px] p-0"
         align="start"
-        onOpenAutoFocus={focusCmdkRootOnOpen}
+        onOpenAutoFocus={focusCmdkOnOpen}
       >
         <Command>
           <CommandList className="max-h-[300px]">

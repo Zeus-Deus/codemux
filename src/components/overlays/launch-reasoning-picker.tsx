@@ -13,7 +13,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { focusCmdkRootOnOpen } from "@/components/chat/pickers/focus-cmdk-root";
+import { focusCmdkOnOpen } from "@/components/chat/pickers/focus-cmdk-root";
 import { cn } from "@/lib/utils";
 import type { ReasoningOption } from "@/lib/launch-models";
 
@@ -147,7 +147,7 @@ export function LaunchReasoningPicker({
       <PopoverContent
         className="w-[260px] p-0"
         align="start"
-        onOpenAutoFocus={focusCmdkRootOnOpen}
+        onOpenAutoFocus={focusCmdkOnOpen}
       >
         <Command shouldFilter={false}>
           {/* This popover is portaled outside the enclosing modal Dialog, so

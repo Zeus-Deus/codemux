@@ -15,7 +15,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { ChatModelInfo } from "@/tauri/types";
 
-import { focusCmdkRootOnOpen } from "./focus-cmdk-root";
+import { focusCmdkOnOpen } from "./focus-cmdk-root";
 import { FOOTER_TRIGGER } from "./footer-trigger";
 
 interface Props {
@@ -88,7 +88,7 @@ export function SpeedPicker({
       <PopoverContent
         className="w-[300px] p-0"
         align="start"
-        onOpenAutoFocus={focusCmdkRootOnOpen}
+        onOpenAutoFocus={focusCmdkOnOpen}
       >
         <Command>
           <CommandList>

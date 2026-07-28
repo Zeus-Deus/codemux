@@ -126,4 +126,20 @@ describe("LaunchModelPicker — adaptive search", () => {
     await userEvent.click(trigger);
     expect(document.querySelector('[cmdk-input=""]')).toBeInTheDocument();
   });
+
+  it("focuses the search box on open so typing filters without a click", async () => {
+    const { trigger } = renderPicker({
+      providerKind: "opencode",
+      models: manyModels(24),
+    });
+    await userEvent.click(trigger);
+    const input = document.querySelector('[cmdk-input=""]') as HTMLElement;
+    expect(input).toHaveFocus();
+    // Deliberately NO click on the input — keystrokes must land in it
+    // straight from the popover's open-autofocus.
+    await userEvent.keyboard("Model 3");
+    expect(input).toHaveValue("Model 3");
+    expect(screen.getByText("Model 3")).toBeInTheDocument();
+    expect(screen.queryByText("Model 1")).not.toBeInTheDocument();
+  });
 });

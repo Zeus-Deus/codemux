@@ -1694,10 +1694,17 @@ disguised as a scope control.
 **Location popover is keyboard-first.** The "Run in" popover is a cmdk
 `Command` with `shouldFilter={false}` plus a `CommandInput`
 ("Search projects…"), so opening it focuses the search field and the
-whole flow is type → `Enter` with no mouse. Radix's default
-auto-focus is deliberately NOT overridden here (unlike the checkout /
-branch popovers, which use `focusCmdkRootOnOpen`) — the input is the
-first focusable child and forwards arrow/Enter to cmdk itself.
+whole flow is type → `Enter` with no mouse. Every cmdk popover in the
+app routes Radix's open-autofocus through `focusCmdkOnOpen`
+(`src/components/chat/pickers/focus-cmdk-root.ts`): it targets the
+`[cmdk-input]` when the popover has one — the search field must own
+focus so typing filters immediately, and being a descendant of the
+root it still forwards arrow/Enter to cmdk — and falls back to the
+`[cmdk-root]` div on input-less pickers, which is what keeps arrow-key
+navigation alive there. The input MUST win when present: cmdk's root
+keydown only handles navigation keys, so focusing the root on an
+input-bearing popover would leave printable keystrokes with nowhere to
+go until the user clicked the search box.
 Filtering + ranking is `fuzzyFilter` from `src/lib/fuzzy.ts` (shared
 scored subsequence matcher, also used by the GitHub issue/PR pickers):
 prefix beats substring beats scattered subsequence, word-boundary and
@@ -1706,11 +1713,60 @@ shorter candidates win ties. The haystack is the display name; a query
 containing `/` switches it to the full project path, which is how two
 checkouts of the same repo are disambiguated. Matching name AND path
 at once was tried and reverted — a short query is a subsequence of
-nearly every long path, so the list stops narrowing. "Home directory
+nearly every long path, so the list stops narrowing (a query grazing
+the shared `/home/…/projects/` prefix would otherwise match every row).
+"Home directory
 (~)" is filtered as a row like any other (it matches `home` and `~`),
 while "Open another project…" sits outside `CommandList` and is never
 filtered — it has to stay reachable exactly when nothing matched. The
 query resets on close so the next open starts from the full list.
+
+**Location list — Active / Settled sections.** The "Run in" popover
+lists every project that has a live workspace, i.e. the same set the
+sidebar draws from. Because parking a workspace (settling OR snoozing —
+see `docs/features/sidebar.md`) hides its sidebar card without closing
+anything, that set only ever grows: a long-lived install accumulates a
+dozen-plus projects that are all still valid targets. A flat, unsorted,
+uncapped list buried the project you touched a minute ago below one you
+settled months ago. So the popover mirrors the sidebar's own vocabulary
+(`project-scope-list.ts`):
+
+- **Active** — at least one workspace is unparked (still has a sidebar
+  card). Ordered most-recently-active first, using the inbox store's
+  `activity` stamps. Unstamped projects rank last and keep their
+  app-state order, so the ordering is strictly better than insertion
+  order rather than dependent on a signal we can't guarantee.
+- **Settled · still open** — every workspace is parked. BOTH parked
+  lifecycles fold into this side of the partition — a project whose
+  workspaces are all *snoozed* must not read as Active any more than a
+  fully-settled one — and any future parked state must fold in the same
+  way (`partitionProjectScopes` documents the invariant). Deprioritized,
+  never hidden: starting a thread here is how you resurrect parked work.
+  Ordered most-recently-parked first and collapsed to
+  `SETTLED_COLLAPSED_COUNT` behind a "Show N more" row. The
+  currently-targeted project is always shown even from the hidden tail —
+  a checkmark the user can't see reads as a lost selection.
+- Section headings appear **only** when something is parked; otherwise
+  the popover stays the flat list it always was.
+- A search spans both sections: each is filtered + ranked by
+  `fuzzyFilter` separately (Active always above Settled), a non-empty
+  query reveals the full settled tail, and the "Show N more" row never
+  appears in search results. `CommandList` is capped + scrollable,
+  bounded by `--radix-popover-content-available-height` so the taller
+  sectioned popover can't clip off the top of a short window.
+- Avatar loading is scoped to the rows actually on screen (it used to
+  fetch 3 UI-state keys for EVERY known project on every open — 50+ IPC
+  round trips on a long-lived install); expanding or searching pays only
+  for what it newly reveals, and the per-open fetch generation resets so
+  appearance edits made elsewhere in the session are picked up.
+
+All signals come from `sidebar-inbox-store`, so the picker's order can't
+disagree with the sidebar. It reads that store but never writes it:
+selecting a parked project deliberately does **not** un-settle or wake
+it, because the inbox already resurfaces a parked workspace the moment
+its agent goes `working` — which is exactly what first send does.
+Un-parking on mere selection would also fire while the user is only
+browsing locations.
 
 **Pane-surface state.** `AgentChatPane` holds no scope state at all —
 no `checkoutMode`, no `worktreeName`, no `baseBranch`, no scope

@@ -14,7 +14,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { focusCmdkRootOnOpen } from "@/components/chat/pickers/focus-cmdk-root";
+import { focusCmdkOnOpen } from "@/components/chat/pickers/focus-cmdk-root";
 import { cn } from "@/lib/utils";
 import {
   MODEL_SEARCH_THRESHOLD,
@@ -267,7 +267,7 @@ export function LaunchModelPicker({
       <PopoverContent
         className="w-[300px] p-0"
         align="start"
-        onOpenAutoFocus={focusCmdkRootOnOpen}
+        onOpenAutoFocus={focusCmdkOnOpen}
       >
         <Command shouldFilter={false}>
           {showSearch ? (
