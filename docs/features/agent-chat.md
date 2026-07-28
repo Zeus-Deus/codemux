@@ -274,7 +274,23 @@ The chat pane stack:
     the active pane's provider, which is the whole point of the
     cross-provider design (a Codex skill is invocable from a Claude
     pane and vice versa). Provider appears only as a label in the row
-    description and as grouping/sort order.
+    description and as grouping/sort order. Same-named skills
+    collapse to one row via `dedupeSkillsByName`
+    (`src/lib/agent-chat/skill-groups.ts`, first-wins over the
+    backend's provider → scope → name order). A skill is addressed in
+    the draft by name alone, so every copy of `/omarchy` would insert
+    byte-identical text; one source symlinked into `~/.claude/skills`,
+    `~/.codex/skills`, and `~/.agents/skills` (plus a real directory
+    under `~/.codemux/skills`) previously produced one row per root,
+    and copies reached through symlinks share a skill id — the id is a
+    hash of the *canonical* SKILL.md path — so the popup emitted
+    duplicate React keys and colliding menu values. The send-time
+    resolver `parseSkillTokens` (`skill-tokens.ts`) applies the same
+    first-wins rule, so the row the menu offers is guaranteed to be the
+    body that gets injected; its lookup used to be last-wins, which
+    silently resolved a picked skill to the *lowest*-priority copy.
+    Settings deliberately keeps every copy visible — `detectConflicts`
+    exists to surface exactly these clashes.
   - **COMMANDS** — **provider-native slash commands, discovered live**
     (never hardcoded). The claude-agent sidecar's `list-commands`
     JSON-RPC method opens a transient SDK `query()` (same lifecycle as
@@ -286,6 +302,17 @@ The chat pane stack:
     (`ClaudeSlashCommandCache`, per-cwd, app-lifetime, errors not
     cached) behind the `list_chat_slash_commands` Tauri command
     (Codex/OpenCode resolve to an empty list — no discovery surface).
+    `dedupe_commands` also drops commands the CLI marks `isHidden` but
+    the SDK reports anyway (`is_internal_command`): any `__`-prefixed
+    name, plus an exact-match denylist of `heapdump`,
+    `workflow-launch-exec`, `design-consent`, `design-revoke`,
+    `extra-usage`, `pro-trial-expired`, `rate-limit-options`. Each is
+    unusable from a Codemux thread — a debug affordance, a renamed
+    alias, or gated on a session kind Codemux never creates (the
+    workflow entries describe their own gate: "server-launched
+    sessions only"). Against the deployed CLI this trims 54 discovered
+    commands to 48. The filter is menu-only: a hand-typed name is still
+    forwarded verbatim.
     Frontend: `provider-commands-store.ts` (lazy load on first popup
     open, 60s TTL, keyed `(provider, cwd)`), `buildProviderCommands`
     (case-preserving map + reserved-name filter: collisions with
@@ -294,6 +321,23 @@ The chat pane stack:
     literal `/name ` text (same mechanics as skills/`/workflow`); the
     text is forwarded verbatim and the provider interprets the leading
     slash itself — Codemux never executes provider commands locally.
+
+    **Why the CLI's interactive commands are absent, and should stay
+    absent.** The CLI registers commands as `local`, `local-jsx`, or
+    `prompt`. The `local-jsx` ones render an ink/TUI surface and exist
+    only in an interactive terminal — `/remote-control` (alias `/rc`),
+    `/login`, `/resume`, `/rewind`, `/terminal-setup`, `/theme`,
+    `/statusline`, … The Agent SDK does not report them, and forwarding
+    one anyway returns `"<name> isn't available in this environment."`
+    Listing them would only offer rows that cannot work. Verified two
+    ways: `initializationResult().commands` and `supportedCommands()`
+    return the *identical* 54-command list (diffed, zero difference),
+    so switching probe APIs would change nothing. Remote control does
+    surface in the init result, but as session capability flags
+    (`remote_control_auto_enable`, `remote_control_auto_on_by_default`,
+    `ide_rc_auto_enable_gate`) rather than a command — deliberately not
+    consumed, since Codemux ships its own web remote access
+    (`docs/features/web-remote-access.md`).
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
   compat. Server-side sync (see `docs/features/skills-sync.md`).
   - **Scan roots** (`skills::paths::enumerate_scan_paths` — the single

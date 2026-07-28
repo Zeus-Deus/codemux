@@ -4,6 +4,7 @@ import type { Skill, SkillProvider, SkillScope } from "@/tauri/commands";
 
 import {
   GROUP_ORDER,
+  dedupeSkillsByName,
   detectConflicts,
   groupHeadingFor,
   groupSkillsByScope,
@@ -144,6 +145,60 @@ describe("groupSkillsByScope", () => {
       makeSkill("solo", "claude", "user"),
     ]);
     expect(conflicts.size).toBe(0);
+  });
+
+  it("dedupeSkillsByName keeps the first copy of a name, dropping the rest", () => {
+    // The real-world shape: one source symlinked into several provider
+    // roots, so the same name arrives once per root.
+    const out = dedupeSkillsByName([
+      makeSkill("omarchy", "claude", "user"),
+      makeSkill("omarchy", "codex", "user"),
+      makeSkill("omarchy", "codemux", "user"),
+      makeSkill("solo", "claude", "user"),
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out[0].provider).toBe("claude");
+    expect(out[1].name).toBe("solo");
+  });
+
+  it("dedupeSkillsByName keeps names that differ only in case", () => {
+    // `parseSkillTokens` resolves case-sensitively, so these are two
+    // separately addressable skills. Folding them would hide one from
+    // the menu while leaving it reachable by typing.
+    const out = dedupeSkillsByName([
+      makeSkill("Deploy", "claude", "user"),
+      makeSkill("deploy", "codex", "user"),
+    ]);
+    expect(out).toHaveLength(2);
+  });
+
+  it("dedupeSkillsByName leaves distinct names untouched and preserves order", () => {
+    const out = dedupeSkillsByName([
+      makeSkill("b", "claude", "user"),
+      makeSkill("a", "codex", "user"),
+    ]);
+    expect(out.map((s) => s.name)).toEqual(["b", "a"]);
+  });
+
+  it("dedupeSkillsByName does not mutate its input", () => {
+    const input = [
+      makeSkill("dup", "claude", "user"),
+      makeSkill("dup", "codex", "user"),
+    ];
+    dedupeSkillsByName(input);
+    expect(input).toHaveLength(2);
+  });
+
+  it("detectConflicts still reports duplicates that the popup collapses", () => {
+    // Settings must keep showing every install location even though
+    // the composer only ever offers one — the two behaviours are
+    // intentionally different views of the same data.
+    const skills = [
+      makeSkill("omarchy", "claude", "user"),
+      makeSkill("omarchy", "codex", "user"),
+    ];
+    expect(dedupeSkillsByName(skills)).toHaveLength(1);
+    expect(detectConflicts(skills).get("omarchy")).toHaveLength(2);
   });
 
   it("produces independent arrays per group (mutating one doesn't bleed)", () => {

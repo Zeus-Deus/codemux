@@ -91,16 +91,67 @@ impl ClaudeSlashCommandCache {
     }
 }
 
+/// Commands the CLI itself marks `isHidden` but which the SDK's
+/// command list reports anyway. They are unusable from a Codemux chat
+/// thread — each is either a debug affordance or gated on a session
+/// kind Codemux never creates — so offering them is pure menu noise.
+///
+/// Verified against the deployed CLI's command registry: every name
+/// here carries `isHidden` upstream, and the two `*workflow*` entries
+/// describe their own gate ("server-launched sessions only",
+/// "workflow_launch event sessions only").
+///
+/// This is deliberately a small, evidence-backed denylist rather than
+/// a broad heuristic: a custom user command is never dropped by it.
+const HIDDEN_COMMAND_NAMES: &[&str] = &[
+    // Debug-only: writes a heap snapshot to the user's Desktop.
+    "heapdump",
+    // Gated on server-launched / workflow-handoff sessions.
+    "workflow-launch-exec",
+    // Consent flows that require the CLI's interactive UI.
+    "design-consent",
+    "design-revoke",
+    // Renamed upstream to `usage-credits`, kept only as a hidden alias.
+    "extra-usage",
+    // Transient upsell states, surfaced by the CLI on its own terms.
+    "pro-trial-expired",
+    "rate-limit-options",
+];
+
+/// Whether a discovered command should be withheld from the menu.
+///
+/// Two rules, both evidence-backed:
+/// 1. A `__` prefix is the CLI's internal-command convention
+///    (e.g. `__remote-workflow`).
+/// 2. An explicit denylist for hidden commands the SDK leaks anyway.
+///
+/// Note this filters only the *menu*. A user who types the name by
+/// hand still has it forwarded verbatim — Codemux does not block
+/// commands, it just declines to advertise unusable ones.
+fn is_internal_command(name: &str) -> bool {
+    if name.starts_with("__") {
+        return true;
+    }
+    let lower = name.to_ascii_lowercase();
+    HIDDEN_COMMAND_NAMES.contains(&lower.as_str())
+}
+
 /// Case-insensitive dedupe by name, first occurrence wins. The SDK
 /// can report a user-level and a project-level custom command with
 /// the same name; the CLI resolves to one of them, so the menu should
 /// list it once.
+///
+/// Internal / CLI-hidden commands are dropped here too, so every
+/// consumer of the cache sees the same filtered vocabulary.
 fn dedupe_commands(commands: Vec<SdkSlashCommand>) -> Vec<ProviderSlashCommand> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out = Vec::with_capacity(commands.len());
     for c in commands {
         let name = c.name.trim().trim_start_matches('/').to_string();
         if name.is_empty() {
+            continue;
+        }
+        if is_internal_command(&name) {
             continue;
         }
         if !seen.insert(name.to_ascii_lowercase()) {
@@ -192,6 +243,54 @@ mod tests {
         ]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "init");
+    }
+
+    #[test]
+    fn drops_double_underscore_internal_commands() {
+        let out = dedupe_commands(vec![
+            sdk("compact", "Compact the conversation", ""),
+            sdk(
+                "__remote-workflow",
+                "Run the workflow script delivered in this session environment",
+                "",
+            ),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "compact");
+    }
+
+    #[test]
+    fn drops_cli_hidden_commands_the_sdk_still_reports() {
+        // Every name here is `isHidden` in the deployed CLI registry
+        // but comes back from the SDK's command list regardless.
+        let out = dedupe_commands(vec![
+            sdk("heapdump", "Dump the JS heap to ~/Desktop", ""),
+            sdk("workflow-launch-exec", "Execute a handoff", ""),
+            sdk("design-consent", "Grant access", ""),
+            sdk("design-revoke", "Revoke access", ""),
+            sdk("extra-usage", "Renamed to /usage-credits", ""),
+            sdk("usage-credits", "Configure usage credits", ""),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].name, "usage-credits");
+    }
+
+    #[test]
+    fn hidden_filter_is_case_insensitive_and_slash_tolerant() {
+        let out = dedupe_commands(vec![sdk("/HeapDump", "shouting", "")]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn keeps_user_commands_that_merely_resemble_hidden_ones() {
+        // The denylist is exact-match: a custom command must never be
+        // swallowed by a prefix/substring heuristic.
+        let out = dedupe_commands(vec![
+            sdk("design", "Real user command", ""),
+            sdk("heapdump-report", "Custom command", ""),
+            sdk("my__internal", "Underscores not at the start", ""),
+        ]);
+        assert_eq!(out.len(), 3);
     }
 
     #[test]
