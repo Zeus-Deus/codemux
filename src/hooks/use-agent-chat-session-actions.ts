@@ -98,7 +98,7 @@ export function useAgentChatSessionActions(
           if (payloads.length > 0) {
             useAgentChatStore
               .getState()
-              .hydrateThread(newLocalThreadId, payloads);
+              .hydrateThread(newLocalThreadId, payloads, { provider });
           }
         } catch (err) {
           // Hydration failure is non-fatal — the SDK still has the

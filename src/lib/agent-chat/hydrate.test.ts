@@ -249,6 +249,94 @@ describe("replayPayloads", () => {
     expect(state.pendingRequestIds).toEqual(["req-live"]);
   });
 
+  describe("provider-aware orphan expiry", () => {
+    function openRequest(): string[] {
+      return [
+        user("run the thing"),
+        event({
+          type: "request_opened",
+          thread_id: "t",
+          turn_id: "turn-1",
+          request_id: "req-orphan",
+          request_kind: "tool",
+          payload: {},
+          tool_use_id: null,
+        }),
+      ];
+    }
+
+    function soleRequest(
+      state: ReturnType<typeof replayPayloads>,
+    ): PermissionRequestItem | undefined {
+      return state.messages.find(
+        (m): m is PermissionRequestItem => m.kind === "permission_request",
+      );
+    }
+
+    it("keeps an OpenCode request actionable with no live turn", () => {
+      // OpenCode's permissions live in its own HTTP server, and the
+      // backend's `pending_requests_survive_session_restart` opt-in lets
+      // `agent_chat_respond_to_request` re-adopt that session to answer
+      // them. Expiring the control here would strand a request the user
+      // can still resolve — and `request_opened`'s early-return on a known
+      // id means no re-broadcast could resurrect it.
+      const state = replayPayloads(openRequest(), { provider: "opencode" });
+      expect(soleRequest(state)?.resolution.state).toBe("pending");
+      expect(state.pendingRequestIds).toEqual(["req-orphan"]);
+    });
+
+    it.each(["claude", "codex"] as const)(
+      "expires a %s request with no live turn (process-local callback)",
+      (provider) => {
+        const state = replayPayloads(openRequest(), { provider });
+        expect(soleRequest(state)?.resolution).toMatchObject({
+          state: "failed",
+          reason: "stale_provider_callback",
+        });
+        expect(state.pendingRequestIds).toEqual([]);
+      },
+    );
+
+    it("expires when the provider is unknown (matches the backend default)", () => {
+      const state = replayPayloads(openRequest());
+      expect(soleRequest(state)?.resolution.state).toBe("failed");
+      expect(state.pendingRequestIds).toEqual([]);
+    });
+
+    it("preserves a pending_approval OpenCode workflow with no live turn", () => {
+      const state = replayPayloads(
+        [
+          user("/workflow audit"),
+          event({
+            type: "workflow_updated",
+            thread_id: "t",
+            workflow: {
+              workflow_id: "wf",
+              status: "pending_approval",
+              name: "Audit",
+              phases: [{ title: "Run", detail: null }],
+            },
+          } as ProviderRuntimeEvent),
+          event({
+            type: "request_opened",
+            thread_id: "t",
+            turn_id: "turn-1",
+            request_id: "req-wf",
+            request_kind: "other",
+            payload: {},
+            tool_use_id: "wf",
+          }),
+        ],
+        { provider: "opencode" },
+      );
+      const wf = state.messages.find(
+        (m): m is WorkflowRunItem => m.kind === "workflow_run",
+      );
+      expect(wf?.status).toBe("pending_approval");
+      expect(soleRequest(state)?.resolution.state).toBe("pending");
+    });
+  });
+
   it("skips malformed JSON without affecting the rest of the replay", () => {
     const state = replayPayloads([
       user("first"),

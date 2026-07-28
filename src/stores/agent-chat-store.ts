@@ -1,6 +1,7 @@
 import { create } from "zustand";
 
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
+import type { ReplayOptions } from "@/lib/agent-chat/hydrate";
 import {
   applyEvent,
   appendUserMessage,
@@ -238,11 +239,16 @@ interface AgentChatStore {
    *  `opts.runLive` is forwarded to `replayPayloads`: when the caller
    *  has confirmed the thread's turn is in flight (remount of a live
    *  run) it suppresses the Run-interrupted heuristic and marks the
-   *  slice streaming. Omit for the plain resume path. */
+   *  slice streaming. Omit for the plain resume path.
+   *
+   *  `opts.provider` is likewise forwarded: it decides whether an
+   *  unresolved persisted request is expired on hydrate (Claude/Codex,
+   *  whose callbacks die with the process) or kept actionable (OpenCode,
+   *  whose permissions live in its own server). */
   hydrateThread: (
     threadId: string,
     payloads: string[],
-    opts?: { runLive?: boolean },
+    opts?: ReplayOptions,
   ) => void;
   /** Clear a thread entirely (e.g. on session stop). */
   resetThread: (threadId: string) => void;

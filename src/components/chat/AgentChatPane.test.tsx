@@ -756,7 +756,7 @@ describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
       expect(hydrateThreadMock).toHaveBeenCalledWith(
         "thread-x",
         [userPayload, assistantPayload],
-        { runLive: false },
+        { runLive: false, provider: "claude" },
       );
     });
   });
@@ -789,7 +789,7 @@ describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
       expect(hydrateThreadMock).toHaveBeenCalledWith(
         "thread-x",
         [userPayload, assistantPayload],
-        { runLive: true },
+        { runLive: true, provider: "claude" },
       );
     });
   });
@@ -821,7 +821,7 @@ describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
       expect(hydrateThreadMock).toHaveBeenCalledWith(
         "thread-x",
         [userPayload, assistantPayload],
-        { runLive: false },
+        { runLive: false, provider: "claude" },
       );
     });
   });

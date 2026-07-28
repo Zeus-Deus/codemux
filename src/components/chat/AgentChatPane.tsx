@@ -918,7 +918,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         const payloads = await agentChatListMessages(threadId);
         if (cancelled) return;
         if (payloads.length === 0) return;
-        const replayed = replayPayloads(payloads);
+        const replayed = replayPayloads(payloads, { provider });
         const slice = useAgentChatStore.getState().threads[threadId];
         const localCount = slice?.messages.length ?? 0;
         // Guard against clobbering live state: only hydrate when disk
@@ -940,7 +940,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (cancelled) return;
         useAgentChatStore
           .getState()
-          .hydrateThread(threadId, payloads, { runLive });
+          .hydrateThread(threadId, payloads, { runLive, provider });
       } catch (err) {
         // Soft-fail: if hydrate fails, the user still sees whatever
         // the live stream brings in. Log so it's debuggable.
