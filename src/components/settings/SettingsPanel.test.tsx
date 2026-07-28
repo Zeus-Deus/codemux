@@ -58,6 +58,7 @@ vi.mock("@/stores/settings-store", () => {
     "sidebar.auto_settle_days": "3",
     "sidebar.working_indicator": "braille",
     "sidebar.working_indicator_color": "status-working",
+    "chat.code_wrap": "false",
   };
   return {
     SETTINGS_DEFAULTS: defaults,
@@ -72,6 +73,7 @@ vi.mock("@/stores/settings-store", () => {
     selectDensity: () => "comfortable",
     selectSmoothScrolling: () => false,
     selectSidebarShowGitStats: () => true,
+    selectChatCodeWrap: () => false,
     selectSidebarAutoSettleDays: () => 3,
     selectWorkingIndicator: () => "braille",
     selectWorkingIndicatorColor: () => "status-working",

@@ -97,3 +97,10 @@ overview):
 - Streamdown's compiled utility classes are registered as a Tailwind scan
   source (`@source "../node_modules/streamdown/dist/*.js"`) so the streaming
   markdown renderer's classes survive the Tailwind v4 tree-shake.
+- Chat code blocks are syntax-highlighted by Shiki, which inlines concrete
+  colors into `style` attributes and so cannot consume CSS variables. Their
+  token colors are derived from the terminal ANSI palette
+  (`src/lib/shiki-chat-theme.ts`) — the same documented ANSI exception that
+  covers `TerminalPane` and the CodeMirror editor theme. Structural chrome
+  (container, header, borders, inline-code pill) stays on design tokens under
+  `.chat-markdown` in `globals.css`.
