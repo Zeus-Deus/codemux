@@ -82,6 +82,26 @@ describe("buildChatCodeThemes", () => {
     expect(a.name).not.toBe(b.name);
   });
 
+  // `color9` only feeds the `invalid` scope, so it is the easiest color to
+  // drop out of the identity hash. Every color the token map reads has to be
+  // in it, or two palettes collide on name and the cache serves stale colors.
+  it.each([
+    ["color1", "#101010"],
+    ["color2", "#202020"],
+    ["color3", "#303030"],
+    ["color4", "#404040"],
+    ["color5", "#505050"],
+    ["color6", "#606060"],
+    ["color8", "#808080"],
+    ["color9", "#909090"],
+    ["color11", "#b0b0b0"],
+    ["foreground", "#fefefe"],
+  ] as const)("changes the theme name when %s alone changes", (key, value) => {
+    const [a] = buildChatCodeThemes(palette);
+    const [b] = buildChatCodeThemes({ ...palette, [key]: value });
+    expect(b.name).not.toBe(a.name);
+  });
+
   it("is stable for an unchanged palette", () => {
     const [a] = buildChatCodeThemes(palette);
     const [b] = buildChatCodeThemes({ ...palette });

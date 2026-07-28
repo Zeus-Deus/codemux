@@ -17,9 +17,11 @@ import { fallbackTheme } from "./use-theme-colors";
  * `theme-changed` listener *per message*. Here every consumer shares a single
  * fetch, a single listener, and a single plugin instance.
  *
- * The plugin is memoized on palette identity because `@streamdown/code` keeps
- * its Shiki highlighter and token caches inside the plugin instance — rebuilding
- * it on unrelated renders would throw those caches away on every keystroke.
+ * The plugin is memoized on palette identity so a streaming transcript hands
+ * every `ChatMarkdown` the same plugin object across renders. (`@streamdown/code`
+ * keeps its highlighter and token caches in module-level maps, so those survive
+ * a rebuild — what the memo avoids is the churn of a new plugin identity
+ * propagating through the markdown tree on every keystroke.)
  */
 
 let currentTheme: ThemeColors = fallbackTheme;

@@ -28,28 +28,6 @@ function fnv1a32(input: string): number {
   return hash >>> 0;
 }
 
-/**
- * Shiki's highlighter cache inside `@streamdown/code` is keyed by theme
- * *name*, not by theme content. A fixed name would serve stale colors after
- * the user switches terminal theme, so the palette is hashed into the name:
- * a new palette is a new theme identity and misses the cache correctly.
- */
-function paletteId(theme: ThemeColors): string {
-  const palette = [
-    theme.foreground,
-    theme.background,
-    theme.color1,
-    theme.color2,
-    theme.color3,
-    theme.color4,
-    theme.color5,
-    theme.color6,
-    theme.color8,
-    theme.color11,
-  ].join("|");
-  return fnv1a32(palette).toString(36);
-}
-
 function buildTokenColors(theme: ThemeColors) {
   return [
     {
@@ -146,6 +124,27 @@ function buildTokenColors(theme: ThemeColors) {
   ];
 }
 
+type ChatCodeThemeBase = {
+  bg: string;
+  fg: string;
+  tokenColors: ReturnType<typeof buildTokenColors>;
+};
+
+/**
+ * Shiki's highlighter cache inside `@streamdown/code` is keyed by theme
+ * *name*, not by theme content. A fixed name would serve stale colors after
+ * the user switches terminal theme, so the theme is hashed into the name: a
+ * new palette is a new theme identity and misses the cache correctly.
+ *
+ * The hash covers the *built* theme rather than a hand-picked list of
+ * `ThemeColors` fields, so every color the token map actually consumes is
+ * part of the identity by construction — repointing a scope or adding one
+ * can't silently leave a color out of the hash.
+ */
+function themeId(base: ChatCodeThemeBase): string {
+  return fnv1a32(JSON.stringify(base)).toString(36);
+}
+
 /**
  * Streamdown always renders a light/dark theme pair, and Shiki emits both a
  * `color` and a `--shiki-dark` value per token. The app shell is dark-only
@@ -161,14 +160,12 @@ function buildTokenColors(theme: ThemeColors) {
 export function buildChatCodeThemes(
   theme: ThemeColors,
 ): [ThemeRegistrationAny, ThemeRegistrationAny] {
-  const id = paletteId(theme);
-  const tokenColors = buildTokenColors(theme);
-
-  const base = {
+  const base: ChatCodeThemeBase = {
     bg: "transparent",
     fg: theme.foreground,
-    tokenColors,
-  } as const;
+    tokenColors: buildTokenColors(theme),
+  };
+  const id = themeId(base);
 
   return [
     { ...base, name: `codemux-ansi-${id}-light`, type: "light" },
