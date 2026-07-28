@@ -89,7 +89,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
               // Settled workspaces remain live workspace records, so the
               // global search indexes them exactly like active cards. Include
               // project path as an explicit search term as well as the visible
-              // title/branch, matching the T3 settled-history lookup model.
+              // title/branch, matching the settled-history lookup model.
               value={workspaceCommandValue(w)}
               onSelect={() =>
                 run(() =>

@@ -938,7 +938,7 @@ describe("SidebarInbox — settle / un-settle", () => {
     const { container } = await flushRender();
 
     // The first snapshot is a baseline, not proof that activity happened
-    // after the persisted user override. T3 gives that explicit override
+    // after the persisted user override. That explicit override keeps
     // precedence until a later real status edge clears it.
     expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
     expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
@@ -1113,7 +1113,7 @@ describe("SidebarInbox — settle / un-settle", () => {
       .getByText("Implement sidebar v2")
       .closest("[data-settled-row]") as HTMLElement;
     expect(row).not.toBeNull();
-    // Like T3's slim history rows, the PR remains visible and directly
+    // In a slim settled-history row, the PR remains visible and directly
     // reachable instead of degrading to an unlabeled merge glyph.
     const pr = within(row).getByRole("button", {
       name: "Open PR #203 on GitHub — merged",
@@ -1124,6 +1124,38 @@ describe("SidebarInbox — settle / un-settle", () => {
     expect(mockOpenUrl).toHaveBeenCalledWith(
       "https://github.com/u/r/pull/203",
     );
+  });
+
+  it("Enter on the PR badge does not also activate the settled row", async () => {
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({
+        title: "Implement sidebar v2",
+        worktree_path: "/wt/a",
+        pr_number: 203,
+        pr_state: "MERGED",
+        pr_url: "https://github.com/u/r/pull/203",
+      }),
+    ];
+    await renderInbox();
+
+    const row = screen
+      .getByText("Implement sidebar v2")
+      .closest("[data-settled-row]") as HTMLElement;
+    const pr = within(row).getByRole("button", {
+      name: "Open PR #203 on GitHub — merged",
+    });
+
+    // The row is itself a `role="button"`, so a keydown on the badge bubbles
+    // into it. Opening the PR and yanking the main pane onto the workspace are
+    // two different intents — the inner button owns the key press.
+    fireEvent.keyDown(pr, { key: "Enter" });
+    expect(activateWorkspace).not.toHaveBeenCalled();
+
+    // Positive control: the same key on the row itself still opens it, so the
+    // guard narrows activation rather than removing it.
+    fireEvent.keyDown(row, { key: "Enter" });
+    expect(activateWorkspace).toHaveBeenCalledWith("ws-1");
   });
 });
 
@@ -1581,7 +1613,7 @@ describe("SidebarInbox — idle-clock seeding", () => {
     activeWorkspaceId = "ws-1";
     const { container } = await flushRender();
 
-    // Like T3, merely reading old work does not rewrite its work-activity
+    // Merely reading old work does not rewrite its work-activity
     // clock. Settlement changes the row classification, not the open surface.
     expect(container.querySelector('[data-inbox-card="ws-1"]')).toBeNull();
     const row = container.querySelector(
@@ -2190,7 +2222,7 @@ describe("sidebar-inbox pure helpers", () => {
     expect(effectiveActivityAt(null, undefined)).toBeUndefined();
   });
 
-  it("shouldAutoSettle mirrors T3's completion blockers and idle fallback", () => {
+  it("shouldAutoSettle mirrors server-side completion blockers and idle fallback", () => {
     const now = 10 * 86_400_000;
     const stale = now - 4 * 86_400_000;
     const fresh = now - 60_000;

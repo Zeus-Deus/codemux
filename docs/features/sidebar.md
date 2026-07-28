@@ -337,8 +337,8 @@ visual only — nothing is archived, closed, or deleted.
   brand new for a full idle window after every update — the exact bug the
   backend field exists to kill. Preferring the backend retires the polluted
   state without a migration pass.
-- **Auto-settle** — the Settled shelf fills itself using the same completion
-  semantics as T3 Code. A workspace whose PR is **merged or closed** settles
+- **Auto-settle** — the Settled shelf fills itself using server-side completion
+  semantics. A workspace whose PR is **merged or closed** settles
   immediately once it is neither working nor blocked; no activity stamp or
   extra idle grace is required. A completed **review** status is settleable —
   it says the run finished, not that work is still executing. An **open** PR

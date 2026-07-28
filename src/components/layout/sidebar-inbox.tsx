@@ -157,7 +157,7 @@ export function isWrappingUp(
   return prState === "open" && status === null && !unread;
 }
 
-/** T3-style automatic settlement.
+/** Completion-driven automatic settlement.
  *
  * A merged/closed PR is itself the completion signal, so it settles as soon as
  * no agent is running or blocked — no extra idle timestamp or grace period is
@@ -422,6 +422,19 @@ function WrappingUpDivider() {
   );
 }
 
+/** Does this keydown activate the row *itself*?
+ *
+ *  Settled and snoozed rows are `role="button"` containers that also host their
+ *  own buttons (PR badge, Un-settle, Wake now). Those inner buttons stop click
+ *  propagation, but a keyboard activation on a focused inner button still
+ *  bubbles its `keydown` up to the row — so without a target check, Enter on
+ *  the PR badge would open the PR *and* activate the workspace. Only a keydown
+ *  whose target is the row node is a row activation. */
+function isRowActivationKey(e: React.KeyboardEvent<HTMLElement>): boolean {
+  if (e.key !== "Enter" && e.key !== " ") return false;
+  return e.target === e.currentTarget;
+}
+
 interface SettledRowProps {
   workspace: WorkspaceSnapshot;
   repo: InboxRepo;
@@ -497,7 +510,7 @@ function SettledRow({
       data-selected={selected ? "true" : undefined}
       onClick={handleClick}
       onKeyDown={(e) => {
-        if (e.key !== "Enter" && e.key !== " ") return;
+        if (!isRowActivationKey(e)) return;
         // Space would otherwise scroll the sidebar as it activates the row.
         if (e.key === " ") e.preventDefault();
         // Collapse any multi-select first, exactly like a plain click —
@@ -655,7 +668,7 @@ function SnoozeRow({
         data-selected={selected ? "true" : undefined}
         onClick={handleClick}
         onKeyDown={(e) => {
-          if (e.key !== "Enter" && e.key !== " ") return;
+          if (!isRowActivationKey(e)) return;
           if (e.key === " ") e.preventDefault();
           // Same selection collapse as a plain click (see `SettledRow`).
           onSelect(workspace.workspace_id, "single");
@@ -788,7 +801,7 @@ export function SidebarInbox() {
   // the truth it is overriding.
   const [manualUnread, setManualUnread] = useState<ReadonlySet<string>>(new Set());
   // Last status observed by the activity effect. A keep-active pin is cleared
-  // only by a NEW non-idle status edge, matching T3's server-side
+  // only by a NEW non-idle status edge, matching the server-side
   // "real activity clears the override" lifecycle. Re-reading an existing
   // review status after the user clicks Un-settle must not immediately erase
   // their decision and throw a merged PR back under the divider.
@@ -1298,9 +1311,10 @@ export function SidebarInbox() {
     }
   }, [loaded, paneStatuses, allWorkspaces, activeWorkspaceId, activity, now]);
 
-  // Auto-settle: T3 semantics. A merged/closed PR settles immediately once the
-  // workspace is not running or blocked; otherwise inactivity past the user's
-  // configured window is the fallback. No leaving animation (this is a
+  // Auto-settle: server-side completion semantics. A merged/closed PR settles
+  // immediately once the workspace is not running or blocked; otherwise
+  // inactivity past the user's configured window is the fallback. No
+  // leaving animation (this is a
   // background lifecycle transition, not a gesture) and deliberately no
   // forward navigation: a sweep must never move the user.
   //
