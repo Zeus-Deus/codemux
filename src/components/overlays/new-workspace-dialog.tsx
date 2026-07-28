@@ -48,7 +48,7 @@ import {
   getGitBranchInfo,
   gitFetchPrune,
   createWorkspace,
-  createWorktreeWorkspace,
+  createWorktreeWorkspaceResult,
   importWorktreeWorkspace,
   setWorkspaceHost,
   activateWorkspace,
@@ -764,7 +764,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           // so the user sees reality. No phantom worktree is created.
           wsId = await createWorkspace(projectDir);
         } else {
-          wsId = await createWorktreeWorkspace(
+          const created = await createWorktreeWorkspaceResult(
             projectDir,
             openExistingBranch,
             false,
@@ -775,7 +775,20 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             null,
             launchSelection,
           );
+          wsId = created.workspaceId;
           agentHandled = true;
+          // The backend adopted an existing live workspace for this worktree
+          // instead of creating one — the prompt/preset were deliberately
+          // dropped (injecting into an in-flight session is worse). Silence
+          // here would read as "nothing happened" and quietly lose the
+          // typed message, so say so.
+          if (created.adopted) {
+            toast.info(
+              fullPrompt
+                ? `"${openExistingBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
+                : `"${openExistingBranch}" already has a live workspace — switched to it.`,
+            );
+          }
         }
 
         // Launch agent for paths that don't handle it internally
@@ -878,7 +891,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             "single",
           );
         } else {
-          wsId = await createWorktreeWorkspace(
+          const created = await createWorktreeWorkspaceResult(
             projectDir,
             resolvedBranch,
             isNewBranch,
@@ -889,7 +902,19 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             null,
             launchSelection,
           );
+          wsId = created.workspaceId;
           agentHandled = true;
+          // Adopt path: an existing live workspace claims this worktree, so
+          // the backend focused it and dropped the prompt/preset instead of
+          // typing into its in-flight session. Surface that — otherwise the
+          // user's prompt disappears silently.
+          if (created.adopted) {
+            toast.info(
+              fullPrompt
+                ? `"${resolvedBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
+                : `"${resolvedBranch}" already has a live workspace — switched to it.`,
+            );
+          }
         }
       }
 

@@ -12,10 +12,10 @@ vi.mock("@/tauri/commands", () => ({
   dbGetRecentProjects: vi.fn().mockResolvedValue([]),
   dbGetUiState: vi.fn().mockResolvedValue(null),
   // Post-"New worktree" dispatch: activateWorkspace fires after the
-  // helper resolves. create_pane + start_session are called INSIDE
-  // prestartWorktreeSession; assertions below verify both ran with
-  // the workspace's real cwd (NOT null), closing the
-  // session_not_found race.
+  // helper resolves. create_pane + start_session are called inside
+  // `materializeAndSend`; assertions below verify both ran with the
+  // workspace's real cwd (NOT null), closing the session_not_found
+  // race.
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-echo"),
@@ -134,13 +134,8 @@ vi.mock("@/stores/picker-favorites-store", () => ({
 // stub records the most recently passed props so individual tests can
 // invoke the callbacks directly to exercise the dispatch logic.
 type ThreadScopeRowStubProps = {
-  location: {
-    kind: "draft";
-    target: import("@/stores/chat-draft-store").ChatDraft["target"];
-    onChangeTarget: (
-      t: import("@/stores/chat-draft-store").DraftTarget,
-    ) => void;
-  };
+  target: import("@/stores/chat-draft-store").ChatDraft["target"];
+  onChangeTarget: (t: import("@/stores/chat-draft-store").DraftTarget) => void;
   projectPath: string | null;
   checkoutMode: "current" | "worktree";
   worktreeName: string;
@@ -159,8 +154,7 @@ vi.mock("@/components/chat/pickers/ThreadScopeRow", () => ({
     return (
       <button
         data-testid="thread-scope-row-stub"
-        data-location-kind={props.location.kind}
-        data-target-kind={props.location.target.kind}
+        data-target-kind={props.target.kind}
         data-project-path={props.projectPath ?? ""}
         data-checkout-mode={props.checkoutMode}
         data-base-branch={props.baseBranch}
@@ -735,7 +729,7 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
       expect(lastThreadScopeRowProps.current).not.toBeNull();
-      lastThreadScopeRowProps.current!.location.onChangeTarget({
+      lastThreadScopeRowProps.current!.onChangeTarget({
         kind: "existing_workspace",
         workspaceId: "ws-foo-feat",
       });
@@ -827,7 +821,7 @@ describe("DraftChatSurface", () => {
       useChatDraftStore.getState().updateDraftTarget(draft.draftId, target);
       useChatDraftStore.getState().setActiveDraft(draft.draftId);
       renderSurface();
-      expect(lastThreadScopeRowProps.current!.location.target).toEqual(target);
+      expect(lastThreadScopeRowProps.current!.target).toEqual(target);
     });
 
     it("draft.promoting disables the row", () => {

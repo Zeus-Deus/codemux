@@ -130,6 +130,20 @@ pub fn conventional_remote_root_path_keyed(
     PathBuf::from(format!("~/.codemux/projects/{p}"))
 }
 
+/// Compare two paths for filesystem identity: canonicalize both sides
+/// (resolving symlinks, `.`/`..`, and macOS's `/private` prefix) and fall
+/// back to a raw comparison when either side doesn't exist on disk.
+///
+/// Shared by `scripts.rs` (worktree-include copying) and
+/// `commands/workspace.rs` (the adopt-existing worktree guard) so the
+/// "same directory?" question has exactly one answer everywhere.
+pub fn paths_equal(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ac), Ok(bc)) => ac == bc,
+        _ => a == b,
+    }
+}
+
 /// Expand a `~/` prefix using the OS-detected home dir. Returns the
 /// input unchanged when no `~/` prefix is present. Falls back to
 /// the raw path when home_dir is unavailable.

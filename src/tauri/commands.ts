@@ -282,26 +282,37 @@ export const createWorkspace = (cwd: string | null = null) =>
  *  returns the freshly-created workspace's absolute `cwd` alongside its
  *  id so first-send paths can skip the `waitForWorkspaceCwd` poll; older
  *  backends (and other code paths) may still return a bare id string, in
- *  which case `cwd` is `null` and the caller falls back to the poll. */
+ *  which case `cwd` is `null` and the caller falls back to the poll.
+ *
+ *  `adopted` is true when no workspace was created: a live workspace
+ *  already claimed the target worktree path, so the backend focused it and
+ *  returned its id instead — dropping any `initialPrompt`/`agentPresetId`
+ *  rather than injecting into the in-flight session. Callers use it to
+ *  tell the user their prompt wasn't sent. Missing on older backends,
+ *  which never adopt — normalized to `false`. */
 export interface WorkspaceCreateResult {
   workspaceId: string;
   cwd: string | null;
+  adopted: boolean;
 }
 
 /** Coerce the create_* response, which is either the legacy bare
- *  workspace-id string or the additive `{ workspace_id, cwd }` object,
- *  into a stable {@link WorkspaceCreateResult}. Tolerant of either shape
- *  so the frontend never breaks on the sibling backend's rollout order. */
+ *  workspace-id string or the additive `{ workspace_id, cwd, adopted }`
+ *  object, into a stable {@link WorkspaceCreateResult}. Tolerant of either
+ *  shape so the frontend never breaks on the sibling backend's rollout
+ *  order. */
 function normalizeWorkspaceCreate(raw: unknown): WorkspaceCreateResult {
-  if (typeof raw === "string") return { workspaceId: raw, cwd: null };
+  if (typeof raw === "string") return { workspaceId: raw, cwd: null, adopted: false };
   const obj = (raw ?? {}) as {
     workspace_id?: string;
     workspaceId?: string;
     cwd?: string | null;
+    adopted?: boolean;
   };
   return {
     workspaceId: obj.workspace_id ?? obj.workspaceId ?? "",
     cwd: obj.cwd ?? null,
+    adopted: obj.adopted === true,
   };
 }
 

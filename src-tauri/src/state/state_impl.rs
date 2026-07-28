@@ -641,6 +641,18 @@ pub struct AppStateStore {
     inner: Mutex<AppStateSnapshot>,
 }
 
+/// Outcome of [`AppStateStore::adopt_or_create_worktree_workspace`]:
+/// either an existing live workspace already claimed the worktree path
+/// (adopt it — do NOT run the create-side effects again), or a fresh
+/// workspace was inserted with its `worktree_path` claim already stamped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeWorkspaceClaim {
+    /// Id of the live workspace that already claims the path.
+    Adopted(String),
+    /// Id of the freshly created workspace.
+    Created(WorkspaceId),
+}
+
 fn terminal_count_for_workspace(workspace: &WorkspaceSnapshot) -> usize {
     collect_terminal_sessions(&workspace.surfaces).len()
 }
@@ -1017,6 +1029,16 @@ impl AppStateStore {
     /// Used by "Add repository" so the empty workspace state shows.
     pub fn create_empty_workspace_at_path(&self, cwd_path: PathBuf) -> WorkspaceId {
         let mut snapshot = self.inner.lock().unwrap();
+        Self::create_empty_workspace_at_path_locked(&mut snapshot, cwd_path)
+    }
+
+    /// Body of [`Self::create_empty_workspace_at_path`], factored out so
+    /// callers that already hold the state lock (the atomic
+    /// adopt-or-create path) can insert without re-locking.
+    fn create_empty_workspace_at_path_locked(
+        snapshot: &mut AppStateSnapshot,
+        cwd_path: PathBuf,
+    ) -> WorkspaceId {
         let workspace_id = WorkspaceId(next_id("workspace"));
         let workspace_index = snapshot.workspaces.len() + 1;
         let cwd = cwd_path.display().to_string();
@@ -1352,16 +1374,27 @@ impl AppStateStore {
         cwd_path: PathBuf,
         layout: WorkspacePresetLayout,
     ) -> WorkspaceId {
+        let mut snapshot = self.inner.lock().unwrap();
+        Self::create_workspace_with_layout_locked(&mut snapshot, cwd_path, layout)
+    }
+
+    /// Body of [`Self::create_workspace_with_layout`], factored out so
+    /// callers that already hold the state lock (the atomic
+    /// adopt-or-create path) can insert without re-locking.
+    fn create_workspace_with_layout_locked(
+        snapshot: &mut AppStateSnapshot,
+        cwd_path: PathBuf,
+        layout: WorkspacePresetLayout,
+    ) -> WorkspaceId {
         // Empty layout short-circuits to the same shape
         // `create_empty_workspace_at_path` produces: no tabs, no
         // surfaces, no terminal sessions. Callers (e.g. the inline
         // chat-worktree flow) fill the workspace with their own pane
         // afterward via `agent_chat_create_pane`.
         if matches!(layout, WorkspacePresetLayout::Empty) {
-            return self.create_empty_workspace_at_path(cwd_path);
+            return Self::create_empty_workspace_at_path_locked(snapshot, cwd_path);
         }
 
-        let mut snapshot = self.inner.lock().unwrap();
         let workspace_id = WorkspaceId(next_id("workspace"));
         let surface_id = SurfaceId(next_id("surface"));
         let cwd = cwd_path.display().to_string();
@@ -1464,6 +1497,51 @@ impl AppStateStore {
             .notifications
             .retain(|notification| notification.workspace_id != workspace_id);
         workspace_id
+    }
+
+    /// Atomically either adopt the live workspace `probe` finds, or create a
+    /// new one at `cwd_path` with its worktree claim (`worktree_path` +
+    /// `title`) already stamped — all under ONE acquisition of the state
+    /// lock.
+    ///
+    /// This is the linearization point for the duplicate-worktree guard:
+    /// with lookup and insert as separate lock acquisitions, two concurrent
+    /// `create_worktree_workspace` calls for the same path could both probe
+    /// empty and both insert — exactly the two-workspaces/one-checkout state
+    /// the guard exists to prevent. Stamping `worktree_path` inside the same
+    /// critical section matters for the same reason: it is the claim a
+    /// concurrent creator's probe matches on.
+    ///
+    /// `probe` runs under the state lock; it must only read the snapshot and
+    /// must not touch this store (or any other lock). The slow work around a
+    /// worktree creation (`git worktree add`, git-info population, PTY
+    /// spawning) stays outside — only the check+insert is serialized here.
+    pub fn adopt_or_create_worktree_workspace<F>(
+        &self,
+        cwd_path: PathBuf,
+        layout: WorkspacePresetLayout,
+        worktree_path: String,
+        title: String,
+        probe: F,
+    ) -> WorktreeWorkspaceClaim
+    where
+        F: FnOnce(&AppStateSnapshot) -> Option<String>,
+    {
+        let mut snapshot = self.inner.lock().unwrap();
+        if let Some(existing_id) = probe(&snapshot) {
+            return WorktreeWorkspaceClaim::Adopted(existing_id);
+        }
+        let workspace_id =
+            Self::create_workspace_with_layout_locked(&mut snapshot, cwd_path, layout);
+        if let Some(workspace) = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|w| w.workspace_id == workspace_id)
+        {
+            workspace.worktree_path = Some(worktree_path);
+            workspace.title = title;
+        }
+        WorktreeWorkspaceClaim::Created(workspace_id)
     }
 
     pub fn create_browser_pane(&self, pane_id: &str, url: Option<&str>) -> Result<(PaneId, BrowserId), String> {

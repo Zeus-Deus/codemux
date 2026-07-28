@@ -100,17 +100,15 @@ function renderRow(
   const onChangeCheckoutMode = vi.fn();
   const onChangeWorktreeName = vi.fn();
   const onChangeBaseBranch = vi.fn();
-  const { draftTarget, ...rest } = overrides;
+  const { draftTarget, checkoutMode, worktreeName, baseBranch, ...rest } =
+    overrides;
   const props: ThreadScopeRowProps = {
-    location: {
-      kind: "draft",
-      target: draftTarget ?? { kind: "project", projectPath: "/projects/foo" },
-      onChangeTarget,
-    },
+    target: draftTarget ?? { kind: "project", projectPath: "/projects/foo" },
+    onChangeTarget,
     projectPath: "/projects/foo",
-    checkoutMode: "current",
-    worktreeName: "",
-    baseBranch: "main",
+    checkoutMode: checkoutMode ?? "current",
+    worktreeName: worktreeName ?? "",
+    baseBranch: baseBranch ?? "main",
     onChangeCheckoutMode,
     onChangeWorktreeName,
     onChangeBaseBranch,
@@ -120,43 +118,6 @@ function renderRow(
   return {
     ...utils,
     onChangeTarget,
-    onChangeCheckoutMode,
-    onChangeWorktreeName,
-    onChangeBaseBranch,
-  };
-}
-
-/** Workspace-mode variant — `AgentChatPane`'s new-thread empty state. */
-function renderWorkspaceRow(
-  overrides: Partial<ThreadScopeRowProps> & { isHome?: boolean } = {},
-) {
-  const onSelectHomeWorkspace = vi.fn();
-  const onSelectProject = vi.fn();
-  const onChangeCheckoutMode = vi.fn();
-  const onChangeWorktreeName = vi.fn();
-  const onChangeBaseBranch = vi.fn();
-  const { isHome, ...rest } = overrides;
-  const props: ThreadScopeRowProps = {
-    location: {
-      kind: "workspace",
-      isHome: isHome ?? false,
-      onSelectHomeWorkspace,
-      onSelectProject,
-    },
-    projectPath: isHome ? null : "/projects/foo",
-    checkoutMode: "current",
-    worktreeName: "",
-    baseBranch: "main",
-    onChangeCheckoutMode,
-    onChangeWorktreeName,
-    onChangeBaseBranch,
-    ...rest,
-  };
-  const utils = render(<ThreadScopeRow {...props} />);
-  return {
-    ...utils,
-    onSelectHomeWorkspace,
-    onSelectProject,
     onChangeCheckoutMode,
     onChangeWorktreeName,
     onChangeBaseBranch,
@@ -489,93 +450,6 @@ describe("ThreadScopeRow", () => {
       await waitFor(() => {
         expect(screen.getByText("WORKTREE")).toBeInTheDocument();
       });
-    });
-  });
-
-  describe("workspace mode (AgentChatPane empty state)", () => {
-    it("project pane renders location + checkout + branch controls", () => {
-      renderWorkspaceRow();
-      expect(screen.getByText("foo")).toBeInTheDocument();
-      expect(screen.getByText("Current checkout")).toBeInTheDocument();
-    });
-
-    it("home-rooted pane renders only the location control", () => {
-      renderWorkspaceRow({ isHome: true });
-      expect(screen.getByText("Home")).toBeInTheDocument();
-      expect(screen.queryByText("Current checkout")).toBeNull();
-    });
-
-    it("picking a DIFFERENT project calls onSelectProject with its path", async () => {
-      currentWorkspaces = [
-        makeWs({
-          workspace_id: "ws-bar",
-          cwd: "/projects/bar",
-          project_root: "/projects/bar",
-        }),
-      ];
-      const user = userEvent.setup();
-      const { onSelectProject } = renderWorkspaceRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Run in");
-      await user.click(screen.getByText("bar"));
-      expect(onSelectProject).toHaveBeenCalledWith("/projects/bar");
-    });
-
-    it("picking the ALREADY-ACTIVE project is a no-op (no navigation)", async () => {
-      currentWorkspaces = [
-        makeWs({
-          workspace_id: "ws-foo",
-          cwd: "/projects/foo",
-          project_root: "/projects/foo",
-        }),
-      ];
-      const user = userEvent.setup();
-      const { onSelectProject } = renderWorkspaceRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Run in");
-      // The popover row for the active project — click it.
-      const rows = screen.getAllByText("foo");
-      await user.click(rows[rows.length - 1]);
-      expect(onSelectProject).not.toHaveBeenCalled();
-    });
-
-    it("hides the Home option when no home-rooted workspace exists (never creates hidden workspaces)", async () => {
-      const user = userEvent.setup();
-      renderWorkspaceRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Run in");
-      expect(screen.queryByText("Home directory (~)")).toBeNull();
-    });
-
-    it("offers Home when a home-rooted workspace exists, and selecting it activates that workspace", async () => {
-      currentWorkspaces = [
-        makeWs({
-          workspace_id: "ws-home",
-          cwd: "/home/user",
-          project_root: "/home/user",
-        }),
-      ];
-      const user = userEvent.setup();
-      const { onSelectHomeWorkspace } = renderWorkspaceRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Run in");
-      await user.click(screen.getByText("Home directory (~)"));
-      expect(onSelectHomeWorkspace).toHaveBeenCalledWith("ws-home");
-    });
-
-    it("'Open another project…' routes through onSelectProject", async () => {
-      mockOpenProject.mockResolvedValue({
-        success: true,
-        path: "/projects/opened",
-        name: "opened",
-      });
-      const user = userEvent.setup();
-      const { onSelectProject } = renderWorkspaceRow();
-      await user.click(screen.getByText("foo"));
-      await screen.findByText("Open another project…");
-      await user.click(screen.getByText("Open another project…"));
-      await waitFor(() => expect(mockOpenProject).toHaveBeenCalled());
-      expect(onSelectProject).toHaveBeenCalledWith("/projects/opened");
     });
   });
 });
