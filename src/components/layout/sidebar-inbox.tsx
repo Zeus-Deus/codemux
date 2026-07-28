@@ -51,6 +51,7 @@ import {
   formatTimeUntil,
   type SnoozePreset,
 } from "./sidebar-snooze";
+import { WorkspaceHoverCard } from "./workspace-hover-card";
 import { activateWorkspace } from "@/tauri/commands";
 import {
   normalizePrState,
@@ -411,6 +412,10 @@ interface SettledRowProps {
   repo: InboxRepo;
   isActive: boolean;
   selected: boolean;
+  /** Live agent status for the hover card — a settled workspace can still be
+   *  running (e.g. a "review" agent stays settled), so the row must not hard-
+   *  code idle. */
+  status: ActivePaneStatus | null;
   /** Elapsed-since-work-ended label ("2h"), or null when unknown. */
   time: string | null;
   justSettled: boolean;
@@ -424,6 +429,7 @@ function SettledRow({
   repo,
   isActive,
   selected,
+  status,
   time,
   justSettled,
   onUnsettle,
@@ -456,6 +462,13 @@ function SettledRow({
         onMarkUnread: () => onMarkUnread(workspace.workspace_id),
       }}
     >
+    {/* Settled rows show only a title, so the hover card carries even more
+        weight here than on an active card. The bare div is intentional: it
+        takes the ContextMenuTrigger's `asChild` so the hover trigger below
+        never composes onto the same node, and the settled list is a plain
+        block container, so the extra block wrapper is layout-neutral. */}
+    <div>
+    <WorkspaceHoverCard workspace={workspace} repo={repo} status={status}>
     <div
       role="button"
       tabIndex={0}
@@ -528,6 +541,8 @@ function SettledRow({
         Un-settle
       </button>
     </div>
+    </WorkspaceHoverCard>
+    </div>
     </WorkspaceInboxMenu>
   );
 }
@@ -537,6 +552,10 @@ interface SnoozeRowProps {
   repo: InboxRepo;
   isActive: boolean;
   selected: boolean;
+  /** Live agent status for the hover card — same contract as `SettledRow`.
+   *  A snoozed "review" agent stays snoozed (only working/permission wake it
+   *  early), so the row must not hard-code idle. */
+  status: ActivePaneStatus | null;
   /** Time until the workspace comes back ("3h", "2d") — a snoozed row's whole
    *  story is its return ticket, so it shows time-until, not time-since. */
   timeUntil: string;
@@ -553,6 +572,7 @@ function SnoozeRow({
   repo,
   isActive,
   selected,
+  status,
   timeUntil,
   onWake,
   onSelect,
@@ -582,6 +602,11 @@ function SnoozeRow({
         onMarkUnread: () => onMarkUnread(workspace.workspace_id),
       }}
     >
+    {/* Same hover-details coverage as a settled row — a snoozed row is just as
+        lossy (one line, no meta), and the same bare-div nesting keeps the
+        ContextMenuTrigger and the hover trigger off one shared node. */}
+    <div>
+    <WorkspaceHoverCard workspace={workspace} repo={repo} status={status}>
       <div
         role="button"
         tabIndex={0}
@@ -645,6 +670,8 @@ function SnoozeRow({
           Wake now
         </button>
       </div>
+    </WorkspaceHoverCard>
+    </div>
     </WorkspaceInboxMenu>
   );
 }
@@ -1567,6 +1594,11 @@ export function SidebarInbox() {
                   repo={repo}
                   isActive={workspace.workspace_id === activeWorkspaceId}
                   selected={selectedIds.has(workspace.workspace_id)}
+                  status={
+                    paneStatuses
+                      ? getWorkspaceStatus(workspace.surfaces, paneStatuses)
+                      : null
+                  }
                   timeUntil={formatTimeUntil(entry.until - now)}
                   onWake={(id) => wake(id, "user")}
                   onSelect={handleSelect}
@@ -1596,6 +1628,11 @@ export function SidebarInbox() {
                   repo={repo}
                   isActive={workspace.workspace_id === activeWorkspaceId}
                   selected={selectedIds.has(workspace.workspace_id)}
+                  status={
+                    paneStatuses
+                      ? getWorkspaceStatus(workspace.surfaces, paneStatuses)
+                      : null
+                  }
                   time={formatElapsed(now - resolveSettledTimestamp(entry))}
                   justSettled={justSettledId === workspace.workspace_id}
                   onUnsettle={handleUnsettle}

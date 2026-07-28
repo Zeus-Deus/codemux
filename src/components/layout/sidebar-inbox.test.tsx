@@ -63,6 +63,24 @@ vi.mock("@/hooks/use-project-actions", () => ({
   useProjectActions: () => ({ openProject: vi.fn() }),
 }));
 
+// Record the status each row hands its hover card (the card content itself is
+// unmounted while closed, so a render-through wrapper is the observable seam),
+// then delegate to the real component.
+let hoverCardStatus: Record<string, unknown> = {};
+vi.mock("./workspace-hover-card", async (importOriginal) => {
+  const mod =
+    await importOriginal<typeof import("./workspace-hover-card")>();
+  return {
+    ...mod,
+    WorkspaceHoverCard: (
+      props: Parameters<typeof mod.WorkspaceHoverCard>[0],
+    ) => {
+      hoverCardStatus[props.workspace.workspace_id] = props.status;
+      return <mod.WorkspaceHoverCard {...props} />;
+    },
+  };
+});
+
 vi.mock("@/stores/hosts-store", () => ({
   useHosts: () => [],
 }));
@@ -242,6 +260,7 @@ beforeEach(() => {
   paneStatuses = {};
   activeWorkspaceId = "";
   wsCounter = 0;
+  hoverCardStatus = {};
 });
 
 afterEach(async () => {
@@ -874,6 +893,25 @@ describe("SidebarInbox — settle / un-settle", () => {
     expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
   });
 
+  it("settled rows pass the workspace's live agent status to the hover card", async () => {
+    // Regression: settled rows hard-coded status={null}, so the hover card
+    // read "Idle" even while the workspace's agent was in "review". A settled
+    // "review" workspace stays settled (only working/permission resurface),
+    // so its row must still surface the real computed status.
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({ title: "Finished work", surfaces: surfaceWithPane("p1") }),
+    ];
+    paneStatuses = { p1: "review" };
+    const { container } = await renderInbox();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
+    expect(hoverCardStatus["ws-1"]).toBe("review");
+  });
+
   it("settled rows have the workspace context menu with Un-settle on top", async () => {
     persistedSettled = JSON.stringify({
       settled: [{ id: "ws-1", at: Date.now() }],
@@ -1436,6 +1474,27 @@ describe("SidebarInbox — snooze shelf", () => {
     // The row's whole story is its return ticket, not time-since.
     expect(screen.getByLabelText(/^Wakes in 3h/)).toBeInTheDocument();
     expect(screen.getByText("Come back later")).toBeInTheDocument();
+  });
+
+  it("snoozed rows pass the workspace's live agent status to the hover card", async () => {
+    // Same contract as the settled rows: a snoozed "review" workspace stays
+    // snoozed (only working/permission wake it early), so its row must hand
+    // the hover card the real computed status rather than hard-coding idle.
+    const base = Date.now();
+    persistInbox({
+      snoozed: [{ id: "ws-1", at: base, until: base + 3 * 3_600_000 }],
+    });
+    workspaces = [
+      makeWorkspace({ title: "Deferred work", surfaces: surfaceWithPane("p1") }),
+    ];
+    paneStatuses = { p1: "review" };
+    const { container } = await flushRender();
+
+    fireEvent.click(screen.getByRole("button", { name: "Snoozed (1)" }));
+    expect(
+      container.querySelector('[data-snoozed-row="ws-1"]'),
+    ).not.toBeNull();
+    expect(hoverCardStatus["ws-1"]).toBe("review");
   });
 
   it("wakes a snoozed workspace whose wake time has already passed", async () => {
