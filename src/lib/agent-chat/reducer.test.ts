@@ -406,6 +406,66 @@ describe("agent-chat reducer", () => {
     expect(state.pendingRequestIds).toEqual([]);
   });
 
+  it("keeps a resolved request resolved when a duplicate respond fails", () => {
+    // Two windows on the same thread: the second respond loses the race and
+    // the provider answers "not found" — which it cannot distinguish from
+    // "already resolved" (Codex drops the pending entry on the first answer).
+    // The persisted failure event must not flip an answered approval into
+    // the expired state, live or on replay.
+    let state = runEvents([
+      {
+        type: "item_completed",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        item: {
+          kind: "tool_use",
+          tool_name: "Bash",
+          input: { command: "pwd" },
+          tool_use_id: "tool-dup",
+        },
+      },
+      {
+        type: "request_opened",
+        thread_id: "t1",
+        turn_id: "turn-1",
+        request_id: "req-dup",
+        request_kind: "tool-permission",
+        payload: { tool_name: "Bash" },
+        tool_use_id: "tool-dup",
+      },
+      {
+        type: "request_resolved",
+        thread_id: "t1",
+        request_id: "req-dup",
+        decision: { decision: "allow" },
+      },
+    ]);
+
+    state = applyEvent(state, {
+      type: "request_response_failed",
+      thread_id: "t1",
+      request_id: "req-dup",
+      reason: "stale_provider_callback",
+      message: "Question expired.",
+    });
+
+    const request = state.messages.find(
+      (m): m is PermissionRequestItem =>
+        m.kind === "permission_request" && m.request_id === "req-dup",
+    );
+    expect(request?.resolution).toEqual({
+      state: "resolved",
+      decision: { decision: "allow" },
+    });
+    // The allowed tool keeps running — the failure belongs to a duplicate
+    // reply, not to the tool call the user approved.
+    const tool = state.messages.find(
+      (m) => m.kind === "tool_call" && m.tool_use_id === "tool-dup",
+    );
+    expect(tool?.kind === "tool_call" && tool.status).toBe("running");
+    expect(state.pendingRequestIds).toEqual([]);
+  });
+
   it("terminalizes a stale request response and settles its linked tool", () => {
     let state = runEvents([
       {

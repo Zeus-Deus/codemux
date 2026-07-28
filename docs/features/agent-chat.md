@@ -332,12 +332,31 @@ The chat pane stack:
     Claude/Codex session merely to answer an old request. It persists
     `request_response_failed { reason: "stale_provider_callback" }` instead;
     reducer replay terminalizes the request and explains that the user should
-    Continue so the agent can repeat it. Hydration applies the same terminal
-    state to an unresolved persisted request whenever the backend confirms no
-    turn is live, while preserving requests across an ordinary workspace
-    switch when their original turn is still running. OpenCode is the
-    exception: its permission state lives in the external HTTP server, so its
-    adapter explicitly opts into request resume.
+    Continue so the agent can repeat it. Hydration (`replayPayloads` in
+    `src/lib/agent-chat/hydrate.ts`) applies the same terminal state to an
+    unresolved persisted request, but only when BOTH guards say the callback
+    is gone:
+    - `opts.runLive` — the backend's `agent_chat_turn_active` probe. A live
+      turn means an ordinary workspace-switch remount, so its requests stay
+      actionable.
+    - `opts.provider` — OpenCode is the exception: its permission state lives
+      in the external HTTP server, so its adapter opts into request resume
+      (`pending_requests_survive_session_restart`) and
+      `agent_chat_respond_to_request` re-adopts the session to deliver the
+      answer. Hydration mirrors that opt-in through the pure frontend table
+      `providerRequestsSurviveSessionRestart` (in
+      `src/lib/agent-chat/capability-defaults.ts`, no extra IPC) and leaves
+      OpenCode requests `pending`. Expiring them would be unrecoverable: the
+      reducer's `request_opened` early-returns on a known request id, so no
+      re-broadcast can resurrect a request the UI already terminalized.
+    Terminalizing is one-way but not destructive of a real answer: the
+    reducer's `request_response_failed` arm skips a request already in the
+    `resolved` state. Providers cannot distinguish "unknown request" from
+    "already answered" (Codex drops the pending entry on the first reply), so
+    a duplicate respond — the same thread answered from two windows — reports
+    a failure for a request that actually succeeded; without the guard that
+    persisted event would durably flip an answered approval to "expired" on
+    every replay.
   - **NULL `permission_mode` heal**: rows created before the
     `permission_mode` column existed read back NULL. The frontend seeds its
     permission picker to the provider default ("Full access" =

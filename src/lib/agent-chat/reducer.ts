@@ -1407,14 +1407,24 @@ function applyEventInner(
 
     case "request_response_failed": {
       const found = findPermissionRequest(state.messages, event.request_id);
-      if (!found) {
-        return {
-          ...state,
-          pendingRequestIds: state.pendingRequestIds.filter(
-            (id) => id !== event.request_id,
-          ),
-        };
-      }
+      const settled: ChatThreadState = {
+        ...state,
+        pendingRequestIds: state.pendingRequestIds.filter(
+          (id) => id !== event.request_id,
+        ),
+      };
+      if (!found) return settled;
+
+      // A request that already reached the terminal `resolved` state keeps
+      // it. Providers conflate "unknown request" with "already answered"
+      // (Codex drops the pending entry the moment it is answered), so a
+      // duplicate respond — same thread open in two windows, or a retry
+      // after a slow first call — reports a failure for a request the user
+      // successfully answered. Overwriting would durably (this event is
+      // persisted and replayed) flip an answered approval to "expired", and
+      // would un-resume a workflow that `request_resolved` already set
+      // running. Same reasoning as `markRequestPending`.
+      if (found.item.resolution.state === "resolved") return settled;
 
       let messages = replaceItem(state.messages, found.index, {
         ...found.item,
