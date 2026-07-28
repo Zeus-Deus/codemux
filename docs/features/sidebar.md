@@ -33,8 +33,10 @@ There are exactly two states, toggled by the title-bar button and `Ctrl+B`:
 
 ### The workspace inbox (expanded)
 
-Replaced the nested project tree (project groups, drag-reorder, the pinned
-"Needs you" strip, and the "Gather on top" LIVE section) with one flat list.
+Replaced the nested project tree (project groups, drag-reorder, and the
+"Gather on top" LIVE section) with one flat list. The pinned "Needs you"
+strip survived the migration: it is re-mounted in the inbox's sticky header
+(see below).
 A workspace is in exactly one of four states — **active** (a card), **settled**
 (a row on the Settled shelf), **snoozed** (a row on the Snoozed shelf), or
 **pinned-active** (a card carrying a keep-active pin that auto-settle must not
@@ -60,6 +62,28 @@ visual only — nothing is archived, closed, or deleted.
   filtered project disappears (its last workspace archived or deleted) the
   filter resets itself to "All projects". (Replaced the earlier horizontal
   filter-chip strip and its wheel-scroll handling.)
+- **"Needs you" strip** (`sidebar-needs-you-strip.tsx`): pinned in the same
+  sticky block as the project filter, so it stays visible however far the card
+  list scrolls. Renders only while ≥1 workspace has status `permission`;
+  absent otherwise. Each entry is a **jump-link** (project avatar + blocker
+  text + age) that activates the blocked workspace and smooth-scrolls its card
+  into view — the card is never moved or removed, so the strip surfaces
+  blocked work **without reordering the list**. That duplication is what lets
+  the active list stay status-blind. Entries are sorted oldest-blocked-first
+  by each blocker's permission timestamp (density-store `statusSince`; an
+  unseeded timestamp ranks as newest, ties keep stable tree order), so the
+  longest-waiting agent is on top — tree order alone wouldn't deliver that,
+  since the list runs newest-first and a block can land on any card at any
+  time. Capped at **4** rows with a `+N more below` line; the sort means the
+  cap can only ever hide the newest blockers, and the header count
+  (`NEEDS YOU · N`) always reports the true total. Scoped by the active repo
+  filter, so a filtered sidebar never points at a workspace the list is
+  hiding. The strip applies **no settled/snoozed filter**, and doesn't need
+  one: the settle safety net and the snooze hand-raise (below) resurface any
+  parked workspace the moment it goes `permission`, so a strip entry's card
+  is always genuinely in the active list. It is also the **one surface that
+  orders by status** — the list below stays deliberately status-blind, and
+  the strip existing is precisely what lets it.
 - **Pending workspaces**: workspaces still being created render above the
   cards as their own rows — a spinner "creating" row, or a red `AlertCircle`
   "failed" row. They are filter-scoped like everything else and suppress the
@@ -72,7 +96,14 @@ visual only — nothing is archived, closed, or deleted.
   notification counts — so a row holds its position from the moment it opens
   until the user settles or snoozes it. That is what makes `Alt+1..9` muscle
   memory: **`Alt+1` is the newest workspace**, not the oldest. Status is
-  carried by each card's own state cluster instead.
+  carried by each card's own state cluster (and by the pinned needs-you strip)
+  instead. Honest trade-off: newest-first means every *creation* shifts the
+  existing cards (and their jump digits) down one, and a tier change (a card
+  entering or leaving "Wrapping up") moves it across the divider — so
+  positions and digit assignments are stable *between* those lifecycle
+  events, not absolutely. That is accepted on purpose: the win is that the
+  workspace you just created is always at the top, on jump slot 1, rather
+  than below every older card.
 - **The "Wrapping up" tier** (`isWrappingUp` in `sidebar-inbox.tsx`): the active
   list is partitioned into two tiers — everything else on top, winding-down
   cards under a **static "Wrapping up" divider**. A card is wrapping up when
@@ -480,7 +511,11 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   holding a rail button is the deferral undone. The one exception is also the
   inbox's: the **currently-open** workspace keeps its button whichever shelf it
   is parked on, because the selection fill is the collapsed sidebar's only
-  "you are here".
+  "you are here". Buttons run **newest-first** via the same
+  `compareNewestFirst` the expanded inbox sorts with (imported from
+  `sidebar-inbox.tsx` — one implementation, shared so the two views can never
+  disagree), so collapsing the sidebar never re-shuffles the order the user
+  just memorized. The rail has no tiers: it is a single newest-first list.
 - **Footer**: Automations, Workspaces, Ports (badge), Settings — same order
   as the expanded footer row.
 - **Setup banner** (`sidebar-setup-banner.tsx`): hidden in the rail.
@@ -492,6 +527,9 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   notification detail, and work-based titling while an agent is live.
 - Project dropdown filtering active + snoozed + settled lists (with active
   counts); pinned add-repo button; sticky filter row.
+- A pinned, filter-scoped "Needs you" strip of jump-links in the sticky
+  header — oldest-blocked-first, capped at 4 with an honest `+N more below`
+  overflow and true total count.
 - A "Wrapping up" tier that demotes (never hides) an open-PR card once its
   agent is idle and the user has read it, and returns it to the top tier the
   moment a follow-up puts the agent back to work.
@@ -509,8 +547,8 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - Search affordance opening the command palette; neutral-ghost new-agent button.
 - Show git stats toggle (Settings → Appearance → Sidebar).
 - Rail: one avatar button per active (neither settled nor snoozed) workspace,
-  with individual status dots, select-without-expand, and the shared footer
-  destinations.
+  newest-first, with individual status dots, select-without-expand, and the
+  shared footer destinations.
 - Hover details on every workspace surface (card, settled row, snoozed row,
   rail avatar) — full title, complete git picture, PR/issue, ports, device,
   and path on disk.
@@ -574,18 +612,19 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - The rail carries no snooze, unread, or "Woke" affordance — parking state
   reaches it only as an absence (the button is gone), never as a marker.
 - The superseded tree components (`sidebar-project-group.tsx`,
-  `sidebar-needs-you-strip.tsx`, `sidebar-live-section.tsx`,
-  `sidebar-live-grouping.ts`, and the `SidebarWorkspaceRow` component) are still
+  `sidebar-live-section.tsx`, `sidebar-live-grouping.ts`, and the
+  `SidebarWorkspaceRow` component) are still
   in the repo but **unmounted**. Only `sidebar-workspace-row.tsx` is load-bearing:
   the inbox menu (`workspace-inbox-menu.tsx`) imports its `WorkspaceContextMenuItems`
   / `DeleteWorktreeDialog` and its `SettleMenuAction` / `SnoozeMenuAction` types
   plus the lifecycle block those drive (Un-settle / Wake now / Settle /
   "Snooze until…" / Mark unread, ordered so the entries that bring work *back*
   come first) — the `SidebarWorkspaceRow` *component* in that
-  module is itself unmounted. The other four files (`sidebar-project-group.tsx`,
-  `sidebar-needs-you-strip.tsx`, `sidebar-live-section.tsx`,
-  `sidebar-live-grouping.ts`) are pure dead code kept only alongside their test
-  suites. Removing them is a pending cleanup.
+  module is itself unmounted. The other three files (`sidebar-project-group.tsx`,
+  `sidebar-live-section.tsx`, `sidebar-live-grouping.ts`) are pure dead code
+  kept only alongside their test suites. Removing them is a pending cleanup.
+  `sidebar-needs-you-strip.tsx` is **no longer dead** — it is re-mounted in the
+  inbox's sticky header (see "Needs you strip" above).
 
 ## Load-Bearing Assumptions
 
@@ -682,7 +721,8 @@ quietly rather than loudly.
 
 - `src/components/layout/app-sidebar.tsx` — `collapsible="icon"`, rail overflow override
 - `src/components/layout/sidebar-workspace-list.tsx` — expanded → inbox, collapsed → rail
-- `src/components/layout/sidebar-inbox.tsx` — filter dropdown, card list, the two active tiers (`isWrappingUp` + `WrappingUpDivider`), both shelves, the settle/snooze/wake/auto-settle effects and their invariants, multi-select, park navigation
+- `src/components/layout/sidebar-inbox.tsx` — filter dropdown, card list, the two active tiers (`isWrappingUp` + `WrappingUpDivider`), both shelves, the settle/snooze/wake/auto-settle effects and their invariants, multi-select, park navigation, `compareNewestFirst` (shared with the rail)
+- `src/components/layout/sidebar-needs-you-strip.tsx` — the pinned needs-you strip of jump-links in the sticky header (oldest-blocked-first, capped at 4)
 - `src/components/layout/sidebar-inbox-card.tsx` — the workspace card + Settle/Snooze action pair + unread/Woke markers + context menu wiring
 - `src/components/layout/sidebar-snooze.ts` — pure, clock-free wake presets + `formatWakeLabel` + `formatTimeUntil`
 - `src/components/layout/workspace-inbox-menu.tsx` — the shared right-click menu for all three row shapes

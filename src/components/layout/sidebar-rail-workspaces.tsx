@@ -9,6 +9,7 @@ import {
 import { useHosts } from "@/stores/hosts-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
+import { compareNewestFirst } from "./sidebar-inbox";
 import { activateWorkspace } from "@/tauri/commands";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import { useProjectAppearance } from "./use-project-appearance";
@@ -165,10 +166,19 @@ export function SidebarRailWorkspaces() {
   // its row; here the button's selection fill is the only "you are here" the
   // collapsed sidebar has, and dropping it would leave the rail claiming the
   // user is nowhere.
-  const railWorkspaces = allWorkspaces.filter(
-    (ws) =>
-      !parkedIds.has(ws.workspace_id) || ws.workspace_id === activeWorkspaceId,
-  );
+  //
+  // Same newest-first, status-blind order as the expanded inbox (the shared
+  // `compareNewestFirst`), so collapsing the sidebar never re-shuffles the
+  // workspaces the user just memorized positions for.
+  const railWorkspaces = allWorkspaces
+    .map((ws, storedIndex) => ({ ws, storedIndex }))
+    .filter(
+      ({ ws }) =>
+        !parkedIds.has(ws.workspace_id) ||
+        ws.workspace_id === activeWorkspaceId,
+    )
+    .sort(compareNewestFirst)
+    .map(({ ws }) => ws);
 
   return (
     <div className="flex flex-1 min-h-0 flex-col items-center gap-1.5 overflow-y-auto py-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">

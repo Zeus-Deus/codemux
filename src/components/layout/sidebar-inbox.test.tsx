@@ -306,8 +306,11 @@ describe("SidebarInbox — cards", () => {
     expect(screen.getByText("Working")).toBeInTheDocument();
     expect(screen.getByText("Needs you")).toBeInTheDocument();
     expect(screen.getByText("Done · review")).toBeInTheDocument();
-    // Needs-you card carries the blocker line.
-    expect(screen.getByText("Waiting for your input")).toBeInTheDocument();
+    // Needs-you card carries the blocker line — twice over, because the
+    // pinned "needs you" strip above the list mirrors the same text as a
+    // jump-link. Duplication is the point: the blocker stays one click away
+    // however far down its card sits.
+    expect(screen.getAllByText("Waiting for your input")).toHaveLength(2);
   });
 
   it("git stats obey the sidebar.show_git_stats setting (branch always shows)", async () => {
@@ -1670,10 +1673,56 @@ describe("SidebarInbox — settled shelf polish", () => {
     const rows = settledOrder(container);
     expect(rows).toHaveLength(11);
     expect(rows).toContain("ws-14");
-    // Its un-settle affordance and "you are here" highlight stay reachable.
+    // Its un-settle affordance and "you are here" highlight stay reachable,
+    // and the "+N hidden" count stays truthful: the escaped row is rendered,
+    // so it is not counted as hidden (14 settled, 11 visible, 3 hidden).
     expect(
-      screen.getByRole("button", { name: /Show 3 more settled workspaces/ }),
+      screen.getByRole("button", {
+        name: /Show 3 more settled workspaces \(3 hidden\)/,
+      }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("SidebarInbox — needs-you strip × settled shelf", () => {
+  it("a blocked settled workspace keeps a strip jump-link AND a rendered card", async () => {
+    // The strip walks every workspace with no settled filter, so a settled
+    // workspace that lands on `permission` gets a jump-link. That link is only
+    // honest because the permission safety net resurfaces the workspace into
+    // the active card list — pin the pair so a future change to either half
+    // (a settled filter on the strip, or narrowing the resurface statuses)
+    // can't leave the strip pointing at a card that never renders.
+    workspaces = [
+      ...Array.from({ length: 11 }, () => makeWorkspace()),
+      makeWorkspace({
+        title: "Blocked but settled",
+        surfaces: surfaceWithPane("p-blocked"),
+      }),
+    ];
+    paneStatuses = { "p-blocked": "permission" };
+    // All 12 settled; the blocked one is LAST, past the 10-row settled fold,
+    // so if it stayed settled its row would not even be paged in.
+    persistInbox({
+      settled: workspaces.map((w) => ({ id: w.workspace_id, at: Date.now() })),
+    });
+    const { container } = await flushRender();
+
+    // The pinned strip lists the blocker as a jump-link…
+    const link = screen.getByRole("button", {
+      name: /Jump to Blocked but settled/,
+    });
+    // …and its card is genuinely in the DOM: the safety net pulled it out of
+    // the settled shelf and into the active list.
+    expect(container.querySelector('[data-inbox-card="ws-12"]')).not.toBeNull();
+    expect(container.querySelector('[data-settled-row="ws-12"]')).toBeNull();
+
+    // Clicking the strip entry activates the workspace, exactly like a card
+    // click would.
+    fireEvent.click(link);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(activateWorkspace).toHaveBeenCalledWith("ws-12");
   });
 });
 
