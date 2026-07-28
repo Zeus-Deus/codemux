@@ -552,6 +552,10 @@ interface SnoozeRowProps {
   repo: InboxRepo;
   isActive: boolean;
   selected: boolean;
+  /** Live agent status for the hover card — same contract as `SettledRow`.
+   *  A snoozed "review" agent stays snoozed (only working/permission wake it
+   *  early), so the row must not hard-code idle. */
+  status: ActivePaneStatus | null;
   /** Time until the workspace comes back ("3h", "2d") — a snoozed row's whole
    *  story is its return ticket, so it shows time-until, not time-since. */
   timeUntil: string;
@@ -568,6 +572,7 @@ function SnoozeRow({
   repo,
   isActive,
   selected,
+  status,
   timeUntil,
   onWake,
   onSelect,
@@ -597,6 +602,11 @@ function SnoozeRow({
         onMarkUnread: () => onMarkUnread(workspace.workspace_id),
       }}
     >
+    {/* Same hover-details coverage as a settled row — a snoozed row is just as
+        lossy (one line, no meta), and the same bare-div nesting keeps the
+        ContextMenuTrigger and the hover trigger off one shared node. */}
+    <div>
+    <WorkspaceHoverCard workspace={workspace} repo={repo} status={status}>
       <div
         role="button"
         tabIndex={0}
@@ -660,6 +670,8 @@ function SnoozeRow({
           Wake now
         </button>
       </div>
+    </WorkspaceHoverCard>
+    </div>
     </WorkspaceInboxMenu>
   );
 }
@@ -1582,6 +1594,11 @@ export function SidebarInbox() {
                   repo={repo}
                   isActive={workspace.workspace_id === activeWorkspaceId}
                   selected={selectedIds.has(workspace.workspace_id)}
+                  status={
+                    paneStatuses
+                      ? getWorkspaceStatus(workspace.surfaces, paneStatuses)
+                      : null
+                  }
                   timeUntil={formatTimeUntil(entry.until - now)}
                   onWake={(id) => wake(id, "user")}
                   onSelect={handleSelect}

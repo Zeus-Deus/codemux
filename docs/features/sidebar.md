@@ -120,12 +120,12 @@ visual only — nothing is archived, closed, or deleted.
   archive, delete) shared with the old row, including the delete/push-confirm
   dialogs.
 - **Hover details** (`workspace-hover-card.tsx`): resting the pointer on any
-  workspace surface — an active card, a settled one-line row, or a collapsed
-  rail avatar — opens a shared read-only `HoverCard` to the right (350ms open,
-  120ms close, `side="right" align="start"`, 290px). It exists because every
-  sidebar surface is lossy: the card truncates its title and drops
-  `git_behind` / `git_changed_files` entirely, the settled row shows only a
-  title, and the rail shows nothing but an avatar. Contents, all conditional
+  workspace surface — an active card, a settled or snoozed one-line row, or a
+  collapsed rail avatar — opens a shared read-only `HoverCard` to the right
+  (350ms open, 120ms close, `side="right" align="start"`, 290px). It exists
+  because every sidebar surface is lossy: the card truncates its title and
+  drops `git_behind` / `git_changed_files` entirely, the settled and snoozed
+  rows show only a title, and the rail shows nothing but an avatar. Contents, all conditional
   except the header and Location: repo eyebrow + provider marks + agent state
   (with client-derived elapsed), the **full** untruncated title, the linked
   issue's number + title, then label/value rows — Branch, Uncommitted `+A −D`,
@@ -494,8 +494,9 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - Rail: one avatar button per active (neither settled nor snoozed) workspace,
   with individual status dots, select-without-expand, and the shared footer
   destinations.
-- Hover details on every workspace surface (card, settled row, rail avatar) —
-  full title, complete git picture, PR/issue, ports, device, and path on disk.
+- Hover details on every workspace surface (card, settled row, snoozed row,
+  rail avatar) — full title, complete git picture, PR/issue, ports, device,
+  and path on disk.
 - Per-workspace agent status covers both terminal and Agent Chat (Beta) agents
   (chat sessions publish into the same `pane_statuses` snapshot).
 - The done-review checkmark **survives an app restart**. `save_persisted_state`
@@ -530,7 +531,7 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   card. The backend now persists `last_active_at`, which would fix this; the
   card just doesn't read it yet (the settled shelf does, via `workEndedAt`).
   The hover card's elapsed reading inherits exactly this limitation (it reads
-  the same store, sampled once at open rather than off a ticking clock).
+  the same store, ticking on the shared coarse clock while the card is open).
 - Shelf collapse state (Settled open, Snoozed closed) and the settled paging
   window are **component state** — not persisted, and reset on every mount.
 - Multi-selection is session-only and cleared by a plain click, an activation,
@@ -668,7 +669,7 @@ quietly rather than loudly.
 - `src/components/layout/sidebar-inbox-card.tsx` — the workspace card + Settle/Snooze action pair + unread/Woke markers + context menu wiring
 - `src/components/layout/sidebar-snooze.ts` — pure, clock-free wake presets + `formatWakeLabel` + `formatTimeUntil`
 - `src/components/layout/workspace-inbox-menu.tsx` — the shared right-click menu for all three row shapes
-- `src/components/layout/workspace-hover-card.tsx` — the shared hover-details card for cards, settled rows, and rail avatars
+- `src/components/layout/workspace-hover-card.tsx` — the shared hover-details card for cards, settled/snoozed rows, and rail avatars
 - `src/components/layout/sidebar-inbox-jump.ts` — visual-order jump targets for Alt+1..9
 - `src/lib/keybind-registry.ts` — `workspaceJump1..9` actions (default `Alt+1..9`)
 - `src/lib/use-coarse-clock.ts` — the single ~30s clock behind every elapsed label and sweep

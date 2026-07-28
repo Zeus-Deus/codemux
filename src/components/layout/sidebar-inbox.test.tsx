@@ -1476,6 +1476,27 @@ describe("SidebarInbox — snooze shelf", () => {
     expect(screen.getByText("Come back later")).toBeInTheDocument();
   });
 
+  it("snoozed rows pass the workspace's live agent status to the hover card", async () => {
+    // Same contract as the settled rows: a snoozed "review" workspace stays
+    // snoozed (only working/permission wake it early), so its row must hand
+    // the hover card the real computed status rather than hard-coding idle.
+    const base = Date.now();
+    persistInbox({
+      snoozed: [{ id: "ws-1", at: base, until: base + 3 * 3_600_000 }],
+    });
+    workspaces = [
+      makeWorkspace({ title: "Deferred work", surfaces: surfaceWithPane("p1") }),
+    ];
+    paneStatuses = { p1: "review" };
+    const { container } = await flushRender();
+
+    fireEvent.click(screen.getByRole("button", { name: "Snoozed (1)" }));
+    expect(
+      container.querySelector('[data-snoozed-row="ws-1"]'),
+    ).not.toBeNull();
+    expect(hoverCardStatus["ws-1"]).toBe("review");
+  });
+
   it("wakes a snoozed workspace whose wake time has already passed", async () => {
     const base = Date.now();
     persistInbox({ snoozed: [{ id: "ws-1", at: base - 1000, until: base - 1 }] });
