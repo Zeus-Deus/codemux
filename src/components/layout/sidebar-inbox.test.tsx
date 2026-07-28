@@ -138,6 +138,7 @@ import {
   isWrappingUp,
   nextWorkspaceAfterPark,
   selectRange,
+  shouldAutoSettle,
   MAX_TIMER_DELAY_MS,
 } from "./sidebar-inbox";
 import {
@@ -355,9 +356,9 @@ describe("SidebarInbox — cards", () => {
         pr_url: "https://github.com/u/r/pull/203",
       }),
     ];
-    // A "review" status keeps the merged card active (idle merged-PR cards
-    // auto-settle) so its meta-line chip stays on screen.
-    paneStatuses = { p1: "review" };
+    // Live work is a settlement blocker, so the merged card's full meta line
+    // remains available while its agent is running.
+    paneStatuses = { p1: "working" };
     await renderInbox();
     expect(screen.getByText("PR #87")).toBeInTheDocument();
     expect(screen.getByText("merged")).toBeInTheDocument();
@@ -651,17 +652,15 @@ describe("SidebarInbox — settle / un-settle", () => {
     expect(screen.getByText("Settled")).toBeInTheDocument();
   });
 
-  it("keeps a merged-PR card active while it is still warm (1h idle guard)", async () => {
-    // Follow-up work on a merged PR must stay readable. Settling the instant
-    // the agent stops would make the merge signal permanent.
+  it("auto-settles a freshly merged PR without requiring an idle stamp", async () => {
     persistedSettled = JSON.stringify({
       settled: [],
       keepActive: [],
-      activity: { "ws-1": Date.now() - 10 * 60_000 },
+      activity: {},
     });
     workspaces = [
       makeWorkspace({
-        title: "Merged, just touched",
+        title: "Just merged",
         worktree_path: "/wt/a",
         pr_number: 5,
         pr_state: "MERGED",
@@ -669,22 +668,17 @@ describe("SidebarInbox — settle / un-settle", () => {
     ];
     const { container } = await flushRender();
 
-    expect(screen.queryByText("Settled")).not.toBeInTheDocument();
-    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    expect(screen.getByText("Settled")).toBeInTheDocument();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
   });
 
-  it("auto-settles a merged-PR card once it has also been idle an hour (persisted)", async () => {
-    persistedSettled = JSON.stringify({
-      settled: [],
-      keepActive: [],
-      activity: { "ws-1": Date.now() - 2 * 3_600_000 },
-    });
+  it("auto-settles a closed PR immediately", async () => {
     workspaces = [
       makeWorkspace({
-        title: "Merged and idle",
+        title: "Closed without merge",
         worktree_path: "/wt/a",
         pr_number: 5,
-        pr_state: "MERGED",
+        pr_state: "CLOSED",
       }),
     ];
     const { container } = await flushRender();
@@ -698,6 +692,45 @@ describe("SidebarInbox — settle / un-settle", () => {
       "sidebar.inbox.settled",
       expect.any(String),
     );
+  });
+
+  it("auto-settles completed review work when its PR is merged", async () => {
+    workspaces = [
+      makeWorkspace({
+        title: "Merged and ready",
+        surfaces: surfaceWithPane("p1"),
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    paneStatuses = { p1: "review" };
+    const { container } = await flushRender();
+
+    expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
+    expect(hoverCardStatus["ws-1"]).toBe("review");
+  });
+
+  it("settles the currently open merged workspace but keeps its row visible", async () => {
+    workspaces = [
+      makeWorkspace({
+        title: "Open merged result",
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    activeWorkspaceId = "ws-1";
+    const { container } = await flushRender();
+
+    // Settlement is classification, not navigation: the main workspace stays
+    // open and the forced-visible row remains the user's "you are here".
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(row).toHaveClass("bg-foreground/[0.06]");
+    expect(activateWorkspace).not.toHaveBeenCalled();
   });
 
   it("does NOT auto-settle a merged-PR card while its agent is working", async () => {
@@ -715,6 +748,23 @@ describe("SidebarInbox — settle / un-settle", () => {
     await act(async () => {
       await Promise.resolve();
     });
+
+    expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+  });
+
+  it("does NOT auto-settle a merged-PR card while it needs permission", async () => {
+    workspaces = [
+      makeWorkspace({
+        title: "Merged but blocked",
+        surfaces: surfaceWithPane("p1"),
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    paneStatuses = { p1: "permission" };
+    const { container } = await flushRender();
 
     expect(screen.queryByText("Settled")).not.toBeInTheDocument();
     expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
@@ -816,6 +866,82 @@ describe("SidebarInbox — settle / un-settle", () => {
     expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
     expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
     expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBe(true);
+  });
+
+  it("does not clear an un-settle pin by repeatedly observing the same review status", async () => {
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: Date.now() }],
+      keepActive: [],
+      activity: {},
+    });
+    workspaces = [
+      makeWorkspace({
+        title: "Inspect merged result",
+        surfaces: surfaceWithPane("p1"),
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    paneStatuses = { p1: "review" };
+    const { container, rerender } = await flushRender();
+
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    fireEvent.click(
+      within(row).getByRole("button", {
+        name: 'Un-settle "Inspect merged result"',
+      }),
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // A fresh snapshot carrying the same completed state is not a new run.
+    paneStatuses = { p1: "review" };
+    await rerenderInbox(rerender);
+
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBe(true);
+
+    // Genuine new activity clears the pin; the merged completion signal may
+    // settle it again only after that run is no longer live.
+    paneStatuses = { p1: "working" };
+    await rerenderInbox(rerender);
+    expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBeUndefined();
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+
+    paneStatuses = { p1: "review" };
+    await rerenderInbox(rerender);
+    expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
+  });
+
+  it("preserves a persisted keep-active override on the first status snapshot", async () => {
+    persistedSettled = JSON.stringify({
+      settled: [],
+      keepActive: ["ws-1"],
+      activity: {},
+    });
+    workspaces = [
+      makeWorkspace({
+        title: "Still inspecting after restart",
+        surfaces: surfaceWithPane("p1"),
+        worktree_path: "/wt/a",
+        pr_number: 5,
+        pr_state: "MERGED",
+      }),
+    ];
+    paneStatuses = { p1: "review" };
+    const { container } = await flushRender();
+
+    // The first snapshot is a baseline, not proof that activity happened
+    // after the persisted user override. That explicit override keeps
+    // precedence until a later real status edge clears it.
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
     expect(useSidebarInboxStore.getState().keepActive["ws-1"]).toBe(true);
   });
 
@@ -977,6 +1103,7 @@ describe("SidebarInbox — settle / un-settle", () => {
         worktree_path: "/wt/a",
         pr_number: 203,
         pr_state: "MERGED",
+        pr_url: "https://github.com/u/r/pull/203",
       }),
     ];
     await renderInbox();
@@ -986,8 +1113,49 @@ describe("SidebarInbox — settle / un-settle", () => {
       .getByText("Implement sidebar v2")
       .closest("[data-settled-row]") as HTMLElement;
     expect(row).not.toBeNull();
-    // Merged-PR settled rows carry the violet merge glyph.
-    expect(within(row).getByLabelText("PR merged")).toBeInTheDocument();
+    // In a slim settled-history row, the PR remains visible and directly
+    // reachable instead of degrading to an unlabeled merge glyph.
+    const pr = within(row).getByRole("button", {
+      name: "Open PR #203 on GitHub — merged",
+    });
+    expect(pr).toHaveTextContent("#203");
+    expect(pr.querySelector("svg")).not.toBeNull();
+    fireEvent.click(pr);
+    expect(mockOpenUrl).toHaveBeenCalledWith(
+      "https://github.com/u/r/pull/203",
+    );
+  });
+
+  it("Enter on the PR badge does not also activate the settled row", async () => {
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({
+        title: "Implement sidebar v2",
+        worktree_path: "/wt/a",
+        pr_number: 203,
+        pr_state: "MERGED",
+        pr_url: "https://github.com/u/r/pull/203",
+      }),
+    ];
+    await renderInbox();
+
+    const row = screen
+      .getByText("Implement sidebar v2")
+      .closest("[data-settled-row]") as HTMLElement;
+    const pr = within(row).getByRole("button", {
+      name: "Open PR #203 on GitHub — merged",
+    });
+
+    // The row is itself a `role="button"`, so a keydown on the badge bubbles
+    // into it. Opening the PR and yanking the main pane onto the workspace are
+    // two different intents — the inner button owns the key press.
+    fireEvent.keyDown(pr, { key: "Enter" });
+    expect(activateWorkspace).not.toHaveBeenCalled();
+
+    // Positive control: the same key on the row itself still opens it, so the
+    // guard narrows activation rather than removing it.
+    fireEvent.keyDown(row, { key: "Enter" });
+    expect(activateWorkspace).toHaveBeenCalledWith("ws-1");
   });
 });
 
@@ -1435,7 +1603,7 @@ describe("SidebarInbox — idle-clock seeding", () => {
     expect(screen.queryByText("Settled")).not.toBeInTheDocument();
   });
 
-  it("stamps the focused workspace as active now rather than inheriting old history", async () => {
+  it("may idle-settle the focused workspace without navigating away", async () => {
     workspaces = [
       makeWorkspace({
         title: "Open right now",
@@ -1445,8 +1613,15 @@ describe("SidebarInbox — idle-clock seeding", () => {
     activeWorkspaceId = "ws-1";
     const { container } = await flushRender();
 
-    // You are looking at it; sweeping it aside underneath you would be absurd.
-    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    // Merely reading old work does not rewrite its work-activity
+    // clock. Settlement changes the row classification, not the open surface.
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).toBeNull();
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(row).toHaveClass("bg-foreground/[0.06]");
+    expect(activateWorkspace).not.toHaveBeenCalled();
   });
 });
 
@@ -2047,6 +2222,25 @@ describe("sidebar-inbox pure helpers", () => {
     expect(effectiveActivityAt(null, undefined)).toBeUndefined();
   });
 
+  it("shouldAutoSettle mirrors server-side completion blockers and idle fallback", () => {
+    const now = 10 * 86_400_000;
+    const stale = now - 4 * 86_400_000;
+    const fresh = now - 60_000;
+
+    for (const prState of ["merged", "closed"] as const) {
+      expect(shouldAutoSettle(prState, null, undefined, now, null)).toBe(true);
+      expect(shouldAutoSettle(prState, "review", fresh, now, null)).toBe(true);
+      expect(shouldAutoSettle(prState, "working", stale, now, 3)).toBe(false);
+      expect(shouldAutoSettle(prState, "permission", stale, now, 3)).toBe(false);
+    }
+
+    expect(shouldAutoSettle("open", null, stale, now, 3)).toBe(true);
+    expect(shouldAutoSettle("draft", "review", stale, now, 3)).toBe(true);
+    expect(shouldAutoSettle("open", null, fresh, now, 3)).toBe(false);
+    expect(shouldAutoSettle(null, null, undefined, now, 3)).toBe(false);
+    expect(shouldAutoSettle(null, null, stale, now, null)).toBe(false);
+  });
+
   it("nextWorkspaceAfterPark steps forward, wraps, and stays put for background parks", () => {
     const ids = ["a", "b", "c"];
     expect(nextWorkspaceAfterPark(["a"], "a", ids)).toBe("b");
@@ -2098,7 +2292,7 @@ describe("sidebar-inbox pure helpers", () => {
     // Spelled out, because each of these is a separate promise to the user:
     // a draft PR is work still in progress…
     expect(isWrappingUp("draft", null, false)).toBe(false);
-    // …merged and closed belong to auto-settle and its idle guard…
+    // …merged and closed belong to immediate completion auto-settle…
     expect(isWrappingUp("merged", null, false)).toBe(false);
     expect(isWrappingUp("closed", null, false)).toBe(false);
     // …a follow-up message puts the agent back to work and the card back up…

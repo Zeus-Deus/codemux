@@ -31,6 +31,20 @@ interface Props {
   onOpenChange: (open: boolean) => void;
 }
 
+export function workspaceCommandValue(workspace: {
+  title: string;
+  git_branch: string | null;
+  project_root: string | null;
+  cwd: string;
+}): string {
+  return [
+    workspace.title,
+    workspace.git_branch,
+    workspace.project_root,
+    workspace.cwd,
+  ].filter(Boolean).join(" ");
+}
+
 function ShortcutHint({ actionId }: { actionId: string }) {
   const { getKeysForAction } = useResolvedKeybinds();
   const keys = getKeysForAction(actionId);
@@ -72,6 +86,11 @@ export function CommandPalette({ open, onOpenChange }: Props) {
           {appState?.workspaces.map((w) => (
             <CommandItem
               key={w.workspace_id}
+              // Settled workspaces remain live workspace records, so the
+              // global search indexes them exactly like active cards. Include
+              // project path as an explicit search term as well as the visible
+              // title/branch, matching the settled-history lookup model.
+              value={workspaceCommandValue(w)}
               onSelect={() =>
                 run(() =>
                   activateWorkspace(w.workspace_id).catch(console.error),

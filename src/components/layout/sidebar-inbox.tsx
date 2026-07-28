@@ -7,10 +7,10 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
-  GitMerge,
   Loader2,
   Undo2,
 } from "lucide-react";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
 import {
   DropdownMenu,
@@ -56,6 +56,8 @@ import { WorkspaceHoverCard } from "./workspace-hover-card";
 import { activateWorkspace } from "@/tauri/commands";
 import {
   normalizePrState,
+  PrStatusIcon,
+  prStatusTextClass,
   type PrStatusState,
 } from "@/components/github/pr-status-icon";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
@@ -80,18 +82,6 @@ const ROW_IN_MS = 400;
  *  page at a time so the settled section can never dominate the sidebar. */
 const SETTLED_INITIAL_COUNT = 10;
 const SETTLED_PAGE_COUNT = 25;
-
-/** How long a merged/closed-PR workspace must ALSO have been idle before the
- *  sweep parks it.
- *
- *  Without this the merge signal is permanent: the moment status drops to null
- *  the card vanishes under the divider, so returning to a merged workspace for
- *  follow-up work (a review comment, a revert, a cherry-pick) un-settles it
- *  only until the agent stops — then it snaps straight back out of sight,
- *  taking the conversation the user was reading with it. Measuring against the
- *  same activity stamp the idle rule uses keeps a warm workspace visible and
- *  parks it only once it has genuinely gone quiet. */
-export const MERGED_PR_SETTLE_IDLE_MS = 3_600_000;
 
 /** The largest delay `setTimeout` can hold. The delay is stored as a signed
  *  32-bit int, so anything past this silently overflows to a negative value and
@@ -137,7 +127,7 @@ export function compareNewestFirst(
  *  through that workspace, so it must stay on screen and keep every gesture it
  *  had. All this does is stop it occupying the real estate the user's live work
  *  needs. Merged/closed PRs are a different claim entirely and are left to the
- *  auto-settle sweep and its idle guard.
+ *  auto-settle sweep.
  *
  *  Each condition earns its place:
  *  • **`"open"`, never `"draft"`.** A draft PR is a PR the author is still
@@ -165,6 +155,30 @@ export function isWrappingUp(
   unread: boolean,
 ): boolean {
   return prState === "open" && status === null && !unread;
+}
+
+/** Completion-driven automatic settlement.
+ *
+ * A merged/closed PR is itself the completion signal, so it settles as soon as
+ * no agent is running or blocked — no extra idle timestamp or grace period is
+ * required. Inactivity remains a separate fallback for work without a finished
+ * PR. A completed `review` status is deliberately settleable: it says the run
+ * finished, not that work is still executing.
+ *
+ * Explicit keep-active pins, snoozes, and already-settled ids are handled by
+ * the caller because they are persisted inbox lifecycle state rather than
+ * properties of the workspace itself. */
+export function shouldAutoSettle(
+  prState: PrStatusState | null,
+  status: ActivePaneStatus | null,
+  lastActivityAt: number | undefined,
+  now: number,
+  autoSettleDays: number | null,
+): boolean {
+  if (status === "working" || status === "permission") return false;
+  if (prState === "merged" || prState === "closed") return true;
+  if (autoSettleDays === null || lastActivityAt === undefined) return false;
+  return now - lastActivityAt > autoSettleDays * 86_400_000;
 }
 
 /** Where to move the user after parking (settling / snoozing) workspaces.
@@ -408,6 +422,19 @@ function WrappingUpDivider() {
   );
 }
 
+/** Does this keydown activate the row *itself*?
+ *
+ *  Settled and snoozed rows are `role="button"` containers that also host their
+ *  own buttons (PR badge, Un-settle, Wake now). Those inner buttons stop click
+ *  propagation, but a keyboard activation on a focused inner button still
+ *  bubbles its `keydown` up to the row — so without a target check, Enter on
+ *  the PR badge would open the PR *and* activate the workspace. Only a keydown
+ *  whose target is the row node is a row activation. */
+function isRowActivationKey(e: React.KeyboardEvent<HTMLElement>): boolean {
+  if (e.key !== "Enter" && e.key !== " ") return false;
+  return e.target === e.currentTarget;
+}
+
 interface SettledRowProps {
   workspace: WorkspaceSnapshot;
   repo: InboxRepo;
@@ -438,7 +465,7 @@ function SettledRow({
   onMarkUnread,
 }: SettledRowProps) {
   const appearance = useProjectAppearance(repo.path);
-  const merged = normalizePrState(workspace.pr_state) === "merged";
+  const prState = normalizePrState(workspace.pr_state);
 
   const handleClick = (e: React.MouseEvent) => {
     const mode = selectModeFor(e);
@@ -447,6 +474,11 @@ function SettledRow({
     // scroll the main pane away mid-multi-select.
     if (mode !== "single") return;
     activateFromSidebar(workspace.workspace_id);
+  };
+
+  const handlePrClick = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (workspace.pr_url) openUrl(workspace.pr_url).catch(console.error);
   };
 
   return (
@@ -478,7 +510,7 @@ function SettledRow({
       data-selected={selected ? "true" : undefined}
       onClick={handleClick}
       onKeyDown={(e) => {
-        if (e.key !== "Enter" && e.key !== " ") return;
+        if (!isRowActivationKey(e)) return;
         // Space would otherwise scroll the sidebar as it activates the row.
         if (e.key === " ") e.preventDefault();
         // Collapse any multi-select first, exactly like a plain click —
@@ -511,15 +543,34 @@ function SettledRow({
         shape="square"
         className="font-bold opacity-80"
       />
-      {merged && (
-        <GitMerge
-          aria-label="PR merged"
-          className="h-3 w-3 shrink-0 text-accent-violet"
-        />
-      )}
       <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
         {workspace.title}
       </span>
+      {prState && (
+        <button
+          type="button"
+          onClick={handlePrClick}
+          disabled={!workspace.pr_url}
+          aria-label={
+            workspace.pr_number
+              ? workspace.pr_url
+                ? `Open PR #${workspace.pr_number} on GitHub — ${prState}`
+                : `PR #${workspace.pr_number} — ${prState}`
+              : `Pull request — ${prState}`
+          }
+          className={cn(
+            "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 font-mono text-[9.5px] font-medium",
+            "transition-colors duration-150",
+            prStatusTextClass(prState),
+            workspace.pr_url
+              ? "hover:bg-foreground/[0.055]"
+              : "cursor-default opacity-65",
+          )}
+        >
+          <PrStatusIcon state={prState} size={3} className="shrink-0" />
+          {workspace.pr_number != null && <span>#{workspace.pr_number}</span>}
+        </button>
+      )}
       {time && (
         <span className="shrink-0 text-[10.5px] text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
           {time}
@@ -617,7 +668,7 @@ function SnoozeRow({
         data-selected={selected ? "true" : undefined}
         onClick={handleClick}
         onKeyDown={(e) => {
-          if (e.key !== "Enter" && e.key !== " ") return;
+          if (!isRowActivationKey(e)) return;
           if (e.key === " ") e.preventDefault();
           // Same selection collapse as a plain click (see `SettledRow`).
           onSelect(workspace.workspace_id, "single");
@@ -749,6 +800,14 @@ export function SidebarInbox() {
   // `last_visited_at`) is what clears it, so the override can never outlive
   // the truth it is overriding.
   const [manualUnread, setManualUnread] = useState<ReadonlySet<string>>(new Set());
+  // Last status observed by the activity effect. A keep-active pin is cleared
+  // only by a NEW non-idle status edge, matching the server-side
+  // "real activity clears the override" lifecycle. Re-reading an existing
+  // review status after the user clicks Un-settle must not immediately erase
+  // their decision and throw a merged PR back under the divider.
+  const previousStatusRef = useRef(
+    new Map<string, ActivePaneStatus | null>(),
+  );
 
   // Multi-select for bulk parking. Ids only — the rows are re-derived every
   // render, so holding on to snapshots would go stale.
@@ -1221,16 +1280,23 @@ export function SidebarInbox() {
   // back to now — that keeps the anti-mass-settle property (a workspace with no
   // usable history must never auto-settle the instant it is first seen).
   //
-  // Only a non-null status counts as genuine agent activity, so only that path
-  // passes `clearPin` — a keep-active pin must survive merely selecting the
-  // workspace (or its first-seen baseline), otherwise the auto-settle sweep
-  // below would immediately re-settle a card the user just kept active.
+  // Only a NEW non-null status edge counts as genuine activity for pin
+  // clearing. A repeated `review` snapshot is completed work, not a new run;
+  // clearing on every non-null observation would make an explicitly
+  // un-settled merged workspace settle again on the next render.
   useEffect(() => {
     if (!loaded || !paneStatuses) return;
     const noteActivity = useSidebarInboxStore.getState().noteActivity;
     const at = Date.now();
+    const presentIds = new Set<string>();
     for (const ws of allWorkspaces) {
+      presentIds.add(ws.workspace_id);
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
+      const hadPrevious = previousStatusRef.current.has(ws.workspace_id);
+      const previousStatus = previousStatusRef.current.get(ws.workspace_id);
+      const newAgentActivity =
+        status !== null && hadPrevious && previousStatus !== status;
+      previousStatusRef.current.set(ws.workspace_id, status);
       const isActiveWs = ws.workspace_id === activeWorkspaceId;
       const unseen = activity[ws.workspace_id] === undefined;
       if (status === null && !isActiveWs && !unseen) continue;
@@ -1238,23 +1304,26 @@ export function SidebarInbox() {
       // Anything else here is a first sighting, which inherits real history.
       const stamp =
         status !== null || isActiveWs ? at : ws.last_active_at ?? at;
-      noteActivity(ws.workspace_id, stamp, { clearPin: status !== null });
+      noteActivity(ws.workspace_id, stamp, { clearPin: newAgentActivity });
+    }
+    for (const id of previousStatusRef.current.keys()) {
+      if (!presentIds.has(id)) previousStatusRef.current.delete(id);
     }
   }, [loaded, paneStatuses, allWorkspaces, activeWorkspaceId, activity, now]);
 
-  // Auto-settle: sweep an active card under the divider on its own once it is
-  // safely idle — either its PR merged/closed AND it has since gone quiet, or
-  // it has gone untouched past the user's idle window. No leaving animation
-  // (this is a background sweep, not a gesture) and deliberately no forward
-  // navigation: a sweep must never move the user.
+  // Auto-settle: server-side completion semantics. A merged/closed PR settles
+  // immediately once the workspace is not running or blocked; otherwise
+  // inactivity past the user's configured window is the fallback. No
+  // leaving animation (this is a
+  // background lifecycle transition, not a gesture) and deliberately no
+  // forward navigation: a sweep must never move the user.
   //
   // Anti-fight invariants — the inbox has four states (active / settled /
   // snoozed / pinned-active) and these guards make oscillation impossible:
-  //   • auto-settle ONLY fires at status null (never live / blocked / review);
+  //   • auto-settle refuses working/permission, but completed review is safe;
   //   • the auto-un-settle safety net ONLY fires at working/permission;
   //   • the snooze hand-raise ONLY fires at working/permission, and the wake
-  //     sweep only at an elapsed wake time — neither can fire at status null,
-  //     which is the only status auto-settle acts on;
+  //     sweep only at an elapsed wake time;
   //   • auto-settle skips snoozed ids entirely (they aren't in `activeCards`),
   //     so a snoozed workspace can't be settled out from under its own wake
   //     timer; the store keeps the two shelves mutually exclusive from the
@@ -1280,28 +1349,10 @@ export function SidebarInbox() {
       const id = ws.workspace_id;
       if (settledSet.has(id) || snoozedSet.has(id)) continue;
       if (keepActive[id]) continue;
-      // Never sweep the workspace the user is currently looking at. This used
-      // to fall out of the client stamp being refreshed on every tick for the
-      // focused row; now that the backend stamp is authoritative it has to be
-      // said out loud, or the open workspace could settle underneath its own
-      // main pane while the user reads it.
-      if (id === activeWorkspaceId) continue;
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
-      if (status !== null) continue;
       const prState = normalizePrState(ws.pr_state);
-      const prDone = prState === "merged" || prState === "closed";
       const stamp = effectiveActivityAt(ws.last_active_at, activity[id]);
-      const idleFor = stamp === undefined ? 0 : now - stamp;
-      // A merged PR is a strong signal but not an instant one: the workspace
-      // has to have gone quiet too, so follow-up work stays on screen while
-      // it's warm.
-      const prSwept =
-        prDone && stamp !== undefined && idleFor >= MERGED_PR_SETTLE_IDLE_MS;
-      const idleSwept =
-        autoSettleDays !== null &&
-        stamp !== undefined &&
-        idleFor > autoSettleDays * 86_400_000;
-      if (prSwept || idleSwept) {
+      if (shouldAutoSettle(prState, status, stamp, now, autoSettleDays)) {
         store.settle(id, ws.last_active_at ?? undefined);
         markRowIn(setJustSettledId, id);
       }
@@ -1314,7 +1365,6 @@ export function SidebarInbox() {
     snoozed,
     keepActive,
     activity,
-    activeWorkspaceId,
     autoSettleDays,
     now,
   ]);
