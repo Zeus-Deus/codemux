@@ -109,7 +109,7 @@ visual only — nothing is archived, closed, or deleted.
   cards under a **static "Wrapping up" divider**. A card is wrapping up when
   **all** of: its PR state normalizes to **`open`** (explicitly *not* `draft` —
   a draft PR is work the author still owns — and not `merged`/`closed`, which
-  belong to auto-settle and its 1-hour idle guard); its status is **null**; and
+  are completion signals handled by auto-settle); its status is **null**; and
   it is **not unread**. Opening a PR is a *wind-down* signal, not a completion
   one: the card keeps every affordance (Settle, Snooze, context menu, jump
   target, selection) and nothing is hidden or collapsed — it just stops
@@ -189,8 +189,10 @@ visual only — nothing is archived, closed, or deleted.
   (store, persistence keys, which surfaces repaint).
 - **Settle / un-settle** (`sidebar-inbox-store.ts`): Settle collapses the card
   (~200ms height/opacity), then moves it onto the "Settled" shelf as a compact
-  one-line row (repo avatar · violet merge icon when its PR merged · title ·
-  elapsed-since-work-ended). A settled row is itself a button — click or
+  one-line row (repo avatar · title · state-colored PR icon + `#number` when
+  linked · elapsed-since-work-ended). The PR badge opens the pull request
+  directly and remains visible while the row's Un-settle affordance appears.
+  A settled row is itself a button — click or
   Enter/Space activates that workspace without un-settling it. Hover/focus
   reveals **Un-settle**, which reverses it (the returning card eases back in
   via the shared `rise-in` keyframe). Settling is **visual only** — nothing is
@@ -335,25 +337,27 @@ visual only — nothing is archived, closed, or deleted.
   brand new for a full idle window after every update — the exact bug the
   backend field exists to kill. Preferring the backend retires the polluted
   state without a migration pass.
-- **Auto-settle** — the Settled shelf fills itself. It keys off **merged /
-  closed** PRs only; an **open** PR never settles a card, it demotes it into
-  the "Wrapping up" tier described above. A card auto-settles when it
-  is at status **null** (never working / blocked / review) *and* either:
-  - its PR is **merged or closed** *and* it has **also been idle for an hour**
-    (`MERGED_PR_SETTLE_IDLE_MS = 3_600_000`). Without the extra idle window the
-    merge signal is permanent: returning to a merged workspace for a review
-    comment or a revert un-settles it only until the agent stops, then it snaps
-    back out of sight taking the conversation the user was reading with it; or
+- **Auto-settle** — the Settled shelf fills itself using the same completion
+  semantics as T3 Code. A workspace whose PR is **merged or closed** settles
+  immediately once it is neither working nor blocked; no activity stamp or
+  extra idle grace is required. A completed **review** status is settleable —
+  it says the run finished, not that work is still executing. An **open** PR
+  never settles a card by itself; it demotes it into the "Wrapping up" tier
+  described above. Work without a finished PR auto-settles when:
   - it has gone untouched past the user's idle window
     (Settings → Appearance → Sidebar → "Auto-settle idle work":
     Off / 1d / 3d / 7d / 14d, `sidebar.auto_settle_days`, default 3d).
 
-  Both rules require a known stamp — `undefined` never sweeps. The sweep runs
-  no leaving animation and performs **no forward navigation** (a background
-  sweep must never move the user), and it settles with
+  Only the inactivity rule requires a known stamp — `undefined` never sweeps
+  unknown-idle work. The merge/close rule may also settle the currently-open
+  workspace: settlement is classification, not navigation, and the forced-row
+  visibility rule keeps its highlighted row reachable while the main surface
+  stays open. The sweep runs no leaving animation and performs **no forward
+  navigation**, and it settles with
   `workEndedAt = last_active_at` so the row files under when work ended.
   **Un-settling sets a keep-active pin** that suppresses auto-settle until the
-  agent runs again. The persisted UI-state value is
+  agent shows a new non-idle status edge. Repeatedly observing an existing
+  completed `review` status does not clear the pin. The persisted UI-state value is
   `{settled, snoozed, keepActive, activity}`, with transparent migration from
   the older bare-array and pre-snooze object shapes; the key name
   (`sidebar.inbox.settled`) predates snooze and is kept so existing installs
@@ -363,25 +367,26 @@ visual only — nothing is archived, closed, or deleted.
   safety net, the snooze hand-raise, the wake sweep, the precise wake timer)
   share one list, so the guards are what keep a row from being fought over. Each
   effect is keyed to a status band no other effect touches:
-  - auto-settle fires **only at status null**, and additionally skips the
-    **focused** workspace outright. That used to fall out of the client stamp
-    being refreshed every tick for the focused row; now that the backend stamp
-    is authoritative it is an explicit guard, or the open workspace could settle
-    underneath its own main pane while the user reads it.
+  - auto-settle refuses **working / permission** status. Idle and completed
+    review work may settle; the focused workspace may settle on PR completion
+    without navigating away.
   - the settle safety net (auto-un-settle) fires **only at working/permission**.
   - the snooze hand-raise fires **only at working/permission**; the wake sweep
-    fires only on an elapsed wake time. Neither can fire at status null, which
-    is the only status auto-settle acts on.
+    fires only on an elapsed wake time. Auto-settle refuses both live states,
+    so the effects cannot claim the same workspace at once.
   - auto-settle skips snoozed ids entirely (they are not in `activeCards`), so
     a snoozed workspace can't be settled out from under its own wake timer; the
     store enforces the same exclusivity from the other side by dropping a
     snooze when a settle lands (and a settled entry when a snooze lands).
   - a **keep-active pin** blocks auto-settle until the agent shows real
-    activity. Only a non-null status clears it (`noteActivity`'s `clearPin`) —
-    selecting a workspace or laying down a first-seen baseline stamps but leaves
-    the pin standing, and a *timer* wake touches no pin at all (a clock expiring
-    says nothing about what the user wants). `unsettle`/`unsnooze` with reason
-    `"user"` sets the pin; `"activity"` clears it; `"timer"` leaves it alone.
+    activity. Only a **new** non-null status edge clears it
+    (`noteActivity`'s `clearPin`) — selecting a workspace, laying down a
+    first-seen baseline (including after restart), or repeatedly observing the
+    same completed status stamps but leaves the pin standing, and a *timer*
+    wake touches no pin at all (a clock expiring says nothing about what the
+    user wants).
+    `unsettle`/`unsnooze` with reason `"user"` sets the pin; `"activity"`
+    clears it; `"timer"` leaves it alone.
 
   - the **"Wrapping up" tier is not a fifth state.** It mutates nothing — it is
     a pure partition of the cards auto-settle already left alone, so it can
