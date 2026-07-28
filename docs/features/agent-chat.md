@@ -269,7 +269,12 @@ The chat pane stack:
     `ModelPicker` / `MultiProviderModelPicker`; the composer skips its
     usual textarea refocus for this pick so the popover isn't
     dismissed by focus-outside). Built in `buildModelCommand`.
-  - **SKILLS** — dynamic, from the skills registry. Same-named skills
+  - **SKILLS** — dynamic, from the skills registry. Every discovered
+    skill is offered to every provider: the list is **not** filtered by
+    the active pane's provider, which is the whole point of the
+    cross-provider design (a Codex skill is invocable from a Claude
+    pane and vice versa). Provider appears only as a label in the row
+    description and as grouping/sort order. Same-named skills
     collapse to one row via `dedupeSkillsByName`
     (`src/lib/agent-chat/skill-groups.ts`, first-wins over the
     backend's provider → scope → name order). A skill is addressed in
@@ -335,6 +340,30 @@ The chat pane stack:
     (`docs/features/web-remote-access.md`).
 - **Cross-provider skill system**: watcher, conflicts, disable, refined
   compat. Server-side sync (see `docs/features/skills-sync.md`).
+  - **Scan roots** (`skills::paths::enumerate_scan_paths` — the single
+    source of truth; scanner, watcher, conflict detection and the
+    Settings grouping all derive from it, so adding a provider root is
+    a one-line change there):
+    - *User*: `~/.claude/skills`, `~/.codex/skills`, `~/.agents/skills`,
+      `~/.opencode/skills`, `~/.config/opencode/skills`,
+      `~/.codemux/skills`
+    - *Project*: `<root>/.claude/skills`, `<root>/.codex/skills`,
+      `<root>/.agents/skills`, `<root>/.opencode/skills`,
+      `<root>/.codemux/skills`
+    - *Plugin* (only when `include_plugins`):
+      `~/.claude/plugins/marketplaces/*/plugins/*/skills`,
+      `~/.claude/plugins/external_plugins/*/skills`
+  - Codex reads **both** `.codex/skills` and `.agents/skills` at each
+    scope; `.agents` is the newer convention and is frequently a
+    symlink to the older one.
+  - `~/.codex/skills/.system/` is excluded (Codex built-ins, not user
+    content) — see `is_codex_system_dir`.
+  - **Roots are deduped by canonical path** before scanning. Several of
+    these roots are commonly symlinked to each other, and walking both
+    sides of an alias would surface every skill twice — which the
+    name-based `detectConflicts` would then report as a conflict. The
+    first root to claim a directory wins, so enumeration order encodes
+    precedence (user before project; canonical location before alias).
 - **MCP host runtime** (Step 9): Codemux discovers user-installed MCP
   servers across Codemux / Claude / Cursor paths, spawns each child once,
   exposes tools to the Claude SDK via an in-process facade with dynamic

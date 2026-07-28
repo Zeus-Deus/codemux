@@ -49,7 +49,8 @@ The Better Auth account is still cross-product compatible with Vexis (email+pass
 
 ### Provider scope rules
 
-- **Synced (`scope=user`):** `~/.codemux/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.opencode/skills/`. The origin provider tag is preserved through the wire format and restored on the receiving device's mapping.
+- **Synced (`scope=user`):** `~/.codemux/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.agents/skills/` (Codex's newer root), `~/.opencode/skills/`, `~/.config/opencode/skills/`. The origin provider tag is preserved through the wire format and restored on the receiving device's mapping.
+- **Lockstep invariant:** this list is `path_detection::USER_SCOPE_PROVIDERS`, and it must cover every user root that `skills::paths::enumerate_scan_paths` returns. The push pipeline walks the scanner's enumeration and classifies each hit through `detect_skill_path`; a root the scanner knows but the table doesn't classifies as `None` and is dropped from sync with no diagnostic. `user_scope_table_covers_every_scan_root` / `project_scope_table_covers_every_scan_root` fail the build if the two drift.
 - **NOT synced (`is_syncable=false`):** project-scope skills under `<project>/.codemux/skills/`, etc. Reserved for Step 10.5.
 - **NOT synced (`None`):** plugin skills, marketplace skills, anything outside the recognized layouts.
 - **Sync target invariant:** the receiving device always writes to `~/.codemux/skills/<name>/SKILL.md` regardless of origin provider.

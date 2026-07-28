@@ -38,51 +38,142 @@ pub fn enumerate_scan_paths_with_home(
     let mut project_paths: Vec<(PathBuf, SkillProvider)> = Vec::new();
     let mut plugin_paths: Vec<(PathBuf, String)> = Vec::new();
 
+    // One canonical-path ledger for the whole enumeration. Several of the
+    // roots below are commonly symlinked to one another (`~/.agents/skills`
+    // → `~/.codex/skills`, `~/.config/opencode/skills` →
+    // `~/.opencode/skills`, a project root that *is* `$HOME`). Walking both
+    // sides of such an alias would surface every skill twice, which reads
+    // as a name conflict in Settings even though it is one file on disk.
+    // Deduping here — at the single source of truth for scan paths — keeps
+    // every downstream consumer (scanner, watcher, conflict detection)
+    // honest without any of them needing to know about symlinks.
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
     if let Some(home) = home {
         // Claude user-wide.
-        user_paths.push((home.join(".claude").join("skills"), SkillProvider::Claude));
+        push_unique(
+            &mut user_paths,
+            &mut seen,
+            home.join(".claude").join("skills"),
+            SkillProvider::Claude,
+        );
 
         // Codex: legacy `~/.codex/skills/` plus OpenAI's newer
         // `$HOME/.agents/skills/`. The scanner is responsible for
         // excluding the `.system/` subdirectory of `~/.codex/skills/`
         // (built-in skills, not user content).
-        user_paths.push((home.join(".codex").join("skills"), SkillProvider::Codex));
-        user_paths.push((home.join(".agents").join("skills"), SkillProvider::Codex));
+        push_unique(
+            &mut user_paths,
+            &mut seen,
+            home.join(".codex").join("skills"),
+            SkillProvider::Codex,
+        );
+        push_unique(
+            &mut user_paths,
+            &mut seen,
+            home.join(".agents").join("skills"),
+            SkillProvider::Codex,
+        );
 
-        // OpenCode: dedupe the two known conventions if they resolve to
-        // the same directory (e.g., one is a symlink to the other).
-        let oc_a = home.join(".opencode").join("skills");
-        let oc_b = home.join(".config").join("opencode").join("skills");
-        let mut opencode_seen: HashSet<PathBuf> = HashSet::new();
-        for path in [oc_a, oc_b] {
-            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
-            if opencode_seen.insert(canonical) {
-                user_paths.push((path, SkillProvider::Opencode));
-            }
-        }
+        // OpenCode publishes two conventions for the same directory.
+        push_unique(
+            &mut user_paths,
+            &mut seen,
+            home.join(".opencode").join("skills"),
+            SkillProvider::Opencode,
+        );
+        push_unique(
+            &mut user_paths,
+            &mut seen,
+            home.join(".config").join("opencode").join("skills"),
+            SkillProvider::Opencode,
+        );
 
         // Codemux's neutral location.
-        user_paths.push((home.join(".codemux").join("skills"), SkillProvider::Codemux));
+        push_unique(
+            &mut user_paths,
+            &mut seen,
+            home.join(".codemux").join("skills"),
+            SkillProvider::Codemux,
+        );
 
         // Plugin-bundled Claude skills. The locked path globs are
         // `~/.claude/plugins/marketplaces/*/plugins/*/skills`
         // and `~/.claude/plugins/external_plugins/*/skills`.
         if include_plugins {
-            plugin_paths.extend(enumerate_claude_plugin_paths(home));
+            for (path, slug) in enumerate_claude_plugin_paths(home) {
+                if seen.insert(canonical_key(&path)) {
+                    plugin_paths.push((path, slug));
+                }
+            }
         }
     }
 
     if let Some(root) = project_root {
-        project_paths.push((root.join(".claude").join("skills"), SkillProvider::Claude));
-        project_paths.push((root.join(".codex").join("skills"), SkillProvider::Codex));
-        project_paths.push((root.join(".opencode").join("skills"), SkillProvider::Opencode));
-        project_paths.push((root.join(".codemux").join("skills"), SkillProvider::Codemux));
+        push_unique(
+            &mut project_paths,
+            &mut seen,
+            root.join(".claude").join("skills"),
+            SkillProvider::Claude,
+        );
+        // Codex reads BOTH `<root>/.codex/skills/` and the newer
+        // `<root>/.agents/skills/` at project scope, mirroring the two
+        // user-scope Codex roots above. Omitting `.agents/skills` here
+        // meant project-local Codex skills showed up in the Codex CLI but
+        // never in the Codemux slash popup.
+        push_unique(
+            &mut project_paths,
+            &mut seen,
+            root.join(".codex").join("skills"),
+            SkillProvider::Codex,
+        );
+        push_unique(
+            &mut project_paths,
+            &mut seen,
+            root.join(".agents").join("skills"),
+            SkillProvider::Codex,
+        );
+        push_unique(
+            &mut project_paths,
+            &mut seen,
+            root.join(".opencode").join("skills"),
+            SkillProvider::Opencode,
+        );
+        push_unique(
+            &mut project_paths,
+            &mut seen,
+            root.join(".codemux").join("skills"),
+            SkillProvider::Codemux,
+        );
     }
 
     ScanPaths {
         user_paths,
         project_paths,
         plugin_paths,
+    }
+}
+
+/// Identity used for alias detection. Resolves symlinks when the
+/// directory exists; falls back to the literal path when it doesn't.
+/// The fallback is deliberate — a missing directory can't alias anything,
+/// and the scanner skips it silently anyway.
+fn canonical_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Append `path` unless some earlier root already resolved to the same
+/// directory. The *first* root to claim a directory wins, so enumeration
+/// order encodes precedence: user scope before project scope, and within
+/// a provider the canonical location before the alias.
+fn push_unique(
+    out: &mut Vec<(PathBuf, SkillProvider)>,
+    seen: &mut HashSet<PathBuf>,
+    path: PathBuf,
+    provider: SkillProvider,
+) {
+    if seen.insert(canonical_key(&path)) {
+        out.push((path, provider));
     }
 }
 
@@ -211,7 +302,24 @@ mod tests {
 
         let project_dir = TempDir::new().unwrap();
         let with_project = enumerate_scan_paths_with_home(Some(project_dir.path()), false, Some(home.path()));
-        assert_eq!(with_project.project_paths.len(), 4);
+        assert_eq!(with_project.project_paths.len(), 5);
+    }
+
+    #[test]
+    fn project_scope_includes_both_codex_roots() {
+        let home = fake_home();
+        let project_dir = TempDir::new().unwrap();
+        let paths =
+            enumerate_scan_paths_with_home(Some(project_dir.path()), false, Some(home.path()));
+        let codex: Vec<_> = paths
+            .project_paths
+            .iter()
+            .filter(|(_, p)| matches!(p, SkillProvider::Codex))
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert_eq!(codex.len(), 2);
+        assert!(codex.iter().any(|p| p.ends_with(".codex/skills")));
+        assert!(codex.iter().any(|p| p.ends_with(".agents/skills")));
     }
 
     #[test]
@@ -299,5 +407,82 @@ mod tests {
             .collect();
         // Symlink resolves to the same target — only one entry survives.
         assert_eq!(opencode.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_dedupes_when_agents_symlinks_to_codex() {
+        use std::os::unix::fs::symlink;
+
+        // `~/.agents/skills -> ~/.codex/skills` is a common way to serve
+        // both Codex conventions from one directory. Scanning both would
+        // double every Codex skill and read as a name conflict.
+        let home = fake_home();
+        let real = home.path().join(".codex").join("skills");
+        fs::create_dir_all(&real).unwrap();
+        fs::create_dir_all(home.path().join(".agents")).unwrap();
+        symlink(&real, home.path().join(".agents").join("skills")).unwrap();
+
+        let paths = enumerate_scan_paths_with_home(None, false, Some(home.path()));
+        let codex: Vec<_> = paths
+            .user_paths
+            .iter()
+            .filter(|(_, p)| matches!(p, SkillProvider::Codex))
+            .map(|(p, _)| p.clone())
+            .collect();
+        assert_eq!(codex.len(), 1);
+        // The canonical root wins because it is enumerated first.
+        assert!(codex[0].ends_with(".codex/skills"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_root_aliasing_home_does_not_duplicate_user_paths() {
+        use std::os::unix::fs::symlink;
+
+        // A project whose `.claude/skills` symlinks at the user-wide one
+        // must not yield the same directory under both scopes.
+        let home = fake_home();
+        let user_skills = home.path().join(".claude").join("skills");
+        fs::create_dir_all(&user_skills).unwrap();
+
+        let project = TempDir::new().unwrap();
+        fs::create_dir_all(project.path().join(".claude")).unwrap();
+        symlink(&user_skills, project.path().join(".claude").join("skills")).unwrap();
+
+        let paths =
+            enumerate_scan_paths_with_home(Some(project.path()), false, Some(home.path()));
+        // User scope claimed it first; the project alias is dropped.
+        assert!(paths
+            .project_paths
+            .iter()
+            .all(|(p, _)| !p.ends_with(".claude/skills")));
+        assert_eq!(
+            paths
+                .user_paths
+                .iter()
+                .filter(|(p, _)| p.ends_with(".claude/skills"))
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plugin_paths_dedupe_against_user_roots() {
+        use std::os::unix::fs::symlink;
+
+        let home = fake_home();
+        let user_skills = home.path().join(".claude").join("skills");
+        fs::create_dir_all(&user_skills).unwrap();
+
+        let plugin_parent = home
+            .path()
+            .join(".claude/plugins/external_plugins/aliased");
+        fs::create_dir_all(&plugin_parent).unwrap();
+        symlink(&user_skills, plugin_parent.join("skills")).unwrap();
+
+        let paths = enumerate_scan_paths_with_home(None, true, Some(home.path()));
+        assert!(paths.plugin_paths.is_empty());
     }
 }

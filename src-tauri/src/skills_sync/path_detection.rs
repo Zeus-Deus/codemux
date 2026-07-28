@@ -114,11 +114,19 @@ pub fn destination_path_after_pull(name: &str, home: &Path) -> PathBuf {
 
 /// User-scope skill roots. Order matters only for diagnostic
 /// messages — paths are mutually disjoint by construction.
+///
+/// Must stay in lockstep with `crate::skills::paths::enumerate_scan_paths`
+/// — the push pipeline walks that enumeration and classifies each hit
+/// here, so a root present there but missing here is silently dropped
+/// from sync. `skills_sync::tests::user_scope_table_covers_every_scan_root`
+/// pins the two lists together.
 const USER_SCOPE_PROVIDERS: &[(&str, &str)] = &[
     (".codemux/skills", "codemux"),
     (".claude/skills", "claude"),
     (".codex/skills", "codex"),
+    (".agents/skills", "codex"),
     (".opencode/skills", "opencode"),
+    (".config/opencode/skills", "opencode"),
 ];
 
 /// Subdirectories searched relative to a project root. Each one
@@ -129,6 +137,7 @@ const PROJECT_SCOPE_SUBDIRS: &[&str] = &[
     ".codemux/skills",
     ".claude/skills",
     ".codex/skills",
+    ".agents/skills",
     ".opencode/skills",
 ];
 
@@ -136,7 +145,7 @@ fn provider_from_project_subdir(subdir: &str) -> &'static str {
     match subdir {
         ".codemux/skills" => "codemux",
         ".claude/skills" => "claude",
-        ".codex/skills" => "codex",
+        ".codex/skills" | ".agents/skills" => "codex",
         ".opencode/skills" => "opencode",
         _ => "unknown",
     }
@@ -171,6 +180,17 @@ mod tests {
         PathBuf::from("/home/zeus")
     }
 
+    /// `SkillPathInfo::provider` is documented to mirror
+    /// `SkillProvider`'s serde output, so compare through serde rather
+    /// than hand-maintaining a second mapping in the test.
+    fn provider_str(p: &crate::skills::SkillProvider) -> String {
+        serde_json::to_value(p)
+            .unwrap()
+            .as_str()
+            .expect("SkillProvider serializes to a string")
+            .to_string()
+    }
+
     // ── User-scope detection ───────────────────────────────────
 
     #[test]
@@ -199,6 +219,75 @@ mod tests {
         let info = detect_skill_path(&p, &home).unwrap();
         assert_eq!(info.provider, "codex");
         assert!(info.is_syncable);
+    }
+
+    #[test]
+    fn codex_agents_root_user_path_is_syncable() {
+        let home = fake_home();
+        let p = home.join(".agents/skills/bar/SKILL.md");
+        let info = detect_skill_path(&p, &home).unwrap();
+        assert_eq!(info.provider, "codex");
+        assert!(info.is_syncable);
+    }
+
+    /// The push pipeline walks `skills::paths::enumerate_scan_paths` and
+    /// classifies each hit through `detect_skill_path`. A root that the
+    /// scanner knows but this table doesn't is classified `None` and
+    /// dropped from sync without a diagnostic — which is how
+    /// `~/.agents/skills` and `~/.config/opencode/skills` went missing.
+    /// Fail loudly here instead of silently there.
+    #[test]
+    fn user_scope_table_covers_every_scan_root() {
+        let home = fake_home();
+        let scan = crate::skills::paths::enumerate_scan_paths_with_home(None, false, Some(&home));
+
+        for (root, provider) in &scan.user_paths {
+            let probe = root.join("probe/SKILL.md");
+            let info = detect_skill_path(&probe, &home).unwrap_or_else(|| {
+                panic!(
+                    "scan root {} is not classified by path_detection — it would be \
+                     silently dropped from sync",
+                    root.display()
+                )
+            });
+            assert_eq!(info.scope, "user", "root {}", root.display());
+            assert_eq!(
+                info.provider,
+                provider_str(provider),
+                "provider mismatch for {}",
+                root.display()
+            );
+        }
+    }
+
+    #[test]
+    fn project_scope_table_covers_every_scan_root() {
+        let home = fake_home();
+        let project = PathBuf::from("/repo/myproj");
+        let scan = crate::skills::paths::enumerate_scan_paths_with_home(
+            Some(&project),
+            false,
+            Some(&home),
+        );
+
+        for (root, provider) in &scan.project_paths {
+            let probe = root.join("probe/SKILL.md");
+            let info = detect_with_project_root(&probe, &home, Some(&project)).unwrap_or_else(
+                || {
+                    panic!(
+                        "project scan root {} is not classified by path_detection",
+                        root.display()
+                    )
+                },
+            );
+            assert_eq!(info.scope, "project", "root {}", root.display());
+            assert_eq!(
+                info.provider,
+                provider_str(provider),
+                "provider mismatch for {}",
+                root.display()
+            );
+        }
     }
 
     #[test]
