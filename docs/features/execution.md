@@ -33,7 +33,7 @@ pub struct ExecutionPolicy {
 }
 ```
 
-`ExecutionPolicy::openflow_agent_default()` (historical name — today it's the default for every agent session, not strictly OpenFlow-only) picks the backend based on the compile-time host OS (`cfg!(target_os = ...)`) and sets sensible defaults (network on, browser automation on, desktop GUI off).
+`ExecutionPolicy::openflow_agent_default()` (the name is accurate — it is constructed only by the OpenFlow adapters; see "Scope" below) picks the backend based on the compile-time host OS (`cfg!(target_os = ...)`) and sets sensible defaults (network on, browser automation on, desktop GUI off).
 
 `prepare_agent_command(executable, args, cwd, policy)` is the spawn-time entry point. It reads `policy.effective_backend()` and returns a `PreparedExecutionCommand` with the real executable, args, and the backend that was actually applied. On Linux with Bubblewrap, it wraps the command in `bwrap --bind / / --unshare-pid --unshare-ipc --die-with-parent --new-session --proc /proc --dev-bind /dev --tmpfs /tmp/.X11-unix ...` (see `build_linux_bwrap_args`), plus an `XDG_RUNTIME_DIR` tmpfs mask. `--unshare-net` is **conditional** — emitted only when `policy.allow_network` is false, which the default agent policy is not, so the default agent spawn does not unshare the network namespace. On every other branch today, it returns the original command unwrapped — the macOS and Windows backends are placeholders.
 
@@ -50,14 +50,50 @@ pub struct ExecutionPolicy {
 - Backend label string (`"linux_bubblewrap"`, `"host_passthrough"`, etc.) surfaced in observability logs for every agent spawn
 - Cross-platform compile (the `LinuxBubblewrap` arm is `#[cfg(target_os = "linux")]` gated inside `prepare_agent_command`)
 - **Cross-platform GUI env handling (Phase 1 display isolation).** `PreparedExecutionCommand` carries **two** lists:
-  - `env_unset` — GUI variables removed via `CommandBuilder::env_remove` by both `spawn_pty_for_agent` and `spawn_pty_for_session` after all env setting. Empty on the bwrap branch (bwrap handles it via `--unsetenv`); populated from `gui_env_keys()` on every fallback path (macOS stub, Windows stub, bwrap-missing Linux, `HostPassthrough`) whenever `allow_desktop_gui=false`.
-  - `env_set` — GUI *neutralizers* from `gui_env_overrides()`: `BROWSER=true`, `MOZ_NO_REMOTE=1`, `DBUS_SESSION_BUS_ADDRESS=disabled:`, `XDG_CURRENT_DESKTOP=X-Generic`. Unsetting alone isn't enough; these actively steer well-behaved tools away from the host session.
+  - `env_unset` — GUI variables removed via `CommandBuilder::env_remove` after all env setting (including the `extra_env` merge). Empty on the bwrap branch (bwrap handles it via `--unsetenv`); populated from `gui_env_keys()` on every fallback path (macOS stub, Windows stub, bwrap-missing Linux, `HostPassthrough`) whenever `allow_desktop_gui=false`.
+  - `env_set` — GUI *neutralizers* from `gui_env_overrides()`: `BROWSER=true`, `MOZ_NO_REMOTE=1`, `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null`, `XDG_CURRENT_DESKTOP=X-Generic`, `DE=generic`, `GTK_USE_PORTAL=0`, `GIO_USE_VFS=local`, `NO_AT_BRIDGE=1`. Unsetting alone isn't enough; these actively steer well-behaved tools away from the host session.
 
   Helpers `sanitize_gui_env_std` / `sanitize_gui_env_tokio` (and their `*_keep_dbus` variants) apply the same treatment to non-PTY `Command` spawns.
 - **Adapter `extra_env` is filtered** against `env_unset` in `spawn_pty_for_agent` so an adapter propagating `DISPLAY` from the host env cannot silently un-do the strip.
 - **`ExecutionPolicy::worktree_session_default()`** governs regular (non-agent) worktree shells: `HostPassthrough` backend, no wrapping, and `allow_desktop_gui` read from the `CODEMUX_ALLOW_DESKTOP_GUI` env var — **defaulting to `false`** (safe-by-default since April 2026). Set `CODEMUX_ALLOW_DESKTOP_GUI=1|true|yes` before launching Codemux to restore host GUI inheritance for these shells.
 - **Policy `virtual_display: bool` field** with `#[serde(default)]` for backward compatibility. `openflow_agent_default()` reads `CODEMUX_VIRTUAL_DISPLAY=1|true|yes` at construction time and flips the flag.
 - **Workspace close releases the virtual display.** Both `close_workspace` and `close_workspace_with_worktree` in `src-tauri/src/commands/workspace.rs` call `VirtualDisplayManager::release(workspace_id)` after PTY teardown. Idempotent — no-op if the workspace never acquired one.
+
+## Scope: this applies to OpenFlow agents only
+
+Worth stating plainly, because it is easy to assume otherwise. The entire
+`ExecutionPolicy` / `prepare_agent_command` PTY path is reached from exactly
+one place in production: `spawn_pty_for_agent` (→
+`spawn_pty_for_agent_in_process`, or `spawn_pty_for_agent_via_daemon`), whose
+only callers are in `src-tauri/src/commands/openflow.rs`. `ExecutionPolicy`
+itself is only ever constructed by the OpenFlow adapters
+(`openflow/adapters/{claude,opencode}.rs`).
+
+Note the name collision: `branch_name.rs` defines its *own* unrelated
+`prepare_agent_command` (a `(String, bool)` prompt-embedding CLI-string
+builder used by `commands/presets.rs` and `commands/workspace.rs`). It never
+touches `ExecutionPolicy`, `env_unset`, or the sanitize helpers.
+
+**Ordinary terminal and preset panes do not go through it.** A Claude Code /
+Codex / OpenCode / Gemini / Pi *preset* pane spawns via
+`spawn_pty_for_session`, which never constructs an `ExecutionPolicy` and never
+applies `env_unset` / `env_set`. There is no `persona` field on presets and no
+"agent preset" flag anywhere in the codebase — so those panes inherit the host
+display environment like any other terminal.
+
+`ExecutionPolicy::worktree_session_default()` likewise has **no production
+caller** — it is referenced only from `execution/mod.rs`'s own test module.
+
+Because OpenFlow is itself currently unreachable from the UI (see
+`docs/features/openflow.md`), the practical reach of the *policy/spawn* path
+today is close to zero. That is a gap worth closing — routing preset agent
+panes through a policy is the point of the abstraction — but it should not be
+described as shipped behavior.
+
+Scoped claim: this is about the PTY policy path only. The module's
+`sanitize_gui_env_std` / `sanitize_gui_env_tokio` helpers *are* used widely in
+production (`github.rs`, `agent_provider/opencode/{server,discovery}.rs`,
+`commands/files.rs`, `commands/mod.rs`).
 
 ## Built But Not Wired (virtual display, Phase 2 / 2.5)
 

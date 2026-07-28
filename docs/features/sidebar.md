@@ -84,9 +84,9 @@ visual only — nothing is archived, closed, or deleted.
   is always genuinely in the active list. It is also the **one surface that
   orders by status** — the list below stays deliberately status-blind, and
   the strip existing is precisely what lets it.
-- **Pending workspaces**: workspaces still being created render above the
-  cards as their own rows — a spinner "creating" row, or a red `AlertCircle`
-  "failed" row. They are filter-scoped like everything else and suppress the
+- **Pending workspaces**: workspaces still being created render as their own
+  rows **below the top-tier cards and above the "Wrapping up" divider** — a
+  spinner "creating" row, or a red `AlertCircle` "failed" row. They are filter-scoped like everything else and suppress the
   "Nothing active" empty state while present.
 - **Card order — newest first, and static** (`compareNewestFirst` in
   `sidebar-inbox.tsx`): cards sort by **stored snapshot index, descending**.
@@ -165,6 +165,11 @@ visual only — nothing is archived, closed, or deleted.
   a `+N` overflow), Location (`This device` / host name / `host · in place`),
   Notifications muted — and finally the real path on disk (`worktree_path ??
   remote_cwd ?? cwd`, `$HOME` collapsed to `~`, wrapped not truncated).
+  **Parked rows report real agent state, not "Idle."** A settled or snoozed
+  workspace can still be running — a review-state agent stays settled — so
+  `SettledRow` / `SnoozeRow` take a `status` prop that their call sites derive
+  live via `getWorkspaceStatus(workspace.surfaces, paneStatuses)` rather than
+  hard-coding idle into the parked shapes.
   It reuses the `DetailRow` label/value shape from the context bar's popover
   (`WorkspaceStatusCluster`), and needs **no new Tauri command** — every field
   is already on `WorkspaceSnapshot` or in `appState.detected_ports`. The card
@@ -176,14 +181,12 @@ visual only — nothing is archived, closed, or deleted.
   `ContextMenuTrigger`, so the two `asChild` triggers never collide.
 - **Project section of the workspace menu** (`project-appearance-menu.tsx`): all
   three row shapes' right-click menus (active card, settled row, snoozed row)
-  carry a `Project "<name>"` submenu between the
-  workspace actions and the device actions — an image entry (opens
-  `ProjectImageDialog`) plus the 12-color accent palette, applying to the whole
-  project the row belongs to. This is the re-homed project-avatar customization
-  that lost its entry point when the project tree was unmounted; writes go
-  through `src/stores/project-appearance-store.ts`, so every card, settled row,
-  rail button, and filter-dropdown entry of that project repaints at once.
-  See `docs/features/project-avatars.md`.
+  carry a `Project "<name>"` submenu between the workspace actions and the
+  device actions — an image entry plus the 12-color accent palette, applying to
+  the whole project the row belongs to. This is the re-homed project-avatar
+  customization that lost its entry point when the project tree was unmounted.
+  `docs/features/project-avatars.md` is the canonical doc for the mechanism
+  (store, persistence keys, which surfaces repaint).
 - **Settle / un-settle** (`sidebar-inbox-store.ts`): Settle collapses the card
   (~200ms height/opacity), then moves it onto the "Settled" shelf as a compact
   one-line row (repo avatar · violet merge icon when its PR merged · title ·
@@ -620,9 +623,11 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   plus the lifecycle block those drive (Un-settle / Wake now / Settle /
   "Snooze until…" / Mark unread, ordered so the entries that bring work *back*
   come first) — the `SidebarWorkspaceRow` *component* in that
-  module is itself unmounted. The other three files (`sidebar-project-group.tsx`,
-  `sidebar-live-section.tsx`, `sidebar-live-grouping.ts`) are pure dead code
-  kept only alongside their test suites. Removing them is a pending cleanup.
+  module is itself unmounted. The other files (`sidebar-project-group.tsx`,
+  `sidebar-live-section.tsx`, `sidebar-live-grouping.ts`, and
+  `workspace-reorder.ts` — the old drag-reorder pure transform, which the inbox
+  has no equivalent for) are pure dead code; each still has a test suite except
+  `sidebar-live-section.tsx`, which has none. Removing them is a pending cleanup.
   `sidebar-needs-you-strip.tsx` is **no longer dead** — it is re-mounted in the
   inbox's sticky header (see "Needs you strip" above).
 

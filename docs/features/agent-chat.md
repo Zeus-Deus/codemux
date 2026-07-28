@@ -611,7 +611,32 @@ structural wins:
   (`appearance.smooth_scrolling` in the settings store) and is pushed to
   the webview via the `set_smooth_scrolling` command
   (`smooth-scrolling-section.tsx`, `use-smooth-scrolling.ts`); the toggle
-  only renders on Linux WebKitGTK, where it has an effect.
+  only renders on Linux WebKitGTK, where it has an effect, and is hidden
+  on the web remote client (`isRemoteClient()`) — `useSmoothScrollingInit`
+  and `useRendererModeInit` likewise no-op there, because the command acts
+  on the desktop host's webview, not the browser the page is rendered in.
+- **Renderer selection is guarded four ways** (`webview_tuning.rs`). The
+  accelerated `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1` default is only applied
+  when it can work and can be backed out of:
+  - **WebKitGTK ≥ 2.40 floor** (`FORCE_SHM_MIN_WEBKIT`, probed at runtime
+    via `webkit_get_major/minor_version` in `runtime_webkit_version` — no
+    GTK init needed). Older WebKit doesn't recognize the variable, so
+    setting it would silently reinstate the original crash; those builds
+    drop straight to the legacy compat flags with no sentinel bookkeeping.
+  - **Crash sentinel, disarmed on clean exit.** Startups that never reach
+    page-load are counted in an on-disk sentinel and stick the process
+    back on legacy CPU flags after repeated failures. `mark_clean_exit`
+    fires on `tauri::RunEvent::Exit`, so quitting during boot no longer
+    counts as a crash (ownership-gated, so a second instance can't clear
+    the first's counter).
+  - **`=0` is a real opt-out.** `WEBKIT_DISABLE_*=0` / `…FORCE_SHM=0`
+    survive the inherited-env scrub and do NOT mark the process
+    CPU-rendered (`env_value_disables`) — only a non-`0` value counts as
+    the user pinning the legacy renderer.
+  - **Recovery.** The CPU fallback is sticky by design; deleting
+    `webview-renderer.sentinel` under the app data dir re-arms the
+    accelerated path on the next launch (the stderr note says so when the
+    fallback engages).
 - **Slot-object reuse + a memoized whole-row wrapper** (see "Stable keys
   + two-level memo rows" above): `reuseTranscriptSlots` preserves an
   untouched slot's object identity across the per-token rebuild, so with
@@ -1634,7 +1659,7 @@ read-only Context Row from its FIRST render instead (see "Context Row"
 below) — same strip shape at every message count, so scope never
 appears to change across the first send.
 
-Until `v0.15.x` the pane rendered the full row, and both of its
+Through `v0.15.0` the pane rendered the full row, and both of its
 controls were app-wide relocations wearing per-thread clothing:
 
 - **"New worktree"** did not rescope the thread. It created a SECOND
@@ -1695,8 +1720,15 @@ disguised as a scope control.
 `Command` with `shouldFilter={false}` plus a `CommandInput`
 ("Search projects…"), so opening it focuses the search field and the
 whole flow is type → `Enter` with no mouse. Every cmdk popover in the
-app routes Radix's open-autofocus through `focusCmdkOnOpen`
-(`src/components/chat/pickers/focus-cmdk-root.ts`): it targets the
+*chat* surfaces routes Radix's open-autofocus through `focusCmdkOnOpen`
+(`src/components/chat/pickers/focus-cmdk-root.ts`) — `ThreadScopeRow`'s
+three popovers, `ModelPicker`, `MultiProviderModelPicker`,
+`PermissionModePicker`, `ReasoningPicker`, `SpeedPicker`, plus the
+launch-time `launch-model-picker.tsx` / `launch-reasoning-picker.tsx`.
+(Other cmdk-in-Popover surfaces — `branch-picker.tsx`,
+`project-picker.tsx`, `sidebar-ports-popover.tsx`, `agent-launcher.tsx`
+— do not use it; they work incidentally because their `CommandInput` is
+the first tabbable element.) It targets the
 `[cmdk-input]` when the popover has one — the search field must own
 focus so typing filters immediately, and being a descendant of the
 root it still forwards arrow/Enter to cmdk — and falls back to the
@@ -1790,7 +1822,7 @@ log instead of failing silently) → `generateRandomBranchName(projectPath)`
 on error/empty, then
 `createWorktreeWorkspace` off the row's `baseBranch` with the `"empty"`
 layout. Only ONE surface routes it (the pane arm was removed — see
-"Scope binding" above):
+"Location binding" above):
 
 - **Draft surface** — `materializeAndSend` takes an optional
   `worktreeProjectPath` (resolved by `DraftChatSurface`:
@@ -1871,8 +1903,8 @@ launch), and DROPS `initial_prompt` / `agent_preset_id` rather than
 injecting them into a session someone else is already using — the
 command returns `adopted: true` (`WorkspaceCreated { workspace_id, cwd,
 adopted }`; also in the control-socket JSON), and the new-workspace
-dialog toasts "…switched to it. Your prompt wasn't sent." so the drop is
-never silent. Archived workspaces live in `archived_workspaces`, so they
+dialog toasts "…switched to it.", appending "Your prompt wasn't sent."
+only when a prompt was actually entered, so the drop is never silent. Archived workspaces live in `archived_workspaces`, so they
 neither block creation nor get silently un-archived.
 
 **Branch control ↔ checkout mode coupling** (editable scope only — the
@@ -1914,11 +1946,12 @@ title-bar chat tab). See `docs/features/gui-chrome.md`.
 ### Context Row (running-thread status)
 
 Design: `.design-import/Context Row.dc.html` (claude.ai/design handoff).
-Once a thread has messages, `AgentChatPane`'s `belowComposerSlot` swaps
-`ThreadScopeRow` for a read-only **Context Row** — the same tucked
+`AgentChatPane` never renders `ThreadScopeRow`; its `belowComposerSlot`
+is the read-only **Context Row** from the pane's FIRST render, at every
+message count (`AgentChatPane.tsx:2626`) — the same tucked
 scope-strip shell (`SCOPE_STRIP` / `SCOPE_STRIP_INSET` exported from
-`ThreadScopeRow.tsx`), but scope is committed (the first
-send locked it in) so the left side is no longer clickable:
+`ThreadScopeRow.tsx`), but scope is committed (the workspace
+binding locked it in) so the left side is not clickable:
 
 - **Left** — static ghost-styled spans: folder icon (home icon +
   `text-status-remote` for a home-rooted pane) + project name (`title`
@@ -1926,13 +1959,14 @@ send locked it in) so the left side is no longer clickable:
   `font-mono` branch-icon span with the workspace's checked-out branch
   (`title="Branch: <name>"`) — omitted entirely when the workspace has
   no `git_branch`.
-- **Right** — `<WorkspaceStatusCluster />` (`src/components/chat/WorkspaceStatusCluster.tsx`),
-  the same component `ThreadScopeRow`'s `trailing` slot uses in the
-  empty-thread state, so the passive status reads identically on both
-  sides of the first send.
+- **Right** — `<WorkspaceStatusCluster />` (`src/components/chat/WorkspaceStatusCluster.tsx`).
+  (It used to also fill `ThreadScopeRow`'s `trailing` slot in the
+  empty-thread state; that slot was deleted with the scope-row removal,
+  so the cluster now renders only inside this Context Row.)
 
-The row renders only when `messages.length > 0 && workspaceProjectRoot`;
-otherwise `belowComposerSlot` falls through to `undefined` (unresolved
+The row renders whenever `workspaceProjectRoot` resolves — no
+message-count gate (see "Pane-surface state" above); otherwise
+`belowComposerSlot` falls through to `undefined` (unresolved
 project root, e.g. very early boot).
 
 **`WorkspaceStatusCluster`** is self-contained — it reads
@@ -2067,7 +2101,7 @@ settings).
 - **Pruning.** Each create prunes both `refs/codemux/` namespaces to
   the 20 newest refs and drops the matching bookkeeping rows.
 
-Design note: `docs/plans/agent-run-checkpoint.md`.
+Design note: `docs/archive/agent-run-checkpoint.md`.
 
 ## Event bridge
 

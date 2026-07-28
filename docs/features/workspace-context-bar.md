@@ -10,11 +10,13 @@
 
 A passive, read-only 42px status strip pinned under the work surface (inside
 `SidebarInset`, after `WorkspaceMain`). It is the "one home for the details"
-half of the sidebar-density split: the sidebar keeps glanceable, state-driven
-row density (idle rows are one-liners; only rows with live agents or dirty
-worktrees expand), while the context bar holds the full labeled git detail
-for the **active** workspace — regardless of the row's current density, so
-nothing is lost when a row rests as a one-liner.
+half of the sidebar/detail split: the sidebar inbox stays deliberately
+lossy — active workspaces are fixed multi-line cards that truncate the title
+and omit `git_behind` / changed-file counts, and parked (settled or snoozed)
+workspaces collapse to one-line rows — while the context bar holds the full
+labeled git detail for the **active** workspace, so nothing is lost when a
+workspace rests as a parked one-liner. (The sidebar's own hover card covers
+the same gap per row; see `docs/features/sidebar.md`.)
 
 ## Current Model
 
@@ -103,9 +105,9 @@ new data plumbing.
 ## Current Constraints
 
 - Read-only by design: no commit/push/pull actions live here.
-- Shows regardless of the active row's state-derived density, so an expanded
-  working row intentionally duplicates the git numbers between sidebar row
-  and bar.
+- Shows regardless of what the sidebar row already displays, so an active
+  workspace card intentionally duplicates the branch/ahead/diff numbers
+  between sidebar card and bar.
 - Spans only the content area (right of the sidebar), matching the design.
 
 ## Important Touch Points

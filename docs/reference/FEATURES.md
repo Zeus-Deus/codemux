@@ -57,6 +57,7 @@
 - PTY resize auto-syncs when pane resizes
 - Terminal lifecycle status overlay (starting, ready, exited, failed with exit code)
 - Shell font family configurable via Omarchy shell appearance
+- Live working-directory hint in the pane header, shown only when the session has moved off the workspace root (`Terminal · src-tauri`); OSC 7 from shell integration is the primary source with a Linux `/proc` poll fallback, deep paths elide to a 2-segment tail, `$HOME` contracts to `~`, and the hover tooltip carries the full path
 
 ## Panes
 
@@ -177,6 +178,7 @@
 - Browser sessions restored with URL history
 - Notification state persisted
 - Notification sound preference persisted
+- Done-review checkmarks survive a restart — only `Review` pane statuses whose pane still exists are persisted; working/permission states are deliberately dropped (they would describe processes that died with the app) along with entries for panes that no longer exist
 - Project memory persisted independently per project root
 - Debounced disk writes (500ms quiet period) to prevent write amplification
 
