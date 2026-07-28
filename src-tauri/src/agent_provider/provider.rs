@@ -95,6 +95,16 @@ pub trait AgentProvider: Send + Sync {
         decision: ApprovalDecision,
     ) -> Result<(), ProviderError>;
 
+    /// Whether an outstanding provider request can still be answered after
+    /// Codemux rebuilds a missing live session from its resume cursor.
+    ///
+    /// Claude and Codex callbacks are tied to the sidecar/app-server process,
+    /// so the safe default is `false`. Providers whose request state lives in
+    /// a durable external service can opt in.
+    fn pending_requests_survive_session_restart(&self) -> bool {
+        false
+    }
+
     /// Swap the session's model at runtime. Providers that do not support
     /// this return
     /// [`ProviderError::ValidationError`](super::errors::ProviderError::ValidationError).

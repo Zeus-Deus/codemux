@@ -1,10 +1,12 @@
 import { create } from "zustand";
 
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
+import type { ReplayOptions } from "@/lib/agent-chat/hydrate";
 import {
   applyEvent,
   appendUserMessage,
   createEmptyThreadState,
+  markRequestPending,
   markRequestResolved,
   markRequestResponding,
   removeUserMessageByNonce,
@@ -202,6 +204,8 @@ interface AgentChatStore {
     requestId: string,
     decision: ApprovalDecision,
   ) => void;
+  /** Restore an in-flight request after a retryable response failure. */
+  markRequestPending: (threadId: string, requestId: string) => void;
   /** Locally mark a permission request resolved (no sidecar round-trip).
    *  Used for plan accept/reject — the sidecar denied+interrupted the
    *  ExitPlanMode tool, so no `request-resolved` notification will fire. */
@@ -235,11 +239,16 @@ interface AgentChatStore {
    *  `opts.runLive` is forwarded to `replayPayloads`: when the caller
    *  has confirmed the thread's turn is in flight (remount of a live
    *  run) it suppresses the Run-interrupted heuristic and marks the
-   *  slice streaming. Omit for the plain resume path. */
+   *  slice streaming. Omit for the plain resume path.
+   *
+   *  `opts.provider` is likewise forwarded: it decides whether an
+   *  unresolved persisted request is expired on hydrate (Claude/Codex,
+   *  whose callbacks die with the process) or kept actionable (OpenCode,
+   *  whose permissions live in its own server). */
   hydrateThread: (
     threadId: string,
     payloads: string[],
-    opts?: { runLive?: boolean },
+    opts?: ReplayOptions,
   ) => void;
   /** Clear a thread entirely (e.g. on session stop). */
   resetThread: (threadId: string) => void;
@@ -375,6 +384,14 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       updateSlice(state, threadId, (slice) => ({
         ...slice,
         ...markRequestResponding(slice, requestId, decision),
+      })),
+    ),
+
+  markRequestPending: (threadId, requestId) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) => ({
+        ...slice,
+        ...markRequestPending(slice, requestId),
       })),
     ),
 

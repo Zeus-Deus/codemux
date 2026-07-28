@@ -47,6 +47,41 @@ const FALLBACK_DEFAULT_PERMISSION_MODE_BY_PROVIDER: Record<
   opencode: null,
 };
 
+/**
+ * Whether a provider's outstanding approval / input requests can still be
+ * answered after the live Codemux session is gone (app restart, pane
+ * teardown, session adoption).
+ *
+ * Mirrors `AgentProvider::pending_requests_survive_session_restart` in
+ * `src-tauri/src/agent_provider/provider.rs`. Claude and Codex keep their
+ * callbacks inside the sidecar / app-server process, so a rebuilt session
+ * can never deliver an old answer. OpenCode holds permissions in its
+ * external HTTP server and its adapter opts in, so `respond_to_request`
+ * re-adopts the server session and delivers the reply.
+ *
+ * This is a protocol fact, not a harvested capability — it is a static
+ * table rather than a `provider-capabilities-store` read so the pure
+ * hydrate path can consult it without an extra IPC round-trip.
+ */
+const REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER: Record<
+  AgentChatProviderKind,
+  boolean
+> = {
+  claude: false,
+  codex: false,
+  opencode: true,
+};
+
+/** Predicate form of {@link REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER}.
+ *  An unknown / absent provider is treated as NOT surviving, matching the
+ *  backend trait default. */
+export function providerRequestsSurviveSessionRestart(
+  provider: AgentChatProviderKind | null | undefined,
+): boolean {
+  if (!provider) return false;
+  return REQUESTS_SURVIVE_SESSION_RESTART_BY_PROVIDER[provider] ?? false;
+}
+
 /** Synchronous accessor for the provider's default model id.
  *
  * Reads `provider-capabilities-store.getState()` (safe outside React —

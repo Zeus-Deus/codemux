@@ -444,6 +444,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const markRequestResponding = useAgentChatStore(
     (s) => s.markRequestResponding,
   );
+  const markRequestPending = useAgentChatStore((s) => s.markRequestPending);
   const markRequestResolved = useAgentChatStore(
     (s) => s.markRequestResolved,
   );
@@ -917,7 +918,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         const payloads = await agentChatListMessages(threadId);
         if (cancelled) return;
         if (payloads.length === 0) return;
-        const replayed = replayPayloads(payloads);
+        const replayed = replayPayloads(payloads, { provider });
         const slice = useAgentChatStore.getState().threads[threadId];
         const localCount = slice?.messages.length ?? 0;
         // Guard against clobbering live state: only hydrate when disk
@@ -939,7 +940,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (cancelled) return;
         useAgentChatStore
           .getState()
-          .hydrateThread(threadId, payloads, { runLive });
+          .hydrateThread(threadId, payloads, { runLive, provider });
       } catch (err) {
         // Soft-fail: if hydrate fails, the user still sees whatever
         // the live stream brings in. Log so it's debuggable.
@@ -1923,16 +1924,31 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
 
   const handleRespond = useCallback(
-    (requestId: string, decision: ApprovalDecision) => {
-      if (!threadId) return;
+    (
+      requestId: string,
+      decision: ApprovalDecision,
+      propagateFailure = false,
+    ) => {
+      if (!threadId) return Promise.resolve();
+      const tid = threadId;
       markRequestResponding(threadId, requestId, decision);
-      agentChatRespondToRequest(provider, threadId, requestId, decision).catch(
-        (err) => {
-          toast.error(`Failed to send decision: ${err}`);
-        },
-      );
+      return agentChatRespondToRequest(
+        provider,
+        threadId,
+        requestId,
+        decision,
+      ).catch((err) => {
+        markRequestPending(tid, requestId);
+        toast.error(`Failed to send decision: ${err}`);
+        if (propagateFailure) throw err;
+      });
     },
-    [threadId, provider, markRequestResponding],
+    [
+      threadId,
+      provider,
+      markRequestResponding,
+      markRequestPending,
+    ],
   );
 
   /**
@@ -2689,12 +2705,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleSubmitUserInput = useCallback(
     (output: AskUserQuestionOutput) => {
       if (!pendingUserInput || pendingUserInput.kind !== "permission_request") {
-        return;
+        return Promise.resolve();
       }
-      handleRespond(pendingUserInput.request_id, {
-        decision: "allow",
-        updated_input: output,
-      });
+      return handleRespond(
+        pendingUserInput.request_id,
+        {
+          decision: "allow",
+          updated_input: output,
+        },
+        true,
+      );
     },
     [pendingUserInput, handleRespond],
   );

@@ -1697,9 +1697,11 @@ async fn session_error_emits_session_state_changed_plus_warning() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn respond_to_unknown_request_id_returns_validation_error() {
-    // The fake sidecar rejects requestId=="unknown-request" with
-    // -32602; the adapter maps that to ValidationError.
+async fn respond_to_unknown_request_id_returns_request_not_pending() {
+    // The fake sidecar rejects requestId=="unknown-request" with -32602
+    // ("not found or already resolved"); the adapter classifies that as
+    // RequestNotPending so the command layer can expire the control
+    // instead of surfacing a generic validation failure.
     let provider = provider_with_fake().await;
     provider.start_session(start_input("t-unkr")).await.unwrap();
     let err = provider
@@ -1710,7 +1712,10 @@ async fn respond_to_unknown_request_id_returns_validation_error() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, ProviderError::ValidationError { .. }));
+    assert!(
+        matches!(err, ProviderError::RequestNotPending { .. }),
+        "expected RequestNotPending, got {err:?}"
+    );
     provider.stop_session(ThreadId("t-unkr".into())).await.ok();
 }
 

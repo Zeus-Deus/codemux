@@ -69,6 +69,7 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
   });
   const [otherText, setOtherText] = useState<Record<number, string>>({});
   const [submitted, setSubmitted] = useState(false);
+  const submittedRef = useRef(false);
 
   // ------- Selection + answer helpers ---------------------------------
 
@@ -165,11 +166,13 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
   }, [questions.length]);
 
   const handleSubmit = useCallback(async () => {
-    if (submitted || !allAnswered) return;
+    if (submittedRef.current || submitted || !allAnswered) return;
+    submittedRef.current = true;
     setSubmitted(true);
     try {
       await onSubmit(collectAnswers());
     } catch {
+      submittedRef.current = false;
       setSubmitted(false);
     }
   }, [submitted, allAnswered, collectAnswers, onSubmit]);

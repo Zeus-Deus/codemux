@@ -300,7 +300,18 @@ const respondToRequest: MethodHandler = async (params) => {
       `decision.behavior must be "allow" or "deny", got ${behavior}`,
     );
   }
-  await session.respondToRequest(requestId, decision);
+  try {
+    await session.respondToRequest(requestId, decision);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (
+      message.includes("not found or already resolved") ||
+      message.toLowerCase().includes("unknown pending")
+    ) {
+      throw new InvalidParamsError(message);
+    }
+    throw err;
+  }
   return {};
 };
 

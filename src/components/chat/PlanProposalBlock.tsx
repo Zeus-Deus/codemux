@@ -50,7 +50,9 @@ export const PlanProposalBlock = memo(function PlanProposalBlock({
     // after the user has acted.
     return (
       <div className="py-0.5 text-xs text-muted-foreground">
-        {resolvedLabel(item.resolution.state)}
+        {item.resolution.state === "failed"
+          ? item.resolution.message
+          : resolvedLabel(item.resolution.state)}
       </div>
     );
   }

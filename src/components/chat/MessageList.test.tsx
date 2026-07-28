@@ -199,6 +199,22 @@ describe("MessageList dispatch", () => {
     expect(screen.getByText(/Submitting answers/)).toBeInTheDocument();
   });
 
+  it("shows the durable expiry explanation for a stale user-input request", () => {
+    renderList([
+      askReq({
+        resolution: {
+          state: "failed",
+          reason: "stale_provider_callback",
+          message: "This question expired after restart.",
+        },
+      }),
+    ]);
+    expect(
+      screen.getByText("This question expired after restart."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/answer above the composer/)).toBeNull();
+  });
+
   it("echoes the user's answer as a reply once a user-input request resolves", () => {
     renderList([
       askReq({

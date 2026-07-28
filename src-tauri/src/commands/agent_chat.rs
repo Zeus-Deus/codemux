@@ -24,8 +24,8 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
-    ProviderRuntimeEvent, RequestId, SendTurnInput, SerializableProviderError,
-    StartSessionInput, ThreadId, TurnId,
+    ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
+    SerializableProviderError, StartSessionInput, ThreadId, TurnId,
 };
 use crate::database::{
     AgentChatCheckpointRecord, AgentChatSessionConfig, AgentChatSessionRecord, DatabaseStore,
@@ -2099,16 +2099,59 @@ pub async fn agent_chat_respond_to_request<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-    // Auto-resume before responding: a pending approval a user acts on
-    // after a restart must land on a live session, not a
-    // `session_not_found`. No-op when a session is already live.
-    ensure_live_session(&app, provider, &thread_id).await?;
     let registry: State<'_, ProviderRegistry> = app.state();
     let impl_ = lookup_provider(&registry, provider).await?;
-    impl_
-        .respond_to_request(thread_id, request_id, decision)
+
+    // Conversation history is resumable; provider callbacks usually are
+    // not. Rebuilding a Claude/Codex session here creates a healthy process
+    // with an empty pending-request map, then guarantees the confusing
+    // "request not found or already resolved" failure. Terminalize the
+    // orphan instead. OpenCode opts into resume because its permission
+    // request lives in the external HTTP server rather than this process.
+    if !impl_.has_session(&thread_id).await {
+        if !impl_.pending_requests_survive_session_restart() {
+            emit_stale_request_failure(&app, thread_id, request_id);
+            return Ok(());
+        }
+        ensure_live_session(&app, provider, &thread_id).await?;
+    }
+
+    match impl_
+        .respond_to_request(thread_id.clone(), request_id.clone(), decision)
         .await
-        .map_err(provider_err)
+    {
+        Ok(()) => Ok(()),
+        // A provider can lose the callback between the liveness check and
+        // the response, or a recovered external session may no longer know
+        // the request. Persist one terminal failure so remount/hydration
+        // cannot make the same dead control actionable again.
+        Err(ProviderError::RequestNotPending { .. })
+        | Err(ProviderError::SessionNotFound { .. })
+        | Err(ProviderError::SessionClosed { .. }) => {
+            emit_stale_request_failure(&app, thread_id, request_id);
+            Ok(())
+        }
+        Err(err) => Err(provider_err(err)),
+    }
+}
+
+const STALE_REQUEST_MESSAGE: &str =
+    "This request expired when the provider session restarted. Continue to have the agent repeat it.";
+
+fn emit_stale_request_failure<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: ThreadId,
+    request_id: RequestId,
+) {
+    forward_event(
+        app,
+        ProviderRuntimeEvent::RequestResponseFailed {
+            thread_id,
+            request_id,
+            reason: RequestResponseFailureReason::StaleProviderCallback,
+            message: STALE_REQUEST_MESSAGE.to_string(),
+        },
+    );
 }
 
 /// Swap a session's active model. `model == None` is a validation
@@ -2839,6 +2882,7 @@ fn map_event_to_pane_status(
         | ProviderRuntimeEvent::ItemCompleted { .. }
         | ProviderRuntimeEvent::RequestResolved { .. } => Some(PaneStatus::Working),
         ProviderRuntimeEvent::RequestOpened { .. } => Some(PaneStatus::Permission),
+        ProviderRuntimeEvent::RequestResponseFailed { .. } => Some(PaneStatus::Review),
         ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => match subagent.status {
             SubagentStatus::Pending | SubagentStatus::Running => {
                 if !subagent.subagent_id.is_empty() {
@@ -3092,6 +3136,7 @@ fn activity_update(
         } => mid_turn(true),
         // Turn/session settled — the thread is no longer mid-turn.
         ProviderRuntimeEvent::TurnCompleted { .. }
+        | ProviderRuntimeEvent::RequestResponseFailed { .. }
         | ProviderRuntimeEvent::SessionStateChanged {
             status: SessionStatus::Ready
                 | SessionStatus::Closed
@@ -3236,6 +3281,7 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             | ProviderRuntimeEvent::TurnCompleted { .. }
             | ProviderRuntimeEvent::RequestOpened { .. }
             | ProviderRuntimeEvent::RequestResolved { .. }
+            | ProviderRuntimeEvent::RequestResponseFailed { .. }
             // Subagent snapshots persist so the orchestration card and
             // child transcripts survive restart: DB hydrate replays them
             // through the same reducer with zero schema migration.
@@ -3373,6 +3419,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::TurnCompleted { thread_id, .. }
         | ProviderRuntimeEvent::RequestOpened { thread_id, .. }
         | ProviderRuntimeEvent::RequestResolved { thread_id, .. }
+        | ProviderRuntimeEvent::RequestResponseFailed { thread_id, .. }
         | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. }
         | ProviderRuntimeEvent::SubagentUpdated { thread_id, .. }
         | ProviderRuntimeEvent::WorkflowUpdated { thread_id, .. }

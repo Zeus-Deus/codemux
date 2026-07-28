@@ -38,6 +38,14 @@ export const PermissionRequestBlock = memo(function PermissionRequestBlock({
     );
   }
 
+  if (item.resolution.state === "failed") {
+    return (
+      <div className="py-0.5 text-xs text-muted-foreground">
+        {item.resolution.message}
+      </div>
+    );
+  }
+
   const toolName = readToolName(item.payload);
   const toolInput = readToolInput(item.payload);
   const inputText =

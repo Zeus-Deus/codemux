@@ -772,8 +772,8 @@ impl CodexSession {
             state
                 .pending_approvals
                 .remove(&request_id)
-                .ok_or_else(|| ProviderError::ValidationError {
-                    message: format!("no pending approval for request {}", request_id.0),
+                .ok_or_else(|| ProviderError::RequestNotPending {
+                    request_id: request_id.clone(),
                 })?
         };
         let payload = serde_json::to_value(&response).unwrap();

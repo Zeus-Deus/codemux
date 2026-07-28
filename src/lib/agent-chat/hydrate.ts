@@ -1,5 +1,7 @@
 import type { ProviderRuntimeEvent } from "@/tauri/events";
+import type { AgentChatProviderKind } from "@/tauri/types";
 
+import { providerRequestsSurviveSessionRestart } from "./capability-defaults";
 import {
   applyEvent,
   appendUserMessage,
@@ -29,6 +31,21 @@ export interface UserMessageEnvelope {
 }
 
 type ReplayPayload = UserMessageEnvelope | ProviderRuntimeEvent;
+
+const STALE_REQUEST_MESSAGE =
+  "This request expired when the provider session restarted. Continue to have the agent repeat it.";
+
+/** Options accepted by {@link replayPayloads} (and forwarded verbatim by
+ *  `agent-chat-store.hydrateThread`). */
+export interface ReplayOptions {
+  /** The backend authoritatively confirmed a turn is in flight. */
+  runLive?: boolean;
+  /** Provider that owns the thread. Decides whether an unresolved
+   *  persisted request is still answerable once no turn is live — see
+   *  `providerRequestsSurviveSessionRestart`. Omitted means "assume
+   *  process-local callbacks", i.e. today's expire-on-hydrate behavior. */
+  provider?: AgentChatProviderKind | null;
+}
 
 /**
  * Rebuild a thread state by replaying persisted payloads through the
@@ -60,12 +77,24 @@ type ReplayPayload = UserMessageEnvelope | ProviderRuntimeEvent;
  * instead of the divider. The next live event keeps or clears that flag
  * through the reducer as usual. With `opts` absent (or `runLive` falsy)
  * behavior is identical to the resume path.
+ *
+ * `opts.provider` gates the synthetic expiry of unresolved requests: a
+ * provider whose request state lives outside the Codemux process (OpenCode)
+ * keeps its pending requests actionable even with no live turn.
  */
 export function replayPayloads(
   payloads: string[],
-  opts?: { runLive?: boolean },
+  opts?: ReplayOptions,
 ): ChatThreadState {
   const runLive = opts?.runLive ?? false;
+  // Only providers with process-local callbacks lose their requests when the
+  // session dies. OpenCode's permissions live in its HTTP server, and
+  // `agent_chat_respond_to_request` re-adopts that session to deliver the
+  // answer, so expiring them here would render a still-answerable request
+  // dead — and the reducer's `request_opened` early-return means no
+  // re-broadcast could ever bring it back.
+  const requestsSurvive = providerRequestsSurviveSessionRestart(opts?.provider);
+  const expireOrphanRequests = !runLive && !requestsSurvive;
   let state = createEmptyThreadState();
   for (const raw of payloads) {
     const parsed = parsePayload(raw);
@@ -80,6 +109,28 @@ export function replayPayloads(
       state = appendUserMessage(state, parsed.text, undefined, undefined, images);
     } else {
       state = applyEvent(state, parsed);
+    }
+  }
+
+  // Provider request callbacks are ephemeral even though the transcript is
+  // durable. When no live turn owns the replayed requests, settle every
+  // orphan through the same reducer event used by a failed live response.
+  // This is the part the old `pendingRequestIds: []` cleanup missed: the
+  // rendered PermissionRequestItem itself stayed `pending`, so the composer
+  // resurrected the questionnaire despite the supposedly-empty pending set.
+  //
+  // A workspace-switch remount can happen while the original provider turn
+  // is still alive. `runLive` is the backend's authoritative guard for that
+  // case, so those callbacks remain actionable.
+  if (expireOrphanRequests) {
+    for (const requestId of [...state.pendingRequestIds]) {
+      state = applyEvent(state, {
+        type: "request_response_failed",
+        thread_id: "",
+        request_id: requestId,
+        reason: "stale_provider_callback",
+        message: STALE_REQUEST_MESSAGE,
+      });
     }
   }
   // Guarantee post-replay state matches a quiescent thread. The
@@ -110,11 +161,11 @@ export function replayPayloads(
   // the reducer derived from), that terminal state already won during
   // replay and is left untouched here.
   //
-  // A `pending_approval` workflow is deliberately PRESERVED — it is a
-  // legitimate persisted resting state awaiting the user's decision (the
-  // "Run as a workflow?" card), not a runaway spinner, and the backend
-  // auto-resume re-establishes the session so the approval can still be
-  // answered after a restart.
+  // A `pending_approval` workflow whose request is still answerable (live
+  // turn, or a provider whose requests survive the session) is deliberately
+  // preserved. A genuinely-orphaned one was already stopped above by
+  // `request_response_failed`, since resuming conversation history cannot
+  // recreate a process-local provider callback.
   messages = interruptRunningSubagents(messages);
   messages = messages.map((m) =>
     m.kind === "workflow_run" && m.status === "running"
@@ -129,7 +180,7 @@ export function replayPayloads(
     // turn is in flight we mark the thread streaming so the streaming
     // marker shows instead of the Run-interrupted divider.
     streaming: runLive,
-    pendingRequestIds: [],
+    pendingRequestIds: expireOrphanRequests ? [] : state.pendingRequestIds,
     // Interrupted when EITHER the replay itself observed a `child_exited`
     // terminal turn (the watchdog persisted a `turn_completed` error) OR
     // the raw history ends with an unsettled user turn (the app died before

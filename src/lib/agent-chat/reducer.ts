@@ -1035,6 +1035,24 @@ export function markRequestResponding(
   };
 }
 
+/** Restore a locally-responding request after a retryable IPC/provider
+ * failure. Terminal `resolved`/`failed` requests are intentionally left
+ * untouched so a late promise rejection can never resurrect them. */
+export function markRequestPending(
+  state: ChatThreadState,
+  requestId: string,
+): ChatThreadState {
+  const found = findPermissionRequest(state.messages, requestId);
+  if (!found || found.item.resolution.state !== "responding") return state;
+  return {
+    ...state,
+    messages: replaceItem(state.messages, found.index, {
+      ...found.item,
+      resolution: { state: "pending" },
+    }),
+  };
+}
+
 /**
  * Local-only action: mark a permission request as resolved. Used for
  * synthetic decisions where there is no round-trip through the sidecar
@@ -1378,6 +1396,72 @@ function applyEventInner(
         messages = replaceItem(messages, wfMatch.index, patchedWf);
       }
       if (!found && !wfMatch) return state;
+      return {
+        ...state,
+        messages,
+        pendingRequestIds: state.pendingRequestIds.filter(
+          (id) => id !== event.request_id,
+        ),
+      };
+    }
+
+    case "request_response_failed": {
+      const found = findPermissionRequest(state.messages, event.request_id);
+      const settled: ChatThreadState = {
+        ...state,
+        pendingRequestIds: state.pendingRequestIds.filter(
+          (id) => id !== event.request_id,
+        ),
+      };
+      if (!found) return settled;
+
+      // A request that already reached the terminal `resolved` state keeps
+      // it. Providers conflate "unknown request" with "already answered"
+      // (Codex drops the pending entry the moment it is answered), so a
+      // duplicate respond — same thread open in two windows, or a retry
+      // after a slow first call — reports a failure for a request the user
+      // successfully answered. Overwriting would durably (this event is
+      // persisted and replayed) flip an answered approval to "expired", and
+      // would un-resume a workflow that `request_resolved` already set
+      // running. Same reasoning as `markRequestPending`.
+      if (found.item.resolution.state === "resolved") return settled;
+
+      let messages = replaceItem(state.messages, found.index, {
+        ...found.item,
+        resolution: {
+          state: "failed",
+          reason: event.reason,
+          message: event.message,
+        },
+      });
+
+      // A request-linked tool/workflow cannot receive a later result once
+      // its provider callback is gone. Settle those visual owners too so a
+      // stale approval never leaves a spinner or pending workflow card.
+      if (found.item.tool_use_id) {
+        const toolMatch = findToolCallByUseId(
+          messages,
+          found.item.tool_use_id,
+        );
+        if (toolMatch && toolMatch.item.status === "running") {
+          messages = replaceItem(messages, toolMatch.index, {
+            ...toolMatch.item,
+            status: "error",
+            completed_at: now(),
+          });
+        }
+      }
+      const wfMatch = findWorkflowByApprovalRequestId(
+        messages,
+        event.request_id,
+      );
+      if (wfMatch) {
+        messages = replaceItem(messages, wfMatch.index, {
+          ...wfMatch.item,
+          status: "stopped",
+        });
+      }
+
       return {
         ...state,
         messages,

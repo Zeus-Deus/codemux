@@ -10,7 +10,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use super::types::{ProviderKind, ThreadId};
+use super::types::{ProviderKind, RequestId, ThreadId};
 
 /// All ways an [`AgentProvider`](super::AgentProvider) call can fail.
 #[derive(Debug)]
@@ -30,6 +30,11 @@ pub enum ProviderError {
     SessionNotFound { thread_id: ThreadId },
     /// The session existed but has already been closed.
     SessionClosed { thread_id: ThreadId },
+    /// The provider no longer has a live callback for a request that the
+    /// persisted transcript still considers open. Pending approval/input
+    /// callbacks are generally process-local and cannot be reconstructed by
+    /// resuming conversation history after an app or provider restart.
+    RequestNotPending { request_id: RequestId },
     /// Inputs failed adapter-level validation (missing required fields,
     /// unsupported mode, etc.).
     ValidationError { message: String },
@@ -59,6 +64,9 @@ impl fmt::Display for ProviderError {
             }
             Self::SessionClosed { thread_id } => {
                 write!(f, "session for thread {:?} is closed", thread_id.0)
+            }
+            Self::RequestNotPending { request_id } => {
+                write!(f, "request {:?} is not pending", request_id.0)
             }
             Self::ValidationError { message } => write!(f, "validation error: {message}"),
             Self::ProcessError { message, source } => match source {
@@ -99,6 +107,9 @@ pub enum SerializableProviderError {
     SessionClosed {
         thread_id: ThreadId,
     },
+    RequestNotPending {
+        request_id: RequestId,
+    },
     ValidationError {
         message: String,
     },
@@ -136,6 +147,11 @@ impl ProviderError {
             Self::SessionClosed { thread_id } => SerializableProviderError::SessionClosed {
                 thread_id: thread_id.clone(),
             },
+            Self::RequestNotPending { request_id } => {
+                SerializableProviderError::RequestNotPending {
+                    request_id: request_id.clone(),
+                }
+            }
             Self::ValidationError { message } => SerializableProviderError::ValidationError {
                 message: message.clone(),
             },
@@ -171,6 +187,9 @@ impl From<SerializableProviderError> for ProviderError {
             }
             SerializableProviderError::SessionClosed { thread_id } => {
                 Self::SessionClosed { thread_id }
+            }
+            SerializableProviderError::RequestNotPending { request_id } => {
+                Self::RequestNotPending { request_id }
             }
             SerializableProviderError::ValidationError { message } => {
                 Self::ValidationError { message }
