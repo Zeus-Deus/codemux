@@ -131,9 +131,21 @@ visual only — nothing is archived, closed, or deleted.
 - **Workspace cards** (`sidebar-inbox-card.tsx`): each active workspace is a
   card — repo avatar + name eyebrow; work title (linked-issue title while an
   agent is live, worktree name when idle) + issue chip; a red blocker line
-  (needs-you only); and a mono meta line (branch · `↑ahead` · `+/−` diff · PR
-  chip (`PR #n` green / `merged` violet, opens the PR) · provider logos ·
-  remote cloud icon · notification badge). The blocker line is a fixed string
+  (needs-you only); and a mono meta line. The meta line is **two columns, not
+  one flow**: the git-local facts (branch · `↑ahead` · `+/−` diff) flow from the
+  left, then a `flex-1` spacer pins the rest to the right — PR chip (`PR #n`
+  green / `merged` violet, opens the PR) · provider logos · remote cloud icon ·
+  notification badge. The spacer sits *before* the PR chip deliberately: with it
+  after, the chip began wherever the branch name happened to end, so chips landed
+  at a different x on every card and the column read as ragged. Right-aligning
+  also makes the chip's own variable width (`merged` vs `PR #1234`) harmless. The
+  trailing indicator cluster owns the far-right column and reserves a
+  `min-w-[15px]` slot — sized to the *widest* single indicator (the notification
+  pill, not the 13px provider logo) so neither a bare card nor a card showing a
+  different indicator can shift the chip. The invariant is guarded by the
+  "meta line alignment" tests in `sidebar-inbox-card.test.tsx`, which assert DOM
+  order around the spacer (jsdom does not lay out, so pixels cannot be asserted).
+  The blocker line is a fixed string
   (`permissionBlockerText()` always returns "Waiting for your input" — it does
   not surface the agent's actual question). The right side of the eyebrow shows
   the agent state — Working (configurable `WorkingIndicator`, amber text) /

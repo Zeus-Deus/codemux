@@ -302,3 +302,91 @@ describe("SidebarInboxCard — multi-select", () => {
     expect(card?.className).toContain("ring-accent-ember/55");
   });
 });
+
+describe("SidebarInboxCard — meta line alignment", () => {
+  function metaLine(container: HTMLElement) {
+    return container.querySelector("[data-meta-line]") as HTMLElement;
+  }
+
+  // jsdom does not lay out, so these assert the DOM contract that *produces*
+  // the alignment rather than the pixels: the git-local facts flow from the
+  // left, a flex spacer absorbs the slack, and everything after it is pinned
+  // right. Before this, the PR chip sat directly after the branch name, so it
+  // landed at a different x on every card depending on how long that branch
+  // happened to be.
+  it("puts the flex spacer before the PR chip so the chip right-aligns", () => {
+    const { container } = renderCard({
+      workspace: makeWorkspace({
+        git_branch: "a-very-long-worktree-branch-name",
+        pr_number: 219,
+        pr_state: "open",
+        pr_url: "https://example.test/pr/219",
+      }),
+    });
+    const children = [...metaLine(container).children];
+    const spacer = children.findIndex((c) => c.className.includes("flex-1"));
+    const chip = children.findIndex(
+      (c) => c.getAttribute("aria-label") === "Pull request #219 — open",
+    );
+
+    expect(spacer).toBeGreaterThanOrEqual(0);
+    expect(chip).toBeGreaterThan(spacer);
+    // Branch text stays on the left of the spacer, where its length can only
+    // push its own truncation — never the chip's position.
+    expect(children[0]).toHaveTextContent("a-very-long-worktree-branch-name");
+    expect(children.indexOf(children[0])).toBeLessThan(spacer);
+  });
+
+  it("keeps the git-local facts left of the spacer for every PR state", () => {
+    for (const state of ["open", "closed", "draft", "merged"] as const) {
+      const { container } = renderCard({
+        workspace: makeWorkspace({
+          git_branch: "feat/x",
+          git_ahead: 2,
+          git_additions: 484,
+          git_deletions: 26,
+          pr_number: 7,
+          pr_state: state,
+          pr_url: "https://example.test/pr/7",
+        }),
+      });
+      const children = [...metaLine(container).children];
+      const spacer = children.findIndex((c) => c.className.includes("flex-1"));
+      const chip = children.findIndex((c) =>
+        c.getAttribute("aria-label")?.startsWith("Pull request #7"),
+      );
+
+      // ahead + diff stats are git-local facts: they belong with the branch on
+      // the left, so growing them shifts nothing in the right-hand column.
+      expect(children.slice(0, spacer).map((c) => c.textContent).join(" ")).toContain("↑2");
+      expect(children.slice(0, spacer).map((c) => c.textContent).join(" ")).toContain("+484");
+      expect(chip).toBeGreaterThan(spacer);
+      cleanup();
+    }
+  });
+
+  it("reserves the trailing indicator column so a bare card still aligns", () => {
+    // The reserved width is sized to the widest single indicator (the 15px
+    // notification pill), not the 13px provider logo — otherwise which
+    // indicator a card happens to show would shift its PR chip by 2px.
+    const { container } = renderCard({
+      workspace: makeWorkspace({ pr_number: 1, pr_state: "open" }),
+    });
+    const children = [...metaLine(container).children];
+    const trailing = children[children.length - 1];
+
+    expect(trailing.className).toContain("min-w-[15px]");
+    expect(trailing.className).toContain("justify-end");
+    // Last child, so it — not the PR chip — owns the far-right column.
+    expect(trailing.nextElementSibling).toBeNull();
+  });
+
+  it("still renders the trailing indicators it owns", () => {
+    const { container } = renderCard({
+      workspace: makeWorkspace({ notification_count: 3 }),
+    });
+    const children = [...metaLine(container).children];
+    const trailing = children[children.length - 1];
+    expect(trailing).toHaveTextContent("3");
+  });
+});
