@@ -41,6 +41,7 @@ import {
   webRemoteDisable,
   webRemoteEnable,
   webRemoteListEndpoints,
+  webRemoteRegistrationStatus,
   webRemoteRejectSession,
   webRemoteRevokeSession,
   webRemoteSetConfig,
@@ -51,6 +52,7 @@ import type {
   WebRemoteBindScope,
   WebRemoteEndpoint,
   WebRemotePairingInfo,
+  WebRemoteRegistrationStatus,
   WebRemoteSessionView,
   WebRemoteStatus,
 } from "@/tauri/types";
@@ -636,6 +638,11 @@ export function RemoteAccessSection() {
   const [approvalPending, setApprovalPending] = useState(false);
   const [accountModePending, setAccountModePending] = useState(false);
   const [trustAccountPending, setTrustAccountPending] = useState(false);
+  const [relayModePending, setRelayModePending] = useState(false);
+  // Control-plane registration state for the from-anywhere transport. Null
+  // while relay mode is off (or when the read failed — see the effect below).
+  const [registration, setRegistration] =
+    useState<WebRemoteRegistrationStatus | null>(null);
   const [pairingPending, setPairingPending] = useState(false);
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
   const [revokingAll, setRevokingAll] = useState(false);
@@ -771,12 +778,55 @@ export function RemoteAccessSection() {
   const accountModeEnabled = status?.account_mode_enabled ?? false;
   const trustAccountBrowsers = status?.trust_account_browsers ?? false;
   const accountSignedIn = status?.account_signed_in ?? false;
+  const relayModeEnabled = status?.relay_mode_enabled ?? false;
+  // Coarse signals the status broadcast carries. They double as the refetch
+  // trigger for the richer registration read and as its fallback.
+  const deviceRegistered = status?.device_registered ?? false;
+  const irohNodeId = status?.iroh_node_id ?? null;
   // While a web-client rebind settles, show the requested scope optimistically
   // rather than the server's last-broadcast value.
   const bindScope = scopeOverride ?? bindScopeOf(status);
   const pending = useMemo(() => pendingSessions(status), [status]);
   const approved = useMemo(() => approvedSessions(status), [status]);
   const connectedCount = connectedSessionCount(status);
+
+  // The status broadcast carries only a coarse `device_registered` flag; the
+  // dedicated read adds the ids, the last heartbeat, and the last error. Refetch
+  // whenever relay mode, the broadcast registration signal, the node id, or the
+  // sign-in state changes — those are exactly the transitions that can move the
+  // registration. A failed read (older backend, or the registry unreachable)
+  // degrades to the status flags rather than surfacing a raw error.
+  const relayLive = enabled && relayModeEnabled;
+  useEffect(() => {
+    if (!relayLive) {
+      setRegistration(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const next = await webRemoteRegistrationStatus();
+        if (!cancelled) setRegistration(next);
+      } catch (err) {
+        console.error("[remote-access] registration status failed:", err);
+        if (!cancelled) setRegistration(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [relayLive, deviceRegistered, irohNodeId, accountSignedIn]);
+
+  // Prefer the dedicated read, fall back to the live status broadcast.
+  const relayRegistered = registration?.registered ?? deviceRegistered;
+  const relayDeviceId = registration?.device_id ?? status?.device_id ?? null;
+  // The hostname reads as "this machine" to a human; the device id only means
+  // something when two hosts share a name. Fall back to the id when an older
+  // backend sends no name.
+  const relayDisplayName = registration?.name || relayDeviceId;
+  const relayNodeId = registration?.node_id ?? irohNodeId;
+  const relayLastRegisteredAt = registration?.last_registered_at ?? null;
+  const relayLastError = registration?.last_error ?? null;
 
   const portValidation = validatePort(portDraft);
   const portDirty = status != null && portDraft !== String(status.port);
@@ -1002,6 +1052,27 @@ export function RemoteAccessSection() {
         toast.error(`Couldn't change account approval: ${String(err)}`);
       } finally {
         setTrustAccountPending(false);
+      }
+    },
+    [applyStatus],
+  );
+
+  const handleToggleRelayMode = useCallback(
+    async (next: boolean) => {
+      setRelayModePending(true);
+      try {
+        const result = await webRemoteSetConfig({ relayModeEnabled: next });
+        applyStatus(result, { detectPending: false });
+        toast.success(
+          next
+            ? "From-anywhere access is on — this device is registering with your account."
+            : "From-anywhere access is off — this device is reachable on the networks above only.",
+        );
+      } catch (err) {
+        console.error("[remote-access] set relay mode failed:", err);
+        toast.error(`Couldn't change from-anywhere access: ${String(err)}`);
+      } finally {
+        setRelayModePending(false);
       }
     },
     [applyStatus],
@@ -1330,6 +1401,123 @@ export function RemoteAccessSection() {
                   disabled={trustAccountPending}
                   aria-label="Toggle trust account browsers"
                 />
+              </div>
+            )}
+          </section>
+
+          {/* From anywhere (relay) — the account-scoped iroh transport. Off by
+              default; only meaningful while the server itself is on, so it
+              lives inside the enabled block alongside account access. */}
+          <section className="space-y-4">
+            <SubHeading>From anywhere (relay)</SubHeading>
+
+            <div className="flex items-center justify-between gap-8">
+              <div className="min-w-0 space-y-1">
+                <p className="text-[13px] font-medium leading-tight text-foreground">
+                  Reach this device from any network
+                </p>
+                <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                  Let a browser signed into{" "}
+                  <span className="font-medium text-foreground">
+                    the same Codemux account
+                  </span>{" "}
+                  reach this desktop from any network — no shared Wi-Fi, no VPN,
+                  no port forwarding. The connection is end-to-end encrypted
+                  between that browser and this machine; the relay that carries
+                  it only ever passes along encrypted traffic and can't read
+                  your terminals, files, or agents.
+                </p>
+              </div>
+              <Switch
+                checked={relayModeEnabled}
+                onCheckedChange={handleToggleRelayMode}
+                disabled={relayModePending}
+                aria-label="Toggle from-anywhere access"
+              />
+            </div>
+
+            {relayModeEnabled && !accountSignedIn && (
+              <div
+                role="status"
+                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[13px] leading-relaxed text-status-attention"
+              >
+                <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+                <span>
+                  This desktop isn't signed into a Codemux account, so it can't
+                  register for from-anywhere access. Sign in from the account
+                  menu to activate it.
+                </span>
+              </div>
+            )}
+
+            {relayModeEnabled && accountSignedIn && (
+              <div className="space-y-2 rounded-lg border border-border/60 bg-muted/30 px-3.5 py-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-[13px] font-semibold text-foreground">
+                    Device registration
+                  </p>
+                  {relayRegistered ? (
+                    <Badge
+                      variant="outline"
+                      className="gap-1 border-status-open/30 bg-status-open/10 text-[10px] text-status-open"
+                    >
+                      <ShieldCheck className="h-3 w-3" />
+                      Registered
+                    </Badge>
+                  ) : (
+                    <Badge
+                      variant="outline"
+                      className="gap-1 border-status-working/30 bg-status-working/10 text-[10px] text-status-working"
+                    >
+                      <ShieldAlert className="h-3 w-3" />
+                      Not registered yet
+                    </Badge>
+                  )}
+                </div>
+                <p className="text-[12px] leading-relaxed text-muted-foreground/80">
+                  {relayRegistered
+                    ? "This device is listed with your account, so a browser signed into it can find and dial this machine from anywhere."
+                    : "This device isn't listed with your account yet. Registration runs on its own and usually settles in a moment — until then, only the addresses above reach it."}
+                </p>
+
+                {relayDisplayName && (
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 text-[12px] text-muted-foreground/70">
+                      Registered as
+                    </span>
+                    <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
+                      {relayDisplayName}
+                    </code>
+                    <CopyButton
+                      text={relayDisplayName}
+                      label="Copy device name"
+                    />
+                  </div>
+                )}
+
+                {relayNodeId && (
+                  <div className="flex items-center gap-2">
+                    <span className="shrink-0 text-[12px] text-muted-foreground/70">
+                      Address
+                    </span>
+                    <code className="min-w-0 flex-1 truncate font-mono text-[12px] text-foreground">
+                      {relayNodeId}
+                    </code>
+                    <CopyButton text={relayNodeId} label="Copy device address" />
+                  </div>
+                )}
+
+                {relayLastRegisteredAt && (
+                  <p className="text-[12px] text-muted-foreground/70">
+                    Last confirmed {relativeTime(relayLastRegisteredAt)}.
+                  </p>
+                )}
+
+                {!relayRegistered && relayLastError && (
+                  <p className="text-[12px] leading-relaxed text-status-attention">
+                    Last attempt failed: {relayLastError}
+                  </p>
+                )}
               </div>
             )}
           </section>

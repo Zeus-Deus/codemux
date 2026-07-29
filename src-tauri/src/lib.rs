@@ -2062,19 +2062,53 @@ fn build_core_app<R: tauri::Runtime>(
 /// `app.invoke_key()` off this same app, so the WS dispatch path stays
 /// consistent.
 ///
-/// After build we create the in-memory "main" webview so
-/// `get_webview_window("main")` resolves — the web-remote dispatcher, the
-/// notification bridge, and the background polling loops all look it up.
-/// `MockRuntime::create_window` is a pure in-memory stub, so this succeeds
-/// with no windowing system present.
+/// After build we run the `setup` hook (see below), which also creates the
+/// in-memory "main" webview so `get_webview_window("main")` resolves — the
+/// web-remote dispatcher, the notification bridge, and the background polling
+/// loops all look it up. `MockRuntime::create_window` is a pure in-memory stub,
+/// so this succeeds with no windowing system present.
+///
+/// ## Why `run_iteration` is called here
+///
+/// `Builder::build()` does **not** run the `.setup(…)` closure. Tauri defers
+/// `setup` to the first `RuntimeRunEvent::Ready` its event loop delivers, i.e.
+/// it runs from `App::run` / `App::run_return` / `App::run_iteration` — never
+/// from `build()`. `codemux serve` deliberately never calls `app.run()` (it is
+/// a foreground process blocking on a signal, and `MockRuntime::run` is an
+/// infinite polling loop with no display to drive), so for as long as this
+/// function only called `build()`, **none** of the setup side effects ran:
+/// no control server (so `codemux remote pair`, `connect status`, and the
+/// GUI/serve mutual-exclusion guard all failed against a live `serve`), no
+/// `web_remote::restore_on_boot` (so the persisted port/scope/relay config was
+/// never hydrated — and the un-hydrated in-memory default was then persisted
+/// back over the user's settings row), no layout restore, no PTY/hook wiring,
+/// no background loops. The command surface still answered because managed
+/// state is registered at `Builder` time, which is why the gap stayed hidden.
+///
+/// `App::run_iteration` is the one public entry point that runs `setup`
+/// without taking ownership of the app and blocking forever: it calls
+/// `setup(self)` when it has not run yet, then delegates a single iteration to
+/// the runtime — and `MockRuntime::run_iteration` is a no-op, so this returns
+/// immediately. It is deprecated only for its "call me in a loop" usage (which
+/// busy-loops); a single call to run setup on a runtime we own is exactly what
+/// it still does correctly.
 pub fn build_headless_app() -> tauri::Result<tauri::App<tauri::test::MockRuntime>> {
-    let app = build_core_app(
+    let mut app = build_core_app(
         tauri::Builder::<tauri::test::MockRuntime>::new(),
         AppMode::ServeHeadless,
     )
     .build(app_context())?;
 
-    tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
+    #[allow(deprecated)]
+    app.run_iteration(|_app, _event| {});
+
+    // Tauri's own `setup` creates every window declared in `tauri.conf.json`
+    // (that is where "main" comes from now). Keep a fallback so a config that
+    // stops declaring it — or declares it with `create: false` — can't silently
+    // leave the WS dispatcher without a webview to drive.
+    if app.get_webview_window("main").is_none() {
+        tauri::WebviewWindowBuilder::new(&app, "main", tauri::WebviewUrl::default()).build()?;
+    }
 
     Ok(app)
 }

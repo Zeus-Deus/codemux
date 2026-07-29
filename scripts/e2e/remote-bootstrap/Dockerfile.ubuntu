@@ -1,0 +1,67 @@
+# Ubuntu 24.04 with real systemd as PID 1 — the .deb half of the matrix.
+#
+# Deliberately minimal: it carries systemd + logind + dbus (so `systemctl
+# --user` and `loginctl enable-linger` are real), sudo, and the tools the
+# harness itself needs to probe the box (curl, ss). It does NOT preinstall
+# WebKitGTK/GTK — resolving those from the package's own Depends is part of
+# what `scripts/install.sh` is being tested on.
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    container=docker \
+    LANG=C.UTF-8
+
+# openssh-server is here on purpose: the harness drives the flow over a real
+# SSH login rather than `docker exec`, because pam_systemd is what creates the
+# logind session that starts `user@<uid>.service`. Without it there is no user
+# bus and `systemctl --user` cannot work — which is the exact difference
+# between this container and the VPS `codemux connect` targets.
+RUN apt-get update -qq \
+ && apt-get install -y --no-install-recommends \
+      systemd systemd-sysv dbus dbus-user-session libpam-systemd \
+      polkitd \
+      openssh-server \
+      sudo curl ca-certificates iproute2 procps file sqlite3
+# NOTE: the apt package index is deliberately NOT deleted. `install.sh`'s .deb
+# path relies on apt resolving the package's own Depends (WebKitGTK/GTK) from
+# the archive, which is exactly what a real Debian/Ubuntu box can do — and a
+# real box has an index. (The installer now refreshes a stale one itself, but
+# testing against a permanently empty index would test the fallback, not the
+# path users take.)
+#
+# polkitd is likewise load-bearing rather than incidental: `codemux connect`
+# ends with `loginctl enable-linger`, and logind delegates that to polkit's
+# `org.freedesktop.login1.set-self-linger` (allow_active). With no polkit on
+# the box every caller but root is denied, so lingering — the "stays reachable
+# after you log out" half of the promise — would silently fail.
+
+# Strip the boot-time units a container has no business running (getty,
+# fs remounts, udev …). Whitelisted: journald (so `journalctl --user -u
+# codemux` works), tmpfiles, user-sessions, dbus and logind — logind is
+# load-bearing here, it is what starts `user@<uid>.service` for a lingering
+# user at boot, which is the whole "survives a reboot" property under test.
+RUN find /etc/systemd/system /lib/systemd/system -path '*.wants/*' \
+      -not -name '*journald*' \
+      -not -name '*systemd-tmpfiles*' \
+      -not -name '*systemd-user-sessions*' \
+      -not -name '*dbus*' \
+      -not -name '*logind*' \
+      -delete
+
+# sshd needs host keys and a place to drop its privsep dir before it can be
+# started by systemd at boot.
+RUN ssh-keygen -A && mkdir -p /run/sshd && systemctl enable ssh
+
+# The unprivileged user the whole flow runs as. Passwordless sudo because
+# install.sh's .deb path needs root for `apt-get install`, exactly like a
+# normal user on a VPS.
+ARG E2E_USER=tester
+RUN useradd --create-home --shell /bin/bash "${E2E_USER}" \
+ && printf '%s ALL=(ALL) NOPASSWD:ALL\n' "${E2E_USER}" > "/etc/sudoers.d/${E2E_USER}" \
+ && chmod 0440 "/etc/sudoers.d/${E2E_USER}"
+
+# systemd's shutdown signal, so `docker restart` is a clean reboot rather than
+# a SIGKILL — the reboot-resilience step depends on state being flushed.
+STOPSIGNAL SIGRTMIN+3
+
+CMD ["/sbin/init"]

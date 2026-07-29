@@ -65,6 +65,56 @@ pub enum CommandSet {
         #[arg(long)]
         relay: bool,
     },
+    /// Set this machine up for remote access in one command: sign in, turn on
+    /// from-anywhere (relay) access, and install a background service so
+    /// Codemux stays reachable after you log out. Safe to re-run — it reports
+    /// the steps that were already done instead of undoing them.
+    ///
+    /// With a Codemux instance already running here it drives that instance
+    /// over the control socket instead of installing a service (two backends
+    /// on one machine would fight over the port and the database).
+    Connect {
+        #[command(subcommand)]
+        command: Option<ConnectCommand>,
+        /// Account email, if a sign-in is needed. Omit to be prompted.
+        #[arg(long)]
+        email: Option<String>,
+        /// Which interfaces the local server binds: `all`, `tailscale`, or
+        /// `loopback`. Leave unset to keep the current scope (`all` on a
+        /// first run). From-anywhere access works regardless of this.
+        #[arg(long, value_parser = ["all", "tailscale", "loopback"])]
+        scope: Option<String>,
+        /// Port to bind. Leave unset to keep the current port (default 4377).
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Sign this machine into a Codemux account. Works from a bare shell —
+    /// no GUI, no display, and no running Codemux instance required — so a
+    /// VPS reached over SSH can be signed in before `codemux serve --relay`
+    /// registers it as a device. Prompts for the email and password
+    /// (password input is never echoed) and stores the same encrypted
+    /// session the desktop app writes.
+    Login {
+        /// Account email. Omit to be prompted for it.
+        #[arg(long)]
+        email: Option<String>,
+        /// Sign in with an already-issued session token instead of a
+        /// password. The escape hatch for an account that has no password
+        /// (signed up through GitHub): sign in on a machine with a browser,
+        /// copy the session token, and paste it here. The token is verified
+        /// against the Codemux API before anything is stored.
+        #[arg(long, conflicts_with = "email")]
+        token: Option<String>,
+        /// Print the current session instead of signing in (same output as
+        /// `codemux whoami`).
+        #[arg(long)]
+        status: bool,
+    },
+    /// Clear the cached account session on this machine.
+    Logout,
+    /// Print the account this machine is signed in as. Exits 1 when there
+    /// is no live session.
+    Whoami,
     /// Print recent lines from the desktop app's log file
     Logs {
         /// Number of lines from the end of the log to print
@@ -96,6 +146,18 @@ pub enum WorkspaceCommand {
         /// Workspace ID (defaults to active workspace)
         workspace_id: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ConnectCommand {
+    /// Show what remote access is currently set up on this machine: the
+    /// signed-in account, the persisted configuration, the background
+    /// service, and whether Codemux is running here.
+    Status,
+    /// Turn from-anywhere access off and remove the background service. The
+    /// account session is left alone — run `codemux logout` to clear that.
+    #[command(alias = "disconnect")]
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -756,6 +818,48 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             }
             Ok(true)
         }
+        // Account commands are deliberately local: they open the same
+        // SQLite store the app uses and talk to the auth API directly,
+        // never the control socket. Requiring a running instance would
+        // defeat the point — the whole reason `login` exists is to sign in
+        // on a headless box that has nothing running yet.
+        Some(CommandSet::Login {
+            email,
+            token,
+            status,
+        }) => {
+            crate::auth::cli_login::run_login(email, token, status).await?;
+            Ok(true)
+        }
+        // `connect` is local for the same reason `login` is — it exists to set
+        // up a machine that has nothing running yet. It reaches for the control
+        // socket only when it detects a live instance (see `web_remote::connect`).
+        Some(CommandSet::Connect {
+            command,
+            email,
+            scope,
+            port,
+        }) => {
+            match command {
+                Some(ConnectCommand::Status) => crate::web_remote::connect::run_connect_status()?,
+                Some(ConnectCommand::Off) => crate::web_remote::connect::run_connect_off().await?,
+                None => {
+                    crate::web_remote::connect::run_connect(
+                        crate::web_remote::connect::ConnectOptions { email, scope, port },
+                    )
+                    .await?
+                }
+            }
+            Ok(true)
+        }
+        Some(CommandSet::Logout) => {
+            crate::auth::cli_login::run_logout()?;
+            Ok(true)
+        }
+        Some(CommandSet::Whoami) => {
+            crate::auth::cli_login::run_whoami()?;
+            Ok(true)
+        }
         Some(CommandSet::Logs { tail }) => {
             // Purely local — reads the file tauri-plugin-log writes, so
             // it works even when (especially when) the app won't start.
@@ -868,6 +972,20 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                         "args": "[--scope all|tailscale|loopback] [--port N] [--relay]",
                         "description": "Run headless as a web-remote server (no GUI); prints a pairing QR + link and runs until Ctrl-C"
                     },
+                    "connect": {
+                        "args": "[--email <address>] [--scope all|tailscale|loopback] [--port N]",
+                        "description": "One-command remote-access setup: sign in, turn relay mode on, and install a background service so this machine stays reachable",
+                        "subcommands": {
+                            "status": { "description": "Show the account, remote-access config, background service, and running-instance state" },
+                            "off": { "description": "Turn from-anywhere access off and remove the background service (stays signed in)" }
+                        }
+                    },
+                    "login": {
+                        "args": "[--email <address>] [--token <token>] [--status]",
+                        "description": "Sign this machine into a Codemux account (headless-friendly; no GUI or running instance needed)"
+                    },
+                    "logout": { "description": "Clear the cached account session on this machine" },
+                    "whoami": { "description": "Print the signed-in account; exits 1 when signed out" },
                     "status": { "description": "Show Codemux app status" },
                     "notify": { "args": "<message>", "description": "Send a notification to the user" },
                     "handoff": { "description": "Generate project handoff summary" },
@@ -880,6 +998,8 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     "CODEMUX_VERSION": "Codemux version",
                     "CODEMUX_WORKSPACE_ID": "Current workspace ID",
                     "CODEMUX_BROWSER_CMD": "Command prefix for browser control",
+                    "CODEMUX_PASSWORD": "Password for a non-interactive `codemux login` (warns; for automated runs only)",
+                    "CODEMUX_API_URL": "Override the Codemux API base URL (default https://api.codemux.org)",
                     "BROWSER": "Set to 'codemux browser open' for URL handling"
                 }
             });
@@ -1007,6 +1127,144 @@ mod tests {
             qr.chars().any(|c| c == '█' || c == '▀' || c == '▄' || c == ' '),
             "uses the unicode Dense1x2 block glyphs"
         );
+    }
+
+    #[test]
+    fn account_subcommands_parse() {
+        // `login` must accept both the bare interactive form and the
+        // automation form; `whoami` / `logout` take no arguments. Pinned
+        // because these three are the headless sign-in entry points a
+        // docker/CI harness scripts against.
+        let cli = Cli::try_parse_from(["codemux", "login"]).expect("bare login parses");
+        assert!(matches!(
+            cli.command,
+            Some(CommandSet::Login {
+                email: None,
+                token: None,
+                status: false
+            })
+        ));
+
+        let cli = Cli::try_parse_from(["codemux", "login", "--email", "a@b.co"])
+            .expect("login --email parses");
+        match cli.command {
+            Some(CommandSet::Login { email, token, status }) => {
+                assert_eq!(email.as_deref(), Some("a@b.co"));
+                assert_eq!(token, None);
+                assert!(!status);
+            }
+            _ => panic!("expected login"),
+        }
+
+        // The OAuth-only escape hatch. `--token` is mutually exclusive with
+        // `--email`: a bearer already identifies the account, so accepting
+        // both would let the two disagree.
+        let cli = Cli::try_parse_from(["codemux", "login", "--token", "sess_abc"])
+            .expect("login --token parses");
+        match cli.command {
+            Some(CommandSet::Login { email, token, .. }) => {
+                assert_eq!(token.as_deref(), Some("sess_abc"));
+                assert_eq!(email, None);
+            }
+            _ => panic!("expected login"),
+        }
+        assert!(
+            Cli::try_parse_from(["codemux", "login", "--email", "a@b.co", "--token", "t"])
+                .is_err(),
+            "--email and --token must not be combined"
+        );
+
+        let cli =
+            Cli::try_parse_from(["codemux", "login", "--status"]).expect("login --status parses");
+        assert!(matches!(
+            cli.command,
+            Some(CommandSet::Login { status: true, .. })
+        ));
+
+        assert!(matches!(
+            Cli::try_parse_from(["codemux", "whoami"]).unwrap().command,
+            Some(CommandSet::Whoami)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["codemux", "logout"]).unwrap().command,
+            Some(CommandSet::Logout)
+        ));
+        // `status` (app status) must not be shadowed by the new account
+        // commands.
+        assert!(matches!(
+            Cli::try_parse_from(["codemux", "status"]).unwrap().command,
+            Some(CommandSet::Status)
+        ));
+    }
+
+    #[test]
+    fn the_command_tree_is_internally_consistent() {
+        // clap's own audit: duplicate names, impossible `conflicts_with`
+        // targets, and malformed value parsers are compile-time-looking bugs
+        // that otherwise only surface when a user runs the command.
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn connect_subcommands_parse() {
+        // The flagship path is the *bare* verb — `codemux connect` with no
+        // arguments must be the whole setup, not an error asking for one.
+        match Cli::try_parse_from(["codemux", "connect"]).unwrap().command {
+            Some(CommandSet::Connect {
+                command,
+                email,
+                scope,
+                port,
+            }) => {
+                assert!(command.is_none(), "no subcommand means: set this machine up");
+                assert!(email.is_none() && scope.is_none() && port.is_none());
+            }
+            _ => panic!("expected connect"),
+        }
+
+        match Cli::try_parse_from([
+            "codemux", "connect", "--email", "a@b.co", "--scope", "tailscale", "--port", "5100",
+        ])
+        .unwrap()
+        .command
+        {
+            Some(CommandSet::Connect {
+                email, scope, port, ..
+            }) => {
+                assert_eq!(email.as_deref(), Some("a@b.co"));
+                assert_eq!(scope.as_deref(), Some("tailscale"));
+                assert_eq!(port, Some(5100));
+            }
+            _ => panic!("expected connect"),
+        }
+
+        assert!(matches!(
+            Cli::try_parse_from(["codemux", "connect", "status"]).unwrap().command,
+            Some(CommandSet::Connect {
+                command: Some(ConnectCommand::Status),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["codemux", "connect", "off"]).unwrap().command,
+            Some(CommandSet::Connect {
+                command: Some(ConnectCommand::Off),
+                ..
+            })
+        ));
+        // `disconnect` reads better in some sentences; both reach the same verb.
+        assert!(matches!(
+            Cli::try_parse_from(["codemux", "connect", "disconnect"]).unwrap().command,
+            Some(CommandSet::Connect {
+                command: Some(ConnectCommand::Off),
+                ..
+            })
+        ));
+
+        // The same scope values the rest of the remote surface accepts, and
+        // nothing else.
+        assert!(Cli::try_parse_from(["codemux", "connect", "--scope", "wan"]).is_err());
     }
 
     #[test]

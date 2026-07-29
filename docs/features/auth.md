@@ -39,9 +39,37 @@ The auth backend is a Better Auth API server at `api.codemux.org` (Bun + Hono + 
 - **Algorithm**: AES-256-GCM (authenticated encryption)
 - **Key derivation**: SHA-256 of machine ID + 16-byte random salt
 - **Machine ID sources**: `/etc/machine-id` > `/var/lib/dbus/machine-id` > hostname > fallback
-- **File format**: Binary — `salt (16B) || nonce (12B) || ciphertext + GCM tag`
-- **Location**: `~/.local/share/codemux/auth-token.enc`
-- **Content**: Encrypted JSON `{token, expires_at}`
+- **Location**: the SQLite `auth_tokens` row (machine-bound key, same AES-256-GCM
+  envelope). The legacy file `~/.local/share/codemux/auth-token.enc`
+  (`salt (16B) || nonce (12B) || ciphertext + GCM tag` around JSON
+  `{token, expires_at}`) is read once by a startup migration in `lib.rs` and is
+  no longer written.
+
+### CLI Sign-In (headless)
+
+`codemux login` / `codemux logout` / `codemux whoami` manage the account from a
+shell with nothing running — no GUI, no control socket. This is the sign-in path
+for headless boxes (VPS over SSH) and what `codemux connect` calls when needed.
+
+- `codemux login` prompts for email, then password with echo off (prompts on
+  stderr, stdout stays pipeable). The password never leaves the machine — the
+  client derives the shared AuthSecret (`auth/derivation.rs`) and calls the same
+  `/api/auth/desktop/signin` path the GUI uses.
+- `codemux login --email <e>` skips the email prompt. Password sources, in
+  precedence order: `CODEMUX_PASSWORD` env (always prints a warning) → TTY
+  no-echo prompt → a line piped on stdin.
+- `codemux login --token <bearer>` verifies a pasted Better Auth bearer via
+  `/api/auth/desktop/verify` and persists it (`auth_method = "token"`). This is
+  the escape hatch for OAuth-only accounts, which have no password. A proper
+  device-authorization sign-in needs new API-side surface (tracked in
+  `docs/plans/one-command-remote-bootstrap.md`).
+- Persisted state is identical to a GUI sign-in (same `save_auth` +
+  `save_stored_auth_method` path), so a cold-started GUI or `codemux serve`
+  loads it unchanged; a *running* instance picks it up on its next
+  registration/status tick without a restart.
+- Errors are non-enumerating: every credential rejection collapses to one
+  message that never reveals whether an email exists.
+- Implementation: `src-tauri/src/auth/cli_login.rs`.
 
 ### CSRF Protection
 

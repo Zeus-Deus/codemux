@@ -143,6 +143,12 @@ qrcode = { version = "0.14", default-features = false }
 # spawned. See `src/web_remote/iroh.rs` and
 # `docs/plans/web-remote-account-mode.md` (Design 1 §1.2, Stage C).
 iroh = "1"
+# No-echo password prompt for `codemux login`. The CLI has to read a
+# password from a bare SSH session with no GUI, so it needs to flip the
+# terminal's ECHO flag off (termios on unix, console mode on Windows).
+# rpassword is the small, widely-used crate for exactly that and pulls in
+# nothing beyond libc / windows-sys, both already in the tree.
+rpassword = "7"
 
 [target.'cfg(unix)'.dependencies]
 tauri-plugin-dialog = { version = "2", default-features = false, features = ["xdg-portal"] }
