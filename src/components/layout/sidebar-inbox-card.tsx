@@ -74,7 +74,8 @@ interface Props {
 
 /** One active-workspace card in the flat sidebar inbox: repo eyebrow, work
  *  title + issue chip, optional blocker line (needs-you only), and a mono
- *  meta line (branch · ↑ahead · +/− · PR chip · remote / notifications).
+ *  meta line, left-to-right: branch · ↑ahead · +/− — then, right-aligned,
+ *  PR chip · provider marks / remote / notifications.
  *  The right side of the eyebrow shows the agent state, swapping to a
  *  "✓ Settle" button on hover/focus. */
 export function SidebarInboxCard({
@@ -510,8 +511,18 @@ export function SidebarInboxCard({
                 </div>
               )}
 
-              {/* Mono meta line: branch · ↑ahead · +/− · PR chip · remote/notifs */}
-              <div className="mt-[5px] flex min-w-0 items-center gap-2 font-mono text-[10.5px] leading-tight text-muted-foreground/60">
+              {/* Mono meta line, two columns: the git-local facts (branch ·
+                  ↑ahead · +/−) flow from the left, then a flex spacer pins the
+                  PR chip and the trailing indicator cluster to the right.
+                  The spacer sits *before* the PR chip on purpose: with it after,
+                  the chip started wherever the branch name happened to end, so
+                  chips landed at a different x on every card and the column read
+                  as ragged noise down a scrolling list. Right-aligning also makes
+                  the chip's own variable width ("merged" vs "PR #1234") harmless. */}
+              <div
+                data-meta-line
+                className="mt-[5px] flex min-w-0 items-center gap-2 font-mono text-[10.5px] leading-tight text-muted-foreground/60"
+              >
                 {workspace.git_branch && (
                   <span className="min-w-0 truncate">{workspace.git_branch}</span>
                 )}
@@ -534,6 +545,7 @@ export function SidebarInboxCard({
                     )}
                   </span>
                 )}
+                <span className="flex-1" />
                 {prState && (
                   <button
                     type="button"
@@ -554,25 +566,33 @@ export function SidebarInboxCard({
                     {prMerged ? "merged" : `PR #${workspace.pr_number ?? ""}`}
                   </button>
                 )}
-                <span className="flex-1" />
-                {providers.map((p) => (
-                  <ProviderLogo
-                    key={p}
-                    provider={p}
-                    className="h-[13px] w-[13px] opacity-80"
-                  />
-                ))}
-                {isRemote && (
-                  <Cloud
-                    aria-label="Runs on a remote host"
-                    className="h-[13px] w-[13px] shrink-0 text-status-remote"
-                  />
-                )}
-                {workspace.notification_count > 0 && (
-                  <span className="flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-[9.5px] font-bold text-muted-foreground">
-                    {workspace.notification_count}
-                  </span>
-                )}
+                {/* Trailing indicators keep the far-right column. The reserved
+                    min-width is what stops a card with no provider mark from
+                    pulling its PR chip out past its neighbours' — the icon
+                    cluster is the anchor the chip aligns against. It is sized to
+                    the *widest* single indicator (the 15px notification pill, not
+                    the 13px logos) so which indicator a card happens to show
+                    cannot shift the chip either. */}
+                <span className="flex min-w-[15px] shrink-0 items-center justify-end gap-2">
+                  {providers.map((p) => (
+                    <ProviderLogo
+                      key={p}
+                      provider={p}
+                      className="h-[13px] w-[13px] opacity-80"
+                    />
+                  ))}
+                  {isRemote && (
+                    <Cloud
+                      aria-label="Runs on a remote host"
+                      className="h-[13px] w-[13px] shrink-0 text-status-remote"
+                    />
+                  )}
+                  {workspace.notification_count > 0 && (
+                    <span className="flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-[9.5px] font-bold text-muted-foreground">
+                      {workspace.notification_count}
+                    </span>
+                  )}
+                </span>
               </div>
             </div>
         </WorkspaceHoverCard>
