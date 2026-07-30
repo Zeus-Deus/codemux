@@ -97,10 +97,19 @@ The chat pane stack:
   a per-component hook: a transcript mounts one `ChatMarkdown` per assistant
   message, so a per-hook fetch would fire one `get_current_theme` IPC call and
   one `theme-changed` listener per message. The plugin instance is memoized on
-  palette identity because Shiki's highlighter and token caches live inside it.
-- Shiki's highlighter cache in `@streamdown/code` is keyed by theme **name**,
-  not content, so `buildChatCodeThemes` hashes the palette into the name. A
-  fixed name would serve stale colors after a terminal-theme switch.
+  palette identity to avoid **render churn** — a fresh plugin identity on every
+  streamed keystroke would propagate through the whole markdown tree. It is
+  *not* about cache preservation: Shiki's highlighter and token caches live in
+  module-level maps inside `@streamdown/code`, not on the plugin instance.
+- That highlighter cache is keyed by theme **name**, not content, so
+  `buildChatCodeThemes` hashes the built theme into the name. A fixed name
+  would serve stale colors after a terminal-theme switch. `themeId` hashes the
+  **built** object (`bg`, `fg`, `tokenColors`) rather than a hand-picked list
+  of `ThemeColors` fields, so every color the token map actually consumes is in
+  the identity *by construction* — including ones only reachable through a
+  single scope, like `color9` behind `invalid` / `invalid.illegal`. Hashing a
+  curated field list is how two palettes differing solely in `color9` used to
+  collide on one name and serve each other's colors.
 - **Streamdown owns the card.** It renders its own container, header,
   copy/download pill, and body whether or not the `code` plugin is installed —
   fenced blocks are *not* a bare `<pre>`. The `prose-pre:*` / `prose-code:*`
@@ -112,9 +121,9 @@ The chat pane stack:
   not files. Streamdown only gives each line span `display: block` as part of
   its line-number class, so `globals.css` restores the line box explicitly;
   without that rule every line collapses onto one.
-- **Word wrap** is the `chat.code_wrap` setting (default off), applied as
-  `data-code-wrap` on the markdown root. Off keeps lines intact behind a
-  horizontal scroll.
+- **Word wrap** is the `chat.code_wrap` setting (default off), exposed as
+  Settings → Appearance → "Wrap code in chat" and applied as `data-code-wrap`
+  on the markdown root. Off keeps lines intact behind a horizontal scroll.
 - Streamdown's fence meta only supports `startLine=` and `noLineNumbers`;
   there is no filename/title slot, so the header shows the language only.
 
@@ -483,6 +492,34 @@ Card styling (all in `globals.css`, all on design tokens):
     a failure for a request that actually succeeded; without the guard that
     persisted event would durably flip an answered approval to "expired" on
     every replay.
+    - **Wire surface.** `ProviderError::RequestNotPending { request_id }`
+      (`agent_provider/errors.rs`, mirrored as
+      `SerializableProviderError::RequestNotPending`) is the shared
+      classification every adapter converges on: Codex returns it in place of
+      the old `ValidationError`, OpenCode maps HTTP 404/409/410 onto it, and
+      Claude derives it in `is_request_not_pending_rpc` (`claude/session.rs`)
+      from an RPC code of `-32602` **or** `-32603` *plus* a message containing
+      `not found or already resolved` / `unknown pending` / `no pending
+      approval` — the sidecar's `respondToRequest`
+      (`sidecar/claude-agent/src/methods/index.ts`) rethrows those as
+      `InvalidParamsError` (-32602), and `-32603` is kept only so an older
+      bundled sidecar still classifies. The match is deliberately narrow: an
+      unrelated internal error keeps its real classification.
+      `agent_chat_respond_to_request` converts `RequestNotPending`,
+      `SessionNotFound`, and `SessionClosed` into the same
+      `ProviderRuntimeEvent::RequestResponseFailed { thread_id, request_id,
+      reason, message }`, whose `RequestResponseFailureReason` enum currently
+      has one variant, `StaleProviderCallback` (serde
+      `"stale_provider_callback"`). The event is persisted
+      (`should_persist_event`), counts as turn-settling in `activity_update`,
+      and maps to `PaneStatus::Review` in `map_event_to_pane_status` — the
+      thread needs the user, but no turn is running.
+    - **Frontend shape.** `PermissionRequestItem.resolution` gains a
+      `{ state: "failed", reason: "stale_provider_callback", message }`
+      variant (`src/lib/agent-chat/types.ts`), rendered in three places:
+      `PermissionRequestBlock.tsx` (the control itself), `MessageList.tsx`,
+      and `ToolCallCard.tsx` (error header + the expiry explanation). A linked
+      workflow card goes to `stopped`.
   - **NULL `permission_mode` heal**: rows created before the
     `permission_mode` column existed read back NULL. The frontend seeds its
     permission picker to the provider default ("Full access" =
@@ -1614,7 +1651,7 @@ Two side-channel notifications are emitted in addition to the raw
 | `set-model` | Swap the session's default model. |
 | `set-permission-mode` | Change the session's permission mode. |
 | `update-mcp-tools` | Push an updated MCP tool list into the live session (`query.setMcpServers`); lets servers that come up after `start-session` surface without a chat restart. Empty list removes the codemux MCP. Idempotent. |
-| `respond-to-request` | Resolve a pending `canUseTool` approval. |
+| `respond-to-request` | Resolve a pending `canUseTool` approval. Rethrows the SDK's "not found or already resolved" family as `InvalidParamsError` (-32602) so Rust can classify it as `ProviderError::RequestNotPending` — see "Pending requests are not conversation history". |
 | `respond-to-user-input` | Answer an `AskUserQuestion` prompt. |
 | `initialization-result` | Read the SDK's cached init payload. |
 | `stop-session` | Close a session; idempotent. |
@@ -2320,7 +2357,10 @@ streaming deltas / committed items / a running session / a resolved
 request → `Working`; an opened approval / plan / AskUserQuestion (or a
 session parked on approval) → `Permission`; `TurnCompleted` → `Review`
 (downgraded to `Idle` when the pane's workspace is already active,
-mirroring `handle_lifecycle_event`); session `Closed`/`Error` → cleared.
+mirroring `handle_lifecycle_event`); `RequestResponseFailed` → `Review`
+(a request expired against a restarted provider session, so the thread
+wants the user but no turn is running); session `Closed`/`Error` →
+cleared.
 A change-guard on `set_pane_status_by_thread` means the `content_delta`
 token stream collapses to a single write per turn rather than one per
 token. Because the write lands in `pane_statuses`, the sidebar rows,

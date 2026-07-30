@@ -8,7 +8,7 @@
 
 ## What This Feature Is
 
-User-authored skills (markdown files under `~/.codemux/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.opencode/skills/`) sync across every device the user signs into Codemux on. Skills are stored **server-side**: the skill name and content travel as plaintext and the server persists them in plaintext columns, protected at rest by the database — the same model Codemux's `user_settings` sync already uses. There is **no client-held encryption key**, so single-sign-on users (GitHub OAuth) sync without ever setting a sync password.
+User-authored skills (markdown files under `~/.codemux/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.agents/skills/`, `~/.opencode/skills/`, `~/.config/opencode/skills/` — the full list, with per-root provider tags, is under "Provider scope rules" below) sync across every device the user signs into Codemux on. Skills are stored **server-side**: the skill name and content travel as plaintext and the server persists them in plaintext columns, protected at rest by the database — the same model Codemux's `user_settings` sync already uses. There is **no client-held encryption key**, so single-sign-on users (GitHub OAuth) sync without ever setting a sync password.
 
 The Better Auth account is still cross-product compatible with Vexis (email+password login derives the same `AuthSecret` via the shared `codemux-api-*` HKDF protocol); only the **skills payload** is non-E2E.
 
@@ -51,7 +51,8 @@ The Better Auth account is still cross-product compatible with Vexis (email+pass
 
 - **Synced (`scope=user`):** `~/.codemux/skills/`, `~/.claude/skills/`, `~/.codex/skills/`, `~/.agents/skills/` (Codex's newer root), `~/.opencode/skills/`, `~/.config/opencode/skills/`. The origin provider tag is preserved through the wire format and restored on the receiving device's mapping.
 - **Lockstep invariant:** this list is `path_detection::USER_SCOPE_PROVIDERS`, and it must cover every user root that `skills::paths::enumerate_scan_paths` returns. The push pipeline walks the scanner's enumeration and classifies each hit through `detect_skill_path`; a root the scanner knows but the table doesn't classifies as `None` and is dropped from sync with no diagnostic. `user_scope_table_covers_every_scan_root` / `project_scope_table_covers_every_scan_root` fail the build if the two drift.
-- **NOT synced (`is_syncable=false`):** project-scope skills under `<project>/.codemux/skills/`, etc. Reserved for Step 10.5.
+- **NOT synced (`is_syncable=false`):** project-scope skills. `PROJECT_SCOPE_SUBDIRS` recognizes five roots — `<project>/.codemux/skills/`, `.claude/skills/`, `.codex/skills/`, `.agents/skills/`, `.opencode/skills/` — and `provider_from_project_subdir` maps **both** `.codex/skills` and `.agents/skills` to provider `codex`. They are classified (so they show correct provider grouping and are covered by the lockstep guard) but never pushed. Reserved for Step 10.5.
+- **Alias dedup upstream of sync:** the scanner dedupes roots by canonical path (`skills::paths::canonical_key`), so when two roots resolve to the same directory — a project root aliasing `$HOME`, or a symlinked plugin dir — only the first-enumerated one survives and sync sees exactly that one. User scope claims before project scope, and the canonical location claims before its alias (`~/.codex/skills` wins over `~/.agents/skills`). See `docs/features/agent-chat.md` § "Cross-provider skill system" for the full enumeration order.
 - **NOT synced (`None`):** plugin skills, marketplace skills, anything outside the recognized layouts.
 - **Sync target invariant:** the receiving device always writes to `~/.codemux/skills/<name>/SKILL.md` regardless of origin provider.
 

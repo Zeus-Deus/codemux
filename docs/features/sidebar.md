@@ -47,7 +47,12 @@ visual only — nothing is archived, closed, or deleted.
   button that opens the command palette (shows the resolved `⌘K` keybind) and
   a neutral-ghost new-agent button (same click/shift-click semantics as
   before). Add repository moved into the filter row; Automations and Workspaces
-  moved into the footer nav row (see "Footer" below).
+  moved into the footer nav row (see "Footer" below). The palette indexes every
+  workspace record — active **and** settled — through `workspaceCommandValue`
+  (`command-palette.tsx`), which joins `title`, `git_branch`, `project_root`,
+  and `cwd` into the `CommandItem` value. Search therefore reaches a workspace
+  that has been parked onto the Settled shelf, and matches on project path as
+  well as on name or branch.
 - **Project filter dropdown** (`sidebar-inbox.tsx`): one 32px sticky row
   (`h-8` trigger + `size-8` add-repo button, matching the action row above) —
   a flex-1 trigger showing the current filter (Folder icon + "All projects",
@@ -204,8 +209,16 @@ visual only — nothing is archived, closed, or deleted.
   one-line row (repo avatar · title · state-colored PR icon + `#number` when
   linked · elapsed-since-work-ended). The PR badge opens the pull request
   directly and remains visible while the row's Un-settle affordance appears.
+  With no `pr_url` the badge renders disabled and dimmed, still labeled
+  `PR #n — <state>`.
   A settled row is itself a button — click or
-  Enter/Space activates that workspace without un-settling it. Hover/focus
+  Enter/Space activates that workspace without un-settling it. Row activation is
+  scoped to the row node by `isRowActivationKey` (`Enter`/`Space` **and**
+  `e.target === e.currentTarget`), so pressing Enter/Space on an inner control —
+  the PR badge, Un-settle, Wake now — runs only that control's action instead of
+  also activating the workspace. Snoozed rows use the same guard. Because it is
+  DOM-identity based, any inner interactive element added later is exempt
+  automatically. Hover/focus
   reveals **Un-settle**, which reverses it (the returning card eases back in
   via the shared `rise-in` keyframe). Settling is **visual only** — nothing is
   archived, closed, or deleted; a settle still mid-animation is flushed to the

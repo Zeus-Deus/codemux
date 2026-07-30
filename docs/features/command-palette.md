@@ -18,7 +18,7 @@ Actions are defined as `CommandItem` components organized into `CommandGroup` co
 
 ### Action Groups
 
-**Workspaces** — Dynamic list of all workspaces for quick switching, plus:
+**Workspaces** — Dynamic list of all workspaces for quick switching, including ones parked onto the sidebar's Settled shelf. Each entry's search value is built by `workspaceCommandValue` from `title` + `git_branch` + `project_root` + `cwd`, so a workspace is reachable by project path as well as by name or branch. Plus:
 - Create New Workspace
 - Run Dev Command (Ctrl+Shift+G)
 
