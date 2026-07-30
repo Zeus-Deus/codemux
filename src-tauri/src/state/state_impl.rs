@@ -1025,6 +1025,33 @@ impl AppStateStore {
         self.create_workspace_with_layout(cwd_path, WorkspacePresetLayout::Single)
     }
 
+    /// Title a freshly-created workspace that has nothing better to go on.
+    ///
+    /// Prefers the directory's own name (`~/projects/codemux` → `codemux`),
+    /// falling back to `Workspace {n}` only when the path has no usable
+    /// final component (filesystem root, empty path).
+    ///
+    /// Why not always `Workspace {n}`: several creation paths never get a
+    /// second chance at a name. Worktree creation overwrites the title with
+    /// its branch (`set_workspace_worktree`) and the chat surfaces rename
+    /// from the first prompt, but "Open project", "Clone", and "New project"
+    /// have no branch and no prompt — so their workspaces kept a bare
+    /// ordinal forever. The directory name is what the user picked and what
+    /// every other tool shows for the same thing.
+    ///
+    /// Callers that DO have a better name still overwrite this afterwards;
+    /// the frontend's `isDefaultWorkspaceTitle` recognises both this shape
+    /// and the legacy `Workspace {n}` so auto-naming can still upgrade it.
+    fn default_workspace_title(cwd_path: &Path, workspace_index: usize) -> String {
+        cwd_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.trim())
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("Workspace {workspace_index}"))
+    }
+
     /// Create a workspace with no tabs, surfaces, or terminal sessions.
     /// Used by "Add repository" so the empty workspace state shows.
     pub fn create_empty_workspace_at_path(&self, cwd_path: PathBuf) -> WorkspaceId {
@@ -1046,7 +1073,7 @@ impl AppStateStore {
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
             is_git: true,
-            title: format!("Workspace {workspace_index}"),
+            title: Self::default_workspace_title(&cwd_path, workspace_index),
             workspace_type: WorkspaceType::Standard,
             cwd,
             git_branch: None,
@@ -1447,7 +1474,7 @@ impl AppStateStore {
         snapshot.workspaces.push(WorkspaceSnapshot {
             workspace_id: workspace_id.clone(),
             is_git: true,
-            title: format!("Workspace {workspace_index}"),
+            title: Self::default_workspace_title(&cwd_path, workspace_index),
             workspace_type: WorkspaceType::Standard,
             cwd,
             git_branch: None,
@@ -5592,6 +5619,54 @@ fn collect_numeric_ids_from_node(root: &PaneNodeSnapshot) -> Vec<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Default workspace titles ────────────────────────────────────
+    //
+    // "Open project" / "Clone" / "New project" have no branch and no
+    // first prompt, so whatever these produce is what the user lives
+    // with permanently.
+
+    #[test]
+    fn default_title_uses_the_directory_name() {
+        assert_eq!(
+            AppStateStore::default_workspace_title(Path::new("/home/u/projects/codemux"), 58),
+            "codemux"
+        );
+    }
+
+    #[test]
+    fn default_title_ignores_a_trailing_slash() {
+        assert_eq!(
+            AppStateStore::default_workspace_title(Path::new("/home/u/projects/codemux/"), 58),
+            "codemux"
+        );
+    }
+
+    #[test]
+    fn default_title_falls_back_to_the_ordinal_without_a_usable_name() {
+        // Filesystem root and empty paths have no final component.
+        assert_eq!(
+            AppStateStore::default_workspace_title(Path::new("/"), 58),
+            "Workspace 58"
+        );
+        assert_eq!(
+            AppStateStore::default_workspace_title(Path::new(""), 7),
+            "Workspace 7"
+        );
+    }
+
+    #[test]
+    fn created_workspace_is_titled_after_its_directory() {
+        let store = AppStateStore::default();
+        let id = store.create_empty_workspace_at_path(PathBuf::from("/home/u/projects/codemux"));
+        let snapshot = store.snapshot();
+        let ws = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id == id)
+            .expect("workspace exists");
+        assert_eq!(ws.title, "codemux");
+    }
 
     fn sample_split_tree() -> PaneNodeSnapshot {
         PaneNodeSnapshot::Split {

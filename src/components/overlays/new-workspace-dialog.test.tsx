@@ -42,6 +42,7 @@ vi.mock("@/tauri/commands", () => ({
     .mockResolvedValue({ workspaceId: "ws-new", cwd: null, adopted: false }),
   importWorktreeWorkspace: vi.fn().mockResolvedValue("ws-new"),
   activateWorkspace: vi.fn().mockResolvedValue(undefined),
+  renameWorkspace: vi.fn().mockResolvedValue(undefined),
   applyPreset: vi.fn().mockResolvedValue(undefined),
   dbAddRecentProject: vi.fn().mockResolvedValue(undefined),
   dbGetRecentProjects: vi.fn().mockResolvedValue([]),
@@ -101,6 +102,7 @@ import {
   getGitBranchInfo,
   createWorktreeWorkspaceResult,
   activateWorkspace,
+  renameWorkspace,
   generateBranchName,
   generateRandomBranchName,
   pasteClipboardImageToFile,
@@ -358,6 +360,49 @@ describe("Submit flow", () => {
     });
   });
 
+  it("applies the typed workspace name to the created workspace", async () => {
+    // Regression: the "Workspace name (optional)" input used to feed
+    // only the optimistic pending row, so the name was silently dropped
+    // the moment the real workspace landed and it kept the
+    // backend-assigned title.
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("Workspace name (optional)"),
+      { target: { value: "  Payments rewrite  " } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      // Trimmed, and applied to whatever workspace the create path made.
+      expect(renameWorkspace).toHaveBeenCalledWith(
+        "ws-new",
+        "Payments rewrite",
+      );
+    });
+  });
+
+  it("leaves the backend title alone when no workspace name is typed", async () => {
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    const textarea = within(dialog).getByPlaceholderText(
+      "What do you want to do?",
+    );
+    fireEvent.change(textarea, { target: { value: "Fix the login bug" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(createWorktreeWorkspaceResult).toHaveBeenCalled();
+    });
+    // Worktree paths are titled from the branch by the backend; an
+    // untouched name input must not overwrite that with anything.
+    expect(renameWorkspace).not.toHaveBeenCalled();
+  });
+
   it("uses explicit branch name when provided", async () => {
     setAppState("/path/to/project");
     renderDialog(true);
@@ -543,6 +588,32 @@ describe("Submit flow", () => {
     expect(toast.info).toHaveBeenCalledWith(
       expect.stringContaining("prompt wasn't sent"),
     );
+  });
+
+  it("does not rename an adopted workspace to the typed name", async () => {
+    // An adopted workspace belongs to a session someone is already using.
+    // The typed name is meant for the workspace this dialog CREATES — the
+    // dialog never creates one here, so retitling the adoptee would rename
+    // another workspace out from under its owner.
+    (createWorktreeWorkspaceResult as Mock).mockResolvedValueOnce({
+      workspaceId: "ws-existing",
+      cwd: "/path/to/wt",
+      adopted: true,
+    });
+    setAppState("/path/to/project");
+    renderDialog(true);
+
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByPlaceholderText("Workspace name (optional)"),
+      { target: { value: "Payments rewrite" } },
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Create/i }));
+
+    await waitFor(() => {
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-existing");
+    });
+    expect(renameWorkspace).not.toHaveBeenCalled();
   });
 
   it("does not show the adoption notice for a freshly created workspace", async () => {

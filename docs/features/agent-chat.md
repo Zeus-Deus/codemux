@@ -1981,7 +1981,9 @@ layout. Only ONE surface routes it (the pane arm was removed — see
   backstop prime so children can't double-spawn).
 - **Pane empty state** — no longer participates. Every submit on a
   workspace-bound pane goes through the unmodified `handleSubmit` and
-  stays in that pane's own workspace.
+  stays in that pane's own workspace. (Its empty-thread first send is
+  wrapped only to TITLE that workspace — see "Current-checkout
+  auto-naming" below — never to create one.)
 
 **CWD-resolution invariant.** A freshly-created worktree
 workspace only reaches the Zustand app-store via the async
@@ -2009,8 +2011,67 @@ the session at the parent/project-root cwd — on timeout,
 `materializeAndSend` fails the send via `markSendFailed` (draft text
 preserved) rather than proceeding.
 
-`checkoutMode === "current"` (the draft surface's default) is unchanged
-from before the redesign — no worktree, no new Tauri calls.
+**Current-checkout auto-naming.** `checkoutMode === "current"` (the
+default) still creates no worktree and no branch, but it is no longer
+naming-inert. A worktree first-send gets a human-readable workspace name
+for free — `createDeferredWorktree` resolves an AI branch name and the
+backend's `set_workspace_worktree` (`state_impl.rs`) overwrites the
+workspace title with that branch — whereas the current-checkout path
+creates no branch and so used to keep the backend default
+(`format!("Workspace {workspace_index}")`, i.e. `Workspace 58`) forever.
+That was the last asymmetry: Home already derived a title, worktrees
+inherited one, and only "run on the current checkout" stayed numbered.
+Both surfaces now name it from the first message via the shared
+`autoNameWorkspace` (`materialize.ts`):
+
+- **Draft surface** — a `project` target routes through
+  `createProjectWorkspace`, which is `createEmptyWorkspace` + a fired-off
+  `autoNameWorkspace`. Same treatment in `materializeWithPreset`.
+- **Pane empty state** — the pane has no checkout mode to choose; it
+  always sends into the checkout its workspace is already on, so its
+  first send is a current-checkout send by construction.
+  `handleCurrentCheckoutFirstSubmit` fires `autoNameWorkspace` and falls
+  straight through to the unmodified `handleSubmit`, so the send path is
+  byte-for-byte what it was. The interception is gated on
+  `messages.length === 0`, a non-home workspace, and a resolvable project
+  root; everything else stays on `handleSubmit`.
+
+**Same namer as worktrees, on purpose.** Naming routes through
+`generateBranchName` — the exact call `createDeferredWorktree` and the
+CLI use — rather than the cheap `deriveTitleFromFirstMessage`. These
+titles sit side by side in the sidebar; deriving from message text would
+put `take a look at this image, when i make a…` directly above
+`sidebar-workspace-ordering` and the list would read as two different
+products. One namer means every workspace title has the same shape.
+`deriveTitleFromFirstMessage` survives as the fallback when the namer's
+IPC itself rejects (truncated message text still beats `Workspace 58`)
+and as the Home path's naming, which stays message-derived — a
+home-rooted workspace is not a project checkout, so there is no repo for
+`generateBranchName` to name a branch against or deconflict within.
+
+**Fire-and-forget, guarded at apply time.** `generateBranchName` shells
+out to `claude --print` (5-9s warm, 30s timeout), so awaiting it would
+put that on the critical path of a send that otherwise makes no extra
+backend calls. The send proceeds immediately and the sidebar card
+re-titles itself seconds later — the "conversation names itself shortly
+after you send" behavior chat UIs use. Renaming twice (instant
+truncation, then upgrading to the slug) was rejected: two visible title
+changes per workspace is churn and the intermediate value is the ugly
+one. Because the rename lands seconds late, the
+`isDefaultWorkspaceTitle` guard (`derive-title.ts`) is re-read AFTER the
+namer resolves, not at call time — on the pane path the workspace may
+have existed for days, and a user can rename it mid-flight; either way a
+user-chosen or branch-derived name is never clobbered. The guard takes
+the workspace's directory alongside its title, because a
+backend-assigned title can BE the directory name: it accepts the
+directory-name default (`~/projects/codemux` → `codemux`), the legacy
+`Workspace {n}` shape, and an absent title (nothing there to protect).
+See `docs/features/workspace-creation.md` § Workspace Titles for where
+each default comes from. A workspace absent from the store is one just
+created whose `app-state-changed` hasn't landed, so absence is not
+evidence of a user-chosen name and naming proceeds. Naming never rejects
+into the send path (it is cosmetic), and an empty/whitespace-only message
+skips it entirely rather than blanking the title.
 
 **Backend adopt-don't-duplicate guard.** `git_create_worktree` can
 return an EXISTING worktree path without creating anything (the

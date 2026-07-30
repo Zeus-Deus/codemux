@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { deriveTitleFromFirstMessage } from "./derive-title";
+import {
+  deriveTitleFromFirstMessage,
+  isDefaultWorkspaceTitle,
+} from "./derive-title";
 
 describe("deriveTitleFromFirstMessage", () => {
   it("returns null for an empty string", () => {
@@ -66,5 +69,53 @@ describe("deriveTitleFromFirstMessage", () => {
     const text = "word1 word2 word3                       suffix-far-away";
     const result = deriveTitleFromFirstMessage(text);
     expect(result!.endsWith(" ")).toBe(false);
+  });
+});
+
+describe("isDefaultWorkspaceTitle", () => {
+  it("matches the backend's `Workspace <n>` default", () => {
+    // Mirrors state_impl.rs: format!("Workspace {workspace_index}").
+    expect(isDefaultWorkspaceTitle("Workspace 1")).toBe(true);
+    expect(isDefaultWorkspaceTitle("Workspace 58")).toBe(true);
+    expect(isDefaultWorkspaceTitle("  Workspace 58  ")).toBe(true);
+  });
+
+  it("treats an absent title as nameable — there is nothing to protect", () => {
+    expect(isDefaultWorkspaceTitle(null)).toBe(true);
+    expect(isDefaultWorkspaceTitle(undefined)).toBe(true);
+    expect(isDefaultWorkspaceTitle("")).toBe(true);
+    expect(isDefaultWorkspaceTitle("   ")).toBe(true);
+  });
+
+  it("matches the directory-name default", () => {
+    // The current backend default (`default_workspace_title`): a
+    // workspace opened at ~/projects/codemux is titled `codemux`.
+    expect(isDefaultWorkspaceTitle("codemux", "/home/u/projects/codemux")).toBe(
+      true,
+    );
+    expect(isDefaultWorkspaceTitle("codemux", "/home/u/projects/codemux/")).toBe(
+      true,
+    );
+    // A different name at the same path is the user's.
+    expect(
+      isDefaultWorkspaceTitle("payments rewrite", "/home/u/projects/codemux"),
+    ).toBe(false);
+    // Without a path to compare against, only the legacy shape matches —
+    // the safe direction is declining to rename.
+    expect(isDefaultWorkspaceTitle("codemux")).toBe(false);
+  });
+
+  it("never claims a user-chosen or branch-derived name as default", () => {
+    // These are the names auto-renaming must never clobber.
+    expect(isDefaultWorkspaceTitle("sidebar-workspace-ordering")).toBe(false);
+    expect(isDefaultWorkspaceTitle("Workspace")).toBe(false);
+    expect(isDefaultWorkspaceTitle("Workspace 58 (mine)")).toBe(false);
+    expect(isDefaultWorkspaceTitle("My Workspace 58")).toBe(false);
+    expect(isDefaultWorkspaceTitle("workspace 58")).toBe(false);
+    expect(isDefaultWorkspaceTitle("Workspace 58b")).toBe(false);
+    // A branch-named worktree workspace, whose dirPath is the repo root.
+    expect(
+      isDefaultWorkspaceTitle("fix-login-bug", "/home/u/projects/codemux"),
+    ).toBe(false);
   });
 });
