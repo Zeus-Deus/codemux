@@ -44,6 +44,7 @@ import { UserInputAnswer } from "./UserInputAnswer";
 import { UserMessage } from "./UserMessage";
 import { WorkflowRunCard } from "./WorkflowRunCard";
 import { ScrollAnchoringShim } from "./scroll-anchoring-shim";
+import { CHAT_COLUMN } from "./chat-column";
 import {
   subscribeTranscriptFade,
   transcriptFadeEnabled,
@@ -287,7 +288,7 @@ export function MessageList({
         >
           <MessageScrollerContent
             aria-busy={showThinking || undefined}
-            className="mx-auto w-full max-w-[760px] gap-0 px-7 pb-[30px] pt-[26px]"
+            className={cn(CHAT_COLUMN, "gap-0 pb-[30px] pt-[26px]")}
           >
             <SessionStartMarker startedAt={sessionStartedAt} />
 

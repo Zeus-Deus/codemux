@@ -40,7 +40,14 @@ function MessageScrollerViewport({
     <MessageScrollerPrimitive.Viewport
       data-slot="message-scroller-viewport"
       className={cn(
-        "size-full min-h-0 min-w-0 overflow-y-auto overscroll-contain contain-content [overflow-anchor:none] [scrollbar-gutter:stable] data-[scrollable~=end]:[overflow-anchor:auto]",
+        // `scrollbar-gutter: stable both-edges` (not plain `stable`):
+        // reserving the gutter on one side only would shrink the box the
+        // centered content column is measured against, sliding the whole
+        // transcript half a scrollbar to the left of the composer, which
+        // sits outside this scroller. Both edges keeps the column
+        // concentric with the pane, so transcript and composer share the
+        // same rails (see chat/chat-column.ts).
+        "size-full min-h-0 min-w-0 overflow-y-auto overscroll-contain contain-content [overflow-anchor:none] [scrollbar-gutter:stable_both-edges] data-[scrollable~=end]:[overflow-anchor:auto]",
         className
       )}
       {...props}

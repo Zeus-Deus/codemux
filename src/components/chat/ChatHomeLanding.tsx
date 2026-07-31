@@ -12,13 +12,14 @@ interface Props {
  */
 export function ChatHomeLanding({ composer }: Props) {
   return (
-    <div className="flex h-full w-full flex-col items-center justify-center gap-8 px-4 pb-12">
-      <h1 className="text-3xl font-medium tracking-tight text-foreground text-center">
+    <div className="flex h-full w-full flex-col items-center justify-center gap-8 pb-12">
+      <h1 className="px-4 text-3xl font-medium tracking-tight text-foreground text-center">
         What should we do today?
       </h1>
-      {/* Match the composer's own 760px column (design D10/D12) so the
-          landing card lines up with the mid-conversation composer. */}
-      <div className="w-full max-w-[760px]">{composer}</div>
+      {/* The composer carries the shared column rails itself (see
+          chat-column.ts), so the landing card lines up with the
+          mid-conversation composer at every pane width. */}
+      <div className="w-full">{composer}</div>
     </div>
   );
 }

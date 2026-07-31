@@ -15,7 +15,10 @@ import {
   HoverCardTrigger,
 } from "@/components/ui/hover-card";
 import { cn } from "@/lib/utils";
+
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
+
+import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 
 /** Matches the Claude Agent SDK's `AskUserQuestionOutput` (sdk-tools.d.ts):
  *  `answers` is an object keyed by question text, value is the chosen
@@ -256,8 +259,8 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
 
   if (questions.length === 0) {
     return (
-      <div className="w-full px-4 pb-2">
-        <div className="mx-auto w-full max-w-[760px]">
+      <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
+        <div className={CHAT_COLUMN_INNER}>
           <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3 text-xs text-muted-foreground">
             AskUserQuestion with no questions.
           </div>
@@ -271,8 +274,8 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
   const primaryLabel = isLast ? "Send" : "Next";
 
   return (
-    <div className="w-full px-4 pb-2">
-      <div className="mx-auto w-full max-w-[760px]">
+    <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
+      <div className={CHAT_COLUMN_INNER}>
         <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3 space-y-3">
           {/* Header row: optional uppercase header on the left, pagination on the right. */}
           <div className="flex items-center gap-2">

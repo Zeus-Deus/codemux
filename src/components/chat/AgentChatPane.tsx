@@ -2861,7 +2861,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               hidden while drilled into a subagent (the design only shows
               it in the conversation view) and hidden entirely while idle. */}
           {!enteredSubagent && (
-            <div className="px-7 pt-2.5">
+            <div className="pt-2.5">
               <SubagentActivityBar
                 messages={messages}
                 threadId={threadId}

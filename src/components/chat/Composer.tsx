@@ -77,6 +77,7 @@ import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { ComposerFooter } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { SlashCommandPopup } from "./SlashCommandPopup";
+import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
@@ -1954,8 +1955,8 @@ export function Composer({
   };
 
   return (
-    <div className="w-full px-4 pb-3">
-      <div className="mx-auto w-full max-w-[760px]">
+    <div className={cn(CHAT_COLUMN_OUTER, "pb-3")}>
+      <div className={CHAT_COLUMN_INNER}>
         {zone1Override !== null && zone1Override !== undefined ? (
           <div className="pb-1">{zone1Override}</div>
         ) : zone1Override === undefined && cwd ? (
