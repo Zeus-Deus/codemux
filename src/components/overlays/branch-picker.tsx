@@ -306,8 +306,20 @@ export function BranchPicker({
 
                       // Determine action labels based on branch state
                       const hasAnyWorktree = hasOpenWorkspace || hasWorktree;
+                      // This row is the repo's currently-checked-out
+                      // branch and has nothing attached yet, so
+                      // `handlePrimaryAction` takes the
+                      // `onCreateOnCurrent` path: it works IN the
+                      // existing checkout instead of cutting a worktree.
+                      // The label has to say so — it previously read
+                      // "Open" (or, when the current branch was also the
+                      // default, "Fork", which claimed the opposite of
+                      // what the click did).
+                      const isCurrentCheckout =
+                        !baseOnly && !hasAnyWorktree && branch.name === currentBranch;
                       const primaryLabel = baseOnly ? "Select"
                         : hasOpenWorkspace ? "Focus"
+                        : isCurrentCheckout ? "Open here"
                         : (isDefault && !hasAnyWorktree) ? "Fork"
                         : "Open";
                       const secondaryLabel = (!hasAnyWorktree && isDefault) ? "Open" : "Fork";
@@ -335,6 +347,18 @@ export function BranchPicker({
                           </span>
 
                           {/* Badges */}
+                          {branch.name === currentBranch && (
+                            // Nothing else in this list identified the
+                            // checked-out branch, so the row whose
+                            // primary action behaves differently looked
+                            // identical to every other row.
+                            <Badge
+                              variant="secondary"
+                              className="text-[9px] px-1 py-0 shrink-0"
+                            >
+                              checked out
+                            </Badge>
+                          )}
                           {isDefault && (
                             <Badge
                               variant="secondary"

@@ -33,7 +33,60 @@ Creation dispatches one of:
 
 **Orphan worktree reclamation**: a worktree's conventional path is `~/.codemux/worktrees/<repo>/<branch>`. When a previous worktree for the same branch was removed from git's registry but its directory was left on disk (e.g. spinning up a workspace from an already-worked, often closed, issue branch whose `feature/<n>-<slug>` name is auto-suggested), `git worktree add` would otherwise die with `fatal: '<path>' already exists`. Creation now detects a **safe orphan** — a path git no longer tracks as a worktree, with no `.git` entry, holding nothing but Codemux's own `.codemux/` metadata (or empty) — and removes it before adding. Anything resembling user data, or a real path collision against a different registered branch, is left untouched so git still fails loudly. Both the desktop and headless daemon paths share this policy (`is_reclaimable_orphan_worktree`).
 
+**Optional workspace name**: the dialog's "Workspace name (optional)" input
+is applied via `renameWorkspace` once the workspace exists
+(`applyTypedWorkspaceName`), on every create path including the
+current-checkout ones. It has to be applied explicitly because each path
+lands on a backend-assigned title first (see "Workspace titles" below). A
+typed name is the strongest signal available, so it wins over the
+branch-derived title too; the rename is best-effort and never fails a
+workspace that already exists. (Before this the input only fed the
+optimistic pending-row label and was silently discarded the moment the
+real workspace landed.) The one exclusion is the backend's adopt path
+(`WorkspaceCreated.adopted`, see "Backend adopt-don't-duplicate guard" in
+`docs/features/agent-chat.md`): nothing was created, and the workspace
+that got focused belongs to a session already in use, so its title is not
+this dialog's to overwrite.
+
+**Current checkout vs. worktree in the branch picker**: selecting the
+repo's currently-checked-out branch, when it has no worktree or workspace
+yet, attaches a workspace to the existing checkout
+(`handlePrimaryAction` → `onCreateOnCurrent`) instead of cutting a
+worktree. That row is labelled **"Open here"** and carries a `checked out`
+badge. Both exist because the behaviour was previously undiscoverable:
+the row read `Open` like every other, and when the checked-out branch was
+also the default it read `Fork` — claiming the opposite of what the click
+did, since the `currentBranch` test in `handlePrimaryAction` runs before
+the `isDefault` one.
+
 After creation: preset applied, issue linked, project marked as recent, workspace activated.
+
+### Workspace Titles
+
+Every creation path lands on a backend default from
+`state_impl.rs::default_workspace_title`, which some paths then overwrite:
+
+| Path | Title |
+|---|---|
+| Worktree creation | branch name (`set_workspace_worktree` overwrites) |
+| Dialog with a typed name | that name (`applyTypedWorkspaceName`) |
+| Chat first-send on a current checkout | AI name from the first prompt (`autoNameWorkspace`, async — see `docs/features/agent-chat.md`) |
+| Open project / Clone / New project | the backend default, permanently |
+
+The backend default is **the directory's own name** (`~/projects/codemux`
+→ `codemux`), falling back to `Workspace {n}` only when the path has no
+usable final component (filesystem root, empty path). It used to be
+`Workspace {n}` unconditionally, which was fine for the paths that
+overwrite it but left the last row of that table — the paths with no
+branch and no prompt — showing a bare ordinal forever.
+
+Existing workspaces keep whatever title they were created with; there is
+no migration. The frontend's `isDefaultWorkspaceTitle`
+(`src/lib/agent-chat/derive-title.ts`) therefore recognises **both**
+shapes plus an absent title, so a legacy `Workspace 58` is still
+upgradeable by a first prompt. It needs the workspace's directory to do
+this, since the current default *is* the directory name — call it with
+the cwd/project root, not just the title.
 
 ### Cloning a Repository
 

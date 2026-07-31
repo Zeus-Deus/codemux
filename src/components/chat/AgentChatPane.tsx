@@ -89,6 +89,7 @@ import {
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
+import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
@@ -371,6 +372,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   });
   const isHomeWorkspace =
     homeDir !== null && workspaceProjectRoot === homeDir;
+  // Identity of the pane's workspace, for the current-checkout
+  // first-send rename (see `handleCurrentCheckoutFirstSubmit`). A plain
+  // scalar, so this selector doesn't re-render on unrelated snapshot
+  // churn. The workspace's CURRENT title is deliberately not read here —
+  // `autoNameWorkspace` re-reads it after its AI call resolves, which is
+  // the only moment the guard is meaningful.
+  const paneWorkspaceId = useAppStore(
+    (s) => workspaceIdForPane ?? s.appState?.active_workspace_id ?? null,
+  );
   // The pane workspace's actual checked-out branch (from the workspace
   // snapshot's git watcher). Thread Scope prefers this over the branch
   // picker's main/master heuristic for the "current checkout" display,
@@ -2587,6 +2597,52 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     </div>
   ) : undefined;
 
+  // A worktree first-send gets a human-readable workspace name for free
+  // (the backend overwrites the title with the new branch name). A
+  // workspace-bound pane never cuts a branch — it always sends into the
+  // checkout it is already on — so without this the workspace keeps the
+  // backend default title forever.
+  //
+  // `autoNameWorkspace` is fire-and-forget and re-checks the
+  // still-default-title guard itself, so this wrapper only resolves the
+  // text and hands straight off to the unmodified `handleSubmit` — the
+  // send path is byte-for-byte what it was.
+  const handleCurrentCheckoutFirstSubmit = useCallback(
+    (textOverride?: string, options?: { continueRun?: boolean }) => {
+      // Mirror `handleSubmit`'s bail-outs BEFORE naming, in the same
+      // order, so the namer fires exactly when a turn does. The
+      // `sendInFlightRef` check matters most: `messages.length === 0`
+      // (which selects this handler) only flips once the optimistic
+      // bubble lands, so two Enter presses in one tick would otherwise
+      // both reach here and race two `claude --print` calls into two
+      // renames — the second landing before the first's title reached
+      // the store, so the late guard couldn't stop it either.
+      if (sendInFlightRef.current) return;
+      if (!threadId) return;
+      // Same text resolution as `handleSubmit`, so the name is derived
+      // from the message actually sent.
+      const rawText = (
+        typeof textOverride === "string" ? textOverride : draft
+      ).trim();
+      if (!rawText) return;
+      if (paneWorkspaceId && workspaceProjectRoot) {
+        autoNameWorkspace(paneWorkspaceId, workspaceProjectRoot, rawText);
+      }
+      handleSubmit(textOverride, options);
+    },
+    [draft, threadId, paneWorkspaceId, workspaceProjectRoot, handleSubmit],
+  );
+
+  // Intercept ONLY the empty-thread first send; everything else stays on
+  // the unmodified `handleSubmit` path. This pane always sends into its
+  // own checkout (the per-thread "New worktree" control was removed —
+  // see the Thread Scope note above), so the first send just names the
+  // workspace it is already in.
+  const composerOnSubmit =
+    messages.length === 0 && !isHomeWorkspace && workspaceProjectRoot !== null
+      ? handleCurrentCheckoutFirstSubmit
+      : handleSubmit;
+
   // AskUserQuestion prompts render as a composer-attached panel
   // (one-question-per-card pattern, similar to Claude.ai) rather
   // than inline in the transcript. Only the first pending
@@ -2696,7 +2752,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (!threadId) return;
         setInputDraft(threadId, next);
       }}
-      onSubmit={handleSubmit}
+      onSubmit={composerOnSubmit}
       onStop={handleStop}
       onProviderModelChange={handleProviderModelChange}
       onModelChange={handleModelChange}
