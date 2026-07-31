@@ -273,6 +273,34 @@ describe("SidebarRailWorkspaces", () => {
     }
   });
 
+  it("recedes background buttons that are not asking for anything", async () => {
+    // Rail parity with the expanded inbox: a quietly-working agent and an
+    // idle, already-read workspace sit back so the needs-you / done-review /
+    // unread buttons are the bright ones. Hover restores them.
+    workspaces = [
+      makeWorkspace({ title: "Needs", surfaces: surfaceWithPane("p1") }),
+      makeWorkspace({ title: "Working", surfaces: surfaceWithPane("p2") }),
+      makeWorkspace({ title: "Review", surfaces: surfaceWithPane("p3") }),
+      makeWorkspace({ title: "Idle" }),
+      makeWorkspace({ title: "Unread", last_active_at: 100 }),
+      makeWorkspace({ title: "Open now" }),
+    ];
+    paneStatuses = { p1: "permission", p2: "working", p3: "review" };
+    activeWorkspaceId = "ws-6";
+    const { container } = await renderRail();
+
+    const btn = (id: string) =>
+      container.querySelector(`[data-rail-ws="${id}"]`)!;
+
+    expect(btn("ws-2").className).toContain("opacity-70");
+    expect(btn("ws-2").className).toContain("hover:opacity-100");
+    expect(btn("ws-4").className).toContain("opacity-70");
+
+    for (const id of ["ws-1", "ws-3", "ws-5", "ws-6"]) {
+      expect(btn(id).className, id).not.toContain("opacity-70");
+    }
+  });
+
   it("prunes persisted entries whose workspace no longer exists", async () => {
     // A session spent entirely in the collapsed rail must still trim the
     // persisted blob, otherwise it grows without bound.

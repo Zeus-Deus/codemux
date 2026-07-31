@@ -9,7 +9,7 @@ import {
 import { useHosts } from "@/stores/hosts-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
-import { compareNewestFirst } from "./sidebar-inbox";
+import { compareNewestFirst, isWorkspaceUnread } from "./sidebar-inbox";
 import { activateWorkspace } from "@/tauri/commands";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import { useProjectAppearance } from "./use-project-appearance";
@@ -50,6 +50,21 @@ function RailWorkspaceItem({
     });
   };
 
+  // Rail parity with the expanded inbox's background recede: a button whose
+  // agent is quietly working, or that is idle and already read, is not asking
+  // for anything yet, so it sits back and lets the needs-you / done-review /
+  // unread buttons be the bright ones. Hover restores it in full. Unread is
+  // the pure stamp predicate the inbox derives from — the rail carries no
+  // unread affordance of its own and no manual override, hence `false`; and
+  // it has no "Woke" concept at all, so there is nothing to skip for.
+  const unread = isWorkspaceUnread(
+    workspace.last_active_at,
+    workspace.last_visited_at,
+    false,
+  );
+  const receded =
+    !isActive && !unread && (status === "working" || status === null);
+
   // Per-workspace status dot: red (pulse) needs-you > amber working >
   // green review. Idle / null shows nothing.
   const dotClass: Record<ActivePaneStatus, string> = {
@@ -69,10 +84,15 @@ function RailWorkspaceItem({
           onClick={handleClick}
           aria-label={workspace.title}
           className={cn(
-            "relative flex size-7 items-center justify-center rounded-lg border transition-colors duration-150",
+            "relative flex size-7 items-center justify-center rounded-lg border duration-150",
+            "transition-[color,background-color,border-color,opacity]",
             isActive
               ? "border-border bg-foreground/[0.09]"
               : "border-transparent hover:bg-foreground/[0.04]",
+            // The status dot inherits the dim along with the avatar, which is
+            // the point: a quietly-working button should read as quieter as a
+            // whole, not as a dim avatar wearing a full-strength badge.
+            receded && "opacity-70 hover:opacity-100",
           )}
         >
           <ProjectAvatar
