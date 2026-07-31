@@ -164,6 +164,22 @@ export function SidebarInboxCard({
   const isNeeds = status === "permission";
   const isDone = status === "review";
 
+  // Background recede. Prominence is a scarce resource, so it is reserved for
+  // the rows that actually want a human right now: the workspace you are in,
+  // one that is blocked on you, one that has finished and wants a review, one
+  // holding output you have not read, and one that just came back from a
+  // snooze — plus anything you have ticked for a bulk action. Everything else
+  // is either an agent quietly working (not your problem yet) or an idle row
+  // you have already read, so it sits back at reduced opacity and the ones
+  // that need you read as the bright rows in the list. Hovering or focusing a
+  // receded card restores it in full, so nothing is ever hidden — only ranked.
+  const receded =
+    !isActive &&
+    !selected &&
+    !unread &&
+    !woke &&
+    (status === "working" || status === null);
+
   // Settle safety net: a live or blocked agent can never be swept out of
   // sight. Only finished ("review") and idle cards offer Settle — sweeping
   // completed work aside is the whole point of the gesture.
@@ -333,7 +349,12 @@ export function SidebarInboxCard({
                 "group/card relative mb-1.5 cursor-pointer rounded-[10px] border px-[11px] pt-[9px] pb-[10px]",
                 // select-none: a shift-click range gesture would otherwise
                 // drag a text highlight across every card it spans.
-                "select-none outline-none transition-colors duration-150",
+                "select-none outline-none duration-150",
+                // The opacity axis lives on this node, not on the animation
+                // wrapper above — that wrapper already owns one (the leaving
+                // collapse and the rise-in keyframe both drive opacity), and a
+                // second declaration there would fight them.
+                "transition-[color,background-color,border-color,opacity]",
                 isActive
                   ? "border-border bg-foreground/[0.09]"
                   : isNeeds
@@ -346,6 +367,14 @@ export function SidebarInboxCard({
                 // resting/active treatments stay pure lightness.
                 selected &&
                   "border-transparent bg-accent-ember/[0.08] ring-1 ring-accent-ember/55",
+                // Hover restores by pointer, focus-within by keyboard. The
+                // pinned exception is the Snooze dropdown: Radix portals the
+                // open menu out of this card, so the pointer has left and
+                // focus sits outside — neither restore would hold, and the
+                // card the user is actively operating on would dim mid-menu.
+                receded &&
+                  !actionsPinned &&
+                  "opacity-70 hover:opacity-100 focus-within:opacity-100",
               )}
             >
               {/* Jump-shortcut hint: the digit that activates this card while

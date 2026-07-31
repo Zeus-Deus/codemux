@@ -20,6 +20,12 @@ at rest and *which workspace you are in* reads as lightness — no accent color
 for that. Accent is reserved for the claims lightness can't make: the
 needs-you red border, the ember unread dot, the ember ring that marks a row as
 checked for a bulk action, and the green "Woke" pill.
+The same doctrine runs in the other direction as **background recede**: full
+brightness is reserved for the cards that want a human — the workspace you are
+in, needs-you, done-review, unread, just-woke, and multi-selected — while a
+card whose agent is quietly working, or that is idle and already read, sits at
+reduced opacity. Nothing is hidden: hovering or focusing a receded card
+restores it in full.
 
 ## Current Model
 
@@ -163,7 +169,16 @@ visual only — nothing is archived, closed, or deleted.
   accent color — the sidebar surface is darker than the main pane, so cards
   sit flat/transparent at rest and lift on hover); needs-you cards a
   red-tinted border; multi-selected cards an **ember ring** layered over
-  whatever the card already is. Click activates; the right-click context menu
+  whatever the card already is. A card that is **none** of those and whose
+  agent is either working or absent (idle) — and that has been read and has no
+  "Woke" pill — **recedes** to `opacity-70`, restored to full by hover or
+  `focus-within` (the dim is suppressed outright while the card's Snooze menu
+  is pinned open, since Radix portals that menu out of the card and neither
+  restore would hold). The dim rides the card's own container, not the settle
+  animation wrapper, which already owns an opacity axis. It deliberately
+  includes "Wrapping up" cards: an open PR on an idle, read card is exactly the
+  work that is nobody's problem this minute. The status label keeps its hue
+  inside a dimmed card — the row is quieter, not recolored. Click activates; the right-click context menu
   is the same `WorkspaceContextMenuItems` (rename, editors, move-to-host,
   archive, delete) shared with the old row, including the delete/push-confirm
   dialogs.
@@ -549,6 +564,12 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   `sidebar-inbox.tsx` — one implementation, shared so the two views can never
   disagree), so collapsing the sidebar never re-shuffles the order the user
   just memorized. The rail has no tiers: it is a single newest-first list.
+  It mirrors the cards' **background recede**: a button that is not the open
+  workspace, is not unread (`isWorkspaceUnread` on the two backend stamps,
+  imported from `sidebar-inbox.tsx` — the rail has no manual-unread override),
+  and whose agent is working or idle drops to `opacity-70`, restored on hover.
+  The status dot dims with the button on purpose. There is no "Woke" term in
+  the predicate here, since the rail carries no woke marker.
 - **Footer**: Automations, Workspaces, Ports (badge), Settings — same order
   as the expanded footer row.
 - **Setup banner** (`sidebar-setup-banner.tsx`): hidden in the rail.
@@ -575,6 +596,9 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
 - Backend-owned `last_active_at` / `last_visited_at` stamps that survive
   restarts and reinstalls, with a one-time boot backfill from git history.
 - Unread markers derived from those stamps, plus a "Mark unread" override.
+- Background recede on cards and rail buttons: quietly-working and idle-read
+  rows sit at reduced opacity so the current, needs-you, done-review, unread,
+  woke and multi-selected rows are the bright ones; hover/focus restores.
 - Cmd/Ctrl-click and Shift-click multi-select with a bulk Settle/Snooze menu.
 - Forward navigation when parking the workspace you are currently viewing.
 - Search affordance opening the command palette; neutral-ghost new-agent button.
