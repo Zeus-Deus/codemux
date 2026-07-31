@@ -497,13 +497,22 @@ fn build_core_app<R: tauri::Runtime>(
                     state.backfill_workspace_protection();
                 });
                 layout_loaded = true;
-            } else {
+            } else if mode == AppMode::Gui {
                 // First launch — no persisted layout exists. Replace the
                 // default_app_state (which creates a CWD workspace) with an
                 // empty state so the user sees the splash screen instead.
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.clear_workspaces();
             }
+            // Headless (`codemux serve`) deliberately keeps the CWD workspace
+            // `default_app_state()` creates. The clear above exists purely to
+            // show the GUI's splash screen, and there is no splash screen to
+            // show here — a daemon that emptied its state on first launch
+            // would hand the connecting browser an instance with no active
+            // workspace, so every workspace-scoped command (`create_terminal_session`
+            // first among them) would fail until someone opened a folder from
+            // the desktop app. Serving the current directory is both the
+            // useful default and what a fresh headless box has to offer.
 
             // Ensure .mcp.json exists for all active workspaces
             if mcp_server::is_auto_mcp_enabled(&handle) {
