@@ -105,6 +105,17 @@ rrule = "0.14"
 # tokio-tungstenite + sha1 + base64 (all already in the tree).
 axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
+# HTTP response compression for the web-remote server's JSON APIs and embedded
+# frontend bundle (`CompressionLayer`, gzip only — images and other
+# already-compressed types are excluded by tower-http's default predicate).
+# Negotiated per request: a client that sends no `Accept-Encoding` still gets
+# identical identity bytes.
+tower-http = { version = "0.6", features = ["compression-gzip"] }
+# Raw-deflate codec behind the web-remote WebSocket's application-level
+# compression (`src/web_remote/compress.rs`). tungstenite has no
+# permessage-deflate, so the server frames its own compressed messages with one
+# shared deflate stream per connection. Already in the dependency tree.
+flate2 = "1"
 # Streaming body for the authenticated `/api/assets` route: `ReaderStream`
 # wraps a `tokio::fs::File` so large files (images referenced from the web
 # client) are piped chunk-by-chunk instead of buffered whole into memory.

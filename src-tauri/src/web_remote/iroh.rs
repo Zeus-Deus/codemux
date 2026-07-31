@@ -90,6 +90,11 @@ const KEY_FILE: &str = "web-remote-iroh.key";
 pub const KIND_TEXT: u8 = 0;
 /// Binary frame: a raw payload (the `[0x01]…` PTY framing).
 pub const KIND_BINARY: u8 = 1;
+// Kinds 2 and 3 are RESERVED for compressed text / binary frames, mirroring the
+// `0x02`/`0x03` wrappers the WebSocket transport already uses
+// ([`super::compress`]). This transport does not emit them yet: QUIC gives it no
+// permessage-deflate either, so it will want the same scheme, and pinning the
+// numbering now keeps the two transports' tags aligned.
 
 /// Frame header: `[u8 kind][u32 BE len]`.
 const HEADER_LEN: usize = 1 + 4;
