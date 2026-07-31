@@ -160,6 +160,11 @@ fn service_exec_path(
 /// First executable named `name` on `PATH`. Hand-rolled rather than shelling
 /// out to `which`/`command -v` so it works identically in the minimal
 /// environments this command targets.
+///
+/// The name is matched literally — no Windows `PATHEXT` expansion — because the
+/// only caller is [`resolve_exec_path`], which runs on the systemd install path
+/// and is therefore Linux-only (see [`default_host`]). A Windows caller would
+/// have to spell the extension out.
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
@@ -1083,9 +1088,14 @@ mod tests {
         // Sanity-check the PATH walk against something every host has, so a
         // broken implementation can't silently always return `None` (which
         // would quietly downgrade every AppImage install to the AppRun path).
+        //
+        // The fixture is per-platform: the lookup matches names literally, so
+        // on Windows the shell is `cmd.exe` (there is no extensionless `cmd`
+        // file in System32), while `sh` is the safe bet everywhere else.
+        let shell = if cfg!(windows) { "cmd.exe" } else { "sh" };
         assert!(
-            find_on_path("sh").is_some(),
-            "PATH lookup should find a shell"
+            find_on_path(shell).is_some(),
+            "PATH lookup should find {shell}"
         );
         assert!(find_on_path("codemux-definitely-not-installed").is_none());
     }
