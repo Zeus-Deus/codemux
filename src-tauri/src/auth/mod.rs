@@ -21,6 +21,10 @@ use tauri::Emitter;
 // ── Submodules ───────────────────────────────────────────────────
 
 pub mod api;
+/// Headless sign-in/out for the `codemux` CLI (`login` / `logout` /
+/// `whoami`). Lives beside the storage helpers it drives so the CLI and
+/// the GUI's Tauri commands persist the identical auth record.
+pub mod cli_login;
 pub mod derivation;
 
 // Re-export the zero-knowledge auth derivation + API client at the

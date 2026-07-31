@@ -5,8 +5,13 @@
 //!
 //! - **loopback** — `127.0.0.1` (a browser secure-context origin, so
 //!   clipboard etc. keep working here).
-//! - **lan** — every non-loopback IPv4 on a *real* local interface that is
-//!   not inside the tailnet CGNAT range.
+//! - **lan** — every non-loopback *private* IPv4 on a *real* local interface
+//!   that is not inside the tailnet CGNAT range (plus marginal addresses such
+//!   as unique-local IPv6).
+//! - **public** — a globally routable IPv4/IPv6 on a real interface. The only
+//!   way a server-class host (a VPS whose one address is a public IPv4) is
+//!   reachable at all, so it is surfaced and — absent anything better —
+//!   recommended.
 //! - **tailnet** — interface IPs inside `100.64.0.0/10` plus whatever
 //!   `tailscale status --json` reports for this node.
 //! - **magicdns** — the node's MagicDNS name (`Self.DNSName`) when
@@ -18,23 +23,24 @@
 //! human wants to point a browser.
 //!
 //! Each endpoint also carries a coarse `group` (`this_device` |
-//! `local_network` | `tailscale` | `other`) that the settings UI renders as
-//! labelled sections, and a single `recommended` hint pointing at the best
-//! "from anywhere" option.
+//! `local_network` | `tailscale` | `public_internet` | `other`) that the
+//! settings UI renders as labelled sections, and a single `recommended` hint
+//! pointing at the best "from anywhere" option.
 //!
 //! Everything degrades gracefully: no interfaces, no `tailscale` binary,
 //! or a malformed status blob just yields fewer entries, never an error.
 
 use serde::Serialize;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// A single place a browser could reach this desktop.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Endpoint {
-    /// `loopback` | `lan` | `tailnet` | `magicdns`.
+    /// `loopback` | `lan` | `public` | `tailnet` | `magicdns`.
     pub kind: String,
     /// Coarse UI grouping: `this_device` | `local_network` | `tailscale` |
-    /// `other`. Drives the labelled sections in the settings panel.
+    /// `public_internet` | `other`. Drives the labelled sections in the
+    /// settings panel.
     pub group: String,
     /// IP literal or DNS hostname (no scheme, no port).
     pub host: String,
@@ -56,6 +62,11 @@ pub struct Endpoint {
 const GROUP_THIS_DEVICE: &str = "this_device";
 const GROUP_LOCAL_NETWORK: &str = "local_network";
 const GROUP_TAILSCALE: &str = "tailscale";
+/// Globally routable addresses — a VPS's public IPv4/IPv6. Kept out of
+/// `other` (which is a catch-all disclosure for marginal addresses) because on
+/// a server-class host it is *the* way in, and because the internet-exposure
+/// note deserves to be visible rather than tucked away.
+const GROUP_PUBLIC: &str = "public_internet";
 const GROUP_OTHER: &str = "other";
 /// The from-anywhere iroh transport's group. New to the UI's fixed set; the
 /// frontend grouping helper degrades an unrecognised group to `other`, so this
@@ -114,6 +125,52 @@ fn is_tailnet_v4(addr: Ipv4Addr) -> bool {
 fn is_lan_v4(addr: Ipv4Addr) -> bool {
     addr.is_private() || addr.is_link_local()
 }
+
+/// `true` if `addr` is a globally routable IPv4 — the public address of a
+/// server-class host. Everything with a special-use meaning is excluded:
+/// private/loopback/link-local/broadcast/multicast, the CGNAT range used by
+/// the tailnet, documentation ranges, `0.0.0.0/8`, `192.0.0.0/24` (IETF
+/// protocol assignments), `198.18.0.0/15` (benchmarking), and the reserved
+/// `240.0.0.0/4`. `Ipv4Addr::is_global` would say this for us, but it is
+/// still unstable, so the checks live here.
+fn is_global_v4(addr: Ipv4Addr) -> bool {
+    let o = addr.octets();
+    !(addr.is_private()
+        || addr.is_loopback()
+        || addr.is_link_local()
+        || addr.is_broadcast()
+        || addr.is_documentation()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+        || is_tailnet_v4(addr)
+        || o[0] == 0
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        || o[0] >= 240)
+}
+
+/// `true` if `addr` is a globally routable IPv6. Excludes loopback, the
+/// unspecified address, multicast, link-local (`fe80::/10`), unique-local
+/// (`fc00::/7`, which covers the tailnet's `fd7a:115c:a1e0::/48`), the
+/// documentation prefix (`2001:db8::/32`), and IPv4-mapped addresses (judged
+/// by their embedded v4 instead). `Ipv6Addr::is_global` is unstable, hence the
+/// hand-rolled version.
+fn is_global_v6(addr: Ipv6Addr) -> bool {
+    let s = addr.segments();
+    let is_v4_mapped = s[0..5].iter().all(|x| *x == 0) && s[5] == 0xffff;
+    !(addr.is_loopback()
+        || addr.is_unspecified()
+        || addr.is_multicast()
+        || (s[0] & 0xffc0) == 0xfe80
+        || (s[0] & 0xfe00) == 0xfc00
+        || (s[0] == 0x2001 && s[1] == 0x0db8)
+        || is_v4_mapped)
+}
+
+/// The human hint attached to a globally routable address. Deliberately blunt:
+/// unlike a LAN or tailnet address this port is reachable by anyone on the
+/// internet who finds it, and it is plain HTTP (`secure: false`) either way.
+const PUBLIC_LABEL: &str = "Public address (plain HTTP — reachable from the internet)";
 
 /// Build the URL host portion, bracketing IPv6 literals.
 fn url_host(host: &str, is_v6: bool) -> String {
@@ -293,6 +350,22 @@ fn push_interface_endpoints(ifaces: &[(String, IpAddr)], port: u16, out: &mut Ve
                             false,
                         ),
                     );
+                } else if is_global_v4(*v4) {
+                    // A public IPv4 on a real interface — on a hosted box this
+                    // is the only address anyone can reach, so surface it
+                    // rather than dropping it and leaving only loopback.
+                    push_unique(
+                        out,
+                        make_endpoint(
+                            "public",
+                            GROUP_PUBLIC,
+                            v4.to_string(),
+                            port,
+                            false,
+                            PUBLIC_LABEL,
+                            false,
+                        ),
+                    );
                 }
             }
             IpAddr::V6(v6) => {
@@ -301,19 +374,17 @@ fn push_interface_endpoints(ifaces: &[(String, IpAddr)], port: u16, out: &mut Ve
                 if (v6.segments()[0] & 0xffc0) == 0xfe80 {
                     continue;
                 }
-                // Unique-local (fc00::/7) and global v6 have no better class
-                // than "other" from the server's point of view; plain HTTP.
+                // A globally routable v6 is internet-reachable, exactly like a
+                // public v4; unique-local (fc00::/7) and anything else has no
+                // better class than "other". Plain HTTP either way.
+                let (kind, group, label) = if is_global_v6(*v6) {
+                    ("public", GROUP_PUBLIC, PUBLIC_LABEL)
+                } else {
+                    ("lan", GROUP_OTHER, "Other network address (plain HTTP)")
+                };
                 push_unique(
                     out,
-                    make_endpoint(
-                        "lan",
-                        GROUP_OTHER,
-                        v6.to_string(),
-                        port,
-                        false,
-                        "Other network address (plain HTTP)",
-                        true,
-                    ),
+                    make_endpoint(kind, group, v6.to_string(), port, false, label, true),
                 );
             }
         }
@@ -321,14 +392,19 @@ fn push_interface_endpoints(ifaces: &[(String, IpAddr)], port: u16, out: &mut Ve
 }
 
 /// Mark the single best "from anywhere" endpoint as recommended: the MagicDNS
-/// name if present, else any tailnet IP, else the first local-network
-/// address. Loopback-only (nowhere to reach from) leaves nothing marked.
+/// name if present, else any tailnet IP, else the first local-network address,
+/// else a globally routable address. Public comes last because it is the least
+/// private option, but it must be considered — a hosted box whose only address
+/// is a public IPv4 would otherwise recommend nothing and fall back to a
+/// useless `127.0.0.1` pairing URL. Loopback-only (nowhere to reach from)
+/// still leaves nothing marked.
 fn mark_recommended(out: &mut [Endpoint]) {
     let idx = out
         .iter()
         .position(|e| e.kind == "magicdns")
         .or_else(|| out.iter().position(|e| e.group == GROUP_TAILSCALE))
-        .or_else(|| out.iter().position(|e| e.group == GROUP_LOCAL_NETWORK));
+        .or_else(|| out.iter().position(|e| e.group == GROUP_LOCAL_NETWORK))
+        .or_else(|| out.iter().position(|e| e.kind == "public"));
     if let Some(i) = idx {
         out[i].recommended = true;
     }
@@ -400,6 +476,104 @@ mod tests {
         assert!(is_lan_v4("10.0.0.7".parse().unwrap()));
         assert!(is_lan_v4("172.16.4.4".parse().unwrap()));
         assert!(!is_lan_v4("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn global_v4_detection() {
+        assert!(is_global_v4("203.0.114.9".parse().unwrap()));
+        assert!(is_global_v4("8.8.8.8".parse().unwrap()));
+        assert!(is_global_v4("45.79.12.34".parse().unwrap()));
+        // Special-use ranges are never "public".
+        for special in [
+            "192.168.1.5",
+            "10.0.0.7",
+            "172.16.4.4",
+            "127.0.0.1",
+            "169.254.5.5",
+            "100.100.100.100",
+            "0.1.2.3",
+            "192.0.0.8",
+            "192.0.2.7",
+            "198.51.100.7",
+            "203.0.113.7",
+            "198.19.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+            "224.0.0.1",
+        ] {
+            assert!(
+                !is_global_v4(special.parse().unwrap()),
+                "{special} should not count as a public address"
+            );
+        }
+    }
+
+    #[test]
+    fn global_v6_detection() {
+        assert!(is_global_v6("2a01:4f8:1c1c:1::1".parse().unwrap()));
+        for special in [
+            "::1",
+            "::",
+            "fe80::1",
+            "fd00::5",
+            "fd7a:115c:a1e0::1",
+            "2001:db8::1",
+            "ff02::1",
+            "::ffff:192.168.1.5",
+        ] {
+            assert!(
+                !is_global_v6(special.parse().unwrap()),
+                "{special} should not count as a public address"
+            );
+        }
+    }
+
+    #[test]
+    fn public_v4_is_surfaced_and_grouped() {
+        let ifaces = vec![("eth0".to_string(), "203.0.114.9".parse().unwrap())];
+        let mut out = Vec::new();
+        push_interface_endpoints(&ifaces, 4377, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].kind, "public");
+        assert_eq!(out[0].group, GROUP_PUBLIC);
+        assert_eq!(out[0].url, "http://203.0.114.9:4377");
+        assert!(!out[0].secure, "a public address is still plain HTTP");
+        assert!(
+            out[0].label.contains("internet"),
+            "the label must warn that the address is internet-reachable: {}",
+            out[0].label
+        );
+    }
+
+    #[test]
+    fn public_v6_is_grouped_with_public_v4_and_bracketed() {
+        let ifaces = vec![
+            ("eth0".to_string(), "2a01:4f8:1c1c:1::1".parse().unwrap()),
+            ("eth0".to_string(), "fd00::5".parse().unwrap()),
+        ];
+        let mut out = Vec::new();
+        push_interface_endpoints(&ifaces, 4377, &mut out);
+        let public = out.iter().find(|e| e.kind == "public").unwrap();
+        assert_eq!(public.group, GROUP_PUBLIC);
+        assert_eq!(public.url, "http://[2a01:4f8:1c1c:1::1]:4377");
+        // Unique-local v6 keeps its old "other" classification.
+        let ula = out.iter().find(|e| e.host == "fd00::5").unwrap();
+        assert_eq!(ula.kind, "lan");
+        assert_eq!(ula.group, GROUP_OTHER);
+    }
+
+    #[test]
+    fn public_addresses_on_virtual_ifaces_are_still_skipped() {
+        let ifaces = vec![
+            ("docker0".to_string(), "203.0.114.9".parse().unwrap()),
+            ("veth1234".to_string(), "8.8.8.8".parse().unwrap()),
+            ("tailscale0".to_string(), "2a01:4f8:1c1c:1::1".parse().unwrap()),
+            ("eth0".to_string(), "203.0.114.10".parse().unwrap()),
+        ];
+        let mut out = Vec::new();
+        push_interface_endpoints(&ifaces, 4377, &mut out);
+        assert_eq!(out.len(), 1, "only the real interface's address survives");
+        assert_eq!(out[0].host, "203.0.114.10");
     }
 
     #[test]
@@ -522,6 +696,79 @@ mod tests {
         )];
         mark_recommended(&mut c);
         assert_eq!(c.iter().filter(|e| e.recommended).count(), 0);
+    }
+
+    #[test]
+    fn recommended_falls_back_to_public_when_it_is_the_only_way_in() {
+        // A hosted box: loopback plus one public IPv4. Without the public
+        // fallback this recommended nothing and the pairing URL was 127.0.0.1.
+        let mut out = vec![
+            make_endpoint("loopback", GROUP_THIS_DEVICE, "127.0.0.1".into(), 4377, true, "", false),
+            make_endpoint("public", GROUP_PUBLIC, "203.0.114.9".into(), 4377, false, "", false),
+        ];
+        mark_recommended(&mut out);
+        let rec = out.iter().find(|e| e.recommended).unwrap();
+        assert_eq!(rec.kind, "public");
+        assert_eq!(rec.host, "203.0.114.9");
+        assert_eq!(out.iter().filter(|e| e.recommended).count(), 1);
+    }
+
+    #[test]
+    fn tailnet_and_local_network_still_outrank_public() {
+        // Tailnet beats a public address.
+        let mut a = vec![
+            make_endpoint("loopback", GROUP_THIS_DEVICE, "127.0.0.1".into(), 4377, true, "", false),
+            make_endpoint("public", GROUP_PUBLIC, "203.0.114.9".into(), 4377, false, "", false),
+            make_endpoint("tailnet", GROUP_TAILSCALE, "100.64.0.1".into(), 4377, false, "", false),
+        ];
+        mark_recommended(&mut a);
+        assert_eq!(a.iter().find(|e| e.recommended).unwrap().kind, "tailnet");
+
+        // So does a local-network address.
+        let mut b = vec![
+            make_endpoint("loopback", GROUP_THIS_DEVICE, "127.0.0.1".into(), 4377, true, "", false),
+            make_endpoint("public", GROUP_PUBLIC, "203.0.114.9".into(), 4377, false, "", false),
+            make_endpoint("lan", GROUP_LOCAL_NETWORK, "192.168.1.5".into(), 4377, false, "", false),
+        ];
+        mark_recommended(&mut b);
+        assert_eq!(b.iter().find(|e| e.recommended).unwrap().host, "192.168.1.5");
+
+        // And a marginal "other" address (link-local, ULA) never wins — it is
+        // not a public address, so loopback-plus-other still recommends nothing.
+        let mut c = vec![
+            make_endpoint("loopback", GROUP_THIS_DEVICE, "127.0.0.1".into(), 4377, true, "", false),
+            make_endpoint("lan", GROUP_OTHER, "169.254.5.5".into(), 4377, false, "", false),
+        ];
+        mark_recommended(&mut c);
+        assert_eq!(c.iter().filter(|e| e.recommended).count(), 0);
+    }
+
+    #[test]
+    fn public_only_host_yields_a_public_pairing_endpoint_end_to_end() {
+        // The full `list`-shaped path for a public-IPv4-only host: loopback
+        // first (so `.first()` is loopback), the public address recommended —
+        // which is what `control_pair_from` turns into the pairing URL.
+        let mut out = vec![make_endpoint(
+            "loopback",
+            GROUP_THIS_DEVICE,
+            "127.0.0.1".into(),
+            4377,
+            true,
+            "This device only (secure context)",
+            false,
+        )];
+        push_interface_endpoints(
+            &[("eth0".to_string(), "203.0.114.9".parse().unwrap())],
+            4377,
+            &mut out,
+        );
+        mark_recommended(&mut out);
+        let chosen = out
+            .iter()
+            .find(|e| e.recommended)
+            .or_else(|| out.first())
+            .unwrap();
+        assert_eq!(chosen.url, "http://203.0.114.9:4377");
     }
 
     #[test]

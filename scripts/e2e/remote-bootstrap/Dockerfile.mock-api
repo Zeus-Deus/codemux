@@ -1,0 +1,13 @@
+# The stand-in Codemux account API. Stdlib-only Python, so no pip layer and no
+# network access at build time beyond the base image itself.
+FROM python:3.12-slim
+
+RUN mkdir -p /var/log/mock-api
+COPY mock-api/server.py /opt/mock-api/server.py
+
+ENV E2E_PORT=8787 \
+    E2E_LOG=/var/log/mock-api/requests.jsonl \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8787
+CMD ["python3", "/opt/mock-api/server.py"]

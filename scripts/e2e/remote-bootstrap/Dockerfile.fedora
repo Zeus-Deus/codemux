@@ -1,0 +1,53 @@
+# Fedora 41 with real systemd as PID 1 — the .rpm half of the matrix.
+#
+# Same shape as Dockerfile.ubuntu: systemd + logind + dbus so `systemctl
+# --user` and lingering are genuine, sudo for the package install, and no
+# preinstalled WebKitGTK (the .rpm's own Requires must pull it).
+FROM fedora:41
+
+ENV container=docker \
+    LANG=C.UTF-8
+
+# openssh-server: the harness logs in over real SSH so pam_systemd creates a
+# logind session and starts `user@<uid>.service` — without that there is no
+# user bus and `systemctl --user` is unusable.
+#
+# polkit is load-bearing, not incidental: `codemux connect` ends with
+# `loginctl enable-linger`, which logind delegates to polkit's
+# `org.freedesktop.login1.set-self-linger` (allow_active). Without polkit
+# installed, every non-root caller is denied and lingering — the "stays
+# reachable after you log out" half of the promise — silently fails.
+RUN dnf -y install \
+      systemd dbus-daemon dbus-broker polkit \
+      openssh-server \
+      sudo curl iproute procps-ng shadow-utils file sqlite \
+ && dnf clean all \
+ && ssh-keygen -A \
+ && systemctl enable sshd
+
+# Container-hostile boot units. Unlike the Debian image, Fedora's presets are
+# already lean, so masking the handful that fail is enough — and logind is
+# explicitly left running (it starts `user@<uid>.service` for lingering users).
+# Container-hostile boot units. systemd-oomd needs cgroup pressure data it
+# cannot get here and systemd-resolved has no resolv.conf to own; both only
+# ever land the boot in `degraded`, which would make a real failure harder to
+# spot.
+RUN systemctl mask \
+      systemd-remount-fs.service \
+      dev-hugepages.mount \
+      sys-fs-fuse-connections.mount \
+      systemd-udevd.service \
+      systemd-udev-trigger.service \
+      systemd-oomd.service \
+      systemd-oomd.socket \
+      systemd-resolved.service \
+    || true
+
+ARG E2E_USER=tester
+RUN useradd --create-home --shell /bin/bash "${E2E_USER}" \
+ && printf '%s ALL=(ALL) NOPASSWD:ALL\n' "${E2E_USER}" > "/etc/sudoers.d/${E2E_USER}" \
+ && chmod 0440 "/etc/sudoers.d/${E2E_USER}"
+
+STOPSIGNAL SIGRTMIN+3
+
+CMD ["/sbin/init"]

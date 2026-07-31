@@ -182,7 +182,10 @@ export interface EndpointSecurityHint {
  * The per-endpoint security note surfaced next to each URL. Secure
  * origins are marked "Secure"; plain-HTTP origins carry the explicit
  * degradation warning (clipboard + notifications disabled) so the user
- * understands why the web client feels limited there.
+ * understands why the web client feels limited there. A globally routable
+ * address (`kind: "public"` — e.g. a hosted box's public IPv4) additionally
+ * says so out loud: unlike a LAN or mesh address, anyone on the internet who
+ * finds the port can reach the pairing screen.
  */
 export function endpointSecurityHint(ep: WebRemoteEndpoint): EndpointSecurityHint {
   if (endpointIsSecure(ep)) {
@@ -190,6 +193,14 @@ export function endpointSecurityHint(ep: WebRemoteEndpoint): EndpointSecurityHin
       secure: true,
       badge: "Secure",
       detail: "Secure origin — clipboard and notifications work in the browser.",
+    };
+  }
+  if (ep.kind === "public") {
+    return {
+      secure: false,
+      badge: "Public",
+      detail:
+        "Reachable from the internet over plain HTTP — anyone who can reach this port can load the pairing screen, and browser clipboard and notifications are disabled here. Put it behind HTTPS (a reverse proxy) or a mesh VPN, and keep the firewall tight.",
     };
   }
   return {
@@ -206,6 +217,7 @@ export type EndpointGroupId =
   | "this_device"
   | "local_network"
   | "tailscale"
+  | "public_internet"
   | "other";
 
 export interface EndpointGroupMeta {
@@ -240,6 +252,13 @@ export const ENDPOINT_GROUPS: EndpointGroupMeta[] = [
     title: "Tailscale",
     explanation:
       "Reach this machine from anywhere on your tailnet — set up Tailscale's HTTPS serve for a secure connection",
+    collapsible: false,
+  },
+  {
+    id: "public_internet",
+    title: "Public internet",
+    explanation:
+      "Globally routable address — reachable from anywhere, by anyone who can reach the port",
     collapsible: false,
   },
   {

@@ -10,6 +10,8 @@
 //! - [`mod@self`] — managed state, config persistence, lifecycle, commands.
 //! - [`server`]   — axum router, static assets, `/api/*`, `/ws`.
 //! - [`auth`]     — pairing tokens, sessions, WS tickets, origin checks.
+//! - [`connect`]  — the one-command `codemux connect` remote-access bootstrap
+//!   (sign in → persist relay config → install/drive a background service).
 //! - [`account`]  — account-mode admission: verify the browser owns the same
 //!   Codemux account the desktop is signed into, then mint a session.
 //! - [`dispatch`] — invoke dispatch via synthesized `on_message` + channels.
@@ -29,6 +31,7 @@ pub mod account;
 pub mod assets;
 pub mod auth;
 pub mod compress;
+pub mod connect;
 pub mod dispatch;
 pub mod endpoints;
 pub mod events;
@@ -40,6 +43,7 @@ pub mod server;
 pub mod snapshot;
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -178,6 +182,18 @@ pub(crate) struct RunningServer {
 /// `lib.rs` needs [`Shared::channels`] at `Builder` time).
 pub(crate) struct Shared {
     pub config: Mutex<WebRemoteConfig>,
+    /// Has `config` been read back from the settings store yet?
+    ///
+    /// `Shared` is constructed at `Builder` time, long before a `DatabaseStore`
+    /// exists, so `config` starts as [`WebRemoteConfig::default`] — a value
+    /// nobody chose. Because [`persist_config`] writes the *whole* struct, any
+    /// mutation made before the persisted row was loaded would silently
+    /// overwrite every field the caller never touched (this is exactly how a
+    /// persisted `relay_mode_enabled: true` used to be flipped back to `false`
+    /// by a plain enable under `codemux serve`). Every entry point that reads or
+    /// mutates the config therefore calls [`ensure_config_hydrated`] first,
+    /// which flips this once.
+    config_hydrated: AtomicBool,
     pub runtime: Mutex<Option<RunningServer>>,
     pub pairing: auth::PairingStore,
     pub tickets: auth::TicketStore,
@@ -201,6 +217,7 @@ impl Default for Shared {
     fn default() -> Self {
         Self {
             config: Mutex::new(WebRemoteConfig::default()),
+            config_hydrated: AtomicBool::new(false),
             runtime: Mutex::new(None),
             pairing: auth::PairingStore::default(),
             tickets: auth::TicketStore::default(),
@@ -357,7 +374,7 @@ pub struct ControlPairing {
     /// (loopback only). Informational for the CLI.
     pub secure: bool,
     /// The endpoint kind backing `host` (`magicdns` | `tailnet` | `lan` |
-    /// `loopback`), so the CLI can hint how far it reaches.
+    /// `public` | `loopback`), so the CLI can hint how far it reaches.
     pub endpoint_kind: String,
 }
 
@@ -407,6 +424,9 @@ pub fn control_pair<R: Runtime>(
     suggested_name: Option<String>,
 ) -> Result<ControlPairing, String> {
     let shared = app.state::<WebRemoteState>().shared();
+    // Pairing refuses when remote access is off and embeds the port in the URL,
+    // so it has to see the persisted config, not the pre-boot default.
+    ensure_config_hydrated(app, &shared);
     control_pair_from(&shared, suggested_name)
 }
 
@@ -420,13 +440,14 @@ pub struct ControlEnableResult {
     pub status: WebRemoteStatus,
     /// The recommended endpoint's base URL (`http://<host>:<port>`) — the same
     /// single `recommended` pick the Settings pane surfaces (MagicDNS → tailnet
-    /// → local network, falling back to loopback). `None` only if no endpoint
-    /// could be enumerated at all.
+    /// → local network → public), falling back to the first enumerated entry
+    /// (loopback) when nothing is reachable from off-box. `None` only if no
+    /// endpoint could be enumerated at all.
     pub endpoint_url: Option<String>,
     /// The recommended endpoint's host (IP literal or MagicDNS name).
     pub endpoint_host: Option<String>,
     /// The recommended endpoint kind (`magicdns` | `tailnet` | `lan` |
-    /// `loopback`), so the CLI can hint how far it reaches.
+    /// `public` | `loopback`), so the CLI can hint how far it reaches.
     pub endpoint_kind: Option<String>,
     /// Whether the recommended endpoint is a browser secure context (loopback).
     pub endpoint_secure: bool,
@@ -487,6 +508,10 @@ pub async fn control_enable<R: Runtime>(
     port: Option<u16>,
 ) -> Result<ControlEnableResult, String> {
     let shared = app.state::<WebRemoteState>().shared();
+    // Decide against the persisted config, never against the pre-boot default:
+    // an enable with no flags must keep the persisted port/scope/relay, and
+    // must not persist a default over them.
+    ensure_config_hydrated(app, &shared);
     let already_enabled = shared.config.lock().unwrap().enabled;
     let already_bound = shared.runtime.lock().unwrap().is_some();
 
@@ -496,7 +521,16 @@ pub async fn control_enable<R: Runtime>(
             // port change from the Settings pane uses (drops existing sockets).
             let status =
                 set_config_core(app, &shared, port, None, scope, None, None, None).await?;
-            (status, false)
+            if already_bound {
+                (status, false)
+            } else {
+                // Persisted-enabled but nothing bound (headless serve leaves
+                // boot-time binding to its awaited startup path). `set_config_core`
+                // only *rebinds* an already-running listener, so an enable with
+                // flags would otherwise persist the new scope/port and leave the
+                // server off. Bind through the shared path instead.
+                (enable_core(app, &shared).await?, false)
+            }
         } else if already_bound {
             (build_status(app, &shared), true)
         } else {
@@ -547,6 +581,24 @@ pub async fn control_enable<R: Runtime>(
     })
 }
 
+/// Turn the from-anywhere relay transport on or off in a RUNNING instance,
+/// from the same-machine control socket (`codemux connect` / `codemux connect
+/// off` when a GUI or `serve` already holds the control endpoint).
+///
+/// Goes through the same [`set_config_core`] the Settings pane's relay switch
+/// uses, so the flag is persisted and — when the server is bound — the iroh
+/// endpoint plus device registration start/stop in lockstep. Deliberately the
+/// only way the CLI flips relay mode on a live instance: writing the setting
+/// row directly would be silently overwritten the next time the instance
+/// persists its in-memory config.
+pub async fn control_set_relay<R: Runtime>(
+    app: &AppHandle<R>,
+    enabled: bool,
+) -> Result<WebRemoteStatus, String> {
+    let shared = app.state::<WebRemoteState>().shared();
+    set_config_core(app, &shared, None, None, None, None, None, Some(enabled)).await
+}
+
 /// Disable web remote access from the same-machine control socket (the
 /// `codemux remote disable` CLI over SSH). Shares the exact [`disable_core`]
 /// path the Tauri command uses: severs live sockets, tears the iroh endpoint
@@ -557,6 +609,11 @@ pub fn control_disable<R: Runtime>(app: &AppHandle<R>) -> Result<WebRemoteStatus
 }
 
 fn build_status<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> WebRemoteStatus {
+    // The single funnel for every config *read* surfaced to a caller (the
+    // `web_remote_status` command, the `web-remote-state-changed` payload, and
+    // `serve`'s scope resolution), so none of them can see the pre-boot default
+    // instead of what the user actually persisted.
+    ensure_config_hydrated(app, shared);
     let cfg = shared.config.lock().unwrap().clone();
     let running = shared.runtime.lock().unwrap().is_some();
     let active_connections = shared.connections.active_count();
@@ -614,19 +671,88 @@ pub(crate) fn emit_state_changed<R: Runtime>(app: &AppHandle<R>) {
 // ── Config persistence ──────────────────────────────────────────────
 
 fn persist_config<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
+    // Writing the live config over the settings row is only safe once the row
+    // has been read back into it — otherwise fields the caller never intended
+    // to change (relay mode, account mode, the port…) get stamped with the
+    // in-memory default. Every mutating entry point hydrates first; this
+    // assertion is the tripwire for a future one that forgets.
+    debug_assert!(
+        shared.config_hydrated.load(Ordering::SeqCst),
+        "persist_config before ensure_config_hydrated would clobber persisted fields"
+    );
     let cfg = shared.config.lock().unwrap().clone();
-    if let Ok(json) = serde_json::to_string(&cfg) {
-        let _ = app
-            .state::<crate::database::DatabaseStore>()
-            .set_setting(CONFIG_KEY, &json);
-    }
+    let _ = save_config_to_db(&app.state::<crate::database::DatabaseStore>(), &cfg);
 }
 
-fn load_config<R: Runtime>(app: &AppHandle<R>) -> WebRemoteConfig {
-    app.state::<crate::database::DatabaseStore>()
-        .get_setting(CONFIG_KEY)
+/// Read the persisted config into `shared.config` exactly once, before anything
+/// reads or mutates it. Idempotent and cheap after the first call.
+///
+/// The GUI reaches this through [`restore_on_boot`] in the Tauri `setup` hook.
+/// Anything that can run *without* that hook — headless `codemux serve`, whose
+/// startup path binds the server itself — hydrates through the same door, so
+/// there is no ordering in which a caller can persist a config it never loaded.
+/// See [`Shared::config_hydrated`].
+pub(crate) fn ensure_config_hydrated<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) {
+    hydrate_config_from(shared, &app.state::<crate::database::DatabaseStore>());
+}
+
+/// [`ensure_config_hydrated`] against a `DatabaseStore` directly, so the
+/// invariant is unit-testable without an `AppHandle`. The load happens under
+/// the config lock so a concurrent mutation can neither be lost nor observe a
+/// half-hydrated config.
+pub(crate) fn hydrate_config_from(shared: &Arc<Shared>, db: &crate::database::DatabaseStore) {
+    let mut cfg = shared.config.lock().unwrap();
+    if shared.config_hydrated.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    *cfg = load_config_from_db(db);
+}
+
+// ── Headless config access (no running instance) ────────────────────
+//
+// `persist_config` / `load_config` above need an `AppHandle` because that is
+// how the running app reaches the settings store. `codemux connect` has no app
+// — it configures a machine BEFORE anything runs — so these three take the
+// `DatabaseStore` directly and go through the exact same `CONFIG_KEY` +
+// serde-JSON representation the app reads back on boot (`restore_on_boot`).
+// Keeping them adjacent to the app-handle pair is deliberate: a change to how
+// the config is stored has to touch both or neither.
+
+/// Read the persisted config straight from the settings store. Missing or
+/// unparseable → [`WebRemoteConfig::default`], matching [`load_config`].
+pub fn load_config_from_db(db: &crate::database::DatabaseStore) -> WebRemoteConfig {
+    db.get_setting(CONFIG_KEY)
         .and_then(|v| serde_json::from_str(&v).ok())
         .unwrap_or_default()
+}
+
+/// Write the config to the settings store. Unlike [`persist_config`] (which is
+/// best-effort because the running server is the source of truth) this reports
+/// failures — a headless caller has no other way to know the write was lost.
+pub fn save_config_to_db(
+    db: &crate::database::DatabaseStore,
+    cfg: &WebRemoteConfig,
+) -> Result<(), String> {
+    let json = serde_json::to_string(cfg).map_err(|e| format!("serialize config: {e}"))?;
+    db.set_setting(CONFIG_KEY, &json)
+}
+
+/// Load → mutate → save, returning the config as persisted. The mutation may
+/// reject the request (an unknown bind scope), in which case nothing is
+/// written. Used by `codemux connect` on a machine with nothing running; when
+/// an instance IS running it must not be used — the live instance owns the
+/// in-memory config and would re-persist over this write.
+pub fn update_config_headless<F>(
+    db: &crate::database::DatabaseStore,
+    mutate: F,
+) -> Result<WebRemoteConfig, String>
+where
+    F: FnOnce(&mut WebRemoteConfig) -> Result<(), String>,
+{
+    let mut cfg = load_config_from_db(db);
+    mutate(&mut cfg)?;
+    save_config_to_db(db, &cfg)?;
+    Ok(cfg)
 }
 
 // ── Server lifecycle ────────────────────────────────────────────────
@@ -734,17 +860,19 @@ fn stop_server(shared: &Arc<Shared>) {
 }
 
 /// Load persisted config on boot and, if the feature was left enabled,
-/// re-bind the server. Called once from the Tauri `setup` hook. A bind
-/// failure (port taken) is logged, not fatal — the desktop still runs.
+/// re-bind the server. Called once from the Tauri `setup` hook — which the
+/// headless `codemux serve` app runs too (see `crate::build_headless_app`). A
+/// bind failure (port taken) is logged, not fatal — the desktop still runs.
 pub fn restore_on_boot<R: Runtime>(app: &AppHandle<R>) {
     let shared = app.state::<WebRemoteState>().shared();
-    let cfg = load_config(app);
-    let enabled = cfg.enabled;
-    *shared.config.lock().unwrap() = cfg;
+    ensure_config_hydrated(app, &shared);
+    let enabled = shared.config.lock().unwrap().enabled;
     // `codemux serve` performs an awaited enable after the full headless app
     // has built so startup can report bind failures synchronously. Spawning
     // this normal GUI restore in parallel would race that enable and could
-    // make serve print a pairing URL before any listener exists.
+    // make serve print a pairing URL before any listener exists. The hydration
+    // above still happened, which is what that awaited enable then merges its
+    // explicit flags into.
     if crate::app_mode(app) == crate::AppMode::ServeHeadless {
         return;
     }
@@ -814,6 +942,9 @@ pub fn e2e_autostart<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let shared = app.state::<WebRemoteState>().shared();
+        // Same rule as every other mutate-then-persist path: load the persisted
+        // row before overriding the three fields the harness owns.
+        ensure_config_hydrated(&app, &shared);
         {
             let mut cfg = shared.config.lock().unwrap();
             cfg.enabled = true;
@@ -867,6 +998,10 @@ pub fn web_remote_status<R: Runtime>(app: AppHandle<R>) -> WebRemoteStatus {
 /// changed` through the exact same path. Callers that want to change the scope
 /// or port first mutate `shared.config`, then call this.
 async fn enable_core<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<WebRemoteStatus, String> {
+    // Enabling changes exactly one field. Hydrating first is what keeps the
+    // `persist_config` below from writing the in-memory default over every
+    // other persisted field (notably `relay_mode_enabled`).
+    ensure_config_hydrated(app, shared);
     shared.config.lock().unwrap().enabled = true;
     persist_config(app, shared);
     if let Err(e) = start_server(app, shared).await {
@@ -909,6 +1044,9 @@ fn mark_disabled(cfg: &mut WebRemoteConfig) {
 /// Turn every remote transport off — the shared body of the `web_remote_disable`
 /// Tauri command and the `codemux remote disable` control command.
 fn disable_core<R: Runtime>(app: &AppHandle<R>, shared: &Arc<Shared>) -> Result<WebRemoteStatus, String> {
+    // Same reason as `enable_core`: disable owns one field, so the rest of the
+    // persisted config has to be in memory before it is written back.
+    ensure_config_hydrated(app, shared);
     mark_disabled(&mut shared.config.lock().unwrap());
     persist_config(app, shared);
     // The master switch is the kill for *every* remote transport: `stop_server`
@@ -965,6 +1103,11 @@ async fn set_config_core<R: Runtime>(
     trust_account_browsers: Option<bool>,
     relay_mode_enabled: Option<bool>,
 ) -> Result<WebRemoteStatus, String> {
+    // Every `Some(…)` below is an intentional change; every `None` must be left
+    // exactly as persisted, which requires the persisted values to be in memory
+    // before the write-back.
+    ensure_config_hydrated(app, shared);
+
     // Reject an unknown scope before mutating anything, so we never persist a
     // value the bind logic can't honour.
     if let Some(ref s) = bind_scope {
@@ -1067,6 +1210,9 @@ pub fn web_remote_create_pairing<R: Runtime>(app: AppHandle<R>) -> PairingInfo {
 #[tauri::command]
 pub fn web_remote_list_endpoints<R: Runtime>(app: AppHandle<R>) -> Vec<endpoints::Endpoint> {
     let shared = app.state::<WebRemoteState>().shared();
+    // The enumerated URLs carry the port, so they must reflect the persisted
+    // config rather than the pre-boot default.
+    ensure_config_hydrated(&app, &shared);
     let (port, relay_mode_enabled) = {
         let cfg = shared.config.lock().unwrap();
         (cfg.port, cfg.relay_mode_enabled)
@@ -1605,6 +1751,88 @@ mod tests {
         let sessions = vec![mk("a", true), mk("b", false), mk("c", true)];
         let connected = sessions.iter().filter(|s| s.connected).count();
         assert_eq!(connected, 2, "only sessions with a live socket count");
+    }
+
+    // ── Config hydration (the "enable must not clobber" invariant) ──
+
+    /// The exact shape `codemux connect` leaves behind on a fresh box: remote
+    /// access on, relay on, a non-default port.
+    fn seed_connect_config(db: &crate::database::DatabaseStore) {
+        update_config_headless(db, |cfg| {
+            cfg.enabled = true;
+            cfg.port = 4399;
+            cfg.bind_scope = BIND_SCOPE_LOOPBACK.to_string();
+            cfg.relay_mode_enabled = true;
+            Ok(())
+        })
+        .expect("seed config");
+    }
+
+    #[test]
+    fn enable_after_hydration_leaves_untouched_fields_alone() {
+        // `Shared` is built before any DB exists, so its config starts as the
+        // all-default value. Persisting THAT (as an enable does) without
+        // hydrating first is what used to flip a persisted
+        // `relay_mode_enabled: true` to false and reset the port to 4377.
+        let db = crate::database::DatabaseStore::new_in_memory();
+        seed_connect_config(&db);
+
+        let shared = Arc::new(Shared::default());
+        assert!(
+            !shared.config.lock().unwrap().relay_mode_enabled,
+            "precondition: the pre-boot in-memory config knows nothing"
+        );
+
+        hydrate_config_from(&shared, &db);
+        // The enable-side mutation: exactly one field.
+        shared.config.lock().unwrap().enabled = true;
+        let live = shared.config.lock().unwrap().clone();
+        save_config_to_db(&db, &live).unwrap();
+
+        let back = load_config_from_db(&db);
+        assert!(back.enabled, "the field the caller did change is written");
+        assert!(
+            back.relay_mode_enabled,
+            "a field the caller never touched must survive the write-back"
+        );
+        assert_eq!(back.port, 4399, "so must the port");
+        assert_eq!(back.bind_scope, BIND_SCOPE_LOOPBACK);
+    }
+
+    #[test]
+    fn hydration_runs_once_and_never_overwrites_live_state() {
+        // Hydration is a boot-time load, not a reload: once the running
+        // instance owns the config, a later call (a status read, a second
+        // enable) must not resurrect the on-disk copy over in-memory changes
+        // that have not been persisted yet.
+        let db = crate::database::DatabaseStore::new_in_memory();
+        seed_connect_config(&db);
+
+        let shared = Arc::new(Shared::default());
+        hydrate_config_from(&shared, &db);
+        assert_eq!(shared.config.lock().unwrap().port, 4399);
+
+        shared.config.lock().unwrap().port = 5000;
+        hydrate_config_from(&shared, &db);
+        assert_eq!(
+            shared.config.lock().unwrap().port,
+            5000,
+            "a second hydrate must be a no-op"
+        );
+    }
+
+    #[test]
+    fn hydration_of_an_unconfigured_machine_yields_the_defaults() {
+        // First run: no row at all. Hydration must not invent anything — the
+        // defaults are what `serve`'s first-run path then folds its flags into.
+        let db = crate::database::DatabaseStore::new_in_memory();
+        let shared = Arc::new(Shared::default());
+        hydrate_config_from(&shared, &db);
+        let cfg = shared.config.lock().unwrap().clone();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.port, DEFAULT_PORT);
+        assert_eq!(cfg.bind_scope, BIND_SCOPE_ALL);
+        assert!(!cfg.relay_mode_enabled);
     }
 
     #[test]

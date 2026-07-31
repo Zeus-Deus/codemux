@@ -1325,6 +1325,11 @@ export interface WebRemoteRegistrationStatus {
   registered: boolean;
   /** Stable per-install device id sent at registration, when known. */
   device_id?: string | null;
+  /** Display name this device registers under — the machine hostname. Always
+   *  present from a current backend (it is a local fact, so it is filled in
+   *  even before the first registration attempt); optional here because an
+   *  older backend omits the field entirely. */
+  name?: string | null;
   /** The iroh `node_id` registered for this device, when known. */
   node_id?: string | null;
   /** RFC3339 timestamp of the last successful registration heartbeat. */
