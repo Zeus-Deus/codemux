@@ -32,7 +32,7 @@ export const TaskSummaryCard = memo(function TaskSummaryCard({
           return (
             <div
               key={i}
-              className="flex items-start gap-[9px] text-[12.5px] leading-[1.5] text-foreground"
+              className="flex items-start gap-[9px] text-[13px] leading-[1.5] text-foreground"
             >
               {complete ? (
                 <CircleCheck

@@ -206,7 +206,7 @@ export function WorkspaceHoverCardBody({
           ))}
           <span
             className={cn(
-              "shrink-0 text-[10.5px] font-semibold",
+              "shrink-0 text-[11px] font-semibold",
               status ? STATUS_TONE[status] : "text-muted-foreground/70",
             )}
           >
@@ -220,7 +220,7 @@ export function WorkspaceHoverCardBody({
         </div>
         {/* Full title — the row truncates it, so this is often the whole
             reason the user hovered. */}
-        <div className="mt-1 text-[12.5px] font-bold leading-[1.35] text-foreground">
+        <div className="mt-1 text-[13px] font-bold leading-[1.35] text-foreground">
           {workspace.title}
         </div>
         {issue && (
@@ -336,7 +336,7 @@ function DetailRow({
     // So the label holds its width and the VALUE truncates — the reverse
     // would leave you reading "Bran…" next to the thing you came to see.
     <div className="flex items-center gap-3 rounded-md px-2 py-1.5">
-      <span className="shrink-0 text-[11.5px] text-muted-foreground">
+      <span className="shrink-0 text-[12px] text-muted-foreground">
         {label}
       </span>
       <span

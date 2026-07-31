@@ -216,7 +216,7 @@ export function SidebarNeedsYouStrip({
       {/* Header line: small red dot + mono uppercase label with a count. */}
       <div className="flex items-center gap-1.5 px-1 pb-1">
         <span className="size-1.5 rounded-full bg-status-attention shrink-0" />
-        <span className="font-mono text-[9.5px] font-semibold tracking-[0.14em] text-status-attention">
+        <span className="font-mono text-[10px] font-semibold tracking-[0.14em] text-status-attention">
           NEEDS YOU · {entries.length}
         </span>
       </div>
@@ -242,10 +242,10 @@ export function SidebarNeedsYouStrip({
                   shape="square"
                   className="font-bold"
                 />
-                <span className="min-w-0 flex-1 truncate text-[11.5px] text-foreground">
+                <span className="min-w-0 flex-1 truncate text-[12px] text-foreground">
                   {permissionBlockerText(workspace)}
                 </span>
-                <span className="ml-auto flex items-center gap-1 shrink-0 font-mono text-[9.5px] text-muted-foreground tabular-nums">
+                <span className="ml-auto flex items-center gap-1 shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
                   {age}
                   <ArrowDown className="size-2.5" aria-hidden />
                 </span>
@@ -255,7 +255,7 @@ export function SidebarNeedsYouStrip({
         {/* Never let the cap hide work silently — say how many blocked
             workspaces are only reachable by scrolling. */}
         {entries.length > MAX_VISIBLE_ENTRIES && (
-          <span className="px-1 pt-1 font-mono text-[9.5px] text-status-attention/70">
+          <span className="px-1 pt-1 font-mono text-[10px] text-status-attention/70">
             +{entries.length - MAX_VISIBLE_ENTRIES} more below
           </span>
         )}

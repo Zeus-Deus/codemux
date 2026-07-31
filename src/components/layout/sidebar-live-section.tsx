@@ -64,10 +64,10 @@ export function SidebarLiveSection({ entries, activeWorkspaceId }: Props) {
       aria-label="Live agents"
     >
       <div className="flex items-center gap-1.5 px-2 pb-1 pt-1">
-        <span className="font-mono text-[9.5px] font-semibold uppercase tracking-[0.14em] text-accent-ember">
+        <span className="font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-accent-ember">
           LIVE
         </span>
-        <span className="font-mono text-[9.5px] font-semibold tracking-[0.14em] text-muted-foreground">
+        <span className="font-mono text-[10px] font-semibold tracking-[0.14em] text-muted-foreground">
           · {entries.length}
         </span>
       </div>

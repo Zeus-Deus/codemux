@@ -343,7 +343,7 @@ export function ArchiveSection() {
         <p className="text-[13px] text-muted-foreground">
           No archived workspaces
         </p>
-        <p className="text-[11.5px] text-muted-foreground/70 max-w-prose">
+        <p className="text-[12px] text-muted-foreground/70 max-w-prose">
           Archive a workspace from the sidebar to park it here without
           touching its files.
         </p>

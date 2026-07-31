@@ -55,7 +55,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
         />
         <span
           className={cn(
-            "text-[12.5px] font-semibold text-muted-foreground",
+            "text-[13px] font-semibold text-muted-foreground",
             item.streaming && "shimmer",
           )}
         >
@@ -70,7 +70,7 @@ export const ReasoningBlock = memo(function ReasoningBlock({
         />
       </button>
       {open && item.text.length > 0 && (
-        <div className="whitespace-pre-wrap break-words border-t border-border/60 py-[11px] pl-[33px] pr-3.5 text-[12.5px] italic leading-[1.65] text-muted-foreground">
+        <div className="whitespace-pre-wrap break-words border-t border-border/60 py-[11px] pl-[33px] pr-3.5 text-[13px] italic leading-[1.65] text-muted-foreground">
           {item.text}
         </div>
       )}

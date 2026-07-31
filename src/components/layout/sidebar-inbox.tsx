@@ -385,11 +385,11 @@ function ShelfHeader({
           !collapsed && "rotate-90",
         )}
       />
-      <span className="font-mono text-[9.5px] uppercase tracking-[0.13em] text-muted-foreground/70">
+      <span className="font-mono text-[10px] uppercase tracking-[0.13em] text-muted-foreground/70">
         {label}
       </span>
       {showCount && (
-        <span className="font-mono text-[9.5px] tabular-nums text-muted-foreground/70">
+        <span className="font-mono text-[10px] tabular-nums text-muted-foreground/70">
           ({count})
         </span>
       )}
@@ -414,7 +414,7 @@ function WrappingUpDivider() {
       data-wrapping-up-divider
       className="flex w-full items-center gap-2 px-1 pb-1.5 pt-3"
     >
-      <span className="font-mono text-[9.5px] uppercase tracking-[0.13em] text-muted-foreground/70">
+      <span className="font-mono text-[10px] uppercase tracking-[0.13em] text-muted-foreground/70">
         Wrapping up
       </span>
       <span aria-hidden="true" className="h-px flex-1 bg-border/60" />
@@ -559,7 +559,7 @@ function SettledRow({
               : `Pull request — ${prState}`
           }
           className={cn(
-            "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 font-mono text-[9.5px] font-medium",
+            "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 font-mono text-[10px] font-medium",
             "transition-colors duration-150",
             prStatusTextClass(prState),
             workspace.pr_url
@@ -572,7 +572,7 @@ function SettledRow({
         </button>
       )}
       {time && (
-        <span className="shrink-0 text-[10.5px] text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
+        <span className="shrink-0 text-[11px] text-muted-foreground/70 group-hover/settled:hidden group-focus-within/settled:hidden">
           {time}
         </span>
       )}
@@ -702,7 +702,7 @@ function SnoozeRow({
         </span>
         <span
           aria-label={`Wakes in ${timeUntil}`}
-          className="shrink-0 text-[10.5px] tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
+          className="shrink-0 text-[11px] tabular-nums text-muted-foreground/70 group-hover/snoozed:hidden group-focus-within/snoozed:hidden"
         >
           {timeUntil}
         </span>
@@ -1721,7 +1721,7 @@ export function SidebarInbox() {
                     onClick={() =>
                       setSettledVisibleCount((c) => c + SETTLED_PAGE_COUNT)
                     }
-                    className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-[10.5px] text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
+                    className="flex h-7 w-full items-center justify-center rounded-lg font-mono text-[11px] text-muted-foreground/70 transition-colors duration-150 hover:text-foreground"
                   >
                     {`Show ${next} more (${settledHidden} hidden)`}
                   </button>

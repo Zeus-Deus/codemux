@@ -42,11 +42,11 @@ export const UserInputAnswer = memo(function UserInputAnswer({
   return (
     <div className="flex justify-end">
       <div className="flex max-w-[82%] flex-col items-end gap-1">
-        <div className="flex flex-col gap-2 rounded-[14px_14px_5px_14px] border border-border/60 bg-card px-[15px] py-[11px] text-[13.5px] leading-[1.55] text-foreground">
+        <div className="flex flex-col gap-2 rounded-[14px_14px_5px_14px] border border-border/60 bg-card px-[15px] py-[11px] text-sm leading-relaxed text-foreground">
           {lines.map((line, i) => (
             <div key={i} className="flex flex-col gap-0.5">
               {showHeaders && line.header ? (
-                <div className="text-[10.5px] font-medium uppercase tracking-wide text-muted-foreground">
+                <div className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
                   {line.header}
                 </div>
               ) : null}

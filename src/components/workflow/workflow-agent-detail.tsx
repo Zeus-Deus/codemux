@@ -96,7 +96,7 @@ export function WorkflowAgentDetail({
         )}
         <div className="min-w-0 flex-1">
           <div className="truncate font-mono text-[12px] font-semibold text-foreground">{label}</div>
-          <div className="truncate text-[10.5px] text-muted-foreground">
+          <div className="truncate text-[11px] text-muted-foreground">
             Phase {phaseIndex} · {phaseTitle} · agent {agentIndex} of {agentsInPhase}
             {agent.model ? ` · ${agent.model}` : ""}
           </div>
@@ -104,7 +104,7 @@ export function WorkflowAgentDetail({
         {badge && (
           <span
             className={cn(
-              "shrink-0 rounded-[5px] px-2 py-0.5 text-[9.5px] font-bold uppercase",
+              "shrink-0 rounded-[5px] px-2 py-0.5 text-[10px] font-bold uppercase",
               tone.chipBg,
             )}
           >
@@ -147,7 +147,7 @@ export function WorkflowAgentDetail({
         <SectionLabel>Result</SectionLabel>
         {running ? (
           <div className="rounded-[9px] border border-border/60 bg-muted/30 px-2.5 py-2.5 text-[12px] text-muted-foreground">
-            <span className="shimmer font-mono text-[11.5px]">{subagentActivityLine(agent)}</span>
+            <span className="shimmer font-mono text-[12px]">{subagentActivityLine(agent)}</span>
           </div>
         ) : (
           <div
@@ -164,7 +164,7 @@ export function WorkflowAgentDetail({
       <div className="flex gap-2 pt-1">
         <Tooltip>
           <TooltipTrigger asChild>
-            <Button variant="outline" size="sm" className="text-[11.5px]" disabled>
+            <Button variant="outline" size="sm" className="text-[12px]" disabled>
               Restart agent
             </Button>
           </TooltipTrigger>
@@ -175,7 +175,7 @@ export function WorkflowAgentDetail({
             type="button"
             variant="ghost"
             size="sm"
-            className="text-[11.5px] text-muted-foreground hover:text-foreground"
+            className="text-[12px] text-muted-foreground hover:text-foreground"
             onClick={() => {
               openEditorTab(workspace.workspace_id, workspace.tabs, label).catch(console.error);
             }}
@@ -190,7 +190,7 @@ export function WorkflowAgentDetail({
 
 function SectionLabel({ children }: { children: React.ReactNode }) {
   return (
-    <div className="mb-1.5 font-mono text-[9.5px] font-semibold uppercase tracking-wider text-muted-foreground">
+    <div className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
       {children}
     </div>
   );

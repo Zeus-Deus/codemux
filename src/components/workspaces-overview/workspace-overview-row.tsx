@@ -430,7 +430,7 @@ function LocalRow({
           <div className="flex items-center gap-2">
             <h4
               className={cn(
-                "min-w-0 flex-1 truncate text-[13.5px] font-semibold leading-tight tracking-[-0.01em]",
+                "min-w-0 flex-1 truncate text-[14px] font-semibold leading-tight tracking-[-0.01em]",
                 isAttached ? "text-foreground" : "text-foreground/90",
               )}
               title={workspace.title}
@@ -480,7 +480,7 @@ function LocalRow({
               </span>
             )}
           </div>
-          <p className="mt-[3px] truncate text-[11.5px] text-muted-foreground/65">
+          <p className="mt-[3px] truncate text-[12px] text-muted-foreground/65">
             {project ? project.name : "—"}
             {isWorking && (
               <span className="ml-1.5 text-status-working/90">
@@ -781,7 +781,7 @@ function RemoteRow({
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <h4
-              className="min-w-0 flex-1 truncate text-[13.5px] font-semibold leading-tight tracking-[-0.01em] text-foreground/90"
+              className="min-w-0 flex-1 truncate text-[14px] font-semibold leading-tight tracking-[-0.01em] text-foreground/90"
               title={row.title}
             >
               {row.title}
@@ -806,7 +806,7 @@ function RemoteRow({
               other device
             </span>
           </div>
-          <p className="mt-[3px] truncate text-[11.5px] text-muted-foreground/65">
+          <p className="mt-[3px] truncate text-[12px] text-muted-foreground/65">
             {item.projectName ?? "—"}
             <span className="ml-1.5 text-status-remote/70">
               · not on this device

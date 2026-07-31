@@ -492,7 +492,7 @@ function OptionRow({
         <p className="mb-1 text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">
           Preview
         </p>
-        <pre className="whitespace-pre-wrap break-words font-mono text-[11.5px] leading-5 text-foreground">
+        <pre className="whitespace-pre-wrap break-words font-mono text-[12px] leading-5 text-foreground">
           {preview}
         </pre>
       </HoverCardContent>

@@ -115,14 +115,14 @@ function PhaseCard({
     <>
       {statusIcon}
       <div className="min-w-0 flex-1">
-        <div className="text-[12.5px] font-bold text-foreground">
+        <div className="text-[13px] font-bold text-foreground">
           {index} · {phase.title}
         </div>
         <div className="truncate text-[11px] text-muted-foreground">{subLine}</div>
       </div>
       <div className="shrink-0 text-right">
         <div className="font-mono text-[11px] text-foreground/80">{agentCountLabel}</div>
-        <div className="font-mono text-[9.5px] text-muted-foreground">{metaLabel}</div>
+        <div className="font-mono text-[10px] text-muted-foreground">{metaLabel}</div>
       </div>
     </>
   );
@@ -179,7 +179,7 @@ function PhaseAgents({
   return (
     <div className="border-t border-border/60 p-1.5">
       <div className="flex items-center gap-1.5 px-1.5 py-1">
-        <span className="font-mono text-[9.5px] font-semibold uppercase tracking-wider text-muted-foreground">
+        <span className="font-mono text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
           Agents
         </span>
         <div className="ml-auto flex gap-1">
@@ -192,7 +192,7 @@ function PhaseAgents({
                 setFilter(f);
               }}
               className={cn(
-                "rounded-full px-2 py-0.5 text-[9.5px] font-semibold",
+                "rounded-full px-2 py-0.5 text-[10px] font-semibold",
                 filter === f
                   ? "bg-foreground/[0.12] text-foreground"
                   : "text-muted-foreground hover:text-foreground/80",
@@ -246,7 +246,7 @@ function AgentRow({ agent, onSelect }: { agent: SubagentView; onSelect: () => vo
       {badge && (
         <span
           className={cn(
-            "shrink-0 rounded-[4px] px-1.5 py-0.5 text-[9.5px] font-semibold",
+            "shrink-0 rounded-[4px] px-1.5 py-0.5 text-[10px] font-semibold",
             findingTone(badge.tone).chipBg,
           )}
         >

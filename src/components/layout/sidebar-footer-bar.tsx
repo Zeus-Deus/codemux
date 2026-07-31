@@ -190,7 +190,7 @@ export function SidebarFooterBar() {
         className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-[7px] bg-transparent text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
       >
         <CalendarClock className="size-[13px]" />
-        <span className="text-[11.5px] font-medium">Automations</span>
+        <span className="text-[12px] font-medium">Automations</span>
       </button>
       <button
         type="button"
@@ -199,7 +199,7 @@ export function SidebarFooterBar() {
         className="flex h-7 flex-1 items-center justify-center gap-1.5 rounded-[7px] bg-transparent text-muted-foreground transition-colors hover:bg-foreground/[0.04] hover:text-foreground"
       >
         <LayoutGrid className="size-[13px]" />
-        <span className="text-[11.5px] font-medium">Workspaces</span>
+        <span className="text-[12px] font-medium">Workspaces</span>
       </button>
       <SidebarPortsPopover />
       <AppMenu />

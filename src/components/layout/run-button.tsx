@@ -107,7 +107,7 @@ export function RunButton({ workspaceId, variant = "legacy" }: RunButtonProps) {
               type="button"
               onClick={isConfigured ? handleRun : handleConfigure}
               className={cn(
-                "flex h-full items-center gap-1.5 px-[9px] text-[11.5px] font-semibold text-foreground",
+                "flex h-full items-center gap-1.5 px-[9px] text-[12px] font-semibold text-foreground",
                 "transition-colors duration-150 hover:bg-secondary",
                 !isConfigured && "text-muted-foreground",
               )}
