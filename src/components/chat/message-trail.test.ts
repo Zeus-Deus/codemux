@@ -8,7 +8,7 @@ import {
   sampleTrailIndices,
   withActiveIndex,
 } from "./message-trail";
-import { buildTranscriptSlots, type TranscriptSlot } from "./transcript-slots";
+import { buildTranscriptSlots } from "./transcript-slots";
 
 function userMsg(seq: number, text = "hi"): ChatViewItem {
   return { kind: "user_message", id: `um-${seq}`, seq, text };
@@ -37,12 +37,6 @@ function tool(seq: number): ToolCallItem {
     result_content: null,
     approval_request_id: null,
   };
-}
-
-function slotIndexMap(slots: TranscriptSlot[]): Map<string, number> {
-  const map = new Map<string, number>();
-  slots.forEach((s, i) => map.set(s.messageId, i));
-  return map;
 }
 
 describe("buildTrailEntries", () => {
@@ -118,36 +112,28 @@ describe("deriveActiveTrailIndex", () => {
     userMsg(6),
   ]);
   const entries = buildTrailEntries(slots); // slotIndex 0, 2, 5
-  const byId = slotIndexMap(slots);
-
   it("returns -1 with no entries", () => {
-    expect(deriveActiveTrailIndex([], ["um-0"], byId)).toBe(-1);
+    expect(deriveActiveTrailIndex([], 0)).toBe(-1);
   });
 
-  it("returns -1 when nothing is visible", () => {
-    expect(deriveActiveTrailIndex(entries, [], byId)).toBe(-1);
-  });
-
-  it("returns -1 when the first visible id is unknown", () => {
-    expect(deriveActiveTrailIndex(entries, ["ghost"], byId)).toBe(-1);
+  it("returns -1 before the list reports a visible row", () => {
+    expect(deriveActiveTrailIndex(entries, -1)).toBe(-1);
   });
 
   it("maps the first visible user row to its own turn", () => {
-    expect(deriveActiveTrailIndex(entries, ["um-0"], byId)).toBe(0);
-    expect(deriveActiveTrailIndex(entries, ["um-6"], byId)).toBe(2);
+    expect(deriveActiveTrailIndex(entries, 0)).toBe(0);
+    expect(deriveActiveTrailIndex(entries, 5)).toBe(2);
   });
 
   it("maps a visible assistant row to the enclosing turn", () => {
     // am-1 (slot 1) is still turn 0; am-5 (slot 4) is turn 1.
-    expect(deriveActiveTrailIndex(entries, ["am-1"], byId)).toBe(0);
-    expect(deriveActiveTrailIndex(entries, ["am-5"], byId)).toBe(1);
+    expect(deriveActiveTrailIndex(entries, 1)).toBe(0);
+    expect(deriveActiveTrailIndex(entries, 4)).toBe(1);
   });
 
   it("maps a visible folded tool-group id to the enclosing turn", () => {
     // run:tc-3 is slot 3, inside turn 1 (user at slot 2).
-    expect(
-      deriveActiveTrailIndex(entries, ["run:tc-3", "am-5"], byId),
-    ).toBe(1);
+    expect(deriveActiveTrailIndex(entries, 3)).toBe(1);
   });
 
   it("stays -1 while the viewport sits above the first user turn", () => {
@@ -159,9 +145,7 @@ describe("deriveActiveTrailIndex", () => {
     ]);
     const leadEntries = buildTrailEntries(lead); // slotIndex 1, 3
     // am-0 is slot 0, before the first turn's slot 1.
-    expect(
-      deriveActiveTrailIndex(leadEntries, ["am-0"], slotIndexMap(lead)),
-    ).toBe(-1);
+    expect(deriveActiveTrailIndex(leadEntries, 0)).toBe(-1);
   });
 
   it("clamps to the last turn once scrolled past it", () => {
@@ -175,9 +159,7 @@ describe("deriveActiveTrailIndex", () => {
     ]);
     const pastEntries = buildTrailEntries(past); // slotIndex 0, 2
     // am-4 (slot 4) is beyond the last user turn (slot 2) → clamp to index 1.
-    expect(
-      deriveActiveTrailIndex(pastEntries, ["am-4"], slotIndexMap(past)),
-    ).toBe(1);
+    expect(deriveActiveTrailIndex(pastEntries, 4)).toBe(1);
   });
 });
 

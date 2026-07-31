@@ -28,31 +28,45 @@ vi.mock("@/assets/preset-icons/opencode.svg", () => ({
   default: "/mock/opencode.svg",
 }));
 
-// Send → jump-to-latest: `ScrollToBottomOnSend` calls the scroller
-// engine's imperative `scrollToEnd` (which snaps to the tail AND re-pins
-// following-bottom). Stub the hook so we can assert the wiring without a
-// live layout. `scrollToEnd` is a stable ref so the effect never refires
-// on unrelated re-renders (only on a real signal change).
+// jsdom has no layout, so use a transparent LegendList test double for the
+// dispatch tests. Dedicated virtualization tests below use a bounded window.
 const { scrollToEndSpy } = vi.hoisted(() => ({ scrollToEndSpy: vi.fn() }));
-vi.mock("@/components/ui/message-scroller", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("@/components/ui/message-scroller")>();
+vi.mock("@legendapp/list/react", async () => {
+  const React = await import("react");
   return {
-    ...actual,
-    useMessageScroller: () => ({
-      scrollToEnd: scrollToEndSpy,
-      scrollToMessage: vi.fn(),
-      scrollToStart: vi.fn(),
+    LegendList: React.forwardRef(function LegendListMock(
+      props: Record<string, any>,
+      ref: React.ForwardedRef<any>,
+    ) {
+      const nodeRef = React.useRef<HTMLDivElement>(null);
+      React.useImperativeHandle(ref, () => ({
+        getScrollableNode: () => nodeRef.current,
+        getState: () => ({ isAtEnd: false, listen: () => () => undefined }),
+        scrollToEnd: (options: unknown) => {
+          scrollToEndSpy(options);
+          return Promise.resolve();
+        },
+        scrollToIndex: () => Promise.resolve(),
+      }));
+      return (
+        <div ref={nodeRef} data-slot="transcript-list">
+          {props.ListHeaderComponent}
+          {props.data.map((item: unknown, index: number) => (
+            <React.Fragment key={props.keyExtractor(item, index)}>
+              {props.renderItem({ item, index })}
+            </React.Fragment>
+          ))}
+          {props.ListFooterComponent}
+        </div>
+      );
     }),
   };
 });
 
 afterEach(() => cleanup());
 
-// The MessageScroller renders every row into the DOM (perf comes from
-// `content-visibility:auto`, not row unmounting), so a plain render is
-// enough to assert on grouping / dispatch / marker DOM — no virtualizer
-// mock context is needed.
+// The transparent test double above renders all rows so component dispatch
+// and marker behavior can be asserted without browser layout.
 function renderList(
   messages: ChatViewItem[],
   extra?: {
@@ -865,7 +879,7 @@ describe("MessageList send → jump-to-latest", () => {
       />,
     );
     expect(scrollToEndSpy).toHaveBeenCalledTimes(1);
-    // `behavior: "auto"` = instant catch-up (no smooth-scroll lag on send).
-    expect(scrollToEndSpy).toHaveBeenCalledWith({ behavior: "auto" });
+    // `animated: false` = instant catch-up (no smooth-scroll lag on send).
+    expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false });
   });
 });

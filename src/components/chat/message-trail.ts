@@ -8,15 +8,13 @@ import type { TranscriptSlot } from "./transcript-slots";
  * unit-tested directly (jsdom can't exercise real scrolling / an
  * IntersectionObserver).
  *
- * The trail derives its active turn from the scroller's `visibleMessageIds`
- * (document-order list of rows intersecting the viewport), NOT from
- * `currentAnchorId`: this transcript sets `scrollAnchor={false}` on every
- * row (the engine's anchor handling breaks the #77 stick-to-bottom pin on
- * hydrated transcripts), so `currentAnchorId` is always `null` here.
+ * The trail derives its active turn from LegendList's first-visible-item
+ * callback. That signal comes from the virtualizer's range model, so it also
+ * works when most transcript rows are deliberately not mounted.
  */
 
 export interface TrailEntry {
-  /** MessageScroller `messageId` of the user-turn row — the jump target. */
+  /** Stable id of the user-turn row — used by labels and previews. */
   messageId: string;
   /** Index of this turn's slot in the full `slots` array. Active-turn
    *  tracking compares this against the first visible row's slot index. */
@@ -76,20 +74,15 @@ export function buildTrailEntries(slots: TranscriptSlot[]): TrailEntry[] {
  * - Clamps to the last entry once the viewport scrolls past the final turn
  *   (the last entry's slot index stays `<=` any later row's index).
  *
- * `visibleMessageIds` includes non-user rows (assistant rows, folded tool
- * groups keyed `run:<id>`), which is exactly why the lookup routes through
- * `slotIndexById` (messageId → slot index) rather than matching entries by
- * id: the first visible row is usually NOT a user turn.
+ * `firstVisibleSlotIndex` may identify any row (assistant prose, a folded
+ * activity group, etc.); the active turn is therefore the most recent user
+ * turn at or before that position.
  */
 export function deriveActiveTrailIndex(
   entries: TrailEntry[],
-  visibleMessageIds: string[],
-  slotIndexById: Map<string, number>,
+  firstVisibleSlotIndex: number,
 ): number {
-  if (entries.length === 0 || visibleMessageIds.length === 0) return -1;
-
-  const firstVisibleSlotIndex = slotIndexById.get(visibleMessageIds[0]);
-  if (firstVisibleSlotIndex == null) return -1;
+  if (entries.length === 0 || firstVisibleSlotIndex < 0) return -1;
 
   let active = -1;
   for (let i = 0; i < entries.length; i++) {

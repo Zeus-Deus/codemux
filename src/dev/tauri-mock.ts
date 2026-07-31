@@ -559,10 +559,10 @@ const CLAUDE_CAPABILITIES: ProviderChatCapabilities = {
 };
 
 /** Number of simulated turns in the seeded transcript. Every 5th turn
- *  includes an 8-call tool burst (exercises the run-collapse row), so
- *  the item total lands well past 1,200 — enough to make unbounded
- *  row mounting obvious in devtools if virtualization ever regresses. */
-const MOCK_CHAT_TURNS = 220;
+ * includes an 8-call tool burst (exercises run folding). At 520 turns the
+ * derived transcript still has more than 1,100 independently virtualized
+ * slots, so fast-scroll and bounded-DOM behavior are visible in devtools. */
+const MOCK_CHAT_TURNS = 520;
 
 const ASSISTANT_BODIES = [
   "Short answer: yes — the transcript only mounts the rows that intersect the viewport.",

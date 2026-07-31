@@ -32,10 +32,8 @@ import { cn } from "@/lib/utils";
  * re-renders (issue #77 scroller contract preserved). A local 1s tick
  * refreshes the derived elapsed time while any subagent is running.
  *
- * The root carries `data-subagent-card={item.id}` so the docked
- * {@link SubagentActivityBar} can locate + scroll to + flash-highlight
- * this card by plain DOM query, without any new prop plumbing through
- * MessageList/ChatTranscript.
+ * The root carries `data-subagent-card={item.id}` so MessageList can apply
+ * the post-navigation highlight after LegendList mounts the requested row.
  */
 export const SubagentsCard = memo(function SubagentsCard({
   item,

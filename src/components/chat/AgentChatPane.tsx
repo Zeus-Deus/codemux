@@ -174,19 +174,6 @@ export function detectAnimatedGif(buffer: ArrayBuffer): boolean {
   return false;
 }
 
-// Jump-to-card correction-loop tuning for the docked SubagentActivityBar
-// (see `handleJumpToSubagentCard` below). Mirrors MessageTrail.tsx's own
-// jump constants: `content-visibility:auto` rows only expose estimated
-// heights until they render, so a single scrollTop computation can land
-// off; a few corrective rAF passes converge on the real offset.
-const JUMP_SCROLL_MARGIN_PX = 16;
-const JUMP_SETTLE_TOLERANCE_PX = 2;
-const JUMP_SETTLE_STABLE_FRAMES = 3;
-const JUMP_SETTLE_MAX_FRAMES = 40;
-/** How long the ember ring highlight stays on a jumped-to card (design:
- *  "flashes `box-shadow` ... for ~1100ms"). */
-const JUMP_HIGHLIGHT_MS = 1100;
-
 export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
   const [provider, setProvider] = useState<AgentChatProviderKind>(initialProvider);
@@ -526,14 +513,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [enteredSubagentId]);
-  // Scoped to this pane's own subtree (not `document`) so split panes each
-  // jump within their own transcript. Plain DOM query rather than the
-  // MessageScroller engine's `scrollToMessage`: the docked bar lives
-  // outside the scroller's provider tree, and MessageList renders every
-  // slot (no windowing — see docs/features/agent-chat.md "Transcript
-  // scroller"), so a direct query by `data-subagent-card` always finds the
-  // node.
-  const paneRootRef = useRef<HTMLDivElement>(null);
   // Send → jump-to-latest (catch-up on send). An incrementing counter
   // forwarded to the transcript; bumping it snaps the viewport to the
   // bottom and re-pins following-bottom mode. Sending a new prompt must
@@ -545,92 +524,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     () => setScrollToBottomSignal((n) => n + 1),
     [],
   );
-  // Live handles for an in-flight jump (rAF settle loop + highlight
-  // timeout), cancelled on a re-jump, a thread switch, and unmount — the
-  // same hygiene as MessageList's / MessageTrail's own settle loops.
-  const jumpFrameRef = useRef<number | null>(null);
-  const jumpHighlightRef = useRef<{
-    timer: number;
-    card: HTMLElement;
+  const [subagentJumpRequest, setSubagentJumpRequest] = useState<{
+    cardId: string;
+    nonce: number;
   } | null>(null);
-  const cancelJump = useCallback(() => {
-    if (jumpFrameRef.current != null) {
-      cancelAnimationFrame(jumpFrameRef.current);
-      jumpFrameRef.current = null;
-    }
-    if (jumpHighlightRef.current != null) {
-      window.clearTimeout(jumpHighlightRef.current.timer);
-      jumpHighlightRef.current.card.classList.remove(
-        "subagent-card-highlight",
-      );
-      jumpHighlightRef.current = null;
-    }
-  }, []);
-  // Cleanup-only effect: cancels any in-flight jump when the thread
-  // changes and on unmount.
-  useEffect(() => cancelJump, [cancelJump, threadId]);
   const handleJumpToSubagentCard = useCallback(
-    (cardId: string) => {
-      const root = paneRootRef.current;
-      if (!root) return;
-      const viewport = root.querySelector<HTMLElement>(
-        '[data-slot="message-scroller-viewport"]',
-      );
-      if (!viewport) return;
-      const findCard = () => {
-        const nodes = viewport.querySelectorAll<HTMLElement>(
-          "[data-subagent-card]",
-        );
-        for (const node of Array.from(nodes)) {
-          if (node.dataset.subagentCard === cardId) return node;
-        }
-        return null;
-      };
-      let card = findCard();
-      if (!card) return;
-
-      // A jump already in flight (or a lingering highlight on another
-      // card) is superseded by this one.
-      cancelJump();
-
-      card.classList.add("subagent-card-highlight");
-      jumpHighlightRef.current = {
-        card,
-        timer: window.setTimeout(() => {
-          jumpHighlightRef.current?.card.classList.remove(
-            "subagent-card-highlight",
-          );
-          jumpHighlightRef.current = null;
-        }, JUMP_HIGHLIGHT_MS),
-      };
-
-      let frames = 0;
-      let stableFrames = 0;
-      const settle = () => {
-        jumpFrameRef.current = null;
-        if (!card?.isConnected) card = findCard();
-        if (!card) return;
-        const top =
-          card.getBoundingClientRect().top -
-          viewport.getBoundingClientRect().top;
-        const delta = top - JUMP_SCROLL_MARGIN_PX;
-        if (Math.abs(delta) > JUMP_SETTLE_TOLERANCE_PX) {
-          viewport.scrollTop += delta;
-          stableFrames = 0;
-        } else {
-          stableFrames += 1;
-        }
-        frames += 1;
-        if (
-          stableFrames < JUMP_SETTLE_STABLE_FRAMES &&
-          frames < JUMP_SETTLE_MAX_FRAMES
-        ) {
-          jumpFrameRef.current = requestAnimationFrame(settle);
-        }
-      };
-      jumpFrameRef.current = requestAnimationFrame(settle);
-    },
-    [cancelJump],
+    (cardId: string) =>
+      setSubagentJumpRequest((current) => ({
+        cardId,
+        nonce: (current?.nonce ?? 0) + 1,
+      })),
+    [],
   );
   const activeTurnId = slice?.activeTurnId ?? null;
   const model = slice?.model ?? null;
@@ -2814,10 +2718,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ) : null;
 
   return (
-    <div
-      ref={paneRootRef}
-      className="flex h-full w-full flex-col bg-background"
-    >
+    <div className="flex h-full w-full flex-col bg-background">
       {messages.length === 0 ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (
@@ -2845,6 +2746,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               stalled={stalled}
               interrupted={interrupted}
               scrollToBottomSignal={scrollToBottomSignal}
+              subagentJumpRequest={subagentJumpRequest}
               sessionStartedAt={sessionStartedAt}
               provider={provider}
               onRespondToRequest={handleRespond}
