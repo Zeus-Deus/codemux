@@ -127,26 +127,3 @@ export function resetTranscriptFadeCacheForTests(): void {
   cachedFade = null;
   rendererMode = "accelerated";
 }
-
-/**
- * Change C (issue #129): one-shot content-visibility support diagnostic. Row
- * containment (`[content-visibility:auto]` on each `MessageScrollerItem`) is
- * what keeps thousands of rows cheap; on old WebKitGTK builds the property may
- * be a silent no-op, voiding that assumption. Warn once (grep-able on the
- * "content-visibility" string) so a profiling session can spot it. Suppressed
- * under vitest — jsdom's `CSS.supports` reports false, which would warn on
- * every run — and fires at most once per module load.
- */
-function warnIfContentVisibilityUnsupported(): void {
-  if (import.meta.env?.MODE === "test") return;
-  if (typeof CSS !== "undefined" && CSS.supports?.("content-visibility", "auto")) {
-    return;
-  }
-  console.warn(
-    "[codemux::transcript] content-visibility:auto is unsupported in this " +
-      "webview engine — transcript row containment is inactive, so long " +
-      "threads may not stay cheap.",
-  );
-}
-
-warnIfContentVisibilityUnsupported();

@@ -1,22 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
-/**
- * Rendering + memoization guarantees for the transcript on MessageScroller:
- *
- *  1. Every message row mounts into the DOM — the scroller keeps rows
- *     cheap with `content-visibility:auto` row containment (not by
- *     unmounting off-screen rows), so jsdom sees them all.
- *  2. A streaming token delta (tail row replaced in place by the reducer)
- *     re-renders exactly one row LEAF — the memoized-leaf win holds on the
- *     MessageScroller.
- *  3. That same delta re-renders exactly one row WRAPPER
- *     (`SlotRowMemo` → `MessageScrollerItem`) — the two-level memo + slot
- *     reuse (issue #129) skips reconciliation for every untouched row.
- *
- * The scroller renders plain rows: no external virtualization context to
- * mock (wrapper renders are counted by wrapping the real `MessageScrollerItem`
- * in a counting passthrough).
- */
-import { afterEach, describe, it, expect, vi } from "vitest";
+/** Regression coverage for the transcript's virtual-list contract. */
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
 import type {
@@ -26,8 +10,6 @@ import type {
 
 import { MessageList } from "./MessageList";
 
-// Replace the prose renderer with a counting stub so we can observe
-// per-row (leaf) render counts without markdown noise.
 const renderCounts = new Map<string, number>();
 vi.mock("./AssistantMessage", () => ({
   AssistantMessage: ({ item }: { item: AssistantMessageItem }) => {
@@ -36,29 +18,50 @@ vi.mock("./AssistantMessage", () => ({
   },
 }));
 
-// Count WRAPPER (level-1 memo) renders by wrapping the real
-// `MessageScrollerItem` in a counting passthrough — the rest of the engine
-// module (provider/viewport/hooks used by MessageList and MessageTrail) is
-// preserved via `importActual` so the real scroller still drives the DOM.
-const itemRenderCounts = vi.hoisted(() => new Map<string, number>());
-vi.mock("@/components/ui/message-scroller", async (importOriginal) => {
-  const actual =
-    await importOriginal<typeof import("@/components/ui/message-scroller")>();
-  const RealItem = actual.MessageScrollerItem;
+const { lastListProps } = vi.hoisted(() => ({
+  lastListProps: { current: null as Record<string, any> | null },
+}));
+
+// jsdom has no layout. This double models a bottom-pinned viewport by
+// mounting a bounded tail window while exposing the production configuration
+// for assertions.
+vi.mock("@legendapp/list/react", async () => {
+  const React = await import("react");
   return {
-    ...actual,
-    MessageScrollerItem: (props: Parameters<typeof RealItem>[0]) => {
-      const id = String(props.messageId ?? "");
-      itemRenderCounts.set(id, (itemRenderCounts.get(id) ?? 0) + 1);
-      return <RealItem {...props} />;
-    },
+    LegendList: React.forwardRef(function LegendListMock(
+      props: Record<string, any>,
+      ref: React.ForwardedRef<any>,
+    ) {
+      lastListProps.current = props;
+      React.useImperativeHandle(ref, () => ({
+        getScrollableNode: () => document.createElement("div"),
+        getState: () => ({ isAtEnd: true, listen: () => () => undefined }),
+        scrollToEnd: () => Promise.resolve(),
+        scrollToIndex: () => Promise.resolve(),
+      }));
+      const start = Math.max(0, props.data.length - 12);
+      return (
+        <div data-slot="transcript-list">
+          {props.ListHeaderComponent}
+          {props.data.slice(start).map((item: unknown, offset: number) => {
+            const index = start + offset;
+            return (
+              <React.Fragment key={props.keyExtractor(item, index)}>
+                {props.renderItem({ item, index })}
+              </React.Fragment>
+            );
+          })}
+          {props.ListFooterComponent}
+        </div>
+      );
+    }),
   };
 });
 
 afterEach(() => {
   cleanup();
   renderCounts.clear();
-  itemRenderCounts.clear();
+  lastListProps.current = null;
 });
 
 function assistantMsg(seq: number, text: string): AssistantMessageItem {
@@ -82,63 +85,74 @@ function renderList(messages: ChatViewItem[]) {
   return render(<MessageList messages={messages} {...noopHandlers} />);
 }
 
-describe("MessageList rendering & memoization", () => {
-  it("mounts every message row (content-visibility, not row unmounting)", () => {
+describe("MessageList virtualization & memoization", () => {
+  it("keeps the mounted DOM bounded for a long transcript", () => {
     const messages: ChatViewItem[] = [];
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < 1000; i++) {
       messages.push(assistantMsg(i, `message body ${i}`));
     }
     renderList(messages);
-    expect(document.querySelectorAll("[data-am-row]").length).toBe(40);
+
+    expect(document.querySelectorAll("[data-am-row]")).toHaveLength(12);
+    expect(screen.getByText("message body 999")).toBeInTheDocument();
+    expect(screen.queryByText("message body 0")).not.toBeInTheDocument();
+    expect(lastListProps.current).toMatchObject({
+      drawDistance: 800,
+      estimatedItemSize: 112,
+      initialScrollAtEnd: true,
+      recycleItems: false,
+      maintainVisibleContentPosition: { data: true, size: false },
+    });
   });
 
-  it("re-renders exactly one row when a token delta mutates the tail", () => {
+  it("re-renders exactly one mounted leaf for a streaming token delta", () => {
     const initial: ChatViewItem[] = [];
     for (let i = 0; i < 12; i++) {
       initial.push(assistantMsg(i, `message body ${i}`));
     }
     const { rerender } = renderList(initial);
-    expect(screen.getByText("message body 11")).toBeInTheDocument();
-
     const before = new Map(renderCounts);
 
-    // Simulate the reducer's `replaceItem` for a streaming delta: a fresh
-    // array, every row identity preserved except the tail.
     const next = initial.slice();
-    next[11] = { ...assistantMsg(11, "message body 11 plus-token") };
+    next[11] = assistantMsg(11, "message body 11 plus-token");
     rerender(<MessageList messages={next} {...noopHandlers} />);
-    expect(
-      screen.getByText("message body 11 plus-token"),
-    ).toBeInTheDocument();
 
+    expect(screen.getByText("message body 11 plus-token")).toBeInTheDocument();
     for (let i = 0; i < 11; i++) {
       expect(renderCounts.get(`am-${i}`)).toBe(before.get(`am-${i}`));
     }
     expect(renderCounts.get("am-11")).toBe((before.get("am-11") ?? 0) + 1);
   });
 
-  it("re-renders exactly one row WRAPPER when a token delta mutates the tail", () => {
-    const initial: ChatViewItem[] = [];
-    for (let i = 0; i < 12; i++) {
-      initial.push(assistantMsg(i, `message body ${i}`));
-    }
-    const { rerender } = renderList(initial);
-    // Every row mounted through the counting wrapper (all 12 rows exist).
-    expect(itemRenderCounts.size).toBe(12);
-    const before = new Map(itemRenderCounts);
+  it("puts every windowed row on the shared chat column with symmetric gutters", () => {
+    // The composer lives outside this scroller on the same CHAT_COLUMN
+    // rails. Reserving the scrollbar gutter on one edge only would shrink
+    // the box the rows are centered in and slide the transcript half a
+    // scrollbar off-centre from the composer.
+    renderList([assistantMsg(0, "message body 0")]);
 
-    const next = initial.slice();
-    next[11] = { ...assistantMsg(11, "message body 11 plus-token") };
-    rerender(<MessageList messages={next} {...noopHandlers} />);
-    expect(
-      screen.getByText("message body 11 plus-token"),
-    ).toBeInTheDocument();
-
-    // Slot-object reuse keeps every untouched wrapper's props shallow-equal, so
-    // only the tail wrapper re-renders — not just its leaf.
-    for (let i = 0; i < 11; i++) {
-      expect(itemRenderCounts.get(`am-${i}`)).toBe(before.get(`am-${i}`));
+    expect(lastListProps.current?.className).toContain(
+      "[scrollbar-gutter:stable_both-edges]",
+    );
+    const rails = document.querySelectorAll(`.${CSS.escape("max-w-[792px]")}`);
+    // Header, the single row, and the footer.
+    expect(rails).toHaveLength(3);
+    for (const rail of rails) {
+      expect(rail).toHaveClass("mx-auto", "w-full", "max-w-[792px]", "px-4");
     }
-    expect(itemRenderCounts.get("am-11")).toBe((before.get("am-11") ?? 0) + 1);
+  });
+
+  it("pins data, item, viewport, and footer growth while following", () => {
+    renderList([assistantMsg(0, "message body 0")]);
+    expect(lastListProps.current?.maintainScrollAtEnd).toEqual({
+      animated: false,
+      on: {
+        dataChange: true,
+        footerLayout: true,
+        itemLayout: true,
+        layout: true,
+      },
+    });
+    expect(lastListProps.current?.maintainScrollAtEndThreshold).toBe(0.03);
   });
 });

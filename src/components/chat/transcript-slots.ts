@@ -25,7 +25,7 @@ export type SlotBody =
   | { kind: "activity"; items: ActivityStep[]; working: boolean };
 
 export interface TranscriptSlot {
-  /** Stable React key + MessageScroller `messageId`. */
+  /** Stable React key + virtual-list navigation id. */
   key: string;
   messageId: string;
   /** Turn-boundary anchor — set on user messages so the scroller pins a
