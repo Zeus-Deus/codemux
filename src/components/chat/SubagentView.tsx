@@ -21,6 +21,7 @@ import { isTaskSummaryTool, TaskSummaryCard } from "./TaskSummaryCard";
 import { ToolCallCard } from "./ToolCallCard";
 import { UserMessage } from "./UserMessage";
 import { buildTranscriptSlots } from "./transcript-slots";
+import { CHAT_COLUMN } from "./chat-column";
 
 const NOOP = () => {};
 
@@ -57,7 +58,7 @@ export function SubagentView({
   }, [subagent.items, requests]);
 
   return (
-    <div className="mx-auto w-full max-w-[760px] px-7 pb-[30px] pt-[26px]">
+    <div className={cn(CHAT_COLUMN, "pb-[30px] pt-[26px]")}>
       {/* Read-only banner */}
       <div
         className={cn(

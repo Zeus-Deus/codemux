@@ -1,6 +1,9 @@
 import { Bug } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+
+import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 
 interface Props {
   /** Click triggers the cleanup turn (synthetic user prompt that
@@ -18,8 +21,13 @@ interface Props {
  *  cleanup turn — see `triggerDebugCleanup` in AgentChatPane. */
 export function DebugCleanupBanner({ onCleanup, busy = false }: Props) {
   return (
-    <div className="px-4 pb-2">
-      <div className="mx-auto flex w-full max-w-2xl items-center gap-2 rounded-md border border-danger/20 bg-danger/10 px-3 py-2 text-xs">
+    <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
+      <div
+        className={cn(
+          CHAT_COLUMN_INNER,
+          "flex items-center gap-2 rounded-md border border-danger/20 bg-danger/10 px-3 py-2 text-xs"
+        )}
+      >
         <Bug className="size-3.5 text-danger" aria-hidden />
         <span>Debug markers detected in this project.</span>
         <Button

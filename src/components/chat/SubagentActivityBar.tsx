@@ -11,6 +11,8 @@ import {
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
+import { CHAT_COLUMN } from "./chat-column";
+
 /** How long the green "just finished" flash stays up before the bar
  *  disappears entirely (design "for ~2.5s, then disappears"). */
 const FINISHED_FLASH_MS = 2500;
@@ -110,7 +112,7 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
       if (finishedCardId) onJump(finishedCardId);
     };
     return (
-      <div className="mx-auto w-full max-w-[760px]">
+      <div className={CHAT_COLUMN}>
         <div
           data-testid="subagent-activity-bar"
           data-tone="finished"
@@ -170,7 +172,7 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
   };
 
   return (
-    <div className="mx-auto w-full max-w-[760px]">
+    <div className={CHAT_COLUMN}>
       {multi && open && (
         <div
           id={listId}
