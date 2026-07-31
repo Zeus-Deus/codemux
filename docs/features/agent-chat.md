@@ -2034,7 +2034,14 @@ Both surfaces now name it from the first message via the shared
   straight through to the unmodified `handleSubmit`, so the send path is
   byte-for-byte what it was. The interception is gated on
   `messages.length === 0`, a non-home workspace, and a resolvable project
-  root; everything else stays on `handleSubmit`.
+  root; everything else stays on `handleSubmit`. It re-checks
+  `handleSubmit`'s own bail-outs (`sendInFlightRef`, `threadId`, empty
+  text) BEFORE naming, in the same order: `messages.length` only flips
+  once the optimistic bubble lands, so two Enter presses in one tick both
+  reach this handler and only the in-flight ref rules the second one out —
+  without it they would race two `claude --print` calls into two renames,
+  the second landing before the first's title reached the store, where the
+  apply-time guard below could no longer see it.
 
 **Same namer as worktrees, on purpose.** Naming routes through
 `generateBranchName` — the exact call `createDeferredWorktree` and the

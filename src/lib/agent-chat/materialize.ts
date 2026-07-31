@@ -667,7 +667,8 @@ async function createProjectWorkspace(
  *  backend's `set_workspace_worktree` overwrites the workspace title with
  *  that branch. The current-checkout path creates no branch, so nothing
  *  ever named it and it kept the backend default
- *  (`format!("Workspace {workspace_index}")` → `Workspace 58`) forever.
+ *  (`state_impl.rs::default_workspace_title` — the directory's own name,
+ *  or `Workspace {n}` for anything created before that) forever.
  *
  *  **Why the AI name and not the cheap truncated message.** These titles
  *  sit side by side in the sidebar. Deriving from message text would
@@ -716,7 +717,7 @@ async function resolveAndApplyWorkspaceName(
   // `generate_ai_name` degrades internally (bad output / timeout / no
   // CLI → `generate_random_name`), so a resolved value is always usable
   // and this catch only covers the IPC itself failing. In that case the
-  // truncated message still beats leaving `Workspace 58`.
+  // truncated message still beats leaving the backend default.
   let title: string;
   try {
     title = (await generateBranchName(firstMessage, projectPath)).trim() || fallback;

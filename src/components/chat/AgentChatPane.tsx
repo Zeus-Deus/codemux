@@ -2609,17 +2609,28 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // send path is byte-for-byte what it was.
   const handleCurrentCheckoutFirstSubmit = useCallback(
     (textOverride?: string, options?: { continueRun?: boolean }) => {
-      // Mirror `handleSubmit`'s text resolution so the name is derived
+      // Mirror `handleSubmit`'s bail-outs BEFORE naming, in the same
+      // order, so the namer fires exactly when a turn does. The
+      // `sendInFlightRef` check matters most: `messages.length === 0`
+      // (which selects this handler) only flips once the optimistic
+      // bubble lands, so two Enter presses in one tick would otherwise
+      // both reach here and race two `claude --print` calls into two
+      // renames — the second landing before the first's title reached
+      // the store, so the late guard couldn't stop it either.
+      if (sendInFlightRef.current) return;
+      if (!threadId) return;
+      // Same text resolution as `handleSubmit`, so the name is derived
       // from the message actually sent.
       const rawText = (
         typeof textOverride === "string" ? textOverride : draft
       ).trim();
-      if (rawText && paneWorkspaceId && workspaceProjectRoot) {
+      if (!rawText) return;
+      if (paneWorkspaceId && workspaceProjectRoot) {
         autoNameWorkspace(paneWorkspaceId, workspaceProjectRoot, rawText);
       }
       handleSubmit(textOverride, options);
     },
-    [draft, paneWorkspaceId, workspaceProjectRoot, handleSubmit],
+    [draft, threadId, paneWorkspaceId, workspaceProjectRoot, handleSubmit],
   );
 
   // Intercept ONLY the empty-thread first send; everything else stays on

@@ -1231,6 +1231,35 @@ describe("AgentChatPane Thread Scope — the pane's scope is fixed, not chosen",
     });
   });
 
+  it("names once when two Enter presses land in the same tick", async () => {
+    // `messages.length === 0` (the gate that selects the naming handler)
+    // only flips once the optimistic bubble lands, so both presses see an
+    // empty thread. Only the send-in-flight ref rules the second one out,
+    // and it has to do so BEFORE the namer runs — two `claude --print`
+    // calls would otherwise race two different titles into the workspace,
+    // the second landing before the first reached the store.
+    const projectPane = seedProjectWorkspace({ title: "Workspace 58" });
+    currentSliceOverrides = {
+      "thread-x": { inputDraft: "fix the login bug" },
+    };
+    const { agentChatSendTurn, generateBranchName } = await import(
+      "@/tauri/commands"
+    );
+    vi.mocked(generateBranchName).mockClear();
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
+      turn_id: "turn-1",
+      queued_id: null,
+    } as never);
+    const { container } = render(<AgentChatPane pane={projectPane} />);
+    const submit = container.querySelector('[data-testid="composer-submit"]')!;
+    fireEvent.click(submit);
+    fireEvent.click(submit);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
+    });
+    expect(vi.mocked(generateBranchName)).toHaveBeenCalledTimes(1);
+  });
+
   it("does not clobber a title the user already chose", async () => {
     const projectPane = seedProjectWorkspace({ title: "Payments rewrite" });
     currentSliceOverrides = {

@@ -120,12 +120,13 @@ export function buildPromptWithIssueContext(
 /** Apply the dialog's optional "Workspace name" to the workspace that was
  *  just created.
  *
- *  Every create path here lands on a backend-assigned title — `Workspace
- *  N` for the repo-root paths (`create_workspace`), the branch name for
- *  the worktree paths (`set_workspace_worktree`) — so a name the user
- *  typed has to be applied explicitly afterwards. Without this the input
- *  only ever labelled the optimistic pending row and was silently
- *  discarded the moment the real workspace landed.
+ *  Every create path here lands on a backend-assigned title —
+ *  `default_workspace_title` (the directory's own name) for the repo-root
+ *  paths, the branch name for the worktree paths
+ *  (`set_workspace_worktree`) — so a name the user typed has to be
+ *  applied explicitly afterwards. Without this the input only ever
+ *  labelled the optimistic pending row and was silently discarded the
+ *  moment the real workspace landed.
  *
  *  A typed name is the strongest available signal, so it wins over the
  *  branch-derived title too. Best-effort: a rename failure leaves the
@@ -1450,8 +1451,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 createWorkspace(projectDir)
                   .then(async (wsId) => {
                     // Same contract as the main create paths: honour a
-                    // typed name before the workspace becomes visible,
-                    // otherwise it lands as `Workspace N`.
+                    // typed name before the workspace becomes visible.
+                    // Nothing else ever names this one — it cuts no
+                    // branch — so without this it keeps the backend
+                    // default (the directory's name) forever.
                     await applyTypedWorkspaceName(wsId, workspaceName);
                     await activateWorkspace(wsId);
                   })
