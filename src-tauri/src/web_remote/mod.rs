@@ -13,6 +13,8 @@
 //! - [`account`]  — account-mode admission: verify the browser owns the same
 //!   Codemux account the desktop is signed into, then mint a session.
 //! - [`dispatch`] — invoke dispatch via synthesized `on_message` + channels.
+//! - [`compress`] — negotiated application-level WS frame compression + the
+//!   per-connection outbound byte accounting, both owned by the WS writer.
 //! - [`events`]   — `listen_any` fan-out hub with per-event refcounting.
 //! - [`iroh`]     — parallel from-anywhere transport (default-off): the `/ws`
 //!   protocol carried inside an E2E-encrypted iroh QUIC bi-stream.
@@ -26,6 +28,7 @@
 pub mod account;
 pub mod assets;
 pub mod auth;
+pub mod compress;
 pub mod dispatch;
 pub mod endpoints;
 pub mod events;

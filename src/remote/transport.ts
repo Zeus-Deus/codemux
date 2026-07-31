@@ -14,6 +14,10 @@
  *   - Channel frame parsing — JSON `{t:"chan"}` bodies and the binary
  *     `[0x01][u32 BE cb][u64 BE idx][payload]` framing for PTY bytes —
  *     handed to the shim as `(callbackId, index, message)`.
+ *   - Negotiated inbound compression: the client offers `compress=deflate`
+ *     on the WS URL and, if the server takes it up, unwraps the
+ *     `[0x02]`/`[0x03]` compressed envelopes back into ordinary text and
+ *     binary frames (see `FrameInflater`).
  *   - Reconnect with exponential backoff (1s → 16s cap): re-issue a
  *     ticket, reopen, re-subscribe. In-flight invokes reject on the drop;
  *     the UI's own `get_app_state`-on-mount + snapshot events self-heal.
@@ -21,6 +25,7 @@
  * The protocol contract is defined in `docs/plans/web-remote-access.md`
  * ("WS protocol contract") and MUST match the Rust server exactly.
  */
+import { Inflate } from "fflate";
 
 export type ConnectionStatus = "connecting" | "connected" | "reconnecting";
 
@@ -108,6 +113,128 @@ export function parseBinaryChannelFrame(
   return { callbackId, index, payload };
 }
 
+/** Compressed envelopes: an inflated text frame / an inflated binary frame. */
+const COMPRESSED_TEXT_TAG = 0x02;
+const COMPRESSED_BINARY_TAG = 0x03;
+/** Compressed envelope header: tag(1) + u32 BE uncompressed length. */
+const COMPRESSED_HEADER_LEN = 5;
+
+const textDecoder = new TextDecoder();
+
+/**
+ * Ceiling on a compressed envelope's declared uncompressed length. Matches the
+ * 64 MiB inbound frame cap the server side enforces (tungstenite's default
+ * message limit on `/ws`, and `iroh::MAX_FRAME_LEN` on the relay path), so no
+ * legitimate frame can declare more. Without the check the declared `u32` is
+ * attacker-supplied input to `new Uint8Array(…)`: 4 GiB would either throw a
+ * `RangeError` straight out of `ws.onmessage` or balloon the tab's heap.
+ */
+const MAX_INFLATED_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Per-connection raw-inflate stream for the server's compressed frames.
+ *
+ * tungstenite has no permessage-deflate, so compression is done at the
+ * application level: the server runs ONE raw-deflate stream (32 KiB window)
+ * per connection and sync-flushes after every message, which means the
+ * `00 00 FF FF` boundary ships inside the frame and the sliding-window
+ * dictionary carries into the next one (context takeover). Decoding is
+ * therefore stateful — frames must be pushed in arrival order, and every
+ * new connection starts from a fresh instance on both sides.
+ *
+ * A malformed frame desyncs that dictionary beyond repair (later frames would
+ * inflate to garbage), so the first failure *poisons* the stream: the frame is
+ * dropped, one line is logged, and `onPoison` fires. Dropping later frames
+ * silently is not an option — a lost `ok`/`err` frame would hang its invoke
+ * forever and a lost `0x03` PTY frame would stall the `Channel` reorder buffer
+ * on the missing index — so the transport's `onPoison` closes the socket. That
+ * rejects in-flight invokes, flips the status to reconnecting, and the
+ * reconnect's `reset` gives both sides a fresh stream; any compressed frame
+ * still in flight on the dying socket is dropped on the way. Plain text and
+ * `0x01` binary frames never touch this stream.
+ *
+ * Exported for direct unit testing.
+ */
+export class FrameInflater {
+  private stream: Inflate | null = null;
+  private poisoned = false;
+
+  /**
+   * @param onPoison Fired once, on the failure that poisons the stream. The
+   *   transport uses it to tear the socket down (see the class note); a bare
+   *   `FrameInflater` under test can leave it out.
+   */
+  constructor(private readonly onPoison?: () => void) {}
+
+  /**
+   * Decode one `[tag][u32 BE uncompressed_len][deflate-raw bytes]` envelope
+   * into the exact bytes the server compressed. Returns `null` for anything
+   * malformed (already logged) — callers drop the frame; the poison escalation
+   * takes care of getting the connection back to a decodable state.
+   */
+  decode(frame: ArrayBuffer): Uint8Array | null {
+    if (this.poisoned) return null;
+    if (frame.byteLength < COMPRESSED_HEADER_LEN) {
+      this.poison("compressed frame is shorter than its header");
+      return null;
+    }
+    const expected = new DataView(frame).getUint32(1, false);
+    // Validate before allocating: see `MAX_INFLATED_BYTES`.
+    if (expected > MAX_INFLATED_BYTES) {
+      this.poison(
+        `compressed frame declares ${expected} inflated bytes, above the ${MAX_INFLATED_BYTES} cap`,
+      );
+      return null;
+    }
+    const stream = (this.stream ??= new Inflate());
+    try {
+      // Belt and braces: the cap above already rules out a hostile length, and
+      // an allocation failure here is caught rather than escaping `onmessage`
+      // with the dictionary silently desynced.
+      const out = new Uint8Array(expected);
+      let written = 0;
+      let overflowed = false;
+      // `ondata` fires synchronously inside `push`, so arrival order is
+      // preserved with no async hop. Each chunk is already a fresh allocation;
+      // copying into `out` is what assembles one contiguous frame and enforces
+      // the declared length.
+      stream.ondata = (chunk) => {
+        if (written + chunk.length > expected) {
+          overflowed = true;
+          return;
+        }
+        out.set(chunk, written);
+        written += chunk.length;
+      };
+      stream.push(new Uint8Array(frame, COMPRESSED_HEADER_LEN));
+      if (overflowed || written !== expected) {
+        this.poison(
+          `inflated length mismatch (declared ${expected}, got ${
+            overflowed ? "more" : written
+          })`,
+        );
+        return null;
+      }
+      return out;
+    } catch (err) {
+      this.poison(`inflate failed: ${String(err)}`);
+      return null;
+    }
+  }
+
+  /** Start over — the server opens a fresh deflate stream per connection. */
+  reset(): void {
+    this.stream = null;
+    this.poisoned = false;
+  }
+
+  private poison(reason: string): void {
+    this.poisoned = true;
+    console.error(`[web-remote] ${reason}; reconnecting for a fresh stream`);
+    this.onPoison?.();
+  }
+}
+
 interface PendingInvoke {
   resolve(value: unknown): void;
   reject(reason: unknown): void;
@@ -123,6 +250,9 @@ export class RemoteTransport {
   private ws: WebSocketLike | null = null;
   private socketOpen = false;
   private closed = false;
+
+  /** Inbound-compression state; reset for every socket (see `FrameInflater`). */
+  private readonly inflater = new FrameInflater(() => this.dropPoisonedSocket());
 
   private nextInvokeId = 1;
   private readonly pending = new Map<number, PendingInvoke>();
@@ -246,6 +376,8 @@ export class RemoteTransport {
       this.scheduleReconnect();
       return;
     }
+    // A fresh socket means a fresh server-side deflate stream.
+    this.inflater.reset();
     ws.binaryType = "arraybuffer";
     ws.onopen = () => this.handleOpen();
     ws.onmessage = (ev) => this.handleMessage(ev.data);
@@ -278,7 +410,11 @@ export class RemoteTransport {
 
   private wsUrl(ticket: string): string {
     const wsBase = this.baseUrl.replace(/^http/i, "ws");
-    return `${wsBase}/ws?ticket=${encodeURIComponent(ticket)}`;
+    // `compress=deflate` *offers* application-level compression; its mere
+    // presence is the whole negotiation. A server that doesn't know the
+    // param just never sends `0x02`/`0x03` frames, so an older desktop keeps
+    // working untouched. C→S frames are never compressed.
+    return `${wsBase}/ws?ticket=${encodeURIComponent(ticket)}&compress=deflate`;
   }
 
   private handleOpen(): void {
@@ -311,6 +447,22 @@ export class RemoteTransport {
     this.scheduleReconnect();
   }
 
+  /**
+   * The inflate stream desynced, so nothing else on this socket can be
+   * trusted or even parsed. Close it and let the normal drop path do the
+   * recovery: `handleClose` rejects in-flight invokes (a dropped `ok`/`err`
+   * frame would otherwise hang forever — there is no invoke timeout), reports
+   * `reconnecting`, and schedules the reconnect whose `attemptConnect` resets
+   * the inflater against the server's fresh deflate stream.
+   */
+  private dropPoisonedSocket(): void {
+    try {
+      this.ws?.close();
+    } catch {
+      /* already gone — `handleClose` still runs, or already ran */
+    }
+  }
+
   private scheduleReconnect(): void {
     if (this.closed || this.reconnectTimer !== null) return;
     const delay = this.reconnectDelay;
@@ -321,19 +473,47 @@ export class RemoteTransport {
     }, delay);
   }
 
+  /** Both transports (WS and iroh) surface strings and `ArrayBuffer`s here. */
   private handleMessage(data: unknown): void {
     if (data instanceof ArrayBuffer) {
-      const frame = parseBinaryChannelFrame(data);
-      if (frame) {
-        this.hooks.onChannelMessage(
-          frame.callbackId,
-          frame.index,
-          frame.payload,
-        );
-      }
+      this.handleBinaryMessage(data);
       return;
     }
     if (typeof data !== "string") return;
+    this.handleTextMessage(data);
+  }
+
+  /**
+   * Route a binary message: the plain `[0x01]` channel framing, or a
+   * compressed envelope that unwraps to a text or binary frame and is then
+   * handled exactly as if it had arrived in that uncompressed shape.
+   */
+  private handleBinaryMessage(buffer: ArrayBuffer): void {
+    if (buffer.byteLength > 0) {
+      const tag = new DataView(buffer).getUint8(0);
+      if (tag === COMPRESSED_TEXT_TAG) {
+        const inflated = this.inflater.decode(buffer);
+        if (inflated) this.handleTextMessage(textDecoder.decode(inflated));
+        return;
+      }
+      if (tag === COMPRESSED_BINARY_TAG) {
+        // Inflates to a whole binary frame, `0x01` tag included.
+        const inflated = this.inflater.decode(buffer);
+        if (inflated) this.deliverBinaryChannelFrame(inflated.buffer);
+        return;
+      }
+    }
+    this.deliverBinaryChannelFrame(buffer);
+  }
+
+  private deliverBinaryChannelFrame(buffer: ArrayBuffer): void {
+    const frame = parseBinaryChannelFrame(buffer);
+    if (frame) {
+      this.hooks.onChannelMessage(frame.callbackId, frame.index, frame.payload);
+    }
+  }
+
+  private handleTextMessage(data: string): void {
     let msg: {
       t?: string;
       id?: number;
