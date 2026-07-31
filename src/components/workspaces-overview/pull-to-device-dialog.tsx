@@ -409,7 +409,7 @@ function HostBackedAdoptionForm({
 }) {
   return (
     <>
-      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[12.5px] space-y-1.5">
+      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[13px] space-y-1.5">
         <SummaryRow
           label="From"
           icon={<Cloud className="size-3 text-status-remote/80" />}
@@ -420,7 +420,7 @@ function HostBackedAdoptionForm({
           {remoteProjectName(syncRow) ?? "—"}
         </SummaryRow>
         <SummaryRow label="Branch">
-          <span className="font-mono text-[11.5px]">
+          <span className="font-mono text-[12px]">
             {syncRow.git_branch ?? "—"}
           </span>
         </SummaryRow>
@@ -434,7 +434,7 @@ function HostBackedAdoptionForm({
       <button
         type="button"
         onClick={onToggleDisclosure}
-        className="flex w-full items-center gap-1 text-[11.5px] text-muted-foreground/75 hover:text-foreground transition-colors"
+        className="flex w-full items-center gap-1 text-[12px] text-muted-foreground/75 hover:text-foreground transition-colors"
       >
         {disclosureOpen ? (
           <ChevronDown className="size-3" />
@@ -445,7 +445,7 @@ function HostBackedAdoptionForm({
       </button>
 
       {disclosureOpen && (
-        <ul className="rounded-md bg-muted/20 border border-border/40 px-3 py-2 text-[11.5px] text-muted-foreground/85 leading-relaxed space-y-1">
+        <ul className="rounded-md bg-muted/20 border border-border/40 px-3 py-2 text-[12px] text-muted-foreground/85 leading-relaxed space-y-1">
           <li>
             • Copies the workspace files from{" "}
             <span className="font-medium text-foreground/90">
@@ -494,7 +494,7 @@ function HostNotConfiguredBlock({
       <Button
         variant="outline"
         size="sm"
-        className="h-7 px-2.5 text-[11.5px] gap-1.5 border-warning/30 hover:bg-warning/15"
+        className="h-7 px-2.5 text-[12px] gap-1.5 border-warning/30 hover:bg-warning/15"
         onClick={() => {
           onClose();
           // TODO: deep-link to Settings → Devices when that route lands.
@@ -521,9 +521,9 @@ function CloneFallbackBlock({
         We'll clone it from git.
       </p>
 
-      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[12.5px] space-y-1.5">
+      <dl className="rounded-md border border-border/60 bg-muted/30 px-3 py-2.5 text-[13px] space-y-1.5">
         <SummaryRow label="Clone from">
-          <span className="font-mono text-[11.5px] break-all">
+          <span className="font-mono text-[12px] break-all">
             {syncRow.project_remote ?? "—"}
           </span>
         </SummaryRow>
@@ -531,7 +531,7 @@ function CloneFallbackBlock({
           label="Branch"
           icon={<GitBranch className="size-3 text-muted-foreground/70" />}
         >
-          <span className="font-mono text-[11.5px]">
+          <span className="font-mono text-[12px]">
             {syncRow.git_branch ?? "main"}
           </span>
         </SummaryRow>
@@ -542,7 +542,7 @@ function CloneFallbackBlock({
         </SummaryRow>
       </dl>
 
-      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[11.5px] text-warning/90 leading-relaxed">
+      <div className="flex items-start gap-2 rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-[12px] text-warning/90 leading-relaxed">
         <AlertTriangle className="size-3.5 shrink-0 mt-0.5" />
         <div>
           <p className="font-medium text-warning">
@@ -608,7 +608,7 @@ function SameBranchProjectBlock({
       <Button
         variant="secondary"
         size="sm"
-        className="h-7 px-2.5 text-[11.5px]"
+        className="h-7 px-2.5 text-[12px]"
         onClick={onOpenExisting}
       >
         Open the existing workspace
@@ -624,7 +624,7 @@ function AlreadyAdoptedBlock({ onOpen }: { onOpen: () => void }) {
       <Button
         variant="secondary"
         size="sm"
-        className="h-7 px-2.5 text-[11.5px]"
+        className="h-7 px-2.5 text-[12px]"
         onClick={onOpen}
       >
         Open it
@@ -652,7 +652,7 @@ function SummaryRow({
 }) {
   return (
     <div className="flex items-baseline gap-2">
-      <dt className="w-[68px] shrink-0 text-[10.5px] uppercase tracking-wider text-muted-foreground/55">
+      <dt className="w-[68px] shrink-0 text-[11px] uppercase tracking-wider text-muted-foreground/55">
         {label}
       </dt>
       <dd

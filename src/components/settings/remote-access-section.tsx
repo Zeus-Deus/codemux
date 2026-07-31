@@ -173,7 +173,7 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
     <div className="flex items-start gap-3 py-2.5">
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex flex-wrap items-center gap-2">
-          <code className="truncate font-mono text-[12.5px] text-foreground">
+          <code className="truncate font-mono text-[13px] text-foreground">
             {endpoint.url}
           </code>
           {endpoint.recommended && (
@@ -202,7 +202,7 @@ function EndpointRow({ endpoint }: { endpoint: WebRemoteEndpoint }) {
             </Badge>
           )}
         </div>
-        <p className="text-[11.5px] leading-relaxed text-muted-foreground/80">
+        <p className="text-[12px] leading-relaxed text-muted-foreground/80">
           {hint.detail}
         </p>
       </div>
@@ -233,7 +233,7 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
   if (group.collapsible) {
     return (
       <details className="group rounded-md border border-border/50 bg-muted/20 px-3 py-2">
-        <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[12.5px] font-semibold text-foreground marker:content-none">
+        <summary className="flex cursor-pointer list-none items-center gap-1.5 text-[13px] font-semibold text-foreground marker:content-none">
           <span className="text-muted-foreground/70 transition-transform group-open:rotate-90">
             ›
           </span>
@@ -243,7 +243,7 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
           </span>
         </summary>
         <div className="mt-1.5 space-y-1">
-          <p className="text-[11.5px] leading-relaxed text-muted-foreground/70">
+          <p className="text-[12px] leading-relaxed text-muted-foreground/70">
             {group.explanation}
           </p>
           <EndpointGroupRows endpoints={group.endpoints} />
@@ -253,10 +253,10 @@ function EndpointGroupBlock({ group }: { group: EndpointGroupView }) {
   }
   return (
     <div className="space-y-1">
-      <p className="text-[12.5px] font-semibold text-foreground">
+      <p className="text-[13px] font-semibold text-foreground">
         {group.title}
       </p>
-      <p className="text-[11.5px] leading-relaxed text-muted-foreground/70">
+      <p className="text-[12px] leading-relaxed text-muted-foreground/70">
         {group.explanation}
       </p>
       <EndpointGroupRows endpoints={group.endpoints} />
@@ -383,14 +383,14 @@ function PairingPanel({
               </p>
               <span
                 className={cn(
-                  "font-mono text-[11.5px] tabular-nums",
+                  "font-mono text-[12px] tabular-nums",
                   expired ? "text-status-attention" : "text-muted-foreground",
                 )}
               >
                 {expired ? "Expired" : `Expires in ${formatCountdown(remainingMs)}`}
               </span>
             </div>
-            <p className="mt-1 text-[11.5px] leading-relaxed text-muted-foreground/80">
+            <p className="mt-1 text-[12px] leading-relaxed text-muted-foreground/80">
               One-time link — it pairs a single device, then can't be reused.
               Open it on your phone or laptop to connect.
             </p>
@@ -485,7 +485,7 @@ function PendingRow({
             </Badge>
           )}
         </div>
-        <p className="truncate text-[11.5px] text-muted-foreground/80">
+        <p className="truncate text-[12px] text-muted-foreground/80">
           {d.platform || "Unknown platform"} ·{" "}
           {session.source === "account"
             ? "signed in and awaiting approval"
@@ -560,7 +560,7 @@ function DeviceRow({
             </span>
           )}
         </div>
-        <p className="truncate text-[11.5px] text-muted-foreground/80">
+        <p className="truncate text-[12px] text-muted-foreground/80">
           {d.platform || "Unknown platform"} ·{" "}
           {isAccount ? "signed in" : "paired"} {relativeTime(session.created_at)}{" "}
           · last seen {relativeTime(session.last_seen_at)}
@@ -1090,7 +1090,7 @@ export function RemoteAccessSection() {
             Remote Access
           </h2>
         </div>
-        <p className="mt-1.5 max-w-prose text-[13.5px] leading-relaxed text-muted-foreground/80">
+        <p className="mt-1.5 max-w-prose text-[14px] leading-relaxed text-muted-foreground/80">
           Open this desktop to a browser on another device — a laptop or phone
           on your network or mesh VPN — and drive the same projects, sessions,
           and agents from there.
@@ -1147,7 +1147,7 @@ export function RemoteAccessSection() {
               rebindPhase.status === "cutoff" ? (
                 <div
                   role="status"
-                  className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[12.5px] leading-relaxed text-status-attention"
+                  className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[13px] leading-relaxed text-status-attention"
                 >
                   <WifiOff className="mt-0.5 h-4 w-4 shrink-0" />
                   <span>{rebindPhase.message}</span>
@@ -1155,7 +1155,7 @@ export function RemoteAccessSection() {
               ) : (
                 <div
                   role="status"
-                  className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-[12.5px] text-status-working"
+                  className="flex items-center gap-2.5 rounded-lg border border-status-working/40 bg-status-working/[0.08] px-3.5 py-3 text-[13px] text-status-working"
                 >
                   <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
                   <span>Applying change — reconnecting to this device…</span>
@@ -1187,7 +1187,7 @@ export function RemoteAccessSection() {
                       disabled={scopePending || rebindBusy}
                       onClick={() => handleSetScope(opt.value)}
                       className={cn(
-                        "rounded-[7px] px-3 py-1.5 text-[12.5px] font-medium transition-colors disabled:opacity-60",
+                        "rounded-[7px] px-3 py-1.5 text-[13px] font-medium transition-colors disabled:opacity-60",
                         active
                           ? "bg-accent-ember/15 text-accent-ember shadow-sm"
                           : "text-muted-foreground hover:text-foreground",
@@ -1216,7 +1216,7 @@ export function RemoteAccessSection() {
                   invalidates any open pairing link.
                 </p>
                 {portDraft !== "" && !portValidation.valid && (
-                  <p className="text-[11.5px] text-status-attention">
+                  <p className="text-[12px] text-status-attention">
                     {portValidation.error}
                   </p>
                 )}
@@ -1300,7 +1300,7 @@ export function RemoteAccessSection() {
             {accountModeEnabled && !accountSignedIn && (
               <div
                 role="status"
-                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[12.5px] leading-relaxed text-status-attention"
+                className="flex items-start gap-2.5 rounded-lg border border-status-attention/40 bg-status-attention/[0.08] px-3.5 py-3 text-[13px] leading-relaxed text-status-attention"
               >
                 <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
                 <span>
@@ -1338,7 +1338,7 @@ export function RemoteAccessSection() {
           <section className="space-y-2">
             <SubHeading>Reachable at</SubHeading>
             {endpoints.length === 0 ? (
-              <p className="py-2 text-[12.5px] text-muted-foreground/70">
+              <p className="py-2 text-[13px] text-muted-foreground/70">
                 {running
                   ? "No reachable endpoints found."
                   : "Starting the server…"}
@@ -1360,7 +1360,7 @@ export function RemoteAccessSection() {
               />
             ) : (
               <div className="flex items-center justify-between gap-4 rounded-lg border border-border/60 bg-muted/30 p-4">
-                <p className="text-[12.5px] leading-relaxed text-muted-foreground/85">
+                <p className="text-[13px] leading-relaxed text-muted-foreground/85">
                   Create a one-time link, then scan its QR code or open it on the
                   other device to pair.
                 </p>
@@ -1430,7 +1430,7 @@ export function RemoteAccessSection() {
               )}
             </div>
             {approved.length === 0 ? (
-              <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-[12.5px] text-muted-foreground/70">
+              <div className="flex items-center gap-2.5 rounded-lg border border-dashed border-border/60 px-3.5 py-4 text-[13px] text-muted-foreground/70">
                 <Server className="h-4 w-4" />
                 No devices paired yet. Create a pairing link above to connect
                 one.

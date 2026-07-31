@@ -354,7 +354,7 @@ export function MessageList({
           behavior="auto"
           variant="secondary"
           size="sm"
-          className="bottom-4 h-8 w-auto gap-1.5 rounded-full border border-border bg-card px-3.5 text-[11.5px] font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
+          className="bottom-4 h-8 w-auto gap-1.5 rounded-full border border-border bg-card px-3.5 text-[12px] font-semibold text-muted-foreground shadow-lg hover:bg-card hover:text-foreground"
         >
           Jump to latest
           <ArrowDown className="h-3.5 w-3.5" aria-hidden />
@@ -447,7 +447,7 @@ function RunInterruptedDivider() {
       className="flex items-center gap-3 text-warning"
     >
       <span className="h-px flex-1 bg-warning/40" />
-      <span className="font-mono text-[10.5px] font-medium tracking-wide">
+      <span className="font-mono text-[11px] font-medium tracking-wide">
         Run interrupted
       </span>
       <span className="h-px flex-1 bg-warning/40" />
@@ -459,7 +459,7 @@ function SessionStartMarker({ startedAt }: { startedAt?: number }) {
   return (
     <div className="flex items-center gap-3 text-muted-foreground/70">
       <span className="h-px flex-1 bg-border/60" />
-      <span className="font-mono text-[10.5px] font-medium tracking-wide">
+      <span className="font-mono text-[11px] font-medium tracking-wide">
         {formatSessionStart(startedAt)}
       </span>
       <span className="h-px flex-1 bg-border/60" />
@@ -724,7 +724,7 @@ function renderAssistantBody(
           return (
             <div className="space-y-1">
               {handlers.subagentName && (
-                <div className="font-mono text-[10.5px] font-semibold uppercase tracking-wide text-muted-foreground">
+                <div className="font-mono text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
                   From subagent {handlers.subagentName}
                 </div>
               )}

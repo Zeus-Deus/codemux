@@ -406,7 +406,7 @@ export function AutomationsSection() {
             <h3 className="text-[15px] font-semibold tracking-tight text-foreground">
               No automations yet
             </h3>
-            <p className="text-[12.5px] leading-relaxed text-muted-foreground/80">
+            <p className="text-[13px] leading-relaxed text-muted-foreground/80">
               Run an agent on a schedule — triage issues each morning,
               sweep stale branches nightly, post a weekly summary. It runs
               on the host you choose, even with your laptop closed.
@@ -416,7 +416,7 @@ export function AutomationsSection() {
             type="button"
             variant="secondary"
             size="sm"
-            className="h-8 gap-1.5 text-[12.5px]"
+            className="h-8 gap-1.5 text-[13px]"
             onClick={startCreate}
           >
             <Plus className="size-3.5" />
@@ -638,7 +638,7 @@ function AutomationDetail({
         <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
           Prompt
         </p>
-        <div className="rounded-lg border border-border/60 bg-muted/30 p-3 text-[12.5px] text-foreground/90 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
+        <div className="rounded-lg border border-border/60 bg-muted/30 p-3 text-[13px] text-foreground/90 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
           {automation.prompt}
         </div>
       </div>
@@ -701,7 +701,7 @@ function FactCard({ label, value }: { label: string; value: string }) {
       <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
         {label}
       </p>
-      <p className="mt-1 text-[12.5px] text-foreground/90 tabular-nums">{value}</p>
+      <p className="mt-1 text-[13px] text-foreground/90 tabular-nums">{value}</p>
     </div>
   );
 }
@@ -772,7 +772,7 @@ function RunHistory({ automationId }: { automationId: number }) {
               title={run.error ?? undefined}
               className="flex items-center gap-2.5 px-3 py-2"
             >
-              <span className="shrink-0 font-mono text-[11.5px] tabular-nums text-muted-foreground/80">
+              <span className="shrink-0 font-mono text-[12px] tabular-nums text-muted-foreground/80">
                 {formatStamp(run.scheduled_for)}
               </span>
               {run.pr_url ? (
@@ -784,7 +784,7 @@ function RunHistory({ automationId }: { automationId: number }) {
                   Pull request ↗
                 </button>
               ) : run.branch ? (
-                <span className="min-w-0 truncate font-mono text-[10.5px] text-muted-foreground/55">
+                <span className="min-w-0 truncate font-mono text-[11px] text-muted-foreground/55">
                   {run.branch}
                 </span>
               ) : null}
@@ -1044,7 +1044,7 @@ function ScheduleField({
             className="h-9 w-28 text-[13px] tabular-nums"
           />
           {draft.builder.frequency === "HOURLY" && (
-            <span className="text-[11.5px] text-muted-foreground/70">
+            <span className="text-[12px] text-muted-foreground/70">
               past each hour
             </span>
           )}
@@ -1173,7 +1173,7 @@ function RepoAccessRow({
   if (hostId === null) return null;
 
   return (
-    <div className="flex items-start gap-2 text-[11.5px] leading-relaxed">
+    <div className="flex items-start gap-2 text-[12px] leading-relaxed">
       {checking ? (
         <>
           <Loader2 className="mt-0.5 size-3 shrink-0 animate-spin text-muted-foreground/60" />

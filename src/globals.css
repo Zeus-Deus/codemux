@@ -303,9 +303,6 @@ body.pane-resizing iframe {
     }
   body {
     @apply bg-background text-foreground;
-    -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    text-rendering: optimizeLegibility;
     }
   html {
     @apply font-sans;
@@ -710,4 +707,3 @@ body.pane-resizing iframe {
   box-shadow: 0 0 0 2px var(--accent-ember);
   transition: box-shadow 0.3s ease;
 }
-

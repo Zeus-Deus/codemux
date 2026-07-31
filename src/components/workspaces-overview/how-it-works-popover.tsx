@@ -84,7 +84,7 @@ export function HowItWorksPopover() {
         className="w-[320px] p-0 overflow-hidden"
       >
         <div className="bg-gradient-to-br from-status-remote/10 via-transparent to-status-open/8 px-4 py-3 border-b border-border/40">
-          <p className="text-[12.5px] font-semibold text-foreground">
+          <p className="text-[13px] font-semibold text-foreground">
             How workspaces sync across devices
           </p>
           <p className="mt-0.5 text-[11px] text-muted-foreground/75 leading-relaxed">
@@ -92,7 +92,7 @@ export function HowItWorksPopover() {
             device of your account where each workspace is.
           </p>
         </div>
-        <ol className="px-4 py-3 space-y-3 text-[11.5px] leading-relaxed">
+        <ol className="px-4 py-3 space-y-3 text-[12px] leading-relaxed">
           <Step
             n="1"
             icon={<ArrowUpRight className="size-3 text-status-open" />}
@@ -115,7 +115,7 @@ export function HowItWorksPopover() {
           />
         </ol>
         <div className="px-4 py-2.5 border-t border-border/40 bg-muted/20">
-          <p className="text-[10.5px] text-muted-foreground/65 leading-relaxed">
+          <p className="text-[11px] text-muted-foreground/65 leading-relaxed">
             Every push and pull is undoable for 10 seconds. Workspace
             files never sync silently — they only move when you say so.
           </p>

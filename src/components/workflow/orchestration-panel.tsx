@@ -101,12 +101,12 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
               <ChevronLeft className="h-3.5 w-3.5" strokeWidth={1.7} aria-hidden />
             </button>
           )}
-          <span className="min-w-0 flex-1 truncate text-[13.5px] font-bold text-foreground">
+          <span className="min-w-0 flex-1 truncate text-[14px] font-bold text-foreground">
             {level === "agent" ? "Agent detail" : (run.name ?? "Workflow")}
           </span>
           <span
             className={cn(
-              "shrink-0 rounded-[5px] px-2 py-0.5 text-[10.5px] font-bold uppercase tracking-wide",
+              "shrink-0 rounded-[5px] px-2 py-0.5 text-[11px] font-bold uppercase tracking-wide",
               tone.chipBg,
             )}
           >
@@ -185,7 +185,7 @@ function Stat({ label, value }: { label: string; value: string }) {
   return (
     <span className="flex flex-col">
       <span className="font-mono text-[13px] font-semibold text-foreground">{value}</span>
-      <span className="text-[9.5px] uppercase tracking-wide text-muted-foreground">{label}</span>
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</span>
     </span>
   );
 }

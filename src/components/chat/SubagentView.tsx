@@ -61,7 +61,7 @@ export function SubagentView({
       {/* Read-only banner */}
       <div
         className={cn(
-          "mb-4 flex items-center gap-2.5 rounded-[9px] border px-3 py-2.5 text-[11.5px] text-muted-foreground",
+          "mb-4 flex items-center gap-2.5 rounded-[9px] border px-3 py-2.5 text-[12px] text-muted-foreground",
           tone.softBg,
           tone.border,
         )}

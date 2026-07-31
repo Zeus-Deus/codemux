@@ -1107,7 +1107,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                   className={cn(
                   "truncate leading-tight",
                   isCard
-                    ? "text-[12.5px] font-semibold text-foreground"
+                    ? "text-[13px] font-semibold text-foreground"
                     : cn(
                         "text-[13px]",
                         isActive
@@ -1161,7 +1161,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                             type="button"
                             onClick={(e) => e.stopPropagation()}
                             aria-label={`${shippedCount} shipped`}
-                            className="flex items-center gap-1 font-mono text-[10.5px] leading-none tabular-nums text-muted-foreground select-none transition-transform group-hover/row:-translate-x-8"
+                            className="flex items-center gap-1 font-mono text-[11px] leading-none tabular-nums text-muted-foreground select-none transition-transform group-hover/row:-translate-x-8"
                           >
                             <span className="text-status-open">✓</span>
                             {shippedCount} shipped
@@ -1172,7 +1172,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                           align="start"
                           className="w-64 p-2"
                         >
-                          <div className="mb-1.5 font-mono text-[9.5px] uppercase tracking-wide text-muted-foreground/70">
+                          <div className="mb-1.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground/70">
                             Shipped from this workspace
                           </div>
                           <ul className="space-y-1">
@@ -1199,7 +1199,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         opacity decays over ~1h, then it disappears. */}
                     {showSettledCheck && (
                       <span
-                        className="text-status-open text-[10.5px] leading-none tabular-nums select-none"
+                        className="text-status-open text-[11px] leading-none tabular-nums select-none"
                         style={{ opacity: settledOpacity }}
                         aria-label="Recently finished"
                       >

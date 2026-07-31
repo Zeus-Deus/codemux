@@ -116,7 +116,7 @@ export const UserMessage = memo(function UserMessage({
       <div className="flex max-w-[82%] flex-col items-end gap-1">
         <div
           className={cn(
-            "flex flex-col gap-2 rounded-[14px_14px_5px_14px] border px-[15px] py-[11px] text-[13.5px] leading-[1.55]",
+            "flex flex-col gap-2 rounded-[14px_14px_5px_14px] border px-[15px] py-[11px] text-sm leading-relaxed",
             queued
               ? "border-dashed border-border/50 bg-muted/40 text-muted-foreground opacity-70"
               : "border-border/60 bg-card text-foreground",

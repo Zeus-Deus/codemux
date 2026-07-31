@@ -88,7 +88,7 @@ export const SubagentsCard = memo(function SubagentsCard({
           )}
         </span>
         <span className="text-[13px] font-bold text-foreground">Subagents</span>
-        <span className="text-[11.5px] text-muted-foreground">
+        <span className="text-[12px] text-muted-foreground">
           {subs.length} {subs.length === 1 ? "task" : "tasks"}
           {anyRunning ? " · running in parallel" : " · complete"}
         </span>
@@ -187,7 +187,7 @@ function SubagentRow({
 
         {/* Name + model column */}
         <div className="flex w-[150px] shrink-0 flex-col gap-0.5">
-          <span className="truncate text-[12.5px] font-bold text-foreground">
+          <span className="truncate text-[13px] font-bold text-foreground">
             {sub.name ?? sub.agentType ?? "Subagent"}
           </span>
           {sub.model && (
@@ -200,7 +200,7 @@ function SubagentRow({
         {/* Live activity / result line */}
         <div className="min-w-0 flex-1 overflow-hidden">
           {running ? (
-            <span className="shimmer block truncate font-mono text-[11.5px]">
+            <span className="shimmer block truncate font-mono text-[12px]">
               {activity}
             </span>
           ) : (
@@ -211,7 +211,7 @@ function SubagentRow({
         </div>
 
         {/* Meta */}
-        <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">
+        <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
           {meta}
         </span>
 
@@ -278,7 +278,7 @@ function SubagentRow({
               e.stopPropagation();
               onEnter();
             }}
-            className="mt-2 flex h-7 items-center gap-1.5 self-start rounded-lg bg-foreground/[0.09] px-3 text-[11.5px] font-semibold text-foreground hover:bg-foreground/[0.14]"
+            className="mt-2 flex h-7 items-center gap-1.5 self-start rounded-lg bg-foreground/[0.09] px-3 text-[12px] font-semibold text-foreground hover:bg-foreground/[0.14]"
           >
             Enter subagent
             <ChevronRight className="h-3 w-3" strokeWidth={1.7} aria-hidden />

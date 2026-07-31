@@ -424,7 +424,7 @@ export function HostsSection() {
                             : "text-muted-foreground/70",
                         )}
                       />
-                      <span className="text-[10.5px] font-medium leading-tight">
+                      <span className="text-[11px] font-medium leading-tight">
                         {kind.label}
                       </span>
                     </button>
@@ -613,7 +613,7 @@ export function HostsSection() {
               <div className="mb-3 flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <p className="text-[13px] font-medium text-foreground">Test connection</p>
-                  <p className="text-[11.5px] text-muted-foreground/75 leading-relaxed mt-0.5">
+                  <p className="text-[12px] text-muted-foreground/75 leading-relaxed mt-0.5">
                     Probes SSH reachability and the remote codemux-remote helper.
                   </p>
                 </div>
@@ -693,7 +693,7 @@ export function HostsSection() {
               <div className="flex items-center justify-between gap-3">
                 <div className="min-w-0">
                   <p className="text-[13px] font-medium text-foreground">Reinstall agent</p>
-                  <p className="text-[11.5px] text-muted-foreground/75 leading-relaxed mt-0.5">
+                  <p className="text-[12px] text-muted-foreground/75 leading-relaxed mt-0.5">
                     Re-upload codemux-remote and restart it on the host. Use after
                     rebuilding the agent locally — pushes skip the update when the
                     version string is unchanged.
@@ -763,7 +763,7 @@ function AutoInstallToggle() {
     setEnabled(localStorage.getItem(AUTO_INSTALL_KEY) === "1");
   }, []);
   return (
-    <label className="mt-3 flex items-start gap-2 text-[11.5px] text-muted-foreground/85 cursor-pointer leading-relaxed select-none hover:text-foreground transition-colors">
+    <label className="mt-3 flex items-start gap-2 text-[12px] text-muted-foreground/85 cursor-pointer leading-relaxed select-none hover:text-foreground transition-colors">
       <input
         type="checkbox"
         className="mt-0.5 size-3 shrink-0 accent-foreground"

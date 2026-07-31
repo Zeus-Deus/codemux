@@ -80,7 +80,7 @@ export function BashToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {command && (
-        <div className="rounded-md bg-muted/40 px-3 py-2 font-mono text-[11.5px] leading-5 text-foreground whitespace-pre-wrap break-words">
+        <div className="rounded-md bg-muted/40 px-3 py-2 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
           <span className="text-muted-foreground/70">$ </span>
           {command}
           {description && (
@@ -92,7 +92,7 @@ export function BashToolBody({ item, input }: BodyProps) {
       )}
       {result && (
         <div className="rounded-md bg-muted/40">
-          <pre className="whitespace-pre-wrap break-words px-3 py-2 font-mono text-[11.5px] leading-5 text-foreground">
+          <pre className="whitespace-pre-wrap break-words px-3 py-2 font-mono text-[12px] leading-5 text-foreground">
             {tail}
           </pre>
           {tailHidden > 0 && (
@@ -110,7 +110,7 @@ export function BashToolBody({ item, input }: BodyProps) {
         // not a status billboard.
         <span
           aria-label={`Exit code ${exitCode}`}
-          className="font-mono text-[10.5px] text-destructive/80"
+          className="font-mono text-[11px] text-destructive/80"
         >
           exit {exitCode}
         </span>
@@ -132,7 +132,7 @@ export function ReadToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {path && (
-        <div className="font-mono text-[11.5px] text-foreground">
+        <div className="font-mono text-[12px] text-foreground">
           {path}
           {(offset != null || limit != null) && (
             <span className="ml-2 text-muted-foreground/70">
@@ -143,7 +143,7 @@ export function ReadToolBody({ item, input }: BodyProps) {
       )}
       {preview && (
         <div className="rounded-md bg-muted/40">
-          <pre className="whitespace-pre-wrap break-words px-3 py-2 font-mono text-[11.5px] leading-5 text-foreground">
+          <pre className="whitespace-pre-wrap break-words px-3 py-2 font-mono text-[12px] leading-5 text-foreground">
             {preview}
           </pre>
           {totalLines > READ_PREVIEW_LINES && (
@@ -168,7 +168,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {(pattern || path) && (
-        <div className="font-mono text-[11.5px] text-foreground">
+        <div className="font-mono text-[12px] text-foreground">
           {pattern && <span>{pattern}</span>}
           {path && (
             <span className="ml-2 text-muted-foreground/70">in {path}</span>
@@ -184,7 +184,7 @@ export function GrepToolBody({ item, input }: BodyProps) {
             {visible.map((m, i) => (
               <li
                 key={i}
-                className="font-mono text-[11.5px] leading-5 text-foreground break-words"
+                className="font-mono text-[12px] leading-5 text-foreground break-words"
               >
                 <span className="text-muted-foreground/70">{m.location}</span>
                 {m.text && <span className="ml-2">{m.text}</span>}
@@ -218,7 +218,7 @@ export function WebFetchToolBody({ item, input }: BodyProps) {
             href={url}
             target="_blank"
             rel="noopener noreferrer"
-            className="block break-all font-mono text-[11.5px] text-foreground underline-offset-4 hover:underline"
+            className="block break-all font-mono text-[12px] text-foreground underline-offset-4 hover:underline"
           >
             {url}
           </a>
@@ -226,16 +226,16 @@ export function WebFetchToolBody({ item, input }: BodyProps) {
           // Refuse to render non-http(s) URLs as links — `javascript:`,
           // `data:`, `file:`, etc. from a buggy or malicious tool result
           // are XSS vectors otherwise.
-          <span className="block break-all font-mono text-[11.5px] text-muted-foreground">
+          <span className="block break-all font-mono text-[12px] text-muted-foreground">
             {url}
           </span>
         )
       )}
       {title && (
-        <p className="text-[11.5px] text-muted-foreground">{title}</p>
+        <p className="text-[12px] text-muted-foreground">{title}</p>
       )}
       {prompt && (
-        <p className="rounded-md bg-muted/40 px-3 py-2 text-[11.5px] text-foreground">
+        <p className="rounded-md bg-muted/40 px-3 py-2 text-[12px] text-foreground">
           {prompt}
         </p>
       )}
@@ -281,7 +281,7 @@ export function EditToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-1">
       {path && (
-        <div className="font-mono text-[11.5px] text-foreground">{path}</div>
+        <div className="font-mono text-[12px] text-foreground">{path}</div>
       )}
       {result && <ToolCallBlock content={result} />}
     </div>

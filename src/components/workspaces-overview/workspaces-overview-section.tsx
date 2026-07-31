@@ -83,7 +83,7 @@ function filterTriggerCls(active: boolean): string {
   // replaces the SelectTrigger's own `data-[size=default]:h-8` instead of
   // colliding with it at equal specificity (the bare class would lose).
   return cn(
-    "data-[size=default]:h-10 rounded-lg text-[12.5px] font-semibold transition-colors",
+    "data-[size=default]:h-10 rounded-lg text-[13px] font-semibold transition-colors",
     active
       ? "border-primary/45 bg-primary/5 text-foreground"
       : "text-muted-foreground",
@@ -501,7 +501,7 @@ export function WorkspacesOverviewSection() {
             <h3 className="text-[15px] font-semibold tracking-tight text-foreground">
               No workspaces yet
             </h3>
-            <p className="text-[12.5px] leading-relaxed text-muted-foreground/80">
+            <p className="text-[13px] leading-relaxed text-muted-foreground/80">
               Workspaces hold a worktree, an agent, and any panes you open.
               Create one here, then push it to a host whenever you want it
               to run somewhere else — every device of your account shows up
@@ -512,7 +512,7 @@ export function WorkspacesOverviewSection() {
             type="button"
             variant="secondary"
             size="sm"
-            className="h-8 gap-1.5 text-[12.5px]"
+            className="h-8 gap-1.5 text-[13px]"
             onClick={() => {
               setShowWorkspacesOverview(false);
               setShowNewWorkspaceDialog(true);
@@ -660,7 +660,7 @@ export function WorkspacesOverviewSection() {
       <div className="shrink-0 border-b border-border/40 px-6 py-2">
         <div className="mx-auto flex max-w-[1180px] items-center justify-between gap-3">
           <div className="flex items-center gap-1.5">
-            <p className="text-[11.5px] text-muted-foreground/70 tabular-nums">
+            <p className="text-[12px] text-muted-foreground/70 tabular-nums">
               {totalShown === totalAll
                 ? `${totalAll} ${totalAll === 1 ? "workspace" : "workspaces"}`
                 : `${totalShown} of ${totalAll} shown`}
@@ -682,7 +682,7 @@ export function WorkspacesOverviewSection() {
               type="button"
               variant="secondary"
               size="sm"
-              className="h-9 gap-1.5 px-3.5 text-[12.5px] font-semibold"
+              className="h-9 gap-1.5 px-3.5 text-[13px] font-semibold"
               onClick={() => {
                 setShowWorkspacesOverview(false);
                 setShowSettings(true, "hosts");
@@ -696,7 +696,7 @@ export function WorkspacesOverviewSection() {
             <Button
               type="button"
               size="sm"
-              className="h-9 gap-1.5 px-3.5 text-[12.5px] font-bold"
+              className="h-9 gap-1.5 px-3.5 text-[13px] font-bold"
               onClick={() => {
                 setShowWorkspacesOverview(false);
                 setShowNewWorkspaceDialog(true);
@@ -863,7 +863,7 @@ function DeviceSection({
                 {hiddenByFilter} filtered
               </span>
             )}
-            <span className="text-[11.5px] tabular-nums text-muted-foreground/65">
+            <span className="text-[12px] tabular-nums text-muted-foreground/65">
               {bucket.items.length}{" "}
               {bucket.items.length === 1 ? "workspace" : "workspaces"}
             </span>
@@ -1161,7 +1161,7 @@ function EmptyBucketCTA({
   if (isLocal) {
     return (
       <div className="rounded-lg border border-dashed border-border/50 bg-muted/20 px-4 py-5 text-center space-y-3">
-        <p className="text-[12.5px] text-muted-foreground/85">
+        <p className="text-[13px] text-muted-foreground/85">
           No workspaces on this device yet.
         </p>
         <div className="flex flex-wrap items-center justify-center gap-2">
@@ -1203,7 +1203,7 @@ function EmptyBucketCTA({
   // construct a "push" CTA (which needs a workspace pre-selected).
   return (
     <div className="rounded-lg border border-dashed border-border/50 bg-muted/20 px-4 py-5 text-center space-y-2">
-      <p className="text-[12.5px] text-muted-foreground/85">
+      <p className="text-[13px] text-muted-foreground/85">
         No workspaces pushed to {bucketLabel} yet.
       </p>
       <p className="text-[11px] text-muted-foreground/65 leading-relaxed">
@@ -1223,7 +1223,7 @@ function EmptyFilters({ onClear }: { onClear: () => void }) {
         <p className="text-[13px] font-medium text-foreground">
           No workspaces match these filters
         </p>
-        <p className="text-[11.5px] text-muted-foreground/70">
+        <p className="text-[12px] text-muted-foreground/70">
           Try a different search, or clear the filter to see everything.
         </p>
       </div>

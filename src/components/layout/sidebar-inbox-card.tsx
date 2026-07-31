@@ -214,7 +214,7 @@ export function SidebarInboxCard({
    *  pair rather than two buttons that happen to sit together. */
   const eyebrowActionClass = cn(
     "h-5 shrink-0 items-center gap-1 rounded-md border border-border bg-muted px-2",
-    "text-[10.5px] font-semibold text-muted-foreground transition-colors duration-150",
+    "text-[11px] font-semibold text-muted-foreground transition-colors duration-150",
     "hover:border-muted-foreground/50 hover:text-foreground",
     actionsPinned
       ? "inline-flex"
@@ -396,7 +396,7 @@ export function SidebarInboxCard({
                     className={cn(
                       "flex shrink-0 items-center gap-0.5 rounded-full px-1.5",
                       "border border-status-open/25 bg-status-open/10",
-                      "text-[9.5px] font-semibold leading-[15px] text-status-open",
+                      "text-[10px] font-semibold leading-[15px] text-status-open",
                     )}
                   >
                     <AlarmClock className="h-2.5 w-2.5" strokeWidth={2.5} />
@@ -521,7 +521,7 @@ export function SidebarInboxCard({
                   the chip's own variable width ("merged" vs "PR #1234") harmless. */}
               <div
                 data-meta-line
-                className="mt-[5px] flex min-w-0 items-center gap-2 font-mono text-[10.5px] leading-tight text-muted-foreground/60"
+                className="mt-[5px] flex min-w-0 items-center gap-2 font-mono text-[11px] leading-tight text-muted-foreground/60"
               >
                 {workspace.git_branch && (
                   <span className="min-w-0 truncate">{workspace.git_branch}</span>
@@ -557,7 +557,7 @@ export function SidebarInboxCard({
                         : `Pull request — ${prState}`
                     }
                     className={cn(
-                      "shrink-0 rounded-[5px] border px-[5px] py-px font-mono text-[9.5px] font-medium",
+                      "shrink-0 rounded-[5px] border px-[5px] py-px font-mono text-[10px] font-medium",
                       "transition-colors duration-150",
                       PR_CHIP_TONE[prState],
                       !workspace.pr_url && "pointer-events-none",
@@ -588,7 +588,7 @@ export function SidebarInboxCard({
                     />
                   )}
                   {workspace.notification_count > 0 && (
-                    <span className="flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-[9.5px] font-bold text-muted-foreground">
+                    <span className="flex h-[15px] min-w-[15px] shrink-0 items-center justify-center rounded-full bg-foreground/10 px-1 text-[10px] font-bold text-muted-foreground">
                       {workspace.notification_count}
                     </span>
                   )}

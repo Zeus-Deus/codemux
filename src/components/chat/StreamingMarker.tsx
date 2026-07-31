@@ -47,7 +47,7 @@ export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
         />
       </span>
       <span className="flex min-w-0 items-baseline gap-1.5">
-        <span className="shimmer text-[12.5px] font-semibold">{label}</span>
+        <span className="shimmer text-[13px] font-semibold">{label}</span>
         {startedAt != null && (
           // Populated imperatively by the effect; render nothing when no
           // turn start is derivable (e.g. hydrated old transcripts) so the

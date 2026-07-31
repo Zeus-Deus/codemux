@@ -9,7 +9,7 @@ export function ToolCallStatus({ item }: { item: ToolCallItem }) {
   const { verb, target, argument } = describeToolCall(item);
 
   return (
-    <div className="font-mono text-[11.5px] leading-5 text-muted-foreground break-words">
+    <div className="font-mono text-[12px] leading-5 text-muted-foreground break-words">
       <span>{verb}</span>
       {target && (
         <>

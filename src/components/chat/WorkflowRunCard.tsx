@@ -128,7 +128,7 @@ function WorkflowApprovalCard({
           <div className="text-[13px] font-bold text-foreground">
             Run as a workflow?
           </div>
-          <div className="text-[11.5px] text-muted-foreground">
+          <div className="text-[12px] text-muted-foreground">
             Claude wrote a script to orchestrate this — you can read it before
             running.
           </div>
@@ -149,7 +149,7 @@ function WorkflowApprovalCard({
                 {phase.title}
               </span>
               {phase.detail && (
-                <span className="font-mono text-[10.5px] text-muted-foreground">
+                <span className="font-mono text-[11px] text-muted-foreground">
                   {phase.detail}
                 </span>
               )}
@@ -226,7 +226,7 @@ function WorkflowApprovalCard({
                 "The script Claude wrote to orchestrate this workflow."}
             </DialogDescription>
           </DialogHeader>
-          <pre className="max-h-[60vh] overflow-auto rounded-md bg-muted/40 p-3 font-mono text-[11.5px] leading-5 text-foreground whitespace-pre-wrap break-words">
+          <pre className="max-h-[60vh] overflow-auto rounded-md bg-muted/40 p-3 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
             {item.script ?? "No script available."}
           </pre>
         </DialogContent>
@@ -297,7 +297,7 @@ function WorkflowRunningRow({
           strokeWidth={1.9}
           aria-hidden
         />
-        <span className="shrink-0 text-[12.5px] font-bold text-foreground">
+        <span className="shrink-0 text-[13px] font-bold text-foreground">
           Workflow running
         </span>
         <span className="min-w-0 flex-1 overflow-hidden">
@@ -376,11 +376,11 @@ function WorkflowSummaryRow({
       className="flex cursor-pointer items-center gap-2.5 rounded-[12px] border border-border/60 bg-muted/30 px-3.5 py-2.5 hover:border-muted-foreground/60"
     >
       <Icon className={cn("h-4 w-4 shrink-0", iconClass)} strokeWidth={1.8} aria-hidden />
-      <span className="flex-1 text-[12.5px] font-semibold text-muted-foreground">
+      <span className="flex-1 text-[13px] font-semibold text-muted-foreground">
         {label} · {agents} agent{agents === 1 ? "" : "s"} · {phases} phase
         {phases === 1 ? "" : "s"} · {elapsed}
       </span>
-      <span className="font-mono text-[10.5px] text-muted-foreground">
+      <span className="font-mono text-[11px] text-muted-foreground">
         View run
       </span>
     </div>

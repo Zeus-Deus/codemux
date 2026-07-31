@@ -106,7 +106,7 @@ export function SidebarActionRow() {
           <SearchIcon className="h-3.5 w-3.5 shrink-0" />
           <span className="flex-1 text-left text-xs">Search</span>
           {paletteKeys && (
-            <kbd className="rounded border border-border/60 px-1 py-px font-mono text-[9.5px]">
+            <kbd className="rounded border border-border/60 px-1 py-px font-mono text-[10px]">
               {paletteKeys}
             </kbd>
           )}
