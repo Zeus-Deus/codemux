@@ -19,6 +19,9 @@ export default defineConfig({
       "**/dist/**",
       "**/src-tauri/**",
       "sidecar/**",
+      // Agent worktrees carry stale full copies of the repo; without this
+      // exclude Vitest crawls in and runs every copy's suite too.
+      "**/.claude/**",
     ],
   },
   resolve: {
