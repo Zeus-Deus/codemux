@@ -302,26 +302,28 @@ pub async fn refresh_workspace_pr<R: tauri::Runtime>(
     };
 
     let cwd_for_pr = cwd.clone();
-    let pr_info =
+    let lookup =
         tokio::task::spawn_blocking(move || crate::github::get_branch_pr(Path::new(&cwd_for_pr)))
             .await
-            .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))??;
-    // Decision matrix (mirrors the background pollers):
-    //   - branch/repository match found → write fresh info
-    //   - successful branch query returned nothing → clear stale info
-    //   - lookup error → return before mutation and preserve last known info
-    match pr_info.as_ref() {
-        Some(pr) => {
+            .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))?;
+    // Decision matrix, shared with both background pollers via
+    // `branch_pr_outcome`: match → write, successful empty → clear, lookup
+    // error (or detached HEAD) → leave the stored info untouched. A failed
+    // lookup is deliberately not an `Err` back to the frontend: a manual
+    // refresh during a rebase should be a no-op, not an error toast.
+    match crate::github::branch_pr_outcome(lookup) {
+        crate::github::BranchPrOutcome::Write(pr) => {
             state.update_workspace_pr_info(
                 &workspace_id,
                 Some(pr.number),
                 Some(pr.display_state()),
-                Some(pr.url.clone()),
+                Some(pr.url),
             );
         }
-        None => {
+        crate::github::BranchPrOutcome::Clear => {
             state.update_workspace_pr_info(&workspace_id, None, None, None);
         }
+        crate::github::BranchPrOutcome::Preserve => {}
     }
     crate::state::emit_app_state(&app);
     Ok(())

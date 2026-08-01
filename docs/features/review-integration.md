@@ -18,16 +18,18 @@ The Review tab is a right-sidebar surface that displays pull request details, re
 
 PR data is fetched from GitHub through `gh` CLI commands routed via Rust
 (`src-tauri/src/github.rs`). The current workspace association uses an explicit
-branch query (`gh pr list --head <branch-or-owner:branch> --state all`) rather
-than implicit `gh pr view` inference or exact commit-SHA equality. This keeps a
-merged/closed PR attached when review commits advanced its remote head beyond
-the local worktree, supports fork-tracking branches, and lets the sidebar see
-the terminal state. Open/draft matches take precedence when a branch name has
+branch query (`gh pr list --head <branch> --state all`) rather than implicit
+`gh pr view` inference or exact commit-SHA equality. This keeps a merged/closed
+PR attached when review commits advanced its remote head beyond the local
+worktree and lets the sidebar see the terminal state. The head argument is
+always the bare branch name — gh does not match the `owner:branch` form here —
+so a fork-tracking branch is disambiguated client-side by the row's
+`headRepositoryOwner`. Open/draft matches take precedence when a branch name has
 been reused; historical matches are hidden on the repository default branch.
-A successful empty result clears the association, while command/auth/network
-errors preserve the last known value. The frontend renders sub-components for
-each PR aspect. Auth status is checked before fetching. The panel updates when
-workspace state changes.
+A successful empty result clears the association, while an unanswerable lookup
+(command/auth/network error, or a detached HEAD) preserves the last known value.
+The frontend renders sub-components for each PR aspect. Auth status is checked
+before fetching. The panel updates when workspace state changes.
 
 ## What Works Today
 

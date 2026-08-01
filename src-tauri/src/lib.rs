@@ -1015,6 +1015,12 @@ fn build_core_app<R: tauri::Runtime>(
             // elsewhere.
             let git_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Last branch-PR lookup error logged by this loop. The loop
+                // ticks every 5 s, so a persistent condition (expired `gh`
+                // token, no network) would otherwise write the same line to
+                // stderr ~17k times a day. Log each distinct message once and
+                // reset on the next success, so a *new* failure is still loud.
+                let mut last_pr_error: Option<String> = None;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
@@ -1053,13 +1059,31 @@ fn build_core_app<R: tauri::Runtime>(
                     // at a time anyway.
                     if let Some((workspace_id, cwd)) = active {
                         let path = std::path::PathBuf::from(&cwd);
-                        if github::gh_available() {
+                        // `is_github_repo` is a pure `git remote -v` read (no
+                        // `gh`, no network), and it matches the gate the
+                        // dedicated PR poller already applies. Without it a
+                        // GitLab / local-only workspace would shell out to
+                        // `gh` every tick just to fail.
+                        if github::gh_available() && github::is_github_repo(&path) {
                             // Branch/repository identity owns association. A
                             // failed lookup preserves the last known state;
                             // a successful empty result is authoritative and
                             // clears any stale association.
-                            match github::get_branch_pr(&path) {
-                                Ok(Some(pr)) => {
+                            let lookup = github::get_branch_pr(&path);
+                            match &lookup {
+                                Err(e) => {
+                                    let message = format!(
+                                        "[codemux::github] Failed to fetch PR info for {cwd}: {e}"
+                                    );
+                                    if last_pr_error.as_deref() != Some(message.as_str()) {
+                                        eprintln!("{message}");
+                                        last_pr_error = Some(message);
+                                    }
+                                }
+                                Ok(_) => last_pr_error = None,
+                            }
+                            match github::branch_pr_outcome(lookup) {
+                                github::BranchPrOutcome::Write(pr) => {
                                     state.update_workspace_pr_info(
                                         &workspace_id,
                                         Some(pr.number),
@@ -1067,7 +1091,7 @@ fn build_core_app<R: tauri::Runtime>(
                                         Some(pr.url),
                                     );
                                 }
-                                Ok(None) => {
+                                github::BranchPrOutcome::Clear => {
                                     state.update_workspace_pr_info(
                                         &workspace_id,
                                         None,
@@ -1075,9 +1099,7 @@ fn build_core_app<R: tauri::Runtime>(
                                         None,
                                     );
                                 }
-                                Err(e) => {
-                                    eprintln!("[codemux::github] Failed to fetch PR info for {}: {e}", cwd);
-                                }
+                                github::BranchPrOutcome::Preserve => {}
                             }
 
                             // Refresh linked issue state (lightweight: only if workspace has one)
@@ -1429,31 +1451,37 @@ fn build_core_app<R: tauri::Runtime>(
                         .await;
 
                         match pr_result {
-                            Ok(Ok(Ok(Some(pr)))) => {
-                                state.update_workspace_pr_info(
-                                    &workspace_id,
-                                    Some(pr.number),
-                                    Some(pr.display_state()),
-                                    Some(pr.url),
-                                );
-                                refreshed += 1;
-                            }
-                            Ok(Ok(Ok(None))) => {
-                                // A successful empty branch query is
-                                // authoritative. Errors take separate arms and
-                                // deliberately retain the last known value.
-                                state.update_workspace_pr_info(
-                                    &workspace_id,
-                                    None,
-                                    None,
-                                    None,
-                                );
-                                refreshed += 1;
-                            }
-                            Ok(Ok(Err(e))) => {
-                                eprintln!(
-                                    "[codemux::pr-poll] get_branch_pr failed for {workspace_id}: {e}"
-                                );
+                            Ok(Ok(lookup)) => {
+                                if let Err(e) = &lookup {
+                                    eprintln!(
+                                        "[codemux::pr-poll] get_branch_pr failed for {workspace_id}: {e}"
+                                    );
+                                }
+                                // Shared matrix: match → write, successful
+                                // empty → authoritative clear, error (or
+                                // detached HEAD) → retain the last known
+                                // value.
+                                match github::branch_pr_outcome(lookup) {
+                                    github::BranchPrOutcome::Write(pr) => {
+                                        state.update_workspace_pr_info(
+                                            &workspace_id,
+                                            Some(pr.number),
+                                            Some(pr.display_state()),
+                                            Some(pr.url),
+                                        );
+                                        refreshed += 1;
+                                    }
+                                    github::BranchPrOutcome::Clear => {
+                                        state.update_workspace_pr_info(
+                                            &workspace_id,
+                                            None,
+                                            None,
+                                            None,
+                                        );
+                                        refreshed += 1;
+                                    }
+                                    github::BranchPrOutcome::Preserve => {}
+                                }
                             }
                             Ok(Err(e)) => {
                                 eprintln!(
