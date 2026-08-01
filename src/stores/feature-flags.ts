@@ -19,14 +19,15 @@ interface FeatureFlagsStore {
    *  once — later calls overwrite the in-memory state with whatever
    *  the backend currently reports. */
   refresh: () => Promise<void>;
-  /** Step 13 — atomic toggle for the Agent Chat Beta. Flips
-   *  `enableAgentChat` and `enableLazyWorkspaceCreation` together
-   *  through the `set_agent_chat_beta` Tauri command (which writes
-   *  both fields under one mutex acquisition on the backend), then
-   *  mirrors the new state into the store. The two flags must always
-   *  move together — every production read site pairs them with `&&`,
-   *  and the user-facing toggle in Settings → Beta Features is a
-   *  single Switch. */
+  /** Atomic toggle for the Agent Chat GUI (default on; off = classic
+   *  CLI interface). Flips `enableAgentChat` and
+   *  `enableLazyWorkspaceCreation` together through the
+   *  `set_agent_chat_enabled` Tauri command (which writes both fields
+   *  under one mutex acquisition on the backend), then mirrors the
+   *  new state into the store. The two flags must always move
+   *  together — every production read site pairs them with `&&`, and
+   *  the user-facing toggle in Settings → Interface is a single
+   *  Switch. */
   setAgentChatEnabled: (enabled: boolean) => Promise<void>;
 }
 
@@ -50,7 +51,7 @@ export const useFeatureFlags = create<FeatureFlagsStore>((set) => ({
     }
   },
   setAgentChatEnabled: async (enabled: boolean) => {
-    await invoke<void>("set_agent_chat_beta", { enabled });
+    await invoke<void>("set_agent_chat_enabled", { enabled });
     set({
       enableAgentChat: enabled,
       enableLazyWorkspaceCreation: enabled,

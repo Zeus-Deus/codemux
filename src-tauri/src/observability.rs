@@ -37,24 +37,30 @@ pub struct FeatureFlags {
     /// Gates the agent-chat pane kind, its Tauri command surface, and
     /// the runtime provider registry.
     ///
-    /// Defaults to `false`: the chat pane is not selectable in the UI,
+    /// Defaults to `true` — the Agent Chat GUI is the default
+    /// interface (promoted out of Beta). When `false` (Settings →
+    /// Interface toggle) the chat pane is not selectable in the UI,
     /// lifecycle commands return `FeatureDisabled`, and the provider
-    /// registry is not initialised at startup. Flip to `true` via
-    /// `update_feature_flags` or by editing the persisted
-    /// `observability.json` (see [`snapshot_path`]) to dogfood the
-    /// scaffolding.
-    #[serde(default)]
+    /// registry is not initialised at startup — the classic
+    /// terminal-first (CLI) interface renders instead.
+    #[serde(default = "default_true")]
     pub enable_agent_chat: bool,
     /// Gates the lazy-workspace-creation path: sidebar-plus and
     /// boot-into-Home open a client-side chat draft instead of
     /// eagerly materialising a workspace. The draft is promoted to a
     /// real workspace on first message send.
     ///
-    /// Defaults to `false`: today's eager flow is preserved. Flip to
-    /// `true` via `update_feature_flags` or by editing the persisted
-    /// `observability.json` (see [`snapshot_path`]).
-    #[serde(default)]
+    /// Defaults to `true`, paired with [`enable_agent_chat`] — the
+    /// two always move together through `set_agent_chat_enabled`
+    /// (every production read site pairs them with `&&`).
+    ///
+    /// [`enable_agent_chat`]: FeatureFlags::enable_agent_chat
+    #[serde(default = "default_true")]
     pub enable_lazy_workspace_creation: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +99,16 @@ pub struct ObservabilitySnapshot {
     pub replay_records: Vec<ReplayRecord>,
     #[serde(default = "default_safety_config")]
     pub safety_config: SafetyConfig,
+    /// One-time migration marker for the Agent Chat GUI promotion
+    /// (Beta → default-on). Because the whole snapshot is re-saved on
+    /// every log/metric mutation, every pre-promotion install has an
+    /// explicit `enable_agent_chat: false` on disk (the old default) —
+    /// indistinguishable from a deliberate opt-out. On the first load
+    /// where this marker is missing/false, both agent-chat flags are
+    /// forced on and the marker is persisted as `true`; from then on
+    /// the Settings → Interface toggle is fully respected.
+    #[serde(default)]
+    pub agent_chat_promoted: bool,
 }
 
 fn default_metrics_snapshot() -> MetricsSnapshot {
@@ -263,7 +279,7 @@ fn read_snapshot(path: &Path) -> ReadOutcome {
 /// file, so they diverge from that point on — which is the fix for
 /// the shared-flags bug (see [`snapshot_path`]).
 fn load_or_migrate_snapshot(path: &Path, legacy_path: &Path) -> ObservabilitySnapshot {
-    match read_snapshot(path) {
+    let mut snapshot = match read_snapshot(path) {
         ReadOutcome::Loaded(snapshot) => *snapshot,
         ReadOutcome::Unreadable => default_snapshot(),
         ReadOutcome::Missing => match read_snapshot(legacy_path) {
@@ -281,6 +297,36 @@ fn load_or_migrate_snapshot(path: &Path, legacy_path: &Path) -> ObservabilitySna
             }
             _ => default_snapshot(),
         },
+    };
+    promote_agent_chat_default(&mut snapshot, path);
+    snapshot
+}
+
+/// One-time promotion of the Agent Chat GUI from opt-in Beta to the
+/// default interface.
+///
+/// Pre-promotion snapshots carry an explicit `enable_agent_chat:
+/// false` written by the old default (the full snapshot is persisted
+/// on every mutation), so flipping the serde/`default_snapshot`
+/// literals alone would leave every existing install in CLI mode. The
+/// first load without the [`ObservabilitySnapshot::agent_chat_promoted`]
+/// marker forces both paired flags on and stamps the marker; any later
+/// opt-out via Settings → Interface persists alongside the marker and
+/// is never overridden again.
+fn promote_agent_chat_default(snapshot: &mut ObservabilitySnapshot, path: &Path) {
+    if snapshot.agent_chat_promoted {
+        return;
+    }
+    snapshot.agent_chat_promoted = true;
+    snapshot.feature_flags.enable_agent_chat = true;
+    snapshot.feature_flags.enable_lazy_workspace_creation = true;
+    if let Err(error) = save_snapshot_to(path, snapshot) {
+        // Non-fatal: the promotion re-applies on every boot until a
+        // save sticks, and any snapshot mutation persists it too.
+        eprintln!(
+            "[codemux::observability] Failed to persist agent-chat promotion to {}: {error}",
+            path.display()
+        );
     }
 }
 
@@ -297,15 +343,16 @@ fn default_snapshot() -> ObservabilitySnapshot {
             unstable_openflow: true,
             unstable_browser_automation: true,
             unstable_indexing: true,
-            // Step 13 — Agent Chat Beta is OFF by default. Existing users
-            // with a persisted observability.json that has these keys set
-            // to `true` keep their state (the persisted file wins over
-            // these literals). The `Settings → Beta Features → Agent Chat`
-            // toggle flips both flags atomically — they're paired in every
-            // production read site, so the user-facing decision is one
-            // switch. See docs/plans/step-13-beta-toggle-research.md §1.
-            enable_agent_chat: false,
-            enable_lazy_workspace_creation: false,
+            // The Agent Chat GUI is the default interface (promoted out
+            // of Beta). The `Settings → Interface` toggle flips both
+            // flags atomically back to the classic CLI view — they're
+            // paired in every production read site, so the user-facing
+            // decision is one switch. Existing installs are upgraded
+            // once via `promote_agent_chat_default`; an opt-out made
+            // after that is respected (the persisted file wins over
+            // these literals).
+            enable_agent_chat: true,
+            enable_lazy_workspace_creation: true,
         },
         permission_policy: PermissionPolicy {
             require_risky_action_approval: true,
@@ -318,6 +365,9 @@ fn default_snapshot() -> ObservabilitySnapshot {
             auto_apply: false,
             approval_required_for_completion: true,
         },
+        // Fresh installs never need the one-time promotion — the flag
+        // literals above are already the promoted state.
+        agent_chat_promoted: true,
     }
 }
 
@@ -496,7 +546,11 @@ mod tests {
         fs::create_dir_all(legacy.parent().unwrap()).unwrap();
         fs::write(&legacy, serde_json::to_string_pretty(&legacy_snapshot).unwrap()).unwrap();
 
-        let new_snapshot = default_snapshot(); // Beta off
+        // Per-build state: user explicitly opted out of the GUI after
+        // the promotion already ran (marker stamped).
+        let mut new_snapshot = default_snapshot();
+        new_snapshot.feature_flags.enable_agent_chat = false;
+        new_snapshot.feature_flags.enable_lazy_workspace_creation = false;
         fs::create_dir_all(new.parent().unwrap()).unwrap();
         fs::write(&new, serde_json::to_string_pretty(&new_snapshot).unwrap()).unwrap();
 
@@ -518,37 +572,44 @@ mod tests {
 
         let loaded = load_or_migrate_snapshot(&new, &legacy);
 
-        assert!(!loaded.feature_flags.enable_agent_chat);
+        assert!(
+            loaded.feature_flags.enable_agent_chat,
+            "fresh install must boot into the Agent Chat GUI"
+        );
         assert!(!new.exists(), "load must not create files when there is nothing to migrate");
     }
 
-    /// Step 13 — Agent Chat is OFF by default for new users. The
-    /// `default_snapshot()` literals and `#[serde(default)]` for the
-    /// flag fields must agree, otherwise a fresh-install user sees
-    /// the Beta surface without opting in.
+    /// The Agent Chat GUI is the default interface for new users. The
+    /// `default_snapshot()` literals and the serde defaults for the
+    /// flag fields must agree, otherwise a fresh-install user and a
+    /// partial-config user see different interfaces.
     #[test]
-    fn default_snapshot_disables_agent_chat_beta() {
+    fn default_snapshot_enables_agent_chat_gui() {
         let snap = default_snapshot();
         assert!(
-            !snap.feature_flags.enable_agent_chat,
-            "default_snapshot must have enable_agent_chat = false; new users opt in via Settings → Beta Features"
+            snap.feature_flags.enable_agent_chat,
+            "default_snapshot must have enable_agent_chat = true; the GUI is the default interface"
         );
         assert!(
-            !snap.feature_flags.enable_lazy_workspace_creation,
-            "default_snapshot must have enable_lazy_workspace_creation = false; paired with enable_agent_chat as the unified Beta toggle"
+            snap.feature_flags.enable_lazy_workspace_creation,
+            "default_snapshot must have enable_lazy_workspace_creation = true; paired with enable_agent_chat as one toggle"
+        );
+        assert!(
+            snap.agent_chat_promoted,
+            "fresh installs must not re-run the one-time promotion"
         );
     }
 
-    /// `#[serde(default)]` on the flag fields must produce the same
-    /// off-default as `default_snapshot()`. Drift between the two
-    /// produces "fresh install OFF, partial-config user ON" surprises
-    /// — the bug Step 13 was scoped to fix.
+    /// The `default_true` serde default on the flag fields must
+    /// produce the same on-default as `default_snapshot()`. Drift
+    /// between the two produces "fresh install ON, partial-config
+    /// user OFF" surprises.
     #[test]
-    fn serde_default_for_agent_chat_flags_is_false() {
+    fn serde_default_for_agent_chat_flags_is_true() {
         // FeatureFlags requires the unstable_* fields, but the agent-
-        // chat fields are `#[serde(default)]`. A partial JSON missing
-        // those fields must default them to false, matching
-        // `default_snapshot()`'s off-state.
+        // chat fields have serde defaults. A partial JSON missing
+        // those fields must default them to true, matching
+        // `default_snapshot()`'s on-state.
         let json = r#"{
             "unstable_openflow": true,
             "unstable_browser_automation": true,
@@ -557,35 +618,93 @@ mod tests {
         let parsed: FeatureFlags = serde_json::from_str(json)
             .expect("FeatureFlags missing only the agent-chat keys parses with serde defaults");
         assert!(
-            !parsed.enable_agent_chat,
-            "serde(default) for enable_agent_chat must be false to match default_snapshot()"
+            parsed.enable_agent_chat,
+            "serde default for enable_agent_chat must be true to match default_snapshot()"
         );
         assert!(
-            !parsed.enable_lazy_workspace_creation,
-            "serde(default) for enable_lazy_workspace_creation must be false to match default_snapshot()"
+            parsed.enable_lazy_workspace_creation,
+            "serde default for enable_lazy_workspace_creation must be true to match default_snapshot()"
         );
     }
 
-    /// An existing user with a persisted observability.json that opted
-    /// into the Beta during dogfooding should keep their state — the
-    /// persisted file wins over the off-default. Pins the merge
-    /// promise made in docs/plans/step-13-beta-toggle-research.md §6.
+    /// An explicit opt-out persisted in observability.json must win
+    /// over the on-default — serde only fills missing fields, it never
+    /// overrides written values.
     #[test]
-    fn persisted_agent_chat_true_survives_default_flip() {
+    fn persisted_agent_chat_false_survives_default_flip() {
         let json = r#"{
             "unstable_openflow": true,
             "unstable_browser_automation": true,
             "unstable_indexing": true,
-            "enable_agent_chat": true,
-            "enable_lazy_workspace_creation": true
+            "enable_agent_chat": false,
+            "enable_lazy_workspace_creation": false
         }"#;
         let parsed: FeatureFlags = serde_json::from_str(json).expect("full flags parse");
-        assert!(parsed.enable_agent_chat);
-        assert!(parsed.enable_lazy_workspace_creation);
+        assert!(!parsed.enable_agent_chat);
+        assert!(!parsed.enable_lazy_workspace_creation);
     }
 
-    /// `set_agent_chat_beta` must flip both fields together. The Step
-    /// 6–12 surface assumes both flags are true to function — leaving
+    /// A pre-promotion snapshot (no `agent_chat_promoted` marker) with
+    /// the flags explicitly `false` — i.e. every install that simply
+    /// never touched the old Beta toggle — must be upgraded to the GUI
+    /// exactly once, with the marker persisted so the upgrade never
+    /// re-runs.
+    #[test]
+    fn promotion_upgrades_pre_promotion_snapshot_once() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let legacy = tmp.path().join(".codemux").join("observability.json");
+        let new = tmp.path().join("data").join("observability.json");
+
+        // Hand-write a pre-promotion file: flags explicitly false, no
+        // marker key at all (serde default = false).
+        let mut old = default_snapshot();
+        old.feature_flags.enable_agent_chat = false;
+        old.feature_flags.enable_lazy_workspace_creation = false;
+        let mut value = serde_json::to_value(&old).unwrap();
+        value.as_object_mut().unwrap().remove("agent_chat_promoted");
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        fs::write(&new, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let loaded = load_or_migrate_snapshot(&new, &legacy);
+
+        assert!(loaded.feature_flags.enable_agent_chat, "promotion must flip the GUI on");
+        assert!(loaded.feature_flags.enable_lazy_workspace_creation);
+        assert!(loaded.agent_chat_promoted, "promotion must stamp the marker");
+
+        // The upgraded state must be persisted so the next boot
+        // doesn't depend on re-running the migration.
+        let persisted: ObservabilitySnapshot =
+            serde_json::from_str(&fs::read_to_string(&new).unwrap()).unwrap();
+        assert!(persisted.feature_flags.enable_agent_chat);
+        assert!(persisted.agent_chat_promoted);
+    }
+
+    /// After the promotion has run, a user's explicit opt-out (flags
+    /// false, marker true) is respected on every subsequent load.
+    #[test]
+    fn promotion_respects_post_promotion_opt_out() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let legacy = tmp.path().join(".codemux").join("observability.json");
+        let new = tmp.path().join("data").join("observability.json");
+
+        let mut opted_out = default_snapshot();
+        opted_out.feature_flags.enable_agent_chat = false;
+        opted_out.feature_flags.enable_lazy_workspace_creation = false;
+        assert!(opted_out.agent_chat_promoted, "default_snapshot carries the marker");
+        fs::create_dir_all(new.parent().unwrap()).unwrap();
+        fs::write(&new, serde_json::to_string_pretty(&opted_out).unwrap()).unwrap();
+
+        let loaded = load_or_migrate_snapshot(&new, &legacy);
+
+        assert!(
+            !loaded.feature_flags.enable_agent_chat,
+            "an opt-out made after the promotion must never be overridden"
+        );
+        assert!(!loaded.feature_flags.enable_lazy_workspace_creation);
+    }
+
+    /// `set_agent_chat_enabled` must flip both fields together. The
+    /// chat surface assumes both flags are true to function — leaving
     /// one of them flipped without the other lights up half the
     /// surface and breaks composer routing. Pin the contract at the
     /// store level so any future setter that bypasses the command
@@ -594,20 +713,11 @@ mod tests {
     fn agent_chat_flags_can_be_flipped_atomically_via_store() {
         let store = ObservabilityStore::default();
         let starting = store.feature_flags();
-        assert!(!starting.enable_agent_chat, "default is off");
-        assert!(!starting.enable_lazy_workspace_creation, "default is off");
+        assert!(starting.enable_agent_chat, "default is on (GUI is the default interface)");
+        assert!(starting.enable_lazy_workspace_creation, "default is on");
 
-        // Mirror what `commands::set_agent_chat_beta(enabled=true)` does.
-        let mut next = store.feature_flags();
-        next.enable_agent_chat = true;
-        next.enable_lazy_workspace_creation = true;
-        store.set_feature_flags(next);
-
-        let after_on = store.feature_flags();
-        assert!(after_on.enable_agent_chat);
-        assert!(after_on.enable_lazy_workspace_creation);
-
-        // And the symmetric off flip.
+        // Mirror what `commands::set_agent_chat_enabled(enabled=false)`
+        // does — the Settings → Interface opt-out back to CLI.
         let mut next = store.feature_flags();
         next.enable_agent_chat = false;
         next.enable_lazy_workspace_creation = false;
@@ -617,9 +727,19 @@ mod tests {
         assert!(!after_off.enable_agent_chat);
         assert!(!after_off.enable_lazy_workspace_creation);
 
+        // And the symmetric on flip.
+        let mut next = store.feature_flags();
+        next.enable_agent_chat = true;
+        next.enable_lazy_workspace_creation = true;
+        store.set_feature_flags(next);
+
+        let after_on = store.feature_flags();
+        assert!(after_on.enable_agent_chat);
+        assert!(after_on.enable_lazy_workspace_creation);
+
         // Other flags untouched by the toggle.
-        assert!(after_off.unstable_openflow);
-        assert!(after_off.unstable_browser_automation);
-        assert!(after_off.unstable_indexing);
+        assert!(after_on.unstable_openflow);
+        assert!(after_on.unstable_browser_automation);
+        assert!(after_on.unstable_indexing);
     }
 }

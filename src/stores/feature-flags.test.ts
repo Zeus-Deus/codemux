@@ -63,12 +63,12 @@ describe("useFeatureFlags", () => {
     expect(s.loaded).toBe(true);
   });
 
-  it("setAgentChatEnabled(true) calls set_agent_chat_beta and flips both flags", async () => {
+  it("setAgentChatEnabled(true) calls set_agent_chat_enabled and flips both flags", async () => {
     invokeMock.mockResolvedValueOnce(undefined);
 
     await useFeatureFlags.getState().setAgentChatEnabled(true);
 
-    expect(invokeMock).toHaveBeenCalledWith("set_agent_chat_beta", {
+    expect(invokeMock).toHaveBeenCalledWith("set_agent_chat_enabled", {
       enabled: true,
     });
     const s = useFeatureFlags.getState();
@@ -87,7 +87,7 @@ describe("useFeatureFlags", () => {
 
     await useFeatureFlags.getState().setAgentChatEnabled(false);
 
-    expect(invokeMock).toHaveBeenCalledWith("set_agent_chat_beta", {
+    expect(invokeMock).toHaveBeenCalledWith("set_agent_chat_enabled", {
       enabled: false,
     });
     const s = useFeatureFlags.getState();

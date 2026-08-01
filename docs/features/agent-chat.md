@@ -20,10 +20,11 @@ of a raw terminal. It surfaces a streaming chat UX — messages, tool
 approvals, plan proposals, AskUserQuestion panels, image and file
 attachments, slash commands, mode pills — over subprocess-backed runners.
 
-## Beta Gate (Step 13)
+## Interface Gate (formerly the Step 13 Beta gate)
 
-The feature is **OFF by default**. Two persisted feature flags gate the
-entire Step 6–12 surface:
+The feature is **ON by default** — the Agent Chat GUI was promoted out of
+Beta and is now the default interface. Two persisted feature flags still
+gate the entire chat surface:
 
 - `enable_agent_chat` — gates the chat pane kind, its Tauri command surface,
   the provider registry (Claude + Codex + OpenCode), and the MCP host
@@ -32,15 +33,25 @@ entire Step 6–12 surface:
   `+` and boot-into-Home open a client-side chat draft instead of eagerly
   materialising a workspace; the draft is promoted on first message send.
 
-Both flags default to `false`. The Settings → Beta Features section flips
-them together (see `src/components/settings/beta-features-section.tsx`).
-Turning Beta off triggers a plain-quit (no auto-restart) to keep user data
-intact across the legacy/Beta UI swap. The legacy main-branch experience
-(preset bar, terminal panes, empty-state splash) is byte-identical when
-both flags are off.
+Both flags default to `true`. The Settings → Personal → **Interface**
+section flips them together via `set_agent_chat_enabled` (see
+`src/components/settings/interface-section.tsx`); turning the toggle off
+returns to the classic terminal-first (CLI) interface. Either flip triggers
+a plain-quit (no auto-restart) to keep user data intact across the
+legacy/GUI swap. The legacy experience (preset bar, terminal panes,
+empty-state splash) is byte-identical when both flags are off.
 
-See `docs/archive/step-13-beta-toggle-research.md` for the toggle scoping and
-`docs/archive/step-13-ui-smoke-checklist.md` for the operator-verified gate.
+**Promotion migration**: because the whole observability snapshot is
+re-saved on every mutation, pre-promotion installs carry an explicit
+`enable_agent_chat: false` from the old off-default. A one-time
+`agent_chat_promoted` marker on `ObservabilitySnapshot`
+(`promote_agent_chat_default` in `src-tauri/src/observability.rs`) flips
+both flags on at first load after upgrade and stamps the marker; opt-outs
+made after that are never overridden.
+
+See `docs/archive/step-13-beta-toggle-research.md` for the original Beta
+toggle scoping and `docs/archive/step-13-ui-smoke-checklist.md` for the
+operator-verified gate.
 
 ## Current Model
 
@@ -931,7 +942,7 @@ can be scanned and jumped without scrubbing the scrollbar. It lives
 as a sibling of LegendList, absolutely positioned over the dead left
 margin of the shared `CHAT_COLUMN` transcript column, so it
 never overlaps text. It needs **no new setting** — it is part of the
-already Beta-gated pane and simply hides on short threads.
+already flag-gated pane and simply hides on short threads.
 
 - **Data source is the virtualizer's first visible index.** The
   pure helpers in `message-trail.ts` (`buildTrailEntries` /
@@ -1411,8 +1422,9 @@ in the browser pane.
 
 ## Current Constraints
 
-- **Beta-gated.** The chat pane is hidden unless the user opts in via
-  Settings → Beta Features. See "Beta Gate" above.
+- **Flag-gated, default on.** The chat pane is the default interface; the
+  Settings → Interface toggle switches back to the classic CLI view. See
+  "Interface Gate" above.
 - **Single instance per provider.** A user with multiple Codex accounts or
   multiple OpenCode connections sees them collapsed under one rail entry.
   Multi-instance lifting is planned for v2 (the `ProviderInstanceId` shim
@@ -2173,7 +2185,7 @@ reachable there); `ProjectPicker`
 (`src/components/overlays/project-picker.tsx`) survives for the
 new-workspace dialog only.
 
-**GUI chrome suppression.** When the Beta flag is on and the chat pane is
+**GUI chrome suppression.** When the GUI flag is on and the chat pane is
 the **sole root** of its surface (not a split), `AgentChatPaneHeader` does
 NOT render — the title bar absorbs the tab, its session-history dropdown,
 close, and "Restore checkpoint" (`PaneNode` gates on `isSurfaceRoot`);
@@ -2277,7 +2289,7 @@ of the active surface in GUI chrome, `WorkspaceContextBar` renders
 `docs/features/workspace-context-bar.md` and
 `useAgentChatPaneActive()` (`src/hooks/use-gui-chrome.ts`). A terminal
 (or other) pane active in GUI mode keeps the bottom bar; legacy chrome
-(Beta flag off) is unaffected.
+(GUI flag off) is unaffected.
 
 ## Context-window meter (composer)
 

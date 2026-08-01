@@ -143,17 +143,17 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { GripVertical, Star } from "lucide-react";
 
-type Section = "beta_features" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "archive" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
+type Section = "interface" | "account" | "appearance" | "editor" | "terminal" | "presets" | "projects" | "archive" | "git" | "agent" | "permissions" | "skills" | "mcp" | "hosts" | "remote_access" | "browser" | "shortcuts" | "notifications" | "session_restore";
 
 interface NavItem { id: Section; label: string; icon: React.ElementType }
 interface NavGroup { label: string; items: NavItem[] }
 
 /** Build the Settings nav groups for the current flag state.
- *  - The "BETA FEATURES" group is always present at the top so users
- *    can discover the toggle. Its single row stays visible regardless
- *    of the flag.
- *  - The Step 6–12 rows (Permissions, Skills, MCP Servers) are only
- *    surfaced when the toggle is on; they reach into chat-only data.
+ *  - The "Interface" row (home of the Agent Chat GUI toggle, default
+ *    on) lives in PERSONAL and stays visible regardless of the flag
+ *    so users in either mode can find their way back.
+ *  - The chat-only rows (Permissions, Skills, MCP Servers) are only
+ *    surfaced when the GUI is on; they reach into chat-only data.
  *    Hiding them when off matches the "feature absent, no work
  *    performed" promise of the master toggle.
  *  - The pre-existing rows (Account, Appearance, …, Agent) stay
@@ -195,14 +195,11 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
 
   return [
     {
-      label: "BETA FEATURES",
-      items: [{ id: "beta_features", label: "Agent Chat", icon: Sparkles }],
-    },
-    {
       label: "PERSONAL",
       items: [
         { id: "account", label: "Account", icon: UserCircle },
         { id: "appearance", label: "Appearance", icon: Palette },
+        { id: "interface", label: "Interface", icon: Sparkles },
         { id: "notifications", label: "Notifications", icon: Bell },
         { id: "shortcuts", label: "Shortcuts", icon: Keyboard },
       ],
@@ -215,12 +212,12 @@ function buildNavGroups(agentChatEnabled: boolean): NavGroup[] {
 }
 
 /** All sections that exist regardless of flag — used to validate the
- *  initial-section URL hash. The Step 6–12-only sections are
+ *  initial-section URL hash. The chat-only sections are
  *  intentionally included here too: a stale URL hash to `?settings=skills`
  *  from a flag-on session falls back to "account" via the validity
  *  check (see `initialSection` below) when the flag is off. */
 const ALL_SECTION_IDS: Section[] = [
-  "beta_features",
+  "interface",
   "account", "appearance", "editor", "terminal", "presets", "projects",
   "archive", "git", "agent", "permissions", "skills", "mcp", "hosts",
   "remote_access", "browser", "shortcuts", "notifications", "session_restore",
@@ -228,7 +225,7 @@ const ALL_SECTION_IDS: Section[] = [
 
 import { KeybindEditor } from "./keybind-editor";
 import { ArchiveSection } from "./archive-section";
-import { BetaFeaturesSection } from "./beta-features-section";
+import { InterfaceSection } from "./interface-section";
 import { HostsSection } from "./hosts-section";
 import { RemoteAccessSection } from "./remote-access-section";
 import { McpSection } from "./mcp-section";
@@ -2219,8 +2216,8 @@ export function SettingsView() {
                 />
               </SettingRow>
               {/* Run-start rollback checkpoint (issue #80). Only shown
-                  when the Agent Chat beta is on — the snapshot fires on
-                  chat-session start, so without the beta the toggle
+                  when the Agent Chat GUI is on — the snapshot fires on
+                  chat-session start, so with the GUI off the toggle
                   would do nothing. */}
               {enableAgentChat && (
                 <>
@@ -2239,7 +2236,7 @@ export function SettingsView() {
                   <Separator />
                   {/* GUI-mode background browser viewport pin. Like the
                       checkpoint toggle, only meaningful with the Agent
-                      Chat beta on — the peek popover it affects is a
+                      Chat GUI on — the peek popover it affects is a
                       GUI-chrome surface. */}
                   <SettingRow
                     label="Desktop-size background browser"
@@ -2258,32 +2255,32 @@ export function SettingsView() {
           </div>
         );
 
-      case "beta_features":
-        return <BetaFeaturesSection />;
+      case "interface":
+        return <InterfaceSection />;
 
       case "permissions":
-        // Defensive guard: the nav row is hidden when the Beta toggle
-        // is off, but a stale URL hash can still route here. Render
-        // the Beta toggle instead so the user lands somewhere useful
-        // and learns how to enable the feature.
+        // Defensive guard: the nav row is hidden when the Agent Chat
+        // GUI is off, but a stale URL hash can still route here.
+        // Render the Interface toggle instead so the user lands
+        // somewhere useful and learns how to turn the GUI back on.
         return enableAgentChat ? (
           <PermissionsSection projectRoot={projectRoot} />
         ) : (
-          <BetaFeaturesSection />
+          <InterfaceSection />
         );
 
       case "skills":
         return enableAgentChat ? (
           <SkillsSection projectRoot={projectRoot} />
         ) : (
-          <BetaFeaturesSection />
+          <InterfaceSection />
         );
 
       case "mcp":
         return enableAgentChat ? (
           <McpSection projectRoot={projectRoot} />
         ) : (
-          <BetaFeaturesSection />
+          <InterfaceSection />
         );
 
       case "archive":
