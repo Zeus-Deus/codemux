@@ -145,6 +145,24 @@ Card styling (all in `globals.css`, all on design tokens):
 - The language caption is a small uppercase tracked label with no divider rule;
   the fill change against surrounding prose is enough separation.
 
+### Rich external links in chat
+
+Assistant and plan markdown renders absolute `http(s)` links with the
+destination site's favicon inline. The markdown label remains authoritative —
+so the same treatment works for `PR #235`, issue labels, documentation names,
+and bare URLs instead of relying on GitHub-specific parsing. Bare URLs keep the
+favicon attached to their protocol; labelled links keep it attached to the
+first character, preventing an icon from wrapping onto a line by itself.
+
+`rehypeRichExternalLinks` (`src/lib/agent-chat/rich-links.ts`) decorates the HAST
+children rather than replacing Streamdown's anchor component. This preserves
+Streamdown's safe-link confirmation behavior. `MarkdownLinkFavicon` requests a
+32px image from the same Google favicon service already used for project
+avatars, caches failed hosts for the browser session, and falls back to a
+token-colored globe. Fragment, relative, `mailto:`, and other non-web links are
+left unchanged. The dev mock's rich transcript includes both GitHub and docs
+examples for visual verification.
+
 ## What Works Today
 
 - **Three end-to-end providers** behind one unified picker:

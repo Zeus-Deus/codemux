@@ -1,10 +1,15 @@
 import { useMemo } from "react";
 import remarkGfm from "remark-gfm";
-import { Streamdown } from "streamdown";
+import { Streamdown, type Components } from "streamdown";
 
 import { useChatCodePlugin } from "@/hooks/use-chat-code-plugin";
+import {
+  CHAT_LINK_FAVICON_TAG,
+  rehypeRichExternalLinks,
+} from "@/lib/agent-chat/rich-links";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
+import { MarkdownLinkFavicon } from "./MarkdownLinkFavicon";
 
 /**
  * Shared markdown renderer for chat surfaces (assistant messages,
@@ -100,6 +105,12 @@ const controls = {
   table: { copy: true, download: true, fullscreen: true },
 } as const;
 
+const markdownComponents: Components = {
+  [CHAT_LINK_FAVICON_TAG]: MarkdownLinkFavicon,
+};
+
+const rehypePlugins = [rehypeRichExternalLinks];
+
 export function ChatMarkdown({ children }: { children: string }) {
   const code = useChatCodePlugin();
   const plugins = useMemo(() => ({ code }), [code]);
@@ -110,7 +121,8 @@ export function ChatMarkdown({ children }: { children: string }) {
       <Streamdown
         parseIncompleteMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[]}
+        rehypePlugins={rehypePlugins}
+        components={markdownComponents}
         plugins={plugins}
         controls={controls}
         lineNumbers={false}
