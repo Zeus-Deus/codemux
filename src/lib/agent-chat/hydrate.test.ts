@@ -2,9 +2,19 @@ import { describe, expect, it } from "vitest";
 
 import type { ProviderRuntimeEvent } from "@/tauri/events";
 
-import { lastTurnUnsettled, replayPayloads } from "./hydrate";
+import {
+  applyReplayTail,
+  lastTurnUnsettled,
+  parseReplayPayloads,
+  replayPayloads,
+} from "./hydrate";
+import { applyEvent, createEmptyThreadState } from "./reducer";
 import { findSubagentView, runningSubagentEntries } from "./subagents";
-import type { PermissionRequestItem, WorkflowRunItem } from "./types";
+import type {
+  ChatThreadState,
+  PermissionRequestItem,
+  WorkflowRunItem,
+} from "./types";
 
 function user(text: string): string {
   return JSON.stringify({ type: "user_message", thread_id: "t", text });
@@ -645,32 +655,52 @@ describe("lastTurnUnsettled (issue #154)", () => {
       usage: null,
     });
 
+  /** The helper takes parsed rows now — the hydrate path parses once and
+   *  shares the array with the fold. */
+  const unsettled = (payloads: string[], previous = false): boolean =>
+    lastTurnUnsettled(parseReplayPayloads(payloads), previous);
+
   it("is false for an empty thread", () => {
-    expect(lastTurnUnsettled([])).toBe(false);
+    expect(unsettled([])).toBe(false);
   });
 
   it("is true when the last user turn has no later turn_completed", () => {
-    expect(lastTurnUnsettled([completed("turn-0"), user("still running…")])).toBe(
-      true,
-    );
+    expect(unsettled([completed("turn-0"), user("still running…")])).toBe(true);
   });
 
   it("is false when the last user turn settled", () => {
-    expect(lastTurnUnsettled([user("hi"), completed("turn-1")])).toBe(false);
+    expect(unsettled([user("hi"), completed("turn-1")])).toBe(false);
   });
 
   it("is true for a settled turn followed by a fresh unsettled one", () => {
     expect(
-      lastTurnUnsettled([
-        user("one"),
-        completed("turn-1"),
-        user("two — never finished"),
-      ]),
+      unsettled([user("one"), completed("turn-1"), user("two — never finished")]),
     ).toBe(true);
   });
 
   it("ignores malformed rows", () => {
-    expect(lastTurnUnsettled(["not json", user("hi")])).toBe(true);
+    expect(unsettled(["not json", user("hi")])).toBe(true);
+  });
+
+  describe("cursor tail (a prefix already in memory)", () => {
+    it("carries the prefix answer through a tail with no turn markers", () => {
+      // A tail of pure tool/assistant items decides nothing on its own.
+      expect(unsettled([], true)).toBe(true);
+      expect(unsettled([], false)).toBe(false);
+    });
+
+    it("lets the tail override the prefix in both directions", () => {
+      expect(unsettled([completed("turn-1")], true)).toBe(false);
+      expect(unsettled([user("new turn")], false)).toBe(true);
+    });
+
+    it("matches a scan of the whole concatenated history", () => {
+      const prefix = [user("one"), completed("turn-1")];
+      const tail = [user("two"), completed("turn-2"), user("three")];
+      expect(unsettled(tail, unsettled(prefix))).toBe(
+        unsettled([...prefix, ...tail]),
+      );
+    });
   });
 });
 
@@ -777,5 +807,51 @@ describe("replayPayloads runLive (workspace-switch remount of a live run)", () =
     const live = replayPayloads(payloads, { runLive: true });
     expect(live.interrupted).toBe(false);
     expect(live.streaming).toBe(true);
+  });
+});
+
+describe("applyReplayTail — a live run's streaming reasoning", () => {
+  const thinking = (text: string): ProviderRuntimeEvent => ({
+    type: "content_delta",
+    thread_id: "t",
+    turn_id: "turn-1",
+    delta: { kind: "thinking", text },
+  });
+
+  function reasoningBlocks(state: ChatThreadState) {
+    return state.messages.filter((m) => m.kind === "reasoning");
+  }
+
+  it("leaves a reasoning block streaming when the tail merges into a live run", () => {
+    // Warm slice mid-thought — the block is streaming because a LIVE
+    // delta put it there — and the tail merges while the backend confirms
+    // the turn is still in flight. Sealing here would make the next
+    // thinking delta mint a SECOND block.
+    const warm = applyEvent(createEmptyThreadState(), thinking("half a "));
+    expect(reasoningBlocks(warm)).toHaveLength(1);
+
+    const merged = applyReplayTail(warm, parseReplayPayloads([]), {
+      runLive: true,
+      previousUnsettled: true,
+    });
+    const [block] = reasoningBlocks(merged);
+    expect(block.kind === "reasoning" && block.streaming).toBe(true);
+
+    // The next delta continues the SAME block instead of starting another.
+    const next = applyEvent(merged, thinking("thought"));
+    const blocks = reasoningBlocks(next);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0].kind === "reasoning" && blocks[0].text).toBe(
+      "half a thought",
+    );
+  });
+
+  it("still seals when the run is NOT live", () => {
+    const warm = applyEvent(createEmptyThreadState(), thinking("half a thought"));
+    const merged = applyReplayTail(warm, parseReplayPayloads([]), {
+      previousUnsettled: true,
+    });
+    const [block] = reasoningBlocks(merged);
+    expect(block.kind === "reasoning" && block.streaming).toBe(false);
   });
 });

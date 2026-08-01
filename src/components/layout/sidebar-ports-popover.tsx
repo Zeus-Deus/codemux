@@ -21,12 +21,12 @@ import {
 import { useAppStore } from "@/stores/app-store";
 import {
   createBrowserPane,
-  activateWorkspace,
   killPort,
 } from "@/tauri/commands";
 import { Plug, Globe, X, Copy } from "lucide-react";
 import type { PortInfoSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 import { cn } from "@/lib/utils";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 
 type PortGroupKind = "workspace" | "docker" | "other";
 
@@ -112,7 +112,7 @@ export function SidebarPortsPopover() {
 
       try {
         if (wsId !== state.active_workspace_id) {
-          await activateWorkspace(wsId);
+          await activateWorkspaceInteraction(wsId);
           await new Promise((r) => setTimeout(r, 100));
         }
         const fresh = useAppStore.getState().appState;

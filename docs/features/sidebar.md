@@ -597,6 +597,43 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   as the expanded footer row.
 - **Setup banner** (`sidebar-setup-banner.tsx`): hidden in the rail.
 
+### Selection and update cost
+
+Two properties keep the sidebar cheap at real profile scale (the audited
+79-workspace profile). Both are invariants rather than incidental
+optimizations — see `docs/plans/gui-responsiveness.md` for the program they
+came from.
+
+- **Selection is optimistic.** Every activation surface — inbox card, rail
+  button, needs-you jump-link, ports popover, resource monitor row, command
+  palette, workspaces overview, `Alt+1..9` — goes through the single
+  `activateWorkspaceInteraction` helper (`src/lib/perf/instrumented-activate.ts`)
+  rather than calling `activateWorkspace` directly. The helper writes a
+  **pending** active id into `app-store` synchronously, in the click's own task,
+  and only then invokes Rust, so the highlight moves before the round trip
+  instead of waiting on the snapshot, the IPC hop, and the emit coalescer. The
+  exported `selectActiveWorkspaceId` resolves that pending id **only while the
+  workspace still exists in the snapshot**, falling back to
+  `appState.active_workspace_id` otherwise, so a pending id for a
+  deleted/archived workspace can never blank the selection. A rejected invoke
+  rolls back, id-scoped (`clearPendingActivation(id)` no-ops when a newer click
+  already moved the pending id, so a late failure cannot cancel a newer
+  selection), and a 5 s timeout is the backstop for a reply that never comes.
+  `prevWorkspace` / `nextWorkspace` are the one exception — they still run the
+  Rust `cycle_workspace` command, which now performs the same side effects as
+  `activate_workspace`.
+- **A backend tick re-renders one card, not the list.** `SidebarInbox`
+  subscribes to `appState.workspaces`, `appState.pane_statuses` and a boolean
+  "have we loaded state" flag instead of the whole snapshot, and
+  `SidebarInboxCard`, `SettledRow` and `SnoozeRow` are `memo()`d with
+  `useCallback`'d handlers over a latched ref and interned `InboxRepo` objects.
+  The backend's high-frequency metadata now arrives as ordered
+  `app-state-delta` messages (`workspace_git`, `detected_ports`, `pane_status`)
+  that replace only the touched workspace's object rather than rebuilding the
+  snapshot, so one workspace's git sweep result re-renders exactly that card.
+  This is asserted, not assumed: `sidebar-inbox-delta.test.tsx` drives a real
+  delta through the store and fails if a sibling card re-renders.
+
 ## What Works Today
 
 - Two-state toggle (expanded inbox ↔ icon rail) via title-bar button and `Ctrl+B`.
@@ -801,6 +838,19 @@ quietly rather than loudly.
   actionable cards; giving the section a disclosure control would offer to hide
   work that is nearly-but-not-done, which is precisely what the tier exists to
   avoid doing.
+- **Every activation surface must route through `activateWorkspaceInteraction`.**
+  A site that calls `activateWorkspace` directly still works, but loses the
+  synchronous pending id — so that one surface silently reverts to
+  "selection waits for the backend", and it contributes no interaction trace.
+  The helper is the only place the pending id, its rollback, and its 5 s
+  timeout are managed; adding a second writer of `pendingActiveWorkspaceId`
+  reopens the race the id-scoped clear exists to close.
+- **`useCoarseClock` must keep its timestamp in state.** It used to return a
+  fresh `Date.now()` on every render, which changed a prop on every parent
+  render and silently defeated *every* memo boundary beneath it — the cards
+  looked memoized and re-rendered anyway. It now ticks state on one shared
+  ~30 s interval; reverting it to a per-render read would undo the row
+  memoization without touching any `memo()` call.
 - **Bulk actions resolve against `renderedIds`.** Selection, ranges, and the
   menu's counts all describe rows currently on screen; widening them to the full
   list would let a bulk action hit workspaces the user never saw.

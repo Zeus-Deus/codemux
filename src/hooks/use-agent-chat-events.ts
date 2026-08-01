@@ -1,6 +1,10 @@
 import { useEffect, useRef } from "react";
 
 import {
+  clearAgentChatAttach,
+  registerAgentChatAttach,
+} from "@/lib/agent-chat/attach-registry";
+import {
   attachAgentChatOutput,
   Channel,
   detachAgentChatOutput,
@@ -50,11 +54,17 @@ export function useAgentChatEvents(
       handlerRef.current(payload);
     });
     const attached = attachAgentChatOutput(threadId, channel);
+    // Published so the cursor hydrate can read the persisted tail only
+    // AFTER this channel is live — a row persisted while the attach is in
+    // flight reaches no channel, and a tail read that preceded the attach
+    // would miss it for good (see lib/agent-chat/attach-registry.ts).
+    registerAgentChatAttach(threadId, attached);
     attached.catch((error) => {
       console.error("[agent-chat] attach_agent_chat_output failed:", error);
     });
     return () => {
       cancelled = true;
+      clearAgentChatAttach(threadId, attached);
       // Serialize detach behind the attach so out-of-order delivery
       // can't detach before the attach registers. The generation
       // token makes a late detach a no-op if a newer pane already

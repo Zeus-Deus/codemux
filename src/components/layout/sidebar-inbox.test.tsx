@@ -102,6 +102,12 @@ function appStoreState() {
     workspacePushPullInFlight: null,
     workspacePushPullStartedAt: null,
     setWorkspacePushPullInFlight: vi.fn(),
+    // Optimistic selection: the activation helper writes these before the
+    // invoke (docs/plans/gui-responsiveness.md, Phase 1).
+    pendingActiveWorkspaceId: null,
+    pendingActivationAt: null,
+    beginPendingActivation: vi.fn(),
+    clearPendingActivation: vi.fn(),
   };
 }
 
@@ -112,6 +118,18 @@ vi.mock("@/stores/app-store", () => {
   );
   return {
     useAppStore,
+    // Mirrors the real pending-aware selector: the optimistic id wins while
+    // its workspace is present in the snapshot.
+    selectActiveWorkspaceId: (s: {
+      appState: AppStateSnapshot | null;
+      pendingActiveWorkspaceId: string | null;
+    }) =>
+      (s.pendingActiveWorkspaceId !== null &&
+      s.appState?.workspaces.some(
+        (w) => w.workspace_id === s.pendingActiveWorkspaceId,
+      )
+        ? s.pendingActiveWorkspaceId
+        : s.appState?.active_workspace_id) ?? null,
     useHomeDir: () => "/home/u",
     useProjectGroupedWorkspaces: (all: WorkspaceSnapshot[]) => {
       const byPath = new Map<string, WorkspaceSnapshot[]>();

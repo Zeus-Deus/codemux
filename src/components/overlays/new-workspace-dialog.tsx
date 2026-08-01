@@ -67,6 +67,7 @@ import {
   applyPreset,
   renameWorkspace,
 } from "@/tauri/commands";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { pickFiles } from "@/lib/file-dialog";
 import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue, ModelSelection } from "@/tauri/types";
 import { LaunchModelPicker } from "./launch-model-picker";
@@ -419,7 +420,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const handleOpenExistingWorkspace = useCallback(
     async (wsId: string) => {
       onOpenChange(false);
-      await activateWorkspace(wsId);
+      await activateWorkspaceInteraction(wsId);
     },
     [onOpenChange],
   );
@@ -769,7 +770,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
               : `"${openExistingBranch}" already has a workspace — switched to it.`,
           );
-          await activateWorkspace(existingWsId);
+          await activateWorkspaceInteraction(existingWsId);
           removePendingWorkspace(tempId);
           return;
         }
@@ -895,7 +896,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             ? `Issue #${linkedIssue.number} already has a workspace — switched to it.`
             : `"${resolvedBranch}" already has a workspace — switched to it.`,
         );
-        await activateWorkspace(existingWsId);
+        await activateWorkspaceInteraction(existingWsId);
         removePendingWorkspace(tempId);
         return;
       }
@@ -1438,7 +1439,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               }}
               onOpenWorkspace={(wsId) => {
                 onOpenChange(false);
-                activateWorkspace(wsId).catch(console.error);
+                activateWorkspaceInteraction(wsId).catch(console.error);
               }}
               onImportWorktree={(path, branch) => {
                 onOpenChange(false);

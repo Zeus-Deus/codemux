@@ -1,12 +1,16 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import {
+  applyDeltaToSnapshot,
   buildSessionWorkspaceIndex,
+  DELTA_BUFFER_LIMIT,
   getSessionWorkspaceId,
   groupWorkspacesByProject,
   resolveProjectRoot,
+  selectActiveWorkspaceId,
   useAppStore,
 } from "./app-store";
 import type {
+  AppStateDelta,
   AppStateSnapshot,
   PaneNodeSnapshot,
   SurfaceSnapshot,
@@ -649,6 +653,346 @@ describe("useAppStore.setAppState — structural sharing identity", () => {
   });
 });
 
+// ── Optimistic selection (Phase 1) ──────────────────────────────────────
+
+describe("useAppStore — optimistic pending activation", () => {
+  const wsA = makeWs({ workspace_id: "ws-A" });
+  const wsB = makeWs({ workspace_id: "ws-B" });
+
+  function reset(): void {
+    useAppStore.setState({
+      appState: null,
+      pendingActiveWorkspaceId: null,
+      pendingActivationAt: null,
+      lastSeenRevision: 0,
+    });
+  }
+
+  beforeEach(reset);
+  afterEach(reset);
+
+  it("prefers a pending id whose workspace is already in the snapshot", () => {
+    const snapshot = makeAppState([wsA, wsB]);
+    snapshot.active_workspace_id = "ws-A";
+    useAppStore.setState({ appState: snapshot });
+
+    // Before the click, the snapshot's own active id wins.
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-A");
+
+    useAppStore.getState().beginPendingActivation("ws-B");
+
+    // The optimistic paint: no snapshot has arrived, but selection already
+    // reads as ws-B.
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-B");
+    expect(useAppStore.getState().pendingActivationAt).not.toBeNull();
+  });
+
+  it("ignores a pending id the current snapshot knows nothing about", () => {
+    // A just-created workspace has no local data to paint from, so the
+    // optimistic path must defer to the backend rather than blank the pane.
+    const snapshot = makeAppState([wsA]);
+    snapshot.active_workspace_id = "ws-A";
+    useAppStore.setState({ appState: snapshot });
+    useAppStore.getState().beginPendingActivation("ws-brand-new");
+
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-A");
+  });
+
+  it("clears the pending id when a snapshot confirms it", () => {
+    useAppStore.getState().setAppState(makeAppState([wsA, wsB]));
+    useAppStore.getState().beginPendingActivation("ws-B");
+
+    const confirming = makeAppState([wsA, wsB]);
+    confirming.active_workspace_id = "ws-B";
+    useAppStore.getState().setAppState(confirming);
+
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBeNull();
+    expect(useAppStore.getState().pendingActivationAt).toBeNull();
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-B");
+  });
+
+  it("keeps the pending id while a non-confirming snapshot arrives", () => {
+    // A background emit built before the activation still says ws-A. It is
+    // applied (it may carry fresh git/PR data) but must not un-select ws-B.
+    const first = makeAppState([wsA, wsB]);
+    first.active_workspace_id = "ws-A";
+    useAppStore.getState().setAppState(first);
+    useAppStore.getState().beginPendingActivation("ws-B");
+
+    const background = makeAppState([wsA, wsB]);
+    background.active_workspace_id = "ws-A";
+    background.pane_statuses = { "pane-x": "working" };
+    useAppStore.getState().setAppState(background);
+
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-B");
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-B");
+    expect(useAppStore.getState().appState!.pane_statuses).toEqual({
+      "pane-x": "working",
+    });
+  });
+
+  it("clearPendingActivation rolls selection back to the snapshot", () => {
+    const snapshot = makeAppState([wsA, wsB]);
+    snapshot.active_workspace_id = "ws-A";
+    useAppStore.setState({ appState: snapshot });
+    useAppStore.getState().beginPendingActivation("ws-B");
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-B");
+
+    useAppStore.getState().clearPendingActivation("ws-B");
+
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBeNull();
+    expect(selectActiveWorkspaceId(useAppStore.getState())).toBe("ws-A");
+  });
+
+  it("clearPendingActivation scoped to another id leaves the newer selection", () => {
+    useAppStore.setState({ appState: makeAppState([wsA, wsB]) });
+    useAppStore.getState().beginPendingActivation("ws-B");
+
+    // A late rollback for a superseded activation must not cancel ws-B.
+    useAppStore.getState().clearPendingActivation("ws-A");
+
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-B");
+  });
+});
+
+describe("useAppStore.setAppState — snapshot revision ordering", () => {
+  const wsA = makeWs({ workspace_id: "ws-A" });
+  const wsB = makeWs({ workspace_id: "ws-B" });
+
+  function reset(): void {
+    useAppStore.setState({
+      appState: null,
+      pendingActiveWorkspaceId: null,
+      pendingActivationAt: null,
+      lastSeenRevision: 0,
+    });
+  }
+
+  beforeEach(reset);
+  afterEach(reset);
+
+  it("tracks the highest applied revision", () => {
+    const first = makeAppState([wsA]);
+    first.snapshot_revision = 7;
+    useAppStore.getState().setAppState(first);
+    expect(useAppStore.getState().lastSeenRevision).toBe(7);
+
+    const second = makeAppState([wsA, wsB]);
+    second.snapshot_revision = 8;
+    useAppStore.getState().setAppState(second);
+    expect(useAppStore.getState().lastSeenRevision).toBe(8);
+    expect(useAppStore.getState().appState!.workspaces).toHaveLength(2);
+  });
+
+  it("drops a snapshot at or below the applied revision", () => {
+    const applied = makeAppState([wsA, wsB]);
+    applied.active_workspace_id = "ws-B";
+    applied.snapshot_revision = 10;
+    useAppStore.getState().setAppState(applied);
+
+    // An older background emit delivered late still names ws-A as active.
+    const stale = makeAppState([wsA, wsB]);
+    stale.active_workspace_id = "ws-A";
+    stale.snapshot_revision = 9;
+    useAppStore.getState().setAppState(stale);
+
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-B");
+    expect(useAppStore.getState().lastSeenRevision).toBe(10);
+
+    // Same revision twice is equally stale.
+    const duplicate = makeAppState([wsA, wsB]);
+    duplicate.active_workspace_id = "ws-A";
+    duplicate.snapshot_revision = 10;
+    useAppStore.getState().setAppState(duplicate);
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-B");
+  });
+
+  it("always applies an unrevisioned snapshot", () => {
+    const applied = makeAppState([wsA, wsB]);
+    applied.snapshot_revision = 10;
+    useAppStore.getState().setAppState(applied);
+
+    // Restored state / older backends / the dev mock carry no revision.
+    const unrevisioned = makeAppState([wsA, wsB]);
+    unrevisioned.active_workspace_id = "ws-B";
+    useAppStore.getState().setAppState(unrevisioned);
+
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-B");
+    // The high-water mark survives so a genuinely stale revision still drops.
+    expect(useAppStore.getState().lastSeenRevision).toBe(10);
+  });
+
+  it("does not let a stale snapshot cancel a pending activation", () => {
+    const applied = makeAppState([wsA, wsB]);
+    applied.active_workspace_id = "ws-A";
+    applied.snapshot_revision = 4;
+    useAppStore.getState().setAppState(applied);
+    useAppStore.getState().beginPendingActivation("ws-B");
+
+    const stale = makeAppState([wsA, wsB]);
+    stale.active_workspace_id = "ws-B";
+    stale.snapshot_revision = 3;
+    useAppStore.getState().setAppState(stale);
+
+    // The stale snapshot never applied, so it cannot count as confirmation.
+    expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-B");
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-A");
+  });
+});
+
+describe("useAppStore — a backend restart resets the revision baseline", () => {
+  // The revision counter is process-lifetime and restarts at 0. A desktop
+  // webview dies with the process so it never notices; a web-remote browser
+  // survives the restart holding a `lastSeenRevision` from the DEAD process,
+  // and every message from the new one then looks stale. The ordering guards
+  // discarded all of them and the page sat frozen — showing the pre-restart
+  // world — until the new counter climbed past the old number, which on a
+  // long-lived session is minutes or never. The instance token is what makes
+  // "the counter restarted" distinguishable from "this message is stale".
+  const wsA = makeWs({ workspace_id: "ws-A" });
+  const wsB = makeWs({ workspace_id: "ws-B" });
+
+  const portsDelta: AppStateDelta = {
+    domain: "detected_ports",
+    ports: [
+      {
+        port: 5173,
+        pid: 42,
+        process_name: "vite",
+        workspace_id: null,
+        label: null,
+        source: null,
+      },
+    ],
+  };
+
+  function reset(): void {
+    useAppStore.setState({
+      appState: null,
+      pendingActiveWorkspaceId: null,
+      pendingActivationAt: null,
+      lastSeenRevision: 0,
+      backendInstance: null,
+      resyncInFlight: false,
+      resyncRequestId: 0,
+      deltaBuffer: new Map(),
+      gapWindowId: 0,
+    });
+  }
+
+  function seed(revision: number, instance: string): void {
+    const snapshot = makeAppState([wsA, wsB]);
+    snapshot.snapshot_revision = revision;
+    snapshot.snapshot_instance = instance;
+    useAppStore.getState().setAppState(snapshot);
+  }
+
+  beforeEach(reset);
+  afterEach(reset);
+
+  it("adopts the instance that stamped the snapshot", () => {
+    seed(500, "instance-1");
+    expect(useAppStore.getState().backendInstance).toBe("instance-1");
+    expect(useAppStore.getState().lastSeenRevision).toBe(500);
+  });
+
+  it("applies a low-revision snapshot from a NEW instance instead of dropping it", () => {
+    // This is the freeze, exactly: the reconnect's reseeded snapshot arrives
+    // at revision 3 while the page still holds 500 from the previous process.
+    seed(500, "instance-1");
+
+    const reseeded = makeAppState([wsA, wsB]);
+    reseeded.active_workspace_id = "ws-B";
+    reseeded.snapshot_revision = 3;
+    reseeded.snapshot_instance = "instance-2";
+    useAppStore.getState().setAppState(reseeded);
+
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B");
+    expect(state.lastSeenRevision).toBe(3);
+    expect(state.backendInstance).toBe("instance-2");
+  });
+
+  it("still drops a stale snapshot from the SAME instance", () => {
+    // The restart escape hatch must not weaken the ordering guard it sits in
+    // front of — a late background emit from the live process is still stale.
+    seed(500, "instance-1");
+
+    const stale = makeAppState([wsA, wsB]);
+    stale.active_workspace_id = "ws-B";
+    stale.snapshot_revision = 499;
+    stale.snapshot_instance = "instance-1";
+    useAppStore.getState().setAppState(stale);
+
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-A");
+    expect(useAppStore.getState().lastSeenRevision).toBe(500);
+  });
+
+  it("discards deltas buffered against the dead instance's counter", () => {
+    // A gap opened just before the restart. Those revisions belong to a
+    // process that no longer exists and will never arrive, so holding them
+    // would keep a reorder window open against a counter that reset.
+    seed(500, "instance-1");
+    useAppStore.getState().applyAppStateDelta(505, portsDelta, "instance-1");
+    expect(useAppStore.getState().deltaBuffer.size).toBe(1);
+    expect(useAppStore.getState().gapWindowId).not.toBe(0);
+
+    const reseeded = makeAppState([wsA, wsB]);
+    reseeded.snapshot_revision = 2;
+    reseeded.snapshot_instance = "instance-2";
+    useAppStore.getState().setAppState(reseeded);
+
+    const state = useAppStore.getState();
+    expect(state.deltaBuffer.size).toBe(0);
+    expect(state.gapWindowId).toBe(0);
+    expect(state.lastSeenRevision).toBe(2);
+  });
+
+  it("a delta from a new instance opens a resync rather than patching a dead baseline", () => {
+    // If a delta beats the reseeded snapshot, applying it would patch the
+    // PREVIOUS process's world with the new one's data — a snapshot that
+    // never existed anywhere.
+    seed(500, "instance-1");
+    const before = useAppStore.getState().appState;
+
+    useAppStore.getState().applyAppStateDelta(1, portsDelta, "instance-2");
+
+    const state = useAppStore.getState();
+    expect(state.appState).toBe(before); // untouched
+    expect(state.resyncInFlight).toBe(true);
+    expect(state.resyncRequestId).toBe(1);
+    expect(state.lastSeenRevision).toBe(0);
+    expect(state.deltaBuffer.size).toBe(0);
+  });
+
+  it("leaves the baseline alone for an unstamped snapshot", () => {
+    // A restored layout, the dev mock, or an older backend carries neither a
+    // revision nor a token. It must not be read as a restart — that would
+    // reset the high-water mark and let a genuinely stale emit back in.
+    seed(500, "instance-1");
+
+    const unstamped = makeAppState([wsA, wsB]);
+    unstamped.active_workspace_id = "ws-B";
+    useAppStore.getState().setAppState(unstamped);
+
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B"); // applied
+    expect(state.lastSeenRevision).toBe(500); // but the mark survives
+    expect(state.backendInstance).toBe("instance-1");
+  });
+
+  it("the first stamped snapshot is not a restart", () => {
+    // Boot: no baseline yet, so there is nothing to invalidate.
+    const first = makeAppState([wsA]);
+    first.snapshot_revision = 9;
+    first.snapshot_instance = "instance-1";
+    useAppStore.getState().setAppState(first);
+
+    expect(useAppStore.getState().lastSeenRevision).toBe(9);
+    expect(useAppStore.getState().resyncRequestId).toBe(0);
+  });
+});
+
 describe("getSessionWorkspaceId", () => {
   it("reads the cached index from useAppStore.getState()", () => {
     const ws = makeWs({
@@ -695,5 +1039,419 @@ describe("getSessionWorkspaceId", () => {
     } finally {
       useAppStore.setState({ appState: null });
     }
+  });
+});
+
+// ── Domain deltas (Phase 6) ─────────────────────────────────────────────
+
+describe("applyDeltaToSnapshot", () => {
+  const wsA = makeWs({ workspace_id: "ws-A", git_branch: "main" });
+  const wsB = makeWs({ workspace_id: "ws-B", git_branch: "other" });
+
+  it("replaces only the named workspace and keeps every other reference", () => {
+    const before = makeAppState([wsA, wsB]);
+    const after = applyDeltaToSnapshot(
+      before,
+      {
+        domain: "workspace_git",
+        workspace_id: "ws-A",
+        git: {
+          is_git: true,
+          git_branch: "feature",
+          git_ahead: 2,
+          git_behind: 0,
+          git_additions: 0,
+          git_deletions: 0,
+          git_changed_files: 0,
+        },
+      },
+      9,
+    );
+
+    expect(after).not.toBe(before);
+    expect(after.workspaces).not.toBe(before.workspaces);
+    // The whole point: the untouched workspace keeps its identity, so the
+    // memoized card for it bails out.
+    expect(after.workspaces[1]).toBe(before.workspaces[1]);
+    expect(after.workspaces[0]).not.toBe(before.workspaces[0]);
+    expect(after.workspaces[0].git_branch).toBe("feature");
+    expect(after.workspaces[0].git_ahead).toBe(2);
+    // Domains the delta didn't name keep their references too.
+    expect(after.pane_statuses).toBe(before.pane_statuses);
+    expect(after.detected_ports).toBe(before.detected_ports);
+    expect(after.config).toBe(before.config);
+    expect(after.snapshot_revision).toBe(9);
+    // Immutability: the input snapshot is untouched.
+    expect(before.workspaces[0].git_branch).toBe("main");
+  });
+
+  it("keeps nested workspace subtrees by reference", () => {
+    const surfaces = [makeSurface(termPane("p1", "s1"))];
+    const ws = makeWs({ workspace_id: "ws-A", surfaces });
+    const before = makeAppState([ws]);
+    const after = applyDeltaToSnapshot(
+      before,
+      {
+        domain: "workspace_git",
+        workspace_id: "ws-A",
+        git: {
+          is_git: true,
+          git_branch: "feature",
+          git_ahead: 0,
+          git_behind: 0,
+          git_additions: 0,
+          git_deletions: 0,
+          git_changed_files: 0,
+        },
+      },
+      2,
+    );
+    expect(after.workspaces[0].surfaces).toBe(surfaces);
+  });
+
+  it("returns the same snapshot for a no-op delta", () => {
+    const before = makeAppState([wsA]);
+    const after = applyDeltaToSnapshot(
+      before,
+      { domain: "detected_ports", ports: before.detected_ports },
+      4,
+    );
+    expect(after).toBe(before);
+  });
+
+  it("ignores a delta for a workspace it doesn't have", () => {
+    const before = makeAppState([wsA]);
+    const after = applyDeltaToSnapshot(
+      before,
+      {
+        domain: "workspace_git",
+        workspace_id: "ws-gone",
+        git: {
+          is_git: true,
+          git_branch: "x",
+          git_ahead: 0,
+          git_behind: 0,
+          git_additions: 0,
+          git_deletions: 0,
+          git_changed_files: 0,
+        },
+      },
+      5,
+    );
+    expect(after).toBe(before);
+  });
+
+  it("sets and clears a pane status without touching the workspaces", () => {
+    const before = makeAppState([wsA]);
+    const set = applyDeltaToSnapshot(
+      before,
+      { domain: "pane_status", pane_id: "pane-1", status: "working" },
+      1,
+    );
+    expect(set.pane_statuses).toEqual({ "pane-1": "working" });
+    expect(set.workspaces).toBe(before.workspaces);
+    expect(before.pane_statuses).toEqual({});
+
+    const cleared = applyDeltaToSnapshot(
+      set,
+      { domain: "pane_status", pane_id: "pane-1", status: null },
+      2,
+    );
+    expect(cleared.pane_statuses).toEqual({});
+    expect(cleared.workspaces).toBe(before.workspaces);
+
+    // Clearing an absent pane is a no-op.
+    expect(
+      applyDeltaToSnapshot(
+        cleared,
+        { domain: "pane_status", pane_id: "pane-1", status: null },
+        3,
+      ),
+    ).toBe(cleared);
+  });
+
+  it("swaps the whole detected-ports array", () => {
+    const before = makeAppState([wsA]);
+    const ports = [
+      {
+        port: 5173,
+        pid: 42,
+        process_name: "vite",
+        workspace_id: null,
+        label: null,
+        source: null,
+      },
+    ];
+    const after = applyDeltaToSnapshot(
+      before,
+      { domain: "detected_ports", ports },
+      6,
+    );
+    expect(after.detected_ports).toBe(ports);
+    expect(after.workspaces).toBe(before.workspaces);
+  });
+});
+
+describe("useAppStore — delta ordering and gap recovery", () => {
+  const wsA = makeWs({ workspace_id: "ws-A" });
+  const wsB = makeWs({ workspace_id: "ws-B" });
+
+  const gitDelta: AppStateDelta = {
+    domain: "workspace_git",
+    workspace_id: "ws-A",
+    git: {
+      is_git: true,
+      git_branch: "feature",
+      git_ahead: 1,
+      git_behind: 0,
+      git_additions: 0,
+      git_deletions: 0,
+      git_changed_files: 0,
+    },
+  };
+
+  const staleGitDelta: AppStateDelta = {
+    domain: "workspace_git",
+    workspace_id: "ws-A",
+    git: {
+      is_git: true,
+      git_branch: "stale",
+      git_ahead: 1,
+      git_behind: 0,
+      git_additions: 0,
+      git_deletions: 0,
+      git_changed_files: 0,
+    },
+  };
+
+  const portsDelta: AppStateDelta = {
+    domain: "detected_ports",
+    ports: [
+      {
+        port: 5173,
+        pid: 42,
+        process_name: "vite",
+        workspace_id: null,
+        label: null,
+        source: null,
+      },
+    ],
+  };
+
+  function reset(): void {
+    useAppStore.setState({
+      appState: null,
+      pendingActiveWorkspaceId: null,
+      pendingActivationAt: null,
+      lastSeenRevision: 0,
+      resyncInFlight: false,
+      resyncRequestId: 0,
+      deltaBuffer: new Map(),
+      gapWindowId: 0,
+    });
+  }
+
+  function seed(revision: number): void {
+    const snapshot = makeAppState([wsA, wsB]);
+    snapshot.snapshot_revision = revision;
+    useAppStore.getState().setAppState(snapshot);
+  }
+
+  beforeEach(reset);
+  afterEach(reset);
+
+  it("applies a contiguous delta and advances the revision", () => {
+    seed(10);
+    useAppStore.getState().applyAppStateDelta(11, gitDelta);
+    const state = useAppStore.getState();
+    expect(state.lastSeenRevision).toBe(11);
+    expect(state.appState!.workspaces[0].git_branch).toBe("feature");
+    expect(state.resyncRequestId).toBe(0);
+  });
+
+  it("drops a delta that lost the race to a newer snapshot", () => {
+    seed(10);
+    const applied = useAppStore.getState().appState;
+    useAppStore.getState().applyAppStateDelta(10, gitDelta);
+    expect(useAppStore.getState().appState).toBe(applied);
+    expect(useAppStore.getState().lastSeenRevision).toBe(10);
+    expect(useAppStore.getState().resyncRequestId).toBe(0);
+  });
+
+  it("buffers a small forward gap instead of resyncing on the spot", () => {
+    // The backend stamps under the state lock but emits after releasing it, so
+    // a delta can overtake a snapshot that is still being serialized. That is
+    // a reordering, not a loss.
+    seed(10);
+    const applied = useAppStore.getState().appState;
+    useAppStore.getState().applyAppStateDelta(13, gitDelta);
+
+    const state = useAppStore.getState();
+    expect(state.resyncInFlight).toBe(false);
+    expect(state.resyncRequestId).toBe(0);
+    expect(state.gapWindowId).not.toBe(0);
+    // Held, not applied: applying it would advance the baseline past 11 and 12.
+    expect(state.appState).toBe(applied);
+    expect(state.lastSeenRevision).toBe(10);
+  });
+
+  it("applies a buffered delta once the revision before it arrives", () => {
+    seed(10);
+    useAppStore.getState().applyAppStateDelta(12, gitDelta);
+    useAppStore.getState().applyAppStateDelta(11, portsDelta);
+
+    const state = useAppStore.getState();
+    expect(state.lastSeenRevision).toBe(12);
+    expect(state.appState!.workspaces[0].git_branch).toBe("feature");
+    // Nothing is left waiting, so the window closed without a resync.
+    expect(state.gapWindowId).toBe(0);
+    expect(state.resyncRequestId).toBe(0);
+  });
+
+  it("lets a snapshot inside the window close the gap and replay above it", () => {
+    // Delta N+2 first, then the snapshot at N+1 it overtook.
+    seed(10);
+    useAppStore.getState().applyAppStateDelta(12, gitDelta);
+    seed(11);
+
+    const state = useAppStore.getState();
+    expect(state.lastSeenRevision).toBe(12);
+    expect(state.appState!.workspaces[0].git_branch).toBe("feature");
+    expect(state.gapWindowId).toBe(0);
+    expect(state.resyncInFlight).toBe(false);
+    expect(state.resyncRequestId).toBe(0);
+  });
+
+  it("opens exactly one resync when the reorder window expires", () => {
+    seed(10);
+    useAppStore.getState().applyAppStateDelta(13, gitDelta);
+    const { gapWindowId } = useAppStore.getState();
+
+    useAppStore.getState().expireGapWindow(gapWindowId);
+    expect(useAppStore.getState().resyncInFlight).toBe(true);
+    expect(useAppStore.getState().resyncRequestId).toBe(1);
+    expect(useAppStore.getState().gapWindowId).toBe(0);
+
+    // A timer for a window that has already been resolved must do nothing.
+    useAppStore.getState().expireGapWindow(gapWindowId);
+    expect(useAppStore.getState().resyncRequestId).toBe(1);
+  });
+
+  it("buffers deltas while a resync is in flight and stays single-flight", () => {
+    seed(10);
+    useAppStore.getState().requestResync();
+    const baseline = useAppStore.getState().appState;
+
+    useAppStore.getState().applyAppStateDelta(11, gitDelta);
+    useAppStore.getState().applyAppStateDelta(12, portsDelta);
+    useAppStore.getState().requestResync();
+
+    const state = useAppStore.getState();
+    // Held until the baseline lands — the snapshot may be older than these.
+    expect(state.appState).toBe(baseline);
+    expect(state.resyncRequestId).toBe(1);
+    expect(state.deltaBuffer.size).toBe(2);
+  });
+
+  it("replays deltas above the resync baseline and discards those below it", () => {
+    seed(10);
+    useAppStore.getState().requestResync();
+    useAppStore.getState().applyAppStateDelta(11, staleGitDelta);
+    useAppStore.getState().applyAppStateDelta(13, gitDelta);
+
+    // The fetch reports revision 12, so 11 is already in it and 13 is not.
+    seed(12);
+    useAppStore.getState().endResync();
+
+    const state = useAppStore.getState();
+    expect(state.lastSeenRevision).toBe(13);
+    expect(state.appState!.workspaces[0].git_branch).toBe("feature");
+    expect(state.deltaBuffer.size).toBe(0);
+  });
+
+  it("does not strand buffered deltas when the resync fetch fails", () => {
+    seed(10);
+    useAppStore.getState().requestResync();
+    useAppStore.getState().applyAppStateDelta(11, gitDelta);
+    // The fetch rejected: no baseline ever landed.
+    useAppStore.getState().endResync();
+
+    const state = useAppStore.getState();
+    // 11 continued the sequence, so it applies rather than sitting forever.
+    expect(state.lastSeenRevision).toBe(11);
+    expect(state.appState!.workspaces[0].git_branch).toBe("feature");
+    expect(state.deltaBuffer.size).toBe(0);
+    expect(state.gapWindowId).toBe(0);
+  });
+
+  it("reopens a reorder window for deltas a failed resync left behind", () => {
+    seed(10);
+    useAppStore.getState().requestResync();
+    useAppStore.getState().applyAppStateDelta(13, gitDelta);
+    useAppStore.getState().endResync();
+
+    const state = useAppStore.getState();
+    // Still gapped, so it must be waiting on a window, not stranded.
+    expect(state.lastSeenRevision).toBe(10);
+    expect(state.deltaBuffer.size).toBe(1);
+    expect(state.gapWindowId).not.toBe(0);
+  });
+
+  it("abandons the buffer for a resync once it overflows", () => {
+    seed(10);
+    // Every one of these is non-contiguous, so nothing ever drains.
+    for (let i = 0; i <= DELTA_BUFFER_LIMIT; i++) {
+      useAppStore.getState().applyAppStateDelta(12 + i, gitDelta);
+    }
+
+    const state = useAppStore.getState();
+    expect(state.deltaBuffer.size).toBe(0);
+    expect(state.resyncInFlight).toBe(true);
+    expect(state.resyncRequestId).toBe(1);
+    expect(state.gapWindowId).toBe(0);
+  });
+
+  it("resumes applying deltas once the resync snapshot rebases the baseline", () => {
+    seed(10);
+    useAppStore.getState().applyAppStateDelta(13, gitDelta);
+    useAppStore.getState().expireGapWindow(useAppStore.getState().gapWindowId);
+    seed(20);
+    useAppStore.getState().endResync();
+
+    useAppStore.getState().applyAppStateDelta(21, gitDelta);
+    const state = useAppStore.getState();
+    expect(state.lastSeenRevision).toBe(21);
+    expect(state.appState!.workspaces[0].git_branch).toBe("feature");
+  });
+
+  it("reopens the resync when a rejected fetch left the baseline behind", () => {
+    seed(10);
+    useAppStore.getState().applyAppStateDelta(13, gitDelta);
+    useAppStore.getState().expireGapWindow(useAppStore.getState().gapWindowId);
+    // The fetch failed: endResync runs, no snapshot landed.
+    useAppStore.getState().endResync();
+
+    useAppStore.getState().applyAppStateDelta(14, gitDelta);
+    useAppStore.getState().expireGapWindow(useAppStore.getState().gapWindowId);
+    expect(useAppStore.getState().resyncRequestId).toBe(2);
+  });
+
+  it("never clobbers an optimistic pending selection", () => {
+    seed(10);
+    useAppStore.getState().beginPendingActivation("ws-B");
+    useAppStore.getState().applyAppStateDelta(11, gitDelta);
+
+    const state = useAppStore.getState();
+    expect(state.pendingActiveWorkspaceId).toBe("ws-B");
+    expect(selectActiveWorkspaceId(state)).toBe("ws-B");
+    // The snapshot's own active id is untouched by the delta.
+    expect(state.appState!.active_workspace_id).toBe("ws-A");
+  });
+
+  it("ignores deltas before the first snapshot", () => {
+    useAppStore.getState().applyAppStateDelta(1, gitDelta);
+    const state = useAppStore.getState();
+    expect(state.appState).toBeNull();
+    expect(state.resyncRequestId).toBe(0);
   });
 });

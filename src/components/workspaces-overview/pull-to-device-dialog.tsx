@@ -33,6 +33,7 @@ import {
   type AdoptionPreview,
   type WorkspaceSyncView,
 } from "@/tauri/commands";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useHostsStore } from "@/stores/hosts-store";
 
 import { remoteProjectName } from "./use-overview-items";
@@ -275,7 +276,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     if (!alreadyAdopted) return;
     onOpenChange(false);
     setShowWorkspacesOverview(false);
-    void activateWorkspace(alreadyAdopted);
+    void activateWorkspaceInteraction(alreadyAdopted).catch(console.error);
   }, [alreadyAdopted, onOpenChange, setShowWorkspacesOverview]);
 
   // ── Cross-machine same-branch-same-project guard ──────────────
@@ -295,7 +296,7 @@ export function PullToDeviceDialog({ syncRow, onOpenChange }: Props) {
     if (!sameBranchConflict) return;
     onOpenChange(false);
     setShowWorkspacesOverview(false);
-    void activateWorkspace(sameBranchConflict);
+    void activateWorkspaceInteraction(sameBranchConflict).catch(console.error);
   }, [sameBranchConflict, onOpenChange, setShowWorkspacesOverview]);
 
   if (!syncRow) return null;

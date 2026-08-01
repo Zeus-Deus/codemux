@@ -311,6 +311,20 @@ pub struct ContextUsageSnapshot {
     pub compacts_automatically: Option<bool>,
 }
 
+/// One on-disk image attached to a persisted user turn.
+///
+/// Mirrors the `{"path","media_type"}` records
+/// `persist_user_message` writes into the transcript envelope's `images`
+/// array, so [`ProviderRuntimeEvent::UserMessage`] and the persisted row
+/// deserialize identically on the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMessageImage {
+    /// Absolute path to the on-disk copy of the image bytes.
+    pub path: String,
+    /// Original media type (e.g. `"image/png"`).
+    pub media_type: String,
+}
+
 /// The canonical event stream produced by every provider.
 ///
 /// Downstream consumers pattern-match on the top-level tag. New variants are
@@ -448,6 +462,38 @@ pub enum ProviderRuntimeEvent {
     ResumeCursorUpdated {
         thread_id: ThreadId,
         resume_cursor: serde_json::Value,
+    },
+    /// A user turn was persisted to `agent_chat_messages`, fanned out to
+    /// every client attached to the thread.
+    ///
+    /// **No provider ever emits this** — it is minted by the command layer
+    /// right after [`persist_user_message`](crate::commands::agent_chat)
+    /// writes the row, and its serialized shape is deliberately identical
+    /// to that persisted envelope (`{"type":"user_message", thread_id,
+    /// text, images?, client_nonce?}`) so the frontend folds a live copy
+    /// and a replayed row through exactly one reducer case.
+    ///
+    /// It exists because user turns are the one transcript-affecting thing
+    /// providers never echo back. Without the fan-out, a second client
+    /// watching the same thread (desktop open while the phone sends) sees
+    /// the *assistant* reply arrive with a higher `persisted_id`, advances
+    /// its cursor past the user row it never received, and then skips that
+    /// row on every subsequent `id > cursor` tail read — the bubble is lost
+    /// permanently. The sending client already has the bubble and drops
+    /// this copy by `client_nonce`.
+    UserMessage {
+        thread_id: ThreadId,
+        text: String,
+        /// On-disk image records attached to the turn. Omitted (not
+        /// `null`) when empty, matching the persisted envelope byte for
+        /// byte so both paths deserialize the same way.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<UserMessageImage>,
+        /// The composer's correlation token for the optimistic bubble.
+        /// Present iff the sender supplied one; the sending client matches
+        /// on it to drop its own duplicate.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_nonce: Option<String>,
     },
     /// A user turn arrived while a turn was already in flight, so it was
     /// **queued** instead of rejected. The UI renders it greyed-out in

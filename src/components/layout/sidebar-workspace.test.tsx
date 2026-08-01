@@ -56,6 +56,7 @@ vi.mock("@/tauri/commands", () => ({
 // mock return from a prior test doesn't leak in.
 import { __resetDefaultBranchCacheForTests } from "./sidebar-workspace-row.test-utils";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
+import { useAppStore } from "@/stores/app-store";
 beforeEach(() => {
   __resetDefaultBranchCacheForTests();
   // Row density is now derived from live agent + git state (the old
@@ -738,6 +739,25 @@ describe("SidebarWorkspaceRow", () => {
 
       expect(activateWorkspace).toHaveBeenCalledWith("ws-target-2");
       expect(useChatDraftStore.getState().activeDraftId).toBeNull();
+    });
+
+    // The row must go through the optimistic helper like every other
+    // activation surface: without the pending id the selection only paints
+    // once the backend snapshot lands, and a competing click through this row
+    // would strand another row's pending id until its 5 s timeout.
+    it("sets the optimistic pending id in the click's own task", () => {
+      useAppStore.setState({ pendingActiveWorkspaceId: null });
+      const ws = makeWorkspace({ workspace_id: "ws-optimistic" });
+      const { container } = render(
+        <TooltipProvider>
+          <SidebarWorkspaceRow workspace={ws} isActive={false} />
+        </TooltipProvider>,
+      );
+
+      fireEvent.click(container.querySelector("[role='button']") as HTMLElement);
+
+      expect(useAppStore.getState().pendingActiveWorkspaceId).toBe("ws-optimistic");
+      expect(activateWorkspace).toHaveBeenCalledWith("ws-optimistic");
     });
   });
 });

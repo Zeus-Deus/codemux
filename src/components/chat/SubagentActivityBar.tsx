@@ -8,10 +8,11 @@ import {
   subagentElapsedMs,
   type RunningSubagentEntry,
 } from "@/lib/agent-chat/subagents";
-import type { ChatViewItem } from "@/lib/agent-chat/types";
+import type { ChatViewItem, SubagentView } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
 import { CHAT_COLUMN } from "./chat-column";
+import { TickingText } from "./TickingText";
 
 /** How long the green "just finished" flash stays up before the bar
  *  disappears entirely (design "for ~2.5s, then disappears"). */
@@ -52,7 +53,6 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
 }) {
   const entries = runningSubagentEntries(messages);
   const count = entries.length;
-  const now = useNow(count > 0);
 
   const listId = useId();
   const [open, setOpen] = useState(false);
@@ -151,7 +151,6 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
   const primaryName =
     primary.subagent.name ?? primary.subagent.agentType ?? "Subagent";
   const primaryActivity = subagentActivityLine(primary.subagent);
-  const primaryElapsedMs = subagentElapsedMs(primary.subagent, now);
 
   const handleBarClick = () => {
     if (multi) {
@@ -192,7 +191,6 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
               <SubagentActivityBarRow
                 key={entry.subagent.id}
                 entry={entry}
-                now={now}
                 onJump={() => handleRowJump(entry)}
               />
             ))}
@@ -236,9 +234,10 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
         <span className="shimmer min-w-0 flex-1 truncate font-mono text-[12px]">
           {primaryName} · {primaryActivity}
         </span>
-        <span className="shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground">
-          {primaryElapsedMs != null ? formatElapsed(primaryElapsedMs) : ""}
-        </span>
+        <TickingText
+          className="shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground"
+          compute={(now) => elapsedLabel(primary.subagent, now)}
+        />
         <span className="flex h-[30px] shrink-0 items-center gap-1.5 rounded-lg bg-foreground/[0.08] px-2.5 text-[11px] font-semibold text-muted-foreground">
           {multi ? (open ? "Hide" : "Show all") : "View"}
           {multi ? (
@@ -261,17 +260,14 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
 
 function SubagentActivityBarRow({
   entry,
-  now,
   onJump,
 }: {
   entry: RunningSubagentEntry;
-  now: number;
   onJump: () => void;
 }) {
   const { subagent, fromLabel } = entry;
   const name = subagent.name ?? subagent.agentType ?? "Subagent";
   const activity = subagentActivityLine(subagent);
-  const elapsedMs = subagentElapsedMs(subagent, now);
 
   return (
     <div
@@ -301,9 +297,10 @@ function SubagentActivityBarRow({
       <span className="shimmer min-w-0 flex-1 truncate font-mono text-[11px]">
         {activity}
       </span>
-      <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-        {elapsedMs != null ? formatElapsed(elapsedMs) : ""}
-      </span>
+      <TickingText
+        className="shrink-0 font-mono text-[10px] text-muted-foreground"
+        compute={(now) => elapsedLabel(subagent, now)}
+      />
       {fromLabel && (
         <span className="shrink-0 text-[10px] font-semibold text-muted-foreground">
           from {fromLabel}
@@ -318,15 +315,9 @@ function SubagentActivityBarRow({
   );
 }
 
-/** 1s tick while `active`, so derived elapsed times advance without a
- *  provider `duration_ms`. Frozen (no interval) when nothing is running.
- *  Mirrors `SubagentsCard.tsx`'s local `useNow`. */
-function useNow(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [active]);
-  return now;
+/** Elapsed suffix for a running subagent; empty when nothing is derivable
+ *  (so the bar renders no number rather than a fabricated one). */
+function elapsedLabel(subagent: SubagentView, now: number): string {
+  const ms = subagentElapsedMs(subagent, now);
+  return ms != null ? formatElapsed(ms) : "";
 }

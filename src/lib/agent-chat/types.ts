@@ -332,6 +332,22 @@ export type ChatViewItem =
   | WorkflowRunItem
   | RuntimeNoticeItem;
 
+/**
+ * A live provider event plus the durable row id it was persisted as
+ * (`null` for kinds the backend never persists — `content_delta`,
+ * lifecycle notices).
+ *
+ * The id is what makes cursor resume safe: history replayed from a tail
+ * read and the live stream overlap by design (the pane buffers live
+ * events across a hydrate rather than risk a gap), and an event at or
+ * below the thread's `lastPersistedEventId` is one the tail already
+ * applied.
+ */
+export interface LiveChatEvent {
+  event: ProviderRuntimeEvent;
+  persistedId: number | null;
+}
+
 export interface ChatThreadState {
   messages: ChatViewItem[];
   /** Latest complete provider-authored task plan for this thread. */

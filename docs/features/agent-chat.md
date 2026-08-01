@@ -501,7 +501,8 @@ examples for visual verification.
   See `docs/features/mcp-server.md`.
 - **Permissions settings page** with per-tool body rendering and
   `AllowAlways` rule persistence.
-- **Session lifecycle**: transcripts persist + replay on session resume;
+- **Session lifecycle**: transcripts persist + replay on session resume (by
+  durable row-id cursor — see § "Hydration by cursor (warm resume)");
   session history selector; permission-mode mid-session restart;
   pane-scoped chats; new-tab preset launch; base-branch picker; stop-click
   restarts the session so the next turn works.
@@ -752,6 +753,160 @@ the plan and progress but cannot check, reorder, or rewrite its rows.
   `WorkflowRunCard`'s "Open panel"); without one the row renders inert. The
   panel is the live truth; the thread just records that a plan landed.
 
+## Hydration by cursor (warm resume)
+
+Opening a thread no longer replays it from event zero. Hydration is a **tail
+read against a durable DB cursor**, driven by `hydrateThreadByCursor`
+(`src/lib/agent-chat/cursor-hydrate.ts`) — the pane's only hydrate call
+(`AgentChatPane.tsx`). The old shape (a preflight `agent_chat_list_messages`
+replay whose result was discarded except for `messages.length`, then a second
+full replay inside `hydrateThread`) is gone; a cold open parses each payload
+once.
+
+- **The cursor is a row id, not a rendered count.** `agent_chat_messages` has
+  an autoincrement `id` with a `(thread_id, id ASC)` index, so no migration was
+  needed. `agent_chat_list_messages_after(thread_id, after_id)` returns
+  `{ id, payload }` rows strictly greater than the cursor in id order, and the
+  slice stores the last one as `lastPersistedEventId`. A **warm revisit of an
+  unchanged thread therefore reads and reduces nothing** — the tail is empty.
+  A companion `agent_chat_thread_head_id` probe rides in the same `Promise.all`
+  so a cursor left over from a foreign id space (a re-homed session) is caught
+  rather than trusted.
+- **Read-after-attach, with the live stream held.** The window between the DB
+  read and the store write used to lose events. Hydration now runs
+  `hold → wait for attach → read → apply → filtered release`: the batcher's
+  hold parks incoming events for the thread,
+  `waitForAgentChatAttach(threadId)` (`attach-registry.ts`, 2 s cap, never
+  rejects) waits for the channel registration published by
+  `use-agent-chat-events.ts`, and the release drops only the `content_delta`s
+  the read already settled (`dropDeltasSettledByRead(cursor)`) so a streamed
+  block cannot be appended twice. A hydrate cancelled by unmount drops its
+  buffer instead of releasing it.
+- **Hold tokens are owned.** `holdAgentChatEvents` mints a fresh `Symbol`;
+  `release`/`drop` no-op unless they present the token that is currently
+  installed. So an older overlapping hydrate's teardown cannot release the
+  newer hydrate's hold and let events through mid-read.
+- **A cold empty read never wipes a populated transcript.** If a cold hydrate
+  reads zero rows for a thread the store already has messages for, the rows are
+  assumed to be filed under a different id (session resume re-homing) rather
+  than deleted: the transcript is left alone, the cursor is invalidated, and the
+  read is retried exactly once after 500 ms.
+- **Duplicates are killed on two axes.** Live channel events carry their
+  `persisted_id`, and `applyLiveEvents` skips any event at or below
+  `lastPersistedEventId` (so the tail read and the live stream can overlap
+  freely). Separately, an optimistic user bubble carries a `client_nonce` that
+  hydration and the live `turn_queued` reconciliation both match on, so the
+  persisted copy replaces the optimistic one instead of doubling it.
+- **User turns are fanned out, because nothing else would carry them.**
+  Providers never echo a user turn, so its `agent_chat_messages` row is the
+  only record of it. The backend therefore mints a
+  `ProviderRuntimeEvent::UserMessage` from the row it just wrote and sends it
+  to every channel attached to the thread, stamped with that row's id — the
+  same persist-before-fan-out order `forward_event` uses, through the same
+  `fan_out_to_thread_channels` helper. Its serialized shape is deliberately
+  identical to the stored `{"type":"user_message", …}` envelope, and one
+  reducer case folds both, so a client that saw the turn live and a client
+  that only replays the rows cannot end up with different transcripts.
+  Without the fan-out, a *second* client watching the thread (a desktop window
+  while the phone sends) received only the assistant reply — persisted at a
+  higher id — and `applyLiveEvents` advanced its cursor past a user row it had
+  never seen. Every `id > cursor` tail read then skipped that row, so the other
+  client's prompt was lost permanently, with no revisit that could recover it.
+  The sender is unaffected either way: it drops its own copy on the nonce while
+  still advancing its cursor over the row. The queued-follow-up path fans out
+  at dispatch (when the envelope is actually written) and only when a nonce
+  exists, since `turn_queued` has already put a greyed bubble on every client
+  attached at enqueue time and the nonce is what keeps this copy from becoming
+  a second one.
+
+### Large tool results hydrate as metadata
+
+A single 13 MB thread used to ship every collapsed tool body across IPC just to
+render twelve preview lines. On the **read path only**, a persisted
+`tool_result` whose serialized content exceeds
+`LAZY_TOOL_RESULT_THRESHOLD_BYTES` (32 KiB) is replaced by a stub keyed
+`__codemux_lazy_tool_result` carrying `{ row_id, bytes, preview (2 KiB,
+truncated on a char boundary), line_count, has_images: false }`. The collapsed
+card renders from the preview and line count; expanding fetches the real body
+with `agent_chat_get_tool_result(row_id)` and `resolveLazyToolResult` swaps it
+into the item, producing a new item object so exactly one row re-renders.
+
+Two constraints are load-bearing:
+
+- **An image-bearing result is never stubbed.** `shape_persisted_payload`
+  returns early when the content holds a renderable image block, and its
+  accept-set deliberately mirrors the frontend's `tool-result-images.ts` — a
+  stubbed image would render as a broken attachment with no way back.
+- **Live events and `agent_chat_list_messages` are untouched.** Only
+  `agent_chat_list_messages_after` shapes payloads, so the mirror/web-remote
+  path and the streaming path still see verbatim content.
+
+Two known gaps, neither reachable today: the stub's own doc comments describe
+a "copy" path that does not exist (nothing in the chat UI copies
+`result_content` — the clipboard writers copy tool *input* and markdown code
+blocks), and `grepHitCount` (`activity-steps.ts`) reads `result_content` to
+label a Grep step "N hits", so an oversized Grep result falls back to "done".
+Both become real bugs the moment a copy-result or transcript-export surface
+lands; a consumer of a tool body must go through the fetch.
+
+### Warm slices are byte-weighted, not unbounded
+
+Hydrated threads stay in the store so a revisit is free, which without a bound
+is a leak on a 161-thread profile. `evictColdThreads` drops least-recently-
+touched slices once the estimated total exceeds `WARM_SLICE_BUDGET_UNITS`
+(128 Mi units of estimated payload characters, not heap bytes; per-item weights
+memoized in a `WeakMap`). LRU stamps live in a module-level map **outside** the
+slice, so touching a thread never changes slice identity and never re-renders
+anything. Exempt from eviction: the thread being hydrated, any thread a pane is
+mounted on (refcounted), and any *busy* slice — streaming, mid-turn, holding a
+pending request, or holding unsent composer work (draft text or staged
+attachments). An evicted thread simply cold-hydrates again.
+
+### Streaming is batched at display cadence
+
+Provider `content_delta` events used to be one `set()` and one render per
+token. `src/lib/agent-chat/event-batcher.ts` coalesces them at frame cadence:
+deltas queue and drain on a `requestAnimationFrame`, while **every other event
+kind flushes the thread's whole queue synchronously, itself included, in
+arrival order** — so an approval, a tool result, or a turn/session state change
+is never delayed behind a token, and ordering is preserved. A hidden document
+has no rAF, so the batcher falls back to a 32 ms timer and drains immediately
+on `visibilitychange`. Pane detach and pre-hydrate are explicit flush seams.
+
+The scheduler idles when there is nothing it could drain: a queue belonging to
+a HELD thread can only be moved by `release`/`drop`, so re-arming for one would
+wake every frame, drain nothing and re-arm — a 60 Hz no-op loop lasting exactly
+as long as the hydrate's IPC round trip, which is when the main thread is
+busiest. `flushAll` therefore re-schedules only while some *unheld* queue
+remains, and ending a hold is what wakes the flush back up.
+
+### The pane subscribes by field, not by slice
+
+`AgentChatPane` used to read its entire thread slice, so a draft keystroke
+re-entered the whole tree. It now takes six narrow subscriptions: `draft`
+(a scalar), a `useShallow` `timeline` group
+(`messages`/`streaming`/`stalled`/`interrupted`/`activeTurnId`), a `useShallow`
+`settings` group (model, permission mode, effort, context window, fast mode,
+mode, debug-activity flags), `stagedAttachments` with an empty-array
+sentinel, and one scalar each for `tasks` and `contextUsage`. The last two are
+deliberately *not* folded into `settings`: the Tasks panel updates on tool
+events and the context meter once per provider usage report, and either riding
+the settings group would re-run every picker consumer on a cadence it has no
+stake in. The pane itself still re-renders on a keystroke — it owns the
+composer — but **no timeline row does**, which
+`transcript-keystroke-isolation.test.tsx` asserts directly (a draft write
+leaves the timeline fields reference-equal and every row's render count
+unchanged, while a real message change still re-renders exactly that row).
+
+Per-second elapsed labels are also out of React: `TickingText`
+(`src/components/chat/TickingText.tsx`) renders an empty span and writes
+`textContent` from an interval, so the activity bar's and subagent cards' 1 Hz
+readouts never enter a commit. It is only valid for output that is a pure
+function of `now` plus already-rendered props. The Orchestration panel's
+per-phase labels deliberately stayed on a coarse 5 s `now` prop instead —
+that value crosses a component boundary, so the trade there is a few seconds
+of precision on a secondary readout for a 12× drop in panel re-renders.
+
 ## Transcript scroller (issue #77 contract, LegendList)
 
 The transcript body (`MessageList.tsx`) is a real windowed list built on
@@ -795,7 +950,12 @@ Contract preserved from the pre-redesign renderer:
   transcript is untouched. (Activity rows still rebuild their `items` array
   each build, as the old tool-group rows did; the stable `run:<first-id>` key
   keeps the scroller row from remounting as the run grows and transitions
-  working → settled.)
+  working → settled.) The shells around the window are memoized too —
+  `ChatTranscript`, `MessageList` and `MessageTrail`/`TrailRail` are `memo()`d,
+  `keyExtractor` / `itemsAreEqual` are hoisted to module scope, and the
+  `ListHeaderComponent` element is memoized like the footer already was — so a
+  parent re-render does not walk back into the list. `MessageList.memoization.test.tsx`
+  guards it.
 - **Stick-to-bottom and free-scroll are one virtualizer contract.**
   `initialScrollAtEnd` opens hydrated sessions at the latest row.
   `maintainScrollAtEnd` follows data, item-size, footer-size, and viewport

@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useRef } from "react";
+import { useEffect, useRef } from "react";
 import {
   splitPane,
   closePane,
@@ -21,6 +21,7 @@ import { normalizeKeyCombo } from "@/lib/keybind-utils";
 import { getRegistryEntry } from "@/lib/keybind-registry";
 import { updateAppShortcuts } from "@/lib/app-shortcuts";
 import { getJumpTarget } from "@/components/layout/sidebar-inbox-jump";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import {
   useSyncedSettingsStore,
   selectKeyboardShortcuts,
@@ -182,17 +183,15 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
 
   // ── Jump to the Nth visible sidebar-inbox card ──
-  // Resolves against the same filter-scoped, non-settled order the user sees;
-  // mirrors the card's own activation (clear the active chat draft, then
-  // activate). Runs before the appState guard so it works from anywhere.
+  // Resolves against the same filter-scoped, non-settled order the user sees,
+  // and routes through the shared activation helper so the jump paints
+  // optimistically and clears the draft exactly like the card's own click.
+  // Runs before the appState guard so it works from anywhere.
   const jumpMatch = actionId.match(/^workspaceJump([1-9])$/);
   if (jumpMatch) {
     const target = getJumpTarget(parseInt(jumpMatch[1], 10));
     if (target) {
-      useChatDraftStore.getState().setActiveDraft(null);
-      startTransition(() => {
-        activateWorkspace(target).catch(console.error);
-      });
+      activateWorkspaceInteraction(target).catch(console.error);
     }
     // Consume the combo regardless so a held Alt+digit never leaks to the page.
     return true;

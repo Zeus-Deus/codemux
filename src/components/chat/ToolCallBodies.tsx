@@ -1,8 +1,18 @@
+import { useState } from "react";
+
+import {
+  formatLazyBytes,
+  lazyToolResultStub,
+  toolResultContentFromPayload,
+  type LazyToolResultStub,
+} from "@/lib/agent-chat/lazy-tool-result";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 import {
   extractToolResultImages,
   isRenderableImageBlock,
 } from "@/lib/agent-chat/tool-result-images";
+import { useAgentChatStore } from "@/stores/agent-chat-store";
+import { agentChatGetToolResult } from "@/tauri/commands";
 
 import { DiffView } from "./DiffView";
 import { ToolCallBlock } from "./ToolCallBlock";
@@ -24,6 +34,10 @@ const GREP_PREVIEW_MATCHES = 5;
  */
 export function ToolCallBody({ item }: { item: ToolCallItem }) {
   const input = isRecord(item.input) ? item.input : null;
+  // A hydrated oversized result ships as metadata; the body arrives when
+  // the user actually asks for it.
+  const stub = lazyToolResultStub(item.result_content);
+  if (stub) return <LazyToolResultBody stub={stub} />;
   const body = renderToolBody(item, input);
 
   // Images returned in the tool result (a screenshot from `Read` on a
@@ -339,6 +353,64 @@ function editDiffInput(
       };
     }
   }
+}
+
+/**
+ * Collapsed view of a tool result whose body stayed on disk. Renders the
+ * preview the backend shipped with the stub — visually the same recessed
+ * block a truncated body gets — and fetches the real content on demand.
+ * A resolved fetch swaps the content into the store item, so the next
+ * render takes the normal per-tool path.
+ */
+function LazyToolResultBody({ stub }: { stub: LazyToolResultStub }) {
+  const [loading, setLoading] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  const load = () => {
+    setLoading(true);
+    setFailed(false);
+    agentChatGetToolResult(stub.row_id)
+      .then((payload) => {
+        const content = toolResultContentFromPayload(payload);
+        if (content == null) {
+          setFailed(true);
+          return;
+        }
+        useAgentChatStore.getState().resolveLazyToolResult(stub.row_id, content);
+      })
+      .catch((err) => {
+        console.warn("[agent-chat] tool-result fetch failed:", err);
+        setFailed(true);
+      })
+      .finally(() => setLoading(false));
+  };
+
+  const hidden = Math.max(stub.line_count - previewLineCount(stub.preview), 0);
+
+  return (
+    <div className="rounded-md bg-muted/40 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
+      <div className="px-3 py-2">
+        {stub.preview}
+        <span className="text-muted-foreground/60">{"\n"}…</span>
+      </div>
+      <button
+        type="button"
+        onClick={load}
+        disabled={loading}
+        className="block w-full border-t border-border/40 px-3 py-1.5 text-left text-[11px] text-muted-foreground hover:text-foreground disabled:opacity-60"
+      >
+        {loading
+          ? "Loading…"
+          : failed
+            ? "Couldn't load the full output — retry"
+            : `Show ${hidden} more line${hidden === 1 ? "" : "s"} (${formatLazyBytes(stub.bytes)})`}
+      </button>
+    </div>
+  );
+}
+
+function previewLineCount(preview: string): number {
+  return preview ? preview.split("\n").length : 0;
 }
 
 function GenericToolBody({ item }: { item: ToolCallItem }) {

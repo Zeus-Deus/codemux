@@ -35,6 +35,32 @@ Command handling:
 
 `mock-fixtures.ts` mirrors `src/tauri/types.ts` exactly, so TypeScript catches drift the moment a real snapshot field changes. The seed (per issue #40 acceptance criteria) covers three projects, primary + worktree workspaces, all four PR states, agent states (working / review / permission), a linked issue, a muted workspace, non-zero git ahead/behind/diff stats, and a non-zero notification count.
 
+### Stress fixtures
+
+The curated seed is a *design* fixture (18 workspaces), far below the audited real profile — measuring responsiveness against it flatters every number. `src/dev/stress-fixture.ts` scales the same seed on demand, selected by URL param or localStorage:
+
+```
+http://localhost:1420/?fixture=large
+localStorage["codemux:fixture"] = "large"
+```
+
+Presets `small` / `medium` / `large` / `xl` set `{ workspaces, chatEvents, payloadMb, deltasPerSec }`; `xl` is the audited profile (80 workspaces, 5,000 persisted events, ~15 MB of tool_result payload). An inline JSON object is merged over the `medium` preset for one-off shapes (`?fixture={"workspaces":80,"chatEvents":5000}`) and every field is clamped to its supported range.
+
+With a fixture selected, generated workspaces are built by the same `makeWorkspace` / `chatSurface` builders as the curated ones (so they carry real panes, sessions and statuses), every third one opens on a chat pane, and `agent_chat_list_messages` serves a synthetic transcript for those threads and for the seeded thread. **With no fixture selected the seed and the seeded transcript are unchanged.**
+
+### Cursor hydration + lazy tool results (parity with `commands/agent_chat.rs`)
+
+The mock implements the whole cursor-hydration read path, so the chat pane's real hydrate runs unmodified in a plain browser:
+
+- `agent_chat_list_messages` — full payload list, verbatim (the legacy/mirror path).
+- `agent_chat_list_messages_after` — the tail read, filtering `row.id > afterId`.
+- `agent_chat_thread_head_id` — newest row id, or `null` for an empty thread.
+- `agent_chat_get_tool_result` — body fetch by `rowId`, throwing `not_found: row <id>` when absent.
+
+`mockShapePayload` is a deliberate mirror of the Rust `shape_persisted_payload`: on the `_after` read only, an oversized non-image `tool_result` body is replaced by the same `__codemux_lazy_tool_result` stub (32 KiB threshold, 2 KiB preview, `line_count`), so expand-to-fetch is exercisable in dev. `src/dev/lazy-tool-result-mock.test.ts` pins that parity — including shapes the fixture generator never produces.
+
+One gotcha worth keeping: **the named presets never trip the threshold.** They spread their payload budget across enough turns that each individual result lands under 32 KiB. To see the lazy path, ask for few turns and a big budget — `?fixture={"chatEvents":200,"payloadMb":5}` yields roughly 130 KB per result.
+
 ## What Works Today
 
 - Boots the full UI in a browser tab via `npm run dev` with no desktop window or Rust backend
@@ -114,6 +140,7 @@ Command handling:
 
 - `src/dev/tauri-mock.ts` — the runtime shim + command router + event subsystem
 - `src/dev/mock-fixtures.ts` — hand-curated seed `AppStateSnapshot` and fixtures
+- `src/dev/stress-fixture.ts` — fixture-scale selector + synthetic transcript generator
 - `src/main.tsx` — the dual-guarded conditional import
 - `docs/core/TESTING.md` — visual-verification workflow that uses this mock
 

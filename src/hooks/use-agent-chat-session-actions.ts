@@ -7,7 +7,7 @@ import { toast } from "@/lib/toast";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
 import {
-  agentChatListMessages,
+  agentChatListMessagesAfter,
   agentChatStartSession,
   agentChatStopSession,
   type AgentChatSessionRecord,
@@ -94,11 +94,16 @@ export function useAgentChatSessionActions(
         // pane renders the full history immediately, instead of going
         // blank for the second or two it takes the SDK to boot.
         try {
-          const payloads = await agentChatListMessages(record.thread_id);
-          if (payloads.length > 0) {
+          // Cursor read, single replay: the rows carry their durable ids,
+          // so the new slice starts with a resume cursor instead of
+          // having to cold-replay again on its first remount. Row ids are
+          // table-wide monotonic, so every row this thread writes from
+          // here on sorts above the resumed history's head.
+          const rows = await agentChatListMessagesAfter(record.thread_id, null);
+          if (rows.length > 0) {
             useAgentChatStore
               .getState()
-              .hydrateThread(newLocalThreadId, payloads, { provider });
+              .hydrateThread(newLocalThreadId, rows, { provider });
           }
         } catch (err) {
           // Hydration failure is non-fatal — the SDK still has the

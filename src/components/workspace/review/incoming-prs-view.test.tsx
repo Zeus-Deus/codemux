@@ -36,10 +36,19 @@ vi.mock("@/tauri/commands", () => ({
 
 const mockWorkspaces: { workspace_id: string; git_branch: string | null; project_root: string | null }[] = [];
 
-vi.mock("@/stores/app-store", () => ({
-  useAppStore: (selector: (s: Record<string, unknown>) => unknown) =>
-    selector({ appState: { workspaces: mockWorkspaces } }),
-}));
+// Only the hook's projection is faked; the real selectors and `getState` stay,
+// because the activation helper reads both.
+vi.mock("@/stores/app-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/stores/app-store")>();
+  return {
+    ...actual,
+    useAppStore: Object.assign(
+      (selector: (s: Record<string, unknown>) => unknown) =>
+        selector({ appState: { workspaces: mockWorkspaces } }),
+      { getState: actual.useAppStore.getState },
+    ),
+  };
+});
 
 import { IncomingPrsView, _resetIncomingPrsCache } from "./incoming-prs-view";
 import type { IncomingPrItem } from "@/tauri/types";

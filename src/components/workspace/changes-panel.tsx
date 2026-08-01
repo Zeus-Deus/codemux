@@ -65,6 +65,7 @@ import {
   checkClaudeAvailable,
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
+import { keepIfUnchanged } from "@/lib/poll-equality";
 import { useQueryClient } from "@tanstack/react-query";
 import { useDiffStore } from "@/stores/diff-store";
 import { useAppStore } from "@/stores/app-store";
@@ -327,9 +328,13 @@ export function ChangesPanel({ workspace }: Props) {
       getGitBranchInfo(cwd).catch(() => null),
       getMergeState(cwd).catch(() => null as MergeState | null),
     ]).then(([s, info, merge]) => {
-      setFiles(s);
-      if (info) setBranchInfo(info);
-      setMergeState(merge);
+      // This refresh runs every 10 s over three IPC calls, and a quiet
+      // working tree returns the same payloads every time. Keeping the
+      // previous objects when nothing moved makes the idle tick a React
+      // bail-out instead of a full panel re-render.
+      setFiles((prev) => keepIfUnchanged(prev, s));
+      if (info) setBranchInfo((prev) => keepIfUnchanged(prev, info));
+      setMergeState((prev) => keepIfUnchanged(prev, merge));
     });
   }, [cwd]);
 

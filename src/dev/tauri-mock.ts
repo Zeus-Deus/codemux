@@ -32,6 +32,8 @@
  * `app-state-changed` so the UI reflects the change; everything else
  * falls through to a logged, shape-safe default.
  */
+import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
+
 import {
   MOCK_CHAT_THREAD_ID,
   MOCK_DIRTY_ARCHIVE_ID,
@@ -53,6 +55,11 @@ import {
   workflowCompleteEnvelopes,
   workflowRunningEnvelopes,
 } from "./mock-fixtures";
+import {
+  STRESS_THREAD_PREFIX,
+  getStressFixture,
+  stressChatTranscript,
+} from "./stress-fixture";
 import type {
   ScrollbackMeta,
   ScrollbackPayload,
@@ -248,11 +255,16 @@ function chatChannelPush(entry: MockChatChannelEntry, payload: unknown): void {
 }
 
 /** Route one runtime event to the thread's attached channel — the
- *  mock twin of `forward_event`'s channel arm. No channel → drop. */
+ *  mock twin of `forward_event`'s channel arm. No channel → drop.
+ *
+ *  `persisted_id` is always null here: the mock's transcripts are
+ *  generated, and simulated live events are never appended to them, so
+ *  there is no row for them to point at. The frontend treats that as
+ *  "ephemeral event" and leaves its cursor where the tail read put it. */
 function emitChatEvent(threadId: string, event: unknown): void {
   const entry = chatChannels.get(threadId);
   if (!entry) return;
-  chatChannelPush(entry, { thread_id: threadId, event });
+  chatChannelPush(entry, { thread_id: threadId, event, persisted_id: null });
 }
 
 // The turn simulator itself (`streamMockChatReply`) lives in the
@@ -573,6 +585,125 @@ const ASSISTANT_BODIES = [
 ];
 
 let mockChatTranscriptCache: string[] | null = null;
+
+// ── Cursor reads + lazy tool results (mirrors commands/agent_chat.rs) ──
+
+/** Same threshold the Rust read path applies. */
+const MOCK_LAZY_TOOL_RESULT_THRESHOLD_BYTES = 32 * 1024;
+const MOCK_LAZY_TOOL_RESULT_PREVIEW_BYTES = 2 * 1024;
+
+interface MockMessageRow {
+  id: number;
+  payload: string;
+}
+
+/** Row id → the UNSHAPED payload, so `agent_chat_get_tool_result` can
+ *  serve the full body the list read stubbed out. */
+const mockFullPayloadById = new Map<number, string>();
+const mockThreadRowCache = new Map<string, MockMessageRow[]>();
+
+/** The raw persisted payloads a thread would hold. */
+function mockThreadPayloads(threadId: string): string[] {
+  // Under a stress fixture the generated threads AND the seeded thread serve
+  // the synthetic transcript — hydration cost is one of the things being
+  // measured, and the curated 520-turn showcase is not that profile.
+  const fixture = getStressFixture();
+  if (
+    fixture &&
+    (threadId.startsWith(STRESS_THREAD_PREFIX) || threadId === MOCK_CHAT_THREAD_ID)
+  ) {
+    return stressChatTranscript(threadId, fixture);
+  }
+  if (threadId === MOCK_CHAT_THREAD_ID) return mockChatTranscript();
+  return mockWorkflowTranscript(threadId) ?? [];
+}
+
+/** Ids are per-thread here (the real table is global), which is all the
+ *  frontend's cursor arithmetic depends on. */
+function mockThreadRows(threadId: string): MockMessageRow[] {
+  const cached = mockThreadRowCache.get(threadId);
+  if (cached) return cached;
+  const rows = mockThreadPayloads(threadId).map((payload, index) => {
+    const id = index + 1;
+    mockFullPayloadById.set(id, payload);
+    return { id, payload: mockShapePayload(id, payload) };
+  });
+  mockThreadRowCache.set(threadId, rows);
+  return rows;
+}
+
+/** Mirror of `shape_persisted_payload`: replace an oversized, non-image
+ *  tool-result body with a stub. Exported so a test can pin the parity
+ *  with the Rust twin on shapes the stress fixture never produces.
+ *
+ *  The named presets spread their payload budget over enough turns that
+ *  each individual result lands UNDER the threshold; to exercise the
+ *  lazy path in `npm run dev`, ask for few turns and a big budget:
+ *  `?fixture={"chatEvents":200,"payloadMb":5}` → ~130 KB per result. */
+export function mockShapePayload(rowId: number, payload: string): string {
+  if (payload.length <= MOCK_LAZY_TOOL_RESULT_THRESHOLD_BYTES) return payload;
+  let value: Record<string, unknown>;
+  try {
+    value = JSON.parse(payload) as Record<string, unknown>;
+  } catch {
+    return payload;
+  }
+  if (value.type !== "item_completed") return payload;
+  const item = value.item as Record<string, unknown> | undefined;
+  if (!item || item.kind !== "tool_result" || item.content == null) return payload;
+  const content = item.content;
+  // The same accept-set the Rust side mirrors — this IS the frontend's.
+  if (hasToolResultImages(content)) return payload;
+  const serialized = JSON.stringify(content);
+  if (serialized.length <= MOCK_LAZY_TOOL_RESULT_THRESHOLD_BYTES) return payload;
+  const text = mockStringifyToolContent(content);
+  item.content = {
+    __codemux_lazy_tool_result: {
+      row_id: rowId,
+      bytes: serialized.length,
+      preview: mockTruncateOnCharBoundary(
+        text,
+        MOCK_LAZY_TOOL_RESULT_PREVIEW_BYTES,
+      ),
+      line_count: text.split("\n").length,
+      has_images: false,
+    },
+  };
+  return JSON.stringify(value);
+}
+
+/** Mirror of `stringify_tool_content`: flatten content to the text the
+ *  collapsed card renders, joining block entries' `text` fields. Getting
+ *  this wrong would hand the mock a preview shaped nothing like the real
+ *  one — the point of the mock is to exercise the real shape. */
+function mockStringifyToolContent(content: unknown): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((entry) => {
+        if (entry == null) return "";
+        if (typeof entry === "string") return entry;
+        const text = (entry as { text?: unknown }).text;
+        return typeof text === "string" ? text : JSON.stringify(entry, null, 2);
+      })
+      .join("\n");
+  }
+  const text = (content as { text?: unknown }).text;
+  return typeof text === "string" ? text : JSON.stringify(content, null, 2);
+}
+
+/** Mirror of `truncate_on_char_boundary`. The Rust cap is UTF-8 BYTES, so
+ *  a `String.slice` (UTF-16 code units) would disagree on any non-ASCII
+ *  body — and could split a character where Rust never would. */
+function mockTruncateOnCharBoundary(text: string, maxBytes: number): string {
+  const encoded = new TextEncoder().encode(text);
+  if (encoded.length <= maxBytes) return text;
+  let end = maxBytes;
+  // Walk back off any UTF-8 continuation byte (0b10xxxxxx).
+  while (end > 0 && (encoded[end] & 0b1100_0000) === 0b1000_0000) end -= 1;
+  return new TextDecoder().decode(encoded.subarray(0, end));
+}
 
 /** Generate the persisted-payload list `agent_chat_list_messages`
  *  returns for the seeded thread: the same JSON envelopes the real
@@ -1709,10 +1840,25 @@ const handlers: Record<string, Handler> = {
           },
         ]
       : [],
-  agent_chat_list_messages: (a) => {
+  agent_chat_list_messages: (a) => mockThreadPayloads(a.threadId as string),
+  // Cursor read (Phase 3). The mock's transcripts are generated and
+  // stable per thread, so a row id is just "index + 1" within the
+  // thread — enough to exercise the frontend's cursor arithmetic and
+  // the lazy tool-result path (the stress fixture's tool bodies are
+  // deliberately megabyte-scale).
+  agent_chat_list_messages_after: (a) => {
     const threadId = a.threadId as string;
-    if (threadId === MOCK_CHAT_THREAD_ID) return mockChatTranscript();
-    return mockWorkflowTranscript(threadId) ?? [];
+    const afterId = (a.afterId as number | null | undefined) ?? 0;
+    return mockThreadRows(threadId).filter((row) => row.id > afterId);
+  },
+  agent_chat_thread_head_id: (a) => {
+    const rows = mockThreadRows(a.threadId as string);
+    return rows.length > 0 ? rows[rows.length - 1].id : null;
+  },
+  agent_chat_get_tool_result: (a) => {
+    const payload = mockFullPayloadById.get(a.rowId as number);
+    if (payload == null) throw new Error(`not_found: row ${a.rowId}`);
+    return payload;
   },
   // Return one record for the seeded thread so the pane can resolve the
   // D2 session-start marker's `created_at` (and the SessionSelector

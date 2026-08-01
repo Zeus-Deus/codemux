@@ -22,7 +22,7 @@ import { useEffect } from "react";
 import { useAppStore } from "@/stores/app-store";
 import { useTerminalCwdStore } from "@/stores/terminal-cwd-store";
 import { terminalSessionCwds } from "@/tauri/commands";
-import type { PaneNodeSnapshot } from "@/tauri/types";
+import type { AppStateSnapshot, PaneNodeSnapshot } from "@/tauri/types";
 
 /** How often to re-read the shell's directory. Fast enough that a `cd`
  *  feels reflected in the header, slow enough that idle panes cost
@@ -40,10 +40,38 @@ function collectSessionIds(node: PaneNodeSnapshot, out: string[]): void {
   }
 }
 
+/** Every live terminal session id in the snapshot, across all workspaces. */
+export function collectLiveSessionIds(appState: AppStateSnapshot): Set<string> {
+  const live = new Set<string>();
+  for (const ws of appState.workspaces) {
+    for (const surface of ws.surfaces) {
+      const ids: string[] = [];
+      collectSessionIds(surface.root, ids);
+      for (const id of ids) live.add(id);
+    }
+  }
+  return live;
+}
+
+/** Set equality by membership. */
+export function sameSessionSet(
+  a: ReadonlySet<string>,
+  b: ReadonlySet<string>,
+): boolean {
+  if (a === b) return true;
+  if (a.size !== b.size) return false;
+  for (const id of a) if (!b.has(id)) return false;
+  return true;
+}
+
 export function useTerminalCwdPoll(): void {
   useEffect(() => {
     let cancelled = false;
     let inFlight = false;
+    // Snapshot the pruning walk depends on, plus its result. Both are
+    // compared before any work is redone — see the prune block below.
+    let prunedFrom: AppStateSnapshot | null = null;
+    let prunedIds: ReadonlySet<string> = new Set<string>();
 
     const tick = async () => {
       // Never stack requests: a slow IPC round-trip must not queue up a
@@ -71,15 +99,20 @@ export function useTerminalCwdPoll(): void {
       // session doesn't accumulate cwds for closed panes. Scoped to the
       // whole snapshot (not just the active workspace) so switching
       // workspaces doesn't discard a background pane's known directory.
-      const live = new Set<string>();
-      for (const ws of appState.workspaces) {
-        for (const surface of ws.surfaces) {
-          const ids: string[] = [];
-          collectSessionIds(surface.root, ids);
-          for (const id of ids) live.add(id);
+      //
+      // Walking every workspace's pane tree twice a second is pure waste:
+      // sessions only appear and disappear when the snapshot changes, and
+      // `shareStructural` hands back the identical object on a no-op emit.
+      // So the walk runs on snapshot identity change, and the store write
+      // only when the session set genuinely moved.
+      if (appState !== prunedFrom) {
+        prunedFrom = appState;
+        const live = collectLiveSessionIds(appState);
+        if (!sameSessionSet(live, prunedIds)) {
+          prunedIds = live;
+          cwdStore.pruneCwds(live);
         }
       }
-      cwdStore.pruneCwds(live);
 
       if (needed.length === 0) return;
 

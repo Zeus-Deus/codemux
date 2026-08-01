@@ -30,6 +30,7 @@ vi.mock("@/stores/hosts-store", () => ({
 let workspaces: WorkspaceSnapshot[] = [];
 let paneStatuses: Record<string, PaneStatus> = {};
 let activeWorkspaceId = "";
+let pendingActiveWorkspaceId: string | null = null;
 
 function appStoreState() {
   return {
@@ -39,6 +40,12 @@ function appStoreState() {
       active_workspace_id: activeWorkspaceId,
     } as unknown as AppStateSnapshot,
     homeDir: "/home/u",
+    // Optimistic selection: the activation helper writes these before the
+    // invoke (docs/plans/gui-responsiveness.md, Phase 1).
+    pendingActiveWorkspaceId,
+    pendingActivationAt: null,
+    beginPendingActivation: vi.fn(),
+    clearPendingActivation: vi.fn(),
   };
 }
 
@@ -49,6 +56,18 @@ vi.mock("@/stores/app-store", () => {
   );
   return {
     useAppStore,
+    // Mirrors the real pending-aware selector: the optimistic id wins while
+    // its workspace is present in the snapshot.
+    selectActiveWorkspaceId: (s: {
+      appState: AppStateSnapshot | null;
+      pendingActiveWorkspaceId: string | null;
+    }) =>
+      (s.pendingActiveWorkspaceId !== null &&
+      s.appState?.workspaces.some(
+        (w) => w.workspace_id === s.pendingActiveWorkspaceId,
+      )
+        ? s.pendingActiveWorkspaceId
+        : s.appState?.active_workspace_id) ?? null,
     useHomeDir: () => "/home/u",
     useProjectGroupedWorkspaces: (all: WorkspaceSnapshot[]) => {
       const byPath = new Map<string, WorkspaceSnapshot[]>();
@@ -130,6 +149,7 @@ beforeEach(() => {
   workspaces = [];
   paneStatuses = {};
   activeWorkspaceId = "";
+  pendingActiveWorkspaceId = null;
   wsCounter = 0;
 });
 
@@ -271,6 +291,37 @@ describe("SidebarRailWorkspaces", () => {
     for (const btn of container.querySelectorAll("[data-rail-ws]")) {
       expect(btn.className).not.toMatch(/accent-ember/);
     }
+  });
+
+  it("moves the selection fill to the pending workspace before the snapshot lands", async () => {
+    // The Phase 1 exit gate at the UI: the backend still says ws-1 is active,
+    // but the click already wrote a pending id, so the highlight is on ws-2.
+    workspaces = [
+      makeWorkspace({ title: "Alpha" }),
+      makeWorkspace({ title: "Beta" }),
+    ];
+    activeWorkspaceId = "ws-1";
+    pendingActiveWorkspaceId = "ws-2";
+    const { container } = await renderRail();
+
+    expect(container.querySelector('[data-rail-ws="ws-2"]')).toHaveClass(
+      "bg-foreground/[0.09]",
+    );
+    expect(
+      container.querySelector('[data-rail-ws="ws-1"]'),
+    ).not.toHaveClass("bg-foreground/[0.09]");
+  });
+
+  it("keeps the snapshot's selection when the pending workspace is unknown", async () => {
+    // A just-created workspace has no local data to paint from.
+    workspaces = [makeWorkspace({ title: "Alpha" })];
+    activeWorkspaceId = "ws-1";
+    pendingActiveWorkspaceId = "ws-brand-new";
+    const { container } = await renderRail();
+
+    expect(container.querySelector('[data-rail-ws="ws-1"]')).toHaveClass(
+      "bg-foreground/[0.09]",
+    );
   });
 
   it("recedes background buttons that are not asking for anything", async () => {

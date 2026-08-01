@@ -4,36 +4,41 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import { providerRequestsSurviveSessionRestart } from "./capability-defaults";
 import {
   applyEvent,
-  appendUserMessage,
   createEmptyThreadState,
 } from "./reducer";
 import { interruptRunningSubagents } from "./subagents";
-import type { ChatThreadState, ChatViewItem, UserMessageImage } from "./types";
+import type { ChatThreadState, ChatViewItem } from "./types";
 
 /**
- * Synthetic envelope written by the backend in `agent_chat_send_turn`
- * to record user turns. User messages never come back through the
- * provider event stream, so we persist them under this tag to keep
- * everything that affects the rendered transcript inside a single
- * ordered list. The frontend reducer has no notion of this envelope
- * — `replayPayloads` translates it into `appendUserMessage`.
+ * Synthetic envelope written by the backend to record user turns.
+ * Providers never echo user messages back on the event stream, so they
+ * are persisted under this tag to keep everything that affects the
+ * rendered transcript inside one ordered list.
+ *
+ * It is no longer replay-only: the backend also fans the freshly-written
+ * row out to every client attached to the thread, under this exact shape,
+ * so a second viewer sees the turn live AND advances its cursor over the
+ * row. That is why the tag now lives in the `ProviderRuntimeEvent` union
+ * (`src/tauri/events.ts`) with one reducer case serving both paths, and
+ * this alias just names the variant for the replay code.
  */
-export interface UserMessageEnvelope {
-  type: "user_message";
-  thread_id: string;
-  text: string;
-  /** Images attached to this turn, written by the backend when the
-   *  turn carried paste/drop/picker images. Each `path` is an absolute
-   *  filesystem location the webview loads via Tauri's asset protocol
-   *  (mapped onto the bubble item's `images[].src`). Absent for
-   *  text-only turns and for turns persisted before the field existed. */
-  images?: Array<{ path: string; media_type?: string }>;
-}
+export type UserMessageEnvelope = Extract<
+  ProviderRuntimeEvent,
+  { type: "user_message" }
+>;
 
-type ReplayPayload = UserMessageEnvelope | ProviderRuntimeEvent;
+export type ReplayPayload = ProviderRuntimeEvent;
 
 const STALE_REQUEST_MESSAGE =
   "This request expired when the provider session restarted. Continue to have the agent repeat it.";
+
+/**
+ * Gap ceiling for warm resume: past this many unapplied rows, rebuilding
+ * the thread cold is both cheaper and simpler than merging a tail (the
+ * merge holds live events for its duration, and a tail that large means
+ * the pane was away for a whole session's worth of work).
+ */
+export const MAX_WARM_TAIL_ROWS = 2_000;
 
 /** Options accepted by {@link replayPayloads} (and forwarded verbatim by
  *  `agent-chat-store.hydrateThread`). */
@@ -86,6 +91,90 @@ export function replayPayloads(
   payloads: string[],
   opts?: ReplayOptions,
 ): ChatThreadState {
+  return replayParsed(parseReplayPayloads(payloads), opts);
+}
+
+/**
+ * {@link replayPayloads} over already-parsed rows. The cursor hydrate
+ * path parses each payload exactly once and then feeds both the fold and
+ * the tail heuristics from the same array — the old code re-parsed every
+ * row up to four times per mount.
+ */
+export function replayParsed(
+  parsed: ReplayPayload[],
+  opts?: ReplayOptions,
+): ChatThreadState {
+  const state = foldReplayPayloads(createEmptyThreadState(), parsed);
+  return finalizeReplay(state, parsed, opts, false, false);
+}
+
+/**
+ * Merge a CURSOR TAIL (rows the slice has not applied yet) into a warm
+ * thread state, in one ordered reduction.
+ *
+ * This is the warm-revisit counterpart of {@link replayParsed}: the
+ * transcript prefix is already in memory, so only the rows after the
+ * slice's `lastPersistedEventId` are folded — but the post-replay
+ * heuristics still have to run over the MERGED result, because every one
+ * of them (orphan-request expiry, reasoning unseal, subagent interrupt,
+ * workflow stop, the unsettled-tail flag) is a property of the whole
+ * history, not of the tail.
+ *
+ * `previousUnsettled` summarizes the prefix for the unsettled-tail scan:
+ * a warm slice that is streaming or already flagged interrupted ends on
+ * an unsettled user turn. Any `user_message` / `turn_completed` in the
+ * tail overrides it, which makes the merged answer identical to scanning
+ * the concatenated history.
+ *
+ * When the run is live the settle passes are skipped entirely: their job
+ * is to reconcile a transcript that ends mid-run, and a confirmed
+ * in-flight turn means those spinners are real.
+ */
+export function applyReplayTail(
+  base: ChatThreadState,
+  parsed: ReplayPayload[],
+  opts: ReplayOptions & { previousUnsettled: boolean },
+): ChatThreadState {
+  const merged = foldReplayPayloads(base, parsed);
+  return finalizeReplay(
+    merged,
+    parsed,
+    opts,
+    opts.previousUnsettled,
+    opts.runLive ?? false,
+  );
+}
+
+/** Fold parsed rows through the same reducer the live stream uses.
+ *
+ *  Every row kind, `user_message` included, goes through `applyEvent`:
+ *  the backend now fans a persisted user turn out live under the same
+ *  `{"type":"user_message"}` shape it stores, so replaying a row and
+ *  receiving one must not be able to disagree. The nonce dedup and the
+ *  `images` path→`src` mapping live in the reducer's case. */
+function foldReplayPayloads(
+  base: ChatThreadState,
+  parsed: ReplayPayload[],
+): ChatThreadState {
+  let state = base;
+  for (const row of parsed) {
+    state = applyEvent(state, row);
+  }
+  return state;
+}
+
+/**
+ * The post-replay passes, shared by cold replay and tail merge. Operates
+ * on the FULL (merged) state; `parsed` is only read for the tail
+ * heuristics.
+ */
+function finalizeReplay(
+  input: ChatThreadState,
+  parsed: ReplayPayload[],
+  opts: ReplayOptions | undefined,
+  previousUnsettled: boolean,
+  skipSettlePasses: boolean,
+): ChatThreadState {
   const runLive = opts?.runLive ?? false;
   // Only providers with process-local callbacks lose their requests when the
   // session dies. OpenCode's permissions live in its HTTP server, and
@@ -95,22 +184,7 @@ export function replayPayloads(
   // re-broadcast could ever bring it back.
   const requestsSurvive = providerRequestsSurviveSessionRestart(opts?.provider);
   const expireOrphanRequests = !runLive && !requestsSurvive;
-  let state = createEmptyThreadState();
-  for (const raw of payloads) {
-    const parsed = parsePayload(raw);
-    if (!parsed) continue;
-    if (parsed.type === "user_message") {
-      // Map the persisted `images` (absolute paths) onto the bubble's
-      // display shape; `src` is the path, which `resolveAssetSrc`
-      // routes through Tauri's asset protocol at render time.
-      const images: UserMessageImage[] | undefined = parsed.images?.map(
-        (img) => ({ src: img.path, mediaType: img.media_type }),
-      );
-      state = appendUserMessage(state, parsed.text, undefined, undefined, images);
-    } else {
-      state = applyEvent(state, parsed);
-    }
-  }
+  let state = input;
 
   // Provider request callbacks are ephemeral even though the transcript is
   // durable. When no live turn owns the replayed requests, settle every
@@ -142,9 +216,14 @@ export function replayPayloads(
   // completion, no trailing boundary item) can leave a reasoning block
   // flagged `streaming`. Seal those so a restored thread never renders a
   // perpetual "Thinking…" shimmer.
-  const hasStreamingReasoning = state.messages.some(
-    (m) => m.kind === "reasoning" && m.streaming,
-  );
+  //
+  // Skipped on the same condition as the other settle passes: a tail
+  // merged into a CONFIRMED-live run is sealing a block the provider is
+  // still streaming into. The next thinking delta would find no streaming
+  // reasoning tail and mint a second block — the shimmer is real here.
+  const hasStreamingReasoning =
+    !skipSettlePasses &&
+    state.messages.some((m) => m.kind === "reasoning" && m.streaming);
   let messages: ChatViewItem[] = hasStreamingReasoning
     ? state.messages.map((m) =>
         m.kind === "reasoning" && m.streaming ? { ...m, streaming: false } : m,
@@ -166,12 +245,20 @@ export function replayPayloads(
   // preserved. A genuinely-orphaned one was already stopped above by
   // `request_response_failed`, since resuming conversation history cannot
   // recreate a process-local provider callback.
-  messages = interruptRunningSubagents(messages);
-  messages = messages.map((m) =>
-    m.kind === "workflow_run" && m.status === "running"
-      ? { ...m, status: "stopped" as const }
-      : m,
-  );
+  //
+  // Skipped for a tail merged into a confirmed-live run: the warm slice
+  // already holds live cards whose spinners belong to the turn that is
+  // still executing. (A cold replay always runs them — it is rebuilding
+  // the transcript from persisted rows alone, where a `running` snapshot
+  // with no terminal successor genuinely means "never settled".)
+  if (!skipSettlePasses) {
+    messages = interruptRunningSubagents(messages);
+    messages = messages.map((m) =>
+      m.kind === "workflow_run" && m.status === "running"
+        ? { ...m, status: "stopped" as const }
+        : m,
+    );
+  }
 
   return {
     ...state,
@@ -193,7 +280,7 @@ export function replayPayloads(
     // stale replay-observed `child_exited` should surface the divider.
     interrupted: runLive
       ? false
-      : state.interrupted || lastTurnUnsettled(payloads),
+      : state.interrupted || lastTurnUnsettled(parsed, previousUnsettled),
     // Transient — never persisted, so a hydrated thread always starts clear.
     stalled: null,
   };
@@ -202,34 +289,39 @@ export function replayPayloads(
 /**
  * Pure helper: does the persisted history end with an unsettled user turn?
  *
- * Scans the ordered raw payloads for the LAST `user_message` envelope and
- * returns true iff one exists and NO later payload is a `turn_completed`
- * event. `session_state_changed` is never persisted, so `turn_completed`
- * is the sole settlement marker; queued-turn envelopes persist at dispatch
- * time, so ordering is sound. Exported for direct unit testing.
+ * Scans the ordered rows for the LAST `user_message` envelope and returns
+ * true iff one exists and NO later row is a `turn_completed` event.
+ * `session_state_changed` is never persisted, so `turn_completed` is the
+ * sole settlement marker; queued-turn envelopes persist at dispatch time,
+ * so ordering is sound. Exported for direct unit testing.
+ *
+ * Takes ALREADY-PARSED rows: the hydrate path parses each payload once
+ * and shares the array with the fold. `previous` seeds the scan with the
+ * answer for the history before `parsed` (always `false` for a cold
+ * replay, the warm slice's state for a cursor tail), which makes a tail
+ * scan equal to scanning the whole concatenated history.
  */
-export function lastTurnUnsettled(payloads: string[]): boolean {
-  const types = payloads.map((raw) => {
-    try {
-      const value = JSON.parse(raw) as unknown;
-      return value &&
-        typeof value === "object" &&
-        typeof (value as { type?: unknown }).type === "string"
-        ? (value as { type: string }).type
-        : null;
-    } catch {
-      return null;
-    }
-  });
-  let lastUserIdx = -1;
-  for (let i = 0; i < types.length; i++) {
-    if (types[i] === "user_message") lastUserIdx = i;
+export function lastTurnUnsettled(
+  parsed: ReplayPayload[],
+  previous = false,
+): boolean {
+  let unsettled = previous;
+  for (const row of parsed) {
+    if (row.type === "user_message") unsettled = true;
+    else if (row.type === "turn_completed") unsettled = false;
   }
-  if (lastUserIdx < 0) return false;
-  for (let i = lastUserIdx + 1; i < types.length; i++) {
-    if (types[i] === "turn_completed") return false;
+  return unsettled;
+}
+
+/** Parse raw payload strings once, dropping rows that are not usable
+ *  envelopes (malformed JSON, unknown shapes). */
+export function parseReplayPayloads(payloads: string[]): ReplayPayload[] {
+  const parsed: ReplayPayload[] = [];
+  for (const raw of payloads) {
+    const row = parsePayload(raw);
+    if (row) parsed.push(row);
   }
-  return true;
+  return parsed;
 }
 
 function parsePayload(raw: string): ReplayPayload | null {
@@ -269,7 +361,14 @@ function parsePayload(raw: string): ReplayPayload | null {
           ];
         })
       : undefined;
-    return { type: "user_message", thread_id: (value as { thread_id?: string }).thread_id ?? "", text, images };
+    const nonce = (value as { client_nonce?: unknown }).client_nonce;
+    return {
+      type: "user_message",
+      thread_id: (value as { thread_id?: string }).thread_id ?? "",
+      text,
+      images,
+      client_nonce: typeof nonce === "string" && nonce ? nonce : undefined,
+    };
   }
   // Provider events — trust the discriminated union shape. Unknown
   // discriminators fall through to the reducer's `warnOnce` path.

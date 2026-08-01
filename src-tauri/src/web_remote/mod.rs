@@ -249,6 +249,17 @@ impl WebRemoteState {
     pub(crate) fn shared(&self) -> Arc<Shared> {
         self.inner.clone()
     }
+
+    /// Live WebSocket connections right now (raw socket count).
+    ///
+    /// Exposed for the background loops in `lib.rs`, which gate work on the
+    /// desktop window being on screen. That gate is only sound when the
+    /// desktop webview is the ONLY consumer: a minimized window with a paired
+    /// browser attached still has a renderer waiting for updates, and pausing
+    /// there stops the remote page rather than saving idle work.
+    pub fn active_connection_count(&self) -> usize {
+        self.inner.connections.active_count()
+    }
 }
 
 // ── Status snapshot (command return + event payload) ────────────────

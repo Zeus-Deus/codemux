@@ -943,6 +943,20 @@ function applyGenericSubagentUpdated(
   };
 }
 
+/** Whether a bubble carrying this correlation token is already on screen.
+ *  The dedup key for every path that can deliver the same user turn twice:
+ *  an optimistic append racing its own persisted row, a live fan-out
+ *  racing a cursor tail read, or a `turn_queued` bubble meeting the
+ *  envelope written when the turn dispatched. */
+export function hasUserMessageNonce(
+  state: ChatThreadState,
+  nonce: string,
+): boolean {
+  return state.messages.some(
+    (m) => m.kind === "user_message" && m.clientNonce === nonce,
+  );
+}
+
 function appendUserMessageLocal(
   state: ChatThreadState,
   text: string,
@@ -1145,6 +1159,38 @@ function applyEventInner(
         return state;
       }
       return { ...state, stalled: next };
+    }
+
+    case "user_message": {
+      // The one place a user turn enters the transcript from outside the
+      // composer. Two callers, deliberately sharing this case:
+      //   - hydrate replay, folding a persisted `user_message` row;
+      //   - the live stream, folding the backend's fan-out of that same
+      //     row to every client attached to the thread.
+      // Sharing matters because they are the same bytes: a client can
+      // receive a turn live and then read the identical row in a tail,
+      // and only one bubble may result.
+      //
+      // `client_nonce` is that guard. It is on the optimistic bubble the
+      // sender appended, on the greyed bubble `turn_queued` reconstructs,
+      // and on this envelope — so whoever already has the turn on screen
+      // skips it, and whoever does not inserts it in row order.
+      if (event.client_nonce && hasUserMessageNonce(state, event.client_nonce)) {
+        return state;
+      }
+      // Persisted `images` carry absolute paths; the bubble's display
+      // shape wants them under `src`, which `resolveAssetSrc` routes
+      // through the asset protocol at render time.
+      const images: UserMessageImage[] | undefined = event.images?.map(
+        (image) => ({ src: image.path, mediaType: image.media_type }),
+      );
+      return appendUserMessageLocal(
+        state,
+        event.text,
+        now,
+        event.client_nonce,
+        images,
+      );
     }
 
     case "session_configured": {

@@ -74,11 +74,16 @@ pub fn start_hook_server<R: Runtime>(app: AppHandle<R>) -> u16 {
                 // session running in this pane.
                 if !agent_session_id.is_empty() {
                     let state: tauri::State<'_, AppStateStore> = app.state();
-                    state.set_terminal_adapter_capture(
+                    // `handle_lifecycle_event` below emits, but only for event
+                    // types it recognises — an unrecognised one returns early,
+                    // and this write would then never reach the renderer.
+                    if state.set_terminal_adapter_capture(
                         session_id,
                         "claude_session_id",
                         agent_session_id,
-                    );
+                    ) {
+                        crate::state::schedule_emit_app_state(&app);
+                    }
                 }
 
                 let status = match map_event_type(event_type) {
@@ -301,18 +306,10 @@ fn start_agent_exit_monitor<R: Runtime>(app: AppHandle<R>, session_id: String, s
 
             // Check if the pane status is still active (Working/Permission)
             let state: tauri::State<'_, AppStateStore> = app.state();
-            let snapshot = state.snapshot();
-            let still_active = snapshot
-                .workspaces
-                .iter()
-                .find_map(|ws| {
-                    ws.surfaces
-                        .iter()
-                        .find_map(|s| state::find_terminal_pane_id(&s.root, &session_id))
-                })
-                .and_then(|pane_id| snapshot.pane_statuses.get(&pane_id.0))
-                .map(|s| matches!(s, PaneStatus::Working | PaneStatus::Permission))
-                .unwrap_or(false);
+            let still_active = matches!(
+                state.pane_status_for_session(&session_id),
+                Some(PaneStatus::Working | PaneStatus::Permission)
+            );
 
             if !still_active {
                 break; // Status already cleared by a hook or terminal exit
@@ -320,11 +317,12 @@ fn start_agent_exit_monitor<R: Runtime>(app: AppHandle<R>, session_id: String, s
 
             // Check if the shell is the foreground process (agent has exited)
             if shell_is_foreground(shell_pid) {
-                state.clear_transient_pane_status_by_session(&session_id);
-                // Coalesced: this fires from a polling loop checking
-                // shell foreground state; not perception-sensitive at
-                // 16 ms.
-                state::schedule_emit_app_state(&app);
+                // Clearing the stuck status is this path's entire mutation, so
+                // it ships as a `PaneStatus` delta instead of a full snapshot.
+                if let Some(delta) = state.clear_transient_pane_status_by_session_delta(&session_id)
+                {
+                    state::emit_app_state_delta(&app, delta);
+                }
                 break;
             }
         }

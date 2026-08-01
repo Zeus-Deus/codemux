@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   AlertTriangle,
   Ban,
@@ -246,8 +246,11 @@ function WorkflowRunningRow({
   item: WorkflowRunItem;
   onOpenPanel: () => void;
 }) {
-  const now = useNow(true);
-  const stats = workflowRunStats(item, now);
+  // No wall-clock tick here: the running row shows phase / agent / progress
+  // stats, all derived from `item`. `elapsedMs` is the only `now`-dependent
+  // field and this row never renders it, so the old 1 Hz `setNow` re-render
+  // changed nothing on screen.
+  const stats = workflowRunStats(item);
   const phaseIdx = Math.min(
     stats.currentPhaseIndex,
     Math.max(stats.phasesTotal - 1, 0),
@@ -417,15 +420,3 @@ function trimTrailingZero(v: number): string {
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
 }
 
-/** 1s tick while `active`, so the derived phase/elapsed stats advance
- *  without a fresh provider snapshot. Same discipline as SubagentsCard's
- *  local `useNow`. */
-function useNow(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [active]);
-  return now;
-}

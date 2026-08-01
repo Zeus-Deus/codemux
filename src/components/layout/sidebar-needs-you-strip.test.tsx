@@ -32,11 +32,27 @@ vi.mock("@/tauri/commands", () => ({
 
 // The strip reads `appState.pane_statuses` to derive which workspaces are
 // blocked; a hoisted holder lets each test inject a snapshot.
-vi.mock("@/stores/app-store", () => ({
-  useAppStore: vi.fn((selector: (s: Record<string, unknown>) => unknown) =>
-    selector({ appState: appStateHolder.current }),
-  ),
-}));
+vi.mock("@/stores/app-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/stores/app-store")>();
+  const state = () => ({
+    appState: appStateHolder.current,
+    // Optimistic selection: the activation helper writes these before the
+    // invoke (docs/plans/gui-responsiveness.md, Phase 1).
+    pendingActiveWorkspaceId: null,
+    pendingActivationAt: null,
+    beginPendingActivation: vi.fn(),
+    clearPendingActivation: vi.fn(),
+  });
+  return {
+    // The real selectors run against the faked slice — the activation helper
+    // reads `selectActiveWorkspaceId` to decide whether to open a trace.
+    ...actual,
+    useAppStore: Object.assign(
+      vi.fn((selector: (s: Record<string, unknown>) => unknown) => selector(state())),
+      { getState: state },
+    ),
+  };
+});
 
 vi.mock("@/stores/chat-draft-store", () => ({
   useChatDraftStore: {

@@ -34,7 +34,6 @@ import {
   formatElapsed,
   useSidebarDensityStore,
 } from "@/stores/sidebar-density-store";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useProjectAppearance } from "@/components/layout/use-project-appearance";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
 import {
@@ -46,7 +45,6 @@ import {
 import { shortenPath } from "@/lib/shorten-path";
 import { cn } from "@/lib/utils";
 import {
-  activateWorkspace,
   createBrowserPane,
   cyclePane,
   getPresets,
@@ -55,6 +53,7 @@ import {
 } from "@/tauri/commands";
 import { dispatch } from "@/hooks/use-keyboard-shortcuts";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 import {
   COMMAND_MODE_PREFIX,
@@ -418,10 +417,13 @@ function PaletteBody({ onOpenChange }: { onOpenChange: (open: boolean) => void }
 
   const openWorkspace = (workspaceId: string) => {
     close();
-    // Mirrors the inbox card: clear any active chat draft first so activating
-    // a workspace isn't overridden by a draft surface still holding the view.
-    useChatDraftStore.getState().setActiveDraft(null);
-    activateWorkspace(workspaceId).catch(console.error);
+    // The one activation path (`docs/plans/gui-responsiveness.md`, Phase 1):
+    // commits the selection optimistically in this click's own task, clears any
+    // active chat draft so a draft surface can't keep holding the view, and
+    // traces the switch. Both palette entry points — a workspace row and a
+    // project row's top-ranked workspace — land here, so neither can regress to
+    // a raw activate that waits on the snapshot round trip.
+    activateWorkspaceInteraction(workspaceId).catch(console.error);
   };
 
   const openProject = (row: ProjectRow) => {

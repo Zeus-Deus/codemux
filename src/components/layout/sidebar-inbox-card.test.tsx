@@ -47,15 +47,24 @@ function appStoreState() {
     workspacePushPullInFlight: null,
     workspacePushPullStartedAt: null,
     setWorkspacePushPullInFlight: vi.fn(),
+    // Optimistic selection: the activation helper writes these before the
+    // invoke (docs/plans/gui-responsiveness.md, Phase 1).
+    pendingActiveWorkspaceId: null,
+    pendingActivationAt: null,
+    beginPendingActivation: vi.fn(),
+    clearPendingActivation: vi.fn(),
   };
 }
 
-vi.mock("@/stores/app-store", () => {
+vi.mock("@/stores/app-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/stores/app-store")>();
   const useAppStore = Object.assign(
     vi.fn((selector: (s: unknown) => unknown) => selector(appStoreState())),
     { getState: () => appStoreState() },
   );
-  return { useAppStore, useHomeDir: () => "/home/u" };
+  // The real selectors run against the faked slice — the activation helper
+  // reads `selectActiveWorkspaceId` to decide whether to open a trace.
+  return { ...actual, useAppStore, useHomeDir: () => "/home/u" };
 });
 
 // Late imports so the mocks above apply.
@@ -424,5 +433,19 @@ describe("SidebarInboxCard — meta line alignment", () => {
     const children = [...metaLine(container).children];
     const trailing = children[children.length - 1];
     expect(trailing).toHaveTextContent("3");
+  });
+});
+
+describe("SidebarInboxCard — memo boundary", () => {
+  it("is wrapped in React.memo", () => {
+    // The behavioral half of this guarantee — that the inbox actually hands
+    // the card reference-stable props, so the boundary bails out — is asserted
+    // in `sidebar-inbox-delta.test.tsx`. This is the other half: the boundary
+    // exists at all. Losing the wrapper would silently restore "every card
+    // re-renders on every backend tick", with no failing render assertion
+    // anywhere to catch it.
+    expect(
+      (SidebarInboxCard as unknown as { $$typeof?: symbol }).$$typeof,
+    ).toBe(Symbol.for("react.memo"));
   });
 });

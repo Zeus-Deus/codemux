@@ -121,8 +121,12 @@ interface Props {
  * both history anchoring and tail following — the windowed-list architecture
  * used by comparable agent transcript UIs — instead of asking the browser to
  * lay out every transcript row.
+ *
+ * Memoized alongside `ChatTranscript`: with the pane's field-level store
+ * subscriptions none of these props move while the composer draft changes,
+ * so a keystroke stops at this boundary instead of re-entering the list.
  */
-export function MessageList({
+export const MessageList = memo(function MessageList({
   messages,
   showThinking = false,
   streaming = false,
@@ -357,6 +361,25 @@ export function MessageList({
     ],
   );
 
+  // Stable element identity: LegendList re-mounts / re-lays-out the header
+  // when this prop changes, so it must not be rebuilt on unrelated renders.
+  const listHeader = useMemo(
+    () => (
+      <div className={cn(CHAT_COLUMN, "pt-[26px]")}>
+        <SessionStartMarker startedAt={sessionStartedAt} />
+      </div>
+    ),
+    [sessionStartedAt],
+  );
+
+  const handleFirstVisibleItemChanged = useCallback(
+    ({ index }: { index: number }) =>
+      setFirstVisibleSlotIndex((current) =>
+        current === index ? current : index,
+      ),
+    [],
+  );
+
   const listFooter = useMemo(
     () => (
       <div className={cn(CHAT_COLUMN, "pb-[30px]")}>
@@ -408,9 +431,9 @@ export function MessageList({
       <LegendList<TranscriptSlot>
         ref={listRef}
         data={slots}
-        keyExtractor={(slot) => slot.key}
+        keyExtractor={transcriptSlotKey}
         getItemType={transcriptSlotType}
-        itemsAreEqual={(previous, item) => previous === item}
+        itemsAreEqual={transcriptSlotsAreEqual}
         renderItem={renderItem}
         estimatedItemSize={112}
         estimatedHeaderSize={48}
@@ -431,11 +454,7 @@ export function MessageList({
         }}
         maintainScrollAtEndThreshold={0.03}
         maintainVisibleContentPosition={{ data: true, size: false }}
-        onFirstVisibleItemChanged={({ index }) =>
-          setFirstVisibleSlotIndex((current) =>
-            current === index ? current : index,
-          )
-        }
+        onFirstVisibleItemChanged={handleFirstVisibleItemChanged}
         aria-busy={showThinking || undefined}
         data-slot="transcript-list"
         // `scrollbar-gutter: stable both-edges` (not plain `stable`):
@@ -447,11 +466,7 @@ export function MessageList({
         // same rails (see chat/chat-column.ts).
         className="h-full min-h-0 overflow-x-hidden overscroll-y-contain [overflow-anchor:none] [scrollbar-gutter:stable_both-edges]"
         style={fadeEnabled ? WS_FADE_STYLE : undefined}
-        ListHeaderComponent={
-          <div className={cn(CHAT_COLUMN, "pt-[26px]")}>
-            <SessionStartMarker startedAt={sessionStartedAt} />
-          </div>
-        }
+        ListHeaderComponent={listHeader}
         ListFooterComponent={listFooter}
       />
       {!isAtEnd && (
@@ -468,7 +483,7 @@ export function MessageList({
       )}
     </div>
   );
-}
+});
 
 /** Viewport edge fade (design `wsFade`): dissolve content at the top/bottom
  *  of the scroll surface. A mask, not an overlay, so it works over any
@@ -557,6 +572,23 @@ function subagentNameFor(
 ): string | null {
   if (item.kind !== "permission_request" || !item.subagent_id) return null;
   return subagentNames.get(item.subagent_id) ?? "subagent";
+}
+
+/** Module scope, not a per-render closure: LegendList keys, type buckets and
+ *  identity comparisons are pure functions of the slot, and a fresh closure
+ *  each render invalidates the list's own memoization for no reason. */
+function transcriptSlotKey(slot: TranscriptSlot): string {
+  return slot.key;
+}
+
+/** The row-identity contract that pairs with `reuseTranscriptSlots`: an
+ *  untouched slot keeps its object identity across rebuilds, so reference
+ *  equality is exactly "this row did not change". */
+function transcriptSlotsAreEqual(
+  previous: TranscriptSlot,
+  item: TranscriptSlot,
+): boolean {
+  return previous === item;
 }
 
 /** Stable row type lets LegendList keep separate measured-size averages. */

@@ -19,8 +19,10 @@
 //! ```
 //!
 //! - `app_state` is byte-for-byte the value the `get_app_state` command
-//!   returns — it is produced by the *same* [`crate::state::AppStateStore::snapshot`]
-//!   call, so there is no second serialization path to keep in sync.
+//!   returns — it is produced by the *same*
+//!   [`crate::state::AppStateStore::snapshot_at_current_revision`] call, so
+//!   there is no second serialization path to keep in sync and the client's
+//!   baseline revision belongs to the same sequence as the deltas that follow.
 //! - `status` is the same [`super::WebRemoteStatus`] the `web_remote_status`
 //!   command and the `web-remote-state-changed` event carry, built by the same
 //!   [`super::build_status`] helper.
@@ -57,8 +59,12 @@ pub async fn serve<R: Runtime>(State(app): State<AppHandle<R>>, headers: HeaderM
     }
 
     // The *same* snapshot the `get_app_state` command returns — one code path,
-    // no duplicated serialization.
-    let app_state = app.state::<crate::state::AppStateStore>().snapshot();
+    // no duplicated serialization. Reads label the revision they already
+    // reflect and consume none, so this bootstrap gives the client a baseline
+    // that is in the same sequence as the deltas it is about to receive.
+    let app_state = app
+        .state::<crate::state::AppStateStore>()
+        .snapshot_at_current_revision();
     let shared = app.state::<WebRemoteState>().shared();
     let status = super::build_status(&app, &shared);
     let body = snapshot_json(&app_state, &status);

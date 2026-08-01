@@ -1,16 +1,16 @@
-import { startTransition, useEffect, useMemo } from "react";
+import { useEffect, useMemo } from "react";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
 import {
+  selectActiveWorkspaceId,
   useAppStore,
   useHomeDir,
   useProjectGroupedWorkspaces,
 } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { compareNewestFirst, isWorkspaceUnread } from "./sidebar-inbox";
-import { activateWorkspace } from "@/tauri/commands";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { getWorkspaceStatus, STATUS_DOT_CLASS } from "@/lib/pane-status";
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
@@ -44,10 +44,7 @@ function RailWorkspaceItem({
   );
 
   const handleClick = () => {
-    useChatDraftStore.getState().setActiveDraft(null);
-    startTransition(() => {
-      activateWorkspace(workspace.workspace_id).catch(console.error);
-    });
+    activateWorkspaceInteraction(workspace.workspace_id).catch(console.error);
   };
 
   // Rail parity with the expanded inbox's background recede: a button whose
@@ -125,7 +122,9 @@ export function SidebarRailWorkspaces() {
     () => appState?.workspaces ?? [],
     [appState?.workspaces],
   );
-  const activeWorkspaceId = appState?.active_workspace_id ?? "";
+  // Pending-aware so the highlight moves in the click's own task, before the
+  // backend snapshot lands (docs/plans/gui-responsiveness.md, Phase 1).
+  const activeWorkspaceId = useAppStore(selectActiveWorkspaceId) ?? "";
   const homeDir = useHomeDir();
   const hosts = useHosts();
   const projectGroups = useProjectGroupedWorkspaces(

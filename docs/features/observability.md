@@ -1,9 +1,9 @@
 # Observability
 
-- Purpose: Describe the structured logging, metrics, feature flag, and safety config subsystem.
-- Audience: Anyone working on OpenFlow safety gates, feature flags, debug logging, or the replay-record UI.
-- Authority: Canonical feature doc for `ObservabilityStore` and its persisted snapshot.
-- Update when: A new metric, feature flag, permission policy, or safety config field is added.
+- Purpose: Describe the structured logging, metrics, feature flag, and safety config subsystem, plus the diagnostic surfaces layered beside it (native log file, cloud-push tracing, the interaction-trace perf harness).
+- Audience: Anyone working on OpenFlow safety gates, feature flags, debug logging, the replay-record UI, or latency measurement.
+- Authority: Canonical feature doc for `ObservabilityStore` and its persisted snapshot, and for the app's diagnostic/tracing surfaces.
+- Update when: A new metric, feature flag, permission policy, or safety config field is added, or a diagnostic/trace surface changes.
 - Read next: `docs/features/openflow.md`, `docs/features/settings.md`
 
 ## What This Feature Is
@@ -98,8 +98,86 @@ Implementation: `src-tauri/src/trace.rs` defines `cloud_push_enabled()`
 call sites live in `terminal/daemon_backed.rs`, `ssh/registry.rs`,
 `ssh/tunnel_supervisor.rs`, and `pty_daemon/server.rs`.
 
+## Interaction Trace Harness (`codemux:perf-trace`)
+
+Separate again from both stores: a frontend harness that makes a slow
+workspace switch *attributable* rather than merely slow. It exists because
+"the app feels laggy" was never actionable — the 2026-07-31 responsiveness
+audit needed to say which of backend, delivery, hydration, React commit,
+terminal cleanup, or background contention owned each millisecond. See
+`docs/plans/gui-responsiveness.md`.
+
+- **One id spans the whole interaction.** `src/lib/perf/interaction-trace.ts`
+  stamps seven phases under a single interaction id: `click`, `invoke-start`,
+  `invoke-returned`, `snapshot-received`, `state-committed`, `pane-mounted`,
+  `painted` — the last written from a **double `requestAnimationFrame`** after
+  the mount, which is the closest a page can get to "the user saw it". Spans
+  are derived from consecutive pairs (`invoke`, `delivery`, `commit`, `mount`,
+  `paint`). The trace *closes* at `state-committed` rather than at `painted`,
+  because optimistic selection paints before the round trip finishes. Marks are
+  mirrored into User Timing as `codemux/<kind>#<id>/<phase>` so a browser
+  profile lines up with the log.
+- **Wiring.** `instrumented-activate.ts` opens the trace at every activation
+  site, `use-app-state.ts` marks delivery and commit (without changing the
+  debounce), `pane-container.tsx` marks the mount and arms the paint stamp, and
+  `TerminalPane.tsx` records a `terminal-teardown` sub-measure around the
+  scrollback serialize.
+- **Off by default, and short-circuited when off.** The gate is
+  `localStorage["codemux:perf-trace"] === "1"` or a dev build; one boolean
+  check exits every entry point otherwise. When on, `window.codemuxPerf`
+  exposes `{ getTraces, clearTraces, summarize, renderer, export }`.
+- **Bounded and self-cleaning.** A 100-trace ring buffer; a trace with no
+  progress for 10 s is marked `abandoned` rather than leaked; long tasks
+  arriving up to 1 s late are back-attributed to the trace they belong to.
+- **Long-task observation is feature-detected.** A `PerformanceObserver` over
+  `longtask` and `long-animation-frame`, filtered through
+  `PerformanceObserver.supportedEntryTypes` — WebKitGTK may advertise neither,
+  and asking for an unsupported type throws. Observers start on the first open
+  trace and stop when the last one closes.
+- **`summarizeTraces()`** reports per-kind `count` / `abandoned` plus
+  `p50` / `p95` / `max` (nearest-rank) for the total and each span, and long
+  tasks per trace — the shape the § "Product Budgets" gates in the plan are
+  written against.
+- **`exportDiagnostics()`** returns a versioned envelope (`version: 2`) of
+  `enabled`, `observedEntryTypes`, `renderer`, `traceCount`, `summaries` and
+  the raw traces. The `renderer` section is what makes an outlier arrive with
+  engine evidence attached: `userAgent`, `webkitVersion`,
+  `webkitReleaseVersion`, `linuxWebKitGtk`, `devicePixelRatio`, and the
+  terminal WebGL verdict (`{ use, reason, glRenderer }`) read from the probe's
+  **cache** — it never triggers a probe. Mark metadata is typed
+  `Record<string, number | boolean>`, so no path, project name, branch, or
+  transcript content can reach an export; the only string carried is the
+  interaction's `target` (an internal workspace id).
+
+**Backend section timings** ride the normal stderr/log path under
+`[codemux::perf::*]` tags, each gated so a healthy run stays quiet:
+
+- `[codemux::perf::emit] snapshot=<ms> serialize=<ms> workspaces=<n>` — emitted
+  only when the two together exceed 8 ms, splitting the state deep-clone from
+  serde.
+- `[codemux::perf::job] git-sweep|pr-poll|port-poll tick=<ms>ms` — only when a
+  tick exceeds 50 ms.
+- `[codemux::perf::job] git-fetch tick=<s>s repos=<n> (drain outlasted the 60s
+  period)` — only when the bounded fetch drain overruns its own period.
+- Adjacent, not `perf::`-tagged: `[codemux::workspace] activate_workspace(<id>)
+  returned in <ms>ms (mutate=… emit=… persist=…)`, gated above 8 ms.
+
+**Measuring against something real.** The curated dev seed is 18 workspaces,
+far below the audited profile, so numbers taken on it flatter everything.
+`src/dev/stress-fixture.ts` scales the dev-mock seed to `small` / `medium` /
+`large` / `xl` (the audited profile: 80 workspaces, 5,000 persisted events,
+~15 MB of tool-result payload) via `?fixture=` or
+`localStorage["codemux:fixture"]`, with inline JSON for one-off shapes. See
+`docs/features/dev-mock-runtime.md` § "Stress fixtures".
+
 ## Important Touch Points
 
+- `src/lib/perf/interaction-trace.ts` — the interaction-trace ring buffer,
+  phase/span model, long-task observers, `summarizeTraces`, `exportDiagnostics`
+  and the `window.codemuxPerf` handle; `src/lib/perf/instrumented-activate.ts` —
+  `activateWorkspaceInteraction`, the single traced activation entry point
+  (which also owns the optimistic pending-selection rollback and its 5 s
+  timeout)
 - `src-tauri/src/observability.rs`:
   - Types: `LogLevel`, `StructuredLogEntry`, `MetricsSnapshot`, `FeatureFlags`, `PermissionPolicy`, `ReplayRecord`, `SafetyConfig`, `ObservabilitySnapshot`
   - Store: `ObservabilityStore::default`, `snapshot`, `log`, `increment_metric`, `set_feature_flags`, `set_permission_policy`, `set_safety_config`, `add_replay_record`

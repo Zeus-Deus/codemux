@@ -1,7 +1,12 @@
 import { create } from "zustand";
 
-import { replayPayloads } from "@/lib/agent-chat/hydrate";
+import {
+  applyReplayTail,
+  parseReplayPayloads,
+  replayParsed,
+} from "@/lib/agent-chat/hydrate";
 import type { ReplayOptions } from "@/lib/agent-chat/hydrate";
+import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
 import {
   applyEvent,
   appendUserMessage,
@@ -14,9 +19,14 @@ import {
 import type {
   ChatThreadState,
   ChatViewItem,
+  LiveChatEvent,
+  ToolCallItem,
   UserMessageImage,
 } from "@/lib/agent-chat/types";
-import type { AgentChatCheckpointRecord } from "@/tauri/commands";
+import type {
+  AgentChatCheckpointRecord,
+  AgentChatMessageRow,
+} from "@/tauri/commands";
 import type {
   ApprovalDecision,
   ProviderRuntimeEvent,
@@ -149,6 +159,22 @@ export interface ChatThreadSlice extends ChatThreadState {
    *  background snapshot lands (event) or the on-mount fetch resolves.
    *  Drives the pane header's "Restore checkpoint" affordance. */
   checkpoint: AgentChatCheckpointRecord | null;
+  /** Durable resume cursor: the highest `agent_chat_messages.id` whose
+   *  effect this slice already holds. A remount asks the backend for
+   *  everything after it instead of replaying from row zero.
+   *
+   *  `null` means "never hydrated from disk" — the slice may hold live
+   *  events whose position in the row space is unknown, so the next
+   *  hydrate must be a cold full replay (which replaces the transcript
+   *  wholesale and therefore cannot duplicate anything). A hydrate that
+   *  found no rows sets `0`, not `null`: the thread IS synced, it just
+   *  starts at the beginning of the id space.
+   *
+   *  Invariant the whole design rests on: every row with an id at or
+   *  below this cursor is represented in `messages`. Live events may
+   *  therefore only advance it when it is already non-null — otherwise a
+   *  single live event would strand every unread row below it. */
+  lastPersistedEventId: number | null;
 }
 
 function emptySlice(): ChatThreadSlice {
@@ -169,6 +195,7 @@ function emptySlice(): ChatThreadSlice {
     debugActivityResolved: false,
     stagedAttachments: [],
     checkpoint: null,
+    lastPersistedEventId: null,
   };
 }
 
@@ -179,6 +206,20 @@ interface AgentChatStore {
   ensureThread: (threadId: string) => void;
   /** Apply a canonical provider event to the matching slice. */
   applyEvent: (threadId: string, event: ProviderRuntimeEvent) => void;
+  /** Apply an ordered batch of provider events in a SINGLE `set()`.
+   *  Identical to calling `applyEvent` once per element (same reducer,
+   *  same order, same final slice) but it emits one store update, so a
+   *  frame's worth of coalesced streaming deltas costs one React render
+   *  instead of one per token. See `lib/agent-chat/event-batcher.ts`. */
+  applyEvents: (threadId: string, events: ProviderRuntimeEvent[]) => void;
+  /** Apply an ordered batch of LIVE events, each tagged with the durable
+   *  row id it was persisted as. Identical to `applyEvents` except that
+   *  an event whose `persistedId` is at or below the slice's cursor is
+   *  dropped as a replay duplicate, and a higher one advances the cursor.
+   *  This is the guard that makes "buffer live events across a hydrate,
+   *  then drain" safe — the overlap it creates is deduped here rather
+   *  than risking a gap. */
+  applyLiveEvents: (threadId: string, items: LiveChatEvent[]) => void;
   /** Append a user message optimistically (no provider echo).
    *  `images` (when present) carries the turn's staged images as
    *  `data:` URLs so the bubble renders their thumbnails immediately. */
@@ -247,9 +288,36 @@ interface AgentChatStore {
    *  whose permissions live in its own server). */
   hydrateThread: (
     threadId: string,
-    payloads: string[],
+    rows: AgentChatMessageRow[],
     opts?: ReplayOptions,
   ) => void;
+  /** Warm resume: fold a CURSOR TAIL (rows after `lastPersistedEventId`)
+   *  into the existing slice in ONE ordered reduction, then advance the
+   *  cursor to the tail's last row id. Unlike `hydrateThread` this never
+   *  rebuilds the transcript prefix, and it leaves `activeTurnId` alone
+   *  because a live run may own it. No-op for an empty tail — that is
+   *  the "warm unchanged revisit does no work" path. */
+  applyPayloadsTail: (
+    threadId: string,
+    rows: AgentChatMessageRow[],
+    opts?: ReplayOptions,
+  ) => void;
+  /** Forget a thread's resume cursor, forcing the next hydrate down the
+   *  cold path. Used when a tail read cannot be trusted (a failed
+   *  hydrate whose buffered live events are about to land, a cursor
+   *  ahead of the thread's own head after a merge). */
+  invalidateThreadCursor: (threadId: string) => void;
+  /** Swap a lazily-fetched tool-result body into the item that carries
+   *  the matching stub. Row ids are table-wide unique, so the lookup
+   *  needs no thread id — the card that renders the stub does not know
+   *  which slice it belongs to. */
+  resolveLazyToolResult: (rowId: number, content: unknown) => void;
+  /** Drop warm slices until the estimated total payload is back under
+   *  budget, oldest-touched first. `keep` is the caller's protected set
+   *  (the mounted panes' threads); running / pending threads are never
+   *  evicted regardless. An evicted thread simply cold-hydrates on its
+   *  next visit. */
+  evictColdThreads: (keep: string[]) => void;
   /** Clear a thread entirely (e.g. on session stop). */
   resetThread: (threadId: string) => void;
   /** Seed / update the thread's resume cursor. Normally set by the
@@ -313,7 +381,147 @@ function updateSlice(
   const existing = state.threads[threadId] ?? emptySlice();
   const next = update(existing);
   if (next === existing) return {};
+  touchThread(threadId);
   return { threads: { ...state.threads, [threadId]: next } };
+}
+
+// ── Warm-slice retention ─────────────────────────────────────────────
+//
+// Visited threads stay warm so a revisit costs a cursor tail read instead
+// of a full replay — but "every thread ever opened, forever" is how a
+// long session ends up holding the whole 165 MB transcript corpus in the
+// renderer. Last-touch times and weights live OUTSIDE the slice so
+// bookkeeping never changes a slice's identity (which would defeat the
+// field-level subscriptions and the transcript's slot reuse).
+
+/** Heuristic byte budget for all warm transcripts combined. The unit is
+ *  "estimated payload characters", not real heap bytes. */
+export const WARM_SLICE_BUDGET_UNITS = 128 * 1024 * 1024;
+
+const lastTouchedAt = new Map<string, number>();
+const itemWeights = new WeakMap<object, number>();
+
+function touchThread(threadId: string): void {
+  lastTouchedAt.set(threadId, Date.now());
+}
+
+/** Threads with a live pane, by mount count. Split panes and a dev
+ *  double-mount can both hold the same thread, so this refcounts rather
+ *  than toggling a flag. Lives outside the slice for the same reason the
+ *  touch times do: bookkeeping must never change a slice's identity. */
+const mountedThreads = new Map<string, number>();
+
+/** Mark a thread as displayed. Returns the matching unregister so a caller
+ *  cannot leak a mount by forgetting the thread id. */
+export function registerMountedThread(threadId: string): () => void {
+  mountedThreads.set(threadId, (mountedThreads.get(threadId) ?? 0) + 1);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = (mountedThreads.get(threadId) ?? 1) - 1;
+    if (next <= 0) mountedThreads.delete(threadId);
+    else mountedThreads.set(threadId, next);
+  };
+}
+
+/** Whether a pane is currently displaying this thread — read by eviction. */
+export function isThreadMounted(threadId: string): boolean {
+  return mountedThreads.has(threadId);
+}
+
+/** Cheap size proxy for one transcript item, memoized on the item object.
+ *  Items are structurally shared across renders, so a re-estimate after a
+ *  streaming delta only walks the handful of items that actually changed. */
+function estimateItemWeight(item: ChatViewItem): number {
+  const cached = itemWeights.get(item);
+  if (cached !== undefined) return cached;
+  const weight = estimateValueWeight(item, 0);
+  itemWeights.set(item, weight);
+  return weight;
+}
+
+function estimateValueWeight(value: unknown, depth: number): number {
+  if (value == null) return 0;
+  if (typeof value === "string") return value.length;
+  if (typeof value === "number" || typeof value === "boolean") return 8;
+  if (typeof value !== "object") return 8;
+  // Depth cap: tool payloads can nest arbitrarily and this is a budget
+  // heuristic, not an allocator.
+  if (depth >= 6) return 64;
+  if (Array.isArray(value)) {
+    let weight = 16;
+    for (const entry of value) weight += estimateValueWeight(entry, depth + 1);
+    return weight;
+  }
+  let weight = 32;
+  for (const [key, entry] of Object.entries(value)) {
+    weight += key.length + estimateValueWeight(entry, depth + 1);
+  }
+  return weight;
+}
+
+function estimateSliceWeight(slice: ChatThreadSlice): number {
+  let weight = slice.inputDraft.length;
+  for (const item of slice.messages) weight += estimateItemWeight(item);
+  return weight;
+}
+
+/** A thread the user could still be watching — or has unsent work in —
+ *  must never be evicted, no matter how cold its last touch looks.
+ *
+ *  Unsent composer state is the important half: eviction drops the whole
+ *  slice, and a typed-but-unsent message or a staged attachment exists
+ *  NOWHERE else. Run state is recoverable from disk; a draft is not. */
+function isSliceBusy(slice: ChatThreadSlice): boolean {
+  return (
+    slice.streaming ||
+    slice.activeTurnId !== null ||
+    slice.pendingRequestIds.length > 0 ||
+    slice.inputDraft.trim().length > 0 ||
+    slice.stagedAttachments.length > 0
+  );
+}
+
+/**
+ * One provider event folded into one slice. Returns the SAME slice object
+ * when nothing changed, which is what keeps `updateSlice` from cloning the
+ * threads map (and, in a batch, what lets a no-op event drop out for free).
+ */
+function reduceThreadEvent(
+  slice: ChatThreadSlice,
+  event: ProviderRuntimeEvent,
+): ChatThreadSlice {
+  const applied = applyEvent(slice, event);
+  // Track active turn id for the Stop button so we can thread it
+  // to interrupt_turn if the provider wants a specific turn.
+  let activeTurnId = slice.activeTurnId;
+  let resumeCursor = slice.resumeCursor;
+  if (event.type === "session_state_changed") {
+    if (event.status.status === "running") {
+      activeTurnId = event.status.active_turn;
+    } else if (
+      event.status.status === "ready" ||
+      event.status.status === "closed" ||
+      event.status.status === "error"
+    ) {
+      activeTurnId = null;
+    }
+  } else if (event.type === "turn_completed") {
+    activeTurnId = null;
+  } else if (event.type === "content_delta") {
+    activeTurnId = event.turn_id;
+  } else if (event.type === "resume_cursor_updated") {
+    resumeCursor = event.resume_cursor;
+  }
+  if (
+    applied === (slice as ChatThreadState) &&
+    activeTurnId === slice.activeTurnId &&
+    resumeCursor === slice.resumeCursor
+  ) {
+    return slice;
+  }
+  return { ...slice, ...applied, activeTurnId, resumeCursor };
 }
 
 export const useAgentChatStore = create<AgentChatStore>((set) => ({
@@ -328,39 +536,42 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
 
   applyEvent: (threadId, event) =>
     set((state) =>
-      updateSlice(state, threadId, (slice) => {
-        const applied = applyEvent(slice, event);
-        // Track active turn id for the Stop button so we can thread it
-        // to interrupt_turn if the provider wants a specific turn.
-        let activeTurnId = slice.activeTurnId;
-        let resumeCursor = slice.resumeCursor;
-        if (event.type === "session_state_changed") {
-          if (event.status.status === "running") {
-            activeTurnId = event.status.active_turn;
-          } else if (
-            event.status.status === "ready" ||
-            event.status.status === "closed" ||
-            event.status.status === "error"
-          ) {
-            activeTurnId = null;
-          }
-        } else if (event.type === "turn_completed") {
-          activeTurnId = null;
-        } else if (event.type === "content_delta") {
-          activeTurnId = event.turn_id;
-        } else if (event.type === "resume_cursor_updated") {
-          resumeCursor = event.resume_cursor;
-        }
-        if (
-          applied === (slice as ChatThreadState) &&
-          activeTurnId === slice.activeTurnId &&
-          resumeCursor === slice.resumeCursor
-        ) {
-          return slice;
-        }
-        return { ...slice, ...applied, activeTurnId, resumeCursor };
-      }),
+      updateSlice(state, threadId, (slice) => reduceThreadEvent(slice, event)),
     ),
+
+  applyEvents: (threadId, events) =>
+    set((state) => {
+      if (events.length === 0) return {};
+      return updateSlice(state, threadId, (slice) => {
+        let next = slice;
+        for (const event of events) next = reduceThreadEvent(next, event);
+        return next;
+      });
+    }),
+
+  applyLiveEvents: (threadId, items) =>
+    set((state) => {
+      if (items.length === 0) return {};
+      return updateSlice(state, threadId, (slice) => {
+        let next = slice;
+        let cursor = slice.lastPersistedEventId;
+        for (const { event, persistedId } of items) {
+          // Already applied through a tail read — the overlap the
+          // buffer-then-drain hydrate deliberately creates.
+          if (persistedId != null && cursor != null && persistedId <= cursor) {
+            continue;
+          }
+          next = reduceThreadEvent(next, event);
+          // Only a synced slice may advance: from `null` we have no idea
+          // which rows below this id we are missing.
+          if (persistedId != null && cursor != null && persistedId > cursor) {
+            cursor = persistedId;
+          }
+        }
+        if (cursor === slice.lastPersistedEventId) return next;
+        return { ...next, lastPersistedEventId: cursor };
+      });
+    }),
 
   appendUserMessage: (threadId, text, clientNonce, images) =>
     set((state) =>
@@ -456,6 +667,12 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         // this. Carrying the stale record would render a restore
         // button pointing at a deleted row.
         checkpoint: null,
+        // The cursor belongs to the OLD thread's rows. The restart /
+        // collapse paths re-home rows between threads keeping their
+        // original ids, so the old head can sit above the new thread's
+        // head — a cursor that would make every tail read look empty.
+        // Cold-hydrate the new id instead.
+        lastPersistedEventId: null,
       };
       const nextThreads: Record<string, ChatThreadSlice> = {};
       for (const [key, value] of Object.entries(state.threads)) {
@@ -466,9 +683,12 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
       return { threads: nextThreads };
     }),
 
-  hydrateThread: (threadId, payloads, opts) =>
+  hydrateThread: (threadId, rows, opts) =>
     set((state) => {
-      const replayed = replayPayloads(payloads, opts);
+      const replayed = replayParsed(
+        parseReplayPayloads(rows.map((row) => row.payload)),
+        opts,
+      );
       const existing = state.threads[threadId] ?? emptySlice();
       // Spread `replayed` last so its `messages`, `nextSeq`,
       // `streaming`, `pendingRequestIds` overwrite the empty slice's
@@ -481,8 +701,122 @@ export const useAgentChatStore = create<AgentChatStore>((set) => ({
         // Hydration is a fresh-start scenario — drop ephemeral
         // turn-state fields the live event stream owns.
         activeTurnId: null,
+        // Rows arrive ascending, so the last one is the head. An empty
+        // hydrate still syncs the thread (cursor 0, not null): its
+        // history simply starts at the beginning of the id space.
+        lastPersistedEventId: rows.length > 0 ? rows[rows.length - 1].id : 0,
       };
+      touchThread(threadId);
       return { threads: { ...state.threads, [threadId]: next } };
+    }),
+
+  applyPayloadsTail: (threadId, rows, opts) =>
+    set((state) => {
+      if (rows.length === 0) return {};
+      return updateSlice(state, threadId, (slice) => {
+        // Two hydrates can overlap (remount inside the IPC window) and
+        // read the same tail from the same cursor. The cursor invariant —
+        // every row at or below it is already represented — makes that
+        // decidable per row, so a re-applied tail folds nothing twice.
+        const cursor = slice.lastPersistedEventId;
+        const fresh =
+          cursor == null ? rows : rows.filter((row) => row.id > cursor);
+        if (fresh.length === 0) return slice;
+        const merged = applyReplayTail(
+          slice,
+          parseReplayPayloads(fresh.map((row) => row.payload)),
+          {
+            ...opts,
+            // Summarizes the prefix for the unsettled-tail scan: a slice
+            // that is streaming or already flagged interrupted ends on an
+            // unsettled user turn.
+            previousUnsettled: slice.interrupted || slice.streaming,
+          },
+        );
+        return {
+          ...slice,
+          ...merged,
+          // `activeTurnId` is deliberately preserved: a tail merge can
+          // happen mid-run and the Stop button needs its turn id.
+          lastPersistedEventId: fresh[fresh.length - 1].id,
+        };
+      });
+    }),
+
+  invalidateThreadCursor: (threadId) =>
+    set((state) =>
+      updateSlice(state, threadId, (slice) =>
+        slice.lastPersistedEventId === null
+          ? slice
+          : { ...slice, lastPersistedEventId: null },
+      ),
+    ),
+
+  resolveLazyToolResult: (rowId, content) =>
+    set((state) => {
+      for (const [threadId, slice] of Object.entries(state.threads)) {
+        const index = slice.messages.findIndex(
+          (item) =>
+            item.kind === "tool_call" &&
+            isLazyToolResultStub(item.result_content) &&
+            item.result_content.__codemux_lazy_tool_result.row_id === rowId,
+        );
+        if (index < 0) continue;
+        const item = slice.messages[index] as ToolCallItem;
+        const messages = [...slice.messages];
+        // A new item object is exactly right: the transcript's slot reuse
+        // keys off item identity, so precisely this row re-renders.
+        messages[index] = { ...item, result_content: content };
+        return {
+          threads: {
+            ...state.threads,
+            [threadId]: { ...slice, messages },
+          },
+        };
+      }
+      return {};
+    }),
+
+  evictColdThreads: (keep) =>
+    set((state) => {
+      const entries = Object.entries(state.threads);
+      if (entries.length === 0) return {};
+      let total = 0;
+      const weights = new Map<string, number>();
+      for (const [threadId, slice] of entries) {
+        const weight = estimateSliceWeight(slice);
+        weights.set(threadId, weight);
+        total += weight;
+      }
+      if (total <= WARM_SLICE_BUDGET_UNITS) return {};
+      const protectedIds = new Set(keep);
+      const candidates = entries
+        .filter(
+          ([threadId, slice]) =>
+            !protectedIds.has(threadId) &&
+            // A mounted pane is rendering this slice right now; dropping
+            // it blanks the transcript in place. `keep` only names the
+            // thread that just hydrated, which says nothing about the
+            // other panes on screen.
+            !isThreadMounted(threadId) &&
+            !isSliceBusy(slice),
+        )
+        .sort(
+          (a, b) => (lastTouchedAt.get(a[0]) ?? 0) - (lastTouchedAt.get(b[0]) ?? 0),
+        );
+      const evicted = new Set<string>();
+      for (const [threadId] of candidates) {
+        if (total <= WARM_SLICE_BUDGET_UNITS) break;
+        evicted.add(threadId);
+        lastTouchedAt.delete(threadId);
+        total -= weights.get(threadId) ?? 0;
+      }
+      if (evicted.size === 0) return {};
+      const threads: Record<string, ChatThreadSlice> = {};
+      for (const [threadId, slice] of entries) {
+        if (!evicted.has(threadId)) threads[threadId] = slice;
+      }
+      return { threads };
     }),
 
   resetThread: (threadId) =>
@@ -626,4 +960,7 @@ export const selectMessages =
     return state.threads[threadId]?.messages ?? EMPTY_ITEMS;
   };
 
-const EMPTY_ITEMS: ChatViewItem[] = [];
+// Frozen so a null-thread read is reference-stable AND provably read-only:
+// every `?? EMPTY_ITEMS` fallback has to hand back the same array or the
+// identity checks the memoized transcript rows rely on are defeated.
+const EMPTY_ITEMS = Object.freeze([]) as unknown as ChatViewItem[];

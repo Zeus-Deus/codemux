@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowDownNarrowWide, Cpu, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -22,7 +22,6 @@ import {
 import { cn } from "@/lib/utils";
 import {
   activateTerminalSession,
-  activateWorkspace,
   getResourceMetrics,
 } from "@/tauri/commands";
 import type { ResourceSessionMetrics } from "@/tauri/types";
@@ -30,6 +29,7 @@ import {
   selectShowResourceMonitor,
   useSyncedSettingsStore,
 } from "@/stores/synced-settings-store";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { AppResourceSection } from "./AppResourceSection";
 import { MetricBadge } from "./MetricBadge";
 import type { SortOption } from "./types";
@@ -77,12 +77,20 @@ export function ResourceMonitor({ className }: ResourceMonitorProps) {
     isFetching,
   } = useQuery({
     queryKey: ["resource_metrics"],
-    queryFn: getResourceMetrics,
+    // Closed, only the host share and the severity dot are on screen, so the
+    // backend serves a cached summary instead of walking every process.
+    queryFn: () => getResourceMetrics(open),
     enabled,
     // Poll fast while the popover is open, slow while it is closed so the
     // tooltip / severity dot stay roughly fresh without wasting work.
     refetchInterval: open ? 2000 : 15000,
   });
+
+  // Opening asks for detail immediately rather than showing the summary's
+  // (possibly minute-old) per-process rows until the first 2 s tick.
+  useEffect(() => {
+    if (open) void refetch();
+  }, [open, refetch]);
 
   const trackedMemorySharePercent = snapshot
     ? getTrackedMemorySharePercent(
@@ -115,7 +123,7 @@ export function ResourceMonitor({ className }: ResourceMonitorProps) {
     session.title ?? `Terminal ${session.session_id.slice(0, 8)}`;
 
   const navigateToWorkspace = (workspaceId: string) => {
-    void activateWorkspace(workspaceId);
+    activateWorkspaceInteraction(workspaceId).catch(console.error);
     setOpen(false);
   };
 

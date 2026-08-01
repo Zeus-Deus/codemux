@@ -10,7 +10,8 @@ import {
   GitPullRequest,
   X,
 } from "lucide-react";
-import { listIncomingPrs, activateWorkspace, createWorktreeWorkspace } from "@/tauri/commands";
+import { listIncomingPrs, createWorktreeWorkspace } from "@/tauri/commands";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { useAppStore } from "@/stores/app-store";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
@@ -92,7 +93,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
     e.stopPropagation();
     try {
       if (existingWs) {
-        await activateWorkspace(existingWs.workspace_id);
+        await activateWorkspaceInteraction(existingWs.workspace_id);
       } else if (pr.head_branch) {
         await createWorktreeWorkspace(projectRoot, pr.head_branch, false, "single", null, null, null, pr.number);
       }
@@ -107,7 +108,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
   return (
     <div
       className="group px-2.5 py-1.5 hover:bg-muted/40 rounded-sm transition-colors cursor-default min-w-0"
-      onClick={() => { if (existingWs) activateWorkspace(existingWs.workspace_id); }}
+      onClick={() => { if (existingWs) activateWorkspaceInteraction(existingWs.workspace_id).catch(console.error); }}
     >
       <div className="flex items-center gap-1.5 min-w-0 h-5">
         <ChecksIndicator status={pr.checks_status} />

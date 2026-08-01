@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ArrowDown } from "lucide-react";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { getWorkspaceStatus } from "@/lib/pane-status";
@@ -11,8 +11,8 @@ import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { useAppStore } from "@/stores/app-store";
 import type { ProjectGroup } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
-import { activateWorkspace, dbGetUiState } from "@/tauri/commands";
+import { dbGetUiState } from "@/tauri/commands";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 interface StripEntry {
@@ -50,15 +50,12 @@ const MAX_VISIBLE_ENTRIES = 4;
  *  The card never moves — the strip only points at it, which is what lets the
  *  list keep a stable, status-blind order. */
 function jumpToWorkspace(workspaceId: string, projectPath: string) {
-  useChatDraftStore.getState().setActiveDraft(null);
   // Ask the target's project to expand. A no-op in the flat inbox (it has no
   // collapsible groups), but harmless and still correct for any grouped list:
   // a row inside a collapsed group isn't rendered, so the scroll below would
   // silently do nothing.
   useUIStore.getState().requestExpandProject(projectPath);
-  startTransition(() => {
-    activateWorkspace(workspaceId).catch(console.error);
-  });
+  activateWorkspaceInteraction(workspaceId).catch(console.error);
   // The row may not exist yet — the group was just asked to expand and React
   // needs a commit to mount it. Retry across a few frames until the row is in
   // the DOM, then scroll; give up after a small cap so we never spin.
