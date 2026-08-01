@@ -26,6 +26,22 @@ export interface ResolvedImage {
 }
 
 /**
+ * Build the shared Google favicon-service URL used by project avatars and
+ * rich external links in chat.
+ */
+export function faviconUrlForDomain(
+  domain: string,
+  size: number,
+  cacheBust?: string | number | null,
+): string {
+  let url = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=${size}`;
+  if (cacheBust) {
+    url += `&v=${encodeURIComponent(String(cacheBust))}`;
+  }
+  return url;
+}
+
+/**
  * @param input     Raw user input (image URL, data URL, website, or domain).
  * @param cacheBust Optional token appended to derived favicon URLs as `&v=`.
  *   The favicon service URL is otherwise identical for a given domain, so the
@@ -55,10 +71,7 @@ export function resolveImageUrl(
   // Try to interpret as a website / bare domain.
   const domain = extractDomain(trimmed);
   if (domain) {
-    let url = `https://www.google.com/s2/favicons?domain=${encodeURIComponent(domain)}&sz=128`;
-    if (cacheBust) {
-      url += `&v=${encodeURIComponent(String(cacheBust))}`;
-    }
+    const url = faviconUrlForDomain(domain, 128, cacheBust);
     return { url, isFavicon: true, domain };
   }
 

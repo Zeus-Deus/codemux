@@ -1118,7 +1118,10 @@ export function richChatTurnEnvelopes(
       type: "item_completed",
       item: {
         kind: "assistant_text",
-        text: "Done — issue #57298 implemented and the regression test passes.",
+        text:
+          "Done — [issue #57298](https://github.com/example/gateway/issues/57298) " +
+          "implemented, the regression test passes, and the " +
+          "[exception-chain notes](https://docs.python.org/3/library/exceptions.html) are ready.",
       },
     }),
   ];

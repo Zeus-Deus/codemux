@@ -84,7 +84,7 @@
 - Per-workspace browser sessions stable across concurrent worktrees (PID-tracked daemons, single canonical key, atomic teardown)
 - Browser inspector / DevTools panel
 
-## Agent Chat (Beta — opt-in via Settings → Beta Features)
+## Agent Chat (default interface — opt-out back to CLI via Settings → Interface)
 
 - In-app chat pane that talks to CLI coding agents (Claude, Codex, OpenCode) through a conversational UX instead of a raw terminal
 - Three providers behind one unified picker:
@@ -108,7 +108,7 @@
 - Permission-mode mid-session restart
 - Favorites on the model picker with `localStorage` persistence
 - Debug-mode banner with explicit exit dialog
-- Plain-quit on Beta toggle off (no auto-restart) to keep user data intact
+- Plain-quit on interface toggle flip (no auto-restart) to keep user data intact
 
 ## OpenFlow Orchestration
 
@@ -341,11 +341,11 @@
 ## Settings Panel
 
 - Centralized configuration overlay (Ctrl+,)
-- 19 sections (`ALL_SECTION_IDS` in `settings-view.tsx`): Beta Features, Account, Appearance, Editor, Terminal, Presets, Projects, Archive, Git, Agent, Permissions, Skills, MCP, Hosts (labeled "Devices"), Remote Access, Browser, Shortcuts, Notifications, Session Restore. Sync is a subsection inside Account, not a section of its own
+- 19 sections (`ALL_SECTION_IDS` in `settings-view.tsx`): Interface, Account, Appearance, Editor, Terminal, Presets, Projects, Archive, Git, Agent, Permissions, Skills, MCP, Hosts (labeled "Devices"), Remote Access, Browser, Shortcuts, Notifications, Session Restore. Sync is a subsection inside Account, not a section of its own
 - Keyboard shortcut editor with conflict detection and search
 - Server-synced settings with offline cache
 - Workspace-level project config (setup/teardown scripts, worktree includes)
-- Beta Features section that flips the Step 13 agent-chat toggle (controls `enable_agent_chat` and `enable_lazy_workspace_creation` together)
+- Interface section with the Agent Chat GUI master toggle, default on (controls `enable_agent_chat` and `enable_lazy_workspace_creation` together; off = classic CLI interface)
 
 ## Remote Hosts + Workspace Push
 
