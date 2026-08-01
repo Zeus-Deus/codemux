@@ -20,10 +20,11 @@ of a raw terminal. It surfaces a streaming chat UX — messages, tool
 approvals, plan proposals, AskUserQuestion panels, image and file
 attachments, slash commands, mode pills — over subprocess-backed runners.
 
-## Beta Gate (Step 13)
+## Interface Gate (formerly the Step 13 Beta gate)
 
-The feature is **OFF by default**. Two persisted feature flags gate the
-entire Step 6–12 surface:
+The feature is **ON by default** — the Agent Chat GUI was promoted out of
+Beta and is now the default interface. Two persisted feature flags still
+gate the entire chat surface:
 
 - `enable_agent_chat` — gates the chat pane kind, its Tauri command surface,
   the provider registry (Claude + Codex + OpenCode), and the MCP host
@@ -32,15 +33,33 @@ entire Step 6–12 surface:
   `+` and boot-into-Home open a client-side chat draft instead of eagerly
   materialising a workspace; the draft is promoted on first message send.
 
-Both flags default to `false`. The Settings → Beta Features section flips
-them together (see `src/components/settings/beta-features-section.tsx`).
-Turning Beta off triggers a plain-quit (no auto-restart) to keep user data
-intact across the legacy/Beta UI swap. The legacy main-branch experience
-(preset bar, terminal panes, empty-state splash) is byte-identical when
-both flags are off.
+Both flags default to `true`. The Settings → Personal → **Interface**
+section flips them together via `set_agent_chat_enabled` (see
+`src/components/settings/interface-section.tsx`); turning the toggle off
+returns to the classic terminal-first (CLI) interface. Either flip triggers
+a plain-quit (no auto-restart) to keep user data intact across the
+legacy/GUI swap. The legacy experience (preset bar, terminal panes,
+empty-state splash) is byte-identical when both flags are off.
 
-See `docs/archive/step-13-beta-toggle-research.md` for the toggle scoping and
-`docs/archive/step-13-ui-smoke-checklist.md` for the operator-verified gate.
+**Promotion migration**: because the whole observability snapshot is
+re-saved on every mutation, pre-promotion installs carry an explicit
+`enable_agent_chat: false` from the old off-default. A one-time
+`agent_chat_promoted` marker (`promote_agent_chat_default` in
+`src-tauri/src/observability.rs`) flips both flags on at first load after
+upgrade and stamps the marker; opt-outs made after that are never
+overridden. The marker is a standalone **sentinel file**
+(`<data root>/agent_chat_promoted`, next to `observability.json`) rather
+than only the `agent_chat_promoted` snapshot key: an older binary
+deserializes the snapshot without that key and re-serializes without it,
+so a downgrade → upgrade round trip would erase a snapshot-only marker,
+re-run the promotion, and force-revert a deliberate opt-out. Old binaries
+never touch the sentinel. The snapshot field is still honoured on read
+(and mirrored into the sentinel on first sight) for installs promoted
+before the sentinel existed.
+
+See `docs/archive/step-13-beta-toggle-research.md` for the original Beta
+toggle scoping and `docs/archive/step-13-ui-smoke-checklist.md` for the
+operator-verified gate.
 
 ## Current Model
 
@@ -111,39 +130,60 @@ The chat pane stack:
   single scope, like `color9` behind `invalid` / `invalid.illegal`. Hashing a
   curated field list is how two palettes differing solely in `color9` used to
   collide on one name and serve each other's colors.
-- **Streamdown owns the card.** It renders its own container, header,
-  copy/download pill, and body whether or not the `code` plugin is installed —
-  fenced blocks are *not* a bare `<pre>`. The `prose-pre:*` / `prose-code:*`
-  chain in `ChatMarkdown.tsx` therefore only *neutralizes* the typography
-  plugin's defaults; the card is styled by `.chat-markdown` rules in
-  `globals.css`. Styling `pre` there again stacks a third border/background
-  inside the card.
+- **Codemux owns the card shell; Streamdown owns parsing.**
+  `ChatCodeBlock.tsx` supplies Streamdown's custom `code` / `inlineCode`
+  components and keeps using the shared Shiki plugin for tokenization.
+  Fenced cards therefore have stable Codemux markup rather than depending on
+  Streamdown's private header/action layout. The custom shell renders a
+  file-aware title, per-block wrap and copy actions, and the highlighted body;
+  the `prose-pre:*` / `prose-code:*` chain in `ChatMarkdown.tsx` still only
+  neutralizes typography defaults.
 - **Line numbers are off** (`lineNumbers={false}`) — chat snippets are quotes,
   not files. Streamdown only gives each line span `display: block` as part of
   its line-number class, so `globals.css` restores the line box explicitly;
   without that rule every line collapses onto one.
 - **Word wrap** is the `chat.code_wrap` setting (default off), exposed as
-  Settings → Appearance → "Wrap code in chat" and applied as `data-code-wrap`
-  on the markdown root. Off keeps lines intact behind a horizontal scroll.
-- Streamdown's fence meta only supports `startLine=` and `noLineNumbers`;
-  there is no filename/title slot, so the header shows the language only.
+  Settings → Appearance → "Wrap code in chat". It supplies each block's
+  default; the header's wrap action can override one block without changing
+  the global preference. Off keeps lines intact behind a horizontal scroll.
+- **Highlighting is stale-while-revalidating.** `highlight()` only answers
+  synchronously on a cache hit, and a streaming fence changes on every token,
+  so rendering "the result for exactly this code, else raw" would flash the
+  whole block back to uncolored text between every append. `useHighlightedCode`
+  keeps the last result on screen and appends the not-yet-tokenized tail
+  uncolored, so neither color nor text lags the stream. Reuse is guarded on the
+  block's own state, an unchanged language, and the old code still being a
+  prefix of the new — a fence that switches language or is rewritten falls back
+  to raw rather than painting one language's colors onto another's source.
+- Fence metadata comes from Streamdown's own `codeMeta` plugin, composed out of
+  its exported `defaultRemarkPlugins` (passing `remarkPlugins` *replaces* the
+  defaults, so `gfm` and `codeMeta` are named explicitly rather than
+  reimplemented locally). `title=`, `file=`, `filename=`, and bare
+  filename/path forms render a file icon plus title. A bare token only counts
+  as a filename when it ends in a real-looking extension and is not
+  version-like, so ` ```txt 1.5 ` and ` ```js v2.0 ` stay plain fences while
+  `main.rs`, `.env.local`, and `@scope/pkg/file.tsx` still caption. Without a
+  title, common language ids map to a synthetic filename and the existing
+  `material-file-icons` system supplies the language/framework icon; unknown
+  languages fall back to a text label.
+- The fence body keeps whatever the author wrote: mdast terminates a fence with
+  exactly one newline, and only that one is stripped, so a snippet genuinely
+  ending in blank lines keeps them in both the render and the clipboard.
 
 Card styling (all in `globals.css`, all on design tokens):
 
-- A fence with **no language** (plain command output) still renders a header
-  element with an empty label, which otherwise reserves an empty strip at the
-  top of the block. It's hidden via `[data-language=""]`, and the body takes
-  over the block's top padding in that case.
-- The copy/download pill is **revealed on hover/focus** — a transcript can hold
-  dozens of blocks and always-lit icons are a lot of standing chrome. A
-  `@media (hover: none)` fallback keeps it visible where hover doesn't exist.
-- Streamdown positions that pill by pulling a sticky spacer row up over the
-  header (`-mt-10`), hard-coupling it to the header's height — so hiding the
-  header would fling the pill outside the card. The spacer (the only child div
-  with no `data-streamdown` attribute) is collapsed and the pill is anchored to
-  the card instead.
-- The language caption is a small uppercase tracked label with no divider rule;
-  the fill change against surrounding prose is enough separation.
+- A fence with **no language** is labeled `text`, so copy and wrap remain
+  discoverable and the header never becomes an unexplained empty strip.
+- A fence still waiting on its closing ``` carries `data-incomplete` and dims
+  its title, so a card that is still filling in (and whose copy action would
+  only capture the partial snippet) reads as provisional. Opacity only — no
+  motion, since a transcript can stream several blocks at once.
+- Wrap/copy actions remain visible in the header. They use the shared compact
+  ghost-button treatment and tooltips, with `aria-pressed` on wrap and a
+  temporary copied state.
+- The card uses a 12px radius, a quiet header/body divider, and distinct token
+  surfaces. Code remains 12px JetBrains Mono with compact 1.4 line-height and
+  more body padding than the preceding flattened Streamdown card.
 
 ### Rich external links in chat
 
@@ -957,7 +997,7 @@ can be scanned and jumped without scrubbing the scrollbar. It lives
 as a sibling of LegendList, absolutely positioned over the dead left
 margin of the shared `CHAT_COLUMN` transcript column, so it
 never overlaps text. It needs **no new setting** — it is part of the
-already Beta-gated pane and simply hides on short threads.
+already flag-gated pane and simply hides on short threads.
 
 - **Data source is the virtualizer's first visible index.** The
   pure helpers in `message-trail.ts` (`buildTrailEntries` /
@@ -1437,8 +1477,9 @@ in the browser pane.
 
 ## Current Constraints
 
-- **Beta-gated.** The chat pane is hidden unless the user opts in via
-  Settings → Beta Features. See "Beta Gate" above.
+- **Flag-gated, default on.** The chat pane is the default interface; the
+  Settings → Interface toggle switches back to the classic CLI view. See
+  "Interface Gate" above.
 - **Single instance per provider.** A user with multiple Codex accounts or
   multiple OpenCode connections sees them collapsed under one rail entry.
   Multi-instance lifting is planned for v2 (the `ProviderInstanceId` shim
@@ -2199,7 +2240,7 @@ reachable there); `ProjectPicker`
 (`src/components/overlays/project-picker.tsx`) survives for the
 new-workspace dialog only.
 
-**GUI chrome suppression.** When the Beta flag is on and the chat pane is
+**GUI chrome suppression.** When the GUI flag is on and the chat pane is
 the **sole root** of its surface (not a split), `AgentChatPaneHeader` does
 NOT render — the title bar absorbs the tab, its session-history dropdown,
 close, and "Restore checkpoint" (`PaneNode` gates on `isSurfaceRoot`);
@@ -2303,7 +2344,7 @@ of the active surface in GUI chrome, `WorkspaceContextBar` renders
 `docs/features/workspace-context-bar.md` and
 `useAgentChatPaneActive()` (`src/hooks/use-gui-chrome.ts`). A terminal
 (or other) pane active in GUI mode keeps the bottom bar; legacy chrome
-(Beta flag off) is unaffected.
+(GUI flag off) is unaffected.
 
 ## Context-window meter (composer)
 

@@ -18,7 +18,7 @@ A preset is either a **raw command** preset (a list of literal shell command lin
 
 Every builtin agent preset launches in its CLI's skip-permissions / auto-approve ("YOLO") mode so the agent runs without per-action confirmation prompts. The exact flag is per-CLI and was verified against each tool's own `--help` (see the table below).
 
-In **GUI chrome** (Agent Chat Beta on, real non-OpenFlow workspace) the preset-bar row does not render: it is replaced by the title bar's `+` agent-launcher popover (GUI chat presets / CLI agents, Shift = split) plus an inline ember chat favorite. The preset data model, storage, and `apply_preset` launch pipeline are unchanged — the launcher reads the same live preset snapshot and fires the same commands. Draft (lazy-creation) workspaces keep the preset bar. See `docs/features/gui-chrome.md`.
+In **GUI chrome** (Agent Chat GUI on — the default — with a real non-OpenFlow workspace) the preset-bar row does not render: it is replaced by the title bar's `+` agent-launcher popover (GUI chat presets / CLI agents, Shift = split) plus an inline ember chat favorite. The preset data model, storage, and `apply_preset` launch pipeline are unchanged — the launcher reads the same live preset snapshot and fires the same commands. Draft (lazy-creation) workspaces keep the preset bar. See `docs/features/gui-chrome.md`.
 
 ## Structured Agent Launchers
 

@@ -1015,6 +1015,12 @@ fn build_core_app<R: tauri::Runtime>(
             // elsewhere.
             let git_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                // Last branch-PR lookup error logged by this loop. The loop
+                // ticks every 5 s, so a persistent condition (expired `gh`
+                // token, no network) would otherwise write the same line to
+                // stderr ~17k times a day. Log each distinct message once and
+                // reset on the next success, so a *new* failure is still loud.
+                let mut last_pr_error: Option<String> = None;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
@@ -1053,57 +1059,47 @@ fn build_core_app<R: tauri::Runtime>(
                     // at a time anyway.
                     if let Some((workspace_id, cwd)) = active {
                         let path = std::path::PathBuf::from(&cwd);
-                        if github::gh_available() {
-                            let pr_info = match github::get_branch_pr(&path) {
-                                Ok(info) => info,
+                        // `is_github_repo` is a pure `git remote -v` read (no
+                        // `gh`, no network), and it matches the gate the
+                        // dedicated PR poller already applies. Without it a
+                        // GitLab / local-only workspace would shell out to
+                        // `gh` every tick just to fail.
+                        if github::gh_available() && github::is_github_repo(&path) {
+                            // Branch/repository identity owns association. A
+                            // failed lookup preserves the last known state;
+                            // a successful empty result is authoritative and
+                            // clears any stale association.
+                            let lookup = github::get_branch_pr(&path);
+                            match &lookup {
                                 Err(e) => {
-                                    eprintln!("[codemux::github] Failed to fetch PR info for {}: {e}", cwd);
-                                    None
-                                }
-                            };
-                            // Decision matrix (mirrors Superset's pr-resolution):
-                            //   - PR found & passes SHA gate → write fresh info
-                            //   - PR found but gated out (historical PR whose
-                            //     head SHA no longer matches workspace HEAD,
-                            //     e.g. PR merged into `main` long ago) → clear
-                            //   - `gh pr view` returned nothing AND the persisted
-                            //     state is historical (CLOSED/MERGED) → clear,
-                            //     because the persisted pill is from when the PR
-                            //     was open and gh can no longer resolve it
-                            //   - `gh pr view` returned nothing AND the persisted
-                            //     state is OPEN/DRAFT → preserve. This protects
-                            //     the fork-branch case where the PR was set
-                            //     during `gh pr checkout` and `gh pr view` can't
-                            //     re-resolve it via tracking refs.
-                            match pr_info.as_ref() {
-                                Some(pr) => {
-                                    let head_sha = github::get_head_sha(&path);
-                                    if github::should_show_branch_pr(pr, head_sha.as_deref()) {
-                                        state.update_workspace_pr_info(
-                                            &workspace_id,
-                                            Some(pr.number),
-                                            Some(pr.display_state()),
-                                            Some(pr.url.clone()),
-                                        );
-                                    } else {
-                                        state.update_workspace_pr_info(&workspace_id, None, None, None);
+                                    let message = format!(
+                                        "[codemux::github] Failed to fetch PR info for {cwd}: {e}"
+                                    );
+                                    if last_pr_error.as_deref() != Some(message.as_str()) {
+                                        eprintln!("{message}");
+                                        last_pr_error = Some(message);
                                     }
                                 }
-                                None => {
-                                    let persisted_state = {
-                                        let snap = state.snapshot();
-                                        snap.workspaces.iter()
-                                            .find(|w| w.workspace_id.0 == workspace_id)
-                                            .and_then(|w| w.pr_state.clone())
-                                    };
-                                    if persisted_state
-                                        .as_deref()
-                                        .map(github::is_historical_pr_state)
-                                        .unwrap_or(false)
-                                    {
-                                        state.update_workspace_pr_info(&workspace_id, None, None, None);
-                                    }
+                                Ok(_) => last_pr_error = None,
+                            }
+                            match github::branch_pr_outcome(lookup) {
+                                github::BranchPrOutcome::Write(pr) => {
+                                    state.update_workspace_pr_info(
+                                        &workspace_id,
+                                        Some(pr.number),
+                                        Some(pr.display_state()),
+                                        Some(pr.url),
+                                    );
                                 }
+                                github::BranchPrOutcome::Clear => {
+                                    state.update_workspace_pr_info(
+                                        &workspace_id,
+                                        None,
+                                        None,
+                                        None,
+                                    );
+                                }
+                                github::BranchPrOutcome::Preserve => {}
                             }
 
                             // Refresh linked issue state (lightweight: only if workspace has one)
@@ -1362,7 +1358,7 @@ fn build_core_app<R: tauri::Runtime>(
             // don't go stale (the user might leave the app open while a
             // teammate merges a PR on GitHub).
             //
-            // Sequential per tick on purpose — each `gh pr view` is a
+            // Sequential per tick on purpose — each branch PR query is a
             // subprocess fork, and we'd rather take ~Nx longer than slam
             // `gh` with N parallel children. Each call gets a 10s timeout
             // so a single hanging `gh` doesn't block subsequent workspaces.
@@ -1422,10 +1418,8 @@ fn build_core_app<R: tauri::Runtime>(
                     for (workspace_id, cwd) in workspaces {
                         let path = std::path::PathBuf::from(&cwd);
 
-                        // Skip non-GitHub repos cheaply (this itself shells
-                        // out, but a single `gh repo view` is cheap relative
-                        // to skipping the whole tick on a non-GitHub
-                        // workspace).
+                        // Skip non-GitHub repos using the local remote config,
+                        // avoiding an unnecessary network call.
                         let path_for_repo = path.clone();
                         let is_gh = tokio::time::timeout(
                             std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
@@ -1457,66 +1451,37 @@ fn build_core_app<R: tauri::Runtime>(
                         .await;
 
                         match pr_result {
-                            Ok(Ok(Ok(Some(pr)))) => {
-                                // Resolve workspace HEAD on the blocking pool
-                                // — a `git rev-parse HEAD` shells out and we
-                                // don't want to block this async loop on
-                                // slow disks.
-                                let path_for_head = path.clone();
-                                let head_sha = tokio::task::spawn_blocking(move || {
-                                    github::get_head_sha(&path_for_head)
-                                })
-                                .await
-                                .ok()
-                                .flatten();
-
-                                if github::should_show_branch_pr(&pr, head_sha.as_deref()) {
-                                    state.update_workspace_pr_info(
-                                        &workspace_id,
-                                        Some(pr.number),
-                                        Some(pr.display_state()),
-                                        Some(pr.url.clone()),
+                            Ok(Ok(lookup)) => {
+                                if let Err(e) = &lookup {
+                                    eprintln!(
+                                        "[codemux::pr-poll] get_branch_pr failed for {workspace_id}: {e}"
                                     );
-                                    refreshed += 1;
-                                } else {
-                                    // Historical PR (CLOSED/MERGED) whose head
-                                    // SHA no longer matches workspace HEAD —
-                                    // clear the pill so a long-lived branch
-                                    // (typically `main`) doesn't carry the old
-                                    // merged PR forever.
-                                    state.update_workspace_pr_info(&workspace_id, None, None, None);
-                                    refreshed += 1;
                                 }
-                            }
-                            Ok(Ok(Ok(None))) => {
-                                // No PR resolved by `gh pr view`. Two sub-cases:
-                                //   - persisted state is OPEN/DRAFT → preserve,
-                                //     to protect the fork-branch case where
-                                //     `gh pr checkout` set the PR but `gh pr view`
-                                //     can't re-resolve it via tracking refs.
-                                //   - persisted state is historical (CLOSED/MERGED)
-                                //     → clear, because that pill is left over
-                                //     from when the PR was active and there's no
-                                //     way for it to ever flip back to "current".
-                                let persisted_state = {
-                                    let snap = state.snapshot();
-                                    snap.workspaces.iter()
-                                        .find(|w| w.workspace_id.0 == workspace_id)
-                                        .and_then(|w| w.pr_state.clone())
-                                };
-                                if persisted_state
-                                    .as_deref()
-                                    .map(github::is_historical_pr_state)
-                                    .unwrap_or(false)
-                                {
-                                    state.update_workspace_pr_info(&workspace_id, None, None, None);
-                                    refreshed += 1;
+                                // Shared matrix: match → write, successful
+                                // empty → authoritative clear, error (or
+                                // detached HEAD) → retain the last known
+                                // value.
+                                match github::branch_pr_outcome(lookup) {
+                                    github::BranchPrOutcome::Write(pr) => {
+                                        state.update_workspace_pr_info(
+                                            &workspace_id,
+                                            Some(pr.number),
+                                            Some(pr.display_state()),
+                                            Some(pr.url),
+                                        );
+                                        refreshed += 1;
+                                    }
+                                    github::BranchPrOutcome::Clear => {
+                                        state.update_workspace_pr_info(
+                                            &workspace_id,
+                                            None,
+                                            None,
+                                            None,
+                                        );
+                                        refreshed += 1;
+                                    }
+                                    github::BranchPrOutcome::Preserve => {}
                                 }
-                            }
-                            Ok(Ok(Err(e))) => {
-                                eprintln!(
-                                    "[codemux::pr-poll] get_branch_pr failed for {workspace_id}: {e}"
-                                );
                             }
                             Ok(Err(e)) => {
                                 eprintln!(
@@ -1525,7 +1490,7 @@ fn build_core_app<R: tauri::Runtime>(
                             }
                             Err(_) => {
                                 eprintln!(
-                                    "[codemux::pr-poll] gh pr view timed out (>{PER_CALL_TIMEOUT_SECS}s) for {workspace_id}"
+                                    "[codemux::pr-poll] branch PR lookup timed out (>{PER_CALL_TIMEOUT_SECS}s) for {workspace_id}"
                                 );
                                 timed_out += 1;
                             }
@@ -1806,7 +1771,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::add_structured_log,
             commands::update_feature_flags,
             commands::get_feature_flags,
-            commands::set_agent_chat_beta,
+            commands::set_agent_chat_enabled,
             commands::quit_app,
             commands::get_home_dir,
             commands::agent_chat_create_pane,

@@ -41,8 +41,8 @@ export const SETTINGS_DEFAULTS: Record<string, string> = {
   "sidebar.auto_settle_days": "3",
   // Whether fenced code blocks in chat soft-wrap long lines. Off keeps each
   // line intact behind a horizontal scroll (better for diffs and tables of
-  // output); on trades that for no sideways scrolling. Applied as a
-  // `data-code-wrap` attr on the chat markdown root — see globals.css.
+  // output); on trades that for no sideways scrolling. Supplies each block's
+  // default, applied as `data-wrap` on the card — see ChatCodeBlock.tsx.
   "chat.code_wrap": "false",
 };
 

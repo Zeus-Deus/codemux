@@ -1,7 +1,7 @@
 # GUI-Mode Chrome
 
 - Purpose: Describe the collapsed single-titlebar chrome that renders for a
-  real workspace when the Agent Chat Beta is on.
+  real workspace when the Agent Chat GUI is on (the default interface).
 - Audience: Anyone working on the title bar, tab strip, preset launch UX, or
   the chat pane header.
 - Authority: Canonical feature-level reality doc for GUI chrome.
@@ -14,9 +14,10 @@
 
 GUI chrome collapses the four stacked chrome rows of a chat workspace —
 `TitleBar` → `TabBar` → `PresetBar` → `AgentChatPaneHeader` — into a **single
-`h-10` title bar**. It renders only when the `enable_agent_chat` Beta flag is
-on and a real, non-OpenFlow workspace is active; every other case keeps the
-legacy chrome unchanged.
+`h-10` title bar**. It renders only when the `enable_agent_chat` flag is on
+(the default — the flag is now a regular Settings → Interface toggle, not a
+Beta opt-in) and a real, non-OpenFlow workspace is active; every other case
+keeps the legacy chrome unchanged.
 
 ## Current Model
 
@@ -110,8 +111,9 @@ titlebar tab share one implementation (see "Important Touch Points").
 
 ## What Works Today
 
-- Single `h-10` titlebar for a real, non-OpenFlow chat workspace with the Beta
-  flag on; legacy `h-9` chrome is byte-identical with the flag off.
+- Single `h-10` titlebar for a real, non-OpenFlow chat workspace with the
+  GUI flag on (default); legacy `h-9` chrome is byte-identical with the flag
+  off.
 - Pill tabs with status dots, active-tab close, and a chat-tab chevron opening
   the shared session-history dropdown ("+ New Chat" and a "Restore checkpoint"
   item at the top when a run-start checkpoint exists, then the grouped sessions
@@ -192,5 +194,6 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
 ## Notes
 
 - Keep this file about current truth, not future plans.
-- The legacy/GUI split is gated purely on the `enable_agent_chat` Beta flag —
-  no new setting.
+- The legacy/GUI split is gated purely on the `enable_agent_chat` flag —
+  default on, flipped from Settings → Interface (the retired Beta toggle,
+  promoted to a regular setting).

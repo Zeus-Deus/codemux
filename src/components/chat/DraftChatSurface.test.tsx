@@ -171,6 +171,7 @@ import { toast } from "@/lib/toast";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 
 afterEach(() => cleanup());
@@ -192,6 +193,14 @@ function resetStores() {
     showNewWorkspaceDialog: false,
     newWorkspaceProjectDir: null,
   });
+  // These cases exercise the legacy (CLI opt-out) chrome, where the
+  // surface renders its own pane-header band. The store now boots
+  // with the flag ON to match the backend default, so pin it OFF
+  // here; the one GUI-chrome case below opts back in explicitly.
+  useFeatureFlags.setState({
+    enableAgentChat: false,
+    enableLazyWorkspaceCreation: false,
+  });
   lastThreadScopeRowProps.current = null;
 }
 
@@ -201,6 +210,38 @@ function renderSurface() {
       <DraftChatSurface />
     </TooltipProvider>,
   );
+}
+
+/**
+ * Utility classes that would narrow or shift the composer column if they
+ * showed up on an ancestor of the composer's own rails. Guards against:
+ *   - `max-w-*` (including arbitrary values like `max-w-[760px]`)
+ *   - horizontal padding: `px|pl|pr|ps|pe-*`
+ *   - horizontal margins: `mx|ml|mr|ms|me-*` (incl. negative)
+ *   - any explicit width other than `w-full` / `w-auto` — `w-96`,
+ *     `w-[760px]`, `w-fit`, …
+ *   - `basis-*` other than `basis-full` / `basis-auto`
+ * Only `w-full`/`w-auto`, vertical spacing, and layout classes
+ * (`flex`, `min-h-0`, `overflow-*`, `bg-*`, …) are allowed through.
+ */
+const HORIZONTAL_INSET_CLASS = /^-?[pm](?:x|l|r|s|e)-/;
+
+function narrowsComposerColumn(token: string): boolean {
+  // Strip variant prefixes (`md:`, `dark:`, `group-hover:`) so
+  // `md:max-w-lg` is caught too. Arbitrary values (`[a:b]`) start with
+  // `[` and are left alone.
+  const cls = token.replace(/^(?:[a-z][\w-]*:)+/, "");
+  if (HORIZONTAL_INSET_CLASS.test(cls)) return true;
+  if (cls.startsWith("max-w-")) return true;
+  if (cls.startsWith("w-")) return cls !== "w-full" && cls !== "w-auto";
+  if (cls.startsWith("basis-")) {
+    return cls !== "basis-full" && cls !== "basis-auto";
+  }
+  return false;
+}
+
+function columnNarrowingClasses(className: string): string[] {
+  return className.split(/\s+/).filter(Boolean).filter(narrowsComposerColumn);
 }
 
 describe("DraftChatSurface", () => {
@@ -654,6 +695,52 @@ describe("DraftChatSurface", () => {
       });
       const [, , cwd] = vi.mocked(materializeAndSend).mock.calls[0];
       expect(cwd).toBe("/home/user");
+    });
+
+    it("the mid-materialise composer keeps the shared column rails (no extra inset)", async () => {
+      // Regression guard: the pending view used to wrap the composer in
+      // its own `max-w-[760px] px-7` box, so the composer's own rails
+      // resolved INSIDE it — the card shrank to 672px for the seconds
+      // the workspace was being created, then snapped back to 760px
+      // when the real pane took over. The wrapper may only add vertical
+      // spacing; the rails belong to the composer (see chat-column.ts).
+      vi.mocked(materializeAndSend).mockImplementation(
+        () => new Promise(() => {}),
+      );
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "hello");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container, getByRole } = renderSurface();
+      const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+      fireEvent.keyDown(ta, { key: "Enter" });
+      // The pending view is up (status line) and the composer is still
+      // mounted below it.
+      await vi.waitFor(() => {
+        expect(getByRole("status", { name: "Starting the agent" })).toBeTruthy();
+      });
+
+      const card = container.querySelector(
+        '[data-testid="composer-wrapper"]',
+      ) as HTMLElement;
+      const inner = card.parentElement as HTMLElement;
+      const outer = inner.parentElement as HTMLElement;
+      expect(inner.className).toContain("max-w-[760px]");
+      expect(outer.className).toContain("px-4");
+
+      // Nothing between the composer's own rails and the surface root
+      // may constrain width or add a horizontal gutter.
+      for (
+        let node = outer.parentElement;
+        node && node !== container;
+        node = node.parentElement
+      ) {
+        expect(
+          columnNarrowingClasses(node.className),
+          `ancestor <${node.tagName.toLowerCase()} class="${node.className}"> narrows the composer column`,
+        ).toEqual([]);
+      }
     });
   });
 

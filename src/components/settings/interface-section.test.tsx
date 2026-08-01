@@ -20,7 +20,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { toast } from "@/lib/toast";
 import { useFeatureFlags } from "@/stores/feature-flags";
 
-import { BetaFeaturesSection } from "./beta-features-section";
+import { InterfaceSection } from "./interface-section";
 
 const invokeMock = invoke as unknown as ReturnType<typeof vi.fn>;
 
@@ -34,7 +34,7 @@ function resetStore(enabled: boolean) {
   });
 }
 
-describe("BetaFeaturesSection", () => {
+describe("InterfaceSection", () => {
   beforeEach(() => {
     invokeMock.mockReset();
     // Default: every invoke resolves cleanly (each test that needs a
@@ -43,40 +43,41 @@ describe("BetaFeaturesSection", () => {
     vi.mocked(toast.success).mockReset();
     vi.mocked(toast.error).mockReset();
     vi.mocked(toast.warning).mockReset();
-    resetStore(false);
+    // GUI is the default interface — tests start from the default-on
+    // state unless they opt out explicitly.
+    resetStore(true);
   });
 
-  it("renders headline + Beta badge + description in OFF state", () => {
-    render(<BetaFeaturesSection />);
+  it("renders headline + toggle description without any Beta framing", () => {
+    render(<InterfaceSection />);
 
-    expect(screen.getByText(/Beta Features/i)).toBeInTheDocument();
-    expect(screen.getByText("Agent Chat")).toBeInTheDocument();
-    // The badge sits next to the "Agent Chat" label; use exact-match
-    // so the section header's "Beta Features" doesn't double-count.
-    expect(screen.getByText("Beta")).toBeInTheDocument();
-    // Description copy includes the "off by default" hint.
+    expect(screen.getByText("Interface")).toBeInTheDocument();
+    expect(screen.getByText("Agent Chat GUI")).toBeInTheDocument();
+    // The GUI is a promoted default, not a preview surface.
+    expect(screen.queryByText(/beta/i)).toBeNull();
+    // Description copy explains the way back to the CLI view.
     expect(
-      screen.getByText(/your existing CLI workflow is unchanged/i),
+      screen.getByText(/classic terminal-first/i),
     ).toBeInTheDocument();
   });
 
-  it('shows the Switch unchecked when the toggle is off', () => {
-    resetStore(false);
-    render(<BetaFeaturesSection />);
-    const sw = screen.getByRole("switch");
-    expect(sw).toHaveAttribute("data-state", "unchecked");
-  });
-
-  it("shows the Switch checked when the toggle is on", () => {
+  it("shows the Switch checked in the default (GUI-on) state", () => {
     resetStore(true);
-    render(<BetaFeaturesSection />);
+    render(<InterfaceSection />);
     const sw = screen.getByRole("switch");
     expect(sw).toHaveAttribute("data-state", "checked");
   });
 
+  it("shows the Switch unchecked when the user opted back into CLI", () => {
+    resetStore(false);
+    render(<InterfaceSection />);
+    const sw = screen.getByRole("switch");
+    expect(sw).toHaveAttribute("data-state", "unchecked");
+  });
+
   it('"What\'s included" expander toggles the details list', async () => {
     const user = userEvent.setup();
-    render(<BetaFeaturesSection />);
+    render(<InterfaceSection />);
 
     expect(screen.queryByText(/MCP server runtime and management/i)).toBeNull();
 
@@ -89,16 +90,16 @@ describe("BetaFeaturesSection", () => {
     expect(screen.queryByText(/MCP server runtime and management/i)).toBeNull();
   });
 
-  it("flipping the toggle persists the flag and quits the app", async () => {
+  it("flipping the toggle off persists the flag and quits the app", async () => {
     const user = userEvent.setup();
 
-    render(<BetaFeaturesSection />);
+    render(<InterfaceSection />);
 
     await user.click(screen.getByRole("switch"));
 
     await waitFor(() =>
-      expect(invokeMock).toHaveBeenCalledWith("set_agent_chat_beta", {
-        enabled: true,
+      expect(invokeMock).toHaveBeenCalledWith("set_agent_chat_enabled", {
+        enabled: false,
       }),
     );
     expect(toast.success).toHaveBeenCalledWith(
@@ -118,22 +119,22 @@ describe("BetaFeaturesSection", () => {
     );
   });
 
-  it("surfaces a toast.error and does NOT quit when set_agent_chat_beta fails", async () => {
+  it("surfaces a toast.error and does NOT quit when set_agent_chat_enabled fails", async () => {
     const user = userEvent.setup();
     invokeMock.mockReset();
     invokeMock.mockRejectedValueOnce(new Error("disk full"));
 
-    render(<BetaFeaturesSection />);
+    render(<InterfaceSection />);
 
     await user.click(screen.getByRole("switch"));
 
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith(
-        expect.stringMatching(/Failed to update Agent Chat/i),
+        expect.stringMatching(/Failed to update the interface setting/i),
       ),
     );
     // No quit_app call should fire even after the 600ms window
-    // passes — only the failed set_agent_chat_beta is in the log.
+    // passes — only the failed set_agent_chat_enabled is in the log.
     // (Quitting after a failed persist would lose the user's intent
     // without persisting it.)
     await new Promise((resolve) => setTimeout(resolve, 800));
@@ -143,7 +144,7 @@ describe("BetaFeaturesSection", () => {
   it("surfaces a fallback toast if quit_app itself fails", async () => {
     const user = userEvent.setup();
     invokeMock.mockReset();
-    // First call (set_agent_chat_beta) succeeds; second call
+    // First call (set_agent_chat_enabled) succeeds; second call
     // (quit_app) rejects.
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "quit_app") {
@@ -152,7 +153,7 @@ describe("BetaFeaturesSection", () => {
       return Promise.resolve(undefined);
     });
 
-    render(<BetaFeaturesSection />);
+    render(<InterfaceSection />);
 
     await user.click(screen.getByRole("switch"));
 

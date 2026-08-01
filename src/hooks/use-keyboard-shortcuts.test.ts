@@ -16,6 +16,7 @@ vi.mock("@/tauri/commands", () => ({
 import { dispatch } from "./use-keyboard-shortcuts";
 import { useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { activateWorkspace } from "@/tauri/commands";
 import {
   setJumpTargets,
@@ -36,6 +37,13 @@ beforeEach(() => {
     showContentSearch: false,
     showCommandPalette: false,
     showNewWorkspaceDialog: false,
+  });
+  // Restore the store's boot state (GUI on) so a case that opts out
+  // doesn't leak into the next one.
+  const initialFlags = useFeatureFlags.getInitialState();
+  useFeatureFlags.setState({
+    enableAgentChat: initialFlags.enableAgentChat,
+    enableLazyWorkspaceCreation: initialFlags.enableLazyWorkspaceCreation,
   });
   window.localStorage.clear();
 });
@@ -154,8 +162,13 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
     });
 
     it("newAgent opens the New Workspace dialog when agent chat is off", () => {
-      // Default feature flags have agent chat disabled, so the New agent
-      // shortcut falls back to the dialog (same as the sidebar + button).
+      // With the Agent Chat GUI opted out, the New agent shortcut falls
+      // back to the dialog (same as the sidebar + button). The flags
+      // store boots ON to match the backend default, so opt out here.
+      useFeatureFlags.setState({
+        enableAgentChat: false,
+        enableLazyWorkspaceCreation: false,
+      });
       expect(useUIStore.getState().showNewWorkspaceDialog).toBe(false);
       const handled = dispatch("newAgent", FAKE_EVENT);
       expect(handled).toBe(true);

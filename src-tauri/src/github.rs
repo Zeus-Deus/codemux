@@ -28,12 +28,20 @@ pub struct PullRequestInfo {
     pub checks_passing: Option<bool>,
     #[serde(alias = "updatedAt", default)]
     pub updated_at: Option<String>,
-    /// Head commit SHA of the PR. Used to gate stale historical PRs:
-    /// once a workspace's HEAD has moved past this SHA, a MERGED/CLOSED
-    /// PR for the branch is no longer considered current and the badge
-    /// is cleared. Mirrors Superset's `headRefOid`-based attach rule.
+    /// Head commit SHA reported by GitHub. Kept as useful PR metadata, but
+    /// association is branch/repository based: a local worktree may
+    /// legitimately be behind the final remote PR head after review commits
+    /// land, so exact SHA equality is not a valid identity check.
     #[serde(alias = "headRefOid", default)]
     pub head_ref_oid: Option<String>,
+    /// Login of the repository that owns the PR's head branch (the fork
+    /// owner for a cross-repository PR, the base repo's owner otherwise).
+    /// Populated by the branch-PR list query only, where it disambiguates a
+    /// fork-tracking local branch from a same-named branch in the upstream
+    /// repo. Not a serde alias: gh emits this as a nested
+    /// `{"login": …}` object, so `parse_pr_json` flattens it by hand.
+    #[serde(default)]
+    pub head_repository_owner: Option<String>,
     /// Stage 5 — populated by `get_pull_request` only; list paths
     /// leave it `None` so a list query stays cheap. Body is truncated
     /// to 50 KB at a char boundary, mirroring the issue path.
@@ -68,47 +76,9 @@ impl PullRequestInfo {
     }
 }
 
-/// True for terminal PR states. `gh pr view` keeps returning a closed/merged
-/// PR for a branch indefinitely, so a long-lived workspace (typically `main`)
-/// would otherwise show the same merged-PR pill forever.
+/// True for terminal PR states.
 pub fn is_historical_pr_state(state: &str) -> bool {
     matches!(state, "CLOSED" | "MERGED")
-}
-
-/// Whether to attach a PR to a workspace's sidebar pill given the workspace's
-/// current HEAD SHA. Open/draft PRs always attach; historical PRs only attach
-/// while the workspace still points at the exact PR head commit. Mirrors
-/// Superset's `shouldAcceptPRMatch` SHA gate.
-pub fn should_show_branch_pr(pr: &PullRequestInfo, head_sha: Option<&str>) -> bool {
-    if !is_historical_pr_state(&pr.state) {
-        return true;
-    }
-    match (pr.head_ref_oid.as_deref(), head_sha) {
-        (Some(pr_sha), Some(ws_sha)) => pr_sha == ws_sha,
-        // Missing either side ⇒ can't prove the PR is still current; hide it
-        // rather than risk a stale pill on a long-lived branch.
-        _ => false,
-    }
-}
-
-/// `git rev-parse HEAD` for a worktree path. Returns `None` on any failure
-/// (detached HEAD edge cases, missing repo, transient errors) — callers
-/// treat None as "can't gate, fall back to permissive behavior".
-pub fn get_head_sha(repo_path: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if sha.is_empty() {
-        None
-    } else {
-        Some(sha)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -399,6 +369,25 @@ const ISSUE_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const MAX_ISSUE_COMMENTS: usize = 20;
 
 /// Run `gh` with a timeout. Returns Err if the process doesn't finish in time.
+/// Map a finished `gh` invocation onto the `Result` callers branch on.
+///
+/// Split out of `run_gh_timed` because the branch-PR pollers key their
+/// preserve-vs-clear decision on exactly this mapping: a non-zero exit must
+/// surface as `Err`, never as a successful-but-empty `Ok` (which they treat as
+/// authoritative and act on by clearing). Being process-free, it is unit
+/// testable without a live `gh`.
+fn gh_exit_result(
+    command: &str,
+    success: bool,
+    stdout: String,
+    stderr: &str,
+) -> Result<String, String> {
+    if !success {
+        return Err(format!("gh {command} failed: {}", stderr.trim()));
+    }
+    Ok(stdout.trim_end().to_string())
+}
+
 fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
     let mut cmd = Command::new("gh");
     cmd.args(args)
@@ -423,19 +412,21 @@ fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<St
                     buf
                 }).unwrap_or_default();
 
-                if !status.success() {
-                    let stderr = child.stderr.take().map(|mut s| {
+                let stderr = if status.success() {
+                    String::new()
+                } else {
+                    child.stderr.take().map(|mut s| {
                         let mut buf = String::new();
                         std::io::Read::read_to_string(&mut s, &mut buf).ok();
                         buf
-                    }).unwrap_or_default();
-                    return Err(format!(
-                        "gh {} failed: {}",
-                        args.first().unwrap_or(&""),
-                        stderr.trim()
-                    ));
-                }
-                return Ok(stdout.trim_end().to_string());
+                    }).unwrap_or_default()
+                };
+                return gh_exit_result(
+                    args.first().unwrap_or(&""),
+                    status.success(),
+                    stdout,
+                    &stderr,
+                );
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
@@ -759,23 +750,250 @@ pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, 
     ))
 }
 
+const BRANCH_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn run_git_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo_path);
+    sanitize_gui_env_std(&mut cmd);
+    cmd.output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|output| !output.is_empty())
+}
+
+/// Parse a GitHub remote into `(owner, repository)`. The normalized identity
+/// is used only to tell an origin branch from a fork branch; all other hosts
+/// deliberately fall back to the unqualified branch selector.
+fn parse_github_remote(remote_url: &str) -> Option<(String, String)> {
+    let remote_url = remote_url.trim();
+    let path = if let Some(path) = remote_url.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = remote_url.strip_prefix("github.com:") {
+        path
+    } else if let Some(path) = remote_url.strip_prefix("github.com/") {
+        path
+    } else {
+        let (_, authority_and_path) = remote_url.split_once("://")?;
+        let (authority, path) = authority_and_path.split_once('/')?;
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        path
+    }
+    .trim_matches('/');
+    let mut segments = path.split('/');
+    let owner = segments.next()?.trim();
+    let repository = segments.next()?.trim().trim_end_matches(".git");
+    if owner.is_empty() || repository.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    Some((owner.to_ascii_lowercase(), repository.to_ascii_lowercase()))
+}
+
+/// Owner login that a branch's PR head repository must match, or `None`
+/// when any owner is acceptable.
+///
+/// `gh pr list --head` matches the *bare* branch name only. The
+/// `owner:branch` form that `gh pr create` accepts is taken without
+/// complaint here but matches nothing — verified against gh 2.96.0, where
+/// `--head owner:branch` returns `[]` with exit 0 for a branch that
+/// `--head branch` resolves fine. Since a successful empty list is
+/// authoritative for callers, querying that way would clear a
+/// fork-tracking workspace's badge on every poll tick. So the query always
+/// uses the bare branch name and cross-repository ambiguity is resolved
+/// here instead: when the branch tracks a fork, only PRs whose head
+/// repository belongs to that fork's owner may match.
+fn branch_head_owner_filter(
+    tracking_remote_url: Option<&str>,
+    origin_remote_url: Option<&str>,
+) -> Option<String> {
+    let (tracking_owner, tracking_repo) = tracking_remote_url.and_then(parse_github_remote)?;
+    let (origin_owner, origin_repo) = origin_remote_url.and_then(parse_github_remote)?;
+
+    if tracking_owner == origin_owner && tracking_repo == origin_repo {
+        None
+    } else {
+        Some(tracking_owner)
+    }
+}
+
+/// Does this PR's head repository belong to the owner the branch expects?
+/// With no expected owner every PR qualifies. With one, a PR that failed to
+/// report its head repository owner cannot be confirmed as the fork's and
+/// is rejected — the alternative would be attaching an upstream PR to a
+/// fork workspace that merely shares a branch name.
+fn pr_matches_expected_owner(pr: &PullRequestInfo, expected_owner: Option<&str>) -> bool {
+    let Some(expected) = expected_owner else {
+        return true;
+    };
+    pr.head_repository_owner
+        .as_deref()
+        .is_some_and(|owner| owner.eq_ignore_ascii_case(expected))
+}
+
+fn resolve_branch_head_owner(repo_path: &Path, branch: &str) -> Option<String> {
+    let branch_remote_key = format!("branch.{branch}.remote");
+    let tracking_remote = run_git_optional(repo_path, &["config", "--get", &branch_remote_key]);
+    let tracking_remote_url = tracking_remote.as_deref().and_then(|remote| {
+        if remote == "." {
+            return None;
+        }
+        let remote_url_key = format!("remote.{remote}.url");
+        run_git_optional(repo_path, &["config", "--get", &remote_url_key])
+    });
+    let origin_remote_url = run_git_optional(repo_path, &["config", "--get", "remote.origin.url"]);
+
+    branch_head_owner_filter(
+        tracking_remote_url.as_deref(),
+        origin_remote_url.as_deref(),
+    )
+}
+
+fn is_newer_pr(candidate: &PullRequestInfo, current: &PullRequestInfo) -> bool {
+    candidate
+        .updated_at
+        .cmp(&current.updated_at)
+        .then_with(|| candidate.number.cmp(&current.number))
+        .is_gt()
+}
+
+/// Choose the PR that represents a branch today. An open/draft PR always wins
+/// over historical work when a branch name has been reused; otherwise the most
+/// recently updated PR wins. Historical PRs are suppressed only on the
+/// repository default branch, where they usually describe reverse-merge
+/// history rather than the workspace's work item.
+///
+/// `expected_owner` scopes the match to one head-repository owner for
+/// fork-tracking branches — see `branch_head_owner_filter`.
+///
+/// Candidates are ordered newest-first (highest PR number) before selection so
+/// the outcome never depends on the order gh happened to return, and so a
+/// heavily-reused branch name whose history was truncated by `--limit` still
+/// resolves deterministically to the newest PR it did see.
+fn select_branch_pr(
+    pull_requests: impl IntoIterator<Item = PullRequestInfo>,
+    branch: &str,
+    expected_owner: Option<&str>,
+    is_default_branch: bool,
+) -> Option<PullRequestInfo> {
+    let mut latest_open: Option<PullRequestInfo> = None;
+    let mut latest_historical: Option<PullRequestInfo> = None;
+
+    let mut candidates: Vec<PullRequestInfo> = pull_requests
+        .into_iter()
+        .filter(|pr| pr.head_branch.as_deref() == Some(branch))
+        .filter(|pr| pr_matches_expected_owner(pr, expected_owner))
+        .collect();
+    candidates.sort_by(|a, b| b.number.cmp(&a.number));
+
+    for pr in candidates {
+        if is_historical_pr_state(&pr.state) {
+            if is_default_branch {
+                continue;
+            }
+            if latest_historical
+                .as_ref()
+                .is_none_or(|current| is_newer_pr(&pr, current))
+            {
+                latest_historical = Some(pr);
+            }
+        } else if latest_open
+            .as_ref()
+            .is_none_or(|current| is_newer_pr(&pr, current))
+        {
+            latest_open = Some(pr);
+        }
+    }
+
+    latest_open.or(latest_historical)
+}
+
+/// Resolve the current branch's PR by explicit branch/repository identity.
+///
+/// `gh pr view` infers from local git state and applies an exact-SHA gate that
+/// drops a merged PR whenever review commits made the remote head newer than
+/// the still-open local worktree. Listing every state for the branch instead
+/// keeps merged/closed history visible: branch identity owns the association,
+/// while SHA is metadata. A failed GitHub request remains an `Err`, distinct
+/// from a successful empty list, so callers can preserve the last known PR
+/// through transient failures.
+///
+/// A detached HEAD (mid-rebase, mid-bisect, `gh pr checkout` of a SHA) is an
+/// `Err` for the same reason: there is no branch to answer *about*, so the
+/// question is unanswerable rather than answered "no PR". Returning `Ok(None)`
+/// there would let a routine rebase clear an OPEN badge.
 pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
-    let output = run_gh_optional(
+    let Some(branch) = run_git_optional(repo_path, &["branch", "--show-current"]) else {
+        return Err("detached HEAD: no branch to resolve a PR for".to_string());
+    };
+    let expected_owner = resolve_branch_head_owner(repo_path, &branch);
+    let output = run_gh_timed(
         repo_path,
         &[
-            "pr", "view",
-            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid",
+            "pr",
+            "list",
+            // Bare branch name on purpose — gh does not match the
+            // `owner:branch` form here. Fork disambiguation happens
+            // client-side via `expected_owner`.
+            "--head",
+            &branch,
+            "--state",
+            "all",
+            // 100 is gh's per-page maximum. Generous because the newest PR
+            // being paged out of a reused branch name's history is the one
+            // failure mode a smaller cap can produce.
+            "--limit",
+            "100",
+            "--json",
+            "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid,headRepositoryOwner",
         ],
-    );
+        BRANCH_PR_LOOKUP_TIMEOUT,
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "Expected JSON array from gh pr list".to_string())?;
+    let is_default_branch = crate::git::find_default_branch(repo_path).as_deref() == Some(&branch);
 
-    let Some(json_str) = output else {
-        return Ok(None);
-    };
+    Ok(select_branch_pr(
+        rows.iter().map(parse_pr_json),
+        &branch,
+        expected_owner.as_deref(),
+        is_default_branch,
+    ))
+}
 
-    let v: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+/// What a branch-PR lookup should do to a workspace's stored association.
+///
+/// The three arms are load-bearing and deliberately not collapsible: an
+/// unanswerable lookup must not be mistaken for an authoritative "no PR", or a
+/// dropped network / expired `gh` token would wipe every badge in the sidebar.
+#[derive(Debug, Clone)]
+pub enum BranchPrOutcome {
+    /// A PR is associated with the branch — store it.
+    Write(PullRequestInfo),
+    /// The lookup succeeded and the branch genuinely has no PR — clear any
+    /// stored association, including a merged/closed one.
+    Clear,
+    /// The lookup could not answer (gh failed or timed out, detached HEAD) —
+    /// keep whatever is already stored.
+    Preserve,
+}
 
-    Ok(Some(parse_pr_json(&v)))
+/// Single decision point shared by `refresh_workspace_pr` and both background
+/// pollers, so the match/empty/error matrix can't drift between them.
+pub fn branch_pr_outcome(lookup: Result<Option<PullRequestInfo>, String>) -> BranchPrOutcome {
+    match lookup {
+        Ok(Some(pr)) => BranchPrOutcome::Write(pr),
+        Ok(None) => BranchPrOutcome::Clear,
+        Err(_) => BranchPrOutcome::Preserve,
+    }
 }
 
 pub fn create_pull_request(
@@ -1027,7 +1245,7 @@ pub fn get_pr_inline_comments(
 
 // NOTE: As of 2026-04-26 the Review tab UI no longer exposes review
 // submission — the composer was removed in the visual-match PR
-// (`feature/review-tab-visual-match`) to mirror Superset's resting
+// (`feature/review-tab-visual-match`) in favour of a quieter resting
 // layout. This command is retained intact in case the UI is restored
 // later (e.g. command palette action, modal, or context menu). Don't
 // delete without confirming with the maintainer.
@@ -1151,6 +1369,11 @@ fn parse_pr_json(v: &serde_json::Value) -> PullRequestInfo {
             .as_str()
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty()),
+        // gh nests this as `{"id": …, "login": …}`; only the login is useful.
+        head_repository_owner: v["headRepositoryOwner"]["login"]
+            .as_str()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty()),
         // Detail-only fields. List paths leave these None / empty so
         // the cheap query stays cheap.
         body: None,
@@ -1231,8 +1454,8 @@ mod tests {
 
     #[test]
     fn test_parse_pr_info_captures_head_ref_oid() {
-        // `headRefOid` powers the SHA-gate that hides stale merged PRs
-        // from long-lived branches. Without it the gate falls open.
+        // Keep the remote SHA available as metadata without using it as the
+        // identity of a branch's PR.
         let json = serde_json::json!({
             "number": 1,
             "url": "https://example",
@@ -1246,9 +1469,8 @@ mod tests {
 
     #[test]
     fn test_parse_pr_info_treats_missing_head_ref_oid_as_none() {
-        // List-shape gh JSON rarely includes headRefOid. Don't synthesize
-        // a placeholder — the gate treats None as "can't prove current"
-        // and hides historical PRs accordingly.
+        // Older gh output and callers that request a smaller JSON shape may
+        // omit the SHA. Branch association must not depend on its presence.
         let json = serde_json::json!({
             "number": 1,
             "url": "https://example",
@@ -1259,22 +1481,29 @@ mod tests {
         assert!(pr.head_ref_oid.is_none());
     }
 
-    fn pr_with(state: &str, head_ref_oid: Option<&str>) -> PullRequestInfo {
+    fn branch_pr(
+        number: u32,
+        state: &str,
+        branch: &str,
+        updated_at: &str,
+        head_ref_oid: Option<&str>,
+    ) -> PullRequestInfo {
         PullRequestInfo {
-            number: 1,
-            url: "https://example".into(),
+            number,
+            url: format!("https://example/pull/{number}"),
             state: state.into(),
-            title: "T".into(),
-            head_branch: None,
-            base_branch: None,
+            title: format!("PR {number}"),
+            head_branch: Some(branch.into()),
+            base_branch: Some("main".into()),
             is_draft: false,
             mergeable: None,
             additions: None,
             deletions: None,
             review_decision: None,
             checks_passing: None,
-            updated_at: None,
+            updated_at: Some(updated_at.into()),
             head_ref_oid: head_ref_oid.map(|s| s.to_string()),
+            head_repository_owner: None,
             body: None,
             comments: Vec::new(),
             total_comments: 0,
@@ -1282,48 +1511,249 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_should_show_branch_pr_open_always_attaches() {
-        // Open PRs attach regardless of SHA — the user is actively working
-        // on the branch and expects to see the pill.
-        let pr = pr_with("OPEN", Some("aaa"));
-        assert!(should_show_branch_pr(&pr, Some("bbb")));
-        assert!(should_show_branch_pr(&pr, None));
+    /// `branch_pr` plus a head-repository owner, for the fork-disambiguation
+    /// cases. `None` models a row where gh reported no owner at all.
+    fn branch_pr_owned_by(
+        number: u32,
+        state: &str,
+        branch: &str,
+        updated_at: &str,
+        owner: Option<&str>,
+    ) -> PullRequestInfo {
+        PullRequestInfo {
+            head_repository_owner: owner.map(|s| s.to_string()),
+            ..branch_pr(number, state, branch, updated_at, None)
+        }
     }
 
     #[test]
-    fn test_should_show_branch_pr_merged_attaches_when_sha_matches() {
-        // On the original feature-branch worktree the branch HEAD still
-        // equals the PR head SHA, so the merged-PR pill stays until the
-        // worktree is removed.
-        let pr = pr_with("MERGED", Some("aaa"));
-        assert!(should_show_branch_pr(&pr, Some("aaa")));
+    fn test_parse_github_remote_supports_ssh_and_https() {
+        assert_eq!(
+            parse_github_remote("git@github.com:Zeus-Deus/codemux.git"),
+            Some(("zeus-deus".into(), "codemux".into()))
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com/Zeus-Deus/codemux.git"),
+            Some(("zeus-deus".into(), "codemux".into()))
+        );
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/Zeus-Deus/codemux.git"),
+            Some(("zeus-deus".into(), "codemux".into()))
+        );
     }
 
     #[test]
-    fn test_should_show_branch_pr_merged_hides_when_sha_diverges() {
-        // The bug this fix targets: on `main`, after merging PR #138,
-        // main's HEAD has advanced past the PR's head commit and the
-        // pill must disappear.
-        let pr = pr_with("MERGED", Some("aaa"));
-        assert!(!should_show_branch_pr(&pr, Some("bbb")));
+    fn test_parse_github_remote_rejects_other_hosts_and_malformed_paths() {
+        assert_eq!(
+            parse_github_remote("https://notgithub.com/owner/repo.git"),
+            None
+        );
+        assert_eq!(parse_github_remote("git@gitlab.com:owner/repo.git"), None);
+        assert_eq!(parse_github_remote("https://github.com/owner"), None);
     }
 
     #[test]
-    fn test_should_show_branch_pr_closed_hides_when_sha_diverges() {
-        let pr = pr_with("CLOSED", Some("aaa"));
-        assert!(!should_show_branch_pr(&pr, Some("bbb")));
+    fn test_branch_head_owner_filter_is_unset_inside_the_origin_repo() {
+        // Same repo (case-insensitively) — every PR gh returns for the branch
+        // is ours, so no owner filter is needed.
+        assert_eq!(
+            branch_head_owner_filter(
+                Some("git@github.com:owner/repo.git"),
+                Some("https://github.com/OWNER/repo.git"),
+            ),
+            None
+        );
     }
 
     #[test]
-    fn test_should_show_branch_pr_historical_with_missing_sha_hides() {
-        // If we can't prove the workspace still points at the PR head,
-        // err on the side of hiding the pill rather than leaving stale
-        // data on the screen forever.
-        let pr_no_oid = pr_with("MERGED", None);
-        assert!(!should_show_branch_pr(&pr_no_oid, Some("aaa")));
-        let pr = pr_with("MERGED", Some("aaa"));
-        assert!(!should_show_branch_pr(&pr, None));
+    fn test_branch_head_owner_filter_names_the_fork_owner() {
+        assert_eq!(
+            branch_head_owner_filter(
+                Some("git@github.com:contributor/repo.git"),
+                Some("https://github.com/upstream/repo.git"),
+            ),
+            Some("contributor".to_string())
+        );
+    }
+
+    #[test]
+    fn test_branch_head_owner_filter_is_unset_for_unparseable_remotes() {
+        // A non-GitHub or missing remote yields no filter rather than a
+        // filter that would reject everything.
+        assert_eq!(
+            branch_head_owner_filter(
+                Some("git@gitlab.com:contributor/repo.git"),
+                Some("https://github.com/upstream/repo.git"),
+            ),
+            None
+        );
+        assert_eq!(
+            branch_head_owner_filter(None, Some("https://github.com/upstream/repo.git")),
+            None
+        );
+    }
+
+    #[test]
+    fn test_select_branch_pr_keeps_only_the_fork_owners_pr() {
+        // Both PRs share the branch name; only the fork's is this
+        // workspace's. gh cannot express this server-side (`--head
+        // owner:branch` matches nothing), so the filter runs here.
+        let upstream = branch_pr_owned_by(
+            10,
+            "OPEN",
+            "feature/popup",
+            "2026-08-02T10:00:00Z",
+            Some("upstream"),
+        );
+        let fork = branch_pr_owned_by(
+            9,
+            "OPEN",
+            "feature/popup",
+            "2026-08-01T10:00:00Z",
+            Some("Contributor"),
+        );
+        // Owner comparison is case-insensitive: git remotes are normalised to
+        // lowercase, gh reports GitHub's canonical casing.
+        assert_eq!(
+            select_branch_pr(
+                [upstream, fork],
+                "feature/popup",
+                Some("contributor"),
+                false
+            )
+            .map(|pr| pr.number),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn test_select_branch_pr_rejects_prs_with_no_owner_when_a_fork_is_expected() {
+        // An unconfirmable row must not be attached to a fork workspace.
+        let unknown = branch_pr_owned_by(11, "OPEN", "feature/popup", "2026-08-02T10:00:00Z", None);
+        assert!(select_branch_pr([unknown], "feature/popup", Some("contributor"), false).is_none());
+    }
+
+    #[test]
+    fn test_select_branch_pr_ignores_owner_when_no_fork_is_expected() {
+        // Same-repo branches must keep matching even though the list query
+        // now carries owner data.
+        let pr = branch_pr_owned_by(12, "OPEN", "feature/popup", "2026-08-02T10:00:00Z", None);
+        assert_eq!(
+            select_branch_pr([pr], "feature/popup", None, false).map(|pr| pr.number),
+            Some(12)
+        );
+    }
+
+    #[test]
+    fn test_select_branch_pr_keeps_merged_pr_when_remote_sha_advanced() {
+        // Regression: review commits can advance GitHub's PR head beyond the
+        // still-open local worktree. Selection is intentionally independent
+        // of the local SHA, so the MERGED state still reaches the sidebar.
+        let merged = branch_pr(
+            231,
+            "MERGED",
+            "feature/popup",
+            "2026-08-01T10:00:00Z",
+            Some("remote-sha-after-review"),
+        );
+        let selected = select_branch_pr([merged], "feature/popup", None, false).unwrap();
+        assert_eq!(selected.number, 231);
+        assert_eq!(selected.state, "MERGED");
+    }
+
+    #[test]
+    fn test_select_branch_pr_hides_historical_prs_on_default_branch() {
+        let merged = branch_pr(23, "MERGED", "main", "2026-08-01T10:00:00Z", None);
+        let closed = branch_pr(24, "CLOSED", "main", "2026-08-02T10:00:00Z", None);
+        assert!(select_branch_pr([merged, closed], "main", None, true).is_none());
+    }
+
+    #[test]
+    fn test_select_branch_pr_allows_open_pr_on_default_branch() {
+        let open = branch_pr(25, "OPEN", "main", "2026-08-01T10:00:00Z", None);
+        assert_eq!(
+            select_branch_pr([open], "main", None, true).map(|pr| pr.number),
+            Some(25)
+        );
+    }
+
+    #[test]
+    fn test_select_branch_pr_prefers_open_over_newer_merged_pr() {
+        let merged = branch_pr(45, "MERGED", "feature/reused", "2026-08-02T10:00:00Z", None);
+        let open = branch_pr(46, "OPEN", "feature/reused", "2026-08-01T10:00:00Z", None);
+        assert_eq!(
+            select_branch_pr([merged, open], "feature/reused", None, false).map(|pr| pr.number),
+            Some(46)
+        );
+    }
+
+    #[test]
+    fn test_select_branch_pr_uses_newest_historical_pr_and_ignores_other_branches() {
+        let old = branch_pr(30, "MERGED", "feature/reused", "2026-08-01T10:00:00Z", None);
+        let latest = branch_pr(31, "CLOSED", "feature/reused", "2026-08-02T10:00:00Z", None);
+        let other = branch_pr(99, "OPEN", "feature/other", "2026-08-03T10:00:00Z", None);
+        assert_eq!(
+            select_branch_pr([old, latest, other], "feature/reused", None, false)
+                .map(|pr| pr.number),
+            Some(31)
+        );
+    }
+
+    #[test]
+    fn test_select_branch_pr_is_independent_of_input_order() {
+        // Candidates are sorted newest-first before selection, so whatever
+        // order gh returns cannot change the answer — including when two
+        // historical PRs share an `updatedAt` and only the number separates
+        // them.
+        let a = branch_pr(60, "MERGED", "feature/reused", "2026-08-01T10:00:00Z", None);
+        let b = branch_pr(61, "MERGED", "feature/reused", "2026-08-01T10:00:00Z", None);
+        let c = branch_pr(59, "MERGED", "feature/reused", "2026-08-01T10:00:00Z", None);
+        let ascending = select_branch_pr(
+            [c.clone(), a.clone(), b.clone()],
+            "feature/reused",
+            None,
+            false,
+        )
+        .map(|pr| pr.number);
+        let descending = select_branch_pr([b, a, c], "feature/reused", None, false).map(|pr| pr.number);
+        assert_eq!(ascending, Some(61));
+        assert_eq!(descending, Some(61));
+    }
+
+    #[test]
+    fn test_gh_exit_result_maps_a_non_zero_exit_to_err() {
+        // Load-bearing: the pollers preserve a stored PR badge on `Err` and
+        // clear it on a successful empty list. A failed `gh` must never look
+        // like an empty success.
+        let failed = gh_exit_result(
+            "pr",
+            false,
+            "[]".to_string(),
+            "gh: To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN environment variable.\n",
+        );
+        assert!(failed.is_err());
+        assert!(failed.unwrap_err().starts_with("gh pr failed:"));
+
+        let succeeded = gh_exit_result("pr", true, "[]\n".to_string(), "");
+        assert_eq!(succeeded, Ok("[]".to_string()));
+    }
+
+    #[test]
+    fn test_branch_pr_outcome_matrix() {
+        // match → write, successful empty → clear, error → preserve.
+        let pr = branch_pr(70, "MERGED", "feature/popup", "2026-08-01T10:00:00Z", None);
+        assert!(matches!(
+            branch_pr_outcome(Ok(Some(pr))),
+            BranchPrOutcome::Write(written) if written.number == 70
+        ));
+        assert!(matches!(
+            branch_pr_outcome(Ok(None)),
+            BranchPrOutcome::Clear
+        ));
+        assert!(matches!(
+            branch_pr_outcome(Err("gh pr failed: network unreachable".to_string())),
+            BranchPrOutcome::Preserve
+        ));
     }
 
     #[test]
@@ -1377,6 +1807,7 @@ mod tests {
             checks_passing: None,
             updated_at: Some("2026-04-27T00:00:00Z".into()),
             head_ref_oid: Some("deadbeef".into()),
+            head_repository_owner: Some("zeus".into()),
             body: Some("PR body here".into()),
             comments: vec![IssueComment {
                 author: "alice".into(),

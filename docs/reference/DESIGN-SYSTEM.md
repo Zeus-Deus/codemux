@@ -115,6 +115,7 @@ overview):
   colors into `style` attributes and so cannot consume CSS variables. Their
   token colors are derived from the terminal ANSI palette
   (`src/lib/shiki-chat-theme.ts`) — the same documented ANSI exception that
-  covers `TerminalPane` and the CodeMirror editor theme. Structural chrome
+  covers `TerminalPane` and the CodeMirror editor theme. `ChatCodeBlock.tsx`
+  owns the file-aware header and wrap/copy controls; structural chrome
   (container, header, borders, inline-code pill) stays on design tokens under
   `.chat-markdown` in `globals.css`.
