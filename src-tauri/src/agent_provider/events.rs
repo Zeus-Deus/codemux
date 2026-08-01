@@ -168,6 +168,44 @@ pub struct WorkflowSnapshot {
     pub duration_ms: Option<u64>,
 }
 
+/// Provider-neutral lifecycle state for one agent-authored task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One row in the agent's current task plan.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TaskSnapshotItem {
+    /// Provider-native id when one exists; positional adapters synthesize a
+    /// stable id so persisted replay and the live UI share row identity.
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: TaskStatus,
+    /// Optional provider-authored detail (for example Claude's active form).
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Provider-native dependency ids that currently block this task.
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+}
+
+/// Complete replacement snapshot of the task plan for one chat thread.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TasksSnapshot {
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<TaskSnapshotItem>,
+}
+
 /// A streamed fragment produced mid-turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -285,6 +323,12 @@ pub enum ProviderRuntimeEvent {
     WorkflowUpdated {
         thread_id: ThreadId,
         workflow: WorkflowSnapshot,
+    },
+    /// The provider replaced its current task plan. This durable, thread-
+    /// scoped state drives both the composer toggle and the Tasks panel.
+    TasksUpdated {
+        thread_id: ThreadId,
+        tasks: TasksSnapshot,
     },
     /// The turn finished — either successfully or with a terminal error.
     TurnCompleted {

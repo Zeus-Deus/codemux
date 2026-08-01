@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
+import type { TasksSnapshot } from "@/tauri/events";
 import type { PaneNodeSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
 // ── Mocks ──
@@ -22,9 +23,13 @@ vi.mock("@/components/workflow/orchestration-panel", () => ({
 
 const mocks = vi.hoisted(() => ({
   workflow: { run: null as WorkflowRunItem | null, threadId: null as string | null },
+  tasks: null as TasksSnapshot | null,
 }));
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
   useWorkspaceWorkflow: () => mocks.workflow,
+}));
+vi.mock("@/hooks/use-active-chat-tasks", () => ({
+  useActiveChatTasks: () => ({ threadId: "thread-1", tasks: mocks.tasks }),
 }));
 
 import { RightPanel } from "./right-panel";
@@ -97,6 +102,42 @@ function makeRun(overrides: Partial<WorkflowRunItem> = {}): WorkflowRunItem {
 afterEach(() => {
   cleanup();
   mocks.workflow = { run: null, threadId: null };
+  mocks.tasks = null;
+});
+
+describe("RightPanel Tasks tab", () => {
+  it("is absent until the focused chat has tasks", () => {
+    render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);
+    expect(screen.queryByTestId("tasks-tab")).toBeNull();
+  });
+
+  it("shows progress and renders the task body for the focused chat", () => {
+    mocks.tasks = {
+      tasks: [
+        { task_id: "1", title: "Done", status: "completed", blocked_by: [] },
+        { task_id: "2", title: "Working", status: "in_progress", blocked_by: [] },
+      ],
+    };
+    render(<RightPanel workspace={makeWorkspace()} activeTab="tasks" />);
+    expect(screen.getByTestId("tasks-tab")).toHaveTextContent("1/2");
+    expect(screen.getByTestId("tasks-panel")).toBeInTheDocument();
+  });
+
+  it("shows a live dot for an in-flight step only while another tab is active", () => {
+    mocks.tasks = {
+      tasks: [
+        { task_id: "1", title: "Done", status: "completed", blocked_by: [] },
+        { task_id: "2", title: "Working", status: "in_progress", blocked_by: [] },
+      ],
+    };
+    const { rerender } = render(
+      <RightPanel workspace={makeWorkspace()} activeTab="files" />,
+    );
+    expect(screen.getByTestId("tasks-live-dot")).toBeInTheDocument();
+
+    rerender(<RightPanel workspace={makeWorkspace()} activeTab="tasks" />);
+    expect(screen.queryByTestId("tasks-live-dot")).toBeNull();
+  });
 });
 
 describe("RightPanel Orchestration tab", () => {

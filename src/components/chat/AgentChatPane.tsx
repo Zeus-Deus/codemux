@@ -55,6 +55,7 @@ import {
   type Attachment,
 } from "@/stores/agent-chat-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useUIStore } from "@/stores/ui-store";
 import { useShallow } from "zustand/react/shallow";
 import {
   selectCapabilities,
@@ -381,6 +382,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const paneWorkspaceId = useAppStore(
     (s) => workspaceIdForPane ?? s.appState?.active_workspace_id ?? null,
   );
+  const rightPanelTab = useUIStore((state) =>
+    paneWorkspaceId ? state.rightPanelTabs?.[paneWorkspaceId] ?? null : null,
+  );
+  const toggleRightPanel = useUIStore((state) => state.toggleRightPanel);
   // The pane workspace's actual checked-out branch (from the workspace
   // snapshot's git watcher). Thread Scope prefers this over the branch
   // picker's main/master heuristic for the "current checkout" display,
@@ -459,6 +464,18 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const draft = slice?.inputDraft ?? "";
   const messages = slice?.messages ?? EMPTY_MESSAGES;
   const streaming = slice?.streaming ?? false;
+  const tasks = slice?.tasks ?? null;
+  const taskSummary = useMemo(() => {
+    if (!tasks || tasks.tasks.length === 0) return null;
+    return {
+      completed: tasks.tasks.filter((task) => task.status === "completed").length,
+      total: tasks.tasks.length,
+      running: tasks.tasks.some((task) => task.status === "in_progress"),
+    };
+  }, [tasks]);
+  const handleTasksClick = useCallback(() => {
+    if (paneWorkspaceId) toggleRightPanel?.(paneWorkspaceId, "tasks");
+  }, [paneWorkspaceId, toggleRightPanel]);
 
   // Warm the MCP servers once when a fresh (empty) chat pane mounts, so
   // the prime cost overlaps the user composing rather than blocking the
@@ -2705,6 +2722,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       zone1Override={zone1Override}
       belowComposerSlot={belowComposerSlot}
+      tasks={taskSummary}
+      tasksOpen={rightPanelTab === "tasks"}
+      onTasksClick={handleTasksClick}
       provider={provider}
       model={model}
       permissionMode={permissionMode}

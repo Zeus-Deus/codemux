@@ -1,60 +1,78 @@
-import { Circle, CircleCheck } from "lucide-react";
-import { memo } from "react";
+import { ChevronRight, ListTodo } from "lucide-react";
+import { memo, useCallback } from "react";
 
 import { cn } from "@/lib/utils";
+import { useUIStore } from "@/stores/ui-store";
 import type { ToolCallItem } from "@/lib/agent-chat/types";
 
 /**
- * Task-list summary card (design D8). Rendered for `TodoWrite`-style tool
- * calls — a tool whose input carries a `todos` array. Completed items get
- * a green circled check; everything else a hollow circle. We never
- * fabricate a summary from prose: no `todos` array → this component is
- * not used (see `extractTodos` / the MessageList dispatch).
+ * Task-list receipt line. Rendered for `TodoWrite`-style tool calls — a
+ * tool whose input carries a `todos` array. The full list used to be
+ * printed here, duplicating the Tasks panel with a copy that never
+ * updated; now the thread just records that a plan landed ("Task list
+ * created · 3 items") and the panel stays the single live truth.
+ * Clicking the receipt flips the right panel to the Tasks tab when a
+ * `workspaceId` is available (same pattern as `WorkflowRunCard`'s
+ * "Open panel"); absent → the row is inert rather than throwing. We
+ * never fabricate a receipt from prose: no `todos` array → this
+ * component is not used (see `extractTodos` / the MessageList dispatch).
  */
 export const TaskSummaryCard = memo(function TaskSummaryCard({
   item,
+  workspaceId = null,
 }: {
   item: ToolCallItem;
+  workspaceId?: string | null;
 }) {
+  const openPanel = useCallback(() => {
+    if (workspaceId) useUIStore.getState().setRightPanelTab(workspaceId, "tasks");
+  }, [workspaceId]);
+
   const todos = extractTodos(item.input);
   if (todos.length === 0) return null;
 
   const done = todos.filter((t) => t.status === "completed").length;
+  const interactive = workspaceId != null;
 
   return (
-    <div className="rounded-[11px] border border-border/60 bg-foreground/[0.025] px-[15px] py-[14px]">
-      <div className="mb-2.5 text-[13px] font-bold text-foreground">
-        Task list · {done}/{todos.length} done
-      </div>
-      <div className="flex flex-col gap-2">
-        {todos.map((todo, i) => {
-          const complete = todo.status === "completed";
-          return (
-            <div
-              key={i}
-              className="flex items-start gap-[9px] text-[13px] leading-[1.5] text-foreground"
-            >
-              {complete ? (
-                <CircleCheck
-                  className="mt-px h-[15px] w-[15px] shrink-0 text-status-open"
-                  strokeWidth={1.7}
-                  aria-hidden
-                />
-              ) : (
-                <Circle
-                  className="mt-px h-[15px] w-[15px] shrink-0 text-muted-foreground/40"
-                  strokeWidth={1.7}
-                  aria-hidden
-                />
-              )}
-              <span className={cn(complete && "text-muted-foreground")}>
-                {todo.label}
-              </span>
-            </div>
-          );
-        })}
-      </div>
-    </div>
+    <button
+      type="button"
+      onClick={openPanel}
+      disabled={!interactive}
+      data-testid="task-receipt"
+      className={cn(
+        "flex w-full items-center gap-2.5 rounded-[11px] border border-border/60 bg-foreground/[0.025] px-3 py-2 text-left transition-colors",
+        interactive
+          ? "cursor-pointer hover:border-border hover:bg-foreground/[0.05]"
+          : "cursor-default",
+      )}
+    >
+      <ListTodo
+        className="size-[15px] shrink-0 text-muted-foreground"
+        strokeWidth={1.6}
+        aria-hidden
+      />
+      <span className="min-w-0 flex-1 truncate text-xs text-foreground/80">
+        {done > 0 ? "Task list updated" : "Task list created"} ·{" "}
+        <span className="font-semibold text-foreground">
+          {done > 0
+            ? `${done}/${todos.length} done`
+            : `${todos.length} item${todos.length === 1 ? "" : "s"}`}
+        </span>
+      </span>
+      {interactive && (
+        <>
+          <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">
+            Open in panel
+          </span>
+          <ChevronRight
+            className="size-3 shrink-0 text-muted-foreground"
+            strokeWidth={1.7}
+            aria-hidden
+          />
+        </>
+      )}
+    </button>
   );
 });
 
