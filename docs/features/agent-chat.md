@@ -648,8 +648,8 @@ the plan and progress but cannot check, reorder, or rewrite its rows.
 - **Provider mapping.** Codex maps `turn/plan/updated`; OpenCode maps
   `todo.updated`; Claude maps legacy `TodoWrite` and the current
   `TaskCreate` / `TaskUpdate` / `TaskList` result stream. Child/subagent plans
-  remain child-scoped and never replace the orchestrator's panel. There is no
-  Cursor provider adapter in Codemux today; the canonical event is deliberately
+  remain child-scoped and never replace the orchestrator's panel. No ACP-based
+  provider adapter exists in Codemux today; the canonical event is deliberately
   provider-neutral so a future adapter can map ACP `plan` updates without UI
   changes.
 - **Thread focus.** `useActiveChatTasks` resolves the active surface's focused
