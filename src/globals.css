@@ -390,81 +390,113 @@ body.pane-resizing iframe {
   accent-color: var(--accent-ember);
 }
 
-/* ── Chat markdown (Streamdown) ──────────────────────────────────────
+/* ── Chat markdown ──────────────────────────────────────────────────
  *
- * Streamdown renders its own code-block card: an outer container *and* an
- * inner bordered body. Left alone that reads as a box inside a box, so the
- * body is flattened here and the outer container carries the single border.
+ * Streamdown owns parsing and incomplete-fence repair; Codemux owns the
+ * fenced-code card so its file-aware title, wrap/copy actions and spacing are
+ * stable across Streamdown releases.
  *
  * Only structure/chrome is styled here, all from design tokens. Syntax token
  * colors are inlined by Shiki from the terminal ANSI palette — see
  * `src/lib/shiki-chat-theme.ts` and the ANSI exception in
  * `docs/reference/DESIGN-SYSTEM.md`.
  *
- * These selectors are `.chat-markdown [data-streamdown=...]` (two units of
- * specificity) so they win over streamdown's inline Tailwind utilities
- * without `!important`.
+ * Syntax token colors are still supplied by the shared Streamdown Shiki
+ * plugin. The custom card changes the shell, not the highlighting pipeline.
  */
-.chat-markdown [data-streamdown="code-block"] {
-  position: relative;
-  margin: 0.6rem 0;
-  gap: 0;
-  border-radius: 8px;
-  border-color: color-mix(in srgb, var(--border) 80%, transparent);
+.chat-markdown [data-chat-code-block] {
+  width: 100%;
+  min-width: 0;
+  margin: 0.65rem 0;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--muted) 78%, var(--background));
+  contain-intrinsic-size: auto 120px;
+  content-visibility: auto;
+}
+
+.chat-markdown [data-chat-code-header] {
+  display: flex;
+  min-height: 33px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 84%, transparent);
   background: var(--muted);
-  padding: 0;
+  padding: 0.25rem 0.375rem 0.25rem 0.7rem;
+  color: var(--muted-foreground);
 }
 
-/* The language caption. Small, tracked, and quiet — it labels the block
- * without competing with the code. No divider rule: the fill change against
- * the surrounding prose is already enough separation, and a second line here
- * is what made the card read as boxy. */
-.chat-markdown [data-streamdown="code-block-header"] {
-  height: auto;
-  padding: 0.4rem 0.7rem 0;
-  border-bottom: none;
-  color: color-mix(in srgb, var(--muted-foreground) 85%, transparent);
-  font-size: 10px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+.chat-markdown [data-chat-code-title] {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.4rem;
+  border-radius: 3px;
+  font-family: 'JetBrains Mono Variable', monospace;
+  font-size: 11px;
+  line-height: 1;
 }
 
-/* A fence with no language (plain command output) still gets a header
- * element with an empty label. Left alone it reserves a full empty strip at
- * the top of the block, which is why those blocks looked top-heavy. */
-.chat-markdown [data-streamdown="code-block-header"][data-language=""] {
-  display: none;
+.chat-markdown [data-chat-code-title]:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--ring) 70%, transparent);
+  outline-offset: 2px;
 }
 
-.chat-markdown [data-streamdown="code-block-body"] {
-  border: none;
-  border-radius: 0;
-  background: transparent;
-  padding: 0.3rem 0.7rem 0.55rem;
+/* A fence whose closing ``` has not arrived yet is still filling in, and its
+ * copy action would only capture the partial snippet. `data-incomplete` (from
+ * Streamdown's incomplete-fence signal) softens the title so the card reads as
+ * provisional. Deliberately opacity only — no motion, since a transcript can
+ * stream several blocks at once, and no color literal. */
+.chat-markdown [data-chat-code-block][data-incomplete] [data-chat-code-title] {
+  opacity: 0.6;
+}
+
+.chat-markdown [data-chat-code-actions] {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 0.125rem;
+}
+
+.chat-markdown [data-chat-code-actions] [data-slot="button"] {
+  color: var(--muted-foreground);
+}
+
+.chat-markdown [data-chat-code-actions] [data-slot="button"]:hover,
+.chat-markdown [data-chat-code-actions] [data-slot="button"][aria-pressed="true"] {
+  color: var(--foreground);
+}
+
+.chat-markdown [data-chat-code-body] {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 0.8rem 0.9rem;
 }
 
 /* Long lines scroll sideways (wrap is opt-in via `chat.code_wrap`), so the
  * scrollbar is a permanent fixture on wide blocks — keep it thin and quiet
  * instead of the platform default slab. */
-.chat-markdown [data-streamdown="code-block-body"] {
+.chat-markdown [data-chat-code-body] {
   scrollbar-width: thin;
   scrollbar-color: color-mix(in srgb, var(--border) 90%, transparent) transparent;
 }
 
-.chat-markdown [data-streamdown="code-block-body"]::-webkit-scrollbar {
+.chat-markdown [data-chat-code-body]::-webkit-scrollbar {
   height: 7px;
 }
 
-.chat-markdown [data-streamdown="code-block-body"]::-webkit-scrollbar-track {
+.chat-markdown [data-chat-code-body]::-webkit-scrollbar-track {
   background: transparent;
 }
 
-.chat-markdown [data-streamdown="code-block-body"]::-webkit-scrollbar-thumb {
+.chat-markdown [data-chat-code-body]::-webkit-scrollbar-thumb {
   border-radius: 999px;
   background: color-mix(in srgb, var(--border) 90%, transparent);
 }
 
-.chat-markdown [data-streamdown="code-block-body"]::-webkit-scrollbar-thumb:hover {
+.chat-markdown [data-chat-code-body]::-webkit-scrollbar-thumb:hover {
   background: color-mix(in srgb, var(--muted-foreground) 60%, transparent);
 }
 
@@ -494,72 +526,28 @@ body.pane-resizing iframe {
   background: color-mix(in srgb, var(--muted-foreground) 60%, transparent);
 }
 
-/* Without the caption above it, the body owns the block's top padding. */
-.chat-markdown
-  [data-streamdown="code-block"][data-language=""]
-  [data-streamdown="code-block-body"] {
-  padding-top: 0.55rem;
-}
-
-/* Copy/download pill.
- *
- * Streamdown positions it by pulling a sticky spacer row up over the header
- * (`-mt-10`), which hard-couples it to the header's height — so hiding the
- * header for plain fences would fling the pill outside the card. Collapsing
- * that spacer and anchoring the pill to the card instead decouples the two.
- * The spacer is the only child div with no `data-streamdown` attribute. */
-.chat-markdown [data-streamdown="code-block"] > div:not([data-streamdown]) {
-  position: static;
-  height: 0;
+.chat-markdown [data-chat-code-body] pre,
+.chat-markdown [data-chat-code-body] code {
   margin: 0;
-}
-
-/* Reveal on hover/focus: a transcript can hold dozens of blocks, and two
- * always-lit icons per block is a lot of standing chrome. */
-.chat-markdown [data-streamdown="code-block-actions"] {
-  position: absolute;
-  top: 5px;
-  right: 5px;
-  z-index: 10;
-  border-color: transparent;
-  background: color-mix(in srgb, var(--muted) 92%, var(--foreground));
-  opacity: 0;
-  transition: opacity 120ms ease;
-}
-
-.chat-markdown [data-streamdown="code-block"]:hover [data-streamdown="code-block-actions"],
-.chat-markdown [data-streamdown="code-block-actions"]:focus-within {
-  opacity: 1;
-}
-
-/* Keyboard users never trigger :hover, so never hide it from them. */
-@media (hover: none) {
-  .chat-markdown [data-streamdown="code-block-actions"] {
-    opacity: 1;
-  }
-}
-
-.chat-markdown [data-streamdown="code-block-body"] pre,
-.chat-markdown [data-streamdown="code-block-body"] code {
+  padding: 0;
   font-family: 'JetBrains Mono Variable', monospace;
   font-size: 12px;
-  line-height: 1.55;
+  line-height: 1.4;
   background: transparent;
 }
 
-/* Streamdown wraps each source line in a bare `<span>` and only gives it
- * `display: block` as part of the *line-number* class. With line numbers off
- * those spans stay inline and every line collapses onto one, so the line box
- * has to be restored here. */
-.chat-markdown [data-streamdown="code-block-body"] pre > code > span {
+/* Each source line is its own box so empty lines retain height and horizontal
+ * scrolling measures the longest line instead of collapsing the token spans. */
+.chat-markdown [data-chat-code-line] {
   display: block;
-  min-height: 1.55em;
+  min-height: 1.4em;
 }
 
 /* Word wrap is a per-surface toggle driven by the `codeWrap` setting; the
  * default (off) keeps long lines on one line behind a horizontal scroll. */
-.chat-markdown[data-code-wrap="true"] [data-streamdown="code-block-body"] pre,
-.chat-markdown[data-code-wrap="true"] [data-streamdown="code-block-body"] code {
+.chat-markdown [data-chat-code-block][data-wrap="true"] pre,
+.chat-markdown [data-chat-code-block][data-wrap="true"] code,
+.chat-markdown [data-chat-code-block][data-wrap="true"] [data-chat-code-line] {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }

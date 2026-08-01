@@ -130,39 +130,60 @@ The chat pane stack:
   single scope, like `color9` behind `invalid` / `invalid.illegal`. Hashing a
   curated field list is how two palettes differing solely in `color9` used to
   collide on one name and serve each other's colors.
-- **Streamdown owns the card.** It renders its own container, header,
-  copy/download pill, and body whether or not the `code` plugin is installed —
-  fenced blocks are *not* a bare `<pre>`. The `prose-pre:*` / `prose-code:*`
-  chain in `ChatMarkdown.tsx` therefore only *neutralizes* the typography
-  plugin's defaults; the card is styled by `.chat-markdown` rules in
-  `globals.css`. Styling `pre` there again stacks a third border/background
-  inside the card.
+- **Codemux owns the card shell; Streamdown owns parsing.**
+  `ChatCodeBlock.tsx` supplies Streamdown's custom `code` / `inlineCode`
+  components and keeps using the shared Shiki plugin for tokenization.
+  Fenced cards therefore have stable Codemux markup rather than depending on
+  Streamdown's private header/action layout. The custom shell renders a
+  file-aware title, per-block wrap and copy actions, and the highlighted body;
+  the `prose-pre:*` / `prose-code:*` chain in `ChatMarkdown.tsx` still only
+  neutralizes typography defaults.
 - **Line numbers are off** (`lineNumbers={false}`) — chat snippets are quotes,
   not files. Streamdown only gives each line span `display: block` as part of
   its line-number class, so `globals.css` restores the line box explicitly;
   without that rule every line collapses onto one.
 - **Word wrap** is the `chat.code_wrap` setting (default off), exposed as
-  Settings → Appearance → "Wrap code in chat" and applied as `data-code-wrap`
-  on the markdown root. Off keeps lines intact behind a horizontal scroll.
-- Streamdown's fence meta only supports `startLine=` and `noLineNumbers`;
-  there is no filename/title slot, so the header shows the language only.
+  Settings → Appearance → "Wrap code in chat". It supplies each block's
+  default; the header's wrap action can override one block without changing
+  the global preference. Off keeps lines intact behind a horizontal scroll.
+- **Highlighting is stale-while-revalidating.** `highlight()` only answers
+  synchronously on a cache hit, and a streaming fence changes on every token,
+  so rendering "the result for exactly this code, else raw" would flash the
+  whole block back to uncolored text between every append. `useHighlightedCode`
+  keeps the last result on screen and appends the not-yet-tokenized tail
+  uncolored, so neither color nor text lags the stream. Reuse is guarded on the
+  block's own state, an unchanged language, and the old code still being a
+  prefix of the new — a fence that switches language or is rewritten falls back
+  to raw rather than painting one language's colors onto another's source.
+- Fence metadata comes from Streamdown's own `codeMeta` plugin, composed out of
+  its exported `defaultRemarkPlugins` (passing `remarkPlugins` *replaces* the
+  defaults, so `gfm` and `codeMeta` are named explicitly rather than
+  reimplemented locally). `title=`, `file=`, `filename=`, and bare
+  filename/path forms render a file icon plus title. A bare token only counts
+  as a filename when it ends in a real-looking extension and is not
+  version-like, so ` ```txt 1.5 ` and ` ```js v2.0 ` stay plain fences while
+  `main.rs`, `.env.local`, and `@scope/pkg/file.tsx` still caption. Without a
+  title, common language ids map to a synthetic filename and the existing
+  `material-file-icons` system supplies the language/framework icon; unknown
+  languages fall back to a text label.
+- The fence body keeps whatever the author wrote: mdast terminates a fence with
+  exactly one newline, and only that one is stripped, so a snippet genuinely
+  ending in blank lines keeps them in both the render and the clipboard.
 
 Card styling (all in `globals.css`, all on design tokens):
 
-- A fence with **no language** (plain command output) still renders a header
-  element with an empty label, which otherwise reserves an empty strip at the
-  top of the block. It's hidden via `[data-language=""]`, and the body takes
-  over the block's top padding in that case.
-- The copy/download pill is **revealed on hover/focus** — a transcript can hold
-  dozens of blocks and always-lit icons are a lot of standing chrome. A
-  `@media (hover: none)` fallback keeps it visible where hover doesn't exist.
-- Streamdown positions that pill by pulling a sticky spacer row up over the
-  header (`-mt-10`), hard-coupling it to the header's height — so hiding the
-  header would fling the pill outside the card. The spacer (the only child div
-  with no `data-streamdown` attribute) is collapsed and the pill is anchored to
-  the card instead.
-- The language caption is a small uppercase tracked label with no divider rule;
-  the fill change against surrounding prose is enough separation.
+- A fence with **no language** is labeled `text`, so copy and wrap remain
+  discoverable and the header never becomes an unexplained empty strip.
+- A fence still waiting on its closing ``` carries `data-incomplete` and dims
+  its title, so a card that is still filling in (and whose copy action would
+  only capture the partial snippet) reads as provisional. Opacity only — no
+  motion, since a transcript can stream several blocks at once.
+- Wrap/copy actions remain visible in the header. They use the shared compact
+  ghost-button treatment and tooltips, with `aria-pressed` on wrap and a
+  temporary copied state.
+- The card uses a 12px radius, a quiet header/body divider, and distinct token
+  surfaces. Code remains 12px JetBrains Mono with compact 1.4 line-height and
+  more body padding than the preceding flattened Streamdown card.
 
 ## What Works Today
 

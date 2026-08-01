@@ -1,10 +1,13 @@
 import { useMemo } from "react";
-import remarkGfm from "remark-gfm";
-import { Streamdown } from "streamdown";
+import { defaultRemarkPlugins, Streamdown } from "streamdown";
 
 import { useChatCodePlugin } from "@/hooks/use-chat-code-plugin";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
+import {
+  CHAT_MARKDOWN_COMPONENTS,
+  ChatCodeRendererProvider,
+} from "./ChatCodeBlock";
 
 /**
  * Shared markdown renderer for chat surfaces (assistant messages,
@@ -14,20 +17,19 @@ import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
  * replacement shadcn's AI Elements are built on). `parseIncompleteMarkdown`
  * closes unterminated fences / emphasis / lists mid-stream so a
  * half-arrived token never flashes broken markup. We keep the same
- * `remarkGfm`-only plugin set the previous react-markdown renderer used
+ * GFM-only plugin set the previous react-markdown renderer used
  * (no math/KaTeX).
  *
  * Fenced code blocks are syntax-highlighted by streamdown's shiki `code`
  * plugin, themed from the terminal ANSI palette via `useChatCodePlugin`
  * so chat code matches the file editor and terminal panes.
  *
- * Note that streamdown renders its own code-block card (container, header,
- * copy/download pill, optional line numbers) whether or not the `code`
- * plugin is installed — it is not a bare `<pre>`. The prose chain below
- * therefore *neutralizes* the typography plugin's `pre`/`code` defaults
- * instead of styling them; the card itself is styled by design tokens in
- * `globals.css` under `.chat-markdown`. Styling `pre` here again would
- * stack a third border/background/padding inside that card.
+ * Codemux supplies the fenced-code shell through Streamdown's component
+ * overrides while leaving Markdown parsing and incomplete-fence repair to
+ * Streamdown. The prose chain below therefore *neutralizes* the typography
+ * plugin's `pre`/`code` defaults; `ChatCodeBlock.tsx` and the design-token
+ * rules under `.chat-markdown` own the actual card. Styling `pre` here again
+ * would stack extra border/background/padding inside that shell.
  *
  * Built on `@tailwindcss/typography` (registered as a `@plugin` in
  * `globals.css`). The `prose` class provides a typography stack;
@@ -79,8 +81,8 @@ const proseClasses = [
   // `globals.css` — don't restate it here or the two stack.
   "prose-code:before:content-none prose-code:after:content-none prose-code:font-normal",
   // Fenced code blocks — neutralize the typography plugin's `pre`
-  // defaults (dark slab, padding, radius). Streamdown's card provides
-  // the real surface; see `.chat-markdown` in `globals.css`.
+  // defaults (dark slab, padding, radius). ChatCodeBlock provides the real
+  // surface; see `.chat-markdown` in `globals.css`.
   "prose-pre:m-0 prose-pre:p-0 prose-pre:bg-transparent prose-pre:text-inherit prose-pre:rounded-none prose-pre:border-0 prose-pre:leading-snug",
   // Tables — plugin-default spacing is loose; pull in for chat.
   "prose-table:my-3 prose-table:text-[0.9em]",
@@ -96,9 +98,18 @@ const proseClasses = [
 // files, and the gutter competes with the prose column. Tables keep their
 // full control set — only the code block's chrome is trimmed.
 const controls = {
-  code: { copy: true, download: true },
+  code: false,
   table: { copy: true, download: true, fullscreen: true },
 } as const;
+
+// Passing `remarkPlugins` *replaces* Streamdown's defaults, so the fence
+// metadata plugin that populates `node.properties.metastring` (read by
+// `ChatCodeBlock` for `title=` / bare-filename captions) has to be named
+// explicitly. It is Streamdown's own `codeMeta`, composed out of the exported
+// `defaultRemarkPlugins` rather than reimplemented here, so an upstream fix
+// arrives with the dependency bump instead of drifting from a local copy.
+// GFM is likewise upstream's; math/KaTeX stays out.
+const remarkPlugins = [defaultRemarkPlugins.gfm, defaultRemarkPlugins.codeMeta];
 
 export function ChatMarkdown({ children }: { children: string }) {
   const code = useChatCodePlugin();
@@ -106,17 +117,20 @@ export function ChatMarkdown({ children }: { children: string }) {
   const wrap = useSettingsStore(selectChatCodeWrap);
 
   return (
-    <div className={cn("chat-markdown", proseClasses)} data-code-wrap={wrap}>
-      <Streamdown
-        parseIncompleteMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[]}
-        plugins={plugins}
-        controls={controls}
-        lineNumbers={false}
-      >
-        {children}
-      </Streamdown>
+    <div className={cn("chat-markdown", proseClasses)}>
+      <ChatCodeRendererProvider defaultWrap={wrap} highlighter={code}>
+        <Streamdown
+          parseIncompleteMarkdown
+          remarkPlugins={remarkPlugins}
+          rehypePlugins={[]}
+          plugins={plugins}
+          components={CHAT_MARKDOWN_COMPONENTS}
+          controls={controls}
+          lineNumbers={false}
+        >
+          {children}
+        </Streamdown>
+      </ChatCodeRendererProvider>
     </div>
   );
 }
