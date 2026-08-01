@@ -1,13 +1,19 @@
 import { useMemo } from "react";
-import { defaultRemarkPlugins, Streamdown } from "streamdown";
+import { defaultRemarkPlugins, Streamdown, type Components } from "streamdown";
 
 import { useChatCodePlugin } from "@/hooks/use-chat-code-plugin";
+import {
+  CHAT_LINK_FAVICON_TAG,
+  rehypeRichExternalLinks,
+} from "@/lib/agent-chat/rich-links";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
+import { ChatMarkdownStreamingContext } from "./chat-markdown-streaming";
 import {
   CHAT_MARKDOWN_COMPONENTS,
   ChatCodeRendererProvider,
 } from "./ChatCodeBlock";
+import { MarkdownLinkFavicon } from "./MarkdownLinkFavicon";
 
 /**
  * Shared markdown renderer for chat surfaces (assistant messages,
@@ -111,26 +117,52 @@ const controls = {
 // GFM is likewise upstream's; math/KaTeX stays out.
 const remarkPlugins = [defaultRemarkPlugins.gfm, defaultRemarkPlugins.codeMeta];
 
-export function ChatMarkdown({ children }: { children: string }) {
+const rehypePlugins = [rehypeRichExternalLinks];
+
+// The fenced/inline code shells plus the custom element `rehypeRichExternalLinks`
+// emits for decorated links. Code blocks never grow favicons (a fence's contents
+// are never parsed as links), so the two override sets are disjoint — they just
+// have to travel in one module-level object, because Streamdown keys its
+// processor cache on the identity of this map.
+const markdownComponents: Components = {
+  ...CHAT_MARKDOWN_COMPONENTS,
+  [CHAT_LINK_FAVICON_TAG]: MarkdownLinkFavicon,
+};
+
+/**
+ * `streaming` marks markdown that is still arriving token by token. Only the
+ * link favicons care today: a bare URL is autolinked on every frame as it
+ * types out, so decorating an in-flight message would request icons for
+ * hostname prefixes that never resolve (see `MarkdownLinkFavicon`).
+ */
+export function ChatMarkdown({
+  children,
+  streaming = false,
+}: {
+  children: string;
+  streaming?: boolean;
+}) {
   const code = useChatCodePlugin();
   const plugins = useMemo(() => ({ code }), [code]);
   const wrap = useSettingsStore(selectChatCodeWrap);
 
   return (
-    <div className={cn("chat-markdown", proseClasses)}>
-      <ChatCodeRendererProvider defaultWrap={wrap} highlighter={code}>
-        <Streamdown
-          parseIncompleteMarkdown
-          remarkPlugins={remarkPlugins}
-          rehypePlugins={[]}
-          plugins={plugins}
-          components={CHAT_MARKDOWN_COMPONENTS}
-          controls={controls}
-          lineNumbers={false}
-        >
-          {children}
-        </Streamdown>
-      </ChatCodeRendererProvider>
-    </div>
+    <ChatMarkdownStreamingContext.Provider value={streaming}>
+      <div className={cn("chat-markdown", proseClasses)}>
+        <ChatCodeRendererProvider defaultWrap={wrap} highlighter={code}>
+          <Streamdown
+            parseIncompleteMarkdown
+            remarkPlugins={remarkPlugins}
+            rehypePlugins={rehypePlugins}
+            plugins={plugins}
+            components={markdownComponents}
+            controls={controls}
+            lineNumbers={false}
+          >
+            {children}
+          </Streamdown>
+        </ChatCodeRendererProvider>
+      </div>
+    </ChatMarkdownStreamingContext.Provider>
   );
 }

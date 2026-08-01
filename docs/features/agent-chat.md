@@ -185,6 +185,32 @@ Card styling (all in `globals.css`, all on design tokens):
   surfaces. Code remains 12px JetBrains Mono with compact 1.4 line-height and
   more body padding than the preceding flattened Streamdown card.
 
+### Rich external links in chat
+
+Assistant and plan markdown renders absolute `http(s)` links with the
+destination site's favicon inline. The markdown label remains authoritative —
+so the same treatment works for `PR #235`, issue labels, documentation names,
+and bare URLs instead of relying on GitHub-specific parsing. Bare URLs keep the
+favicon attached to their protocol; labelled links keep it attached to the
+first character, preventing an icon from wrapping onto a line by itself.
+
+`rehypeRichExternalLinks` (`src/lib/agent-chat/rich-links.ts`) decorates the HAST
+children rather than replacing Streamdown's anchor component. This preserves
+Streamdown's safe-link confirmation behavior. `MarkdownLinkFavicon` requests a
+32px image from the same Google favicon service already used for project
+avatars and falls back to a token-colored globe.
+
+Three cases render that globe with no network request at all: while the
+message is still streaming (a bare URL is autolinked on every frame, so
+in-flight prefixes like `docs.p` would each fire a lookup), for hostnames that
+are not publicly resolvable (`localhost`, single-label names, `.local`/
+`.internal`/`.lan`/`.home`/`.corp` suffixes, and private or reserved IP
+literals — those names are never sent to the third-party favicon service), and
+for hosts whose icon recently failed to load (a five-minute TTL, capped cache).
+Fragment, relative, `mailto:`, `javascript:`, and other non-web links are left
+unchanged. The dev mock's rich transcript includes both GitHub and docs
+examples for visual verification.
+
 ## What Works Today
 
 - **Three end-to-end providers** behind one unified picker:

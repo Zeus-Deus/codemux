@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { resolveImageUrl } from "./project-image";
+import { faviconUrlForDomain, resolveImageUrl } from "./project-image";
+
+describe("faviconUrlForDomain", () => {
+  it("builds a size-specific URL and safely encodes cache-bust values", () => {
+    expect(faviconUrlForDomain("github.com", 32, "fresh value")).toBe(
+      "https://www.google.com/s2/favicons?domain=github.com&sz=32&v=fresh%20value",
+    );
+  });
+});
 
 describe("resolveImageUrl", () => {
   it("returns empty for blank input", () => {

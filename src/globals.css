@@ -564,6 +564,24 @@ body.pane-resizing iframe {
   padding: 0.1rem 0.35rem;
 }
 
+/* Rich external links — destination favicons provide recognition without
+ * turning an inline citation into a bulky preview card. The icon and the
+ * label's first character (or URL protocol) stay together so the favicon can
+ * never wrap onto a line by itself. Streamdown continues to own the actual
+ * link/button and its safe-link confirmation behavior. */
+.chat-markdown .chat-markdown-link-favicon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  margin-inline: 0.2em 0.22em;
+  color: var(--muted-foreground);
+  vertical-align: -0.125em;
+}
+
+.chat-markdown .chat-markdown-link-leading {
+  white-space: nowrap;
+}
+
 /* Workspaces overview "pulse a row to draw attention" effect.
  *
  * Triggered when:

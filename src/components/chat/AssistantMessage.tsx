@@ -21,7 +21,7 @@ export const AssistantMessage = memo(function AssistantMessage({
 
   return (
     <div className="text-sm leading-relaxed text-foreground break-words">
-      <ChatMarkdown>{item.text}</ChatMarkdown>
+      <ChatMarkdown streaming={item.streaming}>{item.text}</ChatMarkdown>
       {item.streaming && !showIndicator && (
         <StreamingIndicator className="ml-0.5" />
       )}
