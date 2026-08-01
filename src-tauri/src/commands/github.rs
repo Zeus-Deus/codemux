@@ -302,54 +302,25 @@ pub async fn refresh_workspace_pr<R: tauri::Runtime>(
     };
 
     let cwd_for_pr = cwd.clone();
-    let pr_info = tokio::task::spawn_blocking(move || {
-        crate::github::get_branch_pr(Path::new(&cwd_for_pr))
-    })
-    .await
-    .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))??;
+    let pr_info =
+        tokio::task::spawn_blocking(move || crate::github::get_branch_pr(Path::new(&cwd_for_pr)))
+            .await
+            .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))??;
     // Decision matrix (mirrors the background pollers):
-    //   - PR found & passes the historical-SHA gate → write fresh info
-    //   - PR found but gated out (CLOSED/MERGED with diverged SHA) → clear
-    //   - `gh pr view` returned nothing AND persisted state is historical
-    //     → clear stale leftover from when the PR was active
-    //   - `gh pr view` returned nothing AND persisted state is OPEN/DRAFT
-    //     → preserve, protecting the fork-branch `gh pr checkout` case
+    //   - branch/repository match found → write fresh info
+    //   - successful branch query returned nothing → clear stale info
+    //   - lookup error → return before mutation and preserve last known info
     match pr_info.as_ref() {
         Some(pr) => {
-            let cwd_for_head = cwd.clone();
-            let head_sha = tokio::task::spawn_blocking(move || {
-                crate::github::get_head_sha(Path::new(&cwd_for_head))
-            })
-            .await
-            .ok()
-            .flatten();
-            if crate::github::should_show_branch_pr(pr, head_sha.as_deref()) {
-                state.update_workspace_pr_info(
-                    &workspace_id,
-                    Some(pr.number),
-                    Some(pr.display_state()),
-                    Some(pr.url.clone()),
-                );
-            } else {
-                state.update_workspace_pr_info(&workspace_id, None, None, None);
-            }
+            state.update_workspace_pr_info(
+                &workspace_id,
+                Some(pr.number),
+                Some(pr.display_state()),
+                Some(pr.url.clone()),
+            );
         }
         None => {
-            let persisted_state = {
-                let snapshot = state.snapshot();
-                snapshot
-                    .workspaces
-                    .iter()
-                    .find(|w| w.workspace_id.0 == workspace_id)
-                    .and_then(|w| w.pr_state.clone())
-            };
-            if persisted_state
-                .as_deref()
-                .map(crate::github::is_historical_pr_state)
-                .unwrap_or(false)
-            {
-                state.update_workspace_pr_info(&workspace_id, None, None, None);
-            }
+            state.update_workspace_pr_info(&workspace_id, None, None, None);
         }
     }
     crate::state::emit_app_state(&app);

@@ -28,10 +28,10 @@ pub struct PullRequestInfo {
     pub checks_passing: Option<bool>,
     #[serde(alias = "updatedAt", default)]
     pub updated_at: Option<String>,
-    /// Head commit SHA of the PR. Used to gate stale historical PRs:
-    /// once a workspace's HEAD has moved past this SHA, a MERGED/CLOSED
-    /// PR for the branch is no longer considered current and the badge
-    /// is cleared. Mirrors Superset's `headRefOid`-based attach rule.
+    /// Head commit SHA reported by GitHub. Kept as useful PR metadata, but
+    /// association is branch/repository based: a local worktree may
+    /// legitimately be behind the final remote PR head after review commits
+    /// land, so exact SHA equality is not a valid identity check.
     #[serde(alias = "headRefOid", default)]
     pub head_ref_oid: Option<String>,
     /// Stage 5 — populated by `get_pull_request` only; list paths
@@ -68,47 +68,9 @@ impl PullRequestInfo {
     }
 }
 
-/// True for terminal PR states. `gh pr view` keeps returning a closed/merged
-/// PR for a branch indefinitely, so a long-lived workspace (typically `main`)
-/// would otherwise show the same merged-PR pill forever.
+/// True for terminal PR states.
 pub fn is_historical_pr_state(state: &str) -> bool {
     matches!(state, "CLOSED" | "MERGED")
-}
-
-/// Whether to attach a PR to a workspace's sidebar pill given the workspace's
-/// current HEAD SHA. Open/draft PRs always attach; historical PRs only attach
-/// while the workspace still points at the exact PR head commit. Mirrors
-/// Superset's `shouldAcceptPRMatch` SHA gate.
-pub fn should_show_branch_pr(pr: &PullRequestInfo, head_sha: Option<&str>) -> bool {
-    if !is_historical_pr_state(&pr.state) {
-        return true;
-    }
-    match (pr.head_ref_oid.as_deref(), head_sha) {
-        (Some(pr_sha), Some(ws_sha)) => pr_sha == ws_sha,
-        // Missing either side ⇒ can't prove the PR is still current; hide it
-        // rather than risk a stale pill on a long-lived branch.
-        _ => false,
-    }
-}
-
-/// `git rev-parse HEAD` for a worktree path. Returns `None` on any failure
-/// (detached HEAD edge cases, missing repo, transient errors) — callers
-/// treat None as "can't gate, fall back to permissive behavior".
-pub fn get_head_sha(repo_path: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(repo_path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if sha.is_empty() {
-        None
-    } else {
-        Some(sha)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -759,23 +721,177 @@ pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, 
     ))
 }
 
-pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
-    let output = run_gh_optional(
-        repo_path,
-        &[
-            "pr", "view",
-            "--json", "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid",
-        ],
-    );
+const BRANCH_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
-    let Some(json_str) = output else {
-        return Ok(None);
+fn run_git_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
+    let mut cmd = Command::new("git");
+    cmd.args(args).current_dir(repo_path);
+    sanitize_gui_env_std(&mut cmd);
+    cmd.output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|output| !output.is_empty())
+}
+
+/// Parse a GitHub remote into `(owner, repository)`. The normalized identity
+/// is used only to tell an origin branch from a fork branch; all other hosts
+/// deliberately fall back to the unqualified branch selector.
+fn parse_github_remote(remote_url: &str) -> Option<(String, String)> {
+    let remote_url = remote_url.trim();
+    let path = if let Some(path) = remote_url.strip_prefix("git@github.com:") {
+        path
+    } else if let Some(path) = remote_url.strip_prefix("github.com:") {
+        path
+    } else if let Some(path) = remote_url.strip_prefix("github.com/") {
+        path
+    } else {
+        let (_, authority_and_path) = remote_url.split_once("://")?;
+        let (authority, path) = authority_and_path.split_once('/')?;
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        path
+    }
+    .trim_matches('/');
+    let mut segments = path.split('/');
+    let owner = segments.next()?.trim();
+    let repository = segments.next()?.trim().trim_end_matches(".git");
+    if owner.is_empty() || repository.is_empty() || segments.next().is_some() {
+        return None;
+    }
+    Some((owner.to_ascii_lowercase(), repository.to_ascii_lowercase()))
+}
+
+fn branch_head_selector(
+    branch: &str,
+    tracking_remote_url: Option<&str>,
+    origin_remote_url: Option<&str>,
+) -> String {
+    let Some((tracking_owner, tracking_repo)) = tracking_remote_url.and_then(parse_github_remote)
+    else {
+        return branch.to_string();
+    };
+    let Some((origin_owner, origin_repo)) = origin_remote_url.and_then(parse_github_remote) else {
+        return branch.to_string();
     };
 
-    let v: serde_json::Value = serde_json::from_str(&json_str)
-        .map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+    if tracking_owner == origin_owner && tracking_repo == origin_repo {
+        branch.to_string()
+    } else {
+        format!("{tracking_owner}:{branch}")
+    }
+}
 
-    Ok(Some(parse_pr_json(&v)))
+fn resolve_branch_head_selector(repo_path: &Path, branch: &str) -> String {
+    let branch_remote_key = format!("branch.{branch}.remote");
+    let tracking_remote = run_git_optional(repo_path, &["config", "--get", &branch_remote_key]);
+    let tracking_remote_url = tracking_remote.as_deref().and_then(|remote| {
+        if remote == "." {
+            return None;
+        }
+        let remote_url_key = format!("remote.{remote}.url");
+        run_git_optional(repo_path, &["config", "--get", &remote_url_key])
+    });
+    let origin_remote_url = run_git_optional(repo_path, &["config", "--get", "remote.origin.url"]);
+
+    branch_head_selector(
+        branch,
+        tracking_remote_url.as_deref(),
+        origin_remote_url.as_deref(),
+    )
+}
+
+fn is_newer_pr(candidate: &PullRequestInfo, current: &PullRequestInfo) -> bool {
+    candidate
+        .updated_at
+        .cmp(&current.updated_at)
+        .then_with(|| candidate.number.cmp(&current.number))
+        .is_gt()
+}
+
+/// Choose the PR that represents a branch today. An open/draft PR always wins
+/// over historical work when a branch name has been reused; otherwise the most
+/// recently updated PR wins. Historical PRs are suppressed only on the
+/// repository default branch, where they usually describe reverse-merge
+/// history rather than the workspace's work item.
+fn select_branch_pr(
+    pull_requests: impl IntoIterator<Item = PullRequestInfo>,
+    branch: &str,
+    is_default_branch: bool,
+) -> Option<PullRequestInfo> {
+    let mut latest_open: Option<PullRequestInfo> = None;
+    let mut latest_historical: Option<PullRequestInfo> = None;
+
+    for pr in pull_requests {
+        if pr.head_branch.as_deref() != Some(branch) {
+            continue;
+        }
+        if is_historical_pr_state(&pr.state) {
+            if is_default_branch {
+                continue;
+            }
+            if latest_historical
+                .as_ref()
+                .is_none_or(|current| is_newer_pr(&pr, current))
+            {
+                latest_historical = Some(pr);
+            }
+        } else if latest_open
+            .as_ref()
+            .is_none_or(|current| is_newer_pr(&pr, current))
+        {
+            latest_open = Some(pr);
+        }
+    }
+
+    latest_open.or(latest_historical)
+}
+
+/// Resolve the current branch's PR by explicit branch/repository identity.
+///
+/// `gh pr view` infers from local git state and an exact-SHA gate used to drop
+/// a merged PR whenever review commits made the remote head newer than the
+/// still-open local worktree. Listing every state for the branch mirrors T3
+/// Code's model: branch identity owns the association, while SHA is metadata.
+/// A failed GitHub request remains an `Err`, distinct from a successful empty
+/// list, so callers can preserve the last known PR through transient failures.
+pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
+    let Some(branch) = run_git_optional(repo_path, &["branch", "--show-current"]) else {
+        return Ok(None);
+    };
+    let head_selector = resolve_branch_head_selector(repo_path, &branch);
+    let output = run_gh_timed(
+        repo_path,
+        &[
+            "pr",
+            "list",
+            "--head",
+            &head_selector,
+            "--state",
+            "all",
+            "--limit",
+            "20",
+            "--json",
+            "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid",
+        ],
+        BRANCH_PR_LOOKUP_TIMEOUT,
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+    let rows = value
+        .as_array()
+        .ok_or_else(|| "Expected JSON array from gh pr list".to_string())?;
+    let is_default_branch = crate::git::find_default_branch(repo_path).as_deref() == Some(&branch);
+
+    Ok(select_branch_pr(
+        rows.iter().map(parse_pr_json),
+        &branch,
+        is_default_branch,
+    ))
 }
 
 pub fn create_pull_request(
@@ -1231,8 +1347,8 @@ mod tests {
 
     #[test]
     fn test_parse_pr_info_captures_head_ref_oid() {
-        // `headRefOid` powers the SHA-gate that hides stale merged PRs
-        // from long-lived branches. Without it the gate falls open.
+        // Keep the remote SHA available as metadata without using it as the
+        // identity of a branch's PR.
         let json = serde_json::json!({
             "number": 1,
             "url": "https://example",
@@ -1246,9 +1362,8 @@ mod tests {
 
     #[test]
     fn test_parse_pr_info_treats_missing_head_ref_oid_as_none() {
-        // List-shape gh JSON rarely includes headRefOid. Don't synthesize
-        // a placeholder — the gate treats None as "can't prove current"
-        // and hides historical PRs accordingly.
+        // Older gh output and callers that request a smaller JSON shape may
+        // omit the SHA. Branch association must not depend on its presence.
         let json = serde_json::json!({
             "number": 1,
             "url": "https://example",
@@ -1259,21 +1374,27 @@ mod tests {
         assert!(pr.head_ref_oid.is_none());
     }
 
-    fn pr_with(state: &str, head_ref_oid: Option<&str>) -> PullRequestInfo {
+    fn branch_pr(
+        number: u32,
+        state: &str,
+        branch: &str,
+        updated_at: &str,
+        head_ref_oid: Option<&str>,
+    ) -> PullRequestInfo {
         PullRequestInfo {
-            number: 1,
-            url: "https://example".into(),
+            number,
+            url: format!("https://example/pull/{number}"),
             state: state.into(),
-            title: "T".into(),
-            head_branch: None,
-            base_branch: None,
+            title: format!("PR {number}"),
+            head_branch: Some(branch.into()),
+            base_branch: Some("main".into()),
             is_draft: false,
             mergeable: None,
             additions: None,
             deletions: None,
             review_decision: None,
             checks_passing: None,
-            updated_at: None,
+            updated_at: Some(updated_at.into()),
             head_ref_oid: head_ref_oid.map(|s| s.to_string()),
             body: None,
             comments: Vec::new(),
@@ -1283,47 +1404,107 @@ mod tests {
     }
 
     #[test]
-    fn test_should_show_branch_pr_open_always_attaches() {
-        // Open PRs attach regardless of SHA — the user is actively working
-        // on the branch and expects to see the pill.
-        let pr = pr_with("OPEN", Some("aaa"));
-        assert!(should_show_branch_pr(&pr, Some("bbb")));
-        assert!(should_show_branch_pr(&pr, None));
+    fn test_parse_github_remote_supports_ssh_and_https() {
+        assert_eq!(
+            parse_github_remote("git@github.com:Zeus-Deus/codemux.git"),
+            Some(("zeus-deus".into(), "codemux".into()))
+        );
+        assert_eq!(
+            parse_github_remote("https://github.com/Zeus-Deus/codemux.git"),
+            Some(("zeus-deus".into(), "codemux".into()))
+        );
+        assert_eq!(
+            parse_github_remote("ssh://git@github.com/Zeus-Deus/codemux.git"),
+            Some(("zeus-deus".into(), "codemux".into()))
+        );
     }
 
     #[test]
-    fn test_should_show_branch_pr_merged_attaches_when_sha_matches() {
-        // On the original feature-branch worktree the branch HEAD still
-        // equals the PR head SHA, so the merged-PR pill stays until the
-        // worktree is removed.
-        let pr = pr_with("MERGED", Some("aaa"));
-        assert!(should_show_branch_pr(&pr, Some("aaa")));
+    fn test_parse_github_remote_rejects_other_hosts_and_malformed_paths() {
+        assert_eq!(
+            parse_github_remote("https://notgithub.com/owner/repo.git"),
+            None
+        );
+        assert_eq!(parse_github_remote("git@gitlab.com:owner/repo.git"), None);
+        assert_eq!(parse_github_remote("https://github.com/owner"), None);
     }
 
     #[test]
-    fn test_should_show_branch_pr_merged_hides_when_sha_diverges() {
-        // The bug this fix targets: on `main`, after merging PR #138,
-        // main's HEAD has advanced past the PR's head commit and the
-        // pill must disappear.
-        let pr = pr_with("MERGED", Some("aaa"));
-        assert!(!should_show_branch_pr(&pr, Some("bbb")));
+    fn test_branch_head_selector_uses_plain_branch_in_the_origin_repo() {
+        assert_eq!(
+            branch_head_selector(
+                "feature/popup",
+                Some("git@github.com:owner/repo.git"),
+                Some("https://github.com/OWNER/repo.git"),
+            ),
+            "feature/popup"
+        );
     }
 
     #[test]
-    fn test_should_show_branch_pr_closed_hides_when_sha_diverges() {
-        let pr = pr_with("CLOSED", Some("aaa"));
-        assert!(!should_show_branch_pr(&pr, Some("bbb")));
+    fn test_branch_head_selector_qualifies_a_fork_branch_by_owner() {
+        assert_eq!(
+            branch_head_selector(
+                "feature/popup",
+                Some("git@github.com:contributor/repo.git"),
+                Some("https://github.com/upstream/repo.git"),
+            ),
+            "contributor:feature/popup"
+        );
     }
 
     #[test]
-    fn test_should_show_branch_pr_historical_with_missing_sha_hides() {
-        // If we can't prove the workspace still points at the PR head,
-        // err on the side of hiding the pill rather than leaving stale
-        // data on the screen forever.
-        let pr_no_oid = pr_with("MERGED", None);
-        assert!(!should_show_branch_pr(&pr_no_oid, Some("aaa")));
-        let pr = pr_with("MERGED", Some("aaa"));
-        assert!(!should_show_branch_pr(&pr, None));
+    fn test_select_branch_pr_keeps_merged_pr_when_remote_sha_advanced() {
+        // Regression: review commits can advance GitHub's PR head beyond the
+        // still-open local worktree. Selection is intentionally independent
+        // of the local SHA, so the MERGED state still reaches the sidebar.
+        let merged = branch_pr(
+            231,
+            "MERGED",
+            "feature/popup",
+            "2026-08-01T10:00:00Z",
+            Some("remote-sha-after-review"),
+        );
+        let selected = select_branch_pr([merged], "feature/popup", false).unwrap();
+        assert_eq!(selected.number, 231);
+        assert_eq!(selected.state, "MERGED");
+    }
+
+    #[test]
+    fn test_select_branch_pr_hides_historical_prs_on_default_branch() {
+        let merged = branch_pr(23, "MERGED", "main", "2026-08-01T10:00:00Z", None);
+        let closed = branch_pr(24, "CLOSED", "main", "2026-08-02T10:00:00Z", None);
+        assert!(select_branch_pr([merged, closed], "main", true).is_none());
+    }
+
+    #[test]
+    fn test_select_branch_pr_allows_open_pr_on_default_branch() {
+        let open = branch_pr(25, "OPEN", "main", "2026-08-01T10:00:00Z", None);
+        assert_eq!(
+            select_branch_pr([open], "main", true).map(|pr| pr.number),
+            Some(25)
+        );
+    }
+
+    #[test]
+    fn test_select_branch_pr_prefers_open_over_newer_merged_pr() {
+        let merged = branch_pr(45, "MERGED", "feature/reused", "2026-08-02T10:00:00Z", None);
+        let open = branch_pr(46, "OPEN", "feature/reused", "2026-08-01T10:00:00Z", None);
+        assert_eq!(
+            select_branch_pr([merged, open], "feature/reused", false).map(|pr| pr.number),
+            Some(46)
+        );
+    }
+
+    #[test]
+    fn test_select_branch_pr_uses_newest_historical_pr_and_ignores_other_branches() {
+        let old = branch_pr(30, "MERGED", "feature/reused", "2026-08-01T10:00:00Z", None);
+        let latest = branch_pr(31, "CLOSED", "feature/reused", "2026-08-02T10:00:00Z", None);
+        let other = branch_pr(99, "OPEN", "feature/other", "2026-08-03T10:00:00Z", None);
+        assert_eq!(
+            select_branch_pr([old, latest, other], "feature/reused", false).map(|pr| pr.number),
+            Some(31)
+        );
     }
 
     #[test]

@@ -377,7 +377,7 @@ visual only — nothing is archived, closed, or deleted.
   brand new for a full idle window after every update — the exact bug the
   backend field exists to kill. Preferring the backend retires the polluted
   state without a migration pass.
-- **Auto-settle** — the Settled shelf fills itself using server-side completion
+- **Auto-settle** — the Settled shelf fills itself using PR-completion
   semantics. A workspace whose PR is **merged or closed** settles
   immediately once it is neither working nor blocked; no activity stamp or
   extra idle grace is required. A completed **review** status is settleable —
@@ -402,6 +402,18 @@ visual only — nothing is archived, closed, or deleted.
   the older bare-array and pre-snooze object shapes; the key name
   (`sidebar.inbox.settled`) predates snooze and is kept so existing installs
   don't lose their shelf.
+- **PR association is branch/repository based, not commit-SHA based.** The Rust
+  refresh path explicitly lists all PR states for the checked-out branch via
+  `gh pr list --head ... --state all`. This is important after review: GitHub's
+  final PR head can contain commits that the still-open local worktree has not
+  fetched, but that does not make it a different work item. Fork-tracking
+  branches use an owner-qualified head selector. If a branch name was reused,
+  the newest open/draft PR wins over historical matches; otherwise the newest
+  merged/closed match wins. Historical matches are suppressed on the default
+  branch, where they usually represent reverse-merge history rather than the
+  workspace's work. A successful empty query clears stale PR metadata, while a
+  failed or timed-out lookup leaves the last known badge untouched. These rules
+  are what let a real `MERGED`/`CLOSED` transition reach auto-settle reliably.
 - **The anti-oscillation invariant.** Four states (active / settled / snoozed /
   pinned-active) and five park-mutating effects (auto-settle, the auto-un-settle
   safety net, the snooze hand-raise, the wake sweep, the precise wake timer)
@@ -763,6 +775,12 @@ quietly rather than loudly.
   check breaks "send a follow-up and it comes back up"; accepting `draft`
   demotes work the author has explicitly marked as still in progress; accepting
   `merged`/`closed` puts it in a tug-of-war with auto-settle over the same card.
+- **Never gate a historical PR on exact local/remote head-SHA equality.** A
+  review commit can legitimately advance the remote PR head beyond a workspace
+  that remains open locally. The branch/repository identity owns the
+  association; `headRefOid` is metadata only. Also keep lookup errors distinct
+  from successful empty results, or an offline/rate-limited poll will erase a
+  correct badge.
 - **The jump targets and range selection read `orderedActiveCards`, not
   `activeCards`.** Both describe positions the user can *see*, so they must be
   `[...topTier, ...wrappingUp]`. Reverting either to the unpartitioned list
