@@ -9,6 +9,7 @@ import {
 } from "@/lib/agent-chat/rich-links";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
+import { ChatMarkdownStreamingContext } from "./chat-markdown-streaming";
 import { MarkdownLinkFavicon } from "./MarkdownLinkFavicon";
 
 /**
@@ -111,24 +112,38 @@ const markdownComponents: Components = {
 
 const rehypePlugins = [rehypeRichExternalLinks];
 
-export function ChatMarkdown({ children }: { children: string }) {
+/**
+ * `streaming` marks markdown that is still arriving token by token. Only the
+ * link favicons care today: a bare URL is autolinked on every frame as it
+ * types out, so decorating an in-flight message would request icons for
+ * hostname prefixes that never resolve (see `MarkdownLinkFavicon`).
+ */
+export function ChatMarkdown({
+  children,
+  streaming = false,
+}: {
+  children: string;
+  streaming?: boolean;
+}) {
   const code = useChatCodePlugin();
   const plugins = useMemo(() => ({ code }), [code]);
   const wrap = useSettingsStore(selectChatCodeWrap);
 
   return (
-    <div className={cn("chat-markdown", proseClasses)} data-code-wrap={wrap}>
-      <Streamdown
-        parseIncompleteMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={rehypePlugins}
-        components={markdownComponents}
-        plugins={plugins}
-        controls={controls}
-        lineNumbers={false}
-      >
-        {children}
-      </Streamdown>
-    </div>
+    <ChatMarkdownStreamingContext.Provider value={streaming}>
+      <div className={cn("chat-markdown", proseClasses)} data-code-wrap={wrap}>
+        <Streamdown
+          parseIncompleteMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={rehypePlugins}
+          components={markdownComponents}
+          plugins={plugins}
+          controls={controls}
+          lineNumbers={false}
+        >
+          {children}
+        </Streamdown>
+      </div>
+    </ChatMarkdownStreamingContext.Provider>
   );
 }

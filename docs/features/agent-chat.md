@@ -158,9 +158,17 @@ first character, preventing an icon from wrapping onto a line by itself.
 children rather than replacing Streamdown's anchor component. This preserves
 Streamdown's safe-link confirmation behavior. `MarkdownLinkFavicon` requests a
 32px image from the same Google favicon service already used for project
-avatars, caches failed hosts for the browser session, and falls back to a
-token-colored globe. Fragment, relative, `mailto:`, and other non-web links are
-left unchanged. The dev mock's rich transcript includes both GitHub and docs
+avatars and falls back to a token-colored globe.
+
+Three cases render that globe with no network request at all: while the
+message is still streaming (a bare URL is autolinked on every frame, so
+in-flight prefixes like `docs.p` would each fire a lookup), for hostnames that
+are not publicly resolvable (`localhost`, single-label names, `.local`/
+`.internal`/`.lan`/`.home`/`.corp` suffixes, and private or reserved IP
+literals — those names are never sent to the third-party favicon service), and
+for hosts whose icon recently failed to load (a five-minute TTL, capped cache).
+Fragment, relative, `mailto:`, `javascript:`, and other non-web links are left
+unchanged. The dev mock's rich transcript includes both GitHub and docs
 examples for visual verification.
 
 ## What Works Today
