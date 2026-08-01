@@ -83,6 +83,18 @@ describe("ChatMarkdown rich external links", () => {
     expect(link).toHaveTextContent("A very long bolded release title");
   });
 
+  it("keeps a leading emoji whole in the nowrap span", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[🚀 Launch notes](https://example.com/launch)"}</ChatMarkdown>,
+    );
+
+    const link = container.querySelector('[data-streamdown="link"]');
+    const leading = link?.querySelector(".chat-markdown-link-leading");
+    // The whole code point moves, so no lone surrogate renders as a tofu box.
+    expect(leading?.textContent).toBe("🚀");
+    expect(link).toHaveTextContent("🚀 Launch notes");
+  });
+
   it("keeps the favicon outside an inline-code label's pill", () => {
     const { container } = render(
       <ChatMarkdown>{"[`rich-links.ts`](https://example.com/src)"}</ChatMarkdown>,

@@ -66,14 +66,73 @@ function isPrivateIpv4([a, b]: number[]): boolean {
   return false;
 }
 
+/**
+ * Expand an IPv6 literal into its eight 16-bit blocks, resolving `::`
+ * compression and the dotted-quad tail of an IPv4-mapped address. Returns null
+ * for anything that is not a well-formed literal.
+ */
+function ipv6Blocks(address: string): number[] | null {
+  let text = address;
+
+  // `::ffff:192.168.1.1` — fold the trailing dotted quad into two hex blocks.
+  const dotted = /:(\d{1,3}(?:\.\d{1,3}){3})$/.exec(text);
+  if (dotted) {
+    const octets = ipv4Octets(dotted[1]!);
+    if (!octets) return null;
+    const high = ((octets[0]! << 8) | octets[1]!).toString(16);
+    const low = ((octets[2]! << 8) | octets[3]!).toString(16);
+    text = `${text.slice(0, dotted.index)}:${high}:${low}`;
+  }
+
+  const halves = text.split("::");
+  if (halves.length > 2) return null;
+
+  const parseGroups = (part: string): number[] | null => {
+    if (!part) return [];
+    const blocks: number[] = [];
+    for (const group of part.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/.test(group)) return null;
+      blocks.push(Number.parseInt(group, 16));
+    }
+    return blocks;
+  };
+
+  const head = parseGroups(halves[0]!);
+  if (!head) return null;
+  if (halves.length === 1) return head.length === 8 ? head : null;
+
+  const tail = parseGroups(halves[1]!);
+  if (!tail) return null;
+  const zeros = 8 - head.length - tail.length;
+  if (zeros < 0) return null;
+  return [...head, ...(Array<number>(zeros).fill(0)), ...tail];
+}
+
 function isPrivateIpv6(host: string): boolean {
   const address = host.replace(/^\[|\]$/g, "").split("%")[0]!.toLowerCase();
-  if (address === "::1" || address === "::") return true;
+  const blocks = ipv6Blocks(address);
+  if (!blocks) return false;
+
+  const zeroPrefix = blocks.slice(0, 5).every((block) => block === 0);
+  if (zeroPrefix) {
+    // `::` (unspecified) and `::1` (loopback).
+    if (blocks[5] === 0 && blocks[6] === 0 && (blocks[7] === 0 || blocks[7] === 1)) {
+      return true;
+    }
+    // `::ffff:a.b.c.d` — an IPv4 address wearing an IPv6 costume, so the IPv4
+    // private ranges still apply.
+    if (blocks[5] === 0xffff) {
+      return isPrivateIpv4([
+        blocks[6]! >> 8,
+        blocks[6]! & 0xff,
+        blocks[7]! >> 8,
+        blocks[7]! & 0xff,
+      ]);
+    }
+  }
+
   // fc00::/7 (unique local) and fe80::/10 (link local).
-  const [first] = address.split(":");
-  if (!first) return false;
-  const block = Number.parseInt(first.padStart(4, "0"), 16);
-  if (Number.isNaN(block)) return false;
+  const block = blocks[0]!;
   if (block >= 0xfc00 && block <= 0xfdff) return true;
   if (block >= 0xfe80 && block <= 0xfebf) return true;
   return false;
@@ -107,7 +166,10 @@ export function isPublicWebHost(host: unknown): boolean {
 function leadingTextLength(text: string): number {
   const protocol = /^(?:https?:\/\/)/i.exec(text)?.[0];
   if (protocol) return protocol.length;
-  return Math.min(text.length, 1);
+  // One whole code point, so an astral first character (an emoji label) is
+  // never split into lone surrogates.
+  const [firstCodePoint] = text;
+  return firstCodePoint?.length ?? 0;
 }
 
 function faviconNode(host: string): HastNode {

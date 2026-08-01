@@ -59,6 +59,12 @@ describe("isPublicWebHost", () => {
     ["[fd12:3456::1]", false],
     ["[fe80::1]", false],
     ["[2606:4700::1111]", true],
+    // IPv4-mapped literals: the mapped address decides, not the `::` prefix.
+    ["[::ffff:c0a8:101]", false],
+    ["[::ffff:7f00:1]", false],
+    ["[::ffff:a00:1]", false],
+    ["[::ffff:192.168.1.1]", false],
+    ["[::ffff:808:808]", true],
     ["", false],
     ["   ", false],
   ];
