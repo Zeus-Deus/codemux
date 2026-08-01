@@ -655,6 +655,50 @@ describe("DraftChatSurface", () => {
       const [, , cwd] = vi.mocked(materializeAndSend).mock.calls[0];
       expect(cwd).toBe("/home/user");
     });
+
+    it("the mid-materialise composer keeps the shared column rails (no extra inset)", async () => {
+      // Regression guard: the pending view used to wrap the composer in
+      // its own `max-w-[760px] px-7` box, so the composer's own rails
+      // resolved INSIDE it — the card shrank to 672px for the seconds
+      // the workspace was being created, then snapped back to 760px
+      // when the real pane took over. The wrapper may only add vertical
+      // spacing; the rails belong to the composer (see chat-column.ts).
+      vi.mocked(materializeAndSend).mockImplementation(
+        () => new Promise(() => {}),
+      );
+      const draft = useChatDraftStore
+        .getState()
+        .getOrCreateProjectDraft("/projects/foo");
+      useChatDraftStore.getState().updateDraftInput(draft.draftId, "hello");
+      useChatDraftStore.getState().setActiveDraft(draft.draftId);
+      const { container, getByRole } = renderSurface();
+      const ta = container.querySelector("textarea") as HTMLTextAreaElement;
+      fireEvent.keyDown(ta, { key: "Enter" });
+      // The pending view is up (status line) and the composer is still
+      // mounted below it.
+      await vi.waitFor(() => {
+        expect(getByRole("status", { name: "Starting the agent" })).toBeTruthy();
+      });
+
+      const card = container.querySelector(
+        '[data-testid="composer-wrapper"]',
+      ) as HTMLElement;
+      const inner = card.parentElement as HTMLElement;
+      const outer = inner.parentElement as HTMLElement;
+      expect(inner.className).toContain("max-w-[760px]");
+      expect(outer.className).toContain("px-4");
+
+      // Nothing between the composer's own rails and the surface root
+      // may constrain width or add a horizontal gutter.
+      for (
+        let node = outer.parentElement;
+        node && node !== container;
+        node = node.parentElement
+      ) {
+        expect(node.className).not.toMatch(/(^|\s)max-w-/);
+        expect(node.className).not.toMatch(/(^|\s)-?p[xlr]-/);
+      }
+    });
   });
 
   describe("config handlers", () => {
