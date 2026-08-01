@@ -40,8 +40,10 @@ use super::protocol::{
     PermissionRespondRequest, SessionCreateRequest, SessionResponse,
 };
 use super::sse::{spawn_sse_listener, SsePeer, SseRouter};
+use super::client::{OpenCodeClient, OpenCodeClientConfig, OpenCodeProviderEntry};
 use super::translate::{
     approval_decision_to_permission_reply, build_prompt_async_request, EventContext,
+    OpenCodeUsageState,
 };
 
 /// Live handle to an OpenCode session bound to one Codemux thread.
@@ -162,7 +164,18 @@ impl OpenCodeSession {
             turn_id: initial_turn,
             provider_session_id: provider_session_id.clone(),
             turn_active: false,
+            context_window_tokens: None,
         }));
+        // Best-effort: the numeric context window lives only in the
+        // upstream provider catalogue, so resolve it off the hot path.
+        // Failure is non-fatal — the meter simply renders a bare token
+        // count until (or unless) a number lands.
+        spawn_context_window_probe(
+            server_handle.base_url.clone(),
+            server_handle.server_password.clone(),
+            initial_model.clone(),
+            event_ctx.clone(),
+        );
 
         // Shared liveness flag: the SSE listener flips it when it exhausts
         // its reconnect budget (server gone), which makes `has_session`
@@ -175,6 +188,10 @@ impl OpenCodeSession {
             event_ctx: event_ctx.clone(),
             router: router.clone(),
             dead: dead.clone(),
+            // Owned by the listener task: this session spawns exactly
+            // one, and a dead listener means a rebuilt session (and a
+            // fresh thread-level accounting) anyway.
+            usage: Arc::new(Mutex::new(OpenCodeUsageState::default())),
         };
         let sse_handle = spawn_sse_listener(
             server_handle.base_url.clone(),
@@ -401,8 +418,20 @@ impl OpenCodeSession {
     /// not have a "session-level model swap" RPC — the change is
     /// applied at the next `prompt_async` body.
     pub async fn set_model(&self, model: String) {
-        let mut current = self.current_model.lock().await;
-        *current = Some(model);
+        {
+            let mut current = self.current_model.lock().await;
+            *current = Some(model.clone());
+        }
+        // The window is a property of the model, so a swap invalidates
+        // the cached number. Clear it immediately (a stale denominator
+        // is worse than none) and re-probe in the background.
+        self.event_ctx.lock().await.context_window_tokens = None;
+        spawn_context_window_probe(
+            self.server_handle.base_url.clone(),
+            self.server_handle.server_password.clone(),
+            Some(model),
+            self.event_ctx.clone(),
+        );
     }
 
     /// Tear down the session. Aborts the SSE task, deletes the
@@ -469,6 +498,56 @@ async fn session_is_addressable(
     }
 }
 
+/// Resolve `model_slug` (`providerID/modelID`) to its numeric context
+/// window in a harvested provider catalogue.
+///
+/// Returns `None` for an unknown provider/model or an upstream that
+/// reports no `limit.context` — the meter then degrades to a bare
+/// token count rather than rendering a guessed percentage.
+pub(crate) fn lookup_context_window(
+    providers: &[OpenCodeProviderEntry],
+    model_slug: &str,
+) -> Option<u64> {
+    let (provider_id, model_id) = model_slug.split_once('/')?;
+    providers
+        .iter()
+        .find(|p| p.id == provider_id)?
+        .models
+        .get(model_id)
+        .and_then(|m| m.context_window)
+}
+
+/// Look the active model's context window up in the background and
+/// drop it into the shared [`EventContext`].
+///
+/// Deliberately fire-and-forget: the number only sharpens the context
+/// meter (it supplies the denominator), so a slow or failed catalogue
+/// fetch must never delay session start or fail it. A `None` model or
+/// any error simply leaves the window unknown.
+fn spawn_context_window_probe(
+    base_url: String,
+    server_password: String,
+    model_slug: Option<String>,
+    event_ctx: Arc<Mutex<EventContext>>,
+) {
+    let Some(model_slug) = model_slug else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut config = OpenCodeClientConfig::new(base_url);
+        config.server_password = Some(server_password);
+        let Ok(client) = OpenCodeClient::new(config) else {
+            return;
+        };
+        let Ok(providers) = client.list_models().await else {
+            return;
+        };
+        if let Some(window) = lookup_context_window(&providers, &model_slug) {
+            event_ctx.lock().await.context_window_tokens = Some(window);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +582,7 @@ mod tests {
             turn_id: initial_turn,
             provider_session_id: provider_session_id.clone(),
             turn_active: false,
+            context_window_tokens: None,
         }));
         let session = Arc::new(OpenCodeSession {
             thread_id: ThreadId("t1".into()),
@@ -868,5 +948,61 @@ mod tests {
             .await
             .expect("send_turn ok");
         mock.assert_async().await;
+    }
+
+    // ── Context-window lookup ──
+
+    fn catalogue() -> Vec<OpenCodeProviderEntry> {
+        let mut models = std::collections::BTreeMap::new();
+        models.insert(
+            "gpt-5".to_string(),
+            super::super::client::OpenCodeModel {
+                id: "gpt-5".into(),
+                name: "GPT-5".into(),
+                description: None,
+                variants: vec![],
+                context_window: Some(200_000),
+                supports_images: false,
+                is_free: false,
+            },
+        );
+        models.insert(
+            "mystery".to_string(),
+            super::super::client::OpenCodeModel {
+                id: "mystery".into(),
+                name: "Mystery".into(),
+                description: None,
+                variants: vec![],
+                context_window: None,
+                supports_images: false,
+                is_free: false,
+            },
+        );
+        vec![OpenCodeProviderEntry {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            connected: true,
+            models,
+        }]
+    }
+
+    #[test]
+    fn lookup_context_window_resolves_a_known_model_slug() {
+        assert_eq!(
+            lookup_context_window(&catalogue(), "openai/gpt-5"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn lookup_context_window_is_none_for_unknown_or_silent_entries() {
+        // Unknown provider, unknown model, a model the upstream reports
+        // no window for, and a malformed slug all yield `None` — the
+        // meter degrades rather than guessing a denominator.
+        let cat = catalogue();
+        assert!(lookup_context_window(&cat, "anthropic/claude").is_none());
+        assert!(lookup_context_window(&cat, "openai/nope").is_none());
+        assert!(lookup_context_window(&cat, "openai/mystery").is_none());
+        assert!(lookup_context_window(&cat, "no-slash").is_none());
     }
 }

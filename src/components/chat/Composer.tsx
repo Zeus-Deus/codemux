@@ -62,6 +62,7 @@ import { useMcpRuntime } from "@/hooks/use-mcp-runtime";
 import { useMcpStore } from "@/stores/mcp-store";
 import { IssuePickerPanel } from "@/components/github/issue-picker";
 import { PrPickerPanel } from "@/components/github/pr-picker";
+import type { ContextUsageSnapshot } from "@/tauri/events";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
@@ -173,6 +174,14 @@ interface Props {
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
   belowComposerSlot?: React.ReactNode;
+  /** Latest context-window occupancy for the thread, forwarded to the
+   *  footer's meter. Optional (defaults to `null`): the draft surface
+   *  has no session yet, so it omits this and the meter stays hidden. */
+  contextUsage?: ContextUsageSnapshot | null;
+  /** Capability-registry window size seeding the meter's first paint. */
+  contextUsageSeedMaxTokens?: number | null;
+  /** Display name of the agent for the meter's auto-compaction note. */
+  contextUsageProviderLabel?: string | null;
   /** Step 8 Stage 1 — staged attachments rendered as a chip strip
    *  inside the composer card, above the textarea. Empty array hides
    *  the strip. Defaults to `[]` so existing call sites keep working
@@ -281,6 +290,9 @@ export function Composer({
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
+  contextUsage = null,
+  contextUsageSeedMaxTokens = null,
+  contextUsageProviderLabel = null,
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
   onToggleExpandPr,
@@ -2430,6 +2442,9 @@ export function Composer({
             onAttachClick={handleAttachClick}
             attachOpen={attachOpen}
             modelPickerOpenSignal={modelPickerOpenSignal}
+            contextUsage={contextUsage}
+            contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
+            contextUsageProviderLabel={contextUsageProviderLabel}
           />
         </div>
         {/* No gap here — the scope strip / context strip attaches

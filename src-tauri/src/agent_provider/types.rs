@@ -188,6 +188,15 @@ pub struct ContextWindowOption {
     /// True when this option should be selected by default.
     #[serde(default)]
     pub is_default: bool,
+    /// The option's window size in tokens (e.g. `200_000` for `"200k"`).
+    ///
+    /// Lets the UI seed the context meter's denominator at first paint,
+    /// before the provider has reported a runtime figure of its own.
+    /// `None` when the registry does not state a number — never
+    /// guessed from the label. `#[serde(default)]` so payloads
+    /// persisted before this field existed still deserialise.
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
 }
 
 /// A single permission mode a provider exposes (e.g. Claude's
@@ -270,6 +279,19 @@ pub struct ChatModelInfo {
     /// list (after favorites).
     #[serde(default)]
     pub is_free: bool,
+    /// The model's context-window size in tokens, when the registry
+    /// knows it outright (either harvested live from the provider or
+    /// stated explicitly in the maintained entry).
+    ///
+    /// Seeds the context meter's denominator before the provider
+    /// reports a runtime figure. Models that expose a
+    /// [`ContextWindowOption`] picker leave this `None` and carry the
+    /// number on the *selected option* instead, since the effective
+    /// window depends on which option is active. `None` is always the
+    /// safe answer — the UI degrades to a bare token count rather than
+    /// rendering a guessed percentage.
+    #[serde(default)]
+    pub max_context_tokens: Option<u64>,
 }
 
 /// Bundle of chat-side capability data for a single provider. Returned by

@@ -292,6 +292,13 @@ fn model_entry_to_chat_info(entry: ModelEntry) -> ChatModelInfo {
         supports_images,
         sub_provider: None,
         is_free: false,
+        // The app-server's model catalogue does not carry a context
+        // window, so there is nothing to seed the meter with here. The
+        // live figure arrives instead on `thread/tokenUsage/updated`
+        // (`modelContextWindow`), which the adapter stamps onto every
+        // context-usage snapshot. Guessing a static number would render
+        // a wrong percentage until the first turn ends.
+        max_context_tokens: None,
     }
 }
 
@@ -499,5 +506,18 @@ mod tests {
         cache.invalidate().await;
         let guard = cache.inner.lock().await;
         assert!(guard.is_none());
+    }
+
+    // ── Numeric context window ──
+
+    #[test]
+    fn model_entries_state_no_context_window() {
+        // The app-server's model catalogue carries no window size, so
+        // the registry asserts none. The live figure arrives instead on
+        // `thread/tokenUsage/updated` (`modelContextWindow`) and is
+        // stamped onto every context-usage snapshot from there.
+        let info = model_entry_to_chat_info(entry("gpt-5", false, vec!["text"]));
+        assert!(info.max_context_tokens.is_none());
+        assert!(info.context_window_options.is_empty());
     }
 }

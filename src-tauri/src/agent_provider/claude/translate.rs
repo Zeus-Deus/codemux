@@ -26,9 +26,9 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::agent_provider::{
-    CompletedItem, ContentDelta, ProviderRuntimeEvent, ProviderSessionId, RequestId,
-    SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus, TurnUsage,
-    WorkflowPhaseSnapshot, WorkflowSnapshot,
+    CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent, ProviderSessionId,
+    RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
+    TurnUsage, WorkflowPhaseSnapshot, WorkflowSnapshot,
 };
 
 use super::protocol::{SidecarError, SidecarNotification};
@@ -64,6 +64,12 @@ pub struct SubagentDemux {
     /// snapshot is stamped with this id (see [`stamp_workflow_attribution`])
     /// so the frontend can route it into the workflow's phase view.
     active_workflow: Option<String>,
+    /// Context-window accounting for this session's thread. Lives here
+    /// because it needs exactly the same treatment as the subagent maps
+    /// — per-session, mutated across messages, owned by the single
+    /// notification task — so it rides the `&mut` the translator is
+    /// already handed rather than inventing a second channel.
+    context: ContextUsageTracker,
 }
 
 impl SubagentDemux {
@@ -398,7 +404,7 @@ pub fn translate_sdk_message_with(
             // render them.
             warning(thread_id, "sdk user-replay message", msg)
         }
-        "result" => translate_result(thread_id, msg),
+        "result" => translate_result(thread_id, msg, demux),
         "system" => translate_system(thread_id, msg, demux),
         "stream_event" => translate_stream_event(thread_id, msg, demux),
         "auth_status" => warning(thread_id, "auth status changed", msg),
@@ -555,7 +561,48 @@ fn translate_assistant(
         // was seen.
         out = warning(thread_id, "assistant message with no recognized blocks", msg);
     }
+    // Live context-occupancy update, from the `message.usage` block the
+    // SDK stamps on every assistant message.
+    //
+    // Subagent messages are excluded: a subagent runs against its OWN
+    // context window, so folding its tokens into the parent's meter
+    // would overstate the parent. This is the same usage-hygiene rule
+    // that drops subagent `message_delta` events in
+    // `translate_stream_event`.
+    if subagent_id.is_none() {
+        if let Some(usage) = msg.get("message").and_then(|m| m.get("usage")) {
+            out.extend(demux.context.events(
+                thread_id,
+                usage_block_tokens(usage),
+                None,
+                CLAUDE_COMPACTS_AUTOMATICALLY,
+            ));
+        }
+    }
     out
+}
+
+/// Claude Code compacts the context automatically once the window
+/// fills, and Codemux exposes no toggle to turn that off — so every
+/// Claude snapshot reports automatic compaction as on.
+const CLAUDE_COMPACTS_AUTOMATICALLY: Option<bool> = Some(true);
+
+/// Sum an Anthropic `usage` block into live context occupancy.
+///
+/// All four token classes count: fresh input, both cache tiers, and
+/// output. Cache reads in particular are *not* free context — they are
+/// prompt content the model sees on this request, so they occupy the
+/// window exactly like uncached input does.
+fn usage_block_tokens(usage: &serde_json::Value) -> u64 {
+    [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ]
+    .iter()
+    .filter_map(|key| usage.get(key).and_then(|v| v.as_u64()))
+    .fold(0u64, |acc, v| acc.saturating_add(v))
 }
 
 /// Build the initial [`SubagentSnapshot`] from an `Agent`/`Task`
@@ -995,6 +1042,7 @@ fn agent_output_text(tur: &serde_json::Value) -> Option<String> {
 fn translate_result(
     thread_id: &ThreadId,
     msg: &serde_json::Value,
+    demux: &mut SubagentDemux,
 ) -> Vec<ProviderRuntimeEvent> {
     let turn_id = extract_turn_id(msg);
     let subtype = msg
@@ -1025,12 +1073,77 @@ fn translate_result(
         },
     };
     let usage = extract_usage(msg);
-    vec![ProviderRuntimeEvent::TurnCompleted {
+    // Context usage first, so the meter is already correct by the time
+    // the UI processes the turn settling.
+    let mut out = result_context_usage(thread_id, msg, &mut demux.context);
+    out.push(ProviderRuntimeEvent::TurnCompleted {
         thread_id: thread_id.clone(),
         turn_id,
         status,
         usage,
-    }]
+    });
+    out
+}
+
+/// Turn-end context accounting, derived from the `result` message.
+///
+/// Two things only the result knows:
+///
+/// * `modelUsage` — a map keyed by model id whose entries carry the
+///   `contextWindow` that model ran with. This is the ONLY place Claude
+///   states a window size, so it is the sole source for `max_tokens`;
+///   the largest window across the entries wins, since a turn that
+///   spilled across models is bounded by the biggest one it used.
+/// * `usage` — the turn's *cumulative* token consumption, which is the
+///   per-turn figure that feeds the lifetime accumulator. It is
+///   deliberately NOT used as live occupancy: cache reads repeat in
+///   full on every iteration within a turn, so the cumulative sum runs
+///   far ahead of what actually sits in the window.
+///
+/// The emitted snapshot therefore re-states the last live occupancy
+/// observed from an assistant message, now stamped with the freshly
+/// learned window and lifetime total. When no assistant reading exists
+/// (a single-iteration turn whose assistant message carried no usage)
+/// the turn figure is the occupancy, so it is used as the fallback.
+fn result_context_usage(
+    thread_id: &ThreadId,
+    msg: &serde_json::Value,
+    tracker: &mut crate::agent_provider::ContextUsageTracker,
+) -> Vec<ProviderRuntimeEvent> {
+    tracker.observe_max_tokens(model_usage_context_window(msg));
+    let mut turn_tokens = 0;
+    if let Some(usage) = msg.get("usage") {
+        turn_tokens = usage_block_tokens(usage);
+        // An explicit total wins over the summed breakdown when the
+        // result states one — it is the provider's own arithmetic.
+        let processed = usage
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(turn_tokens);
+        // Once per turn. Accumulating this per assistant message
+        // instead would multiply every repeated cache read by the
+        // iteration count.
+        tracker.add_processed(processed);
+    }
+    // A result with no `usage` at all still re-emits, so a window
+    // learned from `modelUsage` reaches the meter.
+    let live = match tracker.last_live_used() {
+        0 => turn_tokens,
+        seen => seen,
+    };
+    tracker.events(thread_id, live, None, CLAUDE_COMPACTS_AUTOMATICALLY)
+}
+
+/// Largest `modelUsage[*].contextWindow` reported on a `result`.
+fn model_usage_context_window(msg: &serde_json::Value) -> Option<u64> {
+    msg.get("modelUsage")
+        .and_then(|v| v.as_object())
+        .and_then(|entries| {
+            entries
+                .values()
+                .filter_map(|entry| entry.get("contextWindow").and_then(|v| v.as_u64()))
+                .max()
+        })
 }
 
 /// `type: "system"` family — discriminated by `subtype`.
@@ -1095,8 +1208,15 @@ fn translate_system(
         "task_progress" => translate_task_progress(thread_id, msg, demux),
         "task_updated" => translate_task_updated(thread_id, msg, demux),
         "task_notification" => translate_task_notification(thread_id, msg, demux),
-        "compact_boundary"
-        | "hook_started"
+        // A compaction just rewrote the window. Emit the token facts
+        // first, then keep surfacing the raw system event so anything
+        // already keyed off the warning still sees it.
+        "compact_boundary" => {
+            let mut out = translate_compact_boundary(thread_id, msg, &mut demux.context);
+            out.extend(warning(thread_id, "sdk system.compact_boundary", msg));
+            out
+        }
+        "hook_started"
         | "hook_progress"
         | "hook_response"
         | "files_persisted"
@@ -1111,6 +1231,32 @@ fn translate_system(
         }
         _ => warning(thread_id, &format!("unknown sdk system subtype: {subtype}"), msg),
     }
+}
+
+/// `system.compact_boundary` — the SDK just compacted the thread.
+///
+/// `compact_metadata` carries the occupancy on both sides of the
+/// boundary: `post_tokens` is what survived into the fresh window (the
+/// new live occupancy) and `pre_tokens` is the high-water mark it
+/// replaced. The lifetime total is untouched and carries forward, so
+/// the meter drops while the informational lifetime figure keeps
+/// climbing — which is exactly what a compaction means.
+///
+/// Emits nothing when the post-compaction figure is missing or zero:
+/// an unknown occupancy is worse than a stale-but-real one.
+fn translate_compact_boundary(
+    thread_id: &ThreadId,
+    msg: &serde_json::Value,
+    tracker: &mut crate::agent_provider::ContextUsageTracker,
+) -> Vec<ProviderRuntimeEvent> {
+    let meta = msg.get("compact_metadata");
+    let field = |snake: &str, camel: &str| {
+        meta.and_then(|m| m.get(snake).or_else(|| m.get(camel)))
+            .and_then(|v| v.as_u64())
+    };
+    let post = field("post_tokens", "postTokens").unwrap_or(0);
+    let pre = field("pre_tokens", "preTokens");
+    tracker.events(thread_id, post, pre, CLAUDE_COMPACTS_AUTOMATICALLY)
 }
 
 /// Pull the `usage` block ({ total_tokens, tool_uses, duration_ms })
@@ -1454,6 +1600,7 @@ fn classify_tool(tool_name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_provider::ContextUsageSnapshot;
     use serde_json::json;
 
     fn tid() -> ThreadId {
@@ -2939,5 +3086,353 @@ async function run() {
         ))
         .clone();
         assert_eq!(snap.workflow_id.as_deref(), Some("toolu_wf1"));
+    }
+
+    // ── Context-window usage ──
+    //
+    // The meter's numerator is *live occupancy*: fresh input + both
+    // cache tiers + output of the latest report. Cache reads count —
+    // they are prompt content the model sees, not free context.
+
+    /// Extract the single `ContextUsageUpdated` snapshot from a batch,
+    /// asserting exactly one was emitted.
+    fn only_usage(events: &[ProviderRuntimeEvent]) -> ContextUsageSnapshot {
+        let mut found = events.iter().filter_map(|e| match e {
+            ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } => Some(usage.clone()),
+            _ => None,
+        });
+        let snap = found.next().expect("expected a ContextUsageUpdated");
+        assert!(found.next().is_none(), "expected exactly one snapshot");
+        snap
+    }
+
+    fn usage_snapshots(events: &[ProviderRuntimeEvent]) -> Vec<ContextUsageSnapshot> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assistant_with_usage(usage: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "assistant",
+            "turn_id": "turn-1",
+            "message": {
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": usage
+            }
+        })
+    }
+
+    fn result_msg(usage: serde_json::Value, model_usage: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "turn_id": "turn-1",
+            "duration_ms": 1000,
+            "num_turns": 1,
+            "usage": usage,
+            "modelUsage": model_usage
+        })
+    }
+
+    #[test]
+    fn assistant_usage_sums_all_four_token_classes() {
+        let msg = assistant_with_usage(json!({
+            "input_tokens": 4,
+            "cache_creation_input_tokens": 2715,
+            "cache_read_input_tokens": 21144,
+            "output_tokens": 679
+        }));
+        let events = translate_sdk_message(&tid(), &msg);
+        let snap = only_usage(&events);
+        assert_eq!(snap.used_tokens, 24_542);
+        // No window reported yet, and nothing accumulated.
+        assert!(snap.max_tokens.is_none());
+        assert!(snap.total_processed_tokens.is_none());
+        assert_eq!(snap.compacts_automatically, Some(true));
+        // The transcript item still lands alongside the snapshot.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProviderRuntimeEvent::ItemCompleted { .. })));
+    }
+
+    #[test]
+    fn assistant_without_usage_block_emits_no_snapshot() {
+        let events = translate_sdk_message(&tid(), &assistant_text("hi"));
+        assert!(usage_snapshots(&events).is_empty());
+    }
+
+    #[test]
+    fn zero_usage_emits_no_snapshot() {
+        let msg = assistant_with_usage(json!({"input_tokens": 0, "output_tokens": 0}));
+        let events = translate_sdk_message(&tid(), &msg);
+        assert!(usage_snapshots(&events).is_empty());
+    }
+
+    #[test]
+    fn repeated_identical_usage_is_suppressed() {
+        let mut demux = SubagentDemux::default();
+        let msg = assistant_with_usage(json!({"input_tokens": 100, "output_tokens": 20}));
+        let first = translate_sdk_message_with(&tid(), &msg, &mut demux);
+        assert_eq!(only_usage(&first).used_tokens, 120);
+        let second = translate_sdk_message_with(&tid(), &msg, &mut demux);
+        assert!(
+            usage_snapshots(&second).is_empty(),
+            "an identical repeat snapshot must not re-emit"
+        );
+    }
+
+    #[test]
+    fn subagent_assistant_usage_does_not_feed_the_parent_meter() {
+        // Usage hygiene: a subagent burns its OWN context window, so
+        // its tokens must never move the parent's meter.
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &launch_msg("Agent", "toolu_root", json!({"subagent_type": "Explore"})),
+            &mut demux,
+        );
+        let inner = json!({
+            "type": "assistant",
+            "parent_tool_use_id": "toolu_root",
+            "turn_id": "turn-1",
+            "message": {
+                "content": [{"type": "text", "text": "working"}],
+                "usage": {"input_tokens": 500_000, "output_tokens": 1000}
+            }
+        });
+        let events = translate_sdk_message_with(&tid(), &inner, &mut demux);
+        assert!(
+            usage_snapshots(&events).is_empty(),
+            "subagent usage must not emit a parent context snapshot"
+        );
+    }
+
+    #[test]
+    fn result_model_usage_supplies_the_context_window() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &assistant_with_usage(json!({"input_tokens": 30_000, "output_tokens": 500})),
+            &mut demux,
+        );
+        let result = result_msg(
+            json!({"input_tokens": 30_000, "output_tokens": 500}),
+            json!({"claude-opus-4-8": {"contextWindow": 200_000, "inputTokens": 30_000}}),
+        );
+        let events = translate_sdk_message_with(&tid(), &result, &mut demux);
+        let snap = only_usage(&events);
+        assert_eq!(snap.max_tokens, Some(200_000));
+        // Live occupancy is the assistant reading, not the turn total.
+        assert_eq!(snap.used_tokens, 30_500);
+        // The turn settles after the meter is already correct.
+        assert!(matches!(
+            events.last(),
+            Some(ProviderRuntimeEvent::TurnCompleted { .. })
+        ));
+    }
+
+    #[test]
+    fn result_takes_the_largest_window_across_models() {
+        let mut demux = SubagentDemux::default();
+        let result = result_msg(
+            json!({"input_tokens": 10, "output_tokens": 5}),
+            json!({
+                "claude-haiku-4-5": {"contextWindow": 200_000},
+                "claude-opus-4-8": {"contextWindow": 1_000_000}
+            }),
+        );
+        let events = translate_sdk_message_with(&tid(), &result, &mut demux);
+        assert_eq!(only_usage(&events).max_tokens, Some(1_000_000));
+    }
+
+    #[test]
+    fn used_is_clamped_to_the_window_while_the_lifetime_total_stays_real() {
+        let mut demux = SubagentDemux::default();
+        // A reading that overshoots the window (provider drift, or a
+        // window that shrank mid-session) must never render >100%.
+        translate_sdk_message_with(
+            &tid(),
+            &assistant_with_usage(json!({"input_tokens": 240_000, "output_tokens": 10_000})),
+            &mut demux,
+        );
+        let result = result_msg(
+            json!({"input_tokens": 240_000, "output_tokens": 10_000, "total_tokens": 250_000}),
+            json!({"claude-opus-4-8": {"contextWindow": 200_000}}),
+        );
+        let events = translate_sdk_message_with(&tid(), &result, &mut demux);
+        let snap = only_usage(&events);
+        assert_eq!(snap.used_tokens, 200_000, "clamped to the window");
+        assert_eq!(
+            snap.total_processed_tokens,
+            Some(250_000),
+            "the lifetime figure keeps the real number"
+        );
+    }
+
+    #[test]
+    fn lifetime_total_accumulates_once_per_turn_and_only_when_above_used() {
+        let mut demux = SubagentDemux::default();
+        let usage = json!({"input_tokens": 1_000, "output_tokens": 200});
+        // Turn 1: the assistant reading is the whole story. At the
+        // result the lifetime total merely equals the live occupancy,
+        // so it is omitted — leaving a snapshot identical to the one
+        // already emitted, which the no-op suppression drops entirely.
+        let opening =
+            translate_sdk_message_with(&tid(), &assistant_with_usage(usage.clone()), &mut demux);
+        let opening = only_usage(&opening);
+        assert_eq!(opening.used_tokens, 1_200);
+        assert!(opening.total_processed_tokens.is_none());
+        let first = translate_sdk_message_with(
+            &tid(),
+            &result_msg(usage.clone(), json!({})),
+            &mut demux,
+        );
+        assert!(
+            usage_snapshots(&first).is_empty(),
+            "a result that changes nothing must not re-emit"
+        );
+        // Turn 2: the same live occupancy repeats (still suppressed),
+        // but the second turn's tokens push the lifetime figure past
+        // it — so the result snapshot now carries a real total.
+        let repeat =
+            translate_sdk_message_with(&tid(), &assistant_with_usage(usage.clone()), &mut demux);
+        assert!(usage_snapshots(&repeat).is_empty());
+        let second =
+            translate_sdk_message_with(&tid(), &result_msg(usage, json!({})), &mut demux);
+        assert_eq!(
+            only_usage(&second).total_processed_tokens,
+            Some(2_400),
+            "each turn contributes exactly once"
+        );
+    }
+
+    #[test]
+    fn result_explicit_total_wins_over_the_summed_breakdown() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &assistant_with_usage(json!({"input_tokens": 100, "output_tokens": 10})),
+            &mut demux,
+        );
+        // The breakdown sums to 110 but the provider states 9_000.
+        let result = result_msg(
+            json!({"input_tokens": 100, "output_tokens": 10, "total_tokens": 9_000}),
+            json!({}),
+        );
+        let events = translate_sdk_message_with(&tid(), &result, &mut demux);
+        assert_eq!(only_usage(&events).total_processed_tokens, Some(9_000));
+    }
+
+    #[test]
+    fn result_without_a_prior_assistant_reading_falls_back_to_the_turn_figure() {
+        let mut demux = SubagentDemux::default();
+        let events = translate_sdk_message_with(
+            &tid(),
+            &result_msg(json!({"input_tokens": 800, "output_tokens": 200}), json!({})),
+            &mut demux,
+        );
+        assert_eq!(only_usage(&events).used_tokens, 1_000);
+    }
+
+    #[test]
+    fn result_without_usage_still_delivers_a_window_learned_from_model_usage() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &assistant_with_usage(json!({"input_tokens": 5_000, "output_tokens": 100})),
+            &mut demux,
+        );
+        // No `usage` block, but `modelUsage` states the window — the
+        // meter must still learn its denominator.
+        let result = json!({
+            "type": "result",
+            "subtype": "success",
+            "turn_id": "turn-1",
+            "duration_ms": 10,
+            "num_turns": 1,
+            "modelUsage": {"claude-opus-4-8": {"contextWindow": 200_000}}
+        });
+        let events = translate_sdk_message_with(&tid(), &result, &mut demux);
+        let snap = only_usage(&events);
+        assert_eq!(snap.max_tokens, Some(200_000));
+        assert_eq!(snap.used_tokens, 5_100);
+    }
+
+    #[test]
+    fn compact_boundary_drops_used_and_records_the_pre_compaction_mark() {
+        let mut demux = SubagentDemux::default();
+        translate_sdk_message_with(
+            &tid(),
+            &assistant_with_usage(json!({"input_tokens": 150_000, "output_tokens": 5_000})),
+            &mut demux,
+        );
+        translate_sdk_message_with(
+            &tid(),
+            &result_msg(
+                json!({"input_tokens": 150_000, "output_tokens": 5_000, "total_tokens": 400_000}),
+                json!({"claude-opus-4-8": {"contextWindow": 200_000}}),
+            ),
+            &mut demux,
+        );
+        let boundary = json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {"pre_tokens": 155_000, "post_tokens": 30_000, "trigger": "auto"}
+        });
+        let events = translate_sdk_message_with(&tid(), &boundary, &mut demux);
+        let snap = only_usage(&events);
+        assert_eq!(snap.used_tokens, 30_000, "post-compaction occupancy");
+        assert_eq!(
+            snap.last_used_tokens,
+            Some(155_000),
+            "pre-compaction high-water mark is preserved"
+        );
+        assert_eq!(
+            snap.total_processed_tokens,
+            Some(400_000),
+            "the lifetime total carries forward across the compaction"
+        );
+        assert_eq!(snap.max_tokens, Some(200_000), "the window stays known");
+        // The raw system event is still surfaced for existing consumers.
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProviderRuntimeEvent::RuntimeWarning { .. })));
+    }
+
+    #[test]
+    fn compact_boundary_without_post_tokens_emits_no_snapshot() {
+        // An unknown post-compaction occupancy is worse than none — the
+        // previous (stale but real) reading stands.
+        let mut demux = SubagentDemux::default();
+        let boundary = json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {"pre_tokens": 155_000}
+        });
+        let events = translate_sdk_message_with(&tid(), &boundary, &mut demux);
+        assert!(usage_snapshots(&events).is_empty());
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ProviderRuntimeEvent::RuntimeWarning { .. })));
+    }
+
+    #[test]
+    fn compact_boundary_accepts_camel_case_metadata() {
+        // Wire-drift tolerance: both casings decode.
+        let mut demux = SubagentDemux::default();
+        let boundary = json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compact_metadata": {"preTokens": 90_000, "postTokens": 12_000}
+        });
+        let events = translate_sdk_message_with(&tid(), &boundary, &mut demux);
+        let snap = only_usage(&events);
+        assert_eq!(snap.used_tokens, 12_000);
+        assert_eq!(snap.last_used_tokens, Some(90_000));
     }
 }

@@ -704,6 +704,11 @@ export interface ContextWindowOption {
   value: string;
   label: string;
   is_default: boolean;
+  /** Numeric window size in tokens for this option (e.g. 200_000 for
+   *  `"200k"`, 1_000_000 for `"1m"`). Seed value for the context meter's
+   *  first paint only — the provider's own runtime report always wins.
+   *  Optional: absent/null on older payloads or when unknown. */
+  context_window_tokens?: number | null;
 }
 
 export interface ChatModelInfo {
@@ -728,6 +733,13 @@ export interface ChatModelInfo {
    *  picker's grouping rail and the secondary label rendered below
    *  the model name. */
   sub_provider: string | null;
+  /** Numeric context-window size in tokens for models with no
+   *  selectable window options (OpenCode harvests this from the
+   *  upstream catalog's `limit.context`). Seed for the context meter's
+   *  first paint; the provider's runtime report always wins. Absent/
+   *  null = unknown — the meter degrades to a bare token count rather
+   *  than guessing. */
+  max_context_tokens?: number | null;
   /** True when the model is free-tier on the upstream provider's
    *  configured plan (both input and output token costs are 0).
    *  Drives a "FREE" pill in the picker and a soft sort boost so

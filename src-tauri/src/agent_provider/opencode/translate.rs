@@ -15,6 +15,9 @@
 //! as [`ProviderRuntimeEvent::RuntimeWarning`] instead of silently
 //! dropping them — adapter drift must be observable.
 
+use std::collections::HashMap;
+
+use crate::agent_provider::context_usage::ContextUsageTracker;
 use crate::agent_provider::events::{
     CompletedItem, ContentDelta, ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus, TurnStatus,
 };
@@ -117,6 +120,14 @@ pub fn approval_decision_to_permission_reply(decision: &ApprovalDecision) -> Per
 #[derive(Debug, Clone)]
 pub struct EventContext {
     pub thread_id: ThreadId,
+    /// The active model's context-window size in tokens, when known.
+    ///
+    /// OpenCode states this only in the upstream provider catalogue
+    /// (`limit.context`), never on the event stream, so the session
+    /// probes for it in the background and drops the number here.
+    /// `None` until (or unless) that lands — the meter then renders a
+    /// bare token count rather than a guessed percentage.
+    pub context_window_tokens: Option<u64>,
     /// Active turn id Codemux assigned when the user hit send.
     pub turn_id: TurnId,
     /// OpenCode's session id for the active session — used to
@@ -147,8 +158,39 @@ pub fn opencode_event_to_runtime(
     ctx: &EventContext,
     subagent_id: Option<&str>,
 ) -> Vec<ProviderRuntimeEvent> {
+    opencode_event_to_runtime_with(
+        event,
+        ctx,
+        subagent_id,
+        &mut OpenCodeUsageState::default(),
+    )
+}
+
+/// Per-session token accounting for the OpenCode adapter.
+///
+/// OpenCode has no lifetime counter of its own, so the adapter keeps
+/// one. Assistant messages are updated *incrementally* — the same
+/// message id is re-broadcast with a growing `tokens` block — so
+/// accumulating each report wholesale would multiply the total. The
+/// per-message high-water map fixes that: only the growth since that
+/// message's previous report is added.
+#[derive(Debug, Default)]
+pub struct OpenCodeUsageState {
+    tracker: ContextUsageTracker,
+    /// Assistant message id → the largest token figure seen for it.
+    seen_per_message: HashMap<String, u64>,
+}
+
+/// [`opencode_event_to_runtime`] threading the session's token
+/// accounting so context-usage snapshots span multiple events.
+pub fn opencode_event_to_runtime_with(
+    event: OpenCodeEvent,
+    ctx: &EventContext,
+    subagent_id: Option<&str>,
+    usage: &mut OpenCodeUsageState,
+) -> Vec<ProviderRuntimeEvent> {
     match event {
-        OpenCodeEvent::Known(known) => translate_known(known, ctx, subagent_id),
+        OpenCodeEvent::Known(known) => translate_known(known, ctx, subagent_id, usage),
         OpenCodeEvent::Other(payload) => {
             let event_type = payload
                 .get("type")
@@ -168,6 +210,7 @@ fn translate_known(
     event: KnownEvent,
     ctx: &EventContext,
     subagent_id: Option<&str>,
+    usage: &mut OpenCodeUsageState,
 ) -> Vec<ProviderRuntimeEvent> {
     match event {
         KnownEvent::MessagePartDelta(delta) => translate_part_delta(delta, ctx, subagent_id),
@@ -175,7 +218,9 @@ fn translate_known(
             translate_part_updated(updated, ctx, subagent_id)
         }
         KnownEvent::MessagePartRemoved(_) => vec![],
-        KnownEvent::MessageUpdated(env) => translate_message_updated(env, ctx, subagent_id),
+        KnownEvent::MessageUpdated(env) => {
+            translate_message_updated(env, ctx, subagent_id, usage)
+        }
         KnownEvent::MessageRemoved(_) => vec![],
         KnownEvent::SessionIdle(_) => {
             // A child session going idle fires *before* the parent's
@@ -624,6 +669,7 @@ fn translate_message_updated(
     env: super::protocol::MessageEnvelope,
     ctx: &EventContext,
     subagent_id: Option<&str>,
+    usage: &mut OpenCodeUsageState,
 ) -> Vec<ProviderRuntimeEvent> {
     // Only assistant errors matter at this layer; all other content is
     // already covered by the per-part events.
@@ -649,7 +695,45 @@ fn translate_message_updated(
         }
         return translate_assistant_error(err, ctx);
     }
-    vec![]
+    translate_message_tokens(&env.info, ctx, subagent_id, usage)
+}
+
+/// Context-meter update from an assistant message's `tokens` block.
+///
+/// Subagent messages are excluded: a child session runs against its
+/// own context window, so folding its tokens into the parent's meter
+/// would overstate the parent.
+fn translate_message_tokens(
+    info: &super::protocol::MessageInfo,
+    ctx: &EventContext,
+    subagent_id: Option<&str>,
+    usage: &mut OpenCodeUsageState,
+) -> Vec<ProviderRuntimeEvent> {
+    if subagent_id.is_some() {
+        return vec![];
+    }
+    let Some(tokens) = info.tokens.as_ref() else {
+        return vec![];
+    };
+    let used = tokens.total();
+    if used == 0 {
+        return vec![];
+    }
+    // Add only this message's growth since its last report, so the
+    // repeated incremental updates of one message don't compound. The
+    // stored value is a high-water mark: a report that comes back
+    // *lower* (partial re-send) must not let the next one re-add the
+    // difference.
+    let seen = usage.seen_per_message.entry(info.id.clone()).or_insert(0);
+    if used > *seen {
+        usage.tracker.add_processed(used - *seen);
+        *seen = used;
+    }
+    usage.tracker.observe_max_tokens(ctx.context_window_tokens);
+    // OpenCode does not advertise whether the upstream compacts
+    // automatically, and it varies by upstream provider — so it stays
+    // unknown rather than being asserted either way.
+    usage.tracker.events(&ctx.thread_id, used, None, None)
 }
 
 fn translate_session_error(
@@ -694,6 +778,7 @@ mod tests {
     use super::*;
     use super::super::protocol::KnownEvent;
     use crate::agent_provider::types::{ImageInput, ProviderSessionId, ThreadId, TurnId};
+    use serde_json::json;
 
     fn ctx() -> EventContext {
         EventContext {
@@ -701,6 +786,16 @@ mod tests {
             turn_id: TurnId("turn_1".into()),
             provider_session_id: ProviderSessionId("sess_1".into()),
             turn_active: true,
+            context_window_tokens: None,
+        }
+    }
+
+    /// [`ctx`] with a known context window, for the clamping /
+    /// denominator assertions.
+    fn ctx_with_window(window: u64) -> EventContext {
+        EventContext {
+            context_window_tokens: Some(window),
+            ..ctx()
         }
     }
 
@@ -1378,5 +1473,237 @@ mod tests {
             }),
         }));
         assert!(opencode_event_to_runtime(event, &ctx(), None).is_empty());
+    }
+
+    // ── Context-window usage (assistant `tokens` block) ──
+
+    fn usage_snapshots(
+        events: &[ProviderRuntimeEvent],
+    ) -> Vec<crate::agent_provider::ContextUsageSnapshot> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A `message.updated` event for an assistant message carrying a
+    /// `tokens` block, decoded from the wire shape so the test covers
+    /// the decoder as well as the translation.
+    fn assistant_tokens_event(
+        message_id: &str,
+        input: u64,
+        cache_read: u64,
+        cache_write: u64,
+        output: u64,
+        reasoning: u64,
+    ) -> OpenCodeEvent {
+        serde_json::from_value(json!({
+            "type": "message.updated",
+            "properties": {
+                "info": {
+                    "id": message_id,
+                    "sessionID": "sess_1",
+                    "role": "assistant",
+                    "tokens": {
+                        "input": input,
+                        "output": output,
+                        "reasoning": reasoning,
+                        "cache": {"read": cache_read, "write": cache_write}
+                    }
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn assistant_tokens_block_sums_every_bucket() {
+        let mut usage = OpenCodeUsageState::default();
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 4, 21_144, 2_715, 679, 0),
+            &ctx(),
+            None,
+            &mut usage,
+        );
+        let snaps = usage_snapshots(&events);
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].used_tokens, 24_542);
+        // No window known yet, and OpenCode never states whether the
+        // upstream auto-compacts.
+        assert!(snaps[0].max_tokens.is_none());
+        assert!(snaps[0].compacts_automatically.is_none());
+    }
+
+    #[test]
+    fn reasoning_tokens_are_counted_toward_occupancy() {
+        let mut usage = OpenCodeUsageState::default();
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 100, 0, 0, 50, 25),
+            &ctx(),
+            None,
+            &mut usage,
+        );
+        assert_eq!(usage_snapshots(&events)[0].used_tokens, 175);
+    }
+
+    #[test]
+    fn context_window_from_the_session_seeds_the_denominator_and_clamps() {
+        let mut usage = OpenCodeUsageState::default();
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 250_000, 0, 0, 1_000, 0),
+            &ctx_with_window(200_000),
+            None,
+            &mut usage,
+        );
+        let snap = &usage_snapshots(&events)[0];
+        assert_eq!(snap.max_tokens, Some(200_000));
+        assert_eq!(snap.used_tokens, 200_000, "never renders above 100%");
+    }
+
+    #[test]
+    fn incremental_updates_of_one_message_do_not_compound_the_lifetime_total() {
+        // OpenCode re-broadcasts the same message id with a growing
+        // token block; only the growth may be accumulated.
+        let mut usage = OpenCodeUsageState::default();
+        let ctx = ctx();
+        opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 1_000, 0, 0, 0, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 1_000, 0, 0, 500, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        // A second message adds its own figure on top.
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_2", 2_000, 0, 0, 100, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        let snap = &usage_snapshots(&events)[0];
+        assert_eq!(snap.used_tokens, 2_100, "live occupancy is this message");
+        assert_eq!(
+            snap.total_processed_tokens,
+            Some(3_600),
+            "1500 from msg_1 (not 1000+1500) plus 2100 from msg_2"
+        );
+    }
+
+    #[test]
+    fn a_lower_re_report_does_not_let_the_next_one_re_add() {
+        // Defensive: a partial re-send that reports fewer tokens must
+        // not reset the high-water mark, or the following report would
+        // add the same tokens to the lifetime total twice.
+        let mut usage = OpenCodeUsageState::default();
+        let ctx = ctx();
+        opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 5_000, 0, 0, 0, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 1_000, 0, 0, 0, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 6_000, 0, 0, 0, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        let snap = &usage_snapshots(&events)[0];
+        assert_eq!(snap.used_tokens, 6_000);
+        // 6_000 total processed == used, so it is omitted rather than
+        // surfacing an inflated 11_000/12_000 figure.
+        assert!(snap.total_processed_tokens.is_none());
+    }
+
+    #[test]
+    fn repeated_identical_token_report_is_suppressed() {
+        let mut usage = OpenCodeUsageState::default();
+        let ctx = ctx();
+        let first = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 100, 0, 0, 20, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        assert_eq!(usage_snapshots(&first).len(), 1);
+        let second = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 100, 0, 0, 20, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        assert!(usage_snapshots(&second).is_empty());
+    }
+
+    #[test]
+    fn zeroed_token_block_emits_nothing() {
+        // Early partial envelopes carry an all-zero block.
+        let mut usage = OpenCodeUsageState::default();
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 0, 0, 0, 0, 0),
+            &ctx(),
+            None,
+            &mut usage,
+        );
+        assert!(usage_snapshots(&events).is_empty());
+    }
+
+    #[test]
+    fn assistant_message_without_a_tokens_block_emits_nothing() {
+        let mut usage = OpenCodeUsageState::default();
+        let event: OpenCodeEvent = serde_json::from_value(json!({
+            "type": "message.updated",
+            "properties": {
+                "info": {"id": "msg_1", "sessionID": "sess_1", "role": "assistant"}
+            }
+        }))
+        .unwrap();
+        let events = opencode_event_to_runtime_with(event, &ctx(), None, &mut usage);
+        assert!(usage_snapshots(&events).is_empty());
+    }
+
+    #[test]
+    fn user_message_tokens_are_ignored() {
+        let mut usage = OpenCodeUsageState::default();
+        let event: OpenCodeEvent = serde_json::from_value(json!({
+            "type": "message.updated",
+            "properties": {
+                "info": {
+                    "id": "msg_1", "sessionID": "sess_1", "role": "user",
+                    "tokens": {"input": 999, "output": 0, "reasoning": 0,
+                               "cache": {"read": 0, "write": 0}}
+                }
+            }
+        }))
+        .unwrap();
+        let events = opencode_event_to_runtime_with(event, &ctx(), None, &mut usage);
+        assert!(usage_snapshots(&events).is_empty());
+    }
+
+    #[test]
+    fn subagent_tokens_do_not_feed_the_parent_meter() {
+        // Usage hygiene: a child session has its own context window.
+        let mut usage = OpenCodeUsageState::default();
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_child", 500_000, 0, 0, 1_000, 0),
+            &ctx(),
+            Some("child_sess"),
+            &mut usage,
+        );
+        assert!(usage_snapshots(&events).is_empty());
     }
 }

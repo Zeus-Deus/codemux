@@ -8,6 +8,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod context_usage;
 pub mod errors;
 pub mod events;
 pub mod instance;
@@ -15,9 +16,10 @@ pub mod opencode;
 pub mod provider;
 pub mod types;
 
+pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};
 pub use events::{
-    child_exit_events, CompletedItem, ContentDelta, ProviderRuntimeEvent,
+    child_exit_events, CompletedItem, ContentDelta, ContextUsageSnapshot, ProviderRuntimeEvent,
     RequestResponseFailureReason, SubagentSnapshot, SubagentStatus, TurnStatus, TurnUsage,
     WorkflowPhaseSnapshot, WorkflowSnapshot, CHILD_EXITED_SUBTYPE,
 };

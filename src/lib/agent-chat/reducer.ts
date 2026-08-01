@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   CompletedItem,
   ContentDelta,
+  ContextUsageSnapshot,
   ProviderRuntimeEvent,
   SubagentSnapshot,
   WorkflowSnapshot,
@@ -788,6 +789,45 @@ function settleWorkflowForToolResult(
   return replaceItem(messages, found.index, nextItem);
 }
 
+/** Store the latest context-window occupancy snapshot for the thread.
+ *
+ *  Latest snapshot wins wholesale — the provider re-reports the full
+ *  reading every time, so there is nothing to accumulate. Two
+ *  exceptions:
+ *
+ *  - Malformed readings are dropped. A non-finite or negative
+ *    `used_tokens` would blank/NaN the meter, so we keep the previous
+ *    (still-plausible) snapshot instead.
+ *  - `total_processed_tokens` is a monotonic lifetime counter, but only
+ *    travels on snapshots where it exceeds `used_tokens`. A later
+ *    snapshot that omits it (or reports a smaller value) must not make
+ *    the "Total processed" row shrink or vanish, so the larger known
+ *    value is merged forward.
+ */
+function applyContextUsage(
+  state: ChatThreadState,
+  usage: ContextUsageSnapshot,
+): ChatThreadState {
+  const used = usage.used_tokens;
+  if (typeof used !== "number" || !Number.isFinite(used) || used < 0) {
+    return state;
+  }
+  const prevTotal = finiteOrNull(state.contextUsage?.total_processed_tokens);
+  const nextTotal = finiteOrNull(usage.total_processed_tokens);
+  const total =
+    prevTotal !== null && (nextTotal === null || nextTotal < prevTotal)
+      ? prevTotal
+      : nextTotal;
+  return {
+    ...state,
+    contextUsage: { ...usage, total_processed_tokens: total },
+  };
+}
+
+function finiteOrNull(value: number | null | undefined): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
 /** Merge a `workflow_updated` snapshot into its item (non-null fields
  *  win, status stays monotonic), creating the item on first sight. */
 function applyWorkflowUpdated(
@@ -1245,6 +1285,10 @@ function applyEventInner(
 
     case "workflow_updated": {
       return applyWorkflowUpdated(state, event.workflow, now);
+    }
+
+    case "context_usage_updated": {
+      return applyContextUsage(state, event.usage);
     }
 
     case "turn_completed": {

@@ -27,16 +27,16 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::agent_provider::{
-    CompletedItem, ContentDelta, ProviderRuntimeEvent, ProviderSessionId, RequestId,
-    SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
+    CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent, ProviderSessionId,
+    RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
 };
 
 use super::protocol::{
     CollabAgentToolCallItem, DeltaParams, ErrorParams, FileChangePatchUpdatedParams, ItemEnvelope,
     McpToolCallProgressParams, NotificationMessage, ReasoningSummaryPartAddedParams,
     ReasoningSummaryTextDeltaParams, ReasoningTextDeltaParams, ServerRequestMessage,
-    SubAgentActivityItem, TerminalInteractionParams, ThreadStartedParams, TurnCompletedParams,
-    TurnStartedParams,
+    SubAgentActivityItem, TerminalInteractionParams, ThreadStartedParams,
+    ThreadTokenUsageUpdatedParams, TurnCompletedParams, TurnStartedParams,
 };
 
 /// Per-session subagent demux state.
@@ -69,6 +69,10 @@ pub struct CodexSubagentDemux {
     /// higher sub-agent). Retained for diagnostics / future nested UI.
     #[allow(dead_code)]
     child_to_parent: HashMap<String, String>,
+    /// Context-window accounting for the parent thread. Per-session and
+    /// mutated across messages, exactly like the sub-agent maps, so it
+    /// rides the `&mut` the translator already receives.
+    context: ContextUsageTracker,
 }
 
 impl CodexSubagentDemux {
@@ -78,6 +82,7 @@ impl CodexSubagentDemux {
             parent_thread_id: parent_thread_id.into(),
             subagents: HashSet::new(),
             child_to_parent: HashMap::new(),
+            context: ContextUsageTracker::default(),
         }
     }
 
@@ -158,6 +163,9 @@ pub fn translate_notification_with(
         NotificationMessage::TurnCompleted(p) if demux.is_subagent(&p.thread_id) => {
             return handle_subagent_turn_completed(thread_id, p);
         }
+        NotificationMessage::ThreadTokenUsageUpdated(p) => {
+            return handle_thread_token_usage(demux, thread_id, p);
+        }
         NotificationMessage::Error(e) => {
             if let Some(child) = e.thread_id.as_deref() {
                 if demux.is_subagent(child) {
@@ -213,6 +221,11 @@ fn translate_parent(
             }]
         }
         NotificationMessage::TurnCompleted(params) => translate_turn_completed(thread_id, params),
+        // Intercepted before this function by `handle_thread_token_usage`
+        // (it needs the session's `&mut` tracker to clamp, dedupe, and
+        // carry the lifetime total), so this arm exists only to keep the
+        // match exhaustive.
+        NotificationMessage::ThreadTokenUsageUpdated(_) => vec![],
         NotificationMessage::Error(ErrorParams {
             message,
             will_retry,
@@ -572,6 +585,45 @@ fn handle_subagent_error(
 /// whose canonical translation should be routed into a child transcript).
 /// Lifecycle notifications (`thread/*`, `turn/*`, `error`) are handled
 /// separately and return `None` here.
+/// `thread/tokenUsage/updated` → [`ProviderRuntimeEvent::ContextUsageUpdated`].
+///
+/// The app-server does the accounting for us: `last` is the current
+/// window occupancy, `total` is the provider-maintained lifetime sum
+/// (preferred over a local accumulator — it is the source of truth),
+/// and `modelContextWindow` is the only place Codex states a window
+/// size.
+///
+/// Usage hygiene: a sub-agent runs as its own Codex thread against its
+/// own context window and reports usage under its own `threadId`.
+/// Those reports are dropped rather than folded into the parent's
+/// meter, matching the rule the Claude adapter applies to subagent
+/// messages.
+fn handle_thread_token_usage(
+    demux: &mut CodexSubagentDemux,
+    thread_id: &ThreadId,
+    params: &ThreadTokenUsageUpdatedParams,
+) -> Vec<ProviderRuntimeEvent> {
+    if demux.is_subagent(&params.thread_id) {
+        return Vec::new();
+    }
+    let usage = &params.token_usage;
+    let (last, total, window) = (
+        usage.last.tokens(),
+        usage.total.tokens(),
+        usage.model_context_window,
+    );
+    demux.context.observe_max_tokens(window);
+    demux.context.observe_lifetime_total(total);
+    demux.context.events(
+        thread_id,
+        last,
+        None,
+        // Codex compacts automatically as the window fills, and
+        // Codemux exposes no toggle for it.
+        Some(true),
+    )
+}
+
 fn generic_wire_thread_id(msg: &NotificationMessage) -> Option<&str> {
     use NotificationMessage::*;
     match msg {
@@ -1827,5 +1879,152 @@ mod tests {
             }
             other => panic!("expected SubagentUpdated, got {other:?}"),
         }
+    }
+
+    // ── Context-window usage (thread/tokenUsage/updated) ──
+
+    fn usage_snapshots(events: &[ProviderRuntimeEvent]) -> Vec<crate::agent_provider::ContextUsageSnapshot> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } => Some(usage.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn token_usage_msg(
+        wire_thread_id: &str,
+        last: u64,
+        total: u64,
+        window: Option<u64>,
+    ) -> NotificationMessage {
+        NotificationMessage::from_raw(
+            "thread/tokenUsage/updated",
+            json!({
+                "threadId": wire_thread_id,
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": {"totalTokens": last},
+                    "total": {"totalTokens": total},
+                    "modelContextWindow": window
+                }
+            }),
+        )
+    }
+
+    #[test]
+    fn token_usage_emits_a_thread_scoped_context_snapshot() {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        let events = translate_notification_with(
+            &mut demux,
+            &tid(),
+            token_usage_msg("c-1", 24_542, 180_000, Some(272_000)),
+        );
+        let snaps = usage_snapshots(&events);
+        assert_eq!(snaps.len(), 1);
+        let snap = &snaps[0];
+        // `last` is the live window occupancy; `total` is the
+        // app-server's own lifetime counter, adopted verbatim.
+        assert_eq!(snap.used_tokens, 24_542);
+        assert_eq!(snap.total_processed_tokens, Some(180_000));
+        assert_eq!(snap.max_tokens, Some(272_000));
+        assert_eq!(snap.compacts_automatically, Some(true));
+        assert!(snap.last_used_tokens.is_none());
+    }
+
+    #[test]
+    fn token_usage_clamps_used_to_the_reported_window() {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        let events = translate_notification_with(
+            &mut demux,
+            &tid(),
+            token_usage_msg("c-1", 300_000, 400_000, Some(272_000)),
+        );
+        let snap = usage_snapshots(&events).remove(0);
+        assert_eq!(snap.used_tokens, 272_000, "never renders above 100%");
+        assert_eq!(snap.total_processed_tokens, Some(400_000));
+    }
+
+    #[test]
+    fn token_usage_window_is_sticky_across_reports() {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        translate_notification_with(
+            &mut demux,
+            &tid(),
+            token_usage_msg("c-1", 1_000, 1_000, Some(272_000)),
+        );
+        // A later report omits the window; the known one must persist.
+        let events =
+            translate_notification_with(&mut demux, &tid(), token_usage_msg("c-1", 2_000, 5_000, None));
+        assert_eq!(usage_snapshots(&events).remove(0).max_tokens, Some(272_000));
+    }
+
+    #[test]
+    fn token_usage_lifetime_total_never_regresses() {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        translate_notification_with(
+            &mut demux,
+            &tid(),
+            token_usage_msg("c-1", 1_000, 90_000, None),
+        );
+        let events = translate_notification_with(
+            &mut demux,
+            &tid(),
+            token_usage_msg("c-1", 2_000, 10_000, None),
+        );
+        assert_eq!(
+            usage_snapshots(&events).remove(0).total_processed_tokens,
+            Some(90_000)
+        );
+    }
+
+    #[test]
+    fn repeated_identical_token_usage_is_suppressed() {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        let first = translate_notification_with(
+            &mut demux,
+            &tid(),
+            token_usage_msg("c-1", 500, 500, None),
+        );
+        assert_eq!(usage_snapshots(&first).len(), 1);
+        let second = translate_notification_with(
+            &mut demux,
+            &tid(),
+            token_usage_msg("c-1", 500, 500, None),
+        );
+        assert!(usage_snapshots(&second).is_empty());
+    }
+
+    #[test]
+    fn zero_token_usage_emits_nothing() {
+        let mut demux = CodexSubagentDemux::new("c-1");
+        let events =
+            translate_notification_with(&mut demux, &tid(), token_usage_msg("c-1", 0, 0, None));
+        assert!(usage_snapshots(&events).is_empty());
+    }
+
+    #[test]
+    fn subagent_token_usage_does_not_feed_the_parent_meter() {
+        // Usage hygiene: a sub-agent runs as its own thread against its
+        // own window, so its report must not move the parent's meter.
+        let mut demux = CodexSubagentDemux::new("c-1");
+        translate_notification_with(
+            &mut demux,
+            &tid(),
+            NotificationMessage::from_raw(
+                "thread/started",
+                json!({"thread": {"id": "c-child", "parentThreadId": "c-1"}}),
+            ),
+        );
+        let events = translate_notification_with(
+            &mut demux,
+            &tid(),
+            token_usage_msg("c-child", 500_000, 900_000, Some(272_000)),
+        );
+        assert!(
+            usage_snapshots(&events).is_empty(),
+            "child-thread usage must be dropped"
+        );
     }
 }
