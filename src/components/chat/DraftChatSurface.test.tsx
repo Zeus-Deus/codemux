@@ -203,6 +203,38 @@ function renderSurface() {
   );
 }
 
+/**
+ * Utility classes that would narrow or shift the composer column if they
+ * showed up on an ancestor of the composer's own rails. Guards against:
+ *   - `max-w-*` (including arbitrary values like `max-w-[760px]`)
+ *   - horizontal padding: `px|pl|pr|ps|pe-*`
+ *   - horizontal margins: `mx|ml|mr|ms|me-*` (incl. negative)
+ *   - any explicit width other than `w-full` / `w-auto` — `w-96`,
+ *     `w-[760px]`, `w-fit`, …
+ *   - `basis-*` other than `basis-full` / `basis-auto`
+ * Only `w-full`/`w-auto`, vertical spacing, and layout classes
+ * (`flex`, `min-h-0`, `overflow-*`, `bg-*`, …) are allowed through.
+ */
+const HORIZONTAL_INSET_CLASS = /^-?[pm](?:x|l|r|s|e)-/;
+
+function narrowsComposerColumn(token: string): boolean {
+  // Strip variant prefixes (`md:`, `dark:`, `group-hover:`) so
+  // `md:max-w-lg` is caught too. Arbitrary values (`[a:b]`) start with
+  // `[` and are left alone.
+  const cls = token.replace(/^(?:[a-z][\w-]*:)+/, "");
+  if (HORIZONTAL_INSET_CLASS.test(cls)) return true;
+  if (cls.startsWith("max-w-")) return true;
+  if (cls.startsWith("w-")) return cls !== "w-full" && cls !== "w-auto";
+  if (cls.startsWith("basis-")) {
+    return cls !== "basis-full" && cls !== "basis-auto";
+  }
+  return false;
+}
+
+function columnNarrowingClasses(className: string): string[] {
+  return className.split(/\s+/).filter(Boolean).filter(narrowsComposerColumn);
+}
+
 describe("DraftChatSurface", () => {
   beforeEach(() => {
     resetStores();
@@ -695,8 +727,10 @@ describe("DraftChatSurface", () => {
         node && node !== container;
         node = node.parentElement
       ) {
-        expect(node.className).not.toMatch(/(^|\s)max-w-/);
-        expect(node.className).not.toMatch(/(^|\s)-?p[xlr]-/);
+        expect(
+          columnNarrowingClasses(node.className),
+          `ancestor <${node.tagName.toLowerCase()} class="${node.className}"> narrows the composer column`,
+        ).toEqual([]);
       }
     });
   });
