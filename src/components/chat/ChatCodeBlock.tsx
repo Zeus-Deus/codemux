@@ -68,7 +68,23 @@ function useChatCodeRenderer(): ChatCodeRendererContextValue {
 const CODE_FENCE_LANGUAGE_REGEX = /(?:^|\s)language-([^\s]+)/;
 const FENCE_TITLE_ATTR_REGEX =
   /(?:^|\s)(?:title|file(?:name)?)=(?:"([^"]+)"|'([^']+)'|(\S+))/i;
-const FENCE_FILENAME_TOKEN_REGEX = /^[\w@][\w@./-]*\.[A-Za-z0-9]+$/;
+// A bare fence token is only treated as a filename when it ends in something
+// that actually looks like a file extension — alphabetic first character, so
+// ```txt 1.5 and ```js v2.0 keep rendering as plain language fences instead of
+// captioning the block "1.5" / "v2.0". A leading dot is allowed for dotfiles
+// (`.env.local`).
+const FENCE_FILENAME_TOKEN_REGEX = /^[\w@.][\w@./-]*\.[A-Za-z][A-Za-z0-9]*$/;
+// ...and only when what precedes that extension isn't itself a version number:
+// `2.0.x` clears the extension test, and `2.tsx` is far likelier to be a
+// version or a line range than a path. Tested against the basename alone, so
+// real files that merely start with a version (`v2.config.js`) still caption.
+const VERSION_LIKE_BASENAME_REGEX = /^v?\d+(?:\.\d+)*$/i;
+
+function isFenceFilenameToken(candidate: string): boolean {
+  if (!FENCE_FILENAME_TOKEN_REGEX.test(candidate)) return false;
+  const basename = candidate.slice(0, candidate.lastIndexOf("."));
+  return !VERSION_LIKE_BASENAME_REGEX.test(basename);
+}
 
 const LANGUAGE_EXTENSION_ALIASES: Record<string, string> = {
   bash: "sh",
@@ -99,11 +115,7 @@ export function extractFenceTitle(meta: string | undefined): string | null {
   const attributeTitle =
     attributeMatch?.[1] ?? attributeMatch?.[2] ?? attributeMatch?.[3];
   if (attributeTitle) return attributeTitle;
-  return (
-    meta
-      .split(/\s+/)
-      .find((candidate) => FENCE_FILENAME_TOKEN_REGEX.test(candidate)) ?? null
-  );
+  return meta.split(/\s+/).find(isFenceFilenameToken) ?? null;
 }
 
 export function syntheticFilenameForLanguage(language: string): string {
@@ -127,38 +139,78 @@ function nodeToPlainText(node: ReactNode): string {
   return "";
 }
 
+type HighlightedToken = HighlightResult["tokens"][number][number];
+
+function plainToken(content: string): HighlightedToken {
+  return {
+    content,
+    color: "inherit",
+    bgColor: "transparent",
+    htmlStyle: {},
+    offset: 0,
+  };
+}
+
 function rawHighlightResult(code: string): HighlightResult {
   return {
     bg: "transparent",
     fg: "inherit",
-    tokens: code.split("\n").map((line) => [
-      {
-        content: line,
-        color: "inherit",
-        bgColor: "transparent",
-        htmlStyle: {},
-        offset: 0,
-      },
-    ]),
+    tokens: code.split("\n").map((line) => [plainToken(line)]),
   };
 }
 
+/**
+ * Previously highlighted tokens plus the tail Shiki has not tokenized yet,
+ * carried uncolored so streamed text is on screen the frame it arrives.
+ */
+function withPlainTail(result: HighlightResult, tail: string): HighlightResult {
+  if (!tail) return result;
+  const [firstLine, ...restLines] = tail.split("\n");
+  const tokens = result.tokens.map((line) => [...line]);
+  if (firstLine) {
+    const lastLine = tokens[tokens.length - 1];
+    if (lastLine) lastLine.push(plainToken(firstLine));
+    else tokens.push([plainToken(firstLine)]);
+  }
+  for (const line of restLines) tokens.push([plainToken(line)]);
+  return { ...result, tokens };
+}
+
+type HighlightedEntry = {
+  cacheKey: string;
+  code: string;
+  language: string;
+  result: HighlightResult;
+};
+
+/**
+ * Highlighted tokens for one fence, stale-while-revalidating.
+ *
+ * `highlight()` only answers synchronously on a cache hit, and a streaming
+ * fence changes on every token, so reading "the result for exactly this code,
+ * else raw" drops the whole block back to uncolored text between every append
+ * and re-colors it a tick later — a full-block flicker lasting the entire
+ * stream. Instead the last result stays on screen while the next one is
+ * pending, with the not-yet-tokenized tail appended uncolored so text never
+ * lags behind the stream either.
+ *
+ * Reuse is guarded on this block's own state (the hook is per-block), on the
+ * language being unchanged, and on the old code still being a prefix of the
+ * new one — a fence that switches language or is rewritten falls back to raw
+ * rather than painting one language's colors onto another's source.
+ */
 function useHighlightedCode(
   code: string,
   language: string,
   highlighter: CodeHighlighterPlugin,
 ): HighlightResult {
   const cacheKey = `${language}\u0000${code}`;
-  const raw = useMemo(() => rawHighlightResult(code), [code]);
-  const [highlighted, setHighlighted] = useState<{
-    cacheKey: string;
-    result: HighlightResult;
-  } | null>(null);
+  const [highlighted, setHighlighted] = useState<HighlightedEntry | null>(null);
 
   useEffect(() => {
     let active = true;
     const accept = (result: HighlightResult) => {
-      if (active) setHighlighted({ cacheKey, result });
+      if (active) setHighlighted({ cacheKey, code, language, result });
     };
     const result = highlighter.highlight(
       {
@@ -174,7 +226,16 @@ function useHighlightedCode(
     };
   }, [cacheKey, code, highlighter, language]);
 
-  return highlighted?.cacheKey === cacheKey ? highlighted.result : raw;
+  return useMemo(() => {
+    if (highlighted?.cacheKey === cacheKey) return highlighted.result;
+    if (highlighted?.language === language && code.startsWith(highlighted.code)) {
+      return withPlainTail(
+        highlighted.result,
+        code.slice(highlighted.code.length),
+      );
+    }
+    return rawHighlightResult(code);
+  }, [cacheKey, code, highlighted, language]);
 }
 
 type TokenStyle = CSSProperties & Record<`--${string}`, string | number>;
@@ -274,17 +335,11 @@ function CodeBlockTitle({
   );
 }
 
-type MarkdownCodeProps = ComponentProps<"code"> &
-  ExtraProps & {
-    metastring?: string;
-    "data-block"?: string;
-  };
-
 function ChatFencedCode({
   children,
   className,
   node,
-}: MarkdownCodeProps) {
+}: ComponentProps<"code"> & ExtraProps) {
   const { defaultWrap, highlighter } = useChatCodeRenderer();
   const isIncomplete = useIsCodeFenceIncomplete();
   const language = extractFenceLanguage(className);
@@ -292,7 +347,10 @@ function ChatFencedCode({
   const fenceTitle = extractFenceTitle(
     typeof meta === "string" ? meta : undefined,
   );
-  const code = nodeToPlainText(children).replace(/\n+$/, "");
+  // mdast terminates a fence's value with exactly one newline; strip that one
+  // and no more, so a snippet that genuinely ends in blank lines keeps them in
+  // both the render and the clipboard.
+  const code = nodeToPlainText(children).replace(/\n$/, "");
   const [wrapOverride, setWrapOverride] = useState<boolean | null>(null);
   const wrapped = wrapOverride ?? defaultWrap;
   const [copied, setCopied] = useState(false);

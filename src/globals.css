@@ -444,6 +444,15 @@ body.pane-resizing iframe {
   outline-offset: 2px;
 }
 
+/* A fence whose closing ``` has not arrived yet is still filling in, and its
+ * copy action would only capture the partial snippet. `data-incomplete` (from
+ * Streamdown's incomplete-fence signal) softens the title so the card reads as
+ * provisional. Deliberately opacity only — no motion, since a transcript can
+ * stream several blocks at once, and no color literal. */
+.chat-markdown [data-chat-code-block][data-incomplete] [data-chat-code-title] {
+  opacity: 0.6;
+}
+
 .chat-markdown [data-chat-code-actions] {
   display: inline-flex;
   flex-shrink: 0;

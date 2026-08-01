@@ -127,16 +127,38 @@ The chat pane stack:
   Settings → Appearance → "Wrap code in chat". It supplies each block's
   default; the header's wrap action can override one block without changing
   the global preference. Off keeps lines intact behind a horizontal scroll.
-- Fence metadata is preserved by `remarkPreserveCodeMeta`: `title=`, `file=`,
-  `filename=`, and bare filename/path forms render a file icon plus title.
-  Without a title, common language ids map to a synthetic filename and the
-  existing `material-file-icons` system supplies the language/framework icon;
-  unknown languages fall back to a text label.
+- **Highlighting is stale-while-revalidating.** `highlight()` only answers
+  synchronously on a cache hit, and a streaming fence changes on every token,
+  so rendering "the result for exactly this code, else raw" would flash the
+  whole block back to uncolored text between every append. `useHighlightedCode`
+  keeps the last result on screen and appends the not-yet-tokenized tail
+  uncolored, so neither color nor text lags the stream. Reuse is guarded on the
+  block's own state, an unchanged language, and the old code still being a
+  prefix of the new — a fence that switches language or is rewritten falls back
+  to raw rather than painting one language's colors onto another's source.
+- Fence metadata comes from Streamdown's own `codeMeta` plugin, composed out of
+  its exported `defaultRemarkPlugins` (passing `remarkPlugins` *replaces* the
+  defaults, so `gfm` and `codeMeta` are named explicitly rather than
+  reimplemented locally). `title=`, `file=`, `filename=`, and bare
+  filename/path forms render a file icon plus title. A bare token only counts
+  as a filename when it ends in a real-looking extension and is not
+  version-like, so ` ```txt 1.5 ` and ` ```js v2.0 ` stay plain fences while
+  `main.rs`, `.env.local`, and `@scope/pkg/file.tsx` still caption. Without a
+  title, common language ids map to a synthetic filename and the existing
+  `material-file-icons` system supplies the language/framework icon; unknown
+  languages fall back to a text label.
+- The fence body keeps whatever the author wrote: mdast terminates a fence with
+  exactly one newline, and only that one is stripped, so a snippet genuinely
+  ending in blank lines keeps them in both the render and the clipboard.
 
 Card styling (all in `globals.css`, all on design tokens):
 
 - A fence with **no language** is labeled `text`, so copy and wrap remain
   discoverable and the header never becomes an unexplained empty strip.
+- A fence still waiting on its closing ``` carries `data-incomplete` and dims
+  its title, so a card that is still filling in (and whose copy action would
+  only capture the partial snippet) reads as provisional. Opacity only — no
+  motion, since a transcript can stream several blocks at once.
 - Wrap/copy actions remain visible in the header. They use the shared compact
   ghost-button treatment and tooltips, with `aria-pressed` on wrap and a
   temporary copied state.

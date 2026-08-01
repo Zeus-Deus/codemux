@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -10,22 +10,58 @@ import {
 import { ChatMarkdown } from "./ChatMarkdown";
 
 const codePluginMocks = vi.hoisted(() => {
+  // Mirrors `@streamdown/code`: answer synchronously only for code already
+  // seen, otherwise return null and resolve through the callback. Tests drive
+  // `deferred` to hold a highlight open the way a cold Shiki load would.
+  let deferred = false;
+  const pending: Array<() => void> = [];
+  const seen = new Set<string>();
+
+  const tokenize = ({ code }: { code: string }) => ({
+    bg: "transparent",
+    fg: "inherit",
+    tokens: code.split("\n").map((line) => [
+      {
+        content: line,
+        color: "rgb(1, 2, 3)",
+        bgColor: "transparent",
+        htmlStyle: {},
+        offset: 0,
+      },
+    ]),
+  });
+
   const highlight = vi.fn(
-    ({ code }: { code: string }) => ({
-      bg: "transparent",
-      fg: "inherit",
-      tokens: code.split("\n").map((line) => [
-        {
-          content: line,
-          color: "rgb(1, 2, 3)",
-          bgColor: "transparent",
-          htmlStyle: {},
-          offset: 0,
-        },
-      ]),
-    }),
+    (
+      options: { code: string; language: string },
+      callback?: (result: ReturnType<typeof tokenize>) => void,
+    ) => {
+      const key = `${options.language} ${options.code}`;
+      if (!deferred || seen.has(key)) {
+        seen.add(key);
+        return tokenize(options);
+      }
+      pending.push(() => {
+        seen.add(key);
+        callback?.(tokenize(options));
+      });
+      return null;
+    },
   );
+
   return {
+    setDeferred: (value: boolean) => {
+      deferred = value;
+    },
+    flush: () => {
+      const queued = pending.splice(0, pending.length);
+      for (const resolve of queued) resolve();
+    },
+    reset: () => {
+      deferred = false;
+      pending.length = 0;
+      seen.clear();
+    },
     highlighter: {
       name: "shiki",
       type: "code-highlighter",
@@ -48,17 +84,29 @@ function fenced(language: string, code: string, meta = ""): string {
   );
 }
 
-function renderMarkdown(markdown: string) {
-  return render(
+function markdownTree(markdown: string) {
+  return (
     <TooltipProvider>
       <ChatMarkdown>{markdown}</ChatMarkdown>
-    </TooltipProvider>,
+    </TooltipProvider>
   );
+}
+
+function renderMarkdown(markdown: string) {
+  return render(markdownTree(markdown));
+}
+
+/** Per-token highlight color, in source order — `inherit` means un-highlighted. */
+function tokenColors(container: HTMLElement): string[] {
+  return Array.from(
+    container.querySelectorAll<HTMLElement>("[data-chat-code-line] span"),
+  ).map((span) => span.style.getPropertyValue("--chat-code-token"));
 }
 
 beforeEach(() => {
   useSettingsStore.setState({ loaded: true, settings: {} });
   codePluginMocks.highlight.mockClear();
+  codePluginMocks.reset();
 });
 
 afterEach(() => {
@@ -121,11 +169,59 @@ describe("ChatMarkdown code blocks", () => {
     });
   });
 
+  it("keeps blank lines a snippet genuinely ends with", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    // mdast terminates the fence value with one newline; the two blank lines
+    // before it are the author's and must survive render and copy.
+    const { container } = renderMarkdown(fenced("txt", "one\n\n"));
+
+    expect(container.querySelectorAll("[data-chat-code-line]")).toHaveLength(3);
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    await vi.waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith("one\n\n");
+    });
+  });
+
   it("keeps plain fences identifiable and actionable", () => {
     renderMarkdown(fenced("", "plain output"));
     expect(screen.getByText("text")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Wrap lines" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy code" })).toBeInTheDocument();
+  });
+});
+
+describe("streaming code blocks", () => {
+  it("keeps the previous highlight on screen while an append re-highlights", () => {
+    codePluginMocks.setDeferred(true);
+    const { container, rerender } = renderMarkdown(
+      fenced("tsx", "const a = 1;"),
+    );
+    act(() => codePluginMocks.flush());
+    expect(tokenColors(container)).toEqual(["rgb(1, 2, 3)"]);
+
+    rerender(markdownTree(fenced("tsx", "const a = 1;\nconst b = 2;")));
+
+    // No raw fallback: the already-highlighted line keeps its color and the
+    // streamed tail rides along un-highlighted until Shiki catches up.
+    expect(tokenColors(container)).toEqual(["rgb(1, 2, 3)", "inherit"]);
+    expect(container.textContent).toContain("const b = 2;");
+
+    act(() => codePluginMocks.flush());
+    expect(tokenColors(container)).toEqual(["rgb(1, 2, 3)", "rgb(1, 2, 3)"]);
+  });
+
+  it("drops to raw rather than reusing another language's highlight", () => {
+    codePluginMocks.setDeferred(true);
+    const { container, rerender } = renderMarkdown(fenced("tsx", "let x = 1;"));
+    act(() => codePluginMocks.flush());
+    expect(tokenColors(container)).toEqual(["rgb(1, 2, 3)"]);
+
+    rerender(markdownTree(fenced("python", "let x = 1;")));
+    expect(tokenColors(container)).toEqual(["inherit"]);
   });
 });
 
@@ -135,6 +231,23 @@ describe("chat code fence metadata", () => {
     expect(extractFenceTitle("file='src/main.rs'")).toBe("src/main.rs");
     expect(extractFenceTitle("filename=worker.py")).toBe("worker.py");
     expect(extractFenceTitle("noLineNumbers src/theme.css")).toBe("src/theme.css");
+  });
+
+  it("treats real paths and dotfiles as filenames", () => {
+    expect(extractFenceTitle("main.rs")).toBe("main.rs");
+    expect(extractFenceTitle(".env.local")).toBe(".env.local");
+    expect(extractFenceTitle("src/lib/foo.ts")).toBe("src/lib/foo.ts");
+    expect(extractFenceTitle("@scope/pkg/file.tsx")).toBe("@scope/pkg/file.tsx");
+    expect(extractFenceTitle("Dockerfile.prod")).toBe("Dockerfile.prod");
+    expect(extractFenceTitle("v2.config.js")).toBe("v2.config.js");
+  });
+
+  it("ignores version numbers and line ranges that merely contain a dot", () => {
+    expect(extractFenceTitle("1.5")).toBeNull();
+    expect(extractFenceTitle("v2.0")).toBeNull();
+    expect(extractFenceTitle("2.0.x")).toBeNull();
+    expect(extractFenceTitle("{1-3}")).toBeNull();
+    expect(extractFenceTitle("showLineNumbers {1-3}")).toBeNull();
   });
 
   it("maps common fence aliases to filenames understood by the icon set", () => {

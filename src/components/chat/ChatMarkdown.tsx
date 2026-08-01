@@ -1,6 +1,5 @@
 import { useMemo } from "react";
-import remarkGfm from "remark-gfm";
-import { Streamdown } from "streamdown";
+import { defaultRemarkPlugins, Streamdown } from "streamdown";
 
 import { useChatCodePlugin } from "@/hooks/use-chat-code-plugin";
 import { cn } from "@/lib/utils";
@@ -18,7 +17,7 @@ import {
  * replacement shadcn's AI Elements are built on). `parseIncompleteMarkdown`
  * closes unterminated fences / emphasis / lists mid-stream so a
  * half-arrived token never flashes broken markup. We keep the same
- * `remarkGfm`-only plugin set the previous react-markdown renderer used
+ * GFM-only plugin set the previous react-markdown renderer used
  * (no math/KaTeX).
  *
  * Fenced code blocks are syntax-highlighted by streamdown's shiki `code`
@@ -103,33 +102,14 @@ const controls = {
   table: { copy: true, download: true, fullscreen: true },
 } as const;
 
-type MarkdownAstNode = {
-  type?: string;
-  meta?: unknown;
-  data?: { hProperties?: Record<string, unknown> };
-  children?: MarkdownAstNode[];
-};
-
-/** Preserve fenced-code metadata (`title=`, `filename=`, or a bare path). */
-function remarkPreserveCodeMeta() {
-  return (tree: MarkdownAstNode) => {
-    const visit = (node: MarkdownAstNode) => {
-      if (node.type === "code" && typeof node.meta === "string") {
-        node.data = {
-          ...node.data,
-          hProperties: {
-            ...node.data?.hProperties,
-            metastring: node.meta,
-          },
-        };
-      }
-      node.children?.forEach(visit);
-    };
-    visit(tree);
-  };
-}
-
-const remarkPlugins = [remarkGfm, remarkPreserveCodeMeta];
+// Passing `remarkPlugins` *replaces* Streamdown's defaults, so the fence
+// metadata plugin that populates `node.properties.metastring` (read by
+// `ChatCodeBlock` for `title=` / bare-filename captions) has to be named
+// explicitly. It is Streamdown's own `codeMeta`, composed out of the exported
+// `defaultRemarkPlugins` rather than reimplemented here, so an upstream fix
+// arrives with the dependency bump instead of drifting from a local copy.
+// GFM is likewise upstream's; math/KaTeX stays out.
+const remarkPlugins = [defaultRemarkPlugins.gfm, defaultRemarkPlugins.codeMeta];
 
 export function ChatMarkdown({ children }: { children: string }) {
   const code = useChatCodePlugin();
@@ -137,7 +117,7 @@ export function ChatMarkdown({ children }: { children: string }) {
   const wrap = useSettingsStore(selectChatCodeWrap);
 
   return (
-    <div className={cn("chat-markdown", proseClasses)} data-code-wrap={wrap}>
+    <div className={cn("chat-markdown", proseClasses)}>
       <ChatCodeRendererProvider defaultWrap={wrap} highlighter={code}>
         <Streamdown
           parseIncompleteMarkdown
