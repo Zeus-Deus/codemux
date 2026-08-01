@@ -32,8 +32,12 @@ interface FeatureFlagsStore {
 }
 
 export const useFeatureFlags = create<FeatureFlagsStore>((set) => ({
-  enableAgentChat: false,
-  enableLazyWorkspaceCreation: false,
+  // Pre-refresh state must mirror the backend default (GUI on), not
+  // the retired Beta default. Booting these `false` flashes the legacy
+  // CLI chrome for the frames before `get_feature_flags` resolves.
+  // `loaded` stays false so consumers that can wait still wait.
+  enableAgentChat: true,
+  enableLazyWorkspaceCreation: true,
   loaded: false,
   refresh: async () => {
     try {
@@ -45,9 +49,10 @@ export const useFeatureFlags = create<FeatureFlagsStore>((set) => ({
       });
     } catch (err) {
       console.error("Failed to fetch feature flags:", err);
-      // Fall back to defaults-off on error so guards stay closed,
-      // but mark loaded so consumers can stop waiting.
-      set({ enableAgentChat: false, enableLazyWorkspaceCreation: false, loaded: true });
+      // Fall back to the backend default (GUI on) rather than off: a
+      // rejected invoke would otherwise strand a default-mode user in
+      // the CLI chrome. Mark loaded so consumers stop waiting.
+      set({ enableAgentChat: true, enableLazyWorkspaceCreation: true, loaded: true });
     }
   },
   setAgentChatEnabled: async (enabled: boolean) => {

@@ -88,8 +88,8 @@ export function InterfaceSection() {
               selection, MCP server management, and skills sync. On by
               default — turn it off to go back to the classic terminal-first
               (CLI) interface. Your data is preserved either way, and you can
-              still launch CLI agents from the GUI (hold Shift in the
-              launcher).
+              still launch CLI agents from the GUI — click one in the +
+              launcher to open it in a new tab.
             </p>
           </div>
           <Switch

@@ -211,11 +211,12 @@ pub fn get_feature_flags(
     Ok(store.feature_flags())
 }
 
-/// Quit the Codemux app cleanly. Used by Settings → Beta Features →
-/// Agent Chat toggle: flipping the master Beta flag requires the
-/// process to come up fresh under the new flag state (backend
-/// singletons — MCP runtime, OpenCode supervisor, capability caches,
-/// ProviderRegistry — only initialise on app boot), and the simplest
+/// Quit the Codemux app cleanly. Used by the Settings → Interface →
+/// Agent Chat GUI toggle (the GUI is the default interface; the toggle
+/// is the opt-out back to the classic CLI view): flipping the master
+/// flag requires the process to come up fresh under the new state
+/// (backend singletons — MCP runtime, OpenCode supervisor, capability
+/// caches, ProviderRegistry — only initialise on app boot), and the simplest
 /// way to guarantee that is to close the app and let the user reopen
 /// it manually.
 ///

@@ -104,9 +104,17 @@ pub struct ObservabilitySnapshot {
     /// every log/metric mutation, every pre-promotion install has an
     /// explicit `enable_agent_chat: false` on disk (the old default) —
     /// indistinguishable from a deliberate opt-out. On the first load
-    /// where this marker is missing/false, both agent-chat flags are
-    /// forced on and the marker is persisted as `true`; from then on
-    /// the Settings → Interface toggle is fully respected.
+    /// where no marker is found, both agent-chat flags are forced on
+    /// and the marker is stamped; from then on the Settings → Interface
+    /// toggle is fully respected.
+    ///
+    /// Read-only back-compat surface: the authoritative marker is the
+    /// standalone `agent_chat_promoted` sentinel file next to this
+    /// snapshot (see `promote_agent_chat_default`), because an older
+    /// binary re-serializes the snapshot without this field and would
+    /// otherwise erase it on a downgrade → upgrade round trip. This
+    /// field is still honoured on read for installs promoted before
+    /// the sentinel existed.
     #[serde(default)]
     pub agent_chat_promoted: bool,
 }
@@ -309,25 +317,86 @@ fn load_or_migrate_snapshot(path: &Path, legacy_path: &Path) -> ObservabilitySna
 /// false` written by the old default (the full snapshot is persisted
 /// on every mutation), so flipping the serde/`default_snapshot`
 /// literals alone would leave every existing install in CLI mode. The
-/// first load without the [`ObservabilitySnapshot::agent_chat_promoted`]
-/// marker forces both paired flags on and stamps the marker; any later
-/// opt-out via Settings → Interface persists alongside the marker and
-/// is never overridden again.
+/// first load with no promotion marker forces both paired flags on and
+/// stamps the marker; any later opt-out via Settings → Interface is
+/// never overridden again.
+///
+/// The marker lives in a standalone sentinel file next to the snapshot
+/// ([`promotion_marker_path`]), *not* only in the snapshot JSON. An
+/// older binary that doesn't know the
+/// [`ObservabilitySnapshot::agent_chat_promoted`] field drops it on
+/// its next write (serde ignores unknown keys on deserialize and
+/// re-serializes without them), so a downgrade → upgrade round trip
+/// would erase a snapshot-only marker, re-run the promotion, and
+/// force-revert a deliberate opt-out. Old binaries never touch the
+/// sentinel file, so it survives. The snapshot field is still honoured
+/// on read for back-compat with installs promoted before this change.
 fn promote_agent_chat_default(snapshot: &mut ObservabilitySnapshot, path: &Path) {
-    if snapshot.agent_chat_promoted {
-        return;
+    let marker_path = promotion_marker_path(path);
+    let marker_file_present = marker_path.exists();
+    // Either marker counts: the sentinel file (written from here on)
+    // or the legacy snapshot field (installs promoted before the
+    // sentinel existed, and fresh installs, whose `default_snapshot`
+    // is already the promoted state).
+    let already_promoted = marker_file_present || snapshot.agent_chat_promoted;
+
+    if !already_promoted {
+        snapshot.feature_flags.enable_agent_chat = true;
+        snapshot.feature_flags.enable_lazy_workspace_creation = true;
     }
     snapshot.agent_chat_promoted = true;
-    snapshot.feature_flags.enable_agent_chat = true;
-    snapshot.feature_flags.enable_lazy_workspace_creation = true;
-    if let Err(error) = save_snapshot_to(path, snapshot) {
-        // Non-fatal: the promotion re-applies on every boot until a
-        // save sticks, and any snapshot mutation persists it too.
-        eprintln!(
-            "[codemux::observability] Failed to persist agent-chat promotion to {}: {error}",
-            path.display()
-        );
+
+    if !marker_file_present {
+        // Written on every path, including the "already promoted via
+        // the snapshot field" and fresh-install ones — that is what
+        // makes a later downgrade → upgrade cycle safe. Cheap: one
+        // tiny write, once per install.
+        if let Err(error) = write_promotion_marker(&marker_path) {
+            // Non-fatal: without the sentinel we simply fall back to
+            // the snapshot field, i.e. today's behavior.
+            eprintln!("[codemux::observability] {error}");
+        }
     }
+
+    if !already_promoted {
+        if let Err(error) = save_snapshot_to(path, snapshot) {
+            // Non-fatal: the promotion re-applies on every boot until a
+            // save sticks, and any snapshot mutation persists it too.
+            eprintln!(
+                "[codemux::observability] Failed to persist agent-chat promotion to {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Sentinel file recording that the one-time Agent Chat GUI promotion
+/// has already been applied — `<data root>/agent_chat_promoted`,
+/// alongside `observability.json`. A standalone file (rather than only
+/// a snapshot key) because older binaries rewrite the snapshot without
+/// keys they don't know about, but never delete unrelated files.
+fn promotion_marker_path(snapshot_path: &Path) -> PathBuf {
+    snapshot_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("agent_chat_promoted")
+}
+
+fn write_promotion_marker(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create observability dir: {error}"))?;
+    }
+    fs::write(
+        path,
+        "Agent Chat GUI promotion applied. Delete to re-run the one-time upgrade.\n",
+    )
+    .map_err(|error| {
+        format!(
+            "Failed to write agent-chat promotion marker {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn default_snapshot() -> ObservabilitySnapshot {
@@ -407,8 +476,8 @@ fn save_snapshot_to(path: &Path, snapshot: &ObservabilitySnapshot) -> Result<(),
 /// 2. Scope by `APP_DIR_NAME`, like every other piece of local state
 ///    (sqlite db, auth tokens, settings cache). The previous location,
 ///    `~/.codemux/observability.json`, was shared by every Codemux
-///    build on the machine, so flipping Settings → Beta Features →
-///    Agent Chat in a dev build also flipped it in the installed
+///    build on the machine, so flipping Settings → Interface → Agent
+///    Chat GUI in a dev build also flipped it in the installed
 ///    release (and vice versa) — feature flags leaked across
 ///    otherwise-isolated instances and accounts.
 fn snapshot_path() -> PathBuf {
@@ -465,7 +534,7 @@ mod tests {
     //    dev` and a different file under the installed binary — flags
     //    appeared to "not stick". The path must not depend on CWD.
     // 2. Cross-build leak: the follow-up `$HOME/.codemux/` anchor was
-    //    shared by every build on the machine, so the Agent Chat Beta
+    //    shared by every build on the machine, so the Agent Chat GUI
     //    toggle flipped in BOTH the installed release and a dev build
     //    at once. The path must be scoped by `APP_DIR_NAME` like the
     //    rest of local state.
@@ -644,9 +713,20 @@ mod tests {
         assert!(!parsed.enable_lazy_workspace_creation);
     }
 
-    /// A pre-promotion snapshot (no `agent_chat_promoted` marker) with
-    /// the flags explicitly `false` — i.e. every install that simply
-    /// never touched the old Beta toggle — must be upgraded to the GUI
+    /// Write a snapshot to `path` with the `agent_chat_promoted` key
+    /// stripped — exactly what an older binary leaves behind, since
+    /// serde drops unknown keys on deserialize and re-serializes
+    /// without them.
+    fn write_snapshot_without_marker_field(path: &Path, snapshot: &ObservabilitySnapshot) {
+        let mut value = serde_json::to_value(snapshot).unwrap();
+        value.as_object_mut().unwrap().remove("agent_chat_promoted");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    }
+
+    /// A pre-promotion snapshot (no marker anywhere) with the flags
+    /// explicitly `false` — i.e. every install that simply never
+    /// touched the old Beta toggle — must be upgraded to the GUI
     /// exactly once, with the marker persisted so the upgrade never
     /// re-runs.
     #[test]
@@ -660,10 +740,7 @@ mod tests {
         let mut old = default_snapshot();
         old.feature_flags.enable_agent_chat = false;
         old.feature_flags.enable_lazy_workspace_creation = false;
-        let mut value = serde_json::to_value(&old).unwrap();
-        value.as_object_mut().unwrap().remove("agent_chat_promoted");
-        fs::create_dir_all(new.parent().unwrap()).unwrap();
-        fs::write(&new, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+        write_snapshot_without_marker_field(&new, &old);
 
         let loaded = load_or_migrate_snapshot(&new, &legacy);
 
@@ -677,6 +754,12 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&new).unwrap()).unwrap();
         assert!(persisted.feature_flags.enable_agent_chat);
         assert!(persisted.agent_chat_promoted);
+
+        // …and the downgrade-proof sentinel is written alongside it.
+        assert!(
+            promotion_marker_path(&new).exists(),
+            "promotion must drop the standalone sentinel file"
+        );
     }
 
     /// After the promotion has run, a user's explicit opt-out (flags
@@ -701,6 +784,84 @@ mod tests {
             "an opt-out made after the promotion must never be overridden"
         );
         assert!(!loaded.feature_flags.enable_lazy_workspace_creation);
+        // Reading a legacy field-only marker must upgrade it to the
+        // sentinel file, otherwise the next downgrade erases it.
+        assert!(
+            promotion_marker_path(&new).exists(),
+            "a field-only marker must be mirrored into the sentinel file"
+        );
+    }
+
+    /// The downgrade → upgrade round trip. An older binary rewrites
+    /// `observability.json` without the `agent_chat_promoted` key
+    /// (serde ignores unknown fields), so a snapshot-only marker
+    /// vanishes. If that were the only marker, the promotion would
+    /// re-run and force-revert a deliberate opt-out. The standalone
+    /// sentinel file — which old binaries never touch — must keep the
+    /// opt-out intact.
+    #[test]
+    fn opt_out_survives_marker_field_erasure_via_sentinel() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let legacy = tmp.path().join(".codemux").join("observability.json");
+        let new = tmp.path().join("data").join("observability.json");
+
+        // User opted out on a current binary…
+        let mut opted_out = default_snapshot();
+        opted_out.feature_flags.enable_agent_chat = false;
+        opted_out.feature_flags.enable_lazy_workspace_creation = false;
+        // …then downgraded: the old binary rewrote the file, dropping
+        // the marker field but leaving the sentinel alone.
+        write_snapshot_without_marker_field(&new, &opted_out);
+        write_promotion_marker(&promotion_marker_path(&new)).expect("write sentinel");
+
+        let loaded = load_or_migrate_snapshot(&new, &legacy);
+
+        assert!(
+            !loaded.feature_flags.enable_agent_chat,
+            "the sentinel must stop the promotion from re-running over an opt-out"
+        );
+        assert!(!loaded.feature_flags.enable_lazy_workspace_creation);
+        assert!(loaded.agent_chat_promoted, "the sentinel re-stamps the in-memory marker");
+    }
+
+    /// Without the sentinel the same file *is* a genuine pre-promotion
+    /// install and must be upgraded — pins that the previous test
+    /// passes because of the sentinel, not because of the flags.
+    #[test]
+    fn marker_field_erasure_without_sentinel_still_promotes() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let legacy = tmp.path().join(".codemux").join("observability.json");
+        let new = tmp.path().join("data").join("observability.json");
+
+        let mut old = default_snapshot();
+        old.feature_flags.enable_agent_chat = false;
+        old.feature_flags.enable_lazy_workspace_creation = false;
+        write_snapshot_without_marker_field(&new, &old);
+
+        let loaded = load_or_migrate_snapshot(&new, &legacy);
+
+        assert!(loaded.feature_flags.enable_agent_chat);
+    }
+
+    /// Fresh install: nothing to migrate, but the sentinel is still
+    /// stamped so a later opt-out can't be undone by a downgrade →
+    /// upgrade cycle. The snapshot itself stays unwritten until a real
+    /// mutation.
+    #[test]
+    fn fresh_install_stamps_the_sentinel_without_writing_a_snapshot() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let legacy = tmp.path().join(".codemux").join("observability.json");
+        let new = tmp.path().join("data").join("observability.json");
+
+        let loaded = load_or_migrate_snapshot(&new, &legacy);
+
+        assert!(loaded.feature_flags.enable_agent_chat);
+        assert!(loaded.agent_chat_promoted);
+        assert!(!new.exists(), "no snapshot is written when there is nothing to migrate");
+        assert!(
+            promotion_marker_path(&new).exists(),
+            "a fresh install is already promoted — record it so a downgrade can't undo it"
+        );
     }
 
     /// `set_agent_chat_enabled` must flip both fields together. The

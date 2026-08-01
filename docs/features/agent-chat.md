@@ -44,10 +44,18 @@ empty-state splash) is byte-identical when both flags are off.
 **Promotion migration**: because the whole observability snapshot is
 re-saved on every mutation, pre-promotion installs carry an explicit
 `enable_agent_chat: false` from the old off-default. A one-time
-`agent_chat_promoted` marker on `ObservabilitySnapshot`
-(`promote_agent_chat_default` in `src-tauri/src/observability.rs`) flips
-both flags on at first load after upgrade and stamps the marker; opt-outs
-made after that are never overridden.
+`agent_chat_promoted` marker (`promote_agent_chat_default` in
+`src-tauri/src/observability.rs`) flips both flags on at first load after
+upgrade and stamps the marker; opt-outs made after that are never
+overridden. The marker is a standalone **sentinel file**
+(`<data root>/agent_chat_promoted`, next to `observability.json`) rather
+than only the `agent_chat_promoted` snapshot key: an older binary
+deserializes the snapshot without that key and re-serializes without it,
+so a downgrade → upgrade round trip would erase a snapshot-only marker,
+re-run the promotion, and force-revert a deliberate opt-out. Old binaries
+never touch the sentinel. The snapshot field is still honoured on read
+(and mirrored into the sentinel on first sight) for installs promoted
+before the sentinel existed.
 
 See `docs/archive/step-13-beta-toggle-research.md` for the original Beta
 toggle scoping and `docs/archive/step-13-ui-smoke-checklist.md` for the
