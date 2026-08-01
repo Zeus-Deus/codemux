@@ -19,20 +19,25 @@ interface FeatureFlagsStore {
    *  once — later calls overwrite the in-memory state with whatever
    *  the backend currently reports. */
   refresh: () => Promise<void>;
-  /** Step 13 — atomic toggle for the Agent Chat Beta. Flips
-   *  `enableAgentChat` and `enableLazyWorkspaceCreation` together
-   *  through the `set_agent_chat_beta` Tauri command (which writes
-   *  both fields under one mutex acquisition on the backend), then
-   *  mirrors the new state into the store. The two flags must always
-   *  move together — every production read site pairs them with `&&`,
-   *  and the user-facing toggle in Settings → Beta Features is a
-   *  single Switch. */
+  /** Atomic toggle for the Agent Chat GUI (default on; off = classic
+   *  CLI interface). Flips `enableAgentChat` and
+   *  `enableLazyWorkspaceCreation` together through the
+   *  `set_agent_chat_enabled` Tauri command (which writes both fields
+   *  under one mutex acquisition on the backend), then mirrors the
+   *  new state into the store. The two flags must always move
+   *  together — every production read site pairs them with `&&`, and
+   *  the user-facing toggle in Settings → Interface is a single
+   *  Switch. */
   setAgentChatEnabled: (enabled: boolean) => Promise<void>;
 }
 
 export const useFeatureFlags = create<FeatureFlagsStore>((set) => ({
-  enableAgentChat: false,
-  enableLazyWorkspaceCreation: false,
+  // Pre-refresh state must mirror the backend default (GUI on), not
+  // the retired Beta default. Booting these `false` flashes the legacy
+  // CLI chrome for the frames before `get_feature_flags` resolves.
+  // `loaded` stays false so consumers that can wait still wait.
+  enableAgentChat: true,
+  enableLazyWorkspaceCreation: true,
   loaded: false,
   refresh: async () => {
     try {
@@ -44,13 +49,14 @@ export const useFeatureFlags = create<FeatureFlagsStore>((set) => ({
       });
     } catch (err) {
       console.error("Failed to fetch feature flags:", err);
-      // Fall back to defaults-off on error so guards stay closed,
-      // but mark loaded so consumers can stop waiting.
-      set({ enableAgentChat: false, enableLazyWorkspaceCreation: false, loaded: true });
+      // Fall back to the backend default (GUI on) rather than off: a
+      // rejected invoke would otherwise strand a default-mode user in
+      // the CLI chrome. Mark loaded so consumers stop waiting.
+      set({ enableAgentChat: true, enableLazyWorkspaceCreation: true, loaded: true });
     }
   },
   setAgentChatEnabled: async (enabled: boolean) => {
-    await invoke<void>("set_agent_chat_beta", { enabled });
+    await invoke<void>("set_agent_chat_enabled", { enabled });
     set({
       enableAgentChat: enabled,
       enableLazyWorkspaceCreation: enabled,

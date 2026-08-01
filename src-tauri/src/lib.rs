@@ -1771,7 +1771,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::add_structured_log,
             commands::update_feature_flags,
             commands::get_feature_flags,
-            commands::set_agent_chat_beta,
+            commands::set_agent_chat_enabled,
             commands::quit_app,
             commands::get_home_dir,
             commands::agent_chat_create_pane,

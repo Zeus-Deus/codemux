@@ -82,7 +82,7 @@ new data plumbing.
   `docs/features/agent-chat.md` § "Context Row (running-thread
   status)") — showing both would duplicate the same numbers twice on
   screen, so the permanent strip steps aside. A terminal (or other)
-  pane active in GUI mode keeps the bar; legacy chrome (Beta flag off)
+  pane active in GUI mode keeps the bar; legacy chrome (GUI flag off)
   is untouched, since `useGuiChrome()` — which the predicate is built
   on — always resolves `false` there.
 

@@ -171,6 +171,7 @@ import { toast } from "@/lib/toast";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 
 afterEach(() => cleanup());
@@ -191,6 +192,14 @@ function resetStores() {
   useUIStore.setState({
     showNewWorkspaceDialog: false,
     newWorkspaceProjectDir: null,
+  });
+  // These cases exercise the legacy (CLI opt-out) chrome, where the
+  // surface renders its own pane-header band. The store now boots
+  // with the flag ON to match the backend default, so pin it OFF
+  // here; the one GUI-chrome case below opts back in explicitly.
+  useFeatureFlags.setState({
+    enableAgentChat: false,
+    enableLazyWorkspaceCreation: false,
   });
   lastThreadScopeRowProps.current = null;
 }

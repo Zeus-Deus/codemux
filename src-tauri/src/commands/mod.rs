@@ -211,11 +211,12 @@ pub fn get_feature_flags(
     Ok(store.feature_flags())
 }
 
-/// Quit the Codemux app cleanly. Used by Settings → Beta Features →
-/// Agent Chat toggle: flipping the master Beta flag requires the
-/// process to come up fresh under the new flag state (backend
-/// singletons — MCP runtime, OpenCode supervisor, capability caches,
-/// ProviderRegistry — only initialise on app boot), and the simplest
+/// Quit the Codemux app cleanly. Used by the Settings → Interface →
+/// Agent Chat GUI toggle (the GUI is the default interface; the toggle
+/// is the opt-out back to the classic CLI view): flipping the master
+/// flag requires the process to come up fresh under the new state
+/// (backend singletons — MCP runtime, OpenCode supervisor, capability
+/// caches, ProviderRegistry — only initialise on app boot), and the simplest
 /// way to guarantee that is to close the app and let the user reopen
 /// it manually.
 ///
@@ -237,10 +238,11 @@ pub fn quit_app<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
     Ok(())
 }
 
-/// Atomic flip of the Agent Chat Beta master toggle. Sets
-/// `enable_agent_chat` and `enable_lazy_workspace_creation` to the
-/// same value in one mutex-held write so the two flags can never end
-/// up half-on (the Step 6–12 surface assumes both are true to
+/// Atomic flip of the Agent Chat GUI master toggle (default on;
+/// turning it off returns to the classic terminal-first interface).
+/// Sets `enable_agent_chat` and `enable_lazy_workspace_creation` to
+/// the same value in one mutex-held write so the two flags can never
+/// end up half-on (the chat surface assumes both are true to
 /// function correctly).
 ///
 /// The two flags exist as separate fields for wire-compat with
@@ -248,12 +250,12 @@ pub fn quit_app<R: Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
 /// pairs them with `&&`, so there's no real toggle matrix to expose.
 /// `update_feature_flags` is the lower-level setter (writes whatever
 /// `FeatureFlags` you hand it); use this command from the Settings
-/// → Beta Features UI to keep the two paired without forcing the
+/// → Interface UI to keep the two paired without forcing the
 /// frontend to read-modify-write the whole struct.
 ///
 /// Other flags (`unstable_*`) are left untouched.
 #[tauri::command]
-pub fn set_agent_chat_beta(
+pub fn set_agent_chat_enabled(
     store: State<'_, ObservabilityStore>,
     enabled: bool,
 ) -> Result<(), String> {

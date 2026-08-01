@@ -5,21 +5,21 @@ import { useUIStore } from "@/stores/ui-store";
 
 interface DisabledFeaturePlaceholderProps {
   /** User-facing feature name shown in the headline (e.g. "Agent
-   *  Chat"). Match the label in `BetaFeaturesSection` so the user
+   *  Chat"). Match the label in `InterfaceSection` so the user
    *  knows where to flip it back on. */
   feature: string;
   /** One-line explanation of why this pane is suspended. Defaults to
-   *  the standard Beta-toggle copy; override only when the suspension
-   *  has a different cause. */
+   *  the standard interface-toggle copy; override only when the
+   *  suspension has a different cause. */
   description?: string;
 }
 
 /**
- * Step 13 — placeholder shown in place of `AgentChatPane` (and any
- * future Beta-only pane kind) when the master Beta toggle is off but
+ * Placeholder shown in place of `AgentChatPane` (and any future
+ * chat-only pane kind) when the Agent Chat GUI toggle is off but
  * the persisted layout still references that pane kind. Hides the
  * pane chrome instead of crashing on mount, and offers a CTA that
- * jumps the user straight to Settings → Beta Features so they can
+ * jumps the user straight to Settings → Interface so they can
  * flip it back on if they meant to.
  *
  * Data preservation contract: this component renders, but does not
@@ -29,12 +29,12 @@ interface DisabledFeaturePlaceholderProps {
  */
 export function DisabledFeaturePlaceholder({
   feature,
-  description = "This pane needs the Agent Chat Beta. Your data is preserved — enable it in Settings to use this pane again.",
+  description = "This pane needs the Agent Chat GUI, which is turned off. Your data is preserved — turn it back on in Settings → Interface to use this pane again.",
 }: DisabledFeaturePlaceholderProps) {
   const setShowSettings = useUIStore((s) => s.setShowSettings);
 
   const openSettings = () => {
-    setShowSettings(true, "beta_features");
+    setShowSettings(true, "interface");
   };
 
   return (
@@ -55,7 +55,7 @@ export function DisabledFeaturePlaceholder({
           onClick={openSettings}
           className="border-warning/30 hover:bg-warning/10 hover:text-warning"
         >
-          Open Settings → Beta Features
+          Open Settings → Interface
         </Button>
       </div>
     </div>

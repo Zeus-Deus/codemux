@@ -15,8 +15,8 @@ persistent-rule counterpart to the in-chat Allow/Deny approval cards (see `docs/
 approval cards decide a single tool call live; these rules are the standing policy the SDK applies
 before it ever asks.
 
-The section only appears when the **Agent Chat Beta** flag is on (it sits under Editor & Workflow
-alongside Skills and MCP Servers).
+The section only appears when the **Agent Chat GUI** flag is on (the default; it sits under
+Editor & Workflow alongside Skills and MCP Servers).
 
 ## Current Model
 

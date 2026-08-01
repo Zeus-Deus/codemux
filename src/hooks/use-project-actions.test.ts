@@ -23,6 +23,7 @@ import {
 } from "@/tauri/commands";
 import { useProjectActions } from "./use-project-actions";
 import { useAppStore } from "@/stores/app-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { useUIStore } from "@/stores/ui-store";
 
 const mockPickFolderDialog = vi.mocked(pickFolderDialog);
@@ -89,6 +90,14 @@ beforeEach(() => {
   useUIStore.setState({
     onboardingProjectDir: null,
     hasSeenOnboarding: false,
+  });
+  // The legacy first-project onboarding wizard only fires when the
+  // Agent Chat GUI is off (see `shouldUseLegacyOnboarding`). The flags
+  // store now boots ON to match the backend default, so pin the CLI
+  // opt-out state these cases are about.
+  useFeatureFlags.setState({
+    enableAgentChat: false,
+    enableLazyWorkspaceCreation: false,
   });
   window.localStorage.clear();
 });
