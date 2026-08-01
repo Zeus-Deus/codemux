@@ -171,4 +171,37 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     expect(onProviderModelChange).toHaveBeenCalledWith("codex", "gpt-5.4");
     expect(onModelChange).not.toHaveBeenCalled();
   });
+
+  it("reveals the Tasks toggle only for a non-empty provider plan", () => {
+    const onTasksClick = vi.fn();
+    const { rerender } = renderFooter();
+    expect(screen.queryByTestId("composer-tasks-toggle")).toBeNull();
+
+    rerender(
+      <TooltipProvider>
+        <ComposerFooter
+          {...baseProps()}
+          tasks={{ completed: 2, total: 5 }}
+          onTasksClick={onTasksClick}
+        />
+      </TooltipProvider>,
+    );
+    const toggle = screen.getByTestId("composer-tasks-toggle");
+    expect(toggle).toHaveTextContent("Tasks");
+    expect(toggle).toHaveTextContent("2/5");
+    fireEvent.click(toggle);
+    expect(onTasksClick).toHaveBeenCalledOnce();
+  });
+
+  it("marks the Tasks toggle pressed while its panel is open", () => {
+    renderFooter({
+      tasks: { completed: 0, total: 3 },
+      tasksOpen: true,
+      onTasksClick: vi.fn(),
+    });
+    expect(screen.getByTestId("composer-tasks-toggle")).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
 });

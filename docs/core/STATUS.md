@@ -306,7 +306,11 @@ The frontend is React + Tailwind v4 + shadcn + Vite. The Rust backend is unchang
 - Workspace list from real Tauri backend data (zustand + app-state-changed events, coalesced into 16ms windows)
 - Terminal panes with xterm.js WebGL (hardware-GL gated) + DOM fallback + PTY via Tauri Channel, persistent across workspace switch
 - Pane splits (horizontal/vertical) with CSS Grid, resize handles, drag-to-swap
-- Right panel with Changes panel, File tree, and Review (PR) panel tabs
+- Right panel with Changes, Files, Review, conditional Orchestration, and
+  conditional Agent Tasks tabs. Agent Tasks is a durable, thread-focused,
+  read-only provider plan fed by Claude (`TodoWrite` + `Task*`), Codex
+  (`turn/plan/updated`), and OpenCode (`todo.updated`); its compact composer
+  toggle appears only after a non-empty plan exists
 - OpenFlow UI: orchestration view, agent config, communication panel, agent graph
 - Agent Chat UI: chat pane, composer (with `+` popup, `@` mention popup, slash command popup, image paste/drop), transcript, mode pill, model picker, session selector, attachment chips, plan proposal block, AskUserQuestion panel, thinking indicator, permission request block, tool-call card with per-tool body rendering, debug-mode banner + exit dialog; runtime events (incl. `content_delta` token stream) arrive per-thread over a Tauri Channel (`attach_agent_chat_output`, issue #75) instead of the global event bus; transcript body uses LegendList bounded-DOM virtualization while preserving the issue #77 stick-to-bottom contract; docked `SubagentActivityBar` between transcript and composer while subagents run
 - Settings panel (15+ sections including Beta Features, Sync, Skills, MCP, Permissions)

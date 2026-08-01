@@ -40,6 +40,46 @@ describe("agent-chat reducer", () => {
     __resetReducerIdCounterForTests();
   });
 
+  it("stores complete task snapshots without adding transcript rows", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "tasks_updated",
+      thread_id: "t1",
+      tasks: {
+        explanation: "Ship the feature",
+        tasks: [
+          {
+            task_id: "1",
+            title: "Wire provider events",
+            status: "in_progress",
+            blocked_by: [],
+          },
+        ],
+      },
+    });
+    expect(state.tasks?.explanation).toBe("Ship the feature");
+    expect(state.tasks?.tasks[0].status).toBe("in_progress");
+    expect(state.tasksUpdatedAt).toEqual(expect.any(Number));
+    expect(state.messages).toEqual([]);
+  });
+
+  it("replaces rather than merges task snapshots", () => {
+    const first = applyEvent(createEmptyThreadState(), {
+      type: "tasks_updated",
+      thread_id: "t1",
+      tasks: {
+        tasks: [{ task_id: "1", title: "Old", status: "pending", blocked_by: [] }],
+      },
+    });
+    const next = applyEvent(first, {
+      type: "tasks_updated",
+      thread_id: "t1",
+      tasks: {
+        tasks: [{ task_id: "2", title: "New", status: "completed", blocked_by: [] }],
+      },
+    });
+    expect(next.tasks?.tasks.map((task) => task.task_id)).toEqual(["2"]);
+  });
+
   it("accumulates text deltas into a single assistant message", () => {
     const state = runEvents([
       {

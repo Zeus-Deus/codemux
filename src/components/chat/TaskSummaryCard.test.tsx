@@ -1,8 +1,9 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, describe, it, expect } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { ToolCallItem } from "@/lib/agent-chat/types";
+import { useUIStore } from "@/stores/ui-store";
 
 import {
   TaskSummaryCard,
@@ -62,9 +63,29 @@ describe("isTaskSummaryTool", () => {
 });
 
 describe("TaskSummaryCard", () => {
-  it("renders every todo label and a done/total summary", () => {
+  it("collapses a fresh plan to a created-receipt line", () => {
     render(
       <TaskSummaryCard
+        item={todoTool({
+          todos: [
+            { content: "Branch off origin/main", status: "pending" },
+            { content: "Add regression test", status: "pending" },
+            { content: "Open the PR", status: "pending" },
+          ],
+        })}
+      />,
+    );
+    const receipt = screen.getByTestId("task-receipt");
+    expect(receipt).toHaveTextContent("Task list created");
+    expect(receipt).toHaveTextContent("3 items");
+    // The thread no longer duplicates the panel's row list.
+    expect(screen.queryByText("Branch off origin/main")).toBeNull();
+  });
+
+  it("shows progress for an updated plan and opens the Tasks panel", () => {
+    render(
+      <TaskSummaryCard
+        workspaceId="ws-1"
         item={todoTool({
           todos: [
             { content: "Branch off origin/main", status: "completed" },
@@ -74,10 +95,23 @@ describe("TaskSummaryCard", () => {
         })}
       />,
     );
-    expect(screen.getByText("Task list · 2/3 done")).toBeInTheDocument();
-    expect(screen.getByText("Branch off origin/main")).toBeInTheDocument();
-    expect(screen.getByText("Add regression test")).toBeInTheDocument();
-    expect(screen.getByText("Open the PR")).toBeInTheDocument();
+    const receipt = screen.getByTestId("task-receipt");
+    expect(receipt).toHaveTextContent("Task list updated");
+    expect(receipt).toHaveTextContent("2/3 done");
+    expect(receipt).toHaveTextContent("Open in panel");
+    fireEvent.click(receipt);
+    expect(useUIStore.getState().rightPanelTabs["ws-1"]).toBe("tasks");
+  });
+
+  it("is inert without a workspace id", () => {
+    render(
+      <TaskSummaryCard
+        item={todoTool({ todos: [{ content: "a", status: "pending" }] })}
+      />,
+    );
+    const receipt = screen.getByTestId("task-receipt");
+    expect(receipt).toBeDisabled();
+    expect(receipt).not.toHaveTextContent("Open in panel");
   });
 
   it("renders nothing when there are no todos", () => {

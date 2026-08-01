@@ -2,6 +2,7 @@ import type {
   ApprovalDecision,
   ProviderRuntimeEvent,
   SubagentStatus,
+  TasksSnapshot,
   TurnStatus,
 } from "@/tauri/events";
 
@@ -332,6 +333,13 @@ export type ChatViewItem =
 
 export interface ChatThreadState {
   messages: ChatViewItem[];
+  /** Latest complete provider-authored task plan for this thread. */
+  tasks: TasksSnapshot | null;
+  /** Clock time (ms) the latest task snapshot was applied. Hydration
+   *  replays through the same reducer path, so after a reopen this is
+   *  "when this session learned about the plan", not the original wall
+   *  time — good enough for the panel's "last update" caption. */
+  tasksUpdatedAt: number | null;
   streaming: boolean;
   pendingRequestIds: string[];
   /** Next `seq` to assign to a freshly-appended item. Strictly
@@ -356,6 +364,8 @@ export interface ChatThreadState {
 export function emptyThreadState(): ChatThreadState {
   return {
     messages: [],
+    tasks: null,
+    tasksUpdatedAt: null,
     streaming: false,
     pendingRequestIds: [],
     nextSeq: 0,

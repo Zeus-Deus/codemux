@@ -428,6 +428,7 @@ fn event_session_id(known: &KnownEvent) -> Option<&str> {
         K::MessagePartRemoved(p) => Some(p.session_id.as_str()),
         K::PermissionAsked(p) => Some(p.session_id.as_str()),
         K::PermissionReplied(p) => Some(p.session_id.as_str()),
+        K::TodoUpdated(p) => Some(p.session_id.as_str()),
     }
 }
 

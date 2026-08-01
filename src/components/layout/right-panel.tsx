@@ -7,7 +7,9 @@ import { ChangesPanel } from "@/components/workspace/changes-panel";
 import { FileTreePanel } from "@/components/workspace/file-tree-panel";
 import { ReviewPanel } from "@/components/workspace/review-panel";
 import { OrchestrationPanel } from "@/components/workflow/orchestration-panel";
+import { TasksPanel } from "@/components/chat/TasksPanel";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
+import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 import type {
   WorkspaceSnapshot,
   CheckInfo,
@@ -98,6 +100,12 @@ const TAB_TRIGGER_CLS = cn(
 export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Props) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
   const workspaceWorkflow = useWorkspaceWorkflow(workspace);
+  const { tasks: activeChatTasks, updatedAt: tasksUpdatedAt } =
+    useActiveChatTasks(workspace);
+  const tasksSnapshot =
+    activeChatTasks && activeChatTasks.tasks.length > 0 ? activeChatTasks : null;
+  const tasksRunning =
+    tasksSnapshot?.tasks.some((task) => task.status === "in_progress") ?? false;
   // The Orchestration tab appears only once a run is approved (design:
   // the approval card in the thread owns the pending_approval state; the
   // panel would just duplicate the planned phases as "queued").
@@ -156,6 +164,28 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
                 )}
               </TabsTrigger>
             )}
+            {tasksSnapshot && (
+              <TabsTrigger
+                value="tasks"
+                className={TAB_TRIGGER_CLS}
+                data-testid="tasks-tab"
+              >
+                Tasks
+                <span className="ml-1 text-[10px] tabular-nums text-muted-foreground/60">
+                  {tasksSnapshot.tasks.filter((task) => task.status === "completed").length}/
+                  {tasksSnapshot.tasks.length}
+                </span>
+                {/* Progress stays readable from any tab: a live dot marks
+                    an in-flight step until the user is actually looking. */}
+                {tasksRunning && activeTab !== "tasks" && (
+                  <span
+                    data-testid="tasks-live-dot"
+                    className="cm-blink ml-1.5 h-1.5 w-1.5 rounded-full bg-status-working"
+                    aria-hidden
+                  />
+                )}
+              </TabsTrigger>
+            )}
           </TabsList>
         </div>
         <TabsContent value="files" className="flex-1 overflow-hidden">
@@ -174,6 +204,11 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
               run={workflowRun}
               threadId={workflowThreadId}
             />
+          </TabsContent>
+        )}
+        {tasksSnapshot && (
+          <TabsContent value="tasks" className="flex-1 overflow-hidden">
+            <TasksPanel snapshot={tasksSnapshot} updatedAt={tasksUpdatedAt} />
           </TabsContent>
         )}
       </Tabs>

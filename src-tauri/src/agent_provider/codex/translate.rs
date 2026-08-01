@@ -28,7 +28,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::agent_provider::{
     CompletedItem, ContentDelta, ProviderRuntimeEvent, ProviderSessionId, RequestId,
-    SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
+    SessionStatus, SubagentSnapshot, SubagentStatus, TaskSnapshotItem, TaskStatus, TasksSnapshot,
+    ThreadId, TurnId, TurnStatus,
 };
 
 use super::protocol::{
@@ -158,6 +159,12 @@ pub fn translate_notification_with(
         NotificationMessage::TurnCompleted(p) if demux.is_subagent(&p.thread_id) => {
             return handle_subagent_turn_completed(thread_id, p);
         }
+        // The right-panel plan belongs to the orchestrator. A child may
+        // maintain its own plan, but projecting it over the parent would
+        // make the toggle jump between unrelated scopes.
+        NotificationMessage::TurnPlanUpdated(p) if demux.is_subagent(&p.thread_id) => {
+            return vec![];
+        }
         NotificationMessage::Error(e) => {
             if let Some(child) = e.thread_id.as_deref() {
                 if demux.is_subagent(child) {
@@ -239,6 +246,38 @@ fn translate_parent(
             text_delta(thread_id, p, ContentStream::FileChange)
         }
         NotificationMessage::PlanDelta(p) => text_delta(thread_id, p, ContentStream::Plan),
+        NotificationMessage::TurnPlanUpdated(p) => {
+            let tasks = p
+                .plan
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, step)| {
+                    let title = step.step.trim().to_string();
+                    if title.is_empty() {
+                        return None;
+                    }
+                    let status = match step.status.as_str() {
+                        "completed" => TaskStatus::Completed,
+                        "inProgress" | "in_progress" => TaskStatus::InProgress,
+                        _ => TaskStatus::Pending,
+                    };
+                    Some(TaskSnapshotItem {
+                        task_id: format!("codex-{index}"),
+                        title,
+                        status,
+                        detail: None,
+                        blocked_by: Vec::new(),
+                    })
+                })
+                .collect();
+            vec![ProviderRuntimeEvent::TasksUpdated {
+                thread_id: thread_id.clone(),
+                tasks: TasksSnapshot {
+                    explanation: p.explanation,
+                    tasks,
+                },
+            }]
+        }
         NotificationMessage::ReasoningTextDelta(p) => translate_reasoning_text(thread_id, p),
         NotificationMessage::ReasoningSummaryTextDelta(p) => {
             translate_reasoning_summary_text(thread_id, p)
@@ -579,6 +618,7 @@ fn generic_wire_thread_id(msg: &NotificationMessage) -> Option<&str> {
         | CommandExecutionOutputDelta(p)
         | FileChangeOutputDelta(p)
         | PlanDelta(p) => Some(&p.thread_id),
+        TurnPlanUpdated(p) => Some(&p.thread_id),
         ReasoningTextDelta(p) => Some(&p.thread_id),
         ReasoningSummaryTextDelta(p) => Some(&p.thread_id),
         ReasoningSummaryPartAdded(p) => Some(&p.thread_id),
@@ -1826,6 +1866,34 @@ mod tests {
                 assert_eq!(subagent.activity.as_deref(), Some("child exploded"));
             }
             other => panic!("expected SubagentUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn structured_plan_maps_to_tasks_snapshot() {
+        let events = translate_notification(
+            &tid(),
+            NotificationMessage::from_raw(
+                "turn/plan/updated",
+                json!({
+                    "threadId": "c-1",
+                    "explanation": "Finish the feature",
+                    "plan": [
+                        {"step": "Research", "status": "completed"},
+                        {"step": "Implement", "status": "inProgress"},
+                        {"step": "Test", "status": "pending"}
+                    ]
+                }),
+            ),
+        );
+        match &events[0] {
+            ProviderRuntimeEvent::TasksUpdated { tasks, .. } => {
+                assert_eq!(tasks.explanation.as_deref(), Some("Finish the feature"));
+                assert_eq!(tasks.tasks[0].status, TaskStatus::Completed);
+                assert_eq!(tasks.tasks[1].status, TaskStatus::InProgress);
+                assert_eq!(tasks.tasks[2].status, TaskStatus::Pending);
+            }
+            other => panic!("expected TasksUpdated, got {other:?}"),
         }
     }
 }
