@@ -41,6 +41,10 @@ function trimDecimal(text: string): string {
  * Under 10k keeps one decimal because the difference between 1.4k and
  * 2.3k of context matters at that scale; above it the decimal is noise.
  *
+ * The band is chosen from the *rounded* figure, not the raw one: 999_600
+ * is below 1m but rounds to 1000 thousands, and `"1000k"` is a unit that
+ * doesn't exist in this scheme — it promotes to `"1m"` instead.
+ *
  * Never returns an empty string or a dash — an unknown count formats as
  * `"0"` so the composer's fixed-width row can't jump when the first
  * real reading lands.
@@ -50,7 +54,8 @@ export function formatContextTokens(value: number | null): string {
   if (n === null || n <= 0) return "0";
   if (n < 1_000) return String(Math.round(n));
   if (n < 10_000) return `${trimDecimal((n / 1_000).toFixed(1))}k`;
-  if (n < 1_000_000) return `${Math.round(n / 1_000)}k`;
+  const thousands = Math.round(n / 1_000);
+  if (thousands < 1_000) return `${thousands}k`;
   return `${trimDecimal((n / 1_000_000).toFixed(1))}m`;
 }
 

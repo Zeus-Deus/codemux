@@ -2310,7 +2310,8 @@ property of the *selected* option — and for Codex). Resolution lives in
 `src/lib/agent-chat/context-usage.ts` (`resolveContextWindowTokens`,
 `deriveContextUsageDisplay`, and the `formatContextTokens` banding:
 lowercase `k`/`m`, one decimal only in the 1k–10k and ≥1M bands, `1m`
-never `1.0m`, null/NaN → `"0"`).
+never `1.0m`, the band picked from the rounded figure so 999_600 reads
+`1m` rather than a nonexistent `1000k`, null/NaN → `"0"`).
 
 **Components.** `src/components/chat/ContextUsageMeter.tsx`
 (`{ usage, seedMaxTokens?, providerLabel? }`, test hooks

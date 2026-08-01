@@ -47,8 +47,16 @@ describe("formatContextTokens", () => {
     expect(formatContextTokens(10_000)).toBe("10k");
     expect(formatContextTokens(224_000)).toBe("224k");
     expect(formatContextTokens(224_400)).toBe("224k");
-    // Band edge: still below 1m, so still expressed in thousands.
-    expect(formatContextTokens(999_999)).toBe("1000k");
+    // Last figure that still rounds inside the thousands band.
+    expect(formatContextTokens(999_499)).toBe("999k");
+  });
+
+  it("promotes to `m` rather than printing a nonexistent `1000k`", () => {
+    // Below 1m, but `Math.round(n / 1000)` crosses 1000 — the band is
+    // picked from the rounded figure, so these read as millions.
+    expect(formatContextTokens(999_500)).toBe("1m");
+    expect(formatContextTokens(999_600)).toBe("1m");
+    expect(formatContextTokens(999_999)).toBe("1m");
   });
 
   it("switches to millions at 1m with one decimal", () => {
