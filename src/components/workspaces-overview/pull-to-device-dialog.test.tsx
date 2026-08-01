@@ -40,13 +40,22 @@ vi.mock("@/stores/hosts-store", () => ({
   ),
 }));
 
-vi.mock("@/stores/app-store", () => ({
-  useAppStore: vi.fn((selector: (s: unknown) => unknown) =>
-    selector({
-      setWorkspacePushPullInFlight: vi.fn(),
-    }),
-  ),
-}));
+// Only the hook's projection is faked; the real selectors and `getState` stay,
+// because the activation helper reads both.
+vi.mock("@/stores/app-store", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/stores/app-store")>();
+  return {
+    ...actual,
+    useAppStore: Object.assign(
+      vi.fn((selector: (s: unknown) => unknown) =>
+        selector({
+          setWorkspacePushPullInFlight: vi.fn(),
+        }),
+      ),
+      { getState: actual.useAppStore.getState },
+    ),
+  };
+});
 
 vi.mock("@/stores/ui-store", () => ({
   useUIStore: vi.fn((selector: (s: unknown) => unknown) =>

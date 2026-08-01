@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import {
   ArrowDownLeft,
@@ -47,6 +47,7 @@ import {
 } from "@/tauri/commands";
 import { toast } from "@/lib/toast";
 import { runDeleteWithForceToast } from "@/hooks/use-force-delete";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
 
 import type { DivergenceInfo, OverviewItem } from "./use-overview-items";
@@ -222,18 +223,16 @@ function LocalRow({
 
   const handleOpen = useCallback(() => {
     if (inFlight) return;
-    startTransition(() => {
-      activateWorkspace(workspace.workspace_id)
-        .then(() => {
-          setShowWorkspacesOverview(false);
-          onAfterOpen();
-        })
-        .catch((err) => {
-          toast.error("Couldn't open workspace", {
-            description: err instanceof Error ? err.message : String(err),
-          });
+    activateWorkspaceInteraction(workspace.workspace_id)
+      .then(() => {
+        setShowWorkspacesOverview(false);
+        onAfterOpen();
+      })
+      .catch((err) => {
+        toast.error("Couldn't open workspace", {
+          description: err instanceof Error ? err.message : String(err),
         });
-    });
+      });
   }, [inFlight, workspace.workspace_id, setShowWorkspacesOverview, onAfterOpen]);
 
   const handlePushToHost = useCallback(

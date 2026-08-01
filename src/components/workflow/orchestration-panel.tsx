@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { ChevronLeft, Pause, Square } from "lucide-react";
 
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -7,6 +7,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { agentChatInterruptTurn } from "@/tauri/commands";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 import { formatCompactTokens } from "@/components/chat/WorkflowRunCard";
+import { TickingText } from "@/components/chat/TickingText";
 import { formatElapsed } from "@/lib/agent-chat/subagents";
 import { workflowRunStats } from "@/lib/agent-chat/workflows";
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
@@ -118,7 +119,16 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
           <div className="mt-2.5 flex items-center gap-3.5">
             <Stat label="agents" value={String(stats.agents)} />
             <Stat label="tokens" value={formatCompactTokens(stats.tokens)} />
-            <Stat label="elapsed" value={formatElapsed(stats.elapsedMs)} />
+            <Stat
+              label="elapsed"
+              value={
+                <TickingText
+                  active={running}
+                  compute={(nowMs) => formatElapsed(workflowRunStats(run, nowMs).elapsedMs)}
+                  testId="workflow-elapsed"
+                />
+              }
+            />
             <div className="ml-auto flex gap-1.5">
               <Tooltip>
                 <TooltipTrigger asChild>
@@ -181,7 +191,7 @@ export function OrchestrationPanel({ workspace, run, threadId }: Props) {
   );
 }
 
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, value }: { label: string; value: ReactNode }) {
   return (
     <span className="flex flex-col">
       <span className="font-mono text-[13px] font-semibold text-foreground">{value}</span>
@@ -190,14 +200,19 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
-/** 1s tick while `active`, so derived elapsed stats advance without a
- *  fresh provider snapshot. Same discipline as SubagentsCard/
- *  WorkflowRunCard's local `useNow`. */
+/** Coarse tick while `active`, feeding the per-phase elapsed labels that
+ *  take `now` as a prop. The header's own elapsed readout is a
+ *  `TickingText` and stays exact at 1 Hz without any React commit; this
+ *  interval exists only for the phase list, where the value crosses a
+ *  component boundary, so it trades a few seconds of precision on a
+ *  secondary readout for a 12× drop in panel re-renders. */
+const PHASE_TICK_MS = 5000;
+
 function useNow(active: boolean): number {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!active) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    const id = window.setInterval(() => setNow(Date.now()), PHASE_TICK_MS);
     return () => window.clearInterval(id);
   }, [active]);
   return now;

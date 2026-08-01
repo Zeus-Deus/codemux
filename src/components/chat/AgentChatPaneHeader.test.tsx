@@ -16,6 +16,7 @@ import type {
 vi.mock("@/tauri/commands", () => ({
   agentChatGetCheckpoint: vi.fn().mockResolvedValue(null),
   agentChatListMessages: vi.fn().mockResolvedValue([]),
+  agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
   agentChatRestoreCheckpoint: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
   agentChatStopSession: vi.fn().mockResolvedValue(undefined),
@@ -87,6 +88,7 @@ import { AgentChatPaneHeader } from "./AgentChatPaneHeader";
 import {
   agentChatGetCheckpoint,
   agentChatListMessages,
+  agentChatListMessagesAfter,
   agentChatRestoreCheckpoint,
   agentChatStartSession,
   agentChatStopSession,
@@ -146,28 +148,35 @@ describe("AgentChatPaneHeader — resume hydration", () => {
   beforeEach(() => {
     useAgentChatStore.setState({ threads: {} });
     vi.mocked(agentChatListMessages).mockReset();
+    vi.mocked(agentChatListMessagesAfter).mockReset();
     vi.mocked(agentChatStartSession).mockReset();
     vi.mocked(agentChatStopSession).mockReset();
     vi.mocked(toast.error).mockReset();
     vi.mocked(toast.success).mockReset();
     vi.mocked(toast.warning).mockReset();
     vi.mocked(agentChatListMessages).mockResolvedValue([]);
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
     vi.mocked(agentChatStartSession).mockResolvedValue("thread-new");
     vi.mocked(agentChatStopSession).mockResolvedValue(undefined);
   });
 
-  it("calls agentChatListMessages with the picked record's thread_id BEFORE start_session", async () => {
-    vi.mocked(agentChatListMessages).mockResolvedValue([
-      JSON.stringify({ type: "user_message", thread_id: "x", text: "hi" }),
+  it("reads the picked record's transcript BEFORE start_session", async () => {
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue([
+      {
+        id: 1,
+        payload: JSON.stringify({ type: "user_message", thread_id: "x", text: "hi" }),
+      },
     ]);
     renderHeader();
     expect(lastSessionSelectorProps.current).not.toBeNull();
     const onSelect = lastSessionSelectorProps.current!.onSelect;
     await onSelect(makeRecord({ thread_id: "thread-source" }));
 
-    // Both calls happened.
-    expect(vi.mocked(agentChatListMessages)).toHaveBeenCalledWith(
+    // Both calls happened. The resume path reads by cursor (from the
+    // start of the source thread) so the new slice inherits a cursor.
+    expect(vi.mocked(agentChatListMessagesAfter)).toHaveBeenCalledWith(
       "thread-source",
+      null,
     );
     expect(vi.mocked(agentChatStartSession)).toHaveBeenCalledTimes(1);
     // Ordering: list_messages was called before start_session. We
@@ -175,7 +184,7 @@ describe("AgentChatPaneHeader — resume hydration", () => {
     // (different mocks), so use invocation-call-order via the
     // .mock.invocationCallOrder array Vitest exposes.
     const listOrder =
-      vi.mocked(agentChatListMessages).mock.invocationCallOrder[0];
+      vi.mocked(agentChatListMessagesAfter).mock.invocationCallOrder[0];
     const startOrder =
       vi.mocked(agentChatStartSession).mock.invocationCallOrder[0];
     expect(listOrder).toBeLessThan(startOrder);
@@ -187,7 +196,9 @@ describe("AgentChatPaneHeader — resume hydration", () => {
       thread_id: "x",
       text: "hello from history",
     });
-    vi.mocked(agentChatListMessages).mockResolvedValue([payload]);
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue([
+      { id: 7, payload },
+    ]);
 
     renderHeader();
     const onSelect = lastSessionSelectorProps.current!.onSelect;
@@ -205,10 +216,12 @@ describe("AgentChatPaneHeader — resume hydration", () => {
     if (slice.messages[0].kind === "user_message") {
       expect(slice.messages[0].text).toBe("hello from history");
     }
+    // …and a resume cursor, so its first remount is a warm tail read.
+    expect(slice.lastPersistedEventId).toBe(7);
   });
 
   it("does NOT hydrate when the picked record has no payloads", async () => {
-    vi.mocked(agentChatListMessages).mockResolvedValue([]);
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
     renderHeader();
     await lastSessionSelectorProps.current!.onSelect(makeRecord());
 
@@ -223,11 +236,11 @@ describe("AgentChatPaneHeader — resume hydration", () => {
     expect(seeded.messages).toHaveLength(0);
   });
 
-  it("continues with start_session when agentChatListMessages rejects", async () => {
+  it("continues with start_session when the transcript read rejects", async () => {
     // Hydration is best-effort. A failed list call must NOT skip the
     // resume — the SDK still has server-side context, the user just
     // won't see the local transcript.
-    vi.mocked(agentChatListMessages).mockRejectedValue(
+    vi.mocked(agentChatListMessagesAfter).mockRejectedValue(
       new Error("db locked"),
     );
     renderHeader();
@@ -254,7 +267,7 @@ describe("AgentChatPaneHeader — resume hydration", () => {
     await lastSessionSelectorProps.current!.onSelect(
       makeRecord({ sdk_session_id: null }),
     );
-    expect(vi.mocked(agentChatListMessages)).not.toHaveBeenCalled();
+    expect(vi.mocked(agentChatListMessagesAfter)).not.toHaveBeenCalled();
     expect(vi.mocked(agentChatStartSession)).not.toHaveBeenCalled();
     expect(vi.mocked(toast.warning)).toHaveBeenCalled();
   });

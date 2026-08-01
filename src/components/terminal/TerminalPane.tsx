@@ -17,6 +17,7 @@ import {
   kittyFlags,
 } from "@/lib/kitty-keyboard";
 import { resolveKeybinds } from "@/hooks/use-resolved-keybinds";
+import { endSubMeasure, startSubMeasure } from "@/lib/perf/interaction-trace";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
 import {
   getTerminalFontSize,
@@ -41,6 +42,7 @@ import {
 import { registerTerminalForSerialize } from "@/hooks/use-scrollback-serializer";
 import { createWritePump } from "./terminal-write-pump";
 import { createIdleScrollbackSerializer } from "./scrollback-idle-serializer";
+import { parkTeardown, flushTeardown } from "./deferred-teardown";
 import { useAppStore, getSessionWorkspaceId } from "@/stores/app-store";
 import {
   useTerminalCwdStore,
@@ -317,6 +319,15 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
   // ── Main mount/teardown effect ──
   useEffect(() => {
     const sid = sessionId;
+
+    // Switching back to a session whose teardown is still parked (A → B → A):
+    // finish it NOW, before this mount builds a second Terminal for the same
+    // session. Two invariants depend on it — the parked job's serialize +
+    // `cacheTerminalScrollback` must land before the read below, and its WebGL
+    // context must be released before we allocate the replacement (see the
+    // context-cap note in `deferred-teardown.ts`).
+    flushTeardown(sid);
+
     const containerEl = containerRef.current;
     if (!containerEl) return;
 
@@ -362,6 +373,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         // xterm falls back to the DOM renderer rather than rendering a blank pane.
         addon.onContextLoss(() => {
           addon.dispose();
+          // Clear the local too: the deferred teardown disposes from this
+          // binding (the ref is nulled at unmount, before the job runs) and
+          // must not double-dispose an addon the GPU already took away.
+          webglAddon = null;
           webglAddonRef.current = null;
         });
         term.loadAddon(addon);
@@ -547,9 +562,12 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     const buildScrollbackPayload = (
       opts: { precomputedData?: string; trigger: "unmount" | "close" },
     ): ScrollbackPayload | null => {
-      const t = termRef.current;
-      const sa = serializeAddonRef.current;
-      if (!t || !sa) return null;
+      // The effect's own terminal, not `termRef.current`: the unmount path
+      // clears the refs synchronously and finishes the serialize later, from a
+      // parked job (see the cleanup below). Both bindings are identical while
+      // the pane is mounted, so nothing changes for the live paths.
+      const t = term;
+      const sa = serializeAddon;
 
       const appState = useAppStore.getState().appState;
       if (!appState) return null;
@@ -619,8 +637,8 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
     // ── Idle-time scrollback serializer ──
     // Opportunistically serializes the buffer while the pane is quiet so the
     // unmount/close path can reuse the result instead of blocking the workspace
-    // switch on a synchronous serialize (issue #128). Closes over termRef /
-    // serializeAddonRef so it always serializes the live buffer.
+    // switch on a synchronous serialize (issue #128). Closes over this effect's
+    // terminal + serialize addon, so it stays valid for the deferred teardown.
     // The idle cache bakes in the scrollback_lines value used at serialize
     // time, and a synced-settings change emits no output and no resize — so
     // nothing else invalidates the cache. Track the value each idle serialize
@@ -631,9 +649,7 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
     const idleSerializer = createIdleScrollbackSerializer({
       serialize: () => {
-        const sa = serializeAddonRef.current;
-        if (!sa) return "";
-        const { data, ms, lines } = timedSerialize(sa);
+        const { data, ms, lines } = timedSerialize(serializeAddon);
         idleSerializedScrollbackLines = lines;
         if (import.meta.env.DEV || ms > 30) {
           // DEV observability: every idle serialize. Prod noise unchanged:
@@ -648,10 +664,10 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
         }
         return data;
       },
-      isAlternateBuffer: () => {
-        const t = termRef.current;
-        return t !== null && isAltScreen(t);
-      },
+      // Same reason as buildScrollbackPayload: read the effect's terminal so a
+      // deferred teardown still sees the real buffer type after the refs are
+      // cleared.
+      isAlternateBuffer: () => isAltScreen(term),
       // When session restore is off the unmount path discards the payload, so
       // an idle serialize would be pure wasted main-thread work — gate the
       // idle path on the same setting.
@@ -1020,36 +1036,72 @@ export const TerminalPane = memo(function TerminalPane({ sessionId, paneId, focu
 
       window.removeEventListener("resize", windowResize);
 
-      // Cache scrollback BEFORE disposing xterm — the serialize addon needs
-      // the live terminal buffer. This covers tab switches and workspace
-      // switches. Fresh-if-clean: if the idle serializer already produced an
-      // up-to-date buffer while the pane was quiet, reuse it and skip the
-      // synchronous serialize that used to block the switch (issue #128);
-      // otherwise fall back to a fresh serialize so persistence never regresses.
+      // ── Deferred tail: serialize + persist scrollback, then dispose ──
+      //
+      // Everything above stops output, input and event listening, and has to
+      // stay synchronous. What is left is pure cost that the incoming pane
+      // cannot observe: when the idle cache is stale, `buildFreshOrCached`
+      // runs a synchronous xterm serialize (the >30ms hotspot of issue #128)
+      // inside the switch that is trying to paint, and the disposes aren't
+      // free either. Park it and run it after the next paint, at idle.
+      //
+      // The job closes over the effect's own `term` / `serializeAddon` /
+      // `webglAddon` (never the refs, which are cleared just below) so React
+      // state can't reach the parked instance, and it is bounded on both of
+      // this area's historical failure modes — a parked terminal is already
+      // detached from the PTY so it consumes no output, and it still disposes
+      // its WebGL addon under a hard 2-job cap. See `deferred-teardown.ts`.
+      //
+      // With session restore off there is nothing to serialize, but the job is
+      // still parked: the disposes are the remaining cost, and one path keeps
+      // the WebGL-context bound identical in both settings states.
       const restoreEnabled = useSyncedSettingsStore.getState().settings.session_restore.enabled;
-      if (restoreEnabled) {
-        const payload = buildFreshOrCached("unmount");
-        if (payload && payload.data) {
-          cacheTerminalScrollback(payload).catch(() => {});
-        }
-      }
+      parkTeardown({
+        sessionId: sid,
+        run: () => {
+          // Serialize BEFORE disposing xterm — the serialize addon reads the
+          // terminal buffer, which is still intact in memory even though the
+          // container is out of the DOM. Fresh-if-clean: reuse the idle
+          // serializer's buffer when it is still current, else serialize now.
+          if (restoreEnabled) {
+            // Same measure name as before this became deferred, so a
+            // before/after comparison of `terminal-teardown` holds. Off the
+            // critical path there is no open interaction to attribute to and
+            // the sample is dropped by design — which is itself the signal
+            // that teardown left the switch. A synchronous flush (fast switch
+            // back, or queue eviction) still lands on the open trace.
+            const teardownStarted = startSubMeasure();
+            const payload = buildFreshOrCached("unmount");
+            endSubMeasure("terminal-teardown", teardownStarted);
+            if (payload && payload.data) {
+              cacheTerminalScrollback(payload).catch(() => {});
+            }
+          }
 
-      // Dispose the idle serializer BEFORE term.dispose() so a pending idle
-      // callback can't serialize into a torn-down terminal.
-      idleSerializer.dispose();
+          // Dispose the idle serializer BEFORE term.dispose() so a pending idle
+          // callback can't serialize into a torn-down terminal.
+          idleSerializer.dispose();
 
-      unregisterSerialize();
-      // Dispose the WebGL addon before the terminal so its GPU context /
-      // canvas is released deterministically (no leak across mounts). The
-      // wrapped dispose unregisters it from xterm's addon manager, so the
-      // following term.dispose() won't double-dispose it.
-      webglAddonRef.current?.dispose();
+          // Unregistered here rather than synchronously so an app quit during
+          // the parked window still finds a live terminal to serialize. Only a
+          // remount of this same session could collide on the registry key, and
+          // that path flushes this job before it registers.
+          unregisterSerialize();
+          // Dispose the WebGL addon before the terminal so its GPU context /
+          // canvas is released deterministically (no leak across mounts). The
+          // wrapped dispose unregisters it from xterm's addon manager, so the
+          // following term.dispose() won't double-dispose it.
+          webglAddon?.dispose();
+          webglAddon = null;
+          term.dispose();
+        },
+      });
+
       webglAddonRef.current = null;
       serializeAddonRef.current = null;
       fitAddonRef.current = null;
       kittyStackRef.current = [];
       kittyLevelRef.current = 0;
-      term.dispose();
       termRef.current = null;
     };
     // Intentionally depend only on sessionId — theme updates are handled separately

@@ -58,7 +58,25 @@ pub struct TabSnapshot {
 /// multiple resize events) only result in a single write after a quiet period.
 struct PersistDebouncer {
     pending: Arc<AtomicBool>,
-    last_snapshot: Arc<Mutex<Option<AppStateSnapshot>>>,
+    last_snapshot: Arc<Mutex<Option<PendingPersist>>>,
+}
+
+/// What the debouncer will write when its quiet period elapses: a snapshot the
+/// emit path already had to build, or — for delta emits, which build none — a
+/// closure that clones the store at flush time. The lazy form means a burst of
+/// deltas costs one deep clone per 500 ms window instead of one per delta.
+enum PendingPersist {
+    Ready(Box<AppStateSnapshot>),
+    Lazy(Box<dyn Fn() -> AppStateSnapshot + Send>),
+}
+
+impl PendingPersist {
+    fn resolve(self) -> AppStateSnapshot {
+        match self {
+            PendingPersist::Ready(snapshot) => *snapshot,
+            PendingPersist::Lazy(build) => build(),
+        }
+    }
 }
 
 impl PersistDebouncer {
@@ -72,9 +90,13 @@ impl PersistDebouncer {
     /// Queue a persist. If a write is already scheduled, just update the
     /// buffered snapshot — the background thread will pick up the latest value.
     fn schedule(&self, snapshot: AppStateSnapshot) {
+        self.schedule_pending(PendingPersist::Ready(Box::new(snapshot)));
+    }
+
+    fn schedule_pending(&self, pending: PendingPersist) {
         {
             let mut guard = self.last_snapshot.lock().unwrap();
-            *guard = Some(snapshot);
+            *guard = Some(pending);
         }
 
         // If a background task is already running, nothing more to do.
@@ -99,12 +121,22 @@ impl PersistDebouncer {
             };
 
             if let Some(snapshot) = snapshot {
-                if let Err(error) = save_persisted_state(&snapshot) {
+                if let Err(error) = save_persisted_state(&snapshot.resolve()) {
                     eprintln!("[codemux::state] Failed to persist layout state: {error}");
                 }
             }
         });
     }
+}
+
+/// Schedule a persist for a mutation that produced no snapshot of its own —
+/// the store is cloned once, at flush time, off the mutating thread.
+fn schedule_persist_current<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    persist_debouncer().schedule_pending(PendingPersist::Lazy(Box::new(move || {
+        let state: State<'_, AppStateStore> = app.state();
+        state.snapshot()
+    })));
 }
 
 static PERSIST_DEBOUNCER: std::sync::OnceLock<PersistDebouncer> = std::sync::OnceLock::new();
@@ -184,7 +216,7 @@ pub enum SplitDirection {
     Vertical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalSessionState {
     Starting,
@@ -612,9 +644,77 @@ pub struct PortInfoSnapshot {
     pub source: Option<String>,
 }
 
+/// The git-metadata subset of [`WorkspaceSnapshot`] carried by
+/// [`AppStateDelta::WorkspaceGit`]. Exactly the fields
+/// [`AppStateStore::update_workspace_git_info`] writes — nothing else from the
+/// workspace travels on this domain, so a delta can never move selection,
+/// focus or PR state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceGitDelta {
+    pub is_git: bool,
+    pub git_branch: Option<String>,
+    pub git_ahead: u32,
+    pub git_behind: u32,
+    pub git_additions: u32,
+    pub git_deletions: u32,
+    pub git_changed_files: u32,
+}
+
+/// One domain-scoped change to the app state, small enough that a steady-state
+/// metadata refresh no longer ships (and re-parses) the whole world.
+///
+/// Deltas ride the SAME revision counter as [`AppStateSnapshot`], so the
+/// renderer sees one totally ordered stream: a delta at revision N reflects the
+/// state at N, and a snapshot at N supersedes every delta at or below N.
+/// Deliberately narrow — no variant carries `active_workspace_id`, so a
+/// background delta can never clobber the optimistic selection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "domain", rename_all = "snake_case")]
+pub enum AppStateDelta {
+    WorkspaceGit {
+        workspace_id: String,
+        git: WorkspaceGitDelta,
+    },
+    DetectedPorts {
+        ports: Vec<PortInfoSnapshot>,
+    },
+    PaneStatus {
+        pane_id: String,
+        /// `None` clears the pane's entry (the map only stores non-idle panes).
+        status: Option<PaneStatus>,
+    },
+}
+
+/// A delta plus the revision it reflects — the `app-state-delta` payload.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RevisionedDelta {
+    pub revision: u64,
+    pub delta: AppStateDelta,
+}
+
+/// Event carrying a single [`RevisionedDelta`].
+pub const APP_STATE_DELTA_EVENT: &str = "app-state-delta";
+
+/// Event carrying only the current revision counter — the resync safety net.
+pub const APP_STATE_REVISION_EVENT: &str = "app-state-revision";
+
+/// Payload of [`APP_STATE_REVISION_EVENT`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RevisionHeartbeat {
+    pub revision: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppStateSnapshot {
     pub schema_version: u32,
+    /// Monotonic, app-lifetime emit counter stamped by [`emit_app_state`].
+    /// Strictly increasing per emitted snapshot so the renderer can drop a
+    /// snapshot that lost the race to a newer one (out-of-order background
+    /// emits must never overwrite interaction state). Not a persistence
+    /// marker — that is `schema_version`. `#[serde(default)]` keeps snapshots
+    /// persisted before this field loadable, and 0 reads as "unrevisioned".
+    #[serde(default)]
+    pub snapshot_revision: u64,
     pub active_workspace_id: WorkspaceId,
     pub workspaces: Vec<WorkspaceSnapshot>,
     pub terminal_sessions: Vec<TerminalSessionSnapshot>,
@@ -653,6 +753,62 @@ pub enum WorktreeWorkspaceClaim {
     Created(WorkspaceId),
 }
 
+/// Write the git subset onto a workspace, returning whether anything moved.
+/// Shared by the plain writer and the delta writer so both agree on exactly
+/// which fields the `WorkspaceGit` domain owns.
+fn write_workspace_git(
+    snapshot: &mut AppStateSnapshot,
+    workspace_id: &str,
+    git: WorkspaceGitDelta,
+) -> bool {
+    let Some(workspace) = snapshot
+        .workspaces
+        .iter_mut()
+        .find(|workspace| workspace.workspace_id.0 == workspace_id)
+    else {
+        return false;
+    };
+    let changed = workspace.is_git != git.is_git
+        || workspace.git_branch != git.git_branch
+        || workspace.git_ahead != git.git_ahead
+        || workspace.git_behind != git.git_behind
+        || workspace.git_additions != git.git_additions
+        || workspace.git_deletions != git.git_deletions
+        || workspace.git_changed_files != git.git_changed_files;
+    if !changed {
+        return false;
+    }
+    workspace.is_git = git.is_git;
+    workspace.git_branch = git.git_branch;
+    workspace.git_ahead = git.git_ahead;
+    workspace.git_behind = git.git_behind;
+    workspace.git_additions = git.git_additions;
+    workspace.git_deletions = git.git_deletions;
+    workspace.git_changed_files = git.git_changed_files;
+    true
+}
+
+/// Drop a session's pane from `pane_statuses` when it is mid-run
+/// (working/permission). Returns the pane id that was cleared, or `None` when
+/// the session has no pane or the pane was not in a transient state.
+fn clear_transient_pane_status(
+    snapshot: &mut AppStateSnapshot,
+    session_id: &str,
+) -> Option<String> {
+    let pane_id = snapshot.workspaces.iter().find_map(|ws| {
+        ws.surfaces
+            .iter()
+            .find_map(|s| find_terminal_pane_id(&s.root, session_id))
+    })?;
+    match snapshot.pane_statuses.get(&pane_id.0) {
+        Some(PaneStatus::Working | PaneStatus::Permission) => {
+            snapshot.pane_statuses.remove(&pane_id.0);
+            Some(pane_id.0)
+        }
+        _ => None,
+    }
+}
+
 fn terminal_count_for_workspace(workspace: &WorkspaceSnapshot) -> usize {
     collect_terminal_sessions(&workspace.surfaces).len()
 }
@@ -668,6 +824,46 @@ impl Default for AppStateStore {
 impl AppStateStore {
     pub fn snapshot(&self) -> AppStateSnapshot {
         self.inner.lock().unwrap().clone()
+    }
+
+    /// Clone the state and stamp it with the next revision **without releasing
+    /// the lock in between**, so snapshots and deltas form one totally ordered
+    /// stream. Every emitted snapshot goes through here — including the ones
+    /// the [`EmitDebouncer`] flushes.
+    pub fn stamped_snapshot(&self) -> AppStateSnapshot {
+        let guard = self.inner.lock().unwrap();
+        let mut snapshot = guard.clone();
+        snapshot.snapshot_revision = next_revision();
+        snapshot
+    }
+
+    /// Clone the state and label it with the revision it *already* reflects,
+    /// consuming nothing. For reads (`get_app_state`, and through it the
+    /// renderer's resync): a fetch is not a mutation, and consuming a revision
+    /// here would punch a hole in the delta sequence the renderer checks for
+    /// contiguity. The clone can only be newer than the label it carries —
+    /// never older — which is exactly what a resync baseline needs.
+    pub fn snapshot_at_current_revision(&self) -> AppStateSnapshot {
+        let guard = self.inner.lock().unwrap();
+        let mut snapshot = guard.clone();
+        snapshot.snapshot_revision = current_revision();
+        snapshot
+    }
+
+    /// Run `mutate` under the state lock and, when it reports a change worth
+    /// shipping, stamp the next revision before the lock is released. That
+    /// pairing is the whole ordering guarantee: a delta at revision N reflects
+    /// the state at N, so a later snapshot at M > N supersedes it.
+    fn mutate_with_delta(
+        &self,
+        mutate: impl FnOnce(&mut AppStateSnapshot) -> Option<AppStateDelta>,
+    ) -> Option<RevisionedDelta> {
+        let mut guard = self.inner.lock().unwrap();
+        let delta = mutate(&mut guard)?;
+        Some(RevisionedDelta {
+            revision: next_revision(),
+            delta,
+        })
     }
 
     pub fn replace_snapshot(&self, snapshot: AppStateSnapshot) {
@@ -840,6 +1036,19 @@ impl AppStateStore {
             return true;
         }
         false
+    }
+
+    /// The cwd of one workspace, read under the lock without cloning the
+    /// whole snapshot. The activate path only needs this one string; a full
+    /// `snapshot()` there deep-clones every workspace, surface and pane tree
+    /// for it.
+    pub fn workspace_cwd(&self, workspace_id: &str) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+            .map(|workspace| workspace.cwd.clone())
     }
 
     pub fn activate_pane(&self, pane_id: &str) -> bool {
@@ -1864,6 +2073,10 @@ impl AppStateStore {
         })
     }
 
+    /// Returns true when at least one field actually moved. The periodic
+    /// sweeps use that to emit a snapshot only when a workspace's git
+    /// metadata changed — re-running the same 5 s refresh over an idle
+    /// fleet must not cost a full-state serialise + IPC + render pass.
     #[allow(clippy::too_many_arguments)]
     pub fn update_workspace_git_info(
         &self,
@@ -1875,40 +2088,70 @@ impl AppStateStore {
         additions: u32,
         deletions: u32,
         changed_files: u32,
-    ) {
+    ) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
-        if let Some(workspace) = snapshot
-            .workspaces
-            .iter_mut()
-            .find(|workspace| workspace.workspace_id.0 == workspace_id)
-        {
-            workspace.is_git = is_git;
-            workspace.git_branch = branch;
-            workspace.git_ahead = ahead;
-            workspace.git_behind = behind;
-            workspace.git_additions = additions;
-            workspace.git_deletions = deletions;
-            workspace.git_changed_files = changed_files;
-        }
+        write_workspace_git(
+            &mut snapshot,
+            workspace_id,
+            WorkspaceGitDelta {
+                is_git,
+                git_branch: branch,
+                git_ahead: ahead,
+                git_behind: behind,
+                git_additions: additions,
+                git_deletions: deletions,
+                git_changed_files: changed_files,
+            },
+        )
     }
 
+    /// The same write as [`Self::update_workspace_git_info`], but returning the
+    /// delta to ship instead of a bare "changed" flag — the mutation and the
+    /// revision stamp happen under one lock acquisition. Used by the periodic
+    /// git sweep, whose steady state is "one workspace's branch counters
+    /// moved" and which has no business re-shipping the whole app state.
+    pub fn update_workspace_git_info_delta(
+        &self,
+        workspace_id: &str,
+        git: WorkspaceGitDelta,
+    ) -> Option<RevisionedDelta> {
+        self.mutate_with_delta(|snapshot| {
+            write_workspace_git(snapshot, workspace_id, git.clone()).then(|| {
+                AppStateDelta::WorkspaceGit {
+                    workspace_id: workspace_id.to_string(),
+                    git,
+                }
+            })
+        })
+    }
+
+    /// Returns true when the stored PR pill actually changed (same
+    /// emit-gating contract as `update_workspace_git_info`).
     pub fn update_workspace_pr_info(
         &self,
         workspace_id: &str,
         pr_number: Option<u32>,
         pr_state: Option<String>,
         pr_url: Option<String>,
-    ) {
+    ) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
-        if let Some(workspace) = snapshot
+        let Some(workspace) = snapshot
             .workspaces
             .iter_mut()
             .find(|workspace| workspace.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        if workspace.pr_number == pr_number
+            && workspace.pr_state == pr_state
+            && workspace.pr_url == pr_url
         {
-            workspace.pr_number = pr_number;
-            workspace.pr_state = pr_state;
-            workspace.pr_url = pr_url;
+            return false;
         }
+        workspace.pr_number = pr_number;
+        workspace.pr_state = pr_state;
+        workspace.pr_url = pr_url;
+        true
     }
 
     pub fn set_workspace_worktree(
@@ -1928,19 +2171,34 @@ impl AppStateStore {
         }
     }
 
+    /// Returns true when the stored issue card actually changed (same
+    /// emit-gating contract as `update_workspace_git_info`).
     pub fn link_workspace_issue(
         &self,
         workspace_id: &str,
         linked_issue: crate::github::LinkedIssue,
-    ) {
+    ) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
-        if let Some(workspace) = snapshot
+        let Some(workspace) = snapshot
             .workspaces
             .iter_mut()
             .find(|w| w.workspace_id.0 == workspace_id)
-        {
-            workspace.linked_issue = Some(linked_issue);
+        else {
+            return false;
+        };
+        // `LinkedIssue` has no `PartialEq` (it crosses serde boundaries in
+        // github.rs), so compare the display fields the sidebar renders.
+        if let Some(current) = &workspace.linked_issue {
+            if current.number == linked_issue.number
+                && current.title == linked_issue.title
+                && current.state == linked_issue.state
+                && current.labels == linked_issue.labels
+            {
+                return false;
+            }
         }
+        workspace.linked_issue = Some(linked_issue);
+        true
     }
 
     pub fn unlink_workspace_issue(&self, workspace_id: &str) {
@@ -2213,14 +2471,19 @@ impl AppStateStore {
             .map(|w| w.workspace_id.0.clone())
     }
 
-    /// Update detected ports. Returns true if the port list actually changed.
-    pub fn update_detected_ports(&self, ports: Vec<PortInfoSnapshot>) -> bool {
-        let mut snapshot = self.inner.lock().unwrap();
-        if snapshot.detected_ports == ports {
-            return false;
-        }
-        snapshot.detected_ports = ports;
-        true
+    /// Replace the detected-port list, change-gated. The whole domain is one
+    /// array, so the delta carries it wholesale.
+    pub fn update_detected_ports_delta(
+        &self,
+        ports: Vec<PortInfoSnapshot>,
+    ) -> Option<RevisionedDelta> {
+        self.mutate_with_delta(|snapshot| {
+            if snapshot.detected_ports == ports {
+                return None;
+            }
+            snapshot.detected_ports = ports.clone();
+            Some(AppStateDelta::DetectedPorts { ports })
+        })
     }
 
     /// Returns workspace_id -> cwd for all workspaces.
@@ -2236,6 +2499,35 @@ impl AppStateStore {
             .filter(|w| !w.attach_only)
             .map(|w| (w.workspace_id.0.clone(), w.cwd.clone()))
             .collect()
+    }
+
+    /// `(cwd, project_root)` for every workspace with a local checkout — the
+    /// exact input [`crate::jobs::dedupe_fetch_targets`] needs. Narrow on
+    /// purpose: the fetch sweep used to deep-clone the whole app state once a
+    /// minute to read two strings per workspace. Attach-in-place workspaces are
+    /// filtered for the same reason [`Self::all_workspace_cwds`] filters them.
+    pub fn fetchable_workspace_checkouts(&self) -> Vec<(String, Option<String>)> {
+        let snapshot = self.inner.lock().unwrap();
+        snapshot
+            .workspaces
+            .iter()
+            .filter(|w| !w.attach_only)
+            .map(|w| (w.cwd.clone(), w.project_root.clone()))
+            .collect()
+    }
+
+    /// The status of the pane running `session_id`, or `None` when the session
+    /// has no pane or the pane is idle. Narrow on purpose: the agent-exit
+    /// monitor polls this once a second per monitored session, and cloning the
+    /// whole app state to read one enum was the entire cost of that tick.
+    pub fn pane_status_for_session(&self, session_id: &str) -> Option<PaneStatus> {
+        let snapshot = self.inner.lock().unwrap();
+        let pane_id = snapshot.workspaces.iter().find_map(|ws| {
+            ws.surfaces
+                .iter()
+                .find_map(|s| find_terminal_pane_id(&s.root, session_id))
+        })?;
+        snapshot.pane_statuses.get(&pane_id.0).cloned()
     }
 
     /// Returns absolute path -> workspace_id for all workspaces, covering
@@ -3078,11 +3370,13 @@ impl AppStateStore {
     /// (P6 in `docs/plans/browser-stream-fix.md`). Returns Err when no
     /// session exists for the workspace yet — callers should
     /// `resolve_agent_browser_session` first if that matters.
+    /// Returns whether `stream_url` actually moved — re-allocating the same
+    /// port is the common case and is not news for the renderer.
     pub fn update_agent_browser_stream_port(
         &self,
         workspace_id: &str,
         stream_port: u16,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let mut snapshot = self.inner.lock().unwrap();
         let session = snapshot
             .agent_browser_sessions
@@ -3091,8 +3385,10 @@ impl AppStateStore {
             .ok_or_else(|| {
                 format!("No agent browser session for workspace {workspace_id}")
             })?;
-        session.stream_url = format!("ws://localhost:{stream_port}");
-        Ok(())
+        let stream_url = format!("ws://localhost:{stream_port}");
+        let changed = session.stream_url != stream_url;
+        session.stream_url = stream_url;
+        Ok(changed)
     }
 
     /// Mark an agent browser session as live/active without attaching it to
@@ -3358,15 +3654,21 @@ impl AppStateStore {
 
     /// Store an adapter capture key-value pair on a terminal session.
     /// Called immediately when hooks fire so each pane owns its own data.
-    pub fn set_terminal_adapter_capture(&self, session: &str, key: &str, value: &str) {
+    /// Returns whether the capture actually moved, so callers can emit only on
+    /// change — the hook endpoint re-sends the same session id on every event.
+    pub fn set_terminal_adapter_capture(&self, session: &str, key: &str, value: &str) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(terminal) = snapshot
             .terminal_sessions
             .iter_mut()
             .find(|terminal| terminal.session_id.0 == session)
         {
-            terminal.adapter_captures.insert(key.to_string(), value.to_string());
+            let previous = terminal
+                .adapter_captures
+                .insert(key.to_string(), value.to_string());
+            return previous.as_deref() != Some(value);
         }
+        false
     }
 
     /// Get all adapter captures for a terminal session.
@@ -3381,15 +3683,21 @@ impl AppStateStore {
     }
 
     /// Clear all adapter captures for a terminal session (e.g. when user clicks "Start fresh").
-    pub fn clear_terminal_adapter_captures(&self, session: &str) {
+    /// Returns whether anything was actually cleared.
+    pub fn clear_terminal_adapter_captures(&self, session: &str) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         if let Some(terminal) = snapshot
             .terminal_sessions
             .iter_mut()
             .find(|terminal| terminal.session_id.0 == session)
         {
+            if terminal.adapter_captures.is_empty() {
+                return false;
+            }
             terminal.adapter_captures.clear();
+            return true;
         }
+        false
     }
 
     pub fn update_terminal_session_size(&self, session: &str, cols: u16, rows: u16) -> bool {
@@ -3406,6 +3714,8 @@ impl AppStateStore {
         false
     }
 
+    /// Returns whether anything actually moved, so the caller can emit only on
+    /// change — a repeated status for an unchanged session is not news.
     pub fn update_terminal_session_status(
         &self,
         session: &str,
@@ -3419,10 +3729,13 @@ impl AppStateStore {
             .iter_mut()
             .find(|terminal| terminal.session_id.0 == session)
         {
+            let changed = terminal.state != state
+                || terminal.last_message != message
+                || terminal.exit_code != exit_code;
             terminal.state = state;
             terminal.last_message = message;
             terminal.exit_code = exit_code;
-            return true;
+            return changed;
         }
         false
     }
@@ -3539,18 +3852,25 @@ impl AppStateStore {
     /// Clear working/permission status for a session (on terminal exit).
     pub fn clear_transient_pane_status_by_session(&self, session_id: &str) {
         let mut snapshot = self.inner.lock().unwrap();
-        let pane_id = snapshot.workspaces.iter().find_map(|ws| {
-            ws.surfaces
-                .iter()
-                .find_map(|s| find_terminal_pane_id(&s.root, session_id))
-        });
-        if let Some(pane_id) = pane_id {
-            if let Some(status) = snapshot.pane_statuses.get(&pane_id.0) {
-                if matches!(status, PaneStatus::Working | PaneStatus::Permission) {
-                    snapshot.pane_statuses.remove(&pane_id.0);
-                }
-            }
-        }
+        clear_transient_pane_status(&mut snapshot, session_id);
+    }
+
+    /// Delta-returning variant of
+    /// [`Self::clear_transient_pane_status_by_session`]. Only the two callers
+    /// whose whole operation is this one clear use it — the rest of the
+    /// pane-status writers mutate other domains in the same breath and stay on
+    /// full snapshot emits (see `docs/plans/gui-responsiveness.md`).
+    pub fn clear_transient_pane_status_by_session_delta(
+        &self,
+        session_id: &str,
+    ) -> Option<RevisionedDelta> {
+        self.mutate_with_delta(|snapshot| {
+            let pane_id = clear_transient_pane_status(snapshot, session_id)?;
+            Some(AppStateDelta::PaneStatus {
+                pane_id,
+                status: None,
+            })
+        })
     }
 
     pub fn add_notification(
@@ -4052,11 +4372,76 @@ fn collect_browser_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<BrowserI
     }
 }
 
+/// Emit counter behind [`AppStateSnapshot::snapshot_revision`]. Process-wide
+/// and never reset, so a revision the renderer has already applied can only
+/// be older than one it has not.
+static SNAPSHOT_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Consume the next revision. Only ever called while the state mutex is held
+/// (see [`AppStateStore::stamped_snapshot`] and the `*_delta` writers), so the
+/// revision order matches the order the mutations were applied in.
+///
+/// Every consumed revision MUST be emitted — as a snapshot or as a delta.
+/// The renderer treats a non-contiguous delta revision as a dropped message
+/// and resyncs, so a stamp that never reaches it costs a full snapshot fetch.
+fn next_revision() -> u64 {
+    SNAPSHOT_REVISION.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+/// The last revision handed out. Read-only — used by the heartbeat.
+fn current_revision() -> u64 {
+    SNAPSHOT_REVISION.load(Ordering::Relaxed)
+}
+
+/// Emit the current revision counter without building a snapshot. The renderer
+/// compares it against the highest revision it applied and resyncs when it is
+/// behind, which recovers an emit that was *stamped but lost in delivery*.
+///
+/// It cannot recover a mutation that never stamped a revision: such a write
+/// leaves the counter where it was, so the heartbeat reports a number the
+/// renderer already has and nothing resyncs. Every mutation worth rendering
+/// still has to emit — as a snapshot or as a delta.
+pub fn emit_app_state_revision<R: tauri::Runtime>(app: &AppHandle<R>) {
+    let payload = RevisionHeartbeat {
+        revision: current_revision(),
+    };
+    if let Err(error) = app.emit(APP_STATE_REVISION_EVENT, payload) {
+        eprintln!("[codemux::state] Failed to emit revision heartbeat: {error}");
+    }
+}
+
+/// Ship one domain delta. The mutation that produced it already consumed the
+/// revision under the state lock — see [`AppStateStore::mutate_with_delta`].
+pub fn emit_app_state_delta<R: tauri::Runtime>(app: &AppHandle<R>, delta: RevisionedDelta) {
+    if let Err(error) = app.emit(APP_STATE_DELTA_EVENT, delta) {
+        eprintln!("[codemux::state] Failed to emit app state delta: {error}");
+    }
+    // A delta mutated persisted state without building a snapshot, so the
+    // disk write has to be scheduled separately. Lazily: the debouncer clones
+    // the store once at flush time instead of once per delta.
+    schedule_persist_current(app);
+}
+
 pub fn emit_app_state<R: tauri::Runtime>(app: &AppHandle<R>) {
     let state: State<'_, AppStateStore> = app.state();
-    let snapshot = state.snapshot();
+    // The deep clone and the serialise are separate costs that scale with
+    // different things (workspace/pane count vs total payload bytes), so the
+    // Phase 0 harness reports them apart — one opaque emit number cannot say
+    // which of the two to attack.
+    let snapshot_started = std::time::Instant::now();
+    let snapshot = state.stamped_snapshot();
+    let snapshot_ms = snapshot_started.elapsed().as_secs_f64() * 1000.0;
+    let workspace_count = snapshot.workspaces.len();
+    let serialize_started = std::time::Instant::now();
     if let Err(error) = app.emit("app-state-changed", &snapshot) {
         eprintln!("[codemux::state] Failed to emit app state: {error}");
+    }
+    let serialize_ms = serialize_started.elapsed().as_secs_f64() * 1000.0;
+    if snapshot_ms + serialize_ms > 8.0 {
+        eprintln!(
+            "[codemux::perf::emit] snapshot={snapshot_ms:.1}ms \
+             serialize={serialize_ms:.1}ms workspaces={workspace_count}"
+        );
     }
     // Persist asynchronously with debounce — rapid consecutive calls (e.g.
     // swap + multiple resize events) collapse into a single disk write.
@@ -4446,6 +4831,7 @@ fn default_app_state() -> AppStateSnapshot {
 
     AppStateSnapshot {
         schema_version: APP_STATE_SCHEMA_VERSION,
+        snapshot_revision: 0,
         archived_workspaces: Vec::new(),
         active_workspace_id: workspace_id.clone(),
         workspaces: vec![WorkspaceSnapshot {
@@ -4834,6 +5220,30 @@ fn retain_persistable_pane_statuses(snapshot: &mut AppStateSnapshot) {
         .retain(|pane_id, status| *status == PaneStatus::Review && live_panes.contains(pane_id));
 }
 
+/// Strip everything that is runtime-only from a snapshot about to be written to
+/// `layout.json`. Separate from [`save_persisted_state`] so the contract can be
+/// asserted without a filesystem.
+fn persistable_snapshot(snapshot: &AppStateSnapshot) -> AppStateSnapshot {
+    // Never persist OpenFlow workspaces or their terminal sessions so they cannot accumulate.
+    let mut snapshot = strip_openflow_from_snapshot(snapshot.clone());
+    // Browser panes are live streaming connections — stale panes start a
+    // daemon with the wrong session name, causing white-screen bugs.
+    snapshot = strip_browser_panes_from_snapshot(snapshot);
+    // Detected ports are runtime-only state — never persist them.
+    snapshot.detected_ports.clear();
+    // The revision counter is process-lifetime, not persisted state: it restarts
+    // at 0 next launch. Persisting a stamped value would seed the restored store
+    // with a revision far above the live counter, and every real emit afterwards
+    // would look stale to a client that adopted the boot snapshot's number.
+    snapshot.snapshot_revision = 0;
+    // Keep only the review checkmarks; working/permission are runtime-only.
+    retain_persistable_pane_statuses(&mut snapshot);
+    // Agent browser sessions are runtime-only — pane_id/browser_id/user_dismissed
+    // become stale after restart and block auto-creation.
+    snapshot.agent_browser_sessions.clear();
+    snapshot
+}
+
 fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
     let Some(path) = persisted_layout_path() else {
         return Ok(());
@@ -4844,18 +5254,7 @@ fn save_persisted_state(snapshot: &AppStateSnapshot) -> Result<(), String> {
             .map_err(|error| format!("Failed to create config dir: {error}"))?;
     }
 
-    // Never persist OpenFlow workspaces or their terminal sessions so they cannot accumulate.
-    let mut snapshot = strip_openflow_from_snapshot(snapshot.clone());
-    // Browser panes are live streaming connections — stale panes start a
-    // daemon with the wrong session name, causing white-screen bugs.
-    snapshot = strip_browser_panes_from_snapshot(snapshot);
-    // Detected ports are runtime-only state — never persist them.
-    snapshot.detected_ports.clear();
-    // Keep only the review checkmarks; working/permission are runtime-only.
-    retain_persistable_pane_statuses(&mut snapshot);
-    // Agent browser sessions are runtime-only — pane_id/browser_id/user_dismissed
-    // become stale after restart and block auto-creation.
-    snapshot.agent_browser_sessions.clear();
+    let snapshot = persistable_snapshot(snapshot);
 
     let json = serde_json::to_string_pretty(&snapshot)
         .map_err(|error| format!("Failed to serialize layout state: {error}"))?;
@@ -6734,6 +7133,28 @@ mod tests {
 
     // ── Agent Browser Session Tests ──
 
+    /// The control-socket browser handler emits on this, and re-allocating the
+    /// same port is by far the common case.
+    #[test]
+    fn updating_the_stream_port_reports_whether_the_url_moved() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        assert_eq!(
+            store.update_agent_browser_stream_port(&ws_id.0, 9223),
+            Ok(false),
+            "the same port is not news"
+        );
+        assert_eq!(
+            store.update_agent_browser_stream_port(&ws_id.0, 9224),
+            Ok(true)
+        );
+        assert!(store
+            .update_agent_browser_stream_port("no-such-workspace", 9223)
+            .is_err());
+    }
+
     #[test]
     fn agent_browser_session_created_for_workspace() {
         let store = AppStateStore::default();
@@ -7864,6 +8285,334 @@ mod tests {
         assert_ne!(third, first, "post-deletion call must create a fresh id");
         assert_eq!(store.find_home_workspace_id(), Some(third));
     }
+
+    // ── Snapshot revision ───────────────────────────────────────────
+
+    #[test]
+    fn consecutive_emitted_snapshots_carry_increasing_revisions() {
+        let _revisions = revision_guard();
+        // `stamped_snapshot` is the one producer of emitted snapshots, so
+        // testing it covers both the direct `emit_app_state` path and the
+        // coalesced `EmitDebouncer` flush.
+        let store = AppStateStore::default();
+        let first = store.stamped_snapshot();
+        let second = store.stamped_snapshot();
+        let third = store.stamped_snapshot();
+        assert!(
+            first.snapshot_revision < second.snapshot_revision,
+            "revision must strictly increase between emits"
+        );
+        assert!(second.snapshot_revision < third.snapshot_revision);
+        // 0 is reserved for "unrevisioned" (stored state, older payloads),
+        // so the renderer can tell a stamped snapshot from a restored one.
+        assert!(first.snapshot_revision > 0);
+    }
+
+    // ── Domain deltas ───────────────────────────────────────────────
+    //
+    // The revision counter is process-wide, so every test that consumes or
+    // observes it takes [`revision_guard`] first — otherwise a parallel test
+    // stamping in between turns the exact-value assertions into coin flips.
+
+    /// Serializes the tests that consume [`SNAPSHOT_REVISION`]. Poison is
+    /// ignored: a panic in one revision test must not cascade into the rest.
+    fn revision_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: Mutex<()> = Mutex::new(());
+        GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn git_of(branch: &str, ahead: u32) -> WorkspaceGitDelta {
+        WorkspaceGitDelta {
+            is_git: true,
+            git_branch: Some(branch.to_string()),
+            git_ahead: ahead,
+            git_behind: 0,
+            git_additions: 0,
+            git_deletions: 0,
+            git_changed_files: 0,
+        }
+    }
+
+    #[test]
+    fn deltas_and_snapshots_share_one_increasing_revision_stream() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace().0;
+
+        let before = store.stamped_snapshot();
+        let git = store
+            .update_workspace_git_info_delta(&workspace_id, git_of("feature", 2))
+            .expect("a first git write is a change");
+        let ports = store
+            .update_detected_ports_delta(vec![PortInfoSnapshot {
+                port: 5173,
+                pid: 42,
+                process_name: "vite".to_string(),
+                workspace_id: None,
+                label: None,
+                source: None,
+            }])
+            .expect("a first port list is a change");
+        let after = store.stamped_snapshot();
+
+        assert!(before.snapshot_revision < git.revision);
+        assert!(git.revision < ports.revision);
+        assert!(
+            ports.revision < after.snapshot_revision,
+            "a snapshot taken after a delta must supersede it"
+        );
+    }
+
+    #[test]
+    fn a_git_delta_reflects_the_state_at_its_revision() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace().0;
+
+        let delta = store
+            .update_workspace_git_info_delta(&workspace_id, git_of("main", 3))
+            .expect("changed");
+        let AppStateDelta::WorkspaceGit {
+            workspace_id: delta_id,
+            git,
+        } = delta.delta
+        else {
+            panic!("expected a WorkspaceGit delta");
+        };
+        assert_eq!(delta_id, workspace_id);
+        assert_eq!(git.git_branch.as_deref(), Some("main"));
+
+        // The store itself carries the same values the delta shipped, so a
+        // renderer that applies the delta and a renderer that refetches a
+        // snapshot land on identical state.
+        let snapshot = store.snapshot();
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|w| w.workspace_id.0 == workspace_id)
+            .expect("workspace");
+        assert_eq!(workspace.git_branch.as_deref(), Some("main"));
+        assert_eq!(workspace.git_ahead, 3);
+    }
+
+    #[test]
+    fn an_unchanged_domain_write_produces_no_delta_and_consumes_no_revision() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace().0;
+        store
+            .update_workspace_git_info_delta(&workspace_id, git_of("main", 0))
+            .expect("first write changes");
+
+        let before = current_revision();
+        assert!(
+            store
+                .update_workspace_git_info_delta(&workspace_id, git_of("main", 0))
+                .is_none(),
+            "re-writing identical git info must not emit"
+        );
+        assert!(
+            store.update_detected_ports_delta(Vec::new()).is_none(),
+            "an unchanged (empty) port list must not emit"
+        );
+        assert_eq!(
+            current_revision(),
+            before,
+            "a no-op write must not punch a hole in the delta sequence"
+        );
+    }
+
+    #[test]
+    fn reading_the_state_does_not_consume_a_revision() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let stamped = store.stamped_snapshot();
+        let read = store.snapshot_at_current_revision();
+        assert_eq!(
+            read.snapshot_revision, stamped.snapshot_revision,
+            "a fetch reports the revision it already reflects"
+        );
+        // What the heartbeat publishes: the counter as last handed out.
+        assert!(current_revision() >= stamped.snapshot_revision);
+        assert!(store.stamped_snapshot().snapshot_revision > stamped.snapshot_revision);
+    }
+
+    /// The hook endpoint re-sends the same agent session id on every event and
+    /// the `clear_adapter_captures` command can fire on an already-empty
+    /// session; both now emit only when they changed something.
+    #[test]
+    fn adapter_capture_writes_report_whether_they_changed_anything() {
+        let store = AppStateStore::default();
+        let snapshot = store.snapshot();
+        let session_id = collect_terminal_sessions(&snapshot.workspaces[0].surfaces)[0].clone();
+
+        assert!(store.set_terminal_adapter_capture(&session_id, "claude_session_id", "uuid-a"));
+        assert!(
+            !store.set_terminal_adapter_capture(&session_id, "claude_session_id", "uuid-a"),
+            "re-sending the same id is not news"
+        );
+        assert!(store.set_terminal_adapter_capture(&session_id, "claude_session_id", "uuid-b"));
+        assert!(!store.set_terminal_adapter_capture("no-such-session", "k", "v"));
+
+        assert!(store.clear_terminal_adapter_captures(&session_id));
+        assert!(
+            !store.clear_terminal_adapter_captures(&session_id),
+            "clearing an already-empty capture set mutates nothing"
+        );
+        assert!(store
+            .get_terminal_adapter_captures(&session_id)
+            .is_empty());
+    }
+
+    /// `emit_terminal_status` writes the session's lifecycle fields into the app
+    /// state and then emits only when this reports a change, so a repeated
+    /// status must not schedule a snapshot.
+    #[test]
+    fn a_repeated_terminal_session_status_reports_no_change() {
+        let store = AppStateStore::default();
+        let snapshot = store.snapshot();
+        let session_id = collect_terminal_sessions(&snapshot.workspaces[0].surfaces)[0].clone();
+
+        assert!(
+            store.update_terminal_session_status(
+                &session_id,
+                TerminalSessionState::Exited,
+                Some("exited".to_string()),
+                Some(0),
+            ),
+            "the first transition is news"
+        );
+        assert!(
+            !store.update_terminal_session_status(
+                &session_id,
+                TerminalSessionState::Exited,
+                Some("exited".to_string()),
+                Some(0),
+            ),
+            "the same status again must not emit"
+        );
+        assert!(
+            !store.update_terminal_session_status(
+                "session-that-does-not-exist",
+                TerminalSessionState::Ready,
+                None,
+                None,
+            ),
+            "an unknown session mutates nothing"
+        );
+
+        let stored = store
+            .snapshot()
+            .terminal_sessions
+            .into_iter()
+            .find(|s| s.session_id.0 == session_id)
+            .expect("session");
+        assert_eq!(stored.state, TerminalSessionState::Exited);
+        assert_eq!(stored.exit_code, Some(0));
+    }
+
+    #[test]
+    fn clearing_a_transient_pane_status_yields_a_pane_status_delta() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let snapshot = store.snapshot();
+        let workspace = &snapshot.workspaces[0];
+        let session_id = collect_terminal_sessions(&workspace.surfaces)[0].clone();
+        let pane_id = workspace
+            .surfaces
+            .iter()
+            .find_map(|s| find_terminal_pane_id(&s.root, &session_id))
+            .expect("terminal pane");
+        store.set_pane_status(&pane_id.0, PaneStatus::Working);
+
+        let delta = store
+            .clear_transient_pane_status_by_session_delta(&session_id)
+            .expect("a working pane clears");
+        assert_eq!(
+            delta.delta,
+            AppStateDelta::PaneStatus {
+                pane_id: pane_id.0.clone(),
+                status: None,
+            }
+        );
+        assert!(store.snapshot().pane_statuses.get(&pane_id.0).is_none());
+
+        assert!(
+            store
+                .clear_transient_pane_status_by_session_delta(&session_id)
+                .is_none(),
+            "an already-idle pane has nothing to ship"
+        );
+    }
+
+    #[test]
+    fn stored_state_starts_unrevisioned() {
+        let store = AppStateStore::default();
+        assert_eq!(store.snapshot().snapshot_revision, 0);
+    }
+
+    /// The revision counter restarts at 0 every launch, so a persisted stamp
+    /// would seed the restored store above the live counter and every real
+    /// snapshot/delta/heartbeat after boot would read as older than the
+    /// baseline a client adopted.
+    #[test]
+    fn persisted_state_round_trips_unrevisioned() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let stamped = store.stamped_snapshot();
+        assert!(stamped.snapshot_revision > 0, "emitted snapshots are stamped");
+
+        let json = serde_json::to_string(&persistable_snapshot(&stamped)).unwrap();
+        let restored: AppStateSnapshot = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(restored.snapshot_revision, 0);
+    }
+
+    /// What boot actually does: seed the store from `layout.json`, then serve
+    /// the first read to the renderer / web client. That baseline has to sit in
+    /// the same sequence as the deltas that follow it, not at the persisted
+    /// number.
+    #[test]
+    fn boot_seeded_snapshot_reads_the_live_revision() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let stamped = store.stamped_snapshot();
+        let persisted: AppStateSnapshot =
+            serde_json::from_str(&serde_json::to_string(&persistable_snapshot(&stamped)).unwrap())
+                .unwrap();
+
+        store.replace_snapshot(persisted);
+        let seeded = store.snapshot_at_current_revision();
+
+        assert_eq!(seeded.snapshot_revision, current_revision());
+        assert!(
+            store.stamped_snapshot().snapshot_revision > seeded.snapshot_revision,
+            "the next emit must be newer than the boot baseline",
+        );
+    }
+
+    #[test]
+    fn snapshot_revision_deserializes_from_a_payload_without_the_field() {
+        // Old layout.json files predate the field; they must still load.
+        let mut json = serde_json::to_value(AppStateStore::default().snapshot()).unwrap();
+        json.as_object_mut().unwrap().remove("snapshot_revision");
+        let restored: AppStateSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.snapshot_revision, 0);
+    }
+
+    // ── Narrow accessors ────────────────────────────────────────────
+
+    #[test]
+    fn workspace_cwd_reads_one_path_without_a_full_snapshot() {
+        let store = AppStateStore::default();
+        let id = store.create_empty_workspace_at_path(PathBuf::from("/tmp/narrow"));
+        assert_eq!(
+            store.workspace_cwd(&id.0).as_deref(),
+            Some("/tmp/narrow"),
+            "must return the workspace's own cwd"
+        );
+        assert_eq!(store.workspace_cwd("no-such-workspace"), None);
+    }
 }
 
 #[cfg(test)]
@@ -8573,6 +9322,107 @@ mod workspace_activity_tests {
         assert_eq!(
             round_tripped.workspaces[0].last_visited_at,
             Some(1_700_000_001_000)
+        );
+    }
+
+}
+
+/// Metadata change detection — the emit gate for the background sweeps.
+///
+/// The 5 s git sweep emits a full snapshot only when one of these writes
+/// reports a change. A false positive here reinstates the unconditional
+/// per-tick emit they exist to prevent; a false negative strands a stale
+/// sidebar row until some other write emits.
+#[cfg(test)]
+mod metadata_change_tests {
+    use super::*;
+
+    #[test]
+    fn git_info_reports_change_only_when_a_field_moves() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+
+        assert!(
+            store.update_workspace_git_info(&id, true, Some("main".into()), 0, 0, 0, 0, 0),
+            "first write populates the fields"
+        );
+        assert!(
+            !store.update_workspace_git_info(&id, true, Some("main".into()), 0, 0, 0, 0, 0),
+            "an identical re-write must not report a change"
+        );
+        assert!(
+            store.update_workspace_git_info(&id, true, Some("feature".into()), 0, 0, 0, 0, 0),
+            "a branch switch is a change"
+        );
+        assert!(
+            store.update_workspace_git_info(&id, true, Some("feature".into()), 1, 0, 0, 0, 0),
+            "an ahead-count move is a change"
+        );
+        assert!(
+            store.update_workspace_git_info(&id, true, Some("feature".into()), 1, 0, 0, 0, 3),
+            "a changed-file count move is a change"
+        );
+        assert!(
+            !store.update_workspace_git_info(&id, true, Some("feature".into()), 1, 0, 0, 0, 3),
+            "settled again"
+        );
+        assert!(
+            !store.update_workspace_git_info("missing-workspace", true, None, 0, 0, 0, 0, 0),
+            "an unknown workspace wrote nothing, so nothing changed"
+        );
+    }
+
+    #[test]
+    fn pr_info_reports_change_only_when_the_pill_moves() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+
+        assert!(store.update_workspace_pr_info(
+            &id,
+            Some(7),
+            Some("OPEN".into()),
+            Some("https://example.test/7".into()),
+        ));
+        assert!(!store.update_workspace_pr_info(
+            &id,
+            Some(7),
+            Some("OPEN".into()),
+            Some("https://example.test/7".into()),
+        ));
+        assert!(
+            store.update_workspace_pr_info(&id, Some(7), Some("MERGED".into()), None),
+            "a state transition is a change"
+        );
+        assert!(
+            store.update_workspace_pr_info(&id, None, None, None),
+            "clearing a populated pill is a change"
+        );
+        assert!(
+            !store.update_workspace_pr_info(&id, None, None, None),
+            "clearing an empty pill is not"
+        );
+    }
+
+    #[test]
+    fn linked_issue_reports_change_only_when_the_card_moves() {
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+        let issue = |title: &str, state: crate::github::IssueState| crate::github::LinkedIssue {
+            number: 12,
+            title: title.into(),
+            state,
+            labels: vec!["bug".into()],
+        };
+
+        assert!(store.link_workspace_issue(&id, issue("Crash on open", crate::github::IssueState::Open)));
+        assert!(!store.link_workspace_issue(&id, issue("Crash on open", crate::github::IssueState::Open)));
+        assert!(
+            store.link_workspace_issue(&id, issue("Crash on open", crate::github::IssueState::Closed)),
+            "a close is a change"
+        );
+        assert!(
+            store.link_workspace_issue(&id, issue("Crash on launch", crate::github::IssueState::Closed)),
+            "a retitle is a change"
         );
     }
 }

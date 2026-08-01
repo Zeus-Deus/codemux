@@ -176,6 +176,16 @@ const DECLINE_REASON_DETAIL: Record<
 };
 
 /**
+ * The verdict from this session's probe, or `null` when nothing has asked for
+ * one yet (no terminal pane has mounted). Read-only on purpose: diagnostics
+ * report what the app decided, they do not create a throwaway GL context to
+ * find out.
+ */
+export function getCachedWebglProbe(): WebglProbeResult | null {
+  return cachedResult;
+}
+
+/**
  * Cached production entry point: decide once per app session and log the
  * verdict once so a lag report can be matched to the renderer in use.
  */

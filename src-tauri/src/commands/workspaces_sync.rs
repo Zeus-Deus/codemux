@@ -1024,6 +1024,12 @@ pub async fn workspaces_adopt_synced<R: tauri::Runtime>(
         app_state.set_workspace_protected(&workspace_id, protected);
     }
 
+    // The last emit on this path happened inside `workspace_pull_back_impl`,
+    // before the identity and `protected` stamps above — so the adopted
+    // workspace would render with stale project grouping and an unguarded
+    // delete affordance until an unrelated change shipped a snapshot.
+    crate::state::schedule_emit_app_state(&app);
+
     // Step 9: nudge the reconcile so the server learns the workspace
     // is now also on this device. Failures here are non-fatal — the
     // background loop will catch up within 30s.
@@ -1487,6 +1493,11 @@ pub async fn workspaces_adopt_via_clone<R: tauri::Runtime>(
     // (and being re-adopted as a duplicate). Recomputing from the local
     // checkout mirrors every other create path.
     app_state.set_workspace_project_root(&workspace_id.0, project_path_str.clone());
+
+    // Nothing else on this path emits, so without this the brand-new workspace
+    // stays invisible in the sidebar and the overview until some unrelated
+    // change happens to ship a snapshot.
+    crate::state::schedule_emit_app_state(&app);
 
     // Nudge sync so the server learns about the new workspace.
     if let Err(e) = crate::workspaces_sync::try_sync_with_app(&app).await {

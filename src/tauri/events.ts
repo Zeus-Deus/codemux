@@ -6,6 +6,8 @@ import type {
   AuthStatePayload,
   OrchestratorTriggerResult,
   PresetStoreSnapshot,
+  RevisionedDelta,
+  RevisionHeartbeat,
   TerminalStatusPayload,
   ThemeColors,
   UserSettings,
@@ -16,6 +18,16 @@ export type EventCallback<T> = (payload: T) => void;
 
 export const onAppStateChanged = (cb: EventCallback<AppStateSnapshot>): Promise<UnlistenFn> =>
   listen<AppStateSnapshot>("app-state-changed", (e) => cb(e.payload));
+
+/** One domain-scoped change to the app state. Ordered against
+ *  `app-state-changed` by a shared revision counter — see `RevisionedDelta`. */
+export const onAppStateDelta = (cb: EventCallback<RevisionedDelta>): Promise<UnlistenFn> =>
+  listen<RevisionedDelta>("app-state-delta", (e) => cb(e.payload));
+
+/** Periodic "the backend is at revision N" ping with no payload to parse.
+ *  Lets a renderer that missed an emit notice and resync. */
+export const onAppStateRevision = (cb: EventCallback<RevisionHeartbeat>): Promise<UnlistenFn> =>
+  listen<RevisionHeartbeat>("app-state-revision", (e) => cb(e.payload));
 
 export const onPresetsChanged = (cb: EventCallback<PresetStoreSnapshot>): Promise<UnlistenFn> =>
   listen<PresetStoreSnapshot>("presets-changed", (e) => cb(e.payload));
@@ -409,6 +421,11 @@ export type ProviderRuntimeEvent =
 export interface AgentChatEventPayload {
   thread_id: string;
   event: ProviderRuntimeEvent;
+  /** `agent_chat_messages.id` of the row this event was persisted as,
+   *  when it was persisted at all (ephemeral kinds carry `null`). The
+   *  store dedups a resume tail against the live stream on this id — see
+   *  `ChatThreadSlice.lastPersistedEventId`. */
+  persisted_id?: number | null;
 }
 
 /** Emitted when the background run-start checkpoint (issue #80) lands,

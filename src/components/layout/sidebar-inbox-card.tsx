@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { AlarmClock, Check, Cloud } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
@@ -18,8 +18,7 @@ import {
 } from "@/components/github/pr-status-icon";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
-import { activateWorkspace } from "@/tauri/commands";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import {
   useSettingsStore,
   selectWorkingIndicator,
@@ -77,8 +76,17 @@ interface Props {
  *  meta line, left-to-right: branch · ↑ahead · +/− — then, right-aligned,
  *  PR chip · provider marks / remote / notifications.
  *  The right side of the eyebrow shows the agent state, swapping to a
- *  "✓ Settle" button on hover/focus. */
-export function SidebarInboxCard({
+ *  "✓ Settle" button on hover/focus.
+ *
+ *  Memoized: at real profile scale the inbox holds dozens of these, and the
+ *  steady state is one workspace's metadata moving (a git sweep tick, an agent
+ *  status flip). The parent hands over primitives plus references that survive
+ *  a backend tick — the workspace object itself (structural sharing on
+ *  snapshots, targeted replacement on deltas), an interned `repo`, and
+ *  `useCallback`'d handlers — so this boundary actually bails out instead of
+ *  paying for a comparison that always fails.
+ */
+export const SidebarInboxCard = memo(function SidebarInboxCard({
   workspace,
   repo,
   isActive,
@@ -129,10 +137,7 @@ export function SidebarInboxCard({
   };
 
   const handleActivate = () => {
-    useChatDraftStore.getState().setActiveDraft(null);
-    startTransition(() => {
-      activateWorkspace(workspace.workspace_id).catch(console.error);
-    });
+    activateWorkspaceInteraction(workspace.workspace_id).catch(console.error);
   };
 
   /** A plain activation (click, Enter, Space) also collapses any multi-select
@@ -628,4 +633,4 @@ export function SidebarInboxCard({
       </div>
     </WorkspaceInboxMenu>
   );
-}
+});

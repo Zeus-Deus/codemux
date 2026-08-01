@@ -1,3 +1,5 @@
+import { memo, useMemo } from "react";
+
 import { shouldShowThinkingIndicator } from "@/lib/agent-chat/thinking";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import type { ApprovalDecision } from "@/tauri/events";
@@ -50,8 +52,13 @@ interface Props {
  * (owned by the shadcn scroller engine inside `MessageList`) both live
  * inside `MessageList` — this layer just sizes it and derives the
  * thinking-pulse flag.
+ *
+ * Memoized: this is the boundary that keeps composer keystrokes out of the
+ * timeline. `AgentChatPane` re-renders on every character (it owns the
+ * draft), but none of the props below move while the user types, so the
+ * whole transcript subtree skips.
  */
-export function ChatTranscript({
+export const ChatTranscript = memo(function ChatTranscript({
   messages,
   streaming,
   stalled,
@@ -68,7 +75,10 @@ export function ChatTranscript({
   onEnterSubagent,
   workspaceId,
 }: Props) {
-  const showThinking = shouldShowThinkingIndicator(messages, streaming);
+  const showThinking = useMemo(
+    () => shouldShowThinkingIndicator(messages, streaming),
+    [messages, streaming],
+  );
 
   return (
     <div className="flex-1 min-h-0 w-full">
@@ -92,4 +102,4 @@ export function ChatTranscript({
       />
     </div>
   );
-}
+});

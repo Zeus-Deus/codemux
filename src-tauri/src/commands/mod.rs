@@ -163,11 +163,16 @@ pub fn debug_log(message: String) {
 }
 
 #[tauri::command]
-pub fn clear_adapter_captures(
+pub fn clear_adapter_captures<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     app_state: State<'_, crate::state::AppStateStore>,
     session_id: String,
 ) -> Result<(), String> {
-    app_state.clear_terminal_adapter_captures(&session_id);
+    // The captures drive the frontend's resume affordance, so clearing them
+    // without an emit leaves it offering a session that is gone.
+    if app_state.clear_terminal_adapter_captures(&session_id) {
+        crate::state::schedule_emit_app_state(&app);
+    }
     Ok(())
 }
 

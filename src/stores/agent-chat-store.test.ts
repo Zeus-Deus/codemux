@@ -177,6 +177,11 @@ describe("agent-chat-store", () => {
   });
 
   describe("hydrateThread", () => {
+    /** Wrap raw payloads as cursor rows (ids ascending from 1), the shape
+     *  `agent_chat_list_messages_after` returns. */
+    function rows(...payloads: string[]) {
+      return payloads.map((payload, index) => ({ id: index + 1, payload }));
+    }
     function userPayload(text: string): string {
       return JSON.stringify({ type: "user_message", thread_id: "t", text });
     }
@@ -192,10 +197,10 @@ describe("agent-chat-store", () => {
     it("creates a slice with the replayed transcript when the thread is unknown", () => {
       useAgentChatStore
         .getState()
-        .hydrateThread("fresh", [
-          userPayload("hi"),
-          assistantPayload("turn-1", "hello back"),
-        ]);
+        .hydrateThread(
+          "fresh",
+          rows(userPayload("hi"), assistantPayload("turn-1", "hello back")),
+        );
       const slice = useAgentChatStore.getState().threads["fresh"];
       expect(slice).toBeDefined();
       expect(slice.messages).toHaveLength(2);
@@ -222,7 +227,7 @@ describe("agent-chat-store", () => {
 
       useAgentChatStore
         .getState()
-        .hydrateThread("t", [userPayload("recovered")]);
+        .hydrateThread("t", rows(userPayload("recovered")));
 
       const after = useAgentChatStore.getState().threads["t"];
       expect(after.model).toBe("claude-opus-4-7");
@@ -247,7 +252,7 @@ describe("agent-chat-store", () => {
 
       useAgentChatStore
         .getState()
-        .hydrateThread("t", [userPayload("fresh-1"), userPayload("fresh-2")]);
+        .hydrateThread("t", rows(userPayload("fresh-1"), userPayload("fresh-2")));
 
       const after = useAgentChatStore.getState().threads["t"];
       expect(after.messages).toHaveLength(2);
@@ -276,7 +281,7 @@ describe("agent-chat-store", () => {
       expect(() =>
         useAgentChatStore
           .getState()
-          .hydrateThread("t", ["not-json", userPayload("ok")]),
+          .hydrateThread("t", rows("not-json", userPayload("ok"))),
       ).not.toThrow();
       const slice = useAgentChatStore.getState().threads["t"];
       expect(slice.messages).toHaveLength(1);

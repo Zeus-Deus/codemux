@@ -12,7 +12,6 @@ import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { useSidebar } from "@/components/ui/sidebar";
 import {
-  activateWorkspace,
   splitPane,
   closePane,
   createTab,
@@ -25,6 +24,7 @@ import {
   runProjectDevCommand,
 } from "@/tauri/commands";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 
 interface Props {
   open: boolean;
@@ -93,7 +93,7 @@ export function CommandPalette({ open, onOpenChange }: Props) {
               value={workspaceCommandValue(w)}
               onSelect={() =>
                 run(() =>
-                  activateWorkspace(w.workspace_id).catch(console.error),
+                  activateWorkspaceInteraction(w.workspace_id).catch(console.error),
                 )
               }
             >

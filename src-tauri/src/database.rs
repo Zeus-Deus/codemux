@@ -2934,18 +2934,25 @@ impl DatabaseStore {
     /// `{"type":"user_message","text":"…"}` record. Best-effort: rows
     /// for an unknown thread_id (FK violation) are silently dropped
     /// rather than crashing the event-bridge loop.
+    ///
+    /// Returns the inserted rowid — the durable, table-wide monotonic
+    /// cursor position the frontend tracks as `lastPersistedEventId` so
+    /// a remount can resume with `list_agent_chat_messages_after`
+    /// instead of replaying from row zero. `Ok(None)` is the swallowed
+    /// FK-violation case: nothing was written, so there is no position
+    /// to advance to.
     pub fn append_agent_chat_message(
         &self,
         thread_id: &str,
         payload_json: &str,
-    ) -> Result<(), String> {
+    ) -> Result<Option<i64>, String> {
         let conn = self.conn.lock().unwrap();
         match conn.execute(
             "INSERT INTO agent_chat_messages (thread_id, payload)
              VALUES (?1, ?2)",
             params![thread_id, payload_json],
         ) {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(Some(conn.last_insert_rowid())),
             Err(rusqlite::Error::SqliteFailure(err, _))
                 if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY =>
             {
@@ -2953,7 +2960,7 @@ impl DatabaseStore {
                 // between forward_event and delete_agent_chat_session).
                 // Drop the message silently — it is exactly the
                 // history the user just asked us to forget.
-                Ok(())
+                Ok(None)
             }
             Err(e) => Err(format!("Failed to append agent_chat_message: {e}")),
         }
@@ -2975,6 +2982,66 @@ impl DatabaseStore {
         stmt.query_map(params![thread_id], |row| row.get::<_, String>(0))
             .map(|iter| iter.filter_map(|r| r.ok()).collect())
             .unwrap_or_default()
+    }
+
+    /// Cursor read: every message for `thread_id` with `id > after_id`,
+    /// ordered ascending, as `(id, payload)` pairs. `None` means "from
+    /// the beginning" (ids start at 1, so the query uses 0).
+    ///
+    /// Served entirely by `idx_agent_chat_messages_thread(thread_id, id
+    /// ASC)` — a warm revisit with nothing new touches only the index
+    /// tail, which is the whole point of the cursor.
+    pub fn list_agent_chat_messages_after(
+        &self,
+        thread_id: &str,
+        after_id: Option<i64>,
+    ) -> Vec<(i64, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn.prepare(
+            "SELECT id, payload FROM agent_chat_messages
+             WHERE thread_id = ?1 AND id > ?2
+             ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        stmt.query_map(params![thread_id, after_id.unwrap_or(0)], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(|iter| iter.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// Highest row id currently stored for a thread, or `None` when the
+    /// thread has no messages. The frontend compares this against its
+    /// warm cursor: a cursor ABOVE the head means the cursor came from a
+    /// different id space (a merged / deleted thread whose rows were
+    /// re-homed by `collapse_duplicate_agent_chat_sessions`), so the
+    /// tail read would silently return nothing forever. That case falls
+    /// back to a cold hydrate.
+    pub fn max_agent_chat_message_id(&self, thread_id: &str) -> Option<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT MAX(id) FROM agent_chat_messages WHERE thread_id = ?1",
+            params![thread_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Fetch one message payload by rowid, verbatim. Backs the lazy
+    /// tool-result fetch: the list read may hand the frontend a stub in
+    /// place of a multi-megabyte `content`, and this is how the full
+    /// body is retrieved on expand.
+    pub fn get_agent_chat_message(&self, row_id: i64) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload FROM agent_chat_messages WHERE id = ?1",
+            params![row_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
     }
 
     /// Drop every persisted message for a thread without touching the
@@ -4818,6 +4885,83 @@ mod tests {
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(row, &format!(r#"{{"i":{i}}}"#));
         }
+    }
+
+    #[test]
+    fn agent_chat_messages_append_returns_monotonic_row_ids() {
+        let db = init_test_database();
+        seed_session(&db, "t");
+
+        let first = db.append_agent_chat_message("t", r#"{"i":0}"#).unwrap();
+        let second = db.append_agent_chat_message("t", r#"{"i":1}"#).unwrap();
+        assert!(first.is_some() && second.is_some());
+        assert!(second.unwrap() > first.unwrap());
+        // The swallowed FK case wrote nothing, so it has no position.
+        assert_eq!(db.append_agent_chat_message("ghost", r#"{}"#).unwrap(), None);
+    }
+
+    #[test]
+    fn agent_chat_messages_after_filters_by_cursor_and_keeps_order() {
+        let db = init_test_database();
+        seed_session(&db, "t");
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            ids.push(
+                db.append_agent_chat_message("t", &format!(r#"{{"i":{i}}}"#))
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+
+        // `None` == from the beginning.
+        let all = db.list_agent_chat_messages_after("t", None);
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0].0, ids[0]);
+        assert_eq!(all[4].1, r#"{"i":4}"#);
+        assert!(all.windows(2).all(|w| w[0].0 < w[1].0));
+
+        // A cursor is exclusive.
+        let tail = db.list_agent_chat_messages_after("t", Some(ids[2]));
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].1, r#"{"i":3}"#);
+
+        // Warm revisit with nothing new.
+        assert!(db.list_agent_chat_messages_after("t", Some(ids[4])).is_empty());
+        // A cursor above the head reads as "nothing new" — the frontend
+        // catches that case with `max_agent_chat_message_id`.
+        assert!(db
+            .list_agent_chat_messages_after("t", Some(ids[4] + 1000))
+            .is_empty());
+    }
+
+    #[test]
+    fn agent_chat_messages_after_filters_by_thread() {
+        let db = init_test_database();
+        seed_session(&db, "t1");
+        seed_session(&db, "t2");
+        db.append_agent_chat_message("t1", r#"{"a":1}"#).unwrap();
+        db.append_agent_chat_message("t2", r#"{"b":2}"#).unwrap();
+        db.append_agent_chat_message("t1", r#"{"c":3}"#).unwrap();
+
+        let t1 = db.list_agent_chat_messages_after("t1", None);
+        assert_eq!(t1.len(), 2);
+        assert_eq!(t1[1].1, r#"{"c":3}"#);
+        assert_eq!(db.list_agent_chat_messages_after("unknown", None).len(), 0);
+    }
+
+    #[test]
+    fn agent_chat_message_head_and_by_id_reads() {
+        let db = init_test_database();
+        seed_session(&db, "t");
+        assert_eq!(db.max_agent_chat_message_id("t"), None);
+
+        let first = db.append_agent_chat_message("t", r#"{"i":0}"#).unwrap().unwrap();
+        let second = db.append_agent_chat_message("t", r#"{"i":1}"#).unwrap().unwrap();
+        assert_eq!(db.max_agent_chat_message_id("t"), Some(second));
+        assert_eq!(db.max_agent_chat_message_id("nope"), None);
+
+        assert_eq!(db.get_agent_chat_message(first).as_deref(), Some(r#"{"i":0}"#));
+        assert_eq!(db.get_agent_chat_message(second + 999), None);
     }
 
     #[test]

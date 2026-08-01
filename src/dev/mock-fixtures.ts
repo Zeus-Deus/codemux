@@ -41,6 +41,7 @@ import type {
   WebRemoteSessionView,
   WorkspaceSnapshot,
 } from "@/tauri/types";
+import { STRESS_THREAD_PREFIX, getStressFixture } from "./stress-fixture";
 
 /** Authenticated user reported by the mock `check_auth`. Bypasses the
  *  login screen so the real app shell renders immediately. */
@@ -1854,6 +1855,66 @@ export function workflowCompleteEnvelopes(threadId: string): unknown[] {
   ];
 }
 
+// ── Stress-fixture scaling ──────────────────────────────────────────
+//
+// The curated 18 workspaces above are a design fixture. Selecting a stress
+// fixture (`?fixture=large`, see `stress-fixture.ts`) scales that list to the
+// audited real profile so switch latency is measured against something honest.
+// Generated workspaces reuse the same builders, so they carry the same pane /
+// session / status bookkeeping as the curated ones.
+
+const STRESS_STATUS_CYCLE: PaneStatus[] = ["idle", "working", "review", "permission"];
+
+let stressWorkspacesCache: WorkspaceSnapshot[] | null = null;
+
+function stressWorkspaces(target: number): WorkspaceSnapshot[] {
+  if (stressWorkspacesCache) return stressWorkspacesCache;
+
+  if (target <= ALL_WORKSPACES.length) {
+    const kept = ALL_WORKSPACES.slice(0, target);
+    // The seed's active workspace must survive any cut, or the snapshot
+    // points `active_workspace_id` at a workspace that isn't in the list.
+    if (!kept.some((w) => w.workspace_id === wsCodemuxMock.workspace_id)) {
+      kept[kept.length - 1] = wsCodemuxMock;
+    }
+    stressWorkspacesCache = kept;
+    return kept;
+  }
+
+  const generated: WorkspaceSnapshot[] = [];
+  for (let i = 1; i <= target - ALL_WORKSPACES.length; i += 1) {
+    const title = `stress-${String(i).padStart(2, "0")}`;
+    const cwd = `${HOME}/projects/stress/${title}`;
+    const workspace = makeWorkspace({
+      workspace_id: `ws-stress-${i}`,
+      title,
+      cwd,
+      project_root: `${HOME}/projects/stress`,
+      project_uid: "uid-stress",
+      git_branch: `feat/${title}`,
+      git_changed_files: i % 7,
+      status: STRESS_STATUS_CYCLE[i % STRESS_STATUS_CYCLE.length],
+    });
+    // Every third generated workspace opens on a chat pane, so a switch
+    // sweep crosses both the terminal and the chat mount paths.
+    if (i % 3 === 0) {
+      const { surface, tab } = chatSurface(title, cwd, `${STRESS_THREAD_PREFIX}${i}`);
+      generated.push({
+        ...workspace,
+        tabs: [tab],
+        active_tab_id: tab.tab_id,
+        active_surface_id: surface.surface_id,
+        surfaces: [surface],
+      });
+    } else {
+      generated.push(workspace);
+    }
+  }
+
+  stressWorkspacesCache = [...ALL_WORKSPACES, ...generated];
+  return stressWorkspacesCache;
+}
+
 /**
  * Build a fresh, deep-ish-cloned `AppStateSnapshot`. The mock holds a
  * single mutable instance and re-emits it after mutating commands, so
@@ -1861,10 +1922,12 @@ export function workflowCompleteEnvelopes(threadId: string): unknown[] {
  * across hot reloads / re-installs.
  */
 export function createSeedAppState(): AppStateSnapshot {
+  const fixture = getStressFixture();
+  const workspaces = fixture ? stressWorkspaces(fixture.workspaces) : ALL_WORKSPACES;
   return structuredClone({
     schema_version: 1,
     active_workspace_id: wsCodemuxMock.workspace_id,
-    workspaces: ALL_WORKSPACES,
+    workspaces,
     terminal_sessions: terminalSessions,
     browser_sessions: [],
     agent_browser_sessions: [MOCK_AGENT_BROWSER_SESSION],

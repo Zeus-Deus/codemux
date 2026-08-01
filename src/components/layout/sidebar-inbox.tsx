@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlarmClock,
   AlertCircle,
@@ -23,13 +23,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import {
+  selectActiveWorkspaceId,
   useAppStore,
   useHomeDir,
   useProjectGroupedWorkspaces,
 } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import {
   useSidebarInboxStore,
   resolveSettledTimestamp,
@@ -53,7 +54,6 @@ import {
   type SnoozePreset,
 } from "./sidebar-snooze";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
-import { activateWorkspace } from "@/tauri/commands";
 import {
   normalizePrState,
   PrStatusIcon,
@@ -292,10 +292,7 @@ function selectModeFor(e: {
 /** Activate a workspace from a sidebar row. Clearing the chat draft first
  *  matches the card path — a stale draft would follow the user across. */
 function activateFromSidebar(workspaceId: string): void {
-  useChatDraftStore.getState().setActiveDraft(null);
-  startTransition(() => {
-    activateWorkspace(workspaceId).catch(console.error);
-  });
+  activateWorkspaceInteraction(workspaceId).catch(console.error);
 }
 
 /** A project's mini square avatar, resolving its customised appearance. Kept
@@ -452,7 +449,10 @@ interface SettledRowProps {
   onMarkUnread: (workspaceId: string) => void;
 }
 
-function SettledRow({
+// Memoized for the same reason as `SidebarInboxCard`: the settled shelf can
+// hold dozens of rows and a metadata delta for one workspace must not re-render
+// the rest. Every prop is a primitive or an interned/stable reference.
+const SettledRow = memo(function SettledRow({
   workspace,
   repo,
   isActive,
@@ -598,7 +598,7 @@ function SettledRow({
     </div>
     </WorkspaceInboxMenu>
   );
-}
+});
 
 interface SnoozeRowProps {
   workspace: WorkspaceSnapshot;
@@ -620,7 +620,7 @@ interface SnoozeRowProps {
 /** One deferred workspace on the Snoozed shelf. Deliberately the same one-line
  *  shape as a settled row — both are "parked", and giving them different
  *  silhouettes would suggest a difference in kind rather than in duration. */
-function SnoozeRow({
+const SnoozeRow = memo(function SnoozeRow({
   workspace,
   repo,
   isActive,
@@ -728,7 +728,7 @@ function SnoozeRow({
     </div>
     </WorkspaceInboxMenu>
   );
-}
+});
 
 /** The flat workspace inbox that replaces the nested project tree in the
  *  expanded sidebar: a project filter dropdown, one multi-line card per active
@@ -736,13 +736,21 @@ function SnoozeRow({
  *  "Settled" section of one-line rows the user has swept aside. Parking a
  *  workspace is visual only — nothing is archived or deleted. */
 export function SidebarInbox() {
-  const appState = useAppStore((s) => s.appState);
-  const allWorkspaces = useMemo(
-    () => appState?.workspaces ?? [],
-    [appState?.workspaces],
-  );
-  const paneStatuses = appState?.pane_statuses;
-  const activeWorkspaceId = appState?.active_workspace_id ?? "";
+  // Narrow subscriptions, not the whole snapshot. Everything this component
+  // derives comes from two fields plus the active id; subscribing to
+  // `appState` itself re-rendered every card on every backend tick, because
+  // the top-level reference moves whenever anything anywhere changes. With
+  // structural sharing on the snapshot path and targeted replacement on the
+  // delta path, these three keep their identity unless their own domain moved.
+  const workspaces = useAppStore((s) => s.appState?.workspaces);
+  const paneStatuses = useAppStore((s) => s.appState?.pane_statuses);
+  // Only "has the first snapshot landed" — a boolean, so the guards below stop
+  // dragging the whole snapshot into their dependency arrays.
+  const appStateLoaded = useAppStore((s) => s.appState !== null);
+  const allWorkspaces = useMemo(() => workspaces ?? [], [workspaces]);
+  // Pending-aware so the highlight moves in the click's own task, before the
+  // backend snapshot lands (docs/plans/gui-responsiveness.md, Phase 1).
+  const activeWorkspaceId = useAppStore(selectActiveWorkspaceId) ?? "";
   const homeDir = useHomeDir();
   const hosts = useHosts();
   const projectGroups = useProjectGroupedWorkspaces(allWorkspaces, homeDir, hosts);
@@ -773,9 +781,9 @@ export function SidebarInbox() {
 
   // Drop settled entries whose workspace vanished (archived / deleted).
   useEffect(() => {
-    if (!loaded || !appState) return;
+    if (!loaded || !appStateLoaded) return;
     prune(new Set(allWorkspaces.map((w) => w.workspace_id)));
-  }, [loaded, appState, allWorkspaces, prune]);
+  }, [loaded, appStateLoaded, allWorkspaces, prune]);
 
   // Settle motion: collapse the card (~200ms), then flip the persisted flag
   // so it re-renders as a one-line row under the divider (which eases in).
@@ -886,14 +894,24 @@ export function SidebarInbox() {
 
   // workspace_id → repo (project) identity, from the same grouping pipeline
   // the rest of the app uses (dedup'd names, Home labeling, host suffixes).
+  //
+  // The `InboxRepo` objects are interned across recomputes: `projectGroups`
+  // is rebuilt whenever the workspace array moves (a git delta on ONE
+  // workspace is enough), and a fresh `{name, path}` per card would break the
+  // memo boundary on every card for a change that touched one of them.
+  const repoIntern = useRef(new Map<string, InboxRepo>());
   const repoByWorkspace = useMemo(() => {
+    const intern = repoIntern.current;
     const map = new Map<string, InboxRepo>();
     for (const group of projectGroups) {
+      const key = `${group.projectName}\n${group.projectPath}`;
+      let repo = intern.get(key);
+      if (!repo) {
+        repo = { name: group.projectName, path: group.projectPath };
+        intern.set(key, repo);
+      }
       for (const ws of group.workspaces) {
-        map.set(ws.workspace_id, {
-          name: group.projectName,
-          path: group.projectPath,
-        });
+        map.set(ws.workspace_id, repo);
       }
     }
     return map;
@@ -1041,19 +1059,42 @@ export function SidebarInbox() {
   );
 
   // ── Park / un-park handlers ──
-
-  const navigateAfterPark = (parkedIds: readonly string[]) => {
-    const next = nextWorkspaceAfterPark(
-      parkedIds,
+  //
+  // Every handler below is passed to a memoized row, so its identity has to
+  // survive a backend tick or the memo never bails out. The values they read
+  // (the workspace map, the active id, the rendered order, the selection
+  // anchor) all move on ordinary ticks, so they are read through a ref
+  // refreshed after each commit instead of captured in the closure — the
+  // handlers themselves then have empty dependency lists.
+  const latest = useRef({
+    workspaceById,
+    activeWorkspaceId,
+    activeCardIds,
+    renderedIds,
+    selectionAnchor,
+  });
+  useEffect(() => {
+    latest.current = {
+      workspaceById,
       activeWorkspaceId,
       activeCardIds,
+      renderedIds,
+      selectionAnchor,
+    };
+  });
+
+  const navigateAfterPark = useCallback((parkedIds: readonly string[]) => {
+    const next = nextWorkspaceAfterPark(
+      parkedIds,
+      latest.current.activeWorkspaceId,
+      latest.current.activeCardIds,
     );
     if (next) activateFromSidebar(next);
-  };
+  }, []);
 
-  const handleSettle = (workspaceId: string) => {
+  const handleSettle = useCallback((workspaceId: string) => {
     const workEndedAt =
-      workspaceById.get(workspaceId)?.last_active_at ?? undefined;
+      latest.current.workspaceById.get(workspaceId)?.last_active_at ?? undefined;
     setLeavingId(workspaceId);
     pendingSettleRef.current = { id: workspaceId, workEndedAt };
     // Navigate now, not after the collapse: the user asked to move on, and
@@ -1067,37 +1108,47 @@ export function SidebarInbox() {
         markRowIn(setJustSettledId, workspaceId);
       }, SETTLE_ANIM_MS),
     );
-  };
+  }, [navigateAfterPark]);
 
-  const handleUnsettle = (workspaceId: string) => {
+  const handleUnsettle = useCallback((workspaceId: string) => {
     // The settled-row button is an explicit "keep this active" — pin it so the
     // idle/PR auto-settle rules leave it alone until its agent runs again.
     useSidebarInboxStore.getState().unsettle(workspaceId, "user");
     markRowIn(setJustUnsettledId, workspaceId);
-  };
+  }, []);
 
-  const handleSnooze = (workspaceId: string, until: number) => {
-    navigateAfterPark([workspaceId]);
-    useSidebarInboxStore.getState().snooze(workspaceId, until);
-  };
+  const handleSnooze = useCallback(
+    (workspaceId: string, until: number) => {
+      navigateAfterPark([workspaceId]);
+      useSidebarInboxStore.getState().snooze(workspaceId, until);
+    },
+    [navigateAfterPark],
+  );
 
   /** Wake a snoozed workspace back into the active list. `reason` follows the
    *  store's pin rules — only an explicit "Wake now" is a user decision. */
-  const wake = (
-    workspaceId: string,
-    reason: "user" | "activity" | "timer",
-  ) => {
-    useSidebarInboxStore.getState().unsnooze(workspaceId, reason);
-    markRowIn(setJustUnsettledId, workspaceId);
-    // A manual wake needs no badge — the user is the one who did it.
-    if (reason === "user") return;
-    setWokeIds((prev) => {
-      if (prev.has(workspaceId)) return prev;
-      const next = new Set(prev);
-      next.add(workspaceId);
-      return next;
-    });
-  };
+  const wake = useCallback(
+    (workspaceId: string, reason: "user" | "activity" | "timer") => {
+      useSidebarInboxStore.getState().unsnooze(workspaceId, reason);
+      markRowIn(setJustUnsettledId, workspaceId);
+      // A manual wake needs no badge — the user is the one who did it.
+      if (reason === "user") return;
+      setWokeIds((prev) => {
+        if (prev.has(workspaceId)) return prev;
+        const next = new Set(prev);
+        next.add(workspaceId);
+        return next;
+      });
+    },
+    [],
+  );
+
+  /** Stable `onWake` for the snoozed rows: the row only ever wakes by an
+   *  explicit user gesture, so the reason is fixed. */
+  const handleWake = useCallback(
+    (workspaceId: string) => wake(workspaceId, "user"),
+    [wake],
+  );
 
   // Un-settle a workspace because its live agent resurfaced it (not a user
   // gesture): clear any keep-active pin via reason "activity", then run the
@@ -1109,7 +1160,7 @@ export function SidebarInbox() {
 
   // ── Selection ──
 
-  const handleSelect = (workspaceId: string, mode: SelectMode) => {
+  const handleSelect = useCallback((workspaceId: string, mode: SelectMode) => {
     if (mode === "single") {
       setSelectedIds(new Set());
       setSelectionAnchor(workspaceId);
@@ -1125,18 +1176,19 @@ export function SidebarInbox() {
       setSelectionAnchor(workspaceId);
       return;
     }
+    const { renderedIds, selectionAnchor } = latest.current;
     setSelectedIds(
       new Set(selectRange(renderedIds, selectionAnchor ?? workspaceId, workspaceId)),
     );
-  };
+  }, []);
 
-  const handleMarkUnread = (workspaceId: string) => {
+  const handleMarkUnread = useCallback((workspaceId: string) => {
     setManualUnread((prev) => {
       const next = new Set(prev);
       next.add(workspaceId);
       return next;
     });
-  };
+  }, []);
 
   // Selection in visual order, restricted to what is on screen — the bulk
   // menu's counts describe exactly the rows the user is looking at.
@@ -1241,21 +1293,25 @@ export function SidebarInbox() {
     }
   }, [loaded, paneStatuses, snoozed, allWorkspaces]);
 
+  // A precise timer at the soonest boundary, because the coarse clock alone
+  // would make a wake up to a full tick late — a "In 1 hour" snooze returning
+  // at 1h00m29s reads as a broken promise. Re-armed via the nonce after each
+  // fire so a queue of wakes is walked one boundary at a time.
+  const [wakeNonce, setWakeNonce] = useState(0);
+
   // Wake sweep: anything whose return ticket has come due goes back to the
-  // active list. Driven off the coarse clock (which is `Date.now()` at render
-  // time, so the comparison is exact even though the tick is not).
+  // active list. It reads the wall clock rather than the coarse one — the
+  // boundary timer below re-runs this effect at the exact moment a ticket
+  // comes due, and the coarse value can be a whole tick behind. The coarse
+  // clock stays in the deps as the periodic backstop.
   useEffect(() => {
     if (!loaded) return;
+    const nowMs = Date.now();
     for (const entry of snoozed) {
-      if (now >= entry.until) wake(entry.id, "timer");
+      if (nowMs >= entry.until) wake(entry.id, "timer");
     }
-  }, [loaded, snoozed, now]);
+  }, [loaded, snoozed, now, wakeNonce, wake]);
 
-  // …and a precise timer at the soonest boundary, because the coarse clock
-  // alone would make a wake up to a full tick late — a "In 1 hour" snooze
-  // returning at 1h00m29s reads as a broken promise. Re-armed via the nonce
-  // after each fire so a queue of wakes is walked one boundary at a time.
-  const [wakeNonce, setWakeNonce] = useState(0);
   useEffect(() => {
     if (!loaded || snoozed.length === 0) return;
     let soonest = Infinity;
@@ -1454,10 +1510,10 @@ export function SidebarInbox() {
   // archived / deleted). Without this the trigger would render a blank label
   // and the list an unexplained empty state, so fall back to "All projects".
   useEffect(() => {
-    if (!appState || filter === null) return;
+    if (!appStateLoaded || filter === null) return;
     if (projectGroups.some((g) => g.projectPath === filter)) return;
     setFilter(null);
-  }, [appState, filter, projectGroups, setFilter]);
+  }, [appStateLoaded, filter, projectGroups, setFilter]);
 
   /** One active card. Both tiers render the identical component — a card that
    *  is wrapping up loses no affordance, only altitude. `visualIndex` is its
@@ -1668,7 +1724,7 @@ export function SidebarInbox() {
                       : null
                   }
                   timeUntil={formatTimeUntil(entry.until - now)}
-                  onWake={(id) => wake(id, "user")}
+                  onWake={handleWake}
                   onSelect={handleSelect}
                   onMarkUnread={handleMarkUnread}
                 />

@@ -1,6 +1,7 @@
 import type * as React from "react";
 import type { LegendListRef } from "@legendapp/list/react";
 import {
+  memo,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -50,8 +51,11 @@ const CARD_EST_H = 96;
  * Rendered as a sibling of LegendList. Active-row tracking and jumps go
  * through the list's index API, so the rail does not assume its target is
  * currently mounted.
+ *
+ * Memoized: it re-derives its entries from every slot, so it must not be
+ * dragged through a render triggered by something it does not consume.
  */
-export function MessageTrail({
+export const MessageTrail = memo(function MessageTrail({
   slots,
   listRef,
   firstVisibleSlotIndex,
@@ -70,9 +74,9 @@ export function MessageTrail({
       firstVisibleSlotIndex={firstVisibleSlotIndex}
     />
   );
-}
+});
 
-function TrailRail({
+const TrailRail = memo(function TrailRail({
   entries,
   listRef,
   firstVisibleSlotIndex,
@@ -246,7 +250,7 @@ function TrailRail({
       ) : null}
     </nav>
   );
-}
+});
 
 /** First `n` words of a prompt, for the tick's aria-label. */
 function firstWords(text: string, n = 6): string {

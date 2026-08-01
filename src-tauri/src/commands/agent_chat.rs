@@ -58,6 +58,18 @@ pub const AGENT_CHAT_EVENT: &str = "agent_chat_event";
 pub struct AgentChatEventPayload {
     pub thread_id: ThreadId,
     pub event: ProviderRuntimeEvent,
+    /// `agent_chat_messages.id` of the row this event was persisted as,
+    /// when it was persisted at all (ephemeral kinds — `content_delta`,
+    /// lifecycle notices — carry `None`).
+    ///
+    /// This is the dedup key for cursor resume: a live event whose id is
+    /// at or below the thread's `lastPersistedEventId` is history the
+    /// frontend already applied through a tail read, so it drops it. The
+    /// `QueuedTurnDispatched` arm carries the id of the user-message row
+    /// it just wrote, because that row is the durable record of the
+    /// bubble this event materializes.
+    #[serde(default)]
+    pub persisted_id: Option<i64>,
 }
 
 /// Error string returned when a command runs with
@@ -1343,22 +1355,29 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     // means resume will skip this user turn but the live conversation is
     // unaffected.
     match &result.queued_id {
-        None => persist_user_message(
-            &db,
-            &thread_id_for_persist,
-            &user_text_for_persist,
-            &saved_images,
-        ),
-        // Queued: stash the (already-on-disk) image records keyed by the
-        // provider's queued_id so the deferred envelope write in
-        // `forward_event`'s `QueuedTurnDispatched` arm can attach them at
-        // real turn order. Skip the map entirely when there are no images
-        // (nothing to carry — the dispatch persist writes text only).
-        Some(queued_id) if !saved_images.is_empty() => {
-            pending_queued_images()
-                .lock()
-                .unwrap()
-                .insert(queued_id.clone(), saved_images);
+        None => {
+            persist_user_message(
+                &db,
+                &thread_id_for_persist,
+                &user_text_for_persist,
+                &saved_images,
+                input.client_nonce.as_deref(),
+            );
+        }
+        // Queued: stash the (already-on-disk) image records and the
+        // client nonce keyed by the provider's queued_id so the deferred
+        // envelope write in `forward_event`'s `QueuedTurnDispatched` arm
+        // can attach them at real turn order. Skip the map entirely when
+        // there is nothing to carry (the dispatch persist writes text
+        // only).
+        Some(queued_id) if !saved_images.is_empty() || input.client_nonce.is_some() => {
+            pending_queued_images().lock().unwrap().insert(
+                queued_id.clone(),
+                PendingQueuedTurn {
+                    images: saved_images,
+                    client_nonce: input.client_nonce.clone(),
+                },
+            );
         }
         Some(_) => {}
     }
@@ -1968,8 +1987,19 @@ pub async fn agent_chat_prime_mcp<R: Runtime>(app: AppHandle<R>) -> Result<(), S
     Ok(())
 }
 
+/// What a QUEUED send stashes for its deferred envelope write.
+#[derive(Debug, Default)]
+struct PendingQueuedTurn {
+    /// On-disk image records minted at enqueue time.
+    images: Vec<PersistedChatImage>,
+    /// The composer's correlation token for the optimistic bubble, so
+    /// the deferred envelope is dedupable against it on a cursor tail
+    /// read (see [`persist_user_message`]).
+    client_nonce: Option<String>,
+}
+
 /// Process-wide bridge carrying a QUEUED send's on-disk image records
-/// through to the deferred user-message envelope write.
+/// and client nonce through to the deferred user-message envelope write.
 ///
 /// The provider's follow-up queue carries a queued turn's *text* to
 /// dispatch, but it has no notion of the transcript paths the command
@@ -1979,31 +2009,44 @@ pub async fn agent_chat_prime_mcp<R: Runtime>(app: AppHandle<R>) -> Result<(), S
 /// written inline in [`agent_chat_send_turn`]. Follows the same
 /// module-static idiom as [`resume_locks`] to avoid threading a new
 /// managed state through every `forward_event` test harness.
-fn pending_queued_images() -> &'static Mutex<HashMap<String, Vec<PersistedChatImage>>> {
-    static PENDING: OnceLock<Mutex<HashMap<String, Vec<PersistedChatImage>>>> =
+fn pending_queued_images() -> &'static Mutex<HashMap<String, PendingQueuedTurn>> {
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingQueuedTurn>>> =
         OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Append the synthetic `{"type":"user_message"}` transcript envelope.
 /// Best-effort — a failed write only means resume skips this user turn.
+/// Returns the row id so the caller can hand it to the frontend as a
+/// cursor position.
 ///
 /// When `images` is non-empty the envelope gains an `"images"` array of
 /// `{"path","media_type"}` records; it is OMITTED entirely otherwise so
 /// older transcripts and image-less turns stay byte-identical (backward
 /// compatible — the frontend hydrate treats a missing field as "no
 /// attachments").
+///
+/// `client_nonce` records the token the composer stamped on its
+/// optimistic bubble. User turns never come back through the provider
+/// stream, so this row is the only place a cursor tail read can learn
+/// about them — and without the nonce a tail read that straddles a send
+/// would render the same bubble twice (the optimistic one plus the
+/// replayed row). Omitted when absent, keeping older rows byte-identical.
 fn persist_user_message(
     db: &DatabaseStore,
     thread_id: &str,
     text: &str,
     images: &[PersistedChatImage],
-) {
+    client_nonce: Option<&str>,
+) -> Option<i64> {
     let mut user_msg = serde_json::json!({
         "type": "user_message",
         "thread_id": thread_id,
         "text": text,
     });
+    if let Some(nonce) = client_nonce.filter(|n| !n.is_empty()) {
+        user_msg["client_nonce"] = serde_json::Value::String(nonce.to_string());
+    }
     if !images.is_empty() {
         let images_json: Vec<serde_json::Value> = images
             .iter()
@@ -2016,9 +2059,8 @@ fn persist_user_message(
             .collect();
         user_msg["images"] = serde_json::Value::Array(images_json);
     }
-    if let Ok(payload) = serde_json::to_string(&user_msg) {
-        let _ = db.append_agent_chat_message(thread_id, &payload);
-    }
+    let payload = serde_json::to_string(&user_msg).ok()?;
+    db.append_agent_chat_message(thread_id, &payload).ok().flatten()
 }
 
 /// Derive a short dropdown title from the first user turn's text.
@@ -2539,6 +2581,248 @@ pub async fn agent_chat_list_messages(
     Ok(db.list_agent_chat_messages(&thread_id))
 }
 
+/// One persisted row, tagged with its durable `agent_chat_messages.id`.
+///
+/// The id is the frontend's resume cursor: it records the highest id it
+/// has applied and asks for everything after it on the next mount, so a
+/// warm revisit never replays history it already holds.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentChatMessageRow {
+    pub id: i64,
+    pub payload: String,
+}
+
+/// Cursor read of a thread's transcript: every row with `id > after_id`
+/// (all rows when `after_id` is null), ascending.
+///
+/// Unlike [`agent_chat_list_messages`] this read SHAPES payloads: a
+/// `tool_result` whose serialized `content` exceeds
+/// [`LAZY_TOOL_RESULT_THRESHOLD_BYTES`] ships a metadata stub with a
+/// preview instead of the body (see [`shape_persisted_payload`]). Stored
+/// rows are untouched; the frontend fetches a full body on demand via
+/// [`agent_chat_get_tool_result`]. The older command keeps returning
+/// verbatim payloads so clients pinned to that surface (mirror /
+/// web-remote) are unaffected.
+#[tauri::command]
+pub async fn agent_chat_list_messages_after(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+    after_id: Option<i64>,
+) -> Result<Vec<AgentChatMessageRow>, String> {
+    Ok(db
+        .list_agent_chat_messages_after(&thread_id, after_id)
+        .into_iter()
+        .map(|(id, payload)| AgentChatMessageRow {
+            payload: shape_persisted_payload(id, &payload),
+            id,
+        })
+        .collect())
+}
+
+/// Highest persisted row id for a thread (`null` when it has none).
+///
+/// The frontend probes this alongside a warm tail read to catch a
+/// cursor that is AHEAD of the thread's own history — a cursor carried
+/// over from a merged or deleted thread, whose rows were re-homed under
+/// a different `thread_id`. Such a cursor would make the tail read look
+/// permanently empty; seeing head < cursor, the pane falls back to a
+/// cold hydrate.
+#[tauri::command]
+pub async fn agent_chat_thread_head_id(
+    db: State<'_, DatabaseStore>,
+    thread_id: String,
+) -> Result<Option<i64>, String> {
+    Ok(db.max_agent_chat_message_id(&thread_id))
+}
+
+/// Return one persisted row verbatim, by rowid — the full payload the
+/// list read replaced with a lazy stub. The frontend pulls the
+/// `item.content` out of it when the user expands or copies the tool
+/// result.
+#[tauri::command]
+pub async fn agent_chat_get_tool_result(
+    db: State<'_, DatabaseStore>,
+    row_id: i64,
+) -> Result<String, String> {
+    db.get_agent_chat_message(row_id)
+        .ok_or_else(|| format!("not_found: agent_chat_messages row {row_id}"))
+}
+
+// ── Lazy tool-result shaping (read path only) ─────────────────────────
+
+/// Serialized `tool_result` content above this size is replaced by a
+/// stub on the cursor read path. A 13 MB thread is mostly collapsed
+/// tool output the user never expands; shipping it costs IPC, two JSON
+/// parses and permanent renderer memory for nothing.
+pub const LAZY_TOOL_RESULT_THRESHOLD_BYTES: usize = 32 * 1024;
+
+/// How much of the stringified body travels with the stub. The collapsed
+/// card renders 12 lines, so this is comfortably more than it can show.
+pub const LAZY_TOOL_RESULT_PREVIEW_BYTES: usize = 2 * 1024;
+
+/// Key the stub object hangs off, so a stub is unambiguously
+/// distinguishable from a genuine tool-result body.
+pub const LAZY_TOOL_RESULT_KEY: &str = "__codemux_lazy_tool_result";
+
+/// Replace an oversized `tool_result` body with a metadata stub.
+///
+/// Returns the payload unchanged unless ALL of the following hold: the
+/// envelope is an `item_completed` carrying a `tool_result`, its
+/// `content` serializes to more than [`LAZY_TOOL_RESULT_THRESHOLD_BYTES`],
+/// and the content carries no image block. Image-bearing results are
+/// never stubbed so the thumbnail grid and the auto-expand-on-image
+/// behaviour keep working off the real content.
+fn shape_persisted_payload(row_id: i64, payload: &str) -> String {
+    // Cheap gate: the stub only ever shrinks a payload that is already
+    // bigger than the threshold, so smaller rows skip the parse entirely.
+    if payload.len() <= LAZY_TOOL_RESULT_THRESHOLD_BYTES {
+        return payload.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return payload.to_string();
+    };
+    if value.get("type").and_then(|v| v.as_str()) != Some("item_completed") {
+        return payload.to_string();
+    }
+    let Some(item) = value.get_mut("item").and_then(|i| i.as_object_mut()) else {
+        return payload.to_string();
+    };
+    if item.get("kind").and_then(|v| v.as_str()) != Some("tool_result") {
+        return payload.to_string();
+    }
+    let Some(content) = item.get("content") else {
+        return payload.to_string();
+    };
+    if content_has_image_block(content) {
+        return payload.to_string();
+    }
+    let Ok(serialized) = serde_json::to_string(content) else {
+        return payload.to_string();
+    };
+    if serialized.len() <= LAZY_TOOL_RESULT_THRESHOLD_BYTES {
+        return payload.to_string();
+    }
+    let text = stringify_tool_content(content);
+    let stub = serde_json::json!({
+        LAZY_TOOL_RESULT_KEY: {
+            "row_id": row_id,
+            "bytes": serialized.len(),
+            "preview": truncate_on_char_boundary(&text, LAZY_TOOL_RESULT_PREVIEW_BYTES),
+            // `split('\n')` (not `lines()`) so the count matches the
+            // frontend's `split("\n").length` on the same text.
+            "line_count": text.split('\n').count(),
+            "has_images": false,
+        }
+    });
+    item.insert("content".to_string(), stub);
+    serde_json::to_string(&value).unwrap_or_else(|_| payload.to_string())
+}
+
+/// Mirror of the frontend's `hasToolResultImages`
+/// (`src/lib/agent-chat/tool-result-images.ts`): an entry counts only if
+/// the renderer would actually draw it.
+///
+/// The accept-set has to match, not merely overlap. Too narrow and we stub
+/// a body the thumbnail grid needs; too wide — the old "any `type` starting
+/// with image" test — and a base64 PDF or a sourceless entry bypasses the
+/// stub, which is exactly backwards, since those are the biggest payloads
+/// and nothing renders them.
+fn content_has_image_block(content: &serde_json::Value) -> bool {
+    let Some(entries) = content.as_array() else {
+        return false;
+    };
+    entries.iter().any(is_renderable_image_entry)
+}
+
+fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+    match entry.get("type").and_then(|t| t.as_str()) {
+        // `{ image_url: { url } }` or a bare string url.
+        Some("image_url") => entry
+            .get("image_url")
+            .and_then(|iu| match iu.as_object() {
+                Some(obj) => obj.get("url").and_then(|u| u.as_str()),
+                None => iu.as_str(),
+            })
+            .is_some_and(is_safe_image_src),
+        Some("image") => {
+            let Some(source) = entry.get("source").and_then(|s| s.as_object()) else {
+                return false;
+            };
+            match source.get("type").and_then(|t| t.as_str()) {
+                Some("base64") => {
+                    let has_data = source
+                        .get("data")
+                        .and_then(|d| d.as_str())
+                        .is_some_and(|d| !d.is_empty());
+                    // An absent media_type renders as image/png frontend-side.
+                    let media_type = source
+                        .get("media_type")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("image/png");
+                    has_data && media_type.to_ascii_lowercase().starts_with("image/")
+                }
+                Some("url") => source
+                    .get("url")
+                    .and_then(|u| u.as_str())
+                    .is_some_and(is_safe_image_src),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Same accept-set as the frontend's `safeImageSrc`: only sources the
+/// webview will load as an image.
+fn is_safe_image_src(raw: &str) -> bool {
+    let url = raw.trim().to_ascii_lowercase();
+    url.starts_with("data:image/")
+        || url.starts_with("http://")
+        || url.starts_with("https://")
+}
+
+/// Flatten tool-result content to the text the collapsed card would
+/// render. Mirrors `contentToString` in `ToolCallBlock.tsx` closely
+/// enough for a preview: strings pass through, array entries contribute
+/// their `text` field (or pretty JSON), objects contribute `text` or
+/// pretty JSON.
+fn stringify_tool_content(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(entries) => entries
+            .iter()
+            .map(|entry| match entry {
+                serde_json::Value::Null => String::new(),
+                serde_json::Value::String(s) => s.clone(),
+                other => match other.get("text").and_then(|t| t.as_str()) {
+                    Some(text) => text.to_string(),
+                    None => serde_json::to_string_pretty(other).unwrap_or_default(),
+                },
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => match other.get("text").and_then(|t| t.as_str()) {
+            Some(text) => text.to_string(),
+            None => serde_json::to_string_pretty(other).unwrap_or_default(),
+        },
+    }
+}
+
+fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
 // ── Event bridge ──────────────────────────────────────────────────────
 
 /// Start the provider-event forwarding tasks.
@@ -2594,6 +2878,12 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
 /// UUID carried by `ResumeCursorUpdated` so the history dropdown can
 /// resume this session after a restart.
 pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent) {
+    // Row id of whatever this event wrote to `agent_chat_messages`, if
+    // anything. Persistence happens BEFORE fan-out (below), so the live
+    // payload can carry the durable position of its own row — that is
+    // what lets a resuming pane tell "already replayed from the tail"
+    // apart from "new".
+    let mut persisted_id: Option<i64> = None;
     if let ProviderRuntimeEvent::ResumeCursorUpdated {
         thread_id,
         resume_cursor,
@@ -2652,12 +2942,25 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             // `pending_queued_images`) so the deferred envelope carries the
             // same attachments an immediate send would have. Absent entry →
             // a text-only queued turn, persisted with no images.
-            let images = pending_queued_images()
+            let pending = pending_queued_images()
                 .lock()
                 .unwrap()
                 .remove(queued_id)
                 .unwrap_or_default();
-            persist_user_message(&db, &thread_id.0, text, &images);
+            // The dispatch event itself is not persisted; the bubble it
+            // promotes is. The row is deliberately NOT reported as this
+            // event's `persisted_id`: a pane that never saw the enqueue
+            // has no queued bubble to promote, so the reducer no-ops and
+            // the row must still arrive through a later tail read. The
+            // nonce carried on the envelope is what keeps that tail read
+            // from duplicating a bubble that WAS promoted.
+            persist_user_message(
+                &db,
+                &thread_id.0,
+                text,
+                &pending.images,
+                pending.client_nonce.as_deref(),
+            );
         }
     }
     // A queued turn was cancelled before it dispatched, so its envelope
@@ -2666,8 +2969,8 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     // leak a file forever.
     if let ProviderRuntimeEvent::QueuedTurnCancelled { queued_id, .. } = &event {
         let orphaned = pending_queued_images().lock().unwrap().remove(queued_id);
-        if let Some(images) = orphaned {
-            for image in images {
+        if let Some(pending) = orphaned {
+            for image in pending.images {
                 let _ = std::fs::remove_file(&image.path);
             }
         }
@@ -2685,12 +2988,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             if !thread_id.0.is_empty() {
                 if let Ok(payload) = serde_json::to_string(&event) {
                     let db: State<'_, DatabaseStore> = app.state();
-                    if let Err(error) =
-                        db.append_agent_chat_message(&thread_id.0, &payload)
-                    {
-                        eprintln!(
+                    match db.append_agent_chat_message(&thread_id.0, &payload) {
+                        Ok(row_id) => persisted_id = row_id,
+                        Err(error) => eprintln!(
                             "[codemux::agent_chat] failed to persist message: {error}"
-                        );
+                        ),
                     }
                 }
             }
@@ -2720,6 +3022,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     let payload = AgentChatEventPayload {
         thread_id: thread_id.clone(),
         event,
+        persisted_id,
     };
     if thread_id.0.is_empty() {
         // Thread-less lifecycle/warning traffic is low-frequency; the
@@ -3024,7 +3327,10 @@ fn publish_pane_status<R: Runtime>(
     // release call always runs even when the pane status itself didn't
     // change (e.g. the thread was already Idle when the session closed).
     if status_changed || released {
-        let snapshot = state.snapshot();
+        // Stamped like every other emitted snapshot: an unrevisioned payload
+        // would be applied unconditionally by the renderer and could overwrite
+        // a newer delta-applied domain with pre-delta values.
+        let snapshot = state.stamped_snapshot();
         if let Err(error) = app.emit("app-state-changed", &snapshot) {
             eprintln!("[codemux::agent_chat] failed to emit app state: {error}");
         }
@@ -3436,6 +3742,175 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ── lazy tool-result shaping (read path) ──
+
+    fn tool_result_payload(content: serde_json::Value) -> String {
+        serde_json::to_string(&json!({
+            "type": "item_completed",
+            "thread_id": "t",
+            "turn_id": "turn-1",
+            "item": {
+                "kind": "tool_result",
+                "tool_use_id": "tu-1",
+                "content": content,
+                "is_error": false,
+            }
+        }))
+        .unwrap()
+    }
+
+    fn big_text(bytes: usize) -> String {
+        // Multi-line so `line_count` is meaningful.
+        "0123456789abcdefghij\n".repeat(bytes / 21 + 1)
+    }
+
+    fn stub_of(payload: &str) -> Option<serde_json::Value> {
+        let value: serde_json::Value = serde_json::from_str(payload).unwrap();
+        value
+            .get("item")?
+            .get("content")?
+            .get(LAZY_TOOL_RESULT_KEY)
+            .cloned()
+    }
+
+    #[test]
+    fn shape_leaves_small_tool_results_untouched() {
+        let payload = tool_result_payload(json!("just a little output"));
+        assert_eq!(shape_persisted_payload(7, &payload), payload);
+    }
+
+    #[test]
+    fn shape_stubs_oversized_tool_result_content() {
+        let text = big_text(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000);
+        let payload = tool_result_payload(json!(text));
+        let shaped = shape_persisted_payload(42, &payload);
+        assert!(shaped.len() < payload.len() / 4);
+
+        let stub = stub_of(&shaped).expect("content replaced by a stub");
+        assert_eq!(stub["row_id"], json!(42));
+        assert_eq!(stub["has_images"], json!(false));
+        assert!(stub["bytes"].as_u64().unwrap() > LAZY_TOOL_RESULT_THRESHOLD_BYTES as u64);
+        assert_eq!(
+            stub["line_count"].as_u64().unwrap() as usize,
+            text.split('\n').count()
+        );
+        let preview = stub["preview"].as_str().unwrap();
+        assert!(preview.len() <= LAZY_TOOL_RESULT_PREVIEW_BYTES);
+        assert!(text.starts_with(preview));
+        // Everything outside `content` survives verbatim.
+        let shaped_value: serde_json::Value = serde_json::from_str(&shaped).unwrap();
+        assert_eq!(shaped_value["item"]["tool_use_id"], json!("tu-1"));
+        assert_eq!(shaped_value["turn_id"], json!("turn-1"));
+    }
+
+    #[test]
+    fn shape_previews_block_arrays_as_flattened_text() {
+        let text = big_text(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000);
+        let payload = tool_result_payload(json!([{ "type": "text", "text": text }]));
+        let stub = stub_of(&shape_persisted_payload(3, &payload)).expect("stubbed");
+        assert!(text.starts_with(stub["preview"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn shape_never_stubs_image_bearing_results() {
+        // Image blocks stay verbatim so the thumbnail grid and the
+        // auto-expand-on-image behaviour keep reading real content.
+        let data = "A".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000);
+        let payload = tool_result_payload(json!([
+            { "type": "text", "text": "screenshot:" },
+            { "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": data } },
+        ]));
+        assert_eq!(shape_persisted_payload(9, &payload), payload);
+
+        let url_payload = tool_result_payload(json!([
+            { "type": "image_url", "image_url": { "url": format!("https://example.test/{data}") } },
+        ]));
+        assert_eq!(shape_persisted_payload(9, &url_payload), url_payload);
+
+        // A bare-string `image_url` and a `source: { type: "url" }` are the
+        // frontend's other two accepted shapes.
+        let bare = tool_result_payload(json!([
+            { "type": "image_url", "image_url": format!("https://example.test/{data}") },
+        ]));
+        assert_eq!(shape_persisted_payload(9, &bare), bare);
+        let sourced = tool_result_payload(json!([
+            { "type": "image", "source": { "type": "url", "url": format!("https://example.test/{data}") } },
+        ]));
+        assert_eq!(shape_persisted_payload(9, &sourced), sourced);
+        // Media type absent → the frontend renders it as image/png.
+        let defaulted = tool_result_payload(json!([
+            { "type": "image", "source": { "type": "base64", "data": data } },
+        ]));
+        assert_eq!(shape_persisted_payload(9, &defaulted), defaulted);
+    }
+
+    #[test]
+    fn shape_stubs_entries_the_frontend_would_never_render_as_images() {
+        // The heaviest payloads used to ride through unstubbed on nothing
+        // but a `type` prefix. None of these draw anything.
+        let data = "A".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000);
+        let cases = vec![
+            // Base64 document, not an image.
+            json!([{ "type": "image", "source": { "type": "base64", "media_type": "application/pdf", "data": data } }]),
+            // No source at all.
+            json!([{ "type": "image", "data": data }]),
+            // Source present but of an unknown kind.
+            json!([{ "type": "image", "source": { "type": "file", "path": data } }]),
+            // Empty base64 data.
+            json!([{ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "" }, "note": data }]),
+            // `image_url` carrying no url string.
+            json!([{ "type": "image_url", "image_url": { "detail": data } }]),
+            // A scheme the webview will not load as an image.
+            json!([{ "type": "image_url", "image_url": { "url": format!("file:///{data}.png") } }]),
+            // Prefix-matching junk type.
+            json!([{ "type": "imagemagick", "text": data }]),
+        ];
+        for content in cases {
+            let payload = tool_result_payload(content.clone());
+            assert!(
+                stub_of(&shape_persisted_payload(9, &payload)).is_some(),
+                "expected a stub for {content}",
+            );
+        }
+    }
+
+    #[test]
+    fn shape_ignores_non_tool_result_envelopes() {
+        let text = big_text(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 5_000);
+        let assistant = serde_json::to_string(&json!({
+            "type": "item_completed",
+            "thread_id": "t",
+            "turn_id": "turn-1",
+            "item": { "kind": "assistant_message", "text": text },
+        }))
+        .unwrap();
+        assert_eq!(shape_persisted_payload(1, &assistant), assistant);
+
+        let user = serde_json::to_string(&json!({
+            "type": "user_message", "thread_id": "t", "text": text,
+        }))
+        .unwrap();
+        assert_eq!(shape_persisted_payload(1, &user), user);
+
+        // Unparseable rows pass through rather than wedging the read.
+        let garbage = format!("not json {}", "x".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES));
+        assert_eq!(shape_persisted_payload(1, &garbage), garbage);
+    }
+
+    #[test]
+    fn shape_skips_payloads_whose_bulk_is_not_the_content() {
+        // A large envelope whose `content` is small keeps its body: the
+        // stub only pays off when the content itself is the weight.
+        let payload = tool_result_payload(json!("small"));
+        let padded = {
+            let mut value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            value["item"]["tool_name"] =
+                json!("N".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 100));
+            serde_json::to_string(&value).unwrap()
+        };
+        assert_eq!(shape_persisted_payload(1, &padded), padded);
+    }
 
     // ── start-path permission_mode heal ──
 
@@ -4354,6 +4829,7 @@ mod tests {
                 delta: ContentDelta::Text { text: text.into() },
                 subagent_id: None,
             },
+            persisted_id: None,
         }
     }
 

@@ -24,13 +24,21 @@ function subscribe(fn: () => void): () => void {
   };
 }
 
-/** Returns `Date.now()` and forces a coarse (~30s) re-render while `active`
- *  is true. When inactive it mounts no interval, so idle rows stay static. */
+/** Returns a coarse (~30s) timestamp and forces a re-render when it advances,
+ *  while `active` is true. When inactive it mounts no interval, so idle rows
+ *  stay static.
+ *
+ *  The timestamp is held in state rather than read as `Date.now()` per render.
+ *  A per-render read looks harmless but hands every consumer a fresh number on
+ *  any unrelated re-render, so passing it down as a prop defeats every
+ *  `React.memo` boundary underneath — which is the whole reason the sidebar
+ *  shares one clock in the first place. Resolution is unchanged: the value is
+ *  never more than one tick stale, which is what "coarse" means here. */
 export function useCoarseClock(active: boolean): number {
-  const [, tick] = useReducer((n: number) => n + 1, 0);
+  const [now, tick] = useReducer(() => Date.now(), 0, () => Date.now());
   useEffect(() => {
     if (!active) return;
     return subscribe(tick);
   }, [active]);
-  return Date.now();
+  return now;
 }

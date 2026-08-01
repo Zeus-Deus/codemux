@@ -3,6 +3,7 @@ import { GitCompare } from "lucide-react";
 import { getGitDiff, getGitStatus, getBaseBranchDiff, getBaseBranchFileDiff } from "@/tauri/commands";
 import { useDiffStore } from "@/stores/diff-store";
 import { parseDiff } from "@/lib/diff-parser";
+import { keepIfUnchanged } from "@/lib/poll-equality";
 import { DiffToolbar } from "./DiffToolbar";
 import { DiffUnifiedView, type DiffViewHandle } from "./DiffUnifiedView";
 import { DiffSplitView } from "./DiffSplitView";
@@ -35,8 +36,11 @@ export function DiffPane({ tabId, workspace }: Props) {
   // Fetch file list on mount and periodically
   useEffect(() => {
     const fetchFiles = () => {
+      // Keep the previous array when the working tree hasn't moved: this
+      // runs every 5 s and an unchanged status must not re-render the file
+      // list and the diff view under it.
       getGitStatus(cwd)
-        .then(setFiles)
+        .then((next) => setFiles((prev) => keepIfUnchanged(prev, next)))
         .catch(console.error);
     };
     fetchFiles();

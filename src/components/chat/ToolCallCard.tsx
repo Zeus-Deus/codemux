@@ -20,6 +20,7 @@ import {
   buildPermissionUpdate,
   type PermissionScope,
 } from "@/lib/agent-chat/permission-rules";
+import { isLazyToolResultStub } from "@/lib/agent-chat/lazy-tool-result";
 import { hasToolResultImages } from "@/lib/agent-chat/tool-result-images";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
@@ -437,6 +438,9 @@ function denialLabel(decision: ApprovalDecision): string {
 
 function hasRenderableContent(content: unknown): boolean {
   if (content == null) return false;
+  // A lazily-stubbed body renders (preview + a fetch affordance), so the
+  // chevron must stay available.
+  if (isLazyToolResultStub(content)) return true;
   if (typeof content === "string") return content.length > 0;
   if (Array.isArray(content)) return content.length > 0;
   return true;

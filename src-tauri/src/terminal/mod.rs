@@ -632,7 +632,7 @@ fn emit_terminal_status<R: Runtime>(
     payload: TerminalStatusPayload,
 ) {
     let app_state: State<'_, AppStateStore> = app.state();
-    app_state.update_terminal_session_status(
+    let session_changed = app_state.update_terminal_session_status(
         &payload.session_id,
         map_status_state(&payload.state),
         payload.message.clone(),
@@ -660,12 +660,25 @@ fn emit_terminal_status<R: Runtime>(
         }
     }
 
-    // On terminal exit, clear transient pane status (working/permission → idle)
+    // On terminal exit, clear transient pane status (working/permission → idle).
+    // The `terminal-status` event below only drives the live terminal overlay,
+    // so the sidebar dot heals from the `PaneStatus` delta instead.
     if matches!(
         payload.state,
         TerminalLifecycleState::Exited | TerminalLifecycleState::Failed
     ) {
-        app_state.clear_transient_pane_status_by_session(&payload.session_id);
+        if let Some(delta) =
+            app_state.clear_transient_pane_status_by_session_delta(&payload.session_id)
+        {
+            state::emit_app_state_delta(app, delta);
+        }
+    }
+
+    // The session's state/last_message/exit_code live in the app state too, and
+    // no delta domain covers them — coalesced so a burst of transitions is one
+    // snapshot.
+    if session_changed {
+        state::schedule_emit_app_state(app);
     }
 
     if let Err(error) = app.emit("terminal-status", payload) {
@@ -2943,8 +2956,11 @@ pub fn resize_pty<R: Runtime>(
 /// so the PTY exit cleanup never fires.
 #[tauri::command]
 pub fn clear_agent_status<R: Runtime>(session_id: String, app_state: State<'_, AppStateStore>, app: AppHandle<R>) {
-    app_state.clear_transient_pane_status_by_session(&session_id);
-    state::emit_app_state(&app);
+    // Nothing else moves on this path, so the clear ships as a `PaneStatus`
+    // delta — the sidebar drops one dot without re-parsing the app state.
+    if let Some(delta) = app_state.clear_transient_pane_status_by_session_delta(&session_id) {
+        state::emit_app_state_delta(&app, delta);
+    }
 }
 
 /// Spawn a PTY for an OpenFlow agent terminal session.
@@ -5457,6 +5473,7 @@ mod tests {
         use crate::state::*;
         AppStateSnapshot {
             schema_version: 1,
+            snapshot_revision: 0,
             active_workspace_id: WorkspaceId(active_id.into()),
             workspaces,
             terminal_sessions: Vec::new(),

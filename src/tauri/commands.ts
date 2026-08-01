@@ -253,8 +253,11 @@ export const resetSyncedSettings = () =>
 
 // ── Resource Monitor ──
 
-export const getResourceMetrics = () =>
-  invoke<ResourceMetricsSnapshot>("get_resource_metrics");
+/** `detail: false` serves a cached summary with fresh host totals, skipping
+ *  the process-table walk + per-PID `smaps_rollup` reads. Used by the slow
+ *  poll that runs while the monitor popover is closed. */
+export const getResourceMetrics = (detail = true) =>
+  invoke<ResourceMetricsSnapshot>("get_resource_metrics", { detail });
 
 // ── Core ──
 
@@ -1664,6 +1667,45 @@ export const agentChatUpdateSessionConfig = (
  */
 export const agentChatListMessages = (threadId: string) =>
   invoke<string[]>("agent_chat_list_messages", { threadId });
+
+/** One persisted row plus its durable `agent_chat_messages.id`. Mirrors
+ *  `AgentChatMessageRow` in `commands/agent_chat.rs`. */
+export interface AgentChatMessageRow {
+  id: number;
+  payload: string;
+}
+
+/**
+ * Cursor read of a thread's transcript: every row after `afterId`
+ * (everything when `null`), ascending.
+ *
+ * This is the resume path — a remounted pane asks only for what it has
+ * not applied yet, so a warm revisit transfers and reduces nothing when
+ * the thread has not moved. Unlike `agentChatListMessages` the payloads
+ * are SHAPED: an oversized tool-result body ships as a lazy stub (see
+ * `lib/agent-chat/lazy-tool-result.ts`) and is fetched on expand through
+ * `agentChatGetToolResult`.
+ */
+export const agentChatListMessagesAfter = (
+  threadId: string,
+  afterId: number | null,
+) =>
+  invoke<AgentChatMessageRow[]>("agent_chat_list_messages_after", {
+    threadId,
+    afterId,
+  });
+
+/** Highest stored row id for a thread (`null` when it has none). Used to
+ *  detect a resume cursor that sits ABOVE the thread's own history — a
+ *  cursor inherited from a merged/deleted thread — which falls back to a
+ *  cold hydrate. */
+export const agentChatThreadHeadId = (threadId: string) =>
+  invoke<number | null>("agent_chat_thread_head_id", { threadId });
+
+/** Fetch one persisted row verbatim, by id: the full tool-result payload
+ *  behind a lazy stub. */
+export const agentChatGetToolResult = (rowId: number) =>
+  invoke<string>("agent_chat_get_tool_result", { rowId });
 
 // ── Run checkpoints (issue #80) ──
 

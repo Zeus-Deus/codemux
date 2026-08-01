@@ -36,6 +36,7 @@ pub mod app_logs;
 pub mod doctor;
 pub mod execution;
 pub mod indexing;
+pub mod jobs;
 pub mod mcp;
 pub mod memory;
 pub mod notifications;
@@ -1002,21 +1003,34 @@ fn build_core_app<R: tauri::Runtime>(
                 }
             }
 
-            // Periodically refresh git info for EVERY workspace (so non-active
-            // sidebar rows stay honest when agents switch branches), plus
-            // PR/issue info for the active workspace only (where `gh` CLI
-            // calls are the expensive part and only the visible row benefits
-            // from being up-to-date every 5s).
+            // Periodically refresh git info for the workspaces due this tick
+            // (so non-active sidebar rows stay honest when agents switch
+            // branches), plus PR/issue info for the active workspace only
+            // (where `gh` CLI calls are the expensive part and only the
+            // visible row benefits from being up-to-date every 5s).
             //
-            // Serial iteration on purpose — cost is predictable (~3 git
-            // subprocesses × N workspaces per tick) and easy to throttle
-            // later if needed. Skips the tick entirely when the main window
-            // is unfocused to avoid wasting CPU/battery while the user is
-            // elsewhere.
+            // Three properties keep this off the interaction path:
+            //
+            //  - **Tiered.** The active workspace refreshes every tick; the
+            //    rest are spread across `GIT_SWEEP_STRIDE` ticks by list
+            //    position, so a 79-workspace profile forks ~N/6 gathers per
+            //    tick instead of N.
+            //  - **Deduped.** Workspaces sharing a checkout gather once.
+            //  - **Change-gated.** The snapshot emit happens only when a
+            //    workspace's git/PR/issue metadata actually moved. An idle
+            //    fleet costs zero serialise + IPC + render passes.
+            //
+            // Serial iteration on purpose — cost stays predictable — but the
+            // git subprocesses run on the blocking pool so a slow disk can't
+            // stall the Tokio worker that also drives in-flight IPC calls.
+            // Skips the tick entirely when the main window is off screen.
             let git_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_secs(2))).await;
+                let mut tick: u64 = 0;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    tick = tick.wrapping_add(1);
 
                     // Pause polling only when the sidebar is genuinely not
                     // on screen. `is_focused()` would wrongly pause when the
@@ -1037,14 +1051,72 @@ fn build_core_app<R: tauri::Runtime>(
                         continue;
                     }
 
+                    // Phase 0 attribution: a periodic tick that overruns a
+                    // frame budget is a candidate explanation for a janky
+                    // interaction. Scheduling is untouched here — only the
+                    // measurement is new.
+                    let tick_started = std::time::Instant::now();
                     let state: tauri::State<'_, state::AppStateStore> = git_handle.state();
-                    let all_workspaces = state.all_workspace_cwds();
+                    // Sorted so a workspace keeps the same stride bucket
+                    // across ticks — a shifting bucket could starve a row.
+                    let mut all_workspaces: Vec<(String, String)> =
+                        state.all_workspace_cwds().into_iter().collect();
+                    all_workspaces.sort();
                     let active = state.active_workspace_cwd();
 
-                    // Refresh git info for every workspace via the shared helper.
-                    for (workspace_id, cwd) in &all_workspaces {
-                        let path = std::path::PathBuf::from(cwd);
-                        commands::workspace::populate_git_info(&state, workspace_id, &path);
+                    // Refresh the workspaces due this tick, gathering once
+                    // per distinct checkout.
+                    //
+                    // `changed` tracks the domains that still ride a full
+                    // snapshot (PR pill, linked issue). Git metadata ships as
+                    // a per-workspace `WorkspaceGit` delta instead — the
+                    // steady state of this loop is one workspace's branch
+                    // counters moving, which has no business re-serialising
+                    // and re-parsing the whole app state.
+                    let mut changed = false;
+                    let mut gathered: std::collections::HashMap<
+                        String,
+                        commands::workspace::WorkspaceGitInfo,
+                    > = std::collections::HashMap::new();
+                    let steps = jobs::plan_git_sweep(
+                        tick,
+                        &all_workspaces,
+                        active.as_ref().map(|(id, _)| id.as_str()),
+                        jobs::GIT_SWEEP_STRIDE,
+                    );
+                    for step in steps {
+                        let info = if step.gather {
+                            let path = std::path::PathBuf::from(&step.cwd);
+                            let gather = tokio::task::spawn_blocking(move || {
+                                commands::workspace::gather_workspace_git_info(&path)
+                            })
+                            .await;
+                            // A panicked gather knows nothing about the
+                            // checkout; the default it would fall back to says
+                            // "not a repo", which wipes the branch and the PR
+                            // pill. Leaving the last good values alone is the
+                            // honest outcome — the next tick retries.
+                            let Ok(info) = gather else {
+                                eprintln!(
+                                    "[codemux::job] git gather failed for {}, keeping last values",
+                                    step.cwd
+                                );
+                                continue;
+                            };
+                            gathered.insert(step.cwd.clone(), info.clone());
+                            info
+                        } else {
+                            match gathered.get(&step.cwd) {
+                                Some(info) => info.clone(),
+                                None => continue,
+                            }
+                        };
+                        if let Some(delta) = state.update_workspace_git_info_delta(
+                            &step.workspace_id,
+                            commands::workspace::git_delta_of(info),
+                        ) {
+                            state::emit_app_state_delta(&git_handle, delta);
+                        }
                     }
 
                     // PR / linked-issue refresh stays scoped to the active
@@ -1079,14 +1151,14 @@ fn build_core_app<R: tauri::Runtime>(
                                 Some(pr) => {
                                     let head_sha = github::get_head_sha(&path);
                                     if github::should_show_branch_pr(pr, head_sha.as_deref()) {
-                                        state.update_workspace_pr_info(
+                                        changed |= state.update_workspace_pr_info(
                                             &workspace_id,
                                             Some(pr.number),
                                             Some(pr.display_state()),
                                             Some(pr.url.clone()),
                                         );
                                     } else {
-                                        state.update_workspace_pr_info(&workspace_id, None, None, None);
+                                        changed |= state.update_workspace_pr_info(&workspace_id, None, None, None);
                                     }
                                 }
                                 None => {
@@ -1101,7 +1173,7 @@ fn build_core_app<R: tauri::Runtime>(
                                         .map(github::is_historical_pr_state)
                                         .unwrap_or(false)
                                     {
-                                        state.update_workspace_pr_info(&workspace_id, None, None, None);
+                                        changed |= state.update_workspace_pr_info(&workspace_id, None, None, None);
                                     }
                                 }
                             }
@@ -1115,7 +1187,7 @@ fn build_core_app<R: tauri::Runtime>(
                             };
                             if let Some(num) = issue_number {
                                 if let Ok(issue) = github::get_github_issue(&path, num) {
-                                    state.link_workspace_issue(&workspace_id, github::LinkedIssue {
+                                    changed |= state.link_workspace_issue(&workspace_id, github::LinkedIssue {
                                         number: issue.number,
                                         title: issue.title,
                                         state: issue.state,
@@ -1126,16 +1198,21 @@ fn build_core_app<R: tauri::Runtime>(
                         }
                     }
 
-                    // Single emit per tick, regardless of how many workspaces
-                    // were refreshed or whether PR info was updated. The
-                    // frontend dedups on payload equality anyway.
+                    // At most one full emit per tick, and only when this tick
+                    // moved something outside the delta domains (the PR pill
+                    // or the linked issue). An idle fleet emits nothing.
                     //
                     // Coalesced because this loop fires every 5 s; if a user
                     // action emits within 16 ms of this tick, both collapse
                     // into one snapshot serialise + IPC + frontend render
                     // pass instead of two.
-                    if !all_workspaces.is_empty() {
+                    if changed {
                         state::schedule_emit_app_state(&git_handle);
+                    }
+
+                    let tick_ms = tick_started.elapsed().as_millis();
+                    if tick_ms > 50 {
+                        eprintln!("[codemux::perf::job] git-sweep tick={tick_ms}ms");
                     }
                 }
             });
@@ -1316,8 +1393,15 @@ fn build_core_app<R: tauri::Runtime>(
 
             let fetch_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                use futures_util::stream::StreamExt as _;
                 const TICK_SECS: u64 = 60;
                 const PER_FETCH_TIMEOUT_SECS: u64 = 10;
+                /// Two `git fetch` children at a time. Unbounded fan-out let
+                /// a large profile start N network+disk children on one
+                /// instant; the tick now drains its own queue and the next
+                /// tick can't overlap it.
+                const FETCH_CONCURRENCY: usize = 2;
+                tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_secs(5))).await;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
 
@@ -1336,22 +1420,46 @@ fn build_core_app<R: tauri::Runtime>(
                     }
 
                     let state: tauri::State<'_, state::AppStateStore> = fetch_handle.state();
-                    let all_workspaces = state.all_workspace_cwds();
+                    // Attach-in-place workspaces are filtered for the same
+                    // reason `all_workspace_cwds` filters them: their cwd is
+                    // a path on another device.
+                    let entries = state.fetchable_workspace_checkouts();
+                    // One fetch per repository: linked worktrees share the
+                    // object store and remote refs of their project root.
+                    let targets = jobs::dedupe_fetch_targets(&entries);
+                    let tick_started = std::time::Instant::now();
+                    let target_count = targets.len();
 
-                    for (_workspace_id, cwd) in all_workspaces {
-                        tokio::spawn(async move {
+                    futures_util::stream::iter(targets)
+                        .for_each_concurrent(FETCH_CONCURRENCY, |cwd| async move {
                             let _ = tokio::time::timeout(
                                 std::time::Duration::from_secs(PER_FETCH_TIMEOUT_SECS),
                                 tokio::process::Command::new("git")
                                     .args(["fetch", "--prune", "--quiet", "--no-tags"])
                                     .current_dir(&cwd)
                                     .env("GIT_TERMINAL_PROMPT", "0")
+                                    // Timing out drops the future, which must
+                                    // take the child with it — an unreachable
+                                    // network otherwise leaves a `git fetch`
+                                    // per repo per tick running forever.
+                                    .kill_on_drop(true)
                                     .output(),
                             )
                             .await;
                             // Result intentionally discarded — see comment
                             // on the parent loop.
-                        });
+                        })
+                        .await;
+
+                    // The tick now drains its own queue, so ticks can't
+                    // overlap — but a queue that outlives its period means
+                    // fetches are the reason a repo's ahead/behind lags.
+                    let tick_secs = tick_started.elapsed().as_secs();
+                    if tick_secs >= TICK_SECS {
+                        eprintln!(
+                            "[codemux::perf::job] git-fetch tick={tick_secs}s repos={target_count} \
+                             (drain outlasted the {TICK_SECS}s period)"
+                        );
                     }
                 }
             });
@@ -1375,6 +1483,7 @@ fn build_core_app<R: tauri::Runtime>(
                 const TICK_SECS: u64 = 60;
                 const PER_CALL_TIMEOUT_SECS: u64 = 10;
                 let mut last_status_authed: Option<bool> = None;
+                tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_secs(3))).await;
 
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(TICK_SECS)).await;
@@ -1399,6 +1508,8 @@ fn build_core_app<R: tauri::Runtime>(
                         continue;
                     }
 
+                    let tick_started = std::time::Instant::now();
+
                     let state: tauri::State<'_, state::AppStateStore> = pr_handle.state();
                     let workspaces: Vec<(String, String)> = {
                         let snapshot = state.snapshot();
@@ -1415,6 +1526,11 @@ fn build_core_app<R: tauri::Runtime>(
                             .collect()
                     };
 
+                    // `refreshed` counts workspaces this tick wrote to (the
+                    // log's unit of work); `changed` is the narrower
+                    // question the emit turns on — whether any of those
+                    // writes actually moved a pill.
+                    let mut changed = false;
                     let mut refreshed = 0usize;
                     let mut skipped_non_github = 0usize;
                     let mut timed_out = 0usize;
@@ -1471,7 +1587,7 @@ fn build_core_app<R: tauri::Runtime>(
                                 .flatten();
 
                                 if github::should_show_branch_pr(&pr, head_sha.as_deref()) {
-                                    state.update_workspace_pr_info(
+                                    changed |= state.update_workspace_pr_info(
                                         &workspace_id,
                                         Some(pr.number),
                                         Some(pr.display_state()),
@@ -1484,7 +1600,7 @@ fn build_core_app<R: tauri::Runtime>(
                                     // clear the pill so a long-lived branch
                                     // (typically `main`) doesn't carry the old
                                     // merged PR forever.
-                                    state.update_workspace_pr_info(&workspace_id, None, None, None);
+                                    changed |= state.update_workspace_pr_info(&workspace_id, None, None, None);
                                     refreshed += 1;
                                 }
                             }
@@ -1509,7 +1625,7 @@ fn build_core_app<R: tauri::Runtime>(
                                     .map(github::is_historical_pr_state)
                                     .unwrap_or(false)
                                 {
-                                    state.update_workspace_pr_info(&workspace_id, None, None, None);
+                                    changed |= state.update_workspace_pr_info(&workspace_id, None, None, None);
                                     refreshed += 1;
                                 }
                             }
@@ -1532,23 +1648,54 @@ fn build_core_app<R: tauri::Runtime>(
                         }
                     }
 
-                    if refreshed > 0 {
+                    if changed {
                         // Coalesced: PR poll runs on its own cadence; if
                         // it lands within 16 ms of the git poll the two
                         // emits collapse into one frontend render.
                         state::schedule_emit_app_state(&pr_handle);
                     }
-                    eprintln!(
-                        "[codemux::pr-poll] tick — refreshed={refreshed} skipped_non_github={skipped_non_github} timed_out={timed_out}"
-                    );
+                    // Log only ticks that did something or hit a timeout —
+                    // the steady state is silent, so a line in the log means
+                    // a real event instead of a heartbeat to scroll past.
+                    if refreshed > 0 || timed_out > 0 {
+                        eprintln!(
+                            "[codemux::pr-poll] tick — refreshed={refreshed} skipped_non_github={skipped_non_github} timed_out={timed_out}"
+                        );
+                    }
+                    let tick_ms = tick_started.elapsed().as_millis();
+                    if tick_ms > 50 {
+                        eprintln!("[codemux::perf::job] pr-poll tick={tick_ms}ms");
+                    }
                 }
             });
 
             // Periodically scan for listening TCP ports and associate with workspaces
             let port_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(jobs::startup_jitter(std::time::Duration::from_millis(1500)))
+                    .await;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                    // Same off-screen gate as the git sweep. Detected ports
+                    // are read only by sidebar surfaces (the ports popover,
+                    // the workspace row pill), so a scan of every
+                    // `/proc/*/fd/` entry while the window is hidden buys
+                    // nothing — the next tick repopulates within 3 s of the
+                    // window coming back.
+                    let window_active = port_handle
+                        .get_webview_window("main")
+                        .map(|w| {
+                            let visible = w.is_visible().unwrap_or(false);
+                            let minimized = w.is_minimized().unwrap_or(true);
+                            visible && !minimized
+                        })
+                        .unwrap_or(false);
+                    if !window_active {
+                        continue;
+                    }
+
+                    let tick_started = std::time::Instant::now();
                     let app_state: tauri::State<'_, state::AppStateStore> = port_handle.state();
                     let pty_state: tauri::State<'_, terminal::PtyState> = port_handle.state();
 
@@ -1575,11 +1722,39 @@ fn build_core_app<R: tauri::Runtime>(
                         })
                         .collect();
 
-                    if app_state.update_detected_ports(port_snapshots) {
-                        // Coalesced: port detection is a background
-                        // heartbeat — no need for synchronous emit.
-                        state::schedule_emit_app_state(&port_handle);
+                    // The detected-port list is its own domain: nothing else
+                    // in the app state moves when it changes, so it ships as a
+                    // delta rather than a full snapshot.
+                    if let Some(delta) = app_state.update_detected_ports_delta(port_snapshots) {
+                        state::emit_app_state_delta(&port_handle, delta);
                     }
+
+                    let tick_ms = tick_started.elapsed().as_millis();
+                    if tick_ms > 50 {
+                        eprintln!("[codemux::perf::job] port-poll tick={tick_ms}ms");
+                    }
+                }
+            });
+
+            // Revision heartbeat — the resync safety net.
+            //
+            // Background loops are change-gated, so an idle app emits nothing
+            // and the renderer's last snapshot could silently drift from the
+            // backend if a mutation path ever mutates and forgets to emit, or
+            // if an event is dropped in delivery. Once a minute we publish the
+            // bare revision counter (no snapshot build, no serialise of state)
+            // and let the renderer decide: it refetches only when it is
+            // actually behind. Jittered so it doesn't line up with the 3 s /
+            // 5 s / 60 s loops.
+            let revision_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(
+                        std::time::Duration::from_secs(60)
+                            + jobs::startup_jitter(std::time::Duration::from_secs(10)),
+                    )
+                    .await;
+                    state::emit_app_state_revision(&revision_handle);
                 }
             });
 
@@ -1835,6 +2010,9 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_rename_session,
             commands::agent_chat_delete_session,
             commands::agent_chat_list_messages,
+            commands::agent_chat_list_messages_after,
+            commands::agent_chat_thread_head_id,
+            commands::agent_chat_get_tool_result,
             commands::agent_chat_get_checkpoint,
             commands::agent_chat_restore_checkpoint,
             commands::attach_agent_chat_output,

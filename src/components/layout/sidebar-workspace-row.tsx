@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -42,7 +42,6 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { PrStatusIcon, humanizePrState } from "@/components/github/pr-status-icon";
 import {
-  activateWorkspace,
   archiveWorkspace,
   checkoutDefaultBranchInWorkspace,
   closeWorkspace,
@@ -68,7 +67,7 @@ import {
   useTunnelStatusStore,
   tunnelStatusKind,
 } from "@/stores/tunnel-status-store";
-import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { getWorkspaceStatus } from "@/lib/pane-status";
 import {
   useSidebarDensityStore,
@@ -714,10 +713,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
   const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
 
   const handleActivate = () => {
-    useChatDraftStore.getState().setActiveDraft(null);
-    startTransition(() => {
-      activateWorkspace(workspace.workspace_id).catch(console.error);
-    });
+    // Paints the selection in this click's own task (the helper clears the
+    // active draft too); a transition here would only delay it.
+    activateWorkspaceInteraction(workspace.workspace_id).catch(console.error);
   };
 
   // Archive: remove from sidebar, keep everything on disk. Undo on the

@@ -926,6 +926,12 @@ export interface PortInfoSnapshot {
 
 export interface AppStateSnapshot {
   schema_version: number;
+  /** Monotonic per-emit counter stamped by the backend. Strictly increasing
+   *  across emitted snapshots, so a snapshot whose revision is not above the
+   *  last applied one is stale and dropped (`app-store.ts`). Optional: state
+   *  restored from disk and older backends carry no revision, which reads as
+   *  0 — "unrevisioned, always apply". */
+  snapshot_revision?: number;
   active_workspace_id: string;
   workspaces: WorkspaceSnapshot[];
   terminal_sessions: TerminalSessionSnapshot[];
@@ -939,6 +945,54 @@ export interface AppStateSnapshot {
   archived_workspaces?: ArchivedWorkspaceSnapshot[];
   persistence: PersistenceSchema;
   config: CodemuxConfigSnapshot;
+}
+
+// ── Domain deltas ──
+//
+// Mirror of `AppStateDelta` / `RevisionedDelta` in
+// src-tauri/src/state/state_impl.rs. High-frequency metadata refreshes ship
+// one of these on `app-state-delta` instead of a full `AppStateSnapshot`;
+// the snapshot stays the boot / resync / activation vehicle.
+//
+// Deltas and snapshots share ONE revision counter, so the renderer sees a
+// single totally ordered stream: a delta at revision N reflects the backend
+// state at N, and a snapshot at N supersedes every delta at or below N. No
+// variant carries `active_workspace_id` — deliberately, so a background
+// refresh can never clobber an optimistic selection.
+
+/** The git-metadata subset of `WorkspaceSnapshot` carried by a
+ *  `workspace_git` delta. Field names match the snapshot's own, so applying
+ *  the delta is a spread. */
+export interface WorkspaceGitDelta {
+  is_git: boolean;
+  git_branch: string | null;
+  git_ahead: number;
+  git_behind: number;
+  git_additions: number;
+  git_deletions: number;
+  git_changed_files: number;
+}
+
+export type AppStateDelta =
+  | { domain: "workspace_git"; workspace_id: string; git: WorkspaceGitDelta }
+  | { domain: "detected_ports"; ports: PortInfoSnapshot[] }
+  | {
+      domain: "pane_status";
+      pane_id: string;
+      /** `null` clears the pane's entry — the map only stores non-idle panes. */
+      status: PaneStatus | null;
+    };
+
+/** Payload of the `app-state-delta` event. */
+export interface RevisionedDelta {
+  revision: number;
+  delta: AppStateDelta;
+}
+
+/** Payload of the `app-state-revision` heartbeat: the backend's current
+ *  revision counter, with no snapshot attached. */
+export interface RevisionHeartbeat {
+  revision: number;
 }
 
 // ── CLI / Agent Config ──

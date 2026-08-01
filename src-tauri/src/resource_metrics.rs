@@ -116,12 +116,16 @@ pub struct ResourceMetricsSnapshot {
 /// `System` every call would always report `0.0` CPU.
 pub struct ResourceMonitorState {
     system: Mutex<System>,
+    /// The most recent detailed snapshot, replayed by the summary path so a
+    /// closed monitor doesn't walk the process table on every poll.
+    last_detailed: Mutex<Option<ResourceMetricsSnapshot>>,
 }
 
 impl ResourceMonitorState {
     pub fn new() -> Self {
         Self {
             system: Mutex::new(System::new()),
+            last_detailed: Mutex::new(None),
         }
     }
 }
@@ -601,12 +605,51 @@ fn collect_host_metrics(system: &System) -> HostMetrics {
     }
 }
 
+// ── Summary path (monitor closed) ──
+
+/// How stale a cached detailed snapshot may get before the summary path pays
+/// for a fresh detailed collection anyway. The closed monitor polls every
+/// 15 s, so this walks the process table on roughly one poll in four while
+/// keeping the severity dot honest to within a minute.
+const SUMMARY_MAX_AGE_MS: u64 = 60_000;
+
+/// Whether the summary path must fall back to a full detailed collection.
+fn summary_needs_detail(cached_collected_at: Option<u64>, now_ms: u64) -> bool {
+    match cached_collected_at {
+        None => true,
+        Some(collected_at) => now_ms.saturating_sub(collected_at) >= SUMMARY_MAX_AGE_MS,
+    }
+}
+
+/// Refresh only what is cheap and replay the rest from `cached`.
+///
+/// Host totals are one `/proc/meminfo`-class read, so they stay live. The
+/// per-process buckets are exactly what this path exists to avoid — a full
+/// `ProcessesToUpdate::All` refresh plus one `smaps_rollup` read per
+/// reported PID — so they are replayed verbatim, `collected_at` included:
+/// the numbers are as old as the timestamp says they are.
+fn collect_summary(
+    system: &mut System,
+    cached: &ResourceMetricsSnapshot,
+) -> ResourceMetricsSnapshot {
+    system.refresh_memory();
+    ResourceMetricsSnapshot {
+        host: collect_host_metrics(system),
+        ..cached.clone()
+    }
+}
+
 // ── Tauri command ──
 
-/// Collect one resource-monitor snapshot. Cheap enough to poll every couple of
-/// seconds; the persistent [`System`] handle makes CPU deltas accurate.
+/// Collect one resource-monitor snapshot.
+///
+/// `detail` defaults to true so any caller that omits it keeps the original
+/// behavior. The renderer passes `false` on the slow poll it runs while the
+/// monitor popover is closed, where only the host share and the severity dot
+/// are on screen and a per-process walk every 15 s is pure waste.
 #[tauri::command]
 pub fn get_resource_metrics(
+    detail: Option<bool>,
     monitor: State<'_, ResourceMonitorState>,
     pty_state: State<'_, PtyState>,
     app_state: State<'_, AppStateStore>,
@@ -615,7 +658,22 @@ pub fn get_resource_metrics(
         .system
         .lock()
         .map_err(|_| "resource monitor state poisoned".to_string())?;
-    Ok(collect_snapshot(&mut system, &pty_state, &app_state))
+    let mut last_detailed = monitor
+        .last_detailed
+        .lock()
+        .map_err(|_| "resource monitor state poisoned".to_string())?;
+
+    if !detail.unwrap_or(true) {
+        if let Some(cached) = last_detailed.as_ref() {
+            if !summary_needs_detail(Some(cached.collected_at), unix_millis()) {
+                return Ok(collect_summary(&mut system, cached));
+            }
+        }
+    }
+
+    let snapshot = collect_snapshot(&mut system, &pty_state, &app_state);
+    *last_detailed = Some(snapshot.clone());
+    Ok(snapshot)
 }
 
 // ── Tests ──
@@ -863,5 +921,75 @@ Shared_Clean:      16384 kB
         assert!(is_web_view_process("msedgewebview2"));
         assert!(!is_web_view_process("bash"));
         assert!(!is_web_view_process("codemux"));
+    }
+
+    // ── Summary path (monitor closed) ──
+
+    fn cached_snapshot(collected_at: u64) -> ResourceMetricsSnapshot {
+        ResourceMetricsSnapshot {
+            app: AppMetrics {
+                cpu: 12.5,
+                memory: 400,
+                main: UsageValues { cpu: 12.5, memory: 400 },
+                web_view: UsageValues::default(),
+                other: UsageValues::default(),
+            },
+            workspaces: vec![WorkspaceMetrics {
+                workspace_id: "ws-1".into(),
+                project_id: "p-1".into(),
+                project_name: "p".into(),
+                workspace_name: "w".into(),
+                cpu: 3.0,
+                memory: 100,
+                sessions: Vec::new(),
+            }],
+            host: HostMetrics {
+                total_memory: 1,
+                free_memory: 1,
+                used_memory: 0,
+                memory_usage_percent: 0.0,
+                cpu_core_count: 1,
+                load_average_1m: 0.0,
+            },
+            total_cpu: 15.5,
+            total_memory: 500,
+            collected_at,
+        }
+    }
+
+    #[test]
+    fn summary_needs_detail_without_a_cached_snapshot() {
+        assert!(summary_needs_detail(None, 1_000));
+    }
+
+    #[test]
+    fn summary_serves_the_cache_until_it_ages_out() {
+        let now = SUMMARY_MAX_AGE_MS + 10_000;
+        assert!(!summary_needs_detail(Some(now - 1), now));
+        assert!(!summary_needs_detail(Some(now - (SUMMARY_MAX_AGE_MS - 1)), now));
+        assert!(summary_needs_detail(Some(now - SUMMARY_MAX_AGE_MS), now));
+    }
+
+    #[test]
+    fn collect_summary_replays_buckets_without_walking_processes() {
+        let cached = cached_snapshot(1_700_000_000_000);
+        // A `System` that has never refreshed its process table: if the
+        // summary path walked processes it would have to populate this, and
+        // the replayed buckets below could not survive.
+        let mut system = System::new();
+        let summary = collect_summary(&mut system, &cached);
+
+        assert!(
+            system.processes().is_empty(),
+            "summary path must not refresh the process table",
+        );
+        assert_eq!(summary.collected_at, cached.collected_at);
+        assert_eq!(summary.total_memory, cached.total_memory);
+        assert_eq!(summary.total_cpu, cached.total_cpu);
+        assert_eq!(summary.app.memory, cached.app.memory);
+        assert_eq!(summary.workspaces.len(), 1);
+        assert_eq!(summary.workspaces[0].workspace_id, "ws-1");
+        // Host totals are the one thing the summary refreshes.
+        assert!(summary.host.total_memory > 1);
     }
 }

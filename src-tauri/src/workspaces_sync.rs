@@ -1025,6 +1025,7 @@ mod tests {
             .unwrap_or_else(|| WorkspaceId(String::new()));
         AppStateSnapshot {
             schema_version: 1,
+            snapshot_revision: 0,
             active_workspace_id: active,
             workspaces,
             terminal_sessions: Vec::new(),

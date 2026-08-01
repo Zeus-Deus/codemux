@@ -1067,13 +1067,21 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 // for real and write the actual port back into state so
                 // the frontend's reactive `stream_url` reflects reality
                 // (P6).
-                let placeholder_port = state
-                    .agent_browser_stream_port_for_workspace(&workspace_id)
+                let existing_port =
+                    state.agent_browser_stream_port_for_workspace(&workspace_id);
+                let placeholder_port = existing_port
                     .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
                 let session_for_naming = state.resolve_agent_browser_session(
                     &workspace_id,
                     placeholder_port,
                 );
+                // `resolve_` inserts a record when none existed (but not for a
+                // workspace that is already gone), so the state is checked
+                // again rather than assumed.
+                let session_created = existing_port.is_none()
+                    && state
+                        .agent_browser_stream_port_for_workspace(&workspace_id)
+                        .is_some();
                 let stream_port = agent_browser
                     .allocate_port(&session_for_naming.cli_session_name)
                     .await
@@ -1082,14 +1090,21 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 // Persist the real port back into the agent session so
                 // the frontend's `stream_url` is reactive when the port
                 // gets re-allocated after a teardown/respawn.
-                let _ = state.update_agent_browser_stream_port(
-                    &workspace_id,
-                    stream_port,
-                );
+                let port_changed = state
+                    .update_agent_browser_stream_port(&workspace_id, stream_port)
+                    .unwrap_or(false);
                 let agent_session = state.resolve_agent_browser_session(
                     &workspace_id,
                     stream_port,
                 );
+
+                // The emits further down are scoped to the action kinds that
+                // create or attach a pane, so a screenshot/click/type action —
+                // or an `open_url` that hits neither branch — would leave the
+                // new session record and the moved `stream_url` unrendered.
+                if session_created || port_changed {
+                    crate::state::schedule_emit_app_state(&app);
+                }
 
                 // GUI-mode background browsing (docs/features/browser.md
                 // "Background browser in GUI mode"): when the Agent Chat

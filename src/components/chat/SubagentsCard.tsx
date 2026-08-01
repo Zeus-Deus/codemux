@@ -7,7 +7,7 @@ import {
   LoaderCircle,
   X,
 } from "lucide-react";
-import { memo, useEffect, useState } from "react";
+import { memo, useState } from "react";
 
 import {
   describeToolCall,
@@ -19,6 +19,8 @@ import {
 } from "@/lib/agent-chat/subagents";
 import type { SubagentRunItem, SubagentView } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
+
+import { TickingText } from "./TickingText";
 
 /**
  * Subagents orchestration card (design "Subagents, made visible"). One
@@ -45,7 +47,6 @@ export const SubagentsCard = memo(function SubagentsCard({
   const subs = item.subagents;
   const anyRunning = subs.some((s) => s.status === "running");
   const anyFailed = subs.some((s) => s.status === "failed");
-  const now = useNow(anyRunning);
   const [openId, setOpenId] = useState<string | null>(null);
 
   const doneCount = subs.filter(
@@ -101,7 +102,6 @@ export const SubagentsCard = memo(function SubagentsCard({
           <SubagentRow
             key={sub.id}
             sub={sub}
-            now={now}
             open={openId === sub.id}
             onToggle={() =>
               setOpenId((cur) => (cur === sub.id ? null : sub.id))
@@ -123,13 +123,11 @@ export const SubagentsCard = memo(function SubagentsCard({
 
 function SubagentRow({
   sub,
-  now,
   open,
   onToggle,
   onEnter,
 }: {
   sub: SubagentView;
-  now: number;
   open: boolean;
   onToggle: () => void;
   onEnter: () => void;
@@ -137,7 +135,6 @@ function SubagentRow({
   const running = isRunning(sub);
   const tone = statusTone(sub.status);
   const activity = subagentActivityLine(sub);
-  const meta = subagentMetaLine(sub, now);
   const peek = recentToolCalls(sub, 3);
 
   return (
@@ -209,9 +206,11 @@ function SubagentRow({
         </div>
 
         {/* Meta */}
-        <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
-          {meta}
-        </span>
+        <TickingText
+          className="shrink-0 font-mono text-[11px] text-muted-foreground"
+          active={running}
+          compute={(now) => subagentMetaLine(sub, now)}
+        />
 
         {/* Enter */}
         <button
@@ -287,14 +286,3 @@ function SubagentRow({
   );
 }
 
-/** 1s tick while `active`, so derived elapsed times advance without a
- *  provider `duration_ms`. Frozen (no interval) when nothing is running. */
-function useNow(active: boolean): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (!active) return;
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [active]);
-  return now;
-}

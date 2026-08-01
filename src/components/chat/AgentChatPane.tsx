@@ -27,6 +27,11 @@ import {
   discardStagedImage,
 } from "@/lib/agent-chat/image-staging";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
+import { hydrateThreadByCursor } from "@/lib/agent-chat/cursor-hydrate";
+import {
+  enqueueAgentChatEvent,
+  flushAgentChatEvents,
+} from "@/lib/agent-chat/event-batcher";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import {
@@ -51,8 +56,10 @@ import {
 } from "@/stores/app-store";
 import {
   DEFAULT_THREAD_PERMISSION_MODE,
+  registerMountedThread,
   useAgentChatStore,
   type Attachment,
+  type ChatMode,
 } from "@/stores/agent-chat-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { useShallow } from "zustand/react/shallow";
@@ -66,8 +73,6 @@ import {
   agentChatSendQueuedTurnNow,
   agentChatGetSession,
   agentChatInterruptTurn,
-  agentChatListMessages,
-  agentChatTurnActive,
   agentChatListSessions,
   agentChatRespondToRequest,
   agentChatSendTurn,
@@ -88,7 +93,6 @@ import {
   type AgentChatSessionConfigUpdate,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
-import { replayPayloads } from "@/lib/agent-chat/hydrate";
 import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
@@ -453,12 +457,52 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     selectCapabilities(s, provider),
   );
 
-  const slice = useAgentChatStore((s) =>
-    threadId ? s.threads[threadId] : null,
+  // Field-level subscriptions, grouped by update cadence, instead of one
+  // whole-slice read. Every store write mints a new slice object, so a
+  // whole-slice subscription made the transcript's inputs look changed on
+  // every keystroke even though `messages` had not moved. Each group below
+  // returns reference-equal values while its own fields are untouched:
+  // typing therefore leaves `timeline` identical, and the memo boundary on
+  // `ChatTranscript` turns that into zero timeline rows rendered per
+  // keystroke. (The pane itself still re-renders — it owns the composer.)
+  const draft = useAgentChatStore(
+    (s) => (threadId ? s.threads[threadId]?.inputDraft ?? "" : ""),
   );
-  const draft = slice?.inputDraft ?? "";
-  const messages = slice?.messages ?? EMPTY_MESSAGES;
-  const streaming = slice?.streaming ?? false;
+  const timeline = useAgentChatStore(
+    useShallow((s) => {
+      const t = threadId ? s.threads[threadId] : undefined;
+      return {
+        messages: t?.messages ?? EMPTY_MESSAGES,
+        streaming: t?.streaming ?? false,
+        // Dead-run detection (issue #154): the stall notice + interrupted /
+        // Continue affordances read straight off the thread slice.
+        stalled: t?.stalled ?? null,
+        interrupted: t?.interrupted ?? false,
+        activeTurnId: t?.activeTurnId ?? null,
+      };
+    }),
+  );
+  const { messages, streaming, stalled, interrupted, activeTurnId } = timeline;
+  const settings = useAgentChatStore(
+    useShallow((s) => {
+      const t = threadId ? s.threads[threadId] : undefined;
+      return {
+        model: t?.model ?? null,
+        permissionMode: t?.permissionMode ?? null,
+        effort: t?.effort ?? null,
+        contextWindow: t?.contextWindow ?? null,
+        fastMode: t?.fastMode ?? false,
+        mode: t?.mode ?? ("default" as ChatMode),
+        hasDebugActivity: t?.hasDebugActivity ?? false,
+        debugActivityResolved: t?.debugActivityResolved ?? false,
+      };
+    }),
+  );
+  const stagedAttachments = useAgentChatStore(
+    (s) =>
+      (threadId ? s.threads[threadId]?.stagedAttachments : undefined) ??
+      EMPTY_ATTACHMENTS,
+  );
 
   // Warm the MCP servers once when a fresh (empty) chat pane mounts, so
   // the prime cost overlaps the user composing rather than blocking the
@@ -473,10 +517,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       /* best-effort */
     });
   }, [messages.length]);
-  // Dead-run detection (issue #154): the stall notice + interrupted /
-  // Continue affordances read straight off the thread slice.
-  const stalled = slice?.stalled ?? null;
-  const interrupted = slice?.interrupted ?? false;
 
   // Subagent drill-in view state (locked decision 3): the pane swaps its
   // transcript body for a read-only sub-transcript and its sub-header for
@@ -546,21 +586,21 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       })),
     [],
   );
-  const activeTurnId = slice?.activeTurnId ?? null;
-  const model = slice?.model ?? null;
+  const {
+    model,
+    effort,
+    contextWindow,
+    fastMode,
+    mode,
+    hasDebugActivity,
+    debugActivityResolved,
+  } = settings;
   const providerDefaultPermissionMode =
     defaultPermissionModeForProvider(provider);
   const permissionMode =
-    slice?.permissionMode ??
+    settings.permissionMode ??
     providerDefaultPermissionMode ??
     DEFAULT_THREAD_PERMISSION_MODE;
-  const effort = slice?.effort ?? null;
-  const contextWindow = slice?.contextWindow ?? null;
-  const fastMode = slice?.fastMode ?? false;
-  const mode = slice?.mode ?? "default";
-  const hasDebugActivity = slice?.hasDebugActivity ?? false;
-  const debugActivityResolved = slice?.debugActivityResolved ?? false;
-  const stagedAttachments = slice?.stagedAttachments ?? EMPTY_ATTACHMENTS;
   const activeModel = selectModel(capabilities, model);
   const effortLabelMap = capabilities?.effort_label_map ?? {};
   const permissionModes = capabilities?.permission_modes ?? null;
@@ -784,14 +824,37 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setStoreDebugActivityResolved,
   ]);
 
-  // Subscribe to provider events for this thread. The handler reads
-  // store actions via `getState()` so it stays stable across
-  // re-renders — otherwise we'd rebind the Tauri listener on every
-  // keystroke.
+  // Subscribe to provider events for this thread. The handler is stable
+  // across re-renders (module-level batcher, no captured state) —
+  // otherwise we'd rebind the Tauri listener on every keystroke.
+  //
+  // Events go through the display-cadence coalescer rather than straight
+  // to `applyEvent`: streaming tokens arrive far faster than frames, and
+  // one store write per token means one full transcript rebuild per token.
+  // Anything that is not a `content_delta` still applies synchronously —
+  // see lib/agent-chat/event-batcher.ts.
   const handleEvent = useCallback((payload: AgentChatEventPayload) => {
-    useAgentChatStore.getState().applyEvent(payload.thread_id, payload.event);
+    enqueueAgentChatEvent(
+      payload.thread_id,
+      payload.event,
+      payload.persisted_id ?? null,
+    );
   }, []);
   useAgentChatEvents(threadId, handleEvent);
+  // Detaching from a thread (switch / unmount) has no next frame to flush
+  // on, so drain whatever this thread queued before the listener goes.
+  useEffect(() => {
+    if (!threadId) return;
+    return () => flushAgentChatEvents(threadId);
+  }, [threadId]);
+
+  // Warm-slice eviction is budget-driven and cannot see the pane tree, so
+  // a mounted-but-idle transcript would otherwise be a legal victim — and
+  // evicting it blanks the pane the user is looking at.
+  useEffect(() => {
+    if (!threadId) return;
+    return registerMountedThread(threadId);
+  }, [threadId]);
 
   // Hydrate on (re)mount when the pane attaches to a thread that
   // already has a server-side transcript.
@@ -809,13 +872,25 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // user message with no agent reply, even though the agent had run
   // (file changes proved it).
   //
-  // We pull the persisted transcript on every mount that lands with a
-  // truthy `threadId`, replay it through the same pure reducer the
-  // live stream uses, and only call `hydrateThread` if the replayed
-  // transcript is longer than the in-memory slice — otherwise the
-  // local state is at least as fresh as disk and a hydrate would
-  // clobber events that haven't been persisted yet (the persistence
-  // path is async, so live state can briefly lead disk).
+  // Resume is cursor-based (Phase 3). The slice records the highest
+  // `agent_chat_messages.id` it has applied, so a remount asks for the
+  // TAIL after that id and folds it in with one ordered reduction. A
+  // thread that has not moved returns zero rows and costs nothing —
+  // where the old code fetched the whole transcript, reduced it twice,
+  // and compared rendered message counts (not a durable position, and
+  // wrong in both directions at the boundaries).
+  //
+  // Race handling, adapted from the buffer-before-read pattern: live
+  // events for this thread are HELD from just before the state read
+  // until just after the merge. Overlap between the tail read and the
+  // held events is expected and harmless — the store drops any event
+  // whose `persisted_id` is at or below the new cursor. Applying them
+  // eagerly instead would let the merge clobber them, and a gap cannot
+  // be recovered the way a duplicate can.
+  //
+  // A cancelled hydrate DISCARDS the held events rather than applying
+  // them: the cursor never advanced past them, so the next mount's tail
+  // read fetches exactly those rows again.
   //
   // `hydrateAttemptedRef` is keyed by thread id so a thread switch
   // (resume → new thread id, recovery → adopted orphan thread id)
@@ -827,42 +902,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     if (hydrateAttemptedRef.current === threadId) return;
     hydrateAttemptedRef.current = threadId;
     let cancelled = false;
-    void (async () => {
-      try {
-        const payloads = await agentChatListMessages(threadId);
-        if (cancelled) return;
-        if (payloads.length === 0) return;
-        const replayed = replayPayloads(payloads, { provider });
-        const slice = useAgentChatStore.getState().threads[threadId];
-        const localCount = slice?.messages.length ?? 0;
-        // Guard against clobbering live state: only hydrate when disk
-        // has strictly more rendered messages than memory. Equal /
-        // shorter means the live stream kept up.
-        if (replayed.messages.length <= localCount) return;
-        // Ask the backend whether this thread's turn is still in flight.
-        // Ordering matters: messages are fetched FIRST, liveness SECOND —
-        // if the turn settles between the two calls the `turn_completed`
-        // row is already in `payloads`, so `runLive` can only ever be a
-        // conservative false, never a stale "alive". Any invoke error
-        // (missing command, transient failure) degrades to `false`, i.e.
-        // today's heuristic behavior. A live turn means the persisted
-        // tail's missing terminal event is expected, not an interrupt —
-        // `runLive` suppresses the false Run-interrupted divider.
-        const runLive = await agentChatTurnActive(provider, threadId).catch(
-          () => false,
-        );
-        if (cancelled) return;
-        useAgentChatStore
-          .getState()
-          .hydrateThread(threadId, payloads, { runLive, provider });
-      } catch (err) {
-        // Soft-fail: if hydrate fails, the user still sees whatever
-        // the live stream brings in. Log so it's debuggable.
-        console.warn("[agent-chat] hydrate-on-mount failed:", err);
-      }
-    })();
+    void hydrateThreadByCursor(threadId, provider, () => cancelled);
     return () => {
       cancelled = true;
+      // The hold belongs to the hydrate, which drops or releases it under
+      // its own token in a `finally`. Dropping from here would have no
+      // token to present — and would clobber the hold of the NEXT
+      // hydrate, which a remount inside the IPC window has already taken.
       // Release the attempt marker on teardown. Without this, React
       // StrictMode's dev-only mount→unmount→remount cycle cancels the
       // first invocation's in-flight fetch and the second invocation
@@ -2845,6 +2891,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   );
 }
 
-const EMPTY_MESSAGES: ChatViewItem[] = [];
-const EMPTY_REQUESTS: PermissionRequestItem[] = [];
-const EMPTY_ATTACHMENTS: Attachment[] = [];
+// Frozen module-scope sentinels: a null-thread read has to hand back the
+// SAME array every time or the `?? []` fallback silently defeats the
+// identity checks the memoized transcript depends on.
+const EMPTY_MESSAGES = Object.freeze([]) as unknown as ChatViewItem[];
+const EMPTY_REQUESTS = Object.freeze([]) as unknown as PermissionRequestItem[];
+const EMPTY_ATTACHMENTS = Object.freeze([]) as unknown as Attachment[];

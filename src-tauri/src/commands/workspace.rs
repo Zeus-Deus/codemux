@@ -30,6 +30,7 @@ use tauri::{Emitter, Manager, State};
 /// them via `spawn_blocking` and then apply the result synchronously to
 /// state — `AppStateStore` references can't cross the `spawn_blocking`
 /// boundary.
+#[derive(Clone)]
 pub(crate) struct WorkspaceGitInfo {
     pub is_git: bool,
     pub branch: Option<String>,
@@ -86,7 +87,15 @@ impl Default for WorkspaceGitInfo {
     }
 }
 
-fn apply_workspace_git_info(state: &AppStateStore, workspace_id: &str, info: WorkspaceGitInfo) {
+/// Write a gathered git snapshot into state. Returns true when a field
+/// actually moved, so the periodic sweep can emit only on real change.
+/// `pub(crate)` because the sweep in `lib.rs` gathers once per checkout and
+/// applies that one result to every workspace sharing it.
+pub(crate) fn apply_workspace_git_info(
+    state: &AppStateStore,
+    workspace_id: &str,
+    info: WorkspaceGitInfo,
+) -> bool {
     state.update_workspace_git_info(
         workspace_id,
         info.is_git,
@@ -96,15 +105,35 @@ fn apply_workspace_git_info(state: &AppStateStore, workspace_id: &str, info: Wor
         info.additions,
         info.deletions,
         info.changed_files,
-    );
+    )
+}
+
+/// Reshape a gather result into the wire subset the `WorkspaceGit` delta
+/// domain carries. Same fields, different owner: `WorkspaceGitInfo` is the
+/// gather's output, `WorkspaceGitDelta` is what the renderer applies.
+pub(crate) fn git_delta_of(info: WorkspaceGitInfo) -> crate::state::WorkspaceGitDelta {
+    crate::state::WorkspaceGitDelta {
+        is_git: info.is_git,
+        git_branch: info.branch,
+        git_ahead: info.ahead,
+        git_behind: info.behind,
+        git_additions: info.additions,
+        git_deletions: info.deletions,
+        git_changed_files: info.changed_files,
+    }
 }
 
 /// Read fresh git branch / ahead-behind / diff-stat / changed-file counts for
 /// `repo_path` and write them into the workspace snapshot. `pub(crate)` so the
 /// periodic refresh loop in `lib.rs` can reuse this instead of duplicating
 /// the extraction logic.
-pub(crate) fn populate_git_info(state: &AppStateStore, workspace_id: &str, repo_path: &Path) {
-    apply_workspace_git_info(state, workspace_id, gather_workspace_git_info(repo_path));
+/// Returns true when the write changed something.
+pub(crate) fn populate_git_info(
+    state: &AppStateStore,
+    workspace_id: &str,
+    repo_path: &Path,
+) -> bool {
+    apply_workspace_git_info(state, workspace_id, gather_workspace_git_info(repo_path))
 }
 
 /// Async equivalent of `populate_git_info` for use inside `async fn` Tauri
@@ -114,11 +143,11 @@ pub(crate) async fn populate_git_info_async(
     state: &AppStateStore,
     workspace_id: &str,
     repo_path: PathBuf,
-) {
+) -> bool {
     let info = tokio::task::spawn_blocking(move || gather_workspace_git_info(&repo_path))
         .await
         .unwrap_or_default();
-    apply_workspace_git_info(state, workspace_id, info);
+    apply_workspace_git_info(state, workspace_id, info)
 }
 
 /// `async fn` so the git-info gather runs on the blocking pool instead of
@@ -194,7 +223,10 @@ pub fn get_shell_appearance() -> Result<ShellAppearance, String> {
 
 #[tauri::command]
 pub fn get_app_state(state: State<'_, AppStateStore>) -> Result<AppStateSnapshot, String> {
-    Ok(state.snapshot())
+    // Labelled with the revision it already reflects rather than a fresh one:
+    // this is the renderer's boot and gap-recovery baseline, and consuming a
+    // revision for a read would break the contiguity of the delta stream.
+    Ok(state.snapshot_at_current_revision())
 }
 
 #[tauri::command]
@@ -1608,74 +1640,103 @@ pub(crate) fn activate_workspace_impl<R: tauri::Runtime>(
     workspace_id: String,
 ) -> Result<(), String> {
     let activate_started = std::time::Instant::now();
-    if state.activate_workspace(&workspace_id) {
-        // Kick off git refresh in a background thread — don't block the
-        // activate click. `populate_git_info` runs 5-8 git subprocesses
-        // (branch + upstream + ahead/behind + two diff-stat calls + status
-        // with duplicated `diff --numstat`), which can hit 100-300ms on a
-        // cold filesystem cache or a large repo. The 5s polling loop
-        // reconciles, so worst case the sidebar shows slightly stale branch
-        // info for one tick. `git_branch_info` handles non-git / detached /
-        // corrupted repos without panicking, and the spawned thread emits
-        // app state when done so the sidebar picks up the refresh.
-        let cwd = {
-            let snapshot = state.snapshot();
-            snapshot
-                .workspaces
-                .iter()
-                .find(|w| w.workspace_id.0 == workspace_id)
-                .map(|w| w.cwd.clone())
-        };
-        if let Some(cwd) = cwd {
-            let refresh_app = app.clone();
-            let refresh_ws = workspace_id.clone();
-            std::thread::spawn(move || {
-                let state: tauri::State<'_, AppStateStore> = refresh_app.state();
-                populate_git_info(&state, &refresh_ws, Path::new(&cwd));
-                // Coalesced: this background refresh fires after the
-                // synchronous activate emit. Without coalescing the user
-                // sees two back-to-back snapshot serialise + IPC + render
-                // passes for what should be one logical change
-                // ("workspace activated").
-                crate::state::schedule_emit_app_state(&refresh_app);
-            });
-        }
-
-        // Lazy PTY hydration: `spawn_missing_ptys` at startup only resumed
-        // sessions for the workspace that was active at last close. Sessions
-        // for any other workspace stay on disk-only until the user activates
-        // them — at which point we spawn whatever PTYs aren't already
-        // running. Idempotent thanks to `try_reserve_session_spawn`, so
-        // re-activating the already-active workspace is a no-op.
-        //
-        // Fire-and-forget on a background thread instead of running on the
-        // IPC thread. `spawn_missing_ptys_for_workspace` issues
-        // synchronous `pty_system.openpty()` + `spawn_command()` calls per
-        // missing session; on Linux those are fast (single-digit ms each)
-        // but a workspace with 3-4 cold terminals + a slow shell rc file
-        // can still tip the IPC thread into a perceptible blocking window
-        // on the click. Spawning gives the UI back the IPC thread
-        // immediately; each terminal's status overlay (`emit_terminal_status`
-        // inside `spawn_pty_for_session`) shows "Starting shell..." until
-        // its child is ready, so the user sees the right state without
-        // the activate click feeling stuck.
-        let spawn_app = app.clone();
-        let spawn_ws = workspace_id.clone();
-        std::thread::spawn(move || {
-            terminal::spawn_missing_ptys_for_workspace(spawn_app, &spawn_ws);
-        });
-        crate::state::emit_app_state(&app);
-        db.set_ui_state("active_workspace", &workspace_id).ok();
+    // Section timings feed the Phase 0 attribution harness
+    // (docs/plans/gui-responsiveness.md): a slow activate must name whether it
+    // was the locked state mutation, the snapshot+serialise, or the SQLite
+    // write, rather than reporting one opaque total.
+    let mutate_started = std::time::Instant::now();
+    let activated = state.activate_workspace(&workspace_id);
+    let mutate_ms = mutate_started.elapsed().as_secs_f64() * 1000.0;
+    if activated {
+        let (emit_ms, persist_ms) = run_activation_side_effects(&app, state, db, &workspace_id);
         let elapsed_ms = activate_started.elapsed().as_millis();
         if elapsed_ms > 8 {
             eprintln!(
-                "[codemux::workspace] activate_workspace({workspace_id}) returned in {elapsed_ms}ms"
+                "[codemux::workspace] activate_workspace({workspace_id}) returned in \
+                 {elapsed_ms}ms (mutate={mutate_ms:.1}ms emit={emit_ms:.1}ms \
+                 persist={persist_ms:.1}ms)"
             );
         }
         Ok(())
     } else {
         Err(format!("No workspace found for {workspace_id}"))
     }
+}
+
+/// Everything that must happen after the active id flips, for every surface
+/// that flips it (sidebar click, command palette, control socket, Ctrl+Tab
+/// cycle). Kept in one function because the cycle path used to diverge —
+/// spawning PTYs synchronously on the IPC thread, skipping the git refresh
+/// and never persisting the active workspace, so a cycled-to workspace was
+/// forgotten at restart.
+///
+/// Returns `(emit_ms, persist_ms)` for the Phase 0 attribution harness
+/// (`docs/plans/gui-responsiveness.md`).
+fn run_activation_side_effects<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &AppStateStore,
+    db: &crate::database::DatabaseStore,
+    workspace_id: &str,
+) -> (f64, f64) {
+    // Kick off git refresh in a background thread — don't block the
+    // activate click. `populate_git_info` runs 5-8 git subprocesses
+    // (branch + upstream + ahead/behind + two diff-stat calls + status
+    // with duplicated `diff --numstat`), which can hit 100-300ms on a
+    // cold filesystem cache or a large repo. The 5s polling loop
+    // reconciles, so worst case the sidebar shows slightly stale branch
+    // info for one tick. `git_branch_info` handles non-git / detached /
+    // corrupted repos without panicking, and the spawned thread emits
+    // app state when done so the sidebar picks up the refresh.
+    if let Some(cwd) = state.workspace_cwd(workspace_id) {
+        let refresh_app = app.clone();
+        let refresh_ws = workspace_id.to_string();
+        std::thread::spawn(move || {
+            let state: tauri::State<'_, AppStateStore> = refresh_app.state();
+            // Re-activating a workspace whose branch counters haven't moved is
+            // the common case, and it has nothing to tell the renderer.
+            if !populate_git_info(&state, &refresh_ws, Path::new(&cwd)) {
+                return;
+            }
+            // Coalesced: this background refresh fires after the
+            // synchronous activate emit. Without coalescing the user
+            // sees two back-to-back snapshot serialise + IPC + render
+            // passes for what should be one logical change
+            // ("workspace activated").
+            crate::state::schedule_emit_app_state(&refresh_app);
+        });
+    }
+
+    // Lazy PTY hydration: `spawn_missing_ptys` at startup only resumed
+    // sessions for the workspace that was active at last close. Sessions
+    // for any other workspace stay on disk-only until the user activates
+    // them — at which point we spawn whatever PTYs aren't already
+    // running. Idempotent thanks to `try_reserve_session_spawn`, so
+    // re-activating the already-active workspace is a no-op.
+    //
+    // Fire-and-forget on a background thread instead of running on the
+    // IPC thread. `spawn_missing_ptys_for_workspace` issues
+    // synchronous `pty_system.openpty()` + `spawn_command()` calls per
+    // missing session; on Linux those are fast (single-digit ms each)
+    // but a workspace with 3-4 cold terminals + a slow shell rc file
+    // can still tip the IPC thread into a perceptible blocking window
+    // on the click. Spawning gives the UI back the IPC thread
+    // immediately; each terminal's status overlay (`emit_terminal_status`
+    // inside `spawn_pty_for_session`) shows "Starting shell..." until
+    // its child is ready, so the user sees the right state without
+    // the activate click feeling stuck.
+    let spawn_app = app.clone();
+    let spawn_ws = workspace_id.to_string();
+    std::thread::spawn(move || {
+        terminal::spawn_missing_ptys_for_workspace(spawn_app, &spawn_ws);
+    });
+
+    let emit_started = std::time::Instant::now();
+    crate::state::emit_app_state(app);
+    let emit_ms = emit_started.elapsed().as_secs_f64() * 1000.0;
+    let persist_started = std::time::Instant::now();
+    db.set_ui_state("active_workspace", workspace_id).ok();
+    let persist_ms = persist_started.elapsed().as_secs_f64() * 1000.0;
+    (emit_ms, persist_ms)
 }
 
 #[tauri::command]
@@ -1867,6 +1928,7 @@ pub async fn close_workspace<R: tauri::Runtime>(
 pub fn cycle_workspace<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: State<'_, AppStateStore>,
+    db: State<'_, crate::database::DatabaseStore>,
     step: isize,
 ) -> Result<String, String> {
     let workspace_id = state
@@ -1874,9 +1936,7 @@ pub fn cycle_workspace<R: tauri::Runtime>(
         .ok_or_else(|| "No workspace navigation target available".to_string())?;
 
     if state.activate_workspace(&workspace_id.0) {
-        // Lazy PTY hydration — same rationale as `activate_workspace`.
-        terminal::spawn_missing_ptys_for_workspace(app.clone(), &workspace_id.0);
-        crate::state::emit_app_state(&app);
+        run_activation_side_effects(&app, &state, &db, &workspace_id.0);
         Ok(workspace_id.0)
     } else {
         Err(format!("No workspace found for {}", workspace_id.0))

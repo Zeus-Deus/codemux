@@ -23,6 +23,9 @@ type SliceOverrides = {
   /** Composer text — the Thread Scope deferred-worktree submit tests
    *  seed this so the pane's `draft` (slice.inputDraft) is non-empty. */
   inputDraft?: string;
+  /** Durable resume cursor. `undefined` (the default) means "never
+   *  hydrated", which sends the mount effect down the cold path. */
+  lastPersistedEventId?: number | null;
 };
 let currentSliceOverrides: Record<string, SliceOverrides> = {};
 let currentDraftsById: Record<
@@ -61,6 +64,14 @@ const setResumeCursorMock = vi.fn();
 // persisted transcript and overlay it onto the in-memory slice when
 // disk has more rendered messages than memory).
 const hydrateThreadMock = vi.fn();
+// Warm cursor resume: the tail merge and the cursor-invalidate escape
+// hatch the mount effect uses when a read fails.
+const applyPayloadsTailMock = vi.fn();
+const invalidateThreadCursorMock = vi.fn();
+// Mount registration keeps eviction off a displayed thread; the pane just
+// has to call it and run the returned unregister on teardown.
+const unregisterMountedThreadMock = vi.fn();
+const registerMountedThreadMock = vi.fn(() => unregisterMountedThreadMock);
 // Hoisted so the deferred-worktree submit tests can assert the
 // optimistic user bubble was appended to the NEW worktree's thread.
 const appendUserMessageMock = vi.fn();
@@ -308,7 +319,11 @@ vi.mock("@/tauri/commands", () => ({
   // with a truthy threadId — return an empty transcript so the effect
   // short-circuits without exercising the resume path in unit tests.
   agentChatListMessages: vi.fn().mockResolvedValue([]),
-  // Liveness probe fired right after `agentChatListMessages` on the
+  // Cursor resume reads. `after` returns rows (`{id, payload}`); the
+  // head probe guards against a cursor from a foreign id space.
+  agentChatListMessagesAfter: vi.fn().mockResolvedValue([]),
+  agentChatThreadHeadId: vi.fn().mockResolvedValue(null),
+  // Liveness probe fired right after the transcript read on the
   // hydrate path. Default to `false` (no live turn) so hydrate keeps its
   // resume-path behavior unless a test opts into the live-run case.
   agentChatTurnActive: vi.fn().mockResolvedValue(false),
@@ -446,6 +461,8 @@ vi.mock("@/stores/agent-chat-store", () => {
       fastMode: false,
       hasDebugActivity: overrides.hasDebugActivity ?? false,
       debugActivityResolved: overrides.debugActivityResolved ?? false,
+      pendingRequestIds: [],
+      lastPersistedEventId: overrides.lastPersistedEventId ?? null,
     };
   }
   function buildThreads() {
@@ -513,14 +530,21 @@ vi.mock("@/stores/agent-chat-store", () => {
         // optimistic user bubble through getState().
         appendUserMessage: appendUserMessageMock,
         // Exposed on getState so the mount-time hydrate effect can
-        // imperatively replace the slice when disk leads memory.
+        // imperatively replace the slice (cold) or fold in a cursor
+        // tail (warm).
         hydrateThread: hydrateThreadMock,
+        applyPayloadsTail: applyPayloadsTailMock,
+        invalidateThreadCursor: invalidateThreadCursorMock,
+        evictColdThreads: vi.fn(),
       }),
     },
   );
   return {
     useAgentChatStore: mockStore,
     DEFAULT_THREAD_PERMISSION_MODE: "bypassPermissions",
+    // The pane registers its thread so warm-slice eviction can't drop a
+    // transcript that is on screen. Returns the unregister.
+    registerMountedThread: () => registerMountedThreadMock(),
   };
 });
 
@@ -528,6 +552,8 @@ import { AgentChatPane } from "./AgentChatPane";
 import {
   agentChatGetSession,
   agentChatListMessages,
+  agentChatListMessagesAfter,
+  agentChatThreadHeadId,
   agentChatTurnActive,
   agentChatListSessions,
   agentChatSendTurn,
@@ -697,100 +723,96 @@ describe("AgentChatPane subagent drill-in (viewMode swap)", () => {
   });
 });
 
-describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
-  // Regression test for the bug where: the user submits a turn, switches
-  // workspaces (the inactive workspace's pane tree unmounts entirely per
-  // workspace-main.tsx), the live event broadcaster drops events with
-  // no listener attached, and the user comes back to a chat that shows
-  // only the optimistic user message — even though the agent ran (file
-  // changes prove it) and the backend persisted the full transcript to
-  // SQLite. The fix pulls `agent_chat_list_messages` on every mount that
-  // lands with a truthy thread id and overlays disk onto memory whenever
-  // disk has more rendered messages.
+describe("AgentChatPane hydrate-on-mount (cursor resume)", () => {
+  // Regression base: the user submits a turn, switches workspaces (the
+  // inactive workspace's pane tree unmounts entirely per
+  // workspace-main.tsx), the live event broadcaster drops events with no
+  // listener attached, and the user comes back to a chat that shows only
+  // the optimistic user message — even though the agent ran and the
+  // backend persisted the full transcript to SQLite.
+  //
+  // Phase 3 resumes that transcript BY CURSOR: a warm slice asks for the
+  // rows after its `lastPersistedEventId`, a cold one reads the thread
+  // from the start. The old rendered-message-count guard is gone — it
+  // was not a durable position and was wrong in both directions.
+  const userPayload = JSON.stringify({
+    type: "user_message",
+    thread_id: "thread-x",
+    text: "hello",
+  });
+  // Persisted assistant reply, shaped per the reducer's
+  // `item_completed` / `assistant_text` arms.
+  const assistantPayload = JSON.stringify({
+    type: "item_completed",
+    thread_id: "thread-x",
+    turn_id: "turn-1",
+    item: { kind: "assistant_text", text: "hi back" },
+  });
+  const rows = [
+    { id: 11, payload: userPayload },
+    { id: 12, payload: assistantPayload },
+  ];
+
   beforeEach(() => {
     currentMessages = [];
     currentThreadsMap = {};
     currentDraftsById = {};
+    currentSliceOverrides = {};
     workspaceIdForPaneOverride = "ws-home";
-    vi.mocked(agentChatListMessages).mockReset();
-    vi.mocked(agentChatListMessages).mockResolvedValue([]);
+    vi.mocked(agentChatListMessagesAfter).mockReset();
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
+    vi.mocked(agentChatThreadHeadId).mockReset();
+    vi.mocked(agentChatThreadHeadId).mockResolvedValue(null);
     vi.mocked(agentChatTurnActive).mockReset();
     vi.mocked(agentChatTurnActive).mockResolvedValue(false);
     hydrateThreadMock.mockClear();
+    applyPayloadsTailMock.mockClear();
+    invalidateThreadCursorMock.mockClear();
   });
 
-  it("reads persisted messages on mount when the pane has an existing thread id", async () => {
+  it("reads from the start of the thread when the slice has no cursor", async () => {
     currentMessages = [{ kind: "user_message", id: "m1" }];
     render(<AgentChatPane pane={pane} />);
     await waitFor(() => {
-      expect(vi.mocked(agentChatListMessages)).toHaveBeenCalledWith("thread-x");
-    });
-  });
-
-  it("hydrates the slice when disk has strictly more rendered messages than memory", async () => {
-    // In-memory slice carries only the optimistic user message — the
-    // exact snapshot the user sees after returning from another workspace.
-    currentMessages = [{ kind: "user_message", id: "m1" }];
-    const userPayload = JSON.stringify({
-      type: "user_message",
-      thread_id: "thread-x",
-      text: "hello",
-    });
-    // Persisted assistant reply, shaped per the reducer's
-    // `item_completed` / `assistant_text` arms (see reducer.ts:254).
-    // The crucial bit for this test is that this payload, when
-    // replayed, ADDS a message to the rebuilt state — driving disk
-    // count strictly above the in-memory count.
-    const assistantPayload = JSON.stringify({
-      type: "item_completed",
-      thread_id: "thread-x",
-      turn_id: "turn-1",
-      item: { kind: "assistant_text", text: "hi back" },
-    });
-    vi.mocked(agentChatListMessages).mockResolvedValue([
-      userPayload,
-      assistantPayload,
-    ]);
-    render(<AgentChatPane pane={pane} />);
-    await waitFor(() => {
-      expect(hydrateThreadMock).toHaveBeenCalledWith(
+      expect(vi.mocked(agentChatListMessagesAfter)).toHaveBeenCalledWith(
         "thread-x",
-        [userPayload, assistantPayload],
-        { runLive: false, provider: "claude" },
+        null,
       );
     });
+    // No cursor means no head probe — there is nothing to validate.
+    expect(vi.mocked(agentChatThreadHeadId)).not.toHaveBeenCalled();
   });
 
-  it("hydrates with runLive:true — and no interrupted state — when the backend reports the turn is still active", async () => {
-    // The workspace-switch false-positive: a healthy live run whose
-    // pane remounted. The persisted tail has no terminal event after the
-    // last user turn, but the backend confirms the turn is in flight, so
+  it("hydrates the slice from a cold read", async () => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
+    render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
+        runLive: false,
+        provider: "claude",
+      });
+    });
+    // ONE replay: the preflight replay + count comparison is gone.
+    expect(hydrateThreadMock).toHaveBeenCalledTimes(1);
+    expect(applyPayloadsTailMock).not.toHaveBeenCalled();
+  });
+
+  it("hydrates with runLive:true when the backend reports the turn is still active", async () => {
+    // The workspace-switch false-positive: a healthy live run whose pane
+    // remounted. The persisted tail has no terminal event after the last
+    // user turn, but the backend confirms the turn is in flight, so
     // hydrate must pass runLive so the streaming marker shows instead of
     // the Run-interrupted divider.
     currentMessages = [{ kind: "user_message", id: "m1" }];
-    const userPayload = JSON.stringify({
-      type: "user_message",
-      thread_id: "thread-x",
-      text: "hello",
-    });
-    const assistantPayload = JSON.stringify({
-      type: "item_completed",
-      thread_id: "thread-x",
-      turn_id: "turn-1",
-      item: { kind: "assistant_text", text: "hi back" },
-    });
-    vi.mocked(agentChatListMessages).mockResolvedValue([
-      userPayload,
-      assistantPayload,
-    ]);
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
     vi.mocked(agentChatTurnActive).mockResolvedValue(true);
     render(<AgentChatPane pane={pane} />);
     await waitFor(() => {
-      expect(hydrateThreadMock).toHaveBeenCalledWith(
-        "thread-x",
-        [userPayload, assistantPayload],
-        { runLive: true, provider: "claude" },
-      );
+      expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
+        runLive: true,
+        provider: "claude",
+      });
     });
   });
 
@@ -798,65 +820,92 @@ describe("AgentChatPane hydrate-on-mount (workspace swap recovery)", () => {
     // A backend without the command, or a transient failure, must degrade
     // to today's heuristic behavior rather than blocking hydrate.
     currentMessages = [{ kind: "user_message", id: "m1" }];
-    const userPayload = JSON.stringify({
-      type: "user_message",
-      thread_id: "thread-x",
-      text: "hello",
-    });
-    const assistantPayload = JSON.stringify({
-      type: "item_completed",
-      thread_id: "thread-x",
-      turn_id: "turn-1",
-      item: { kind: "assistant_text", text: "hi back" },
-    });
-    vi.mocked(agentChatListMessages).mockResolvedValue([
-      userPayload,
-      assistantPayload,
-    ]);
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
     vi.mocked(agentChatTurnActive).mockRejectedValue(
       new Error("command unavailable"),
     );
     render(<AgentChatPane pane={pane} />);
     await waitFor(() => {
-      expect(hydrateThreadMock).toHaveBeenCalledWith(
-        "thread-x",
-        [userPayload, assistantPayload],
-        { runLive: false, provider: "claude" },
-      );
+      expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
+        runLive: false,
+        provider: "claude",
+      });
     });
   });
 
-  it("does NOT hydrate when memory already has at least as many messages as disk", async () => {
-    // Steady-state path: the live stream kept up, so memory is at least
-    // as fresh as disk. Hydrating would clobber events that are queued
-    // for persistence but not yet on disk.
-    currentMessages = [
-      { kind: "user_message", id: "m1" },
-      { kind: "assistant_message", id: "m2", turn_id: "t-1" },
-    ];
-    const userPayload = JSON.stringify({
-      type: "user_message",
-      thread_id: "thread-x",
-      text: "hello",
-    });
-    vi.mocked(agentChatListMessages).mockResolvedValue([userPayload]);
+  it("asks only for the tail when the slice carries a cursor", async () => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentSliceOverrides = { "thread-x": { lastPersistedEventId: 10 } };
+    vi.mocked(agentChatThreadHeadId).mockResolvedValue(12);
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue(rows);
     render(<AgentChatPane pane={pane} />);
     await waitFor(() => {
-      expect(vi.mocked(agentChatListMessages)).toHaveBeenCalled();
+      expect(applyPayloadsTailMock).toHaveBeenCalledWith("thread-x", rows, {
+        runLive: false,
+        provider: "claude",
+      });
     });
+    expect(vi.mocked(agentChatListMessagesAfter)).toHaveBeenCalledWith(
+      "thread-x",
+      10,
+    );
+    // The transcript prefix is never rebuilt on the warm path.
     expect(hydrateThreadMock).not.toHaveBeenCalled();
   });
 
-  it("swallows hydrate failures so a flaky list_messages call cannot blank the pane", async () => {
+  it("does no work at all when a warm thread has not moved", async () => {
+    // The exit gate: revisiting an unchanged warm thread costs one empty
+    // tail read and zero reductions.
     currentMessages = [{ kind: "user_message", id: "m1" }];
-    vi.mocked(agentChatListMessages).mockRejectedValue(
+    currentSliceOverrides = { "thread-x": { lastPersistedEventId: 12 } };
+    vi.mocked(agentChatThreadHeadId).mockResolvedValue(12);
+    vi.mocked(agentChatListMessagesAfter).mockResolvedValue([]);
+    render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatListMessagesAfter)).toHaveBeenCalledWith(
+        "thread-x",
+        12,
+      );
+    });
+    expect(applyPayloadsTailMock).not.toHaveBeenCalled();
+    expect(hydrateThreadMock).not.toHaveBeenCalled();
+    // Not even the liveness probe — there is nothing to interpret.
+    expect(vi.mocked(agentChatTurnActive)).not.toHaveBeenCalled();
+  });
+
+  it("cold-hydrates when the cursor sits above the thread's head", async () => {
+    // A cursor inherited from a merged / deleted thread: its rows were
+    // re-homed under another thread_id keeping their original ids, so the
+    // tail read would look empty forever.
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentSliceOverrides = { "thread-x": { lastPersistedEventId: 900 } };
+    vi.mocked(agentChatThreadHeadId).mockResolvedValue(12);
+    vi.mocked(agentChatListMessagesAfter).mockImplementation(
+      async (_thread: string, afterId: number | null) =>
+        afterId === null ? rows : [],
+    );
+    render(<AgentChatPane pane={pane} />);
+    await waitFor(() => {
+      expect(hydrateThreadMock).toHaveBeenCalledWith("thread-x", rows, {
+        runLive: false,
+        provider: "claude",
+      });
+    });
+    expect(applyPayloadsTailMock).not.toHaveBeenCalled();
+  });
+
+  it("swallows read failures and forgets the cursor so the next visit rebuilds", async () => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentSliceOverrides = { "thread-x": { lastPersistedEventId: 10 } };
+    vi.mocked(agentChatListMessagesAfter).mockRejectedValue(
       new Error("simulated SQLite read failure"),
     );
     expect(() => render(<AgentChatPane pane={pane} />)).not.toThrow();
     await waitFor(() => {
-      expect(vi.mocked(agentChatListMessages)).toHaveBeenCalled();
+      expect(invalidateThreadCursorMock).toHaveBeenCalledWith("thread-x");
     });
     expect(hydrateThreadMock).not.toHaveBeenCalled();
+    expect(applyPayloadsTailMock).not.toHaveBeenCalled();
   });
 });
 
