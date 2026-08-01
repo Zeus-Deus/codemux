@@ -707,6 +707,7 @@ function ItemRow({
       {renderAssistantBody(item, {
         approval,
         subagentName,
+        workspaceId,
         handleDecide,
         handleAcceptPlan,
         handleRejectPlan,
@@ -720,6 +721,7 @@ function renderAssistantBody(
   handlers: {
     approval: PermissionRequestItem | null;
     subagentName: string | null;
+    workspaceId?: string | null;
     handleDecide: (decision: ApprovalDecision) => void;
     handleAcceptPlan: () => void | Promise<void>;
     handleRejectPlan: () => void | Promise<void>;
@@ -732,7 +734,7 @@ function renderAssistantBody(
       return <ReasoningBlock item={item} />;
     case "tool_call":
       return isTaskSummaryTool(item) ? (
-        <TaskSummaryCard item={item} />
+        <TaskSummaryCard item={item} workspaceId={handlers.workspaceId} />
       ) : (
         <ToolCallCard
           item={item}

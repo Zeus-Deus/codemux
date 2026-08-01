@@ -11,10 +11,10 @@ import { useHosts } from "@/stores/hosts-store";
 import { useSidebarInboxStore } from "@/stores/sidebar-inbox-store";
 import { compareNewestFirst, isWorkspaceUnread } from "./sidebar-inbox";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
-import { getWorkspaceStatus } from "@/lib/pane-status";
+import { getWorkspaceStatus, STATUS_DOT_CLASS } from "@/lib/pane-status";
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
-import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
+import type { WorkspaceSnapshot } from "@/tauri/types";
 
 interface RailItemRepo {
   name: string;
@@ -63,12 +63,7 @@ function RailWorkspaceItem({
     !isActive && !unread && (status === "working" || status === null);
 
   // Per-workspace status dot: red (pulse) needs-you > amber working >
-  // green review. Idle / null shows nothing.
-  const dotClass: Record<ActivePaneStatus, string> = {
-    permission: "bg-status-attention animate-pulse",
-    working: "bg-status-working",
-    review: "bg-status-open",
-  };
+  // green review (shared `STATUS_DOT_CLASS`). Idle / null shows nothing.
 
   // Collapsed to a 28px avatar, the rail shows nothing but a status dot — so
   // the same hover card the expanded inbox uses is the only way to tell two
@@ -104,7 +99,7 @@ function RailWorkspaceItem({
             <span
               className={cn(
                 "absolute right-0.5 top-0.5 size-[7px] rounded-full border-[1.5px] border-sidebar",
-                dotClass[status],
+                STATUS_DOT_CLASS[status],
               )}
             />
           )}

@@ -118,6 +118,22 @@ describe("agent-chat-store", () => {
       ).toBeUndefined();
     });
 
+    it("the context-usage snapshot survives migrateThreadId", () => {
+      // The snapshot lives inside the reducer thread state, so the
+      // silent restart carries it with the rest of the slice — the
+      // meter must not blank out when the session id changes.
+      useAgentChatStore.getState().ensureThread("old-thread");
+      useAgentChatStore.getState().applyEvent("old-thread", {
+        type: "context_usage_updated",
+        thread_id: "old-thread",
+        usage: { used_tokens: 44_000, max_tokens: 200_000 },
+      });
+      useAgentChatStore.getState().migrateThreadId("old-thread", "new-thread");
+      expect(
+        useAgentChatStore.getState().threads["new-thread"].contextUsage,
+      ).toMatchObject({ used_tokens: 44_000, max_tokens: 200_000 });
+    });
+
     it("permissionMode survives migrateThreadId (silent restart)", () => {
       useAgentChatStore.getState().ensureThread("old-thread");
       useAgentChatStore

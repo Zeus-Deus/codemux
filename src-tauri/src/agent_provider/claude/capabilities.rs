@@ -28,11 +28,16 @@ use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 // switch. This flipped from "200k is default" in the Stage C
 // Context-Window-visibility pass — previously the picker hid itself
 // on the default, so the 1M option was effectively undiscoverable.
+// `context_window_tokens` is the numeric form of the same window the
+// label spells out. It seeds the chat context meter's denominator at
+// first paint; the live figure the provider reports at turn end wins
+// once it arrives.
 fn ctx_200k() -> ContextWindowOption {
     ContextWindowOption {
         value: "200k".into(),
         label: "200k".into(),
         is_default: false,
+        context_window_tokens: Some(200_000),
     }
 }
 
@@ -41,6 +46,7 @@ fn ctx_1m_default() -> ContextWindowOption {
         value: "1m".into(),
         label: "1M".into(),
         is_default: true,
+        context_window_tokens: Some(1_000_000),
     }
 }
 
@@ -66,6 +72,14 @@ fn claude_effort_label_map() -> HashMap<String, String> {
         .collect()
 }
 
+// Model-level `max_context_tokens` stays `None` across this table on
+// purpose. Every entry that has a known window exposes it through its
+// `context_window_options` picker, where the effective window depends
+// on which option is selected — so the number belongs on the option,
+// not the model. Entries with no picker (Opus 4.5, Haiku 4.5) have no
+// window stated anywhere in the registry, and a guessed denominator is
+// worse than none: the meter degrades to a bare token count until the
+// provider reports its own figure at turn end.
 fn models() -> Vec<ChatModelInfo> {
     vec![
         // Opus 4.8 — the recommended default, effort defaults to high
@@ -92,6 +106,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            max_context_tokens: None,
         },
         // Fable 5 — top tier above Opus. The deployed CLI reports it
         // with the context window pinned into the id itself
@@ -117,6 +132,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            max_context_tokens: None,
         },
         // Opus 4.7 — previous flagship.
         ChatModelInfo {
@@ -139,6 +155,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            max_context_tokens: None,
         },
         // Opus 4.6 — default effort is high, supports ultrathink + 1M.
         // (Fast mode existed on this model but is no longer surfaced —
@@ -162,6 +179,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            max_context_tokens: None,
         },
         // Opus 4.5 — no ultrathink, no 1M context.
         ChatModelInfo {
@@ -183,6 +201,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            max_context_tokens: None,
         },
         // Sonnet 4.6 — narrower effort range, supports ultrathink + 1M.
         ChatModelInfo {
@@ -199,6 +218,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            max_context_tokens: None,
         },
         // Haiku 4.5 — no effort, no context-window picker. Has a thinking
         // toggle we don't render in MVP.
@@ -216,6 +236,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            max_context_tokens: None,
         },
     ]
 }
@@ -569,6 +590,7 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
         supports_images: true,
         sub_provider: None,
         is_free: false,
+        max_context_tokens: None,
     }
 }
 
@@ -1123,6 +1145,7 @@ fn merge_sdk_with_maintained(
         supports_images: true,
         sub_provider: None,
         is_free: false,
+        max_context_tokens: None,
     }
 }
 
@@ -2147,6 +2170,50 @@ mod tests {
             assert!(
                 maintained.contains(*canonical),
                 "alias {alias} maps to unknown canonical id {canonical}",
+            );
+        }
+    }
+
+    // ── Numeric context windows ──
+
+    #[test]
+    fn context_window_options_carry_their_numeric_size() {
+        // The label is for humans; `context_window_tokens` is what
+        // seeds the context meter's denominator at first paint.
+        assert_eq!(ctx_200k().context_window_tokens, Some(200_000));
+        assert_eq!(ctx_1m_default().context_window_tokens, Some(1_000_000));
+    }
+
+    #[test]
+    fn every_offered_context_window_states_a_number() {
+        // A picker option with no number would leave the meter unable
+        // to seed a denominator for a window the registry demonstrably
+        // knows the size of.
+        let caps = claude_fallback_capabilities();
+        for model in &caps.models {
+            for option in &model.context_window_options {
+                assert!(
+                    option.context_window_tokens.is_some(),
+                    "model {} option {} has no numeric window",
+                    model.id,
+                    option.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn models_leave_max_context_tokens_unset() {
+        // Claude's window is a property of the *selected option*, not
+        // the model, so the number lives there. Models with no picker
+        // have no window stated anywhere — and a guess is worse than
+        // `None`, which degrades to a bare token count.
+        let caps = claude_fallback_capabilities();
+        for model in &caps.models {
+            assert!(
+                model.max_context_tokens.is_none(),
+                "model {} should not assert a model-level window",
+                model.id
             );
         }
     }

@@ -168,6 +168,44 @@ pub struct WorkflowSnapshot {
     pub duration_ms: Option<u64>,
 }
 
+/// Provider-neutral lifecycle state for one agent-authored task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One row in the agent's current task plan.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TaskSnapshotItem {
+    /// Provider-native id when one exists; positional adapters synthesize a
+    /// stable id so persisted replay and the live UI share row identity.
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: TaskStatus,
+    /// Optional provider-authored detail (for example Claude's active form).
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Provider-native dependency ids that currently block this task.
+    #[serde(default)]
+    pub blocked_by: Vec<String>,
+}
+
+/// Complete replacement snapshot of the task plan for one chat thread.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TasksSnapshot {
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<TaskSnapshotItem>,
+}
+
 /// A streamed fragment produced mid-turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -231,6 +269,48 @@ pub struct TurnUsage {
     pub num_turns: u32,
 }
 
+/// A point-in-time reading of a thread's context-window occupancy.
+///
+/// `used_tokens` is the *live* occupancy of the model's context window
+/// right now (input including cache reads/writes plus output of the
+/// latest completed iteration) — bounded, and the number the meter
+/// visualizes. `total_processed_tokens` is the monotonic lifetime sum
+/// across the whole thread, including everything compaction has since
+/// discarded — unbounded, informational only. After a compaction the
+/// former drops while the latter keeps climbing.
+///
+/// Every numeric field except `used_tokens` is optional: when a
+/// provider does not report a window size the UI degrades to a bare
+/// token count rather than guessing a denominator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsageSnapshot {
+    /// Tokens currently occupying the live context window. Adapters
+    /// clamp this to `max_tokens` when both are known so the UI can
+    /// never render >100%.
+    pub used_tokens: u64,
+    /// Monotonic lifetime token total for the thread. Adapters omit it
+    /// unless it is strictly greater than `used_tokens`, so a fresh
+    /// thread doesn't show a redundant duplicate line.
+    #[serde(default)]
+    pub total_processed_tokens: Option<u64>,
+    /// The model's context-window size in tokens, when known. Sourced
+    /// from the provider's own runtime report where available; a static
+    /// registry value is only a seed for first paint. `None` = unknown —
+    /// never guessed.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    /// Occupancy immediately before the latest compaction, when this
+    /// snapshot was produced by a compaction boundary. Preserves the
+    /// pre-compaction high-water mark.
+    #[serde(default)]
+    pub last_used_tokens: Option<u64>,
+    /// Whether the provider automatically compacts context when the
+    /// window nears capacity. Drives the explanatory line in the popup.
+    /// `None` = unknown (treated as false by the UI).
+    #[serde(default)]
+    pub compacts_automatically: Option<bool>,
+}
+
 /// The canonical event stream produced by every provider.
 ///
 /// Downstream consumers pattern-match on the top-level tag. New variants are
@@ -285,6 +365,21 @@ pub enum ProviderRuntimeEvent {
     WorkflowUpdated {
         thread_id: ThreadId,
         workflow: WorkflowSnapshot,
+    },
+    /// The thread's context-window occupancy changed — emitted on
+    /// assistant-message usage reports, turn completion, and compaction
+    /// boundaries. Latest snapshot wins; the reducer keeps only the most
+    /// recent one per thread. Persisted so the meter survives restart
+    /// via hydrate-replay (same trick as `SubagentUpdated`).
+    ContextUsageUpdated {
+        thread_id: ThreadId,
+        usage: ContextUsageSnapshot,
+    },
+    /// The provider replaced its current task plan. This durable, thread-
+    /// scoped state drives both the composer toggle and the Tasks panel.
+    TasksUpdated {
+        thread_id: ThreadId,
+        tasks: TasksSnapshot,
     },
     /// The turn finished — either successfully or with a terminal error.
     TurnCompleted {

@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ProviderRuntimeEvent } from "@/tauri/events";
+import type {
+  ContextUsageSnapshot,
+  ProviderRuntimeEvent,
+} from "@/tauri/events";
 
+import { replayPayloads } from "./hydrate";
 import {
   __resetReducerIdCounterForTests,
   applyEvent,
@@ -38,6 +42,46 @@ function runEvents(
 describe("agent-chat reducer", () => {
   beforeEach(() => {
     __resetReducerIdCounterForTests();
+  });
+
+  it("stores complete task snapshots without adding transcript rows", () => {
+    const state = applyEvent(createEmptyThreadState(), {
+      type: "tasks_updated",
+      thread_id: "t1",
+      tasks: {
+        explanation: "Ship the feature",
+        tasks: [
+          {
+            task_id: "1",
+            title: "Wire provider events",
+            status: "in_progress",
+            blocked_by: [],
+          },
+        ],
+      },
+    });
+    expect(state.tasks?.explanation).toBe("Ship the feature");
+    expect(state.tasks?.tasks[0].status).toBe("in_progress");
+    expect(state.tasksUpdatedAt).toEqual(expect.any(Number));
+    expect(state.messages).toEqual([]);
+  });
+
+  it("replaces rather than merges task snapshots", () => {
+    const first = applyEvent(createEmptyThreadState(), {
+      type: "tasks_updated",
+      thread_id: "t1",
+      tasks: {
+        tasks: [{ task_id: "1", title: "Old", status: "pending", blocked_by: [] }],
+      },
+    });
+    const next = applyEvent(first, {
+      type: "tasks_updated",
+      thread_id: "t1",
+      tasks: {
+        tasks: [{ task_id: "2", title: "New", status: "completed", blocked_by: [] }],
+      },
+    });
+    expect(next.tasks?.tasks.map((task) => task.task_id)).toEqual(["2"]);
   });
 
   it("accumulates text deltas into a single assistant message", () => {
@@ -2402,5 +2446,101 @@ describe("dead-run detection (issue #154)", () => {
     );
     const rolledBack = removeUserMessageByNonce(clean, "nonce-2", false);
     expect(rolledBack.interrupted).toBe(false);
+  });
+});
+
+describe("context-window usage", () => {
+  const usage = (
+    thread_id: string,
+    usage: ContextUsageSnapshot,
+  ): ProviderRuntimeEvent => ({
+    type: "context_usage_updated",
+    thread_id,
+    usage,
+  });
+
+  it("starts null and stores the first snapshot", () => {
+    expect(createEmptyThreadState().contextUsage).toBeNull();
+    const state = runEvents([
+      usage("t1", { used_tokens: 44_000, max_tokens: 200_000 }),
+    ]);
+    expect(state.contextUsage).toMatchObject({
+      used_tokens: 44_000,
+      max_tokens: 200_000,
+    });
+  });
+
+  it("latest snapshot wins — a post-compaction drop is respected", () => {
+    const state = runEvents([
+      usage("t1", { used_tokens: 180_000, max_tokens: 200_000 }),
+      usage("t1", {
+        used_tokens: 20_000,
+        max_tokens: 200_000,
+        last_used_tokens: 180_000,
+      }),
+    ]);
+    expect(state.contextUsage?.used_tokens).toBe(20_000);
+    expect(state.contextUsage?.last_used_tokens).toBe(180_000);
+  });
+
+  it("ignores malformed snapshots rather than blanking the meter", () => {
+    const good = runEvents([
+      usage("t1", { used_tokens: 44_000, max_tokens: 200_000 }),
+    ]);
+    for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      const after = applyEvent(good, usage("t1", { used_tokens: bad }));
+      expect(after).toBe(good);
+      expect(after.contextUsage?.used_tokens).toBe(44_000);
+    }
+    // …and a malformed first reading never establishes a snapshot.
+    const empty = createEmptyThreadState();
+    expect(
+      applyEvent(empty, usage("t1", { used_tokens: Number.NaN })).contextUsage,
+    ).toBeNull();
+  });
+
+  it("never lets the lifetime processed total regress", () => {
+    // Omitted on the follow-up (the provider only sends it when it
+    // exceeds live usage) — the known value must survive.
+    const omitted = runEvents([
+      usage("t1", { used_tokens: 30_000, total_processed_tokens: 91_000 }),
+      usage("t1", { used_tokens: 40_000 }),
+    ]);
+    expect(omitted.contextUsage?.total_processed_tokens).toBe(91_000);
+    expect(omitted.contextUsage?.used_tokens).toBe(40_000);
+
+    // Explicitly smaller (a stale/out-of-order report) — keep the max.
+    const smaller = applyEvent(
+      omitted,
+      usage("t1", { used_tokens: 41_000, total_processed_tokens: 50_000 }),
+    );
+    expect(smaller.contextUsage?.total_processed_tokens).toBe(91_000);
+
+    // Genuinely larger — climbs.
+    const larger = applyEvent(
+      smaller,
+      usage("t1", { used_tokens: 42_000, total_processed_tokens: 120_000 }),
+    );
+    expect(larger.contextUsage?.total_processed_tokens).toBe(120_000);
+  });
+
+  it("restores through the hydrate replay path after a restart", () => {
+    const state = replayPayloads([
+      JSON.stringify({ type: "user_message", thread_id: "t1", text: "hi" }),
+      JSON.stringify(
+        usage("t1", {
+          used_tokens: 44_000,
+          max_tokens: 200_000,
+          total_processed_tokens: 91_000,
+          compacts_automatically: true,
+        }),
+      ),
+    ]);
+    expect(state.contextUsage).toMatchObject({
+      used_tokens: 44_000,
+      max_tokens: 200_000,
+      total_processed_tokens: 91_000,
+      compacts_automatically: true,
+    });
   });
 });

@@ -68,7 +68,8 @@ The chat pane stack:
   reasoning + tool calls, working/settled — see "Activity block" below;
   `activity-steps.ts` holds its pure step/summary/duration derivations),
   `DiffView` (red/green edit surface), `TaskSummaryCard` (TodoWrite
-  checklist), `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
+  receipt line — see "Thread receipt" under the Agent Tasks panel),
+  `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
   (icon/tint mapping), `PlanProposalBlock`, `ComposerPendingInputPanel`
   for AskUserQuestion, `PermissionRequestBlock`, `ModePill`,
   `SessionSelector`, `DraftChatSurface`, `ChatHomeLanding`,
@@ -638,6 +639,54 @@ Card styling (all in `globals.css`, all on design tokens):
   in CI to dodge the `fake_codex_app_server` helper-binary build race
   under cargo's parallel scheduler.
 
+## Agent Tasks panel
+
+Provider-authored plans are normalized into the durable
+`ProviderRuntimeEvent::TasksUpdated { thread_id, tasks }` snapshot. This is
+agent state, not a second editable project-management surface: users can inspect
+the plan and progress but cannot check, reorder, or rewrite its rows.
+
+- **Provider mapping.** Codex maps `turn/plan/updated`; OpenCode maps
+  `todo.updated`; Claude maps legacy `TodoWrite` and the current
+  `TaskCreate` / `TaskUpdate` / `TaskList` result stream. Child/subagent plans
+  remain child-scoped and never replace the orchestrator's panel. No ACP-based
+  provider adapter exists in Codemux today; the canonical event is deliberately
+  provider-neutral so a future adapter can map ACP `plan` updates without UI
+  changes.
+- **Thread focus.** `useActiveChatTasks` resolves the active surface's focused
+  leaf pane, then reads only that pane's thread snapshot. Switching panes or
+  split focus therefore switches the task source instead of leaking another
+  chat's plan into the workspace panel.
+- **Conditional chrome.** A compact `Tasks N/M` composer control and right-panel
+  Tasks tab appear only for a non-empty snapshot. Clicking the composer control
+  toggles the shared right panel. A stale persisted `tasks` panel selection
+  falls back to Files when the focused pane has no task state. Both controls
+  carry run state so progress stays readable from any tab: the composer chip
+  turns amber with a spinner while a step is in flight and green with a check
+  once every row is done, and the Tasks tab shows a blinking amber dot while a
+  step is running and the tab is not the active one.
+- **Presentation.** The read-only panel preserves provider order and renders
+  flat, numbered rows (no per-row card chrome) with three visually distinct
+  states — done (green circled check, dimmed, struck through), in-progress
+  (amber spinner, tinted row, full-strength text), pending (hollow dot,
+  muted) — so the eye lands on the active step. The header carries a
+  Queued / Working / Complete status badge, `N/M done`, the last-update time
+  (`tasksUpdatedAt`, stamped by the reducer on each `tasks_updated`), and a
+  3px tone-colored progress bar; the provider's one-line explanation renders
+  above the rows as run intent. Dependency ids resolve to task titles when
+  possible, and a footer offers a Copy action (markdown checklist via
+  `tasksToMarkdown`). Snapshots persist in `agent_chat_messages` and hydrate
+  through the ordinary event reducer, so reopening a thread restores the same
+  toggle and panel (`tasksUpdatedAt` then reflects hydration time, not the
+  original wall time).
+- **Thread receipt.** `TaskSummaryCard` no longer prints the full todo list in
+  the transcript — that duplicated the panel with a copy that never updated.
+  Each `TodoWrite`-style call collapses to a one-line receipt ("Task list
+  created · 3 items" / "Task list updated · 2/3 done") that flips the right
+  panel to Tasks when a `workspaceId` is threaded (same pattern as
+  `WorkflowRunCard`'s "Open panel"); without one the row renders inert. The
+  panel is the live truth; the thread just records that a plan landed.
+
 ## Hydration by cursor (warm resume)
 
 Opening a thread no longer replays it from event zero. Hydration is a **tail
@@ -740,12 +789,16 @@ on `visibilitychange`. Pane detach and pre-hydrate are explicit flush seams.
 ### The pane subscribes by field, not by slice
 
 `AgentChatPane` used to read its entire thread slice, so a draft keystroke
-re-entered the whole tree. It now takes four narrow subscriptions: `draft`
+re-entered the whole tree. It now takes six narrow subscriptions: `draft`
 (a scalar), a `useShallow` `timeline` group
 (`messages`/`streaming`/`stalled`/`interrupted`/`activeTurnId`), a `useShallow`
 `settings` group (model, permission mode, effort, context window, fast mode,
-mode, debug-activity flags), and `stagedAttachments` with an empty-array
-sentinel. The pane itself still re-renders on a keystroke — it owns the
+mode, debug-activity flags), `stagedAttachments` with an empty-array
+sentinel, and one scalar each for `tasks` and `contextUsage`. The last two are
+deliberately *not* folded into `settings`: the Tasks panel updates on tool
+events and the context meter once per provider usage report, and either riding
+the settings group would re-run every picker consumer on a cadence it has no
+stake in. The pane itself still re-renders on a keystroke — it owns the
 composer — but **no timeline row does**, which
 `transcript-keystroke-isolation.test.tsx` asserts directly (a draft write
 leaves the timeline fields reference-equal and every row's render count
@@ -982,7 +1035,7 @@ derivations (unit-tested in `activity-steps.test.ts`).
 - **What stays standalone (breaks the run).** Approval-gated tool calls
   (`approval_request_id` set — the inline approval footer must render),
   TodoWrite / task-summary tools (`TaskSummaryCard` stays a visible
-  checklist), `permission_request`/plan/AskUserQuestion rows, assistant
+  receipt row), `permission_request`/plan/AskUserQuestion rows, assistant
   and user prose. Errored tool calls **do** fold in but stay
   discoverable: a red ✕ step row, and the settled header appends a
   subtle red `· N failed` to the meta. A lone reasoning run with no
@@ -2357,6 +2410,97 @@ of the active surface in GUI chrome, `WorkspaceContextBar` renders
 `useAgentChatPaneActive()` (`src/hooks/use-gui-chrome.ts`). A terminal
 (or other) pane active in GUI mode keeps the bottom bar; legacy chrome
 (Beta flag off) is unaffected.
+
+## Context-window meter (composer)
+
+A donut-ring icon in the composer footer's right cluster, immediately
+before the Send/Stop button, showing the thread's live context-window
+occupancy. Clicking it opens a popover (`side="top" align="end"`) with:
+a "Context Window" header row (`{pct}% · {used}/{max}` in
+`font-mono tabular-nums`), a horizontal progress bar, a
+"Total processed" row (lifetime tokens, only when strictly greater than
+used), and — when the provider auto-compacts — a
+"`{Provider}` automatically compacts its context when needed." note.
+Above 90% occupancy the ring and bar switch to the `danger` token.
+Hidden entirely (no reserved space) until the thread's first usage
+snapshot; the draft surface never shows it.
+
+**Two numbers, one bar.** `used_tokens` is the *live* occupancy of the
+model's window — bounded, clamped to `max_tokens`, drops after a
+compaction; it alone drives the ring/bar/percent. `total_processed_tokens`
+is the monotonic lifetime sum for the thread including everything
+compaction discarded — unbounded, text-only, omitted by adapters unless
+strictly greater than used. `max_tokens` is only ever provider-reported —
+never guessed; without it the UI degrades to a bare token count (no
+percent, no bar).
+
+**Event + persistence.** Adapters emit
+`ProviderRuntimeEvent::ContextUsageUpdated { thread_id, usage:
+ContextUsageSnapshot }` (`agent_provider/events.rs`). The shared
+`ContextUsageTracker` (`agent_provider/context_usage.rs`) enforces the
+cross-provider rules in one place: clamp used≤max, sticky last-known
+window, monotonic lifetime total with omit-unless-greater, and
+no-op/zero suppression. The event is persisted (`should_persist_event`),
+so hydrate replays the latest snapshot through the reducer and the
+meter survives restart with no bespoke schema — same trick as
+`SubagentUpdated`. Latest snapshot wins per thread
+(`ChatThreadState.contextUsage`, `reducer.ts`
+`case "context_usage_updated"`); the reducer additionally never lets
+the lifetime total regress and the snapshot rides through
+`migrateThreadId` on silent session restart.
+
+**Per-provider sources.**
+
+- **Claude** — (a) assistant `message.usage`
+  (`input + cache_creation + cache_read + output`; subagent messages
+  with `parent_tool_use_id` are excluded, preserving the existing
+  usage-hygiene rule); (b) turn-end `result`, whose `modelUsage[*]
+  .contextWindow` is the authoritative `max_tokens` (arrives only at
+  first turn end — mid-first-turn snapshots carry `max_tokens: null`,
+  which is why the registry seed below matters) and whose per-turn
+  figure feeds the lifetime accumulator once per turn; (c)
+  `system.compact_boundary` — `used = post_tokens`,
+  `last_used_tokens = pre_tokens` (unclamped high-water mark), total
+  carried forward. `compacts_automatically: true`.
+- **Codex** — the pinned app-server's `thread/tokenUsage/updated`
+  notification (`{ last, total, modelContextWindow }`): used =
+  `last.totalTokens`, lifetime = provider-maintained `total`, max =
+  `modelContextWindow`. Child-thread reports are dropped.
+  `compacts_automatically: true`.
+- **OpenCode** — the assistant message's `tokens` block
+  (`input + cache.read + cache.write + output + reasoning`), lifetime
+  via a per-message high-water delta so incremental re-broadcasts don't
+  compound; `max_tokens` from the upstream catalogue's `limit.context`
+  (probed in the background, re-probed on `set_model`). A model swap
+  **invalidates** the window rather than waiting for the re-probe: the
+  window belongs to the model, so `set_model` clears both the routing
+  context's copy and the tracker's sticky one
+  (`ContextUsageTracker::clear_max_tokens`, the explicit counterpart to
+  `observe_max_tokens(None)`'s deliberate no-op) and re-publishes the
+  current occupancy with no denominator. The meter degrades to a bare
+  token count for the gap instead of dividing by the old model's window.
+  The lifetime total and its per-message high-water map survive the swap
+  — they de-duplicate incremental re-broadcasts, which is model-independent.
+
+**First-paint seed.** The capability registry carries numeric windows
+purely as a seed until the provider's own report lands:
+`ContextWindowOption.context_window_tokens` (Claude `200k`/`1m` options
+→ 200_000 / 1_000_000) and `ChatModelInfo.max_context_tokens`
+(OpenCode, harvested; `None` for Claude — the window there is a
+property of the *selected* option — and for Codex). Resolution lives in
+`src/lib/agent-chat/context-usage.ts` (`resolveContextWindowTokens`,
+`deriveContextUsageDisplay`, and the `formatContextTokens` banding:
+lowercase `k`/`m`, one decimal only in the 1k–10k and ≥1M bands, `1m`
+never `1.0m`, the band picked from the rounded figure so 999_600 reads
+`1m` rather than a nonexistent `1000k`, null/NaN → `"0"`).
+
+**Components.** `src/components/chat/ContextUsageMeter.tsx`
+(`{ usage, seedMaxTokens?, providerLabel? }`, test hooks
+`context-usage-trigger` / `context-usage-readout` /
+`context-usage-total-processed`), wired `AgentChatPane` → `Composer` →
+`ComposerFooter` via optional `contextUsage*` props. The dev mock seeds
+one snapshot into the showcase thread so the meter is visible under
+`npm run dev`.
 
 ## Tauri command surface
 

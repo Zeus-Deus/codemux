@@ -452,6 +452,10 @@ pub enum NotificationMessage {
     TurnStarted(TurnStartedParams),
     /// `turn/completed` — a turn finished, successfully or otherwise.
     TurnCompleted(TurnCompletedParams),
+    /// `thread/tokenUsage/updated` — the app-server's running token
+    /// accounting for a thread (live window occupancy, lifetime total,
+    /// and the model's context-window size).
+    ThreadTokenUsageUpdated(ThreadTokenUsageUpdatedParams),
     /// `error` — transient / persistent error with optional retry hint.
     Error(ErrorParams),
     /// `item/agentMessage/delta` — streaming assistant text fragment.
@@ -477,6 +481,8 @@ pub enum NotificationMessage {
     McpToolCallProgress(McpToolCallProgressParams),
     /// `item/plan/delta` — plan content streaming chunk.
     PlanDelta(DeltaParams),
+    /// `turn/plan/updated` — complete structured plan replacement.
+    TurnPlanUpdated(TurnPlanUpdatedParams),
     /// `item/started` — an item has just been created. The `item.type`
     /// tag indicates whether it's a tool call, reasoning block, etc.
     ItemStarted(ItemEnvelope),
@@ -517,6 +523,7 @@ impl NotificationMessage {
             "thread/started" => decode!(ThreadStarted),
             "turn/started" => decode!(TurnStarted),
             "turn/completed" => decode!(TurnCompleted),
+            "thread/tokenUsage/updated" => decode!(ThreadTokenUsageUpdated),
             "error" => decode!(Error),
             "item/agentMessage/delta" => decode!(AgentMessageDelta),
             "item/reasoning/textDelta" => decode!(ReasoningTextDelta),
@@ -528,6 +535,7 @@ impl NotificationMessage {
             "item/fileChange/patchUpdated" => decode!(FileChangePatchUpdated),
             "item/mcpToolCall/progress" => decode!(McpToolCallProgress),
             "item/plan/delta" => decode!(PlanDelta),
+            "turn/plan/updated" => decode!(TurnPlanUpdated),
             "item/started" => decode!(ItemStarted),
             "item/completed" => decode!(ItemCompleted),
             _ => Self::Unknown {
@@ -536,6 +544,27 @@ impl NotificationMessage {
             },
         }
     }
+}
+
+/// Complete structured plan pushed by current Codex app-server builds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPlanUpdatedParams {
+    pub thread_id: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub plan: Vec<TurnPlanStep>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TurnPlanStep {
+    #[serde(default)]
+    pub step: String,
+    #[serde(default)]
+    pub status: String,
 }
 
 /// Params for `thread/started`.
@@ -635,6 +664,89 @@ struct TurnObj {
 #[derive(Deserialize)]
 struct TurnErrorObj {
     message: String,
+}
+
+/// Params for `thread/tokenUsage/updated`.
+///
+/// Shape verified against the app-server's own generated protocol
+/// bindings (`codex app-server generate-ts`, `ThreadTokenUsageUpdated
+/// Notification`): `{ threadId, turnId, tokenUsage }`.
+///
+/// `turn_id` is decoded but unused — the snapshot is thread-scoped, and
+/// the runtime already owns the active turn id. It is kept `Option` +
+/// `default` so a build that stops stamping it still decodes.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTokenUsageUpdatedParams {
+    /// The app-server's own thread identifier. Sub-agent child threads
+    /// report their usage under their own id, which is how the adapter
+    /// keeps child token burn out of the parent's meter.
+    pub thread_id: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    pub token_usage: ThreadTokenUsage,
+}
+
+/// The app-server's `ThreadTokenUsage`: a live/lifetime pair plus the
+/// model's window.
+///
+/// * `last` — the most recent request's usage, i.e. what currently
+///   occupies the context window.
+/// * `total` — the thread's provider-maintained lifetime total. Codex
+///   keeps this itself, so the adapter adopts it rather than running
+///   its own accumulator.
+/// * `model_context_window` — window size in tokens, `null` when the
+///   app-server does not know it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTokenUsage {
+    #[serde(default)]
+    pub last: TokenUsageBreakdown,
+    #[serde(default)]
+    pub total: TokenUsageBreakdown,
+    #[serde(default)]
+    pub model_context_window: Option<u64>,
+}
+
+/// One side of a [`ThreadTokenUsage`].
+///
+/// `total_tokens` is the app-server's own sum of the breakdown, so it
+/// is what the adapter reads; the components are decoded too so a
+/// future consumer (or a drifted build that omits the total) has them.
+/// Every field defaults so a partial payload still decodes rather than
+/// falling through to `Unknown`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageBreakdown {
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub reasoning_output_tokens: u64,
+}
+
+impl TokenUsageBreakdown {
+    /// The breakdown's total.
+    ///
+    /// The app-server computes `total_tokens` itself, so it is
+    /// authoritative and preferred. The fallback (for a drifted build
+    /// that omits it) sums only `input_tokens + output_tokens`:
+    /// `cached_input_tokens` is a *subset* of the input figure and
+    /// `reasoning_output_tokens` a subset of the output figure, so
+    /// adding them in would double-count.
+    pub fn tokens(&self) -> u64 {
+        if self.total_tokens > 0 {
+            return self.total_tokens;
+        }
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
 }
 
 /// Params for `turn/started`.
@@ -1607,5 +1719,122 @@ mod tests {
         assert_eq!(act.agent_thread_id, "child-1");
         assert_eq!(act.agent_path.as_deref(), Some("root/child"));
         assert_eq!(act.kind, "interacted");
+    }
+
+    // ── thread/tokenUsage/updated ──
+    //
+    // Shape pinned against the app-server's own generated protocol
+    // bindings (`codex app-server generate-ts`).
+
+    fn token_usage_params() -> serde_json::Value {
+        json!({
+            "threadId": "thr-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "last": {
+                    "totalTokens": 24_542,
+                    "inputTokens": 23_863,
+                    "cachedInputTokens": 21_144,
+                    "cacheWriteInputTokens": 2_715,
+                    "outputTokens": 679,
+                    "reasoningOutputTokens": 512
+                },
+                "total": {
+                    "totalTokens": 180_000,
+                    "inputTokens": 170_000,
+                    "cachedInputTokens": 150_000,
+                    "cacheWriteInputTokens": 0,
+                    "outputTokens": 10_000,
+                    "reasoningOutputTokens": 4_000
+                },
+                "modelContextWindow": 272_000
+            }
+        })
+    }
+
+    #[test]
+    fn thread_token_usage_decodes_full_payload() {
+        let msg = NotificationMessage::from_raw("thread/tokenUsage/updated", token_usage_params());
+        match msg {
+            NotificationMessage::ThreadTokenUsageUpdated(p) => {
+                assert_eq!(p.thread_id, "thr-1");
+                assert_eq!(p.turn_id.as_deref(), Some("turn-1"));
+                assert_eq!(p.token_usage.last.tokens(), 24_542);
+                assert_eq!(p.token_usage.total.tokens(), 180_000);
+                assert_eq!(p.token_usage.model_context_window, Some(272_000));
+            }
+            other => panic!("expected ThreadTokenUsageUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thread_token_usage_tolerates_null_window_and_partial_breakdowns() {
+        let msg = NotificationMessage::from_raw(
+            "thread/tokenUsage/updated",
+            json!({
+                "threadId": "thr-1",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "last": {"totalTokens": 10},
+                    "total": {"totalTokens": 10},
+                    "modelContextWindow": null
+                }
+            }),
+        );
+        match msg {
+            NotificationMessage::ThreadTokenUsageUpdated(p) => {
+                assert!(p.token_usage.model_context_window.is_none());
+                assert_eq!(p.token_usage.last.tokens(), 10);
+            }
+            other => panic!("expected ThreadTokenUsageUpdated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_breakdown_falls_back_to_input_plus_output_without_a_stated_total() {
+        // Cached input is a subset of `inputTokens` and reasoning a
+        // subset of `outputTokens`, so neither is added in — counting
+        // them would double the figure.
+        let breakdown: TokenUsageBreakdown = serde_json::from_value(json!({
+            "inputTokens": 1_000,
+            "cachedInputTokens": 800,
+            "cacheWriteInputTokens": 100,
+            "outputTokens": 200,
+            "reasoningOutputTokens": 150
+        }))
+        .unwrap();
+        assert_eq!(breakdown.tokens(), 1_200);
+    }
+
+    #[test]
+    fn malformed_token_usage_falls_through_to_unknown_not_a_panic() {
+        let msg = NotificationMessage::from_raw(
+            "thread/tokenUsage/updated",
+            json!({"tokenUsage": "not-an-object"}),
+        );
+        assert!(matches!(msg, NotificationMessage::Unknown { .. }));
+    }
+    #[test]
+    fn turn_plan_updated_decodes_structured_plan() {
+        let message = NotificationMessage::from_raw(
+            "turn/plan/updated",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "explanation": "Implement in phases",
+                "plan": [
+                    {"step": "Research", "status": "completed"},
+                    {"step": "Build", "status": "inProgress"}
+                ]
+            }),
+        );
+        match message {
+            NotificationMessage::TurnPlanUpdated(plan) => {
+                assert_eq!(plan.thread_id, "thread-1");
+                assert_eq!(plan.turn_id.as_deref(), Some("turn-1"));
+                assert_eq!(plan.plan.len(), 2);
+            }
+            other => panic!("expected TurnPlanUpdated, got {other:?}"),
+        }
     }
 }

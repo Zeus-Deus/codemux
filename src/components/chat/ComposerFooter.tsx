@@ -1,13 +1,15 @@
-import { ArrowUp, Plus, Square } from "lucide-react";
+import { ArrowUp, Check, ListTodo, LoaderCircle, Plus, Square } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
+import type { ContextUsageSnapshot } from "@/tauri/events";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
   PermissionModeOption,
 } from "@/tauri/types";
 
+import { ContextUsageMeter } from "./ContextUsageMeter";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
@@ -60,6 +62,19 @@ interface Props {
    *  `/model` slash command. Forwarded to whichever picker variant
    *  renders. Optional; omitted by call sites that predate `/model`. */
   modelPickerOpenSignal?: number;
+  /** Latest context-window occupancy for the thread. Optional and
+   *  defaulting to `null`: surfaces without a live session (the draft
+   *  surface) simply never pass it, and the meter stays unrendered so
+   *  the footer's right cluster keeps its current geometry. */
+  contextUsage?: ContextUsageSnapshot | null;
+  /** Capability-registry window size, used to paint the meter before
+   *  the provider's first usage report arrives. */
+  contextUsageSeedMaxTokens?: number | null;
+  /** Display name of the agent for the meter's auto-compaction note. */
+  contextUsageProviderLabel?: string | null;
+  tasks?: { completed: number; total: number; running?: boolean } | null;
+  tasksOpen?: boolean;
+  onTasksClick?: () => void;
 }
 
 export function ComposerFooter({
@@ -90,6 +105,12 @@ export function ComposerFooter({
   onAttachClick,
   attachOpen = false,
   modelPickerOpenSignal,
+  contextUsage = null,
+  contextUsageSeedMaxTokens = null,
+  contextUsageProviderLabel = null,
+  tasks = null,
+  tasksOpen = false,
+  onTasksClick,
 }: Props) {
   const modeIsActive = mode !== "default";
 
@@ -182,6 +203,45 @@ export function ComposerFooter({
           disabled={controlsDisabled || modeIsActive}
           withSeparator
         />
+        {tasks && tasks.total > 0 && onTasksClick && (
+          <>
+            <span className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
+            {/* Same slot, but the chip reports run state instead of
+                reading as a setting: amber + spinner while a step is in
+                flight, green + check when the plan is complete, muted
+                checklist glyph before the run starts. Right of the
+                hairline so it scans as status, not another picker. */}
+            <button
+              type="button"
+              onClick={onTasksClick}
+              data-testid="composer-tasks-toggle"
+              aria-pressed={tasksOpen}
+              className={cn(
+                "inline-flex h-7 items-center gap-1.5 rounded-md border px-2 text-xs font-medium transition-colors",
+                tasks.running
+                  ? "border-status-working/25 bg-status-working/8 text-status-working hover:bg-status-working/15"
+                  : tasks.completed === tasks.total
+                    ? "border-status-open/25 bg-status-open/8 text-status-open hover:bg-status-open/15"
+                    : tasksOpen
+                      ? "border-transparent bg-accent-ember/15 text-accent-ember"
+                      : "border-transparent text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+              )}
+              title={`${tasks.completed} of ${tasks.total} tasks complete`}
+            >
+              {tasks.running ? (
+                <LoaderCircle className="size-3 animate-spin" aria-hidden />
+              ) : tasks.completed === tasks.total ? (
+                <Check className="size-3" aria-hidden />
+              ) : (
+                <ListTodo className="size-3.5" aria-hidden />
+              )}
+              <span>Tasks</span>
+              <span className="text-[10px] tabular-nums opacity-70">
+                {tasks.completed}/{tasks.total}
+              </span>
+            </button>
+          </>
+        )}
         {/* Host (Local / Remote) is a *workspace* property, not a
             chat-session property: pushing a workspace to a remote
             via right-click ships every pane it contains together —
@@ -193,7 +253,15 @@ export function ComposerFooter({
             (alongside the project + worktree pickers) — that's where
             "where will this materialize" decisions already live. */}
       </div>
-      <div className="ml-auto">
+      {/* Right cluster: ambient context-window readout sits immediately
+          left of the send/stop control, so "how full is the window" is
+          read on the way to pressing send. */}
+      <div className="ml-auto flex items-center gap-1">
+        <ContextUsageMeter
+          usage={contextUsage}
+          seedMaxTokens={contextUsageSeedMaxTokens}
+          providerLabel={contextUsageProviderLabel}
+        />
         {streaming && showStopButton ? (
           <button
             type="button"

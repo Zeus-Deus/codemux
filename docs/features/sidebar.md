@@ -54,11 +54,11 @@ visual only — nothing is archived, closed, or deleted.
   a neutral-ghost new-agent button (same click/shift-click semantics as
   before). Add repository moved into the filter row; Automations and Workspaces
   moved into the footer nav row (see "Footer" below). The palette indexes every
-  workspace record — active **and** settled — through `workspaceCommandValue`
-  (`command-palette.tsx`), which joins `title`, `git_branch`, `project_root`,
-  and `cwd` into the `CommandItem` value. Search therefore reaches a workspace
-  that has been parked onto the Settled shelf, and matches on project path as
-  well as on name or branch.
+  workspace record — active **and** settled — so search reaches a workspace
+  parked onto the Settled shelf. It matches on name (`title` + `git_branch`)
+  by default and switches to locations (`project_root`, `worktree_path`,
+  `cwd`) as soon as the query contains a `/`; parked workspaces sort last.
+  See `docs/features/command-palette.md` for the full ranking rules.
 - **Project filter dropdown** (`sidebar-inbox.tsx`): one 32px sticky row
   (`h-8` trigger + `size-8` add-repo button, matching the action row above) —
   a flex-1 trigger showing the current filter (Folder icon + "All projects",

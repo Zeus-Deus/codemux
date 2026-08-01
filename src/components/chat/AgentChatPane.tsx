@@ -32,6 +32,7 @@ import {
   enqueueAgentChatEvent,
   flushAgentChatEvents,
 } from "@/lib/agent-chat/event-batcher";
+import { resolveContextWindowTokens } from "@/lib/agent-chat/context-usage";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import {
@@ -62,6 +63,7 @@ import {
   type ChatMode,
 } from "@/stores/agent-chat-store";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
+import { useUIStore } from "@/stores/ui-store";
 import { useShallow } from "zustand/react/shallow";
 import {
   selectCapabilities,
@@ -134,6 +136,16 @@ type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 // `sub_provider`. The picker is the only entry point for provider
 // switching from inside an existing pane.
 const ENABLE_PROVIDER_PICKER = true;
+
+/** Human-readable agent names for the context meter's auto-compaction
+ *  note ("Claude automatically compacts its context…"). Kept separate
+ *  from the picker's provider labels because this one reads as the
+ *  sentence's subject. */
+const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  opencode: "OpenCode",
+};
 
 /** Step 8 Stage 7 — hard cap on staged attachments. Above this we
  *  toast and reject the next attach so prompts can't silently grow
@@ -385,6 +397,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const paneWorkspaceId = useAppStore(
     (s) => workspaceIdForPane ?? s.appState?.active_workspace_id ?? null,
   );
+  const rightPanelTab = useUIStore((state) =>
+    paneWorkspaceId ? state.rightPanelTabs?.[paneWorkspaceId] ?? null : null,
+  );
+  const toggleRightPanel = useUIStore((state) => state.toggleRightPanel);
   // The pane workspace's actual checked-out branch (from the workspace
   // snapshot's git watcher). Thread Scope prefers this over the branch
   // picker's main/master heuristic for the "current checkout" display,
@@ -503,6 +519,24 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       (threadId ? s.threads[threadId]?.stagedAttachments : undefined) ??
       EMPTY_ATTACHMENTS,
   );
+  // Tasks (the right-panel Tasks tab and the header pill) update on tool
+  // events, not on keystrokes, so they get their own narrow subscription
+  // rather than riding the timeline group: a task update must not invalidate
+  // `messages`, and a keystroke must not invalidate `tasks`.
+  const tasks = useAgentChatStore((s) =>
+    threadId ? s.threads[threadId]?.tasks ?? null : null,
+  );
+  const taskSummary = useMemo(() => {
+    if (!tasks || tasks.tasks.length === 0) return null;
+    return {
+      completed: tasks.tasks.filter((task) => task.status === "completed").length,
+      total: tasks.tasks.length,
+      running: tasks.tasks.some((task) => task.status === "in_progress"),
+    };
+  }, [tasks]);
+  const handleTasksClick = useCallback(() => {
+    if (paneWorkspaceId) toggleRightPanel?.(paneWorkspaceId, "tasks");
+  }, [paneWorkspaceId, toggleRightPanel]);
 
   // Warm the MCP servers once when a fresh (empty) chat pane mounts, so
   // the prime cost overlaps the user composing rather than blocking the
@@ -602,6 +636,22 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     providerDefaultPermissionMode ??
     DEFAULT_THREAD_PERMISSION_MODE;
   const activeModel = selectModel(capabilities, model);
+  // Context meter (composer footer). The snapshot rides on the thread
+  // state, so it survives hydrate-replay and the silent-restart slice
+  // migration for free. The seed only covers the window between the
+  // session starting and its first usage report — the provider's own
+  // `max_tokens` takes over the moment one lands.
+  // Its own narrow subscription rather than a member of the `settings` group:
+  // usage lands once per provider report while a turn streams, and folding it
+  // into `settings` would re-run every settings consumer on each report.
+  const contextUsage = useAgentChatStore((s) =>
+    threadId ? s.threads[threadId]?.contextUsage ?? null : null,
+  );
+  const contextUsageSeedMaxTokens = resolveContextWindowTokens(
+    activeModel,
+    contextWindow,
+  );
+  const contextUsageProviderLabel = CONTEXT_USAGE_PROVIDER_LABELS[provider];
   const effortLabelMap = capabilities?.effort_label_map ?? {};
   const permissionModes = capabilities?.permission_modes ?? null;
   const ultrathinkInBodyText = hasUltrathinkInBodyText(draft);
@@ -2751,6 +2801,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       }
       zone1Override={zone1Override}
       belowComposerSlot={belowComposerSlot}
+      tasks={taskSummary}
+      tasksOpen={rightPanelTab === "tasks"}
+      onTasksClick={handleTasksClick}
       provider={provider}
       model={model}
       permissionMode={permissionMode}
@@ -2770,6 +2823,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // strip when the last run died and nothing is in flight.
       interrupted={interrupted}
       onContinueRun={handleContinueRun}
+      contextUsage={contextUsage}
+      contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
+      contextUsageProviderLabel={contextUsageProviderLabel}
       sessionReady={sessionReady}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}

@@ -275,6 +275,23 @@ export interface WorkflowSnapshot {
   duration_ms?: number | null;
 }
 
+// Provider-neutral agent task plan. Each provider adapter emits complete
+// replacement snapshots so replay and live updates follow the same path.
+export type TaskStatus = "pending" | "in_progress" | "completed";
+
+export interface TaskSnapshotItem {
+  task_id: string;
+  title: string;
+  status: TaskStatus;
+  detail?: string | null;
+  blocked_by: string[];
+}
+
+export interface TasksSnapshot {
+  explanation?: string | null;
+  tasks: TaskSnapshotItem[];
+}
+
 export type TurnStatus =
   | { kind: "success" }
   | { kind: "error"; subtype: string; message: string }
@@ -285,6 +302,28 @@ export interface TurnUsage {
   total_cost_usd: number | null;
   duration_ms: number;
   num_turns: number;
+}
+
+/** A point-in-time reading of a thread's context-window occupancy.
+ *  Mirrors the Rust `ContextUsageSnapshot`.
+ *
+ *  `used_tokens` is the live occupancy of the model's context window
+ *  (bounded — the number the meter visualizes); `total_processed_tokens`
+ *  is the monotonic lifetime sum for the thread including everything
+ *  compaction discarded (unbounded, text-only). After a compaction the
+ *  former drops while the latter keeps climbing. Optional fields are
+ *  `#[serde(default)]` on the Rust side — absent means unknown, and the
+ *  UI degrades (no bar/percent without `max_tokens`) rather than
+ *  guessing a denominator. */
+export interface ContextUsageSnapshot {
+  used_tokens: number;
+  /** Omitted unless strictly greater than `used_tokens`. */
+  total_processed_tokens?: number | null;
+  max_tokens?: number | null;
+  /** Pre-compaction high-water mark, set on compaction-boundary
+   *  snapshots. */
+  last_used_tokens?: number | null;
+  compacts_automatically?: boolean | null;
 }
 
 export type ProviderRuntimeEvent =
@@ -322,6 +361,21 @@ export type ProviderRuntimeEvent =
       type: "workflow_updated";
       thread_id: string;
       workflow: WorkflowSnapshot;
+    }
+  | {
+      /** The thread's context-window occupancy changed — emitted on
+       *  assistant-message usage reports, turn completion, and
+       *  compaction boundaries. Latest snapshot wins per thread.
+       *  Persisted, so hydrate-replay restores the meter after a
+       *  restart. */
+      type: "context_usage_updated";
+      thread_id: string;
+      usage: ContextUsageSnapshot;
+    }
+  | {
+      type: "tasks_updated";
+      thread_id: string;
+      tasks: TasksSnapshot;
     }
   | {
       type: "turn_completed";

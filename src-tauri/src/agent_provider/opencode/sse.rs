@@ -33,7 +33,7 @@ use tokio::task::JoinHandle;
 use crate::agent_provider::events::ProviderRuntimeEvent;
 
 use super::protocol::{KnownEvent, OpenCodeEvent, PartPayload, SessionInfo};
-use super::translate::{opencode_event_to_runtime, EventContext};
+use super::translate::{opencode_event_to_runtime_with, EventContext, OpenCodeUsageState};
 
 /// Cap on consecutive reconnect attempts. Beyond this the listener
 /// gives up — a stuck/missing OpenCode server is a real failure
@@ -136,6 +136,10 @@ pub struct SsePeer {
     /// listener exhausts its reconnect budget so the provider treats the
     /// session as dead and the next send auto-resumes.
     pub dead: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-session context-window accounting, shared with the session
+    /// so a rebuilt listener keeps the thread's lifetime token total
+    /// instead of restarting it from zero.
+    pub usage: Arc<Mutex<OpenCodeUsageState>>,
 }
 
 /// Spawn the SSE listener task. Returns the join handle so the
@@ -334,8 +338,11 @@ async fn handle_record(
     };
 
     let ctx = peer.event_ctx.lock().await.clone();
+    let mut usage = peer.usage.lock().await;
+    let events = opencode_event_to_runtime_with(event, &ctx, subagent_id.as_deref(), &mut usage);
+    drop(usage);
     let mut turn_settled = false;
-    for runtime in opencode_event_to_runtime(event, &ctx, subagent_id.as_deref()) {
+    for runtime in events {
         // A parent-scoped turn completion or terminal session state means
         // the in-flight turn is over — disarm the give-up path so a later
         // server death while idle does NOT synthesize a spurious
@@ -428,6 +435,7 @@ fn event_session_id(known: &KnownEvent) -> Option<&str> {
         K::MessagePartRemoved(p) => Some(p.session_id.as_str()),
         K::PermissionAsked(p) => Some(p.session_id.as_str()),
         K::PermissionReplied(p) => Some(p.session_id.as_str()),
+        K::TodoUpdated(p) => Some(p.session_id.as_str()),
     }
 }
 
@@ -509,9 +517,11 @@ mod tests {
                 turn_id: TurnId("turn1".into()),
                 provider_session_id: ProviderSessionId(session_id.to_string()),
                 turn_active: false,
+                context_window_tokens: None,
             })),
             router: Arc::new(Mutex::new(SseRouter::new(session_id))),
             dead: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            usage: Arc::new(Mutex::new(OpenCodeUsageState::default())),
         }
     }
 

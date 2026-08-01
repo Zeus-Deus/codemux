@@ -1,7 +1,9 @@
 import type {
   ApprovalDecision,
+  ContextUsageSnapshot,
   ProviderRuntimeEvent,
   SubagentStatus,
+  TasksSnapshot,
   TurnStatus,
 } from "@/tauri/events";
 
@@ -348,6 +350,13 @@ export interface LiveChatEvent {
 
 export interface ChatThreadState {
   messages: ChatViewItem[];
+  /** Latest complete provider-authored task plan for this thread. */
+  tasks: TasksSnapshot | null;
+  /** Clock time (ms) the latest task snapshot was applied. Hydration
+   *  replays through the same reducer path, so after a reopen this is
+   *  "when this session learned about the plan", not the original wall
+   *  time — good enough for the panel's "last update" caption. */
+  tasksUpdatedAt: number | null;
   streaming: boolean;
   pendingRequestIds: string[];
   /** Next `seq` to assign to a freshly-appended item. Strictly
@@ -367,16 +376,26 @@ export interface ChatThreadState {
    *  Drives the "Run interrupted" divider and the composer's Continue
    *  chip. */
   interrupted: boolean;
+  /** Latest context-window occupancy reported by the provider, or
+   *  `null` before the first usage report lands (which is also the
+   *  signal to hide the composer's meter entirely). Latest snapshot
+   *  wins; the lifetime `total_processed_tokens` is merged forward so
+   *  it never regresses when a later snapshot omits it. Persisted
+   *  backend-side, so hydrate-replay restores it after a restart. */
+  contextUsage: ContextUsageSnapshot | null;
 }
 
 export function emptyThreadState(): ChatThreadState {
   return {
     messages: [],
+    tasks: null,
+    tasksUpdatedAt: null,
     streaming: false,
     pendingRequestIds: [],
     nextSeq: 0,
     stalled: null,
     interrupted: false,
+    contextUsage: null,
   };
 }
 
