@@ -481,6 +481,8 @@ pub enum NotificationMessage {
     McpToolCallProgress(McpToolCallProgressParams),
     /// `item/plan/delta` — plan content streaming chunk.
     PlanDelta(DeltaParams),
+    /// `turn/plan/updated` — complete structured plan replacement.
+    TurnPlanUpdated(TurnPlanUpdatedParams),
     /// `item/started` — an item has just been created. The `item.type`
     /// tag indicates whether it's a tool call, reasoning block, etc.
     ItemStarted(ItemEnvelope),
@@ -533,6 +535,7 @@ impl NotificationMessage {
             "item/fileChange/patchUpdated" => decode!(FileChangePatchUpdated),
             "item/mcpToolCall/progress" => decode!(McpToolCallProgress),
             "item/plan/delta" => decode!(PlanDelta),
+            "turn/plan/updated" => decode!(TurnPlanUpdated),
             "item/started" => decode!(ItemStarted),
             "item/completed" => decode!(ItemCompleted),
             _ => Self::Unknown {
@@ -541,6 +544,27 @@ impl NotificationMessage {
             },
         }
     }
+}
+
+/// Complete structured plan pushed by current Codex app-server builds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnPlanUpdatedParams {
+    pub thread_id: String,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub plan: Vec<TurnPlanStep>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TurnPlanStep {
+    #[serde(default)]
+    pub step: String,
+    #[serde(default)]
+    pub status: String,
 }
 
 /// Params for `thread/started`.
@@ -1789,5 +1813,28 @@ mod tests {
             json!({"tokenUsage": "not-an-object"}),
         );
         assert!(matches!(msg, NotificationMessage::Unknown { .. }));
+    }
+    #[test]
+    fn turn_plan_updated_decodes_structured_plan() {
+        let message = NotificationMessage::from_raw(
+            "turn/plan/updated",
+            json!({
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "explanation": "Implement in phases",
+                "plan": [
+                    {"step": "Research", "status": "completed"},
+                    {"step": "Build", "status": "inProgress"}
+                ]
+            }),
+        );
+        match message {
+            NotificationMessage::TurnPlanUpdated(plan) => {
+                assert_eq!(plan.thread_id, "thread-1");
+                assert_eq!(plan.turn_id.as_deref(), Some("turn-1"));
+                assert_eq!(plan.plan.len(), 2);
+            }
+            other => panic!("expected TurnPlanUpdated, got {other:?}"),
+        }
     }
 }

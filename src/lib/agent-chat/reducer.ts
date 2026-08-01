@@ -1291,6 +1291,10 @@ function applyEventInner(
       return applyContextUsage(state, event.usage);
     }
 
+    case "tasks_updated": {
+      return { ...state, tasks: event.tasks, tasksUpdatedAt: now() };
+    }
+
     case "turn_completed": {
       // A completed turn is a hard boundary — seal any trailing streaming
       // reasoning block alongside the assistant message.

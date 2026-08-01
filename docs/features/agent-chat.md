@@ -68,7 +68,8 @@ The chat pane stack:
   reasoning + tool calls, working/settled — see "Activity block" below;
   `activity-steps.ts` holds its pure step/summary/duration derivations),
   `DiffView` (red/green edit surface), `TaskSummaryCard` (TodoWrite
-  checklist), `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
+  receipt line — see "Thread receipt" under the Agent Tasks panel),
+  `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
   (icon/tint mapping), `PlanProposalBlock`, `ComposerPendingInputPanel`
   for AskUserQuestion, `PermissionRequestBlock`, `ModePill`,
   `SessionSelector`, `DraftChatSurface`, `ChatHomeLanding`,
@@ -637,6 +638,54 @@ Card styling (all in `globals.css`, all on design tokens):
   in CI to dodge the `fake_codex_app_server` helper-binary build race
   under cargo's parallel scheduler.
 
+## Agent Tasks panel
+
+Provider-authored plans are normalized into the durable
+`ProviderRuntimeEvent::TasksUpdated { thread_id, tasks }` snapshot. This is
+agent state, not a second editable project-management surface: users can inspect
+the plan and progress but cannot check, reorder, or rewrite its rows.
+
+- **Provider mapping.** Codex maps `turn/plan/updated`; OpenCode maps
+  `todo.updated`; Claude maps legacy `TodoWrite` and the current
+  `TaskCreate` / `TaskUpdate` / `TaskList` result stream. Child/subagent plans
+  remain child-scoped and never replace the orchestrator's panel. No ACP-based
+  provider adapter exists in Codemux today; the canonical event is deliberately
+  provider-neutral so a future adapter can map ACP `plan` updates without UI
+  changes.
+- **Thread focus.** `useActiveChatTasks` resolves the active surface's focused
+  leaf pane, then reads only that pane's thread snapshot. Switching panes or
+  split focus therefore switches the task source instead of leaking another
+  chat's plan into the workspace panel.
+- **Conditional chrome.** A compact `Tasks N/M` composer control and right-panel
+  Tasks tab appear only for a non-empty snapshot. Clicking the composer control
+  toggles the shared right panel. A stale persisted `tasks` panel selection
+  falls back to Files when the focused pane has no task state. Both controls
+  carry run state so progress stays readable from any tab: the composer chip
+  turns amber with a spinner while a step is in flight and green with a check
+  once every row is done, and the Tasks tab shows a blinking amber dot while a
+  step is running and the tab is not the active one.
+- **Presentation.** The read-only panel preserves provider order and renders
+  flat, numbered rows (no per-row card chrome) with three visually distinct
+  states — done (green circled check, dimmed, struck through), in-progress
+  (amber spinner, tinted row, full-strength text), pending (hollow dot,
+  muted) — so the eye lands on the active step. The header carries a
+  Queued / Working / Complete status badge, `N/M done`, the last-update time
+  (`tasksUpdatedAt`, stamped by the reducer on each `tasks_updated`), and a
+  3px tone-colored progress bar; the provider's one-line explanation renders
+  above the rows as run intent. Dependency ids resolve to task titles when
+  possible, and a footer offers a Copy action (markdown checklist via
+  `tasksToMarkdown`). Snapshots persist in `agent_chat_messages` and hydrate
+  through the ordinary event reducer, so reopening a thread restores the same
+  toggle and panel (`tasksUpdatedAt` then reflects hydration time, not the
+  original wall time).
+- **Thread receipt.** `TaskSummaryCard` no longer prints the full todo list in
+  the transcript — that duplicated the panel with a copy that never updated.
+  Each `TodoWrite`-style call collapses to a one-line receipt ("Task list
+  created · 3 items" / "Task list updated · 2/3 done") that flips the right
+  panel to Tasks when a `workspaceId` is threaded (same pattern as
+  `WorkflowRunCard`'s "Open panel"); without one the row renders inert. The
+  panel is the live truth; the thread just records that a plan landed.
+
 ## Transcript scroller (issue #77 contract, LegendList)
 
 The transcript body (`MessageList.tsx`) is a real windowed list built on
@@ -854,7 +903,7 @@ derivations (unit-tested in `activity-steps.test.ts`).
 - **What stays standalone (breaks the run).** Approval-gated tool calls
   (`approval_request_id` set — the inline approval footer must render),
   TodoWrite / task-summary tools (`TaskSummaryCard` stays a visible
-  checklist), `permission_request`/plan/AskUserQuestion rows, assistant
+  receipt row), `permission_request`/plan/AskUserQuestion rows, assistant
   and user prose. Errored tool calls **do** fold in but stay
   discoverable: a red ✕ step row, and the settled header appends a
   subtle red `· N failed` to the meta. A lone reasoning run with no

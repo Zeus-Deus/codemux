@@ -185,6 +185,27 @@ pub enum KnownEvent {
     PermissionAsked(PermissionAskedEvent),
     #[serde(rename = "permission.replied")]
     PermissionReplied(PermissionRepliedEvent),
+    #[serde(rename = "todo.updated")]
+    TodoUpdated(TodoUpdatedEvent),
+}
+
+/// OpenCode's complete session todo-list replacement event.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TodoUpdatedEvent {
+    #[serde(rename = "sessionID")]
+    pub session_id: String,
+    #[serde(default)]
+    pub todos: Vec<OpenCodeTodo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OpenCodeTodo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub status: String,
 }
 
 /// Wraps a session payload — emitted by `session.created/updated/deleted`.

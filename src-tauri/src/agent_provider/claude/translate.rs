@@ -27,8 +27,9 @@ use regex::Regex;
 
 use crate::agent_provider::{
     CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent, ProviderSessionId,
-    RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, ThreadId, TurnId, TurnStatus,
-    TurnUsage, WorkflowPhaseSnapshot, WorkflowSnapshot,
+    RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, TaskSnapshotItem, TaskStatus,
+    TasksSnapshot, ThreadId, TurnId, TurnStatus, TurnUsage, WorkflowPhaseSnapshot,
+    WorkflowSnapshot,
 };
 
 use super::protocol::{SidecarError, SidecarNotification};
@@ -70,6 +71,11 @@ pub struct SubagentDemux {
     /// notification task — so it rides the `&mut` the translator is
     /// already handed rather than inventing a second channel.
     context: ContextUsageTracker,
+    /// In-flight Claude TaskCreate/TaskUpdate/TaskList calls, keyed by
+    /// tool_use_id until their structured result arrives.
+    task_tools: HashMap<String, (String, serde_json::Value)>,
+    /// Current task state accumulated from Claude's modern Task* tools.
+    claude_tasks: Vec<TaskSnapshotItem>,
 }
 
 impl SubagentDemux {
@@ -149,6 +155,181 @@ fn is_agent_tool(name: &str) -> bool {
 /// naming it launches a `Workflow` run (see [`translate_assistant`]).
 fn is_workflow_tool(name: &str) -> bool {
     name == "Workflow"
+}
+
+fn is_claude_task_tool(name: &str) -> bool {
+    matches!(name, "TaskCreate" | "TaskUpdate" | "TaskList")
+}
+
+fn task_status(value: Option<&str>) -> TaskStatus {
+    match value {
+        Some("completed") | Some("cancelled") => TaskStatus::Completed,
+        Some("in_progress") | Some("inProgress") => TaskStatus::InProgress,
+        _ => TaskStatus::Pending,
+    }
+}
+
+fn string_array(value: Option<&serde_json::Value>) -> Vec<String> {
+    value
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tasks_event(thread_id: &ThreadId, tasks: Vec<TaskSnapshotItem>) -> ProviderRuntimeEvent {
+    ProviderRuntimeEvent::TasksUpdated {
+        thread_id: thread_id.clone(),
+        tasks: TasksSnapshot {
+            explanation: None,
+            tasks,
+        },
+    }
+}
+
+/// Legacy TodoWrite is already a complete replacement snapshot, so it can
+/// publish as soon as the assistant's finalized tool input arrives.
+fn todo_write_event(
+    thread_id: &ThreadId,
+    input: &serde_json::Value,
+) -> Option<ProviderRuntimeEvent> {
+    let todos = input.get("todos")?.as_array()?;
+    let tasks = todos
+        .iter()
+        .enumerate()
+        .filter_map(|(index, todo)| {
+            let title = todo
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or("Task")
+                .trim();
+            let title = if title.is_empty() { "Task" } else { title };
+            Some(TaskSnapshotItem {
+                task_id: todo
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("claude-todo-{index}")),
+                title: title.to_string(),
+                status: task_status(todo.get("status").and_then(|value| value.as_str())),
+                detail: todo
+                    .get("activeForm")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string),
+                blocked_by: Vec::new(),
+            })
+        })
+        .collect();
+    Some(tasks_event(thread_id, tasks))
+}
+
+fn task_from_value(value: &serde_json::Value) -> Option<TaskSnapshotItem> {
+    let task_id = value.get("id")?.as_str()?.to_string();
+    let title = value.get("subject")?.as_str()?.trim().to_string();
+    if task_id.is_empty() || title.is_empty() {
+        return None;
+    }
+    Some(TaskSnapshotItem {
+        task_id,
+        title,
+        status: task_status(value.get("status").and_then(|status| status.as_str())),
+        detail: value
+            .get("activeForm")
+            .and_then(|detail| detail.as_str())
+            .map(str::to_string),
+        blocked_by: string_array(value.get("blockedBy")),
+    })
+}
+
+/// Apply a successful modern Task* result to the per-session task map.
+/// Returns a complete replacement snapshot when the tool supplied enough
+/// structured data to change state.
+fn apply_claude_task_result(
+    thread_id: &ThreadId,
+    tool_use_id: &str,
+    result: Option<&serde_json::Value>,
+    is_error: bool,
+    demux: &mut SubagentDemux,
+) -> Option<ProviderRuntimeEvent> {
+    let (tool_name, input) = demux.task_tools.remove(tool_use_id)?;
+    if is_error {
+        return None;
+    }
+    match tool_name.as_str() {
+        "TaskList" => {
+            let values = result?.get("tasks")?.as_array()?;
+            demux.claude_tasks = values.iter().filter_map(task_from_value).collect();
+        }
+        "TaskCreate" => {
+            let task = result
+                .and_then(|value| value.get("task"))
+                .and_then(task_from_value)
+                .or_else(|| {
+                    let id = result
+                        .and_then(|value| value.get("task"))
+                        .and_then(|task| task.get("id"))
+                        .and_then(|id| id.as_str())?;
+                    let title = input.get("subject")?.as_str()?.trim();
+                    if title.is_empty() {
+                        return None;
+                    }
+                    Some(TaskSnapshotItem {
+                        task_id: id.to_string(),
+                        title: title.to_string(),
+                        status: TaskStatus::Pending,
+                        detail: input
+                            .get("activeForm")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
+                        blocked_by: string_array(input.get("blockedBy")),
+                    })
+                })?;
+            if let Some(index) = demux
+                .claude_tasks
+                .iter()
+                .position(|existing| existing.task_id == task.task_id)
+            {
+                demux.claude_tasks[index] = task;
+            } else {
+                demux.claude_tasks.push(task);
+            }
+        }
+        "TaskUpdate" => {
+            let task_id = input
+                .get("taskId")
+                .and_then(|value| value.as_str())
+                .or_else(|| result.and_then(|value| value.get("taskId")).and_then(|v| v.as_str()))?;
+            let task = demux
+                .claude_tasks
+                .iter_mut()
+                .find(|task| task.task_id == task_id)?;
+            if let Some(title) = input.get("subject").and_then(|value| value.as_str()) {
+                if !title.trim().is_empty() {
+                    task.title = title.trim().to_string();
+                }
+            }
+            if let Some(status) = input.get("status").and_then(|value| value.as_str()) {
+                task.status = task_status(Some(status));
+            }
+            if let Some(detail) = input.get("activeForm").and_then(|value| value.as_str()) {
+                task.detail = Some(detail.to_string());
+            }
+            for dependency in string_array(input.get("addBlockedBy")) {
+                if !task.blocked_by.contains(&dependency) {
+                    task.blocked_by.push(dependency);
+                }
+            }
+            let removed = string_array(input.get("removeBlockedBy"));
+            task.blocked_by.retain(|dependency| !removed.contains(dependency));
+        }
+        _ => return None,
+    }
+    Some(tasks_event(thread_id, demux.claude_tasks.clone()))
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +686,21 @@ fn translate_assistant(
                         .unwrap_or_default()
                         .to_string();
                     let input = block.get("input").cloned().unwrap_or_default();
+                    if subagent_id.is_none() {
+                        // Claude integrations occasionally namespace tool
+                        // names (for example `mcp__...__TodoWrite`). Match
+                        // the semantic suffix just as the SDK adapter does.
+                        if tool_name.to_ascii_lowercase().contains("todowrite") {
+                            if let Some(event) = todo_write_event(thread_id, &input) {
+                                out.push(event);
+                            }
+                        } else if is_claude_task_tool(&tool_name) {
+                            demux.task_tools.insert(
+                                tool_use_id.clone(),
+                                (tool_name.clone(), input.clone()),
+                            );
+                        }
+                    }
                     // A top-level `Workflow` launch becomes a
                     // WorkflowUpdated card and suppresses the generic
                     // ToolUse, exactly like a top-level Agent launch does
@@ -890,6 +1086,17 @@ fn translate_user(
                 .get("is_error")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            if parent.is_none() {
+                if let Some(event) = apply_claude_task_result(
+                    thread_id,
+                    &tool_use_id,
+                    msg.get("tool_use_result"),
+                    is_error,
+                    demux,
+                ) {
+                    out.push(event);
+                }
+            }
             // Parent-level completion of the active Workflow tool run.
             if parent.is_none() && demux.active_workflow.as_deref() == Some(tool_use_id.as_str())
             {
@@ -3434,5 +3641,56 @@ async function run() {
         let snap = only_usage(&events);
         assert_eq!(snap.used_tokens, 12_000);
         assert_eq!(snap.last_used_tokens, Some(90_000));
+    }
+
+    #[test]
+    fn todo_write_emits_complete_tasks_snapshot() {
+        let message = json!({
+            "type": "assistant",
+            "message": {"id": "turn-1", "content": [{
+                "type": "tool_use",
+                "id": "todo-1",
+                "name": "TodoWrite",
+                "input": {"todos": [
+                    {"content": "Research", "status": "completed"},
+                    {"content": "Implement", "status": "in_progress", "activeForm": "Implementing"}
+                ]}
+            }]}
+        });
+        let events = translate_sdk_message(&tid(), &message);
+        let tasks = events.iter().find_map(|event| match event {
+            ProviderRuntimeEvent::TasksUpdated { tasks, .. } => Some(tasks),
+            _ => None,
+        }).expect("tasks snapshot");
+        assert_eq!(tasks.tasks.len(), 2);
+        assert_eq!(tasks.tasks[1].status, TaskStatus::InProgress);
+        assert_eq!(tasks.tasks[1].detail.as_deref(), Some("Implementing"));
+    }
+
+    #[test]
+    fn modern_task_create_result_updates_snapshot() {
+        let mut state = SubagentDemux::default();
+        let use_message = json!({
+            "type": "assistant",
+            "message": {"id": "turn-1", "content": [{
+                "type": "tool_use", "id": "create-1", "name": "TaskCreate",
+                "input": {"subject": "Test the panel", "activeForm": "Testing"}
+            }]}
+        });
+        translate_sdk_message_with(&tid(), &use_message, &mut state);
+        let result_message = json!({
+            "type": "user",
+            "message": {"id": "turn-1", "content": [{
+                "type": "tool_result", "tool_use_id": "create-1", "content": "created"
+            }]},
+            "tool_use_result": {"task": {"id": "42", "subject": "Test the panel", "status": "pending"}}
+        });
+        let events = translate_sdk_message_with(&tid(), &result_message, &mut state);
+        let tasks = events.iter().find_map(|event| match event {
+            ProviderRuntimeEvent::TasksUpdated { tasks, .. } => Some(tasks),
+            _ => None,
+        }).expect("tasks snapshot");
+        assert_eq!(tasks.tasks[0].task_id, "42");
+        assert_eq!(tasks.tasks[0].title, "Test the panel");
     }
 }

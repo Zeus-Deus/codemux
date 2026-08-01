@@ -14,6 +14,7 @@ import { EditorPane } from "@/components/editor/EditorPane";
 import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
 import { ProjectOnboarding } from "@/components/overlays/project-onboarding";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
+import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
 
 const RIGHT_PANEL_MIN = 240;
 const RIGHT_PANEL_MAX = 500;
@@ -101,9 +102,13 @@ export function WorkspaceMain() {
   const { run: activeWorkflowRun } = useWorkspaceWorkflow(activeWorkspace);
   const showableWorkflowRun =
     activeWorkflowRun != null && activeWorkflowRun.status !== "pending_approval";
+  const { tasks: activeChatTasks } = useActiveChatTasks(activeWorkspace);
+  const hasActiveChatTasks = (activeChatTasks?.tasks.length ?? 0) > 0;
   const rightPanelTab =
     rightPanelTabRaw === "orchestration" && !showableWorkflowRun
       ? "files"
+      : rightPanelTabRaw === "tasks" && !hasActiveChatTasks
+        ? "files"
       : rightPanelTabRaw;
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth);
 

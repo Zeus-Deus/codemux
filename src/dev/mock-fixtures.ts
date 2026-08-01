@@ -1058,6 +1058,28 @@ export function richChatTurnEnvelopes(
       type: "item_completed",
       item: { kind: "tool_result", tool_use_id: editId, content: "Applied edit to gateway/run.py", is_error: false },
     }),
+    // Durable provider-normalized task snapshot: drives the conditional
+    // composer toggle and the right-side Tasks panel.
+    {
+      type: "tasks_updated",
+      thread_id: threadId,
+      tasks: {
+        explanation: "Fix the traceback regression and prepare it for review.",
+        tasks: [
+          { task_id: "branch", title: "Branch fix/57298 off origin/main", status: "completed", blocked_by: [] },
+          { task_id: "patch", title: "Patch the traceback chain walker", status: "completed", blocked_by: [] },
+          { task_id: "test", title: "Add a regression test", status: "completed", blocked_by: [] },
+          {
+            task_id: "pr",
+            title: "Open a PR against origin/main",
+            status: "in_progress",
+            detail: "Preparing the change summary and visual evidence",
+            blocked_by: [],
+          },
+          { task_id: "review", title: "Address review feedback", status: "pending", blocked_by: ["pr"] },
+        ],
+      },
+    },
     // Task summary card: a TodoWrite with a todos array.
     evt({
       type: "item_completed",

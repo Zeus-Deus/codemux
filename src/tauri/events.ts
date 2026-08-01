@@ -263,6 +263,23 @@ export interface WorkflowSnapshot {
   duration_ms?: number | null;
 }
 
+// Provider-neutral agent task plan. Each provider adapter emits complete
+// replacement snapshots so replay and live updates follow the same path.
+export type TaskStatus = "pending" | "in_progress" | "completed";
+
+export interface TaskSnapshotItem {
+  task_id: string;
+  title: string;
+  status: TaskStatus;
+  detail?: string | null;
+  blocked_by: string[];
+}
+
+export interface TasksSnapshot {
+  explanation?: string | null;
+  tasks: TaskSnapshotItem[];
+}
+
 export type TurnStatus =
   | { kind: "success" }
   | { kind: "error"; subtype: string; message: string }
@@ -342,6 +359,11 @@ export type ProviderRuntimeEvent =
       type: "context_usage_updated";
       thread_id: string;
       usage: ContextUsageSnapshot;
+    }
+  | {
+      type: "tasks_updated";
+      thread_id: string;
+      tasks: TasksSnapshot;
     }
   | {
       type: "turn_completed";

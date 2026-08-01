@@ -2965,7 +2965,8 @@ fn map_event_to_pane_status(
         // status transition — the subagents it spawns and the turn it
         // runs within already drive `Working`/`Review` via their own
         // events above.
-        ProviderRuntimeEvent::WorkflowUpdated { .. } => None,
+        ProviderRuntimeEvent::WorkflowUpdated { .. }
+        | ProviderRuntimeEvent::TasksUpdated { .. } => None,
         // Context-usage snapshots are pure metadata riding alongside the
         // turn's real progress events — they must never move the dot.
         ProviderRuntimeEvent::ContextUsageUpdated { .. } => None,
@@ -3124,6 +3125,7 @@ fn activity_update(
         | ProviderRuntimeEvent::ItemCompleted { .. }
         | ProviderRuntimeEvent::SubagentUpdated { .. }
         | ProviderRuntimeEvent::WorkflowUpdated { .. }
+        | ProviderRuntimeEvent::TasksUpdated { .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { .. }
         | ProviderRuntimeEvent::RequestResolved { .. } => mid_turn(false),
         // A turn started (Codex/OpenCode emit this reliably per turn).
@@ -3299,6 +3301,9 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             // meaningful change, so the volume tracks assistant
             // messages, not the token stream.
             | ProviderRuntimeEvent::ContextUsageUpdated { .. }
+            // Task plans are durable conversation state. Persist the full
+            // replacement event so hydrate uses the same reducer path.
+            | ProviderRuntimeEvent::TasksUpdated { .. }
     )
     // NOTE: `RunStalled` is deliberately NOT persisted. It is a transient
     // advisory recomputed live by the stall watchdog; the durable record of
@@ -3432,6 +3437,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::SessionStateChanged { thread_id, .. }
         | ProviderRuntimeEvent::SubagentUpdated { thread_id, .. }
         | ProviderRuntimeEvent::WorkflowUpdated { thread_id, .. }
+        | ProviderRuntimeEvent::TasksUpdated { thread_id, .. }
         | ProviderRuntimeEvent::ResumeCursorUpdated { thread_id, .. }
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
@@ -4002,7 +4008,8 @@ mod tests {
     // means adding a `not persisted` row.
 
     use crate::agent_provider::events::{
-        CompletedItem, ContentDelta, SubagentSnapshot, SubagentStatus, TurnStatus, TurnUsage,
+        CompletedItem, ContentDelta, SubagentSnapshot, SubagentStatus, TaskSnapshotItem,
+        TaskStatus, TasksSnapshot, TurnStatus, TurnUsage,
     };
     use crate::agent_provider::types::{
         ApprovalDecision, ProviderSessionId, RequestId, SessionStatus,
@@ -4016,6 +4023,26 @@ mod tests {
     }
     fn req() -> RequestId {
         RequestId("req-1".into())
+    }
+
+    #[test]
+    fn should_persist_tasks_snapshot_for_hydration() {
+        let event = ProviderRuntimeEvent::TasksUpdated {
+            thread_id: tid(),
+            tasks: TasksSnapshot {
+                explanation: Some("Ship the feature".into()),
+                tasks: vec![TaskSnapshotItem {
+                    task_id: "implement".into(),
+                    title: "Implement the panel".into(),
+                    status: TaskStatus::InProgress,
+                    detail: None,
+                    blocked_by: Vec::new(),
+                }],
+            },
+        };
+
+        assert!(should_persist_event(&event));
+        assert_eq!(thread_id_for_event(&event), Some(tid()));
     }
 
     #[test]

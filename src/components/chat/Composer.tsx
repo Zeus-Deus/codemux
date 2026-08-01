@@ -183,6 +183,12 @@ interface Props {
   contextUsageSeedMaxTokens?: number | null;
   /** Display name of the agent for the meter's auto-compaction note. */
   contextUsageProviderLabel?: string | null;
+  /** Provider-authored plan summary. Non-null reveals the Tasks toggle;
+   *  `running` tints the chip amber with a spinner while a step is in
+   *  flight (green check once completed === total). */
+  tasks?: { completed: number; total: number; running?: boolean } | null;
+  tasksOpen?: boolean;
+  onTasksClick?: () => void;
   /** Step 8 Stage 1 — staged attachments rendered as a chip strip
    *  inside the composer card, above the textarea. Empty array hides
    *  the strip. Defaults to `[]` so existing call sites keep working
@@ -294,6 +300,9 @@ export function Composer({
   contextUsage = null,
   contextUsageSeedMaxTokens = null,
   contextUsageProviderLabel = null,
+  tasks = null,
+  tasksOpen = false,
+  onTasksClick,
   stagedAttachments = EMPTY_ATTACHMENTS,
   onRemoveAttachment,
   onToggleExpandPr,
@@ -2446,6 +2455,9 @@ export function Composer({
             contextUsage={contextUsage}
             contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
             contextUsageProviderLabel={contextUsageProviderLabel}
+            tasks={tasks}
+            tasksOpen={tasksOpen}
+            onTasksClick={onTasksClick}
           />
         </div>
         {/* No gap here — the scope strip / context strip attaches

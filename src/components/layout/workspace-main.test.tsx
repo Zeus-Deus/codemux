@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render } from "@testing-library/react";
 
 import type { WorkflowRunItem } from "@/lib/agent-chat/types";
+import type { TasksSnapshot } from "@/tauri/events";
 import type { WorkspaceSnapshot } from "@/tauri/types";
 
 // ── Mutable mock state ──
@@ -12,11 +13,16 @@ const state = {
   enableLazy: false,
   activeDraftId: null as string | null,
   workflowRun: null as WorkflowRunItem | null,
+  tasks: null as TasksSnapshot | null,
   rightPanelTabs: {} as Record<string, string | null>,
 };
 
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
   useWorkspaceWorkflow: () => ({ run: state.workflowRun, threadId: null }),
+}));
+
+vi.mock("@/hooks/use-active-chat-tasks", () => ({
+  useActiveChatTasks: () => ({ threadId: null, tasks: state.tasks }),
 }));
 
 // Child rows → sentinels so we can assert which chrome rendered.
@@ -151,6 +157,7 @@ beforeEach(() => {
   state.enableLazy = false;
   state.activeDraftId = null;
   state.workflowRun = null;
+  state.tasks = null;
   state.rightPanelTabs = {};
 });
 
@@ -235,5 +242,29 @@ describe("WorkspaceMain right-panel stale-tab guard", () => {
     state.workflowRun = null;
     const { getByTestId } = render(<WorkspaceMain />);
     expect(getByTestId("right-panel").dataset.activeTab).toBe("changes");
+  });
+
+  it("coerces a persisted 'tasks' tab to 'files' when the focused pane has no tasks", () => {
+    state.rightPanelTabs = { "ws-1": "tasks" };
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("right-panel").dataset.activeTab).toBe("files");
+  });
+
+  it("keeps 'tasks' active while the focused chat has a task snapshot", () => {
+    state.rightPanelTabs = { "ws-1": "tasks" };
+    state.tasks = {
+      explanation: null,
+      tasks: [
+        {
+          task_id: "one",
+          title: "First task",
+          status: "pending",
+          detail: null,
+          blocked_by: [],
+        },
+      ],
+    };
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("right-panel").dataset.activeTab).toBe("tasks");
   });
 });

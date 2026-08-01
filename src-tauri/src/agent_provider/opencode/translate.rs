@@ -19,7 +19,8 @@ use std::collections::HashMap;
 
 use crate::agent_provider::context_usage::ContextUsageTracker;
 use crate::agent_provider::events::{
-    CompletedItem, ContentDelta, ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus, TurnStatus,
+    CompletedItem, ContentDelta, ProviderRuntimeEvent, SubagentSnapshot, SubagentStatus,
+    TaskSnapshotItem, TaskStatus, TasksSnapshot, TurnStatus,
 };
 use crate::agent_provider::types::{
     ApprovalDecision, ProviderSessionId, RequestId, SessionStatus, ThreadId, TurnId,
@@ -329,6 +330,46 @@ fn translate_known(
                 thread_id: ctx.thread_id.clone(),
                 request_id: RequestId(reply.request_id),
                 decision,
+            }]
+        }
+        KnownEvent::TodoUpdated(update) => {
+            // The shared panel follows the orchestrator. A child session's
+            // private todo list must not replace the parent's plan.
+            if subagent_id.is_some() {
+                return vec![];
+            }
+            let tasks = update
+                .todos
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, todo)| {
+                    let title = todo.content.trim().to_string();
+                    if title.is_empty() {
+                        return None;
+                    }
+                    Some(TaskSnapshotItem {
+                        task_id: if todo.id.is_empty() {
+                            format!("opencode-{index}")
+                        } else {
+                            todo.id
+                        },
+                        title,
+                        status: match todo.status.as_str() {
+                            "completed" | "cancelled" => TaskStatus::Completed,
+                            "in_progress" | "inProgress" => TaskStatus::InProgress,
+                            _ => TaskStatus::Pending,
+                        },
+                        detail: None,
+                        blocked_by: Vec::new(),
+                    })
+                })
+                .collect();
+            vec![ProviderRuntimeEvent::TasksUpdated {
+                thread_id: ctx.thread_id.clone(),
+                tasks: TasksSnapshot {
+                    explanation: None,
+                    tasks,
+                },
             }]
         }
         // session.created/updated/deleted — Codemux already knows
@@ -1826,5 +1867,28 @@ mod tests {
             &mut usage,
         );
         assert!(usage_snapshots(&events).is_empty());
+    }
+
+    #[test]
+    fn todo_updated_maps_to_parent_tasks_snapshot() {
+        let event: OpenCodeEvent = serde_json::from_value(serde_json::json!({
+            "type": "todo.updated",
+            "properties": {
+                "sessionID": "ses_root",
+                "todos": [
+                    {"id": "a", "content": "Inspect", "status": "completed"},
+                    {"id": "b", "content": "Build", "status": "in_progress"}
+                ]
+            }
+        }))
+        .unwrap();
+        let out = opencode_event_to_runtime(event, &ctx(), None);
+        match &out[0] {
+            ProviderRuntimeEvent::TasksUpdated { tasks, .. } => {
+                assert_eq!(tasks.tasks.len(), 2);
+                assert_eq!(tasks.tasks[1].status, TaskStatus::InProgress);
+            }
+            other => panic!("expected TasksUpdated, got {other:?}"),
+        }
     }
 }
