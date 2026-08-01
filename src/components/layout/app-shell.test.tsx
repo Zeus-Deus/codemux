@@ -73,6 +73,10 @@ vi.mock("@/components/ui/sidebar", () => ({
   SidebarInset: ({ children }: { children: React.ReactNode }) => (
     <div>{children}</div>
   ),
+  // Consumed by `SidebarToggleBridge`, which publishes the real
+  // `toggleSidebar` (mobile Sheet included) to the UI store for the Ctrl+B
+  // keybind and the command palette.
+  useSidebar: () => ({ toggleSidebar: vi.fn() }),
 }));
 
 vi.mock("@/stores/app-store", () => ({

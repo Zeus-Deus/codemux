@@ -9,7 +9,7 @@ import {
   selectDensity,
 } from "@/stores/settings-store";
 import { useSyncedSettingsStore } from "@/stores/synced-settings-store";
-import { SidebarProvider, SidebarInset } from "@/components/ui/sidebar";
+import { SidebarProvider, SidebarInset, useSidebar } from "@/components/ui/sidebar";
 import { BrowserPeekOverlay } from "@/components/browser/BrowserPeekOverlay";
 import { AppSidebar } from "./app-sidebar";
 import { TitleBar } from "./title-bar";
@@ -65,7 +65,12 @@ export function AppShell() {
 
   useWorktreeIncludeToast();
 
-  // Register sidebar toggle in UIStore so the central keyboard hook can call it
+  // Baseline sidebar toggle for the central keyboard hook and the command
+  // palette. `SidebarToggleBridge` (rendered inside `SidebarProvider` below)
+  // replaces this with the provider's own `toggleSidebar` as soon as the
+  // sidebar mounts — that one also handles the narrow-viewport Sheet, which
+  // `setSidebarOpen` alone cannot reach. This registration still matters for
+  // the branches that return before `SidebarProvider` renders.
   useEffect(() => {
     useUIStore.getState().setSidebarToggleFn(() => setSidebarOpen((o) => !o));
     return () => useUIStore.getState().setSidebarToggleFn(null);
@@ -119,6 +124,7 @@ export function AppShell() {
         onOpenChange={setSidebarOpen}
         className="flex-1 min-h-0"
       >
+        <SidebarToggleBridge />
         <AppSidebar />
         <SidebarInset className="flex flex-col overflow-hidden h-full min-w-0">
           <WorkspaceMain />
@@ -142,4 +148,23 @@ export function AppShell() {
       </SidebarProvider>
     </div>
   );
+}
+
+/**
+ * Publishes the sidebar's own `toggleSidebar` to the UI store, so every
+ * non-React caller — the Ctrl+B keybind and the command palette's "Toggle
+ * sidebar" row, both of which go through `dispatch()` — flips whichever
+ * sidebar is actually on screen. Below 768px `SidebarProvider` renders a
+ * Sheet driven by a separate `openMobile` state, so driving the desktop
+ * `open` prop alone is a silent no-op there.
+ *
+ * Must render inside `SidebarProvider` (it needs `useSidebar`), and after it
+ * unmounts the shell's own baseline registration is restored.
+ */
+function SidebarToggleBridge() {
+  const { toggleSidebar } = useSidebar();
+  useEffect(() => {
+    useUIStore.getState().setSidebarToggleFn(toggleSidebar);
+  }, [toggleSidebar]);
+  return null;
 }
