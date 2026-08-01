@@ -102,6 +102,10 @@ overview):
 
 ## Notes
 
+- `.thin-scrollbar` (in `globals.css`) is the shared opt-in for overlay lists
+  tall enough to always show a scrollbar — the command palette's result list.
+  Thin, token-colored, transparent track. Prefer it over hiding the scrollbar
+  (`no-scrollbar`) when the user needs to see how much list is left.
 - OpenFlow role palette stays distinct via tokens (e.g. debugger →
   `accent-ember`).
 - Streamdown's compiled utility classes are registered as a Tailwind scan

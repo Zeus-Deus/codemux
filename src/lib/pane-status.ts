@@ -13,6 +13,38 @@ const STATUS_PRIORITY: Record<PaneStatus, number> = {
   permission: 3,
 };
 
+/** How much a status outranks the others when sorting workspaces "most
+ *  demanding first". Same ordering as {@link STATUS_PRIORITY}, exposed so
+ *  list surfaces (command palette, needs-you strip) can sort without
+ *  re-deriving the ladder. Idle/unknown sorts last as `0`. */
+export function statusRank(status: ActivePaneStatus | null | undefined): number {
+  return status ? STATUS_PRIORITY[status] : 0;
+}
+
+/** The one human label per agent status. Shared so the hover card, the
+ *  command palette, and any future list surface can never drift into
+ *  describing the same state two different ways. */
+export const STATUS_LABEL: Record<ActivePaneStatus, string> = {
+  working: "Working",
+  permission: "Needs you",
+  review: "Done · review",
+};
+
+/** Design-token text colour per status (see `docs/reference/DESIGN-SYSTEM.md`
+ *  — status tones are identical across every palette variant). */
+export const STATUS_TEXT_CLASS: Record<ActivePaneStatus, string> = {
+  working: "text-status-working",
+  permission: "text-status-attention",
+  review: "text-status-open",
+};
+
+/** Matching dot colour, with the attention pulse the inbox and rail use. */
+export const STATUS_DOT_CLASS: Record<ActivePaneStatus, string> = {
+  working: "bg-status-working",
+  permission: "bg-status-attention animate-pulse",
+  review: "bg-status-open",
+};
+
 export function pickHigherStatus(
   a: PaneStatus | undefined,
   b: PaneStatus | undefined,

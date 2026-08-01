@@ -75,7 +75,12 @@ export function useKeyboardShortcuts() {
   return null;
 }
 
-export function dispatch(actionId: string, _e: KeyboardEvent): boolean {
+/**
+ * Run a keybind action by id. The keyboard handler passes the originating
+ * event; the command palette calls it without one, so a palette row and its
+ * shortcut always execute the exact same code path.
+ */
+export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   const ui = useUIStore.getState();
   const appState = useAppStore.getState().appState;
 
