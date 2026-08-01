@@ -21,8 +21,8 @@ pub use errors::{ProviderError, SerializableProviderError};
 pub use events::{
     child_exit_events, CompletedItem, ContentDelta, ContextUsageSnapshot, ProviderRuntimeEvent,
     RequestResponseFailureReason, SubagentSnapshot, SubagentStatus, TaskSnapshotItem, TaskStatus,
-    TasksSnapshot, TurnStatus, TurnUsage, WorkflowPhaseSnapshot, WorkflowSnapshot,
-    CHILD_EXITED_SUBTYPE,
+    TasksSnapshot, TurnStatus, TurnUsage, UserMessageImage, WorkflowPhaseSnapshot,
+    WorkflowSnapshot, CHILD_EXITED_SUBTYPE,
 };
 pub use instance::ProviderInstanceId;
 pub use provider::{AgentProvider, ProviderEventStream};

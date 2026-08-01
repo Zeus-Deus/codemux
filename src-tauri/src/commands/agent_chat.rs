@@ -25,7 +25,7 @@ use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
     ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
-    SerializableProviderError, StartSessionInput, ThreadId, TurnId,
+    SerializableProviderError, StartSessionInput, ThreadId, TurnId, UserMessageImage,
 };
 use crate::database::{
     AgentChatCheckpointRecord, AgentChatSessionConfig, AgentChatSessionRecord, DatabaseStore,
@@ -1356,9 +1356,23 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     // unaffected.
     match &result.queued_id {
         None => {
-            persist_user_message(
+            let row_id = persist_user_message(
                 &db,
                 &thread_id_for_persist,
+                &user_text_for_persist,
+                &saved_images,
+                input.client_nonce.as_deref(),
+            );
+            // Then fan the row out to everyone watching this thread. The
+            // sender already painted this bubble and drops the copy on its
+            // nonce; any OTHER attached client (a second window, a paired
+            // web-remote browser) needs it, both to render the turn and to
+            // keep its cursor from stepping over an id it never saw. See
+            // `fan_out_user_message`.
+            fan_out_user_message(
+                &app,
+                &thread_id_for_persist,
+                row_id,
                 &user_text_for_persist,
                 &saved_images,
                 input.client_nonce.as_deref(),
@@ -2951,16 +2965,33 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             // promotes is. The row is deliberately NOT reported as this
             // event's `persisted_id`: a pane that never saw the enqueue
             // has no queued bubble to promote, so the reducer no-ops and
-            // the row must still arrive through a later tail read. The
-            // nonce carried on the envelope is what keeps that tail read
-            // from duplicating a bubble that WAS promoted.
-            persist_user_message(
+            // the row must still arrive as its own message.
+            let row_id = persist_user_message(
                 &db,
                 &thread_id.0,
                 text,
                 &pending.images,
                 pending.client_nonce.as_deref(),
             );
+            // Fan the row out under its own id, so every attached client's
+            // cursor moves over it instead of over it. Gated on a nonce
+            // because the nonce IS the dedup key here: `TurnQueued` already
+            // put a greyed bubble on every client attached at enqueue time,
+            // and without a token to match it by, this copy would render a
+            // second one. With it, clients holding the queued bubble skip
+            // the copy, and a client that attached mid-queue inserts the
+            // turn it missed (the later `QueuedTurnDispatched` then finds no
+            // `queued` marker on that fresh bubble and leaves it in place).
+            if pending.client_nonce.as_deref().is_some_and(|n| !n.is_empty()) {
+                fan_out_user_message(
+                    app,
+                    &thread_id.0,
+                    row_id,
+                    text,
+                    &pending.images,
+                    pending.client_nonce.as_deref(),
+                );
+            }
         }
     }
     // A queued turn was cancelled before it dispatched, so its envelope
@@ -3034,12 +3065,28 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
         }
         return;
     }
-    // Thread-scoped events (incl. the content_delta token stream) go
-    // over the per-thread Channels only — never the global bus. An empty
-    // subscriber list means no pane is currently attached to this thread;
-    // transcript events were already persisted above, so the DB hydrate
-    // replays them on (re)attach. When several consumers are attached
-    // (mirror mode), each receives an identical copy.
+    fan_out_to_thread_channels(app, &thread_id, &payload);
+}
+
+/// Deliver one already-persisted payload to every channel attached to
+/// `thread_id`.
+///
+/// Thread-scoped events (incl. the `content_delta` token stream) go over
+/// the per-thread Channels only — never the global bus. An empty
+/// subscriber list means no pane is currently attached to this thread;
+/// transcript events are persisted before this call, so the DB hydrate
+/// replays them on (re)attach. When several consumers are attached
+/// (mirror mode, or a desktop window and a web-remote browser on the same
+/// thread), each receives an identical copy.
+///
+/// Extracted so [`fan_out_user_message`] delivers on exactly the same path
+/// and in the same persist-before-fan-out order as [`forward_event`],
+/// rather than growing a second delivery mechanism next to it.
+fn fan_out_to_thread_channels<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &ThreadId,
+    payload: &AgentChatEventPayload,
+) {
     let channels: State<'_, AgentChatChannelRegistry> = app.state();
     for channel in channels.channels_for(&thread_id.0) {
         if let Err(error) = channel.send(payload.clone()) {
@@ -3049,6 +3096,63 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             );
         }
     }
+}
+
+/// Fan a just-persisted user turn out to every client attached to the
+/// thread, stamped with the row id it was written as.
+///
+/// Providers never echo user turns, so before this existed the row was
+/// visible only to the client that sent it (which appended the bubble
+/// optimistically) and to whoever cold-hydrated afterwards. A *second*
+/// client already viewing the thread got the assistant reply — persisted
+/// at a HIGHER id — as its next live event, and `applyLiveEvents` advanced
+/// `lastPersistedEventId` past the user row it had never seen. Every later
+/// warm tail read asks for `id > cursor`, so that user bubble was skipped
+/// forever: the phone's prompt never appeared on the desktop, and no
+/// amount of revisiting recovered it.
+///
+/// Ordering: the row is written first and its id rides on the payload, so
+/// a client that also runs a tail read across the same instant dedups the
+/// duplicate on `persisted_id` (`applyLiveEvents` skips anything at or
+/// below its cursor) exactly as it does for assistant events. The sending
+/// client drops its own copy on `client_nonce`.
+///
+/// Deliberately NOT routed through [`forward_event`]: that function owns
+/// persistence, and this row is already on disk — re-entering it would
+/// either double-write the envelope or lose the `persisted_id` stamp,
+/// since `should_persist_event` returns `false` for this variant.
+/// Pane-status publication and stall-watchdog activity are likewise
+/// skipped: `agent_chat_send_turn` already owns the send's status
+/// transition, and a user turn is an input, not provider liveness.
+fn fan_out_user_message<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+    persisted_id: Option<i64>,
+    text: &str,
+    images: &[PersistedChatImage],
+    client_nonce: Option<&str>,
+) {
+    if thread_id.is_empty() {
+        return;
+    }
+    let thread = ThreadId(thread_id.to_string());
+    let payload = AgentChatEventPayload {
+        thread_id: thread.clone(),
+        event: ProviderRuntimeEvent::UserMessage {
+            thread_id: thread.clone(),
+            text: text.to_string(),
+            images: images
+                .iter()
+                .map(|image| UserMessageImage {
+                    path: image.path.clone(),
+                    media_type: image.media_type.clone(),
+                })
+                .collect(),
+            client_nonce: client_nonce.filter(|n| !n.is_empty()).map(str::to_string),
+        },
+        persisted_id,
+    };
+    fan_out_to_thread_channels(app, &thread, &payload);
 }
 
 // ── Per-thread running-subagent tracking ─────────────────────────────
@@ -3273,6 +3377,11 @@ fn map_event_to_pane_status(
         // Context-usage snapshots are pure metadata riding alongside the
         // turn's real progress events — they must never move the dot.
         ProviderRuntimeEvent::ContextUsageUpdated { .. } => None,
+        // A fanned-out user turn is an INPUT echo, not provider liveness.
+        // `agent_chat_send_turn` already owns the send's status transition
+        // (and it runs on the sending client's command, before any of this),
+        // so re-deriving one here would only race it.
+        ProviderRuntimeEvent::UserMessage { .. } => None,
     }
 }
 
@@ -3611,6 +3720,12 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             // replacement event so hydrate uses the same reducer path.
             | ProviderRuntimeEvent::TasksUpdated { .. }
     )
+    // NOTE: `UserMessage` is deliberately NOT persisted here either — it is
+    // MINTED from a row `persist_user_message` has already written, and
+    // re-persisting it in `forward_event` would double the bubble on every
+    // hydrate. Its `persisted_id` is stamped by `fan_out_user_message`
+    // instead, which is why that path bypasses `forward_event`.
+    //
     // NOTE: `RunStalled` is deliberately NOT persisted. It is a transient
     // advisory recomputed live by the stall watchdog; the durable record of
     // a dead run is the settled/`child_exited` `TurnCompleted`, which drives
@@ -3749,6 +3864,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
         | ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
+        | ProviderRuntimeEvent::UserMessage { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }
@@ -4290,6 +4406,146 @@ mod tests {
                 {"path": "/tmp/b.jpg", "media_type": "image/jpeg"},
             ])
         );
+    }
+
+    // ── user-turn fan-out (cross-client cursor safety) ──
+    //
+    // Providers never echo user turns, so the persisted row is the only
+    // record of one. Before the fan-out, a second client attached to the
+    // thread received the ASSISTANT reply (persisted at a higher id) as its
+    // next live event and advanced `lastPersistedEventId` past a user row it
+    // had never seen — after which every `id > cursor` tail read skipped that
+    // row forever. These tests pin the two properties that make the fix work:
+    // the live payload is byte-identical to the stored envelope, and it
+    // carries the row's own id.
+
+    /// The fanned-out event and the persisted envelope MUST serialize
+    /// identically. The frontend folds both through one reducer case, so any
+    /// drift here silently becomes "the live bubble and the replayed bubble
+    /// disagree" — the exact class of bug the shared shape exists to prevent.
+    #[test]
+    fn user_message_event_serializes_like_the_persisted_envelope() {
+        let images = vec![PersistedChatImage {
+            path: "/tmp/a.png".into(),
+            media_type: "image/png".into(),
+        }];
+        let event = ProviderRuntimeEvent::UserMessage {
+            thread_id: ThreadId("t1".into()),
+            text: "look".into(),
+            images: images
+                .iter()
+                .map(|image| UserMessageImage {
+                    path: image.path.clone(),
+                    media_type: image.media_type.clone(),
+                })
+                .collect(),
+            client_nonce: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&event).unwrap(),
+            user_message_envelope("t1", "look", &images)
+        );
+    }
+
+    /// No images and no nonce → the fields are ABSENT, not `null`, matching
+    /// the pre-images transcript shape byte for byte.
+    #[test]
+    fn user_message_event_omits_empty_images_and_nonce() {
+        let event = ProviderRuntimeEvent::UserMessage {
+            thread_id: ThreadId("t1".into()),
+            text: "hello".into(),
+            images: Vec::new(),
+            client_nonce: None,
+        };
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value, user_message_envelope("t1", "hello", &[]));
+        assert!(value.get("images").is_none());
+        assert!(value.get("client_nonce").is_none());
+    }
+
+    /// The whole point: every client attached to the thread gets the turn,
+    /// stamped with the row id it was persisted as (so cursors advance over
+    /// it rather than past it) and with the sender's nonce (so the sender
+    /// drops its own duplicate).
+    #[test]
+    fn fan_out_user_message_reaches_every_attached_client_with_row_id() {
+        let app = tauri::test::mock_app();
+        app.manage(AgentChatChannelRegistry::default());
+        let handle = app.handle().clone();
+        let registry: State<'_, AgentChatChannelRegistry> = handle.state();
+
+        // Two clients on one thread — e.g. the desktop window and a paired
+        // web-remote browser — plus a third on an unrelated thread.
+        let (desktop, desktop_rx) = capture_channel();
+        let (web, web_rx) = capture_channel();
+        let (other, other_rx) = capture_channel();
+        registry.attach("t1", desktop);
+        registry.attach("t1", web);
+        registry.attach("t2", other);
+
+        let images = vec![PersistedChatImage {
+            path: "/tmp/a.png".into(),
+            media_type: "image/png".into(),
+        }];
+        fan_out_user_message(&handle, "t1", Some(42), "hi there", &images, Some("nonce-1"));
+
+        for captured in [&desktop_rx, &web_rx] {
+            let received = captured.lock().unwrap();
+            assert_eq!(received.len(), 1, "one copy per attached client");
+            assert_eq!(received[0].thread_id.0, "t1");
+            assert_eq!(
+                received[0].persisted_id,
+                Some(42),
+                "the row id must ride along or the cursor cannot advance over it"
+            );
+            match &received[0].event {
+                ProviderRuntimeEvent::UserMessage {
+                    text,
+                    client_nonce,
+                    images,
+                    ..
+                } => {
+                    assert_eq!(text, "hi there");
+                    assert_eq!(client_nonce.as_deref(), Some("nonce-1"));
+                    assert_eq!(images.len(), 1);
+                    assert_eq!(images[0].path, "/tmp/a.png");
+                }
+                other => panic!("unexpected event variant: {other:?}"),
+            }
+        }
+        assert!(
+            other_rx.lock().unwrap().is_empty(),
+            "another thread's clients must not see this turn"
+        );
+    }
+
+    /// An empty thread id is a no-op rather than a broadcast — the same
+    /// guard `forward_event` applies before touching the channel registry.
+    #[test]
+    fn fan_out_user_message_ignores_an_empty_thread_id() {
+        let app = tauri::test::mock_app();
+        app.manage(AgentChatChannelRegistry::default());
+        let handle = app.handle().clone();
+        let registry: State<'_, AgentChatChannelRegistry> = handle.state();
+        let (channel, captured) = capture_channel();
+        registry.attach("", channel);
+
+        fan_out_user_message(&handle, "", Some(1), "hi", &[], None);
+
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    /// `forward_event` must never re-persist a fanned-out user turn: the row
+    /// already exists (that is where the event came from), so persisting it
+    /// again would double the bubble on the next hydrate.
+    #[test]
+    fn user_message_is_not_persisted_by_forward_event() {
+        assert!(!should_persist_event(&ProviderRuntimeEvent::UserMessage {
+            thread_id: ThreadId("t1".into()),
+            text: "hi".into(),
+            images: Vec::new(),
+            client_nonce: None,
+        }));
     }
 
     #[test]

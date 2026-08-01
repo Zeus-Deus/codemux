@@ -840,6 +840,159 @@ describe("useAppStore.setAppState — snapshot revision ordering", () => {
   });
 });
 
+describe("useAppStore — a backend restart resets the revision baseline", () => {
+  // The revision counter is process-lifetime and restarts at 0. A desktop
+  // webview dies with the process so it never notices; a web-remote browser
+  // survives the restart holding a `lastSeenRevision` from the DEAD process,
+  // and every message from the new one then looks stale. The ordering guards
+  // discarded all of them and the page sat frozen — showing the pre-restart
+  // world — until the new counter climbed past the old number, which on a
+  // long-lived session is minutes or never. The instance token is what makes
+  // "the counter restarted" distinguishable from "this message is stale".
+  const wsA = makeWs({ workspace_id: "ws-A" });
+  const wsB = makeWs({ workspace_id: "ws-B" });
+
+  const portsDelta: AppStateDelta = {
+    domain: "detected_ports",
+    ports: [
+      {
+        port: 5173,
+        pid: 42,
+        process_name: "vite",
+        workspace_id: null,
+        label: null,
+        source: null,
+      },
+    ],
+  };
+
+  function reset(): void {
+    useAppStore.setState({
+      appState: null,
+      pendingActiveWorkspaceId: null,
+      pendingActivationAt: null,
+      lastSeenRevision: 0,
+      backendInstance: null,
+      resyncInFlight: false,
+      resyncRequestId: 0,
+      deltaBuffer: new Map(),
+      gapWindowId: 0,
+    });
+  }
+
+  function seed(revision: number, instance: string): void {
+    const snapshot = makeAppState([wsA, wsB]);
+    snapshot.snapshot_revision = revision;
+    snapshot.snapshot_instance = instance;
+    useAppStore.getState().setAppState(snapshot);
+  }
+
+  beforeEach(reset);
+  afterEach(reset);
+
+  it("adopts the instance that stamped the snapshot", () => {
+    seed(500, "instance-1");
+    expect(useAppStore.getState().backendInstance).toBe("instance-1");
+    expect(useAppStore.getState().lastSeenRevision).toBe(500);
+  });
+
+  it("applies a low-revision snapshot from a NEW instance instead of dropping it", () => {
+    // This is the freeze, exactly: the reconnect's reseeded snapshot arrives
+    // at revision 3 while the page still holds 500 from the previous process.
+    seed(500, "instance-1");
+
+    const reseeded = makeAppState([wsA, wsB]);
+    reseeded.active_workspace_id = "ws-B";
+    reseeded.snapshot_revision = 3;
+    reseeded.snapshot_instance = "instance-2";
+    useAppStore.getState().setAppState(reseeded);
+
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B");
+    expect(state.lastSeenRevision).toBe(3);
+    expect(state.backendInstance).toBe("instance-2");
+  });
+
+  it("still drops a stale snapshot from the SAME instance", () => {
+    // The restart escape hatch must not weaken the ordering guard it sits in
+    // front of — a late background emit from the live process is still stale.
+    seed(500, "instance-1");
+
+    const stale = makeAppState([wsA, wsB]);
+    stale.active_workspace_id = "ws-B";
+    stale.snapshot_revision = 499;
+    stale.snapshot_instance = "instance-1";
+    useAppStore.getState().setAppState(stale);
+
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-A");
+    expect(useAppStore.getState().lastSeenRevision).toBe(500);
+  });
+
+  it("discards deltas buffered against the dead instance's counter", () => {
+    // A gap opened just before the restart. Those revisions belong to a
+    // process that no longer exists and will never arrive, so holding them
+    // would keep a reorder window open against a counter that reset.
+    seed(500, "instance-1");
+    useAppStore.getState().applyAppStateDelta(505, portsDelta, "instance-1");
+    expect(useAppStore.getState().deltaBuffer.size).toBe(1);
+    expect(useAppStore.getState().gapWindowId).not.toBe(0);
+
+    const reseeded = makeAppState([wsA, wsB]);
+    reseeded.snapshot_revision = 2;
+    reseeded.snapshot_instance = "instance-2";
+    useAppStore.getState().setAppState(reseeded);
+
+    const state = useAppStore.getState();
+    expect(state.deltaBuffer.size).toBe(0);
+    expect(state.gapWindowId).toBe(0);
+    expect(state.lastSeenRevision).toBe(2);
+  });
+
+  it("a delta from a new instance opens a resync rather than patching a dead baseline", () => {
+    // If a delta beats the reseeded snapshot, applying it would patch the
+    // PREVIOUS process's world with the new one's data — a snapshot that
+    // never existed anywhere.
+    seed(500, "instance-1");
+    const before = useAppStore.getState().appState;
+
+    useAppStore.getState().applyAppStateDelta(1, portsDelta, "instance-2");
+
+    const state = useAppStore.getState();
+    expect(state.appState).toBe(before); // untouched
+    expect(state.resyncInFlight).toBe(true);
+    expect(state.resyncRequestId).toBe(1);
+    expect(state.lastSeenRevision).toBe(0);
+    expect(state.deltaBuffer.size).toBe(0);
+  });
+
+  it("leaves the baseline alone for an unstamped snapshot", () => {
+    // A restored layout, the dev mock, or an older backend carries neither a
+    // revision nor a token. It must not be read as a restart — that would
+    // reset the high-water mark and let a genuinely stale emit back in.
+    seed(500, "instance-1");
+
+    const unstamped = makeAppState([wsA, wsB]);
+    unstamped.active_workspace_id = "ws-B";
+    useAppStore.getState().setAppState(unstamped);
+
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B"); // applied
+    expect(state.lastSeenRevision).toBe(500); // but the mark survives
+    expect(state.backendInstance).toBe("instance-1");
+  });
+
+  it("the first stamped snapshot is not a restart", () => {
+    // Boot: no baseline yet, so there is nothing to invalidate.
+    const first = makeAppState([wsA]);
+    first.snapshot_revision = 9;
+    first.snapshot_instance = "instance-1";
+    useAppStore.getState().setAppState(first);
+
+    expect(useAppStore.getState().lastSeenRevision).toBe(9);
+    expect(useAppStore.getState().resyncRequestId).toBe(0);
+  });
+});
+
 describe("getSessionWorkspaceId", () => {
   it("reads the cached index from useAppStore.getState()", () => {
     const ws = makeWs({

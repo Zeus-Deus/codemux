@@ -1677,12 +1677,22 @@ fn build_core_app<R: tauri::Runtime>(
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-                    // Same off-screen gate as the git sweep. Detected ports
-                    // are read only by sidebar surfaces (the ports popover,
-                    // the workspace row pill), so a scan of every
-                    // `/proc/*/fd/` entry while the window is hidden buys
-                    // nothing — the next tick repopulates within 3 s of the
-                    // window coming back.
+                    // Off-screen gate. Detected ports are read only by sidebar
+                    // surfaces (the ports popover, the workspace row pill), so
+                    // a scan of every `/proc/*/fd/` entry while nobody can see
+                    // the result buys nothing — the next tick repopulates
+                    // within 3 s of the window coming back.
+                    //
+                    // "Nobody can see the result" is the load-bearing part, and
+                    // the desktop window is not the only viewer. A paired
+                    // web-remote browser renders the same sidebar from the same
+                    // `detected_ports` domain, so gating on the desktop window
+                    // alone froze every remote client's port list the moment
+                    // the desktop was minimized — the exact situation where the
+                    // remote page is the one being used. Any live socket
+                    // therefore keeps the poll running. `try_state` because the
+                    // server is optional: no web-remote state managed (or none
+                    // ever started) reads as no remote viewers.
                     let window_active = port_handle
                         .get_webview_window("main")
                         .map(|w| {
@@ -1691,7 +1701,11 @@ fn build_core_app<R: tauri::Runtime>(
                             visible && !minimized
                         })
                         .unwrap_or(false);
-                    if !window_active {
+                    let remote_viewers = port_handle
+                        .try_state::<web_remote::WebRemoteState>()
+                        .map(|s| s.active_connection_count() > 0)
+                        .unwrap_or(false);
+                    if !window_active && !remote_viewers {
                         continue;
                     }
 

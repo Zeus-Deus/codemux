@@ -147,6 +147,26 @@ export function createAgentChatEventBatcher(
       : scheduleFrame(run);
   };
 
+  /** Whether any queued thread could actually be drained right now. A queue
+   *  belonging to a HELD thread cannot: only `release` / `drop` can move it. */
+  const hasDrainableQueue = (): boolean => {
+    for (const threadId of queues.keys()) {
+      if (!held.has(threadId)) return true;
+    }
+    return false;
+  };
+
+  /** Arm the flush only when there is something a flush could do.
+   *
+   *  Scheduling on "any queue is non-empty" instead burns a frame callback
+   *  per frame for as long as every queued thread stays held — i.e. for the
+   *  whole of a hydrate's IPC round trip, which is exactly when the thread is
+   *  held and exactly when the main thread is busiest. Each of those wakeups
+   *  drains nothing and re-arms itself: a 60 Hz no-op loop. */
+  const scheduleIfDrainable = () => {
+    if (hasDrainableQueue()) schedule();
+  };
+
   const flush = (threadId: string, filter?: HeldEventFilter) => {
     if (held.has(threadId)) return;
     const queued = queues.get(threadId);
@@ -171,8 +191,10 @@ export function createAgentChatEventBatcher(
     }
     unschedule();
     for (const [threadId, events] of drained) apply(threadId, events);
-    // A held thread keeps its queue, so it may still owe a drain later.
-    if (queues.size > 0) schedule();
+    // A held thread keeps its queue, so it may still owe a drain — but not one
+    // this scheduler can perform. Re-arming for it would spin until the hold
+    // ends; the hold's own `release` / `drop` is what wakes it instead.
+    scheduleIfDrainable();
   };
 
   const enqueue = (
@@ -203,6 +225,10 @@ export function createAgentChatEventBatcher(
     if (held.get(threadId) !== token) return;
     held.delete(threadId);
     flush(threadId, filter);
+    // Ending a hold is the event that can make another thread's queue
+    // drainable again, and `flushAll` deliberately stopped re-arming for
+    // undrainable queues — so the wakeup has to come from here.
+    scheduleIfDrainable();
   };
 
   const drop = (threadId: string, token: AgentChatHoldToken) => {
@@ -210,6 +236,7 @@ export function createAgentChatEventBatcher(
     held.delete(threadId);
     queues.delete(threadId);
     if (queues.size === 0) unschedule();
+    else scheduleIfDrainable();
   };
 
   // A document going hidden parks rAF mid-flight; drain rather than stall

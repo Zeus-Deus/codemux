@@ -295,6 +295,123 @@ describe("agent-chat event batcher — hold ownership", () => {
   });
 });
 
+describe("agent-chat event batcher — the scheduler idles while held", () => {
+  const OTHER = "t2";
+
+  function otherDelta(text: string): ProviderRuntimeEvent {
+    return {
+      type: "content_delta",
+      thread_id: OTHER,
+      turn_id: "turn-1",
+      delta: { kind: "text", text },
+    };
+  }
+
+  it("stops re-arming when every queued thread is held", () => {
+    // The hold spans a hydrate's IPC round trip. Re-arming for a queue only
+    // `release` can move means one wakeup per frame that drains nothing and
+    // schedules itself again — a 60 Hz no-op loop, running exactly while the
+    // main thread is busy hydrating.
+    const frames = manualScheduler();
+    const apply = vi.fn();
+    const b = createAgentChatEventBatcher({
+      apply,
+      scheduleFrame: frames.schedule,
+      isHidden: () => false,
+      observeVisibility: () => () => undefined,
+    });
+
+    b.enqueue(THREAD, delta("a"));
+    expect(frames.scheduled).toBe(true);
+
+    // The hydrate takes the hold before the frame lands.
+    b.hold(THREAD);
+    frames.runFrame();
+
+    expect(apply).not.toHaveBeenCalled();
+    expect(b.pending(THREAD)).toBe(1); // still owed, still held
+    expect(frames.scheduled).toBe(false);
+  });
+
+  it("keeps draining an unheld thread while another is held", () => {
+    // The idle rule must be "nothing drainable", not "anything held".
+    const frames = manualScheduler();
+    const apply = vi.fn();
+    const b = createAgentChatEventBatcher({
+      apply,
+      scheduleFrame: frames.schedule,
+      isHidden: () => false,
+      observeVisibility: () => () => undefined,
+    });
+
+    b.hold(THREAD);
+    b.enqueue(THREAD, delta("held"));
+    b.enqueue(OTHER, otherDelta("live"));
+
+    frames.runFrame();
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply.mock.calls[0][0]).toBe(OTHER);
+    // Only the held queue is left, so nothing is owed to the scheduler.
+    expect(frames.scheduled).toBe(false);
+    expect(b.pending(THREAD)).toBe(1);
+  });
+
+  it("release wakes the flush back up for a thread queued during the hold", () => {
+    const frames = manualScheduler();
+    const apply = vi.fn();
+    const b = createAgentChatEventBatcher({
+      apply,
+      scheduleFrame: frames.schedule,
+      isHidden: () => false,
+      observeVisibility: () => () => undefined,
+    });
+
+    const token = b.hold(THREAD);
+    b.enqueue(THREAD, delta("held"));
+    frames.runFrame();
+    expect(frames.scheduled).toBe(false);
+
+    b.release(THREAD, token);
+    // The release drains its own thread synchronously…
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply.mock.calls[0][0]).toBe(THREAD);
+    // …and leaves no phantom timer behind.
+    expect(frames.scheduled).toBe(false);
+    expect(b.pending(THREAD)).toBe(0);
+  });
+
+  it("drop re-arms the flush for a thread that is still owed one", () => {
+    // Two threads held, one dropped: the survivor's queue becomes drainable
+    // only if something re-arms, and `flushAll` deliberately no longer does.
+    const frames = manualScheduler();
+    const apply = vi.fn();
+    const b = createAgentChatEventBatcher({
+      apply,
+      scheduleFrame: frames.schedule,
+      isHidden: () => false,
+      observeVisibility: () => () => undefined,
+    });
+
+    const heldToken = b.hold(THREAD);
+    b.enqueue(THREAD, delta("held"));
+    b.enqueue(OTHER, otherDelta("also-queued"));
+    // Park the second thread too, so the frame finds nothing drainable.
+    const otherToken = b.hold(OTHER);
+    frames.runFrame();
+    expect(apply).not.toHaveBeenCalled();
+    expect(frames.scheduled).toBe(false);
+
+    // Dropping one hold makes the OTHER queue reachable again.
+    b.release(OTHER, otherToken);
+    expect(apply).toHaveBeenCalledTimes(1);
+    expect(apply.mock.calls[0][0]).toBe(OTHER);
+
+    b.drop(THREAD, heldToken);
+    expect(b.pending(THREAD)).toBe(0);
+    expect(frames.scheduled).toBe(false);
+  });
+});
+
 describe("agent-chat event batcher → store", () => {
   beforeEach(() => {
     useAgentChatStore.setState({ threads: {} });

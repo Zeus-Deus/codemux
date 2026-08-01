@@ -689,6 +689,11 @@ pub enum AppStateDelta {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RevisionedDelta {
     pub revision: u64,
+    /// The backend process that stamped `revision` — see [`instance_token`].
+    /// `#[serde(default)]` for older peers, where an empty token reads as
+    /// "unstamped" and leaves the renderer's baseline alone.
+    #[serde(default)]
+    pub instance: String,
     pub delta: AppStateDelta,
 }
 
@@ -702,6 +707,9 @@ pub const APP_STATE_REVISION_EVENT: &str = "app-state-revision";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RevisionHeartbeat {
     pub revision: u64,
+    /// The backend process that owns `revision` — see [`instance_token`].
+    #[serde(default)]
+    pub instance: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -715,6 +723,15 @@ pub struct AppStateSnapshot {
     /// persisted before this field loadable, and 0 reads as "unrevisioned".
     #[serde(default)]
     pub snapshot_revision: u64,
+    /// The backend process that stamped `snapshot_revision` — see
+    /// [`instance_token`]. `snapshot_revision` restarts at 0 on every launch,
+    /// so a revision number is only comparable against another from the SAME
+    /// instance; this field is what makes that comparison well-defined for a
+    /// web-remote client that outlives the backend. Zeroed alongside the
+    /// revision in [`AppStateStore::persistable_snapshot`], and empty on an
+    /// older backend, which both read as "unstamped".
+    #[serde(default)]
+    pub snapshot_instance: String,
     pub active_workspace_id: WorkspaceId,
     pub workspaces: Vec<WorkspaceSnapshot>,
     pub terminal_sessions: Vec<TerminalSessionSnapshot>,
@@ -834,6 +851,7 @@ impl AppStateStore {
         let guard = self.inner.lock().unwrap();
         let mut snapshot = guard.clone();
         snapshot.snapshot_revision = next_revision();
+        snapshot.snapshot_instance = instance_token().to_string();
         snapshot
     }
 
@@ -847,6 +865,7 @@ impl AppStateStore {
         let guard = self.inner.lock().unwrap();
         let mut snapshot = guard.clone();
         snapshot.snapshot_revision = current_revision();
+        snapshot.snapshot_instance = instance_token().to_string();
         snapshot
     }
 
@@ -862,6 +881,7 @@ impl AppStateStore {
         let delta = mutate(&mut guard)?;
         Some(RevisionedDelta {
             revision: next_revision(),
+            instance: instance_token().to_string(),
             delta,
         })
     }
@@ -4375,7 +4395,39 @@ fn collect_browser_ids_from_tree(node: &PaneNodeSnapshot, out: &mut Vec<BrowserI
 /// Emit counter behind [`AppStateSnapshot::snapshot_revision`]. Process-wide
 /// and never reset, so a revision the renderer has already applied can only
 /// be older than one it has not.
+///
+/// "Process-wide" is the whole caveat: it starts at 0 on every launch. A
+/// renderer that outlives the backend — i.e. any web-remote browser, since the
+/// desktop webview dies with the process — keeps a `lastSeenRevision` from the
+/// PREVIOUS process, and after a restart every snapshot, delta and heartbeat
+/// carries a number below it. The revision guards then discard all of them and
+/// the page sits frozen until the new counter climbs past the old one. That is
+/// what [`instance_token`] fixes: a revision is only comparable within the
+/// instance that stamped it.
 static SNAPSHOT_REVISION: AtomicU64 = AtomicU64::new(0);
+
+/// Identifies THIS backend process, stamped alongside every revision.
+///
+/// The renderer treats a change of token as "the counter restarted": it drops
+/// its revision baseline to zero, discards any buffered deltas awaiting a
+/// revision that will never arrive, and takes the accompanying snapshot as a
+/// fresh one. An opaque value is enough — the token is only ever compared for
+/// equality, never ordered — because messages from a dead process cannot
+/// arrive after the reconnect (they rode a socket that died with it).
+fn instance_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        // Start time + address entropy: unique per process without pulling in
+        // a UUID dependency, and never compared for order, so a clock that
+        // steps backwards is harmless here.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let entropy = &TOKEN as *const _ as usize;
+        format!("{nanos:x}-{entropy:x}")
+    })
+}
 
 /// Consume the next revision. Only ever called while the state mutex is held
 /// (see [`AppStateStore::stamped_snapshot`] and the `*_delta` writers), so the
@@ -4404,6 +4456,7 @@ fn current_revision() -> u64 {
 pub fn emit_app_state_revision<R: tauri::Runtime>(app: &AppHandle<R>) {
     let payload = RevisionHeartbeat {
         revision: current_revision(),
+        instance: instance_token().to_string(),
     };
     if let Err(error) = app.emit(APP_STATE_REVISION_EVENT, payload) {
         eprintln!("[codemux::state] Failed to emit revision heartbeat: {error}");
@@ -4831,7 +4884,10 @@ fn default_app_state() -> AppStateSnapshot {
 
     AppStateSnapshot {
         schema_version: APP_STATE_SCHEMA_VERSION,
+        // Unstamped: the default state is a pre-emit baseline. Every emitted
+        // snapshot goes through `stamped_snapshot`, which fills both fields.
         snapshot_revision: 0,
+        snapshot_instance: String::new(),
         archived_workspaces: Vec::new(),
         active_workspace_id: workspace_id.clone(),
         workspaces: vec![WorkspaceSnapshot {
@@ -5236,6 +5292,13 @@ fn persistable_snapshot(snapshot: &AppStateSnapshot) -> AppStateSnapshot {
     // with a revision far above the live counter, and every real emit afterwards
     // would look stale to a client that adopted the boot snapshot's number.
     snapshot.snapshot_revision = 0;
+    // Same reasoning for the instance token: it names the process that stamped
+    // that revision, so once the revision is gone the token would only claim a
+    // baseline belongs to a process that no longer exists. Cleared together —
+    // an empty token with revision 0 is the "unstamped" pair the renderer
+    // ignores, and leaving one of the two behind would make a restored
+    // snapshot look like a live one from a dead instance.
+    snapshot.snapshot_instance = String::new();
     // Keep only the review checkmarks; working/permission are runtime-only.
     retain_persistable_pane_statuses(&mut snapshot);
     // Agent browser sessions are runtime-only — pane_id/browser_id/user_dismissed
@@ -8566,6 +8629,84 @@ mod tests {
         let restored: AppStateSnapshot = serde_json::from_str(&json).unwrap();
 
         assert_eq!(restored.snapshot_revision, 0);
+        // The token names the process that stamped that revision, so it has to
+        // go with it. A restored snapshot carrying a live-looking token would
+        // claim a baseline belonging to a process that no longer exists.
+        assert_eq!(restored.snapshot_instance, "");
+    }
+
+    // ── Instance token (the live-restart web-remote freeze) ─────────
+    //
+    // `SNAPSHOT_REVISION` is process-lifetime and restarts at 0. A web-remote
+    // browser outlives a backend restart holding a `lastSeenRevision` from the
+    // dead process, so every message from the new one looked stale and the
+    // page froze. The token is what makes a restart distinguishable from a
+    // late/duplicate emit — it is the ONLY thing that does, since the numbers
+    // alone are indistinguishable.
+
+    #[test]
+    fn every_stamped_emit_carries_the_instance_token() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let workspace_id = store.create_workspace().0;
+
+        let snapshot = store.stamped_snapshot();
+        assert!(!snapshot.snapshot_instance.is_empty());
+
+        // A read-only baseline is stamped too: a resync fetch is exactly the
+        // message a just-restarted client uses to rebase.
+        let read = store.snapshot_at_current_revision();
+        assert_eq!(read.snapshot_instance, snapshot.snapshot_instance);
+
+        // Deltas share the counter, so they must share the token that scopes
+        // it — otherwise a delta from a new process could be applied onto the
+        // previous process's baseline.
+        let delta = store
+            .update_workspace_git_info_delta(&workspace_id, git_of("feature", 2))
+            .expect("a first git write is a change");
+        assert_eq!(delta.instance, snapshot.snapshot_instance);
+    }
+
+    /// One process, one token — for the whole run. A token that changed
+    /// between emits would look like a restart to every client and force a
+    /// full resync on each one.
+    #[test]
+    fn the_instance_token_is_stable_for_the_process() {
+        assert_eq!(instance_token(), instance_token());
+        assert!(!instance_token().is_empty());
+    }
+
+    /// The wire contract a restarted client depends on: the token survives
+    /// serialization, and an OLD payload without one deserializes to the
+    /// "unstamped" empty string rather than failing.
+    #[test]
+    fn the_instance_token_round_trips_and_is_backward_compatible() {
+        let _revisions = revision_guard();
+        let store = AppStateStore::default();
+        let stamped = store.stamped_snapshot();
+        let json = serde_json::to_string(&stamped).unwrap();
+        let parsed: AppStateSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.snapshot_instance, stamped.snapshot_instance);
+
+        let heartbeat = RevisionHeartbeat {
+            revision: 7,
+            instance: instance_token().to_string(),
+        };
+        let json = serde_json::to_string(&heartbeat).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RevisionHeartbeat>(&json).unwrap(),
+            heartbeat
+        );
+
+        // An older backend's payloads carry neither field.
+        let legacy: RevisionHeartbeat =
+            serde_json::from_str(r#"{"revision":3}"#).unwrap();
+        assert_eq!(legacy.instance, "");
+        let legacy_delta: RevisionedDelta = serde_json::from_str(
+            r#"{"revision":3,"delta":{"domain":"detected_ports","ports":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy_delta.instance, "");
     }
 
     /// What boot actually does: seed the store from `layout.json`, then serve

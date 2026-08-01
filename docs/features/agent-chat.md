@@ -731,6 +731,27 @@ once.
   freely). Separately, an optimistic user bubble carries a `client_nonce` that
   hydration and the live `turn_queued` reconciliation both match on, so the
   persisted copy replaces the optimistic one instead of doubling it.
+- **User turns are fanned out, because nothing else would carry them.**
+  Providers never echo a user turn, so its `agent_chat_messages` row is the
+  only record of it. The backend therefore mints a
+  `ProviderRuntimeEvent::UserMessage` from the row it just wrote and sends it
+  to every channel attached to the thread, stamped with that row's id — the
+  same persist-before-fan-out order `forward_event` uses, through the same
+  `fan_out_to_thread_channels` helper. Its serialized shape is deliberately
+  identical to the stored `{"type":"user_message", …}` envelope, and one
+  reducer case folds both, so a client that saw the turn live and a client
+  that only replays the rows cannot end up with different transcripts.
+  Without the fan-out, a *second* client watching the thread (a desktop window
+  while the phone sends) received only the assistant reply — persisted at a
+  higher id — and `applyLiveEvents` advanced its cursor past a user row it had
+  never seen. Every `id > cursor` tail read then skipped that row, so the other
+  client's prompt was lost permanently, with no revisit that could recover it.
+  The sender is unaffected either way: it drops its own copy on the nonce while
+  still advancing its cursor over the row. The queued-follow-up path fans out
+  at dispatch (when the envelope is actually written) and only when a nonce
+  exists, since `turn_queued` has already put a greyed bubble on every client
+  attached at enqueue time and the nonce is what keeps this copy from becoming
+  a second one.
 
 ### Large tool results hydrate as metadata
 
@@ -785,6 +806,13 @@ arrival order** — so an approval, a tool result, or a turn/session state chang
 is never delayed behind a token, and ordering is preserved. A hidden document
 has no rAF, so the batcher falls back to a 32 ms timer and drains immediately
 on `visibilitychange`. Pane detach and pre-hydrate are explicit flush seams.
+
+The scheduler idles when there is nothing it could drain: a queue belonging to
+a HELD thread can only be moved by `release`/`drop`, so re-arming for one would
+wake every frame, drain nothing and re-arm — a 60 Hz no-op loop lasting exactly
+as long as the hydrate's IPC round trip, which is when the main thread is
+busiest. `flushAll` therefore re-schedules only while some *unheld* queue
+remains, and ending a hold is what wakes the flush back up.
 
 ### The pane subscribes by field, not by slice
 

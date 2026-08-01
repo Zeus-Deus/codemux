@@ -944,6 +944,13 @@ export interface AppStateSnapshot {
    *  restored from disk and older backends carry no revision, which reads as
    *  0 — "unrevisioned, always apply". */
   snapshot_revision?: number;
+  /** The backend process that stamped `snapshot_revision`. The counter is
+   *  process-lifetime and restarts at 0, so a revision is only comparable
+   *  against another from the SAME instance — a token change means "the
+   *  counter restarted", not "this message is stale". Absent/empty on a
+   *  restored layout, a mock, or an older backend (all of which carry
+   *  revision 0 and are applied unconditionally). */
+  snapshot_instance?: string;
   active_workspace_id: string;
   workspaces: WorkspaceSnapshot[];
   terminal_sessions: TerminalSessionSnapshot[];
@@ -998,6 +1005,10 @@ export type AppStateDelta =
 /** Payload of the `app-state-delta` event. */
 export interface RevisionedDelta {
   revision: number;
+  /** The backend process that stamped `revision` — see
+   *  `AppStateSnapshot.snapshot_instance`. A delta from a restarted backend
+   *  has no valid baseline to patch and opens a resync instead. */
+  instance?: string;
   delta: AppStateDelta;
 }
 
@@ -1005,6 +1016,10 @@ export interface RevisionedDelta {
  *  revision counter, with no snapshot attached. */
 export interface RevisionHeartbeat {
   revision: number;
+  /** The backend process that owns `revision` — see
+   *  `AppStateSnapshot.snapshot_instance`. A token change is a resync on its
+   *  own, whatever the revision numbers say. */
+  instance?: string;
 }
 
 // ── CLI / Agent Config ──

@@ -122,7 +122,7 @@ export function useAppStateInit(skip = false) {
   const handleDelta = useCallback(
     (payload: RevisionedDelta) => {
       flushPendingSnapshot();
-      applyAppStateDelta(payload.revision, payload.delta);
+      applyAppStateDelta(payload.revision, payload.delta, payload.instance);
     },
     [applyAppStateDelta, flushPendingSnapshot],
   );
@@ -134,8 +134,23 @@ export function useAppStateInit(skip = false) {
   const handleRevision = useCallback(
     (payload: RevisionHeartbeat) => {
       flushPendingSnapshot();
-      const { appState, lastSeenRevision, requestResync } = useAppStore.getState();
+      const { appState, lastSeenRevision, backendInstance, requestResync } =
+        useAppStore.getState();
       if (appState === null) return; // the boot fetch is the baseline
+      // A heartbeat from a DIFFERENT backend process means the counter
+      // restarted, so `payload.revision > lastSeenRevision` is the wrong
+      // question — after a restart it is almost always false, which is
+      // precisely why a reconnected page used to sit frozen with a heartbeat
+      // arriving every minute and never triggering the resync that would have
+      // healed it. Any instance change is a resync, whatever the numbers say.
+      if (
+        payload.instance &&
+        backendInstance !== null &&
+        backendInstance !== payload.instance
+      ) {
+        requestResync();
+        return;
+      }
       if (payload.revision > lastSeenRevision) requestResync();
     },
     [flushPendingSnapshot],

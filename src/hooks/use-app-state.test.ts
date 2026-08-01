@@ -219,6 +219,7 @@ describe("useAppStateInit — deltas, gaps and the revision heartbeat", () => {
       pendingActiveWorkspaceId: null,
       pendingActivationAt: null,
       lastSeenRevision: 0,
+      backendInstance: null,
       resyncInFlight: false,
       resyncRequestId: 0,
       deltaBuffer: new Map(),
@@ -391,5 +392,107 @@ describe("useAppStateInit — deltas, gaps and the revision heartbeat", () => {
       deliverRevision!({ revision: 5 });
     });
     expect(getAppStateMock).not.toHaveBeenCalled();
+  });
+
+  // ── Backend restart (the live-restart web-remote freeze) ──
+  //
+  // The revision counter restarts at 0 with the process. A web-remote page
+  // outlives that restart, so `payload.revision > lastSeenRevision` — the
+  // whole heartbeat condition — is FALSE for every heartbeat the new backend
+  // sends, and the one mechanism that exists to notice "we are behind" never
+  // fires. The page froze with a heartbeat arriving every minute.
+
+  it("resyncs on a heartbeat from a restarted backend even though its revision is LOWER", async () => {
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!({ ...snapshotAt(500), snapshot_instance: "instance-1" });
+      vi.advanceTimersByTime(16);
+    });
+    getAppStateMock.mockClear();
+
+    // The restarted backend is at revision 4 — far below the 500 we hold.
+    act(() => {
+      deliverRevision!({ revision: 4, instance: "instance-2" });
+    });
+    expect(getAppStateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a same-instance heartbeat at a lower revision still resyncs nothing", async () => {
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!({ ...snapshotAt(500), snapshot_instance: "instance-1" });
+      vi.advanceTimersByTime(16);
+    });
+    getAppStateMock.mockClear();
+
+    act(() => {
+      deliverRevision!({ revision: 499, instance: "instance-1" });
+    });
+    expect(getAppStateMock).not.toHaveBeenCalled();
+  });
+
+  it("an unstamped heartbeat keeps the plain revision comparison", async () => {
+    // Older backend / mock: no token, so the only signal is the number.
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!(snapshotAt(10));
+      vi.advanceTimersByTime(16);
+    });
+    getAppStateMock.mockClear();
+
+    act(() => {
+      deliverRevision!({ revision: 9 });
+    });
+    expect(getAppStateMock).not.toHaveBeenCalled();
+
+    act(() => {
+      deliverRevision!({ revision: 11 });
+    });
+    expect(getAppStateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("the reseeded snapshot after a restart applies and rebases the counter", async () => {
+    // The reconnect path: `reseedOnReconnect` refetches and pushes the result
+    // through this same `app-state-changed` handler. Before the instance
+    // token, that snapshot's low revision read as stale and was dropped —
+    // the page kept rendering the pre-restart world.
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!({ ...snapshotAt(500, "ws-A"), snapshot_instance: "instance-1" });
+      vi.advanceTimersByTime(16);
+    });
+    expect(useAppStore.getState().appState!.active_workspace_id).toBe("ws-A");
+
+    act(() => {
+      deliverSnapshot!({ ...snapshotAt(2, "ws-B"), snapshot_instance: "instance-2" });
+      vi.advanceTimersByTime(16);
+    });
+
+    const state = useAppStore.getState();
+    expect(state.appState!.active_workspace_id).toBe("ws-B");
+    expect(state.lastSeenRevision).toBe(2);
+  });
+
+  it("deltas from the restarted backend flow again once the reseed lands", async () => {
+    // End to end: restart → reseed → the next contiguous delta applies. This
+    // is the property the freeze actually denied — not just one snapshot, but
+    // every update afterwards.
+    await mountListeners();
+    act(() => {
+      deliverSnapshot!({ ...snapshotAt(500), snapshot_instance: "instance-1" });
+      vi.advanceTimersByTime(16);
+    });
+
+    act(() => {
+      deliverSnapshot!({ ...snapshotAt(2), snapshot_instance: "instance-2" });
+      vi.advanceTimersByTime(16);
+    });
+    act(() => {
+      deliverDelta!({ revision: 3, instance: "instance-2", delta: gitDelta });
+    });
+
+    const state = useAppStore.getState();
+    expect(state.lastSeenRevision).toBe(3);
+    expect(state.appState!.workspaces[0].git_branch).toBe("feature");
   });
 });

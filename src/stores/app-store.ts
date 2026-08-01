@@ -45,6 +45,19 @@ interface AppStore {
    *  dropped; deltas must be exactly one above it. See `setAppState` and
    *  `applyAppStateDelta`. */
   lastSeenRevision: number;
+  /** The backend process `lastSeenRevision` was counted by, or `null` before
+   *  the first stamped message.
+   *
+   *  The revision counter is process-lifetime and restarts at 0, so a revision
+   *  number only means anything next to another from the SAME backend. That is
+   *  invisible on the desktop (the webview dies with the process) and fatal on
+   *  web remote, where the page outlives a backend restart: every post-restart
+   *  snapshot, delta and heartbeat carried a number below the old
+   *  `lastSeenRevision`, so the ordering guards discarded all of them and the
+   *  page froze until the new counter climbed past the old one. Comparing
+   *  tokens first makes "the counter restarted" distinguishable from "this
+   *  message is stale". */
+  backendInstance: string | null;
   /** True between "we noticed we are behind" and the full snapshot landing.
    *  Makes the resync single-flight. Deltas arriving inside the window are
    *  buffered, not dropped: the snapshot is a baseline, and anything stamped
@@ -70,7 +83,11 @@ interface AppStore {
   /** Apply one domain delta at `revision`. Immutable and targeted: every
    *  object the delta doesn't name keeps its previous reference, which is the
    *  entire point of the delta path. */
-  applyAppStateDelta: (revision: number, delta: AppStateDelta) => void;
+  applyAppStateDelta: (
+    revision: number,
+    delta: AppStateDelta,
+    instance?: string,
+  ) => void;
   /** Open a single-flight full resync (no-op while one is already open). */
   requestResync: () => void;
   /** Close the resync window — called once the fetch settles, success or
@@ -257,6 +274,26 @@ function bufferDelta(
   };
 }
 
+/**
+ * Whether `instance` names a backend process other than the one our revision
+ * baseline was counted by.
+ *
+ * An empty / missing token is "unstamped" — a restored layout, a mock, or an
+ * older backend — and never invalidates the baseline: those messages carry
+ * revision 0 and are applied unconditionally anyway.
+ *
+ * The token is compared for EQUALITY only, never ordered. It doesn't need to
+ * be: messages from a dead backend cannot arrive after the reconnect, because
+ * they rode a socket that died with it. So "different" always means "newer".
+ */
+function isRestartedBackend(
+  instance: string | undefined,
+  current: string | null,
+): boolean {
+  if (!instance) return false;
+  return current !== null && current !== instance;
+}
+
 function hasStaleEntries(buffer: Map<number, AppStateDelta>, revision: number): boolean {
   for (const buffered of buffer.keys()) {
     if (buffered <= revision) return true;
@@ -272,6 +309,7 @@ export const useAppStore = create<AppStore>((set) => ({
   pendingActiveWorkspaceId: null,
   pendingActivationAt: null,
   lastSeenRevision: 0,
+  backendInstance: null,
   resyncInFlight: false,
   resyncRequestId: 0,
   deltaBuffer: EMPTY_DELTA_BUFFER,
@@ -282,6 +320,28 @@ export const useAppStore = create<AppStore>((set) => ({
   // selector subscribers see zero fan-out. See `@/lib/structural-share`.
   setAppState: (snapshot) =>
     set((state) => {
+      const revision = snapshot.snapshot_revision ?? 0;
+      // Restart guard, BEFORE the ordering guard. A different instance token
+      // means the counter this snapshot was stamped by is not the one our
+      // baseline came from, so comparing the two numbers is meaningless — and
+      // comparing them anyway is exactly what froze a web-remote page across a
+      // backend restart: the fresh snapshot's low revision read as "stale" and
+      // was dropped, forever. A restart makes this snapshot the new baseline,
+      // so the revision floor drops to 0 and any delta buffered against the
+      // old counter is discarded (its missing revisions belong to a process
+      // that no longer exists and will never arrive).
+      const restarted = isRestartedBackend(
+        snapshot.snapshot_instance,
+        state.backendInstance,
+      );
+      if (restarted) {
+        state = {
+          ...state,
+          lastSeenRevision: 0,
+          deltaBuffer: EMPTY_DELTA_BUFFER,
+          gapWindowId: 0,
+        };
+      }
       // Ordering guard. The backend stamps every emitted snapshot with a
       // strictly increasing `snapshot_revision`; a snapshot at or below the
       // one we already applied lost the race (a background git/PR/port emit
@@ -289,7 +349,6 @@ export const useAppStore = create<AppStore>((set) => ({
       // otherwise stomp the freshly selected workspace back to the old one.
       // Revision 0 means "unrevisioned" — restored state, an older backend,
       // or a mock — and is always applied.
-      const revision = snapshot.snapshot_revision ?? 0;
       if (revision > 0 && revision <= state.lastSeenRevision) return state;
 
       const shared = state.appState
@@ -311,6 +370,12 @@ export const useAppStore = create<AppStore>((set) => ({
         appState: drained.appState,
         lastSeenRevision: drained.lastSeenRevision,
         deltaBuffer: drained.buffer,
+        // Adopt whatever instance stamped this snapshot. Only a stamped
+        // snapshot moves it — an unstamped one (restored layout, mock) says
+        // nothing about which backend is live.
+        ...(snapshot.snapshot_instance
+          ? { backendInstance: snapshot.snapshot_instance }
+          : null),
         gapWindowId:
           drained.buffer.size === 0
             ? 0
@@ -324,10 +389,30 @@ export const useAppStore = create<AppStore>((set) => ({
     }),
   // Deltas are small and already ordered, so they skip the emit-coalescing
   // window entirely and land in the click's own frame budget.
-  applyAppStateDelta: (revision, delta) =>
+  applyAppStateDelta: (revision, delta, instance) =>
     set((state) => {
       // No baseline to apply onto — the boot fetch is what establishes one.
       if (state.appState === null) return state;
+      // A delta from a RESTARTED backend has nothing valid to patch: our
+      // snapshot describes the previous process's world, and this delta's
+      // revision counts from a fresh 0. Patching one onto the other would
+      // produce a snapshot that never existed. Drop it, drop the buffer of
+      // deltas awaiting revisions the dead process will never emit, and pull a
+      // real baseline. (The reseeded snapshot normally beats the first delta
+      // here; this is the case where it doesn't.)
+      if (isRestartedBackend(instance, state.backendInstance)) {
+        return {
+          lastSeenRevision: 0,
+          deltaBuffer: EMPTY_DELTA_BUFFER,
+          gapWindowId: 0,
+          ...(state.resyncInFlight
+            ? null
+            : {
+                resyncInFlight: true,
+                resyncRequestId: state.resyncRequestId + 1,
+              }),
+        };
+      }
       if (revision <= state.lastSeenRevision) return state; // lost the race
       // A full snapshot is on its way and will be the baseline. Buffer rather
       // than drop: this delta may be stamped ABOVE the revision that snapshot

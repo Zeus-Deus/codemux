@@ -431,6 +431,32 @@ export type ProviderRuntimeEvent =
       thread_id: string;
       resume_cursor: unknown;
     }
+  // A user turn that was written to `agent_chat_messages`, fanned out to
+  // every client attached to the thread (mirrors
+  // `ProviderRuntimeEvent::UserMessage`). No provider emits this: the
+  // command layer mints it right after persisting the row, with the SAME
+  // serialized shape as the stored envelope, so a live copy and a replayed
+  // row fold through one reducer case.
+  //
+  // It exists because user turns are the only transcript-affecting thing
+  // providers never echo. Without it, a second client watching the thread
+  // received the assistant reply at a higher `persisted_id`, advanced
+  // `lastPersistedEventId` past a user row it never saw, and then skipped
+  // that row on every `id > cursor` tail read thereafter. The sending
+  // client already painted the bubble and drops this copy by
+  // `client_nonce`.
+  | {
+      type: "user_message";
+      thread_id: string;
+      text: string;
+      /** On-disk image records; absent for a text-only turn and for rows
+       *  persisted before the field existed. Each `path` is an absolute
+       *  filesystem location the webview loads via the asset protocol. */
+      images?: Array<{ path: string; media_type?: string }>;
+      /** The composer's correlation token for the optimistic bubble this
+       *  turn was sent as. Absent when the sender supplied none. */
+      client_nonce?: string;
+    }
   // Follow-up queueing (mirrors `ProviderRuntimeEvent` in
   // src-tauri/src/agent_provider/events.rs). A send that arrives while a
   // turn is in flight is queued instead of rejected.

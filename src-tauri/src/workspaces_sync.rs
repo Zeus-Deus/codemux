@@ -1026,6 +1026,7 @@ mod tests {
         AppStateSnapshot {
             schema_version: 1,
             snapshot_revision: 0,
+            snapshot_instance: String::new(),
             active_workspace_id: active,
             workspaces,
             terminal_sessions: Vec::new(),

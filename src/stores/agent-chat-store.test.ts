@@ -312,6 +312,160 @@ describe("agent-chat-store", () => {
     });
   });
 
+  describe("user turns fanned out to a second client", () => {
+    // Providers never echo user turns, so the persisted row is the only
+    // record of one. The backend now fans that row out live to every client
+    // attached to the thread. What these tests pin is WHY: without the
+    // fan-out, a second client received only the assistant reply — persisted
+    // at a HIGHER id — and `applyLiveEvents` walked its cursor past a user
+    // row it had never seen, after which every `id > cursor` tail read
+    // skipped that row permanently.
+
+    function userEvent(text: string, clientNonce?: string) {
+      return {
+        type: "user_message" as const,
+        thread_id: "t",
+        text,
+        ...(clientNonce ? { client_nonce: clientNonce } : {}),
+      };
+    }
+
+    function assistantEvent(text: string, turnId = "turn-1") {
+      return {
+        type: "item_completed" as const,
+        thread_id: "t",
+        turn_id: turnId,
+        item: { kind: "assistant_text" as const, text },
+      };
+    }
+
+    function userTexts(threadId: string): string[] {
+      return useAgentChatStore
+        .getState()
+        .threads[threadId].messages.filter((m) => m.kind === "user_message")
+        .map((m) => (m.kind === "user_message" ? m.text : ""));
+    }
+
+    /** A warm, synced slice — the state a second client is in while it
+     *  watches a thread someone else is typing into. */
+    function warmSlice(cursor: number) {
+      useAgentChatStore.getState().hydrateThread("t", []);
+      useAgentChatStore.setState((s) => ({
+        threads: { ...s.threads, t: { ...s.threads.t, lastPersistedEventId: cursor } },
+      }));
+    }
+
+    it("renders the other client's turn and advances the cursor over its row", () => {
+      warmSlice(10);
+
+      // The phone sends; the desktop receives the persisted row live, then
+      // the assistant reply that follows it.
+      useAgentChatStore
+        .getState()
+        .applyLiveEvents("t", [
+          { event: userEvent("from the phone", "nonce-phone"), persistedId: 11 },
+          { event: assistantEvent("on it"), persistedId: 12 },
+        ]);
+
+      const slice = useAgentChatStore.getState().threads["t"];
+      expect(userTexts("t")).toEqual(["from the phone"]);
+      expect(slice.messages).toHaveLength(2);
+      // The cursor moved over the user row, not past it — so the next tail
+      // read starts at 12 having actually seen 11.
+      expect(slice.lastPersistedEventId).toBe(12);
+    });
+
+    it("the sending client dedups its own turn by nonce", () => {
+      warmSlice(10);
+      // The composer already painted this bubble optimistically.
+      useAgentChatStore
+        .getState()
+        .appendUserMessage("t", "from this client", "nonce-mine");
+      expect(userTexts("t")).toEqual(["from this client"]);
+
+      // The same turn comes back as the fan-out of its persisted row.
+      useAgentChatStore
+        .getState()
+        .applyLiveEvents("t", [
+          { event: userEvent("from this client", "nonce-mine"), persistedId: 11 },
+        ]);
+
+      const slice = useAgentChatStore.getState().threads["t"];
+      expect(userTexts("t")).toEqual(["from this client"]); // not doubled
+      // Deduped in the transcript, but the cursor still owns the row — the
+      // sender must not re-read a row it has already rendered.
+      expect(slice.lastPersistedEventId).toBe(11);
+    });
+
+    it("a tail read that overlaps the live fan-out does not double the bubble", () => {
+      // The other client's turn arrives live at id 11, and a hydrate tail
+      // read straddling the same instant returns row 11 again. The
+      // persisted-id guard drops the replay; the nonce guard is the second
+      // net under it.
+      warmSlice(10);
+      useAgentChatStore
+        .getState()
+        .applyLiveEvents("t", [
+          { event: userEvent("overlapping", "nonce-x"), persistedId: 11 },
+        ]);
+      expect(userTexts("t")).toEqual(["overlapping"]);
+
+      useAgentChatStore
+        .getState()
+        .applyLiveEvents("t", [
+          { event: userEvent("overlapping", "nonce-x"), persistedId: 11 },
+        ]);
+
+      expect(userTexts("t")).toEqual(["overlapping"]);
+      expect(
+        useAgentChatStore.getState().threads["t"].lastPersistedEventId,
+      ).toBe(11);
+    });
+
+    it("a nonce-less turn from another client still lands", () => {
+      // Older senders (and any caller that supplies no correlation token)
+      // must not be invisible to other clients just because they cannot be
+      // deduped — insertion is the correct default.
+      warmSlice(10);
+      useAgentChatStore
+        .getState()
+        .applyLiveEvents("t", [{ event: userEvent("no nonce"), persistedId: 11 }]);
+
+      expect(userTexts("t")).toEqual(["no nonce"]);
+      expect(
+        useAgentChatStore.getState().threads["t"].lastPersistedEventId,
+      ).toBe(11);
+    });
+
+    it("hydrating the same rows afterwards reproduces one bubble, not two", () => {
+      // Live fan-out and replay share one reducer case, so a client that saw
+      // the turn live and a client that only ever replays the rows must end
+      // up with identical transcripts.
+      warmSlice(10);
+      useAgentChatStore
+        .getState()
+        .applyLiveEvents("t", [
+          { event: userEvent("shared", "nonce-s"), persistedId: 11 },
+        ]);
+
+      useAgentChatStore
+        .getState()
+        .hydrateThread("t", [
+          {
+            id: 11,
+            payload: JSON.stringify({
+              type: "user_message",
+              thread_id: "t",
+              text: "shared",
+              client_nonce: "nonce-s",
+            }),
+          },
+        ]);
+
+      expect(userTexts("t")).toEqual(["shared"]);
+    });
+  });
+
   describe("stagedAttachments (Step 8 Stage 1)", () => {
     it("seeds a fresh slice with an empty stagedAttachments array", () => {
       useAgentChatStore.getState().ensureThread("t1");

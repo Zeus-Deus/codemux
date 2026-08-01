@@ -240,6 +240,39 @@ not here.
 - **Phase 4 — deferred terminal teardown.** `deferred-teardown.ts` parks serialize/dispose past the new selection's paint, ≤2 jobs, same-session flush before remount, WebGL contexts bounded. → `docs/features/terminal.md`.
 - **Phase 5 — background scheduler.** `jobs.rs` (active-every-tick + 6-tick stride sweep, per-cwd dedupe, blocking-pool gathers, startup jitter), `git fetch` capped at 2 concurrent with `kill_on_drop`, hidden-window gating, log gating, `get_resource_metrics(detail)` cheap summary, `poll-equality.ts` on the frontend polls. Every loop is change-gated, so an idle fleet emits nothing — which is what removed the implicit 5 s full-snapshot resync that Phase 6's heartbeat replaces.
 - **Phase 6 — domain deltas + renderer hardening.** `app-state-delta` (`workspace_git` / `detected_ports` / `pane_status`) and a jittered 60–70 s `app-state-revision` heartbeat share one lock-stamped `AtomicU64`; the frontend does gap detection with a 100 ms reorder buffer, buffer-during-resync and contiguous replay; the sidebar subscribes narrowly and memoizes its rows (`sidebar-inbox-delta.test.tsx`). React Compiler documented as a follow-up, not adopted. → `docs/features/sidebar.md`, `docs/features/web-remote-access.md` § "Event hub".
+- **Second review-fix round (merge with `main`).** Four corrections, all in
+  the machinery the earlier phases introduced:
+  - **User turns are now fanned out to thread subscribers.** Providers never
+    echo a user turn, so its DB row was the only record of it — and
+    `applyLiveEvents` walked a second client's cursor past that row on the
+    *assistant reply's* higher `persisted_id`, after which every `id > cursor`
+    tail read skipped it forever (a prompt sent from the phone never appeared
+    on the desktop, unrecoverably). `persist_user_message` now mints a
+    `ProviderRuntimeEvent::UserMessage` from the row it wrote and ships it
+    through the same `fan_out_to_thread_channels` path and persist-before-
+    fan-out order `forward_event` uses. Its serialized shape equals the stored
+    envelope and ONE reducer case folds both, so live and replay cannot
+    disagree; the sender dedups on `client_nonce` while still advancing its
+    cursor. → `docs/features/agent-chat.md` § "Hydration by cursor".
+  - **A backend restart no longer freezes a connected web-remote page.** The
+    persisted-revision variant was fixed in the first round; this is the LIVE
+    one. `SNAPSHOT_REVISION` restarts at 0 per process, and a browser that
+    outlives the restart keeps a `lastSeenRevision` from the dead one, so the
+    ordering guards discarded every post-restart snapshot (including the
+    reconnect's own reseed), delta and heartbeat. Every stamped message now
+    carries a per-process **instance token**; the renderer treats a token
+    change as "the counter restarted" — baseline to 0, buffered deltas
+    discarded, snapshot adopted — and a delta that beats the reseed opens a
+    resync rather than patching a dead baseline. Covers the reseed AND
+    heartbeat paths; `persistable_snapshot()` clears the token with the
+    revision. → `docs/features/web-remote-access.md` § "Event hub".
+  - **The port poll no longer stops for remote viewers.** Its off-screen gate
+    read the desktop window only, so minimizing the desktop froze
+    `detected_ports` on every paired browser — the case where the remote page
+    IS the one in use. Any live web-remote socket now keeps the poll running.
+  - **The event batcher stops spinning while held.** `flushAll` re-armed
+    whenever any queue was non-empty, including queues only `release`/`drop`
+    can move, so a hydrate's IPC round trip ran a 60 Hz drain-nothing loop.
 - **Review-fix round.** `snapshot_revision` zeroed in `persistable_snapshot()` (a persisted stamp seeded a restored store above the live counter — the web-remote freeze) and the web-remote seed switched to `snapshot_at_current_revision()`; terminal-exit pane-status clear now emits a `PaneStatus` delta and a previously-missing emit was added for session-status changes; ~10 mutate-without-emit sites became change-gated emitters (workspaces adopt/clone flows, `control.rs` browser automation, adapter captures, hooks); trace finalize semantics fixed.
 
 ## Notes

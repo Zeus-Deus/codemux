@@ -4,40 +4,30 @@ import type { AgentChatProviderKind } from "@/tauri/types";
 import { providerRequestsSurviveSessionRestart } from "./capability-defaults";
 import {
   applyEvent,
-  appendUserMessage,
   createEmptyThreadState,
 } from "./reducer";
 import { interruptRunningSubagents } from "./subagents";
-import type { ChatThreadState, ChatViewItem, UserMessageImage } from "./types";
+import type { ChatThreadState, ChatViewItem } from "./types";
 
 /**
- * Synthetic envelope written by the backend in `agent_chat_send_turn`
- * to record user turns. User messages never come back through the
- * provider event stream, so we persist them under this tag to keep
- * everything that affects the rendered transcript inside a single
- * ordered list. The frontend reducer has no notion of this envelope
- * — `replayPayloads` translates it into `appendUserMessage`.
+ * Synthetic envelope written by the backend to record user turns.
+ * Providers never echo user messages back on the event stream, so they
+ * are persisted under this tag to keep everything that affects the
+ * rendered transcript inside one ordered list.
+ *
+ * It is no longer replay-only: the backend also fans the freshly-written
+ * row out to every client attached to the thread, under this exact shape,
+ * so a second viewer sees the turn live AND advances its cursor over the
+ * row. That is why the tag now lives in the `ProviderRuntimeEvent` union
+ * (`src/tauri/events.ts`) with one reducer case serving both paths, and
+ * this alias just names the variant for the replay code.
  */
-export interface UserMessageEnvelope {
-  type: "user_message";
-  thread_id: string;
-  text: string;
-  /** Images attached to this turn, written by the backend when the
-   *  turn carried paste/drop/picker images. Each `path` is an absolute
-   *  filesystem location the webview loads via Tauri's asset protocol
-   *  (mapped onto the bubble item's `images[].src`). Absent for
-   *  text-only turns and for turns persisted before the field existed. */
-  images?: Array<{ path: string; media_type?: string }>;
-  /** The composer's correlation token for the optimistic bubble this
-   *  envelope records. A cursor tail read can straddle a send — the row
-   *  lands on disk while the bubble is already rendered locally — so the
-   *  fold skips an envelope whose nonce is already on screen. Absent on
-   *  rows written before the field existed (and on any turn sent without
-   *  a nonce), which simply fall back to "apply it". */
-  client_nonce?: string;
-}
+export type UserMessageEnvelope = Extract<
+  ProviderRuntimeEvent,
+  { type: "user_message" }
+>;
 
-export type ReplayPayload = UserMessageEnvelope | ProviderRuntimeEvent;
+export type ReplayPayload = ProviderRuntimeEvent;
 
 const STALE_REQUEST_MESSAGE =
   "This request expired when the provider session restarted. Continue to have the agent repeat it.";
@@ -155,44 +145,22 @@ export function applyReplayTail(
   );
 }
 
-/** Fold parsed rows through the same reducer the live stream uses. */
+/** Fold parsed rows through the same reducer the live stream uses.
+ *
+ *  Every row kind, `user_message` included, goes through `applyEvent`:
+ *  the backend now fans a persisted user turn out live under the same
+ *  `{"type":"user_message"}` shape it stores, so replaying a row and
+ *  receiving one must not be able to disagree. The nonce dedup and the
+ *  `images` path→`src` mapping live in the reducer's case. */
 function foldReplayPayloads(
   base: ChatThreadState,
   parsed: ReplayPayload[],
 ): ChatThreadState {
   let state = base;
   for (const row of parsed) {
-    if (row.type === "user_message") {
-      // A tail read can straddle a send: the row is on disk while the
-      // optimistic bubble is already rendered. Same nonce == same turn.
-      if (row.client_nonce && hasUserMessageNonce(state, row.client_nonce)) {
-        continue;
-      }
-      // Map the persisted `images` (absolute paths) onto the bubble's
-      // display shape; `src` is the path, which `resolveAssetSrc`
-      // routes through Tauri's asset protocol at render time.
-      const images: UserMessageImage[] | undefined = row.images?.map((img) => ({
-        src: img.path,
-        mediaType: img.media_type,
-      }));
-      state = appendUserMessage(
-        state,
-        row.text,
-        undefined,
-        row.client_nonce,
-        images,
-      );
-    } else {
-      state = applyEvent(state, row);
-    }
+    state = applyEvent(state, row);
   }
   return state;
-}
-
-function hasUserMessageNonce(state: ChatThreadState, nonce: string): boolean {
-  return state.messages.some(
-    (m) => m.kind === "user_message" && m.clientNonce === nonce,
-  );
 }
 
 /**
