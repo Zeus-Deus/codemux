@@ -12,7 +12,12 @@ import {
 } from "@/components/github/pr-status-icon";
 import { useAppStore, useHomeDir } from "@/stores/app-store";
 import { useHosts } from "@/stores/hosts-store";
-import { getWorkspaceProviders } from "@/lib/pane-status";
+import {
+  getWorkspaceProviders,
+  STATUS_LABEL,
+  STATUS_TEXT_CLASS,
+} from "@/lib/pane-status";
+import { shortenPath } from "@/lib/shorten-path";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
 import {
   formatElapsed,
@@ -44,35 +49,8 @@ interface Props {
 const OPEN_DELAY_MS = 350;
 const CLOSE_DELAY_MS = 120;
 
-/** Collapse `$HOME` to `~` so long worktree paths stay readable in the narrow
- *  card. Only a real home-directory boundary counts: with home `/home/u`, a
- *  sibling like `/home/u2/project` must stay absolute, so the character after
- *  the prefix has to be a path separator (or the path IS home). Accepts both
- *  `/` and `\` since remote workspaces can live on Windows hosts. Falls back
- *  to the raw path when the home dir isn't known yet. */
-function shortenPath(path: string, homeDir: string | null): string {
-  if (!homeDir) return path;
-  // A reported home dir may carry a trailing separator ("/home/u/"); strip it
-  // so the boundary check below sees the bare prefix.
-  const home = homeDir.replace(/[/\\]+$/, "");
-  if (home.length === 0 || !path.startsWith(home)) return path;
-  const next = path[home.length];
-  if (next === undefined) return "~"; // the path IS the home dir
-  if (next !== "/" && next !== "\\") return path; // sibling prefix, not home
-  return `~${path.slice(home.length)}`;
-}
-
-const STATUS_LABEL: Record<ActivePaneStatus, string> = {
-  working: "Working",
-  permission: "Needs you",
-  review: "Done · review",
-};
-
-const STATUS_TONE: Record<ActivePaneStatus, string> = {
-  working: "text-status-working",
-  permission: "text-status-attention",
-  review: "text-status-open",
-};
+// `shortenPath`, `STATUS_LABEL`, and the status tone classes are shared with
+// the command palette — see `@/lib/shorten-path` and `@/lib/pane-status`.
 
 /**
  * Hover details for a sidebar workspace. The sidebar row is deliberately terse
@@ -207,7 +185,7 @@ export function WorkspaceHoverCardBody({
           <span
             className={cn(
               "shrink-0 text-[11px] font-semibold",
-              status ? STATUS_TONE[status] : "text-muted-foreground/70",
+              status ? STATUS_TEXT_CLASS[status] : "text-muted-foreground/70",
             )}
           >
             {status ? STATUS_LABEL[status] : "Idle"}

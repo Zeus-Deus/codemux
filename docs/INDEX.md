@@ -83,7 +83,7 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Search: `docs/features/search.md`
 - Code indexing: `docs/features/code-indexing.md`
 - Project memory: `docs/features/project-memory.md`
-- Command palette: `docs/features/command-palette.md`
+- Command palette (Ctrl+K unified switcher — Workspaces / Projects / Commands in one scored fuzzy search, `>` command mode, `/` path mode, status-first resting order, commands routed through the shared keybind `dispatch()`; from the `Command Palette.dc.html` design handoff, branch-local after `v0.15.5`): `docs/features/command-palette.md`
 - Workspace creation: `docs/features/workspace-creation.md`; model-selection-at-launch plan at `docs/archive/model-selection-before-launch.md`
 - Non-git projects (plain-folder mode — `is_git` snapshot flag, opt-in "Initialize Git" bare-`git init` affordance in the context bar / Context Row cluster / Changes panel, worktree controls hidden in Thread Scope, no add-path git gate; PRs #147/#148, shipped `v0.13.1`): `docs/features/workspace-creation.md` (§ Non-Git Projects)
 - Workspaces overview (full-screen device-grouped list with filters, sibling-device adoption, confirm-before-push + undo, divergence chip, elapsed-time pill): `docs/features/workspaces-overview.md`
