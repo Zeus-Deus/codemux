@@ -2279,6 +2279,97 @@ of the active surface in GUI chrome, `WorkspaceContextBar` renders
 (or other) pane active in GUI mode keeps the bottom bar; legacy chrome
 (Beta flag off) is unaffected.
 
+## Context-window meter (composer)
+
+A donut-ring icon in the composer footer's right cluster, immediately
+before the Send/Stop button, showing the thread's live context-window
+occupancy. Clicking it opens a popover (`side="top" align="end"`) with:
+a "Context Window" header row (`{pct}% · {used}/{max}` in
+`font-mono tabular-nums`), a horizontal progress bar, a
+"Total processed" row (lifetime tokens, only when strictly greater than
+used), and — when the provider auto-compacts — a
+"`{Provider}` automatically compacts its context when needed." note.
+Above 90% occupancy the ring and bar switch to the `danger` token.
+Hidden entirely (no reserved space) until the thread's first usage
+snapshot; the draft surface never shows it.
+
+**Two numbers, one bar.** `used_tokens` is the *live* occupancy of the
+model's window — bounded, clamped to `max_tokens`, drops after a
+compaction; it alone drives the ring/bar/percent. `total_processed_tokens`
+is the monotonic lifetime sum for the thread including everything
+compaction discarded — unbounded, text-only, omitted by adapters unless
+strictly greater than used. `max_tokens` is only ever provider-reported —
+never guessed; without it the UI degrades to a bare token count (no
+percent, no bar).
+
+**Event + persistence.** Adapters emit
+`ProviderRuntimeEvent::ContextUsageUpdated { thread_id, usage:
+ContextUsageSnapshot }` (`agent_provider/events.rs`). The shared
+`ContextUsageTracker` (`agent_provider/context_usage.rs`) enforces the
+cross-provider rules in one place: clamp used≤max, sticky last-known
+window, monotonic lifetime total with omit-unless-greater, and
+no-op/zero suppression. The event is persisted (`should_persist_event`),
+so hydrate replays the latest snapshot through the reducer and the
+meter survives restart with no bespoke schema — same trick as
+`SubagentUpdated`. Latest snapshot wins per thread
+(`ChatThreadState.contextUsage`, `reducer.ts`
+`case "context_usage_updated"`); the reducer additionally never lets
+the lifetime total regress and the snapshot rides through
+`migrateThreadId` on silent session restart.
+
+**Per-provider sources.**
+
+- **Claude** — (a) assistant `message.usage`
+  (`input + cache_creation + cache_read + output`; subagent messages
+  with `parent_tool_use_id` are excluded, preserving the existing
+  usage-hygiene rule); (b) turn-end `result`, whose `modelUsage[*]
+  .contextWindow` is the authoritative `max_tokens` (arrives only at
+  first turn end — mid-first-turn snapshots carry `max_tokens: null`,
+  which is why the registry seed below matters) and whose per-turn
+  figure feeds the lifetime accumulator once per turn; (c)
+  `system.compact_boundary` — `used = post_tokens`,
+  `last_used_tokens = pre_tokens` (unclamped high-water mark), total
+  carried forward. `compacts_automatically: true`.
+- **Codex** — the pinned app-server's `thread/tokenUsage/updated`
+  notification (`{ last, total, modelContextWindow }`): used =
+  `last.totalTokens`, lifetime = provider-maintained `total`, max =
+  `modelContextWindow`. Child-thread reports are dropped.
+  `compacts_automatically: true`.
+- **OpenCode** — the assistant message's `tokens` block
+  (`input + cache.read + cache.write + output + reasoning`), lifetime
+  via a per-message high-water delta so incremental re-broadcasts don't
+  compound; `max_tokens` from the upstream catalogue's `limit.context`
+  (probed in the background, re-probed on `set_model`). A model swap
+  **invalidates** the window rather than waiting for the re-probe: the
+  window belongs to the model, so `set_model` clears both the routing
+  context's copy and the tracker's sticky one
+  (`ContextUsageTracker::clear_max_tokens`, the explicit counterpart to
+  `observe_max_tokens(None)`'s deliberate no-op) and re-publishes the
+  current occupancy with no denominator. The meter degrades to a bare
+  token count for the gap instead of dividing by the old model's window.
+  The lifetime total and its per-message high-water map survive the swap
+  — they de-duplicate incremental re-broadcasts, which is model-independent.
+
+**First-paint seed.** The capability registry carries numeric windows
+purely as a seed until the provider's own report lands:
+`ContextWindowOption.context_window_tokens` (Claude `200k`/`1m` options
+→ 200_000 / 1_000_000) and `ChatModelInfo.max_context_tokens`
+(OpenCode, harvested; `None` for Claude — the window there is a
+property of the *selected* option — and for Codex). Resolution lives in
+`src/lib/agent-chat/context-usage.ts` (`resolveContextWindowTokens`,
+`deriveContextUsageDisplay`, and the `formatContextTokens` banding:
+lowercase `k`/`m`, one decimal only in the 1k–10k and ≥1M bands, `1m`
+never `1.0m`, the band picked from the rounded figure so 999_600 reads
+`1m` rather than a nonexistent `1000k`, null/NaN → `"0"`).
+
+**Components.** `src/components/chat/ContextUsageMeter.tsx`
+(`{ usage, seedMaxTokens?, providerLabel? }`, test hooks
+`context-usage-trigger` / `context-usage-readout` /
+`context-usage-total-processed`), wired `AgentChatPane` → `Composer` →
+`ComposerFooter` via optional `contextUsage*` props. The dev mock seeds
+one snapshot into the showcase thread so the meter is visible under
+`npm run dev`.
+
 ## Tauri command surface
 
 Session/lifecycle commands are gated on the `enable_agent_chat` feature

@@ -1041,6 +1041,59 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
     provider.stop_session(ThreadId("t-fail".into())).await.ok();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_token_usage_reaches_the_event_stream_end_to_end() {
+    // The app-server's own token accounting must surface as a
+    // canonical context-usage snapshot: `last` is the live window
+    // occupancy, `total` the lifetime figure, `modelContextWindow` the
+    // denominator.
+    let script = write_script(json!([
+        {"after":"turn/start","delay_ms":5,"emit":"notification",
+         "method":"thread/tokenUsage/updated",
+         "params":{"threadId":"c-1","turnId":"t-usage","tokenUsage":{
+             "last":{"totalTokens":24542,"inputTokens":23863,"cachedInputTokens":21144,
+                     "cacheWriteInputTokens":2715,"outputTokens":679,"reasoningOutputTokens":0},
+             "total":{"totalTokens":180000,"inputTokens":170000,"cachedInputTokens":150000,
+                      "cacheWriteInputTokens":0,"outputTokens":10000,"reasoningOutputTokens":0},
+             "modelContextWindow":272000}}},
+        {"after":"turn/start","delay_ms":20,"emit":"notification","method":"turn/completed",
+         "params":{"threadId":"c-1","turnId":"t-usage","status":"succeeded"}}
+    ]));
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-usage")).await.unwrap();
+    let mut stream = provider.event_stream();
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-usage".into()),
+            text: "x".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+        })
+        .await
+        .unwrap();
+
+    let mut seen = None;
+    let _ = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } = &ev {
+                seen = Some(usage.clone());
+                break;
+            }
+        }
+    })
+    .await;
+    let usage = seen.expect("expected a ContextUsageUpdated on the stream");
+    assert_eq!(usage.used_tokens, 24_542);
+    assert_eq!(usage.total_processed_tokens, Some(180_000));
+    assert_eq!(usage.max_tokens, Some(272_000));
+    assert_eq!(usage.compacts_automatically, Some(true));
+    provider.stop_session(ThreadId("t-usage".into())).await.ok();
+}
+
 /// Write a bash script body to a fresh dedicated tempdir with +x
 /// permissions and return the guarded path. Dedicated tempdir prevents
 /// ETXTBSY races with other concurrent tests writing to the same

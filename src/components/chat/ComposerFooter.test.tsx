@@ -205,3 +205,71 @@ describe("ComposerFooter — Stage 3 refactor (unified + popup)", () => {
     );
   });
 });
+
+describe("ComposerFooter — context-window meter", () => {
+  it("renders no meter when the thread has no usage snapshot", () => {
+    // Back-compat: every pre-existing call site omits these props, and
+    // the footer's right cluster must stay exactly as it was.
+    renderFooter();
+    expect(screen.queryByTestId("context-usage-trigger")).toBeNull();
+  });
+
+  it("renders no meter when usage is explicitly null", () => {
+    renderFooter({ contextUsage: null });
+    expect(screen.queryByTestId("context-usage-trigger")).toBeNull();
+  });
+
+  it("renders the meter immediately before the Send button", () => {
+    renderFooter({
+      contextUsage: { used_tokens: 44_000, max_tokens: 200_000 },
+    });
+    const meter = screen.getByTestId("context-usage-trigger");
+    const send = screen.getByRole("button", { name: "Send" });
+    expect(meter).toBeInTheDocument();
+    // Same cluster, meter first — the readout is passed on the way to
+    // the send control.
+    expect(meter.parentElement).toBe(send.parentElement);
+    expect(meter.nextElementSibling).toBe(send);
+    expect(meter).toHaveAttribute("aria-label", "Context window 22% used");
+  });
+
+  it("sits before the Stop button while streaming", () => {
+    renderFooter({
+      streaming: true,
+      contextUsage: { used_tokens: 44_000, max_tokens: 200_000 },
+    });
+    const meter = screen.getByTestId("context-usage-trigger");
+    const stop = screen.getByRole("button", { name: "Stop" });
+    expect(meter.nextElementSibling).toBe(stop);
+  });
+
+  it("matches the send button's circle shape", () => {
+    renderFooter({ contextUsage: { used_tokens: 1_000, max_tokens: 200_000 } });
+    const meter = screen.getByTestId("context-usage-trigger");
+    expect(meter.className).toContain("h-8");
+    expect(meter.className).toContain("w-8");
+    expect(meter.className).toContain("rounded-full");
+  });
+
+  it("uses the capability seed when the snapshot has no window", () => {
+    renderFooter({
+      contextUsage: { used_tokens: 44_000 },
+      contextUsageSeedMaxTokens: 200_000,
+    });
+    expect(screen.getByTestId("context-usage-trigger")).toHaveAttribute(
+      "aria-label",
+      "Context window 22% used",
+    );
+  });
+
+  it("forwards the provider label into the compaction note", () => {
+    renderFooter({
+      contextUsage: { used_tokens: 44_000, compacts_automatically: true },
+      contextUsageProviderLabel: "Claude",
+    });
+    fireEvent.click(screen.getByTestId("context-usage-trigger"));
+    expect(
+      screen.getByText(/Claude automatically compacts its context when needed/),
+    ).toBeInTheDocument();
+  });
+});

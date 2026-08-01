@@ -40,8 +40,10 @@ use super::protocol::{
     PermissionRespondRequest, SessionCreateRequest, SessionResponse,
 };
 use super::sse::{spawn_sse_listener, SsePeer, SseRouter};
+use super::client::{OpenCodeClient, OpenCodeClientConfig, OpenCodeProviderEntry};
 use super::translate::{
     approval_decision_to_permission_reply, build_prompt_async_request, EventContext,
+    OpenCodeUsageState,
 };
 
 /// Live handle to an OpenCode session bound to one Codemux thread.
@@ -68,6 +70,11 @@ pub struct OpenCodeSession {
     /// reply path reads the latter so a subagent's approval targets the
     /// child session id rather than the root.
     router: Arc<Mutex<SseRouter>>,
+    /// Per-session token accounting, shared with the SSE listener that
+    /// feeds it. The session itself only touches it on a model swap, to
+    /// invalidate the window the previous model's catalogue entry
+    /// supplied (see [`OpenCodeUsageState::model_changed`]).
+    usage: Arc<Mutex<OpenCodeUsageState>>,
     sse_handle: Mutex<Option<JoinHandle<()>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     /// Set by the SSE listener when it gives up on an unreachable server.
@@ -162,7 +169,18 @@ impl OpenCodeSession {
             turn_id: initial_turn,
             provider_session_id: provider_session_id.clone(),
             turn_active: false,
+            context_window_tokens: None,
         }));
+        // Best-effort: the numeric context window lives only in the
+        // upstream provider catalogue, so resolve it off the hot path.
+        // Failure is non-fatal — the meter simply renders a bare token
+        // count until (or unless) a number lands.
+        spawn_context_window_probe(
+            server_handle.base_url.clone(),
+            server_handle.server_password.clone(),
+            initial_model.clone(),
+            event_ctx.clone(),
+        );
 
         // Shared liveness flag: the SSE listener flips it when it exhausts
         // its reconnect budget (server gone), which makes `has_session`
@@ -170,11 +188,16 @@ impl OpenCodeSession {
         // `ensure_live_session` rather than POSTing to a corpse.
         let dead = Arc::new(AtomicBool::new(false));
         let router = Arc::new(Mutex::new(SseRouter::new(session_id.clone())));
+        let usage = Arc::new(Mutex::new(OpenCodeUsageState::default()));
         let peer = SsePeer {
             session_id: session_id.clone(),
             event_ctx: event_ctx.clone(),
             router: router.clone(),
             dead: dead.clone(),
+            // Written by the listener task (this session spawns exactly
+            // one); the session keeps a handle so `set_model` can
+            // invalidate the previous model's context window.
+            usage: usage.clone(),
         };
         let sse_handle = spawn_sse_listener(
             server_handle.base_url.clone(),
@@ -215,6 +238,7 @@ impl OpenCodeSession {
             http,
             event_ctx,
             router,
+            usage,
             sse_handle: Mutex::new(Some(sse_handle)),
             event_tx,
             dead,
@@ -401,8 +425,30 @@ impl OpenCodeSession {
     /// not have a "session-level model swap" RPC — the change is
     /// applied at the next `prompt_async` body.
     pub async fn set_model(&self, model: String) {
-        let mut current = self.current_model.lock().await;
-        *current = Some(model);
+        {
+            let mut current = self.current_model.lock().await;
+            *current = Some(model.clone());
+        }
+        // The window is a property of the model, so a swap invalidates
+        // the cached number. Clear it immediately (a stale denominator
+        // is worse than none) and re-probe in the background. Both
+        // copies have to go: the one the SSE listener reads off the
+        // routing context, and the sticky one already latched inside the
+        // usage tracker — the latter would otherwise keep stamping the
+        // old window on every snapshot, since `observe_max_tokens(None)`
+        // is a deliberate no-op. Re-publishing the current occupancy
+        // without a denominator makes the meter degrade to a bare token
+        // count now rather than at the next assistant message.
+        self.event_ctx.lock().await.context_window_tokens = None;
+        for event in self.usage.lock().await.model_changed(&self.thread_id) {
+            let _ = self.event_tx.send(event);
+        }
+        spawn_context_window_probe(
+            self.server_handle.base_url.clone(),
+            self.server_handle.server_password.clone(),
+            Some(model),
+            self.event_ctx.clone(),
+        );
     }
 
     /// Tear down the session. Aborts the SSE task, deletes the
@@ -469,6 +515,56 @@ async fn session_is_addressable(
     }
 }
 
+/// Resolve `model_slug` (`providerID/modelID`) to its numeric context
+/// window in a harvested provider catalogue.
+///
+/// Returns `None` for an unknown provider/model or an upstream that
+/// reports no `limit.context` — the meter then degrades to a bare
+/// token count rather than rendering a guessed percentage.
+pub(crate) fn lookup_context_window(
+    providers: &[OpenCodeProviderEntry],
+    model_slug: &str,
+) -> Option<u64> {
+    let (provider_id, model_id) = model_slug.split_once('/')?;
+    providers
+        .iter()
+        .find(|p| p.id == provider_id)?
+        .models
+        .get(model_id)
+        .and_then(|m| m.context_window)
+}
+
+/// Look the active model's context window up in the background and
+/// drop it into the shared [`EventContext`].
+///
+/// Deliberately fire-and-forget: the number only sharpens the context
+/// meter (it supplies the denominator), so a slow or failed catalogue
+/// fetch must never delay session start or fail it. A `None` model or
+/// any error simply leaves the window unknown.
+fn spawn_context_window_probe(
+    base_url: String,
+    server_password: String,
+    model_slug: Option<String>,
+    event_ctx: Arc<Mutex<EventContext>>,
+) {
+    let Some(model_slug) = model_slug else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut config = OpenCodeClientConfig::new(base_url);
+        config.server_password = Some(server_password);
+        let Ok(client) = OpenCodeClient::new(config) else {
+            return;
+        };
+        let Ok(providers) = client.list_models().await else {
+            return;
+        };
+        if let Some(window) = lookup_context_window(&providers, &model_slug) {
+            event_ctx.lock().await.context_window_tokens = Some(window);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +599,7 @@ mod tests {
             turn_id: initial_turn,
             provider_session_id: provider_session_id.clone(),
             turn_active: false,
+            context_window_tokens: None,
         }));
         let session = Arc::new(OpenCodeSession {
             thread_id: ThreadId("t1".into()),
@@ -513,6 +610,7 @@ mod tests {
             http,
             event_ctx,
             router: Arc::new(Mutex::new(SseRouter::new(provider_session_id.0.clone()))),
+            usage: Arc::new(Mutex::new(OpenCodeUsageState::default())),
             sse_handle: Mutex::new(None),
             event_tx: tx.clone(),
             dead: Arc::new(AtomicBool::new(false)),
@@ -868,5 +966,123 @@ mod tests {
             .await
             .expect("send_turn ok");
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn set_model_invalidates_the_previous_model_s_context_window() {
+        // End-to-end wiring proof: the session holds the same usage
+        // handle the SSE listener writes, so a model swap re-publishes
+        // the meter without the old model's denominator instead of
+        // waiting for a probe that may never come.
+        use super::super::translate::opencode_event_to_runtime_with;
+        let mut server = Server::new_async().await;
+        // The background re-probe must not resolve a window during the
+        // test; an unmocked /config/providers 501s, leaving it unknown.
+        let (session, _tx, mut rx) =
+            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let windowed = EventContext {
+            context_window_tokens: Some(1_000_000),
+            ..session.event_ctx.lock().await.clone()
+        };
+        {
+            let mut usage = session.usage.lock().await;
+            let seeded = opencode_event_to_runtime_with(
+                serde_json::from_value(serde_json::json!({
+                    "type": "message.updated",
+                    "properties": {"info": {
+                        "id": "msg_1",
+                        "sessionID": "sess_1",
+                        "role": "assistant",
+                        "tokens": {"input": 300_000, "output": 0, "reasoning": 0,
+                                   "cache": {"read": 0, "write": 0}}
+                    }}
+                }))
+                .unwrap(),
+                &windowed,
+                None,
+                &mut usage,
+            );
+            assert!(matches!(
+                seeded.as_slice(),
+                [ProviderRuntimeEvent::ContextUsageUpdated { usage, .. }]
+                    if usage.max_tokens == Some(1_000_000)
+            ));
+        }
+        while rx.try_recv().is_ok() {}
+
+        session.set_model("anthropic/claude-sonnet-4-6".into()).await;
+
+        assert!(
+            session.event_ctx.lock().await.context_window_tokens.is_none(),
+            "the routing-context copy is cleared for the SSE listener"
+        );
+        match rx.try_recv().expect("a corrected snapshot is published") {
+            ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } => {
+                assert!(
+                    usage.max_tokens.is_none(),
+                    "the sticky window went with it — the meter degrades to a \
+                     bare token count rather than dividing by the old model's window"
+                );
+                assert_eq!(usage.used_tokens, 300_000);
+            }
+            other => panic!("expected ContextUsageUpdated, got {other:?}"),
+        }
+        server.reset();
+    }
+
+    // ── Context-window lookup ──
+
+    fn catalogue() -> Vec<OpenCodeProviderEntry> {
+        let mut models = std::collections::BTreeMap::new();
+        models.insert(
+            "gpt-5".to_string(),
+            super::super::client::OpenCodeModel {
+                id: "gpt-5".into(),
+                name: "GPT-5".into(),
+                description: None,
+                variants: vec![],
+                context_window: Some(200_000),
+                supports_images: false,
+                is_free: false,
+            },
+        );
+        models.insert(
+            "mystery".to_string(),
+            super::super::client::OpenCodeModel {
+                id: "mystery".into(),
+                name: "Mystery".into(),
+                description: None,
+                variants: vec![],
+                context_window: None,
+                supports_images: false,
+                is_free: false,
+            },
+        );
+        vec![OpenCodeProviderEntry {
+            id: "openai".into(),
+            name: "OpenAI".into(),
+            connected: true,
+            models,
+        }]
+    }
+
+    #[test]
+    fn lookup_context_window_resolves_a_known_model_slug() {
+        assert_eq!(
+            lookup_context_window(&catalogue(), "openai/gpt-5"),
+            Some(200_000)
+        );
+    }
+
+    #[test]
+    fn lookup_context_window_is_none_for_unknown_or_silent_entries() {
+        // Unknown provider, unknown model, a model the upstream reports
+        // no window for, and a malformed slug all yield `None` — the
+        // meter degrades rather than guessing a denominator.
+        let cat = catalogue();
+        assert!(lookup_context_window(&cat, "anthropic/claude").is_none());
+        assert!(lookup_context_window(&cat, "openai/nope").is_none());
+        assert!(lookup_context_window(&cat, "openai/mystery").is_none());
+        assert!(lookup_context_window(&cat, "no-slash").is_none());
     }
 }

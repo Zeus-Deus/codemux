@@ -2,12 +2,14 @@ import { ArrowUp, Check, ListTodo, LoaderCircle, Plus, Square } from "lucide-rea
 
 import { cn } from "@/lib/utils";
 import type { ChatMode } from "@/stores/agent-chat-store";
+import type { ContextUsageSnapshot } from "@/tauri/events";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
   PermissionModeOption,
 } from "@/tauri/types";
 
+import { ContextUsageMeter } from "./ContextUsageMeter";
 import { ModelPicker } from "./pickers/ModelPicker";
 import { MultiProviderModelPicker } from "./pickers/MultiProviderModelPicker";
 import { PermissionModePicker } from "./pickers/PermissionModePicker";
@@ -60,6 +62,16 @@ interface Props {
    *  `/model` slash command. Forwarded to whichever picker variant
    *  renders. Optional; omitted by call sites that predate `/model`. */
   modelPickerOpenSignal?: number;
+  /** Latest context-window occupancy for the thread. Optional and
+   *  defaulting to `null`: surfaces without a live session (the draft
+   *  surface) simply never pass it, and the meter stays unrendered so
+   *  the footer's right cluster keeps its current geometry. */
+  contextUsage?: ContextUsageSnapshot | null;
+  /** Capability-registry window size, used to paint the meter before
+   *  the provider's first usage report arrives. */
+  contextUsageSeedMaxTokens?: number | null;
+  /** Display name of the agent for the meter's auto-compaction note. */
+  contextUsageProviderLabel?: string | null;
   tasks?: { completed: number; total: number; running?: boolean } | null;
   tasksOpen?: boolean;
   onTasksClick?: () => void;
@@ -93,6 +105,9 @@ export function ComposerFooter({
   onAttachClick,
   attachOpen = false,
   modelPickerOpenSignal,
+  contextUsage = null,
+  contextUsageSeedMaxTokens = null,
+  contextUsageProviderLabel = null,
   tasks = null,
   tasksOpen = false,
   onTasksClick,
@@ -238,7 +253,15 @@ export function ComposerFooter({
             (alongside the project + worktree pickers) — that's where
             "where will this materialize" decisions already live. */}
       </div>
-      <div className="ml-auto">
+      {/* Right cluster: ambient context-window readout sits immediately
+          left of the send/stop control, so "how full is the window" is
+          read on the way to pressing send. */}
+      <div className="ml-auto flex items-center gap-1">
+        <ContextUsageMeter
+          usage={contextUsage}
+          seedMaxTokens={contextUsageSeedMaxTokens}
+          providerLabel={contextUsageProviderLabel}
+        />
         {streaming && showStopButton ? (
           <button
             type="button"

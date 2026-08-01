@@ -597,6 +597,20 @@ function mockChatTranscript(): string[] {
       // card, a diff card and a task summary card, all landing at the tail
       // so they're visible the moment the seeded thread opens (design QA).
       for (const envelope of richChatTurnEnvelopes(T, turnId)) push(envelope);
+      // Context-usage snapshot so the composer's context meter renders
+      // with the seeded thread (donut ring + popover: % · used/max,
+      // total-processed row, compaction note). Same persisted envelope
+      // the real backend stores; hydrate replays it through the reducer.
+      push({
+        type: "context_usage_updated",
+        thread_id: T,
+        usage: {
+          used_tokens: 224_302,
+          total_processed_tokens: 3_104_886,
+          max_tokens: 1_000_000,
+          compacts_automatically: true,
+        },
+      });
       push({
         type: "turn_completed",
         thread_id: T,

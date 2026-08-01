@@ -27,6 +27,7 @@ import {
   discardStagedImage,
 } from "@/lib/agent-chat/image-staging";
 import { activeAttachments } from "@/lib/agent-chat/attachment-tokens";
+import { resolveContextWindowTokens } from "@/lib/agent-chat/context-usage";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
 import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
 import {
@@ -131,6 +132,16 @@ type AgentChatPaneNode = Extract<PaneNodeSnapshot, { kind: "agent_chat" }>;
 // `sub_provider`. The picker is the only entry point for provider
 // switching from inside an existing pane.
 const ENABLE_PROVIDER_PICKER = true;
+
+/** Human-readable agent names for the context meter's auto-compaction
+ *  note ("Claude automatically compacts its context…"). Kept separate
+ *  from the picker's provider labels because this one reads as the
+ *  sentence's subject. */
+const CONTEXT_USAGE_PROVIDER_LABELS: Record<AgentChatProviderKind, string> = {
+  claude: "Claude",
+  codex: "Codex",
+  opencode: "OpenCode",
+};
 
 /** Step 8 Stage 7 — hard cap on staged attachments. Above this we
  *  toast and reject the next attach so prompts can't silently grow
@@ -579,6 +590,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const debugActivityResolved = slice?.debugActivityResolved ?? false;
   const stagedAttachments = slice?.stagedAttachments ?? EMPTY_ATTACHMENTS;
   const activeModel = selectModel(capabilities, model);
+  // Context meter (composer footer). The snapshot rides on the thread
+  // state, so it survives hydrate-replay and the silent-restart slice
+  // migration for free. The seed only covers the window between the
+  // session starting and its first usage report — the provider's own
+  // `max_tokens` takes over the moment one lands.
+  const contextUsage = slice?.contextUsage ?? null;
+  const contextUsageSeedMaxTokens = resolveContextWindowTokens(
+    activeModel,
+    contextWindow,
+  );
+  const contextUsageProviderLabel = CONTEXT_USAGE_PROVIDER_LABELS[provider];
   const effortLabelMap = capabilities?.effort_label_map ?? {};
   const permissionModes = capabilities?.permission_modes ?? null;
   const ultrathinkInBodyText = hasUltrathinkInBodyText(draft);
@@ -2744,6 +2766,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // strip when the last run died and nothing is in flight.
       interrupted={interrupted}
       onContinueRun={handleContinueRun}
+      contextUsage={contextUsage}
+      contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
+      contextUsageProviderLabel={contextUsageProviderLabel}
       sessionReady={sessionReady}
       showProviderPicker={ENABLE_PROVIDER_PICKER}
       mode={mode}

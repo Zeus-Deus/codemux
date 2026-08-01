@@ -1,5 +1,6 @@
 import type {
   ApprovalDecision,
+  ContextUsageSnapshot,
   ProviderRuntimeEvent,
   SubagentStatus,
   TasksSnapshot,
@@ -359,6 +360,13 @@ export interface ChatThreadState {
    *  Drives the "Run interrupted" divider and the composer's Continue
    *  chip. */
   interrupted: boolean;
+  /** Latest context-window occupancy reported by the provider, or
+   *  `null` before the first usage report lands (which is also the
+   *  signal to hide the composer's meter entirely). Latest snapshot
+   *  wins; the lifetime `total_processed_tokens` is merged forward so
+   *  it never regresses when a later snapshot omits it. Persisted
+   *  backend-side, so hydrate-replay restores it after a restart. */
+  contextUsage: ContextUsageSnapshot | null;
 }
 
 export function emptyThreadState(): ChatThreadState {
@@ -371,6 +379,7 @@ export function emptyThreadState(): ChatThreadState {
     nextSeq: 0,
     stalled: null,
     interrupted: false,
+    contextUsage: null,
   };
 }
 

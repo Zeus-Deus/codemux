@@ -311,9 +311,10 @@ pub struct SessionMessage {
     pub parts: Vec<PartPayload>,
 }
 
-/// Trimmed projection of `Message` — Codemux only needs the routing
-/// fields (`sessionID`, `id`, `role`) plus the optional `error` to
-/// detect mid-turn assistant failures.
+/// Trimmed projection of `Message` — Codemux needs the routing
+/// fields (`sessionID`, `id`, `role`), the optional `error` to detect
+/// mid-turn assistant failures, and the assistant `tokens` block that
+/// drives the context meter.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MessageInfo {
     pub id: String,
@@ -324,6 +325,59 @@ pub struct MessageInfo {
     pub error: Option<OpenCodeApiError>,
     #[serde(default)]
     pub time: Option<MessageTime>,
+    /// Token accounting, present on assistant messages only. Absent on
+    /// user messages and on early partial assistant envelopes.
+    #[serde(default)]
+    pub tokens: Option<MessageTokens>,
+}
+
+/// The assistant `tokens` block: `{ input, output, reasoning, cache: {
+/// read, write } }`.
+///
+/// Every field defaults to 0 so a partial envelope (OpenCode updates a
+/// message incrementally, and the early updates carry a zeroed or
+/// half-filled block) still decodes instead of failing the whole event.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct MessageTokens {
+    #[serde(default)]
+    pub input: u64,
+    #[serde(default)]
+    pub output: u64,
+    #[serde(default)]
+    pub reasoning: u64,
+    #[serde(default)]
+    pub cache: MessageCacheTokens,
+}
+
+/// The `cache` sub-block of [`MessageTokens`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct MessageCacheTokens {
+    #[serde(default)]
+    pub read: u64,
+    #[serde(default)]
+    pub write: u64,
+}
+
+impl MessageTokens {
+    /// Total tokens this message put into the context window.
+    ///
+    /// Every bucket is summed. OpenCode reports the two cache tiers
+    /// separately from `input` (they are the cached / newly-cached
+    /// halves of the prompt, not a subset of it) and surfaces
+    /// `reasoning` as its own line beside `output`. Cache reads count:
+    /// they are prompt content the model sees on this request, so they
+    /// occupy the window exactly like fresh input does.
+    pub fn total(&self) -> u64 {
+        [
+            self.input,
+            self.cache.read,
+            self.cache.write,
+            self.output,
+            self.reasoning,
+        ]
+        .iter()
+        .fold(0u64, |acc, v| acc.saturating_add(*v))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

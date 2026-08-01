@@ -183,6 +183,11 @@ fn flatten_model(
         // positives — user creds, subscriptions, OpenRouter's
         // already-named `(free)` variants).
         is_free: model.is_free && provider.id == FREE_BADGE_PROVIDER_ID,
+        // Harvested live from the upstream's `limit.context` (decoded
+        // in `client.rs`). OpenCode federates hundreds of models with
+        // wildly different windows, so this is the only trustworthy
+        // source — `None` whenever the upstream stays silent.
+        max_context_tokens: model.context_window,
     }
 }
 
@@ -549,5 +554,36 @@ mod tests {
         let models = flatten_into_chat_models(&[p]);
         let ids: Vec<_> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["openai/gpt-3.5", "openai/gpt-4o", "openai/gpt-5"]);
+    }
+
+    // ── Numeric context window ──
+
+    #[test]
+    fn flatten_carries_the_harvested_context_window_to_max_context_tokens() {
+        // The upstream `limit.context` figure is the only trustworthy
+        // window source for OpenCode's federated catalogue, and it is
+        // what seeds the chat context meter's denominator.
+        let openai = make_provider(
+            "openai",
+            "OpenAI",
+            true,
+            &[("gpt-5", make_model("gpt-5", "GPT-5", &["low"], Some(200_000)))],
+        );
+        let models = flatten_into_chat_models(&[openai]);
+        assert_eq!(models[0].max_context_tokens, Some(200_000));
+    }
+
+    #[test]
+    fn flatten_leaves_max_context_tokens_unset_when_the_upstream_is_silent() {
+        // No guessed denominator — the meter degrades to a bare token
+        // count instead of rendering a wrong percentage.
+        let openai = make_provider(
+            "openai",
+            "OpenAI",
+            true,
+            &[("mystery", make_model("mystery", "Mystery", &[], None))],
+        );
+        let models = flatten_into_chat_models(&[openai]);
+        assert!(models[0].max_context_tokens.is_none());
     }
 }

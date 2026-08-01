@@ -2967,6 +2967,9 @@ fn map_event_to_pane_status(
         // events above.
         ProviderRuntimeEvent::WorkflowUpdated { .. }
         | ProviderRuntimeEvent::TasksUpdated { .. } => None,
+        // Context-usage snapshots are pure metadata riding alongside the
+        // turn's real progress events — they must never move the dot.
+        ProviderRuntimeEvent::ContextUsageUpdated { .. } => None,
     }
 }
 
@@ -3292,6 +3295,12 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
             // workflow run card and its phase attribution must survive a
             // restart via hydrate-replay, not a bespoke schema.
             | ProviderRuntimeEvent::WorkflowUpdated { .. }
+            // Context-usage snapshots persist so the meter survives a
+            // restart: hydrate replays the latest snapshot through the
+            // reducer, no bespoke column needed. Adapters only emit on
+            // meaningful change, so the volume tracks assistant
+            // messages, not the token stream.
+            | ProviderRuntimeEvent::ContextUsageUpdated { .. }
             // Task plans are durable conversation state. Persist the full
             // replacement event so hydrate uses the same reducer path.
             | ProviderRuntimeEvent::TasksUpdated { .. }
@@ -3433,6 +3442,7 @@ pub fn thread_id_for_event(event: &ProviderRuntimeEvent) -> Option<ThreadId> {
         | ProviderRuntimeEvent::TurnQueued { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnDispatched { thread_id, .. }
         | ProviderRuntimeEvent::QueuedTurnCancelled { thread_id, .. }
+        | ProviderRuntimeEvent::ContextUsageUpdated { thread_id, .. }
         | ProviderRuntimeEvent::RunStalled { thread_id, .. } => Some(thread_id.clone()),
         ProviderRuntimeEvent::RuntimeWarning { thread_id, .. } => thread_id.clone(),
     }

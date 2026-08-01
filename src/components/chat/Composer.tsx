@@ -62,6 +62,7 @@ import { useMcpRuntime } from "@/hooks/use-mcp-runtime";
 import { useMcpStore } from "@/stores/mcp-store";
 import { IssuePickerPanel } from "@/components/github/issue-picker";
 import { PrPickerPanel } from "@/components/github/pr-picker";
+import type { ContextUsageSnapshot } from "@/tauri/events";
 import type {
   AgentChatProviderKind,
   ChatModelInfo,
@@ -174,6 +175,14 @@ interface Props {
    *  (the default) renders nothing — existing non-draft call sites are
    *  unaffected. */
   belowComposerSlot?: React.ReactNode;
+  /** Latest context-window occupancy for the thread, forwarded to the
+   *  footer's meter. Optional (defaults to `null`): the draft surface
+   *  has no session yet, so it omits this and the meter stays hidden. */
+  contextUsage?: ContextUsageSnapshot | null;
+  /** Capability-registry window size seeding the meter's first paint. */
+  contextUsageSeedMaxTokens?: number | null;
+  /** Display name of the agent for the meter's auto-compaction note. */
+  contextUsageProviderLabel?: string | null;
   /** Provider-authored plan summary. Non-null reveals the Tasks toggle;
    *  `running` tints the chip amber with a spinner while a step is in
    *  flight (green check once completed === total). */
@@ -288,6 +297,9 @@ export function Composer({
   showStopButton = true,
   zone1Override,
   belowComposerSlot,
+  contextUsage = null,
+  contextUsageSeedMaxTokens = null,
+  contextUsageProviderLabel = null,
   tasks = null,
   tasksOpen = false,
   onTasksClick,
@@ -2440,6 +2452,9 @@ export function Composer({
             onAttachClick={handleAttachClick}
             attachOpen={attachOpen}
             modelPickerOpenSignal={modelPickerOpenSignal}
+            contextUsage={contextUsage}
+            contextUsageSeedMaxTokens={contextUsageSeedMaxTokens}
+            contextUsageProviderLabel={contextUsageProviderLabel}
             tasks={tasks}
             tasksOpen={tasksOpen}
             onTasksClick={onTasksClick}
