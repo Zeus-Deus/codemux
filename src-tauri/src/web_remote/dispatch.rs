@@ -31,6 +31,21 @@
 //! command (`attach_pty_output`, `attach_agent_chat_output`, …) and
 //! needs no knowledge of their signatures — so it is unaffected by
 //! concurrent changes to those commands' fan-out internals.
+//!
+//! ## Binary PTY framing
+//!
+//! One wrinkle: a `Channel<Vec<u8>>` is serialised by Tauri *before* the
+//! interceptor sees it, so PTY bytes arrive as
+//! `InvokeResponseBody::Json("[27,91,…]")` — a JSON number array roughly
+//! 3.4x the size of the bytes it describes. The interceptor has no type
+//! information to recover from, so the dispatcher supplies it: when it
+//! rewrites a command's channel markers it already knows `cmd`, and it
+//! tags the route as a raw byte stream for the commands in
+//! [`is_raw_byte_stream`]. [`ChannelRouter::route`] then parses those
+//! bodies back to `Vec<u8>` and emits the compact `[0x01]` binary frame
+//! instead, falling back to the JSON `chan` frame if the body turns out
+//! not to be a byte array. The desktop delivery path is untouched — this
+//! is purely how the web transport encodes the same bytes.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -47,6 +62,18 @@ use super::server::OutboundTx;
 /// The `@tauri-apps/api` `Channel` serialisation marker.
 const CHANNEL_PREFIX: &str = "__CHANNEL__:";
 
+/// Commands whose channel carries a genuine raw byte stream, so their
+/// JSON-number-array bodies are worth re-encoding onto the compact `[0x01]`
+/// binary frame (see the module note on binary PTY framing).
+///
+/// Only `attach_pty_output` qualifies: it is the app's single
+/// `Channel<Vec<u8>>` command. The other channel-taking command,
+/// `attach_agent_chat_output`, sends a structured `AgentChatEventPayload`
+/// object — JSON is its natural encoding, not an expansion of bytes.
+fn is_raw_byte_stream(cmd: &str) -> bool {
+    matches!(cmd, "attach_pty_output")
+}
+
 /// Where the interceptor sends a given server-side channel's frames.
 struct ChannelRoute {
     /// The callback id the browser's shim expects on its frames.
@@ -55,6 +82,9 @@ struct ChannelRoute {
     out: OutboundTx,
     /// Owning connection — used to drop all of a socket's routes on close.
     conn_id: u64,
+    /// Whether the owning command is one of [`is_raw_byte_stream`], i.e. its
+    /// JSON bodies are byte arrays to be re-encoded as binary frames.
+    raw_bytes: bool,
 }
 
 /// Maps server-allocated channel ids to their destination WS. Shared
@@ -74,8 +104,9 @@ pub struct ChannelRouter {
 
 impl ChannelRouter {
     /// Allocate a fresh server-side channel id bound to a browser
-    /// callback id on a specific connection.
-    fn alloc(&self, client_cb: u32, conn_id: u64, out: OutboundTx) -> u32 {
+    /// callback id on a specific connection. `raw_bytes` tags the route for
+    /// binary re-encoding (see [`is_raw_byte_stream`]).
+    fn alloc(&self, client_cb: u32, conn_id: u64, out: OutboundTx, raw_bytes: bool) -> u32 {
         // Start high to keep server ids clustered away from the low ids a
         // freshly booted desktop webview tends to mint first. (Collisions
         // are still only possible against a *currently live* server id and
@@ -88,6 +119,7 @@ impl ChannelRouter {
                 client_cb,
                 out,
                 conn_id,
+                raw_bytes,
             },
         );
         self.active.store(routes.len(), Ordering::Relaxed);
@@ -108,29 +140,21 @@ impl ChannelRouter {
         };
         let msg = match body {
             // Raw channel bodies (e.g. a command that sends
-            // `tauri::ipc::Response` bytes) → compact binary frame:
-            //   [0x01][u32 BE callbackId][u64 BE idx][payload]
+            // `tauri::ipc::Response` bytes) → compact binary frame.
             InvokeResponseBody::Raw(bytes) => {
-                let mut framed = Vec::with_capacity(1 + 4 + 8 + bytes.len());
-                framed.push(0x01u8);
-                framed.extend_from_slice(&route.client_cb.to_be_bytes());
-                framed.extend_from_slice(&(idx as u64).to_be_bytes());
-                framed.extend_from_slice(bytes);
-                Message::Binary(framed)
+                Message::Binary(binary_channel_frame(route.client_cb, idx, bytes))
             }
-            // JSON channel bodies (the common case, incl. PTY bytes which
-            // a `Channel<Vec<u8>>` serialises to a JSON number array) →
-            //   {"t":"chan","ch":<callbackId>,"idx":<n>,"data":<json>}
-            InvokeResponseBody::Json(s) => {
-                let data: Value = serde_json::from_str(s).unwrap_or(Value::Null);
-                let frame = json!({
-                    "t": "chan",
-                    "ch": route.client_cb,
-                    "idx": idx,
-                    "data": data,
-                });
-                Message::Text(frame.to_string())
-            }
+            // JSON channel bodies. For a route tagged as a raw byte stream the
+            // JSON is a number array Tauri produced from a `Channel<Vec<u8>>`,
+            // so decode it back to bytes and ship the binary frame; anything
+            // else (and any body that isn't actually a byte array) keeps the
+            // JSON `chan` frame.
+            InvokeResponseBody::Json(s) => route
+                .raw_bytes
+                .then(|| serde_json::from_str::<Vec<u8>>(s).ok())
+                .flatten()
+                .map(|bytes| Message::Binary(binary_channel_frame(route.client_cb, idx, &bytes)))
+                .unwrap_or_else(|| json_channel_frame(route.client_cb, idx, s)),
         };
         let _ = route.out.send(msg);
         true
@@ -145,32 +169,60 @@ impl ChannelRouter {
     }
 }
 
+/// The compact binary channel frame:
+///   `[0x01][u32 BE callbackId][u64 BE idx][payload]`
+/// Shared by both paths that emit it so the raw and re-encoded-JSON bodies are
+/// framed identically (same cb/idx encoding, `idx` forwarded verbatim).
+fn binary_channel_frame(client_cb: u32, idx: usize, payload: &[u8]) -> Vec<u8> {
+    let mut framed = Vec::with_capacity(1 + 4 + 8 + payload.len());
+    framed.push(0x01u8);
+    framed.extend_from_slice(&client_cb.to_be_bytes());
+    framed.extend_from_slice(&(idx as u64).to_be_bytes());
+    framed.extend_from_slice(payload);
+    framed
+}
+
+/// `{"t":"chan","ch":<callbackId>,"idx":<n>,"data":<json>}` from a JSON body.
+fn json_channel_frame(client_cb: u32, idx: usize, body: &str) -> Message {
+    let data: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let frame = json!({
+        "t": "chan",
+        "ch": client_cb,
+        "idx": idx,
+        "data": data,
+    });
+    Message::Text(frame.to_string())
+}
+
 /// Recursively rewrite every `__CHANNEL__:<id>` string in `value` to a
 /// server-side id and register its route. Handles top-level channel args
-/// and channels nested inside object/array args alike.
+/// and channels nested inside object/array args alike. `raw_bytes` comes from
+/// [`is_raw_byte_stream`] for the command being dispatched and tags every route
+/// it opens.
 fn rewrite_channel_markers(
     value: &mut Value,
     router: &Arc<ChannelRouter>,
     conn_id: u64,
     out: &OutboundTx,
+    raw_bytes: bool,
 ) {
     match value {
         Value::String(s) => {
             if let Some(rest) = s.strip_prefix(CHANNEL_PREFIX) {
                 if let Ok(client_cb) = rest.parse::<u32>() {
-                    let server_cb = router.alloc(client_cb, conn_id, out.clone());
+                    let server_cb = router.alloc(client_cb, conn_id, out.clone(), raw_bytes);
                     *s = format!("{CHANNEL_PREFIX}{server_cb}");
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                rewrite_channel_markers(item, router, conn_id, out);
+                rewrite_channel_markers(item, router, conn_id, out, raw_bytes);
             }
         }
         Value::Object(map) => {
             for (_, v) in map.iter_mut() {
-                rewrite_channel_markers(v, router, conn_id, out);
+                rewrite_channel_markers(v, router, conn_id, out, raw_bytes);
             }
         }
         _ => {}
@@ -187,8 +239,9 @@ pub async fn dispatch_invoke<R: Runtime>(
     cmd: String,
     mut args: Value,
 ) {
-    // Route any channels this command opens back to *this* browser.
-    rewrite_channel_markers(&mut args, router, conn_id, out);
+    // Route any channels this command opens back to *this* browser, tagging
+    // them with whether this command's channel carries raw bytes.
+    rewrite_channel_markers(&mut args, router, conn_id, out, is_raw_byte_stream(&cmd));
 
     let webview = match app.get_webview_window("main") {
         Some(w) => w,
@@ -274,12 +327,31 @@ mod tests {
         }
     }
 
+    /// Register one route the way the dispatcher does and hand back the
+    /// server-side id the interceptor would be called with.
+    fn register_route(
+        router: &Arc<ChannelRouter>,
+        out: &OutboundTx,
+        client_cb: u32,
+        raw_bytes: bool,
+    ) -> u32 {
+        let mut args = json!({ "channel": format!("{CHANNEL_PREFIX}{client_cb}") });
+        rewrite_channel_markers(&mut args, router, 1, out, raw_bytes);
+        args["channel"]
+            .as_str()
+            .unwrap()
+            .strip_prefix(CHANNEL_PREFIX)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
     #[test]
     fn rewrite_allocates_and_registers_top_level_channel() {
         let router = Arc::new(ChannelRouter::default());
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut args = json!({ "channel": "__CHANNEL__:7", "sessionId": "s1" });
-        rewrite_channel_markers(&mut args, &router, 1, &tx);
+        rewrite_channel_markers(&mut args, &router, 1, &tx, false);
 
         // The marker was rewritten to a server id (not the original 7).
         let rewritten = args["channel"].as_str().unwrap();
@@ -295,7 +367,7 @@ mod tests {
         let router = Arc::new(ChannelRouter::default());
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut args = json!({ "opts": { "cb": "__CHANNEL__:3" }, "list": ["__CHANNEL__:4"] });
-        rewrite_channel_markers(&mut args, &router, 9, &tx);
+        rewrite_channel_markers(&mut args, &router, 9, &tx, false);
         assert_eq!(router.routes.lock().unwrap().len(), 2);
     }
 
@@ -303,15 +375,7 @@ mod tests {
     fn route_json_body_emits_chan_frame_with_client_id_and_idx() {
         let router = Arc::new(ChannelRouter::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut args = json!({ "channel": "__CHANNEL__:42" });
-        rewrite_channel_markers(&mut args, &router, 1, &tx);
-        let server_cb: u32 = args["channel"]
-            .as_str()
-            .unwrap()
-            .strip_prefix(CHANNEL_PREFIX)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let server_cb = register_route(&router, &tx, 42, false);
 
         // Simulate a channel send (as the interceptor would).
         let body = InvokeResponseBody::Json("[27,91,65]".to_string());
@@ -328,15 +392,7 @@ mod tests {
     fn route_raw_body_emits_binary_frame() {
         let router = Arc::new(ChannelRouter::default());
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let mut args = json!({ "channel": "__CHANNEL__:1" });
-        rewrite_channel_markers(&mut args, &router, 1, &tx);
-        let server_cb: u32 = args["channel"]
-            .as_str()
-            .unwrap()
-            .strip_prefix(CHANNEL_PREFIX)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let server_cb = register_route(&router, &tx, 1, false);
 
         let body = InvokeResponseBody::Raw(vec![0xde, 0xad]);
         assert!(router.route(server_cb, 2, &body));
@@ -353,6 +409,78 @@ mod tests {
     }
 
     #[test]
+    fn only_pty_output_is_tagged_as_a_raw_byte_stream() {
+        // `attach_pty_output` is the app's single `Channel<Vec<u8>>` command.
+        assert!(is_raw_byte_stream("attach_pty_output"));
+        // The other channel-taking command sends a structured payload, so its
+        // JSON body must keep the `chan` frame.
+        assert!(!is_raw_byte_stream("attach_agent_chat_output"));
+        assert!(!is_raw_byte_stream("get_app_state"));
+        assert!(!is_raw_byte_stream(""));
+    }
+
+    #[test]
+    fn tagged_route_reencodes_json_byte_array_as_a_binary_frame() {
+        // The PTY path: Tauri serialised `Channel<Vec<u8>>` bytes to a number
+        // array before the interceptor saw them, so the router decodes it back
+        // and emits the same compact frame the raw path does.
+        let router = Arc::new(ChannelRouter::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let server_cb = register_route(&router, &tx, 42, true);
+
+        let body = InvokeResponseBody::Json("[27,91,65]".to_string());
+        assert!(router.route(server_cb, 5, &body));
+
+        match rx.try_recv().expect("a frame") {
+            Message::Binary(bytes) => {
+                assert_eq!(bytes[0], 0x01);
+                assert_eq!(&bytes[1..5], &42u32.to_be_bytes(), "client cb id");
+                assert_eq!(&bytes[5..13], &5u64.to_be_bytes(), "idx forwarded verbatim");
+                assert_eq!(&bytes[13..], &[27, 91, 65]);
+                assert_eq!(bytes.len(), 1 + 4 + 8 + 3);
+            }
+            other => panic!("expected binary frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn untagged_route_keeps_the_json_chan_frame_for_the_same_body() {
+        // Byte-identical behaviour for every command that isn't a raw byte
+        // stream — the tag is the only thing that changes the encoding.
+        let router = Arc::new(ChannelRouter::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let server_cb = register_route(&router, &tx, 42, false);
+
+        let body = InvokeResponseBody::Json("[27,91,65]".to_string());
+        assert!(router.route(server_cb, 5, &body));
+
+        let frame = drain_text(&mut rx);
+        assert_eq!(frame["t"], json!("chan"));
+        assert_eq!(frame["data"], json!([27, 91, 65]));
+    }
+
+    #[test]
+    fn tagged_route_falls_back_to_chan_frame_for_non_byte_array_json() {
+        // Defensive: if a tagged command's channel body shape ever changes (an
+        // object, or numbers outside 0..=255), the JSON frame still goes out.
+        let router = Arc::new(ChannelRouter::default());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let server_cb = register_route(&router, &tx, 9, true);
+
+        for body in [
+            InvokeResponseBody::Json(r#"{"kind":"exit"}"#.to_string()),
+            InvokeResponseBody::Json("[27,300]".to_string()),
+            InvokeResponseBody::Json("not json at all".to_string()),
+        ] {
+            assert!(router.route(server_cb, 3, &body));
+            let frame = drain_text(&mut rx);
+            assert_eq!(frame["t"], json!("chan"));
+            assert_eq!(frame["ch"], json!(9));
+            assert_eq!(frame["idx"], json!(3), "idx preserved on the fallback too");
+        }
+    }
+
+    #[test]
     fn route_unknown_id_is_ignored() {
         let router = Arc::new(ChannelRouter::default());
         let body = InvokeResponseBody::Json("null".to_string());
@@ -364,8 +492,8 @@ mod tests {
         let router = Arc::new(ChannelRouter::default());
         let (tx_a, _ra) = mpsc::unbounded_channel();
         let (tx_b, _rb) = mpsc::unbounded_channel();
-        router.alloc(1, 100, tx_a);
-        router.alloc(2, 200, tx_b);
+        router.alloc(1, 100, tx_a, false);
+        router.alloc(2, 200, tx_b, false);
         assert_eq!(router.routes.lock().unwrap().len(), 2);
         router.remove_conn(100);
         let routes = router.routes.lock().unwrap();

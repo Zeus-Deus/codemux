@@ -93,6 +93,22 @@ describe("endpoint security", () => {
     expect(hint.detail).toMatch(/clipboard/i);
     expect(hint.detail).toMatch(/notifications/i);
   });
+
+  it("a public address is called out as internet-reachable", () => {
+    const e = ep({
+      kind: "public",
+      group: "public_internet",
+      host: "203.0.114.9",
+      url: "http://203.0.114.9:4377",
+      secure: false,
+    });
+    const hint = endpointSecurityHint(e);
+    expect(hint.secure).toBe(false);
+    expect(hint.badge).toBe("Public");
+    expect(hint.detail).toMatch(/internet/i);
+    // Still an insecure origin, so the browser-API caveat stays.
+    expect(hint.detail).toMatch(/clipboard/i);
+  });
 });
 
 describe("pairing URL composition", () => {
@@ -160,6 +176,29 @@ describe("groupEndpoints", () => {
     // Only the catch-all group is collapsible.
     expect(groups.find((g) => g.id === "other")?.collapsible).toBe(true);
     expect(groups.find((g) => g.id === "this_device")?.collapsible).toBe(false);
+  });
+
+  it("gives public addresses their own always-visible section, after Tailscale", () => {
+    const eps = [
+      ep({ kind: "loopback", group: "this_device", host: "127.0.0.1" }),
+      ep({ kind: "tailnet", group: "tailscale", host: "100.64.0.1" }),
+      ep({
+        kind: "public",
+        group: "public_internet",
+        host: "203.0.114.9",
+        url: "http://203.0.114.9:4377",
+      }),
+      ep({ kind: "lan", group: "other", host: "fd00::5", url: "http://[fd00::5]:4377" }),
+    ];
+    const groups = groupEndpoints(eps);
+    expect(groups.map((g) => g.id)).toEqual([
+      "this_device",
+      "tailscale",
+      "public_internet",
+      "other",
+    ]);
+    // Never buried behind a disclosure — it may be the only way in.
+    expect(groups.find((g) => g.id === "public_internet")?.collapsible).toBe(false);
   });
 
   it("omits a group with no endpoints (e.g. no Tailscale)", () => {

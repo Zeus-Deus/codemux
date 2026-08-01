@@ -49,6 +49,7 @@ const cmds = vi.hoisted(() => ({
   webRemoteRevokeSession: vi.fn(),
   webRemoteApproveSession: vi.fn(),
   webRemoteRejectSession: vi.fn(),
+  webRemoteRegistrationStatus: vi.fn(),
 }));
 vi.mock("@/tauri/commands", () => cmds);
 
@@ -184,6 +185,7 @@ beforeEach(() => {
   cmds.webRemoteRevokeSession.mockResolvedValue(enabledStatus());
   cmds.webRemoteRejectSession.mockResolvedValue(enabledStatus());
   cmds.webRemoteSetConfig.mockResolvedValue(enabledStatus());
+  cmds.webRemoteRegistrationStatus.mockResolvedValue({ registered: false });
   cmds.webRemoteCreatePairing.mockResolvedValue({
     url_path: "/#pair=tok",
     token: "tok",
@@ -456,6 +458,173 @@ describe("RemoteAccessSection — account access", () => {
     // Both an "Account" and a "Paired" tag are present in the devices list.
     expect(screen.getAllByText("Account").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("Paired").length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+// The from-anywhere (relay) transport: a master toggle that rides
+// `web_remote_set_config`, plus a registration readout sourced from
+// `web_remote_registration_status` with the live status broadcast as fallback.
+describe("RemoteAccessSection — from anywhere (relay)", () => {
+  const relayStatus = (p: Partial<WebRemoteStatus> = {}) =>
+    status({
+      enabled: true,
+      running: true,
+      account_signed_in: true,
+      sessions: [sess({ id: "macbook", name: "MacBook Air", approved: true })],
+      ...p,
+    });
+
+  it("is off by default and doesn't read registration state", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(relayStatus());
+    render(<RemoteAccessSection />);
+
+    const toggle = await screen.findByLabelText(/toggle from-anywhere access/i);
+    expect(toggle).not.toBeChecked();
+    // No readout while off…
+    expect(screen.queryByText(/device registration/i)).toBeNull();
+    // …and the section explains what turning it on does.
+    expect(
+      screen.getByText(/end-to-end encrypted between that browser/i),
+    ).toBeInTheDocument();
+    expect(cmds.webRemoteRegistrationStatus).not.toHaveBeenCalled();
+  });
+
+  it("toggling calls webRemoteSetConfig({ relayModeEnabled })", async () => {
+    const user = userEvent.setup();
+    cmds.webRemoteStatus.mockResolvedValue(relayStatus());
+    render(<RemoteAccessSection />);
+
+    await user.click(await screen.findByLabelText(/toggle from-anywhere access/i));
+    await waitFor(() =>
+      expect(cmds.webRemoteSetConfig).toHaveBeenCalledWith({
+        relayModeEnabled: true,
+      }),
+    );
+  });
+
+  it("shows the registered readout with the device identity when on", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      relayStatus({ relay_mode_enabled: true, device_registered: true }),
+    );
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({
+      registered: true,
+      device_id: "device-abc123",
+      node_id: "node-xyz789",
+      last_registered_at: new Date(Date.now() - 60_000).toISOString(),
+      last_error: null,
+    });
+    render(<RemoteAccessSection />);
+
+    expect(await screen.findByLabelText(/toggle from-anywhere access/i)).toBeChecked();
+    await waitFor(() => expect(screen.getByText(/^Registered$/)).toBeInTheDocument());
+    // No `name` from this (older) backend, so the id is the fallback label.
+    expect(screen.getByText("device-abc123")).toBeInTheDocument();
+    expect(screen.getByText("node-xyz789")).toBeInTheDocument();
+    expect(
+      screen.getByText(/listed with your account, so a browser signed into it/i),
+    ).toBeInTheDocument();
+  });
+
+  it("names the device by hostname when the backend reports one", async () => {
+    // "Registered as vps-fra-1" is what a user recognises in the device
+    // picker; the raw uuid is only meaningful when two hosts share a name.
+    cmds.webRemoteStatus.mockResolvedValue(
+      relayStatus({ relay_mode_enabled: true, device_registered: true }),
+    );
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({
+      registered: true,
+      device_id: "device-abc123",
+      name: "vps-fra-1",
+      node_id: "node-xyz789",
+    });
+    render(<RemoteAccessSection />);
+
+    await waitFor(() =>
+      expect(screen.getByText("vps-fra-1")).toBeInTheDocument(),
+    );
+    expect(screen.queryByText("device-abc123")).toBeNull();
+    expect(
+      screen.getByLabelText(/copy device name/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a pending readout (with the last error) when registration hasn't landed", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      relayStatus({ relay_mode_enabled: true, device_registered: false }),
+    );
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({
+      registered: false,
+      device_id: "device-abc123",
+      node_id: null,
+      last_registered_at: null,
+      last_error: "control plane unreachable",
+    });
+    render(<RemoteAccessSection />);
+
+    await waitFor(() =>
+      expect(screen.getByText(/not registered yet/i)).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByText(/last attempt failed: control plane unreachable/i),
+    ).toBeInTheDocument();
+  });
+
+  it("warns when relay mode is on but the desktop is signed out", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      relayStatus({ relay_mode_enabled: true, account_signed_in: false }),
+    );
+    render(<RemoteAccessSection />);
+
+    expect(
+      await screen.findByText(/can't register for from-anywhere access/i),
+    ).toBeInTheDocument();
+    // The registration readout is replaced by the sign-in warning.
+    expect(screen.queryByText(/device registration/i)).toBeNull();
+  });
+
+  it("live-updates the readout when the state-changed event flips registration", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      relayStatus({ relay_mode_enabled: true, device_registered: false }),
+    );
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({
+      registered: false,
+      device_id: "device-abc123",
+    });
+    render(<RemoteAccessSection />);
+    await waitFor(() =>
+      expect(screen.getByText(/not registered yet/i)).toBeInTheDocument(),
+    );
+
+    cmds.webRemoteRegistrationStatus.mockResolvedValue({
+      registered: true,
+      device_id: "device-abc123",
+      node_id: "node-xyz789",
+    });
+    act(() => {
+      events.cb?.(
+        relayStatus({ relay_mode_enabled: true, device_registered: true }),
+      );
+    });
+
+    await waitFor(() => expect(screen.getByText(/^Registered$/)).toBeInTheDocument());
+    expect(screen.getByText("node-xyz789")).toBeInTheDocument();
+  });
+
+  it("falls back to the status flags when the registration read fails", async () => {
+    cmds.webRemoteStatus.mockResolvedValue(
+      relayStatus({
+        relay_mode_enabled: true,
+        device_registered: true,
+        iroh_node_id: "node-from-status",
+      }),
+    );
+    cmds.webRemoteRegistrationStatus.mockRejectedValue(
+      new Error("unknown command"),
+    );
+    render(<RemoteAccessSection />);
+
+    await waitFor(() => expect(screen.getByText(/^Registered$/)).toBeInTheDocument());
+    expect(screen.getByText("node-from-status")).toBeInTheDocument();
   });
 });
 

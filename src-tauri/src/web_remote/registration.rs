@@ -66,6 +66,12 @@ pub struct RegistrationStatus {
     /// The stable device id this desktop registers under. `None` until the
     /// first registration attempt runs (it is generated + persisted then).
     pub device_id: Option<String>,
+    /// The display name this device registers under — the machine hostname
+    /// (see [`device_name`]). Surfaced so the Settings pane can say
+    /// "Registered as <hostname>" instead of showing a raw uuid; always
+    /// populated by [`RegistrationManager::status`], even before the first
+    /// registration attempt has run, because the name is a local fact.
+    pub name: String,
     /// The iroh `node_id` last registered (the address a browser dials).
     pub node_id: Option<String>,
     /// When the last successful registration happened (RFC3339). `None` if none
@@ -93,9 +99,16 @@ pub struct RegistrationManager {
 }
 
 impl RegistrationManager {
-    /// A snapshot of the current registration status.
+    /// A snapshot of the current registration status. The display `name` is
+    /// filled in from the live hostname when no registration has stamped one
+    /// yet, so the UI can name the device before (and regardless of whether)
+    /// the control plane is reachable.
     pub fn status(&self) -> RegistrationStatus {
-        self.inner.lock().unwrap().status.clone()
+        let mut status = self.inner.lock().unwrap().status.clone();
+        if status.name.is_empty() {
+            status.name = device_name();
+        }
+        status
     }
 
     fn is_running(&self) -> bool {
@@ -106,6 +119,7 @@ impl RegistrationManager {
         let mut inner = self.inner.lock().unwrap();
         inner.status.registered = true;
         inner.status.device_id = Some(reg.device_id.clone());
+        inner.status.name = reg.name.clone();
         inner.status.node_id = Some(reg.node_id.clone());
         inner.status.last_registered_at = Some(chrono::Utc::now().to_rfc3339());
         inner.status.last_error = None;
@@ -137,9 +151,18 @@ fn stable_device_id(db: &DatabaseStore) -> String {
     id
 }
 
+/// The device id already persisted for this install, without generating one.
+/// `codemux connect status` uses this: it reports what the registry knows this
+/// machine as, and must not mint an id as a side effect of being asked.
+pub(crate) fn persisted_device_id(db: &DatabaseStore) -> Option<String> {
+    db.get_setting(DEVICE_ID_KEY)
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
 /// This device's display name for the registry — the machine hostname, falling
 /// back to a generic label so a nameless host still registers.
-fn device_name() -> String {
+pub(crate) fn device_name() -> String {
     hostname::get()
         .ok()
         .and_then(|h| h.into_string().ok())
@@ -312,6 +335,18 @@ mod tests {
     }
 
     #[test]
+    fn persisted_device_id_never_mints_one() {
+        // `codemux connect status` is a read: asking about a machine that has
+        // never registered must not create the id the registry keys on.
+        let db = init_test_database();
+        assert_eq!(persisted_device_id(&db), None);
+        assert_eq!(db.get_setting(DEVICE_ID_KEY), None, "nothing was written");
+
+        let minted = stable_device_id(&db);
+        assert_eq!(persisted_device_id(&db).as_deref(), Some(minted.as_str()));
+    }
+
+    #[test]
     fn build_registration_carries_node_id_and_current_platform() {
         let db = init_test_database();
         let reg = build_registration(&db, "node-xyz");
@@ -396,6 +431,7 @@ mod tests {
         let ok = mgr.status();
         assert!(ok.registered);
         assert_eq!(ok.device_id.as_deref(), Some("dev-9"));
+        assert_eq!(ok.name, "Host", "the registered display name is reported back");
         assert_eq!(ok.node_id.as_deref(), Some("node-9"));
         assert!(ok.last_registered_at.is_some());
         assert!(ok.last_error.is_none());
@@ -406,6 +442,38 @@ mod tests {
         assert_eq!(bad.last_error.as_deref(), Some("device registration returned 500"));
         // The device id survives the error so the UI can still show it.
         assert_eq!(bad.device_id.as_deref(), Some("dev-9"));
+    }
+
+    #[test]
+    fn status_names_the_device_before_any_registration_runs() {
+        // The Settings pane renders "Registered as <name>"; the name is a
+        // local fact (the hostname), so it must be present even when the
+        // control plane has never been reached — otherwise the UI falls back
+        // to a raw uuid on exactly the machines the user is troubleshooting.
+        let mgr = RegistrationManager::default();
+        let status = mgr.status();
+        assert!(!status.registered);
+        assert_eq!(
+            status.name,
+            device_name(),
+            "an un-registered device still reports its display name"
+        );
+        assert!(!status.name.is_empty());
+    }
+
+    #[test]
+    fn status_serializes_name_in_snake_case() {
+        let mgr = RegistrationManager::default();
+        mgr.record_success(&DeviceRegistration {
+            device_id: "dev-1".into(),
+            node_id: "node-1".into(),
+            name: "vps-fra-1".into(),
+            platform: "linux".into(),
+        });
+        let v = serde_json::to_value(mgr.status()).unwrap();
+        assert_eq!(v["name"], "vps-fra-1");
+        assert_eq!(v["device_id"], "dev-1");
+        assert!(v.get("deviceId").is_none(), "no camelCase leakage");
     }
 
     #[test]

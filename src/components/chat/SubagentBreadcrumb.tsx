@@ -44,7 +44,7 @@ export function SubagentBreadcrumb({
         strokeWidth={1.5}
         aria-hidden
       />
-      <span className="flex items-center gap-2 text-[12.5px] font-semibold text-foreground">
+      <span className="flex items-center gap-2 text-[13px] font-semibold text-foreground">
         <span
           className={cn(
             "flex h-[19px] w-[19px] items-center justify-center rounded-md font-mono text-[10px]",
@@ -56,7 +56,7 @@ export function SubagentBreadcrumb({
         <span className="truncate">{name}</span>
       </span>
       {subagent.model && (
-        <span className="rounded-[5px] bg-foreground/[0.07] px-1.5 py-0.5 font-mono text-[10.5px] text-muted-foreground">
+        <span className="rounded-[5px] bg-foreground/[0.07] px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">
           {subagent.model}
         </span>
       )}

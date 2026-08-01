@@ -44,7 +44,7 @@ export function SmoothScrollingSection() {
       <div className="space-y-1">
         <div className="flex items-center justify-between gap-8 py-4">
           <div className="space-y-1 min-w-0">
-            <p className="text-[13.5px] font-semibold leading-tight text-foreground">
+            <p className="text-[14px] font-semibold leading-tight text-foreground">
               Smooth scrolling
             </p>
             <p className="text-[12px] text-muted-foreground/80 leading-relaxed">

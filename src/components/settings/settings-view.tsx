@@ -246,7 +246,7 @@ function SettingRow({ label, description, children }: {
   return (
     <div className="flex items-center justify-between gap-8 py-4">
       <div className="space-y-1 min-w-0">
-        <p className="text-[13.5px] font-semibold leading-tight text-foreground">{label}</p>
+        <p className="text-[14px] font-semibold leading-tight text-foreground">{label}</p>
         {description && (
           <p className="text-[12px] text-muted-foreground/80 leading-relaxed">{description}</p>
         )}
@@ -260,7 +260,7 @@ function SectionHeader({ title, description }: { title: string; description: str
   return (
     <div className="mb-7">
       <h2 className="text-[21px] font-bold tracking-tight text-foreground">{title}</h2>
-      <p className="text-[13.5px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">{description}</p>
+      <p className="text-[14px] text-muted-foreground/80 mt-1.5 leading-relaxed max-w-prose">{description}</p>
     </div>
   );
 }
@@ -466,7 +466,7 @@ function WorkingIndicatorTiles({
             <span className="flex h-5 items-center justify-center">
               <WorkingIndicator variant={opt.value} color={color} preview />
             </span>
-            <span className="text-[10.5px] text-muted-foreground">
+            <span className="text-[11px] text-muted-foreground">
               {opt.label}
             </span>
           </button>
@@ -1668,7 +1668,7 @@ export function SettingsView() {
                 <SubsectionHeader title="Session" />
                 <SettingsCard className="flex items-center justify-between gap-4 border-destructive/25 bg-destructive/[0.07]">
                   <div className="min-w-0">
-                    <p className="text-[13.5px] font-semibold text-foreground">Sign out of Codemux</p>
+                    <p className="text-[14px] font-semibold text-foreground">Sign out of Codemux</p>
                     <p className="text-[12px] text-muted-foreground/80 mt-0.5">
                       You'll need to sign in again to sync settings and use cloud features.
                     </p>
@@ -1861,7 +1861,7 @@ export function SettingsView() {
 
               {/* Live preview at the sidebar row's scale. */}
               <div className="mt-4">
-                <p className="mb-1.5 font-mono text-[9.5px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/55">
+                <p className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground/55">
                   Preview
                 </p>
                 <div className="flex max-w-[300px] items-center gap-2 rounded-[10px] border border-border/60 bg-muted/30 px-2.5 py-2">
@@ -1871,7 +1871,7 @@ export function SettingsView() {
                       color={indicatorColor}
                     />
                   </span>
-                  <span className="text-[12.5px] font-semibold text-foreground">
+                  <span className="text-[13px] font-semibold text-foreground">
                     Fix scroll pinning on send
                   </span>
                   <span className="ml-auto font-mono text-[11px] text-muted-foreground">
@@ -2361,7 +2361,7 @@ export function SettingsView() {
                   </SettingsCard>
                 )}
                 <Textarea
-                  className="font-mono text-[12.5px] min-h-[90px] leading-relaxed"
+                  className="font-mono text-[13px] min-h-[90px] leading-relaxed"
                   placeholder={".env\n.env.*\n.env.local"}
                   value={worktreeIncludes}
                   onChange={(e) => setWorktreeIncludes(e.target.value)}
@@ -2374,7 +2374,7 @@ export function SettingsView() {
                 helper="Runs when a new workspace is created. One command per line."
               >
                 <Textarea
-                  className="font-mono text-[12.5px] min-h-[90px] leading-relaxed"
+                  className="font-mono text-[13px] min-h-[90px] leading-relaxed"
                   placeholder="e.g. npm install"
                   value={setupScripts}
                   onChange={(e) => setSetupScripts(e.target.value)}
@@ -2387,7 +2387,7 @@ export function SettingsView() {
                 helper="Runs when a workspace is deleted. One command per line."
               >
                 <Textarea
-                  className="font-mono text-[12.5px] min-h-[90px] leading-relaxed"
+                  className="font-mono text-[13px] min-h-[90px] leading-relaxed"
                   placeholder="e.g. docker compose down"
                   value={teardownScripts}
                   onChange={(e) => setTeardownScripts(e.target.value)}
@@ -2405,7 +2405,7 @@ export function SettingsView() {
                 }
               >
                 <Input
-                  className="font-mono text-[12.5px] h-9"
+                  className="font-mono text-[13px] h-9"
                   placeholder="e.g. npm run dev"
                   value={runCommand}
                   onChange={(e) => setRunCommand(e.target.value)}

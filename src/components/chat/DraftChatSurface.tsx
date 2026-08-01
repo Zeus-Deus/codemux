@@ -77,6 +77,9 @@ import { Composer } from "./Composer";
 import { UserMessage } from "./UserMessage";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { ThreadScopeRow } from "./pickers/ThreadScopeRow";
+import { cn } from "@/lib/utils";
+
+import { CHAT_COLUMN } from "./chat-column";
 
 /** Grace period between `markPromoted` and `clearDraft`. Gives any
  *  in-flight selector a chance to observe the promotion before the
@@ -1067,8 +1070,10 @@ function DraftPendingConversation({
   };
   return (
     <div className="flex h-full w-full flex-col">
-      <div className="flex-1 min-h-0 overflow-y-auto">
-        <div className="mx-auto flex w-full max-w-[760px] flex-col gap-4 px-7 py-6">
+      {/* Both-edges gutter so the column stays concentric with the pane
+          (and with the composer below) once this view can scroll. */}
+      <div className="flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable_both-edges]">
+        <div className={cn(CHAT_COLUMN, "flex flex-col gap-4 py-6")}>
           <UserMessage item={item} />
           <div
             className="flex items-center gap-[13px] pt-0.5"
@@ -1082,13 +1087,15 @@ function DraftPendingConversation({
                 aria-hidden
               />
             </span>
-            <span className="shimmer text-[12.5px] font-semibold">
+            <span className="shimmer text-[13px] font-semibold">
               {PHASE_LABEL[pending.phase]}
             </span>
           </div>
         </div>
       </div>
-      <div className="mx-auto w-full max-w-[760px] px-7 pb-4">{composer}</div>
+      {/* The composer owns its own column rails (see chat-column.ts), so
+          this wrapper only adds the gap below it. */}
+      <div className="pb-4">{composer}</div>
     </div>
   );
 }

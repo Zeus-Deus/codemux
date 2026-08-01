@@ -99,7 +99,11 @@ jobs:
         # failures show up in a dedicated log step.
         shell: bash
         run: |
-          bash scripts/build-claude-sidecar.sh
+          # --strict: refuse to fall through to "unknown target — skipping",
+          # which would leave whatever is already in src-tauri/binaries/ for
+          # the bundler to pick up. A release must never bundle a sidecar
+          # this step did not itself produce.
+          bash scripts/build-claude-sidecar.sh --strict
           TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
           case "$TARGET" in
             *windows*) DEST="src-tauri/binaries/codemux-claude-sidecar-$TARGET.exe" ;;
@@ -139,42 +143,64 @@ jobs:
             exit 1
           fi
 
-      - name: Build codemux-remote binary (Linux x86_64 only)
+      - name: Build codemux-remote binary (release profile)
         # Used by the push-to-host (cloud-push) feature: this binary is
         # scp'd to the user's remote SSH host the first time they push a
         # workspace. Bundled as a Tauri resource so the laptop app can
         # find it via app.path().resource_dir() at install time.
         #
-        # Scoped to ubuntu-22.04 + x86_64-unknown-linux-gnu for v1:
-        #   - Windows Codemux can't push (remote daemon is #[cfg(unix)])
-        #   - ARM64 Linux + macOS remotes need additional rustup targets
-        #     and (for macOS) a macOS runner — deferred until demand
-        # If those expand later, add `--target` flags here for each
-        # extra triple and stage them at the matching path.
-        if: matrix.os == 'ubuntu-22.04'
+        # Runs on BOTH runners. On Windows the binary is a #[cfg(not(unix))]
+        # no-op stub, but `bundle.resources = ["binaries/codemux-remote-*"]`
+        # still needs a file to match, and if we don't produce one here
+        # tauri's beforeBuildCommand will — so it may as well be a release
+        # build staged by the same code path as Linux. (Before this step
+        # covered Windows, the beforeBuildCommand fallback compiled the
+        # whole dependency graph in DEBUG on the Windows runner just to
+        # produce that stub.)
+        #
+        # Only the host triple is built. ARM64 Linux + macOS remotes need
+        # additional rustup targets and (for macOS) a macOS runner —
+        # deferred until demand. To add them, set CARGO_BUILD_TARGET and
+        # re-run the script once per triple.
         shell: bash
         run: |
-          # Chicken-and-egg: `codemux-remote` is a [[bin]] inside the same
-          # Cargo package as `codemux` (the Tauri app), so `cargo build
-          # --bin codemux-remote` triggers that package's build.rs
-          # (tauri_build::build()). The Tauri build script scans
-          # tauri.conf.json's `bundle.resources = ["binaries/codemux-remote-*"]`
-          # glob and panics if nothing matches — but on a fresh CI checkout,
-          # nothing matches *until* we build the binary. Plant an empty stub
-          # at the glob target first so the resource scan passes; we
-          # overwrite it with the real binary on the next line.
-          mkdir -p src-tauri/binaries
-          touch src-tauri/binaries/codemux-remote-x86_64-unknown-linux-gnu
-          cargo build --release --bin codemux-remote --manifest-path src-tauri/Cargo.toml
-          cp src-tauri/target/release/codemux-remote \
-             src-tauri/binaries/codemux-remote-x86_64-unknown-linux-gnu
-          chmod +x src-tauri/binaries/codemux-remote-x86_64-unknown-linux-gnu
-          # Sanity-check: the file must be non-empty and executable. A
-          # broken binary here would ship a release whose cloud-push
-          # feature dies at first use with "Codemux build doesn't
-          # include codemux-remote for x86_64-unknown-linux-gnu".
-          if [ ! -s src-tauri/binaries/codemux-remote-x86_64-unknown-linux-gnu ]; then
-            echo "::error::codemux-remote build did not produce a non-empty binary"
+          # The script handles the chicken-and-egg with tauri-build's
+          # resource glob (it plants a stub before invoking cargo), always
+          # runs `cargo build --release --bin codemux-remote` itself, and
+          # stages exactly that artifact — never a leftover debug or stale
+          # binary. Doing it here rather than leaving it to
+          # beforeBuildCommand keeps failures in a dedicated log step.
+          bash scripts/build-codemux-remote.sh --profile release
+
+          TARGET="${CARGO_BUILD_TARGET:-$(rustc -vV | grep host | cut -d' ' -f2)}"
+          case "$TARGET" in
+            *windows*) DEST="src-tauri/binaries/codemux-remote-$TARGET.exe" ;;
+            *)         DEST="src-tauri/binaries/codemux-remote-$TARGET" ;;
+          esac
+          STAMP="src-tauri/binaries/.codemux-remote-$TARGET.profile"
+
+          # Sanity-check: the file must be non-empty. A broken binary here
+          # would ship a release whose cloud-push feature dies at first use
+          # with "Codemux build doesn't include codemux-remote for
+          # x86_64-unknown-linux-gnu".
+          if [ ! -s "$DEST" ]; then
+            echo "::error::codemux-remote build did not produce a non-empty binary at $DEST"
+            exit 1
+          fi
+
+          # Guardrail: assert PROVENANCE, not heuristics. The staging script
+          # writes this stamp describing the profile it actually built and
+          # copied. A debug-profile sidecar (~800 MB unstripped, vs ~23 MB
+          # release) shipped in the bundle once because staging ran before
+          # tauri's own `cargo build --release` and picked up a leftover
+          # target/debug artifact. Fail the release rather than publish that.
+          if [ ! -f "$STAMP" ]; then
+            echo "::error::missing provenance stamp $STAMP — build-codemux-remote.sh did not complete"
+            exit 1
+          fi
+          cat "$STAMP"
+          if ! grep -qx 'profile=release' "$STAMP"; then
+            echo "::error::codemux-remote was staged from a non-release profile — refusing to publish"
             exit 1
           fi
           ls -la src-tauri/binaries/codemux-remote-*

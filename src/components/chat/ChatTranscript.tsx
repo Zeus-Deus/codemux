@@ -20,6 +20,8 @@ interface Props {
    *  MessageList: each bump re-pins the transcript tail so sending a new
    *  prompt catches the reader up even from deep in history. */
   scrollToBottomSignal?: number;
+  /** Virtual-list jump request from the docked subagent activity bar. */
+  subagentJumpRequest?: { cardId: string; nonce: number } | null;
   /** Optional session-created timestamp for the top session-start marker
    *  (design D2). Forwarded to MessageList; Stage 3 wires the real value. */
   sessionStartedAt?: number;
@@ -55,6 +57,7 @@ export function ChatTranscript({
   stalled,
   interrupted,
   scrollToBottomSignal,
+  subagentJumpRequest,
   sessionStartedAt,
   provider,
   onRespondToRequest,
@@ -76,6 +79,7 @@ export function ChatTranscript({
         stalled={stalled}
         interrupted={interrupted}
         scrollToBottomSignal={scrollToBottomSignal}
+        subagentJumpRequest={subagentJumpRequest}
         sessionStartedAt={sessionStartedAt}
         provider={provider}
         onRespondToRequest={onRespondToRequest}

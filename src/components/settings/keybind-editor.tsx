@@ -270,14 +270,14 @@ function KeybindRow({
       <div className="space-y-0.5 min-w-0 flex-1 pt-1">
         <span className="text-[13px] text-foreground">{entry.label}</span>
         {entry.description && (
-          <p className="text-[11.5px] text-muted-foreground/75 leading-relaxed">
+          <p className="text-[12px] text-muted-foreground/75 leading-relaxed">
             {entry.description}
           </p>
         )}
 
         {/* Recording timeout hint */}
         {isRecording && recordingTimedOut && !pendingConflict && (
-          <p className="text-[11.5px] text-muted-foreground/80 mt-1.5 leading-relaxed">
+          <p className="text-[12px] text-muted-foreground/80 mt-1.5 leading-relaxed">
             Some shortcuts (e.g. Ctrl+W, Ctrl+T) are captured by the system and
             can't be recorded. Press Escape to cancel.
           </p>
@@ -289,7 +289,7 @@ function KeybindRow({
           return (
             <div className="space-y-1.5 mt-2 rounded-md border border-warning/30 bg-warning/10 px-2.5 py-2">
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-[11.5px] text-warning">
+                <span className="text-[12px] text-warning">
                   Already used by{" "}
                   <span className="font-medium">
                     {pendingConflict.conflictIds
@@ -343,7 +343,7 @@ function KeybindRow({
           ref={badgeRef}
           onClick={isRecording ? undefined : onStartRecording}
           className={cn(
-            "text-[11.5px] font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight transition-all",
+            "text-[12px] font-mono px-2.5 h-7 inline-flex items-center justify-center rounded-md border min-w-[88px] tracking-tight transition-all",
             isRecording
               ? "border-primary/40 bg-primary/10 text-primary-foreground animate-pulse cursor-default"
               : isUnbound

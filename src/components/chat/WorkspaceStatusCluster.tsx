@@ -231,7 +231,7 @@ export function WorkspaceStatusCluster() {
                 aria-label="Workspace details"
                 title="Workspace details"
                 className={cn(
-                  "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-[11.5px] font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09]",
+                  "inline-flex h-[26px] shrink-0 items-center gap-1 rounded-md px-2 text-[12px] font-semibold text-foreground/80 outline-none transition-colors hover:bg-foreground/[0.09]",
                   open && "bg-foreground/[0.09]",
                 )}
               >
@@ -246,10 +246,10 @@ export function WorkspaceStatusCluster() {
               className="w-[290px] p-0"
             >
               <div className="border-b px-3.5 py-2.5">
-                <div className="truncate text-[12.5px] font-bold text-foreground">
+                <div className="truncate text-[13px] font-bold text-foreground">
                   {workspace.title}
                 </div>
-                <div className="mt-0.5 truncate font-mono text-[10.5px] text-muted-foreground">
+                <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
                   {projectName} · {deviceLabel}
                 </div>
               </div>
@@ -304,7 +304,7 @@ export function WorkspaceStatusCluster() {
                     <button
                       type="button"
                       onClick={handlePrClick}
-                      className="h-[30px] flex-1 rounded-md border bg-background text-[11.5px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06]"
+                      className="h-[30px] flex-1 rounded-md border bg-background text-[12px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06]"
                     >
                       View PR #{workspace.pr_number}
                     </button>
@@ -314,7 +314,7 @@ export function WorkspaceStatusCluster() {
                       type="button"
                       onClick={handleSync}
                       disabled={pulling}
-                      className="h-[30px] flex-1 rounded-md border bg-background text-[11.5px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
+                      className="h-[30px] flex-1 rounded-md border bg-background text-[12px] font-semibold text-foreground transition-colors hover:bg-foreground/[0.06] disabled:cursor-not-allowed disabled:opacity-60"
                     >
                       {pulling ? "Syncing…" : `Sync ↓${workspace.git_behind}`}
                     </button>
@@ -348,7 +348,7 @@ function DetailRow({
 }) {
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-1.5 transition-colors hover:bg-foreground/[0.05]">
-      <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate text-[12px] text-muted-foreground">
         {label}
       </span>
       <span

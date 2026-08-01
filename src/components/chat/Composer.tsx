@@ -78,6 +78,7 @@ import { ComposerCommandMenu } from "./ComposerCommandMenu";
 import { ComposerFooter } from "./ComposerFooter";
 import { ModePill, type ActivePillMode } from "./pickers/ModePill";
 import { SlashCommandPopup } from "./SlashCommandPopup";
+import { CHAT_COLUMN_INNER, CHAT_COLUMN_OUTER } from "./chat-column";
 
 const EMPTY_ATTACHMENTS: Attachment[] = [];
 const EMPTY_FILE_MATCHES: FileMatch[] = [];
@@ -1966,8 +1967,8 @@ export function Composer({
   };
 
   return (
-    <div className="w-full px-4 pb-3">
-      <div className="mx-auto w-full max-w-[760px]">
+    <div className={cn(CHAT_COLUMN_OUTER, "pb-3")}>
+      <div className={CHAT_COLUMN_INNER}>
         {zone1Override !== null && zone1Override !== undefined ? (
           <div className="pb-1">{zone1Override}</div>
         ) : zone1Override === undefined && cwd ? (
@@ -2231,7 +2232,7 @@ export function Composer({
               className={cn(
                 "pointer-events-none absolute inset-0 px-3 py-2.5",
                 "whitespace-pre-wrap break-words",
-                "text-sm text-foreground",
+                "text-sm leading-relaxed text-foreground",
                 // `overflow-y-auto` (rather than `overflow-hidden`) is
                 // required so we can imperatively assign `scrollTop` —
                 // setting `scrollTop` on a clipped element is a no-op in
@@ -2396,7 +2397,7 @@ export function Composer({
                 "relative block w-full resize-none bg-transparent px-3 py-2.5",
                 // Transparent text — the colored mirror behind shows
                 // through. Caret stays visible via `caret-foreground`.
-                "text-sm text-transparent caret-foreground",
+                "text-sm leading-relaxed text-transparent caret-foreground",
                 "placeholder:text-muted-foreground/60",
                 "outline-none",
               )}

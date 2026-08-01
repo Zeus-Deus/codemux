@@ -65,6 +65,7 @@ import {
   linkWorkspaceIssue,
   getGithubIssueByPath,
   applyPreset,
+  renameWorkspace,
 } from "@/tauri/commands";
 import { pickFiles } from "@/lib/file-dialog";
 import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue, ModelSelection } from "@/tauri/types";
@@ -114,6 +115,39 @@ export function buildPromptWithIssueContext(
   lines.push("", "---", "");
 
   return lines.join("\n") + userPrompt;
+}
+
+/** Apply the dialog's optional "Workspace name" to the workspace that was
+ *  just created.
+ *
+ *  Every create path here lands on a backend-assigned title —
+ *  `default_workspace_title` (the directory's own name) for the repo-root
+ *  paths, the branch name for the worktree paths
+ *  (`set_workspace_worktree`) — so a name the user typed has to be
+ *  applied explicitly afterwards. Without this the input only ever
+ *  labelled the optimistic pending row and was silently discarded the
+ *  moment the real workspace landed.
+ *
+ *  A typed name is the strongest available signal, so it wins over the
+ *  branch-derived title too. Best-effort: a rename failure leaves the
+ *  backend title rather than failing a workspace that already exists.
+ *
+ *  Callers must skip this when the backend ADOPTED a pre-existing live
+ *  workspace instead of creating one (`WorkspaceCreated.adopted`) — that
+ *  workspace belongs to someone else's session and its title is not ours
+ *  to overwrite. */
+async function applyTypedWorkspaceName(
+  workspaceId: string,
+  typedName: string,
+): Promise<void> {
+  const name = typedName.trim();
+  if (!name) return;
+  await renameWorkspace(workspaceId, name).catch((err) => {
+    console.warn(
+      "[new-workspace-dialog] workspace rename failed (non-fatal):",
+      err,
+    );
+  });
 }
 
 interface Props {
@@ -742,6 +776,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
         let wsId: string;
         let agentHandled = false;
+        let adoptedExisting = false;
         // A real orphan is a worktree on disk whose branch we want, that isn't the
         // main repo itself and isn't already owned by an existing Codemux workspace.
         // Both filters are required: the first excludes the primary repo (which appears
@@ -783,12 +818,17 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           // here would read as "nothing happened" and quietly lose the
           // typed message, so say so.
           if (created.adopted) {
+            adoptedExisting = true;
             toast.info(
               fullPrompt
                 ? `"${openExistingBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
                 : `"${openExistingBranch}" already has a live workspace — switched to it.`,
             );
           }
+        }
+
+        if (!adoptedExisting) {
+          await applyTypedWorkspaceName(wsId, workspaceName);
         }
 
         // Launch agent for paths that don't handle it internally
@@ -862,6 +902,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
 
       let wsId: string;
       let agentHandled = false;
+      let adoptedExisting = false;
 
       // Existing default branch (main/master): always attach to the real repo
       // root regardless of what the main repo currently has checked out. The
@@ -909,6 +950,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
           // typing into its in-flight session. Surface that — otherwise the
           // user's prompt disappears silently.
           if (created.adopted) {
+            adoptedExisting = true;
             toast.info(
               fullPrompt
                 ? `"${resolvedBranch}" already has a live workspace — switched to it. Your prompt wasn't sent.`
@@ -916,6 +958,10 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             );
           }
         }
+      }
+
+      if (!adoptedExisting) {
+        await applyTypedWorkspaceName(wsId, workspaceName);
       }
 
       // Launch agent for paths that don't handle it internally
@@ -1403,7 +1449,15 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               onCreateOnCurrent={() => {
                 onOpenChange(false);
                 createWorkspace(projectDir)
-                  .then((wsId) => activateWorkspace(wsId))
+                  .then(async (wsId) => {
+                    // Same contract as the main create paths: honour a
+                    // typed name before the workspace becomes visible.
+                    // Nothing else ever names this one — it cuts no
+                    // branch — so without this it keeps the backend
+                    // default (the directory's name) forever.
+                    await applyTypedWorkspaceName(wsId, workspaceName);
+                    await activateWorkspace(wsId);
+                  })
                   .catch(console.error);
               }}
               onOpenExisting={handleOpenExisting}

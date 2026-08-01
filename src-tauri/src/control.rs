@@ -1573,6 +1573,19 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                 .await
                 .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string()))
         }
+        // Turn the from-anywhere relay transport on/off in this running
+        // instance (`codemux connect` / `codemux connect off` when a GUI or
+        // `serve` already holds the control endpoint). The CLI cannot just
+        // write the setting row in that case — the running instance owns the
+        // in-memory config and re-persists it — so relay mode has to be flipped
+        // through the live `set_config_core` path, exactly like the Settings
+        // pane's switch. Returns the resulting status.
+        "web_remote_set_relay" => match request.params.get("enabled").and_then(Value::as_bool) {
+            None => Err("web_remote_set_relay requires a boolean `enabled`".to_string()),
+            Some(enabled) => crate::web_remote::control_set_relay(app, enabled)
+                .await
+                .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string())),
+        },
         // Disable web remote access from the terminal (`codemux remote disable`).
         "web_remote_disable" => crate::web_remote::control_disable(app)
             .and_then(|res| serde_json::to_value(res).map_err(|error| error.to_string())),

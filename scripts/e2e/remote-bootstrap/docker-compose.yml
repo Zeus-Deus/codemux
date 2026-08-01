@@ -1,0 +1,114 @@
+# One-command remote bootstrap E2E: a mock account API plus one systemd
+# container per distro, on a private bridge with NO published host ports.
+#
+# Everything is driven from `run.sh` via `docker exec`; nothing in here needs
+# to be reachable from the host, and the mock API is only reachable from the
+# targets (and vice versa) over the `e2e` network — which is also what makes
+# the cross-container `curl http://<target-ip>:4377/api/health` assertion
+# meaningful.
+name: codemux-e2e-remote-bootstrap
+
+x-target-common: &target-common
+  # NOT privileged. One capability (SYS_ADMIN, justified below), no
+  # `security_opt` loosening, no extra devices; the default seccomp and
+  # AppArmor/SELinux profiles still apply.
+  #
+  # systemd as PID 1 needs one thing Docker withholds by default: a *writable*
+  # cgroup hierarchy (it dies at "Failed to create /init.scope control group:
+  # Read-only file system" otherwise). On this cgroup-v2 host that is satisfied
+  # by joining the host cgroup namespace and mounting the hierarchy read-write.
+  # Capabilities are NOT what systemd is missing — `--cap-add SYS_ADMIN` alone
+  # fails identically, and with the hierarchy writable systemd boots with no
+  # added caps at all.
+  #
+  # `cgroup: host` is needed because with a *private* cgroup namespace the
+  # bind-mounted hierarchy and the namespaced path systemd derives from
+  # /proc/1/cgroup disagree, and systemd dies with ENOENT instead. It is not a
+  # licence to roam: systemd reads its own cgroup from /proc/1/cgroup and
+  # confines everything it creates beneath it, e.g.
+  #   /system.slice/docker-<id>.scope/system.slice/sshd.service
+  # so the units under test live inside this container's own scope.
+  cgroup: host
+  # The one capability this harness needs, and it is not for systemd itself —
+  # systemd PID 1 boots fine without it. It is for **polkitd**: Ubuntu's and
+  # Fedora's `polkit.service` are hardened with ProtectSystem/ProtectHome/…,
+  # and systemd must retain CAP_SYS_ADMIN to build those mount namespaces
+  # before dropping to the `polkitd` user. Without it polkitd dies with
+  #   polkit.service: Failed to keep CAP_SYS_ADMIN: Operation not permitted
+  #   polkit.service: Main process exited, code=exited, status=217/USER
+  # and then logind has nobody to answer `org.freedesktop.login1.set-self-linger`,
+  # so `codemux connect`'s `loginctl enable-linger` fails with a D-Bus timeout:
+  #   ⚠ Could not keep the service alive past logout (… Connection timed out)
+  # …which would silently reduce the reboot-survival step to a no-op.
+  #
+  # Everything else is stock: no privileged, no other caps, no security_opt.
+  cap_add:
+    - SYS_ADMIN
+  # systemd wants these writable and empty at boot.
+  tmpfs:
+    - /run
+    - /run/lock
+    - /tmp
+  stop_signal: SIGRTMIN+3
+  stop_grace_period: 20s
+  init: false
+  networks: [e2e]
+  volumes:
+    - type: bind
+      source: /sys/fs/cgroup
+      target: /sys/fs/cgroup
+      bind:
+        propagation: rslave
+    # The .deb/.rpm/.AppImage under test, mounted read-only.
+    - type: bind
+      source: ${CODEMUX_E2E_ARTIFACT_DIR:-./artifacts}
+      target: /artifacts
+      read_only: true
+    # The installer itself, so the container tests the working-tree script
+    # rather than a copy that can drift.
+    - type: bind
+      source: ${CODEMUX_E2E_REPO_SCRIPTS:-../..}
+      target: /repo-scripts
+      read_only: true
+  environment:
+    # Every codemux process in here talks to the mock, never the real API.
+    CODEMUX_API_URL: http://mock-api:8787
+
+services:
+  mock-api:
+    build:
+      context: .
+      dockerfile: Dockerfile.mock-api
+    container_name: codemux-e2e-mock-api
+    networks: [e2e]
+    environment:
+      E2E_EMAIL: ${CODEMUX_E2E_EMAIL:-test@example.com}
+      E2E_TOKEN: ${CODEMUX_E2E_TOKEN:-e2e-session-token}
+      E2E_USER_ID: ${CODEMUX_E2E_USER_ID:-usr_e2e_1}
+
+  ubuntu:
+    <<: *target-common
+    build:
+      context: .
+      dockerfile: Dockerfile.ubuntu
+      args:
+        E2E_USER: ${CODEMUX_E2E_USER:-tester}
+    container_name: codemux-e2e-ubuntu
+    hostname: codemux-e2e-ubuntu
+    depends_on: [mock-api]
+
+  fedora:
+    <<: *target-common
+    build:
+      context: .
+      dockerfile: Dockerfile.fedora
+      args:
+        E2E_USER: ${CODEMUX_E2E_USER:-tester}
+    container_name: codemux-e2e-fedora
+    hostname: codemux-e2e-fedora
+    depends_on: [mock-api]
+
+networks:
+  e2e:
+    name: codemux-e2e-remote-bootstrap
+    driver: bridge

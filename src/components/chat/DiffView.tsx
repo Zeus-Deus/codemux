@@ -31,7 +31,7 @@ export function DiffView({
   return (
     <div className="overflow-hidden rounded-[11px] border border-border/60 bg-muted/40">
       <div className="flex items-center justify-between gap-3 border-b border-border/60 px-[13px] py-[9px]">
-        <span className="flex min-w-0 items-center gap-2 font-mono text-[11.5px] text-muted-foreground">
+        <span className="flex min-w-0 items-center gap-2 font-mono text-[12px] text-muted-foreground">
           <FileText
             className="h-3 w-3 shrink-0 text-muted-foreground/70"
             strokeWidth={1.4}
@@ -47,7 +47,7 @@ export function DiffView({
           <CopyButton text={copyText} />
         </span>
       </div>
-      <div className="overflow-x-auto py-[9px] font-mono text-[11.5px] leading-[1.75]">
+      <div className="overflow-x-auto py-[9px] font-mono text-[12px] leading-[1.75]">
         {rows.map((row, i) => {
           if (row.type === "context" || row.type === "add") lineNo += 1;
           const gutter =

@@ -303,6 +303,42 @@ describe("SidebarInboxCard — multi-select", () => {
   });
 });
 
+describe("SidebarInboxCard — background recede", () => {
+  // Prominence is reserved for rows that want a human: the one you are in,
+  // needs-you, done-review, unread, woke, and anything ticked for a bulk
+  // action. A quietly-working agent and an idle row you have already read sit
+  // back instead, and hover/focus brings them straight back to full.
+  it("dims a background card whose agent is quietly working", () => {
+    const { card } = renderCard({ status: "working" });
+    expect(card.className).toContain("opacity-70");
+    expect(card.className).toContain("hover:opacity-100");
+    expect(card.className).toContain("focus-within:opacity-100");
+  });
+
+  it("dims an idle background card the same way", () => {
+    const { card } = renderCard({ status: null });
+    expect(card.className).toContain("opacity-70");
+    expect(card.className).toContain("hover:opacity-100");
+  });
+
+  it("keeps every card that wants a human at full brightness", () => {
+    const cases: Array<[string, Partial<CardProps>]> = [
+      ["the workspace you are in", { isActive: true, status: "working" }],
+      ["a card ticked for a bulk action", { selected: true, status: "working" }],
+      ["unread agent output", { unread: true, status: "working" }],
+      ["a card just back from a snooze", { woke: true, status: null }],
+      ["an agent blocked on you", { status: "permission" as ActivePaneStatus }],
+      ["work finished and waiting on a review", { status: "review" as ActivePaneStatus }],
+    ];
+
+    for (const [label, overrides] of cases) {
+      const { card } = renderCard(overrides);
+      expect(card.className, label).not.toContain("opacity-70");
+      cleanup();
+    }
+  });
+});
+
 describe("SidebarInboxCard — meta line alignment", () => {
   function metaLine(container: HTMLElement) {
     return container.querySelector("[data-meta-line]") as HTMLElement;

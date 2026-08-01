@@ -90,6 +90,7 @@ import {
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
 import { replayPayloads } from "@/lib/agent-chat/hydrate";
+import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
 import type {
@@ -184,19 +185,6 @@ export function detectAnimatedGif(buffer: ArrayBuffer): boolean {
   }
   return false;
 }
-
-// Jump-to-card correction-loop tuning for the docked SubagentActivityBar
-// (see `handleJumpToSubagentCard` below). Mirrors MessageTrail.tsx's own
-// jump constants: `content-visibility:auto` rows only expose estimated
-// heights until they render, so a single scrollTop computation can land
-// off; a few corrective rAF passes converge on the real offset.
-const JUMP_SCROLL_MARGIN_PX = 16;
-const JUMP_SETTLE_TOLERANCE_PX = 2;
-const JUMP_SETTLE_STABLE_FRAMES = 3;
-const JUMP_SETTLE_MAX_FRAMES = 40;
-/** How long the ember ring highlight stays on a jumped-to card (design:
- *  "flashes `box-shadow` ... for ~1100ms"). */
-const JUMP_HIGHLIGHT_MS = 1100;
 
 export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const initialProvider: AgentChatProviderKind = pane.provider ?? "claude";
@@ -395,6 +383,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   });
   const isHomeWorkspace =
     homeDir !== null && workspaceProjectRoot === homeDir;
+  // Identity of the pane's workspace, for the current-checkout
+  // first-send rename (see `handleCurrentCheckoutFirstSubmit`). A plain
+  // scalar, so this selector doesn't re-render on unrelated snapshot
+  // churn. The workspace's CURRENT title is deliberately not read here —
+  // `autoNameWorkspace` re-reads it after its AI call resolves, which is
+  // the only moment the guard is meaningful.
+  const paneWorkspaceId = useAppStore(
+    (s) => workspaceIdForPane ?? s.appState?.active_workspace_id ?? null,
+  );
   // The pane workspace's actual checked-out branch (from the workspace
   // snapshot's git watcher). Thread Scope prefers this over the branch
   // picker's main/master heuristic for the "current checkout" display,
@@ -537,14 +534,6 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [enteredSubagentId]);
-  // Scoped to this pane's own subtree (not `document`) so split panes each
-  // jump within their own transcript. Plain DOM query rather than the
-  // MessageScroller engine's `scrollToMessage`: the docked bar lives
-  // outside the scroller's provider tree, and MessageList renders every
-  // slot (no windowing — see docs/features/agent-chat.md "Transcript
-  // scroller"), so a direct query by `data-subagent-card` always finds the
-  // node.
-  const paneRootRef = useRef<HTMLDivElement>(null);
   // Send → jump-to-latest (catch-up on send). An incrementing counter
   // forwarded to the transcript; bumping it snaps the viewport to the
   // bottom and re-pins following-bottom mode. Sending a new prompt must
@@ -556,92 +545,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     () => setScrollToBottomSignal((n) => n + 1),
     [],
   );
-  // Live handles for an in-flight jump (rAF settle loop + highlight
-  // timeout), cancelled on a re-jump, a thread switch, and unmount — the
-  // same hygiene as MessageList's / MessageTrail's own settle loops.
-  const jumpFrameRef = useRef<number | null>(null);
-  const jumpHighlightRef = useRef<{
-    timer: number;
-    card: HTMLElement;
+  const [subagentJumpRequest, setSubagentJumpRequest] = useState<{
+    cardId: string;
+    nonce: number;
   } | null>(null);
-  const cancelJump = useCallback(() => {
-    if (jumpFrameRef.current != null) {
-      cancelAnimationFrame(jumpFrameRef.current);
-      jumpFrameRef.current = null;
-    }
-    if (jumpHighlightRef.current != null) {
-      window.clearTimeout(jumpHighlightRef.current.timer);
-      jumpHighlightRef.current.card.classList.remove(
-        "subagent-card-highlight",
-      );
-      jumpHighlightRef.current = null;
-    }
-  }, []);
-  // Cleanup-only effect: cancels any in-flight jump when the thread
-  // changes and on unmount.
-  useEffect(() => cancelJump, [cancelJump, threadId]);
   const handleJumpToSubagentCard = useCallback(
-    (cardId: string) => {
-      const root = paneRootRef.current;
-      if (!root) return;
-      const viewport = root.querySelector<HTMLElement>(
-        '[data-slot="message-scroller-viewport"]',
-      );
-      if (!viewport) return;
-      const findCard = () => {
-        const nodes = viewport.querySelectorAll<HTMLElement>(
-          "[data-subagent-card]",
-        );
-        for (const node of Array.from(nodes)) {
-          if (node.dataset.subagentCard === cardId) return node;
-        }
-        return null;
-      };
-      let card = findCard();
-      if (!card) return;
-
-      // A jump already in flight (or a lingering highlight on another
-      // card) is superseded by this one.
-      cancelJump();
-
-      card.classList.add("subagent-card-highlight");
-      jumpHighlightRef.current = {
-        card,
-        timer: window.setTimeout(() => {
-          jumpHighlightRef.current?.card.classList.remove(
-            "subagent-card-highlight",
-          );
-          jumpHighlightRef.current = null;
-        }, JUMP_HIGHLIGHT_MS),
-      };
-
-      let frames = 0;
-      let stableFrames = 0;
-      const settle = () => {
-        jumpFrameRef.current = null;
-        if (!card?.isConnected) card = findCard();
-        if (!card) return;
-        const top =
-          card.getBoundingClientRect().top -
-          viewport.getBoundingClientRect().top;
-        const delta = top - JUMP_SCROLL_MARGIN_PX;
-        if (Math.abs(delta) > JUMP_SETTLE_TOLERANCE_PX) {
-          viewport.scrollTop += delta;
-          stableFrames = 0;
-        } else {
-          stableFrames += 1;
-        }
-        frames += 1;
-        if (
-          stableFrames < JUMP_SETTLE_STABLE_FRAMES &&
-          frames < JUMP_SETTLE_MAX_FRAMES
-        ) {
-          jumpFrameRef.current = requestAnimationFrame(settle);
-        }
-      };
-      jumpFrameRef.current = requestAnimationFrame(settle);
-    },
-    [cancelJump],
+    (cardId: string) =>
+      setSubagentJumpRequest((current) => ({
+        cardId,
+        nonce: (current?.nonce ?? 0) + 1,
+      })),
+    [],
   );
   const activeTurnId = slice?.activeTurnId ?? null;
   const model = slice?.model ?? null;
@@ -2705,6 +2619,52 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     </div>
   ) : undefined;
 
+  // A worktree first-send gets a human-readable workspace name for free
+  // (the backend overwrites the title with the new branch name). A
+  // workspace-bound pane never cuts a branch — it always sends into the
+  // checkout it is already on — so without this the workspace keeps the
+  // backend default title forever.
+  //
+  // `autoNameWorkspace` is fire-and-forget and re-checks the
+  // still-default-title guard itself, so this wrapper only resolves the
+  // text and hands straight off to the unmodified `handleSubmit` — the
+  // send path is byte-for-byte what it was.
+  const handleCurrentCheckoutFirstSubmit = useCallback(
+    (textOverride?: string, options?: { continueRun?: boolean }) => {
+      // Mirror `handleSubmit`'s bail-outs BEFORE naming, in the same
+      // order, so the namer fires exactly when a turn does. The
+      // `sendInFlightRef` check matters most: `messages.length === 0`
+      // (which selects this handler) only flips once the optimistic
+      // bubble lands, so two Enter presses in one tick would otherwise
+      // both reach here and race two `claude --print` calls into two
+      // renames — the second landing before the first's title reached
+      // the store, so the late guard couldn't stop it either.
+      if (sendInFlightRef.current) return;
+      if (!threadId) return;
+      // Same text resolution as `handleSubmit`, so the name is derived
+      // from the message actually sent.
+      const rawText = (
+        typeof textOverride === "string" ? textOverride : draft
+      ).trim();
+      if (!rawText) return;
+      if (paneWorkspaceId && workspaceProjectRoot) {
+        autoNameWorkspace(paneWorkspaceId, workspaceProjectRoot, rawText);
+      }
+      handleSubmit(textOverride, options);
+    },
+    [draft, threadId, paneWorkspaceId, workspaceProjectRoot, handleSubmit],
+  );
+
+  // Intercept ONLY the empty-thread first send; everything else stays on
+  // the unmodified `handleSubmit` path. This pane always sends into its
+  // own checkout (the per-thread "New worktree" control was removed —
+  // see the Thread Scope note above), so the first send just names the
+  // workspace it is already in.
+  const composerOnSubmit =
+    messages.length === 0 && !isHomeWorkspace && workspaceProjectRoot !== null
+      ? handleCurrentCheckoutFirstSubmit
+      : handleSubmit;
+
   // AskUserQuestion prompts render as a composer-attached panel
   // (one-question-per-card pattern, similar to Claude.ai) rather
   // than inline in the transcript. Only the first pending
@@ -2817,7 +2777,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         if (!threadId) return;
         setInputDraft(threadId, next);
       }}
-      onSubmit={handleSubmit}
+      onSubmit={composerOnSubmit}
       onStop={handleStop}
       onProviderModelChange={handleProviderModelChange}
       onModelChange={handleModelChange}
@@ -2839,10 +2799,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     ) : null;
 
   return (
-    <div
-      ref={paneRootRef}
-      className="flex h-full w-full flex-col bg-background"
-    >
+    <div className="flex h-full w-full flex-col bg-background">
       {messages.length === 0 ? (
         <ChatHomeLanding composer={composerEl} />
       ) : (
@@ -2870,6 +2827,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               stalled={stalled}
               interrupted={interrupted}
               scrollToBottomSignal={scrollToBottomSignal}
+              subagentJumpRequest={subagentJumpRequest}
               sessionStartedAt={sessionStartedAt}
               provider={provider}
               onRespondToRequest={handleRespond}
@@ -2886,7 +2844,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               hidden while drilled into a subagent (the design only shows
               it in the conversation view) and hidden entirely while idle. */}
           {!enteredSubagent && (
-            <div className="px-7 pt-2.5">
+            <div className="pt-2.5">
               <SubagentActivityBar
                 messages={messages}
                 threadId={threadId}

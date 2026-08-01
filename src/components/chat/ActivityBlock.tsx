@@ -103,7 +103,7 @@ function WorkingHeader({
         strokeWidth={1.9}
         aria-hidden
       />
-      <span className="shrink-0 text-[12.5px] font-bold text-foreground">
+      <span className="shrink-0 text-[13px] font-bold text-foreground">
         Working
       </span>
       <span className="min-w-0 flex-1 truncate">
@@ -111,7 +111,7 @@ function WorkingHeader({
           {deriveLiveAction(steps)}
         </span>
       </span>
-      <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">
+      <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
         {deriveWorkingCounter(steps)}
       </span>
       <ChevronDown
@@ -148,17 +148,17 @@ function SettledHeader({
         strokeWidth={1.8}
         aria-hidden
       />
-      <span className="min-w-0 flex-1 truncate text-[12.5px] font-semibold text-muted-foreground">
+      <span className="min-w-0 flex-1 truncate text-[13px] font-semibold text-muted-foreground">
         {deriveActivitySummary(steps)}
       </span>
-      <span className="shrink-0 font-mono text-[10.5px] text-muted-foreground">
+      <span className="shrink-0 font-mono text-[11px] text-muted-foreground">
         {total} step{total === 1 ? "" : "s"}
         {durationMs != null ? ` · ${formatActivityDuration(durationMs)}` : ""}
         {failed > 0 ? (
           <span className="text-status-attention"> · {failed} failed</span>
         ) : null}
       </span>
-      <span className="flex shrink-0 items-center gap-1.5 text-[11.5px] font-semibold text-muted-foreground/70">
+      <span className="flex shrink-0 items-center gap-1.5 text-[12px] font-semibold text-muted-foreground/70">
         {open ? "Hide" : "Details"}
         <ChevronDown
           className={cn("h-3 w-3 transition-transform", open && "rotate-180")}
@@ -221,7 +221,7 @@ function StepRow({
 function StepDetail({ step }: { step: ActivityStep }) {
   if (step.kind === "reasoning") {
     return (
-      <p className="whitespace-pre-wrap break-words text-[12.5px] italic leading-[1.6] text-muted-foreground">
+      <p className="whitespace-pre-wrap break-words text-[13px] italic leading-[1.6] text-muted-foreground">
         {step.text}
       </p>
     );

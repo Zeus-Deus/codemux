@@ -61,7 +61,7 @@ The chat pane stack:
 - **`src/components/chat/`** — chat pane UI (redesigned on the shadcn
   chat primitives, June 2026): `AgentChatPane`, `Composer` (with `+`
   popup, `@` mention popup, slash command popup, image paste/drop),
-  `ChatTranscript`, `MessageList` (shadcn MessageScroller shell),
+  `ChatTranscript`, `MessageList` (LegendList virtualized transcript),
   `transcript-slots.ts` (pure turn-grouping/tool-folding slot builder),
   `AssistantAvatar`, `ReasoningBlock` (collapsible thinking),
   `ToolCallCard` + per-tool bodies, `ActivityBlock` (one folded run of
@@ -74,8 +74,8 @@ The chat pane stack:
   `SessionSelector`, `DraftChatSurface`, `ChatHomeLanding`,
   `DebugCleanupBanner`, `DebugExitDialog`, and the picker family under
   `src/components/chat/pickers/`. Shared primitives live in
-  `src/components/ui/` (message-scroller, message, bubble, attachment,
-  marker, avatar, spinner) and `src/components/ai-elements/` (vendored
+  `src/components/ui/` (message, bubble, attachment, marker, avatar,
+  spinner) and `src/components/ai-elements/` (vendored
   AI Elements — reasoning, tool, task, prompt-input, shimmer,
   message/MessageResponse, code-block — with all Vercel AI SDK type
   imports replaced by local unions; the AI SDK is NOT a dependency).
@@ -637,15 +637,24 @@ Card styling (all in `globals.css`, all on design tokens):
   in CI to dodge the `fake_codex_app_server` helper-binary build race
   under cargo's parallel scheduler.
 
-## Transcript scroller (issue #77 contract, shadcn MessageScroller)
+## Transcript scroller (issue #77 contract, LegendList)
 
-The transcript body (`MessageList.tsx`) renders on the shadcn
-**MessageScroller** (June 2026; styled wrapper over the `@shadcn/react`
-headless engine). It replaced `react-virtuoso`: rows are contained with
-`content-visibility:auto` + `contain-intrinsic-size` instead of
-windowed mounting, so all rows exist in the DOM but off-screen rows
-skip layout/paint — measured ~60 fps through the ~1,200-item mock
-transcript; the reducer's 5,000-message cap bounds the worst case.
+The transcript body (`MessageList.tsx`) is a real windowed list built on
+`@legendapp/list/react` 3.2.0 — the windowed-list architecture used by
+comparable agent transcript UIs. Only the visible range plus an 800px draw
+buffer is mounted; dynamic row heights are measured and cached. This replaces
+the shadcn MessageScroller's all-rows-mounted `content-visibility` approach,
+whose cold estimated heights caused visible corrections during fast scrolling,
+especially on WebKit.
+
+The list scroll container carries `[scrollbar-gutter:stable_both-edges]` and
+every row, the header, and the footer sit on the shared `CHAT_COLUMN` rails
+(`chat/chat-column.ts`). Reserving the gutter on one edge only would shrink
+the box the centered rows are measured against and slide the whole transcript
+half a scrollbar to the left of the composer, which sits *outside* the
+scroller on the same rails; both edges keeps the two concentric. Effective
+content width stays `min(760px, paneWidth - 32px)`, with the horizontal
+gutter outside the max-width box.
 
 Layout derivation lives in the pure `buildTranscriptSlots`
 (`transcript-slots.ts`): turn grouping (avatar once per assistant
@@ -654,11 +663,11 @@ slot — see "Activity block" below), and per-slot identity.
 
 Contract preserved from the pre-redesign renderer:
 
-- **Stable keys + two-level memo rows.** Per-slot keys are still
-  `slot.item.id` / `run:<first-id>` (as `MessageScrollerItem messageId`).
+- **Stable keys + typed, memoized rows.** Per-slot keys remain
+  `slot.item.id` / `run:<first-id>` and `getItemType` separates size averages
+  for user, assistant, activity, workflow, and other row kinds.
   Rows render through **two** memo levels (issue #129): a whole-row
-  wrapper `SlotRowMemo` (owns the `MessageScrollerItem` element + the
-  activity/item branch) and the leaves `ItemRowMemo` / `ActivityRowMemo`.
+  wrapper `SlotRowMemo` and the leaves `ItemRowMemo` / `ActivityRowMemo`.
   The wrapper's skip depends on **slot-object reuse**: `buildTranscriptSlots`
   rebuilds every slot on each store update (each streaming token), so
   `reuseTranscriptSlots` swaps unchanged slots back to their previous object
@@ -672,56 +681,14 @@ Contract preserved from the pre-redesign renderer:
   each build, as the old tool-group rows did; the stable `run:<first-id>` key
   keeps the scroller row from remounting as the run grows and transitions
   working → settled.)
-- **Stick-to-bottom.** The shadcn scroller engine
-  (`MessageScrollerProvider autoScroll`) is the single owner of
-  tail-tracking: its `following-bottom` state machine re-scrolls to
-  the end whenever a ResizeObserver/MutationObserver detects content
-  growth while following, unpins on a real user gesture (wheel /
-  touch / keydown), and re-pins once the reader scrolls back within
-  its `scrollEdgeThreshold` (default 8px) of the bottom. `MessageList`
-  no longer runs a competing hand-rolled pin/snap loop — an earlier
-  version did (direct `scrollTop` writes on a separate 80px
-  threshold), which produced visible jitter fighting the engine in
-  the 8–80px band; that machinery was deleted. Scroll stability is
-  **split by ownership**: native browser scroll anchoring owns
-  free-scroll — while the reader scrolls history it absorbs the
-  `content-visibility:auto` estimated-then-real height settling of rows
-  above the viewport (the mechanism the content-visibility spec relies
-  on) — and the engine owns following-bottom. They never fight because
-  the viewport disables anchoring by default (`[overflow-anchor:none]` —
-  pinned/following, the engine owns the tail snap) and re-enables it
-  **only while the reader is away from the bottom**
-  (`data-[scrollable~=end]:[overflow-anchor:auto]`; the engine keeps
-  `end` in the viewport's `data-scrollable` attribute exactly while the
-  user is unpinned in history, and updates it promptly on scroll
-  commits). Do NOT scope this off `data-autoscrolling` instead: that
-  attribute is only rewritten on engine state commits and measured stale
-  — still set minutes after the user scrolled up and went idle — which
-  would leave anchoring off exactly when the reader needs it. Per-slot
-  `contain-intrinsic-size` estimates
-  (`intrinsicSizeClass` in `MessageList`, keyed off the slot body kind)
-  keep each first-reveal settle small so anchoring's corrections stay
-  imperceptible in both scroll directions. (An earlier build set a blanket
-  `overflow-anchor: none`, which disabled anchoring everywhere and let
-  those settles drift the viewport hundreds of px per wheel batch.)
-  **WebKit caveat — the anchoring shim.** WebKit engines never implemented
-  the `overflow-anchor` property, and (verified empirically on WebKitGTK
-  2.52.5, the Tauri Linux webview; WKWebView on macOS is the same family)
-  they perform **no implicit scroll anchoring at all** — while
-  `content-visibility` IS supported there, so the height settles do happen
-  with nothing absorbing them. That was the shipped Linux symptom: scrolling
-  up through cold history visibly jumped down and corrected. On those
-  engines `ScrollAnchoringShim` (`scroll-anchoring-shim.tsx`, mounted in
-  `MessageList` as a sibling of the viewport) reproduces native anchoring in
-  JS: an rAF-throttled scroll listener captures the topmost visible row and
-  its viewport offset; a ResizeObserver on the content element re-pins that
-  row by nudging `scrollTop` whenever a settle moves it — gated on the exact
-  same conditions as the CSS design (`data-scrollable` contains `end`, no
-  `data-autoscrolling`), so the engine still owns the tail while
-  pinned/following. Feature-detected via `CSS.supports("overflow-anchor",
-  "none")` — a strict no-op on Chromium/WebView2 — with a
-  `codemux:anchoring-shim` localStorage override (`"on"`/`"off"`) for manual
-  A/B testing, mirroring `codemux:transcript-fade`.
+- **Stick-to-bottom and free-scroll are one virtualizer contract.**
+  `initialScrollAtEnd` opens hydrated sessions at the latest row.
+  `maintainScrollAtEnd` follows data, item-size, footer-size, and viewport
+  layout changes only while the reader remains near the end (3% threshold).
+  `maintainVisibleContentPosition={{ data: true, size: false }}` preserves the
+  reader's anchor as data changes while they browse history. Browser-native
+  anchoring stays disabled so it cannot compete with LegendList's measured
+  position model. The former WebKit-specific anchoring shim is deleted.
 - **Send re-pins to the tail (catch-up on send).** Sending a new prompt
   from the composer always snaps the transcript to the bottom and
   re-enters following-bottom mode — even when the reader had scrolled up
@@ -730,24 +697,23 @@ Contract preserved from the pre-redesign renderer:
   `handleSubmit` (right after the optimistic user-message append, so the
   jump lands on the fresh bubble; this also covers the one-click "Continue
   run"), threaded through `ChatTranscript` → `MessageList`, where the
-  `ScrollToBottomOnSend` child fires the engine's own `scrollToEnd` (the
-  imperative API is what re-arms the state machine — a raw `scrollTop`
-  write would move the viewport but leave the engine unpinned). Only a
+  list effect calls LegendList's `scrollToEnd({ animated: false })`. Only a
   real send moves the viewport: streamed tokens and other re-renders keep
   the same signal, so free-scroll while reading history is untouched.
-- **Turn anchoring is deliberately OFF** (`scrollAnchor={false}` on
-  every row): with hundreds of pre-hydrated rows the engine's anchor
-  handling scrolls the viewport to a stale early anchor when new items
-  register mid-stream, breaking the pin. Do not re-enable it without
-  re-testing against the `agent-chat-demo` mock workspace.
-- **Variable heights.** Activity blocks expand in place as a single
-  scroller row (both the step list and per-step inline detail); the
-  browser re-derives sizes as rows materialize.
+- **Variable heights.** LegendList measures rows and observes layout changes;
+  Activity blocks can expand in place while retaining the correct scroll
+  position and cached size model.
+- **Live-control rows never unmount** (`alwaysRender={{ keys }}`). Windowing
+  would otherwise discard transient local interaction state when the reader
+  scrolls away. `deriveAlwaysRenderKeys` (`always-render-keys.ts`, pure and
+  unit-tested in `always-render-keys.test.ts`) pins queued `user_message`
+  rows, `permission_request` rows still `pending` / `responding`, and
+  `tool_call` / `workflow_run` rows whose linked approval is `pending` /
+  `responding`. Nothing else qualifies, so the pinned set stays tiny even on
+  a 5,000-message thread.
 - **Streaming marker** (shimmer status) renders as the last row inside
-  the scroller content (not a footer) so the engine's following-bottom
-  tracking keeps it visible while streaming; the jump-to-latest pill is
-  the restyled `MessageScrollerButton` (its own `scrollToEnd`, which
-  also re-enters following-bottom mode). **A working
+  the list footer so footer-layout following keeps it visible while streaming;
+  the jump-to-latest pill calls the same list `scrollToEnd` API. **A working
   Activity block already shows the single live line, so the marker is
   suppressed when one is the transcript tail** — `MessageList` passes
   the thread `streaming` flag into `buildTranscriptSlots`, and the
@@ -838,13 +804,9 @@ structural wins:
   the two-level memo a streaming token re-renders exactly one row wrapper
   and one leaf — the rest of the transcript skips reconciliation instead
   of re-running all *n* wrappers per token.
-- **One-shot `content-visibility` support warning.** Row containment
-  (`[content-visibility:auto]` per row) is what keeps thousands of rows
-  cheap; on old WebKitGTK builds the property can be a silent no-op. On
-  module load `transcript-fade.ts` checks `CSS.supports("content-visibility",
-  "auto")` once and `console.warn`s (grep-able on `content-visibility`) if
-  it is unsupported (suppressed under vitest). Diagnostic only — no
-  behavior change.
+- **Real row windowing.** Long-thread cost no longer depends on WebKit's
+  `content-visibility` support. LegendList bounds mounted rows and maintains a
+  measured position model on every supported webview.
 - **DMABUF renderer hypothesis** from the issue is handled natively:
   `configure_renderer_env` defaults to `WEBKIT_DMABUF_RENDERER_FORCE_SHM=1`
   (accelerated compositing, SHM buffer handoff, ~16ms scroll frames vs
@@ -917,22 +879,16 @@ the list. jsdom tests assert on the slot builder and rendered DOM
 `MessageTrail.tsx` renders a slim **navigation trail** in the
 transcript's left gutter — one tick mark per user turn — so long threads
 can be scanned and jumped without scrubbing the scrollbar. It lives
-inside `MessageList`'s `<MessageScroller>` (inside the provider, a
-sibling of the viewport), absolutely positioned over the dead left
-margin of the `mx-auto max-w-[760px] px-7` transcript column, so it
+as a sibling of LegendList, absolutely positioned over the dead left
+margin of the shared `CHAT_COLUMN` transcript column, so it
 never overlaps text. It needs **no new setting** — it is part of the
 already Beta-gated pane and simply hides on short threads.
 
-- **Data source is `visibleMessageIds`, not `currentAnchorId`.** The
+- **Data source is the virtualizer's first visible index.** The
   pure helpers in `message-trail.ts` (`buildTrailEntries` /
   `deriveActiveTrailIndex`) derive one entry per user-turn slot and the
-  active turn from the scroller's `useMessageScrollerVisibility()`
-  document-order visible list. `currentAnchorId` only reports rows with
-  `data-scroll-anchor="true"`, and this transcript keeps
-  `scrollAnchor={false}` on **every** row (see below), so it is always
-  `null` here — active tracking routes the first visible row's id
-  through a `messageId → slotIndex` map because the first visible row is
-  usually an assistant / tool-group row, not the user turn itself.
+  active turn from LegendList's `onFirstVisibleItemChanged` callback. This
+  tracks the virtual range without observing or mounting every row.
 - **Threshold.** Hidden entirely below `TRAIL_MIN_TURNS` (3). The
   subscribing rail only mounts past the threshold, so short threads pay
   nothing for visibility tracking (the engine's tracking is pay-for-use).
@@ -940,34 +896,21 @@ already Beta-gated pane and simply hides on short threads.
   height-derived tick cap (≤ `TRAIL_MAX_TICKS`, 60) so the gutter never
   overflows; the in-view turn's tick is always re-injected so the active
   turn stays represented.
-- **Jump behavior.** Clicking a tick calls
-  `scrollToMessage(messageId, { align: "start", behavior: "auto",
-  scrollMargin })` for a rough jump, then runs a bounded rAF **correction**
-  loop: `content-visibility:auto` rows expose only estimated heights, so a
-  cold jump across thousands of estimated pixels lands the target well off
-  (and re-calling `scrollToMessage` reproduces the same wrong offset), so
-  the loop instead nudges `scrollTop` by the target row's *measured* offset
-  error each frame until it rests near the top (its own settle loop,
-  independent of the transcript's tail-tracking). Jumping up fires real
-  scroll events, so the scroller engine's `following-bottom` mode unpins
-  itself on the gesture — no extra coordination needed.
+- **Jump behavior.** Clicking a tick calls LegendList's index-based
+  `scrollToIndex({ animated: false, viewOffset: 10 })`. The target need not
+  be mounted; the virtualizer resolves it through its measured position
+  model and mounts the destination range.
   The rail overlays the viewport's left gutter but is its **sibling**, so
   its `<nav>` forwards `onWheel` manually — otherwise wheeling over that
   28px strip would be a dead zone. The forward is two steps, both
-  required: dispatch a real `wheel` event on the viewport (the engine's
-  stick-to-bottom unpin only listens for genuine user input on the
-  viewport; a bare `scrollTop` write fires only `scroll`, which the engine
-  treats as programmatic — an earlier build did exactly that, so wheeling
-  up over the rail mid-stream got snapped back to the tail on every
-  content mutation), then write `scrollTop` to perform the actual scroll
+  required: dispatch a real `wheel` event on the list node, then write
+  `scrollTop` to perform the actual scroll
   (a synthetic wheel event has no default scroll action). Ticks are real `<button>`s (`Enter`/`Space`,
   focus-visible, `aria-label` "Jump to turn N: …"); the rail is a
   `<nav aria-label="Conversation turns">`. Hovering a tick shows one
   shared preview card (prompt + reply start) after a short delay.
-- **Anchoring stays off.** The trail is the reason turn anchoring can
-  stay disabled: it gives long threads their jump affordance without
-  re-enabling the engine anchor handling that breaks the stick-to-bottom
-  pin on hydrated transcripts. Unit tests cover the pure helpers
+- **Virtualization-safe.** Active tracking and jumps use list indices, never
+  DOM discovery, so the trail works across unmounted history. Unit tests cover the pure helpers
   (`message-trail.test.ts`) and the component (`MessageTrail.test.tsx`).
 
 ## Subagent view (cross-provider)
@@ -1110,21 +1053,14 @@ idle — no resting state.
   flash is itself clickable (design gallery "Jump" CTA): it jumps to the
   card of the last subagent that was still running before the
   transition.
-- **Jump + highlight.** `AgentChatPane.tsx`'s `handleJumpToSubagentCard`
-  queries the pane's own DOM subtree (via a `paneRootRef`, so split panes
-  each jump within their own transcript) for
-  `[data-slot="message-scroller-viewport"]` and the target
-  `[data-subagent-card]`, applies the `subagent-card-highlight` class
+- **Jump + highlight.** `AgentChatPane.tsx` sends a keyed jump request through
+  `ChatTranscript` to `MessageList`. The list resolves the matching slot and
+  calls LegendList's `scrollToIndex`, then applies `subagent-card-highlight`
+  after the destination row mounts
   (ember `box-shadow` ring, ~1100ms, token-driven per the design-system
-  no-hardcoded-color rule) via plain `classList`, and runs a bounded rAF
-  correction loop (mirroring `MessageTrail.tsx`'s own jump — `content-
-  visibility:auto` rows only expose estimated heights until they render)
-  to settle the scroll position. Plain DOM query works because
-  `MessageList` renders every slot (no windowing — see "Transcript
-  scroller" above), so the target node always exists even off-screen.
-  The bar itself never touches the DOM directly — it calls the `onJump`
-  callback prop and lets the pane do the query, since the bar is mounted
-  outside the `MessageScroller` provider tree.
+  no-hardcoded-color rule) via plain `classList`. The bar itself never
+  touches the DOM directly; off-screen targets are valid because navigation
+  is index-based.
 - All tones consume design-system tokens (running = `status-working`,
   finished flash = `status-open`, highlight ring = `accent-ember`); the
   top-edge sweep animation (`cm-sweep` in `globals.css`) and `.cm-blink`
@@ -2045,7 +1981,9 @@ layout. Only ONE surface routes it (the pane arm was removed — see
   backstop prime so children can't double-spawn).
 - **Pane empty state** — no longer participates. Every submit on a
   workspace-bound pane goes through the unmodified `handleSubmit` and
-  stays in that pane's own workspace.
+  stays in that pane's own workspace. (Its empty-thread first send is
+  wrapped only to TITLE that workspace — see "Current-checkout
+  auto-naming" below — never to create one.)
 
 **CWD-resolution invariant.** A freshly-created worktree
 workspace only reaches the Zustand app-store via the async
@@ -2073,8 +2011,74 @@ the session at the parent/project-root cwd — on timeout,
 `materializeAndSend` fails the send via `markSendFailed` (draft text
 preserved) rather than proceeding.
 
-`checkoutMode === "current"` (the draft surface's default) is unchanged
-from before the redesign — no worktree, no new Tauri calls.
+**Current-checkout auto-naming.** `checkoutMode === "current"` (the
+default) still creates no worktree and no branch, but it is no longer
+naming-inert. A worktree first-send gets a human-readable workspace name
+for free — `createDeferredWorktree` resolves an AI branch name and the
+backend's `set_workspace_worktree` (`state_impl.rs`) overwrites the
+workspace title with that branch — whereas the current-checkout path
+creates no branch and so used to keep the backend default
+(`format!("Workspace {workspace_index}")`, i.e. `Workspace 58`) forever.
+That was the last asymmetry: Home already derived a title, worktrees
+inherited one, and only "run on the current checkout" stayed numbered.
+Both surfaces now name it from the first message via the shared
+`autoNameWorkspace` (`materialize.ts`):
+
+- **Draft surface** — a `project` target routes through
+  `createProjectWorkspace`, which is `createEmptyWorkspace` + a fired-off
+  `autoNameWorkspace`. Same treatment in `materializeWithPreset`.
+- **Pane empty state** — the pane has no checkout mode to choose; it
+  always sends into the checkout its workspace is already on, so its
+  first send is a current-checkout send by construction.
+  `handleCurrentCheckoutFirstSubmit` fires `autoNameWorkspace` and falls
+  straight through to the unmodified `handleSubmit`, so the send path is
+  byte-for-byte what it was. The interception is gated on
+  `messages.length === 0`, a non-home workspace, and a resolvable project
+  root; everything else stays on `handleSubmit`. It re-checks
+  `handleSubmit`'s own bail-outs (`sendInFlightRef`, `threadId`, empty
+  text) BEFORE naming, in the same order: `messages.length` only flips
+  once the optimistic bubble lands, so two Enter presses in one tick both
+  reach this handler and only the in-flight ref rules the second one out —
+  without it they would race two `claude --print` calls into two renames,
+  the second landing before the first's title reached the store, where the
+  apply-time guard below could no longer see it.
+
+**Same namer as worktrees, on purpose.** Naming routes through
+`generateBranchName` — the exact call `createDeferredWorktree` and the
+CLI use — rather than the cheap `deriveTitleFromFirstMessage`. These
+titles sit side by side in the sidebar; deriving from message text would
+put `take a look at this image, when i make a…` directly above
+`sidebar-workspace-ordering` and the list would read as two different
+products. One namer means every workspace title has the same shape.
+`deriveTitleFromFirstMessage` survives as the fallback when the namer's
+IPC itself rejects (truncated message text still beats `Workspace 58`)
+and as the Home path's naming, which stays message-derived — a
+home-rooted workspace is not a project checkout, so there is no repo for
+`generateBranchName` to name a branch against or deconflict within.
+
+**Fire-and-forget, guarded at apply time.** `generateBranchName` shells
+out to `claude --print` (5-9s warm, 30s timeout), so awaiting it would
+put that on the critical path of a send that otherwise makes no extra
+backend calls. The send proceeds immediately and the sidebar card
+re-titles itself seconds later — the "conversation names itself shortly
+after you send" behavior chat UIs use. Renaming twice (instant
+truncation, then upgrading to the slug) was rejected: two visible title
+changes per workspace is churn and the intermediate value is the ugly
+one. Because the rename lands seconds late, the
+`isDefaultWorkspaceTitle` guard (`derive-title.ts`) is re-read AFTER the
+namer resolves, not at call time — on the pane path the workspace may
+have existed for days, and a user can rename it mid-flight; either way a
+user-chosen or branch-derived name is never clobbered. The guard takes
+the workspace's directory alongside its title, because a
+backend-assigned title can BE the directory name: it accepts the
+directory-name default (`~/projects/codemux` → `codemux`), the legacy
+`Workspace {n}` shape, and an absent title (nothing there to protect).
+See `docs/features/workspace-creation.md` § Workspace Titles for where
+each default comes from. A workspace absent from the store is one just
+created whose `app-state-changed` hasn't landed, so absence is not
+evidence of a user-chosen name and naming proceeds. Naming never rejects
+into the send path (it is cosmetic), and an empty/whitespace-only message
+skips it entirely rather than blanking the title.
 
 **Backend adopt-don't-duplicate guard.** `git_create_worktree` can
 return an EXISTING worktree path without creating anything (the

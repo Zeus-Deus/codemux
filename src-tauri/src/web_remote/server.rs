@@ -16,6 +16,12 @@
 //!
 //! Origin is checked on every state-touching request; pairing is
 //! rate-limited per IP.
+//!
+//! Bandwidth: the JSON APIs and the frontend bundle are served through a gzip
+//! [`CompressionLayer`] (negotiated per request, so a client that sends no
+//! `Accept-Encoding` gets the identical identity bytes), and a client can opt
+//! its WebSocket into application-level frame compression with
+//! `?compress=deflate` — see [`super::compress`].
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -38,10 +44,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
+use tower_http::compression::CompressionLayer;
 
 use tauri::{AppHandle, Manager, Runtime};
 
 use super::auth;
+use super::compress::{self, FrameCompressor, WireStats};
 use super::{Shared, WebRemoteState};
 
 /// Cookie name for the HttpOnly session token (asset/`<img>` GET auth).
@@ -164,8 +172,15 @@ pub async fn bind(addr: SocketAddr) -> Result<TcpListener, String> {
 
 /// Build the axum router. State is the `AppHandle`, from which handlers
 /// reach both the managed [`WebRemoteState`] and the `DatabaseStore`.
+///
+/// The surface is split in two so gzip only wraps the routes that benefit from
+/// it. The compressible half is the JSON API plus the frontend bundle — the
+/// `/api/snapshot` payload and the JS/CSS bundle are the two biggest transfers
+/// a web client makes. The uncompressed half is the upgrade/tunnel routes,
+/// which either carry no body at all (the `/ws` 101) or are already framed
+/// end-to-end by the peer they proxy.
 pub fn router<R: Runtime>(app: AppHandle<R>) -> Router {
-    Router::new()
+    let compressible = Router::new()
         .route("/api/health", get(health::<R>))
         .route("/api/pair", post(pair::<R>))
         // Account-mode admission: sign into the desktop's Codemux account
@@ -176,12 +191,33 @@ pub fn router<R: Runtime>(app: AppHandle<R>) -> Router {
         .route("/api/snapshot", get(super::snapshot::serve::<R>))
         // Authenticated file streamer backing the shim's `convertFileSrc`.
         .route("/api/assets", get(super::assets::serve::<R>))
+        .fallback(static_asset::<R>)
+        .layer(compression_layer());
+
+    Router::new()
         // Browser-pane proxy to the loopback agent-browser daemons.
         .route("/proxy/browser/:port/ws", get(super::proxy::ws_proxy::<R>))
         .route("/proxy/browser/:port/api/*rest", any(super::proxy::http_forward::<R>))
         .route("/ws", get(ws_upgrade::<R>))
-        .fallback(static_asset::<R>)
+        .merge(compressible)
         .with_state(app)
+}
+
+/// gzip-only response compression for the JSON APIs and the frontend bundle.
+///
+/// gzip alone (no brotli/zstd) keeps the dependency tree and the CPU cost small
+/// while covering every browser. tower-http's default predicate does the rest:
+/// it skips responses under 32 bytes, anything `image/*` (except SVG), SSE
+/// streams, and anything that already carries a `Content-Encoding` — so the
+/// JPEG/PNG files `/api/assets` streams are never re-compressed and keep the
+/// explicit `Content-Length` that route sets. `Vary: Accept-Encoding` is
+/// appended to every response the predicate calls *compressible*, whether or
+/// not this particular request accepted gzip (the layer adds it before the
+/// identity early-return), which is what keeps caches correct. Responses that
+/// are actually compressed additionally lose `Content-Length` in favour of a
+/// chunked body.
+fn compression_layer() -> CompressionLayer {
+    CompressionLayer::new().gzip(true)
 }
 
 // ── HTTP handlers ───────────────────────────────────────────────────
@@ -425,6 +461,10 @@ async fn ws_upgrade<R: Runtime>(
         Some(t) => t.clone(),
         None => return (StatusCode::BAD_REQUEST, "missing ticket").into_response(),
     };
+    // Opt-in application-level frame compression for this connection only. No
+    // confirmation frame: a client that didn't ask sees the exact frames it
+    // always did.
+    let compress_frames = compress::negotiated(params.get("compress").map(String::as_str));
 
     let shared = app.state::<WebRemoteState>().shared();
     let session_id = match shared.tickets.consume(&ticket) {
@@ -444,7 +484,9 @@ async fn ws_upgrade<R: Runtime>(
     }
 
     let app_for_socket = app.clone();
-    ws.on_upgrade(move |socket| handle_socket(app_for_socket, session_id, socket))
+    ws.on_upgrade(move |socket| {
+        handle_socket(app_for_socket, session_id, socket, compress_frames)
+    })
 }
 
 /// Serve a frontend asset. Missing route-looking paths fall back to
@@ -533,7 +575,15 @@ fn mime_for(path: &std::path::Path) -> String {
 
 // ── WebSocket lifecycle ─────────────────────────────────────────────
 
-async fn handle_socket<R: Runtime>(app: AppHandle<R>, session_id: String, socket: WebSocket) {
+/// Drive one upgraded WebSocket to close. `compress_frames` is the result of the
+/// `?compress=deflate` negotiation: when set, every outbound frame goes through
+/// this connection's [`FrameCompressor`] in the writer task below.
+async fn handle_socket<R: Runtime>(
+    app: AppHandle<R>,
+    session_id: String,
+    socket: WebSocket,
+    compress_frames: bool,
+) {
     let shared = app.state::<WebRemoteState>().shared();
     app.state::<crate::database::DatabaseStore>()
         .web_remote_touch_session(&session_id);
@@ -547,18 +597,27 @@ async fn handle_socket<R: Runtime>(app: AppHandle<R>, session_id: String, socket
     super::emit_state_changed(&app);
 
     // Writer: the single owner of the sink; every producer feeds `out_tx`.
-    let writer = tokio::spawn(async move {
-        while let Some(msg) = out_rx.recv().await {
-            let is_close = matches!(msg, Message::Close(_));
-            if sink.send(msg).await.is_err() {
-                break;
+    // Compression and the byte accounting both live here because this is the one
+    // task that touches frames in send order — the shared deflate context
+    // depends on encoding them in exactly the order they hit the wire.
+    let stats = Arc::new(WireStats::default());
+    let writer = {
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            let mut compressor = compress_frames.then(FrameCompressor::new);
+            while let Some(msg) = out_rx.recv().await {
+                let msg = compress::encode_and_account(compressor.as_mut(), &stats, msg);
+                let is_close = matches!(msg, Message::Close(_));
+                if sink.send(msg).await.is_err() {
+                    break;
+                }
+                if is_close {
+                    break;
+                }
             }
-            if is_close {
-                break;
-            }
-        }
-        let _ = sink.close().await;
-    });
+            let _ = sink.close().await;
+        })
+    };
 
     // Ordered dispatch lane: terminal input (`write_to_pty`) must reach the
     // PTY in the exact order the client sent it. Every other invoke keeps
@@ -634,6 +693,16 @@ async fn handle_socket<R: Runtime>(app: AppHandle<R>, session_id: String, socket
     let _ = close_tx.send(true);
     drop(out_tx);
     writer.abort();
+
+    // Opt-in bandwidth baseline: one aggregate line per socket, counters only —
+    // never any payload content. Read here rather than in the writer task
+    // because that task is aborted above.
+    if compress::stats_enabled() {
+        eprintln!(
+            "[codemux::web_remote] conn {conn_id} closed (compress={compress_frames}) out: {}",
+            stats.summary()
+        );
+    }
     super::emit_state_changed(&app);
 }
 
@@ -1009,6 +1078,25 @@ mod tests {
         assert!(!is_ordered_invoke("resize_pty"));
         assert!(!is_ordered_invoke("attach_pty_output"));
         assert!(!is_ordered_invoke(""));
+    }
+
+    #[test]
+    fn compress_query_param_decides_the_connection_encoding() {
+        // The `/ws` query map is what `ws_upgrade` reads; only the exact
+        // `compress=deflate` token opts a connection into compressed frames, so
+        // an older client (no param) keeps byte-identical traffic.
+        let param = |q: &[(&str, &str)]| -> bool {
+            let params: HashMap<String, String> = q
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            compress::negotiated(params.get("compress").map(String::as_str))
+        };
+        assert!(param(&[("ticket", "abc"), ("compress", "deflate")]));
+        assert!(!param(&[("ticket", "abc")]), "absent param → plain frames");
+        assert!(!param(&[("ticket", "abc"), ("compress", "")]));
+        assert!(!param(&[("ticket", "abc"), ("compress", "gzip")]));
+        assert!(!param(&[("ticket", "abc"), ("compress", "1")]));
     }
 
     #[tokio::test]

@@ -54,7 +54,7 @@ machine-readable listing — prefer it over this table when scripting.
 - GitHub issues: `list_github_issues`, `get_github_issue`, `link_workspace_issue`
 - setup scripts: `rerun_setup`
 - automations: `automation_list`, `automation_get`, `automation_create`, `automation_update`, `automation_set_enabled`, `automation_delete`, `automation_runs` (note: the socket uses `automation_set_enabled`; the MCP surface instead exposes `automation_pause`/`automation_resume`)
-- web remote access: `web_remote_enable` (turn remote access on; optional `scope` = `all|tailscale|loopback` and `port`), `web_remote_disable` (turn it off, severing live connections), `web_remote_pair` (mint a one-time pairing code; errors if remote access is disabled). All same-machine only — the SSH-in path, no GUI needed. `web_remote_enable` returns the resulting status plus the recommended reachable endpoint, so you can immediately `web_remote_pair`.
+- web remote access: `web_remote_enable` (turn remote access on; optional `scope` = `all|tailscale|loopback` and `port`), `web_remote_disable` (turn it off, severing live connections), `web_remote_pair` (mint a one-time pairing code; errors if remote access is disabled), `web_remote_set_relay` (flip the from-anywhere relay mode on a running instance — persists and starts/stops the iroh endpoint + device registration in lockstep, same path as the Settings toggle). All same-machine only — the SSH-in path, no GUI needed. `web_remote_enable` returns the resulting status plus the recommended reachable endpoint, so you can immediately `web_remote_pair`.
 
 ## Boundary Notes
 
@@ -83,6 +83,14 @@ codemux remote pair --name "Kitchen iPad"
 codemux serve
 codemux serve --scope loopback --port 4377
 codemux serve --scope tailscale --relay
+codemux login
+codemux login --email user@example.com
+codemux login --token <bearer>
+codemux whoami
+codemux logout
+codemux connect
+codemux connect status
+codemux connect off
 codemux logs --tail 200
 codemux doctor
 ```
@@ -126,6 +134,21 @@ reciprocally refuses while `serve` is running. Because `serve` runs its own
 control server, `codemux remote pair` from another SSH session mints fresh
 codes against it. See `docs/features/web-remote-access.md` §
 "Headless server mode".
+
+`codemux login` / `logout` / `whoami` are **local-only** account commands — no
+control socket, no running instance required (unlike the `remote *`
+round-trips). They persist the same cached auth the GUI writes; see
+`docs/features/auth.md` § "CLI Sign-In (headless)".
+
+`codemux connect` is the one-command remote bootstrap: sign in if needed,
+persist web-remote + relay config, then either flip relay on a *running*
+instance over the control socket (`web_remote_set_relay`) or — with nothing
+running — install the `codemux.service` systemd **user** unit running
+`codemux serve`, enable it now + at boot, and `loginctl enable-linger` so it
+survives logout. `codemux connect status` reports account/config/unit/instance
+state; `codemux connect off` stops and removes the unit and turns relay mode
+off (staying signed in). See `docs/features/web-remote-access.md` §
+"One-command bootstrap".
 
 ## Local Diagnostics
 

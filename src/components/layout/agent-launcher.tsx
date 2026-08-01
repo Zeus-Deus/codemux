@@ -214,7 +214,7 @@ export function AgentLauncher({ workspace }: AgentLauncherProps) {
                     <PresetIcon icon={preset.icon} className="h-4 w-4" />
                     <span className="flex-1 truncate">{preset.name}</span>
                     {preset.pinned && (
-                      <span className="text-[9.5px] font-bold tracking-wide text-muted-foreground">
+                      <span className="text-[10px] font-bold tracking-wide text-muted-foreground">
                         PINNED
                       </span>
                     )}

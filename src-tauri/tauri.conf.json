@@ -4,9 +4,9 @@
   "version": "0.15.6",
   "identifier": "com.codemux.app",
   "build": {
-    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && bash scripts/build-codemux-remote.sh && npm run dev",
+    "beforeDevCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && bash scripts/build-codemux-remote.sh --profile debug && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && bash scripts/build-codemux-remote.sh && npm run build",
+    "beforeBuildCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh --strict && npm run build && bash scripts/build-codemux-remote.sh --profile release",
     "frontendDist": "../dist"
   },
   "app": {

@@ -11,6 +11,8 @@ import {
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
 
+import { CHAT_COLUMN } from "./chat-column";
+
 /** How long the green "just finished" flash stays up before the bar
  *  disappears entirely (design "for ~2.5s, then disappears"). */
 const FINISHED_FLASH_MS = 2500;
@@ -110,7 +112,7 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
       if (finishedCardId) onJump(finishedCardId);
     };
     return (
-      <div className="mx-auto w-full max-w-[760px]">
+      <div className={CHAT_COLUMN}>
         <div
           data-testid="subagent-activity-bar"
           data-tone="finished"
@@ -133,10 +135,10 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
               aria-hidden
             />
           </span>
-          <span className="shrink-0 whitespace-nowrap text-[12.5px] font-bold text-foreground">
+          <span className="shrink-0 whitespace-nowrap text-[13px] font-bold text-foreground">
             Subagents finished
           </span>
-          <span className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-muted-foreground">
+          <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-muted-foreground">
             all tasks complete · results are in the thread
           </span>
         </div>
@@ -170,7 +172,7 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
   };
 
   return (
-    <div className="mx-auto w-full max-w-[760px]">
+    <div className={CHAT_COLUMN}>
       {multi && open && (
         <div
           id={listId}
@@ -178,7 +180,7 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
           className="rise-in mb-2 overflow-hidden rounded-xl border border-border bg-popover shadow-lg"
         >
           <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2.5">
-            <span className="whitespace-nowrap text-[11.5px] font-bold text-foreground">
+            <span className="whitespace-nowrap text-[12px] font-bold text-foreground">
               {count} subagents running
             </span>
             <span className="text-[11px] text-muted-foreground">
@@ -224,17 +226,17 @@ export const SubagentActivityBar = memo(function SubagentActivityBar({
             aria-hidden
           />
         </span>
-        <span className="shrink-0 whitespace-nowrap text-[12.5px] font-bold text-foreground">
+        <span className="shrink-0 whitespace-nowrap text-[13px] font-bold text-foreground">
           {count} subagent{count === 1 ? "" : "s"} running
         </span>
         <span
           className="h-[3px] w-[3px] shrink-0 rounded-full bg-muted-foreground"
           aria-hidden
         />
-        <span className="shimmer min-w-0 flex-1 truncate font-mono text-[11.5px]">
+        <span className="shimmer min-w-0 flex-1 truncate font-mono text-[12px]">
           {primaryName} · {primaryActivity}
         </span>
-        <span className="shrink-0 whitespace-nowrap font-mono text-[10.5px] text-muted-foreground">
+        <span className="shrink-0 whitespace-nowrap font-mono text-[11px] text-muted-foreground">
           {primaryElapsedMs != null ? formatElapsed(primaryElapsedMs) : ""}
         </span>
         <span className="flex h-[30px] shrink-0 items-center gap-1.5 rounded-lg bg-foreground/[0.08] px-2.5 text-[11px] font-semibold text-muted-foreground">

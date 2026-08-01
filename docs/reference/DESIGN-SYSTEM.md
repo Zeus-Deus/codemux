@@ -89,6 +89,16 @@ overview):
   aliases it — headings are sans, not mono).
 - `--font-mono` — **JetBrains Mono Variable**, reserved for code-like
   metadata only (branch names, counters, ids).
+- UI font sizes use whole CSS pixels. Keep the compact scale on
+  `10px` / `11px` / `12px` / `13px` / `14px`; half-pixel font sizes make
+  glyphs noticeably softer in the Linux WebKitGTK desktop renderer.
+- Primary chat prose and composer input use `text-sm leading-relaxed`
+  (14px with a 1.625 line height). Supporting labels may be smaller, but
+  should not compress the main reading surface.
+- Font rasterization is platform-native. Do not apply global
+  `-webkit-font-smoothing`, `-moz-osx-font-smoothing`, or `text-rendering`
+  overrides: they thin DM Sans in WebKitGTK and render differently from the
+  Chromium dev mock.
 
 ## Notes
 
