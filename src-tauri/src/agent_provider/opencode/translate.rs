@@ -181,6 +181,39 @@ pub struct OpenCodeUsageState {
     seen_per_message: HashMap<String, u64>,
 }
 
+impl OpenCodeUsageState {
+    /// Re-base the meter after a session model swap.
+    ///
+    /// The context window is a property of the model, so the number
+    /// harvested for the previous one is wrong the moment the model
+    /// changes — and the tracker's window is sticky by design, so it has
+    /// to be dropped explicitly (`observe_max_tokens(None)` is a no-op on
+    /// purpose, for the far more common "this message just didn't repeat
+    /// the field" case). Swapping a 1M-window model for a 200k one would
+    /// otherwise keep dividing by 1M and understate occupancy until the
+    /// background catalogue probe happened to land.
+    ///
+    /// Returns the events that re-publish the current occupancy without a
+    /// denominator, so the meter degrades to a bare token count
+    /// immediately rather than showing a wrong percentage until the next
+    /// assistant message. Empty when there is no reading to correct.
+    ///
+    /// `seen_per_message` is deliberately **kept**: it is a per-message
+    /// high-water map that de-duplicates OpenCode's incremental
+    /// re-broadcasts of one assistant message into the lifetime total.
+    /// Message ids are model-independent and the session's transcript
+    /// survives the swap (OpenCode applies the new model at the next
+    /// prompt), so clearing it would let an already-counted message be
+    /// re-added in full on its next re-broadcast — double-counting the
+    /// lifetime figure. The lifetime total is likewise a thread-lifetime
+    /// quantity and does not reset.
+    pub fn model_changed(&mut self, thread_id: &ThreadId) -> Vec<ProviderRuntimeEvent> {
+        self.tracker.clear_max_tokens();
+        let used = self.tracker.last_live_used();
+        self.tracker.events(thread_id, used, None, None)
+    }
+}
+
 /// [`opencode_event_to_runtime`] threading the session's token
 /// accounting so context-usage snapshots span multiple events.
 pub fn opencode_event_to_runtime_with(
@@ -1561,6 +1594,94 @@ mod tests {
         let snap = &usage_snapshots(&events)[0];
         assert_eq!(snap.max_tokens, Some(200_000));
         assert_eq!(snap.used_tokens, 200_000, "never renders above 100%");
+    }
+
+    #[test]
+    fn a_model_swap_drops_the_previous_model_s_window_until_the_probe_lands() {
+        // The window is a property of the model, so the number harvested
+        // for the old one must not survive the swap — otherwise a 1M →
+        // 200k swap keeps dividing by 1M and understates occupancy.
+        let mut usage = OpenCodeUsageState::default();
+        let thread = ThreadId("thread_1".into());
+        let big = ctx_with_window(1_000_000);
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 300_000, 0, 0, 0, 0),
+            &big,
+            None,
+            &mut usage,
+        );
+        assert_eq!(usage_snapshots(&events)[0].max_tokens, Some(1_000_000));
+
+        // Swap: the session clears its routing-context copy and calls
+        // this, which re-publishes the same occupancy with no denominator.
+        let swap = usage.model_changed(&thread);
+        let snap = &usage_snapshots(&swap)[0];
+        assert!(
+            snap.max_tokens.is_none(),
+            "no denominator beats a wrong one — the meter degrades to a bare token count"
+        );
+        assert_eq!(snap.used_tokens, 300_000, "occupancy carries over");
+
+        // A later message before the probe returns still has no window…
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_2", 310_000, 0, 0, 0, 0),
+            // `context_window_tokens` is `None` again after the swap.
+            &ctx(),
+            None,
+            &mut usage,
+        );
+        assert!(usage_snapshots(&events)[0].max_tokens.is_none());
+
+        // …and the re-probe's smaller window re-establishes the
+        // denominator once the catalogue lookup lands.
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_3", 320_000, 0, 0, 0, 0),
+            &ctx_with_window(200_000),
+            None,
+            &mut usage,
+        );
+        let snap = &usage_snapshots(&events)[0];
+        assert_eq!(snap.max_tokens, Some(200_000));
+        assert_eq!(snap.used_tokens, 200_000, "clamped to the new window");
+    }
+
+    #[test]
+    fn a_model_swap_keeps_the_lifetime_total_and_its_per_message_high_water() {
+        // `seen_per_message` is a de-duplication map for OpenCode's
+        // incremental re-broadcasts, not model state: clearing it would
+        // let an already-counted message be re-added in full.
+        let mut usage = OpenCodeUsageState::default();
+        let thread = ThreadId("thread_1".into());
+        let ctx = ctx_with_window(200_000);
+        opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 1_000, 0, 0, 0, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        usage.model_changed(&thread);
+        // The same message re-broadcast after the swap adds only growth.
+        let events = opencode_event_to_runtime_with(
+            assistant_tokens_event("msg_1", 1_000, 0, 0, 200, 0),
+            &ctx,
+            None,
+            &mut usage,
+        );
+        let snap = &usage_snapshots(&events)[0];
+        assert_eq!(snap.used_tokens, 1_200);
+        assert_eq!(
+            snap.total_processed_tokens, None,
+            "lifetime is 1200 — equal to used, so it stays omitted rather than \
+             doubling to 2200"
+        );
+    }
+
+    #[test]
+    fn a_model_swap_with_no_reading_yet_emits_nothing() {
+        let mut usage = OpenCodeUsageState::default();
+        assert!(usage
+            .model_changed(&ThreadId("thread_1".into()))
+            .is_empty());
     }
 
     #[test]

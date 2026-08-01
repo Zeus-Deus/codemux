@@ -10,7 +10,9 @@
 //! * **Sticky window** — a provider reports its context-window size
 //!   only on some messages (Claude on `result`, Codex on
 //!   `thread/tokenUsage/updated`). Once observed it is remembered and
-//!   stamped on every later snapshot. Never guessed.
+//!   stamped on every later snapshot. Never guessed, and dropped only
+//!   when an adapter says so explicitly ([`ContextUsageTracker::clear_max_tokens`],
+//!   after a model swap).
 //! * **Monotonic lifetime total** — `total_processed_tokens` only ever
 //!   climbs, and is omitted unless it is strictly greater than
 //!   `used_tokens` (a fresh thread would otherwise render a redundant
@@ -55,6 +57,20 @@ impl ContextUsageTracker {
         if let Some(max) = max_tokens.filter(|m| *m > 0) {
             self.max_tokens = Some(max);
         }
+    }
+
+    /// Forget the sticky context-window size.
+    ///
+    /// The counterpart to the stickiness rule above: [`Self::observe_max_tokens`]
+    /// deliberately ignores `None` so a message that simply omits the
+    /// field cannot clobber a known-good window, which means "the window
+    /// is no longer valid" has to be said explicitly. The one caller that
+    /// knows this is a **model swap** — the window is a property of the
+    /// model, so the previous model's number is not merely unrepeated,
+    /// it is wrong. Snapshots then carry `max_tokens: None` (the UI
+    /// degrades to a bare token count) until a fresh window is observed.
+    pub fn clear_max_tokens(&mut self) {
+        self.max_tokens = None;
     }
 
     /// The sticky context-window size, when a provider has reported one.
@@ -186,6 +202,23 @@ mod tests {
         t.observe_max_tokens(None);
         t.observe_max_tokens(Some(0));
         assert_eq!(t.max_tokens(), Some(200_000));
+    }
+
+    #[test]
+    fn clear_max_tokens_drops_the_sticky_window_and_the_clamp_with_it() {
+        let mut t = ContextUsageTracker::default();
+        t.observe_max_tokens(Some(200_000));
+        assert_eq!(t.snapshot(250_000, None, None).unwrap().used_tokens, 200_000);
+        t.clear_max_tokens();
+        assert_eq!(t.max_tokens(), None);
+        let snap = t.snapshot(250_000, None, None).unwrap();
+        assert!(snap.max_tokens.is_none(), "no denominator to render");
+        assert_eq!(snap.used_tokens, 250_000, "nothing left to clamp against");
+        // The lifetime accumulator is untouched by a window change.
+        assert_eq!(t.lifetime_total(), 0);
+        // A later observation re-establishes the window.
+        t.observe_max_tokens(Some(400_000));
+        assert_eq!(t.snapshot(250_000, None, None).unwrap().max_tokens, Some(400_000));
     }
 
     #[test]

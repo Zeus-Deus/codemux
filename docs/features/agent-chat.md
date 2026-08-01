@@ -2290,7 +2290,16 @@ the lifetime total regress and the snapshot rides through
   (`input + cache.read + cache.write + output + reasoning`), lifetime
   via a per-message high-water delta so incremental re-broadcasts don't
   compound; `max_tokens` from the upstream catalogue's `limit.context`
-  (probed in the background, re-probed on `set_model`).
+  (probed in the background, re-probed on `set_model`). A model swap
+  **invalidates** the window rather than waiting for the re-probe: the
+  window belongs to the model, so `set_model` clears both the routing
+  context's copy and the tracker's sticky one
+  (`ContextUsageTracker::clear_max_tokens`, the explicit counterpart to
+  `observe_max_tokens(None)`'s deliberate no-op) and re-publishes the
+  current occupancy with no denominator. The meter degrades to a bare
+  token count for the gap instead of dividing by the old model's window.
+  The lifetime total and its per-message high-water map survive the swap
+  — they de-duplicate incremental re-broadcasts, which is model-independent.
 
 **First-paint seed.** The capability registry carries numeric windows
 purely as a seed until the provider's own report lands:

@@ -70,6 +70,11 @@ pub struct OpenCodeSession {
     /// reply path reads the latter so a subagent's approval targets the
     /// child session id rather than the root.
     router: Arc<Mutex<SseRouter>>,
+    /// Per-session token accounting, shared with the SSE listener that
+    /// feeds it. The session itself only touches it on a model swap, to
+    /// invalidate the window the previous model's catalogue entry
+    /// supplied (see [`OpenCodeUsageState::model_changed`]).
+    usage: Arc<Mutex<OpenCodeUsageState>>,
     sse_handle: Mutex<Option<JoinHandle<()>>>,
     event_tx: broadcast::Sender<ProviderRuntimeEvent>,
     /// Set by the SSE listener when it gives up on an unreachable server.
@@ -183,15 +188,16 @@ impl OpenCodeSession {
         // `ensure_live_session` rather than POSTing to a corpse.
         let dead = Arc::new(AtomicBool::new(false));
         let router = Arc::new(Mutex::new(SseRouter::new(session_id.clone())));
+        let usage = Arc::new(Mutex::new(OpenCodeUsageState::default()));
         let peer = SsePeer {
             session_id: session_id.clone(),
             event_ctx: event_ctx.clone(),
             router: router.clone(),
             dead: dead.clone(),
-            // Owned by the listener task: this session spawns exactly
-            // one, and a dead listener means a rebuilt session (and a
-            // fresh thread-level accounting) anyway.
-            usage: Arc::new(Mutex::new(OpenCodeUsageState::default())),
+            // Written by the listener task (this session spawns exactly
+            // one); the session keeps a handle so `set_model` can
+            // invalidate the previous model's context window.
+            usage: usage.clone(),
         };
         let sse_handle = spawn_sse_listener(
             server_handle.base_url.clone(),
@@ -232,6 +238,7 @@ impl OpenCodeSession {
             http,
             event_ctx,
             router,
+            usage,
             sse_handle: Mutex::new(Some(sse_handle)),
             event_tx,
             dead,
@@ -424,8 +431,18 @@ impl OpenCodeSession {
         }
         // The window is a property of the model, so a swap invalidates
         // the cached number. Clear it immediately (a stale denominator
-        // is worse than none) and re-probe in the background.
+        // is worse than none) and re-probe in the background. Both
+        // copies have to go: the one the SSE listener reads off the
+        // routing context, and the sticky one already latched inside the
+        // usage tracker — the latter would otherwise keep stamping the
+        // old window on every snapshot, since `observe_max_tokens(None)`
+        // is a deliberate no-op. Re-publishing the current occupancy
+        // without a denominator makes the meter degrade to a bare token
+        // count now rather than at the next assistant message.
         self.event_ctx.lock().await.context_window_tokens = None;
+        for event in self.usage.lock().await.model_changed(&self.thread_id) {
+            let _ = self.event_tx.send(event);
+        }
         spawn_context_window_probe(
             self.server_handle.base_url.clone(),
             self.server_handle.server_password.clone(),
@@ -593,6 +610,7 @@ mod tests {
             http,
             event_ctx,
             router: Arc::new(Mutex::new(SseRouter::new(provider_session_id.0.clone()))),
+            usage: Arc::new(Mutex::new(OpenCodeUsageState::default())),
             sse_handle: Mutex::new(None),
             event_tx: tx.clone(),
             dead: Arc::new(AtomicBool::new(false)),
@@ -948,6 +966,68 @@ mod tests {
             .await
             .expect("send_turn ok");
         mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn set_model_invalidates_the_previous_model_s_context_window() {
+        // End-to-end wiring proof: the session holds the same usage
+        // handle the SSE listener writes, so a model swap re-publishes
+        // the meter without the old model's denominator instead of
+        // waiting for a probe that may never come.
+        use super::super::translate::opencode_event_to_runtime_with;
+        let mut server = Server::new_async().await;
+        // The background re-probe must not resolve a window during the
+        // test; an unmocked /config/providers 501s, leaving it unknown.
+        let (session, _tx, mut rx) =
+            mock_session(server.url(), "pw".into(), "sess_1").await;
+        let windowed = EventContext {
+            context_window_tokens: Some(1_000_000),
+            ..session.event_ctx.lock().await.clone()
+        };
+        {
+            let mut usage = session.usage.lock().await;
+            let seeded = opencode_event_to_runtime_with(
+                serde_json::from_value(serde_json::json!({
+                    "type": "message.updated",
+                    "properties": {"info": {
+                        "id": "msg_1",
+                        "sessionID": "sess_1",
+                        "role": "assistant",
+                        "tokens": {"input": 300_000, "output": 0, "reasoning": 0,
+                                   "cache": {"read": 0, "write": 0}}
+                    }}
+                }))
+                .unwrap(),
+                &windowed,
+                None,
+                &mut usage,
+            );
+            assert!(matches!(
+                seeded.as_slice(),
+                [ProviderRuntimeEvent::ContextUsageUpdated { usage, .. }]
+                    if usage.max_tokens == Some(1_000_000)
+            ));
+        }
+        while rx.try_recv().is_ok() {}
+
+        session.set_model("anthropic/claude-sonnet-4-6".into()).await;
+
+        assert!(
+            session.event_ctx.lock().await.context_window_tokens.is_none(),
+            "the routing-context copy is cleared for the SSE listener"
+        );
+        match rx.try_recv().expect("a corrected snapshot is published") {
+            ProviderRuntimeEvent::ContextUsageUpdated { usage, .. } => {
+                assert!(
+                    usage.max_tokens.is_none(),
+                    "the sticky window went with it — the meter degrades to a \
+                     bare token count rather than dividing by the old model's window"
+                );
+                assert_eq!(usage.used_tokens, 300_000);
+            }
+            other => panic!("expected ContextUsageUpdated, got {other:?}"),
+        }
+        server.reset();
     }
 
     // ── Context-window lookup ──
