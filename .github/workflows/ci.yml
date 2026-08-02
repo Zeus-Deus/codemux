@@ -36,7 +36,7 @@ jobs:
       # even if one platform regresses.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2022]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
 
@@ -96,7 +96,7 @@ jobs:
       # point of having this matrix.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2022]
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     # Healthy runs finish in ~6 min on Linux and ~9 min on Windows. The
     # GitHub-default ceiling is 6 hours per job, so a single hung test on
@@ -155,8 +155,8 @@ jobs:
         # which shells out to `rg` to count CODEMUX_DEBUG markers.
 
       - name: Install Windows system dependencies
-        if: matrix.os == 'windows-2022'
-        # Chocolatey is pre-installed on windows-2022 runners. ripgrep
+        if: matrix.os == 'windows-latest'
+        # Chocolatey is pre-installed on windows-latest runners. ripgrep
         # is needed for the same `grep_count_pattern_*` tests as Linux.
         run: choco install ripgrep -y --no-progress
         shell: pwsh
@@ -228,7 +228,7 @@ jobs:
           # does not exist. Our existing copy-agent-browser.sh maps the host
           # target triple to the upstream npm package's pre-built binary.
           #
-          # Git Bash is preinstalled on windows-2022, so `shell: bash`
+          # Git Bash is preinstalled on windows-latest, so `shell: bash`
           # works on both platforms without needing a second .ps1 script.
           bash scripts/copy-agent-browser.sh || true
 
@@ -304,74 +304,5 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
-      - name: Cargo test (Linux)
-        if: matrix.os == 'ubuntu-latest'
+      - name: Cargo test
         run: cargo test --manifest-path src-tauri/Cargo.toml
-
-      - name: Cargo test (Windows with loader diagnostics)
-        if: matrix.os == 'windows-2022'
-        shell: pwsh
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml
-          $testExit = $LASTEXITCODE
-          if ($testExit -eq 0) { exit 0 }
-
-          Write-Host "::group::Recent Windows application-loader events"
-          Get-WinEvent -FilterHashtable @{
-            LogName = 'Application'
-            StartTime = (Get-Date).AddMinutes(-15)
-          } -ErrorAction SilentlyContinue |
-            Where-Object { $_.Message -match 'codemux_lib|ENTRYPOINT|entry point' } |
-            Select-Object TimeCreated, Id, ProviderName, Message |
-            Format-List
-          Write-Host "::endgroup::"
-
-          $testBins = Get-ChildItem src-tauri/target/debug/deps/codemux_lib-*.exe
-          $dumpbin = Get-ChildItem 'C:/Program Files/Microsoft Visual Studio/2022' `
-            -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
-            Select-Object -First 1 -ExpandProperty FullName
-          if ($dumpbin) {
-            foreach ($testBin in $testBins) {
-              Write-Host "::group::PE imports: $($testBin.Name)"
-              $imports = & $dumpbin /IMPORTS $testBin.FullName
-              $imports
-              Write-Host "::endgroup::"
-
-              Write-Host "::group::Missing PE imports: $($testBin.Name)"
-              $currentDll = $null
-              $dllHandle = [IntPtr]::Zero
-              foreach ($line in $imports) {
-                if ($line -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') {
-                  if ($dllHandle -ne [IntPtr]::Zero) {
-                    [System.Runtime.InteropServices.NativeLibrary]::Free($dllHandle)
-                  }
-                  $currentDll = $Matches[1]
-                  try {
-                    $dllHandle = [System.Runtime.InteropServices.NativeLibrary]::Load($currentDll)
-                  } catch {
-                    $dllHandle = [IntPtr]::Zero
-                    Write-Host "MISSING DLL: $currentDll ($($_.Exception.Message))"
-                  }
-                  continue
-                }
-                if ($dllHandle -ne [IntPtr]::Zero -and $line -match '^\s+[0-9A-F]+\s+(\S+)\s*$') {
-                  $symbol = $Matches[1]
-                  $address = [IntPtr]::Zero
-                  if (-not [System.Runtime.InteropServices.NativeLibrary]::TryGetExport(
-                    $dllHandle,
-                    $symbol,
-                    [ref]$address
-                  )) {
-                    Write-Host "MISSING ENTRYPOINT: $currentDll!$symbol"
-                  }
-                }
-              }
-              if ($dllHandle -ne [IntPtr]::Zero) {
-                [System.Runtime.InteropServices.NativeLibrary]::Free($dllHandle)
-              }
-              Write-Host "::endgroup::"
-            }
-          } else {
-            Write-Warning 'dumpbin.exe was not found; PE import diagnostics unavailable'
-          }
-          exit $testExit

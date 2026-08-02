@@ -14,7 +14,7 @@ jobs:
       # Windows NSIS installer is broken for a given tag.
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-2022]
+        os: [ubuntu-22.04, windows-latest]
         # ubuntu-22.04 is pinned (not ubuntu-latest) so the AppImage stays
         # compatible with the oldest reasonably-supported glibc. When
         # ubuntu-latest rolls over to 24.04, the AppImage would silently
@@ -48,7 +48,7 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         # Installs the stable toolchain for whichever OS the job is running
-        # on — MSVC on windows-2022, GNU on ubuntu-22.04. No toolchain
+        # on — MSVC on windows-latest, GNU on ubuntu-22.04. No toolchain
         # override needed.
 
       - name: Rust cache
@@ -117,7 +117,7 @@ jobs:
           fi
 
       - name: Stage agent-browser sidecar binary
-        # `shell: bash` works on both Linux and windows-2022 because Git
+        # `shell: bash` works on both Linux and windows-latest because Git
         # for Windows (which ships bash.exe) is preinstalled in the runner
         # image. Pre-staging explicitly — rather than relying on tauri's
         # beforeBuildCommand to invoke the script — makes failures easier
@@ -243,7 +243,7 @@ jobs:
       # has uploaded its `latest.json`, the second upload will clobber
       # the first (last-writer-wins). In practice the race is unlikely —
       # ubuntu-22.04 completes the build several minutes before
-      # windows-2022 (Rust compile + NSIS bundling are significantly
+      # windows-latest (Rust compile + NSIS bundling are significantly
       # slower on Windows). Worst case: one release has a stale
       # `latest.json` missing one platform; users on that platform miss
       # a single update cycle but are not bricked, and the next release
@@ -309,7 +309,7 @@ jobs:
           args: --verbose
 
       - name: Build and release (Windows)
-        if: matrix.os == 'windows-2022'
+        if: matrix.os == 'windows-latest'
         uses: tauri-apps/tauri-action@action-v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -333,7 +333,7 @@ jobs:
           # Restrict to the NSIS bundle. `bundle.targets = "all"` in
           # tauri.conf.json would otherwise build both NSIS and MSI on
           # Windows, and MSI requires the WiX Toolset which is NOT
-          # preinstalled on windows-2022 runners — the MSI step would
+          # preinstalled on windows-latest runners — the MSI step would
           # fail with "wix not found". NSIS is bundled with tauri-cli and
           # needs no additional setup.
           args: --bundles nsis
