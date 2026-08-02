@@ -3,6 +3,7 @@ fn main() {
         embed_resource::compile_for_tests("test-common-controls-v6.rc", embed_resource::NONE)
             .manifest_required()
             .expect("failed to embed Common Controls v6 manifest in Windows tests");
+        println!("cargo:rustc-link-arg-tests=/MANIFEST:NO");
     }
     tauri_build::build()
 }
