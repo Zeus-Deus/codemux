@@ -304,5 +304,39 @@ jobs:
           git config --global core.autocrlf false
           git config --global core.eol lf
 
-      - name: Cargo test
+      - name: Cargo test (Linux)
+        if: matrix.os == 'ubuntu-latest'
         run: cargo test --manifest-path src-tauri/Cargo.toml
+
+      - name: Cargo test (Windows with loader diagnostics)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          cargo test --manifest-path src-tauri/Cargo.toml
+          $testExit = $LASTEXITCODE
+          if ($testExit -eq 0) { exit 0 }
+
+          Write-Host "::group::Recent Windows application-loader events"
+          Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'
+            StartTime = (Get-Date).AddMinutes(-15)
+          } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match 'codemux_lib|ENTRYPOINT|entry point' } |
+            Select-Object TimeCreated, Id, ProviderName, Message |
+            Format-List
+          Write-Host "::endgroup::"
+
+          $testBins = Get-ChildItem src-tauri/target/debug/deps/codemux_lib-*.exe
+          $dumpbin = Get-ChildItem 'C:/Program Files/Microsoft Visual Studio/2022' `
+            -Filter dumpbin.exe -Recurse -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if ($dumpbin) {
+            foreach ($testBin in $testBins) {
+              Write-Host "::group::PE imports: $($testBin.Name)"
+              & $dumpbin /IMPORTS $testBin.FullName
+              Write-Host "::endgroup::"
+            }
+          } else {
+            Write-Warning 'dumpbin.exe was not found; PE import diagnostics unavailable'
+          }
+          exit $testExit
