@@ -565,7 +565,7 @@ describe("RemoteAccessSection — from anywhere (relay)", () => {
       expect(screen.getByText(/not registered yet/i)).toBeInTheDocument(),
     );
     expect(
-      screen.getByText(/last attempt failed: control plane unreachable/i),
+      await screen.findByText(/last attempt failed: control plane unreachable/i),
     ).toBeInTheDocument();
   });
 
