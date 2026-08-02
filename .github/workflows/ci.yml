@@ -312,16 +312,32 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: cargo test --manifest-path src-tauri/Cargo.toml --no-run
 
-      - name: Embed Common Controls v6 manifest in Windows tests
+      - name: Provide Common Controls v6 manifests for Windows test executables
         if: matrix.os == 'windows-latest'
+        # The dialog plugin's Windows backend statically imports
+        # comctl32!TaskDialogIndirect, which only exists in Common Controls
+        # v6. The shipped app declares the v6 dependency in the manifest that
+        # tauri-build embeds, but Rust *test* executables get no manifest at
+        # all, so the loader binds legacy comctl32 v5 and the process dies at
+        # startup with STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139) before a
+        # single test runs. This hits the lib unit-test binary in particular:
+        # `cargo:rustc-link-arg-tests` only reaches integration-test targets,
+        # so a build.rs-side linker fix cannot cover it.
+        #
+        # Instead of patching binaries (mt.exe needs a VS dev shell) we drop
+        # an external `<exe>.manifest` next to every test executable. The
+        # Windows loader honors the side-by-side manifest file whenever the
+        # exe has no embedded manifest — exactly the situation Rust test
+        # binaries are in — and creates the v6 activation context before
+        # resolving static imports. Copying to every exe in deps/ is
+        # deliberate overkill: it is harmless for exes that don't import
+        # comctl32 and future-proof for whichever test binary picks up the
+        # import next.
         shell: pwsh
         run: |
           $manifest = (Resolve-Path "src-tauri/test-common-controls-v6.manifest").Path
           Get-ChildItem "src-tauri/target/debug/deps" -Filter "*.exe" | ForEach-Object {
-            & mt.exe -nologo -manifest $manifest "-outputresource:$($_.FullName);#1"
-            if ($LASTEXITCODE -ne 0) {
-              throw "mt.exe failed for $($_.FullName)"
-            }
+            Copy-Item $manifest "$($_.FullName).manifest" -Force
           }
 
       - name: Cargo test (Windows)
