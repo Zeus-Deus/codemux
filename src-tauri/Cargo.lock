@@ -1066,6 +1066,7 @@ dependencies = [
  "clap",
  "codemux",
  "dirs",
+ "embed-resource",
  "flate2",
  "futures-core",
  "futures-util",

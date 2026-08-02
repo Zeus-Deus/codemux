@@ -20,6 +20,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+embed-resource = "3"
 
 [dependencies]
 # The `test` feature exposes `tauri::test::MockRuntime` in normal (non-dev)
