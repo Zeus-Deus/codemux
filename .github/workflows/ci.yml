@@ -36,7 +36,7 @@ jobs:
       # even if one platform regresses.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
 
@@ -96,7 +96,7 @@ jobs:
       # point of having this matrix.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-2022]
     runs-on: ${{ matrix.os }}
     # Healthy runs finish in ~6 min on Linux and ~9 min on Windows. The
     # GitHub-default ceiling is 6 hours per job, so a single hung test on
@@ -155,8 +155,8 @@ jobs:
         # which shells out to `rg` to count CODEMUX_DEBUG markers.
 
       - name: Install Windows system dependencies
-        if: matrix.os == 'windows-latest'
-        # Chocolatey is pre-installed on windows-latest runners. ripgrep
+        if: matrix.os == 'windows-2022'
+        # Chocolatey is pre-installed on windows-2022 runners. ripgrep
         # is needed for the same `grep_count_pattern_*` tests as Linux.
         run: choco install ripgrep -y --no-progress
         shell: pwsh
@@ -228,7 +228,7 @@ jobs:
           # does not exist. Our existing copy-agent-browser.sh maps the host
           # target triple to the upstream npm package's pre-built binary.
           #
-          # Git Bash is preinstalled on windows-latest, so `shell: bash`
+          # Git Bash is preinstalled on windows-2022, so `shell: bash`
           # works on both platforms without needing a second .ps1 script.
           bash scripts/copy-agent-browser.sh || true
 
