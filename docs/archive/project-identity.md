@@ -1,11 +1,13 @@
 # Project Identity (first-class projects + workspace kind)
 
-- Purpose: Track the work to give Codemux a first-class, stable project identity and an explicit `main | worktree` workspace kind, modelled on Superset but adapted to Codemux's REST + SQLite + SSH-daemon stack.
-- Audience: Anyone changing the workspace registry, sync layer, daemon, or the Workspaces overview.
-- Authority: Active work plan only. Current behavior lives in `docs/features/workspaces-sync.md` and `docs/features/workspaces-overview.md`.
-- Update when: A phase lands, or the remaining Phase 3 scope changes.
+- Purpose: Preserve the completed implementation record for first-class project identity and explicit `main | worktree` workspace kind.
+- Audience: Anyone investigating the original design, migration, or rollout.
+- Authority: Historical implementation record. Current behavior lives in `docs/features/workspaces-sync.md` and `docs/features/workspaces-overview.md`.
+- Update when: Rarely; only to correct historical inaccuracies.
 - Read next: `docs/features/workspaces-sync.md`, `docs/features/workspaces-overview.md`
-- Status: MOSTLY LANDED — Phases 1, 2, and the cloud round-trip are done. Only the optional Phase 3 (a first-class `projects` table keyed by `project_uid`) remains; `database.rs` still carries the old path-keyed `projects` table.
+- Status: SHIPPED in `v0.7.4` — Phases 1, 2, and the cloud round-trip landed. The optional first-class `projects` table was not part of this initiative.
+
+> Historical snapshot: present-tense "Today", "remaining", and "local-only" statements below describe the implementation sequence at the time. The feature docs above supersede them.
 
 ## Goal
 
@@ -106,5 +108,3 @@ Verified live on the VPS (`~/codemux-api`, `ssh work@78.47.192.173`): `codemux_w
 
 - Migration safety is the top risk: the daemon DB lives on user machines and currently only does `CREATE TABLE IF NOT EXISTS`. Port the desktop's idempotent ALTER-loop first.
 - Wire is forward/backward compatible: `Workspace` serializes new fields, `RemoteWorkspace` ignores unknown fields, so mixed daemon/desktop versions don't break.
-</content>
-</invoke>

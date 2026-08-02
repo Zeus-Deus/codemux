@@ -8,7 +8,7 @@
 - Update when: A phase lands, a gated deploy happens, or the command surface changes.
 - Read next: `docs/features/web-remote-access.md`, `docs/plans/web-remote-account-mode.md`,
   `docs/plans/app-codemux-org-hosting.md`, `docs/features/auth.md`
-- Status: ACTIVE
+- Status: MOSTLY LANDED — installer, CLI auth/connect, persistent Linux service, docs, and Ubuntu/Fedora Docker coverage are in-repo; release publication and hosted infrastructure are still gated.
 
 ## Goal
 
@@ -22,16 +22,15 @@ strictly simpler (no runtime prerequisite, no pinned-runtime reinstall step).
 
 ## Active Priorities
 
-1. Docker e2e harness proving install → login (mocked API) → connect → unit active →
-   server reachable on the container's non-loopback address, on Ubuntu + Fedora.
-2. Docs pass: fold the landed pieces into `docs/features/web-remote-access.md` and
-   `docs/features/auth.md` (CLI sign-in section; token storage note — `auth-token.enc`
-   is legacy, SQLite `auth_tokens` is current), `docs/reference/CONTROL.md` CLI sampler.
-3. Gated deploys (human-confirmed, production VPS): serve `install.sh` at
+1. Gated deploys (human-confirmed, production VPS): serve `install.sh` at
    `get.codemux.org`; apply the API repo's device-registry patch + CORS origin;
    stand up `app.codemux.org` per its runbook; DNS records; then the live smoke test.
-4. Release + AUR/website follow-through so real installs fetch a binary that has
-   `login`/`connect` (until then the script installs a binary without them).
+2. Release + AUR/website follow-through so real installs fetch a published binary
+   containing `login`/`connect` (the code landed after `v0.15.6`).
+3. Decide and implement OAuth-friendly device authorization for accounts without a
+   password; `login --token` is the current escape hatch.
+4. Decide whether macOS launchd and Windows Task Scheduler services belong in the
+   first cross-platform bootstrap or remain documented manual `codemux serve` paths.
 
 ## Open Questions
 
@@ -75,6 +74,13 @@ strictly simpler (no runtime prerequisite, no pinned-runtime reinstall step).
   (running-instance vs. `codemux.service` unit branch, linger, rollback), plus the
   `web_remote_set_relay` control command, `login --token`, and the registration
   `name` field surfaced in Settings.
+- Network-free installer unit coverage in `scripts/install-sh.test.sh` and a
+  Docker/systemd Ubuntu + Fedora end-to-end harness in
+  `scripts/e2e/remote-bootstrap/` covering install → login → connect → reachable
+  service, idempotent reconnect/reinstall, status, and disconnect.
+- Canonical docs for CLI sign-in, one-command bootstrap, and the command sampler in
+  `docs/features/auth.md`, `docs/features/web-remote-access.md`, and
+  `docs/reference/CONTROL.md`.
 
 ## Notes
 

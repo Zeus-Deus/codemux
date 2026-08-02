@@ -7,7 +7,7 @@
 - Purpose: Track the fix for agent-created workspaces on a `codemux-remote` host that pull as EMPTY worktrees on the desktop, plus the supporting tool/skill gaps surfaced by the same investigation.
 - Audience: Anyone touching the remote daemon tool surface, the hosts-inventory poller, workspaces-sync, or the SSH pull/adoption path.
 - Authority: Active work plan. Behavior that lands moves to `docs/features/remote-hosts.md` / `docs/features/workspaces-sync.md`.
-- Read next: `docs/plans/mcp-on-remote.md`, `docs/plans/project-identity.md`, `docs/features/workspaces-sync.md`.
+- Read next: `docs/plans/mcp-on-remote.md`, `docs/archive/project-identity.md`, `docs/features/workspaces-sync.md`.
 
 ## Trigger / symptom
 

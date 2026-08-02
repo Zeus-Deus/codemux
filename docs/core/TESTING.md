@@ -18,6 +18,8 @@ Default to `npm run verify` after meaningful work. Use the narrower commands whe
 
 `npm run verify` is exactly `cargo check && cargo test && npm run check && npm run test` — it does **not** cover the Claude sidecar. The sidecar is a separate Bun package with its own suite (`sidecar/claude-agent/test/*.test.ts`: session, permissions, MCP bridge, respond-to-request, ping, real-tools). Run it directly with `bun test` from `sidecar/claude-agent/` whenever you touch `sidecar/claude-agent/src/` — the session-lifecycle, permission-mode, and stale-resume recovery behavior documented in `docs/features/agent-chat.md` is enforced there and nowhere else.
 
+`npm run verify` also does not run the shell installer suite. Run `bash scripts/install-sh.test.sh` whenever `scripts/install.sh` or its artifact/distro-selection contract changes; the suite is network-free and performs no installation.
+
 ## Visual Verification (UI work)
 
 When iterating on UI, verify visually against the real React UI running in a browser pane:
@@ -40,6 +42,7 @@ The mock lives in `src/dev/` and only loads when no real Tauri runtime is detect
 - `scripts/e2e/*.sh` — live Docker-backed harnesses run manually from the repo root:
   - `daemon-worktree-setup-e2e.sh` — clean containerized host for headless `worktree_create` provisioning (issue #78): drives the real authed HTTP `tools/call` surface and asserts worktree creation + setup-script run + gitignored-include copy on the container's filesystem. Requires docker, python3, and a debug `codemux-remote` build (`CMX_WT_E2E_BIN` overrides the binary).
   - `opencode-sync-e2e.sh` / `opencode-real-session-e2e.sh` — OpenCode conversation sync across workspace push/pull against a Docker SSH host (issue #16).
+- `scripts/e2e/remote-bootstrap/run.sh` — Docker/systemd Ubuntu + Fedora harness for the fresh-host claim: installer → mocked-API login → `codemux connect` → persistent user unit → local and cross-container health, plus status/off/reconnect/reinstall idempotency. It never calls the production API; see the adjacent `README.md` for prerequisites and invocation.
 - Env-gated Rust integration tests skip by default and run live when pointed at a host: `CODEMUX_E2E_SSH_HOST` gates `src-tauri/tests/codemux_ssh_roundtrip.rs`, `opencode_sync_roundtrip.rs`, and `opencode_real_roundtrip.rs` (the OpenCode pair also needs `CMX_OC_E2E_*` variables — see the script headers).
 
 ## Manual Validation Rules

@@ -4,12 +4,12 @@
 - Audience: Anyone touching the workspace push/pull/adopt pipeline, the `workspaces_sync` schema, project-identity classification, or the Workspaces overview UI.
 - Authority: Active work plan only, not current truth. Current behavior lives in `docs/features/workspaces-sync.md` and `docs/features/workspaces-overview.md`.
 - Update when: Priorities, open questions, schema shape, or likely touch points change.
-- Read next: `docs/features/workspaces-sync.md`, `docs/features/workspaces-overview.md`, `docs/plans/project-identity.md`.
+- Read next: `docs/features/workspaces-sync.md`, `docs/features/workspaces-overview.md`, `docs/archive/project-identity.md`.
 - Status: MOSTLY LANDED — code shipped in `v0.7.8` (`git_canonical_root`, `is_divergent_copy`, `is_protected_repo_root` all live in `git.rs`). Only a manual cross-device SSH round-trip validation on real hardware remains.
 
 ## Goal
 
-Cross-device sync currently carries **loose workspace folders**, not the git repo they belong to. For a project's default branch (e.g. `main`) Codemux cannot `git worktree add` it (the branch is already checked out at the repo root), so the push/pull rsync falls back to copying the whole directory — including `.git` — into `~/.codemux/worktrees/<project>/<branch>`. That copy gets its own object store and **diverges** from the real repo root. Make Codemux treat a git repo as one connected unit: discover the canonical root, register/surface it as the protected default-branch checkout, and on cross-device pull/sync bring the repo over once and recreate sibling workspaces as real shared-history worktrees — never a divergent copy.
+Validate and harden the shipped repo-unit model: Codemux treats a repository root plus its worktrees as one shared-history unit, protects the default-branch root from worktree deletion, and recreates sibling workspaces as real worktrees instead of divergent full copies. The remaining exit gate is a real cross-device SSH round trip covering root pull, sibling adoption, reconnect, and legacy-copy reconciliation.
 
 ## Root Cause (verified against source)
 
@@ -74,7 +74,7 @@ All six phases are implemented and unit-tested (`cargo test`, `npm run check`, `
 - **Phase 4** — `workspace_push_to_host` pushes a repo root to `~/.codemux/projects/<repo>` on the host via the new `conventional_remote_root_path` helper; `workspace_pull_back_impl` is root-aware and tries `projects/` first, falling back to the legacy `worktrees/` path on `RemoteNotFound` so roots pushed before this change still pull.
 - **Phase 5** — non-destructive DETECTION: `divergent_copy` stamp + a "standalone copy" warning chip in the overview guiding the user to re-pull cleanly. The auto-rewrite reconcile actions (re-point / import-as-branch) were intentionally NOT shipped — see Notes. **Post-`v0.7.8`** added a non-destructive `workspaces_reconcile_copy` action (detach-card-only, files left on disk) — see "Follow-ups Landed" below.
 
-Prior related work this builds on: project-identity `project_uid` + `kind` (`docs/plans/project-identity.md`), the worktree-kind repo-rsync adoption path (`adopt_worktree_via_repo_rsync`, `docs/archive/remote-workspace-pull-fix.md`), and the v0.7.6 adopt-failure rollback hardening (`docs/features/workspaces-sync.md`).
+Prior related work this builds on: project-identity `project_uid` + `kind` (`docs/archive/project-identity.md`), the worktree-kind repo-rsync adoption path (`adopt_worktree_via_repo_rsync`, `docs/archive/remote-workspace-pull-fix.md`), and the v0.7.6 adopt-failure rollback hardening (`docs/features/workspaces-sync.md`).
 
 ## Follow-ups Landed (`v0.7.9`)
 
