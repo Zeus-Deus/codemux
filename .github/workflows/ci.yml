@@ -333,7 +333,42 @@ jobs:
           if ($dumpbin) {
             foreach ($testBin in $testBins) {
               Write-Host "::group::PE imports: $($testBin.Name)"
-              & $dumpbin /IMPORTS $testBin.FullName
+              $imports = & $dumpbin /IMPORTS $testBin.FullName
+              $imports
+              Write-Host "::endgroup::"
+
+              Write-Host "::group::Missing PE imports: $($testBin.Name)"
+              $currentDll = $null
+              $dllHandle = [IntPtr]::Zero
+              foreach ($line in $imports) {
+                if ($line -match '^\s+([A-Za-z0-9_.-]+\.dll)\s*$') {
+                  if ($dllHandle -ne [IntPtr]::Zero) {
+                    [System.Runtime.InteropServices.NativeLibrary]::Free($dllHandle)
+                  }
+                  $currentDll = $Matches[1]
+                  try {
+                    $dllHandle = [System.Runtime.InteropServices.NativeLibrary]::Load($currentDll)
+                  } catch {
+                    $dllHandle = [IntPtr]::Zero
+                    Write-Host "MISSING DLL: $currentDll ($($_.Exception.Message))"
+                  }
+                  continue
+                }
+                if ($dllHandle -ne [IntPtr]::Zero -and $line -match '^\s+[0-9A-F]+\s+(\S+)\s*$') {
+                  $symbol = $Matches[1]
+                  $address = [IntPtr]::Zero
+                  if (-not [System.Runtime.InteropServices.NativeLibrary]::TryGetExport(
+                    $dllHandle,
+                    $symbol,
+                    [ref]$address
+                  )) {
+                    Write-Host "MISSING ENTRYPOINT: $currentDll!$symbol"
+                  }
+                }
+              }
+              if ($dllHandle -ne [IntPtr]::Zero) {
+                [System.Runtime.InteropServices.NativeLibrary]::Free($dllHandle)
+              }
               Write-Host "::endgroup::"
             }
           } else {
