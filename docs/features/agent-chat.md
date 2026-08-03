@@ -211,6 +211,30 @@ Fragment, relative, `mailto:`, `javascript:`, and other non-web links are left
 unchanged. The dev mock's rich transcript includes both GitHub and docs
 examples for visual verification.
 
+### Local screenshot links in chat
+
+Assistant and plan Markdown upgrades absolute local image destinations into a
+visual proof card. Both the form agents most often produce —
+`[Terminal screenshot](/absolute/path.png)` — and standard image syntax —
+`![Terminal screenshot](/absolute/path.png)` — render an inline, labelled
+preview instead of a dead underlined filesystem link. Clicking the card opens
+a near-fullscreen lightbox; a missing or reaped temp file becomes a stable
+"Image unavailable" card rather than a broken-image glyph. PNG, JPEG, GIF, and
+WebP are accepted on POSIX paths, Windows drive paths, and local `file://` URLs.
+Relative paths stay ordinary Markdown because a chat message has no durable
+document directory.
+
+`rehypeLocalImageLinks` (`src/lib/agent-chat/local-image-links.ts`) performs the
+narrow HAST upgrade and `MarkdownLocalImage` owns the card/lightbox. Desktop
+WebKit loads the absolute path through Tauri's asset protocol. If that fails in
+the browser dev mock or a web-remote client, `agent_chat_read_local_image`
+returns only an existing, absolute, supported image with the same 25 MB ceiling
+as chat attachments; the frontend caches a bounded blob URL. This is separate
+from `agent_chat_read_image`, whose containment check remains restricted to
+Codemux's persisted chat-image root. Ordinary local non-image links are not
+upgraded. The rich dev transcript includes a local screenshot link so the card
+and lightbox stay visually testable.
+
 ## What Works Today
 
 - **Three end-to-end providers** behind one unified picker:
@@ -381,9 +405,11 @@ examples for visual verification.
     disappearing. `ToolCallCard` auto-expands when a result first gains a
     renderable image (`hasToolResultImages`) so asynchronously arriving
     screenshots become visible without a manual expand, while a later user
-    collapse remains respected. Standalone assistant-authored image
-    blocks (not wrapped in a tool result) are still unsupported — they
-    would need a new backend `CompletedItem` variant. The dev mock seeds
+    collapse remains respected. Standalone provider image blocks (not wrapped
+    in a tool result) are still unsupported — they would need a new backend
+    `CompletedItem` variant. Absolute image paths written into assistant
+    Markdown are supported separately by the local screenshot-link renderer
+    above. The dev mock seeds
     an image `Read` tool result in the demo transcript
     (`richChatTurnEnvelopes`).
 - **Slash command popup** with cross-provider parsing. Five groups:

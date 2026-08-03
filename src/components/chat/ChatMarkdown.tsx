@@ -6,6 +6,10 @@ import {
   CHAT_LINK_FAVICON_TAG,
   rehypeRichExternalLinks,
 } from "@/lib/agent-chat/rich-links";
+import {
+  CHAT_LOCAL_IMAGE_TAG,
+  rehypeLocalImageLinks,
+} from "@/lib/agent-chat/local-image-links";
 import { cn } from "@/lib/utils";
 import { selectChatCodeWrap, useSettingsStore } from "@/stores/settings-store";
 import { ChatMarkdownStreamingContext } from "./chat-markdown-streaming";
@@ -14,6 +18,7 @@ import {
   ChatCodeRendererProvider,
 } from "./ChatCodeBlock";
 import { MarkdownLinkFavicon } from "./MarkdownLinkFavicon";
+import { MarkdownLocalImage } from "./MarkdownLocalImage";
 
 /**
  * Shared markdown renderer for chat surfaces (assistant messages,
@@ -117,7 +122,7 @@ const controls = {
 // GFM is likewise upstream's; math/KaTeX stays out.
 const remarkPlugins = [defaultRemarkPlugins.gfm, defaultRemarkPlugins.codeMeta];
 
-const rehypePlugins = [rehypeRichExternalLinks];
+const rehypePlugins = [rehypeRichExternalLinks, rehypeLocalImageLinks];
 
 // The fenced/inline code shells plus the custom element `rehypeRichExternalLinks`
 // emits for decorated links. Code blocks never grow favicons (a fence's contents
@@ -127,6 +132,7 @@ const rehypePlugins = [rehypeRichExternalLinks];
 const markdownComponents: Components = {
   ...CHAT_MARKDOWN_COMPONENTS,
   [CHAT_LINK_FAVICON_TAG]: MarkdownLinkFavicon,
+  [CHAT_LOCAL_IMAGE_TAG]: MarkdownLocalImage,
 };
 
 /**
