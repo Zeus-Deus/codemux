@@ -17,6 +17,7 @@ import type {
   InlineReviewComment,
 } from "@/tauri/types";
 import { cn } from "@/lib/utils";
+import { isRemoteClient } from "@/components/remote/is-remote-client";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -127,7 +128,13 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
         onValueChange={handleTabChange}
         className="flex h-full flex-col"
       >
-        <div className="flex items-center h-[45px] shrink-0 border-b border-border">
+        <div
+          data-testid="right-panel-tabs-header"
+          className={cn(
+            "flex h-[45px] shrink-0 items-center border-b border-border",
+            !isRemoteClient() && "mt-10",
+          )}
+        >
           <TabsList variant="line" className="!h-full !p-0 gap-0 flex-1">
             <TabsTrigger value="files" className={TAB_TRIGGER_CLS}>
               Files

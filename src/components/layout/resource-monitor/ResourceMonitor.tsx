@@ -53,13 +53,17 @@ function getTrackedMemorySharePercent(
 
 interface ResourceMonitorProps {
   className?: string;
+  variant?: "ghost" | "outline" | "toolbar";
 }
 
 /**
  * Title-bar resource monitor: a CPU-chip icon that opens a popover showing
  * how much CPU + memory Codemux and every terminal process tree are using.
  */
-export function ResourceMonitor({ className }: ResourceMonitorProps) {
+export function ResourceMonitor({
+  className,
+  variant = "ghost",
+}: ResourceMonitorProps) {
   const [open, setOpen] = useState(false);
   const [sortOption, setSortOption] = useState<SortOption>("memory");
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(
@@ -156,12 +160,12 @@ export function ResourceMonitor({ className }: ResourceMonitorProps) {
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <Button
-              variant="ghost"
+              variant={variant}
               size="icon-sm"
               aria-label="Resource monitor"
               className={cn("text-muted-foreground", className)}
             >
-              <Cpu className="h-3.5 w-3.5" />
+              <Cpu />
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>

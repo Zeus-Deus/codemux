@@ -271,6 +271,25 @@
   transition: opacity 0.1s ease;
 }
 
+/* The GUI titlebar remains fully transparent by default. When runtime
+ * geometry says its controls physically intersect the centered chat column
+ * AND that transcript has scrolled underneath, only the two 32px control
+ * groups lift above it. This is an opaque, borderless surface—not a fading
+ * header—so the controls stay crisp without changing the empty drag region. */
+.titlebar-overlap-surface {
+  transition:
+    background-color 120ms ease-out,
+    box-shadow 120ms ease-out;
+}
+
+[data-chat-overlap="true"] .titlebar-overlap-surface {
+  border-radius: calc(var(--radius) + 2px);
+  background: color-mix(in oklch, var(--background) 94%, var(--card));
+  box-shadow:
+    0 5px 16px color-mix(in oklch, var(--foreground) 10%, transparent),
+    inset 0 1px 0 color-mix(in oklch, var(--foreground) 7%, transparent);
+}
+
 /* Terminal lifecycle overlay (starting / migrating / failed). Opacity is
    driven imperatively from TerminalPane.tsx (DOM-mutation path, for perf):
    it fades to 0 on `ready` before display:none, so the card doesn't snap

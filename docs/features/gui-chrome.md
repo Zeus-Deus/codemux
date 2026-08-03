@@ -1,6 +1,6 @@
 # GUI-Mode Chrome
 
-- Purpose: Describe the collapsed single-titlebar chrome that renders for a
+- Purpose: Describe the floating, edge-to-edge chrome that renders for a
   real workspace when the Agent Chat GUI is on (the default interface).
 - Audience: Anyone working on the title bar, tab strip, preset launch UX, or
   the chat pane header.
@@ -13,8 +13,12 @@
 ## What This Feature Is
 
 GUI chrome collapses the four stacked chrome rows of a chat workspace —
-`TitleBar` → `TabBar` → `PresetBar` → `AgentChatPaneHeader` — into a **single
-`h-10` title bar**. It renders only when the `enable_agent_chat` flag is on
+`TitleBar` → `TabBar` → `PresetBar` → `AgentChatPaneHeader` — into a **floating
+`h-10` overlay with compact control clusters**. There is no full-width titlebar
+surface or divider: the sidebar, workspace, and optional right panel all reach
+the physical top edge, the cluster wrappers are transparent and frameless, and
+only controls that need an affordance carry their own chrome. It
+renders when the `enable_agent_chat` flag is on
 (the default — the flag is now a regular Settings → Interface toggle, not a
 Beta opt-in) and a real, non-OpenFlow workspace is active; every other case
 keeps the legacy chrome unchanged.
@@ -28,28 +32,35 @@ predicate lives in the shared `useGuiChrome()` hook
 (`src/hooks/use-gui-chrome.ts`) so other GUI-mode-only surfaces gate on the
 identical rule — currently the background-browser inline chip, context-bar
 indicator, and peek overlay (`docs/features/browser.md` § "Background
-browser in GUI mode"). A live lazy-creation draft renders the same `h-10`
-shell with **draft slots** instead, gated on the sibling
+browser in GUI mode"). A live lazy-creation draft renders the same floating
+`h-10` overlay with **draft slots** instead, gated on the sibling
 `useDraftGuiChrome()` predicate (`enableAgentChat && lazyDraftActive` —
 mutually exclusive with `guiChrome`; see "Draft titlebar variant" below).
 When neither predicate holds it returns the byte-identical legacy `h-9`
-bar; in workspace GUI chrome it composes discrete slots left-to-right:
+bar in normal document flow. Workspace GUI chrome is absolutely positioned
+over the full app shell and composes four independent control clusters on
+desktop (the native-controls cluster is absent on a web remote client):
 
-`[sidebar-width cluster: sidebar toggle] | [tabs] [+ launcher] | [pinned preset tiles] …drag spacer… [RunButton split] [ResourceMonitor] [IdeLauncher compact] [sep] [right-panel toggle] [WindowControls]`
+`[sidebar toggle]    [tabs | + launcher | pinned preset tiles] …drag region… [RunButton split | ResourceMonitor | IdeLauncher compact | right-panel toggle]    [WindowControls]`
 
-The far-left cluster contains **only the sidebar toggle** and is sized to the
-live sidebar width (`useSidebarGapWidth()` in
+The far-left cluster contains **only the sidebar toggle**. The workspace band
+starts just after the live sidebar width (`useSidebarGapWidth()` in
 `src/hooks/use-sidebar-gap-width.ts` — measures the sidebar's
 `[data-slot="sidebar-gap"]` box via ResizeObserver, since the titlebar
-renders outside `SidebarProvider`), with a hairline `border-r` at the
-sidebar boundary so tabs start where the content pane starts (design:
-`.design/top-bar.dc.html`).
+renders outside `SidebarProvider`). Its right edge moves left when the right
+panel opens, using the persisted panel width, so the action island remains
+anchored immediately before that panel. Native window controls remain a
+separate cluster at the physical top-right corner. Unoccupied overlay space is
+still a Tauri drag region; each interactive cluster opts back into pointer
+events.
 
 - **`TitleBarTabs`** (`src/components/layout/title-bar-tabs.tsx`) — the
   workspace's backend-owned tabs as compact pills (h-7, rounded-lg) with a
   per-tab status dot (highest-priority `pane_statuses` across the tab's panes),
   a chat-bubble / terminal / kind icon, and a hover/active-revealed close `X`.
-  The **active chat tab** grows a chevron opening the session-history dropdown.
+  Inactive tabs use the full `text-muted-foreground` token so their labels
+  remain legible over the narrow-window glass surface. The **active chat tab**
+  grows a chevron opening the session-history dropdown.
   (The inline "N subagents running" pill that used to ride beside it was
   removed in favor of the docked `SubagentActivityBar` above the composer —
   see `docs/features/agent-chat.md` "Docked live activity bar".)
@@ -76,9 +87,16 @@ sidebar boundary so tabs start where the content pane starts (design:
 - **Rehomed controls** — the right-panel toggle (`PanelRight`, mirroring the
   left sidebar's `PanelLeft` glyph, drives
   `rightPanelTabs`) and `RunButton` move from `TabBar`/`PresetBar` into the
-  titlebar right cluster. The panel toggle is docked after the content-cluster
-  separator, immediately beside `WindowControls`; `RunButton` stays before
-  `ResourceMonitor` and the compact IDE launcher. In GUI chrome the `RunButton` renders its
+  floating action cluster. The panel toggle follows the content controls
+  without an extra divider; the separate native-controls cluster remains at
+  the window edge. The controls are split into two visual groups: `RunButton`
+  plus the compact IDE launcher are bordered primary actions; the bordered
+  toolbar-style `ResourceMonitor` plus frameless right-panel toggle are
+  utilities, separated from the action chips by a wider gap. The monitor uses
+  the same `border-border` + `bg-secondary/50` treatment as the adjacent chips
+  so its square silhouette does not read smaller. The legacy titlebar keeps
+  the resource monitor's default ghost treatment. In GUI chrome the
+  `RunButton` renders its
   `variant="split"` form (main segment = green play + Run/Set Run, caret
   segment = configure; no standalone gear) and `IdeLauncher` renders
   `compact` (icon square + caret, combined tooltip). Both components keep
@@ -89,7 +107,20 @@ sidebar boundary so tabs start where the content pane starts (design:
   the draft branch); `PaneNode` (`isSurfaceRoot` + `enableAgentChat`)
   suppresses `AgentChatPaneHeader` for a **sole-root** `agent_chat` pane.
   Split panes keep their per-pane header. `DraftChatSurface` likewise
-  suppresses its placeholder `DraftSurfaceHeader` band in GUI mode.
+  suppresses its placeholder `DraftSurfaceHeader` band in GUI mode. The sole
+  root chat therefore reclaims the top edge; non-chat workspace surfaces and
+  onboarding reserve a local `pt-10` collision zone. The expanded sidebar
+  reserves the same local clearance only above its search row, and the
+  collapsed rail reserves it above its first action. On desktop, the right
+  panel keeps its background full-height but gives its tabs `mt-10`, keeping
+  them clear of native window controls without clipping narrow tab strips.
+  The workspace-tab and action islands stay transparent and frameless at
+  rest. Each mounted chat viewport reports whether it has actually scrolled
+  beneath the overlay, while `TitleBar` measures whether either island
+  physically intersects that viewport's centered 792px reading column. Only
+  when both conditions are true do those two 32px islands gain an opaque,
+  borderless raised surface. There is no full-width header or fading scrim;
+  the empty drag region stays transparent, and the composer is not affected.
 - **Draft titlebar variant** — while a lazy-creation draft is the active
   surface (`useDraftGuiChrome()`), the `h-10` bar renders
   `TitleBarDraftSlots` in place of the workspace slots: a single static
@@ -112,7 +143,8 @@ titlebar tab share one implementation (see "Important Touch Points").
 
 ## What Works Today
 
-- Single `h-10` titlebar for a real, non-OpenFlow chat workspace with the
+- Frameless floating control clusters over full-height sidebar, workspace, and
+  right-panel surfaces for a real, non-OpenFlow chat workspace with the
   GUI flag on (default); legacy `h-9` chrome is byte-identical with the flag
   off.
 - Pill tabs with status dots, active-tab close, and a chat-tab chevron opening
@@ -121,8 +153,8 @@ titlebar tab share one implementation (see "Important Touch Points").
   with active-session dot and delete-on-hover).
 - `+` launcher covering GUI chat presets, CLI agents (with Shift-split),
   Terminal/Browser panes, and Manage presets.
-- Inline ember chat favorite; rehomed RunButton plus a right-panel toggle
-  docked beside the window controls. (The
+- Inline ember chat favorite; rehomed RunButton plus a right-panel toggle in
+  an action cluster that tracks the right-panel edge. (The
   "N subagents running" status pill that originally rehomed next to the
   active chat tab was later removed — subagent status now lives in the
   docked `SubagentActivityBar` above the composer; see
@@ -134,12 +166,12 @@ titlebar tab share one implementation (see "Important Touch Points").
   `data-tauri-drag-region`, unlike HTML5 DnD; a completed drag suppresses
   the trailing click so it never activates a tab or pops the chat-tab
   history dropdown.
-- The empty titlebar center stays an OS drag region.
+- Empty space along the top overlay stays an OS drag region.
 
 ## Current Constraints
 
-- **Draft chrome is a reduced titlebar, not full workspace chrome.** A live
-  chat draft renders the GUI-styled `h-10` draft variant (static pill +
+- **Draft chrome is a reduced floating overlay, not full workspace chrome.** A
+  live chat draft renders the GUI-styled `h-10` draft variant (static pill +
   draft launcher), but `useGuiChrome()` itself still resolves `false` during
   a draft — workspace-scoped GUI surfaces (titlebar tabs, background-browser
   chip, context-bar indicator, right-cluster controls) stay off because the
@@ -168,7 +200,10 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
   `useDraftGuiChrome()` draft predicate.
 - `src/components/layout/title-bar.tsx` — consumes `useGuiChrome()` +
   `useDraftGuiChrome()` for the slot-composition branch, `RightPanelToggle`,
-  `PinnedPresetTiles`, `TitleBarWorkspaceSlots`, `TitleBarDraftSlots`.
+  `PinnedPresetTiles`, `TitleBarWorkspaceSlots`, `TitleBarDraftSlots`, and the
+  floating-island placement.
+- `src/components/layout/app-shell.tsx` — provides the relative, clipped shell
+  that contains the absolute GUI overlay while leaving legacy chrome in flow.
 - `src/lib/agent-chat/draft-preset-launch.ts` — shared
   materialise-with-preset action behind both the legacy draft `PresetBar`
   and `DraftAgentLauncher`.
@@ -186,11 +221,17 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
 - `src/hooks/use-agent-chat-checkpoint-restore.ts` +
   `src/components/chat/restore-checkpoint-dialog.tsx` — shared checkpoint
   restore state + confirm dialog.
-- `src/components/layout/workspace-main.tsx` — TabBar/PresetBar suppression.
+- `src/components/layout/workspace-main.tsx` — TabBar/PresetBar suppression,
+  full-height panel composition, and per-surface top collision clearance.
+- `src/components/layout/sidebar-action-row.tsx` — local top clearance for the
+  expanded sidebar and collapsed rail.
+- `src/components/layout/right-panel.tsx` — full-height panel surface with
+  desktop-only tab-row clearance below native window controls.
 - `src/components/layout/PaneNode.tsx` / `pane-container.tsx` — `isSurfaceRoot`
   header suppression.
 - Tests: `title-bar.test.tsx`, `title-bar-tabs.test.tsx`,
-  `agent-launcher.test.tsx`, `workspace-main.test.tsx` (~49 Vitest cases).
+  `agent-launcher.test.tsx`, `workspace-main.test.tsx`,
+  `right-panel.test.tsx`.
 
 ## Notes
 

@@ -105,6 +105,15 @@ afterEach(() => {
   mocks.tasks = null;
 });
 
+describe("RightPanel floating-chrome clearance", () => {
+  it("keeps its surface full-height while dropping the desktop tab row below window controls", () => {
+    render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);
+    const header = screen.getByTestId("right-panel-tabs-header");
+    expect(header).toHaveClass("mt-10");
+    expect(header).not.toHaveClass("pr-[104px]");
+  });
+});
+
 describe("RightPanel Tasks tab", () => {
   it("is absent until the focused chat has tasks", () => {
     render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);

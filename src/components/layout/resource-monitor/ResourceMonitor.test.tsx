@@ -71,7 +71,7 @@ function makeSnapshot(): ResourceMetricsSnapshot {
   };
 }
 
-function renderMonitor() {
+function renderMonitor(variant?: "ghost" | "outline" | "toolbar") {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false, staleTime: Infinity, refetchInterval: false },
@@ -80,7 +80,7 @@ function renderMonitor() {
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
-        <ResourceMonitor />
+        <ResourceMonitor variant={variant} />
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -115,9 +115,16 @@ describe("ResourceMonitor", () => {
 
   it("renders the title-bar trigger button when enabled", () => {
     renderMonitor();
+    const trigger = screen.getByRole("button", { name: "Resource monitor" });
+    expect(trigger).toBeInTheDocument();
+    expect(trigger).toHaveAttribute("data-variant", "ghost");
+  });
+
+  it("renders a toolbar trigger when requested", () => {
+    renderMonitor("toolbar");
     expect(
       screen.getByRole("button", { name: "Resource monitor" }),
-    ).toBeInTheDocument();
+    ).toHaveAttribute("data-variant", "toolbar");
   });
 
   it("opens the popover and shows the app + workspace breakdown", async () => {

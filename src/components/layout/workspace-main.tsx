@@ -15,6 +15,7 @@ import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
 import { ProjectOnboarding } from "@/components/overlays/project-onboarding";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
+import { cn } from "@/lib/utils";
 
 const RIGHT_PANEL_MIN = 240;
 const RIGHT_PANEL_MAX = 500;
@@ -183,12 +184,14 @@ export function WorkspaceMain() {
 
   if (isOnboarding) {
     return (
-      <ProjectOnboarding
-        projectDir={onboardingProjectDir}
-        tempWorkspaceId={activeWorkspace.workspace_id}
-        onComplete={() => setOnboardingProjectDir(null)}
-        onCancel={() => setOnboardingProjectDir(null)}
-      />
+      <div className={cn("flex flex-1 min-h-0", enableAgentChat && "pt-10")}>
+        <ProjectOnboarding
+          projectDir={onboardingProjectDir}
+          tempWorkspaceId={activeWorkspace.workspace_id}
+          onComplete={() => setOnboardingProjectDir(null)}
+          onCancel={() => setOnboardingProjectDir(null)}
+        />
+      </div>
     );
   }
 
@@ -208,6 +211,10 @@ export function WorkspaceMain() {
   const activeTab = activeWorkspace.tabs.find(
     (t) => t.tab_id === activeWorkspace.active_tab_id,
   );
+  const activeSurface = activeWorkspace.surfaces.find(
+    (surface) => surface.surface_id === activeTab?.surface_id,
+  );
+  const isSoleRootChat = activeSurface?.root.kind === "agent_chat";
 
   return (
     <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
@@ -218,7 +225,13 @@ export function WorkspaceMain() {
         {!enableAgentChat && (
           <PresetBar workspaceId={activeWorkspace.workspace_id} />
         )}
-        <div className="flex-1 min-h-0 overflow-hidden">
+        <div
+          data-testid="workspace-content-surface"
+          className={cn(
+            "flex-1 min-h-0 overflow-hidden",
+            enableAgentChat && !isSoleRootChat && "pt-10",
+          )}
+        >
           {activeTab?.kind === "diff" ? (
             <DiffPane tabId={activeTab.tab_id} workspace={activeWorkspace} />
           ) : activeTab?.kind === "editor" ? (

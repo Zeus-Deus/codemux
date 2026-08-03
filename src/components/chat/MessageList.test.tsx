@@ -8,6 +8,7 @@ import type {
   ToolCallItem,
   WorkflowRunItem,
 } from "@/lib/agent-chat/types";
+import { getTitlebarContentUnder } from "@/lib/titlebar-content-under";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
@@ -81,6 +82,36 @@ function renderList(
     <MessageList messages={messages} {...extra} {...noopHandlers} />,
   );
 }
+
+describe("MessageList titlebar scroll edge", () => {
+  it("publishes only after the transcript scrolls beneath the overlay", () => {
+    const { unmount } = render(
+      <MessageList
+        messages={[readCall(0, "/a")]}
+        workspaceId="ws-scroll-edge"
+        {...noopHandlers}
+      />,
+    );
+    const viewport = document.querySelector<HTMLElement>(
+      '[data-slot="transcript-list"]',
+    );
+    expect(viewport).not.toBeNull();
+
+    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
+    viewport!.scrollTop = 12;
+    fireEvent.scroll(viewport!);
+    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(true);
+
+    viewport!.scrollTop = 0;
+    fireEvent.scroll(viewport!);
+    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
+
+    viewport!.scrollTop = 12;
+    fireEvent.scroll(viewport!);
+    unmount();
+    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
+  });
+});
 
 function planReq(
   overrides: Partial<PermissionRequestItem> = {},

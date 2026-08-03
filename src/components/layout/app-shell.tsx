@@ -114,7 +114,7 @@ export function AppShell() {
   }
 
   return (
-    <div className="flex flex-col h-screen max-h-screen">
+    <div className="relative flex h-screen max-h-screen flex-col overflow-hidden">
       <TitleBar
         sidebarOpen={sidebarOpen}
         onToggleSidebar={() => setSidebarOpen((o) => !o)}

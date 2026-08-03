@@ -50,7 +50,7 @@ export function SidebarActionRow() {
   if (state === "collapsed") {
     return (
       <ShadcnSidebarHeader className="gap-0 p-0">
-        <div className="flex flex-col items-center gap-1.5 px-1 py-2">
+        <div className="flex flex-col items-center gap-1.5 px-1 pb-2 pt-11">
           <Tooltip delayDuration={300}>
             <TooltipTrigger asChild>
               <button
@@ -96,7 +96,7 @@ export function SidebarActionRow() {
     <ShadcnSidebarHeader className="gap-0 p-0">
       {/* Same insets + gap as the project-filter row below, and every control
           in both rows is h-8 / rounded-[7px], so the two read as equal rows. */}
-      <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-3">
+      <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-11">
         <button
           type="button"
           aria-label="Search"
