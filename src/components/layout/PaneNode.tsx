@@ -19,6 +19,7 @@ import { useTerminalCwd } from "@/stores/terminal-cwd-store";
 import { formatCwdHint } from "@/lib/terminal-cwd";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { StatusIndicator } from "@/components/ui/status-indicator";
+import { TerminalBackgroundBrowserIndicator } from "@/components/browser/background-browser-indicator";
 
 // Map known preset names to their icon identifiers
 const PRESET_TITLE_TO_ICON: Record<string, string> = {
@@ -326,6 +327,7 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
               <X className="h-3.5 w-3.5" />
             </Button>
           </div>
+          <TerminalBackgroundBrowserIndicator active={isActive} />
         </header>
         <div className="flex-1 min-h-0 overflow-hidden">
           <TerminalPane

@@ -153,7 +153,7 @@ describe("Composer", () => {
         cwd: "/home/user/projects/foo",
       });
       // `null` suppresses the default cwd label — a running chat keeps
-      // its scope in the workspace context bar instead.
+      // its scope in the Context Row below the composer instead.
       expect(queryByText("/home/user/projects/foo")).toBeNull();
     });
   });

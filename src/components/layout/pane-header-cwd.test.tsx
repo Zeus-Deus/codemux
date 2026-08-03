@@ -2,8 +2,10 @@
 import { memo } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 
 import type {
+  AgentBrowserSession,
   AppStateSnapshot,
   PaneNodeSnapshot,
   SurfaceSnapshot,
@@ -35,6 +37,8 @@ vi.mock("@/tauri/commands", () => ({
 
 import { PaneNode } from "./PaneNode";
 import { useAppStore } from "@/stores/app-store";
+import { useBrowserPeekStore } from "@/stores/browser-peek-store";
+import { useFeatureFlags } from "@/stores/feature-flags";
 import { useTerminalCwdStore } from "@/stores/terminal-cwd-store";
 
 const WS_CWD = "/home/zeus/projects/codemux";
@@ -80,30 +84,37 @@ function makeWs(root: PaneNodeSnapshot): WorkspaceSnapshot {
   } as unknown as WorkspaceSnapshot;
 }
 
-function makeAppState(root: PaneNodeSnapshot): AppStateSnapshot {
+function makeAppState(
+  root: PaneNodeSnapshot,
+  agentBrowserSessions: AgentBrowserSession[] = [],
+): AppStateSnapshot {
   return {
     schema_version: 1,
     active_workspace_id: "ws-1",
     workspaces: [makeWs(root)],
     terminal_sessions: [],
     browser_sessions: [],
-    agent_browser_sessions: [],
+    agent_browser_sessions: agentBrowserSessions,
     notifications: [],
     detected_ports: [],
     pane_statuses: {},
   } as unknown as AppStateSnapshot;
 }
 
-function mount(title = "Terminal") {
+function mount(
+  title = "Terminal",
+  agentBrowserSessions: AgentBrowserSession[] = [],
+  activePaneId = "p1",
+) {
   const root = termPane(title);
   act(() => {
     useAppStore.setState({
-      appState: makeAppState(root),
+      appState: makeAppState(root, agentBrowserSessions),
       homeDir: "/home/zeus",
     });
   });
   return render(
-    <PaneNode node={root} activePaneId="p1" visible={true} />,
+    <PaneNode node={root} activePaneId={activePaneId} visible={true} />,
   );
 }
 
@@ -115,6 +126,11 @@ function hint() {
 beforeEach(() => {
   act(() => {
     useTerminalCwdStore.setState({ cwds: {} });
+    useBrowserPeekStore.setState({ openWorkspaceId: null });
+    useFeatureFlags.setState({
+      enableAgentChat: false,
+      enableLazyWorkspaceCreation: false,
+    });
   });
 });
 
@@ -122,6 +138,11 @@ afterEach(() => {
   cleanup();
   act(() => {
     useAppStore.setState({ appState: null, homeDir: null });
+    useBrowserPeekStore.setState({ openWorkspaceId: null });
+    useFeatureFlags.setState({
+      enableAgentChat: false,
+      enableLazyWorkspaceCreation: false,
+    });
   });
 });
 
@@ -192,5 +213,75 @@ describe("terminal pane header cwd hint", () => {
     expect(screen.getByText("Claude Code")).toBeInTheDocument();
     expect(container.querySelector("svg, img")).not.toBeNull();
     expect(hint()).toHaveTextContent("src");
+  });
+});
+
+describe("terminal pane header background browser", () => {
+  const liveSession: AgentBrowserSession = {
+    session_id: "browser-session-1",
+    workspace_id: "ws-1",
+    cli_session_name: "ws-browser",
+    stream_url: "ws://localhost:9223",
+    current_url: "https://example.com",
+    is_active: true,
+    pane_id: null,
+    browser_id: null,
+    user_dismissed: false,
+  };
+
+  it("surfaces a live detached browser in the active terminal header and opens the peek", async () => {
+    act(() => {
+      useFeatureFlags.setState({ enableAgentChat: true });
+    });
+    mount("Terminal", [liveSession]);
+
+    const button = screen.getByRole("button", {
+      name: /Browser running in background/,
+    });
+    const closePane = screen.getByRole("button", { name: "Close pane" });
+    expect(button).toBeInTheDocument();
+    expect(button.previousElementSibling).toContainElement(closePane);
+    expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
+
+    await userEvent.click(button);
+    expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(true);
+  });
+
+  it("does not show the header control after the browser is attached to a pane", () => {
+    act(() => {
+      useFeatureFlags.setState({ enableAgentChat: true });
+    });
+    mount("Terminal", [
+      { ...liveSession, pane_id: "browser-pane-1", browser_id: "browser-1" },
+    ]);
+
+    expect(
+      screen.queryByRole("button", {
+        name: /Browser running in background/,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show the header control when GUI chrome is disabled", () => {
+    mount("Terminal", [liveSession]);
+
+    expect(
+      screen.queryByRole("button", {
+        name: /Browser running in background/,
+      }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not show the header control on an inactive terminal", () => {
+    act(() => {
+      useFeatureFlags.setState({ enableAgentChat: true });
+    });
+    mount("Terminal", [liveSession], "another-pane");
+
+    expect(
+      screen.queryByRole("button", {
+        name: /Browser running in background/,
+      }),
+    ).not.toBeInTheDocument();
   });
 });

@@ -28,13 +28,12 @@ import type { PullRequestInfo } from "@/tauri/types";
 
 /**
  * Context Row status cluster (design: `.design-import/Context Row.dc.html`)
- * — the passive git/PR status that used to live in the full-width
- * `WorkspaceContextBar`, relocated to sit RIGHT of the composer's scope
- * row once an Agent Chat pane owns the surface (see
+ * — the passive git/PR status from the retired full-width workspace
+ * context bar, relocated to sit RIGHT of the composer's scope row (see
  * `docs/features/agent-chat.md` "Context Row"). Renders:
  *
  *  - the GUI-mode background-browser indicator (the same sky-tinted
- *    "Browser" pill the bar shows for terminal panes — shared
+ *    "Browser" pill shown compactly in terminal headers — shared
  *    `BackgroundBrowserIndicator`) when the workspace has a live,
  *    pane-less agent browser session; click opens the peek overlay,
  *  - a behind-count chip (↓N, warning tone) when the branch trails
@@ -53,7 +52,7 @@ import type { PullRequestInfo } from "@/tauri/types";
  * renders from inside an `AgentChatPane`, and `PaneContainer` only
  * ever mounts panes for the currently active workspace — so
  * `useActiveWorkspace()` always resolves to the pane's own workspace.
- * (That mount context also makes the bar's `enableAgentChat &&
+ * (That mount context also makes the `enableAgentChat &&
  * workspace_type !== "open_flow"` browser-indicator gate implicit
  * here: a disabled flag renders a placeholder instead of the pane, and
  * OpenFlow workspaces never route through `PaneContainer`.)
@@ -79,8 +78,8 @@ export function WorkspaceStatusCluster() {
   const [prInfo, setPrInfo] = useState<PullRequestInfo | null>(null);
   const [pulling, setPulling] = useState(false);
   // Explicit "Initialize Git" affordance for non-git project folders —
-  // this cluster replaces the context bar while a chat pane is active,
-  // so it must carry the same opt-in nudge (never auto-`git init`).
+  // This is the chat surface's home for the opt-in nudge (never
+  // auto-`git init`).
   const { initialize, initializing } = useInitializeGit(workspace ?? null);
 
   const cwd = workspace ? (workspace.worktree_path ?? workspace.cwd) : null;

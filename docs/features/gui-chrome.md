@@ -141,7 +141,7 @@ titlebar tab share one implementation (see "Important Touch Points").
   chat draft renders the GUI-styled `h-10` draft variant (static pill +
   draft launcher), but `useGuiChrome()` itself still resolves `false` during
   a draft — workspace-scoped GUI surfaces (titlebar tabs, background-browser
-  chip, context-bar indicator, right-cluster controls) stay off because the
+  chip, terminal-header indicator, right-cluster controls) stay off because the
   backend's active workspace is not what's on screen.
 - **OpenFlow workspaces are untouched** — they keep their dedicated chrome.
 - **A sole-root chat pane loses its per-pane split/close buttons** (the

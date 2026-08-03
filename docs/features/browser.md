@@ -114,11 +114,13 @@ already in hand:
   opened in background" + `LIVE` badge while active, the current URL
   (`agent_browser_sessions[].current_url`, already tracked — no new field
   needed), and a "View" affordance. Click opens the peek overlay.
-- **Context-bar indicator** (`src/components/layout/workspace-context-bar.tsx`)
-  — a sky-tinted pill with a blinking amber dot in the right-aligned
-  cluster, shown while the active workspace has a live background session.
-  The bar's "nothing to report" early-return now also checks this, so the
-  bar renders for the indicator alone even with no git/PR/issue. See
+- **Terminal-header indicator**
+  (`src/components/browser/background-browser-indicator.tsx`, mounted by
+  `PaneNode.tsx`) — the active terminal shows a compact sky-tinted Browser
+  control with a blinking amber dot while its workspace has a live detached
+  session. Click opens the same peek overlay. This replaced the full-width
+  workspace context bar, so browser activity stays discoverable without
+  reserving 42px below every terminal. See
   `docs/features/workspace-context-bar.md`.
 - **Peek overlay** (`src/components/browser/BrowserPeekOverlay.tsx`) — a
   440×300 floating panel, absolutely positioned top-right inside the
@@ -328,6 +330,7 @@ session are never swept, only workspace-scoped ones.
 - `src/components/browser/stream-protocol.ts` — pure helpers for the stream-input protocol (button mapping, click-count chaining, coordinate mapping, cursor sanitization) and the daemon HTTP endpoints (`/api/status` liveness probe, `/api/command` evals; page scripts minified for the single-segment HTTP constraint). Unit-tested in `stream-protocol.test.ts`
 - `src/components/browser/InspectorPanel.tsx` — browser inspector/DevTools panel
 - `src/components/browser/BrowserPeekOverlay.tsx` — GUI-mode background-browser floating peek (see "Background browser in GUI mode" above)
+- `src/components/browser/background-browser-indicator.tsx` — shared detached-session lookup plus Agent Chat and terminal-header controls
 - `src/components/chat/BackgroundBrowserChip.tsx` — the inline conversation chip for a background session
 - `src/hooks/use-gui-chrome.ts` — the shared `useGuiChrome()` gate the chip/indicator/peek key off
 - `src/stores/browser-peek-store.ts` — peek open/closed state (single `openWorkspaceId`; cleared on workspace switch)
