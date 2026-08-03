@@ -22,10 +22,7 @@ pub struct ScanPaths {
 ///
 /// `home` lets tests inject a fake home; production callers pass `None`
 /// and we use `dirs::home_dir()`.
-pub fn enumerate_scan_paths(
-    project_root: Option<&Path>,
-    include_plugins: bool,
-) -> ScanPaths {
+pub fn enumerate_scan_paths(project_root: Option<&Path>, include_plugins: bool) -> ScanPaths {
     enumerate_scan_paths_with_home(project_root, include_plugins, dirs::home_dir().as_deref())
 }
 
@@ -286,12 +283,8 @@ mod tests {
             .map(|(p, _)| p.clone())
             .collect();
         assert_eq!(codex_paths.len(), 2);
-        assert!(codex_paths
-            .iter()
-            .any(|p| p.ends_with(".codex/skills")));
-        assert!(codex_paths
-            .iter()
-            .any(|p| p.ends_with(".agents/skills")));
+        assert!(codex_paths.iter().any(|p| p.ends_with(".codex/skills")));
+        assert!(codex_paths.iter().any(|p| p.ends_with(".agents/skills")));
     }
 
     #[test]
@@ -301,7 +294,8 @@ mod tests {
         assert!(no_project.project_paths.is_empty());
 
         let project_dir = TempDir::new().unwrap();
-        let with_project = enumerate_scan_paths_with_home(Some(project_dir.path()), false, Some(home.path()));
+        let with_project =
+            enumerate_scan_paths_with_home(Some(project_dir.path()), false, Some(home.path()));
         assert_eq!(with_project.project_paths.len(), 5);
     }
 
@@ -450,8 +444,7 @@ mod tests {
         fs::create_dir_all(project.path().join(".claude")).unwrap();
         symlink(&user_skills, project.path().join(".claude").join("skills")).unwrap();
 
-        let paths =
-            enumerate_scan_paths_with_home(Some(project.path()), false, Some(home.path()));
+        let paths = enumerate_scan_paths_with_home(Some(project.path()), false, Some(home.path()));
         // User scope claimed it first; the project alias is dropped.
         assert!(paths
             .project_paths
@@ -476,9 +469,7 @@ mod tests {
         let user_skills = home.path().join(".claude").join("skills");
         fs::create_dir_all(&user_skills).unwrap();
 
-        let plugin_parent = home
-            .path()
-            .join(".claude/plugins/external_plugins/aliased");
+        let plugin_parent = home.path().join(".claude/plugins/external_plugins/aliased");
         fs::create_dir_all(&plugin_parent).unwrap();
         symlink(&user_skills, plugin_parent.join("skills")).unwrap();
 

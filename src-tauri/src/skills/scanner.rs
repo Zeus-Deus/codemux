@@ -7,9 +7,10 @@ use std::path::Path;
 
 use super::{
     compatibility::classify_compatibility,
-    parser::{extract_name_description, parse_skill_file},
+    parser::{extract_name_description, parse_skill_file, validate_skill_name},
     paths::is_codex_system_dir,
-    skill_id_for_path, Skill, SkillProvider, SkillScope,
+    skill_id_for_path, Skill, SkillAvailability, SkillInvocationKind, SkillProjection,
+    SkillProvenance, SkillProvider, SkillScope,
 };
 
 pub fn scan_directory(
@@ -54,14 +55,17 @@ pub fn scan_directory(
             continue;
         }
 
-        match build_skill(&skill_md, &path, &dir_name, provider, scope, plugin_slug.clone()) {
+        match build_skill(
+            &skill_md,
+            &path,
+            &dir_name,
+            provider,
+            scope,
+            plugin_slug.clone(),
+        ) {
             Ok(skill) => skills.push(skill),
             Err(err) => {
-                eprintln!(
-                    "skills: skipped {} — {}",
-                    skill_md.display(),
-                    err
-                );
+                eprintln!("skills: skipped {} — {}", skill_md.display(), err);
             }
         }
     }
@@ -113,28 +117,57 @@ fn build_skill(
         found
     };
 
-    let content = std::fs::read_to_string(&canonical_md)
-        .map_err(|e| format!("read SKILL.md failed: {e}"))?;
+    let content =
+        std::fs::read_to_string(&canonical_md).map_err(|e| format!("read SKILL.md failed: {e}"))?;
 
     let parsed = parse_skill_file(&content)?;
 
     let (name, description) = extract_name_description(&parsed.frontmatter, dir_name);
+    validate_skill_name(&name)?;
 
     let bundled_files = enumerate_bundled_files(&canonical_dir);
 
-    let (compatibility, signals) = classify_compatibility(
-        &parsed.body,
-        &parsed.frontmatter,
-        provider,
-        // Stage 1: the chat GUI only wires Claude as the active provider
-        // for now. Stage 5 will plumb the real current_provider through.
+    let projections = [
         SkillProvider::Claude,
-    );
+        SkillProvider::Codex,
+        SkillProvider::Opencode,
+    ]
+    .into_iter()
+    .map(|target| {
+        let (compatibility, reasons) =
+            classify_compatibility(&parsed.body, &parsed.frontmatter, provider, target);
+        let native = provider == target && provider != SkillProvider::Codemux;
+        SkillProjection {
+            target_provider: target,
+            availability: if native {
+                SkillAvailability::Native
+            } else {
+                SkillAvailability::ExplicitPortable
+            },
+            compatibility,
+            reasons,
+            invocation: if target == SkillProvider::Codex {
+                SkillInvocationKind::CodexSkillItem
+            } else if native && target == SkillProvider::Claude {
+                SkillInvocationKind::NativeCommand
+            } else {
+                SkillInvocationKind::PromptPrefix
+            },
+        }
+    })
+    .collect::<Vec<_>>();
+    let claude_projection = projections
+        .iter()
+        .find(|projection| projection.target_provider == SkillProvider::Claude)
+        .expect("Claude projection is always computed");
+    let compatibility = claude_projection.compatibility;
+    let signals = claude_projection.reasons.clone();
 
     let file_path = canonical_md.display().to_string();
     let id = skill_id_for_path(&file_path);
 
     Ok(Skill {
+        preference_id: id.clone(),
         id,
         name,
         description,
@@ -149,6 +182,10 @@ fn build_skill(
         compatibility_signals: signals,
         symlinked,
         plugin_slug,
+        provenance: SkillProvenance::Filesystem,
+        readable: true,
+        source_enabled: true,
+        projections,
     })
 }
 
@@ -239,7 +276,12 @@ mod tests {
         let scan_root = TempDir::new().unwrap();
         symlink(&real_dir, scan_root.path().join("omarchy")).unwrap();
 
-        let skills = scan_directory(scan_root.path(), SkillProvider::Claude, SkillScope::User, None);
+        let skills = scan_directory(
+            scan_root.path(),
+            SkillProvider::Claude,
+            SkillScope::User,
+            None,
+        );
         assert_eq!(skills.len(), 1);
         let s = &skills[0];
         assert!(s.symlinked, "expected symlinked=true for symlink target");
@@ -253,7 +295,11 @@ mod tests {
     #[test]
     fn missing_frontmatter_falls_back_to_dir_name() {
         let tmp = TempDir::new().unwrap();
-        write_skill(tmp.path(), "fallback-name", "Just a body, no frontmatter.\n");
+        write_skill(
+            tmp.path(),
+            "fallback-name",
+            "Just a body, no frontmatter.\n",
+        );
         let skills = scan_directory(tmp.path(), SkillProvider::Claude, SkillScope::User, None);
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "fallback-name");

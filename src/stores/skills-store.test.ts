@@ -24,6 +24,12 @@ function resetStore() {
     loadedAt: 0,
     includePlugins: true,
     disabledIds: [],
+    adapterErrors: [],
+    inventoryCache: {},
+    activeContextKey: null,
+    inFlightContexts: {},
+    nextRequestId: 1,
+    cacheGeneration: 0,
   });
   // Persist middleware writes to localStorage; clear so a leftover
   // entry from another test doesn't bleed into the next.
@@ -86,15 +92,26 @@ describe("skills-store", () => {
     expect(s.loaded).toBe(true);
     expect(s.loading).toBe(false);
     expect(s.loadedAt).toBeGreaterThanOrEqual(before);
-    expect(listSkillsMock).toHaveBeenCalledWith(null, true);
+    expect(listSkillsMock).toHaveBeenCalledWith(null, true, false);
   });
 
-  it("subsequent loadSkills within TTL is a no-op", async () => {
-    listSkillsMock.mockResolvedValue([makeSkill("a")]);
+  it("caches inventories per project root", async () => {
+    listSkillsMock
+      .mockResolvedValueOnce([makeSkill("home")])
+      .mockResolvedValueOnce([makeSkill("project")]);
     await useSkillsStore.getState().loadSkills(null);
     await useSkillsStore.getState().loadSkills(null);
     await useSkillsStore.getState().loadSkills("/some/project");
-    expect(listSkillsMock).toHaveBeenCalledTimes(1);
+    expect(listSkillsMock).toHaveBeenCalledTimes(2);
+    expect(useSkillsStore.getState().skills.map((skill) => skill.name)).toEqual([
+      "project",
+    ]);
+
+    await useSkillsStore.getState().loadSkills(null);
+    expect(listSkillsMock).toHaveBeenCalledTimes(2);
+    expect(useSkillsStore.getState().skills.map((skill) => skill.name)).toEqual([
+      "home",
+    ]);
   });
 
   it("force=true bypasses TTL", async () => {
@@ -139,6 +156,36 @@ describe("skills-store", () => {
     expect(useSkillsStore.getState().skills.map((s) => s.name)).toEqual(["a"]);
   });
 
+  it("does not let a slower previous project overwrite the active project", async () => {
+    let resolveFirst: (skills: Skill[]) => void = () => {};
+    listSkillsMock
+      .mockReturnValueOnce(
+        new Promise<Skill[]>((resolve) => {
+          resolveFirst = resolve;
+        }),
+      )
+      .mockResolvedValueOnce([makeSkill("project-b")]);
+
+    const first = useSkillsStore.getState().loadSkills("/project-a");
+    const second = useSkillsStore.getState().loadSkills("/project-b");
+    await second;
+    expect(useSkillsStore.getState().skills.map((skill) => skill.name)).toEqual([
+      "project-b",
+    ]);
+
+    resolveFirst([makeSkill("project-a")]);
+    await first;
+    expect(useSkillsStore.getState().skills.map((skill) => skill.name)).toEqual([
+      "project-b",
+    ]);
+
+    await useSkillsStore.getState().loadSkills("/project-a");
+    expect(listSkillsMock).toHaveBeenCalledTimes(2);
+    expect(useSkillsStore.getState().skills.map((skill) => skill.name)).toEqual([
+      "project-a",
+    ]);
+  });
+
   it("setIncludePlugins(false) invalidates the cache", async () => {
     listSkillsMock.mockResolvedValue([makeSkill("a")]);
     await useSkillsStore.getState().loadSkills(null);
@@ -151,7 +198,7 @@ describe("skills-store", () => {
 
     listSkillsMock.mockResolvedValue([makeSkill("b")]);
     await useSkillsStore.getState().loadSkills(null);
-    expect(listSkillsMock).toHaveBeenLastCalledWith(null, false);
+    expect(listSkillsMock).toHaveBeenLastCalledWith(null, false, false);
   });
 
   it("setIncludePlugins to the same value is a no-op", async () => {
@@ -255,6 +302,14 @@ describe("skills-store · disable toggle (Stage 5)", () => {
     });
     const active = selectActiveSkills(useSkillsStore.getState());
     expect(active.map((s) => s.name)).toEqual(["b"]);
+  });
+
+  it("selectActiveSkills uses worktree-stable preference ids", () => {
+    useSkillsStore.setState({
+      skills: [{ ...makeSkill("foo"), id: "runtime-worktree-id", preferenceId: "repo-skill-id" }],
+      disabledIds: ["repo-skill-id"],
+    });
+    expect(selectActiveSkills(useSkillsStore.getState())).toEqual([]);
   });
 
   it("disabled state persists to localStorage and rehydrates on a fresh import", async () => {

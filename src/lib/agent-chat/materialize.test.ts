@@ -370,6 +370,8 @@ describe("materializeAndSend", () => {
       expect(input).toEqual({
         thread_id: "tid-42",
         text: "first message",
+        display_text: "first message",
+        skill_ids: [],
         // Stage 6 — images default to empty array when no
         // attachments are passed to materializeAndSend.
         images: [],
@@ -756,6 +758,43 @@ describe("materializeAndSend", () => {
       );
       const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
       expect(startInput.cwd).toBe("/projects/foo-ai-named-branch");
+    });
+
+    it("refreshes path-derived skill ids before starting the worktree session", async () => {
+      seedCreatedWorktreeWorkspace("/projects/foo-review");
+      const actions = makeActions();
+      actions.refreshSkillSelection = vi.fn().mockResolvedValue({
+        skillIds: ["worktree-skill-id"],
+        text: "review this",
+      });
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "review",
+        baseBranch: "main",
+      });
+
+      const result = await materializeAndSend(
+        draft,
+        "/review review this",
+        "/projects/foo",
+        actions,
+        { skillIds: ["source-skill-id"], text: "review this" },
+        null,
+        [],
+        [],
+        "/projects/foo",
+      );
+
+      expect(result.success).toBe(true);
+      expect(actions.refreshSkillSelection).toHaveBeenCalledWith(
+        { skillIds: ["source-skill-id"], text: "review this" },
+        "/projects/foo-review",
+      );
+      expect(agentChatSendTurn).toHaveBeenCalledWith(
+        "claude",
+        expect.objectContaining({ skill_ids: ["worktree-skill-id"] }),
+      );
     });
 
     it("falls back to generateRandomBranchName when generateBranchName throws", async () => {

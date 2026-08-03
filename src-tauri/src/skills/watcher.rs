@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
 use super::paths::enumerate_scan_paths;
 
@@ -61,7 +61,10 @@ impl SkillsWatcherState {
         project_root: Option<PathBuf>,
         include_plugins: bool,
     ) -> Result<usize, String> {
-        let mut inner = self.inner.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| format!("lock poisoned: {e}"))?;
         // Drop the old watcher first; notify watchers stop watching on Drop.
         inner.watcher = None;
 
@@ -87,6 +90,13 @@ impl SkillsWatcherState {
                 }
             }
             *last = Some(now);
+            let app_for_invalidation = app_for_closure.clone();
+            tauri::async_runtime::spawn(async move {
+                app_for_invalidation
+                    .state::<crate::skills::inventory::SkillInventoryService>()
+                    .invalidate()
+                    .await;
+            });
             let _ = app_for_closure.emit(SKILLS_CHANGED_EVENT, ());
         })
         .map_err(|e| format!("create watcher: {e}"))?;
@@ -101,10 +111,7 @@ impl SkillsWatcherState {
             match watcher.watch(&path, RecursiveMode::Recursive) {
                 Ok(()) => watched += 1,
                 Err(e) => {
-                    eprintln!(
-                        "skills-watcher: failed to watch {} — {e}",
-                        path.display()
-                    );
+                    eprintln!("skills-watcher: failed to watch {} — {e}", path.display());
                 }
             }
         }
@@ -120,7 +127,10 @@ impl SkillsWatcherState {
 
     /// Drop the watcher. Safe to call when not started.
     pub fn stop(&self) -> Result<(), String> {
-        let mut inner = self.inner.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| format!("lock poisoned: {e}"))?;
         inner.watcher = None;
         Ok(())
     }

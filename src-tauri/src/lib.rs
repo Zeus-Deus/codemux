@@ -358,6 +358,7 @@ fn build_core_app<R: tauri::Runtime>(
         // `state()` call panics with "state() called before manage()".
         .manage(mcp::registry::McpRegistry::default())
         .manage(skills::watcher::SkillsWatcherState::new())
+        .manage(skills::inventory::SkillInventoryService::new())
         .manage(database::init_database().unwrap_or_else(|e| {
             eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
             database::DatabaseStore::new_in_memory()

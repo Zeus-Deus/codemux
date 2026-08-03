@@ -409,7 +409,10 @@ impl ClaudeSession {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
                 let queued_id = mint_queued_id();
-                let text = input.text.clone();
+                let text = input
+                    .display_text
+                    .clone()
+                    .unwrap_or_else(|| input.text.clone());
                 let client_nonce = input.client_nonce.clone();
                 state.queued_turns.push_back(QueuedTurn {
                     queued_id: queued_id.clone(),
@@ -462,7 +465,11 @@ impl ClaudeSession {
                 }
             };
             let Some(queued) = next else { return };
-            let text = queued.input.text.clone();
+            let text = queued
+                .input
+                .display_text
+                .clone()
+                .unwrap_or_else(|| queued.input.text.clone());
             match self
                 .do_send(
                     queued.input.text,
@@ -1545,6 +1552,8 @@ mod tests {
                 effort_override: None,
                 permission_mode_override: None,
                 client_nonce: None,
+                display_text: None,
+                skill_invocations: vec![],
             },
         }
     }

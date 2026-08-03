@@ -139,9 +139,16 @@ pub struct SendTurnInput {
     pub thread_id: ThreadId,
     /// Plain-text content of the user message.
     pub text: String,
+    /// Unexpanded text used for user-visible queue/persistence events.
+    #[serde(default)]
+    pub display_text: Option<String>,
     /// Inline image attachments, in order.
     #[serde(default)]
     pub images: Vec<ImageInput>,
+    /// Backend-resolved skill selections. The command layer reconstructs
+    /// these from stable ids; callers cannot supply arbitrary paths/bodies.
+    #[serde(default)]
+    pub skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
     /// Optional per-turn model override. Not all providers support this.
     pub model_override: Option<String>,
     /// Optional per-turn effort override. Used by Codex which applies

@@ -21,6 +21,7 @@ import { basename } from "@/lib/path";
 import { cn } from "@/lib/utils";
 import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
+import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
 import {
   buildModeCommands,
   buildModelCommand,
@@ -55,6 +56,7 @@ import {
   listPullRequests,
   MCP_CODEMUX_SELF_ID,
   pasteClipboardImage,
+  startSkillsWatcher,
   type McpServerConfig,
 } from "@/tauri/commands";
 import { Switch } from "@/components/ui/switch";
@@ -482,13 +484,16 @@ export function Composer({
   // Lazy-load on first popup open. Picking a skill expands the typed
   // `/<query>` to the full `/<skill-name>` in the textarea — the slash
   // command stays as literal text, syntax-highlighted by the mirror
-  // overlay below. At send time the parent parses the text against the
-  // skills registry and injects matched skill bodies as a per-turn
-  // prefix (no separate chip / staging state needed).
+  // overlay below. At send time the parent parses the text into stable
+  // skill ids; the backend revalidates and invokes them for the provider.
   // `selectActiveSkills` already filters out disabled ids — Composer
   // never sees disabled skills, so highlight + picker + send-time
   // injection all stay consistent.
-  const skills = useSkillsStore(selectActiveSkills);
+  const discoveredSkills = useSkillsStore(selectActiveSkills);
+  const skills = useMemo(
+    () => skillsForProvider(discoveredSkills, provider),
+    [discoveredSkills, provider],
+  );
   const loadSkills = useSkillsStore((s) => s.loadSkills);
   const skillsLoading = useSkillsStore((s) => s.loading);
   const skillsLoaded = useSkillsStore((s) => s.loaded);
@@ -649,6 +654,9 @@ export function Composer({
   useEffect(() => {
     if (!slashOpen) return;
     void loadSkills(cwd ?? null);
+    void startSkillsWatcher(cwd ?? null, useSkillsStore.getState().includePlugins).catch(
+      (error) => console.warn("[skills] watcher failed to start:", error),
+    );
     // Provider command discovery rides the same first-open trigger.
     // The store's lifetime cache + backend per-cwd cache make re-fires
     // cheap; a null cwd (Home draft, no project anchored) is a no-op

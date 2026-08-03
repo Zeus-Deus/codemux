@@ -1,6 +1,6 @@
 import { materializeWithPreset } from "./materialize";
 import type { MaterializeResult } from "./materialize";
-import { resolveSkillBodies } from "./skill-tokens";
+import { resolveSkillSelection, skillsForProvider } from "./skill-tokens";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useChatDraftStore, type DraftId } from "@/stores/chat-draft-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
@@ -33,9 +33,12 @@ export async function launchDraftWithPreset(
   if (!draft) return { success: false, error: "Draft no longer exists" };
   const chat = useAgentChatStore.getState();
 
-  const skillBodies = resolveSkillBodies(
+  const skillSelection = resolveSkillSelection(
     draft.inputDraft,
-    selectActiveSkills(useSkillsStore.getState()),
+    skillsForProvider(
+      selectActiveSkills(useSkillsStore.getState()),
+      draft.provider,
+    ),
   );
 
   const result = await materializeWithPreset(
@@ -58,7 +61,7 @@ export async function launchDraftWithPreset(
       setFastMode: chat.setFastMode,
       setMode: chat.setMode,
     },
-    skillBodies,
+    skillSelection,
   );
 
   if (result.success) {

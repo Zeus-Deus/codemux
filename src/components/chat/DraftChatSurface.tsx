@@ -33,7 +33,11 @@ import type {
   UserMessageImage,
   UserMessageItem,
 } from "@/lib/agent-chat/types";
-import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
+import {
+  resolveSkillSelection,
+  skillsForProvider,
+} from "@/lib/agent-chat/skill-tokens";
+import { refreshSkillSelectionForCwd } from "@/lib/agent-chat/skill-selection-refresh";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
@@ -338,10 +342,11 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     // Resolve any `/skill-name` tokens in the draft text against the
     // skills registry. Same parser the live pane uses; bodies are
     // injected as a per-turn prefix by `materializeAndSend`.
-    const skillBodies = resolveSkillBodies(
-      text,
+    const sourceSkills = skillsForProvider(
       selectActiveSkills(useSkillsStore.getState()),
+      currentDraft.provider,
     );
+    const skillSelection = resolveSkillSelection(text, sourceSkills);
     // Step 8 Stage 2 — snapshot staged attachments at submit time
     // (live store read avoids stale closure if a chip resolved
     // between the last render and Enter). Stage 2.1: filter to
@@ -427,8 +432,16 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
           setContextWindow: chat.setContextWindow,
           setFastMode: chat.setFastMode,
           setMode: chat.setMode,
+          refreshSkillSelection: (selection, effectiveCwd) =>
+            refreshSkillSelectionForCwd(
+              selection,
+              sourceSkills,
+              cwdForSession,
+              effectiveCwd,
+              finalDraft.provider,
+            ),
         },
-        skillBodies,
+        skillSelection,
         attachmentBlock,
         imageRefs,
         imageDisplaySources,

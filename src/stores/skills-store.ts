@@ -22,6 +22,7 @@ interface SkillsState {
   loaded: boolean;
   loading: boolean;
   error: string | null;
+  adapterErrors: Array<{ provider: Skill["provider"]; message: string }>;
   /** epoch-ms of the last successful load. Compared against {@link TTL_MS}. */
   loadedAt: number;
   includePlugins: boolean;
@@ -33,10 +34,21 @@ interface SkillsState {
    */
   disabledIds: string[];
 
-  loadSkills: (
-    projectRoot: string | null,
-    force?: boolean,
-  ) => Promise<void>;
+  /** In-memory inventories are isolated by cwd and discovery options. */
+  inventoryCache: Record<
+    string,
+    {
+      skills: Skill[];
+      adapterErrors: Array<{ provider: Skill["provider"]; message: string }>;
+      loadedAt: number;
+    }
+  >;
+  activeContextKey: string | null;
+  inFlightContexts: Record<string, number>;
+  nextRequestId: number;
+  cacheGeneration: number;
+
+  loadSkills: (projectRoot: string | null, force?: boolean) => Promise<void>;
   setIncludePlugins: (value: boolean) => void;
   /** Toggle a skill's disabled state. Idempotent — calling on an
    *  already-disabled id with the opposite value flips it back. */
@@ -56,38 +68,149 @@ export const useSkillsStore = create<SkillsState>()(
       loaded: false,
       loading: false,
       error: null,
+      adapterErrors: [],
       loadedAt: 0,
       includePlugins: true,
       disabledIds: [],
+      inventoryCache: {},
+      activeContextKey: null,
+      inFlightContexts: {},
+      nextRequestId: 1,
+      cacheGeneration: 0,
 
       loadSkills: async (projectRoot, force = false) => {
         const state = get();
         const now = Date.now();
-        const fresh = state.loaded && now - state.loadedAt < TTL_MS;
+        const contextKey = JSON.stringify([
+          projectRoot,
+          state.includePlugins,
+        ]);
+        const cached = state.inventoryCache[contextKey];
+        const fresh = cached && now - cached.loadedAt < TTL_MS;
 
-        if (state.loading) return;
-        if (fresh && !force) return;
-
-        set({ loading: true, error: null });
-        try {
-          const skills = await listSkills(projectRoot, get().includePlugins);
+        if (fresh && !force) {
           set({
-            skills,
+            skills: cached.skills,
+            adapterErrors: cached.adapterErrors,
             loaded: true,
-            loadedAt: Date.now(),
             loading: false,
+            error: null,
+            loadedAt: cached.loadedAt,
+            activeContextKey: contextKey,
+          });
+          return;
+        }
+        if (state.inFlightContexts[contextKey] !== undefined) {
+          const sameVisibleContext = state.activeContextKey === contextKey;
+          set({
+            activeContextKey: contextKey,
+            skills: cached?.skills ?? (sameVisibleContext ? state.skills : []),
+            adapterErrors:
+              cached?.adapterErrors ??
+              (sameVisibleContext ? state.adapterErrors : []),
+            loaded: Boolean(cached),
+            loadedAt: cached?.loadedAt ?? 0,
+            loading: true,
+            error: null,
+          });
+          return;
+        }
+
+        const requestId = state.nextRequestId;
+        const generation = state.cacheGeneration;
+        const sameVisibleContext = state.activeContextKey === contextKey;
+        set({
+          activeContextKey: contextKey,
+          skills: cached?.skills ?? (sameVisibleContext ? state.skills : []),
+          adapterErrors:
+            cached?.adapterErrors ??
+            (sameVisibleContext ? state.adapterErrors : []),
+          loaded: Boolean(cached),
+          loadedAt: cached?.loadedAt ?? 0,
+          loading: true,
+          error: null,
+          inFlightContexts: {
+            ...state.inFlightContexts,
+            [contextKey]: requestId,
+          },
+          nextRequestId: requestId + 1,
+        });
+        try {
+          const response = await listSkills(
+            projectRoot,
+            get().includePlugins,
+            force,
+          );
+          const inventory = Array.isArray(response)
+            ? { skills: response as Skill[], errors: [] }
+            : response;
+          const loadedAt = Date.now();
+          set((current) => {
+            if (
+              current.cacheGeneration !== generation ||
+              current.inFlightContexts[contextKey] !== requestId
+            ) {
+              return {};
+            }
+            const inFlightContexts = { ...current.inFlightContexts };
+            delete inFlightContexts[contextKey];
+            const inventoryCache = {
+              ...current.inventoryCache,
+              [contextKey]: {
+                skills: inventory.skills,
+                adapterErrors: inventory.errors,
+                loadedAt,
+              },
+            };
+            if (current.activeContextKey !== contextKey) {
+              return { inventoryCache, inFlightContexts };
+            }
+            return {
+              inventoryCache,
+              inFlightContexts,
+              skills: inventory.skills,
+              adapterErrors: inventory.errors,
+              loaded: true,
+              loadedAt,
+              loading: false,
+            };
           });
         } catch (err) {
-          set({
-            loading: false,
-            error: err instanceof Error ? err.message : String(err),
+          set((current) => {
+            if (
+              current.cacheGeneration !== generation ||
+              current.inFlightContexts[contextKey] !== requestId
+            ) {
+              return {};
+            }
+            const inFlightContexts = { ...current.inFlightContexts };
+            delete inFlightContexts[contextKey];
+            if (current.activeContextKey !== contextKey) {
+              return { inFlightContexts };
+            }
+            return {
+              inFlightContexts,
+              loading: false,
+              error: err instanceof Error ? err.message : String(err),
+            };
           });
         }
       },
 
       setIncludePlugins: (value) => {
         if (get().includePlugins === value) return;
-        set({ includePlugins: value, loaded: false, loadedAt: 0 });
+        set((state) => ({
+          includePlugins: value,
+          skills: [],
+          adapterErrors: [],
+          loaded: false,
+          loading: false,
+          loadedAt: 0,
+          activeContextKey: null,
+          inventoryCache: {},
+          inFlightContexts: {},
+          cacheGeneration: state.cacheGeneration + 1,
+        }));
       },
 
       toggleSkillDisabled: (id) => {
@@ -100,7 +223,14 @@ export const useSkillsStore = create<SkillsState>()(
       },
 
       invalidate: () => {
-        set({ loaded: false, loadedAt: 0 });
+        set((state) => ({
+          loaded: false,
+          loading: false,
+          loadedAt: 0,
+          inventoryCache: {},
+          inFlightContexts: {},
+          cacheGeneration: state.cacheGeneration + 1,
+        }));
       },
     }),
     {
@@ -109,7 +239,7 @@ export const useSkillsStore = create<SkillsState>()(
       // is hydrated from disk on demand and would only get stale; the
       // loading/error/loadedAt state is per-session. Persisted shape
       // is the minimal subset the UI cares about across launches.
-      storage: createJSONStorage(() => localStorage),
+      storage: createJSONStorage(() => window.localStorage),
       partialize: (s) => ({
         includePlugins: s.includePlugins,
         disabledIds: s.disabledIds,
@@ -127,5 +257,7 @@ export const useSkillsStore = create<SkillsState>()(
  */
 export const selectActiveSkills = (s: SkillsState): Skill[] => {
   if (s.disabledIds.length === 0) return s.skills;
-  return s.skills.filter((skill) => !s.disabledIds.includes(skill.id));
+  return s.skills.filter(
+    (skill) => !s.disabledIds.includes(skill.preferenceId ?? skill.id),
+  );
 };
