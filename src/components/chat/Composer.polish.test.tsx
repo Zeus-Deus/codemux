@@ -100,6 +100,20 @@ function prAttachment(num = 42, overrides: Partial<Attachment> = {}): Attachment
 }
 
 describe("Composer Stage 7 polish", () => {
+  describe("focus treatment", () => {
+    it("keeps the border stable and uses surface elevation for focus", () => {
+      const { getByTestId } = renderControlled();
+      const wrapper = getByTestId("composer-wrapper");
+
+      expect(wrapper.className).not.toContain("focus-within:border-");
+      expect(wrapper.className).toContain("focus-within:bg-muted/60");
+      expect(wrapper.className).toContain(
+        "focus-within:shadow-[0_16px_38px_-14px]",
+      );
+      expect(wrapper.className).toContain("focus-within:shadow-black/60");
+    });
+  });
+
   describe("drag-drop visual feedback", () => {
     it("does not show the dragging state initially", () => {
       const { getByTestId } = renderControlled();
