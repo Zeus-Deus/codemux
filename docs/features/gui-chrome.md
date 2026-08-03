@@ -73,7 +73,8 @@ sidebar boundary so tabs start where the content pane starts (design:
   drives the flag-off PresetBar) and is toggled from a hover pin button on
   each launcher row. Click semantics mirror the launcher (chat = new chat
   tab; CLI = new tab, Shift-click = split via `applyPreset`).
-- **Rehomed controls** — the right-panel toggle (`FileDiff`, drives
+- **Rehomed controls** — the right-panel toggle (`PanelRight`, mirroring the
+  left sidebar's `PanelLeft` glyph, drives
   `rightPanelTabs`) and `RunButton` move from `TabBar`/`PresetBar` into the
   titlebar right cluster. The panel toggle is docked after the content-cluster
   separator, immediately beside `WindowControls`; `RunButton` stays before

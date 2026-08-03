@@ -267,6 +267,22 @@ describe("TitleBar chrome gating", () => {
     expect(queryByTestId("titlebar-favorite-builtin-chat-agent")).toBeNull();
   });
 
+  it("mirrors the left sidebar glyph for the right-panel toggle", () => {
+    state.enableAgentChat = true;
+    const { getByRole } = renderBar();
+
+    expect(
+      getByRole("button", { name: "Toggle sidebar" }).querySelector(
+        ".lucide-panel-left",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      getByRole("button", { name: "Open panel" }).querySelector(
+        ".lucide-panel-right",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("keeps the legacy bar for OpenFlow workspaces even with the Beta ON", () => {
     state.enableAgentChat = true;
     state.workspaceType = "open_flow";

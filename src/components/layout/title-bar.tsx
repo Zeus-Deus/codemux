@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   PanelLeft,
+  PanelRight,
   ChevronDown,
   ExternalLink,
-  FileDiff,
   MessageSquare,
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
@@ -266,7 +266,7 @@ function RightPanelToggle({ workspaceId }: { workspaceId: string }) {
           aria-pressed={rightPanelTab != null}
           aria-label={rightPanelTab ? "Close panel" : "Open panel"}
         >
-          <FileDiff className="h-3.5 w-3.5" />
+          <PanelRight className="h-3.5 w-3.5" />
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={4}>
