@@ -108,8 +108,12 @@ events.
   suppresses `AgentChatPaneHeader` for a **sole-root** `agent_chat` pane.
   Split panes keep their per-pane header. `DraftChatSurface` likewise
   suppresses its placeholder `DraftSurfaceHeader` band in GUI mode. The sole
-  root chat therefore reclaims the top edge; non-chat workspace surfaces and
-  onboarding reserve a local `pt-10` collision zone. The expanded sidebar
+  root chat therefore reclaims the top edge. Terminal panes retain a 28px
+  local drag/action row, but it is transparent: a sole-root terminal omits its
+  redundant title, while split children render title/CWD and actions as compact
+  pane-local islands instead of a second full-width header. Other non-chat
+  workspace surfaces and onboarding reserve a local `pt-10` collision zone.
+  The expanded sidebar
   reserves the same local clearance only above its search row, and the
   collapsed rail reserves it above its first action. On desktop, the right
   panel keeps its background full-height but gives its tabs `mt-10`, keeping

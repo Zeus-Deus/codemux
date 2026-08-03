@@ -94,7 +94,7 @@ function makeAppState(root: PaneNodeSnapshot): AppStateSnapshot {
   } as unknown as AppStateSnapshot;
 }
 
-function mount(title = "Terminal") {
+function mount(title = "Terminal", isSurfaceRoot = false) {
   const root = termPane(title);
   act(() => {
     useAppStore.setState({
@@ -103,7 +103,12 @@ function mount(title = "Terminal") {
     });
   });
   return render(
-    <PaneNode node={root} activePaneId="p1" visible={true} />,
+    <PaneNode
+      node={root}
+      activePaneId="p1"
+      visible={true}
+      isSurfaceRoot={isSurfaceRoot}
+    />,
   );
 }
 
@@ -126,6 +131,28 @@ afterEach(() => {
 });
 
 describe("terminal pane header cwd hint", () => {
+  it("does not recreate a second full-width header for a sole root terminal", () => {
+    mount("Terminal", true);
+
+    const chrome = document.querySelector("[data-terminal-pane-chrome]");
+    expect(chrome).not.toHaveClass("border-b", "bg-card", "bg-background");
+    expect(document.querySelector("[data-terminal-pane-context]")).toBeNull();
+    expect(screen.queryByText("Terminal")).not.toBeInTheDocument();
+    expect(document.querySelector("[data-terminal-pane-actions]")).not.toBeNull();
+  });
+
+  it("shows only useful cwd context in a sole root terminal", () => {
+    mount("Terminal", true);
+    act(() => {
+      useTerminalCwdStore
+        .getState()
+        .setCwd("s1", `${WS_CWD}/src-tauri`, "osc7");
+    });
+
+    expect(hint()).toHaveTextContent("src-tauri");
+    expect(screen.queryByText("Terminal")).not.toBeInTheDocument();
+  });
+
   it("shows only the title when no cwd is known yet", () => {
     mount();
     expect(screen.getByText("Terminal")).toBeInTheDocument();
@@ -148,7 +175,7 @@ describe("terminal pane header cwd hint", () => {
         .setCwd("s1", `${WS_CWD}/src-tauri`, "osc7");
     });
     expect(hint()).toHaveTextContent("src-tauri");
-    // Title survives alongside it — the pane keeps its identity.
+    // Split panes keep their local identity alongside the useful context.
     expect(screen.getByText("Terminal")).toBeInTheDocument();
   });
 
