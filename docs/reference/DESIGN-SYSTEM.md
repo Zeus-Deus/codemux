@@ -48,6 +48,10 @@ These are **not** theme colors and are left literal on purpose:
    presets can't express. Because these are non-standard variable names,
    switching/re-applying the shadcn preset never touches them:
    - `--accent-ember` — primary accent (selection, links, small accents).
+   - `--selection-background` / `--selection-foreground` — the stable DOM
+     text-selection pair. The background aliases ember; the foreground is a
+     dedicated dark ink that remains above 6:1 contrast across every palette,
+     including the transparent Agent Chat composer textarea.
    - `--accent-violet` — secondary accent (PR merged, OpenFlow).
    - `--status-open` (green), `--status-working` (amber),
      `--status-attention` (red), `--status-remote` (sky) — status tones,
@@ -82,6 +86,24 @@ overview):
 - **Comfortable** (default): `--cpad: 15px`, `--cgap: 13px`, `--rowgap: 20px`.
 - **Compact** (`[data-density="compact"]`): `--cpad: 10px`, `--cgap: 8px`,
   `--rowgap: 13px`.
+
+## Text Selection
+
+Selectable Codemux-owned DOM text inherits one document-level highlight
+contract from `:root::selection`: solid `--selection-background` with
+`--selection-foreground`. Keep the selector root-scoped rather than using a
+bare `::selection`; the CSS highlight inheritance model then provides a
+predictable app default while preserving deliberate descendant overrides.
+
+Always set the selection foreground and background together. Reusing the
+active palette's `--foreground` makes the dark themes' near-white text fail
+contrast against ember and leaves the layered Agent Chat composer's
+transparent textarea glyphs without a reliable selected-text color.
+
+This contract covers Codemux-owned DOM surfaces, including prose, links,
+inline code, inputs, and textareas. Renderer-owned selections remain separate:
+xterm.js and CodeMirror keep their own theme integrations, and pages displayed
+inside the browser pane own their document styling.
 
 ## Typography
 
