@@ -514,10 +514,17 @@ examples for visual verification.
   `agent_chat_send_turn` — reusing the
   SAME `thread_id` (keeping the attached Channel, pane snapshot, and store
   slice valid) and passing `resume_cursor: {"resume": sdk_session_id}`
-  when the row carries one (falling back to a fresh session, whose
-  transcript still hydrates from the DB, when it does not or when the
-  resume-start fails). Each thread's picker config (`model`, `effort`,
-  `context_window`, `permission_mode`, `fast_mode`) is persisted on the session row —
+  when the row carries one. Codex's adapter returns its provider-native
+  `{"threadId": ...}` cursor at session start; the command layer now persists
+  that id, and the adapter accepts the database/frontend's generic `resume`
+  wrapper before emitting the official `thread/resume { threadId }` RPC. This
+  keeps the prior Codex thread's complete model-visible history, including
+  image inputs, available when the user clicks **Continue run** after an app
+  restart; the Continue turn itself remains a plain follow-up and does not
+  duplicate the prior attachments. The adapters fall back to a fresh session,
+  whose transcript still hydrates from the DB, when no durable provider id
+  exists or when the resume-start fails. Each thread's picker config (`model`,
+  `effort`, `context_window`, `permission_mode`, `fast_mode`) is persisted on the session row —
   written at `agent_chat_start_session`, updated fire-and-forget by the
   picker handlers via `agent_chat_update_session_config`, always persisted
   by `agent_chat_set_model` / `agent_chat_set_permission_mode` (which now

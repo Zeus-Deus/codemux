@@ -303,10 +303,7 @@ impl CodexSession {
         // --- thread/start or thread/resume ----------------------------------
         let codex_thread_id = match &resume_cursor {
             Some(cursor) => {
-                let resume_id = cursor
-                    .get("threadId")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+                let resume_id = codex_thread_id_from_resume_cursor(cursor);
                 match resume_id {
                     Some(rid) => {
                         let (approval_policy, sandbox) = match codex_permission_mode_to_policy_pair(
@@ -903,6 +900,18 @@ fn is_recoverable_resume_error(err_msg: &str) -> bool {
         .any(|s| lower.contains(&s.to_lowercase()))
 }
 
+/// Extract the Codex thread id from either the provider-native cursor returned
+/// by this adapter or CodeMux's provider-neutral persisted resume shape.
+/// `ThreadResumeParams::thread_id` still serializes to the official `threadId`
+/// field at the app-server RPC boundary.
+fn codex_thread_id_from_resume_cursor(cursor: &Value) -> Option<String> {
+    cursor
+        .get("threadId")
+        .or_else(|| cursor.get("resume"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
 /// Background task: consume notifications from the child, translate
 /// each into canonical events, and broadcast.
 fn spawn_notifications_task(
@@ -1125,6 +1134,27 @@ mod tests {
         assert!(is_recoverable_resume_error("unknown thread"));
         assert!(is_recoverable_resume_error("NO SUCH THREAD"));
         assert!(!is_recoverable_resume_error("network is unreachable"));
+    }
+
+    #[test]
+    fn resume_cursor_accepts_native_and_persisted_shapes() {
+        assert_eq!(
+            codex_thread_id_from_resume_cursor(&json!({"threadId": "native-thread"})),
+            Some("native-thread".into())
+        );
+        assert_eq!(
+            codex_thread_id_from_resume_cursor(&json!({"resume": "persisted-thread"})),
+            Some("persisted-thread".into())
+        );
+    }
+
+    #[test]
+    fn resume_cursor_prefers_provider_native_thread_id() {
+        let both = json!({"threadId": "native", "resume": "persisted"});
+        assert_eq!(
+            codex_thread_id_from_resume_cursor(&both),
+            Some("native".into())
+        );
     }
 
     #[test]
