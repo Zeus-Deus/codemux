@@ -5,13 +5,12 @@ import type { PaneNodeSnapshot } from "@/tauri/types";
 
 /**
  * GUI chrome predicate (see `docs/features/gui-chrome.md`): renders for a
- * real, non-OpenFlow workspace when the Agent Chat Beta is on. A live
+ * real workspace when the Agent Chat Beta is on. A live
  * lazy-creation draft (no workspace yet) resolves `false` here — the
  * draft renders its own GUI-styled titlebar variant instead (see
  * `useDraftGuiChrome` below), and workspace-scoped GUI surfaces (the
  * background browser chip, context-bar indicator, titlebar tabs) must
- * stay off while the draft covers the workspace pane tree. OpenFlow
- * keeps its dedicated chrome untouched.
+ * stay off while the draft covers the workspace pane tree.
  *
  * Extracted from `title-bar.tsx` (the original single call site) so other
  * GUI-mode-only surfaces — the background browser chip and context-bar
@@ -23,24 +22,11 @@ export function useGuiChrome(): boolean {
   const lazyEnabled = useFeatureFlags((s) => s.enableLazyWorkspaceCreation);
   const activeDraftId = useChatDraftStore((s) => s.activeDraftId);
   const activeWorkspaceId = useActiveWorkspaceId();
-  // Primitive selector — stays stable across backend ticks so consumers
-  // don't re-render on every snapshot emit.
-  const activeWorkspaceType = useAppStore((s) => {
-    const id = s.appState?.active_workspace_id;
-    if (!id) return null;
-    return (
-      s.appState!.workspaces.find((w) => w.workspace_id === id)
-        ?.workspace_type ?? null
-    );
-  });
-
   const lazyDraftActive = lazyEnabled && activeDraftId !== null;
   return (
     enableAgentChat &&
     !lazyDraftActive &&
-    activeWorkspaceId != null &&
-    activeWorkspaceType != null &&
-    activeWorkspaceType !== "open_flow"
+    activeWorkspaceId != null
   );
 }
 

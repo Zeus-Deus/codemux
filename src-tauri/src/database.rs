@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 10;
 
 pub struct DatabaseStore {
     conn: Mutex<Connection>,
@@ -15,17 +15,6 @@ pub struct RecentProject {
     pub path: String,
     pub name: String,
     pub last_opened_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenFlowHistoryEntry {
-    pub run_id: String,
-    pub title: Option<String>,
-    pub goal: Option<String>,
-    pub status: Option<String>,
-    pub agent_count: Option<i32>,
-    pub started_at: Option<String>,
-    pub completed_at: Option<String>,
 }
 
 /// Persisted record for an agent-chat session so the history dropdown
@@ -242,19 +231,6 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             name TEXT NOT NULL,
             last_opened_at TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(user_id, path)
-        );
-
-        CREATE TABLE IF NOT EXISTS openflow_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL DEFAULT 'local',
-            run_id TEXT NOT NULL,
-            title TEXT,
-            goal TEXT,
-            status TEXT,
-            agent_count INTEGER,
-            started_at TEXT,
-            completed_at TEXT,
-            UNIQUE(run_id)
         );
 
         CREATE TABLE IF NOT EXISTS auth_tokens (
@@ -524,6 +500,10 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     // idempotent: on a fresh database the column is already present and
     // SQLite returns a "duplicate column name" error, which we swallow.
     for stmt in [
+        // The retired orchestration feature owned this table. Removing it here
+        // reclaims existing installs' stale run history; fresh databases never
+        // create it.
+        "DROP TABLE IF EXISTS openflow_history",
         "ALTER TABLE automations ADD COLUMN project_remote TEXT",
         "ALTER TABLE automation_runs ADD COLUMN branch TEXT",
         "ALTER TABLE automation_runs ADD COLUMN pr_url TEXT",
@@ -816,53 +796,6 @@ impl DatabaseStore {
         .collect()
     }
 
-    // ── OpenFlow History ──
-
-    pub fn save_openflow_run(
-        &self,
-        run_id: &str,
-        title: Option<&str>,
-        goal: Option<&str>,
-        status: Option<&str>,
-        agent_count: Option<i32>,
-        started_at: Option<&str>,
-        completed_at: Option<&str>,
-    ) -> Result<(), String> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO openflow_history (user_id, run_id, title, goal, status, agent_count, started_at, completed_at)
-             VALUES ('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             ON CONFLICT(run_id) DO UPDATE SET title = ?2, goal = ?3, status = ?4, agent_count = ?5, started_at = ?6, completed_at = ?7",
-            params![run_id, title, goal, status, agent_count, started_at, completed_at],
-        )
-        .map_err(|e| format!("Failed to save openflow run: {e}"))?;
-        Ok(())
-    }
-
-    pub fn get_openflow_history(&self, limit: u32) -> Vec<OpenFlowHistoryEntry> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(
-                "SELECT run_id, title, goal, status, agent_count, started_at, completed_at
-                 FROM openflow_history WHERE user_id = 'local'
-                 ORDER BY started_at DESC LIMIT ?1",
-            )
-            .unwrap();
-        stmt.query_map(params![limit], |row| {
-            Ok(OpenFlowHistoryEntry {
-                run_id: row.get(0)?,
-                title: row.get(1)?,
-                goal: row.get(2)?,
-                status: row.get(3)?,
-                agent_count: row.get(4)?,
-                started_at: row.get(5)?,
-                completed_at: row.get(6)?,
-            })
-        })
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect()
-    }
 }
 
 // ── Hosts (Step 2 of cloud push) ──
@@ -3366,6 +3299,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn migration_drops_retired_orchestration_history() {
+        let db = init_test_database();
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE openflow_history (id TEXT PRIMARY KEY);\n\
+             INSERT INTO openflow_history (id) VALUES ('legacy-run');",
+        )
+        .unwrap();
+
+        create_schema(&conn).unwrap();
+
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'openflow_history'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 0);
+    }
+
+    #[test]
     fn settings_crud() {
         let db = init_test_database();
 
@@ -3524,46 +3480,6 @@ mod tests {
         // Limit
         let projects = db.get_recent_projects(1);
         assert_eq!(projects.len(), 1);
-    }
-
-    #[test]
-    fn openflow_history_crud() {
-        let db = init_test_database();
-
-        assert_eq!(db.get_openflow_history(10).len(), 0);
-
-        db.save_openflow_run(
-            "run-1",
-            Some("Test Run"),
-            Some("Build a feature"),
-            Some("completed"),
-            Some(3),
-            Some("2025-01-01T00:00:00"),
-            Some("2025-01-01T01:00:00"),
-        )
-        .unwrap();
-
-        let history = db.get_openflow_history(10);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].run_id, "run-1");
-        assert_eq!(history[0].title, Some("Test Run".into()));
-        assert_eq!(history[0].agent_count, Some(3));
-
-        // Update
-        db.save_openflow_run(
-            "run-1",
-            Some("Test Run"),
-            Some("Build a feature"),
-            Some("failed"),
-            Some(3),
-            Some("2025-01-01T00:00:00"),
-            None,
-        )
-        .unwrap();
-
-        let history = db.get_openflow_history(10);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].status, Some("failed".into()));
     }
 
     #[test]
@@ -3767,54 +3683,6 @@ mod tests {
         assert_eq!(paths.len(), 20);
     }
 
-    // ── OpenFlow History ──
-
-    #[test]
-    fn openflow_multiple_runs() {
-        let db = init_test_database();
-
-        for i in 0..5 {
-            db.save_openflow_run(
-                &format!("run-{i}"),
-                Some(&format!("Run {i}")),
-                Some("Test goal"),
-                Some("completed"),
-                Some(3),
-                Some(&format!("2025-01-0{}", i + 1)),
-                None,
-            )
-            .unwrap();
-        }
-
-        let history = db.get_openflow_history(100);
-        assert_eq!(history.len(), 5);
-
-        // Most recent first (by started_at DESC)
-        assert_eq!(history[0].run_id, "run-4");
-        assert_eq!(history[4].run_id, "run-0");
-
-        // Limit
-        let limited = db.get_openflow_history(2);
-        assert_eq!(limited.len(), 2);
-    }
-
-    #[test]
-    fn openflow_nullable_fields() {
-        let db = init_test_database();
-
-        // Save with all nulls except run_id
-        db.save_openflow_run("run-null", None, None, None, None, None, None)
-            .unwrap();
-
-        let history = db.get_openflow_history(10);
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].run_id, "run-null");
-        assert_eq!(history[0].title, None);
-        assert_eq!(history[0].goal, None);
-        assert_eq!(history[0].status, None);
-        assert_eq!(history[0].agent_count, None);
-    }
-
     // ── Integration / Lifecycle ──
 
     #[test]
@@ -3832,7 +3700,6 @@ mod tests {
             db.set_setting("theme", "dark").unwrap();
             db.set_ui_state("window_width", "1920").unwrap();
             db.add_recent_project("/home/user/myapp", "myapp").unwrap();
-            db.save_openflow_run("run-x", Some("Lifecycle Test"), None, Some("running"), Some(2), None, None).unwrap();
         }
         // Connection dropped here
 
@@ -3849,10 +3716,6 @@ mod tests {
             assert_eq!(projects.len(), 1);
             assert_eq!(projects[0].name, "myapp");
 
-            let history = db.get_openflow_history(10);
-            assert_eq!(history.len(), 1);
-            assert_eq!(history[0].run_id, "run-x");
-            assert_eq!(history[0].status, Some("running".into()));
         }
     }
 
@@ -4078,7 +3941,7 @@ mod tests {
         db.set_ui_state("scrollback_buffer", &large_json).unwrap();
         assert_eq!(db.get_ui_state("scrollback_buffer"), Some(large_json.clone()));
 
-        // 50KB value (like OpenFlow comm log)
+        // 50KB value
         let huge = "x".repeat(50_000);
         db.set_setting("comm_log", &huge).unwrap();
         assert_eq!(db.get_setting("comm_log"), Some(huge));

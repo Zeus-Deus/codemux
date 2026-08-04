@@ -238,7 +238,7 @@ The only honest argument against E2E for skills specifically is the recovery-pai
 | **3. E2E with new pattern** | Greenfield E2E without reusing Vexis. Pick a different KDF/AEAD, design own derivation, build own multi-device flow, build own recovery story. | **~3-4 weeks** (15-25 days) | Medium — most uncertainty is in the multi-device + recovery design that Vexis already solved. |
 | **4. Defer Step 10** | Don't ship skills sync now. Skills stay local-only until users ask. | **0 weeks** | High — but kicks the can. |
 
-**Recommendation as a sentence:** Pick Option 2. The +1 week over Option 1 buys a stronger threat model, parity with Vexis, and a backend story that doesn't need re-architecting later. Option 3 is hard to justify when the cross-product protocol is already there. Option 4 is the right call only if the user count for sync is currently zero and the team has higher-priority work — which the current `docs/core/PLAN.md` immediate-priority list (release `v0.1.22`, OpenFlow reliability, OpenFlow-on-Windows, sound playback, memory drawer) suggests is plausible.
+**Recommendation as a sentence:** Pick Option 2. The +1 week over Option 1 buys a stronger threat model, parity with Vexis, and a backend story that doesn't need re-architecting later. Option 3 is hard to justify when the cross-product protocol is already there. Option 4 is the right call only if the user count for sync is currently zero and the team has higher-priority work.
 
 ---
 

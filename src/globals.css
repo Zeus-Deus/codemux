@@ -182,7 +182,7 @@
 :root,
 .dark {
   --accent-ember:     oklch(0.705 0.152 47);  /* sparing: selection, links, small accents */
-  --accent-violet:    oklch(0.72 0.13 290);   /* secondary accent — PR merged, openflow   */
+  --accent-violet:    oklch(0.72 0.13 290);   /* secondary accent — PR merged             */
   --status-open:      oklch(0.74 0.14 156);   /* green — open / ready / connected / +    */
   --status-working:   oklch(0.80 0.13 80);    /* amber — agent working / behind / changed */
   --status-attention: oklch(0.685 0.17 22);   /* red   — needs input / destructive / −    */

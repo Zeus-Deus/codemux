@@ -4,7 +4,6 @@ import { SidebarWorkspaceList } from "./sidebar-workspace-list";
 import { SidebarSetupBanner } from "./sidebar-setup-banner";
 import { SidebarFooterBar } from "./sidebar-footer-bar";
 import { CloneDialog } from "@/components/overlays/clone-dialog";
-import { NewRunDialog } from "@/components/openflow/new-run-dialog";
 import { NewWorkspaceDialog } from "@/components/overlays/new-workspace-dialog";
 import { useUIStore } from "@/stores/ui-store";
 
@@ -36,10 +35,6 @@ export function AppSidebar() {
         onOpenChange={setShowNewWorkspaceDialog}
       />
       <CloneDialog />
-      {/* OpenFlow's NewRunDialog used to live inside the (now removed)
-          sidebar section. Keep it mounted here so the "Start Run"
-          button inside an active OpenFlow workspace still opens it. */}
-      <NewRunDialog />
     </Sidebar>
   );
 }

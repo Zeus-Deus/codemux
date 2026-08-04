@@ -13,7 +13,6 @@ import {
   Server,
   Trash2,
   Wrench,
-  Workflow,
 } from "lucide-react";
 
 import {
@@ -422,7 +421,6 @@ function LocalRow({
           attached={isAttached}
           remote={isRemote}
           inFlight={showingInFlight}
-          openFlow={workspace.workspace_type === "open_flow"}
           workspaceStatus={workspaceStatus}
         />
         <div className="min-w-0 flex-1">
@@ -655,9 +653,7 @@ function LocalRow({
         <div className="flex items-center gap-2 pl-5 font-mono text-[11px] text-muted-foreground/60">
           {workspace.git_branch && (
             <span className="flex items-center gap-1 min-w-0">
-              {workspace.workspace_type === "open_flow" ? (
-                <Workflow className="size-3 shrink-0" aria-hidden />
-              ) : isWorktree ? (
+              {isWorktree ? (
                 <GitBranch className="size-3 shrink-0" aria-hidden />
               ) : (
                 <Laptop className="size-3 shrink-0" aria-hidden />
@@ -909,13 +905,11 @@ function StatusDot({
   attached,
   remote,
   inFlight,
-  openFlow,
   workspaceStatus,
 }: {
   attached: boolean;
   remote: boolean;
   inFlight: boolean;
-  openFlow: boolean;
   workspaceStatus: ActivePaneStatus | null;
 }) {
   if (workspaceStatus) {
@@ -932,9 +926,7 @@ function StatusDot({
       ? "Currently open in this app"
       : remote
         ? "On a remote host"
-        : openFlow
-          ? "OpenFlow workspace"
-          : "Local";
+        : "Local";
 
   return (
     <span
@@ -951,9 +943,7 @@ function StatusDot({
             ? "bg-status-open ring-[3px] ring-status-open/15"
             : remote
               ? "bg-status-remote/80 ring-[3px] ring-status-remote/15"
-              : openFlow
-                ? "bg-accent-violet/70 ring-[3px] ring-accent-violet/15"
-                : "bg-muted-foreground/40",
+              : "bg-muted-foreground/40",
       )}
     />
   );

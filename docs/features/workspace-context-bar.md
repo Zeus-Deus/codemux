@@ -47,9 +47,9 @@ Left → right:
   amber dot, shown while the active workspace has a live, pane-less
   `agent_browser_sessions` entry (an agent opened a browser and the Agent
   Chat GUI Beta kept it detached instead of splitting a pane). Click opens
-  the floating peek overlay (`BrowserPeekOverlay`). Gated on `enableAgentChat
-  && workspace.workspace_type !== "open_flow"`, mirroring `useGuiChrome()`.
-  The pill + session lookup now live in the shared
+  the floating peek overlay (`BrowserPeekOverlay`). It is gated on
+  `enableAgentChat`, matching `useGuiChrome()`. The pill + session lookup
+  lives in the shared
   `BackgroundBrowserIndicator` / `useBackgroundBrowserSession` pair
   (`src/components/browser/background-browser-indicator.tsx`), consumed
   by both this bar and the Context Row's `WorkspaceStatusCluster` —

@@ -9,7 +9,6 @@ Patterns and priorities for implementing features that make Codemux a complete A
 
 For visual and CSS standards, read the `/codemux-ui` skill.
 For project architecture and current state, read `WORKFLOW.md` and `docs/INDEX.md` first.
-For OpenFlow orchestration patterns, read `docs/features/openflow.md` and `docs/plans/openflow.md`.
 
 ## Ground Rules
 

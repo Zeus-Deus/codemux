@@ -86,7 +86,6 @@ export function WorkspaceContextBar() {
 
   const showBrowserIndicator =
     enableAgentChat &&
-    workspace.workspace_type !== "open_flow" &&
     !!backgroundBrowserSession;
 
   // Nothing to report at all (e.g. a home-directory workspace).

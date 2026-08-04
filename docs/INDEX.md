@@ -60,7 +60,6 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Worktree bootstrapping: `docs/features/worktree-setup.md`
 - Browser work: `docs/features/browser.md`, `docs/plans/browser.md`, `docs/reference/BROWSER-AGENT-COMMANDS.md` (browser stream stability fix archived at `docs/archive/browser-stream-fix.md`)
 - Background browser in Agent Chat GUI mode (agent-opened browser runs detached instead of splitting the chat — inline chip + context-bar indicator + floating `BrowserPeekOverlay` with promote-to-pane; PR #138, shipped `v0.12.0`; run-finished `LIVE` release (PR #139) + opt-in desktop-size peek viewport `agent_chat.background_browser_desktop_viewport` (PR #140), both shipped `v0.13.0`): `docs/features/browser.md` (§ Background browser in GUI mode, § Run-finished release, § Desktop-size peek viewport)
-- OpenFlow work: `docs/features/openflow.md`, `docs/plans/openflow.md`
 - MCP server (Codemux as host + as server): `docs/features/mcp-server.md`; vexis-agent integration plan (Phase 1 / 1.5 / 1.6 — all merged) at `docs/research/vexis-agent-integration.md`, with supporting research at `docs/research/codemux-control-surfaces-current.md` and `docs/research/codemux-phase-1-5-research.md`; **MCP-on-remote** (headless `codemux-remote serve` + 12-tool stdio MCP bridge — landed in `v0.6.2`, `worktree_create` added in `v0.7.5`) plan at `docs/plans/mcp-on-remote.md`; the `v0.7.5` agent-created-workspace pull/adoption fix is tracked at `docs/archive/remote-workspace-pull-fix.md`
 - File editor: `docs/features/file-editor.md`
 - Diff viewer: `docs/features/diff-viewer.md`
@@ -79,8 +78,8 @@ If the docs themselves feel stale or scattered, also read `docs/reference/DOCS_R
 - Operate a remote workspace in place — **"Open on host"** (attach-in-place: terminal/agent runs on the host with no local copy; detached pty-daemon survives app close and reattaches on reopen; overview action + `attach_only`/`remote_cwd` snapshot fields): `docs/features/remote-in-place.md`
 - Automations (scheduled host-side agent runs): `docs/features/automations.md`; roadmap at `docs/plans/automations.md`; Phase 2 (sync + remote-host) detailed plan at `docs/archive/automations-sync.md`; Superset research at `docs/research/superset-automations.md`
 - Agent hooks: `docs/features/hooks.md`
-- Execution backends / sandboxing: `docs/features/execution.md`
-- Observability (flags, metrics, safety config + native log file / `codemux logs` / `codemux doctor` + opt-in cloud-push diagnostic tracing via `CODEMUX_TRACE_CLOUD_PUSH`): `docs/features/observability.md`
+- Child-process environment hygiene: `docs/features/execution.md`
+- Observability (flags, metrics + native log file / `codemux logs` / `codemux doctor` + opt-in cloud-push diagnostic tracing via `CODEMUX_TRACE_CLOUD_PUSH`): `docs/features/observability.md`
 - Linux file-dialog backend preflight (issue #95 — `select_backend` Portal/Zenity/None decision, Codemux-driven zenity fallback with sanitized env + timeout for the portal-hangs case, cause-specific remediation toast): `docs/features/workspace-creation.md` (§ constraints), `docs/features/observability.md` (§ native log file), `docs/reference/CONTROL.md` (§ local diagnostics)
 - Port detection (incl. Docker-published container ports for open worktrees): `docs/features/ports.md`
 - Search: `docs/features/search.md`

@@ -14,7 +14,6 @@ const MAX_NOTIFICATIONS: usize = 500;
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceType {
     Standard,
-    OpenFlow,
     /// The Home singleton is being retired across the Stage A→E
     /// rework. Stage B keeps the variant intact (code paths like
     /// `get_or_create_home_workspace` still construct it). Stage E
@@ -26,6 +25,10 @@ pub enum WorkspaceType {
     /// variant-level `#[allow]` silences — so the alias work is
     /// deferred to Stage E.
     Home,
+    /// Compatibility sink for workspace kinds retired from persisted layouts.
+    /// Startup strips these workspaces before exposing state to the app.
+    #[serde(other)]
+    Removed,
 }
 
 impl Default for WorkspaceType {
@@ -1103,151 +1106,6 @@ impl AppStateStore {
 
     pub fn create_workspace(&self) -> WorkspaceId {
         self.create_workspace_at_path(current_project_root())
-    }
-
-    pub fn create_openflow_workspace(&self, title: String, _goal: String) -> WorkspaceId {
-        self.create_openflow_workspace_at_path(title, _goal, current_project_root())
-    }
-
-    pub fn create_openflow_workspace_at_path(
-        &self,
-        title: String,
-        _goal: String,
-        cwd_path: PathBuf,
-    ) -> WorkspaceId {
-        let mut snapshot = self.inner.lock().unwrap();
-        let workspace_id = WorkspaceId(next_id("workspace"));
-        let surface_id = SurfaceId(next_id("surface"));
-        let cwd = cwd_path.display().to_string();
-        let _workspace_index = snapshot.workspaces.len() + 1;
-        let pane_id = PaneId(next_id("pane"));
-
-        eprintln!(
-            "DEBUG: Creating OpenFlow workspace with title: {} at {}",
-            title, cwd
-        );
-
-        snapshot.workspaces.push(WorkspaceSnapshot {
-            workspace_id: workspace_id.clone(),
-            is_git: true,
-            title,
-            workspace_type: WorkspaceType::OpenFlow,
-            cwd,
-            git_branch: None,
-            git_ahead: 0,
-            git_behind: 0,
-            git_additions: 0,
-            git_deletions: 0,
-            git_changed_files: 0,
-            worktree_path: None,
-            project_root: None,
-            project_uid: None,
-            workspace_kind: None,
-            protected: false,
-            divergent_copy: false,
-            pr_number: None,
-            pr_state: None,
-            pr_url: None,
-            linked_issue: None,
-            notifications_muted: false,
-            notification_count: 0,
-            latest_agent_state: Some("configuring".into()),
-            tabs: vec![],
-            active_tab_id: String::new(),
-            active_surface_id: surface_id.clone(),
-            surfaces: vec![SurfaceSnapshot {
-                surface_id,
-                title: "OpenFlow".into(),
-                active_pane_id: pane_id.clone(),
-                root: PaneNodeSnapshot::Split {
-                    pane_id,
-                    direction: SplitDirection::Vertical,
-                    child_sizes: vec![100.0],
-                    children: vec![],
-                },
-            }],
-            host_id: None,
-            remote_cwd: None,
-            attach_only: false,
-            last_active_at: Some(current_time_ms_signed()),
-            last_visited_at: Some(current_time_ms_signed()),
-        });
-
-        snapshot.active_workspace_id = workspace_id.clone();
-        workspace_id
-    }
-
-    /// Add a new terminal session to a specific OpenFlow workspace.
-    ///
-    /// Returns the new `SessionId`.  Unlike `create_terminal_session` (which
-    /// uses the *active* workspace and enforces the normal per-workspace
-    /// terminal limit), this method targets an explicit workspace and bypasses
-    /// the limit because OpenFlow workspaces need one pane per agent.
-    pub fn add_agent_terminal_to_workspace(
-        &self,
-        workspace_id: &str,
-        title: String,
-        working_directory: String,
-    ) -> Result<SessionId, String> {
-        let mut snapshot = self.inner.lock().unwrap();
-        let cwd = working_directory;
-
-        let session_id = SessionId(next_id("session"));
-        let pane_id = PaneId(next_id("pane"));
-
-        snapshot.terminal_sessions.push(TerminalSessionSnapshot {
-            session_id: session_id.clone(),
-            title: title.clone(),
-            shell: None, // will be set when the PTY spawns
-            cwd: cwd.clone(),
-            cols: 80,
-            rows: 24,
-            state: TerminalSessionState::Starting,
-            last_message: Some("Preparing agent session".into()),
-            exit_code: None,
-            original_command: None,
-            adapter_captures: Default::default(),
-        });
-
-        let workspace = snapshot
-            .workspaces
-            .iter_mut()
-            .find(|w| w.workspace_id.0 == workspace_id)
-            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
-
-        let surface = workspace
-            .surfaces
-            .iter_mut()
-            .find(|s| s.surface_id == workspace.active_surface_id)
-            .ok_or_else(|| "OpenFlow workspace has no active surface".to_string())?;
-
-        // The OpenFlow workspace root is a Split with no children.  Append
-        // the new terminal pane as a child.
-        match &mut surface.root {
-            PaneNodeSnapshot::Split {
-                children,
-                child_sizes,
-                ..
-            } => {
-                children.push(PaneNodeSnapshot::Terminal {
-                    pane_id: pane_id.clone(),
-                    session_id: session_id.clone(),
-                    title,
-                });
-                // Keep child_sizes length in sync: equal weights.
-                let n = children.len() as f32;
-                let each = 100.0 / n;
-                *child_sizes = vec![each; children.len()];
-                surface.active_pane_id = pane_id;
-            }
-            _ => {
-                return Err(
-                    "OpenFlow workspace root is not a split node; cannot add agent pane".into(),
-                )
-            }
-        }
-
-        Ok(session_id)
     }
 
     pub fn create_workspace_at_path(&self, cwd_path: PathBuf) -> WorkspaceId {
@@ -3077,41 +2935,6 @@ impl AppStateStore {
             .ok_or_else(|| format!("No fallback session available after closing {session_id}"))
     }
 
-    /// Bulk-remove terminal sessions by ID without the "last session" guard.
-    /// Also removes their panes from all workspace trees. Use when stopping an OpenFlow run.
-    pub fn remove_terminal_sessions(&self, session_ids: &[String]) {
-        let ids: std::collections::HashSet<&str> =
-            session_ids.iter().map(String::as_str).collect();
-        if ids.is_empty() {
-            return;
-        }
-        let mut snapshot = self.inner.lock().unwrap();
-        snapshot
-            .terminal_sessions
-            .retain(|s| !ids.contains(s.session_id.0.as_str()));
-        for workspace in &mut snapshot.workspaces {
-            for surface in &mut workspace.surfaces {
-                if let Some(new_root) = remove_terminals_from_tree(&surface.root, &ids) {
-                    surface.root = new_root;
-                } else {
-                    surface.root = PaneNodeSnapshot::Split {
-                        pane_id: PaneId(next_id("pane")),
-                        direction: SplitDirection::Vertical,
-                        child_sizes: vec![100.0],
-                        children: vec![],
-                    };
-                    surface.active_pane_id = pane_id_from_node(&surface.root);
-                }
-            }
-        }
-    }
-
-    /// Returns the workspace that contains the given terminal session, if any.
-    pub fn workspace_id_for_session(&self, session_id: &str) -> Option<WorkspaceId> {
-        let snapshot = self.inner.lock().unwrap();
-        find_workspace_id_for_session(&snapshot.workspaces, session_id)
-    }
-
     /// Look up the `(provider, thread_id)` pair for an `AgentChat` pane.
     /// Returns `None` when the pane id is unknown, the pane is not an
     /// agent-chat leaf, or no session has been bound yet. Callers use this
@@ -3414,7 +3237,7 @@ impl AppStateStore {
     /// Mark an agent browser session as live/active without attaching it to
     /// a pane. Used by the GUI-mode background-browsing gate in
     /// `control.rs`'s `browser_automation` handler: when pane creation is
-    /// suppressed (Agent Chat GUI beta on, non-OpenFlow workspace), the
+    /// suppressed (Agent Chat GUI beta on), the
     /// session would otherwise never flip `is_active` (only
     /// `attach_agent_browser_to_pane` does that), so the frontend's
     /// "background session is live" chip/indicator would never see it.
@@ -3954,10 +3777,6 @@ impl AppStateStore {
             .iter_mut()
             .find(|w| w.workspace_id.0 == workspace_id)
             .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
-
-        if workspace.workspace_type == WorkspaceType::OpenFlow {
-            return Err("Cannot create tabs in OpenFlow workspaces".into());
-        }
 
         let tab_id = next_id("tab");
         let mut new_session_id: Option<SessionId> = None;
@@ -4787,29 +4606,32 @@ fn pane_exists_in_node(node: &PaneNodeSnapshot, pane_id: &str) -> bool {
     }
 }
 
-/// Remove OpenFlow workspaces and their terminal sessions from a snapshot.
-/// Used on startup so persisted agent sessions from crashed runs are not respawned.
-pub fn strip_openflow_from_snapshot(mut snapshot: AppStateSnapshot) -> AppStateSnapshot {
-    let openflow_session_ids: std::collections::HashSet<String> = snapshot
+/// Remove workspaces whose serialized kind no longer exists, together with
+/// their terminal sessions. This keeps layouts written by older releases safe
+/// to load without retaining the retired feature implementation.
+pub fn strip_removed_workspaces_from_snapshot(
+    mut snapshot: AppStateSnapshot,
+) -> AppStateSnapshot {
+    let removed_session_ids: std::collections::HashSet<String> = snapshot
         .workspaces
         .iter()
-        .filter(|w| w.workspace_type == WorkspaceType::OpenFlow)
+        .filter(|w| w.workspace_type == WorkspaceType::Removed)
         .flat_map(|w| collect_terminal_sessions(&w.surfaces))
         .collect();
 
     let removed_workspace_ids: std::collections::HashSet<String> = snapshot
         .workspaces
         .iter()
-        .filter(|w| w.workspace_type == WorkspaceType::OpenFlow)
+        .filter(|w| w.workspace_type == WorkspaceType::Removed)
         .map(|w| w.workspace_id.0.clone())
         .collect();
 
     snapshot
         .terminal_sessions
-        .retain(|s| !openflow_session_ids.contains(s.session_id.0.as_str()));
+        .retain(|s| !removed_session_ids.contains(s.session_id.0.as_str()));
     snapshot
         .workspaces
-        .retain(|w| w.workspace_type != WorkspaceType::OpenFlow);
+        .retain(|w| w.workspace_type != WorkspaceType::Removed);
 
     if removed_workspace_ids.contains(&snapshot.active_workspace_id.0) {
         snapshot.active_workspace_id = snapshot
@@ -5058,47 +4880,6 @@ fn remove_terminal_from_tree(
     }
 }
 
-/// Remove multiple terminal sessions from the pane tree in one pass.
-fn remove_terminals_from_tree(
-    root: &PaneNodeSnapshot,
-    session_ids: &std::collections::HashSet<&str>,
-) -> Option<PaneNodeSnapshot> {
-    match root {
-        PaneNodeSnapshot::Terminal { session_id, .. } if session_ids.contains(session_id.0.as_str()) => {
-            None
-        }
-        PaneNodeSnapshot::Terminal { .. }
-        | PaneNodeSnapshot::Browser { .. }
-        | PaneNodeSnapshot::AgentChat { .. } => Some(root.clone()),
-        PaneNodeSnapshot::Split {
-            pane_id,
-            direction,
-            child_sizes,
-            children,
-        } => {
-            let mut remaining_children: Vec<PaneNodeSnapshot> = Vec::new();
-            let mut kept: Vec<usize> = Vec::new();
-            for (i, child) in children.iter().enumerate() {
-                if let Some(new_child) = remove_terminals_from_tree(child, session_ids) {
-                    remaining_children.push(new_child);
-                    kept.push(i);
-                }
-            }
-
-            match remaining_children.len() {
-                0 => None,
-                1 => remaining_children.into_iter().next(),
-                _ => Some(PaneNodeSnapshot::Split {
-                    pane_id: pane_id.clone(),
-                    direction: direction.clone(),
-                    child_sizes: retained_sizes(child_sizes, &kept),
-                    children: remaining_children,
-                }),
-            }
-        }
-    }
-}
-
 fn first_terminal_pane(root: &PaneNodeSnapshot) -> Option<(PaneId, SessionId)> {
     match root {
         PaneNodeSnapshot::Terminal {
@@ -5261,7 +5042,7 @@ fn persisted_layout_path() -> Option<PathBuf> {
 ///
 /// Entries whose pane no longer exists are dropped too. Nothing removes a
 /// status when its pane goes away (`close_pane` leaves the key behind, and the
-/// openflow/browser strips above delete panes wholesale), so without this the
+/// compatibility/browser strips above delete panes wholesale), so without this the
 /// map would grow forever now that it survives restarts.
 fn retain_persistable_pane_statuses(snapshot: &mut AppStateSnapshot) {
     let live_panes: std::collections::HashSet<String> = snapshot
@@ -5280,8 +5061,8 @@ fn retain_persistable_pane_statuses(snapshot: &mut AppStateSnapshot) {
 /// `layout.json`. Separate from [`save_persisted_state`] so the contract can be
 /// asserted without a filesystem.
 fn persistable_snapshot(snapshot: &AppStateSnapshot) -> AppStateSnapshot {
-    // Never persist OpenFlow workspaces or their terminal sessions so they cannot accumulate.
-    let mut snapshot = strip_openflow_from_snapshot(snapshot.clone());
+    // Never persist workspaces whose type has been retired.
+    let mut snapshot = strip_removed_workspaces_from_snapshot(snapshot.clone());
     // Browser panes are live streaming connections — stale panes start a
     // daemon with the wrong session name, causing white-screen bugs.
     snapshot = strip_browser_panes_from_snapshot(snapshot);
@@ -8282,11 +8063,7 @@ mod tests {
 
     #[test]
     fn workspace_type_serde_roundtrip_all_variants() {
-        for variant in [
-            WorkspaceType::Standard,
-            WorkspaceType::OpenFlow,
-            WorkspaceType::Home,
-        ] {
+        for variant in [WorkspaceType::Standard, WorkspaceType::Home] {
             let json = serde_json::to_string(&variant).unwrap();
             let back: WorkspaceType = serde_json::from_str(&json).unwrap();
             assert_eq!(variant, back, "roundtrip failed for {variant:?} ({json})");
@@ -8295,6 +8072,23 @@ mod tests {
             serde_json::to_string(&WorkspaceType::Home).unwrap(),
             "\"home\""
         );
+        let retired: WorkspaceType = serde_json::from_str("\"open_flow\"").unwrap();
+        assert_eq!(retired, WorkspaceType::Removed);
+    }
+
+    #[test]
+    fn retired_workspace_kind_and_its_sessions_are_stripped_on_load() {
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().active_workspace_id;
+        assert!(store.set_workspace_type(&workspace_id.0, WorkspaceType::Removed));
+
+        let snapshot = store.snapshot();
+        assert!(!snapshot.terminal_sessions.is_empty());
+        let stripped = strip_removed_workspaces_from_snapshot(snapshot);
+
+        assert!(stripped.workspaces.is_empty());
+        assert!(stripped.terminal_sessions.is_empty());
+        assert!(stripped.active_workspace_id.0.is_empty());
     }
 
     #[test]

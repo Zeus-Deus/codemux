@@ -48,7 +48,7 @@ These are **not** theme colors and are left literal on purpose:
    presets can't express. Because these are non-standard variable names,
    switching/re-applying the shadcn preset never touches them:
    - `--accent-ember` — primary accent (selection, links, small accents).
-   - `--accent-violet` — secondary accent (PR merged, OpenFlow).
+   - `--accent-violet` — secondary accent (for example, a merged PR).
    - `--status-open` (green), `--status-working` (amber),
      `--status-attention` (red), `--status-remote` (sky) — status tones,
      **identical across all palettes**.
@@ -106,8 +106,6 @@ overview):
   tall enough to always show a scrollbar — the command palette's result list.
   Thin, token-colored, transparent track. Prefer it over hiding the scrollbar
   (`no-scrollbar`) when the user needs to see how much list is left.
-- OpenFlow role palette stays distinct via tokens (e.g. debugger →
-  `accent-ember`).
 - Streamdown's compiled utility classes are registered as a Tailwind scan
   source (`@source "../node_modules/streamdown/dist/*.js"`) so the streaming
   markdown renderer's classes survive the Tailwind v4 tree-shake.

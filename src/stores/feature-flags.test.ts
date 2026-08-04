@@ -52,7 +52,6 @@ describe("useFeatureFlags", () => {
     invokeMock.mockResolvedValueOnce({
       enable_agent_chat: true,
       enable_lazy_workspace_creation: true,
-      unstable_openflow: true,
       unstable_browser_automation: true,
       unstable_indexing: true,
     });
@@ -72,7 +71,6 @@ describe("useFeatureFlags", () => {
     invokeMock.mockResolvedValueOnce({
       enable_agent_chat: false,
       enable_lazy_workspace_creation: false,
-      unstable_openflow: true,
       unstable_browser_automation: true,
       unstable_indexing: true,
     });

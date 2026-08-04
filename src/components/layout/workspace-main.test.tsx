@@ -49,9 +49,6 @@ vi.mock("@/components/chat/DraftChatSurface", () => ({
 vi.mock("@/components/editor/EditorPane", () => ({
   EditorPane: () => <div data-testid="editor-pane" />,
 }));
-vi.mock("@/components/openflow/openflow-workspace", () => ({
-  OpenFlowWorkspace: () => <div data-testid="openflow" />,
-}));
 vi.mock("@/components/overlays/project-onboarding", () => ({
   ProjectOnboarding: () => <div data-testid="onboarding" />,
 }));

@@ -36,7 +36,6 @@ The mock lives in `src/dev/` and only loads when no real Tauri runtime is detect
 ## Skills
 
 - `/codemux-features` auto-loads for new ADE feature implementation.
-- `/codemux-openflow` auto-loads for orchestration runtime work.
 
 ## Codemux Environment
 
