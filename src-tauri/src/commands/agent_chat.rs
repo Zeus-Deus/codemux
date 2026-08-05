@@ -687,10 +687,8 @@ pub async fn agent_chat_start_session<R: Runtime>(
         // UPDATE racing this upsert across a spawned bridge task — when the
         // event wins it updates 0 rows and the cursor is silently lost,
         // leaving the FIRST dead-run rebuild with no conversation context
-        // (OpenCode returns its cursor at start; Claude's SDK id arrives
-        // later by event and Codex's start-time cursor carries no
-        // extractable id, so this is a no-op for them). Best-effort like the
-        // neighboring persists.
+        // (OpenCode and Codex return their cursors at start; Claude's SDK id
+        // arrives later by event). Best-effort like the neighboring persists.
         if let Some(sdk_session_id) = session
             .resume_cursor
             .as_ref()
@@ -3734,15 +3732,16 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
 
 /// Pull the SDK session UUID out of the opaque `resume_cursor` JSON.
 ///
-/// The Claude adapter wraps the id under a `resume` or `sessionId`
-/// key (same shape the adapter accepts on the way in — see
-/// `agent_provider/claude/session.rs`). Extracted so the logic is
-/// unit-testable without spinning up an app handle.
+/// Providers wrap the id under a provider-native key (`threadId` for Codex,
+/// `sessionId` for Claude) or the generic `resume` key accepted when a
+/// persisted scalar is reconstructed. Extracted so the logic is unit-testable
+/// without spinning up an app handle.
 pub fn extract_sdk_session_id(cursor: &serde_json::Value) -> Option<String> {
     cursor
         .get("resume")
         .or_else(|| cursor.get("sessionId"))
         .or_else(|| cursor.get("session_id"))
+        .or_else(|| cursor.get("threadId"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
@@ -4549,7 +4548,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_sdk_session_id_handles_all_three_keys() {
+    fn extract_sdk_session_id_handles_all_provider_keys() {
         assert_eq!(
             extract_sdk_session_id(&json!({"resume": "uuid-a"})),
             Some("uuid-a".into())
@@ -4561,6 +4560,10 @@ mod tests {
         assert_eq!(
             extract_sdk_session_id(&json!({"session_id": "uuid-c"})),
             Some("uuid-c".into())
+        );
+        assert_eq!(
+            extract_sdk_session_id(&json!({"threadId": "codex-thread"})),
+            Some("codex-thread".into())
         );
     }
 
