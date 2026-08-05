@@ -122,6 +122,7 @@ import {
   type AskUserQuestionOutput,
   ComposerPendingInputPanel,
 } from "./ComposerPendingInputPanel";
+import type { SendAnchorRequest } from "./send-scroll-state";
 import { defaultModelForProvider } from "./pickers/ModelPicker";
 import type { ActivePillMode } from "./pickers/ModePill";
 import { SCOPE_STRIP, SCOPE_STRIP_INSET } from "./pickers/ThreadScopeRow";
@@ -600,17 +601,30 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [enteredSubagentId]);
-  // Send → jump-to-latest (catch-up on send). An incrementing counter
-  // forwarded to the transcript; bumping it snaps the viewport to the
-  // bottom and re-pins following-bottom mode. Sending a new prompt must
-  // always bring the reader to the latest content and keep them on the
-  // stream, even if they had scrolled up into history — see
-  // `ScrollToBottomOnSend` in MessageList.tsx.
-  const [scrollToBottomSignal, setScrollToBottomSignal] = useState(0);
-  const requestScrollToBottom = useCallback(
-    () => setScrollToBottomSignal((n) => n + 1),
-    [],
-  );
+  // New-turn scroll contract (see `send-scroll-state.ts`). A submission is
+  // an explicit navigation intent, not just a data update: the request names
+  // the exact optimistic bubble by its `clientNonce` so the transcript can
+  // position *that* row and reserve response space beneath it, and the
+  // incrementing `nonce` keeps two identical sends distinguishable. Cleared
+  // on failed-send rollback so a dead send leaves no phantom end space.
+  const [sendAnchor, setSendAnchor] = useState<SendAnchorRequest | null>(null);
+  const sendAnchorNonceRef = useRef(0);
+  const requestSendAnchor = useCallback((clientNonce: string) => {
+    sendAnchorNonceRef.current += 1;
+    setSendAnchor({ clientNonce, nonce: sendAnchorNonceRef.current });
+  }, []);
+  // Nonce-matched so a late rollback cannot steal a newer send's anchor. The
+  // transcript reads the transition to `null` as "release the reserved space".
+  const clearSendAnchor = useCallback((clientNonce: string) => {
+    setSendAnchor((current) =>
+      current !== null && current.clientNonce !== clientNonce ? current : null,
+    );
+  }, []);
+  // Switching threads within the pane must not resume the previous thread's
+  // anchor; the transcript treats the change as a fresh hydrated open.
+  useEffect(() => {
+    setSendAnchor(null);
+  }, [threadId]);
   const [subagentJumpRequest, setSubagentJumpRequest] = useState<{
     cardId: string;
     nonce: number;
@@ -1281,11 +1295,12 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ? crypto.randomUUID()
           : `nonce-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       appendUserMessage(threadId, plan.text, clientNonce, imageDisplaySources);
-      // Catch up to the latest on send: snap the transcript to the bottom
-      // and re-pin following-bottom, even if the reader had scrolled up
-      // into history. Bumped in the same commit as the optimistic append
-      // so the jump lands on the freshly-added user bubble.
-      requestScrollToBottom();
+      // Same batch as the optimistic append, naming that exact bubble: the
+      // transcript parks it near the top and reserves the space the answer
+      // streams into, then follows until the reader deliberately leaves.
+      // Covers every composer path through here — text, images, and the
+      // one-click "Continue run".
+      requestSendAnchor(clientNonce);
       if (isContinue) {
         // Preserve the composer: `appendUserMessage` reset `inputDraft` to ""
         // as a side effect, so restore the user's in-progress text. Staged
@@ -1308,6 +1323,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // the image: roll the optimistic bubble back, restore the
         // composer, and leave the chip (with its error) for the user.
         removeUserMessageByNonce(threadId, clientNonce, preSendInterrupted);
+        // The anchored row is gone, so its reserved response space must go
+        // with it — otherwise a failed image send leaves phantom end space.
+        clearSendAnchor(clientNonce);
         setInputDraft(threadId, rawText);
         toast.error(
           "An attached image failed to upload — remove it and try again.",
@@ -1349,6 +1367,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         // so one failed click never strands the run with no recovery
         // affordance.
         removeUserMessageByNonce(threadId, clientNonce, preSendInterrupted);
+        // Same rollback discipline as the failed-image path above: the
+        // anchor dies with the bubble it pointed at.
+        clearSendAnchor(clientNonce);
         // Restore the composer text so the user doesn't lose it. A Continue
         // send never owned the draft (it preserved the user's own in-progress
         // text above), so leave that intact rather than stamping "Continue".
@@ -1373,7 +1394,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
     setInputDraft,
     clearStagedAttachments,
     updateStagedAttachment,
-    requestScrollToBottom,
+    requestSendAnchor,
+    clearSendAnchor,
   ]);
 
   /** One-click "Continue run" (issue #154): resume an interrupted run by
@@ -1936,11 +1958,28 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const handleSendQueuedNow = useCallback(
     (queuedId: string) => {
       if (!threadId) return;
+      // Dispatching a queued turn is a send, so it gets the same navigation
+      // intent as a composer submission — anchored on the bubble that is
+      // about to become the live turn. The bubble already exists (it was
+      // appended optimistically when queued), so its `clientNonce` is
+      // already the right identity; a bubble without one (hydrated from
+      // disk) simply gets no anchor and keeps plain tail following.
+      const queuedItem = useAgentChatStore
+        .getState()
+        .threads[threadId]?.messages.find(
+          (m) => m.kind === "user_message" && m.queued?.queuedId === queuedId,
+        );
+      if (
+        queuedItem?.kind === "user_message" &&
+        queuedItem.clientNonce
+      ) {
+        requestSendAnchor(queuedItem.clientNonce);
+      }
       agentChatSendQueuedTurnNow(provider, threadId, queuedId).catch((err) => {
         toast.error(`Failed to send queued message: ${err}`);
       });
     },
-    [threadId, provider],
+    [threadId, provider, requestSendAnchor],
   );
 
   const handleRespond = useCallback(
@@ -2912,7 +2951,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               streaming={streaming || isSending}
               stalled={stalled}
               interrupted={interrupted}
-              scrollToBottomSignal={scrollToBottomSignal}
+              sendAnchor={sendAnchor}
+              threadKey={threadId}
               subagentJumpRequest={subagentJumpRequest}
               sessionStartedAt={sessionStartedAt}
               provider={provider}
