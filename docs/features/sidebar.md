@@ -202,7 +202,7 @@ visual only — nothing is archived, closed, or deleted.
   `SettledRow` / `SnoozeRow` take a `status` prop that their call sites derive
   live via `getWorkspaceStatus(workspace.surfaces, paneStatuses)` rather than
   hard-coding idle into the parked shapes.
-  It reuses the `DetailRow` label/value shape from the context bar's popover
+  It reuses the `DetailRow` label/value shape from the shared status cluster
   (`WorkspaceStatusCluster`), and needs **no new Tauri command** — every field
   is already on `WorkspaceSnapshot` or in `appState.detected_ports`. The card
   keeps pointer events enabled so the path and branch can be selected and
@@ -669,7 +669,7 @@ came from.
 - Hover details on every workspace surface (card, settled row, snoozed row,
   rail avatar) — full title, complete git picture, PR/issue, ports, device,
   and path on disk.
-- Per-workspace agent status covers both terminal and Agent Chat (Beta) agents
+- Per-workspace agent status covers both terminal and Agent Chat agents
   (chat sessions publish into the same `pane_statuses` snapshot).
 - The done-review checkmark **survives an app restart**. `save_persisted_state`
   keeps `PaneStatus::Review` entries in `layout.json` and drops

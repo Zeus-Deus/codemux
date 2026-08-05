@@ -39,8 +39,8 @@ and the right-panel tabs.
 null`. This
 predicate lives in the shared `useGuiChrome()` hook
 (`src/hooks/use-gui-chrome.ts`) so other GUI-mode-only surfaces gate on the
-identical rule — currently the background-browser inline chip, context-bar
-indicator, and peek overlay (`docs/features/browser.md` § "Background
+identical rule — currently the background-browser inline chip, the
+terminal-header indicator, and the peek overlay (`docs/features/browser.md` § "Background
 browser in GUI mode"). A live lazy-creation draft renders the same floating
 `h-10` overlay with **draft slots** instead, gated on the sibling
 `useDraftGuiChrome()` predicate (`enableAgentChat && lazyDraftActive` —

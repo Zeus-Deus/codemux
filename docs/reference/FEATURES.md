@@ -10,7 +10,7 @@
 
 - Create workspaces with preset pane layouts (1, 2, 4, 6, or 8 terminal slots, or shell+browser)
 - Create workspaces at a specific directory path
-- Lazy workspace creation (Beta-gated): sidebar `+` and boot-into-Home open a client-side chat draft; the draft is promoted on first message send
+- Lazy workspace creation (on by default; opt out via Settings → Interface): sidebar `+` and boot-into-Home open a client-side chat draft; the draft is promoted on first message send
 - Switch workspaces via sidebar click or Ctrl+]/[
 - Rename workspaces by double-clicking the active workspace name in the sidebar
 - Archive local workspaces non-destructively with all child sessions closed; attach-in-place and host-bound workspaces use non-destructive Close instead

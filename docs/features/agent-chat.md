@@ -3154,10 +3154,11 @@ to extend MCP host support to Codex via an HTTP gateway.
 
 Roadmap and build order live in `docs/core/PLAN.md` § "Cross-Cutting Steps"
 (Steps 6–13 plus the Step 10.5 / Step 11 planned work) and § "Immediate
-Priority Order" (which carries the "promote agent-chat from Beta to
-default-on" item). This doc stays about current behavior; the duplicate
-step list that used to sit here has been removed rather than kept in sync
-in two places.
+Priority Order". The "promote agent-chat from Beta to default-on" item that
+used to sit in that priority list is **done** — PR #232 shipped it in
+`v0.16.0`, and Step 13 is marked LANDED. This doc stays about current
+behavior; the duplicate step list that used to sit here has been removed
+rather than kept in sync in two places.
 
 ## Known follow-ups
 

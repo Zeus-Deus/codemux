@@ -1,6 +1,6 @@
 # Plan — Merge `origin/main` into `feature/agent-chat` (archived)
 
-- Status: **LANDED — archived.** The merge executed and the feature-branch work landed on `main` in commit `a58c3d9` ("Merge branch 'feature/agent-chat' into main"). The agent-chat surface is currently shipping gated behind the Step 13 Beta Features toggle.
+- Status: **LANDED — archived.** The merge executed and the feature-branch work landed on `main` in commit `a58c3d9` ("Merge branch 'feature/agent-chat' into main"). The agent-chat surface later became the default interface in PR #232 (`v0.16.0`); the Step 13 Beta gate it describes is retired. Module paths cited below predate later refactors and several no longer exist.
 - Purpose: Historical record of the pre-merge investigation and risk plan.
 - Audience: Anyone needing context on how the feature-branch divergence was reconciled.
 - Read next: `docs/features/auth.md`, `docs/archive/step-13-beta-toggle-research.md`.

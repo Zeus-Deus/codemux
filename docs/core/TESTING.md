@@ -16,6 +16,8 @@
 
 Default to `npm run verify` after meaningful work. Use the narrower commands when iterating on one layer.
 
+Limit Cargo compilation to two jobs (`CARGO_BUILD_JOBS=2`). A full-parallelism `cargo check`/`cargo test` on this crate starves the rest of the machine — including the app under manual test — so the cap is the default, not a low-memory workaround.
+
 `npm run verify` is exactly `cargo check && cargo test && npm run check && npm run test` — it does **not** cover the Claude sidecar. The sidecar is a separate Bun package with its own suite (`sidecar/claude-agent/test/*.test.ts`: session, permissions, MCP bridge, respond-to-request, ping, real-tools). Run it directly with `bun test` from `sidecar/claude-agent/` whenever you touch `sidecar/claude-agent/src/` — the session-lifecycle, permission-mode, and stale-resume recovery behavior documented in `docs/features/agent-chat.md` is enforced there and nowhere else.
 
 `npm run verify` also does not run the shell installer suite. Run `bash scripts/install-sh.test.sh` whenever `scripts/install.sh` or its artifact/distro-selection contract changes; the suite is network-free and performs no installation.

@@ -102,7 +102,7 @@ Six bottlenecks, first four on confirmed user-action paths:
 - **Exit:** selection paints before IPC returns; a keystroke renders no timeline rows; 100 deltas/s → bounded commits with exact final text.
 
 ### Phase 2 — True transcript virtualization (mostly landed via `6a298021`)
-- The LegendList window already exists (`MessageList.tsx:408-455`: `keyExtractor` by slot key, `getItemType`, `itemsAreEqual` identity, `estimatedItemSize 112`, `drawDistance 800`, `maintainScrollAtEnd`, `maintainVisibleContentPosition`, `alwaysRender` keys). Do **not** reintroduce react-virtuoso.
+- The LegendList window already exists (the LegendList props block in `MessageList.tsx` — line numbers moved with the PR #247 scroll-contract rewrite: `keyExtractor` by slot key, `getItemType`, `itemsAreEqual` identity, `estimatedItemSize 112`, `drawDistance 800`, `maintainScrollAtEnd`, `maintainVisibleContentPosition`, `alwaysRender` keys). Do **not** reintroduce react-virtuoso.
 - Remaining work: `memo()` `ChatTranscript`, `MessageList`, `MessageTrail`/`TrailRail`; hoist `keyExtractor`/`itemsAreEqual` to module scope; memoize the `ListHeaderComponent` element (the footer already is); memoize `shouldShowThinkingIndicator`.
 - MessageTrail already driven from `onFirstVisibleItemChanged`. Preserve all behaviors (Markdown/tool expansion, request/subagent cards, images, free scroll, bottom anchoring, jump-to-latest, copy, keyboard focus).
 - **Exit:** 50 and 5,000-event histories both mount only ~20–40 visible/overscan rows; full behavior matrix passes.

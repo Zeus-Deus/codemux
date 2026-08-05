@@ -47,6 +47,7 @@ If the docs system feels stale or messy, also read `docs/reference/DOCS_REINDEX.
 ## Verification
 
 - Default to `npm run verify` after meaningful changes.
+- Limit Cargo compilation to two jobs (`CARGO_BUILD_JOBS=2`).
 - Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
 
 ## Docs Rule

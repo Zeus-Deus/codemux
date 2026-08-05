@@ -295,7 +295,7 @@ Again: **do not build this in v1.** The point of listing it is to lock in the fo
 
 - `src-tauri/src/control.rs` — strip `AppHandle`, take `CoreContext`.
 - `src-tauri/src/mcp_server.rs` — move out of Tauri crate; add `Mode::Desktop | Mode::Headless`.
-- `src-tauri/src/state.rs` — drop `tauri::Manager` calls, expose `Arc<AppStateStore>`.
+- `src-tauri/src/state/` (was a single `state.rs` when this plan was written) — drop `tauri::Manager` calls, expose `Arc<AppStateStore>`.
 - `src-tauri/src/database.rs` — already Tauri-free in spirit; verify.
 - `src-tauri/src/terminal/` — strip the few `app.emit` calls behind `UiNotifier`.
 - `src-tauri/src/bin/codemux_remote.rs` — add `serve`, `serve status`, `mcp` subcommands.

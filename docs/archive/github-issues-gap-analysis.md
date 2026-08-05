@@ -2,9 +2,9 @@
 
 - Purpose: Gap analysis and implementation plan for GitHub issue integration in workspace creation.
 - Audience: Anyone implementing or reviewing the issue linking feature.
-- Authority: Active work plan only, not current truth.
-- Update when: Priorities, open questions, or likely touch points change.
-- Read next: `docs/features/review-integration.md`, `docs/core/STATUS.md`
+- Authority: Archived gap analysis, not current truth. Current behavior lives in `docs/features/github-issues.md`; source paths cited below predate later refactors and several no longer exist.
+- Update when: Never; this file is historical.
+- Read next: `docs/features/github-issues.md`, `docs/features/review-integration.md`
 
 ## Goal
 

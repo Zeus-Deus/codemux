@@ -127,6 +127,26 @@ them too:
 Any future surface that draws its own selection layer needs the same
 `currentColor` opt-out for the text it covers.
 
+## Focus Treatment
+
+Small controls signal focus with a ring or a border change. **Large surfaces do
+not.** On a big rounded rectangle — the Agent Chat composer is the canonical
+case — brightening the border draws a bright wireframe around the largest
+element on screen, which reads as an error state rather than as focus.
+
+The rule: for a large container, keep the resting and focused **border
+identical** and carry focus with **surface tint plus elevation**. The composer
+(`src/components/chat/Composer.tsx`) does this with
+`focus-within:bg-muted/60` and a soft drop shadow, holding its
+`border-border/80` constant across both states. The perceptual cue is the card
+lifting toward the reader, not an outline switching on.
+
+This does not relax the accessibility floor. It applies to the *container*
+chrome only — the focusable control inside it keeps whatever visible focus
+indicator it already had, and keyboard focus on buttons, inputs, and menu items
+continues to use the standard ring. Do not extend the tint-and-elevation
+treatment to controls small enough for a ring to read cleanly.
+
 ## Typography
 
 - `--font-sans` — **DM Sans Variable** (UI + headings; `--font-heading`

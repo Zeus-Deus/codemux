@@ -33,7 +33,7 @@ The Better Auth account is still cross-product compatible with Vexis (email+pass
 ### Sync engine
 
 - **Trigger sources:**
-  - Auth state transitions to `syncAvailable=true` (any signin, gated on the Agent Chat beta toggle).
+  - Auth state transitions to `syncAvailable=true` (any signin, gated on the Agent Chat interface flag — on by default since PR #232).
   - File watcher (`crate::skills::watcher` emits `skills-changed`) → frontend debounces 1.5s on top of the watcher's own 300ms → `skillsSyncNow`.
   - Periodic 5-minute timer in `useSkillsSync`, gated on `document.visibilityState === "visible"`.
   - Manual "Sync now" via the engine's command surface.

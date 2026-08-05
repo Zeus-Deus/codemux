@@ -77,7 +77,7 @@ the correct `permissions.<behavior>` array, and writes back via a sibling-tempfi
   scope→path resolution, atomic write, string/object rule parsing (+ extensive unit tests)
 - `src/components/settings/permissions-section.tsx` — the settings UI (scope groups, behavior icons,
   remove)
-- `src/components/settings/settings-view.tsx` — registers the `permissions` nav item (Beta-gated)
+- `src/components/settings/settings-view.tsx` — registers the `permissions` nav item (Agent Chat GUI only)
 - `~/.claude/settings.json`, `<project>/.claude/settings.json`, `<project>/.claude/settings.local.json`
   — the on-disk sources of truth
 
