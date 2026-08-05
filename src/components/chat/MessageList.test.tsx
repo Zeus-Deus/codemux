@@ -8,6 +8,10 @@ import type {
   ToolCallItem,
   WorkflowRunItem,
 } from "@/lib/agent-chat/types";
+import {
+  getTitlebarContentUnder,
+  getTitlebarTranscriptElements,
+} from "@/lib/titlebar-content-under";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
@@ -81,6 +85,69 @@ function renderList(
     <MessageList messages={messages} {...extra} {...noopHandlers} />,
   );
 }
+
+describe("MessageList titlebar scroll edge", () => {
+  it("publishes only after the transcript scrolls beneath the overlay", () => {
+    const { unmount } = render(
+      <MessageList
+        messages={[readCall(0, "/a")]}
+        workspaceId="ws-scroll-edge"
+        {...noopHandlers}
+      />,
+    );
+    const viewport = document.querySelector<HTMLElement>(
+      '[data-slot="transcript-list"]',
+    );
+    expect(viewport).not.toBeNull();
+
+    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
+    viewport!.scrollTop = 12;
+    fireEvent.scroll(viewport!);
+    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(true);
+
+    viewport!.scrollTop = 0;
+    fireEvent.scroll(viewport!);
+    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
+
+    viewport!.scrollTop = 12;
+    fireEvent.scroll(viewport!);
+    unmount();
+    expect(getTitlebarContentUnder("ws-scroll-edge")).toBe(false);
+  });
+
+  it("registers its live viewport so the titlebar never measures a detached node", () => {
+    // `PaneContainer` renders only the active surface, so a tab switch
+    // unmounts this list entirely. The titlebar keys its overlap
+    // measurement on this registry — if the node stayed registered after
+    // unmount (or was never registered) the raised treatment would latch
+    // onto a detached element and stop firing after any navigation.
+    const { unmount } = render(
+      <MessageList
+        messages={[readCall(0, "/a")]}
+        workspaceId="ws-registry"
+        {...noopHandlers}
+      />,
+    );
+    const viewport = document.querySelector<HTMLElement>(
+      '[data-slot="transcript-list"]',
+    );
+    expect(getTitlebarTranscriptElements()).toContain(viewport);
+
+    unmount();
+    expect(getTitlebarTranscriptElements()).not.toContain(viewport);
+  });
+
+  it("registers even without a workspace id, since the overlap check is geometric", () => {
+    const { unmount } = render(
+      <MessageList messages={[readCall(0, "/a")]} {...noopHandlers} />,
+    );
+    const viewport = document.querySelector<HTMLElement>(
+      '[data-slot="transcript-list"]',
+    );
+    expect(getTitlebarTranscriptElements()).toContain(viewport);
+    unmount();
+  });
+});
 
 function planReq(
   overrides: Partial<PermissionRequestItem> = {},

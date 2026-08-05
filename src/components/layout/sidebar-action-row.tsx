@@ -9,9 +9,15 @@ import { useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { Search as SearchIcon, SquarePen } from "lucide-react";
 import { useResolvedKeybinds } from "@/hooks/use-resolved-keybinds";
+import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
+import { cn } from "@/lib/utils";
 
 export function SidebarActionRow() {
   const { state } = useSidebar();
+  // Only the floating titlebar overlays this header. With legacy chrome the
+  // in-flow `h-9` bar already sits above the sidebar, so the extra clearance
+  // would just be dead padding above the search row.
+  const titlebarOverlay = useTitlebarOverlay();
   const { getKeysForAction } = useResolvedKeybinds();
   const newAgentKeys = getKeysForAction("newAgent");
   const paletteKeys = getKeysForAction("commandPalette");
@@ -50,7 +56,13 @@ export function SidebarActionRow() {
   if (state === "collapsed") {
     return (
       <ShadcnSidebarHeader className="gap-0 p-0">
-        <div className="flex flex-col items-center gap-1.5 px-1 py-2">
+        <div
+          data-testid="sidebar-action-row-collapsed"
+          className={cn(
+            "flex flex-col items-center gap-1.5 px-1 pb-2",
+            titlebarOverlay ? "pt-11" : "pt-2",
+          )}
+        >
           <Tooltip delayDuration={300}>
             <TooltipTrigger asChild>
               <button
@@ -96,7 +108,13 @@ export function SidebarActionRow() {
     <ShadcnSidebarHeader className="gap-0 p-0">
       {/* Same insets + gap as the project-filter row below, and every control
           in both rows is h-8 / rounded-[7px], so the two read as equal rows. */}
-      <div className="flex items-center gap-1.5 px-2.5 pb-2.5 pt-3">
+      <div
+        data-testid="sidebar-action-row-expanded"
+        className={cn(
+          "flex items-center gap-1.5 px-2.5 pb-2.5",
+          titlebarOverlay ? "pt-11" : "pt-3",
+        )}
+      >
         <button
           type="button"
           aria-label="Search"

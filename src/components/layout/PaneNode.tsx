@@ -43,8 +43,9 @@ interface Props {
   visible: boolean;
   /** True only for the top-level pane of a surface (not split children).
    *  In GUI chrome a sole-root agent_chat pane drops its header — session
-   *  history + close live on the title-bar tab instead. Split panes keep
-   *  their per-pane header regardless. */
+   *  history + close live on the title-bar tab instead. A sole-root terminal
+   *  keeps only useful cwd/status context plus pane actions; split children
+   *  retain their local title because it identifies the pane. */
   isSurfaceRoot?: boolean;
 }
 
@@ -277,6 +278,10 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
   };
 
   if (node.kind === "terminal") {
+    const showTerminalTitle = !isSurfaceRoot;
+    const showTerminalStatus = paneStatus && paneStatus !== "idle";
+    const showTerminalContext = showTerminalTitle || cwdHint || showTerminalStatus;
+
     return (
       <div
         className="group/pane flex h-full w-full flex-col min-w-0 min-h-0 overflow-hidden border border-border/30"
@@ -285,46 +290,66 @@ function PaneNodeImpl({ node, activePaneId, visible, isSurfaceRoot = false }: Pr
         onPointerDown={handleActivate}
       >
         <header
-          className={cn("flex h-7 shrink-0 items-center gap-1 border-b border-border/30 px-2 cursor-grab active:cursor-grabbing transition-colors", isActive ? "bg-card" : "bg-background")}
+          className="relative flex h-7 shrink-0 items-center gap-1 px-1.5 cursor-grab active:cursor-grabbing"
+          data-terminal-pane-chrome
           onPointerDown={(e) => handleDragStart(e, node.pane_id)}
         >
-          <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs text-muted-foreground">
-            {PRESET_TITLE_TO_ICON[node.title] && (
-              <PresetIcon icon={PRESET_TITLE_TO_ICON[node.title]} className="h-3 w-3" />
+          {showTerminalContext && (
+            <span
+              className={cn(
+                "flex h-6 min-w-0 max-w-[70%] items-center gap-1.5 rounded-md px-2 text-xs shadow-sm ring-1 ring-border/30 backdrop-blur-md",
+                isActive
+                  ? "bg-card/70 text-muted-foreground"
+                  : "bg-background/65 text-muted-foreground/70",
+              )}
+              data-terminal-pane-context
+            >
+              {showTerminalTitle && PRESET_TITLE_TO_ICON[node.title] && (
+                <PresetIcon icon={PRESET_TITLE_TO_ICON[node.title]} className="size-3" />
+              )}
+              {/* A split pane needs a local identity. A sole-root terminal is
+                  already named by the workspace tab, so repeating "Terminal"
+                  here only recreates the second full-width header visually. */}
+              {showTerminalTitle && (
+                <span className="shrink-0 text-foreground/80">{node.title}</span>
+              )}
+              {/* Live working directory, rendered only when it differs from the
+                  workspace root (see `formatCwdHint`). Mono per the design
+                  system's rule that path-like metadata is code-like. The
+                  untrimmed path is on the tooltip since the label elides its
+                  head to keep the meaningful tail. */}
+              {cwdHint && (
+                <span
+                  className="min-w-0 truncate font-mono text-[11px] text-muted-foreground/70"
+                  title={cwdHint.full}
+                  data-pane-cwd={cwdHint.full}
+                >
+                  {cwdHint.label}
+                </span>
+              )}
+              {showTerminalStatus && (
+                <span className="shrink-0">
+                  <StatusIndicator status={paneStatus} />
+                </span>
+              )}
+            </span>
+          )}
+          <div
+            className={cn(
+              "ml-auto flex h-6 items-center gap-0.5 rounded-md bg-card/65 px-0.5 shadow-sm ring-1 ring-border/30 backdrop-blur-md transition-opacity duration-150",
+              isActive ? "opacity-70" : "opacity-0",
+              "group-hover/pane:opacity-100 focus-within:opacity-100",
             )}
-            {/* `shrink-0`: the title is drawn from a fixed, short set
-                ("Terminal", "Claude Code", …) and is the pane's identity —
-                the cwd hint beside it absorbs any truncation instead. */}
-            <span className="shrink-0">{node.title}</span>
-            {/* Live working directory, rendered only when it differs from the
-                workspace root (see `formatCwdHint`). Mono per the design
-                system's rule that path-like metadata is code-like. The
-                untrimmed path is on the tooltip since the label elides its
-                head to keep the meaningful tail. */}
-            {cwdHint && (
-              <span
-                className="min-w-0 truncate font-mono text-[11px] text-muted-foreground/60"
-                title={cwdHint.full}
-                data-pane-cwd={cwdHint.full}
-              >
-                {cwdHint.label}
-              </span>
-            )}
-            {paneStatus && paneStatus !== "idle" && (
-              <span className="shrink-0">
-                <StatusIndicator status={paneStatus} />
-              </span>
-            )}
-          </span>
-          <div className="flex items-center gap-0.5 opacity-0 transition-opacity duration-150 group-hover/pane:opacity-100">
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
-              <SplitSquareHorizontal className="h-3.5 w-3.5" />
+            data-terminal-pane-actions
+          >
+            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("horizontal")} aria-label="Split right" title="Split right">
+              <SplitSquareHorizontal />
             </Button>
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
-              <SplitSquareVertical className="h-3.5 w-3.5" />
+            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:text-foreground" onClick={() => handleSplit("vertical")} aria-label="Split down" title="Split down">
+              <SplitSquareVertical />
             </Button>
-            <Button variant="ghost" size="icon-sm" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
-              <X className="h-3.5 w-3.5" />
+            <Button variant="ghost" size="icon-xs" className="text-muted-foreground hover:bg-destructive/80 hover:text-destructive-foreground" onClick={handleClose} aria-label="Close pane" title="Close pane">
+              <X />
             </Button>
           </div>
           <TerminalBackgroundBrowserIndicator active={isActive} />

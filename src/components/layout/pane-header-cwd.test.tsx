@@ -103,9 +103,17 @@ function makeAppState(
 
 function mount(
   title = "Terminal",
-  agentBrowserSessions: AgentBrowserSession[] = [],
-  activePaneId = "p1",
+  opts: {
+    isSurfaceRoot?: boolean;
+    agentBrowserSessions?: AgentBrowserSession[];
+    activePaneId?: string;
+  } = {},
 ) {
+  const {
+    isSurfaceRoot = false,
+    agentBrowserSessions = [],
+    activePaneId = "p1",
+  } = opts;
   const root = termPane(title);
   act(() => {
     useAppStore.setState({
@@ -114,7 +122,12 @@ function mount(
     });
   });
   return render(
-    <PaneNode node={root} activePaneId={activePaneId} visible={true} />,
+    <PaneNode
+      node={root}
+      activePaneId={activePaneId}
+      visible={true}
+      isSurfaceRoot={isSurfaceRoot}
+    />,
   );
 }
 
@@ -147,6 +160,28 @@ afterEach(() => {
 });
 
 describe("terminal pane header cwd hint", () => {
+  it("does not recreate a second full-width header for a sole root terminal", () => {
+    mount("Terminal", { isSurfaceRoot: true });
+
+    const chrome = document.querySelector("[data-terminal-pane-chrome]");
+    expect(chrome).not.toHaveClass("border-b", "bg-card", "bg-background");
+    expect(document.querySelector("[data-terminal-pane-context]")).toBeNull();
+    expect(screen.queryByText("Terminal")).not.toBeInTheDocument();
+    expect(document.querySelector("[data-terminal-pane-actions]")).not.toBeNull();
+  });
+
+  it("shows only useful cwd context in a sole root terminal", () => {
+    mount("Terminal", { isSurfaceRoot: true });
+    act(() => {
+      useTerminalCwdStore
+        .getState()
+        .setCwd("s1", `${WS_CWD}/src-tauri`, "osc7");
+    });
+
+    expect(hint()).toHaveTextContent("src-tauri");
+    expect(screen.queryByText("Terminal")).not.toBeInTheDocument();
+  });
+
   it("shows only the title when no cwd is known yet", () => {
     mount();
     expect(screen.getByText("Terminal")).toBeInTheDocument();
@@ -169,7 +204,7 @@ describe("terminal pane header cwd hint", () => {
         .setCwd("s1", `${WS_CWD}/src-tauri`, "osc7");
     });
     expect(hint()).toHaveTextContent("src-tauri");
-    // Title survives alongside it — the pane keeps its identity.
+    // Split panes keep their local identity alongside the useful context.
     expect(screen.getByText("Terminal")).toBeInTheDocument();
   });
 
@@ -233,7 +268,7 @@ describe("terminal pane header background browser", () => {
     act(() => {
       useFeatureFlags.setState({ enableAgentChat: true });
     });
-    mount("Terminal", [liveSession]);
+    mount("Terminal", { agentBrowserSessions: [liveSession] });
 
     const button = screen.getByRole("button", {
       name: /Browser running in background/,
@@ -251,9 +286,11 @@ describe("terminal pane header background browser", () => {
     act(() => {
       useFeatureFlags.setState({ enableAgentChat: true });
     });
-    mount("Terminal", [
-      { ...liveSession, pane_id: "browser-pane-1", browser_id: "browser-1" },
-    ]);
+    mount("Terminal", {
+      agentBrowserSessions: [
+        { ...liveSession, pane_id: "browser-pane-1", browser_id: "browser-1" },
+      ],
+    });
 
     expect(
       screen.queryByRole("button", {
@@ -263,7 +300,7 @@ describe("terminal pane header background browser", () => {
   });
 
   it("does not show the header control when GUI chrome is disabled", () => {
-    mount("Terminal", [liveSession]);
+    mount("Terminal", { agentBrowserSessions: [liveSession] });
 
     expect(
       screen.queryByRole("button", {
@@ -276,7 +313,7 @@ describe("terminal pane header background browser", () => {
     act(() => {
       useFeatureFlags.setState({ enableAgentChat: true });
     });
-    mount("Terminal", [liveSession], "another-pane");
+    mount("Terminal", { agentBrowserSessions: [liveSession], activePaneId: "another-pane" });
 
     expect(
       screen.queryByRole("button", {

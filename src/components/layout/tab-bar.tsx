@@ -14,7 +14,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Plus, X, Terminal, Globe, GitCompare, FileDiff, FileCode } from "lucide-react";
+import { Plus, X, Terminal, Globe, GitCompare, PanelRight, FileCode } from "lucide-react";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import {
   activateTab,
@@ -375,7 +375,7 @@ function TabBarImpl({ workspace }: Props) {
         title={rightPanelTab ? "Close panel" : "Open panel"}
         aria-pressed={rightPanelTab != null}
       >
-        <FileDiff className="h-3.5 w-3.5" />
+        <PanelRight className="h-3.5 w-3.5" />
       </Button>
     </div>
   );

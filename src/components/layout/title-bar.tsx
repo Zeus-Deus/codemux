@@ -1,9 +1,16 @@
-import { useState, useEffect, useCallback } from "react";
+import {
+  useState,
+  useEffect,
+  useCallback,
+  useLayoutEffect,
+  useRef,
+  useSyncExternalStore,
+} from "react";
 import {
   PanelLeft,
+  PanelRight,
   ChevronDown,
   ExternalLink,
-  FileDiff,
   MessageSquare,
 } from "lucide-react";
 import { WindowControls } from "./window-chrome";
@@ -52,6 +59,13 @@ import {
   openInEditor,
 } from "@/tauri/commands";
 import { cn } from "@/lib/utils";
+import {
+  getTitlebarContentUnder,
+  getTitlebarTranscriptElements,
+  getTitlebarTranscriptVersion,
+  subscribeTitlebarContentUnder,
+  subscribeTitlebarTranscripts,
+} from "@/lib/titlebar-content-under";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { useSyncedSettingsStore, selectDefaultEditor } from "@/stores/synced-settings-store";
@@ -259,14 +273,14 @@ function RightPanelToggle({ workspaceId }: { workspaceId: string }) {
           className={cn(
             "shrink-0",
             rightPanelTab
-              ? "bg-card text-foreground"
+              ? "text-foreground"
               : "text-muted-foreground hover:text-foreground",
           )}
           onClick={togglePanel}
           aria-pressed={rightPanelTab != null}
           aria-label={rightPanelTab ? "Close panel" : "Open panel"}
         >
-          <FileDiff className="h-3.5 w-3.5" />
+          <PanelRight className="h-3.5 w-3.5" />
         </Button>
       </TooltipTrigger>
       <TooltipContent side="bottom" sideOffset={4}>
@@ -455,6 +469,84 @@ interface TitleBarProps {
   onToggleSidebar: () => void;
 }
 
+const CHAT_READING_COLUMN_MAX_WIDTH = 792;
+
+/**
+ * Measure the real transcript and control rectangles. This keeps the raised
+ * treatment tied to an actual horizontal collision instead of a viewport
+ * breakpoint that would style windows where the controls still sit safely
+ * outside the centered reading column.
+ *
+ * `transcriptVersion` is the live-registry counter from
+ * `titlebar-content-under.ts`. It MUST stay in the dependency list: the
+ * measured node set is a snapshot, and `PaneContainer` renders only the
+ * active surface, so every tab / workspace switch destroys the observed
+ * transcript and mounts a new one. Without re-keying on the registry the
+ * effect would keep observing a detached node and `overlapsChat` could
+ * never become true again after the first navigation.
+ */
+function useTitlebarChatOverlap(enabled: boolean, transcriptVersion: number) {
+  const workspaceIslandRef = useRef<HTMLDivElement | null>(null);
+  const actionIslandRef = useRef<HTMLDivElement | null>(null);
+  const [overlapsChat, setOverlapsChat] = useState(false);
+
+  useLayoutEffect(() => {
+    if (!enabled) {
+      setOverlapsChat(false);
+      return;
+    }
+
+    // Registered viewports are the live source of truth; the DOM query is
+    // kept as a superset so a transcript rendered by a path that never
+    // registers is still measured on the runs that do happen.
+    const transcripts = Array.from(
+      new Set<HTMLElement>([
+        ...getTitlebarTranscriptElements(),
+        ...document.querySelectorAll<HTMLElement>(
+          '[data-slot="transcript-list"]',
+        ),
+      ]),
+    );
+    const islands = [workspaceIslandRef.current, actionIslandRef.current].filter(
+      (element): element is HTMLDivElement => element !== null,
+    );
+
+    const update = () => {
+      const next = transcripts.some((transcript) => {
+        const transcriptRect = transcript.getBoundingClientRect();
+        if (transcriptRect.width <= 0 || transcriptRect.height <= 0) return false;
+        const columnWidth = Math.min(
+          CHAT_READING_COLUMN_MAX_WIDTH,
+          transcriptRect.width,
+        );
+        const columnLeft =
+          transcriptRect.left + (transcriptRect.width - columnWidth) / 2;
+        const columnRight = columnLeft + columnWidth;
+        return islands.some((island) => {
+          const islandRect = island.getBoundingClientRect();
+          return islandRect.left < columnRight && islandRect.right > columnLeft;
+        });
+      });
+      setOverlapsChat((current) => (current === next ? current : next));
+    };
+
+    update();
+    window.addEventListener("resize", update);
+    if (typeof ResizeObserver === "undefined") {
+      return () => window.removeEventListener("resize", update);
+    }
+    const observer = new ResizeObserver(update);
+    transcripts.forEach((transcript) => observer.observe(transcript));
+    islands.forEach((island) => observer.observe(island));
+    return () => {
+      window.removeEventListener("resize", update);
+      observer.disconnect();
+    };
+  }, [enabled, transcriptVersion]);
+
+  return { actionIslandRef, overlapsChat, workspaceIslandRef };
+}
+
 export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   const activeWorkspaceId = useActiveWorkspaceId();
   // Called unconditionally (Rules of Hooks) even though only the GUI-chrome
@@ -468,6 +560,32 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // `useGuiChrome`.
   const guiChrome = useGuiChrome();
   const draftGuiChrome = useDraftGuiChrome();
+  const rightPanelWidth = useUIStore((s) => s.rightPanelWidth ?? 320);
+  const activeWorkspacePanelOpen = useUIStore((s) =>
+    activeWorkspaceId
+      ? (s.rightPanelTabs[activeWorkspaceId] ?? null) !== null
+      : false,
+  );
+  // During a lazy draft the backend's "active workspace" is whatever was
+  // focused before the draft opened, and the draft surface never renders
+  // that workspace's right panel. Reading its `rightPanelTabs` entry would
+  // stop the floating band ~328px short of the right edge with nothing
+  // below it — same reason the draft branch suppresses the other
+  // workspace-scoped controls.
+  const rightPanelOpen = guiChrome && activeWorkspacePanelOpen;
+  const remoteClient = isRemoteClient();
+  const contentUnder = useSyncExternalStore(
+    subscribeTitlebarContentUnder,
+    () => getTitlebarContentUnder(activeWorkspaceId),
+    () => false,
+  );
+  const transcriptVersion = useSyncExternalStore(
+    subscribeTitlebarTranscripts,
+    getTitlebarTranscriptVersion,
+    () => 0,
+  );
+  const { actionIslandRef, overlapsChat, workspaceIslandRef } =
+    useTitlebarChatOverlap(guiChrome, transcriptVersion);
 
   if (!guiChrome && !draftGuiChrome) {
     return (
@@ -511,70 +629,115 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
 
   return (
     <div
-      data-tauri-drag-region
-      className="relative flex h-10 w-full shrink-0 items-center border-b border-border bg-card"
+      data-testid="floating-titlebar"
+      data-chat-overlap={contentUnder && overlapsChat ? "true" : undefined}
+      className="pointer-events-none absolute inset-x-0 top-0 z-30 h-10"
     >
-      {/* Left — sidebar toggle ONLY, sized to match the app sidebar so
-          tabs begin exactly where the content pane begins (not floating
-          above the sidebar). `TitleBar` renders as a sibling of
-          `SidebarProvider` in AppShell, not a descendant, so it can't read
-          `--sidebar-width` via CSS inheritance or `useSidebar()` — see
-          `useSidebarGapWidth` for how the live width is mirrored instead. */}
+      {/* The unoccupied top edge remains a native drag target. The floating
+          islands below sit above it and opt back into pointer events.
+
+          Desktop only. This layer spans the full app width — over the
+          sidebar, the workspace, and the right panel — so on the web remote
+          client, where `data-tauri-drag-region` does nothing at all, it
+          would be a pure 40px pointer sink: it swallowed clicks on the top
+          of the right panel's 45px tab row (making Files/Tasks/… reliably
+          unclickable there) and ate wheel events over the transcript. */}
+      {!remoteClient && (
+        <div
+          data-testid="titlebar-drag-layer"
+          data-tauri-drag-region
+          className="pointer-events-auto absolute inset-0"
+        />
+      )}
+
+      {/* Sidebar control island. The sidebar surface itself now reaches the
+          top edge; its first local row reserves this small collision area. */}
       <div
         data-testid="titlebar-sidebar-cluster"
-        className="flex h-full shrink-0 items-center justify-start border-r border-border px-2.5"
-        style={{ width: `${sidebarGapWidth}px` }}
+        className="pointer-events-auto absolute left-1.5 top-1 z-10 flex h-8 items-center"
         onPointerDown={(e) => e.stopPropagation()}
       >
         <SidebarToggleButton open={sidebarOpen} onToggle={onToggleSidebar} />
       </div>
 
-      {/* Workspace slots — tabs (scrollable) + launcher + pinned tiles.
-          Draft chrome renders its single "Agent Chat" pill + draft
-          launcher instead (no workspace, no backend tabs yet). */}
-      {guiChrome ? <TitleBarWorkspaceSlots /> : <TitleBarDraftSlots />}
-
-      {/* Draggable spacer — the calm middle stays a window drag region.
-          Tauri v2's injected mousedown handler only checks the direct
-          target for `data-tauri-drag-region` (no ancestor walk), so this
-          covering spacer must carry the attribute itself even though the
-          root does — otherwise the middle isn't draggable on Windows/macOS.
-          Discrete slots (tabs / launcher / pinned tiles / spacer / right
-          cluster) leave room for a future inline workflow-status pill. */}
-      <div data-tauri-drag-region className="flex-1 self-stretch" />
-
-      {/* Right cluster — Run split button, then the standard monitor /
-          IDE controls, with the right-panel toggle docked beside the
-          window controls (layout toggles live next to window chrome).
-          The workspace-scoped controls (panel toggle / Run / IDE) are
-          suppressed in draft chrome: the backend's "active workspace"
-          is whatever was focused before the draft opened, which is NOT
-          what's on screen — acting on it here would be misleading. */}
+      {/* Workspace band. It spans only the space between the measured left
+          sidebar and either the right panel or native window controls. Tabs
+          and actions are separate islands with a calm drag region between. */}
       <div
-        className="flex shrink-0 items-center gap-1.5 pr-0.5"
-        onPointerDown={(e) => e.stopPropagation()}
+        data-testid="titlebar-floating-band"
+        className="absolute top-1 z-10 flex h-8 min-w-0 items-center gap-2"
+        style={{
+          left: `${sidebarGapWidth + 6}px`,
+          right: rightPanelOpen
+            ? `${rightPanelWidth + 8}px`
+            : remoteClient
+              ? "6px"
+              : "104px",
+        }}
       >
-        {guiChrome && activeWorkspaceId && (
-          <RunButton workspaceId={activeWorkspaceId} variant="split" />
-        )}
-        <ResourceMonitor />
-        {guiChrome && <IdeLauncher compact />}
-        {/* The separator divides the content cluster from the layout-toggle
-            + native window controls group — on the web remote client those
-            controls render nothing, so the separator would dangle next to a
-            lone toggle at the right edge. Hide it there. */}
-        {!isRemoteClient() && (
-          <Separator orientation="vertical" className="!h-4 !self-auto bg-border/50" />
-        )}
-        {guiChrome && activeWorkspaceId && (
-          <RightPanelToggle workspaceId={activeWorkspaceId} />
-        )}
-        <WindowControls />
-        {/* Web remote client only: the connection chip takes the slot the
-            hidden window controls free up. Quiet while connected; the loud
-            reconnecting/offline states live in the app-wide banner. */}
-        {isRemoteClient() && <RemoteConnectionChip compact />}
+        <div
+          ref={workspaceIslandRef}
+          data-testid="titlebar-workspace-island"
+          className="titlebar-overlap-surface pointer-events-auto flex h-8 min-w-0 max-w-[58%] items-center"
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {guiChrome ? <TitleBarWorkspaceSlots /> : <TitleBarDraftSlots />}
+        </div>
+
+        {/* Calm drag gap between the two islands. Same web-client rule as
+            the full-width layer above: keep the flex spacer for layout, but
+            stay transparent to pointer events where there is no window to
+            drag. */}
+        <div
+          data-testid="titlebar-drag-gap"
+          data-tauri-drag-region={remoteClient ? undefined : true}
+          className={cn(
+            "min-w-4 flex-1 self-stretch",
+            remoteClient ? "pointer-events-none" : "pointer-events-auto",
+          )}
+        />
+
+        <div
+          ref={actionIslandRef}
+          data-testid="titlebar-action-island"
+          className="titlebar-overlap-surface pointer-events-auto flex h-8 shrink-0 items-center gap-1"
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {guiChrome ? (
+            <>
+              <div
+                data-testid="titlebar-primary-actions"
+                className="flex items-center gap-1"
+              >
+                {activeWorkspaceId && (
+                  <RunButton workspaceId={activeWorkspaceId} variant="split" />
+                )}
+                <IdeLauncher compact />
+              </div>
+              <div
+                data-testid="titlebar-utility-actions"
+                className="ml-1 flex items-center gap-0.5"
+              >
+                <ResourceMonitor variant="toolbar" />
+                {activeWorkspaceId && (
+                  <RightPanelToggle workspaceId={activeWorkspaceId} />
+                )}
+              </div>
+            </>
+          ) : (
+            <ResourceMonitor />
+          )}
+          {remoteClient && <RemoteConnectionChip compact />}
+        </div>
       </div>
+
+      {/* Native window controls stay attached to the physical window edge,
+          outside the workspace action island. */}
+      {!remoteClient && (
+        <div className="pointer-events-auto absolute right-1 top-1 z-10 overflow-hidden rounded-md">
+          <WindowControls />
+        </div>
+      )}
     </div>
   );
 }

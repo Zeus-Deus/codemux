@@ -71,7 +71,7 @@ function makeSnapshot(): ResourceMetricsSnapshot {
   };
 }
 
-function renderMonitor() {
+function renderMonitor(variant?: "ghost" | "outline" | "toolbar") {
   const client = new QueryClient({
     defaultOptions: {
       queries: { retry: false, staleTime: Infinity, refetchInterval: false },
@@ -80,7 +80,7 @@ function renderMonitor() {
   return render(
     <QueryClientProvider client={client}>
       <TooltipProvider>
-        <ResourceMonitor />
+        <ResourceMonitor variant={variant} />
       </TooltipProvider>
     </QueryClientProvider>,
   );
@@ -115,10 +115,31 @@ describe("ResourceMonitor", () => {
 
   it("renders the title-bar trigger button when enabled", () => {
     renderMonitor();
+    const trigger = screen.getByRole("button", { name: "Resource monitor" });
+    expect(trigger).toBeInTheDocument();
+    expect(trigger).toHaveAttribute("data-variant", "ghost");
+  });
+
+  it("renders a toolbar trigger when requested", () => {
+    renderMonitor("toolbar");
     expect(
       screen.getByRole("button", { name: "Resource monitor" }),
-    ).toBeInTheDocument();
+    ).toHaveAttribute("data-variant", "toolbar");
   });
+
+  it.each([undefined, "toolbar"] as const)(
+    "keeps the CPU glyph at 14px (variant: %s)",
+    (variant) => {
+      // Regression: `size="icon-sm"` sets no `[&_svg]` size override, so
+      // dropping the explicit class silently promoted the icon to the button
+      // base's `size-4` — in the legacy title bar as well as the GUI one.
+      renderMonitor(variant);
+      const icon = screen
+        .getByRole("button", { name: "Resource monitor" })
+        .querySelector("svg");
+      expect(icon).toHaveClass("h-3.5", "w-3.5");
+    },
+  );
 
   it("opens the popover and shows the app + workspace breakdown", async () => {
     renderMonitor();

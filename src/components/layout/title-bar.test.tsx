@@ -1,6 +1,13 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import type {
@@ -16,6 +23,7 @@ const state = {
   activeDraftId: null as string | null,
   workspaceId: "ws-1" as string | null,
   workspaceType: "standard" as WorkspaceType | null,
+  rightPanelTab: null as "files" | null,
 };
 
 // Heavy / GUI-only children → sentinels.
@@ -30,7 +38,9 @@ vi.mock("./run-button", () => ({
   RunButton: () => <div data-testid="run-button" />,
 }));
 vi.mock("./resource-monitor", () => ({
-  ResourceMonitor: () => <div data-testid="resource-monitor" />,
+  ResourceMonitor: ({ variant }: { variant?: string }) => (
+    <div data-testid="resource-monitor" data-variant={variant ?? "ghost"} />
+  ),
 }));
 vi.mock("./window-chrome", () => ({
   WindowControls: () => <div data-testid="window-controls" />,
@@ -138,7 +148,10 @@ vi.mock("@/stores/ui-store", () => ({
   useUIStore: Object.assign(
     vi.fn((sel: (s: unknown) => unknown) =>
       sel({
-        rightPanelTabs: {},
+        rightPanelTabs: state.rightPanelTab
+          ? { "ws-1": state.rightPanelTab }
+          : {},
+        rightPanelWidth: 320,
         setRightPanelTab: vi.fn(),
       }),
     ),
@@ -197,7 +210,29 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { agentChatCreatePane, applyPreset } from "@/tauri/commands";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
+import {
+  clearTitlebarContentUnder,
+  publishTitlebarContentUnder,
+  registerTitlebarTranscript,
+} from "@/lib/titlebar-content-under";
 import { TitleBar } from "./title-bar";
+
+/** A stand-in chat viewport wide enough to collide with both islands. */
+function makeTranscriptNode(): HTMLElement {
+  const transcript = document.createElement("div");
+  transcript.dataset.slot = "transcript-list";
+  transcript.getBoundingClientRect = () =>
+    ({ left: 288, right: 1260, width: 972, height: 800 }) as DOMRect;
+  document.body.appendChild(transcript);
+  return transcript;
+}
+
+function stubIslandRects(getByTestId: (id: string) => HTMLElement): void {
+  getByTestId("titlebar-workspace-island").getBoundingClientRect = () =>
+    ({ left: 300, right: 470, width: 170, height: 32 }) as DOMRect;
+  getByTestId("titlebar-action-island").getBoundingClientRect = () =>
+    ({ left: 990, right: 1150, width: 160, height: 32 }) as DOMRect;
+}
 
 function renderBar() {
   return render(
@@ -216,6 +251,7 @@ beforeEach(() => {
   state.activeDraftId = null;
   state.workspaceId = "ws-1";
   state.workspaceType = "standard";
+  state.rightPanelTab = null;
   presetSnapshot = chatPresetSnapshot;
   vi.mocked(agentChatCreatePane).mockClear();
   vi.mocked(applyPreset).mockClear();
@@ -248,9 +284,11 @@ describe("TitleBar chrome gating", () => {
     expect(getByTestId("agent-launcher")).toBeInTheDocument();
     // Rehomed right cluster.
     const runButton = getByTestId("run-button");
+    const resourceMonitor = getByTestId("resource-monitor");
     const panelToggle = getByRole("button", { name: "Open panel" });
     const windowControls = getByTestId("window-controls");
     expect(runButton).toBeInTheDocument();
+    expect(resourceMonitor).toBeInTheDocument();
     expect(panelToggle).toBeInTheDocument();
     expect(
       runButton.compareDocumentPosition(panelToggle) &
@@ -266,6 +304,171 @@ describe("TitleBar chrome gating", () => {
     // the unrelated legacy-PresetBar concept).
     expect(queryByTestId("titlebar-favorite-builtin-chat-agent")).toBeNull();
   });
+
+  it("renders GUI chrome as frameless floating clusters instead of a full-width bar", () => {
+    state.enableAgentChat = true;
+    const { getByTestId } = renderBar();
+    const root = getByTestId("floating-titlebar");
+    const clusters = [
+      getByTestId("titlebar-sidebar-cluster"),
+      getByTestId("titlebar-workspace-island"),
+      getByTestId("titlebar-action-island"),
+    ];
+
+    expect(root.className).toContain("absolute");
+    expect(root.className).toContain("pointer-events-none");
+    expect(root.className).not.toContain("border-b");
+    expect(root.className).not.toContain("bg-card");
+    for (const cluster of clusters) {
+      expect(cluster.className).not.toContain("border");
+      expect(cluster.className).not.toContain("bg-card");
+      expect(cluster.className).not.toContain("shadow");
+      expect(cluster.className).not.toContain("backdrop-blur");
+    }
+  });
+
+  it("mirrors the left sidebar glyph for the right-panel toggle", () => {
+    state.enableAgentChat = true;
+    const { getByRole } = renderBar();
+
+    expect(
+      getByRole("button", { name: "Toggle sidebar" }).querySelector(
+        ".lucide-panel-left",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      getByRole("button", { name: "Open panel" }).querySelector(
+        ".lucide-panel-right",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the open right-panel toggle frameless", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTab = "files";
+    const { getByRole } = renderBar();
+    const panelToggle = getByRole("button", { name: "Close panel" });
+    expect(panelToggle).toHaveClass("text-foreground");
+    expect(panelToggle).not.toHaveClass("bg-card");
+  });
+
+  it("groups primary actions separately from utility controls", () => {
+    state.enableAgentChat = true;
+    const { getByRole, getByTestId } = renderBar();
+    const primary = getByTestId("titlebar-primary-actions");
+    const utilities = getByTestId("titlebar-utility-actions");
+
+    expect(primary).toContainElement(getByTestId("run-button"));
+    expect(utilities).toContainElement(getByTestId("resource-monitor"));
+    expect(getByTestId("resource-monitor")).toHaveAttribute(
+      "data-variant",
+      "toolbar",
+    );
+    expect(utilities).toContainElement(
+      getByRole("button", { name: "Open panel" }),
+    );
+    expect(
+      primary.compareDocumentPosition(utilities) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(utilities).toHaveClass("ml-1");
+  });
+
+  it("keeps overlap surfaces dormant in the normal frameless state", () => {
+    state.enableAgentChat = true;
+    const { getByTestId } = renderBar();
+
+    expect(getByTestId("floating-titlebar")).not.toHaveAttribute(
+      "data-chat-overlap",
+    );
+    expect(getByTestId("titlebar-workspace-island")).toHaveClass(
+      "titlebar-overlap-surface",
+      "h-8",
+    );
+    expect(getByTestId("titlebar-action-island")).toHaveClass(
+      "titlebar-overlap-surface",
+      "h-8",
+    );
+  });
+
+  it("raises only the intersecting islands once transcript content is underneath", async () => {
+    state.enableAgentChat = true;
+    const transcript = makeTranscriptNode();
+    const source = Symbol("overlap-test");
+
+    const { getByTestId } = renderBar();
+    stubIslandRects(getByTestId);
+
+    fireEvent(window, new Event("resize"));
+    act(() => publishTitlebarContentUnder("ws-1", source, true));
+    await waitFor(() =>
+      expect(getByTestId("floating-titlebar")).toHaveAttribute(
+        "data-chat-overlap",
+        "true",
+      ),
+    );
+
+    act(() => clearTitlebarContentUnder("ws-1", source));
+    transcript.remove();
+  });
+
+  it("re-measures against the fresh transcript a tab or workspace switch mounts", async () => {
+    // Regression: the overlap effect snapshotted `querySelectorAll` once and
+    // depended only on `[enabled]`. `PaneContainer` renders only the active
+    // surface, so switching tabs unmounts `MessageList` and mounts a new one
+    // with a brand-new node — the titlebar kept observing the detached
+    // element and the raised treatment could never fire again after any
+    // navigation. Each viewport now registers itself, and the registry
+    // version re-keys the effect.
+    state.enableAgentChat = true;
+    const source = Symbol("overlap-remount");
+    const first = makeTranscriptNode();
+    const unregisterFirst = registerTitlebarTranscript(first);
+
+    const { getByTestId } = renderBar();
+    stubIslandRects(getByTestId);
+
+    fireEvent(window, new Event("resize"));
+    act(() => publishTitlebarContentUnder("ws-1", source, true));
+    await waitFor(() =>
+      expect(getByTestId("floating-titlebar")).toHaveAttribute(
+        "data-chat-overlap",
+        "true",
+      ),
+    );
+
+    // Switch away: the old viewport unmounts.
+    act(() => {
+      first.remove();
+      unregisterFirst();
+    });
+    await waitFor(() =>
+      expect(getByTestId("floating-titlebar")).not.toHaveAttribute(
+        "data-chat-overlap",
+      ),
+    );
+
+    // Switch back / to another chat tab: a different DOM node mounts. The
+    // titlebar must pick it up without a remount of its own.
+    const second = makeTranscriptNode();
+    let unregisterSecond = () => {};
+    act(() => {
+      unregisterSecond = registerTitlebarTranscript(second);
+    });
+    await waitFor(() =>
+      expect(getByTestId("floating-titlebar")).toHaveAttribute(
+        "data-chat-overlap",
+        "true",
+      ),
+    );
+
+    act(() => {
+      unregisterSecond();
+      clearTitlebarContentUnder("ws-1", source);
+    });
+    second.remove();
+  });
+
 
   it("renders the GUI draft chrome (draft pill + draft launcher) while a lazy-creation draft is active", () => {
     // Regression coverage: the draft used to fall back to the legacy
@@ -299,31 +502,78 @@ describe("TitleBar chrome gating", () => {
   });
 });
 
-describe("TitleBar GUI chrome — left cluster sized to the sidebar", () => {
-  it("renders the sidebar-toggle cluster with an explicit pixel width and a boundary border", () => {
+describe("TitleBar GUI chrome — floating placement", () => {
+  it("starts the workspace band after the measured sidebar", () => {
     state.enableAgentChat = true;
     const { getByTestId } = renderBar();
-    const cluster = getByTestId("titlebar-sidebar-cluster");
+    const band = getByTestId("titlebar-floating-band");
     // jsdom has no real `SidebarProvider` DOM to measure (no
     // `[data-slot="sidebar-gap"]` node exists in this test tree), so
     // `useSidebarGapWidth` stays on its fallback — which matches
-    // `SidebarProvider`'s own default width (256px) for exactly that
-    // reason. The point under test is the mechanism (an explicit,
-    // sidebar-derived pixel width + boundary border), not a live resize,
-    // which isn't observable under jsdom's no-op ResizeObserver stub.
-    expect(cluster.style.width).toBe("256px");
-    expect(cluster.className).toContain("border-r");
+    // `SidebarProvider`'s own default width (256px). The floating band
+    // begins six pixels beyond that edge and stops before window controls.
+    expect(band.style.left).toBe("262px");
+    expect(band.style.right).toBe("104px");
   });
 
-  it("left-aligns the sidebar toggle within its cluster (not centered)", () => {
-    // Regression coverage: the cluster used to be `justify-center`, which
-    // visually floated the toggle away from the mock's left-aligned
-    // `padding:0 10px` layout.
+  it("moves the workspace actions left of an open right panel", () => {
+    state.enableAgentChat = true;
+    state.rightPanelTab = "files";
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-floating-band").style.right).toBe("328px");
+  });
+
+  it("renders the sidebar toggle as a compact frameless cluster", () => {
     state.enableAgentChat = true;
     const { getByTestId } = renderBar();
     const cluster = getByTestId("titlebar-sidebar-cluster");
-    expect(cluster.className).toContain("justify-start");
-    expect(cluster.className).not.toContain("justify-center");
+    expect(cluster.className).toContain("absolute");
+    expect(cluster.style.width).toBe("");
+    expect(cluster.className).not.toContain("border");
+    expect(cluster.className).not.toContain("bg-card");
+  });
+
+  it("spans the full width for a draft even when the backend workspace has its panel open", () => {
+    // Regression: the band read `rightPanelTabs` for the backend-active
+    // workspace, which during a lazy draft is whatever was focused *before*
+    // the draft opened. The draft surface never renders that panel, so the
+    // band stopped ~328px short of the right edge with the resource monitor
+    // floating mid-air over empty space.
+    state.enableAgentChat = true;
+    state.enableLazy = true;
+    state.activeDraftId = "draft-1";
+    state.rightPanelTab = "files";
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-floating-band").style.right).toBe("104px");
+  });
+});
+
+describe("TitleBar GUI chrome — drag regions", () => {
+  afterEach(() => {
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = undefined;
+  });
+
+  it("keeps the full-width drag layer on desktop", () => {
+    state.enableAgentChat = true;
+    const { getByTestId } = renderBar();
+    expect(getByTestId("titlebar-drag-layer")).toHaveClass("pointer-events-auto");
+    expect(getByTestId("titlebar-drag-gap")).toHaveAttribute(
+      "data-tauri-drag-region",
+    );
+  });
+
+  it("drops every pointer-eating drag surface on the web client", () => {
+    // Regression: `data-tauri-drag-region` does nothing in a browser, but the
+    // full-width `inset-0` layer still swallowed pointer + wheel events for
+    // the top 40px of everything below it — most visibly the right panel's
+    // 45px tab row, whose triggers became effectively unclickable.
+    (window as { __CODEMUX_REMOTE__?: boolean }).__CODEMUX_REMOTE__ = true;
+    state.enableAgentChat = true;
+    const { getByTestId, queryByTestId } = renderBar();
+    expect(queryByTestId("titlebar-drag-layer")).toBeNull();
+    const gap = getByTestId("titlebar-drag-gap");
+    expect(gap).toHaveClass("pointer-events-none");
+    expect(gap).not.toHaveAttribute("data-tauri-drag-region");
   });
 });
 

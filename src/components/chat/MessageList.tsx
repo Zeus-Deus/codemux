@@ -17,6 +17,11 @@ import type {
   PermissionRequestItem,
 } from "@/lib/agent-chat/types";
 import { cn } from "@/lib/utils";
+import {
+  clearTitlebarContentUnder,
+  publishTitlebarContentUnder,
+  registerTitlebarTranscript,
+} from "@/lib/titlebar-content-under";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import type { ApprovalDecision } from "@/tauri/events";
@@ -233,6 +238,7 @@ export const MessageList = memo(function MessageList({
     tailBody?.kind === "activity" && tailBody.working;
 
   const listRef = useRef<LegendListRef | null>(null);
+  const titlebarScrollSourceRef = useRef(Symbol("chat-scroll-viewport"));
   const [isAtEnd, setIsAtEnd] = useState(true);
   const [firstVisibleSlotIndex, setFirstVisibleSlotIndex] = useState(() =>
     Math.max(0, slots.length - 1),
@@ -244,6 +250,38 @@ export const MessageList = memo(function MessageList({
     setIsAtEnd(state.isAtEnd);
     return state.listen("isAtEnd", setIsAtEnd);
   }, []);
+
+  // Publish this viewport to the titlebar's live-element registry so its
+  // overlap measurement always runs against mounted nodes. `PaneContainer`
+  // renders only the active surface, so switching tabs or workspaces
+  // unmounts this list and mounts a fresh one — register/unregister is what
+  // tells the titlebar to re-measure. Not gated on `workspaceId`: the
+  // measurement is purely geometric, and a hidden/unsized transcript is
+  // filtered out there by its zero-area rect.
+  useEffect(() => {
+    const viewport = listRef.current?.getScrollableNode();
+    if (!viewport) return;
+    return registerTitlebarTranscript(viewport);
+  }, []);
+
+  // Drive the overlay from the transcript's actual scroll position. This
+  // publishes only a boolean transition, not every scroll frame, and the
+  // external store safely aggregates multiple chat panes in one workspace.
+  useEffect(() => {
+    if (!workspaceId) return;
+    const viewport = listRef.current?.getScrollableNode();
+    if (!viewport) return;
+    const source = titlebarScrollSourceRef.current;
+    const sync = () =>
+      publishTitlebarContentUnder(workspaceId, source, viewport.scrollTop > 4);
+
+    sync();
+    viewport.addEventListener("scroll", sync, { passive: true });
+    return () => {
+      viewport.removeEventListener("scroll", sync);
+      clearTitlebarContentUnder(workspaceId, source);
+    };
+  }, [workspaceId]);
 
   const prevScrollSignalRef = useRef(scrollToBottomSignal);
   useEffect(() => {

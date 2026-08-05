@@ -177,6 +177,36 @@ describe("WorkspaceMain chrome rows", () => {
     // Pane content still renders — only the stacked chrome rows drop.
     expect(getByTestId("pane-container")).toBeInTheDocument();
   });
+
+  it("reserves only local top clearance for a non-chat GUI surface", () => {
+    state.enableAgentChat = true;
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("workspace-content-surface")).toHaveClass("pt-10");
+  });
+
+  it("lets a sole-root chat reclaim the top edge beneath the floating islands", () => {
+    state.enableAgentChat = true;
+    state.workspace = makeWorkspace({
+      surfaces: [
+        {
+          surface_id: "surface-1",
+          title: "Agent Chat",
+          active_pane_id: "pane-chat",
+          root: {
+            kind: "agent_chat",
+            pane_id: "pane-chat",
+            title: "Agent Chat",
+            thread_id: "thread-1",
+            provider: "claude",
+            cwd: "/p",
+          },
+        },
+      ],
+    });
+
+    const { getByTestId } = render(<WorkspaceMain />);
+    expect(getByTestId("workspace-content-surface")).not.toHaveClass("pt-10");
+  });
 });
 
 describe("WorkspaceMain draft branch chrome", () => {

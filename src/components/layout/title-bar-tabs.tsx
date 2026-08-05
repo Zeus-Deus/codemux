@@ -67,7 +67,7 @@ const PILL_BASE =
   "group/tab flex h-7 shrink-0 items-center gap-1 rounded-lg pl-2.5 pr-1 text-xs transition-colors";
 const PILL_ACTIVE = "bg-background text-foreground font-semibold";
 const PILL_INACTIVE =
-  "font-medium text-muted-foreground/80 hover:bg-muted/40 hover:text-muted-foreground";
+  "font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground";
 const CLOSE_BTN =
   "ml-0.5 rounded-sm p-0.5 text-muted-foreground/70 transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
 

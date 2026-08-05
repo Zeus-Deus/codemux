@@ -53,13 +53,17 @@ function getTrackedMemorySharePercent(
 
 interface ResourceMonitorProps {
   className?: string;
+  variant?: "ghost" | "outline" | "toolbar";
 }
 
 /**
  * Title-bar resource monitor: a CPU-chip icon that opens a popover showing
  * how much CPU + memory Codemux and every terminal process tree are using.
  */
-export function ResourceMonitor({ className }: ResourceMonitorProps) {
+export function ResourceMonitor({
+  className,
+  variant = "ghost",
+}: ResourceMonitorProps) {
   const [open, setOpen] = useState(false);
   const [sortOption, setSortOption] = useState<SortOption>("memory");
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(
@@ -156,11 +160,16 @@ export function ResourceMonitor({ className }: ResourceMonitorProps) {
         <TooltipTrigger asChild>
           <PopoverTrigger asChild>
             <Button
-              variant="ghost"
+              variant={variant}
               size="icon-sm"
               aria-label="Resource monitor"
               className={cn("text-muted-foreground", className)}
             >
+              {/* Explicit 14px: `size="icon-sm"` sets no `[&_svg]` size, so
+                  dropping this would fall through to the button base's
+                  `size-4` and silently grow the glyph 14→16px — in the
+                  legacy title bar too. 14px also matches the neighbouring
+                  titlebar glyphs (PanelLeft/PanelRight, preset tiles). */}
               <Cpu className="h-3.5 w-3.5" />
             </Button>
           </PopoverTrigger>
