@@ -1053,7 +1053,26 @@ Contract preserved from the pre-redesign renderer:
   contract covers text sends, image sends, the one-click "Continue run" (it
   routes through `handleSubmit`), and dispatching a queued turn with "send
   now". Both failed-send rollback paths call `clearSendAnchor`, so a dead send
-  never strands reserved end space; switching threads clears it too.
+  never strands reserved end space; a failed "send now" clears it too (that
+  bubble stays queued, so there is no rollback to ride along with), and so
+  does switching threads.
+
+  **The anchor expires when the turn settles.** It is a live-turn intent, not
+  a durable property of the thread, so `AgentChatPane` clears it on the
+  falling edge of the same combined live signal the transcript gets
+  (`streaming || isSending`, so the optimistic window between Enter and the
+  backend's first `Running` counts as live). Two things would otherwise go
+  wrong once a run finished: a later `MessageList` remount on the same thread
+  — the subagent drill-in/out swap, for instance — would re-park a
+  long-finished prompt near the top instead of opening at the latest row, and
+  LegendList's built-in end pin, which an anchor deliberately disables, would
+  never come back for the item/footer layout growth the anchor's geometry does
+  not model (a late-loading image growing a row with no data change).
+  Expiry is a lifecycle event, not navigation: if the reader has already
+  gestured into `free-scrolling`, the transcript drops the anchor bookkeeping
+  **without** re-claiming the viewport, so a turn finishing never yanks
+  someone browsing history back to the tail or takes away the pill they are
+  using to get there.
 
   **Anchor after measurement, never on a timer.** The resolved slot index
   feeds LegendList's `anchoredEndSpace` (`anchorOffset: 16`). Its `onReady`
@@ -1069,9 +1088,16 @@ Contract preserved from the pre-redesign renderer:
   stays near the top, then just enough to keep the growing tail on screen.
   The geometry is pure and unit-tested (`send-scroll-state.test.ts`).
 
-  **Opting out is the reader's call.** Only real input gestures release live
-  follow — `wheel`, `touchmove`, `pointerdown` (passive listeners on the
-  scrollable node), plus subagent-jump navigation. Deliberately *not* `scroll`:
+  **Opting out is the reader's call.** Only real navigation gestures release
+  live follow — `wheel`, `touchmove`, and a `pointerdown` **whose target is
+  the scroll container itself** (passive listeners on the scrollable node),
+  plus subagent-jump navigation. The `pointerdown` scoping matters: a
+  scrollbar drag targets the scroller, but accepting a plan, answering an
+  approval, expanding a tool card, or starting a text selection targets a
+  descendant row. Treating those as navigation froze the viewport for the rest
+  of a live run, because while an anchor is mounted the built-in pin is off
+  and the advance effect is the only thing moving it. Deliberately *not*
+  `scroll`:
   every programmatic correction emits one, and trusting those is what used to
   leave the pill stuck on. A generation counter pairs "we still own the
   viewport" against "a gesture has happened", and every async continuation

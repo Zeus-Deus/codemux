@@ -625,6 +625,26 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   useEffect(() => {
     setSendAnchor(null);
   }, [threadId]);
+  // The anchor is a LIVE-TURN intent, not a durable property of the thread,
+  // so it expires when the turn settles. Two things go wrong if it lingers:
+  // a later `MessageList` remount on the same thread (the subagent
+  // drill-in/out swap below, for one) would re-park a long-finished prompt
+  // near the top instead of opening at the latest row, and LegendList's
+  // built-in end pin — which an anchor deliberately disables — would never
+  // come back for the item/footer layout growth an anchor does not model
+  // (a late-loading image growing a row with no data change).
+  //
+  // Watches the same combined signal the transcript gets, so the optimistic
+  // window between Enter and the backend's first `Running` counts as live.
+  const transcriptStreaming = streaming || isSending;
+  const prevTranscriptStreamingRef = useRef(transcriptStreaming);
+  useEffect(() => {
+    const wasStreaming = prevTranscriptStreamingRef.current;
+    prevTranscriptStreamingRef.current = transcriptStreaming;
+    // Falling edge only. Seeded with the current value so mounting onto an
+    // already-settled thread is not itself treated as a completion.
+    if (wasStreaming && !transcriptStreaming) setSendAnchor(null);
+  }, [transcriptStreaming]);
   const [subagentJumpRequest, setSubagentJumpRequest] = useState<{
     cardId: string;
     nonce: number;
@@ -1969,17 +1989,19 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         .threads[threadId]?.messages.find(
           (m) => m.kind === "user_message" && m.queued?.queuedId === queuedId,
         );
-      if (
-        queuedItem?.kind === "user_message" &&
-        queuedItem.clientNonce
-      ) {
-        requestSendAnchor(queuedItem.clientNonce);
-      }
+      const anchoredNonce =
+        queuedItem?.kind === "user_message" ? queuedItem.clientNonce : undefined;
+      if (anchoredNonce) requestSendAnchor(anchoredNonce);
       agentChatSendQueuedTurnNow(provider, threadId, queuedId).catch((err) => {
+        // Unlike a composer send there is no bubble to roll back — the
+        // queued turn stays queued — so without this the list would sit
+        // anchored on a turn that is never going to stream, holding blank
+        // reserved space open beneath it.
+        if (anchoredNonce) clearSendAnchor(anchoredNonce);
         toast.error(`Failed to send queued message: ${err}`);
       });
     },
-    [threadId, provider, requestSendAnchor],
+    [threadId, provider, requestSendAnchor, clearSendAnchor],
   );
 
   const handleRespond = useCallback(
@@ -2948,7 +2970,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
           ) : (
             <ChatTranscript
               messages={messages}
-              streaming={streaming || isSending}
+              streaming={transcriptStreaming}
               stalled={stalled}
               interrupted={interrupted}
               sendAnchor={sendAnchor}

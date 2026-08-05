@@ -1153,6 +1153,167 @@ describe("MessageList new-turn scroll contract", () => {
     expect(scrollToOffsetSpy).not.toHaveBeenCalled();
   });
 
+  it("keeps following through a press on a row inside the transcript", async () => {
+    // Accepting a plan, answering an approval, expanding a tool card, or
+    // starting a text selection all land on a descendant of the scroller.
+    // While an anchor is mounted the built-in end pin is off, so treating
+    // those as navigation would freeze the viewport for the rest of the run.
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    scrollToOffsetSpy.mockClear();
+
+    const row = document.querySelector<HTMLElement>("[data-message-id]")!;
+    act(() => {
+      fireEvent.pointerDown(row);
+    });
+
+    listState.scroll = 84;
+    const grown: ChatViewItem[] = [userTurn, sentTurn];
+    for (let i = 0; i < 6; i++) {
+      grown.push({ ...answer, id: `am-${i}`, seq: 3 + i });
+    }
+    rerender(
+      <MessageList messages={grown} sendAnchor={anchor(1)} {...noopHandlers} />,
+    );
+    await flushFrames();
+
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 316,
+      animated: false,
+    });
+  });
+
+  it("releases follow for a press on the scroll container itself", async () => {
+    // A scrollbar drag targets the scroller, not a row — that IS navigation.
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    scrollToOffsetSpy.mockClear();
+
+    act(() => {
+      fireEvent.pointerDown(viewport());
+    });
+
+    listState.scroll = 84;
+    const grown: ChatViewItem[] = [userTurn, sentTurn];
+    for (let i = 0; i < 6; i++) {
+      grown.push({ ...answer, id: `am-${i}`, seq: 3 + i });
+    }
+    rerender(
+      <MessageList messages={grown} sendAnchor={anchor(1)} {...noopHandlers} />,
+    );
+    await flushFrames();
+
+    expect(scrollToOffsetSpy).not.toHaveBeenCalled();
+  });
+
+  it("restores the built-in end pin when the turn settles", () => {
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+
+    // The turn finished, so the pane expired the anchor. LegendList's own
+    // pin has to come back: it covers item/footer layout growth (a
+    // late-loading image) that the anchor's geometry never modelled.
+    rerender(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={null}
+        {...noopHandlers}
+      />,
+    );
+    expect(lastListProps.current?.anchoredEndSpace).toBeUndefined();
+    expect(lastListProps.current?.maintainScrollAtEnd).toEqual({
+      animated: false,
+      on: {
+        dataChange: true,
+        footerLayout: true,
+        itemLayout: true,
+        layout: true,
+      },
+    });
+  });
+
+  it("does not steal the viewport back when the turn settles mid-history-read", async () => {
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+
+    // The reader scrolls off into history mid-turn and gets their way back.
+    act(() => {
+      fireEvent.wheel(viewport());
+      emitIsAtEnd(false);
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: /jump to latest/i }),
+      ).not.toBeNull(),
+    );
+    scrollToEndSpy.mockClear();
+    scrollToOffsetSpy.mockClear();
+
+    // The turn settles and the pane expires the anchor. That is a lifecycle
+    // event, not a navigation intent: re-claiming here would silently drop
+    // the reader's follow state and take away the pill they are still using.
+    listState.rowHeight = 300;
+    rerender(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={null}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames();
+
+    expect(
+      screen.queryByRole("button", { name: /jump to latest/i }),
+    ).not.toBeNull();
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+    expect(scrollToOffsetSpy).not.toHaveBeenCalled();
+  });
+
   it("releases the reserved end space when a failed send rolls the anchor back", () => {
     const { rerender } = render(
       <MessageList
@@ -1212,6 +1373,14 @@ describe("MessageList jump-to-latest pill", () => {
     text: "second prompt",
     clientNonce: "nonce-send",
   };
+  const streamedAnswer: ChatViewItem = {
+    kind: "assistant_message",
+    id: "am-1",
+    seq: 2,
+    turn_id: "turn-1",
+    text: "answer",
+    streaming: true,
+  };
 
   async function flushFrames(count = 3) {
     for (let i = 0; i < count; i++) {
@@ -1269,6 +1438,67 @@ describe("MessageList jump-to-latest pill", () => {
     act(() => emitIsAtEnd(false));
     await flushFrames();
     expect(pill()).toBeNull();
+  });
+
+  it("appears when a gesture interrupts an anchored stream", async () => {
+    // The list had already reported "not at end" while we were driving the
+    // anchored turn, so that value is edge-triggered *away* — no further
+    // event will fire when the reader takes over. The pill still has to
+    // show, or they are stranded in history with no way back.
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={{ clientNonce: "nonce-send", nonce: 1 }}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames(2);
+    act(() => emitIsAtEnd(false));
+    expect(pill()).toBeNull();
+
+    act(() => {
+      fireEvent.wheel(
+        document.querySelector<HTMLElement>('[data-slot="transcript-list"]')!,
+      );
+    });
+    await waitFor(() => expect(pill()).not.toBeNull());
+  });
+
+  it("re-claims follow and hides itself when the reader scrolls back to the edge", async () => {
+    const anchored = { clientNonce: "nonce-send", nonce: 1 };
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchored}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames(2);
+    act(() => emitIsAtEnd(false));
+    act(() => {
+      fireEvent.wheel(
+        document.querySelector<HTMLElement>('[data-slot="transcript-list"]')!,
+      );
+    });
+    await waitFor(() => expect(pill()).not.toBeNull());
+
+    // Back at the tail: follow resumes rather than staying released.
+    act(() => emitIsAtEnd(true));
+    expect(pill()).toBeNull();
+
+    scrollToEndSpy.mockClear();
+    listState.rowHeight = 300; // real content now overflows the viewport
+    rerender(
+      <MessageList
+        messages={[userTurn, sentTurn, streamedAnswer]}
+        sendAnchor={anchored}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames();
+    // Proof the re-claim took: the next token drives the tail again instead
+    // of leaving the reader behind.
+    expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false });
   });
 
   it("returns to the live edge instantly when used", async () => {

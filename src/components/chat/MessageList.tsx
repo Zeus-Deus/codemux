@@ -339,7 +339,20 @@ export const MessageList = memo(function MessageList({
     modeRef.current = "free-scrolling";
     anchorIndexRef.current = null;
     positionedAnchorRef.current = null;
-  }, []);
+    // LegendList reports `isAtEnd` only on TRANSITIONS, so a gesture landing
+    // while the value is already false gets no event of its own. This is the
+    // moment the viewport changes hands, so it is also where the pill
+    // decision belongs for a reader who is already off the edge — otherwise
+    // they browse history with no way back.
+    const atEnd = listRef.current?.getState()?.isAtEnd;
+    if (atEnd === undefined) return;
+    isAtEndRef.current = atEnd;
+    if (atEnd) {
+      hideJumpToLatest();
+    } else {
+      scheduleJumpToLatest();
+    }
+  }, [hideJumpToLatest, scheduleJumpToLatest]);
 
   // Apply a send's navigation intent synchronously, during the same render
   // that first sees it — not in an effect. The composer's optimistic row and
@@ -362,10 +375,22 @@ export const MessageList = memo(function MessageList({
     setShowJumpToLatest(false);
   } else if (sendNonce !== lastSendNonceRef.current) {
     lastSendNonceRef.current = sendNonce;
-    // A cleared anchor is a failed-send rollback: the reserved end space
-    // disappears with it, and plain tail following takes over.
-    claimScroll(sendAnchor ? "anchoring-turn" : "following-end");
-    setShowJumpToLatest(false);
+    if (sendAnchor) {
+      claimScroll("anchoring-turn");
+      setShowJumpToLatest(false);
+    } else if (ownsScroll()) {
+      // The anchor was cleared — a failed-send rollback, or the turn
+      // settling — while we still own the viewport. The reserved end space
+      // goes away and plain tail following takes over.
+      claimScroll("following-end");
+      setShowJumpToLatest(false);
+    } else {
+      // Same clear, but the reader has gestured into free-scrolling. Drop
+      // the anchor bookkeeping only: a turn finishing must never yank a
+      // reader who deliberately scrolled away back to the tail.
+      anchorIndexRef.current = null;
+      positionedAnchorRef.current = null;
+    }
   }
 
   useEffect(
@@ -382,6 +407,13 @@ export const MessageList = memo(function MessageList({
 
   const handleIsAtEndChange = useCallback(
     (atEnd: boolean) => {
+      // Record reality FIRST, on every event, including ones we go on to
+      // swallow. The listener is edge-triggered, so a swallowed value that
+      // never reaches this ref leaves us disagreeing with the list for as
+      // long as that value holds — and the disagreement then eats the
+      // *next* real transition via the dedup below.
+      const changed = isAtEndRef.current !== atEnd;
+      isAtEndRef.current = atEnd;
       if (!atEnd && ownsScroll()) {
         // We are the one driving. A transient "not at end" while mounting,
         // while the anchored row is being positioned, or while the reserved
@@ -389,8 +421,7 @@ export const MessageList = memo(function MessageList({
         hideJumpToLatest();
         return;
       }
-      if (isAtEndRef.current === atEnd) return;
-      isAtEndRef.current = atEnd;
+      if (!changed) return;
       if (atEnd) {
         // Scrolling back to the edge re-claims live follow, even after a
         // gesture had released it.
@@ -413,23 +444,35 @@ export const MessageList = memo(function MessageList({
     return state.listen("isAtEnd", handleIsAtEndChange);
   }, [handleIsAtEndChange]);
 
-  // Only genuine input gestures release follow. Deliberately NOT `scroll`:
-  // every programmatic correction below emits one, and treating those as
-  // reader intent is exactly the bug that left the pill stuck on.
-  // `pointerdown` covers scrollbar drags.
+  // Only genuine navigation gestures release follow. Deliberately NOT
+  // `scroll`: every programmatic correction below emits one, and treating
+  // those as reader intent is exactly the bug that left the pill stuck on.
   useEffect(() => {
     let removeListeners: (() => void) | null = null;
     const frame = requestAnimationFrame(() => {
       const viewport = listRef.current?.getScrollableNode();
       if (!viewport) return;
       const onGesture = () => cancelFollowForUserNavigation();
+      // `pointerdown` is here for scrollbar drags, which target the scroll
+      // container itself. A press on a row targets a descendant — accepting
+      // a plan, answering an approval, expanding a tool card, or just
+      // starting a text selection — and must NOT retire follow: while an
+      // anchor is mounted the built-in end pin is off and the advance effect
+      // is the only thing moving the viewport, so cancelling on an ordinary
+      // click would freeze the transcript for the rest of a live run.
+      const onPointerDown = (event: Event) => {
+        if (event.target !== viewport) return;
+        cancelFollowForUserNavigation();
+      };
       viewport.addEventListener("wheel", onGesture, { passive: true });
       viewport.addEventListener("touchmove", onGesture, { passive: true });
-      viewport.addEventListener("pointerdown", onGesture, { passive: true });
+      viewport.addEventListener("pointerdown", onPointerDown, {
+        passive: true,
+      });
       removeListeners = () => {
         viewport.removeEventListener("wheel", onGesture);
         viewport.removeEventListener("touchmove", onGesture);
-        viewport.removeEventListener("pointerdown", onGesture);
+        viewport.removeEventListener("pointerdown", onPointerDown);
       };
     });
     return () => {

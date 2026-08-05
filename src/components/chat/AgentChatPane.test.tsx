@@ -23,6 +23,9 @@ type SliceOverrides = {
   /** Composer text — the Thread Scope deferred-worktree submit tests
    *  seed this so the pane's `draft` (slice.inputDraft) is non-empty. */
   inputDraft?: string;
+  /** Live-turn flag. The send-anchor expiry tests flip this to drive the
+   *  falling edge the pane watches for turn completion. */
+  streaming?: boolean;
   /** Durable resume cursor. `undefined` (the default) means "never
    *  hydrated", which sends the mount effect down the cold path. */
   lastPersistedEventId?: number | null;
@@ -465,7 +468,7 @@ vi.mock("@/stores/agent-chat-store", () => {
     return {
       messages,
       inputDraft: overrides.inputDraft ?? "",
-      streaming: false,
+      streaming: overrides.streaming ?? false,
       activeTurnId: null,
       model: overrides.model ?? null,
       permissionMode: overrides.permissionMode ?? "bypassPermissions",
@@ -767,6 +770,52 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
       "thread-x",
       "q-1",
     );
+  });
+
+  it("clears the anchor when a queued 'send now' dispatch fails", async () => {
+    // There is no rollback path for a queued bubble — it just stays queued —
+    // so the anchor has to be released explicitly or the list sits reserving
+    // space for a turn that will never stream.
+    currentMessages = [
+      { kind: "user_message", id: "m1", seq: 0, text: "first" },
+      {
+        kind: "user_message",
+        id: "m2",
+        seq: 1,
+        text: "queued follow-up",
+        clientNonce: "nonce-queued",
+        queued: { queuedId: "q-1" },
+      },
+    ];
+    const { agentChatSendQueuedTurnNow } = await import("@/tauri/commands");
+    vi.mocked(agentChatSendQueuedTurnNow).mockRejectedValueOnce(
+      new Error("boom") as never,
+    );
+
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(
+      container.querySelector('[data-testid="send-queued-now"]')!,
+    );
+    await waitFor(() => expect(anchorClientNonce(container)).toBe(""));
+  });
+
+  it("expires the anchor when the turn settles", async () => {
+    // The anchor is a live-turn intent. Left in place it would re-park a
+    // finished prompt on the next remount and keep LegendList's built-in
+    // end pin disabled for the rest of the thread's life.
+    currentSliceOverrides = {
+      "thread-x": { inputDraft: "hello there", streaming: true },
+    };
+    const { container, rerender } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(anchorNonce(container)).toBe("1"));
+
+    // The run finishes.
+    currentSliceOverrides = {
+      "thread-x": { inputDraft: "hello there", streaming: false },
+    };
+    rerender(<AgentChatPane pane={pane} />);
+    await waitFor(() => expect(anchorNonce(container)).toBe(""));
   });
 
   it("clears the anchor when the send fails, so no reserved space is stranded", async () => {

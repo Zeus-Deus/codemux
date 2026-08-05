@@ -300,6 +300,46 @@ describe("MessageList anchored new-turn contract (windowed list)", () => {
     expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
   });
 
+  it("opens a settled thread at the latest row on remount, with no stale re-park", async () => {
+    const sent = [...hydratedTranscript(500), prompt];
+    const { unmount } = render(
+      <MessageList
+        messages={sent}
+        threadKey="thread-1"
+        sendAnchor={{ clientNonce: "nonce-sent", nonce: 1 }}
+        showThinking
+        streaming
+        {...noopHandlers}
+      />,
+    );
+    measureAnchor();
+    await flushFrames();
+    // Mid-turn the window is parked on the prompt, not the tail.
+    expect(screen.getByText("the prompt I just sent")).toBeInTheDocument();
+    unmount();
+
+    // The turn settled, so the pane expired the anchor. A later remount on
+    // the same thread (a subagent drill-in and back, say) must open at the
+    // latest row like any hydrated thread — not re-park a finished prompt.
+    listView.start = null; // `initialScrollAtEnd`
+    render(
+      <MessageList
+        messages={sent}
+        threadKey="thread-1"
+        sendAnchor={null}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames();
+
+    expect(lastListProps.current?.anchoredEndSpace).toBeUndefined();
+    expect(lastListProps.current?.maintainScrollAtEnd).not.toBe(false);
+    expect(screen.getByText("the prompt I just sent")).toBeInTheDocument();
+    expect(screen.getByText("message body 499")).toBeInTheDocument();
+    // Nothing re-parked the view: the mounted window is still the tail.
+    expect(screen.queryByText("message body 480")).toBeNull();
+  });
+
   it("resolves the anchor by nonce when a queued follow-up lands after it", async () => {
     const queued: ChatViewItem = {
       kind: "user_message",
