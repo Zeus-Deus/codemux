@@ -42,7 +42,7 @@ terminal for information that is not terminal-local.
 
 The terminal-header browser control renders only when all are true:
 
-- GUI chrome applies to the active, non-OpenFlow workspace;
+- GUI chrome applies to the active workspace;
 - the terminal is the active pane;
 - a workspace browser session is active and has no `pane_id`.
 

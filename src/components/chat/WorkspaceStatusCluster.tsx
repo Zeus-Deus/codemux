@@ -52,10 +52,9 @@ import type { PullRequestInfo } from "@/tauri/types";
  * renders from inside an `AgentChatPane`, and `PaneContainer` only
  * ever mounts panes for the currently active workspace — so
  * `useActiveWorkspace()` always resolves to the pane's own workspace.
- * (That mount context also makes the `enableAgentChat &&
- * workspace_type !== "open_flow"` browser-indicator gate implicit
- * here: a disabled flag renders a placeholder instead of the pane, and
- * OpenFlow workspaces never route through `PaneContainer`.)
+ * (That mount context also makes the `enableAgentChat`
+ * browser-indicator gate implicit here: a disabled flag renders a
+ * placeholder instead of the pane.)
  *
  * Renders nothing when there is no active workspace, or there is
  * neither a git branch, a no-git affordance, a background browser

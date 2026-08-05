@@ -12,7 +12,6 @@ pub mod github;
 pub mod hosts;
 pub mod mcp;
 pub mod opencode;
-pub mod openflow;
 pub mod package_detect;
 pub mod permissions;
 pub mod presets;
@@ -21,7 +20,6 @@ pub mod settings_sync;
 pub mod skills;
 pub mod skills_sync;
 pub mod update;
-pub mod virtual_display;
 pub mod workspace;
 pub mod workspaces_sync;
 
@@ -39,7 +37,6 @@ pub use github::*;
 pub use hosts::*;
 pub use mcp::*;
 pub use opencode::*;
-pub use openflow::*;
 pub use package_detect::*;
 pub use permissions::*;
 pub use presets::*;
@@ -48,7 +45,6 @@ pub use settings_sync::*;
 pub use skills::*;
 pub use skills_sync::*;
 pub use update::*;
-pub use virtual_display::*;
 pub use workspace::*;
 pub use workspaces_sync::*;
 
@@ -76,8 +72,6 @@ use crate::observability::{
     LogLevel,
     ObservabilitySnapshot,
     ObservabilityStore,
-    PermissionPolicy,
-    SafetyConfig,
 };
 use tauri::{Runtime, State};
 
@@ -282,34 +276,6 @@ pub fn get_home_dir() -> Result<String, String> {
     dirs::home_dir()
         .map(|p| p.display().to_string())
         .ok_or_else(|| "home_dir_unavailable".to_string())
-}
-
-#[tauri::command]
-pub fn update_permission_policy(
-    store: State<'_, ObservabilityStore>,
-    policy: PermissionPolicy,
-) -> Result<(), String> {
-    store.set_permission_policy(policy);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn update_safety_config(
-    store: State<'_, ObservabilityStore>,
-    config: SafetyConfig,
-) -> Result<(), String> {
-    store.set_safety_config(config);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn add_replay_record(
-    store: State<'_, ObservabilityStore>,
-    title: String,
-    summary: String,
-) -> Result<(), String> {
-    store.add_replay_record(title, summary);
-    Ok(())
 }
 
 #[tauri::command]
@@ -553,19 +519,6 @@ pub async fn pick_open_file_dialog<R: Runtime>(
     });
 
     rx.await.map_err(|error| error.to_string())
-}
-
-// ---- Platform info ----
-
-/// Returns the current OS as reported by `std::env::consts::OS`.
-///
-/// Values are the standard Rust target strings: `"linux"`, `"macos"`,
-/// `"windows"`, `"freebsd"`, `"android"`, `"ios"`, etc. The frontend uses this
-/// to gate Windows-incompatible features (e.g., OpenFlow — the bash wrapper
-/// scripts in `openflow::prompts` do not have Windows equivalents yet).
-#[tauri::command]
-pub fn get_platform() -> String {
-    std::env::consts::OS.to_string()
 }
 
 // ---- Port management ----

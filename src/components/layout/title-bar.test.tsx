@@ -267,14 +267,6 @@ describe("TitleBar chrome gating", () => {
     expect(queryByTestId("titlebar-favorite-builtin-chat-agent")).toBeNull();
   });
 
-  it("keeps the legacy bar for OpenFlow workspaces even with the Beta ON", () => {
-    state.enableAgentChat = true;
-    state.workspaceType = "open_flow";
-    const { queryByTestId } = renderBar();
-    expect(queryByTestId("titlebar-tabs")).toBeNull();
-    expect(queryByTestId("agent-launcher")).toBeNull();
-  });
-
   it("renders the GUI draft chrome (draft pill + draft launcher) while a lazy-creation draft is active", () => {
     // Regression coverage: the draft used to fall back to the legacy
     // h-9 bar + PresetBar rows, so pressing "+" flashed the old chrome

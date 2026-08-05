@@ -14,6 +14,7 @@
 ## Verification
 
 - Default to `npm run verify` after meaningful changes.
+- Limit Cargo compilation to two jobs (`CARGO_BUILD_JOBS=2`).
 - Use `cargo check --manifest-path src-tauri/Cargo.toml`, `cargo test --manifest-path src-tauri/Cargo.toml`, `npm run check`, and `npm run test` when iterating on one layer.
 
 ## Visual Verification
@@ -35,7 +36,6 @@ The mock lives in `src/dev/` and only loads when no real Tauri runtime is detect
 ## Skills
 
 - `/codemux-features` auto-loads for new ADE feature implementation.
-- `/codemux-openflow` auto-loads for orchestration runtime work.
 
 ## Codemux Environment
 

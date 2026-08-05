@@ -91,18 +91,11 @@ describe("useGuiChrome", () => {
     expect(result.current).toBe(false);
   });
 
-  it("is true for a real, non-OpenFlow workspace with the flag on", () => {
+  it("is true for a real workspace with the flag on", () => {
     setActiveWorkspace();
     useFeatureFlags.setState({ enableAgentChat: true });
     const { result } = renderHook(() => useGuiChrome());
     expect(result.current).toBe(true);
-  });
-
-  it("is false for an OpenFlow workspace even with the flag on", () => {
-    setActiveWorkspace({ workspace_type: "open_flow" });
-    useFeatureFlags.setState({ enableAgentChat: true });
-    const { result } = renderHook(() => useGuiChrome());
-    expect(result.current).toBe(false);
   });
 
   it("is false while a lazy-creation chat draft is active", () => {

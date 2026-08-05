@@ -4,19 +4,6 @@
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn is_openflow_agent_context() -> bool {
-    env::var_os("CODEMUX_OPENFLOW_RUN_ID").is_some()
-        || env::var_os("CODEMUX_AGENT_INSTANCE_ID").is_some()
-        || env::var_os("CODEMUX_AGENT_ROLE").is_some()
-        || env::var_os("CODEMUX_COMMUNICATION_LOG").is_some()
-}
-
-fn openflow_agent_label() -> String {
-    env::var("CODEMUX_AGENT_INSTANCE_ID")
-        .or_else(|_| env::var("CODEMUX_AGENT_ROLE"))
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
 #[cfg(all(target_os = "windows", not(debug_assertions)))]
 fn hide_console_for_release_build() {
     // Raw FFI to kernel32 + user32 — kept inline to avoid pulling in winapi/
@@ -120,20 +107,18 @@ fn main() {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<unknown>".to_string());
     let parent_pid = env::var("CODEMUX_PARENT_PID").ok();
-    let agent_instance = env::var("CODEMUX_AGENT_INSTANCE_ID").ok();
     let socket_existed = codemux_lib::control::control_socket_path()
         .map(|p| p.exists())
         .unwrap_or(false);
     #[cfg(debug_assertions)]
     codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
-        "[{}] startup_id={} pid={} parent_pid={:?} cwd={} argv={:?} agent_instance={:?} socket_existed={}",
+        "[{}] startup_id={} pid={} parent_pid={:?} cwd={} argv={:?} socket_existed={}",
         chrono_timestamp(),
         startup_id,
         pid,
         parent_pid,
         cwd,
         env::args().collect::<Vec<_>>(),
-        agent_instance,
         socket_existed
     ));
 
@@ -192,8 +177,6 @@ fn main() {
             // control round-trip. Run it on the main thread (mirroring how the
             // GUI's `run()` is invoked below) — it boots the full backend
             // headless and blocks until a shutdown signal, then exits. The
-            // OpenFlow-agent GUI guard does NOT apply: `serve` is an explicit
-            // CLI subcommand, exactly like `status`/`remote enable`.
             #[cfg(debug_assertions)]
             codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
                 "[{}] startup_id={} outcome=run_serve",
@@ -208,23 +191,7 @@ fn main() {
             }
             return;
         }
-        Ok(codemux_lib::cli::CliOutcome::LaunchGui) => {
-            if is_openflow_agent_context() {
-                let agent = openflow_agent_label();
-                codemux_lib::diagnostics::stderr_line(&format!(
-                    "[codemux] Refusing to launch GUI from OpenFlow agent session {} without a CLI subcommand.",
-                    agent
-                ));
-                #[cfg(debug_assertions)]
-                codemux_lib::diagnostics::native_startup_breadcrumb(&format!(
-                    "[{}] startup_id={} outcome=blocked_agent_gui_launch agent={}",
-                    chrono_timestamp(),
-                    startup_id,
-                    agent
-                ));
-                std::process::exit(2);
-            }
-        }
+        Ok(codemux_lib::cli::CliOutcome::LaunchGui) => {}
         Err(error) => {
             codemux_lib::diagnostics::stderr_line(&format!(
                 "[codemux] CLI command failed: {error}"

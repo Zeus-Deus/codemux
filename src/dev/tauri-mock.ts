@@ -69,7 +69,6 @@ import type {
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
   ChatModelInfo,
-  CliToolInfo,
   FeatureFlags,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
@@ -464,7 +463,6 @@ function emitSerializeBuffers(): void {
 // ── Static command returns ──────────────────────────────────────────
 
 const FEATURE_FLAGS: FeatureFlags = {
-  unstable_openflow: false,
   unstable_browser_automation: false,
   unstable_indexing: false,
   // On in the mock so the seeded agent-chat workspaces render their
@@ -1534,11 +1532,6 @@ const SHELL_APPEARANCE: ShellAppearance = {
   font_family: "'JetBrains Mono Variable', monospace",
 };
 
-const CLI_TOOLS: CliToolInfo[] = [
-  { id: "claude", name: "Claude Code", available: true, path: "/usr/bin/claude" },
-  { id: "codex", name: "Codex", available: false, path: null },
-];
-
 function resourceMetrics(): ResourceMetricsSnapshot {
   return {
     app: {
@@ -1730,7 +1723,6 @@ const handlers: Record<string, Handler> = {
   get_app_state: () => appState,
   get_home_dir: () => MOCK_HOME_DIR,
   get_feature_flags: () => FEATURE_FLAGS,
-  get_platform: () => "linux",
   get_package_format: () => "AppImage",
 
   // ── Settings ──
@@ -1933,6 +1925,17 @@ const handlers: Record<string, Handler> = {
     return {
       bytes: Array.from(entry.bytes),
       media_type: entry.mediaType,
+    };
+  },
+  // Local screenshot links use the same browser fallback as persisted chat
+  // attachments. The mock returns its seeded preview PNG for any accepted
+  // path so the real card + lightbox can be visually exercised without host
+  // filesystem access from the browser origin.
+  agent_chat_read_local_image: () => {
+    const encoded = MOCK_USER_IMAGE_DATA_URL.split(",")[1] ?? "";
+    return {
+      bytes: Array.from(Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0))),
+      media_type: "image/png",
     };
   },
   agent_chat_discard_staged_image: (a) => {
@@ -2154,7 +2157,6 @@ const handlers: Record<string, Handler> = {
 
   // ── Editors / tooling ──
   detect_editors: () => [],
-  list_available_cli_tools: () => CLI_TOOLS,
 
   // ── GitHub / PRs (pre-seeded; never hit a real API) ──
   check_gh_available: () => true,

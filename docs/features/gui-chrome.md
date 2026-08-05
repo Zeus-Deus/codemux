@@ -16,14 +16,14 @@ GUI chrome collapses the four stacked chrome rows of a chat workspace —
 `TitleBar` → `TabBar` → `PresetBar` → `AgentChatPaneHeader` — into a **single
 `h-10` title bar**. It renders only when the `enable_agent_chat` flag is on
 (the default — the flag is now a regular Settings → Interface toggle, not a
-Beta opt-in) and a real, non-OpenFlow workspace is active; every other case
+Beta opt-in) and a real workspace is active; every other case
 keeps the legacy chrome unchanged.
 
 ## Current Model
 
 `TitleBar` (`src/components/layout/title-bar.tsx`) branches on a computed
 `guiChrome` flag: `enableAgentChat && !lazyDraftActive && activeWorkspaceId !=
-null && workspace_type != null && workspace_type !== "open_flow"`. This
+null`. This
 predicate lives in the shared `useGuiChrome()` hook
 (`src/hooks/use-gui-chrome.ts`) so other GUI-mode-only surfaces gate on the
 identical rule — currently the background-browser inline chip, context-bar
@@ -111,7 +111,7 @@ titlebar tab share one implementation (see "Important Touch Points").
 
 ## What Works Today
 
-- Single `h-10` titlebar for a real, non-OpenFlow chat workspace with the
+- Single `h-10` titlebar for a real chat workspace with the
   GUI flag on (default); legacy `h-9` chrome is byte-identical with the flag
   off.
 - Pill tabs with status dots, active-tab close, and a chat-tab chevron opening
@@ -143,7 +143,6 @@ titlebar tab share one implementation (see "Important Touch Points").
   a draft — workspace-scoped GUI surfaces (titlebar tabs, background-browser
   chip, terminal-header indicator, right-cluster controls) stay off because the
   backend's active workspace is not what's on screen.
-- **OpenFlow workspaces are untouched** — they keep their dedicated chrome.
 - **A sole-root chat pane loses its per-pane split/close buttons** (the
   suppressed `AgentChatPaneHeader`); splitting is done from the launcher
   (Shift on a CLI agent) instead, and split layouts restore the per-pane

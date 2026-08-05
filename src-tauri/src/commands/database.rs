@@ -1,4 +1,4 @@
-use crate::database::{DatabaseStore, OpenFlowHistoryEntry, ProjectScripts, RecentProject};
+use crate::database::{DatabaseStore, ProjectScripts, RecentProject};
 use std::collections::HashMap;
 use tauri::State;
 
@@ -54,31 +54,4 @@ pub fn set_project_scripts(
     scripts: ProjectScripts,
 ) -> Result<(), String> {
     db.set_project_scripts(&path, &scripts)
-}
-
-#[tauri::command]
-pub fn db_save_openflow_run(
-    db: State<'_, DatabaseStore>,
-    run_id: String,
-    title: Option<String>,
-    goal: Option<String>,
-    status: Option<String>,
-    agent_count: Option<i32>,
-    started_at: Option<String>,
-    completed_at: Option<String>,
-) -> Result<(), String> {
-    db.save_openflow_run(
-        &run_id,
-        title.as_deref(),
-        goal.as_deref(),
-        status.as_deref(),
-        agent_count,
-        started_at.as_deref(),
-        completed_at.as_deref(),
-    )
-}
-
-#[tauri::command]
-pub fn db_get_openflow_history(db: State<'_, DatabaseStore>, limit: Option<u32>) -> Vec<OpenFlowHistoryEntry> {
-    db.get_openflow_history(limit.unwrap_or(50))
 }

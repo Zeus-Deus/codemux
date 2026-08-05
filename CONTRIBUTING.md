@@ -108,7 +108,6 @@ These are not required to build or run Codemux but enable additional features. A
 | `opencode`                      | OpenCode AI agent             | Other agents or skip                                    |
 | `codex`                         | Codex AI agent (legacy)       | Other agents or skip                                    |
 | `ydotool` + `ydotoold`          | Tier 3 OS-level browser input | CDP-based Tier 1/2 still work                           |
-| `bwrap` (bubblewrap)            | Agent process sandboxing      | Runs without sandbox                                    |
 
 ## Known Gotchas
 
@@ -125,7 +124,7 @@ These are not required to build or run Codemux but enable additional features. A
 
 ```
 src/            React + Tailwind v4 + shadcn frontend
-src-tauri/      Rust backend — Tauri 2, CLI, PTY, browser, OpenFlow
+src-tauri/      Rust backend — Tauri 2, CLI, PTY, browser, agent providers
 scripts/        Build and patch helper scripts
 docs/           Canonical project documentation
 ```
@@ -142,7 +141,7 @@ docs/           Canonical project documentation
 - Tauri commands split by domain in `src-tauri/src/commands/`
 - App state in `src-tauri/src/state/`
 - Browser runtimes: `src-tauri/src/agent_browser.rs` (primary), `src-tauri/src/browser.rs` (legacy CDP)
-- OpenFlow orchestration: `src-tauri/src/openflow/`
+- Workflow orchestration: `src/components/workflow/` and `docs/features/workflow-orchestration.md`
 
 ## Documentation
 

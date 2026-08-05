@@ -136,3 +136,41 @@ describe("ChatMarkdown rich external links", () => {
     );
   });
 });
+
+describe("ChatMarkdown local image links", () => {
+  it("upgrades a labelled absolute PNG link to a clickable preview", () => {
+    const { container, getByRole } = render(
+      <ChatMarkdown>
+        {"[Terminal screenshot](/home/me/screenshots/terminal.png)"}
+      </ChatMarkdown>,
+    );
+
+    expect(container.querySelector("[data-chat-local-image]")).toBeInTheDocument();
+    expect(container.querySelector("a")).toBeNull();
+    expect(
+      getByRole("button", { name: "Open Terminal screenshot" }),
+    ).toBeInTheDocument();
+  });
+
+  it("upgrades absolute Markdown image syntax to the same preview", () => {
+    const { container, getByRole } = render(
+      <ChatMarkdown>{"![Agent Chat unchanged](/tmp/chat.webp)"}</ChatMarkdown>,
+    );
+
+    expect(container.querySelector("[data-chat-local-image]")).toBeInTheDocument();
+    expect(
+      getByRole("button", { name: "Open Agent Chat unchanged" }),
+    ).toBeInTheDocument();
+  });
+
+  it("leaves ordinary local file links as links", () => {
+    const { container } = render(
+      <ChatMarkdown>{"[implementation](/home/me/src/app.tsx)"}</ChatMarkdown>,
+    );
+
+    expect(container.querySelector("[data-chat-local-image]")).toBeNull();
+    expect(container.querySelector('[data-streamdown="link"]')).toHaveTextContent(
+      "implementation",
+    );
+  });
+});

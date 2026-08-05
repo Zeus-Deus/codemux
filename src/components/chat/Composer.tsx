@@ -1998,7 +1998,9 @@ export function Composer({
             // the slightly-elevated surface, and a deep low-opacity
             // shadow so the card lifts off the pane background and
             // the scope strip below reads as a layer tucked under it.
-            // Focus sharpens the border rather than stacking a ring.
+            // The border deliberately stays identical at rest and on focus.
+            // Focus comes from the surface and elevation instead, avoiding a
+            // bright wireframe around this large rounded rectangle.
             "rounded-[20px] border border-border/80 bg-muted/40",
             // Geometry and color split so the tint stays a themeable
             // utility rather than a baked-in rgba literal.
@@ -2011,7 +2013,7 @@ export function Composer({
             // border shift) so the compositor only has work to do on
             // those changes.
             "transition-[box-shadow,border-color,background-color]",
-            "focus-within:border-muted-foreground/50",
+            "focus-within:bg-muted/60 focus-within:shadow-[0_16px_38px_-14px] focus-within:shadow-black/60",
             // Drag-over uses a neutral foreground-tinted ring instead
             // of the primary accent: the chat-ui skill reserves accent
             // for the app shell, and the brightness shift alone is

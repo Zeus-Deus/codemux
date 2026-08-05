@@ -362,22 +362,6 @@ pub async fn get_or_create_home_workspace<R: tauri::Runtime>(
     Ok(workspace_id.0)
 }
 
-#[tauri::command]
-pub fn create_openflow_workspace<R: tauri::Runtime>(
-    app: tauri::AppHandle<R>,
-    state: State<'_, AppStateStore>,
-    title: String,
-    goal: String,
-    cwd: Option<String>,
-) -> Result<String, String> {
-    let workspace_id = match cwd {
-        Some(path) => state.create_openflow_workspace_at_path(title, goal, PathBuf::from(path)),
-        None => state.create_openflow_workspace(title, goal),
-    };
-    crate::state::emit_app_state(&app);
-    Ok(workspace_id.0)
-}
-
 // `async fn` so the git-info subprocesses run on the blocking pool instead
 // of the GTK main thread (same rationale as `create_workspace` above).
 #[tauri::command]
@@ -938,7 +922,7 @@ pub async fn close_workspace_with_worktree<R: tauri::Runtime>(
 /// timeout-bounded internally (see the module doc in `agent_browser.rs`),
 /// so there's no correctness reason to await it here, only a latency one.
 /// `pub(crate)` so every `AppStateStore::close_workspace` call site
-/// (the two close commands here, OpenFlow run teardown, and the
+/// (the two close commands here and the
 /// workspaces-sync reconcile/rollback paths) shares the one
 /// implementation instead of drifting.
 pub(crate) fn reap_agent_browser_sessions<R: tauri::Runtime>(app: &tauri::AppHandle<R>, names: Vec<String>) {
@@ -1152,15 +1136,6 @@ pub(crate) async fn close_workspace_with_worktree_impl<R: tauri::Runtime>(
         &app,
         close_result.removed_agent_chat_threads,
     );
-
-    // Release virtual display for this workspace (idempotent).
-    {
-        let vd_manager: State<
-            '_,
-            crate::execution::virtual_display::VirtualDisplayManager,
-        > = app.state();
-        vd_manager.release(&workspace_id);
-    }
 
     if remove_worktree {
         if let Some(wt_path) = worktree_path {
@@ -1909,16 +1884,6 @@ pub async fn close_workspace<R: tauri::Runtime>(
         &app,
         result.removed_agent_chat_threads,
     );
-
-    // Release the virtual display (if any) allocated for this workspace.
-    // Idempotent — no-op if no display was ever acquired.
-    {
-        let vd_manager: State<
-            '_,
-            crate::execution::virtual_display::VirtualDisplayManager,
-        > = app.state();
-        vd_manager.release(&workspace_id);
-    }
 
     crate::state::emit_app_state(&app);
     Ok(result.fallback.0)

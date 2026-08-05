@@ -147,17 +147,10 @@ export const MessageList = memo(function MessageList({
   // GUI-mode background browser session for this pane's workspace (see
   // docs/features/browser.md "Background browser in GUI mode"). Gated on
   // the same predicate the backend's `browser_automation` handler uses to
-  // suppress pane creation: Agent Chat beta on, workspace not OpenFlow.
+  // suppress pane creation: Agent Chat beta on.
   // `workspaceId` is absent for legacy/non-workspace-scoped callers, so
   // the chip never renders there — byte-identical output preserved.
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
-  const workspaceType = useAppStore((s) => {
-    if (!workspaceId) return null;
-    return (
-      s.appState?.workspaces.find((w) => w.workspace_id === workspaceId)
-        ?.workspace_type ?? null
-    );
-  });
   const backgroundBrowserSession = useAppStore((s) => {
     if (!workspaceId) return null;
     const session = s.appState?.agent_browser_sessions?.find(
@@ -169,7 +162,6 @@ export const MessageList = memo(function MessageList({
   const showBrowserChip =
     !!workspaceId &&
     enableAgentChat &&
-    workspaceType !== "open_flow" &&
     !!backgroundBrowserSession;
 
   // Viewport edge fade. Read through an external store rather than called

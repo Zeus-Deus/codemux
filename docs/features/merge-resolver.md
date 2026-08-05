@@ -4,7 +4,7 @@
 - Audience: Anyone working on git integration, conflict resolution, or AI agent workflows.
 - Authority: Canonical merge resolver feature doc.
 - Update when: Resolver workflow, agent integration, safety model, or UI changes.
-- Read next: `docs/features/openflow.md`, `docs/core/STATUS.md`
+- Read next: `docs/plans/git-bot.md`, `docs/core/STATUS.md`
 
 ## What This Feature Is
 
