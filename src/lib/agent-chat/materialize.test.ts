@@ -370,6 +370,10 @@ describe("materializeAndSend", () => {
       expect(input).toEqual({
         thread_id: "tid-42",
         text: "first message",
+        display_text: "first message",
+        skill_ids: [],
+        skill_text: null,
+        include_plugins: true,
         // Stage 6 — images default to empty array when no
         // attachments are passed to materializeAndSend.
         images: [],
@@ -756,6 +760,43 @@ describe("materializeAndSend", () => {
       );
       const [, , startInput] = vi.mocked(agentChatStartSession).mock.calls[0];
       expect(startInput.cwd).toBe("/projects/foo-ai-named-branch");
+    });
+
+    it("refreshes path-derived skill ids before starting the worktree session", async () => {
+      seedCreatedWorktreeWorkspace("/projects/foo-review");
+      const actions = makeActions();
+      actions.refreshSkillSelection = vi.fn().mockResolvedValue({
+        skillIds: ["worktree-skill-id"],
+        text: "review this",
+      });
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+        checkoutMode: "worktree",
+        worktreeName: "review",
+        baseBranch: "main",
+      });
+
+      const result = await materializeAndSend(
+        draft,
+        "/review review this",
+        "/projects/foo",
+        actions,
+        { skillIds: ["source-skill-id"], text: "review this" },
+        null,
+        [],
+        [],
+        "/projects/foo",
+      );
+
+      expect(result.success).toBe(true);
+      expect(actions.refreshSkillSelection).toHaveBeenCalledWith(
+        { skillIds: ["source-skill-id"], text: "review this" },
+        "/projects/foo-review",
+      );
+      expect(agentChatSendTurn).toHaveBeenCalledWith(
+        "claude",
+        expect.objectContaining({ skill_ids: ["worktree-skill-id"] }),
+      );
     });
 
     it("falls back to generateRandomBranchName when generateBranchName throws", async () => {
@@ -1203,6 +1244,37 @@ describe("materializeWithPreset", () => {
   });
 
   describe("ChatAgent preset dispatch", () => {
+    it("refreshes exact skill ids before a preset turn is sent", async () => {
+      const actions = makeActions();
+      actions.refreshSkillSelection = vi.fn().mockResolvedValue({
+        skillIds: ["refreshed-skill-id"],
+        text: "ship it",
+      });
+      actions.getIncludePlugins = vi.fn(() => false);
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+      });
+      const preset = makePreset({ kind: "chat_agent" });
+
+      await materializeWithPreset(draft, preset, "/deploy ship it", actions, {
+        skillIds: ["source-skill-id"],
+        text: "ship it",
+      });
+
+      expect(actions.refreshSkillSelection).toHaveBeenCalledWith(
+        { skillIds: ["source-skill-id"], text: "ship it" },
+        "/projects/foo",
+      );
+      expect(agentChatSendTurn).toHaveBeenCalledWith(
+        "claude",
+        expect.objectContaining({
+          skill_ids: ["refreshed-skill-id"],
+          skill_text: "ship it",
+          include_plugins: false,
+        }),
+      );
+    });
+
     it("happy path with prompt: creates pane, seeds transcript, starts session, sends turn", async () => {
       const actions = makeActions();
       const draft = makeDraft({

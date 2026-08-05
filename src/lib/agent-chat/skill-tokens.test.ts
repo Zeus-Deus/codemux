@@ -5,8 +5,11 @@ import type { Skill } from "@/tauri/commands";
 import { buildSkillCommands } from "./skill-commands";
 import {
   parseSkillTokens,
+  rebaseSkillSelection,
+  resolveSkillSelection,
   resolveSkillBodies,
   segmentForHighlight,
+  skillsForProvider,
 } from "./skill-tokens";
 
 function makeSkill(name: string, body = `Body for ${name}.`): Skill {
@@ -88,7 +91,10 @@ describe("parseSkillTokens", () => {
   });
 
   it("does not match across newlines incorrectly", () => {
-    const matches = parseSkillTokens("line one\n/omarchy\nline three", REGISTRY);
+    const matches = parseSkillTokens(
+      "line one\n/omarchy\nline three",
+      REGISTRY,
+    );
     expect(matches).toHaveLength(1);
     expect(matches[0].name).toBe("omarchy");
   });
@@ -122,13 +128,15 @@ describe("resolveSkillBodies", () => {
   });
 
   it("concatenates multiple bodies with --- separators in source order", () => {
-    expect(
-      resolveSkillBodies("/omarchy then /codemux-release", REGISTRY),
-    ).toBe("OMARCHY BODY\n\n---\n\nRELEASE BODY");
+    expect(resolveSkillBodies("/omarchy then /codemux-release", REGISTRY)).toBe(
+      "OMARCHY BODY\n\n---\n\nRELEASE BODY",
+    );
   });
 
   it("dedupes by skill id when the same skill is mentioned twice", () => {
-    expect(resolveSkillBodies("/omarchy /omarchy", REGISTRY)).toBe("OMARCHY BODY");
+    expect(resolveSkillBodies("/omarchy /omarchy", REGISTRY)).toBe(
+      "OMARCHY BODY",
+    );
   });
 
   it("skips skills with empty / whitespace-only body", () => {
@@ -136,39 +144,54 @@ describe("resolveSkillBodies", () => {
     expect(resolveSkillBodies("/blank", [empty])).toBeNull();
   });
 
-  it("resolves a duplicated name to the FIRST copy, matching the popup", () => {
-    // Regression: the name lookup used to be last-wins while the popup
-    // was first-wins, so picking the top `/omarchy` row injected the
-    // last copy's body.
+  it("requires a qualified token when a name is duplicated", () => {
     const duplicated = [
       makeSkill("omarchy", "CLAUDE COPY"),
-      { ...makeSkill("omarchy", "CODEX COPY"), id: "id-omarchy-codex" },
+      {
+        ...makeSkill("omarchy", "CODEX COPY"),
+        id: "id-omarchy-codex",
+        provider: "codex" as const,
+      },
     ];
-    expect(resolveSkillBodies("/omarchy", duplicated)).toBe("CLAUDE COPY");
+    expect(resolveSkillBodies("/omarchy", duplicated)).toBeNull();
+    expect(resolveSkillBodies("/claude:user:omarchy", duplicated)).toBe(
+      "CLAUDE COPY",
+    );
+    expect(resolveSkillBodies("/codex:user:omarchy", duplicated)).toBe(
+      "CODEX COPY",
+    );
   });
 });
 
 describe("popup / send-time agreement", () => {
-  it("injects the body of exactly the skill the popup offered", () => {
-    // The two surfaces must not drift: whatever single row the menu
-    // shows for a duplicated name is the body the model receives.
+  it("resolves every collision row to the exact offered skill", () => {
     const duplicated = [
       makeSkill("omarchy", "CLAUDE COPY"),
-      { ...makeSkill("omarchy", "CODEX COPY"), id: "id-omarchy-codex" },
-      { ...makeSkill("omarchy", "CODEMUX COPY"), id: "id-omarchy-codemux" },
+      {
+        ...makeSkill("omarchy", "CODEX COPY"),
+        id: "id-omarchy-codex",
+        provider: "codex" as const,
+      },
+      {
+        ...makeSkill("omarchy", "CODEMUX COPY"),
+        id: "id-omarchy-codemux",
+        provider: "codemux" as const,
+      },
     ];
 
     const rows = buildSkillCommands({
       skills: duplicated,
       onInvoke: () => {},
     });
-    const omarchyRows = rows.filter((r) => r.command === "/omarchy");
-    expect(omarchyRows).toHaveLength(1);
-
-    const offeredId = omarchyRows[0].id.replace(/^skill:/, "");
-    const [resolved] = parseSkillTokens("/omarchy", duplicated);
-    expect(resolved.skill.id).toBe(offeredId);
-    expect(resolveSkillBodies("/omarchy", duplicated)).toBe("CLAUDE COPY");
+    expect(rows.map((row) => row.command)).toEqual([
+      "/claude:user:omarchy",
+      "/codex:user:omarchy",
+      "/codemux:user:omarchy",
+    ]);
+    for (const row of rows) {
+      const [resolved] = parseSkillTokens(row.command, duplicated);
+      expect(resolved.skill.provider).toBe(row.command.split(":")[0].slice(1));
+    }
   });
 
   it("keeps case-variant names reachable from both surfaces", () => {
@@ -244,5 +267,119 @@ describe("segmentForHighlight", () => {
     expect(segmentForHighlight("/notreal", REGISTRY)).toEqual([
       { kind: "plain", text: "/notreal" },
     ]);
+  });
+});
+
+describe("resolveSkillSelection", () => {
+  it("carries exact ids and strips only recognized skill tokens", () => {
+    expect(
+      resolveSkillSelection(
+        "/omarchy please keep /compact and /not-a-skill",
+        REGISTRY,
+      ),
+    ).toEqual({
+      skillIds: ["id-omarchy"],
+      text: "please keep /compact and /not-a-skill",
+    });
+  });
+
+  it("preserves unrelated indentation and repeated spaces byte-for-byte", () => {
+    expect(
+      resolveSkillSelection(
+        "  keep  spacing\n    /omarchy next  value",
+        REGISTRY,
+      ),
+    ).toEqual({
+      skillIds: ["id-omarchy"],
+      text: "  keep  spacing\n    next  value",
+    });
+  });
+
+  it("preserves collision identity through qualified tokens", () => {
+    const duplicated = [
+      makeSkill("deploy", "CLAUDE"),
+      {
+        ...makeSkill("deploy", "CODEX"),
+        id: "id-deploy-codex",
+        provider: "codex" as const,
+      },
+    ];
+    expect(
+      resolveSkillSelection("/codex:user:deploy now", duplicated),
+    ).toEqual({ skillIds: ["id-deploy-codex"], text: "now" });
+  });
+
+  it("uses provider availability consistently when addressing collisions", () => {
+    const available = {
+      ...makeSkill("deploy", "CLAUDE"),
+      projections: [
+        {
+          targetProvider: "claude" as const,
+          availability: "native" as const,
+          compatibility: "compatible" as const,
+          reasons: [],
+          invocation: "native-command" as const,
+        },
+      ],
+    };
+    const unavailable = {
+      ...makeSkill("deploy", "CODEX"),
+      id: "id-deploy-codex",
+      provider: "codex" as const,
+      projections: [
+        {
+          targetProvider: "claude" as const,
+          availability: "unavailable" as const,
+          compatibility: "compatible" as const,
+          reasons: [],
+          invocation: "none" as const,
+        },
+      ],
+    };
+    const registry = skillsForProvider([available, unavailable], "claude");
+
+    expect(resolveSkillSelection("/deploy now", registry)).toEqual({
+      skillIds: [available.id],
+      text: "now",
+    });
+  });
+
+  it("extends collision suffixes until every textual address is unique", () => {
+    const first = { ...makeSkill("deploy"), id: "abcdef1aaa" };
+    const second = { ...makeSkill("deploy"), id: "abcdef2bbb" };
+    const registry = [first, second];
+
+    expect(resolveSkillSelection("/claude:user:deploy:abcdef1 run", registry)).toEqual({
+      skillIds: [first.id],
+      text: "run",
+    });
+    expect(resolveSkillSelection("/claude:user:deploy:abcdef2 run", registry)).toEqual({
+      skillIds: [second.id],
+      text: "run",
+    });
+  });
+
+  it("rebases an exact project definition into a deferred worktree", () => {
+    const source = {
+      ...makeSkill("review"),
+      id: "source-id",
+      scope: "project" as const,
+      filePath: "/repo/.claude/skills/review/SKILL.md",
+    };
+    const target = {
+      ...source,
+      id: "target-id",
+      filePath: "/repo-review/.claude/skills/review/SKILL.md",
+    };
+
+    expect(
+      rebaseSkillSelection(
+        { skillIds: [source.id], text: "check it" },
+        [source],
+        "/repo",
+        "/repo-review",
+        [target],
+      ),
+    ).toEqual({ skillIds: [target.id], text: "check it" });
   });
 });

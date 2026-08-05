@@ -425,27 +425,16 @@ and lightbox stay visually testable.
     usual textarea refocus for this pick so the popover isn't
     dismissed by focus-outside). Built in `buildModelCommand`.
   - **SKILLS** — dynamic, from the skills registry. Every discovered
-    skill is offered to every provider: the list is **not** filtered by
-    the active pane's provider, which is the whole point of the
-    cross-provider design (a Codex skill is invocable from a Claude
-    pane and vice versa). Provider appears only as a label in the row
-    description and as grouping/sort order. Same-named skills
-    collapse to one row via `dedupeSkillsByName`
-    (`src/lib/agent-chat/skill-groups.ts`, first-wins over the
-    backend's provider → scope → name order). A skill is addressed in
-    the draft by name alone, so every copy of `/omarchy` would insert
-    byte-identical text; one source symlinked into `~/.claude/skills`,
-    `~/.codex/skills`, and `~/.agents/skills` (plus a real directory
-    under `~/.codemux/skills`) previously produced one row per root,
-    and copies reached through symlinks share a skill id — the id is a
-    hash of the *canonical* SKILL.md path — so the popup emitted
-    duplicate React keys and colliding menu values. The send-time
-    resolver `parseSkillTokens` (`skill-tokens.ts`) applies the same
-    first-wins rule, so the row the menu offers is guaranteed to be the
-    body that gets injected; its lookup used to be last-wins, which
-    silently resolved a picked skill to the *lowest*-priority copy.
-    Settings deliberately keeps every copy visible — `detectConflicts`
-    exists to surface exactly these clashes.
+    portable skill is offered when its projection says the active provider can
+    use it. Unique names keep `/name`; collisions get an exact qualified token
+    such as `/claude:user:deploy` or `/codex:project:deploy` (with a short id
+    suffix only when provider + scope + name also collide). `skill-tokens.ts`
+    resolves that token to a stable skill id and removes only the recognized
+    Codemux token before send. The backend re-resolves the id against the
+    thread's current cwd inventory, so the popup selection cannot drift into a
+    different same-named body or carry an arbitrary frontend-supplied path.
+    Native-only entries stay visible in Settings but are omitted from foreign
+    provider popups with their reason.
   - **COMMANDS** — **provider-native slash commands, discovered live**
     (never hardcoded). The claude-agent sidecar's `list-commands`
     JSON-RPC method opens a transient SDK `query()` (same lifecycle as
@@ -493,8 +482,51 @@ and lightbox stay visually testable.
     `ide_rc_auto_enable_gate`) rather than a command — deliberately not
     consumed, since Codemux ships its own web remote access
     (`docs/features/web-remote-access.md`).
-- **Cross-provider skill system**: watcher, conflicts, disable, refined
-  compat. Server-side sync (see `docs/features/skills-sync.md`).
+- **Cross-provider skill system**: provider-aware inventory, exact explicit
+  invocation, watcher, conflicts, per-row Codemux availability, and
+  per-target compatibility. Server-side sync remains a separate filesystem
+  concern (see `docs/features/skills-sync.md`).
+  - `SkillInventoryService` merges readable filesystem definitions with the
+    cwd-scoped Codex `skills/list` and OpenCode `GET /skill?directory=...`
+    catalogs. Adapter errors are isolated and returned beside successful
+    results; a provider binary that is not installed is a normal empty catalog,
+    not an error banner. Claude's SDK command list is kept separate because its
+    current response does not prove stable skill provenance; readable Claude
+    files remain portable while unmatched SDK entries stay provider-native
+    commands.
+  - Project discovery walks cwd ancestors for portable definitions, and the
+    filesystem watcher covers those inherited roots as well as the direct cwd.
+    Invalid legacy names remain visible as unavailable Settings rows with the
+    validation reason instead of disappearing from discovery. Canonical
+    SKILL.md paths remain the strongest identity; a provider-catalog identity
+    is used for native-only entries. The provider catalog owns its native
+    enabled state.
+  - Every definition carries a projection for Claude, Codex, and OpenCode:
+    native, explicit-portable, native-only, or unavailable, plus compatibility
+    reasons and the invocation route. Compatibility is no longer calculated
+    once against a hard-coded Claude target.
+  - Sends carry stable `skill_ids`, the token-stripped user text, and the actual
+    `include_plugins` preference over IPC. The backend revalidates them at the
+    persisted thread cwd under that same discovery scope. A cold-cache forced
+    inventory is reused for resolution rather than harvesting both catalogs a
+    second time. Codex receives structured `{type:"skill",
+    name,path}` items for readable selections; one native Claude selection
+    keeps `/name` command semantics only when mode/effort/attachment framing
+    has not changed its arguments, otherwise it uses the portable envelope so
+    wrappers do not become the command's `$ARGUMENTS`. OpenCode and other
+    foreign portable cases receive a normalized envelope containing body,
+    source provenance, and the absolute base directory for relative `scripts/`,
+    `references/`, and `assets/`. Source-specific frontmatter never becomes a
+    permission grant.
+    The durable/optimistic transcript uses `display_text`, so it shows the
+    user's unexpanded command rather than an injected body.
+  - Provider-native automatic invocation is unchanged. The Settings switch is
+    explicitly “available in Codemux”: disabling a row removes it from the
+    Codemux popup and resolver but does not rewrite provider configuration or
+    hide the same skill from its native provider.
+    Pre-inventory path-hash disabled ids migrate opportunistically to the
+    canonical-repository preference id when the same project skill is next
+    discovered, so upgrades do not re-enable it.
   - **Scan roots** (`skills::paths::enumerate_scan_paths` — the single
     source of truth; scanner, watcher, conflict detection and the
     Settings grouping all derive from it, so adding a provider root is
@@ -2827,6 +2859,9 @@ turn that finished between the frontend send and the backend enqueue.
 `TurnStartResult` gained an optional `queued_id` — set when the send was
 queued (its `turn_id` is then an empty placeholder). OpenCode has no busy
 guard and no queue; `cancel_queued_turn` is a trait-default no-op there.
+Pressing Send finalizes attachments and resolves exact skills before this
+enqueue decision; the accepted queue item is an immutable input snapshot, so
+later file edits or Settings changes do not silently rewrite a submitted turn.
 
 **Draining.** On the turn-completion transition (Claude: the SDK `result`
 message → Ready; Codex: `turn/completed` → Ready), and after an explicit

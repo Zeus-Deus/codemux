@@ -445,7 +445,10 @@ impl CodexSession {
             let mut state = self.state.lock().await;
             if state.active_turn.is_some() {
                 let queued_id = mint_queued_id();
-                let text = input.text.clone();
+                let text = input
+                    .display_text
+                    .clone()
+                    .unwrap_or_else(|| input.text.clone());
                 let client_nonce = input.client_nonce.clone();
                 state.queued_turns.push_back(QueuedTurn {
                     queued_id: queued_id.clone(),
@@ -465,6 +468,7 @@ impl CodexSession {
             .do_send(
                 input.text,
                 input.images,
+                input.skill_invocations,
                 input.model_override,
                 input.effort_override,
             )
@@ -490,11 +494,16 @@ impl CodexSession {
                 state.queued_turns.pop_front()
             };
             let Some(queued) = next else { return };
-            let text = queued.input.text.clone();
+            let text = queued
+                .input
+                .display_text
+                .clone()
+                .unwrap_or_else(|| queued.input.text.clone());
             match self
                 .do_send(
                     queued.input.text,
                     queued.input.images,
+                    queued.input.skill_invocations,
                     queued.input.model_override,
                     queued.input.effort_override,
                 )
@@ -639,6 +648,7 @@ impl CodexSession {
         &self,
         text: String,
         images: Vec<crate::agent_provider::ImageInput>,
+        skill_invocations: Vec<crate::skills::ResolvedSkillInvocation>,
         model_override: Option<String>,
         effort_override: Option<String>,
     ) -> Result<TurnId, ProviderError> {
@@ -665,13 +675,27 @@ impl CodexSession {
         // alongside images, which Codex rejects with a 400 on the
         // image-only path.
         use base64::Engine;
-        let mut input_items: Vec<TurnInputItem> = Vec::with_capacity(images.len() + 1);
+        let mut input_items: Vec<TurnInputItem> =
+            Vec::with_capacity(images.len() + skill_invocations.len() + 1);
         for img in images {
             let encoded =
                 base64::engine::general_purpose::STANDARD.encode(&img.data);
             input_items.push(TurnInputItem::Image {
                 url: format!("data:{};base64,{}", img.media_type, encoded),
             });
+        }
+        for skill in skill_invocations {
+            if matches!(
+                skill.invocation,
+                crate::skills::SkillInvocationKind::CodexSkillItem
+            ) {
+                if let Some(path) = skill.path {
+                    input_items.push(TurnInputItem::Skill {
+                        name: skill.name,
+                        path,
+                    });
+                }
+            }
         }
         let trimmed_text = text.trim();
         if !trimmed_text.is_empty() || input_items.is_empty() {
@@ -1172,7 +1196,9 @@ mod tests {
             input: SendTurnInput {
                 thread_id: ThreadId("t".into()),
                 text: String::new(),
+                display_text: None,
                 images: vec![],
+                skill_invocations: vec![],
                 model_override: None,
                 effort_override: None,
                 permission_mode_override: None,

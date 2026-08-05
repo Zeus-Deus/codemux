@@ -122,7 +122,7 @@ describe("SkillsSection", () => {
     listSkillsMock.mockResolvedValue([]);
     render(<SkillsSection projectRoot="/proj" />);
     await waitFor(() => {
-      expect(listSkillsMock).toHaveBeenCalledWith("/proj", true);
+      expect(listSkillsMock).toHaveBeenCalledWith("/proj", true, true);
     });
   });
 
@@ -195,12 +195,12 @@ describe("SkillsSection", () => {
     listSkillsMock.mockResolvedValue([]);
     render(<SkillsSection projectRoot={null} />);
     await waitFor(() => {
-      expect(listSkillsMock).toHaveBeenCalledWith(null, true);
+      expect(listSkillsMock).toHaveBeenCalledWith(null, true, true);
     });
 
     fireEvent.click(screen.getByTestId("include-plugins-switch"));
     await waitFor(() => {
-      expect(listSkillsMock).toHaveBeenLastCalledWith(null, false);
+      expect(listSkillsMock).toHaveBeenLastCalledWith(null, false, true);
     });
   });
 

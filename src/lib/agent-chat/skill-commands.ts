@@ -2,16 +2,12 @@ import { BookOpen } from "lucide-react";
 
 import type { Skill } from "@/tauri/commands";
 
-import { dedupeSkillsByName } from "./skill-groups";
+import { skillTokenFor } from "./skill-tokens";
 import type { SlashCommandItem } from "./slash-commands";
 
 interface BuildSkillCommandsArgs {
   skills: Skill[];
-  /**
-   * Called when the user activates a skill in the popup. Stage 2 wires
-   * a stub that toasts; Stage 3 will stage the skill as a chip on the
-   * composer for prompt-prefix injection on send.
-   */
+  /** Called when the user activates an exact skill definition. */
   onInvoke: (skill: Skill) => void;
 }
 
@@ -22,20 +18,22 @@ interface BuildSkillCommandsArgs {
  * (provider → scope → name) so the popup mirrors the order the user
  * sees in Settings.
  *
- * Same-named skills collapse to one row via `dedupeSkillsByName` —
- * every copy would insert the same `/name` text, and the send-time
- * resolver in `skill-tokens.ts` applies the identical first-wins rule,
- * so the row shown is guaranteed to be the body that gets injected.
+ * Same-named definitions remain separate. Their command text is qualified
+ * by provider and scope, and the backend receives the selected stable id.
  */
 export function buildSkillCommands({
   skills,
   onInvoke,
 }: BuildSkillCommandsArgs): SlashCommandItem[] {
-  return dedupeSkillsByName(skills).map((skill) => ({
-    id: `skill:${skill.id}`,
+  const idCounts = new Map<string, number>();
+  for (const skill of skills) {
+    idCounts.set(skill.id, (idCounts.get(skill.id) ?? 0) + 1);
+  }
+  return skills.map((skill, index) => ({
+    id: `skill:${skill.id}${(idCounts.get(skill.id) ?? 0) > 1 ? `:${index}` : ""}`,
     label: skill.name,
     description: formatSkillDescription(skill),
-    command: `/${skill.name}`,
+    command: skillTokenFor(skill, skills),
     icon: BookOpen,
     group: "SKILLS",
     onSelect: () => onInvoke(skill),

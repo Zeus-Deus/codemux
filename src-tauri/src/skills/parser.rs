@@ -40,8 +40,8 @@ pub fn parse_skill_file(content: &str) -> Result<ParsedSkillFile, String> {
         }
     };
 
-    let yaml: YamlValue = serde_yaml::from_str(yaml_text)
-        .map_err(|e| format!("invalid YAML frontmatter: {e}"))?;
+    let yaml: YamlValue =
+        serde_yaml::from_str(yaml_text).map_err(|e| format!("invalid YAML frontmatter: {e}"))?;
 
     let frontmatter = yaml_to_json(yaml);
 
@@ -100,7 +100,9 @@ fn yaml_to_json(value: YamlValue) -> JsonValue {
             }
         }
         YamlValue::String(s) => JsonValue::String(s),
-        YamlValue::Sequence(items) => JsonValue::Array(items.into_iter().map(yaml_to_json).collect()),
+        YamlValue::Sequence(items) => {
+            JsonValue::Array(items.into_iter().map(yaml_to_json).collect())
+        }
         YamlValue::Mapping(map) => {
             let mut obj = serde_json::Map::new();
             for (k, v) in map {
@@ -151,6 +153,28 @@ pub fn extract_name_description(
     (name, description)
 }
 
+/// Agent Skills baseline: 1-64 lowercase alphanumeric/hyphen characters,
+/// beginning and ending with an alphanumeric character.
+pub fn validate_skill_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 64 {
+        return Err("skill name must be between 1 and 64 bytes".into());
+    }
+    let bytes = name.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return Err("skill name must start with a lowercase letter or digit".into());
+    }
+    if !bytes[bytes.len() - 1].is_ascii_lowercase() && !bytes[bytes.len() - 1].is_ascii_digit() {
+        return Err("skill name must end with a lowercase letter or digit".into());
+    }
+    if !bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    {
+        return Err("skill name may contain only lowercase letters, digits, and hyphens".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +186,20 @@ mod tests {
         assert_eq!(parsed.frontmatter["name"], "foo");
         assert_eq!(parsed.frontmatter["description"], "A demo skill");
         assert_eq!(parsed.body, "Body here.\n");
+    }
+
+    #[test]
+    fn validates_agent_skills_names() {
+        assert!(validate_skill_name("code-review-2").is_ok());
+        for invalid in [
+            "CodeReview",
+            "code review",
+            "code_review",
+            "-review",
+            "review-",
+        ] {
+            assert!(validate_skill_name(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]
@@ -211,7 +249,8 @@ mod tests {
 
     #[test]
     fn malformed_yaml_returns_error() {
-        let content = "---\nname: foo\n: : :\ndescription:\n  - bad indent\n     more bad\n---\nBody.";
+        let content =
+            "---\nname: foo\n: : :\ndescription:\n  - bad indent\n     more bad\n---\nBody.";
         let result = parse_skill_file(content);
         assert!(result.is_err());
     }
@@ -225,7 +264,8 @@ mod tests {
 
     #[test]
     fn unknown_fields_preserved_in_frontmatter() {
-        let content = "---\nname: foo\nallowed-tools: [Bash, Read]\nversion: 2\nlicense: MIT\n---\nBody.";
+        let content =
+            "---\nname: foo\nallowed-tools: [Bash, Read]\nversion: 2\nlicense: MIT\n---\nBody.";
         let parsed = parse_skill_file(content).unwrap();
         assert!(parsed.frontmatter["allowed-tools"].is_array());
         assert_eq!(parsed.frontmatter["version"], 2);
@@ -257,7 +297,8 @@ mod tests {
 
     #[test]
     fn description_field_only_no_metadata_fallback() {
-        let content = "---\nname: foo\ndescription: top-level\nmetadata:\n  short-description: nested\n---";
+        let content =
+            "---\nname: foo\ndescription: top-level\nmetadata:\n  short-description: nested\n---";
         let parsed = parse_skill_file(content).unwrap();
         let (_, desc) = extract_name_description(&parsed.frontmatter, "fallback");
         assert_eq!(desc.as_deref(), Some("top-level"));

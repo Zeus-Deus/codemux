@@ -34,6 +34,8 @@
 //!   responding to the named method (used to simulate crashes).
 //! * `FAKE_CODEX_UNAUTHENTICATED=1` — return no account from `account/read`
 //!   while reporting that the active provider requires OpenAI auth.
+//! * `FAKE_CODEX_CAPTURE_TURN` — write the latest `turn/start` params JSON
+//!   to this path so adapter tests can assert the exact wire contract.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -155,10 +157,10 @@ fn fire_script_entries_for(
 fn main() {
     let script = load_script();
     let fail_resume = env_truthy("FAKE_CODEX_FAIL_RESUME");
-    let thread_id =
-        std::env::var("FAKE_CODEX_THREAD_ID").unwrap_or_else(|_| "c-1".to_string());
+    let thread_id = std::env::var("FAKE_CODEX_THREAD_ID").unwrap_or_else(|_| "c-1".to_string());
     let exit_after = std::env::var("FAKE_CODEX_EXIT_AFTER").ok();
     let unauthenticated = env_truthy("FAKE_CODEX_UNAUTHENTICATED");
+    let capture_turn = std::env::var("FAKE_CODEX_CAPTURE_TURN").ok();
 
     let pending_server_requests: Arc<Mutex<HashMap<String, Value>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -278,6 +280,13 @@ fn main() {
                 fire_script_entries_for(method, &script, &pending_server_requests);
             }
             "turn/start" => {
+                if let Some(path) = capture_turn.as_deref() {
+                    std::fs::write(
+                        path,
+                        serde_json::to_vec(&msg.params).expect("capture params"),
+                    )
+                    .expect("write captured turn/start params");
+                }
                 let t = TURN_COUNTER.fetch_add(1, Ordering::Relaxed);
                 let tid = format!("t-{t}");
                 if let Some(id) = id {

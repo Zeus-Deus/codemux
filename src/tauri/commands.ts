@@ -1274,6 +1274,14 @@ export interface AgentChatStartSessionInput {
 export interface AgentChatSendTurnInput {
   thread_id: string;
   text: string;
+  /** Unexpanded composer text used for the durable transcript. */
+  display_text?: string | null;
+  /** Exact cwd-scoped skill definitions selected in the composer. */
+  skill_ids?: string[];
+  /** Skill-token-stripped text before mode/effort/attachment wrappers. */
+  skill_text?: string | null;
+  /** Whether plugin-bundled skills are included in this selection scope. */
+  include_plugins?: boolean;
   /** Staged image references. Each image's bytes are written to a
    *  staging file at attach time (`agent_chat_stage_image`), so the turn
    *  carries only the absolute path + MIME instead of marshalling the
@@ -1762,11 +1770,39 @@ export const removeToolPermission = (
 // ── Skills ──
 
 export type SkillProvider = "claude" | "codex" | "opencode" | "codemux";
-export type SkillScope = "user" | "project" | "plugin";
+export type SkillScope =
+  | "user"
+  | "project"
+  | "plugin"
+  | "managed"
+  | "admin"
+  | "system"
+  | "configured";
 export type SkillCompatibility = "compatible" | "soft-warn" | "hard-warn";
+export type SkillAvailability =
+  | "native"
+  | "explicit-portable"
+  | "native-only"
+  | "unavailable";
+export type SkillInvocationKind =
+  | "native-command"
+  | "codex-skill-item"
+  | "prompt-prefix"
+  | "none";
+export type SkillProvenance = "filesystem" | "provider_catalog";
+
+export interface SkillProjection {
+  targetProvider: SkillProvider;
+  availability: SkillAvailability;
+  compatibility: SkillCompatibility;
+  reasons: string[];
+  invocation: SkillInvocationKind;
+}
 
 export interface Skill {
   id: string;
+  /** Worktree-stable identity used for persisted enable/disable choices. */
+  preferenceId?: string;
   name: string;
   description: string | null;
   provider: SkillProvider;
@@ -1780,12 +1816,30 @@ export interface Skill {
   compatibilitySignals: string[];
   symlinked: boolean;
   pluginSlug: string | null;
+  provenance?: SkillProvenance;
+  readable?: boolean;
+  sourceEnabled?: boolean;
+  /** Invalid Agent Skills name. The row remains visible in Settings but
+   *  cannot be selected or invoked. */
+  validationError?: string | null;
+  projections?: SkillProjection[];
+}
+
+export interface SkillAdapterError {
+  provider: SkillProvider;
+  message: string;
+}
+
+export interface SkillInventory {
+  skills: Skill[];
+  errors: SkillAdapterError[];
 }
 
 export const listSkills = (
   projectRoot: string | null,
   includePlugins: boolean,
-) => invoke<Skill[]>("list_skills", { projectRoot, includePlugins });
+  force = false,
+) => invoke<SkillInventory>("list_skills", { projectRoot, includePlugins, force });
 
 /** One provider-native slash command (e.g. Claude Code's `/compact`,
  *  `/init`, `/review`, or a custom `.claude/commands` entry).

@@ -243,6 +243,8 @@ pub enum TurnInputItem {
         /// Fully-resolved URL pointing at the image.
         url: String,
     },
+    /// Exact skill selection supported by Codex app-server.
+    Skill { name: String, path: String },
 }
 
 /// Response to `turn/start`.
@@ -1311,6 +1313,18 @@ mod tests {
         let v = serde_json::to_value(&item).unwrap();
         assert_eq!(v["type"], "image");
         assert_eq!(v["url"], "data:image/png;base64,xxx");
+    }
+
+    #[test]
+    fn turn_input_skill_serializes_with_exact_path() {
+        let item = TurnInputItem::Skill {
+            name: "deploy".into(),
+            path: "/skills/deploy/SKILL.md".into(),
+        };
+        let value = serde_json::to_value(item).unwrap();
+        assert_eq!(value["type"], "skill");
+        assert_eq!(value["name"], "deploy");
+        assert_eq!(value["path"], "/skills/deploy/SKILL.md");
     }
 
     // Stage 6 — full TurnStartParams round-trip with images. Lives

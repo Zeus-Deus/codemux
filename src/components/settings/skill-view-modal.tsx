@@ -59,20 +59,22 @@ export function SkillViewModal({ skill, onClose }: Props) {
               {skill.provider} · {skill.scope}
               {skill.pluginSlug ? ` · ${skill.pluginSlug}` : ""}
             </span>
-            <span
-              className="block break-all font-mono text-xs"
-              data-testid="skill-modal-filepath"
-            >
-              {skill.filePath}
-            </span>
+            {skill.filePath && (
+              <span
+                className="block break-all font-mono text-xs"
+                data-testid="skill-modal-filepath"
+              >
+                {skill.filePath}
+              </span>
+            )}
             {skill.symlinked && (
               <span
                 className="inline-flex items-center gap-1 text-xs text-muted-foreground/80"
                 data-testid="skill-modal-symlink"
               >
                 <Link2 className="h-3 w-3" aria-hidden />
-                Resolved from a symlink — the path above is the link
-                target, not where the entry lives in your skills folder.
+                Resolved from a symlink — the path above is the link target, not
+                where the entry lives in your skills folder.
               </span>
             )}
           </DialogDescription>
@@ -111,7 +113,12 @@ export function SkillViewModal({ skill, onClose }: Props) {
           data-testid="skill-modal-body"
           className="flex-1 overflow-y-auto rounded-md border border-border/50 bg-muted/30 p-4"
         >
-          {skill.body.trim().length === 0 ? (
+          {skill.readable === false ? (
+            <p className="text-sm italic text-muted-foreground">
+              This provider reports the skill as native-only and does not expose
+              readable content for Codemux to show or use with another provider.
+            </p>
+          ) : skill.body.trim().length === 0 ? (
             <p className="text-sm italic text-muted-foreground">
               This skill has no body content.
             </p>

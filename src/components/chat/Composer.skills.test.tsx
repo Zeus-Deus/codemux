@@ -17,6 +17,7 @@ vi.mock("@/tauri/commands", async (importActual) => {
   return {
     ...actual,
     listSkills: vi.fn(),
+    startSkillsWatcher: vi.fn().mockResolvedValue(0),
     listChatSlashCommands: vi.fn(),
   };
 });
@@ -113,8 +114,14 @@ function resetSkillsStore() {
     loaded: false,
     loading: false,
     error: null,
+    adapterErrors: [],
     loadedAt: 0,
     includePlugins: true,
+    inventoryCache: {},
+    activeContextKey: null,
+    inFlightContexts: {},
+    nextRequestId: 1,
+    cacheGeneration: 0,
   });
 }
 
@@ -145,7 +152,11 @@ describe("Composer · skills slash integration (Step 7 Stage 2)", () => {
     // Popup opens immediately (modes are synchronous).
     expect(queryByTestId("slash-command-popup")).not.toBeNull();
     // Skill load was kicked off with the workspace cwd.
-    expect(listSkillsMock).toHaveBeenCalledWith("/home/user/project", true);
+    expect(listSkillsMock).toHaveBeenCalledWith(
+      "/home/user/project",
+      true,
+      false,
+    );
 
     await waitFor(() => {
       expect(queryByTestId("slash-item-skill:release")).not.toBeNull();

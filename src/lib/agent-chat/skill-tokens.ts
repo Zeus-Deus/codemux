@@ -1,12 +1,9 @@
-// Skill-token parser for the Cursor-style inline composer.
-//
-// `/skill-name` tokens that appear in the textarea are matched against
-// the skills registry. Matched tokens drive (a) the in-textarea
-// highlight overlay and (b) the per-turn body injection at send time.
-// Unmatched `/foo` text passes through as plain prose so a typo never
-// silently injects nothing.
+// Skill-token parser for the Cursor-style inline composer. Recognized tokens
+// resolve to stable ids; the backend revalidates those ids at turn time and
+// chooses the provider-specific invocation mechanism.
 
 import type { Skill } from "@/tauri/commands";
+import type { AgentChatProviderKind } from "@/tauri/types";
 
 export interface SkillTokenMatch {
   /** Inclusive start offset in the source text, points at the `/`. */
@@ -25,7 +22,55 @@ export interface SkillTokenMatch {
 // the rule in `findSlashAtCursor`. The name is `[A-Za-z0-9_-]+` and must
 // end at a non-name character (or end-of-text). Lookbehind + lookahead
 // keep matches non-greedy and boundary-respecting.
-const SKILL_TOKEN_RE = /(?<=^|\s)\/([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_-]|$)/g;
+const SKILL_TOKEN_RE =
+  /(?<=^|\s)\/([A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+){0,3})(?=[^A-Za-z0-9_:-]|$)/g;
+
+/** Keep popup tokens, highlighting, and send-time resolution on the same
+ * target-provider inventory. An unavailable name collision must not change
+ * the token address after the user selects it. */
+export function skillsForProvider(
+  skills: Skill[],
+  provider: AgentChatProviderKind,
+): Skill[] {
+  return skills.filter((skill) => {
+    const projection = skill.projections?.find(
+      (candidate) => candidate.targetProvider === provider,
+    );
+    return (
+      !projection ||
+      (projection.availability !== "unavailable" &&
+        projection.availability !== "native-only")
+    );
+  });
+}
+
+/** Stable textual address for one exact definition. Unique names keep the
+ * friendly `/name`; collisions are qualified by provider and scope. */
+export function skillTokenFor(skill: Skill, skills: Skill[]): string {
+  const conflicts = skills.filter((candidate) => candidate.name === skill.name);
+  if (conflicts.length <= 1) return `/${skill.name}`;
+  const sameSource = conflicts.filter(
+    (candidate) =>
+      candidate.provider === skill.provider && candidate.scope === skill.scope,
+  );
+  let suffix = "";
+  if (sameSource.length > 1) {
+    let prefixLength = Math.min(6, skill.id.length);
+    while (
+      prefixLength < skill.id.length &&
+      sameSource.some(
+        (candidate) =>
+          candidate.id !== skill.id &&
+          candidate.id.slice(0, prefixLength) ===
+            skill.id.slice(0, prefixLength),
+      )
+    ) {
+      prefixLength += 1;
+    }
+    suffix = `:${skill.id.slice(0, prefixLength)}`;
+  }
+  return `/${skill.provider}:${skill.scope}:${skill.name}${suffix}`;
+}
 
 /**
  * Find every `/skill-name` token in `text` whose name matches a skill
@@ -37,20 +82,17 @@ const SKILL_TOKEN_RE = /(?<=^|\s)\/([A-Za-z0-9_-]+)(?=[^A-Za-z0-9_-]|$)/g;
  * after the regex pass so the highlight UI can decide to render
  * unmatched `/foo` differently if it ever wants to.
  */
-export function parseSkillTokens(text: string, skills: Skill[]): SkillTokenMatch[] {
+export function parseSkillTokens(
+  text: string,
+  skills: Skill[],
+): SkillTokenMatch[] {
   if (!text || skills.length === 0) return [];
 
-  // Build a fast lookup once per call. Skill lists are small (≤50 in
-  // practice) so a Map is sufficient — no need to memoize across calls.
-  //
-  // FIRST-wins, matching the popup's `dedupeSkillsByName`. A plain
-  // `set` loop would be last-wins, which silently disagreed with the
-  // menu: picking the top `/omarchy` row inserted text that resolved
-  // to the *lowest*-priority copy's body at send time.
-  const byName = new Map<string, Skill>();
-  for (const s of skills) {
-    if (!byName.has(s.name)) byName.set(s.name, s);
-  }
+  // Build an exact-address lookup once per call. Conflicting definitions
+  // have distinct qualified tokens, so no discovery-order winner exists.
+  const byToken = new Map(
+    skills.map((skill) => [skillTokenFor(skill, skills).slice(1), skill]),
+  );
 
   const matches: SkillTokenMatch[] = [];
   // Reset stateful regex's lastIndex per call — `g` flag mutates the
@@ -61,13 +103,97 @@ export function parseSkillTokens(text: string, skills: Skill[]): SkillTokenMatch
   while ((m = SKILL_TOKEN_RE.exec(text)) !== null) {
     const name = m[1];
     if (!name) continue;
-    const skill = byName.get(name);
+    const skill = byToken.get(name);
     if (!skill) continue;
     const start = m.index;
     const end = start + m[0].length;
     matches.push({ start, end, token: m[0], name, skill });
   }
   return matches;
+}
+
+export interface ResolvedSkillSelection {
+  skillIds: string[];
+  /** Prompt text with Codemux-owned skill tokens removed. */
+  text: string;
+}
+
+/** Rebind path-derived ids after a deferred worktree is created. Skills
+ * outside the source cwd (for example user skills) retain their exact id;
+ * project skills are matched by their path relative to the old/new cwd. */
+export function rebaseSkillSelection(
+  selection: ResolvedSkillSelection,
+  sourceSkills: Skill[],
+  sourceCwd: string,
+  targetCwd: string,
+  targetSkills: Skill[],
+): ResolvedSkillSelection {
+  if (sourceCwd === targetCwd || selection.skillIds.length === 0) {
+    return selection;
+  }
+  const sourcePrefix = sourceCwd.endsWith("/") ? sourceCwd : `${sourceCwd}/`;
+  const targetPrefix = targetCwd.endsWith("/") ? targetCwd : `${targetCwd}/`;
+  const skillIds = selection.skillIds.map((id) => {
+    const exact = targetSkills.find((skill) => skill.id === id);
+    if (exact) return exact.id;
+    const source = sourceSkills.find((skill) => skill.id === id);
+    if (!source) throw new Error(`Selected skill is no longer available: ${id}`);
+    if (!source.filePath.startsWith(sourcePrefix)) {
+      throw new Error(`Selected skill is no longer available: ${source.name}`);
+    }
+    const rebasedPath = `${targetPrefix}${source.filePath.slice(sourcePrefix.length)}`;
+    const rebased = targetSkills.find(
+      (skill) =>
+        skill.filePath === rebasedPath &&
+        skill.provider === source.provider &&
+        skill.scope === source.scope &&
+        skill.name === source.name,
+    );
+    if (!rebased) {
+      throw new Error(`Selected skill is not available in the new worktree: ${source.name}`);
+    }
+    return rebased.id;
+  });
+  return { ...selection, skillIds };
+}
+
+/** Resolve tokens to stable ids and remove only the recognized token ranges.
+ * Unrecognized provider slash commands and prose remain byte-for-byte. */
+export function resolveSkillSelection(
+  text: string,
+  skills: Skill[],
+): ResolvedSkillSelection {
+  const matches = parseSkillTokens(text, skills);
+  if (matches.length === 0) return { skillIds: [], text };
+  const ids: string[] = [];
+  const seen = new Set<string>();
+  let cursor = 0;
+  let stripped = "";
+  for (const match of matches) {
+    let removeStart = match.start;
+    let removeEnd = match.end;
+    if (removeEnd < text.length && /[ \t]/.test(text[removeEnd])) {
+      // Consume one token delimiter, leaving any additional whitespace
+      // exactly as the user typed it.
+      removeEnd += 1;
+    } else if (
+      removeStart > cursor &&
+      /[ \t]/.test(text[removeStart - 1])
+    ) {
+      removeStart -= 1;
+    }
+    stripped += text.slice(cursor, removeStart);
+    cursor = removeEnd;
+    if (!seen.has(match.skill.id)) {
+      seen.add(match.skill.id);
+      ids.push(match.skill.id);
+    }
+  }
+  stripped += text.slice(cursor);
+  return {
+    skillIds: ids,
+    text: stripped,
+  };
 }
 
 /**
@@ -80,7 +206,10 @@ export function parseSkillTokens(text: string, skills: Skill[]): SkillTokenMatch
  * the first body emitted. Duplicate mentions are deduped by skill id;
  * mentioning `/foo /foo` injects the body once.
  */
-export function resolveSkillBodies(text: string, skills: Skill[]): string | null {
+export function resolveSkillBodies(
+  text: string,
+  skills: Skill[],
+): string | null {
   const matches = parseSkillTokens(text, skills);
   if (matches.length === 0) return null;
 
@@ -107,7 +236,10 @@ export type HighlightSegment =
   | { kind: "plain"; text: string }
   | { kind: "skill"; text: string; name: string };
 
-export function segmentForHighlight(text: string, skills: Skill[]): HighlightSegment[] {
+export function segmentForHighlight(
+  text: string,
+  skills: Skill[],
+): HighlightSegment[] {
   const matches = parseSkillTokens(text, skills);
   if (matches.length === 0) {
     return text ? [{ kind: "plain", text }] : [];

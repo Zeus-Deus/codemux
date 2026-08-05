@@ -10,6 +10,7 @@ import {
   groupHeadingFor,
   groupSkillsByScope,
 } from "@/lib/agent-chat/skill-groups";
+import { skillTokenFor } from "@/lib/agent-chat/skill-tokens";
 import { toast } from "@/lib/toast";
 import { useSkillsStore } from "@/stores/skills-store";
 import {
@@ -52,6 +53,7 @@ export function SkillsSection({ projectRoot }: Props) {
   const loaded = useSkillsStore((s) => s.loaded);
   const loading = useSkillsStore((s) => s.loading);
   const error = useSkillsStore((s) => s.error);
+  const adapterErrors = useSkillsStore((s) => s.adapterErrors);
   const includePlugins = useSkillsStore((s) => s.includePlugins);
   const loadSkills = useSkillsStore((s) => s.loadSkills);
   const setIncludePlugins = useSkillsStore((s) => s.setIncludePlugins);
@@ -117,10 +119,11 @@ export function SkillsSection({ projectRoot }: Props) {
       // Diagnostic logging — visible in DevTools console to help
       // diagnose silent no-op cases (editor not on PATH, sandbox
       // stripping DISPLAY, etc.). Cheap and safe in production.
-      console.info(
-        "[skills] open file requested",
-        { skillId: skill.id, filePath: skill.filePath, preferredEditorId },
-      );
+      console.info("[skills] open file requested", {
+        skillId: skill.id,
+        filePath: skill.filePath,
+        preferredEditorId,
+      });
       try {
         const editors = await detectEditors();
         console.info("[skills] detectEditors →", editors);
@@ -155,11 +158,11 @@ export function SkillsSection({ projectRoot }: Props) {
         <div>
           <h2 className="text-base font-semibold tracking-tight">Skills</h2>
           <p className="mt-1 text-sm text-muted-foreground">
-            Skills are reusable instruction sets that get injected into your
-            messages when you mention them with{" "}
+            Skills are reusable instruction sets you can select with{" "}
             <code className="font-mono text-xs">/skill-name</code>. Discovered
             from your installed providers (Claude, Codex, OpenCode) and
-            Codemux's own skills folder.
+            Codemux's own skills folder. Provider-native automatic discovery
+            remains controlled by each provider.
           </p>
         </div>
         <Button
@@ -196,6 +199,12 @@ export function SkillsSection({ projectRoot }: Props) {
         />
       </div>
 
+      <p className="mb-4 text-xs text-muted-foreground">
+        Each row controls whether the skill is available in Codemux. Turning it
+        off does not change provider configuration, so its native provider may
+        still discover or invoke it automatically.
+      </p>
+
       {error && (
         <p
           data-testid="skills-error"
@@ -203,6 +212,20 @@ export function SkillsSection({ projectRoot }: Props) {
         >
           Failed to load skills: {error}
         </p>
+      )}
+
+      {adapterErrors.length > 0 && (
+        <div className="mb-4 rounded-md border border-border/50 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+          Some provider catalogs could not be refreshed. Readable filesystem
+          skills are still available.
+          <ul className="mt-1 list-inside list-disc">
+            {adapterErrors.map((adapterError) => (
+              <li key={`${adapterError.provider}:${adapterError.message}`}>
+                {adapterError.provider}: {adapterError.message}
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
 
       {loading && !loaded ? (
@@ -280,9 +303,8 @@ function ConflictsSection({
         </span>
       </header>
       <p className="mb-3 text-xs text-muted-foreground">
-        These skill names appear in more than one source. Both stay
-        available in the slash popup with a scope suffix; pick the one
-        you want explicitly.
+        These skill names appear in more than one source. Codemux gives each
+        definition an exact qualified command.
       </p>
       <div className="space-y-3">
         {entries.map(([name, skills]) => (
@@ -292,7 +314,7 @@ function ConflictsSection({
             data-testid={`conflict-group-${name}`}
           >
             <div className="mb-1.5 px-1 text-xs font-mono text-foreground">
-              {name}{" "}
+              /{name}{" "}
               <span className="text-muted-foreground">
                 ({skills.length} sources)
               </span>
@@ -302,6 +324,7 @@ function ConflictsSection({
                 <li key={skill.id}>
                   <ConflictRow
                     skill={skill}
+                    conflictSkills={skills}
                     onView={() => onView(skill)}
                     onOpenFile={() => onOpenFile(skill)}
                   />
@@ -317,10 +340,12 @@ function ConflictsSection({
 
 function ConflictRow({
   skill,
+  conflictSkills,
   onView,
   onOpenFile,
 }: {
   skill: Skill;
+  conflictSkills: Skill[];
   onView: () => void;
   onOpenFile: () => void;
 }) {
@@ -329,14 +354,19 @@ function ConflictRow({
   return (
     <div className="group flex items-center gap-3 px-2 py-1.5">
       <span className="flex-1 truncate text-xs">
-        <span className="text-muted-foreground">{groupHeadingFor(skill)}</span>
+        <span className="font-mono text-foreground">
+          {skillTokenFor(skill, conflictSkills)}
+        </span>
+        <span className="ml-2 text-muted-foreground">
+          {groupHeadingFor(skill)}
+        </span>
         {skill.description && (
           <span className="ml-2 text-muted-foreground/70">
             {skill.description}
           </span>
         )}
       </span>
-      <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+      {skill.readable !== false && <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
         <button
           type="button"
           onClick={onView}
@@ -352,7 +382,7 @@ function ConflictRow({
         >
           ↗
         </button>
-      </div>
+      </div>}
     </div>
   );
 }
@@ -387,8 +417,10 @@ function SkillsGroupSection({
           <li key={skill.id}>
             <SkillRow
               skill={skill}
-              enabled={!disabledIds.includes(skill.id)}
-              onToggleEnabled={() => onToggleDisabled(skill.id)}
+              enabled={!disabledIds.includes(skill.preferenceId ?? skill.id)}
+              onToggleEnabled={() =>
+                onToggleDisabled(skill.preferenceId ?? skill.id)
+              }
               onView={() => onView(skill)}
               onOpenFile={() => onOpenFile(skill)}
             />

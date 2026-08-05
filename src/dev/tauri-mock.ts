@@ -511,6 +511,61 @@ const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
   permission_granularity: "per_session",
 };
 
+const MOCK_SKILL_BODY =
+  "Use the repository context to review the requested change and report actionable findings.";
+
+function mockSkill(
+  id: string,
+  name: string,
+  provider: "claude" | "codex" | "opencode",
+  scope: "project" | "user" | "system",
+) {
+  const filePath = `/mock/${provider}/${scope}/${name}/SKILL.md`;
+  return {
+    id,
+    name,
+    description: `${provider} ${scope} skill for ${name}`,
+    provider,
+    scope,
+    skillDir: filePath.replace(/\/SKILL\.md$/, ""),
+    filePath,
+    body: MOCK_SKILL_BODY,
+    rawFrontmatter: { name },
+    bundledFiles: [],
+    compatibility: "compatible",
+    compatibilitySignals: [],
+    symlinked: false,
+    pluginSlug: null,
+    provenance: "provider_catalog",
+    readable: true,
+    sourceEnabled: true,
+    projections: (["claude", "codex", "opencode"] as const).map(
+      (targetProvider) => ({
+        targetProvider,
+        availability:
+          targetProvider === provider ? "native" : "explicit-portable",
+        compatibility: "compatible",
+        reasons: [],
+        invocation:
+          targetProvider === "codex"
+            ? "codex-skill-item"
+            : targetProvider === provider && provider === "claude"
+              ? "native-command"
+              : "prompt-prefix",
+      }),
+    ),
+  };
+}
+
+const MOCK_SKILL_INVENTORY = {
+  skills: [
+    mockSkill("mock-claude-review", "review", "claude", "project"),
+    mockSkill("mock-codex-review", "review", "codex", "user"),
+    mockSkill("mock-opencode-deploy", "deploy", "opencode", "system"),
+  ],
+  errors: [],
+};
+
 // ── Agent chat (mocked end-to-end) ──────────────────────────────────
 //
 // The seeded `ws-codemux-chat` workspace carries an `agent_chat` pane
@@ -1832,6 +1887,7 @@ const handlers: Record<string, Handler> = {
           },
         ]
       : [],
+  list_skills: () => MOCK_SKILL_INVENTORY,
   agent_chat_list_messages: (a) => mockThreadPayloads(a.threadId as string),
   // Cursor read (Phase 3). The mock's transcripts are generated and
   // stable per thread, so a row id is just "index + 1" within the
