@@ -211,6 +211,7 @@ async fn starts_session_and_reports_ready() {
     let session = start_session_resilient(&provider, start_input("t-ready")).await.unwrap();
     assert_eq!(session.thread_id.0, "t-ready");
     assert!(matches!(session.status, SessionStatus::Ready));
+    assert_eq!(session.resume_cursor, Some(json!({"threadId": "c-1"})));
 
     let events = handle.await.unwrap();
     assert!(events.iter().any(|e| matches!(
@@ -326,6 +327,39 @@ async fn thread_resume_with_recoverable_error_falls_back_to_start() {
     assert!(collect.is_ok(), "timed out waiting for warning");
     assert!(saw_warning, "expected fallback warning");
     provider.stop_session(ThreadId("t-resume".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persisted_resume_cursor_reaches_codex_thread_resume() {
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_FAIL_RESUME", "1")]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let mut stream = provider.event_stream();
+
+    let mut input = start_input("t-persisted-resume");
+    input.resume_cursor = Some(json!({"resume":"stored-codex-thread"}));
+    let session = start_session_resilient(&provider, input).await.unwrap();
+    assert!(matches!(session.status, SessionStatus::Ready));
+
+    // The fake server emits this warning only if the generic persisted cursor
+    // was translated into a real thread/resume request before fresh fallback.
+    let mut saw_warning = false;
+    let collect = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::RuntimeWarning { message, .. } = &ev {
+                if message.contains("thread/resume") && message.contains("fall") {
+                    saw_warning = true;
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(collect.is_ok(), "timed out waiting for warning");
+    assert!(saw_warning, "persisted cursor did not reach thread/resume");
+    provider
+        .stop_session(ThreadId("t-persisted-resume".into()))
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

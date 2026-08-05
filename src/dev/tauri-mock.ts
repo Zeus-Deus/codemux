@@ -1927,6 +1927,17 @@ const handlers: Record<string, Handler> = {
       media_type: entry.mediaType,
     };
   },
+  // Local screenshot links use the same browser fallback as persisted chat
+  // attachments. The mock returns its seeded preview PNG for any accepted
+  // path so the real card + lightbox can be visually exercised without host
+  // filesystem access from the browser origin.
+  agent_chat_read_local_image: () => {
+    const encoded = MOCK_USER_IMAGE_DATA_URL.split(",")[1] ?? "";
+    return {
+      bytes: Array.from(Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0))),
+      media_type: "image/png",
+    };
+  },
   agent_chat_discard_staged_image: (a) => {
     stagedImages.delete(String(a.path));
     return undefined;

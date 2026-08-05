@@ -1974,6 +1974,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_stage_image,
             commands::agent_chat_discard_staged_image,
             commands::agent_chat_read_image,
+            commands::agent_chat_read_local_image,
             commands::agent_chat_prime_mcp,
             commands::agent_chat_cancel_queued_turn,
             commands::agent_chat_send_queued_turn_now,
