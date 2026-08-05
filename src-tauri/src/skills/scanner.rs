@@ -123,7 +123,10 @@ fn build_skill(
     let parsed = parse_skill_file(&content)?;
 
     let (name, description) = extract_name_description(&parsed.frontmatter, dir_name);
-    validate_skill_name(&name)?;
+    // Keep invalid definitions visible in Settings so an upgrade does not
+    // silently make an existing row disappear. They never reach the popup or
+    // turn resolver: every projection is explicitly unavailable.
+    let validation_error = validate_skill_name(&name).err();
 
     let bundled_files = enumerate_bundled_files(&canonical_dir);
 
@@ -134,6 +137,15 @@ fn build_skill(
     ]
     .into_iter()
     .map(|target| {
+        if let Some(error) = validation_error.as_deref() {
+            return SkillProjection {
+                target_provider: target,
+                availability: SkillAvailability::Unavailable,
+                compatibility: super::SkillCompatibility::HardWarn,
+                reasons: vec![format!("Invalid skill name: {error}")],
+                invocation: SkillInvocationKind::None,
+            };
+        }
         let (compatibility, reasons) =
             classify_compatibility(&parsed.body, &parsed.frontmatter, provider, target);
         let native = provider == target && provider != SkillProvider::Codemux;
@@ -184,7 +196,8 @@ fn build_skill(
         plugin_slug,
         provenance: SkillProvenance::Filesystem,
         readable: true,
-        source_enabled: true,
+        source_enabled: validation_error.is_none(),
+        validation_error,
         projections,
     })
 }
@@ -237,6 +250,25 @@ mod tests {
         assert!(s.bundled_files.is_empty());
         assert!(!s.symlinked);
         assert_eq!(s.body, "Body.\n");
+    }
+
+    #[test]
+    fn invalid_name_remains_visible_but_is_not_invocable() {
+        let tmp = TempDir::new().unwrap();
+        write_skill(
+            tmp.path(),
+            "legacy",
+            "---\nname: Legacy_Skill\ndescription: Old name\n---\nBody.\n",
+        );
+        let skills = scan_directory(tmp.path(), SkillProvider::Claude, SkillScope::User, None);
+        assert_eq!(skills.len(), 1);
+        let skill = &skills[0];
+        assert!(skill.validation_error.is_some());
+        assert!(!skill.source_enabled);
+        assert!(skill.projections.iter().all(|projection| {
+            projection.availability == SkillAvailability::Unavailable
+                && projection.invocation == SkillInvocationKind::None
+        }));
     }
 
     #[test]

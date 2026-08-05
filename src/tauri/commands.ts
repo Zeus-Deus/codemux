@@ -1278,6 +1278,10 @@ export interface AgentChatSendTurnInput {
   display_text?: string | null;
   /** Exact cwd-scoped skill definitions selected in the composer. */
   skill_ids?: string[];
+  /** Skill-token-stripped text before mode/effort/attachment wrappers. */
+  skill_text?: string | null;
+  /** Whether plugin-bundled skills are included in this selection scope. */
+  include_plugins?: boolean;
   /** Staged image references. Each image's bytes are written to a
    *  staging file at attach time (`agent_chat_stage_image`), so the turn
    *  carries only the absolute path + MIME instead of marshalling the
@@ -1815,6 +1819,9 @@ export interface Skill {
   provenance?: SkillProvenance;
   readable?: boolean;
   sourceEnabled?: boolean;
+  /** Invalid Agent Skills name. The row remains visible in Settings but
+   *  cannot be selected or invoked. */
+  validationError?: string | null;
   projections?: SkillProjection[];
 }
 

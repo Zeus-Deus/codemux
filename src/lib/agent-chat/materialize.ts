@@ -98,6 +98,9 @@ export interface MaterializeActions {
     selection: ResolvedSkillSelection,
     effectiveCwd: string,
   ) => Promise<ResolvedSkillSelection>;
+  /** Read at dispatch time so Settings changes made while a draft is open
+   * constrain backend revalidation as well as popup discovery. */
+  getIncludePlugins?: () => boolean;
 }
 
 export type MaterializeResult =
@@ -363,6 +366,8 @@ export async function materializeAndSend(
       ),
       display_text: text,
       skill_ids: exactSkillSelection?.skillIds ?? [],
+      skill_text: exactSkillSelection?.text ?? null,
+      include_plugins: actions.getIncludePlugins?.() ?? true,
       images,
       model_override: null,
       effort_override: draft.effort,
@@ -488,6 +493,18 @@ export async function materializeWithPreset(
       return { success: false, error: message };
     }
 
+    let exactSkills =
+      skillBodies && typeof skillBodies === "object" ? skillBodies : null;
+    if (exactSkills && actions.refreshSkillSelection) {
+      try {
+        exactSkills = await actions.refreshSkillSelection(exactSkills, cwd);
+      } catch (err) {
+        const message = errorMessage(err);
+        actions.markSendFailed(draft.draftId, message);
+        return { success: false, error: message };
+      }
+    }
+
     let paneId: string;
     try {
       paneId = await agentChatCreatePane(workspaceId, draft.provider, cwd);
@@ -537,8 +554,6 @@ export async function materializeWithPreset(
 
     if (prompt.length > 0) {
       try {
-        const exactSkills =
-          skillBodies && typeof skillBodies === "object" ? skillBodies : null;
         await agentChatSendTurn(draft.provider, {
           thread_id: draft.threadId,
           text: applyAllPrefixes(
@@ -549,6 +564,8 @@ export async function materializeWithPreset(
           ),
           display_text: prompt,
           skill_ids: exactSkills?.skillIds ?? [],
+          skill_text: exactSkills?.text ?? null,
+          include_plugins: actions.getIncludePlugins?.() ?? true,
           model_override: null,
           effort_override: draft.effort,
           permission_mode_override: null,

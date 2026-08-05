@@ -440,6 +440,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
               effectiveCwd,
               finalDraft.provider,
             ),
+          getIncludePlugins: () => useSkillsStore.getState().includePlugins,
         },
         skillSelection,
         attachmentBlock,

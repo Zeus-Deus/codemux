@@ -489,10 +489,15 @@ and lightbox stay visually testable.
   - `SkillInventoryService` merges readable filesystem definitions with the
     cwd-scoped Codex `skills/list` and OpenCode `GET /skill?directory=...`
     catalogs. Adapter errors are isolated and returned beside successful
-    results. Claude's SDK command list is kept separate because its current
-    response does not prove stable skill provenance; readable Claude files
-    remain portable while unmatched SDK entries stay provider-native commands.
-  - Project discovery walks cwd ancestors for portable definitions. Canonical
+    results; a provider binary that is not installed is a normal empty catalog,
+    not an error banner. Claude's SDK command list is kept separate because its
+    current response does not prove stable skill provenance; readable Claude
+    files remain portable while unmatched SDK entries stay provider-native
+    commands.
+  - Project discovery walks cwd ancestors for portable definitions, and the
+    filesystem watcher covers those inherited roots as well as the direct cwd.
+    Invalid legacy names remain visible as unavailable Settings rows with the
+    validation reason instead of disappearing from discovery. Canonical
     SKILL.md paths remain the strongest identity; a provider-catalog identity
     is used for native-only entries. The provider catalog owns its native
     enabled state.
@@ -500,19 +505,28 @@ and lightbox stay visually testable.
     native, explicit-portable, native-only, or unavailable, plus compatibility
     reasons and the invocation route. Compatibility is no longer calculated
     once against a hard-coded Claude target.
-  - Sends carry only stable `skill_ids` over IPC. The backend revalidates them
-    at the persisted thread cwd. Codex receives structured `{type:"skill",
+  - Sends carry stable `skill_ids`, the token-stripped user text, and the actual
+    `include_plugins` preference over IPC. The backend revalidates them at the
+    persisted thread cwd under that same discovery scope. A cold-cache forced
+    inventory is reused for resolution rather than harvesting both catalogs a
+    second time. Codex receives structured `{type:"skill",
     name,path}` items for readable selections; one native Claude selection
-    keeps `/name` command semantics; OpenCode and other foreign portable cases
-    receive a normalized envelope containing body, source provenance, and the
-    absolute base directory for relative `scripts/`, `references/`, and
-    `assets/`. Source-specific frontmatter never becomes a permission grant.
+    keeps `/name` command semantics only when mode/effort/attachment framing
+    has not changed its arguments, otherwise it uses the portable envelope so
+    wrappers do not become the command's `$ARGUMENTS`. OpenCode and other
+    foreign portable cases receive a normalized envelope containing body,
+    source provenance, and the absolute base directory for relative `scripts/`,
+    `references/`, and `assets/`. Source-specific frontmatter never becomes a
+    permission grant.
     The durable/optimistic transcript uses `display_text`, so it shows the
     user's unexpanded command rather than an injected body.
   - Provider-native automatic invocation is unchanged. The Settings switch is
     explicitly “available in Codemux”: disabling a row removes it from the
     Codemux popup and resolver but does not rewrite provider configuration or
     hide the same skill from its native provider.
+    Pre-inventory path-hash disabled ids migrate opportunistically to the
+    canonical-repository preference id when the same project skill is next
+    discovered, so upgrades do not re-enable it.
   - **Scan roots** (`skills::paths::enumerate_scan_paths` — the single
     source of truth; scanner, watcher, conflict detection and the
     Settings grouping all derive from it, so adding a provider root is

@@ -38,21 +38,26 @@ export function SkillRow({
   onView,
   onOpenFile,
 }: Props) {
-  const status = (skill.projections ?? [])
-    .filter((projection) => projection.availability !== "unavailable")
-    .map((projection) => {
-      const provider =
-        projection.targetProvider === "opencode"
-          ? "OpenCode"
-          : projection.targetProvider[0].toUpperCase() +
-            projection.targetProvider.slice(1);
-      if (projection.availability === "native") return `Auto in ${provider}`;
-      if (projection.availability === "native-only") {
-        return `Native only in ${provider}`;
-      }
-      return `Manual in ${provider}`;
-    })
-    .join(" · ");
+  const status = skill.validationError
+    ? `Invalid: ${skill.validationError}`
+    : (skill.projections ?? [])
+        .filter((projection) => projection.availability !== "unavailable")
+        .map((projection) => {
+          const provider =
+            projection.targetProvider === "opencode"
+              ? "OpenCode"
+              : projection.targetProvider[0].toUpperCase() +
+                projection.targetProvider.slice(1);
+          if (projection.availability === "native") {
+            return `Auto in ${provider}`;
+          }
+          if (projection.availability === "native-only") {
+            return `Native only in ${provider}`;
+          }
+          return `Manual in ${provider}`;
+        })
+        .join(" · ");
+  const canToggle = !skill.validationError;
   return (
     <div
       data-testid={`skill-row-${skill.id}`}
@@ -154,10 +159,13 @@ export function SkillRow({
             a glance. Stops propagation so accidental clicks on the
             row don't fall through to the View action. */}
         <Switch
-          checked={enabled}
+          checked={canToggle && enabled}
           onCheckedChange={onToggleEnabled}
+          disabled={!canToggle}
           aria-label={
-            enabled
+            !canToggle
+              ? `${skill.name} is unavailable in Codemux`
+              : enabled
               ? `Remove ${skill.name} from Codemux`
               : `Make ${skill.name} available in Codemux`
           }

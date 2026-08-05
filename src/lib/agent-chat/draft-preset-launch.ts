@@ -4,6 +4,7 @@ import { resolveSkillSelection, skillsForProvider } from "./skill-tokens";
 import { useAgentChatStore } from "@/stores/agent-chat-store";
 import { useChatDraftStore, type DraftId } from "@/stores/chat-draft-store";
 import { selectActiveSkills, useSkillsStore } from "@/stores/skills-store";
+import { refreshSkillSelectionForCwd } from "./skill-selection-refresh";
 import type { TerminalPreset } from "@/tauri/types";
 
 /** Grace period between promoting a draft and sweeping its entry, so
@@ -40,6 +41,9 @@ export async function launchDraftWithPreset(
       draft.provider,
     ),
   );
+  const sourceSkills = selectActiveSkills(useSkillsStore.getState());
+  const sourceCwd =
+    draft.target.kind === "project" ? draft.target.projectPath : null;
 
   const result = await materializeWithPreset(
     draft,
@@ -60,6 +64,15 @@ export async function launchDraftWithPreset(
       setContextWindow: chat.setContextWindow,
       setFastMode: chat.setFastMode,
       setMode: chat.setMode,
+      refreshSkillSelection: (selection, effectiveCwd) =>
+        refreshSkillSelectionForCwd(
+          selection,
+          sourceSkills,
+          sourceCwd ?? effectiveCwd,
+          effectiveCwd,
+          draft.provider,
+        ),
+      getIncludePlugins: () => useSkillsStore.getState().includePlugins,
     },
     skillSelection,
   );

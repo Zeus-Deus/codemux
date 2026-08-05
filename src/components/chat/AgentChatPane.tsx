@@ -1327,6 +1327,8 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         text: sdkText,
         display_text: rawText,
         skill_ids: skillSelection.skillIds,
+        skill_text: skillSelection.text,
+        include_plugins: useSkillsStore.getState().includePlugins,
         images: imageRefs,
         model_override: null,
         effort_override: plan.effortOverride,

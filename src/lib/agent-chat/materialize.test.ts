@@ -372,6 +372,8 @@ describe("materializeAndSend", () => {
         text: "first message",
         display_text: "first message",
         skill_ids: [],
+        skill_text: null,
+        include_plugins: true,
         // Stage 6 — images default to empty array when no
         // attachments are passed to materializeAndSend.
         images: [],
@@ -1242,6 +1244,37 @@ describe("materializeWithPreset", () => {
   });
 
   describe("ChatAgent preset dispatch", () => {
+    it("refreshes exact skill ids before a preset turn is sent", async () => {
+      const actions = makeActions();
+      actions.refreshSkillSelection = vi.fn().mockResolvedValue({
+        skillIds: ["refreshed-skill-id"],
+        text: "ship it",
+      });
+      actions.getIncludePlugins = vi.fn(() => false);
+      const draft = makeDraft({
+        target: { kind: "project", projectPath: "/projects/foo" },
+      });
+      const preset = makePreset({ kind: "chat_agent" });
+
+      await materializeWithPreset(draft, preset, "/deploy ship it", actions, {
+        skillIds: ["source-skill-id"],
+        text: "ship it",
+      });
+
+      expect(actions.refreshSkillSelection).toHaveBeenCalledWith(
+        { skillIds: ["source-skill-id"], text: "ship it" },
+        "/projects/foo",
+      );
+      expect(agentChatSendTurn).toHaveBeenCalledWith(
+        "claude",
+        expect.objectContaining({
+          skill_ids: ["refreshed-skill-id"],
+          skill_text: "ship it",
+          include_plugins: false,
+        }),
+      );
+    });
+
     it("happy path with prompt: creates pane, seeds transcript, starts session, sends turn", async () => {
       const actions = makeActions();
       const draft = makeDraft({

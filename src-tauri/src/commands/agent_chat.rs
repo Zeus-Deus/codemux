@@ -1241,6 +1241,14 @@ pub struct SendTurnCommandInput {
     /// Stable skill selections. Body/path data is resolved by the backend.
     #[serde(default)]
     pub skill_ids: Vec<String>,
+    /// Skill-token-stripped user text before mode/effort/attachment wrappers.
+    /// Native Claude commands are safe only when this equals `text`.
+    #[serde(default)]
+    pub skill_text: Option<String>,
+    /// Discovery scope selected in Settings. Defaults on for compatibility
+    /// with older clients that predate this field.
+    #[serde(default = "default_include_plugins")]
+    pub include_plugins: bool,
     /// Staged image references, in order.
     #[serde(default)]
     pub images: Vec<ChatImageRef>,
@@ -1255,6 +1263,10 @@ pub struct SendTurnCommandInput {
     /// Optional client-generated correlation token for the follow-up queue.
     #[serde(default)]
     pub client_nonce: Option<String>,
+}
+
+fn default_include_plugins() -> bool {
+    true
 }
 
 fn skill_provider_for(provider: ProviderKind) -> crate::skills::SkillProvider {
@@ -1277,6 +1289,7 @@ fn escape_skill_attribute(value: &str) -> String {
 /// Materialize provider-independent selections after inventory revalidation.
 fn render_skill_invocations(
     text: &str,
+    skill_text: Option<&str>,
     provider: ProviderKind,
     skills: &[crate::skills::ResolvedSkillInvocation],
 ) -> Result<String, String> {
@@ -1292,28 +1305,17 @@ fn render_skill_invocations(
             crate::skills::SkillInvocationKind::NativeCommand
         )
     {
-        let rest = text.trim();
-        return Ok(if rest.is_empty() {
-            format!("/{}", skills[0].name)
-        } else {
-            format!("/{} {}", skills[0].name, rest)
-        });
-    }
-
-    if provider == ProviderKind::Codex
-        && skills.len() == 1
-        && skills[0].source_provider == crate::skills::SkillProvider::Codex
-        && matches!(
-            skills[0].invocation,
-            crate::skills::SkillInvocationKind::NativeCommand
-        )
-    {
-        let rest = text.trim();
-        return Ok(if rest.is_empty() {
-            format!("${}", skills[0].name)
-        } else {
-            format!("${} {}", skills[0].name, rest)
-        });
+        if skill_text == Some(text) {
+            let rest = text.trim();
+            return Ok(if rest.is_empty() {
+                format!("/{}", skills[0].name)
+            } else {
+                format!("/{} {}", skills[0].name, rest)
+            });
+        }
+        // Mode, effort, or attachment framing must remain top-level prompt
+        // context. Putting it after `/name` turns it into the command's
+        // `$ARGUMENTS`, so use the readable portable envelope instead.
     }
 
     let mut envelopes = Vec::new();
@@ -1416,14 +1418,19 @@ pub async fn agent_chat_send_turn<R: Runtime>(
         inventory
             .resolve(
                 std::path::Path::new(&cwd),
-                true,
+                input.include_plugins,
                 skill_provider_for(provider),
                 &input.skill_ids,
                 Some(opencode_manager.inner()),
             )
             .await?
     };
-    let rendered_text = render_skill_invocations(&input.text, provider, &skill_invocations)?;
+    let rendered_text = render_skill_invocations(
+        &input.text,
+        input.skill_text.as_deref(),
+        provider,
+        &skill_invocations,
+    )?;
     // Build the provider's byte-carrying input from the command DTO.
     let provider_input = SendTurnInput {
         thread_id: input.thread_id.clone(),
@@ -5983,9 +5990,13 @@ mod tests {
 
     #[test]
     fn portable_skill_envelope_preserves_base_directory() {
-        let rendered =
-            render_skill_invocations("ship it", ProviderKind::OpenCode, &[portable_skill()])
-                .unwrap();
+        let rendered = render_skill_invocations(
+            "ship it",
+            Some("ship it"),
+            ProviderKind::OpenCode,
+            &[portable_skill()],
+        )
+        .unwrap();
         assert!(rendered.contains("base-dir=\"/skills/deploy\""));
         assert!(rendered.contains("Deploy carefully."));
         assert!(rendered.ends_with("ship it"));
@@ -5996,7 +6007,9 @@ mod tests {
         let mut skill = portable_skill();
         skill.name = "deploy&verify".into();
         skill.base_dir = Some("/skills/a\"b".into());
-        let rendered = render_skill_invocations("ship", ProviderKind::OpenCode, &[skill]).unwrap();
+        let rendered =
+            render_skill_invocations("ship", Some("ship"), ProviderKind::OpenCode, &[skill])
+                .unwrap();
         assert!(rendered.contains("name=\"deploy&amp;verify\""));
         assert!(rendered.contains("base-dir=\"/skills/a&quot;b\""));
     }
@@ -6005,15 +6018,45 @@ mod tests {
     fn native_claude_skill_keeps_native_command_semantics() {
         let mut skill = portable_skill();
         skill.invocation = crate::skills::SkillInvocationKind::NativeCommand;
-        let rendered = render_skill_invocations("release", ProviderKind::Claude, &[skill]).unwrap();
+        let rendered =
+            render_skill_invocations("release", Some("release"), ProviderKind::Claude, &[skill])
+                .unwrap();
         assert_eq!(rendered, "/deploy release");
+    }
+
+    #[test]
+    fn native_claude_skill_with_wrappers_uses_portable_envelope() {
+        let mut skill = portable_skill();
+        skill.invocation = crate::skills::SkillInvocationKind::NativeCommand;
+        let rendered = render_skill_invocations(
+            "Plan instructions.\n\nrelease",
+            Some("release"),
+            ProviderKind::Claude,
+            &[skill],
+        )
+        .unwrap();
+        assert!(rendered.starts_with("<codemux-skill"));
+        assert!(rendered.ends_with("Plan instructions.\n\nrelease"));
+        assert!(!rendered.starts_with("/deploy"));
+    }
+
+    #[test]
+    fn native_claude_skill_without_original_text_uses_portable_envelope() {
+        let mut skill = portable_skill();
+        skill.invocation = crate::skills::SkillInvocationKind::NativeCommand;
+        let rendered =
+            render_skill_invocations("release", None, ProviderKind::Claude, &[skill]).unwrap();
+        assert!(rendered.starts_with("<codemux-skill"));
+        assert!(rendered.ends_with("release"));
     }
 
     #[test]
     fn codex_skill_item_does_not_duplicate_body_in_text() {
         let mut skill = portable_skill();
         skill.invocation = crate::skills::SkillInvocationKind::CodexSkillItem;
-        let rendered = render_skill_invocations("review", ProviderKind::Codex, &[skill]).unwrap();
+        let rendered =
+            render_skill_invocations("review", Some("review"), ProviderKind::Codex, &[skill])
+                .unwrap();
         assert_eq!(rendered, "review");
     }
 

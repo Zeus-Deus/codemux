@@ -102,6 +102,9 @@ pub struct Skill {
     pub provenance: SkillProvenance,
     pub readable: bool,
     pub source_enabled: bool,
+    /// Agent Skills name-validation failure. Invalid definitions remain in
+    /// Settings for diagnosis but are unavailable to every invocation path.
+    pub validation_error: Option<String>,
     pub projections: Vec<SkillProjection>,
 }
 
@@ -200,6 +203,7 @@ mod tests {
             provenance: SkillProvenance::Filesystem,
             readable: true,
             source_enabled: true,
+            validation_error: None,
             projections: vec![],
         };
         let json = serde_json::to_value(&skill).unwrap();

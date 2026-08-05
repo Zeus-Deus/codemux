@@ -154,4 +154,21 @@ describe("SkillRow", () => {
     fireEvent.click(screen.getByTestId("skill-row-switch-demo"));
     expect(onToggleEnabled).toHaveBeenCalledTimes(1);
   });
+
+  it("surfaces invalid legacy names and prevents enabling them", () => {
+    const onToggleEnabled = vi.fn();
+    renderRow({
+      skill: makeSkill({
+        id: "legacy",
+        name: "Legacy_Skill",
+        validationError: "skill name may contain only lowercase letters",
+      }),
+      onToggleEnabled,
+    });
+    expect(screen.getByText(/Invalid: skill name may contain/)).toBeInTheDocument();
+    const sw = screen.getByTestId("skill-row-switch-legacy");
+    expect(sw).toBeDisabled();
+    fireEvent.click(sw);
+    expect(onToggleEnabled).not.toHaveBeenCalled();
+  });
 });

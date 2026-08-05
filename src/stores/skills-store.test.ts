@@ -11,7 +11,12 @@ vi.mock("@/tauri/commands", async (importActual) => {
 });
 
 import { listSkills } from "@/tauri/commands";
-import { TTL_MS, selectActiveSkills, useSkillsStore } from "./skills-store";
+import {
+  TTL_MS,
+  migrateDisabledSkillIds,
+  selectActiveSkills,
+  useSkillsStore,
+} from "./skills-store";
 
 const listSkillsMock = listSkills as unknown as ReturnType<typeof vi.fn>;
 
@@ -310,6 +315,28 @@ describe("skills-store · disable toggle (Stage 5)", () => {
       disabledIds: ["repo-skill-id"],
     });
     expect(selectActiveSkills(useSkillsStore.getState())).toEqual([]);
+  });
+
+  it("migrates a disabled path id to the canonical preference id on discovery", async () => {
+    const skill = {
+      ...makeSkill("project-skill"),
+      id: "legacy-path-hash",
+      preferenceId: "canonical-repo-hash",
+    };
+    useSkillsStore.setState({ disabledIds: ["legacy-path-hash"] });
+    listSkillsMock.mockResolvedValueOnce([skill]);
+
+    await useSkillsStore.getState().loadSkills("/repo", true);
+
+    expect(useSkillsStore.getState().disabledIds).toEqual([
+      "canonical-repo-hash",
+    ]);
+    expect(selectActiveSkills(useSkillsStore.getState())).toEqual([]);
+  });
+
+  it("leaves unrelated disabled ids byte-for-byte unchanged", () => {
+    const ids = ["unrelated"];
+    expect(migrateDisabledSkillIds(ids, [makeSkill("project-skill")])).toBe(ids);
   });
 
   it("disabled state persists to localStorage and rehydrates on a fresh import", async () => {

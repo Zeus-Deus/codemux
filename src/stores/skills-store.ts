@@ -61,6 +61,28 @@ export const TTL_MS = 60_000;
 
 const STORAGE_KEY = "codemux:skills:v1";
 
+/** Opportunistically migrate the pre-inventory path-hash preference to the
+ * canonical-repository preference id. This fires when that same skill path is
+ * rediscovered, preserving an existing disabled choice across the upgrade. */
+export function migrateDisabledSkillIds(
+  disabledIds: string[],
+  skills: Skill[],
+): string[] {
+  if (disabledIds.length === 0) return disabledIds;
+  const migrated = new Set(disabledIds);
+  let changed = false;
+  for (const skill of skills) {
+    const preferenceId = skill.preferenceId;
+    if (!preferenceId || preferenceId === skill.id || !migrated.has(skill.id)) {
+      continue;
+    }
+    migrated.delete(skill.id);
+    migrated.add(preferenceId);
+    changed = true;
+  }
+  return changed ? [...migrated].sort() : disabledIds;
+}
+
 export const useSkillsStore = create<SkillsState>()(
   persist(
     (set, get) => ({
@@ -163,7 +185,14 @@ export const useSkillsStore = create<SkillsState>()(
               },
             };
             if (current.activeContextKey !== contextKey) {
-              return { inventoryCache, inFlightContexts };
+              return {
+                inventoryCache,
+                inFlightContexts,
+                disabledIds: migrateDisabledSkillIds(
+                  current.disabledIds,
+                  inventory.skills,
+                ),
+              };
             }
             return {
               inventoryCache,
@@ -173,6 +202,10 @@ export const useSkillsStore = create<SkillsState>()(
               loaded: true,
               loadedAt,
               loading: false,
+              disabledIds: migrateDisabledSkillIds(
+                current.disabledIds,
+                inventory.skills,
+              ),
             };
           });
         } catch (err) {

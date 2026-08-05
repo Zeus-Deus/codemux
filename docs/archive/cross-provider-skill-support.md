@@ -7,6 +7,17 @@
 - Read next: `docs/features/agent-chat.md`, `docs/features/skills-sync.md`, `docs/features/multi-provider-chat.md`
 - Status: COMPLETED (2026-08-03)
 
+## Review Follow-up (2026-08-05)
+
+The merge-base refresh and review hardening are included in the completed
+implementation: absent provider binaries are empty catalogs; turn resolution
+uses the caller's plugin scope and reuses cold forced discovery; invalid legacy
+names remain visible but unavailable; the dead Codex `$name` route is removed;
+wrapped Claude turns fall back to portable invocation rather than treating
+prefixes as `$ARGUMENTS`; old project-skill disabled ids migrate on discovery;
+preset launches refresh exact selections; and inherited project roots are
+watched as well as scanned.
+
 ## Goal
 
 Make the Agent Chat skills surface reflect what Claude Code, Codex, and OpenCode

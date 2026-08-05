@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-use super::paths::enumerate_scan_paths;
+use super::paths::{enumerate_ancestor_project_paths, enumerate_scan_paths};
 
 /// Coalesce-window for raw filesystem events. 300ms is comfortably
 /// above the typical write+close burst from text editors but short
@@ -148,6 +148,15 @@ fn collect_paths(project_root: Option<&std::path::Path>, include_plugins: bool) 
     for (path, _) in scan.plugin_paths {
         out.push(path);
     }
+    if let Some(project_root) = project_root {
+        out.extend(
+            enumerate_ancestor_project_paths(project_root)
+                .into_iter()
+                .map(|(path, _)| path),
+        );
+    }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -170,6 +179,17 @@ mod tests {
         fs::create_dir_all(project.path().join(".claude/skills")).unwrap();
         let paths = collect_paths(Some(project.path()), false);
         assert!(!paths.is_empty());
+    }
+
+    #[test]
+    fn collect_paths_includes_inherited_project_roots() {
+        let project = TempDir::new().unwrap();
+        let nested = project.path().join("packages/app");
+        fs::create_dir_all(&nested).unwrap();
+        let inherited = project.path().join(".claude/skills");
+        fs::create_dir_all(&inherited).unwrap();
+        let paths = collect_paths(Some(&nested), false);
+        assert!(paths.contains(&inherited));
     }
 
     // The debounce window is checked inline; verify the const itself

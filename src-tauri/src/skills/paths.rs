@@ -26,6 +26,27 @@ pub fn enumerate_scan_paths(project_root: Option<&Path>, include_plugins: bool) 
     enumerate_scan_paths_with_home(project_root, include_plugins, dirs::home_dir().as_deref())
 }
 
+/// Provider project roots inherited from parent directories of `cwd`.
+/// `enumerate_scan_paths` intentionally covers only the supplied directory
+/// because it is also the sync contract; cwd-scoped discovery and its watcher
+/// both extend that base with these ancestor roots.
+pub fn enumerate_ancestor_project_paths(cwd: &Path) -> Vec<(PathBuf, SkillProvider)> {
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    for ancestor in cwd.ancestors().skip(1) {
+        for (relative, provider) in [
+            (".claude/skills", SkillProvider::Claude),
+            (".codex/skills", SkillProvider::Codex),
+            (".agents/skills", SkillProvider::Codex),
+            (".opencode/skills", SkillProvider::Opencode),
+            (".codemux/skills", SkillProvider::Codemux),
+        ] {
+            push_unique(&mut paths, &mut seen, ancestor.join(relative), provider);
+        }
+    }
+    paths
+}
+
 pub fn enumerate_scan_paths_with_home(
     project_root: Option<&Path>,
     include_plugins: bool,
@@ -327,6 +348,29 @@ mod tests {
         .unwrap();
         let paths = enumerate_scan_paths_with_home(None, false, Some(home.path()));
         assert!(paths.plugin_paths.is_empty());
+    }
+
+    #[test]
+    fn ancestor_project_paths_cover_every_inherited_provider_root() {
+        let root = PathBuf::from("/repo");
+        let cwd = root.join("packages/app");
+        let paths = enumerate_ancestor_project_paths(&cwd);
+        assert!(paths
+            .iter()
+            .any(|(path, provider)| path == &root.join(".claude/skills")
+                && *provider == SkillProvider::Claude));
+        assert!(paths
+            .iter()
+            .any(|(path, provider)| path == &root.join(".agents/skills")
+                && *provider == SkillProvider::Codex));
+        assert!(paths
+            .iter()
+            .any(|(path, provider)| path == &root.join(".opencode/skills")
+                && *provider == SkillProvider::Opencode));
+        assert!(paths
+            .iter()
+            .any(|(path, provider)| path == &root.join(".codemux/skills")
+                && *provider == SkillProvider::Codemux));
     }
 
     #[test]

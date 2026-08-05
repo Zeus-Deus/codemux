@@ -20,7 +20,7 @@ use crate::json_rpc_child::{JsonRpcChild, SpawnConfig};
 
 use super::compatibility::classify_compatibility;
 use super::parser::parse_skill_file;
-use super::paths::enumerate_scan_paths;
+use super::paths::{enumerate_ancestor_project_paths, enumerate_scan_paths};
 use super::scanner::scan_directory;
 use super::{
     skill_id_for_path, ResolvedSkillInvocation, Skill, SkillAdapterError, SkillAvailability,
@@ -86,6 +86,7 @@ impl SkillInventoryService {
                             message,
                         }));
                 }
+                Err(message) if is_provider_not_installed(SkillProvider::Codex, &message) => {}
                 Err(message) => inventory.errors.push(SkillAdapterError {
                     provider: SkillProvider::Codex,
                     message,
@@ -94,6 +95,7 @@ impl SkillInventoryService {
             match opencode_result {
                 Ok(Some(entries)) => merge_catalog(&mut inventory.skills, entries),
                 Ok(None) => {}
+                Err(message) if is_provider_not_installed(SkillProvider::Opencode, &message) => {}
                 Err(message) => inventory.errors.push(SkillAdapterError {
                     provider: SkillProvider::Opencode,
                     message,
@@ -141,11 +143,12 @@ impl SkillInventoryService {
             .await
             .get(&cache_key)
             .map(|entry| entry.inventory.clone());
-        if hint.as_ref().is_none_or(|inventory| {
+        let refreshed = hint.as_ref().is_none_or(|inventory| {
             !requested
                 .iter()
                 .all(|id| inventory.skills.iter().any(|skill| &skill.id == id))
-        }) {
+        });
+        if refreshed {
             // A catalog-only selection needs one authoritative discovery when
             // no prior popup inventory exists. The normal path reuses the
             // cached identity hints and avoids starting unrelated providers.
@@ -167,21 +170,30 @@ impl SkillInventoryService {
             .map(|skill| skill.provider)
             .collect::<HashSet<_>>();
 
-        let mut inventory = filesystem_inventory(Some(&canonical_cwd), include_plugins);
-        if source_providers.contains(&SkillProvider::Codex) {
-            if let Ok((entries, _)) = harvest_codex_catalog(&canonical_cwd).await {
-                merge_catalog(&mut inventory.skills, entries);
-            }
-        }
-        if source_providers.contains(&SkillProvider::Opencode) {
-            if let Some(manager) = opencode_manager {
-                if let Ok(entries) = harvest_opencode_catalog(manager, &canonical_cwd).await {
+        // `list(force=true)` already performed a complete authoritative
+        // harvest. Reuse it on a cold send instead of spawning both provider
+        // catalogs a second time. A warm send rebuilds only the selected
+        // source providers so stale ids are still rejected at turn time.
+        let inventory = if refreshed {
+            hint
+        } else {
+            let mut inventory = filesystem_inventory(Some(&canonical_cwd), include_plugins);
+            if source_providers.contains(&SkillProvider::Codex) {
+                if let Ok((entries, _)) = harvest_codex_catalog(&canonical_cwd).await {
                     merge_catalog(&mut inventory.skills, entries);
                 }
             }
-        }
-        stabilize_preference_ids(&mut inventory.skills, Some(&canonical_cwd));
-        sort_skills(&mut inventory.skills);
+            if source_providers.contains(&SkillProvider::Opencode) {
+                if let Some(manager) = opencode_manager {
+                    if let Ok(entries) = harvest_opencode_catalog(manager, &canonical_cwd).await {
+                        merge_catalog(&mut inventory.skills, entries);
+                    }
+                }
+            }
+            stabilize_preference_ids(&mut inventory.skills, Some(&canonical_cwd));
+            sort_skills(&mut inventory.skills);
+            inventory
+        };
 
         let by_id = inventory
             .skills
@@ -282,23 +294,10 @@ fn filesystem_inventory(cwd: Option<&Path>, include_plugins: bool) -> SkillInven
             .iter()
             .map(|skill| skill.file_path.clone())
             .collect::<HashSet<_>>();
-        for ancestor in cwd.ancestors().skip(1) {
-            for (relative, provider) in [
-                (".claude/skills", SkillProvider::Claude),
-                (".codex/skills", SkillProvider::Codex),
-                (".agents/skills", SkillProvider::Codex),
-                (".opencode/skills", SkillProvider::Opencode),
-                (".codemux/skills", SkillProvider::Codemux),
-            ] {
-                for skill in scan_directory(
-                    &ancestor.join(relative),
-                    provider,
-                    SkillScope::Project,
-                    None,
-                ) {
-                    if seen.insert(skill.file_path.clone()) {
-                        skills.push(skill);
-                    }
+        for (path, provider) in enumerate_ancestor_project_paths(cwd) {
+            for skill in scan_directory(&path, provider, SkillScope::Project, None) {
+                if seen.insert(skill.file_path.clone()) {
+                    skills.push(skill);
                 }
             }
         }
@@ -308,6 +307,14 @@ fn filesystem_inventory(cwd: Option<&Path>, include_plugins: bool) -> SkillInven
         skills,
         errors: Vec::new(),
     }
+}
+
+fn is_provider_not_installed(provider: SkillProvider, message: &str) -> bool {
+    matches!(
+        (provider, message),
+        (SkillProvider::Codex, "codex_not_installed")
+            | (SkillProvider::Opencode, "opencode_not_installed")
+    )
 }
 
 fn stabilize_preference_ids(skills: &mut [Skill], cwd: Option<&Path>) {
@@ -532,6 +539,7 @@ fn catalog_skill(
         .or_else(|| parsed_file.map(|parsed| parsed.body))
         .unwrap_or_default();
     let readable = !body.trim().is_empty();
+    let validation_error = super::parser::validate_skill_name(&name).err();
     let id = if canonical_path.is_some() {
         skill_id_for_path(&file_path)
     } else {
@@ -544,6 +552,15 @@ fn catalog_skill(
     ]
     .into_iter()
     .map(|target| {
+        if let Some(error) = validation_error.as_deref() {
+            return SkillProjection {
+                target_provider: target,
+                availability: SkillAvailability::Unavailable,
+                compatibility: super::SkillCompatibility::HardWarn,
+                reasons: vec![format!("Invalid skill name: {error}")],
+                invocation: SkillInvocationKind::None,
+            };
+        }
         let native = target == provider;
         let (compatibility, reasons) =
             classify_compatibility(&body, &raw_frontmatter, provider, target);
@@ -610,7 +627,8 @@ fn catalog_skill(
         plugin_slug: None,
         provenance: SkillProvenance::ProviderCatalog,
         readable,
-        source_enabled: enabled,
+        source_enabled: enabled && validation_error.is_none(),
+        validation_error,
         projections,
     }
 }
@@ -705,6 +723,25 @@ mod tests {
     }
 
     #[test]
+    fn invalid_catalog_name_is_visible_but_unavailable() {
+        let (skills, errors) = parse_codex_catalog(json!({
+            "data": [{
+                "name": "Legacy_Skill",
+                "path": "codex://legacy",
+                "enabled": true
+            }]
+        }));
+        assert!(errors.is_empty());
+        assert_eq!(skills.len(), 1);
+        assert!(skills[0].validation_error.is_some());
+        assert!(!skills[0].source_enabled);
+        assert!(skills[0].projections.iter().all(|projection| {
+            projection.availability == SkillAvailability::Unavailable
+                && projection.invocation == SkillInvocationKind::None
+        }));
+    }
+
+    #[test]
     fn codex_cwd_group_fixture_is_decoded() {
         let (skills, errors) = parse_codex_catalog(json!({
             "data": [{
@@ -747,7 +784,7 @@ mod tests {
         );
         assert!(skill.readable);
         assert_eq!(skill.body, "Read this body.");
-        assert!(skill.file_path.ends_with("review/SKILL.md"));
+        assert!(Path::new(&skill.file_path).ends_with(Path::new("review").join("SKILL.md")));
         assert!(skill.projections.iter().any(|projection| {
             projection.target_provider == SkillProvider::Claude
                 && projection.availability == SkillAvailability::ExplicitPortable
@@ -931,5 +968,21 @@ mod tests {
             canonical,
         );
         assert_eq!(main, linked);
+    }
+
+    #[test]
+    fn missing_provider_binaries_are_normal_empty_catalogs() {
+        assert!(is_provider_not_installed(
+            SkillProvider::Codex,
+            "codex_not_installed"
+        ));
+        assert!(is_provider_not_installed(
+            SkillProvider::Opencode,
+            "opencode_not_installed"
+        ));
+        assert!(!is_provider_not_installed(
+            SkillProvider::Codex,
+            "codex_skills_list_failed: timeout"
+        ));
     }
 }
