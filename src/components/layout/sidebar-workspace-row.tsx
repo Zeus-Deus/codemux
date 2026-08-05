@@ -36,6 +36,8 @@ import {
   BellOff,
   Cloud,
   Loader2,
+  Pin,
+  PinOff,
   X,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -48,6 +50,7 @@ import {
   renameWorkspace,
   unarchiveWorkspace,
   setWorkspaceMuted,
+  setWorkspacePinned,
   detectEditors,
   openInEditor,
   runWorkspaceSetup,
@@ -465,6 +468,17 @@ export function WorkspaceContextMenuItems({
     ).catch(console.error);
   };
 
+  const handleTogglePinned = async () => {
+    const pinned = workspace.pinned_at != null;
+    try {
+      await setWorkspacePinned(workspace.workspace_id, !pinned);
+    } catch (err) {
+      toast.error(pinned ? "Unpin failed" : "Pin failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
   const handleOpenInEditor = (editorId: string) => {
     openInEditor(editorId, workspace.cwd).catch(console.error);
   };
@@ -489,35 +503,41 @@ export function WorkspaceContextMenuItems({
           first: a user who right-clicked a hidden row is almost always there
           to undo the hiding, and burying "Wake now" under the deferral
           options would make the common case the slower one. */}
-      {(settleAction || snooze || unreadAction) && (
-        <>
-          {settleAction?.kind === "unsettle" && (
+      <>
+        <ContextMenuItem onClick={() => void handleTogglePinned()}>
+          {workspace.pinned_at != null ? <PinOff /> : <Pin />}
+          {workspace.pinned_at != null ? "Unpin workspace" : "Pin workspace"}
+        </ContextMenuItem>
+        {workspace.pinned_at == null && (
+          <>
+            {settleAction?.kind === "unsettle" && (
             <ContextMenuItem onClick={settleAction.onAction}>
               Un-settle workspace
             </ContextMenuItem>
-          )}
-          {snooze?.kind === "wake" && (
-            <ContextMenuItem onClick={snooze.onWake}>Wake now</ContextMenuItem>
-          )}
-          {settleAction?.kind === "settle" && (
-            <ContextMenuItem onClick={settleAction.onAction}>
-              Settle workspace
-            </ContextMenuItem>
-          )}
-          {/* `offered` is the guardrail (a working or blocked workspace is
-              never deferrable). The wake times themselves belong to
-              `SnoozeUntilSubmenu`, which only exists while the menu is open. */}
-          {snooze?.kind === "snooze" && snooze.offered && (
-            <SnoozeUntilSubmenu onSnooze={snooze.onSnooze} />
-          )}
-          {unreadAction && (
-            <ContextMenuItem onClick={unreadAction.onMarkUnread}>
-              Mark unread
-            </ContextMenuItem>
-          )}
-          <ContextMenuSeparator />
-        </>
-      )}
+            )}
+            {snooze?.kind === "wake" && (
+              <ContextMenuItem onClick={snooze.onWake}>Wake now</ContextMenuItem>
+            )}
+            {settleAction?.kind === "settle" && (
+              <ContextMenuItem onClick={settleAction.onAction}>
+                Settle workspace
+              </ContextMenuItem>
+            )}
+            {/* `offered` is the guardrail (a working or blocked workspace is
+                never deferrable). The wake times themselves belong to
+                `SnoozeUntilSubmenu`, which only exists while the menu is open. */}
+            {snooze?.kind === "snooze" && snooze.offered && (
+              <SnoozeUntilSubmenu onSnooze={snooze.onSnooze} />
+            )}
+          </>
+        )}
+        {unreadAction && (
+          <ContextMenuItem onClick={unreadAction.onMarkUnread}>
+            Mark unread
+          </ContextMenuItem>
+        )}
+        <ContextMenuSeparator />
+      </>
       <ContextMenuItem onClick={handleRename}>
         Rename workspace
       </ContextMenuItem>

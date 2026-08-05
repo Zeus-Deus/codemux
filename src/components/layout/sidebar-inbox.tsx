@@ -31,6 +31,8 @@ import {
 import { useHosts } from "@/stores/hosts-store";
 import { useUIStore } from "@/stores/ui-store";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
+import { setWorkspacePinned } from "@/tauri/commands";
+import { toast } from "@/lib/toast";
 import {
   useSidebarInboxStore,
   resolveSettledTimestamp,
@@ -316,7 +318,7 @@ function ProjectMiniAvatar({ name, path }: { name: string; path: string }) {
 interface ProjectFilterItemProps {
   name: string;
   path: string;
-  /** Number of active (unsettled) workspaces in this project. */
+  /** Number of visible cards in this project, including pinned parked work. */
   count: number;
   active: boolean;
   onSelect: () => void;
@@ -938,13 +940,24 @@ export function SidebarInbox() {
   const statusOf = (ws: WorkspaceSnapshot) =>
     paneStatuses ? getWorkspaceStatus(ws.surfaces, paneStatuses) : null;
 
+  // A pin overrides both parking lifecycles without erasing either persisted
+  // shelf entry. Unpinning therefore returns the workspace to the exact shelf
+  // it would otherwise occupy. Like t3code, pinned cards keep the inbox's
+  // static creation order rather than reordering by pin time.
+  const pinnedCards = allWorkspaces
+    .map((ws, storedIndex) => ({ ws, storedIndex }))
+    .filter(({ ws }) => ws.pinned_at != null && matchesFilter(ws))
+    .sort(compareNewestFirst)
+    .map(({ ws }) => ws);
+
   // Active cards: newest workspace on top, and the order never moves for any
   // reason short of a lifecycle transition (see `compareNewestFirst`). The
-  // repo filter scopes all three lists.
+  // repo filter scopes every list.
   const activeCards = allWorkspaces
     .map((ws, storedIndex) => ({ ws, storedIndex }))
     .filter(
       ({ ws }) =>
+        ws.pinned_at == null &&
         !settledIds.has(ws.workspace_id) &&
         !snoozedIds.has(ws.workspace_id) &&
         matchesFilter(ws),
@@ -985,14 +998,20 @@ export function SidebarInbox() {
   // the post-park forward navigation all describe positions on screen, so a
   // list in a different order than the DOM would make Alt+3 land on the wrong
   // card and a shift-click select rows the user never dragged across.
-  const orderedActiveCards = [...topTier, ...wrappingUpTier];
+  const orderedActiveCards = [
+    ...pinnedCards,
+    ...topTier,
+    ...wrappingUpTier,
+  ];
 
   // Snoozed rows, soonest wake first — the shelf reads as a queue of returns.
   const snoozedRows = snoozed
     .map((entry) => ({ entry, workspace: workspaceById.get(entry.id) }))
     .filter(
       (r): r is { entry: (typeof snoozed)[number]; workspace: WorkspaceSnapshot } =>
-        r.workspace !== undefined && matchesFilter(r.workspace),
+        r.workspace !== undefined &&
+          r.workspace.pinned_at == null &&
+          matchesFilter(r.workspace),
     )
     .sort((a, b) => a.entry.until - b.entry.until);
 
@@ -1003,7 +1022,9 @@ export function SidebarInbox() {
     .map((entry) => ({ entry, workspace: workspaceById.get(entry.id) }))
     .filter(
       (r): r is { entry: (typeof settled)[number]; workspace: WorkspaceSnapshot } =>
-        r.workspace !== undefined && matchesFilter(r.workspace),
+        r.workspace !== undefined &&
+          r.workspace.pinned_at == null &&
+          matchesFilter(r.workspace),
     )
     .sort(
       (a, b) =>
@@ -1125,6 +1146,14 @@ export function SidebarInbox() {
     [navigateAfterPark],
   );
 
+  const handleUnpin = useCallback((workspaceId: string) => {
+    void setWorkspacePinned(workspaceId, false).catch((err) => {
+      toast.error("Unpin failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    });
+  }, []);
+
   /** Wake a snoozed workspace back into the active list. `reason` follows the
    *  store's pin rules — only an explicit "Wake now" is a user decision. */
   const wake = useCallback(
@@ -1196,9 +1225,12 @@ export function SidebarInbox() {
   // Snooze is only offered when EVERY selected workspace can take it: a bulk
   // action that silently skipped the busy half would be worse than one that
   // isn't offered, because the count would claim otherwise.
+  const parkableSelection = selection.filter(
+    (id) => workspaceById.get(id)?.pinned_at == null,
+  );
   const canBulkSnooze =
-    selection.length > 0 &&
-    selection.every((id) => {
+    parkableSelection.length > 0 &&
+    parkableSelection.every((id) => {
       const ws = workspaceById.get(id);
       return ws !== undefined && isSnoozeable(statusOf(ws));
     });
@@ -1215,8 +1247,8 @@ export function SidebarInbox() {
     // seatbelt for any other route into the handler.
     if (!canBulkSettle) return;
     const store = useSidebarInboxStore.getState();
-    navigateAfterPark(selection);
-    for (const id of selection) {
+    navigateAfterPark(parkableSelection);
+    for (const id of parkableSelection) {
       store.settle(id, workspaceById.get(id)?.last_active_at ?? undefined);
     }
     setSelectedIds(new Set());
@@ -1225,8 +1257,8 @@ export function SidebarInbox() {
 
   const handleBulkSnooze = (until: number) => {
     const store = useSidebarInboxStore.getState();
-    navigateAfterPark(selection);
-    for (const id of selection) store.snooze(id, until);
+    navigateAfterPark(parkableSelection);
+    for (const id of parkableSelection) store.snooze(id, until);
     setSelectedIds(new Set());
     closeBulkMenu();
   };
@@ -1374,8 +1406,10 @@ export function SidebarInbox() {
   // background lifecycle transition, not a gesture) and deliberately no
   // forward navigation: a sweep must never move the user.
   //
-  // Anti-fight invariants — the inbox has four states (active / settled /
-  // snoozed / pinned-active) and these guards make oscillation impossible:
+  // Anti-fight invariants — the inbox has three base lifecycles (active /
+  // settled / snoozed), plus the durable workspace-pin visibility override
+  // and the local keep-active auto-settle override. These guards make
+  // oscillation impossible:
   //   • auto-settle refuses working/permission, but completed review is safe;
   //   • the auto-un-settle safety net ONLY fires at working/permission;
   //   • the snooze hand-raise ONLY fires at working/permission, and the wake
@@ -1388,6 +1422,8 @@ export function SidebarInbox() {
   //     activity (a non-null status un-pins via noteActivity's clearPin);
   //     selecting the workspace is not activity and leaves the pin standing,
   //     and a timer wake deliberately touches no pin at all;
+  //   • a durable workspace pin blocks every park path without mutating a
+  //     preserved settled/snoozed entry; unpinning reveals that base state;
   //   • the "Wrapping up" tier is not a fifth state and mutates nothing — it is
   //     a pure partition of the cards this sweep already left alone, so it can
   //     neither park a row nor be fought over by anything that can. An open PR
@@ -1403,6 +1439,7 @@ export function SidebarInbox() {
     const snoozedSet = new Set(snoozed.map((e) => e.id));
     for (const ws of allWorkspaces) {
       const id = ws.workspace_id;
+      if (ws.pinned_at != null) continue;
       if (settledSet.has(id) || snoozedSet.has(id)) continue;
       if (keepActive[id]) continue;
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
@@ -1492,7 +1529,10 @@ export function SidebarInbox() {
     for (const group of projectGroups) {
       let count = 0;
       for (const ws of group.workspaces) {
-        if (!settledIds.has(ws.workspace_id) && !snoozedIds.has(ws.workspace_id)) {
+        if (
+          ws.pinned_at != null ||
+          (!settledIds.has(ws.workspace_id) && !snoozedIds.has(ws.workspace_id))
+        ) {
           count += 1;
         }
       }
@@ -1542,6 +1582,8 @@ export function SidebarInbox() {
         }
         onSettle={handleSettle}
         onSnooze={handleSnooze}
+        pinned={ws.pinned_at != null}
+        onUnpin={handleUnpin}
         unread={isUnread(ws)}
         woke={wokeIds.has(id)}
         selected={selectedIds.has(id)}
@@ -1653,7 +1695,7 @@ export function SidebarInbox() {
       </div>
 
       <div className="px-2.5 pb-2.5" onContextMenuCapture={handleListContextMenuCapture}>
-        {activeCards.length === 0 && filteredPending.length === 0 && (
+        {orderedActiveCards.length === 0 && filteredPending.length === 0 && (
           <div className="px-2 py-6 text-center text-xs text-muted-foreground">
             Nothing active
             {filterName && (
@@ -1665,7 +1707,17 @@ export function SidebarInbox() {
           </div>
         )}
 
-        {topTier.map((ws, index) => renderCard(ws, index))}
+        {pinnedCards.map((ws, index) => renderCard(ws, index))}
+
+        {pinnedCards.length > 0 && (
+          <div
+            aria-hidden="true"
+            data-pinned-divider
+            className="mx-1 my-1.5 h-px bg-border/60"
+          />
+        )}
+
+        {topTier.map((ws, index) => renderCard(ws, pinnedCards.length + index))}
 
         {filteredPending.map((pw) => (
           <div
@@ -1694,7 +1746,7 @@ export function SidebarInbox() {
           <>
             <WrappingUpDivider />
             {wrappingUpTier.map((ws, index) =>
-              renderCard(ws, topTier.length + index),
+              renderCard(ws, pinnedCards.length + topTier.length + index),
             )}
           </>
         )}
@@ -1813,12 +1865,14 @@ export function SidebarInbox() {
                 says why instead of leaving a blank popover. */}
             {!canBulkSettle && (
               <DropdownMenuItem disabled className="text-xs">
-                Selection includes working or blocked workspaces
+                {parkableSelection.length === 0
+                  ? "Pinned workspaces must be unpinned first"
+                  : "Selection includes working or blocked workspaces"}
               </DropdownMenuItem>
             )}
             {canBulkSettle && (
               <DropdownMenuItem onClick={handleBulkSettle} className="text-xs">
-                {`Settle (${selection.length})`}
+                {`Settle (${parkableSelection.length})`}
               </DropdownMenuItem>
             )}
             {canBulkSnooze && (
@@ -1828,7 +1882,7 @@ export function SidebarInbox() {
                 }}
               >
                 <DropdownMenuSubTrigger className="text-xs">
-                  {`Snooze (${selection.length})`}
+                  {`Snooze (${parkableSelection.length})`}
                 </DropdownMenuSubTrigger>
                 <DropdownMenuSubContent>
                   {bulkSnoozePresets.map((preset) => (

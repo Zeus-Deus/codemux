@@ -353,6 +353,9 @@ export const renameWorkspace = (workspaceId: string, title: string) =>
 export const setWorkspaceMuted = (workspaceId: string, muted: boolean) =>
   invoke("set_workspace_muted", { workspaceId, muted });
 
+export const setWorkspacePinned = (workspaceId: string, pinned: boolean) =>
+  invoke<void>("set_workspace_pinned", { workspaceId, pinned });
+
 export const closeWorkspace = (workspaceId: string, forceDelete: boolean) =>
   invoke<string>("close_workspace", { workspaceId, forceDelete });
 

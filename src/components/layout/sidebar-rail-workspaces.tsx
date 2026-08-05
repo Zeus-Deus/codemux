@@ -15,6 +15,7 @@ import { getWorkspaceStatus, STATUS_DOT_CLASS } from "@/lib/pane-status";
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
+import { Pin } from "lucide-react";
 
 interface RailItemRepo {
   name: string;
@@ -95,6 +96,13 @@ function RailWorkspaceItem({
             size="md"
             shape="square"
           />
+          {workspace.pinned_at != null && (
+            <Pin
+              role="img"
+              aria-label="Pinned workspace"
+              className="absolute bottom-0.5 left-0.5 size-2.5 rounded-sm bg-sidebar p-px text-muted-foreground"
+            />
+          )}
           {status && (
             <span
               className={cn(
@@ -188,10 +196,14 @@ export function SidebarRailWorkspaces() {
     .map((ws, storedIndex) => ({ ws, storedIndex }))
     .filter(
       ({ ws }) =>
+        ws.pinned_at != null ||
         !parkedIds.has(ws.workspace_id) ||
         ws.workspace_id === activeWorkspaceId,
     )
-    .sort(compareNewestFirst)
+    .sort((a, b) => {
+      const pinPriority = Number(b.ws.pinned_at != null) - Number(a.ws.pinned_at != null);
+      return pinPriority || compareNewestFirst(a, b);
+    })
     .map(({ ws }) => ws);
 
   return (

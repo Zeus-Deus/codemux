@@ -1360,6 +1360,9 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
             .map(|w| w.workspace_id.0.clone())
     };
     if let Some(existing_id) = existing {
+        if entry.pinned_at.is_some() {
+            state.set_workspace_pinned(&existing_id, true)?;
+        }
         activate_workspace_impl(app.clone(), state, db, existing_id.clone())?;
         let _ = state.remove_archived_workspace(&archive_id);
         crate::state::emit_app_state(&app);
@@ -1480,6 +1483,10 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
         state.rename_workspace(&id, entry.title.clone());
         id
     };
+
+    if entry.pinned_at.is_some() {
+        state.set_workspace_pinned(&restored_id, true)?;
+    }
 
     let _ = state.remove_archived_workspace(&archive_id);
     activate_workspace_impl(app.clone(), state, db, restored_id.clone())?;
@@ -1745,6 +1752,20 @@ pub fn set_workspace_muted<R: tauri::Runtime>(
     } else {
         Err(format!("No workspace found for {workspace_id}"))
     }
+}
+
+/// Pin or unpin a workspace at the top of the workspace inbox.
+#[tauri::command]
+pub fn set_workspace_pinned<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    if state.set_workspace_pinned(&workspace_id, pinned)? {
+        crate::state::emit_app_state(&app);
+    }
+    Ok(())
 }
 
 #[tauri::command]

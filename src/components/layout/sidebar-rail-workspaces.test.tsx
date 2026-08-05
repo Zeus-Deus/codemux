@@ -185,6 +185,29 @@ describe("SidebarRailWorkspaces", () => {
     ]);
   });
 
+  it("puts pinned workspaces first and keeps a pinned parked workspace visible", async () => {
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: Date.now() }],
+      snoozed: [],
+      keepActive: [],
+      activity: {},
+    });
+    workspaces = [
+      makeWorkspace({ title: "Old pinned", pinned_at: 100 }),
+      makeWorkspace({ title: "New normal" }),
+    ];
+    const { container } = await renderRail();
+
+    const buttons = [...container.querySelectorAll("[data-rail-ws]")];
+    expect(buttons.map((button) => button.getAttribute("data-rail-ws"))).toEqual([
+      "ws-1",
+      "ws-2",
+    ]);
+    expect(
+      buttons[0]?.querySelector('[aria-label="Pinned workspace"]'),
+    ).not.toBeNull();
+  });
+
   it("excludes settled workspaces (repo filter never applies)", async () => {
     persistedSettled = JSON.stringify({
       settled: [{ id: "ws-2", at: Date.now() }],

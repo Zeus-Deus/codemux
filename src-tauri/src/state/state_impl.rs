@@ -453,6 +453,14 @@ pub struct WorkspaceSnapshot {
     /// pills (working spinner, review/permission dots) are unaffected.
     #[serde(default)]
     pub notifications_muted: bool,
+    /// Ms epoch when the user pinned this workspace to the top of the
+    /// workspace inbox. A pin is a visibility override: the frontend renders
+    /// the workspace in the pinned block even when its persisted inbox
+    /// lifecycle would otherwise classify it as snoozed or settled. Clearing
+    /// the pin reveals that underlying lifecycle again. Additive; old layouts
+    /// deserialize as `None`.
+    #[serde(default)]
+    pub pinned_at: Option<i64>,
     #[serde(default)]
     pub tabs: Vec<TabSnapshot>,
     #[serde(default)]
@@ -565,6 +573,9 @@ pub struct ArchivedWorkspaceSnapshot {
     /// rationale on that field.
     #[serde(default = "default_true")]
     pub is_git: bool,
+    /// Preserve the workspace's pin across non-destructive archive/restore.
+    #[serde(default)]
+    pub pinned_at: Option<i64>,
     /// Unix seconds at archive time. Lets the frontend sort the archive
     /// list by recency without a separate timestamp store.
     pub archived_at: u64,
@@ -587,6 +598,7 @@ pub fn build_archive_entry(ws: &WorkspaceSnapshot) -> ArchivedWorkspaceSnapshot 
         git_branch: ws.git_branch.clone(),
         protected: ws.protected,
         is_git: ws.is_git,
+        pinned_at: ws.pinned_at,
         archived_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -1180,6 +1192,7 @@ impl AppStateStore {
             pr_url: None,
             linked_issue: None,
             notifications_muted: false,
+            pinned_at: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![],
@@ -1261,6 +1274,7 @@ impl AppStateStore {
             pr_url: None,
             linked_issue: None,
             notifications_muted: false,
+            pinned_at: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![],
@@ -1333,6 +1347,7 @@ impl AppStateStore {
             pr_url: None,
             linked_issue: None,
             notifications_muted: false,
+            pinned_at: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![],
@@ -1436,6 +1451,7 @@ impl AppStateStore {
             pr_url: None,
             linked_issue: None,
             notifications_muted: false,
+            pinned_at: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -1581,6 +1597,7 @@ impl AppStateStore {
             pr_url: None,
             linked_issue: None,
             notifications_muted: false,
+            pinned_at: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -1936,6 +1953,38 @@ impl AppStateStore {
             return true;
         }
         false
+    }
+
+    /// Pin or unpin a workspace in the workspace inbox.
+    ///
+    /// Returns `Ok(true)` only when the timestamp actually changed, so raced
+    /// clients and repeated clicks are idempotent and do not emit or persist a
+    /// redundant full snapshot. Re-pinning preserves the original timestamp;
+    /// it marks membership, not a manual sort order.
+    pub fn set_workspace_pinned(
+        &self,
+        workspace_id: &str,
+        pinned: bool,
+    ) -> Result<bool, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        if pinned {
+            if workspace.pinned_at.is_some() {
+                return Ok(false);
+            }
+            workspace.pinned_at = Some(current_time_ms_signed());
+        } else {
+            if workspace.pinned_at.is_none() {
+                return Ok(false);
+            }
+            workspace.pinned_at = None;
+        }
+        Ok(true)
     }
 
     /// Whether the workspace containing `session_id` has notifications muted.
@@ -4735,6 +4784,7 @@ fn default_app_state() -> AppStateSnapshot {
             pr_url: None,
             linked_issue: None,
             notifications_muted: false,
+            pinned_at: None,
             notification_count: 0,
             latest_agent_state: Some("idle".into()),
             tabs: vec![TabSnapshot {
@@ -6249,6 +6299,59 @@ mod tests {
 
         // Unknown workspace id: the mutator reports "not found".
         assert!(!store.set_workspace_muted("workspace-does-not-exist", true));
+    }
+
+    #[test]
+    fn workspace_pin_is_timestamped_and_idempotent() {
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().workspaces[0].workspace_id.clone();
+
+        assert_eq!(store.set_workspace_pinned(&workspace_id.0, true), Ok(true));
+        let pinned_at = workspace_by_id(&store.snapshot(), &workspace_id)
+            .pinned_at
+            .expect("pin must stamp a timestamp");
+
+        assert_eq!(store.set_workspace_pinned(&workspace_id.0, true), Ok(false));
+        assert_eq!(
+            workspace_by_id(&store.snapshot(), &workspace_id).pinned_at,
+            Some(pinned_at),
+            "re-pinning must preserve the original timestamp",
+        );
+
+        assert_eq!(store.set_workspace_pinned(&workspace_id.0, false), Ok(true));
+        assert_eq!(
+            workspace_by_id(&store.snapshot(), &workspace_id).pinned_at,
+            None,
+        );
+        assert_eq!(store.set_workspace_pinned(&workspace_id.0, false), Ok(false));
+        assert!(store
+            .set_workspace_pinned("workspace-does-not-exist", true)
+            .is_err());
+    }
+
+    #[test]
+    fn workspace_pin_persists_and_old_layouts_default_to_unpinned() {
+        let store = AppStateStore::default();
+        let workspace_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store
+            .set_workspace_pinned(&workspace_id.0, true)
+            .expect("workspace exists");
+
+        let persisted = persistable_snapshot(&store.snapshot());
+        let mut value = serde_json::to_value(persisted).expect("serialize snapshot");
+        assert!(value["workspaces"][0]["pinned_at"].as_i64().is_some());
+
+        let restored: AppStateSnapshot =
+            serde_json::from_value(value.clone()).expect("pinned snapshot deserializes");
+        assert!(restored.workspaces[0].pinned_at.is_some());
+
+        value["workspaces"][0]
+            .as_object_mut()
+            .expect("workspace serializes to an object")
+            .remove("pinned_at");
+        let legacy: AppStateSnapshot =
+            serde_json::from_value(value).expect("legacy snapshot deserializes");
+        assert_eq!(legacy.workspaces[0].pinned_at, None);
     }
 
     #[test]
@@ -8577,6 +8680,7 @@ mod archived_workspace_tests {
             git_branch: Some("feature/x".into()),
             protected: false,
             is_git: true,
+            pinned_at: None,
             archived_at: 1_700_000_000,
         }
     }
@@ -8654,6 +8758,9 @@ mod archived_workspace_tests {
     fn build_archive_entry_copies_workspace_metadata() {
         let store = AppStateStore::default();
         let ws_id = store.create_workspace_at_path(PathBuf::from("/tmp/archive-build"));
+        store
+            .set_workspace_pinned(&ws_id.0, true)
+            .expect("workspace exists");
         let snapshot = store.snapshot();
         let ws = snapshot
             .workspaces
@@ -8672,6 +8779,7 @@ mod archived_workspace_tests {
         assert_eq!(entry.cwd, ws.cwd);
         assert_eq!(entry.worktree_path, ws.worktree_path);
         assert_eq!(entry.protected, ws.protected);
+        assert_eq!(entry.pinned_at, ws.pinned_at);
         assert!(entry.archived_at > 0, "archived_at must be a real timestamp");
     }
 
@@ -8702,7 +8810,9 @@ mod archived_workspace_tests {
         // must survive the round trip byte-for-byte in the fields that
         // matter for restore.
         let store = AppStateStore::default();
-        store.add_archived_workspace(sample_entry("/tmp/repo/wt", Some("/tmp/repo/wt")));
+        let mut archived = sample_entry("/tmp/repo/wt", Some("/tmp/repo/wt"));
+        archived.pinned_at = Some(1_700_000_000_123);
+        store.add_archived_workspace(archived);
         let snapshot = store.snapshot();
 
         let json = serde_json::to_string(&snapshot).expect("serialize");
@@ -8712,6 +8822,7 @@ mod archived_workspace_tests {
         assert_eq!(entry.cwd, "/tmp/repo/wt");
         assert_eq!(entry.worktree_path.as_deref(), Some("/tmp/repo/wt"));
         assert_eq!(entry.git_branch.as_deref(), Some("feature/x"));
+        assert_eq!(entry.pinned_at, Some(1_700_000_000_123));
         assert_eq!(entry.archived_at, 1_700_000_000);
     }
 }
