@@ -182,6 +182,11 @@
 :root,
 .dark {
   --accent-ember:     oklch(0.705 0.152 47);  /* sparing: selection, links, small accents */
+  /* Text selection is one semantic pair rather than the current palette's
+   * foreground laid over ember. A fixed dark ink keeps the contrast above
+   * 6:1 in every palette, including the transparent chat composer textarea. */
+  --selection-background: var(--accent-ember);
+  --selection-foreground: oklch(0.205 0.006 40);
   --accent-violet:    oklch(0.72 0.13 290);   /* secondary accent — PR merged             */
   --status-open:      oklch(0.74 0.14 156);   /* green — open / ready / connected / +    */
   --status-working:   oklch(0.80 0.13 80);    /* amber — agent working / behind / changed */
@@ -300,6 +305,13 @@ body.pane-resizing iframe {
 @layer base {
   * {
     @apply border-border outline-ring/50;
+    }
+  /* A root-scoped highlight supplies the default through the CSS highlight
+   * inheritance model while still allowing a deliberate descendant override.
+   * Defining both colors prevents browser/WebView native-blue fallbacks. */
+  :root::selection {
+    background-color: var(--selection-background);
+    color: var(--selection-foreground);
     }
   body {
     @apply bg-background text-foreground;

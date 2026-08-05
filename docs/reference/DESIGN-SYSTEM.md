@@ -48,6 +48,10 @@ These are **not** theme colors and are left literal on purpose:
    presets can't express. Because these are non-standard variable names,
    switching/re-applying the shadcn preset never touches them:
    - `--accent-ember` — primary accent (selection, links, small accents).
+   - `--selection-background` / `--selection-foreground` — the stable DOM
+     text-selection pair. The background aliases ember; the foreground is a
+     dedicated dark ink that remains above 6:1 contrast across every palette,
+     including the transparent Agent Chat composer textarea.
    - `--accent-violet` — secondary accent (for example, a merged PR).
    - `--status-open` (green), `--status-working` (amber),
      `--status-attention` (red), `--status-remote` (sky) — status tones,
@@ -82,6 +86,46 @@ overview):
 - **Comfortable** (default): `--cpad: 15px`, `--cgap: 13px`, `--rowgap: 20px`.
 - **Compact** (`[data-density="compact"]`): `--cpad: 10px`, `--cgap: 8px`,
   `--rowgap: 13px`.
+
+## Text Selection
+
+Selectable Codemux-owned DOM text inherits one document-level highlight
+contract from `:root::selection`: solid `--selection-background` with
+`--selection-foreground`. Keep the selector root-scoped rather than using a
+bare `::selection`; the CSS highlight inheritance model then provides a
+predictable app default while preserving deliberate descendant overrides. That
+inheritance is what makes a single rule reach the whole tree — on an engine
+still using the legacy `::selection` matching model the rule simply matches
+nothing below the root and selection falls back to the native highlight, which
+is a cosmetic downgrade, not a broken surface. Both shipped WebViews
+(WebKitGTK, WebView2) implement the inheritance model.
+
+Always set the selection foreground and background together. Reusing the
+active palette's `--foreground` makes the dark themes' near-white text fail
+contrast against ember and leaves the layered Agent Chat composer's
+transparent textarea glyphs without a reliable selected-text color.
+
+This contract covers Codemux-owned DOM surfaces, including prose, links,
+inline code, inputs, and textareas. Pages displayed inside the browser pane are
+separate documents and own their styling.
+
+Renderer-owned selections need explicit handling, because inheritance reaches
+them too:
+
+- **xterm.js** never uses the native highlight — `.xterm` is `user-select:
+  none` and selection is painted by the renderer from the terminal theme's
+  `selectionBackground`. Nothing to opt out of.
+- **CodeMirror** paints its own selection layer (`.cm-selectionBackground`,
+  from `--accent`) and suppresses the native highlight by resetting only its
+  *background*. The foreground still inherits, so `src/lib/codemirror-theme.ts`
+  resets `.cm-line` selected text to `currentColor` — selected code keeps its
+  syntax colors instead of rendering as dark selection ink on the accent fill.
+  The opt-out is scoped to document lines on purpose: the editor's own chrome
+  (search panel inputs, tooltips) uses real native selection and should keep
+  the app-wide pair.
+
+Any future surface that draws its own selection layer needs the same
+`currentColor` opt-out for the text it covers.
 
 ## Typography
 
