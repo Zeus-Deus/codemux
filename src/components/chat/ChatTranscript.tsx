@@ -6,6 +6,7 @@ import type { ApprovalDecision } from "@/tauri/events";
 import type { AgentChatProviderKind } from "@/tauri/types";
 
 import { MessageList } from "./MessageList";
+import type { SendAnchorRequest } from "./send-scroll-state";
 
 interface Props {
   messages: ChatViewItem[];
@@ -18,10 +19,14 @@ interface Props {
   /** True when the last run never cleanly settled — drives the
    *  "Run interrupted" tail divider. */
   interrupted?: boolean;
-  /** Send → jump-to-latest signal (incrementing). Forwarded to
-   *  MessageList: each bump re-pins the transcript tail so sending a new
-   *  prompt catches the reader up even from deep in history. */
-  scrollToBottomSignal?: number;
+  /** The new-turn scroll contract's navigation intent (`{ clientNonce,
+   *  nonce }`). Forwarded verbatim to MessageList, which owns the scroll
+   *  intent; this layer only has to not break the memo boundary, so the
+   *  object identity must stay stable between sends. */
+  sendAnchor?: SendAnchorRequest | null;
+  /** Thread identity — forwarded so the list resets to `following-end` when
+   *  the pane switches threads. */
+  threadKey?: string | null;
   /** Virtual-list jump request from the docked subagent activity bar. */
   subagentJumpRequest?: { cardId: string; nonce: number } | null;
   /** Optional session-created timestamp for the top session-start marker
@@ -63,7 +68,8 @@ export const ChatTranscript = memo(function ChatTranscript({
   streaming,
   stalled,
   interrupted,
-  scrollToBottomSignal,
+  sendAnchor,
+  threadKey,
   subagentJumpRequest,
   sessionStartedAt,
   provider,
@@ -88,7 +94,8 @@ export const ChatTranscript = memo(function ChatTranscript({
         streaming={streaming}
         stalled={stalled}
         interrupted={interrupted}
-        scrollToBottomSignal={scrollToBottomSignal}
+        sendAnchor={sendAnchor}
+        threadKey={threadKey}
         subagentJumpRequest={subagentJumpRequest}
         sessionStartedAt={sessionStartedAt}
         provider={provider}

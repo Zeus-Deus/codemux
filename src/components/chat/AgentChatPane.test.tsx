@@ -23,6 +23,9 @@ type SliceOverrides = {
   /** Composer text — the Thread Scope deferred-worktree submit tests
    *  seed this so the pane's `draft` (slice.inputDraft) is non-empty. */
   inputDraft?: string;
+  /** Live-turn flag. The send-anchor expiry tests flip this to drive the
+   *  falling edge the pane watches for turn completion. */
+  streaming?: boolean;
   /** Durable resume cursor. `undefined` (the default) means "never
    *  hydrated", which sends the mount effect down the cold path. */
   lastPersistedEventId?: number | null;
@@ -86,17 +89,28 @@ vi.mock("./ChatTranscript", () => ({
   ChatTranscript: ({
     messages,
     sessionStartedAt,
+    sendAnchor,
+    threadKey,
     onAcceptPlan,
     onEnterSubagent,
+    onSendQueuedNow,
   }: {
     messages: unknown[];
     sessionStartedAt?: number;
+    sendAnchor?: { clientNonce: string; nonce: number } | null;
+    threadKey?: string | null;
     onAcceptPlan: (requestId: string) => void;
     onEnterSubagent?: (subagentId: string) => void;
+    onSendQueuedNow?: (queuedId: string) => void;
   }) => (
     <div
       data-testid="transcript"
       data-message-count={messages.length}
+      // The new-turn scroll contract's navigation intent. Empty string
+      // encodes "no anchor" (nothing reserved / rolled back).
+      data-send-anchor-nonce={sendAnchor ? String(sendAnchor.nonce) : ""}
+      data-send-anchor-client-nonce={sendAnchor?.clientNonce ?? ""}
+      data-thread-key={threadKey ?? ""}
       // Empty string encodes "no marker timestamp" (plain divider); a
       // numeric string is the parsed session `created_at` the pane wired
       // through for the D2 marker.
@@ -113,6 +127,12 @@ vi.mock("./ChatTranscript", () => ({
       <button
         data-testid="enter-subagent"
         onClick={() => onEnterSubagent?.("sub-1")}
+      />
+      {/* Dispatching a queued turn is a send, so it takes the same
+          new-turn scroll contract as a composer submission. */}
+      <button
+        data-testid="send-queued-now"
+        onClick={() => onSendQueuedNow?.("q-1")}
       />
     </div>
   ),
@@ -333,6 +353,7 @@ vi.mock("@/tauri/commands", () => ({
   agentChatListSessions: vi.fn().mockResolvedValue([]),
   agentChatRespondToRequest: vi.fn().mockResolvedValue(undefined),
   agentChatSendTurn: vi.fn().mockResolvedValue(undefined),
+  agentChatSendQueuedTurnNow: vi.fn().mockResolvedValue(undefined),
   agentChatSetModel: vi.fn().mockResolvedValue(undefined),
   agentChatSetPermissionMode: vi.fn().mockResolvedValue(undefined),
   agentChatStartSession: vi.fn().mockResolvedValue("thread-new"),
@@ -447,7 +468,7 @@ vi.mock("@/stores/agent-chat-store", () => {
     return {
       messages,
       inputDraft: overrides.inputDraft ?? "",
-      streaming: false,
+      streaming: overrides.streaming ?? false,
       activeTurnId: null,
       model: overrides.model ?? null,
       permissionMode: overrides.permissionMode ?? "bypassPermissions",
@@ -642,6 +663,174 @@ describe("AgentChatPane Continue-run chip (issue #154)", () => {
     expect(sendInput.text).toBe("Continue");
     // No images travel with a Continue send even if attachments were staged.
     expect(sendInput.images).toEqual([]);
+  });
+});
+
+describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
+  const anchorNonce = (container: HTMLElement) =>
+    container
+      .querySelector('[data-testid="transcript"]')!
+      .getAttribute("data-send-anchor-nonce");
+  const anchorClientNonce = (container: HTMLElement) =>
+    container
+      .querySelector('[data-testid="transcript"]')!
+      .getAttribute("data-send-anchor-client-nonce");
+
+  beforeEach(async () => {
+    currentMessages = [{ kind: "user_message", id: "m1" }];
+    currentThreadsMap = {};
+    currentDraftsById = {};
+    currentSliceOverrides = { "thread-x": { inputDraft: "hello there" } };
+    workspaceIdForPaneOverride = "ws-home";
+    appendUserMessageMock.mockClear();
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    vi.mocked(agentChatSendTurn).mockClear().mockResolvedValue({
+      turn_id: "turn-1",
+      queued_id: null,
+    } as never);
+  });
+
+  it("anchors the exact bubble it appended, and reports it to the transcript", async () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+    expect(anchorNonce(container)).toBe("");
+
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    await waitFor(() => {
+      expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
+    });
+
+    // One identity for the optimistic bubble, the anchor, and the turn the
+    // backend was asked to run — so the transcript anchors the row the user
+    // actually just sent rather than whatever happens to be last.
+    const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
+    await waitFor(() => {
+      expect(anchorClientNonce(container)).toBe(sendInput.client_nonce);
+    });
+    expect(anchorClientNonce(container)).not.toBe("");
+    expect(anchorNonce(container)).toBe("1");
+  });
+
+  it("gives the one-click Continue run the same contract", async () => {
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(
+      container.querySelector('[data-testid="composer-continue"]')!,
+    );
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    await waitFor(() => {
+      expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
+    });
+    const [, sendInput] = vi.mocked(agentChatSendTurn).mock.calls[0];
+    await waitFor(() => {
+      expect(anchorClientNonce(container)).toBe(sendInput.client_nonce);
+    });
+  });
+
+  it("issues a fresh nonce per send so two identical prompts are two intents", async () => {
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    // The first send fails, which both clears the anchor and releases the
+    // in-flight guard; the retry must read as a *new* navigation intent even
+    // though the prompt text is byte-identical.
+    vi.mocked(agentChatSendTurn)
+      .mockRejectedValueOnce(new Error("boom") as never)
+      .mockResolvedValue({ turn_id: "turn-1", queued_id: null } as never);
+
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(anchorNonce(container)).toBe(""));
+
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(anchorNonce(container)).toBe("2"));
+  });
+
+  it("anchors a queued follow-up dispatched with 'send now'", async () => {
+    // The bubble already exists (appended optimistically when it queued),
+    // so its own nonce is the identity to anchor on.
+    currentMessages = [
+      { kind: "user_message", id: "m1", seq: 0, text: "first" },
+      {
+        kind: "user_message",
+        id: "m2",
+        seq: 1,
+        text: "queued follow-up",
+        clientNonce: "nonce-queued",
+        queued: { queuedId: "q-1" },
+      },
+    ];
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(
+      container.querySelector('[data-testid="send-queued-now"]')!,
+    );
+    await waitFor(() => {
+      expect(anchorClientNonce(container)).toBe("nonce-queued");
+    });
+    const { agentChatSendQueuedTurnNow } = await import("@/tauri/commands");
+    expect(vi.mocked(agentChatSendQueuedTurnNow)).toHaveBeenCalledWith(
+      expect.anything(),
+      "thread-x",
+      "q-1",
+    );
+  });
+
+  it("clears the anchor when a queued 'send now' dispatch fails", async () => {
+    // There is no rollback path for a queued bubble — it just stays queued —
+    // so the anchor has to be released explicitly or the list sits reserving
+    // space for a turn that will never stream.
+    currentMessages = [
+      { kind: "user_message", id: "m1", seq: 0, text: "first" },
+      {
+        kind: "user_message",
+        id: "m2",
+        seq: 1,
+        text: "queued follow-up",
+        clientNonce: "nonce-queued",
+        queued: { queuedId: "q-1" },
+      },
+    ];
+    const { agentChatSendQueuedTurnNow } = await import("@/tauri/commands");
+    vi.mocked(agentChatSendQueuedTurnNow).mockRejectedValueOnce(
+      new Error("boom") as never,
+    );
+
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(
+      container.querySelector('[data-testid="send-queued-now"]')!,
+    );
+    await waitFor(() => expect(anchorClientNonce(container)).toBe(""));
+  });
+
+  it("expires the anchor when the turn settles", async () => {
+    // The anchor is a live-turn intent. Left in place it would re-park a
+    // finished prompt on the next remount and keep LegendList's built-in
+    // end pin disabled for the rest of the thread's life.
+    currentSliceOverrides = {
+      "thread-x": { inputDraft: "hello there", streaming: true },
+    };
+    const { container, rerender } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => expect(anchorNonce(container)).toBe("1"));
+
+    // The run finishes.
+    currentSliceOverrides = {
+      "thread-x": { inputDraft: "hello there", streaming: false },
+    };
+    rerender(<AgentChatPane pane={pane} />);
+    await waitFor(() => expect(anchorNonce(container)).toBe(""));
+  });
+
+  it("clears the anchor when the send fails, so no reserved space is stranded", async () => {
+    const { agentChatSendTurn } = await import("@/tauri/commands");
+    vi.mocked(agentChatSendTurn).mockRejectedValue(new Error("boom") as never);
+
+    const { container } = render(<AgentChatPane pane={pane} />);
+    fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
+    await waitFor(() => {
+      expect(vi.mocked(agentChatSendTurn)).toHaveBeenCalledTimes(1);
+    });
+    // The optimistic bubble was rolled back; its reserved response space
+    // has to go with it.
+    await waitFor(() => expect(anchorClientNonce(container)).toBe(""));
+    expect(anchorNonce(container)).toBe("");
   });
 });
 
