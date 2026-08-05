@@ -21,7 +21,16 @@ only controls that need an affordance carry their own chrome. It
 renders when the `enable_agent_chat` flag is on
 (the default — the flag is now a regular Settings → Interface toggle, not a
 Beta opt-in) and a real, non-OpenFlow workspace is active; every other case
-keeps the legacy chrome unchanged.
+keeps the in-flow legacy `h-9` bar.
+
+**Chrome-mode gate for adjacent surfaces.** Every surface that reaches the
+physical top edge in overlay mode reserves a local 40px collision zone, and
+that clearance is gated on `useTitlebarOverlay()`
+(`src/hooks/use-gui-chrome.ts` — `useGuiChrome() || useDraftGuiChrome()`,
+i.e. "the titlebar is floating"). Gating on anything weaker is a bug: with
+the flag off, or on with an OpenFlow workspace, the legacy bar already
+occupies that space in normal flow, so unconditional clearance renders as a
+dead band above the sidebar search row and the right-panel tabs.
 
 ## Current Model
 
@@ -48,11 +57,18 @@ starts just after the live sidebar width (`useSidebarGapWidth()` in
 `src/hooks/use-sidebar-gap-width.ts` — measures the sidebar's
 `[data-slot="sidebar-gap"]` box via ResizeObserver, since the titlebar
 renders outside `SidebarProvider`). Its right edge moves left when the right
-panel opens, using the persisted panel width, so the action island remains
-anchored immediately before that panel. Native window controls remain a
-separate cluster at the physical top-right corner. Unoccupied overlay space is
-still a Tauri drag region; each interactive cluster opts back into pointer
-events.
+panel opens, using the persisted panel width, **for the workspace branch
+only** — during a draft the backend's active workspace is not what's on
+screen, so its panel state is ignored and the band spans full width. Native
+window controls remain a separate cluster at the physical top-right corner.
+
+Unoccupied overlay space is a Tauri drag region on **desktop only**: both the
+full-width `inset-0` layer and the calm gap between the two islands drop
+`pointer-events` on the web remote client. `data-tauri-drag-region` does
+nothing in a browser, so there those layers were pure pointer sinks — the
+full-width one covered the top 40px of everything beneath it, most visibly
+the right panel's 45px tab row, whose triggers became unclickable. Each
+interactive cluster opts back into pointer events in both modes.
 
 - **`TitleBarTabs`** (`src/components/layout/title-bar-tabs.tsx`) — the
   workspace's backend-owned tabs as compact pills (h-7, rounded-lg) with a
@@ -113,11 +129,14 @@ events.
   redundant title, while split children render title/CWD and actions as compact
   pane-local islands instead of a second full-width header. Other non-chat
   workspace surfaces and onboarding reserve a local `pt-10` collision zone.
-  The expanded sidebar
-  reserves the same local clearance only above its search row, and the
-  collapsed rail reserves it above its first action. On desktop, the right
-  panel keeps its background full-height but gives its tabs `mt-10`, keeping
-  them clear of native window controls without clipping narrow tab strips.
+  The expanded sidebar reserves the same local clearance only above its
+  search row, and the collapsed rail reserves it above its first action —
+  both gated on `useTitlebarOverlay()`, so the legacy insets (`pt-3` /
+  `pt-2`) come back with the in-flow bar. The right panel keeps its
+  background full-height and gives its tabs `mt-10` on **desktop in overlay
+  mode only**, clearing the native window controls without clipping narrow
+  tab strips; the web client needs no allowance because it renders neither
+  those controls nor the overlay drag layer.
   The workspace-tab and action islands stay transparent and frameless at
   rest. Each mounted chat viewport reports whether it has actually scrolled
   beneath the overlay, while `TitleBar` measures whether either island
@@ -125,6 +144,13 @@ events.
   when both conditions are true do those two 32px islands gain an opaque,
   borderless raised surface. There is no full-width header or fading scrim;
   the empty drag region stays transparent, and the composer is not affected.
+  Because `PaneContainer` renders only the active surface, every tab or
+  workspace switch mounts a brand-new transcript node — so each viewport
+  registers itself in `titlebar-content-under.ts`'s element registry, whose
+  version counter re-keys the titlebar's measurement effect. Snapshotting
+  `document.querySelectorAll` once is not sufficient: the titlebar would
+  keep observing a detached node and the raised treatment would stop firing
+  after the first navigation.
 - **Draft titlebar variant** — while a lazy-creation draft is the active
   surface (`useDraftGuiChrome()`), the `h-10` bar renders
   `TitleBarDraftSlots` in place of the workspace slots: a single static
@@ -149,8 +175,13 @@ titlebar tab share one implementation (see "Important Touch Points").
 
 - Frameless floating control clusters over full-height sidebar, workspace, and
   right-panel surfaces for a real, non-OpenFlow chat workspace with the
-  GUI flag on (default); legacy `h-9` chrome is byte-identical with the flag
-  off.
+  GUI flag on (default). With the flag off the legacy `h-9` bar and every
+  layout inset around it are unchanged — but the flag-off surfaces are *not*
+  literally byte-identical any more: the legacy `TabBar`'s panel toggle uses
+  the `PanelRight` glyph (mirroring the sidebar's `PanelLeft`, matching the
+  GUI toggle) rather than `FileDiff`, and the transparent terminal pane
+  chrome (`docs/features/terminal.md`) is deliberately flag-independent so a
+  terminal looks the same in both modes. Both are intended.
 - Pill tabs with status dots, active-tab close, and a chat-tab chevron opening
   the shared session-history dropdown ("+ New Chat" and a "Restore checkpoint"
   item at the top when a run-start checkpoint exists, then the grouped sessions
@@ -185,6 +216,14 @@ titlebar tab share one implementation (see "Important Touch Points").
   suppressed `AgentChatPaneHeader`); splitting is done from the launcher
   (Shift on a CLI agent) instead, and split layouts restore the per-pane
   header.
+- **On desktop, the top 40px of a sole-root chat transcript is a window-drag
+  strip, not scrollable content.** This is the deliberate price of letting
+  the transcript reclaim the top edge (no `pt-10`) while keeping a frameless
+  window draggable — the standard frameless-app tradeoff. The reader can
+  still scroll anywhere below it, and the raised-island treatment keeps the
+  controls legible over whatever passes underneath. The web client has no
+  window to drag, so it drops those layers entirely and the full transcript
+  height stays interactive there.
 
 ## Workflow orchestration integration
 
@@ -200,8 +239,9 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
 ## Important Touch Points
 
 - `src/hooks/use-gui-chrome.ts` — the shared `guiChrome` predicate (single
-  source of truth, extracted from `title-bar.tsx`) plus the sibling
-  `useDraftGuiChrome()` draft predicate.
+  source of truth, extracted from `title-bar.tsx`), the sibling
+  `useDraftGuiChrome()` draft predicate, and `useTitlebarOverlay()` (their
+  union) — the one gate every top-edge collision clearance must use.
 - `src/components/layout/title-bar.tsx` — consumes `useGuiChrome()` +
   `useDraftGuiChrome()` for the slot-composition branch, `RightPanelToggle`,
   `PinnedPresetTiles`, `TitleBarWorkspaceSlots`, `TitleBarDraftSlots`, and the
@@ -227,15 +267,20 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
   restore state + confirm dialog.
 - `src/components/layout/workspace-main.tsx` — TabBar/PresetBar suppression,
   full-height panel composition, and per-surface top collision clearance.
-- `src/components/layout/sidebar-action-row.tsx` — local top clearance for the
-  expanded sidebar and collapsed rail.
+- `src/components/layout/sidebar-action-row.tsx` — overlay-gated top
+  clearance for the expanded sidebar and collapsed rail.
 - `src/components/layout/right-panel.tsx` — full-height panel surface with
-  desktop-only tab-row clearance below native window controls.
+  overlay-mode, desktop-only tab-row clearance below native window controls.
+- `src/lib/titlebar-content-under.ts` — the per-workspace "transcript has
+  scrolled under the overlay" aggregate **and** the live transcript-element
+  registry + version counter that keeps the overlap measurement off detached
+  nodes; published by `src/components/chat/MessageList.tsx`.
 - `src/components/layout/PaneNode.tsx` / `pane-container.tsx` — `isSurfaceRoot`
   header suppression.
 - Tests: `title-bar.test.tsx`, `title-bar-tabs.test.tsx`,
   `agent-launcher.test.tsx`, `workspace-main.test.tsx`,
-  `right-panel.test.tsx`.
+  `right-panel.test.tsx`, `sidebar-action-row.test.tsx`,
+  `titlebar-content-under.test.ts`, `MessageList.test.tsx`.
 
 ## Notes
 

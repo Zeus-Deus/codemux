@@ -20,6 +20,7 @@ import { cn } from "@/lib/utils";
 import {
   clearTitlebarContentUnder,
   publishTitlebarContentUnder,
+  registerTitlebarTranscript,
 } from "@/lib/titlebar-content-under";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
@@ -256,6 +257,19 @@ export const MessageList = memo(function MessageList({
     if (!state) return;
     setIsAtEnd(state.isAtEnd);
     return state.listen("isAtEnd", setIsAtEnd);
+  }, []);
+
+  // Publish this viewport to the titlebar's live-element registry so its
+  // overlap measurement always runs against mounted nodes. `PaneContainer`
+  // renders only the active surface, so switching tabs or workspaces
+  // unmounts this list and mounts a fresh one — register/unregister is what
+  // tells the titlebar to re-measure. Not gated on `workspaceId`: the
+  // measurement is purely geometric, and a hidden/unsized transcript is
+  // filtered out there by its zero-area rect.
+  useEffect(() => {
+    const viewport = listRef.current?.getScrollableNode();
+    if (!viewport) return;
+    return registerTitlebarTranscript(viewport);
   }, []);
 
   // Drive the overlay from the transcript's actual scroll position. This

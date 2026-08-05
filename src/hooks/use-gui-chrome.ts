@@ -67,6 +67,26 @@ export function useDraftGuiChrome(): boolean {
   return enableAgentChat && lazyEnabled && hasActiveDraft;
 }
 
+/**
+ * True exactly when `TitleBar` renders its **floating overlay** instead of
+ * the in-flow legacy `h-9` bar — i.e. either the workspace GUI chrome
+ * (`useGuiChrome`) or the draft variant (`useDraftGuiChrome`).
+ *
+ * Surfaces that reach the physical top edge in overlay mode (the sidebar
+ * header, the right panel's tab row, the workspace content box) reserve a
+ * local 40px collision zone so the floating islands never sit on top of
+ * their first row. That clearance must be gated on *this* predicate and
+ * nothing weaker: with the GUI flag off — or on with an OpenFlow
+ * workspace — the legacy bar already occupies that space in normal
+ * document flow, so an unconditional inset would render as a dead band of
+ * padding above the sidebar search row / panel tabs.
+ */
+export function useTitlebarOverlay(): boolean {
+  const guiChrome = useGuiChrome();
+  const draftGuiChrome = useDraftGuiChrome();
+  return guiChrome || draftGuiChrome;
+}
+
 /** Recursively find the pane node with the given id under `node`,
  *  descending into `split` children. Mirrors `paneTreeContains` in
  *  `app-store.ts` (kept local — this is the only caller that needs

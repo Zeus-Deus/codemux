@@ -165,7 +165,12 @@ export function ResourceMonitor({
               aria-label="Resource monitor"
               className={cn("text-muted-foreground", className)}
             >
-              <Cpu />
+              {/* Explicit 14px: `size="icon-sm"` sets no `[&_svg]` size, so
+                  dropping this would fall through to the button base's
+                  `size-4` and silently grow the glyph 14→16px — in the
+                  legacy title bar too. 14px also matches the neighbouring
+                  titlebar glyphs (PanelLeft/PanelRight, preset tiles). */}
+              <Cpu className="h-3.5 w-3.5" />
             </Button>
           </PopoverTrigger>
         </TooltipTrigger>

@@ -127,6 +127,20 @@ describe("ResourceMonitor", () => {
     ).toHaveAttribute("data-variant", "toolbar");
   });
 
+  it.each([undefined, "toolbar"] as const)(
+    "keeps the CPU glyph at 14px (variant: %s)",
+    (variant) => {
+      // Regression: `size="icon-sm"` sets no `[&_svg]` size override, so
+      // dropping the explicit class silently promoted the icon to the button
+      // base's `size-4` — in the legacy title bar as well as the GUI one.
+      renderMonitor(variant);
+      const icon = screen
+        .getByRole("button", { name: "Resource monitor" })
+        .querySelector("svg");
+      expect(icon).toHaveClass("h-3.5", "w-3.5");
+    },
+  );
+
   it("opens the popover and shows the app + workspace breakdown", async () => {
     renderMonitor();
     fireEvent.click(screen.getByRole("button", { name: "Resource monitor" }));

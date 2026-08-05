@@ -24,12 +24,23 @@ vi.mock("@/components/workflow/orchestration-panel", () => ({
 const mocks = vi.hoisted(() => ({
   workflow: { run: null as WorkflowRunItem | null, threadId: null as string | null },
   tasks: null as TasksSnapshot | null,
+  // `titlebarOverlay` = "TitleBar renders the floating overlay, not the
+  // in-flow legacy h-9 bar"; `remote` = the web remote client, which has no
+  // native window controls and (therefore) no overlay drag layer either.
+  titlebarOverlay: true,
+  remote: false,
 }));
 vi.mock("@/components/workflow/use-workspace-workflow", () => ({
   useWorkspaceWorkflow: () => mocks.workflow,
 }));
 vi.mock("@/hooks/use-active-chat-tasks", () => ({
   useActiveChatTasks: () => ({ threadId: "thread-1", tasks: mocks.tasks }),
+}));
+vi.mock("@/hooks/use-gui-chrome", () => ({
+  useTitlebarOverlay: () => mocks.titlebarOverlay,
+}));
+vi.mock("@/components/remote/is-remote-client", () => ({
+  isRemoteClient: () => mocks.remote,
 }));
 
 import { RightPanel } from "./right-panel";
@@ -103,6 +114,8 @@ afterEach(() => {
   cleanup();
   mocks.workflow = { run: null, threadId: null };
   mocks.tasks = null;
+  mocks.titlebarOverlay = true;
+  mocks.remote = false;
 });
 
 describe("RightPanel floating-chrome clearance", () => {
@@ -111,6 +124,30 @@ describe("RightPanel floating-chrome clearance", () => {
     const header = screen.getByTestId("right-panel-tabs-header");
     expect(header).toHaveClass("mt-10");
     expect(header).not.toHaveClass("pr-[104px]");
+  });
+
+  // Regression: the clearance was gated only on `!isRemoteClient()`, so with
+  // the GUI flag off — or on with an OpenFlow workspace — the in-flow legacy
+  // `h-9` bar already pushed the panel down and this margin rendered as a
+  // 40px blank band above the tabs.
+  it("adds no clearance when the title bar is the in-flow legacy bar", () => {
+    mocks.titlebarOverlay = false;
+    render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);
+    expect(screen.getByTestId("right-panel-tabs-header")).not.toHaveClass(
+      "mt-10",
+    );
+  });
+
+  // Safe only because the overlay also drops its full-width drag layer on
+  // the web client — see the `titlebar-drag-layer` coverage in
+  // `title-bar.test.tsx`. Otherwise that strip would cover the top 40px of
+  // this 45px tab row and swallow every trigger's clickable center.
+  it("adds no clearance on the web client, which renders no window controls", () => {
+    mocks.remote = true;
+    render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);
+    expect(screen.getByTestId("right-panel-tabs-header")).not.toHaveClass(
+      "mt-10",
+    );
   });
 });
 

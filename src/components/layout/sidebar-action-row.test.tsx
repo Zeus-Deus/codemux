@@ -227,3 +227,59 @@ describe("SidebarActionRow — collapsed icon rail", () => {
     ).toBeNull();
   });
 });
+
+describe("SidebarActionRow — floating-titlebar clearance", () => {
+  beforeEach(() => {
+    cleanup();
+    enableAgentChatFlag = false;
+    enableLazyFlag = false;
+    useChatDraftStore.setState({
+      draftsById: {},
+      activeHomeDraftId: null,
+      projectDraftIdByPath: {},
+      activeDraftId: null,
+    });
+  });
+
+  // Regression: the clearance shipped ungated, so with the GUI flag off (or
+  // on with an OpenFlow workspace) — where `TitleBar` renders the in-flow
+  // `h-9` bar and nothing floats over the sidebar — the search row sat
+  // under ~32px of dead padding.
+  it("keeps the legacy inset while the title bar renders in normal flow", () => {
+    const { getByTestId } = renderRow();
+    const row = getByTestId("sidebar-action-row-expanded");
+    expect(row).toHaveClass("pt-3");
+    expect(row).not.toHaveClass("pt-11");
+  });
+
+  it("keeps the collapsed rail's legacy inset with legacy chrome", () => {
+    const { getByTestId } = renderCollapsedRow();
+    const row = getByTestId("sidebar-action-row-collapsed");
+    expect(row).toHaveClass("pt-2");
+    expect(row).not.toHaveClass("pt-11");
+  });
+
+  it("reserves the collision zone once the floating titlebar overlays the sidebar", () => {
+    enableAgentChatFlag = true;
+    enableLazyFlag = true;
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateHomeDraft({ lockedToHome: true });
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const { getByTestId } = renderRow();
+    expect(getByTestId("sidebar-action-row-expanded")).toHaveClass("pt-11");
+  });
+
+  it("reserves the collision zone on the collapsed rail too", () => {
+    enableAgentChatFlag = true;
+    enableLazyFlag = true;
+    const draft = useChatDraftStore
+      .getState()
+      .getOrCreateHomeDraft({ lockedToHome: true });
+    useChatDraftStore.getState().setActiveDraft(draft.draftId);
+
+    const { getByTestId } = renderCollapsedRow();
+    expect(getByTestId("sidebar-action-row-collapsed")).toHaveClass("pt-11");
+  });
+});

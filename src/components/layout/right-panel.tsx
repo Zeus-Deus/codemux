@@ -18,6 +18,7 @@ import type {
 } from "@/tauri/types";
 import { cn } from "@/lib/utils";
 import { isRemoteClient } from "@/components/remote/is-remote-client";
+import { useTitlebarOverlay } from "@/hooks/use-gui-chrome";
 
 interface Props {
   workspace: WorkspaceSnapshot;
@@ -100,6 +101,15 @@ const TAB_TRIGGER_CLS = cn(
 // it, and `activeTab` is a primitive, so shallow compare skips re-renders.
 export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Props) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
+  // Two independent reasons the tab row may need to start 40px down, and
+  // both only exist while the titlebar is a floating overlay:
+  //   1. the native window controls island pinned to the top-right corner
+  //      (desktop only — the web client renders none), and
+  //   2. the overlay's own drag layer, which is skipped on the web client
+  //      precisely because it has nothing to drag (see title-bar.tsx).
+  // With legacy chrome the in-flow `h-9` bar already pushes this panel
+  // down, so any clearance here would be a blank band above the tabs.
+  const titlebarOverlay = useTitlebarOverlay();
   const workspaceWorkflow = useWorkspaceWorkflow(workspace);
   const { tasks: activeChatTasks, updatedAt: tasksUpdatedAt } =
     useActiveChatTasks(workspace);
@@ -132,7 +142,7 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
           data-testid="right-panel-tabs-header"
           className={cn(
             "flex h-[45px] shrink-0 items-center border-b border-border",
-            !isRemoteClient() && "mt-10",
+            titlebarOverlay && !isRemoteClient() && "mt-10",
           )}
         >
           <TabsList variant="line" className="!h-full !p-0 gap-0 flex-1">

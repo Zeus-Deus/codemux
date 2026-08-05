@@ -61,7 +61,10 @@ import {
 import { cn } from "@/lib/utils";
 import {
   getTitlebarContentUnder,
+  getTitlebarTranscriptElements,
+  getTitlebarTranscriptVersion,
   subscribeTitlebarContentUnder,
+  subscribeTitlebarTranscripts,
 } from "@/lib/titlebar-content-under";
 import { EditorIcon } from "@/components/icons/editor-icon";
 import { PresetIcon } from "@/components/icons/preset-icon";
@@ -473,8 +476,16 @@ const CHAT_READING_COLUMN_MAX_WIDTH = 792;
  * treatment tied to an actual horizontal collision instead of a viewport
  * breakpoint that would style windows where the controls still sit safely
  * outside the centered reading column.
+ *
+ * `transcriptVersion` is the live-registry counter from
+ * `titlebar-content-under.ts`. It MUST stay in the dependency list: the
+ * measured node set is a snapshot, and `PaneContainer` renders only the
+ * active surface, so every tab / workspace switch destroys the observed
+ * transcript and mounts a new one. Without re-keying on the registry the
+ * effect would keep observing a detached node and `overlapsChat` could
+ * never become true again after the first navigation.
  */
-function useTitlebarChatOverlap(enabled: boolean) {
+function useTitlebarChatOverlap(enabled: boolean, transcriptVersion: number) {
   const workspaceIslandRef = useRef<HTMLDivElement | null>(null);
   const actionIslandRef = useRef<HTMLDivElement | null>(null);
   const [overlapsChat, setOverlapsChat] = useState(false);
@@ -485,8 +496,16 @@ function useTitlebarChatOverlap(enabled: boolean) {
       return;
     }
 
+    // Registered viewports are the live source of truth; the DOM query is
+    // kept as a superset so a transcript rendered by a path that never
+    // registers is still measured on the runs that do happen.
     const transcripts = Array.from(
-      document.querySelectorAll<HTMLElement>('[data-slot="transcript-list"]'),
+      new Set<HTMLElement>([
+        ...getTitlebarTranscriptElements(),
+        ...document.querySelectorAll<HTMLElement>(
+          '[data-slot="transcript-list"]',
+        ),
+      ]),
     );
     const islands = [workspaceIslandRef.current, actionIslandRef.current].filter(
       (element): element is HTMLDivElement => element !== null,
@@ -523,7 +542,7 @@ function useTitlebarChatOverlap(enabled: boolean) {
       window.removeEventListener("resize", update);
       observer.disconnect();
     };
-  }, [enabled]);
+  }, [enabled, transcriptVersion]);
 
   return { actionIslandRef, overlapsChat, workspaceIslandRef };
 }
@@ -543,19 +562,31 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   const guiChrome = useGuiChrome();
   const draftGuiChrome = useDraftGuiChrome();
   const rightPanelWidth = useUIStore((s) => s.rightPanelWidth ?? 320);
-  const rightPanelOpen = useUIStore((s) =>
+  const activeWorkspacePanelOpen = useUIStore((s) =>
     activeWorkspaceId
       ? (s.rightPanelTabs[activeWorkspaceId] ?? null) !== null
       : false,
   );
+  // During a lazy draft the backend's "active workspace" is whatever was
+  // focused before the draft opened, and the draft surface never renders
+  // that workspace's right panel. Reading its `rightPanelTabs` entry would
+  // stop the floating band ~328px short of the right edge with nothing
+  // below it — same reason the draft branch suppresses the other
+  // workspace-scoped controls.
+  const rightPanelOpen = guiChrome && activeWorkspacePanelOpen;
   const remoteClient = isRemoteClient();
   const contentUnder = useSyncExternalStore(
     subscribeTitlebarContentUnder,
     () => getTitlebarContentUnder(activeWorkspaceId),
     () => false,
   );
+  const transcriptVersion = useSyncExternalStore(
+    subscribeTitlebarTranscripts,
+    getTitlebarTranscriptVersion,
+    () => 0,
+  );
   const { actionIslandRef, overlapsChat, workspaceIslandRef } =
-    useTitlebarChatOverlap(guiChrome);
+    useTitlebarChatOverlap(guiChrome, transcriptVersion);
 
   if (!guiChrome && !draftGuiChrome) {
     return (
@@ -604,11 +635,21 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
       className="pointer-events-none absolute inset-x-0 top-0 z-30 h-10"
     >
       {/* The unoccupied top edge remains a native drag target. The floating
-          islands below sit above it and opt back into pointer events. */}
-      <div
-        data-tauri-drag-region
-        className="pointer-events-auto absolute inset-0"
-      />
+          islands below sit above it and opt back into pointer events.
+
+          Desktop only. This layer spans the full app width — over the
+          sidebar, the workspace, and the right panel — so on the web remote
+          client, where `data-tauri-drag-region` does nothing at all, it
+          would be a pure 40px pointer sink: it swallowed clicks on the top
+          of the right panel's 45px tab row (making Files/Tasks/… reliably
+          unclickable there) and ate wheel events over the transcript. */}
+      {!remoteClient && (
+        <div
+          data-testid="titlebar-drag-layer"
+          data-tauri-drag-region
+          className="pointer-events-auto absolute inset-0"
+        />
+      )}
 
       {/* Sidebar control island. The sidebar surface itself now reaches the
           top edge; its first local row reserves this small collision area. */}
@@ -644,9 +685,17 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
           {guiChrome ? <TitleBarWorkspaceSlots /> : <TitleBarDraftSlots />}
         </div>
 
+        {/* Calm drag gap between the two islands. Same web-client rule as
+            the full-width layer above: keep the flex spacer for layout, but
+            stay transparent to pointer events where there is no window to
+            drag. */}
         <div
-          data-tauri-drag-region
-          className="pointer-events-auto min-w-4 flex-1 self-stretch"
+          data-testid="titlebar-drag-gap"
+          data-tauri-drag-region={remoteClient ? undefined : true}
+          className={cn(
+            "min-w-4 flex-1 self-stretch",
+            remoteClient ? "pointer-events-none" : "pointer-events-auto",
+          )}
         />
 
         <div
