@@ -93,7 +93,12 @@ Selectable Codemux-owned DOM text inherits one document-level highlight
 contract from `:root::selection`: solid `--selection-background` with
 `--selection-foreground`. Keep the selector root-scoped rather than using a
 bare `::selection`; the CSS highlight inheritance model then provides a
-predictable app default while preserving deliberate descendant overrides.
+predictable app default while preserving deliberate descendant overrides. That
+inheritance is what makes a single rule reach the whole tree — on an engine
+still using the legacy `::selection` matching model the rule simply matches
+nothing below the root and selection falls back to the native highlight, which
+is a cosmetic downgrade, not a broken surface. Both shipped WebViews
+(WebKitGTK, WebView2) implement the inheritance model.
 
 Always set the selection foreground and background together. Reusing the
 active palette's `--foreground` makes the dark themes' near-white text fail
@@ -101,9 +106,26 @@ contrast against ember and leaves the layered Agent Chat composer's
 transparent textarea glyphs without a reliable selected-text color.
 
 This contract covers Codemux-owned DOM surfaces, including prose, links,
-inline code, inputs, and textareas. Renderer-owned selections remain separate:
-xterm.js and CodeMirror keep their own theme integrations, and pages displayed
-inside the browser pane own their document styling.
+inline code, inputs, and textareas. Pages displayed inside the browser pane are
+separate documents and own their styling.
+
+Renderer-owned selections need explicit handling, because inheritance reaches
+them too:
+
+- **xterm.js** never uses the native highlight — `.xterm` is `user-select:
+  none` and selection is painted by the renderer from the terminal theme's
+  `selectionBackground`. Nothing to opt out of.
+- **CodeMirror** paints its own selection layer (`.cm-selectionBackground`,
+  from `--accent`) and suppresses the native highlight by resetting only its
+  *background*. The foreground still inherits, so `src/lib/codemirror-theme.ts`
+  resets `.cm-line` selected text to `currentColor` — selected code keeps its
+  syntax colors instead of rendering as dark selection ink on the accent fill.
+  The opt-out is scoped to document lines on purpose: the editor's own chrome
+  (search panel inputs, tooltips) uses real native selection and should keep
+  the app-wide pair.
+
+Any future surface that draws its own selection layer needs the same
+`currentColor` opt-out for the text it covers.
 
 ## Typography
 
