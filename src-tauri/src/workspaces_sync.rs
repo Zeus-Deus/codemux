@@ -500,10 +500,8 @@ fn read_git_head_sha(path: &str) -> Option<String> {
 /// from sibling devices, not yet adopted here) are NEVER touched by
 /// reconcile — they have no app_state counterpart by design.
 ///
-/// OpenFlow workspaces are excluded — they are ephemeral by design
-/// and never persist beyond a single device, so syncing them would
-/// just churn the registry. Same exclusion `save_persisted_state`
-/// uses.
+/// Compatibility-only removed workspace kinds and the Home singleton are
+/// excluded because neither represents a live project to publish.
 ///
 /// Returns Ok even on partial failure: individual row failures are
 /// logged so a corrupt row doesn't strand the whole tick.
@@ -533,11 +531,8 @@ pub fn reconcile_from_snapshot(
     let mut live_wids: HashSet<String> = HashSet::new();
 
     for ws in &snapshot.workspaces {
-        // Skip OpenFlow workspaces — they're not user-durable.
-        if matches!(
-            ws.workspace_type,
-            crate::state::WorkspaceType::OpenFlow
-        ) {
+        // Compatibility-only workspace kinds never represent live projects.
+        if matches!(ws.workspace_type, crate::state::WorkspaceType::Removed) {
             continue;
         }
         // Home workspaces don't represent a project to sync — skip.
@@ -1080,7 +1075,7 @@ mod tests {
         // An "open on host" workspace is a local VIEW onto a host workspace
         // the inventory poller already publishes. Mirroring it here would
         // create a duplicate cloud row that phantoms on every other device.
-        // The reconcile must skip it entirely (like OpenFlow/Home).
+        // The reconcile must skip it entirely (like Home).
         let db = fresh_db();
         let mut attach = make_ws("workspace-onhost", "remote-svc");
         attach.attach_only = true;

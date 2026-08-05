@@ -1,7 +1,6 @@
 // ── Feature flags ──
 
 export interface FeatureFlags {
-  unstable_openflow: boolean;
   unstable_browser_automation: boolean;
   unstable_indexing: boolean;
   enable_agent_chat: boolean;
@@ -285,129 +284,8 @@ export interface HandoffPacket {
   next_steps: string[];
 }
 
-// ── OpenFlow ──
-
-export type OpenFlowRole =
-  | "orchestrator"
-  | "planner"
-  | "builder"
-  | "reviewer"
-  | "tester"
-  | "debugger"
-  | "researcher";
-
-export interface OpenFlowTaskNode {
-  task_id: string;
-  title: string;
-  description: string;
-  role: OpenFlowRole;
-  status:
-    | "pending"
-    | "ready"
-    | "in_progress"
-    | "blocked"
-    | "passed"
-    | "failed"
-    | "cancelled";
-  depends_on: string[];
-  success_criteria: string[];
-  produced_artifacts: string[];
-}
-
-export interface OpenFlowArtifact {
-  artifact_id: string;
-  kind:
-    | "plan"
-    | "log"
-    | "screenshot"
-    | "diff"
-    | "review_note"
-    | "test_result"
-    | "browser_evidence";
-  title: string;
-  location: string | null;
-  summary: string;
-}
-
-export interface OpenFlowTimelineEntry {
-  entry_id: string;
-  level: "info" | "warning" | "error";
-  message: string;
-}
-
-export interface OpenFlowWorkerState {
-  role: OpenFlowRole;
-  assigned_task_ids: string[];
-  status: string;
-  last_output: string | null;
-}
-
-export interface OpenFlowRetryPolicy {
-  max_attempts: number;
-  current_attempt: number;
-  backoff_seconds: number;
-}
-
-export interface OpenFlowRunRecord {
-  run_id: string;
-  title: string;
-  goal: string;
-  status:
-    | "draft"
-    | "planning"
-    | "executing"
-    | "verifying"
-    | "reviewing"
-    | "awaiting_approval"
-    | "completed"
-    | "failed"
-    | "cancelled";
-  current_phase: string;
-  replan_count: number;
-  assigned_roles: OpenFlowRole[];
-  task_graph: OpenFlowTaskNode[];
-  artifacts: OpenFlowArtifact[];
-  approvals: Array<{
-    checkpoint_id: string;
-    kind: string;
-    title: string;
-    required: boolean;
-    reason: string;
-  }>;
-  timeline: OpenFlowTimelineEntry[];
-  workers: OpenFlowWorkerState[];
-  retry_policy: OpenFlowRetryPolicy;
-  resumable: boolean;
-  verification_required: boolean;
-  browser_validation_required: boolean;
-  command_validation_required: boolean;
-  reviewer_score: number | null;
-  stop_reason: string | null;
-  orchestration_state:
-    | "initializing"
-    | "active"
-    | "waiting_for_response"
-    | "correcting_delegation"
-    | "stalled"
-    | "idle"
-    | "error";
-  orchestration_detail: string | null;
-}
-
-export interface OpenFlowRuntimeSnapshot {
-  active_runs: OpenFlowRunRecord[];
-}
-
-export interface OpenFlowCreateRunRequest {
-  title: string;
-  goal: string;
-  agent_roles: string[];
-  cwd?: string;
-}
-
 // ── Workspace & Layout ──
 
-export type WorkspaceTemplateKind = "codemux" | "folder" | "openflow";
 export type LayoutPreset = "single" | "pair" | "quad" | "six" | "shell_browser";
 export type FileStatus =
   | "added"
@@ -791,7 +669,7 @@ export interface SurfaceSnapshot {
   active_pane_id: string;
 }
 
-export type WorkspaceType = "standard" | "open_flow" | "home";
+export type WorkspaceType = "standard" | "home";
 
 export interface WorkspaceSnapshot {
   workspace_id: string;
@@ -1020,64 +898,6 @@ export interface RevisionHeartbeat {
    *  `AppStateSnapshot.snapshot_instance`. A token change is a resync on its
    *  own, whatever the revision numbers say. */
   instance?: string;
-}
-
-// ── CLI / Agent Config ──
-
-export interface CliToolInfo {
-  id: string;
-  name: string;
-  available: boolean;
-  path: string | null;
-}
-
-export interface ModelInfo {
-  id: string;
-  name: string;
-  provider: string | null;
-}
-
-export interface ThinkingModeInfo {
-  id: string;
-  name: string;
-  description: string;
-}
-
-export interface AgentConfig {
-  agent_index: number;
-  cli_tool: string;
-  model: string;
-  provider: string;
-  thinking_mode: string;
-  role: string;
-}
-
-export interface AgentSessionState {
-  session_id: string;
-  run_id: string;
-  config: AgentConfig;
-  status: "spawning" | "running" | "done" | "failed";
-}
-
-export interface CommLogEntry {
-  timestamp: string;
-  role: string;
-  message: string;
-}
-
-export interface OrchestratorTriggerResult {
-  current_phase: string;
-  next_phase: string | null;
-  analysis: {
-    completed_roles: string[];
-    blocked_roles: string[];
-    assignments_count: number;
-    user_injections_count: number;
-  };
-  actions_taken: string[];
-  comm_log_offset: number;
-  orchestration_state: OpenFlowRunRecord["orchestration_state"];
-  orchestration_detail: string | null;
 }
 
 // ── Presets ──

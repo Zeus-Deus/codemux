@@ -844,8 +844,8 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
             // Phase 1.6: backs the `workspace_close` MCP tool. Wraps the
             // existing `close_workspace_with_worktree_impl` so both the
             // Tauri command and the socket arm share teardown, PTY
-            // termination, agent-chat shutdown, virtual-display release,
-            // and (when requested) `git worktree remove`. Safe default:
+            // termination, agent-chat shutdown, MCP cleanup, and (when
+            // requested) `git worktree remove`. Safe default:
             // `delete_worktree=false` — closing never destroys a worktree
             // unless the brain asks for it.
             let state: State<'_, AppStateStore> = app.state();
@@ -1108,20 +1108,12 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
 
                 // GUI-mode background browsing (docs/features/browser.md
                 // "Background browser in GUI mode"): when the Agent Chat
-                // GUI beta is on and this isn't an OpenFlow workspace, the
+                // GUI beta is on, the
                 // agent's browser session must stay detached — the
                 // frontend renders it as an inline chip + context-bar
                 // indicator instead of splitting the chat into a pane.
-                // OpenFlow workspaces and the flag-off path keep today's
-                // split-pane behavior unchanged.
-                let workspace_type = state
-                    .snapshot()
-                    .workspaces
-                    .iter()
-                    .find(|w| w.workspace_id.0 == workspace_id)
-                    .map(|w| w.workspace_type);
-                let gui_background_mode = observability.agent_chat_enabled()
-                    && workspace_type != Some(crate::state::WorkspaceType::OpenFlow);
+                // The flag-off path keeps today's split-pane behavior.
+                let gui_background_mode = observability.agent_chat_enabled();
 
                 // Auto-create a browser pane if no pane is attached and user hasn't dismissed it
                 // — unless GUI-mode background browsing suppresses it (see above).
@@ -1653,8 +1645,8 @@ fn filter_ports_by_workspace<'a>(
 /// unit-testable without standing up `AppStateStore`/`ObservabilityStore`.
 /// `pane_attached` and `user_dismissed` mirror the existing pre-GUI-mode
 /// rule; `gui_background_mode` is `true` when the Agent Chat GUI beta is on
-/// for a non-OpenFlow workspace, in which case the session must stay
-/// detached even though it would otherwise qualify for a new pane.
+/// for a workspace, in which case the session must stay detached even though
+/// it would otherwise qualify for a new pane.
 fn should_create_browser_pane(
     pane_attached: bool,
     user_dismissed: bool,
@@ -1851,7 +1843,7 @@ mod tests {
 
     #[test]
     fn should_create_pane_when_detached_and_not_dismissed_and_not_gui_mode() {
-        // Today's exact behavior: flag off (or OpenFlow) always creates.
+        // The flag-off path always creates.
         assert!(should_create_browser_pane(false, false, false));
     }
 
@@ -1869,7 +1861,7 @@ mod tests {
     fn should_not_create_pane_in_gui_background_mode_even_if_otherwise_eligible() {
         // The core GUI-mode gate: an otherwise-eligible detached,
         // non-dismissed session must NOT get a pane when GUI background
-        // mode applies (Agent Chat beta on, non-OpenFlow workspace).
+        // mode applies (Agent Chat beta on).
         assert!(!should_create_browser_pane(false, false, true));
     }
 

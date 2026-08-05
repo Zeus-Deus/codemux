@@ -14,17 +14,13 @@ import type {
 import type { AgentChatEventPayload, ApprovalDecision } from "./events";
 import type {
   UserSettings,
-  AgentConfig,
   PresetLaunchConfig,
-  AgentSessionState,
   AppStateSnapshot,
   AuthResponse,
   AuthUser,
   BaseBranchDiff,
   BranchDetail,
   CheckInfo,
-  CliToolInfo,
-  CommLogEntry,
   EditorInfo,
   FileAttachmentInfo,
   FileEntry,
@@ -40,12 +36,7 @@ import type {
   CommitFileEntry,
   HandoffPacket,
   LaunchMode,
-  ModelInfo,
-  OpenFlowCreateRunRequest,
-  OpenFlowRunRecord,
   ResourceMetricsSnapshot,
-  OpenFlowRuntimeSnapshot,
-  OrchestratorTriggerResult,
   PresetStoreSnapshot,
   ProjectMemorySnapshot,
   ProjectMemoryUpdate,
@@ -62,7 +53,6 @@ import type {
   TabKind,
   TerminalStatusPayload,
   ThemeColors,
-  ThinkingModeInfo,
   WorkspaceConfig,
   WorktreeInfo,
   ProjectScripts,
@@ -74,14 +64,6 @@ import type {
   WebRemoteBindScope,
   WebRemoteRegistrationStatus,
 } from "./types";
-
-// ── Platform ──
-
-// Returns the Rust target_os string: "linux", "macos", "windows", etc.
-// Used to gate Windows-incompatible features at the UI layer (e.g. OpenFlow's
-// bash wrappers). Safe to call before the rest of the app has initialized.
-export const getPlatform = () =>
-  invoke<string>("get_platform");
 
 // ── Project files (Step 8 — attachments) ──
 
@@ -358,9 +340,6 @@ export const regenerateMcpConfig = (workspaceId: string) =>
 
 export const updateWorkspaceCwd = (workspaceId: string, cwd: string) =>
   invoke("update_workspace_cwd", { workspaceId, cwd });
-
-export const createOpenflowWorkspace = (title: string, goal: string, cwd: string | null) =>
-  invoke<string>("create_openflow_workspace", { title, goal, cwd });
 
 export const createWorkspaceWithPreset = (cwd: string, presetId: string) =>
   invoke<string>("create_workspace_with_preset", { cwd, presetId });
@@ -687,28 +666,6 @@ export const dbAddRecentProject = (path: string, name: string) =>
 export const dbGetRecentProjects = (limit?: number) =>
   invoke<Array<{ path: string; name: string; last_opened_at: string }>>("db_get_recent_projects", { limit });
 
-export const dbSaveOpenflowRun = (params: {
-  runId: string;
-  title?: string;
-  goal?: string;
-  status?: string;
-  agentCount?: number;
-  startedAt?: string;
-  completedAt?: string;
-}) =>
-  invoke("db_save_openflow_run", params);
-
-export const dbGetOpenflowHistory = (limit?: number) =>
-  invoke<Array<{
-    run_id: string;
-    title: string | null;
-    goal: string | null;
-    status: string | null;
-    agent_count: number | null;
-    started_at: string | null;
-    completed_at: string | null;
-  }>>("db_get_openflow_history", { limit });
-
 // ── Git ──
 
 export const checkIsGitRepo = (path: string) =>
@@ -951,57 +908,6 @@ export const clearBrowserCookies = () =>
 
 export const clearAllBrowserData = () =>
   invoke<void>("clear_all_browser_data");
-
-// ── OpenFlow ──
-
-export const getOpenflowRuntimeSnapshot = () =>
-  invoke<OpenFlowRuntimeSnapshot>("get_openflow_runtime_snapshot");
-
-export const createOpenflowRun = (request: OpenFlowCreateRunRequest) =>
-  invoke<OpenFlowRunRecord>("create_openflow_run", { request });
-
-export const retryOpenflowRun = (runId: string) =>
-  invoke<OpenFlowRunRecord>("retry_openflow_run", { runId });
-
-export const applyOpenflowReviewResult = (
-  runId: string,
-  approved: boolean,
-  feedback: string,
-) =>
-  invoke<OpenFlowRunRecord>("apply_openflow_review_result", { runId, approved, feedback });
-
-export const stopOpenflowRun = (runId: string, reason: string, status: string = "cancelled") =>
-  invoke<OpenFlowRunRecord>("stop_openflow_run", { runId, status, reason });
-
-export const listAvailableCliTools = () =>
-  invoke<CliToolInfo[]>("list_available_cli_tools");
-
-export const listModelsForTool = (toolId: string) =>
-  invoke<ModelInfo[]>("list_models_for_tool", { toolId });
-
-export const listThinkingModesForTool = (toolId: string) =>
-  invoke<ThinkingModeInfo[]>("list_thinking_modes_for_tool", { toolId });
-
-export const spawnOpenflowAgents = (
-  workspaceId: string,
-  runId: string,
-  goal: string,
-  workingDirectory: string,
-  agentConfigs: AgentConfig[],
-) =>
-  invoke<string[]>("spawn_openflow_agents", { workspaceId, runId, goal, workingDirectory, agentConfigs });
-
-export const getAgentSessionsForRun = (runId: string) =>
-  invoke<AgentSessionState[]>("get_agent_sessions_for_run", { runId });
-
-export const getCommunicationLog = (runId: string, offset: number) =>
-  invoke<[CommLogEntry[], number]>("get_communication_log", { runId, offset });
-
-export const injectOrchestratorMessage = (runId: string, message: string) =>
-  invoke<number>("inject_orchestrator_message", { runId, message });
-
-export const triggerOrchestratorCycle = (runId: string) =>
-  invoke<OrchestratorTriggerResult>("trigger_orchestrator_cycle", { runId });
 
 // ── Memory ──
 

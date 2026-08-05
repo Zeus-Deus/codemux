@@ -2490,11 +2490,9 @@ one). It renders:
   (`src/components/browser/background-browser-indicator.tsx`, extracted
   verbatim from `WorkspaceContextBar`, which still consumes them for
   the terminal-pane/GUI cases where the bar renders). Click opens the
-  peek overlay (`useBrowserPeekStore().open`). The bar's
-  `enableAgentChat && workspace_type !== "open_flow"` gate is implicit
-  in the cluster's mount context (a disabled flag renders a
-  placeholder instead of the pane; OpenFlow never routes through
-  `PaneContainer`);
+  peek overlay (`useBrowserPeekStore().open`). The `enableAgentChat` gate is
+  implicit in the cluster's mount context because a disabled flag renders a
+  placeholder instead of the pane;
 - a **behind chip** (`↓N`, `text-warning`) when `git_behind > 0`;
 - a **PR chip** (`#N`, tone-tinted via `PR_CHIP_TONE` — the single
   shared map in `src/components/github/pr-status-icon.tsx`, also used
@@ -2990,7 +2988,6 @@ Three ways to flip it on locally:
    ```js
    await window.__TAURI__.invoke("update_feature_flags", {
      flags: {
-       unstable_openflow: true,
        unstable_browser_automation: true,
        unstable_indexing: true,
        enable_agent_chat: true,

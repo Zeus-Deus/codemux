@@ -341,16 +341,6 @@ describe("WorkspaceContextBar", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("hides the background-browser indicator for an OpenFlow workspace even with the flag on", () => {
-    mocks.workspace = makeWorkspace({ workspace_type: "open_flow" });
-    mocks.enableAgentChat = true;
-    mocks.agentBrowserSessions = [makeBackgroundSession()];
-    render(<WorkspaceContextBar />);
-    expect(
-      screen.queryByRole("button", { name: /Browser running in background/ }),
-    ).not.toBeInTheDocument();
-  });
-
   it("hides the background-browser indicator once the session is attached to a pane (no longer background)", () => {
     mocks.workspace = makeWorkspace();
     mocks.enableAgentChat = true;

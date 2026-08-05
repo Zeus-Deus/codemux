@@ -11,7 +11,6 @@ import { RightPanel } from "./right-panel";
 import { DiffPane } from "@/components/diff/DiffPane";
 import { DraftChatSurface } from "@/components/chat/DraftChatSurface";
 import { EditorPane } from "@/components/editor/EditorPane";
-import { OpenFlowWorkspace } from "@/components/openflow/openflow-workspace";
 import { ProjectOnboarding } from "@/components/overlays/project-onboarding";
 import { useWorkspaceWorkflow } from "@/components/workflow/use-workspace-workflow";
 import { useActiveChatTasks } from "@/hooks/use-active-chat-tasks";
@@ -189,18 +188,6 @@ export function WorkspaceMain() {
         onComplete={() => setOnboardingProjectDir(null)}
         onCancel={() => setOnboardingProjectDir(null)}
       />
-    );
-  }
-
-  // OpenFlow workspaces get their own dedicated view
-  if (activeWorkspace.workspace_type === "open_flow") {
-    return (
-      <>
-        <TabBar workspace={activeWorkspace} />
-        <div className="flex flex-1 min-h-0 min-w-0 overflow-hidden">
-          <OpenFlowWorkspace workspace={activeWorkspace} />
-        </div>
-      </>
     );
   }
 

@@ -20,7 +20,7 @@ Codemux is a Linux-first workspace that brings terminals, browser panes, and mul
 - **Browser panes** — Embedded browser alongside your terminals for testing and agent-assisted browsing
 - **Git worktree isolation** — Each workspace gets its own worktree so agents never interfere with each other
 - **Built-in diff review** — See what changed, commit, and manage branches without switching tools
-- **OpenFlow orchestration** — Run multiple AI agents in parallel with automatic task delegation and stuck detection
+- **Workflow orchestration** — Run structured Claude workflows with approval, progress, summaries, and agent drill-in
 - **Notifications & attention signals** — Know exactly when an agent needs you, with desktop notifications and per-pane indicators
 - **CLI & socket control** — Automate everything via `codemux` CLI or the local Unix socket API
 - **Custom keybinds** — Full keyboard-first workflow with a command palette and rebindable shortcuts

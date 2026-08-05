@@ -143,21 +143,13 @@ keeping "Best for everyday, complex tasks" on both is fine short-term).
    `"claude-opus-5"`. This is only the pre-hydration fallback (real default
    comes from `caps.models[0]`), but leaving it stale means one render of
    the wrong pill on cold start.
-2. **`src-tauri/src/commands/openflow.rs:317–345`** —
-   `claude_default_models()` is a *separate, stale* hardcoded list
-   (`sonnet`/`haiku`/`opus`/`claude-sonnet-4-6`/`claude-haiku-4-5`) feeding
-   the OpenFlow new-run dialog. Add `claude-opus-5` (and consider a general
-   refresh — it predates the whole Opus 4.x line). The `opus` alias entry
-   resolves CLI-side, so it starts meaning Opus 5 automatically once the
-   deployed CLI bumps its alias.
-3. **Dev mock** — `src/dev/tauri-mock.ts` (`CLAUDE_CAPABILITIES`, seeded
+2. **Dev mock** — `src/dev/tauri-mock.ts` (`CLAUDE_CAPABILITIES`, seeded
    session configs pinned to `"claude-opus-4-8"`, l. 488–520 / 759 / 1694 /
    1717): add an Opus 5 row so screenshots/dev flows exercise the new
    default; `src/dev/mock-fixtures.ts` display strings are cosmetic.
-4. **Docs** — `docs/features/multi-provider-chat.md` (harvest/description
+3. **Docs** — `docs/features/multi-provider-chat.md` (harvest/description
    contract examples name Opus 4.8), `docs/features/agent-chat.md` (the
-   `Opus 4.8 with 1M context · …` example string), `docs/features/openflow.md`
-   (model-compatibility table), `docs/core/STATUS.md`.
+   `Opus 4.8 with 1M context · …` example string), `docs/core/STATUS.md`.
 
 ## Explicit non-changes (verified)
 
@@ -257,7 +249,6 @@ capability-change heal paths (`AgentChatPane` / `chat-pane-plans` /
    confirm **no** speed picker appears (Claude fast mode is clamped off);
    restart the app and confirm the persisted model re-seeds the pill
    (post-restart "reset to Opus" regression guard).
-4. OpenFlow new-run dialog lists the new model.
-5. Fast-mode removal (already implemented on this branch): confirm no
+4. Fast-mode removal (already implemented on this branch): confirm no
    Claude model shows the Standard/Fast picker, and that a thread with a
    previously persisted `fast_mode = 1` heals to Standard on open.

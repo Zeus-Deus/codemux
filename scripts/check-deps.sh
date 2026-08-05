@@ -217,14 +217,6 @@ else
     echo -e "$(install_hint 'ydotool' 'ydotool' 'ydotool')"
 fi
 
-# bubblewrap
-if command -v bwrap &>/dev/null; then
-    pass "bwrap (process sandboxing)"
-else
-    warn "bwrap not found (agents run without sandbox)"
-    echo -e "$(install_hint 'bubblewrap' 'bubblewrap' 'bubblewrap')"
-fi
-
 # --- Summary ---
 header "Summary"
 total=$((pass_count + warn_count + fail_count))

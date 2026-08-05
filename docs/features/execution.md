@@ -1,140 +1,40 @@
-# Execution Backends
+# Child Process Environment Isolation
 
-- Purpose: Describe Codemux's sandbox-execution abstraction that gates how agent sessions (and any other spawn path that opts in) launch child processes.
-- Audience: Anyone working on agent sandboxing, cross-platform spawn behavior, display isolation, or permission policies. OpenFlow (Codemux's built-in multi-agent orchestrator) is the largest current consumer but not the only one.
-- Authority: Canonical feature doc for execution policy and backends.
-- Update when: A new backend is added, an existing backend's behavior changes, or the default policy changes.
-- Read next: `docs/features/openflow.md`, `docs/plans/windows-support.md`
-
-## What This Feature Is
-
-Execution backends are Codemux's cross-platform abstraction for "how should we spawn an agent child process?". Each host OS picks a different backend: Linux uses Bubblewrap for sandboxed namespace isolation, macOS will use `sandbox-exec`, Windows will use Job Objects / AppContainer, and anything else falls through to a host-passthrough backend that just runs the command directly.
-
-The policy also carries capability flags (`allow_network`, `allow_browser_automation`, `allow_desktop_gui`) so callers can express intent like "this agent can do network requests and control the browser, but it should not be allowed to pop GUI windows on the user's display".
+- Purpose: Document the shared environment sanitizers used when Codemux launches non-interactive child processes.
+- Audience: Anyone adding or changing subprocess launch paths.
+- Authority: Canonical feature doc for GUI-environment isolation.
+- Update when: The sanitized keys, neutralizing overrides, or call sites change.
+- Read next: `docs/plans/windows-support.md`, `docs/features/terminal.md`
 
 ## Current Model
 
-The Rust type lives in `src-tauri/src/execution/mod.rs`:
+`src-tauri/src/execution/mod.rs` contains a small cross-platform helper layer. It is not a process sandbox and does not wrap ordinary terminal PTYs.
 
-```rust
-pub enum ExecutionBackendKind {
-    HostPassthrough,
-    LinuxBubblewrap,
-    MacOsSandbox,
-    WindowsRestricted,
-}
+The helpers remove GUI-session variables such as `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, and desktop-specific socket variables, then add neutralizing values including `BROWSER=true`, `MOZ_NO_REMOTE=1`, `GTK_USE_PORTAL=0`, and `GIO_USE_VFS=local`. The default variants also replace the D-Bus session address with an inert path; `*_keep_dbus` variants preserve D-Bus for commands that need desktop credential or keyring access.
 
-pub struct ExecutionPolicy {
-    pub backend_preference: ExecutionBackendKind,
-    pub allow_network: bool,
-    pub allow_browser_automation: bool,
-    pub allow_desktop_gui: bool,
-    pub virtual_display: bool,
-}
-```
+Four entry points cover both Rust process APIs:
 
-`ExecutionPolicy::openflow_agent_default()` (the name is accurate — it is constructed only by the OpenFlow adapters; see "Scope" below) picks the backend based on the compile-time host OS (`cfg!(target_os = ...)`) and sets sensible defaults (network on, browser automation on, desktop GUI off).
+- `sanitize_gui_env_std`
+- `sanitize_gui_env_tokio`
+- `sanitize_gui_env_std_keep_dbus`
+- `sanitize_gui_env_tokio_keep_dbus`
 
-`prepare_agent_command(executable, args, cwd, policy)` is the spawn-time entry point. It reads `policy.effective_backend()` and returns a `PreparedExecutionCommand` with the real executable, args, and the backend that was actually applied. On Linux with Bubblewrap, it wraps the command in `bwrap --bind / / --unshare-pid --unshare-ipc --die-with-parent --new-session --proc /proc --dev-bind /dev --tmpfs /tmp/.X11-unix ...` (see `build_linux_bwrap_args`), plus an `XDG_RUNTIME_DIR` tmpfs mask. `--unshare-net` is **conditional** — emitted only when `policy.allow_network` is false, which the default agent policy is not, so the default agent spawn does not unshare the network namespace. On every other branch today, it returns the original command unwrapped — the macOS and Windows backends are placeholders.
+## Production Callers
 
-`effective_backend()` degrades gracefully: a preference of `LinuxBubblewrap` on non-Linux falls back to `HostPassthrough`, and if `bwrap` isn't on `PATH` on Linux, the spawn also falls back to `HostPassthrough` with a diagnostics breadcrumb.
+- GitHub authentication and CLI helpers in `src-tauri/src/github.rs`
+- OpenCode discovery and server startup in `src-tauri/src/agent_provider/opencode/`
+- file and external-tool commands in `src-tauri/src/commands/`
 
-## What Works Today
+Interactive terminal sessions deliberately inherit the user's normal desktop environment. The sanitizers are aimed at backend-launched helpers that should not accidentally open a browser, portal, or desktop window.
 
-- Linux Bubblewrap sandbox with PID / IPC namespace unsharing and
-  `--die-with-parent` cleanup (network unsharing only when `allow_network`
-  is false — see above)
-- Graceful `HostPassthrough` fallback when `bwrap` is not installed (logged but not fatal)
-- Capability flags threaded through the policy struct and serialized for UI / settings
-- Agent sessions spawn via this path — consumers (OpenFlow today, potentially others later) do NOT touch `Command::new()` directly
-- Backend label string (`"linux_bubblewrap"`, `"host_passthrough"`, etc.) surfaced in observability logs for every agent spawn
-- Cross-platform compile (the `LinuxBubblewrap` arm is `#[cfg(target_os = "linux")]` gated inside `prepare_agent_command`)
-- **Cross-platform GUI env handling (Phase 1 display isolation).** `PreparedExecutionCommand` carries **two** lists:
-  - `env_unset` — GUI variables removed via `CommandBuilder::env_remove` after all env setting (including the `extra_env` merge). Empty on the bwrap branch (bwrap handles it via `--unsetenv`); populated from `gui_env_keys()` on every fallback path (macOS stub, Windows stub, bwrap-missing Linux, `HostPassthrough`) whenever `allow_desktop_gui=false`.
-  - `env_set` — GUI *neutralizers* from `gui_env_overrides()`: `BROWSER=true`, `MOZ_NO_REMOTE=1`, `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null`, `XDG_CURRENT_DESKTOP=X-Generic`, `DE=generic`, `GTK_USE_PORTAL=0`, `GIO_USE_VFS=local`, `NO_AT_BRIDGE=1`. Unsetting alone isn't enough; these actively steer well-behaved tools away from the host session.
+## Security Boundary
 
-  Helpers `sanitize_gui_env_std` / `sanitize_gui_env_tokio` (and their `*_keep_dbus` variants) apply the same treatment to non-PTY `Command` spawns.
-- **Adapter `extra_env` is filtered** against `env_unset` in `spawn_pty_for_agent` so an adapter propagating `DISPLAY` from the host env cannot silently un-do the strip.
-- **`ExecutionPolicy::worktree_session_default()`** governs regular (non-agent) worktree shells: `HostPassthrough` backend, no wrapping, and `allow_desktop_gui` read from the `CODEMUX_ALLOW_DESKTOP_GUI` env var — **defaulting to `false`** (safe-by-default since April 2026). Set `CODEMUX_ALLOW_DESKTOP_GUI=1|true|yes` before launching Codemux to restore host GUI inheritance for these shells.
-- **Policy `virtual_display: bool` field** with `#[serde(default)]` for backward compatibility. `openflow_agent_default()` reads `CODEMUX_VIRTUAL_DISPLAY=1|true|yes` at construction time and flips the flag.
-- **Workspace close releases the virtual display.** Both `close_workspace` and `close_workspace_with_worktree` in `src-tauri/src/commands/workspace.rs` call `VirtualDisplayManager::release(workspace_id)` after PTY teardown. Idempotent — no-op if the workspace never acquired one.
+Environment sanitization prevents common accidental GUI launches; it is not containment. A child can still access the filesystem, network, and desktop sockets it can discover by other means. Codemux currently has no generic Bubblewrap, AppContainer, `sandbox-exec`, virtual-display, or per-workspace execution-policy layer.
 
-## Scope: this applies to OpenFlow agents only
+Any future sandbox should be introduced as a new, independently reviewed boundary rather than inferred from these helpers.
 
-Worth stating plainly, because it is easy to assume otherwise. The entire
-`ExecutionPolicy` / `prepare_agent_command` PTY path is reached from exactly
-one place in production: `spawn_pty_for_agent` (→
-`spawn_pty_for_agent_in_process`, or `spawn_pty_for_agent_via_daemon`), whose
-only callers are in `src-tauri/src/commands/openflow.rs`. `ExecutionPolicy`
-itself is only ever constructed by the OpenFlow adapters
-(`openflow/adapters/{claude,opencode}.rs`).
+## Verification
 
-Note the name collision: `branch_name.rs` defines its *own* unrelated
-`prepare_agent_command` (a `(String, bool)` prompt-embedding CLI-string
-builder used by `commands/presets.rs` and `commands/workspace.rs`). It never
-touches `ExecutionPolicy`, `env_unset`, or the sanitize helpers.
-
-**Ordinary terminal and preset panes do not go through it.** A Claude Code /
-Codex / OpenCode / Gemini / Pi *preset* pane spawns via
-`spawn_pty_for_session`, which never constructs an `ExecutionPolicy` and never
-applies `env_unset` / `env_set`. There is no `persona` field on presets and no
-"agent preset" flag anywhere in the codebase — so those panes inherit the host
-display environment like any other terminal.
-
-`ExecutionPolicy::worktree_session_default()` likewise has **no production
-caller** — it is referenced only from `execution/mod.rs`'s own test module.
-
-Because OpenFlow is itself currently unreachable from the UI (see
-`docs/features/openflow.md`), the practical reach of the *policy/spawn* path
-today is close to zero. That is a gap worth closing — routing preset agent
-panes through a policy is the point of the abstraction — but it should not be
-described as shipped behavior.
-
-Scoped claim: this is about the PTY policy path only. The module's
-`sanitize_gui_env_std` / `sanitize_gui_env_tokio` helpers *are* used widely in
-production (`github.rs`, `agent_provider/opencode/{server,discovery}.rs`,
-`commands/files.rs`, `commands/mod.rs`).
-
-## Built But Not Wired (virtual display, Phase 2 / 2.5)
-
-The Xvfb virtual-display stack in `src-tauri/src/execution/virtual_display.rs` is
-implemented and unit-tested, and `VirtualDisplayManager` is `.manage()`d in
-`lib.rs` — but **no spawn path calls `acquire()`**. The only non-definition call
-site in the repo is inside the module's own `#[cfg(test)]` block. Everything in
-this section is therefore unreachable at runtime today; the release-on-close
-wiring above exists and would work, but nothing ever acquires a display for it
-to release.
-
-What the module implements, for whoever wires it up:
-
-- Per-workspace Xvfb: idempotent acquire, `SIGTERM` → 5s grace → `SIGKILL` on release, orphan sweep of `/tmp/.X<n>-lock` on startup, shutdown-all on exit via `Drop`. Flags: `-screen 0 1920x1080x24 -dpi 96 -noreset -nolisten tcp +extension GLX +extension RANDR -auth <cookie>`. Displays allocate from `:1000` to dodge host sessions (`:0`–`:2`) and CI (`:99`).
-- Unsupported on macOS/Windows: `is_supported()` returns `false`, `acquire()` returns `Error::Unsupported` / `Error::XvfbNotFound`.
-- MIT-MAGIC-COOKIE-1 xauth: a 128-bit cookie at `/tmp/codemux-vd-<N>.Xauthority` (mode `0600`) via the `xauth` CLI; `XAUTHORITY` propagates through `VirtualDisplayEnv::env_pairs()`. Degrades without `xauth`.
-- `x11vnc` companion ("watch the agent"), gated on the internal `AcquireOptions.watch_vnc` field: `-passwdfile read:<file>` with a random per-display token (deliberately **not** `-nopw`, which left the same-UID case open), bound to `127.0.0.1`, port probe range `5910-5999`. Killed before Xvfb on release. Missing `x11vnc` is non-fatal.
-- Tauri command `get_workspace_virtual_display` returns `VirtualDisplayInfo { display, vnc_port, vnc_password, supported }`. It is registered in `lib.rs` but has **no wrapper in `src/tauri/commands.ts` and no caller in `src/`** — the intended hook for a future "watch the agent" pane.
-
-There is **no `.codemux/config.json` `sandbox` section.** `WorkspaceConfig`
-(`src-tauri/src/config/workspace_config.rs`) has exactly four fields — `setup`,
-`teardown`, `run`, `worktree_includes` — and no `SandboxConfig` type exists.
-A previous version of this doc described a `sandbox` block with
-`virtual_display` / `watch_vnc` / `allow_desktop_gui` keys and a
-`terminal::apply_workspace_sandbox_overrides` reader; neither was ever
-implemented. Per-workspace opt-in remains unbuilt; the env vars above are the
-only switches.
-
-## Current Constraints
-
-- **macOS backend is a placeholder**: `MacOsSandbox` falls through to `HostPassthrough`. A real implementation would use `sandbox-exec` with a profile (`/usr/bin/sandbox-exec -f <profile> ...`).
-- **Windows backend is a placeholder**: `WindowsRestricted` also falls through to `HostPassthrough`. A real implementation would use Job Objects (`CreateJobObject` + `SetInformationJobObject` for process limits) or AppContainer (`CreateProcessAsUser` with a restricted token).
-- **The Bubblewrap policy is hardcoded** — `build_linux_bwrap_args` has a single profile tuned for agent-session use. There is no per-workspace policy at all yet — neither config-file nor UI (see "Built But Not Wired" above).
-- **`allow_desktop_gui: false` is now enforced cross-platform via env-strip** on the `HostPassthrough` branch and the bwrap-missing fallback, in addition to the `--unsetenv` flags on the real bwrap branch. The strip is not a security control — a determined child can probe sockets directly — but it stops ~95% of accidental GUI popups from `npm run dev`, `electron .`, `playwright --headed`, etc. Real containment would be the virtual display (built, unwired) or a full sandbox (not started).
-- **No syscall filtering** — seccomp-bpf isn't wired into the Bubblewrap profile. An agent can still `unlink()` the user's files inside its own filesystem view because `bwrap --bind / /` exposes the host root read-write by default.
-
-## Important Touch Points
-
-- `src-tauri/src/execution/mod.rs` — `ExecutionBackendKind`, `ExecutionPolicy`, `PreparedExecutionCommand`, `prepare_agent_command`, `build_linux_bwrap_args`, `gui_env_keys`, `gui_env_overrides`, `sanitize_gui_env_*`
-- `src-tauri/src/execution/virtual_display.rs` — the built-but-unwired Xvfb/x11vnc manager
-- `src-tauri/src/openflow/mod.rs` / `src-tauri/src/commands/openflow.rs` — OpenFlow agents read an `ExecutionPolicy` from their `AgentConfig` and pass it to `spawn_pty_for_agent`
-- `src-tauri/src/terminal/mod.rs` — `spawn_pty_for_agent` calls `prepare_agent_command` before touching portable-pty
-- `docs/plans/windows-support.md` — tracks the Windows backend work and notes that OpenFlow is currently disabled on Windows because the wrappers (separate concern from execution backend) are not ported yet
-- `docs/features/openflow.md` — describes the agent orchestration that sits on top of this execution layer
+- unit tests in `src-tauri/src/execution/mod.rs` pin the key and override sets
+- `src-tauri/tests/gui_leak_prevention.rs` exercises both standard and Tokio command builders
+- `cargo test --manifest-path src-tauri/Cargo.toml` covers the module and integration tests

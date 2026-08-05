@@ -32,7 +32,6 @@ import {
   Archive,
   Laptop,
   GitBranch,
-  Workflow,
   AlertTriangle,
   BellOff,
   Cloud,
@@ -792,8 +791,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
   const isWorktreeRow =
     !isPushOrPullInFlight &&
     !isRemote &&
-    !isPrimary &&
-    workspace.workspace_type !== "open_flow";
+    !isPrimary;
   // Client-observed work history for the living-row lifecycle: merged-PR
   // retirement + the idle-row "n shipped" tally. Stable reference until the
   // store promotes a new merge, so subscribing here is render-safe.
@@ -837,8 +835,6 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
     <Loader2 className="h-3.5 w-3.5 shrink-0 text-muted-foreground animate-spin" />
   ) : isRemote ? (
     <Cloud className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-  ) : workspace.workspace_type === "open_flow" ? (
-    <Workflow className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
   ) : isPrimary ? (
     <Laptop className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
   ) : showWorkspaceIconAsPr ? (

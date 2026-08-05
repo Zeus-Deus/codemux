@@ -92,18 +92,11 @@ describe("useGuiChrome", () => {
     expect(result.current).toBe(false);
   });
 
-  it("is true for a real, non-OpenFlow workspace with the flag on", () => {
+  it("is true for a real workspace with the flag on", () => {
     setActiveWorkspace();
     useFeatureFlags.setState({ enableAgentChat: true });
     const { result } = renderHook(() => useGuiChrome());
     expect(result.current).toBe(true);
-  });
-
-  it("is false for an OpenFlow workspace even with the flag on", () => {
-    setActiveWorkspace({ workspace_type: "open_flow" });
-    useFeatureFlags.setState({ enableAgentChat: true });
-    const { result } = renderHook(() => useGuiChrome());
-    expect(result.current).toBe(false);
   });
 
   it("is false while a lazy-creation chat draft is active", () => {
@@ -203,23 +196,4 @@ describe("useAgentChatPaneActive", () => {
     expect(result.current).toBe(false);
   });
 
-  it("is false for an OpenFlow workspace even with an active agent_chat pane", () => {
-    setActiveWorkspaceWithPane(
-      { kind: "agent_chat", pane_id: "pane-1", title: "Chat", thread_id: null, provider: null, cwd: null },
-      "pane-1",
-    );
-    // setActiveWorkspaceWithPane resets surfaces via setActiveWorkspace's
-    // overrides merge — workspace_type must be re-applied in the same
-    // call since `makeWorkspace` spreads overrides once.
-    const ws: WorkspaceSnapshot = useAppStore.getState().appState!.workspaces[0];
-    useAppStore.setState({
-      appState: {
-        ...useAppStore.getState().appState!,
-        workspaces: [{ ...ws, workspace_type: "open_flow" }],
-      },
-    });
-    useFeatureFlags.setState({ enableAgentChat: true });
-    const { result } = renderHook(() => useAgentChatPaneActive());
-    expect(result.current).toBe(false);
-  });
 });
