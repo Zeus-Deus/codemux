@@ -5,14 +5,13 @@
 - Authority: Active browser work plan, not current truth.
 - Update when: Browser priorities, unresolved questions, or likely touch points change.
 - Read next: `docs/features/browser.md`, `docs/core/STATUS.md`
-- Status: ACTIVE — pane and automation ship; the richer console-log stream and OpenFlow browser surface are still open.
+- Status: ACTIVE — pane and automation ship; the richer console-log stream is still open.
 
 ## Active Priorities
 
 1. Finish a focused manual pass for back, forward, reload, address-bar flow, and text entry on real sites.
 2. Harden resize, focus, redraw, and lifecycle behavior inside split layouts.
 3. Expose a more useful console log and error stream.
-4. Integrate the current browser runtime more cleanly into OpenFlow verification flows.
 
 ## Open Questions
 

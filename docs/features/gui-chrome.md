@@ -20,7 +20,7 @@ the physical top edge, the cluster wrappers are transparent and frameless, and
 only controls that need an affordance carry their own chrome. It
 renders when the `enable_agent_chat` flag is on
 (the default — the flag is now a regular Settings → Interface toggle, not a
-Beta opt-in) and a real, non-OpenFlow workspace is active; every other case
+Beta opt-in) and a real workspace is active; every other case
 keeps the in-flow legacy `h-9` bar.
 
 **Chrome-mode gate for adjacent surfaces.** Every surface that reaches the
@@ -28,15 +28,15 @@ physical top edge in overlay mode reserves a local 40px collision zone, and
 that clearance is gated on `useTitlebarOverlay()`
 (`src/hooks/use-gui-chrome.ts` — `useGuiChrome() || useDraftGuiChrome()`,
 i.e. "the titlebar is floating"). Gating on anything weaker is a bug: with
-the flag off, or on with an OpenFlow workspace, the legacy bar already
-occupies that space in normal flow, so unconditional clearance renders as a
-dead band above the sidebar search row and the right-panel tabs.
+the flag off, the legacy bar already occupies that space in normal flow, so
+unconditional clearance renders as a dead band above the sidebar search row
+and the right-panel tabs.
 
 ## Current Model
 
 `TitleBar` (`src/components/layout/title-bar.tsx`) branches on a computed
 `guiChrome` flag: `enableAgentChat && !lazyDraftActive && activeWorkspaceId !=
-null && workspace_type != null && workspace_type !== "open_flow"`. This
+null`. This
 predicate lives in the shared `useGuiChrome()` hook
 (`src/hooks/use-gui-chrome.ts`) so other GUI-mode-only surfaces gate on the
 identical rule — currently the background-browser inline chip, context-bar
@@ -174,7 +174,7 @@ titlebar tab share one implementation (see "Important Touch Points").
 ## What Works Today
 
 - Frameless floating control clusters over full-height sidebar, workspace, and
-  right-panel surfaces for a real, non-OpenFlow chat workspace with the
+  right-panel surfaces for a real chat workspace with the
   GUI flag on (default). With the flag off the legacy `h-9` bar and every
   layout inset around it are unchanged — but the flag-off surfaces are *not*
   literally byte-identical any more: the legacy `TabBar`'s panel toggle uses
@@ -209,9 +209,8 @@ titlebar tab share one implementation (see "Important Touch Points").
   live chat draft renders the GUI-styled `h-10` draft variant (static pill +
   draft launcher), but `useGuiChrome()` itself still resolves `false` during
   a draft — workspace-scoped GUI surfaces (titlebar tabs, background-browser
-  chip, context-bar indicator, right-cluster controls) stay off because the
+  chip, terminal-header indicator, right-cluster controls) stay off because the
   backend's active workspace is not what's on screen.
-- **OpenFlow workspaces are untouched** — they keep their dedicated chrome.
 - **A sole-root chat pane loses its per-pane split/close buttons** (the
   suppressed `AgentChatPaneHeader`); splitting is done from the launcher
   (Shift on a CLI agent) instead, and split layouts restore the per-pane

@@ -6,6 +6,7 @@
 // to render in the slash popup and Settings.
 
 pub mod compatibility;
+pub mod inventory;
 pub mod parser;
 pub mod paths;
 pub mod scanner;
@@ -14,7 +15,7 @@ pub mod watcher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillProvider {
     Claude,
@@ -29,6 +30,10 @@ pub enum SkillScope {
     User,
     Project,
     Plugin,
+    Managed,
+    Admin,
+    System,
+    Configured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,10 +44,48 @@ pub enum SkillCompatibility {
     HardWarn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillAvailability {
+    Native,
+    ExplicitPortable,
+    NativeOnly,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SkillInvocationKind {
+    NativeCommand,
+    CodexSkillItem,
+    PromptPrefix,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillProvenance {
+    Filesystem,
+    ProviderCatalog,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillProjection {
+    pub target_provider: SkillProvider,
+    pub availability: SkillAvailability,
+    pub compatibility: SkillCompatibility,
+    pub reasons: Vec<String>,
+    pub invocation: SkillInvocationKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Skill {
     pub id: String,
+    /// Stable user-preference identity. Project skills use the canonical
+    /// repository plus checkout-relative path so sibling worktrees agree.
+    pub preference_id: String,
     pub name: String,
     pub description: Option<String>,
     pub provider: SkillProvider,
@@ -56,6 +99,40 @@ pub struct Skill {
     pub compatibility_signals: Vec<String>,
     pub symlinked: bool,
     pub plugin_slug: Option<String>,
+    pub provenance: SkillProvenance,
+    pub readable: bool,
+    pub source_enabled: bool,
+    /// Agent Skills name-validation failure. Invalid definitions remain in
+    /// Settings for diagnosis but are unavailable to every invocation path.
+    pub validation_error: Option<String>,
+    pub projections: Vec<SkillProjection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillAdapterError {
+    pub provider: SkillProvider,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInventory {
+    pub skills: Vec<Skill>,
+    pub errors: Vec<SkillAdapterError>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedSkillInvocation {
+    pub skill_id: String,
+    pub name: String,
+    pub source_provider: SkillProvider,
+    pub source_scope: SkillScope,
+    pub base_dir: Option<String>,
+    pub path: Option<String>,
+    pub body: Option<String>,
+    pub invocation: SkillInvocationKind,
 }
 
 /// Stable id derived from the canonical SKILL.md path. Truncated SHA-256 hex
@@ -109,6 +186,7 @@ mod tests {
     fn skill_serializes_camel_case_keys() {
         let skill = Skill {
             id: "abc".to_string(),
+            preference_id: "abc".to_string(),
             name: "demo".to_string(),
             description: None,
             provider: SkillProvider::Claude,
@@ -122,9 +200,15 @@ mod tests {
             compatibility_signals: vec![],
             symlinked: false,
             plugin_slug: None,
+            provenance: SkillProvenance::Filesystem,
+            readable: true,
+            source_enabled: true,
+            validation_error: None,
+            projections: vec![],
         };
         let json = serde_json::to_value(&skill).unwrap();
         assert!(json.get("skillDir").is_some());
+        assert!(json.get("preferenceId").is_some());
         assert!(json.get("filePath").is_some());
         assert!(json.get("rawFrontmatter").is_some());
         assert!(json.get("bundledFiles").is_some());

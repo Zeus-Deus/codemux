@@ -241,10 +241,9 @@ describe("SidebarActionRow — floating-titlebar clearance", () => {
     });
   });
 
-  // Regression: the clearance shipped ungated, so with the GUI flag off (or
-  // on with an OpenFlow workspace) — where `TitleBar` renders the in-flow
-  // `h-9` bar and nothing floats over the sidebar — the search row sat
-  // under ~32px of dead padding.
+  // Regression: the clearance shipped ungated, so with the GUI flag off —
+  // where `TitleBar` renders the in-flow `h-9` bar and nothing floats over
+  // the sidebar — the search row sat under ~32px of dead padding.
   it("keeps the legacy inset while the title bar renders in normal flow", () => {
     const { getByTestId } = renderRow();
     const row = getByTestId("sidebar-action-row-expanded");

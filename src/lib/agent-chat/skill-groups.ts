@@ -28,7 +28,8 @@ export function groupHeadingFor(skill: Skill): string {
 function capitalizeScope(scope: SkillScope): string {
   if (scope === "user") return "User";
   if (scope === "project") return "Project";
-  return "Plugin";
+  if (scope === "plugin") return "Plugin";
+  return scope.charAt(0).toUpperCase() + scope.slice(1);
 }
 
 /**

@@ -83,7 +83,7 @@ The bridge between `app_state.workspaces` (runtime state) and `workspaces_sync` 
 4. For sync rows whose `workspace_id` is no longer in `app_state.workspaces`, soft-delete (marks dirty).
 5. Rows with `workspace_id IS NULL` are skipped entirely — they're pulled-only sibling-device entries and have no app_state counterpart by design.
 
-OpenFlow and Home workspaces are excluded — neither needs cross-device persistence.
+Home workspaces and compatibility-only removed workspace kinds are excluded because neither represents a live project.
 
 ### Cadence
 

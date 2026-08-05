@@ -228,6 +228,8 @@ async fn send_turn_forwards_to_selected_provider() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -1013,6 +1015,8 @@ mod auto_resume {
                 effort_override: None,
                 permission_mode_override: None,
                 client_nonce: None,
+                display_text: None,
+                skill_invocations: vec![],
             })
             .await
             .expect("send_turn succeeds on the resumed session");

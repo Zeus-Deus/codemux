@@ -19,7 +19,7 @@ Provide a safe, AI-powered merge conflict resolution workflow that works on temp
 
 ## Open Questions
 
-- Should the bot spawn via OpenFlow agent sessions or a dedicated lighter-weight runner?
+- Should the bot use the existing single-shot runner or a dedicated long-lived provider session?
 - How to handle multi-file conflicts — resolve all at once or file-by-file?
 - Should the bot attempt rebasing as an alternative to merge when appropriate?
 - How to present partial resolutions (some files resolved, some need human input)?

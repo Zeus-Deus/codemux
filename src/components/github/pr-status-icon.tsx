@@ -26,9 +26,8 @@ const STATE_TO_TONE: Record<PrStatusState, string> = {
   draft: "text-muted-foreground bg-muted-foreground/15",
 };
 
-/** Tinted border/fill/text per PR state for a bordered "PR chip" button
- *  (the workspace context bar's PR chip and the Context Row's status
- *  cluster). Same tone family as `STATE_TO_TONE` above, but with the
+/** Tinted border/fill/text per PR state for the Context Row's bordered
+ *  PR chip button. Same tone family as `STATE_TO_TONE` above, but with the
  *  border + hover treatment a clickable chip needs so the PR reads as a
  *  labeled action rather than a bare icon. Single home for both
  *  consumers — do not duplicate this map. */

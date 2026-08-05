@@ -747,21 +747,6 @@ describe("MessageList background browser chip", () => {
     expect(screen.queryByText("Browser opened in background")).toBeNull();
   });
 
-  it("does not render the chip for an OpenFlow workspace even with the flag on", () => {
-    useFeatureFlags.setState({ enableAgentChat: true });
-    setAppStateForBrowserChip({ workspace_type: "open_flow" }, [
-      makeBackgroundSession(),
-    ]);
-    render(
-      <MessageList
-        messages={[readCall(0, "/a")]}
-        workspaceId="ws-1"
-        {...noopHandlers}
-      />,
-    );
-    expect(screen.queryByText("Browser opened in background")).toBeNull();
-  });
-
   it("does not render the chip once the session is attached to a pane (promoted, no longer background)", () => {
     useFeatureFlags.setState({ enableAgentChat: true });
     setAppStateForBrowserChip({}, [

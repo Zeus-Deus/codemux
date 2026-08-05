@@ -29,7 +29,7 @@ Results are filtered to exclude system services and Codemux-internal port ranges
 - open a detected port in the browser pane
 - kill a port's owning process (`kill -9` on Unix, `taskkill /PID {pid} /F` on Windows)
 - static port labels via `.codemux/config.json` ports configuration
-- filtering: system ports (22, 80, 443, 5432, 3306, 6379, 27017), Codemux internals (3900-4199, 9222+) are excluded
+- filtering: system ports (22, 80, 443, 5432, 3306, 6379, 27017) and Codemux's agent-browser range (9222+) are excluded
 - Windows system-process name filter (`WINDOWS_SYSTEM_PROCESS_NAMES`) drops kernel + service-host owned sockets that `netstat -ano` would otherwise surface (16+ ports on a typical Windows host)
 - IPv4 + IPv6 dedup on Windows (services that bind to both `0.0.0.0:port` and `[::]:port` show as one entry)
 - exact-port matching (not substring) so a process listening on `:92230` is never confused with `:9223`

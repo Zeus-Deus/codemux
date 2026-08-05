@@ -114,9 +114,9 @@ fn is_windows_system_process(process_name: &str) -> bool {
         .any(|sys| sys.eq_ignore_ascii_case(process_name))
 }
 
-/// Codemux internal port ranges.
+/// Codemux reserves high ports for agent-browser debugging and streaming.
 fn is_codemux_internal_port(port: u16) -> bool {
-    (3900..=4199).contains(&port) || port >= 9222
+    port >= 9222
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -880,7 +880,7 @@ mod parser_tests {
     /// Realistic multi-line netstat fixture covering the cases we care about:
     /// - TCP LISTENING (IPv4) on a normal user port (5173)
     /// - TCP LISTENING on an IGNORED_PORTS entry (80) — must be skipped
-    /// - TCP LISTENING on a Codemux-internal port (3950) — must be skipped
+    /// - TCP LISTENING on a regular user port (3950)
     /// - TCP LISTENING (IPv4, second entry) on another normal port (8080)
     /// - TCP LISTENING (IPv6) on 5173 — dedup candidate with the IPv4 entry
     /// - TCP ESTABLISHED — must be skipped (not LISTENING)
@@ -908,13 +908,13 @@ Active Connections
         let process_names = empty_process_names();
         let ports = parse_netstat_output(NETSTAT_FIXTURE, &process_names);
 
-        // Expected: 5173 (IPv4 first — IPv6 dedup'd), 8080.
-        // Excluded: 80 (IGNORED_PORTS), 3950 (Codemux internal),
-        //           443 (ESTABLISHED, not LISTENING), 5353 (UDP).
+        // Expected: 3950, 5173 (IPv4 first — IPv6 dedup'd), 8080.
+        // Excluded: 80 (IGNORED_PORTS), 443 (ESTABLISHED, not LISTENING),
+        //           5353 (UDP).
         let got_ports: Vec<u16> = ports.iter().map(|p| p.port).collect();
         assert_eq!(
             got_ports,
-            vec![5173, 8080],
+            vec![3950, 5173, 8080],
             "unexpected ports: {got_ports:?}"
         );
 
@@ -1014,9 +1014,9 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
 
     #[test]
     fn test_parse_netstat_results_sorted_by_port() {
-        // Port selection intentionally dodges both filter ranges:
+        // Port selection intentionally dodges both filters:
         //   - IGNORED_PORTS = [22, 80, 443, 5432, 3306, 6379, 27017]
-        //   - Codemux internal = 3900..=4199 || >= 9222
+        //   - Codemux internal = >= 9222
         // 5000, 7000, 9000 are all outside both.
         let fixture = "\
   TCP    0.0.0.0:9000   0.0.0.0:0  LISTENING  1
@@ -1030,10 +1030,8 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
 
     #[test]
     fn test_parse_netstat_filters_codemux_internal_ports() {
-        // Guards against regressions in the Codemux-internal port range
-        // (3900..=4199 || >= 9222). These are reserved for agent-browser
-        // stream ports and the OpenFlow app-URL range; they must NEVER
-        // surface in the UI.
+        // Guards the agent-browser debug/stream range. Ports below 9222 are
+        // ordinary application ports and must remain visible.
         let fixture = "\
   TCP    0.0.0.0:3950   0.0.0.0:0  LISTENING  11
   TCP    0.0.0.0:4100   0.0.0.0:0  LISTENING  22
@@ -1043,8 +1041,7 @@ TCP 0.0.0.0:9000 0.0.0.0:0 LISTENING 1234
 ";
         let ports = parse_netstat_output(fixture, &empty_process_names());
         let got: Vec<u16> = ports.iter().map(|p| p.port).collect();
-        // Only 8080 survives — everything else is in the internal range.
-        assert_eq!(got, vec![8080]);
+        assert_eq!(got, vec![3950, 4100, 8080]);
     }
 
     #[test]
@@ -1540,8 +1537,7 @@ mod docker_parser_tests {
 
     #[test]
     fn codemux_internal_ports_are_skipped() {
-        // 4000 (in 3900..=4199) and 9300 (>= 9222) are Codemux-internal;
-        // only the normal 8090 should survive.
+        // 9300 is Codemux-internal; ordinary app ports 4000 and 8090 survive.
         let stdout = line(
             "proj-svc-1",
             WT,
@@ -1550,7 +1546,7 @@ mod docker_parser_tests {
         );
         let ports = parse_docker_ps_output(&stdout, &worktree_map());
         let nums: Vec<u16> = ports.iter().map(|p| p.port).collect();
-        assert_eq!(nums, vec![8090]);
+        assert_eq!(nums, vec![4000, 8090]);
     }
 
     #[test]

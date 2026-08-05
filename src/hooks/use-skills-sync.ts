@@ -30,6 +30,7 @@ import {
 } from "@/tauri/events";
 import { useAuthStore } from "@/stores/auth-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
+import { useSkillsStore } from "@/stores/skills-store";
 import { skillsSyncNow } from "@/tauri/commands";
 
 /// Wait window after a `skills-changed` event before triggering
@@ -95,6 +96,9 @@ export function useSkillsSync() {
   // (2) Trigger on filesystem changes, debounced. The same hook
   // mounts both listeners so unmount tears them down together.
   const handleSkillsChanged = useCallback(() => {
+    // Discovery invalidation is independent of cloud-sync eligibility.
+    // The next popup open fetches the active cwd again immediately.
+    useSkillsStore.getState().invalidate();
     if (!enableAgentChat) return;
     if (debounceTimerRef.current !== null) {
       clearTimeout(debounceTimerRef.current);

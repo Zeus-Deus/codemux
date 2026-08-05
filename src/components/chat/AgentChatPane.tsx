@@ -34,7 +34,10 @@ import {
 } from "@/lib/agent-chat/event-batcher";
 import { resolveContextWindowTokens } from "@/lib/agent-chat/context-usage";
 import { applyAllPrefixes } from "@/lib/agent-chat/mode-prefix";
-import { resolveSkillBodies } from "@/lib/agent-chat/skill-tokens";
+import {
+  resolveSkillSelection,
+  skillsForProvider,
+} from "@/lib/agent-chat/skill-tokens";
 import {
   selectActiveSkills,
   useSkillsStore,
@@ -1235,7 +1238,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // Parse `/skill-name` tokens out of the raw text and resolve their
       // bodies against the skills registry. Unmatched tokens (typos, or
       // skills not in the registry) silently pass through as plain prose.
-      const skillBodies = resolveSkillBodies(rawText, skillsRegistry);
+      const skillSelection = resolveSkillSelection(
+        rawText,
+        skillsForProvider(skillsRegistry, provider),
+      );
       // Snapshot staged attachments AT submit time so the block we
       // inject reflects exactly what the user has staged. Reading from
       // the live store via getState() avoids stale closure bugs if a
@@ -1260,10 +1266,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       // the still-in-memory bytes so the thumbnail shows immediately.
       const imageDisplaySources = buildImageDisplaySources(liveAttachments);
       const sdkText = applyAllPrefixes(
-        rawText,
+        skillSelection.text,
         mode,
         effort,
-        skillBodies,
+        null,
         attachmentBlock,
       );
       // Optimistic append carries a client nonce so a `turn_queued`
@@ -1319,6 +1325,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       const input = {
         thread_id: threadId,
         text: sdkText,
+        display_text: rawText,
+        skill_ids: skillSelection.skillIds,
+        skill_text: skillSelection.text,
+        include_plugins: useSkillsStore.getState().includePlugins,
         images: imageRefs,
         model_override: null,
         effort_override: plan.effortOverride,
@@ -2651,10 +2661,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   const belowComposerSlot = workspaceProjectRoot ? (
     // Context Row (design: `.design-import/Context Row.dc.html`) —
-    // static project/branch labels on the left, the same passive
-    // git/PR status cluster on the right that the old bottom
-    // `WorkspaceContextBar` used to show (now hidden for this pane —
-    // see `useAgentChatPaneActive`). Rendered at every message count:
+    // static project/branch labels on the left, plus the passive git/PR
+    // status cluster on the right that survived the retired workspace
+    // context bar. Rendered at every message count:
     // an empty thread has nothing to choose either (see above), so the
     // strip never changes shape across the first send.
     <div className={SCOPE_STRIP_INSET}>

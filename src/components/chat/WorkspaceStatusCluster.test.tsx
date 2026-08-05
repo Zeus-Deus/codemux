@@ -10,7 +10,7 @@ import type {
 } from "@/tauri/types";
 
 // ── Mocks — `vi.mock()` factories are hoisted, so mutable state they
-// close over lives in `vi.hoisted`. Mirrors workspace-context-bar.test.tsx. ──
+// close over lives in `vi.hoisted`. ──
 const mocks = vi.hoisted(() => ({
   workspace: null as WorkspaceSnapshot | null,
   hosts: [] as Array<{ id: number; name: string }>,
@@ -23,7 +23,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/stores/app-store", () => ({
   useActiveWorkspace: () => mocks.workspace,
-  // `useBackgroundBrowserSession` (shared with the context bar) reads
+  // `useBackgroundBrowserSession` (shared with the terminal header) reads
   // `agent_browser_sessions` off the app state via `useAppStore`.
   useAppStore: (sel: (s: Record<string, unknown>) => unknown) =>
     sel({
@@ -80,8 +80,7 @@ function makeWorkspace(
   };
 }
 
-// Mirrors workspace-context-bar.test.tsx's fixture: a live agent
-// browser session detached from any pane (the "background" state).
+// A live agent browser session detached from any pane (the "background" state).
 function makeBackgroundSession(
   overrides: Partial<AgentBrowserSession> = {},
 ): AgentBrowserSession {
@@ -178,7 +177,7 @@ describe("WorkspaceStatusCluster", () => {
     expect(screen.getByText("Branch")).toBeInTheDocument();
     // The header title and the Branch row's value are both
     // "feature/19-cloud-push" in this fixture (a workspace named after
-    // its branch, same as workspace-context-bar.test.tsx's fixture).
+    // its branch, matching the retired bar's visibility contract).
     expect(screen.getAllByText("feature/19-cloud-push")).toHaveLength(2);
     expect(screen.getByText("Behind base")).toBeInTheDocument();
     expect(screen.getByText("↓5")).toBeInTheDocument();
@@ -272,8 +271,7 @@ describe("WorkspaceStatusCluster", () => {
   });
 
   // ── GUI-mode background browser indicator ──
-  // Relocated from the bottom WorkspaceContextBar (which now hides
-  // while an agent-chat pane is active) — same shared
+  // Retained from the retired bottom context bar — same shared
   // `BackgroundBrowserIndicator` chip, same session predicate.
 
   it("shows the background-browser indicator for a live detached session, and opens the peek on click", async () => {
@@ -352,8 +350,7 @@ describe("WorkspaceStatusCluster", () => {
   });
 
   // ── Linked-issue chip ──
-  // Relocated from the old bottom WorkspaceContextBar (which hides while
-  // an agent-chat pane is active) — same shared `IssueDetailPopover`
+  // Retained from the retired bottom context bar — same shared `IssueDetailPopover`
   // (chip variant, opening upward), so a thread's linked issue stays
   // visible on the Context Row (regression from PR #144).
 

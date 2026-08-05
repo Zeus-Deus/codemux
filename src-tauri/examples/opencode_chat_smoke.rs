@@ -85,6 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await?;
     eprintln!("[chat-smoke] turn started: {}", turn.turn_id.0);

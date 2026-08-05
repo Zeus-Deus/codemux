@@ -40,7 +40,6 @@ pub mod jobs;
 pub mod mcp;
 pub mod memory;
 pub mod notifications;
-pub mod openflow;
 pub mod observability;
 pub mod os_input;
 pub mod ports;
@@ -301,8 +300,6 @@ fn build_core_app<R: tauri::Runtime>(
         .manage(state::AppStateStore::default())
         .manage(agent_browser::AgentBrowserManager::new_with_cleanup())
         .manage(indexing::ProjectIndexStore::default())
-        .manage(openflow::OpenFlowRuntimeStore::default())
-        .manage(openflow::AgentSessionStore::default())
         .manage(observability::load_observability_store())
         .manage(terminal::PtyState::default())
         .manage(resource_metrics::ResourceMonitorState::default())
@@ -361,11 +358,7 @@ fn build_core_app<R: tauri::Runtime>(
         // `state()` call panics with "state() called before manage()".
         .manage(mcp::registry::McpRegistry::default())
         .manage(skills::watcher::SkillsWatcherState::new())
-        // Phase 2 display-isolation: per-workspace virtual display manager.
-        // `new()` performs an orphan sweep of stale `/tmp/.X*-lock` files from
-        // prior Codemux crashes. Actual Xvfb spawning is lazy — first agent
-        // that opts in via CODEMUX_VIRTUAL_DISPLAY=1 triggers acquire().
-        .manage(execution::virtual_display::VirtualDisplayManager::new())
+        .manage(skills::inventory::SkillInventoryService::new())
         .manage(database::init_database().unwrap_or_else(|e| {
             eprintln!("[codemux] WARNING: Database init failed: {e}. Using in-memory fallback.");
             database::DatabaseStore::new_in_memory()
@@ -481,8 +474,8 @@ fn build_core_app<R: tauri::Runtime>(
             // for the full failure-mode write-up.
             let mut layout_loaded = false;
             if let Some(snapshot) = state::load_persisted_state() {
-                state::restore_session_ids(&snapshot);
-                let stripped = state::strip_openflow_from_snapshot(snapshot);
+                let stripped = state::strip_removed_workspaces_from_snapshot(snapshot);
+                state::restore_session_ids(&stripped);
                 let state: tauri::State<'_, state::AppStateStore> = handle.state();
                 state.replace_snapshot(stripped);
                 state.migrate_tabs_if_needed();
@@ -1869,8 +1862,6 @@ fn build_core_app<R: tauri::Runtime>(
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            commands::get_platform,
-            commands::get_workspace_virtual_display,
             commands::get_current_theme,
             commands::get_shell_appearance,
             commands::get_app_state,
@@ -1894,7 +1885,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::list_mcp_tools_with_cap_info,
             commands::list_mcp_tools_for_server,
             commands::create_workspace_with_preset,
-            commands::create_openflow_workspace,
             commands::activate_workspace,
             commands::rename_workspace,
             commands::set_workspace_muted,
@@ -1970,12 +1960,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::read_file_for_attachment,
             commands::list_project_folders,
             commands::read_folder_for_attachment,
-            commands::get_openflow_design_spec,
-            commands::get_openflow_runtime_snapshot,
-            commands::create_openflow_run,
-            commands::retry_openflow_run,
-            commands::apply_openflow_review_result,
-            commands::stop_openflow_run,
             commands::get_observability_snapshot,
             commands::add_structured_log,
             commands::update_feature_flags,
@@ -1991,6 +1975,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_stage_image,
             commands::agent_chat_discard_staged_image,
             commands::agent_chat_read_image,
+            commands::agent_chat_read_local_image,
             commands::agent_chat_prime_mcp,
             commands::agent_chat_cancel_queued_turn,
             commands::agent_chat_send_queued_turn_now,
@@ -2019,26 +2004,15 @@ fn build_core_app<R: tauri::Runtime>(
             commands::opencode_check_availability,
             commands::opencode_ping,
             commands::opencode_list_models,
-            commands::update_permission_policy,
             commands::list_tool_permissions,
             commands::remove_tool_permission,
             commands::list_skills,
             commands::start_skills_watcher,
             commands::stop_skills_watcher,
-            commands::update_safety_config,
-            commands::add_replay_record,
             commands::pick_folder_dialog,
             commands::pick_files_dialog,
             commands::pick_save_file_dialog,
             commands::pick_open_file_dialog,
-            commands::list_available_cli_tools,
-            commands::list_models_for_tool,
-            commands::list_thinking_modes_for_tool,
-            commands::spawn_openflow_agents,
-            commands::get_agent_sessions_for_run,
-            commands::get_communication_log,
-            commands::inject_orchestrator_message,
-            commands::trigger_orchestrator_cycle,
             terminal::create_terminal_session,
             terminal::activate_terminal_session,
             terminal::close_terminal_session,
@@ -2060,8 +2034,6 @@ fn build_core_app<R: tauri::Runtime>(
             commands::db_set_ui_state,
             commands::db_add_recent_project,
             commands::db_get_recent_projects,
-            commands::db_save_openflow_run,
-            commands::db_get_openflow_history,
             commands::get_project_scripts,
             commands::set_project_scripts,
             commands::check_is_git_repo,

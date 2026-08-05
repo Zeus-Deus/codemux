@@ -127,9 +127,8 @@ describe("RightPanel floating-chrome clearance", () => {
   });
 
   // Regression: the clearance was gated only on `!isRemoteClient()`, so with
-  // the GUI flag off — or on with an OpenFlow workspace — the in-flow legacy
-  // `h-9` bar already pushed the panel down and this margin rendered as a
-  // 40px blank band above the tabs.
+  // the GUI flag off the in-flow legacy `h-9` bar already pushed the panel
+  // down and this margin rendered as a 40px blank band above the tabs.
   it("adds no clearance when the title bar is the in-flow legacy bar", () => {
     mocks.titlebarOverlay = false;
     render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);

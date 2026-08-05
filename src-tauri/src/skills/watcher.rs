@@ -21,9 +21,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use notify::{recommended_watcher, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-use super::paths::enumerate_scan_paths;
+use super::paths::{enumerate_ancestor_project_paths, enumerate_scan_paths};
 
 /// Coalesce-window for raw filesystem events. 300ms is comfortably
 /// above the typical write+close burst from text editors but short
@@ -61,7 +61,10 @@ impl SkillsWatcherState {
         project_root: Option<PathBuf>,
         include_plugins: bool,
     ) -> Result<usize, String> {
-        let mut inner = self.inner.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| format!("lock poisoned: {e}"))?;
         // Drop the old watcher first; notify watchers stop watching on Drop.
         inner.watcher = None;
 
@@ -87,6 +90,13 @@ impl SkillsWatcherState {
                 }
             }
             *last = Some(now);
+            let app_for_invalidation = app_for_closure.clone();
+            tauri::async_runtime::spawn(async move {
+                app_for_invalidation
+                    .state::<crate::skills::inventory::SkillInventoryService>()
+                    .invalidate()
+                    .await;
+            });
             let _ = app_for_closure.emit(SKILLS_CHANGED_EVENT, ());
         })
         .map_err(|e| format!("create watcher: {e}"))?;
@@ -101,10 +111,7 @@ impl SkillsWatcherState {
             match watcher.watch(&path, RecursiveMode::Recursive) {
                 Ok(()) => watched += 1,
                 Err(e) => {
-                    eprintln!(
-                        "skills-watcher: failed to watch {} — {e}",
-                        path.display()
-                    );
+                    eprintln!("skills-watcher: failed to watch {} — {e}", path.display());
                 }
             }
         }
@@ -120,7 +127,10 @@ impl SkillsWatcherState {
 
     /// Drop the watcher. Safe to call when not started.
     pub fn stop(&self) -> Result<(), String> {
-        let mut inner = self.inner.lock().map_err(|e| format!("lock poisoned: {e}"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| format!("lock poisoned: {e}"))?;
         inner.watcher = None;
         Ok(())
     }
@@ -138,6 +148,15 @@ fn collect_paths(project_root: Option<&std::path::Path>, include_plugins: bool) 
     for (path, _) in scan.plugin_paths {
         out.push(path);
     }
+    if let Some(project_root) = project_root {
+        out.extend(
+            enumerate_ancestor_project_paths(project_root)
+                .into_iter()
+                .map(|(path, _)| path),
+        );
+    }
+    out.sort();
+    out.dedup();
     out
 }
 
@@ -160,6 +179,17 @@ mod tests {
         fs::create_dir_all(project.path().join(".claude/skills")).unwrap();
         let paths = collect_paths(Some(project.path()), false);
         assert!(!paths.is_empty());
+    }
+
+    #[test]
+    fn collect_paths_includes_inherited_project_roots() {
+        let project = TempDir::new().unwrap();
+        let nested = project.path().join("packages/app");
+        fs::create_dir_all(&nested).unwrap();
+        let inherited = project.path().join(".claude/skills");
+        fs::create_dir_all(&inherited).unwrap();
+        let paths = collect_paths(Some(&nested), false);
+        assert!(paths.contains(&inherited));
     }
 
     // The debounce window is checked inline; verify the const itself

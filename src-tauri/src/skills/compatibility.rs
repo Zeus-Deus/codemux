@@ -101,8 +101,7 @@ pub fn classify_compatibility(
     // files don't get carried along.
     if SOFT_SIBLING_FILES.is_match(body) {
         strong_soft += 1;
-        signals
-            .push("references sibling files (scripts/ or references/)".to_string());
+        signals.push("references sibling files (scripts/ or references/)".to_string());
     }
 
     // -- WEAK soft signals (2+ → soft-warn) -----------------------------
@@ -154,8 +153,12 @@ mod tests {
     fn pure_prompt_skill_is_compatible() {
         let body =
             "You are an aesthetic designer. Use generous whitespace and a calm color palette.";
-        let (bucket, signals) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, signals) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::Compatible);
         assert!(signals.is_empty());
     }
@@ -182,8 +185,12 @@ mod tests {
     fn bash_block_is_soft_warn() {
         // Strong signal — single bash block is enough.
         let body = "Run this:\n```bash\ngit status\n```\n";
-        let (bucket, signals) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, signals) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::SoftWarn);
         assert!(signals.iter().any(|s| s.contains("bash code blocks")));
     }
@@ -208,8 +215,12 @@ mod tests {
         // access). The Stage 1 omarchy false-positive lived here.
         // Signals are still recorded for tooltip reuse.
         let body = "First check `gh auth status` to confirm login.";
-        let (bucket, signals) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, signals) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::Compatible);
         assert!(signals.iter().any(|s| s.contains("gh")));
     }
@@ -218,8 +229,12 @@ mod tests {
     fn two_cli_mentions_escalate_to_soft_warn() {
         // Two weak signals = soft-warn (the threshold).
         let body = "Run `gh release create`, then `docker push`.";
-        let (bucket, signals) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, signals) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::SoftWarn);
         assert!(signals.iter().any(|s| s.contains("(and 1 more)")));
     }
@@ -228,8 +243,12 @@ mod tests {
     fn bash_block_alone_is_soft_warn_strong_signal() {
         // A bash code block is a strong signal — one is enough.
         let body = "Run this:\n```bash\nls\n```\n";
-        let (bucket, _) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, _) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::SoftWarn);
     }
 
@@ -237,8 +256,12 @@ mod tests {
     fn sibling_files_alone_is_soft_warn_strong_signal() {
         // Sibling-file refs imply the skill expects bundled assets.
         let body = "See `references/elicitation.md` for examples.";
-        let (bucket, _) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, _) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::SoftWarn);
     }
 
@@ -246,8 +269,12 @@ mod tests {
     fn references_sibling_files_is_soft_warn() {
         // Strong signal — sibling-file ref is enough on its own.
         let body = "See `references/elicitation.md` and run `scripts/build.sh`.";
-        let (bucket, signals) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, signals) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::SoftWarn);
         assert!(signals.iter().any(|s| s.contains("sibling files")));
     }
@@ -255,8 +282,12 @@ mod tests {
     #[test]
     fn codex_home_reference_is_hard_warn() {
         let body = "Open $CODEX_HOME/skills/.system/imagegen/scripts/foo.py";
-        let (bucket, _) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Codex, SkillProvider::Claude);
+        let (bucket, _) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Codex,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::HardWarn);
     }
 
@@ -265,15 +296,23 @@ mod tests {
         let body = "Write to ~/.claude/channels/discord/access.json";
 
         // Same provider — path is fine.
-        let (own, _) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (own, _) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         // The body has no other hard signals, so it should be compatible.
         // Note: it does mention "Write" but that's not in our soft set.
         assert_eq!(own, SkillCompatibility::Compatible);
 
         // Cross provider — hard-warn.
-        let (cross, signals) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Codex);
+        let (cross, signals) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Codex,
+        );
         assert_eq!(cross, SkillCompatibility::HardWarn);
         assert!(signals.iter().any(|s| s.contains("~/.claude/")));
     }
@@ -281,8 +320,12 @@ mod tests {
     #[test]
     fn hard_signal_outranks_soft_signal() {
         let body = "Run `gh status`.\n```bash\ngit status\n```\nAlso uses mcp__foo__bar.";
-        let (bucket, _) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, _) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::HardWarn);
     }
 
@@ -290,8 +333,12 @@ mod tests {
     fn cli_word_boundary_avoids_false_positives() {
         // "ghost" must not match `gh`, "dockerized" must not match `docker`.
         let body = "The ghost in the machine and dockerized apps.";
-        let (bucket, _) =
-            classify_compatibility(body, &empty_fm(), SkillProvider::Claude, SkillProvider::Claude);
+        let (bucket, _) = classify_compatibility(
+            body,
+            &empty_fm(),
+            SkillProvider::Claude,
+            SkillProvider::Claude,
+        );
         assert_eq!(bucket, SkillCompatibility::Compatible);
     }
 }

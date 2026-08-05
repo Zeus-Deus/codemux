@@ -21,6 +21,7 @@ import { basename } from "@/lib/path";
 import { cn } from "@/lib/utils";
 import { segmentDraftHighlight } from "@/lib/agent-chat/attachment-tokens";
 import { buildSkillCommands } from "@/lib/agent-chat/skill-commands";
+import { skillsForProvider } from "@/lib/agent-chat/skill-tokens";
 import {
   buildModeCommands,
   buildModelCommand,
@@ -55,6 +56,7 @@ import {
   listPullRequests,
   MCP_CODEMUX_SELF_ID,
   pasteClipboardImage,
+  startSkillsWatcher,
   type McpServerConfig,
 } from "@/tauri/commands";
 import { Switch } from "@/components/ui/switch";
@@ -166,7 +168,7 @@ interface Props {
    *  a project picker in when the draft target is Home. Omit
    *  (`undefined`) to keep the default cwd label; pass `null` to
    *  render nothing above the textarea (a running chat keeps its
-   *  scope in the workspace context bar instead). */
+   *  scope in the Context Row below the composer instead). */
   zone1Override?: React.ReactNode;
   /** Thread Scope redesign — optional slot rendered BELOW the composer
    *  card (inside the same max-w-[760px] column), under the footer.
@@ -482,13 +484,16 @@ export function Composer({
   // Lazy-load on first popup open. Picking a skill expands the typed
   // `/<query>` to the full `/<skill-name>` in the textarea — the slash
   // command stays as literal text, syntax-highlighted by the mirror
-  // overlay below. At send time the parent parses the text against the
-  // skills registry and injects matched skill bodies as a per-turn
-  // prefix (no separate chip / staging state needed).
+  // overlay below. At send time the parent parses the text into stable
+  // skill ids; the backend revalidates and invokes them for the provider.
   // `selectActiveSkills` already filters out disabled ids — Composer
   // never sees disabled skills, so highlight + picker + send-time
   // injection all stay consistent.
-  const skills = useSkillsStore(selectActiveSkills);
+  const discoveredSkills = useSkillsStore(selectActiveSkills);
+  const skills = useMemo(
+    () => skillsForProvider(discoveredSkills, provider),
+    [discoveredSkills, provider],
+  );
   const loadSkills = useSkillsStore((s) => s.loadSkills);
   const skillsLoading = useSkillsStore((s) => s.loading);
   const skillsLoaded = useSkillsStore((s) => s.loaded);
@@ -649,6 +654,9 @@ export function Composer({
   useEffect(() => {
     if (!slashOpen) return;
     void loadSkills(cwd ?? null);
+    void startSkillsWatcher(cwd ?? null, useSkillsStore.getState().includePlugins).catch(
+      (error) => console.warn("[skills] watcher failed to start:", error),
+    );
     // Provider command discovery rides the same first-open trigger.
     // The store's lifetime cache + backend per-cwd cache make re-fires
     // cheap; a null cwd (Home draft, no project anchored) is a no-op
@@ -1998,7 +2006,9 @@ export function Composer({
             // the slightly-elevated surface, and a deep low-opacity
             // shadow so the card lifts off the pane background and
             // the scope strip below reads as a layer tucked under it.
-            // Focus sharpens the border rather than stacking a ring.
+            // The border deliberately stays identical at rest and on focus.
+            // Focus comes from the surface and elevation instead, avoiding a
+            // bright wireframe around this large rounded rectangle.
             "rounded-[20px] border border-border/80 bg-muted/40",
             // Geometry and color split so the tint stays a themeable
             // utility rather than a baked-in rgba literal.
@@ -2011,7 +2021,7 @@ export function Composer({
             // border shift) so the compositor only has work to do on
             // those changes.
             "transition-[box-shadow,border-color,background-color]",
-            "focus-within:border-muted-foreground/50",
+            "focus-within:bg-muted/60 focus-within:shadow-[0_16px_38px_-14px] focus-within:shadow-black/60",
             // Drag-over uses a neutral foreground-tinted ring instead
             // of the primary accent: the chat-ui skill reserves accent
             // for the app shell, and the brightness shift alone is

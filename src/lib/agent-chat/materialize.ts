@@ -24,6 +24,7 @@ import {
 import { defaultPermissionModeForProvider } from "./capability-defaults";
 import { applyAllPrefixes } from "./mode-prefix";
 import type { UserMessageImage } from "./types";
+import type { ResolvedSkillSelection } from "./skill-tokens";
 import { waitForWorkspaceCwd } from "./wait-for-workspace-cwd";
 
 /**
@@ -91,6 +92,15 @@ export interface MaterializeActions {
   setFastMode: (threadId: string, fastMode: boolean) => void;
   /** Seed the slice's composer mode pill. Stage 3 onward. */
   setMode: (threadId: string, mode: ChatMode) => void;
+  /** Rebind path-derived skill ids when deferred worktree creation changes
+   * the session cwd. Omitted by store-free tests and non-UI callers. */
+  refreshSkillSelection?: (
+    selection: ResolvedSkillSelection,
+    effectiveCwd: string,
+  ) => Promise<ResolvedSkillSelection>;
+  /** Read at dispatch time so Settings changes made while a draft is open
+   * constrain backend revalidation as well as popup discovery. */
+  getIncludePlugins?: () => boolean;
 }
 
 export type MaterializeResult =
@@ -147,7 +157,7 @@ export async function materializeAndSend(
   /** Concatenated skill bodies extracted from `text` by the caller —
    *  caller parses against its own skills registry so this lib stays
    *  free of store imports. `null` when the draft mentions no skills. */
-  skillBodies: string | null = null,
+  skillBodies: string | ResolvedSkillSelection | null = null,
   /** Step 8 Stage 2 — pre-built attachment block from the draft's
    *  staged attachments. Caller is responsible for snapshotting
    *  `stagedAttachments` and running `buildAttachmentBlock` so this
@@ -270,6 +280,22 @@ export async function materializeAndSend(
     return { success: false, error: message };
   }
 
+  let exactSkillSelection =
+    skillBodies && typeof skillBodies === "object" ? skillBodies : null;
+  if (exactSkillSelection && actions.refreshSkillSelection) {
+    try {
+      exactSkillSelection = await actions.refreshSkillSelection(
+        exactSkillSelection,
+        effectiveCwd,
+      );
+    } catch (err) {
+      const message = errorMessage(err);
+      actions.removeUserMessageByNonce(draft.threadId, clientNonce);
+      actions.markSendFailed(draft.draftId, message);
+      return { success: false, error: message };
+    }
+  }
+
   // 2. Create a chat pane on that workspace.
   let paneId: string;
   try {
@@ -332,12 +358,16 @@ export async function materializeAndSend(
     await agentChatSendTurn(draft.provider, {
       thread_id: draft.threadId,
       text: applyAllPrefixes(
-        text,
+        exactSkillSelection?.text ?? text,
         draft.mode,
         draft.effort,
-        skillBodies,
+        typeof skillBodies === "string" ? skillBodies : null,
         attachmentBlock,
       ),
+      display_text: text,
+      skill_ids: exactSkillSelection?.skillIds ?? [],
+      skill_text: exactSkillSelection?.text ?? null,
+      include_plugins: actions.getIncludePlugins?.() ?? true,
       images,
       model_override: null,
       effort_override: draft.effort,
@@ -402,7 +432,7 @@ export async function materializeWithPreset(
   actions: MaterializeActions,
   /** Concatenated skill bodies extracted from `initialPrompt` by the
    *  caller. `null` when the prompt mentions no skills. */
-  skillBodies: string | null = null,
+  skillBodies: string | ResolvedSkillSelection | null = null,
 ): Promise<MaterializeResult> {
   actions.markPromoting(draft.draftId);
 
@@ -463,6 +493,18 @@ export async function materializeWithPreset(
       return { success: false, error: message };
     }
 
+    let exactSkills =
+      skillBodies && typeof skillBodies === "object" ? skillBodies : null;
+    if (exactSkills && actions.refreshSkillSelection) {
+      try {
+        exactSkills = await actions.refreshSkillSelection(exactSkills, cwd);
+      } catch (err) {
+        const message = errorMessage(err);
+        actions.markSendFailed(draft.draftId, message);
+        return { success: false, error: message };
+      }
+    }
+
     let paneId: string;
     try {
       paneId = await agentChatCreatePane(workspaceId, draft.provider, cwd);
@@ -514,7 +556,16 @@ export async function materializeWithPreset(
       try {
         await agentChatSendTurn(draft.provider, {
           thread_id: draft.threadId,
-          text: applyAllPrefixes(prompt, draft.mode, draft.effort, skillBodies),
+          text: applyAllPrefixes(
+            exactSkills?.text ?? prompt,
+            draft.mode,
+            draft.effort,
+            typeof skillBodies === "string" ? skillBodies : null,
+          ),
+          display_text: prompt,
+          skill_ids: exactSkills?.skillIds ?? [],
+          skill_text: exactSkills?.text ?? null,
+          include_plugins: actions.getIncludePlugins?.() ?? true,
           model_override: null,
           effort_override: draft.effort,
           permission_mode_override: null,

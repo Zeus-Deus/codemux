@@ -38,6 +38,26 @@ export function SkillRow({
   onView,
   onOpenFile,
 }: Props) {
+  const status = skill.validationError
+    ? `Invalid: ${skill.validationError}`
+    : (skill.projections ?? [])
+        .filter((projection) => projection.availability !== "unavailable")
+        .map((projection) => {
+          const provider =
+            projection.targetProvider === "opencode"
+              ? "OpenCode"
+              : projection.targetProvider[0].toUpperCase() +
+                projection.targetProvider.slice(1);
+          if (projection.availability === "native") {
+            return `Auto in ${provider}`;
+          }
+          if (projection.availability === "native-only") {
+            return `Native only in ${provider}`;
+          }
+          return `Manual in ${provider}`;
+        })
+        .join(" · ");
+  const canToggle = !skill.validationError;
   return (
     <div
       data-testid={`skill-row-${skill.id}`}
@@ -99,6 +119,9 @@ export function SkillRow({
             {skill.description}
           </p>
         )}
+        <p className="mt-0.5 truncate text-[11px] text-muted-foreground/80">
+          {status || "Unavailable"}
+        </p>
       </div>
       <div className="flex items-center gap-2">
         <div
@@ -108,34 +131,43 @@ export function SkillRow({
             "group-hover:opacity-100 focus-within:opacity-100",
           )}
         >
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 px-2 text-xs"
-            onClick={onView}
-          >
-            <Eye className="mr-1 h-3 w-3" aria-hidden />
-            View
-          </Button>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 px-2 text-xs"
-            onClick={onOpenFile}
-            aria-label={`Open ${skill.name} in editor`}
-          >
-            <ExternalLink className="h-3 w-3" aria-hidden />
-          </Button>
+          {skill.readable !== false && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={onView}
+            >
+              <Eye className="mr-1 h-3 w-3" aria-hidden />
+              View
+            </Button>
+          )}
+          {skill.readable !== false && Boolean(skill.skillDir) && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={onOpenFile}
+              aria-label={`Open ${skill.name} in editor`}
+            >
+              <ExternalLink className="h-3 w-3" aria-hidden />
+            </Button>
+          )}
         </div>
         {/* Switch sits outside the hover-reveal cluster — always
             visible so users know per-row enable/disable exists at
             a glance. Stops propagation so accidental clicks on the
             row don't fall through to the View action. */}
         <Switch
-          checked={enabled}
+          checked={canToggle && enabled}
           onCheckedChange={onToggleEnabled}
+          disabled={!canToggle}
           aria-label={
-            enabled ? `Disable ${skill.name}` : `Enable ${skill.name}`
+            !canToggle
+              ? `${skill.name} is unavailable in Codemux`
+              : enabled
+              ? `Remove ${skill.name} from Codemux`
+              : `Make ${skill.name} available in Codemux`
           }
           data-testid={`skill-row-switch-${skill.id}`}
         />

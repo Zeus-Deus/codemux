@@ -69,7 +69,6 @@ import type {
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
   ChatModelInfo,
-  CliToolInfo,
   FeatureFlags,
   PaneNodeSnapshot,
   PresetStoreSnapshot,
@@ -464,7 +463,6 @@ function emitSerializeBuffers(): void {
 // ── Static command returns ──────────────────────────────────────────
 
 const FEATURE_FLAGS: FeatureFlags = {
-  unstable_openflow: false,
   unstable_browser_automation: false,
   unstable_indexing: false,
   // On in the mock so the seeded agent-chat workspaces render their
@@ -511,6 +509,61 @@ const EMPTY_CAPABILITIES: ProviderChatCapabilities = {
   permission_modes: [],
   default_permission_mode: null,
   permission_granularity: "per_session",
+};
+
+const MOCK_SKILL_BODY =
+  "Use the repository context to review the requested change and report actionable findings.";
+
+function mockSkill(
+  id: string,
+  name: string,
+  provider: "claude" | "codex" | "opencode",
+  scope: "project" | "user" | "system",
+) {
+  const filePath = `/mock/${provider}/${scope}/${name}/SKILL.md`;
+  return {
+    id,
+    name,
+    description: `${provider} ${scope} skill for ${name}`,
+    provider,
+    scope,
+    skillDir: filePath.replace(/\/SKILL\.md$/, ""),
+    filePath,
+    body: MOCK_SKILL_BODY,
+    rawFrontmatter: { name },
+    bundledFiles: [],
+    compatibility: "compatible",
+    compatibilitySignals: [],
+    symlinked: false,
+    pluginSlug: null,
+    provenance: "provider_catalog",
+    readable: true,
+    sourceEnabled: true,
+    projections: (["claude", "codex", "opencode"] as const).map(
+      (targetProvider) => ({
+        targetProvider,
+        availability:
+          targetProvider === provider ? "native" : "explicit-portable",
+        compatibility: "compatible",
+        reasons: [],
+        invocation:
+          targetProvider === "codex"
+            ? "codex-skill-item"
+            : targetProvider === provider && provider === "claude"
+              ? "native-command"
+              : "prompt-prefix",
+      }),
+    ),
+  };
+}
+
+const MOCK_SKILL_INVENTORY = {
+  skills: [
+    mockSkill("mock-claude-review", "review", "claude", "project"),
+    mockSkill("mock-codex-review", "review", "codex", "user"),
+    mockSkill("mock-opencode-deploy", "deploy", "opencode", "system"),
+  ],
+  errors: [],
 };
 
 // ── Agent chat (mocked end-to-end) ──────────────────────────────────
@@ -1534,11 +1587,6 @@ const SHELL_APPEARANCE: ShellAppearance = {
   font_family: "'JetBrains Mono Variable', monospace",
 };
 
-const CLI_TOOLS: CliToolInfo[] = [
-  { id: "claude", name: "Claude Code", available: true, path: "/usr/bin/claude" },
-  { id: "codex", name: "Codex", available: false, path: null },
-];
-
 function resourceMetrics(): ResourceMetricsSnapshot {
   return {
     app: {
@@ -1730,7 +1778,6 @@ const handlers: Record<string, Handler> = {
   get_app_state: () => appState,
   get_home_dir: () => MOCK_HOME_DIR,
   get_feature_flags: () => FEATURE_FLAGS,
-  get_platform: () => "linux",
   get_package_format: () => "AppImage",
 
   // ── Settings ──
@@ -1840,6 +1887,7 @@ const handlers: Record<string, Handler> = {
           },
         ]
       : [],
+  list_skills: () => MOCK_SKILL_INVENTORY,
   agent_chat_list_messages: (a) => mockThreadPayloads(a.threadId as string),
   // Cursor read (Phase 3). The mock's transcripts are generated and
   // stable per thread, so a row id is just "index + 1" within the
@@ -1933,6 +1981,17 @@ const handlers: Record<string, Handler> = {
     return {
       bytes: Array.from(entry.bytes),
       media_type: entry.mediaType,
+    };
+  },
+  // Local screenshot links use the same browser fallback as persisted chat
+  // attachments. The mock returns its seeded preview PNG for any accepted
+  // path so the real card + lightbox can be visually exercised without host
+  // filesystem access from the browser origin.
+  agent_chat_read_local_image: () => {
+    const encoded = MOCK_USER_IMAGE_DATA_URL.split(",")[1] ?? "";
+    return {
+      bytes: Array.from(Uint8Array.from(atob(encoded), (char) => char.charCodeAt(0))),
+      media_type: "image/png",
     };
   },
   agent_chat_discard_staged_image: (a) => {
@@ -2154,14 +2213,13 @@ const handlers: Record<string, Handler> = {
 
   // ── Editors / tooling ──
   detect_editors: () => [],
-  list_available_cli_tools: () => CLI_TOOLS,
 
   // ── GitHub / PRs (pre-seeded; never hit a real API) ──
   check_gh_available: () => true,
   check_gh_status: () => ({ status: "Authenticated", username: "mock-dev" }),
   refresh_workspace_pr: (a) => findWorkspace(a.workspaceId)?.pr_number ?? null,
   refresh_workspace_issue: () => null,
-  // Issue detail popover (sidebar row + workspace context bar): expand
+  // Issue detail popover (sidebar row + Agent Chat Context Row): expand
   // the workspace's seeded `linked_issue` into a full GitHubIssue so
   // the popover renders real content instead of an empty shell.
   get_github_issue: (a) => {

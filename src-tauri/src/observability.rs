@@ -26,12 +26,10 @@ pub struct MetricsSnapshot {
     pub startup_count: u64,
     pub pane_count: u64,
     pub browser_operation_count: u64,
-    pub openflow_run_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeatureFlags {
-    pub unstable_openflow: bool,
     pub unstable_browser_automation: bool,
     pub unstable_indexing: bool,
     /// Gates the agent-chat pane kind, its Tauri command surface, and
@@ -64,28 +62,6 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PermissionPolicy {
-    pub require_risky_action_approval: bool,
-    pub allow_destructive_actions: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ReplayRecord {
-    pub replay_id: String,
-    pub title: String,
-    pub summary: String,
-    pub created_at_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SafetyConfig {
-    pub model_budget_usd: f32,
-    pub max_concurrency: u32,
-    pub auto_apply: bool,
-    pub approval_required_for_completion: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilitySnapshot {
     #[serde(default)]
     pub logs: Vec<StructuredLogEntry>,
@@ -93,12 +69,6 @@ pub struct ObservabilitySnapshot {
     pub metrics: MetricsSnapshot,
     #[serde(default = "default_feature_flags")]
     pub feature_flags: FeatureFlags,
-    #[serde(default = "default_permission_policy")]
-    pub permission_policy: PermissionPolicy,
-    #[serde(default)]
-    pub replay_records: Vec<ReplayRecord>,
-    #[serde(default = "default_safety_config")]
-    pub safety_config: SafetyConfig,
     /// One-time migration marker for the Agent Chat GUI promotion
     /// (Beta → default-on). Because the whole snapshot is re-saved on
     /// every log/metric mutation, every pre-promotion install has an
@@ -125,14 +95,6 @@ fn default_metrics_snapshot() -> MetricsSnapshot {
 
 fn default_feature_flags() -> FeatureFlags {
     default_snapshot().feature_flags
-}
-
-fn default_permission_policy() -> PermissionPolicy {
-    default_snapshot().permission_policy
-}
-
-fn default_safety_config() -> SafetyConfig {
-    default_snapshot().safety_config
 }
 
 pub struct ObservabilityStore {
@@ -179,7 +141,6 @@ impl ObservabilityStore {
             "startup_count" => snapshot.metrics.startup_count += 1,
             "pane_count" => snapshot.metrics.pane_count += 1,
             "browser_operation_count" => snapshot.metrics.browser_operation_count += 1,
-            "openflow_run_count" => snapshot.metrics.openflow_run_count += 1,
             _ => {}
         }
         let _ = save_snapshot(&snapshot);
@@ -209,30 +170,6 @@ impl ObservabilityStore {
         let _ = save_snapshot(&snapshot);
     }
 
-    pub fn set_permission_policy(&self, policy: PermissionPolicy) {
-        let mut snapshot = self.inner.lock().unwrap();
-        snapshot.permission_policy = policy;
-        let _ = save_snapshot(&snapshot);
-    }
-
-    pub fn set_safety_config(&self, config: SafetyConfig) {
-        let mut snapshot = self.inner.lock().unwrap();
-        snapshot.safety_config = config;
-        let _ = save_snapshot(&snapshot);
-    }
-
-    pub fn add_replay_record(&self, title: String, summary: String) {
-        let mut snapshot = self.inner.lock().unwrap();
-        let replay_id = format!("replay-{}", snapshot.replay_records.len() + 1);
-        snapshot.replay_records.push(ReplayRecord {
-            replay_id,
-            title,
-            summary,
-            created_at_ms: current_time_ms(),
-        });
-        trim_replays(&mut snapshot.replay_records, 50);
-        let _ = save_snapshot(&snapshot);
-    }
 }
 
 pub fn load_observability_store() -> ObservabilityStore {
@@ -406,10 +343,8 @@ fn default_snapshot() -> ObservabilitySnapshot {
             startup_count: 0,
             pane_count: 0,
             browser_operation_count: 0,
-            openflow_run_count: 0,
         },
         feature_flags: FeatureFlags {
-            unstable_openflow: true,
             unstable_browser_automation: true,
             unstable_indexing: true,
             // The Agent Chat GUI is the default interface (promoted out
@@ -422,17 +357,6 @@ fn default_snapshot() -> ObservabilitySnapshot {
             // these literals).
             enable_agent_chat: true,
             enable_lazy_workspace_creation: true,
-        },
-        permission_policy: PermissionPolicy {
-            require_risky_action_approval: true,
-            allow_destructive_actions: false,
-        },
-        replay_records: vec![],
-        safety_config: SafetyConfig {
-            model_budget_usd: 25.0,
-            max_concurrency: 4,
-            auto_apply: false,
-            approval_required_for_completion: true,
         },
         // Fresh installs never need the one-time promotion — the flag
         // literals above are already the promoted state.
@@ -471,7 +395,7 @@ fn save_snapshot_to(path: &Path, snapshot: &ObservabilitySnapshot) -> Result<(),
 ///    modes (`cargo tauri dev` launches from `src-tauri/`, the
 ///    installed binary from wherever the user invoked it), so a
 ///    CWD-relative path produces a different file per launch —
-///    feature flags and safety config appear to "not stick" across
+///    feature flags appear to "not stick" across
 ///    restarts. See feature/agent-chat debugging for the incident.
 /// 2. Scope by `APP_DIR_NAME`, like every other piece of local state
 ///    (sqlite db, auth tokens, settings cache). The previous location,
@@ -506,13 +430,6 @@ fn trim_logs(logs: &mut Vec<StructuredLogEntry>, max: usize) {
     if logs.len() > max {
         let remove_count = logs.len() - max;
         logs.drain(0..remove_count);
-    }
-}
-
-fn trim_replays(replays: &mut Vec<ReplayRecord>, max: usize) {
-    if replays.len() > max {
-        let remove_count = replays.len() - max;
-        replays.drain(0..remove_count);
     }
 }
 
@@ -680,7 +597,6 @@ mod tests {
         // those fields must default them to true, matching
         // `default_snapshot()`'s on-state.
         let json = r#"{
-            "unstable_openflow": true,
             "unstable_browser_automation": true,
             "unstable_indexing": true
         }"#;
@@ -702,7 +618,6 @@ mod tests {
     #[test]
     fn persisted_agent_chat_false_survives_default_flip() {
         let json = r#"{
-            "unstable_openflow": true,
             "unstable_browser_automation": true,
             "unstable_indexing": true,
             "enable_agent_chat": false,
@@ -899,7 +814,6 @@ mod tests {
         assert!(after_on.enable_lazy_workspace_creation);
 
         // Other flags untouched by the toggle.
-        assert!(after_on.unstable_openflow);
         assert!(after_on.unstable_browser_automation);
         assert!(after_on.unstable_indexing);
     }

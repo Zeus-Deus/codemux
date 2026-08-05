@@ -30,62 +30,6 @@ use crate::state::{self, AppStateStore, TerminalSessionState};
 #[cfg(unix)]
 pub mod daemon_backed;
 
-static COMM_LOG_LOCKS: std::sync::OnceLock<Arc<Mutex<HashMap<String, Arc<Mutex<std::fs::File>>>>>> =
-    std::sync::OnceLock::new();
-
-pub fn get_comm_log_lock(path: &str) -> Arc<Mutex<std::fs::File>> {
-    let locks = COMM_LOG_LOCKS.get_or_init(|| Arc::new(Mutex::new(HashMap::new())));
-    let mut locks_guard = locks.lock().unwrap_or_else(|e| e.into_inner());
-    locks_guard
-        .entry(path.to_string())
-        .or_insert_with(|| {
-            let file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .expect("Failed to open comm log for locking");
-            Arc::new(Mutex::new(file))
-        })
-        .clone()
-}
-
-pub fn release_comm_log_lock(path: &str) {
-    if let Some(locks) = COMM_LOG_LOCKS.get() {
-        let mut locks_guard = locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks_guard.remove(path);
-    }
-}
-
-/// Turn a raw PTY output chunk into a single OpenFlow comm-log line, or
-/// `None` when the chunk is noise that shouldn't be logged (ANSI-only,
-/// progress spinners, block-glyph redraws, too-short fragments). Shared by
-/// BOTH the in-process reader loop and the daemon-backed reader task so the
-/// two paths can't drift — without it, OpenFlow agents on the daemon spawn
-/// path (the default since persistent agents) wrote an empty comm log and
-/// the orchestrator's stuck-detection went blind.
-pub(crate) fn comm_log_entry_for_chunk(role: &str, data: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(data).ok()?;
-    let cleaned = strip_ansi_codes(text);
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty()
-        || trimmed.len() <= 2
-        || trimmed.starts_with('\x1b')
-        || trimmed.starts_with("No orchestration progress detected")
-        || trimmed.starts_with("STOP: General Agent")
-        || trimmed.chars().all(|c| {
-            c.is_whitespace()
-                || c == '\u{2580}'
-                || c == '\u{2584}'
-                || c == '\u{2588}'
-                || c == ' '
-        })
-    {
-        return None;
-    }
-    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
-    Some(format!("[{}] [{}] {}\n", timestamp, role.to_uppercase(), trimmed))
-}
-
 fn strip_ansi_codes(s: &str) -> String {
     let mut result = String::new();
     let mut in_escape = false;
@@ -1124,10 +1068,10 @@ where
 }
 
 #[cfg(unix)]
-fn ensure_openflow_cli_shims() -> Option<(String, String)> {
+fn ensure_cli_shims() -> Option<(String, String)> {
     let current_exe = std::env::current_exe().ok()?;
     let current_exe = current_exe.display().to_string();
-    let shim_dir = std::env::temp_dir().join(format!("{}-openflow-shims", crate::APP_DIR_NAME));
+    let shim_dir = std::env::temp_dir().join(format!("{}-cli-shims", crate::APP_DIR_NAME));
     std::fs::create_dir_all(&shim_dir).ok()?;
 
     let shim_path = shim_dir.join("codemux");
@@ -1154,10 +1098,10 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
 }
 
 #[cfg(windows)]
-fn ensure_openflow_cli_shims() -> Option<(String, String)> {
+fn ensure_cli_shims() -> Option<(String, String)> {
     let current_exe = std::env::current_exe().ok()?;
     let current_exe = current_exe.display().to_string();
-    let shim_dir = std::env::temp_dir().join(format!("{}-openflow-shims", crate::APP_DIR_NAME));
+    let shim_dir = std::env::temp_dir().join(format!("{}-cli-shims", crate::APP_DIR_NAME));
     std::fs::create_dir_all(&shim_dir).ok()?;
 
     let shim_path = shim_dir.join("codemux.bat");
@@ -1181,7 +1125,7 @@ fn ensure_openflow_cli_shims() -> Option<(String, String)> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn ensure_openflow_cli_shims() -> Option<(String, String)> {
+fn ensure_cli_shims() -> Option<(String, String)> {
     None
 }
 
@@ -1221,7 +1165,7 @@ fn session_working_dir(app_state: &State<'_, AppStateStore>, session_id: &str) -
 /// "close this pane" user action where no flush is needed.
 ///
 /// Does **not** call `waitpid` — the waiter thread at the bottom of
-/// `spawn_pty_for_session` / `spawn_pty_for_agent` owns the `Box<dyn Child>`
+/// `spawn_pty_for_session` owns the `Box<dyn Child>`
 /// and is blocked in `child.wait()`. When SIGKILL lands, that `wait()`
 /// returns and the waiter thread reaps the child normally. Reaping from
 /// two places would race and produce `ECHILD`.
@@ -1284,7 +1228,7 @@ fn kill_session_tree(pid: u32) {
 
 /// RAII guard that kills and waits on a PTY child process if not explicitly
 /// disarmed. Prevents zombie processes when spawn_pty_for_session or
-/// spawn_pty_for_agent encounters an error after the child has been spawned.
+/// terminal spawn encounters an error after the child has been spawned.
 struct ChildGuard {
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
 }
@@ -1326,8 +1270,8 @@ pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
 }
 
 /// Build worktree environment variables and dynamic agent context for a PTY session.
-/// Used by both `spawn_pty_for_session()` and `spawn_pty_for_agent()` to ensure
-/// consistent env var injection across user shells and agent processes.
+/// Used by terminal sessions and agent-chat sidecars so workspace-level
+/// environment variables stay consistent.
 ///
 /// Exposed `pub(crate)` so the agent-chat command layer can reuse the exact
 /// same workspace-level vars when overlaying env onto a chat sidecar
@@ -1641,7 +1585,7 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
     // On Windows, `build_child_path` also prepends `%USERPROFILE%\.local\bin`
     // so Claude Code and similar per-user installs are discoverable even if
     // Codemux's own environment missed the installer's PATH broadcast.
-    if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
+    if let Some((shim_dir, current_exe)) = ensure_cli_shims() {
         let current_path = env::var("PATH").unwrap_or_default();
         let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
@@ -2162,7 +2106,7 @@ pub(crate) fn terminate_pty_session(
         None => {
             // Two causes, both benign by the time we get here:
             //   1. The spawn path fails loudly if `process_id()` returns
-            //      None (see `spawn_pty_for_session` / `spawn_pty_for_agent`),
+            //      None (see `spawn_pty_for_session`),
             //      so a live session cannot reach this branch with
             //      child_pid=None.
             //   2. The waiter thread can transiently re-insert a phantom
@@ -2963,88 +2907,6 @@ pub fn clear_agent_status<R: Runtime>(session_id: String, app_state: State<'_, A
     }
 }
 
-/// Spawn a PTY for an OpenFlow agent terminal session.
-///
-/// Unlike `spawn_pty_for_session` (which launches the user's default shell),
-/// this function runs a specific command (e.g. `opencode`) with extra
-/// environment variables injected for the agent role, run ID, and communication
-/// log path.
-///
-/// `argv` must be non-empty; the first element is the executable and the rest
-/// are arguments.  `extra_env` is a list of `(key, value)` pairs that will be
-/// set on the spawned process on top of the normal Codemux env vars.
-pub fn spawn_pty_for_agent<R: Runtime>(
-    app: AppHandle<R>,
-    session_id: String,
-    workspace_id: String,
-    argv: Vec<String>,
-    extra_env: Vec<(String, String)>,
-    execution_policy: crate::execution::ExecutionPolicy,
-) {
-    // Persistent path: the agent runs inside `codemux pty-daemon` so it
-    // survives this process exiting. Same graceful-fallback contract as
-    // the shell path — any daemon error silently drops back to
-    // in-process spawn so the user always gets a working agent.
-    #[cfg(unix)]
-    if daemon_path_viable() {
-        let app_for_daemon = app.clone();
-        let session_id_for_daemon = session_id.clone();
-        let workspace_id_for_daemon = workspace_id.clone();
-        let argv_for_daemon = argv.clone();
-        let extra_env_for_daemon = extra_env.clone();
-        let execution_policy_for_daemon = execution_policy.clone();
-        tauri::async_runtime::spawn(async move {
-            match daemon_backed::spawn_pty_for_agent_via_daemon(
-                app_for_daemon.clone(),
-                session_id_for_daemon.clone(),
-                workspace_id_for_daemon,
-                argv_for_daemon,
-                extra_env_for_daemon,
-                execution_policy_for_daemon,
-            )
-            .await
-            {
-                Ok(()) => {}
-                Err(error) => {
-                    eprintln!(
-                        "[codemux::terminal] persistent-agent path failed for session \
-                         {session_id_for_daemon}: {error}; falling back to in-process spawn"
-                    );
-                    // Re-enter the function on a non-tokio context so the
-                    // original sync spawn path runs. We re-call ourselves;
-                    // the recursion is bounded because we won't re-enter
-                    // this `if` branch on the fallback (we cleared the
-                    // setting? no — we just rely on the reservation
-                    // already being cleared and try again sync). The
-                    // simplest safe fallback: call the legacy spawn
-                    // helper from a blocking task.
-                    let app2 = app_for_daemon.clone();
-                    let sid2 = session_id_for_daemon.clone();
-                    let ws2 = workspace_id.clone();
-                    let argv2 = argv.clone();
-                    let env2 = extra_env.clone();
-                    let pol2 = execution_policy.clone();
-                    tauri::async_runtime::spawn_blocking(move || {
-                        spawn_pty_for_agent_in_process(
-                            app2, sid2, ws2, argv2, env2, pol2,
-                        );
-                    });
-                }
-            }
-        });
-        return;
-    }
-
-    spawn_pty_for_agent_in_process(
-        app,
-        session_id,
-        workspace_id,
-        argv,
-        extra_env,
-        execution_policy,
-    );
-}
-
 /// Decide whether to try the persistent-PTY-daemon path for this spawn.
 ///
 /// Default app behavior: **always try the daemon first**. The only reasons
@@ -3079,528 +2941,6 @@ fn daemon_path_viable() -> bool {
     {
         !crate::pty_daemon::supervisor::circuit_is_open()
     }
-}
-
-/// In-process PTY spawn — the original behavior. Renamed so the public
-/// `spawn_pty_for_agent` can choose between this and the daemon-backed
-/// path based on settings.
-fn spawn_pty_for_agent_in_process<R: Runtime>(
-    app: AppHandle<R>,
-    session_id: String,
-    workspace_id: String,
-    argv: Vec<String>,
-    extra_env: Vec<(String, String)>,
-    execution_policy: crate::execution::ExecutionPolicy,
-) {
-    let terminal_state: State<'_, PtyState> = app.state();
-    let app_state: State<'_, AppStateStore> = app.state();
-    let agent_store: State<'_, crate::openflow::AgentSessionStore> = app.state();
-    let sessions = terminal_state.sessions.clone();
-    let agent_store_inner = agent_store.clone_inner();
-
-    // Atomic spawn reservation — see `spawn_pty_for_session` for the
-    // TOCTOU-race rationale. Same lock-held placeholder pattern.
-    if !try_reserve_session_spawn(&sessions, &session_id) {
-        return;
-    }
-
-    let executable = match argv.first() {
-        Some(e) => e.clone(),
-        None => {
-            emit_terminal_status(
-                &app,
-                &sessions,
-                TerminalStatusPayload {
-                    session_id: session_id.clone(),
-                    state: TerminalLifecycleState::Failed,
-                    message: Some("Agent spawn failed: empty argv".into()),
-                    exit_code: None,
-                },
-            );
-            // Drop the spawn reservation so a future retry can re-try.
-            remove_session_runtime(&sessions, &session_id);
-            return;
-        }
-    };
-
-    let prepared = crate::execution::prepare_agent_command(
-        executable.clone(),
-        argv.iter().skip(1).cloned().collect(),
-        &session_working_dir(&app_state, &session_id),
-        &execution_policy,
-    );
-
-    emit_terminal_status(
-        &app,
-        &sessions,
-        TerminalStatusPayload {
-            session_id: session_id.clone(),
-            state: TerminalLifecycleState::Starting,
-            message: Some(format!(
-                "Starting agent: {} [{}]",
-                prepared.executable,
-                match prepared.backend {
-                    crate::execution::ExecutionBackendKind::HostPassthrough => "host_passthrough",
-                    crate::execution::ExecutionBackendKind::LinuxBubblewrap => "linux_bubblewrap",
-                    crate::execution::ExecutionBackendKind::MacOsSandbox => "macos_sandbox",
-                    crate::execution::ExecutionBackendKind::WindowsRestricted =>
-                        "windows_restricted",
-                }
-            )),
-            exit_code: None,
-        },
-    );
-
-    let pty_system = native_pty_system();
-    let pty_pair = match pty_system.openpty(PtySize {
-        rows: DEFAULT_ROWS,
-        cols: DEFAULT_COLS,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(pair) => pair,
-        Err(error) => {
-            emit_terminal_status(
-                &app,
-                &sessions,
-                TerminalStatusPayload {
-                    session_id: session_id.clone(),
-                    state: TerminalLifecycleState::Failed,
-                    message: Some(format!("Failed to open PTY for agent: {error}")),
-                    exit_code: None,
-                },
-            );
-            // Drop the spawn reservation so a future retry can re-try.
-            remove_session_runtime(&sessions, &session_id);
-            return;
-        }
-    };
-
-    app_state.update_terminal_session_shell(&session_id, executable.clone());
-
-    let cwd = session_working_dir(&app_state, &session_id);
-    let mut cmd = CommandBuilder::new(&prepared.executable);
-    for arg in &prepared.args {
-        cmd.arg(arg);
-    }
-    cmd.cwd(cwd);
-
-    // Declare terminal capabilities (see spawn_pty_for_session for rationale).
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "codemux");
-    cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
-
-    // Standard Codemux env vars.
-    cmd.env("CODEMUX", "1");
-    cmd.env("CODEMUX_VERSION", env!("CARGO_PKG_VERSION"));
-    cmd.env("CODEMUX_WORKSPACE_ID", &workspace_id);
-    cmd.env("CODEMUX_SURFACE_ID", &session_id);
-    cmd.env("CODEMUX_BROWSER_CMD", "codemux browser");
-    cmd.env("BROWSER", "codemux browser open");
-
-    // Worktree environment variables and dynamic agent context
-    {
-        let ws_snapshot = app_state.snapshot();
-        if let Some(ws) = ws_snapshot
-            .workspaces
-            .iter()
-            .find(|w| w.workspace_id.0 == workspace_id)
-        {
-            for (key, val) in workspace_pty_env(ws) {
-                cmd.env(&key, val);
-            }
-        } else {
-            cmd.env(
-                "CODEMUX_AGENT_CONTEXT",
-                crate::agent_context::build_agent_context(None, None, None, None),
-            );
-        }
-    }
-
-    if let Some((shim_dir, current_exe)) = ensure_openflow_cli_shims() {
-        let current_path = env::var("PATH").unwrap_or_default();
-        let prefixed_path = build_child_path(&shim_dir, &current_path);
-        cmd.env("PATH", prefixed_path);
-        cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
-    }
-
-    // Agent-specific env vars from the adapter.
-    for (key, val) in &extra_env {
-        cmd.env(key, val);
-    }
-
-    // This is wiring for the future sandbox backend selection. For now we pass
-    // the intent through env so agent-side tooling and logs can see which
-    // execution profile was selected, even before platform sandboxes are active.
-    cmd.env(
-        "CODEMUX_EXECUTION_BACKEND",
-        match prepared.backend {
-            crate::execution::ExecutionBackendKind::HostPassthrough => "host_passthrough",
-            crate::execution::ExecutionBackendKind::LinuxBubblewrap => "linux_bubblewrap",
-            crate::execution::ExecutionBackendKind::MacOsSandbox => "macos_sandbox",
-            crate::execution::ExecutionBackendKind::WindowsRestricted => "windows_restricted",
-        },
-    );
-    cmd.env(
-        "CODEMUX_ALLOW_DESKTOP_GUI",
-        if execution_policy.allow_desktop_gui {
-            "1"
-        } else {
-            "0"
-        },
-    );
-    cmd.env(
-        "CODEMUX_ALLOW_BROWSER_AUTOMATION",
-        if execution_policy.allow_browser_automation {
-            "1"
-        } else {
-            "0"
-        },
-    );
-    cmd.env(
-        "CODEMUX_ALLOW_NETWORK",
-        if execution_policy.allow_network {
-            "1"
-        } else {
-            "0"
-        },
-    );
-
-    // Phase 1 display-isolation: authoritative env-strip. On the bwrap branch
-    // this list is empty (bwrap handles it via `--unsetenv`). On every other
-    // branch — macOS/Windows stubs, bwrap-missing fallback, HostPassthrough —
-    // when the policy says `allow_desktop_gui=false` the GUI env keys live
-    // here and we remove them AFTER every `cmd.env(...)` call above (including
-    // the `extra_env` merge). This is the guarantee that OpenFlow agents on
-    // macOS/Windows finally get their `allow_desktop_gui: false` respected
-    // instead of being an advisory flag.
-    for key in &prepared.env_unset {
-        cmd.env_remove(key);
-    }
-    for (key, val) in &prepared.env_set {
-        cmd.env(key, val);
-    }
-
-    // Renderer transport flags are an app-process concern only.
-    strip_renderer_env(&mut cmd);
-
-    let child = match pty_pair.slave.spawn_command(cmd) {
-        Ok(child) => child,
-        Err(error) => {
-            emit_terminal_status(
-                &app,
-                &sessions,
-                TerminalStatusPayload {
-                    session_id: session_id.clone(),
-                    state: TerminalLifecycleState::Failed,
-                    message: Some(format!("Failed to spawn agent {executable}: {error}")),
-                    exit_code: None,
-                },
-            );
-            // Drop the spawn reservation so a future retry can re-try.
-            remove_session_runtime(&sessions, &session_id);
-            return;
-        }
-    };
-
-    let guard = ChildGuard::new(child);
-
-    // A session without a PID is unkillable — fail loudly rather than
-    // leak. The guard will kill the child on drop during the early return.
-    let child_pid = match guard.child.as_ref().and_then(|c| c.process_id()) {
-        Some(pid) => pid,
-        None => {
-            emit_terminal_status(
-                &app,
-                &sessions,
-                TerminalStatusPayload {
-                    session_id: session_id.clone(),
-                    state: TerminalLifecycleState::Failed,
-                    message: Some(
-                        "portable_pty returned an agent child with no process_id(); \
-                         refusing to start an unkillable session"
-                            .into(),
-                    ),
-                    exit_code: None,
-                },
-            );
-            remove_session_runtime(&sessions, &session_id);
-            return; // guard drops here, kills+waits on child
-        }
-    };
-
-    drop(pty_pair.slave);
-
-    let mut reader = match pty_pair.master.try_clone_reader() {
-        Ok(r) => r,
-        Err(error) => {
-            emit_terminal_status(
-                &app,
-                &sessions,
-                TerminalStatusPayload {
-                    session_id: session_id.clone(),
-                    state: TerminalLifecycleState::Failed,
-                    message: Some(format!("Failed to clone PTY reader for agent: {error}")),
-                    exit_code: None,
-                },
-            );
-            remove_session_runtime(&sessions, &session_id);
-            return; // guard drops here, kills+waits on child
-        }
-    };
-
-    let writer = match pty_pair.master.take_writer() {
-        Ok(w) => w,
-        Err(error) => {
-            emit_terminal_status(
-                &app,
-                &sessions,
-                TerminalStatusPayload {
-                    session_id: session_id.clone(),
-                    state: TerminalLifecycleState::Failed,
-                    message: Some(format!("Failed to take PTY writer for agent: {error}")),
-                    exit_code: None,
-                },
-            );
-            remove_session_runtime(&sessions, &session_id);
-            return; // guard drops here, kills+waits on child
-        }
-    };
-
-    let mut child = guard.disarm();
-
-    #[cfg(unix)]
-    let poll_fd: PollFd = pty_pair.master.as_raw_fd().unwrap_or(-1);
-    #[cfg(windows)]
-    let poll_fd: PollFd = ();
-
-    // Share the back-pressure flag with the reader thread (see the same
-    // pattern in `spawn_pty_for_session_in_process`).
-    let flow_paused = with_session_runtime(
-        &sessions,
-        &session_id,
-        || SessionRuntime::new(&session_id),
-        |runtime| {
-            runtime.writer = Some(writer);
-            runtime.master = Some(pty_pair.master);
-            runtime.child_pid = Some(child_pid);
-            runtime.flow_paused.store(false, Ordering::Relaxed);
-            // Spawn complete — clear the reservation marker. See the same
-            // pattern at the end of `spawn_pty_for_session`.
-            runtime.is_spawning = false;
-            runtime.flow_paused.clone()
-        },
-    );
-
-    emit_terminal_status(
-        &app,
-        &sessions,
-        TerminalStatusPayload {
-            session_id: session_id.clone(),
-            state: TerminalLifecycleState::Ready,
-            message: Some(format!("Agent ready: {executable}")),
-            exit_code: None,
-        },
-    );
-
-    // Get communication log path from env vars
-    let comm_log_path = extra_env
-        .iter()
-        .find(|(k, _)| k == "CODEMUX_COMMUNICATION_LOG")
-        .map(|(_, v)| v.clone());
-    // Prefer instance-specific ID (e.g. "builder-0") over bare role ("builder") so that
-    // parallel agents of the same role are distinguishable in the comm log.
-    let agent_role = extra_env
-        .iter()
-        .find(|(k, _)| k == "CODEMUX_AGENT_INSTANCE_ID")
-        .or_else(|| extra_env.iter().find(|(k, _)| k == "CODEMUX_AGENT_ROLE"))
-        .map(|(_, v)| v.clone());
-
-    const COMM_LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(500);
-    const COMM_LOG_FLUSH_BATCH_SIZE: usize = 50;
-
-    let read_sessions = sessions.clone();
-    let read_session_id = session_id.clone();
-    let read_flow_paused = flow_paused;
-    let log_lock_opt: Option<(Arc<Mutex<std::fs::File>>, String)> =
-        match (comm_log_path.as_ref(), agent_role.as_ref()) {
-            (Some(path), Some(role)) => Some((get_comm_log_lock(path), role.clone())),
-            _ => None,
-        };
-
-    std::thread::spawn(move || {
-        let mut comm_log_buffer: Vec<String> = Vec::new();
-        let mut comm_last_flush = Instant::now();
-
-        batched_reader_loop(
-            &mut reader,
-            poll_fd,
-            &read_sessions,
-            &read_session_id,
-            &read_flow_paused,
-            |data| {
-                // Buffer agent output for communication log (cleaned); flush periodically
-                if let Some((ref log_lock, ref role)) = log_lock_opt {
-                    if let Some(entry) = comm_log_entry_for_chunk(role, data) {
-                        comm_log_buffer.push(entry);
-                        if comm_log_buffer.len() >= COMM_LOG_FLUSH_BATCH_SIZE
-                            || comm_last_flush.elapsed() >= COMM_LOG_FLUSH_INTERVAL
-                        {
-                            if let Ok(mut file) = log_lock.lock() {
-                                for e in &comm_log_buffer {
-                                    let _ = file.write_all(e.as_bytes());
-                                }
-                                let _ = file.flush();
-                            }
-                            comm_log_buffer.clear();
-                            comm_last_flush = Instant::now();
-                        }
-                    }
-                }
-            },
-        );
-
-        // Flush any remaining comm log entries
-        if let Some((ref log_lock, _)) = log_lock_opt {
-            if !comm_log_buffer.is_empty() {
-                if let Ok(mut file) = log_lock.lock() {
-                    for e in &comm_log_buffer {
-                        let _ = file.write_all(e.as_bytes());
-                    }
-                    let _ = file.flush();
-                }
-            }
-        }
-    });
-
-    let wait_app = app.clone();
-    let wait_sessions = sessions.clone();
-    let wait_session_id = session_id.clone();
-    let wait_agent_store = agent_store_inner.clone();
-
-    fn decode_exit_status(exit_code: i32) -> (crate::openflow::agent::AgentSessionStatus, String) {
-        match exit_code {
-            0 => (
-                crate::openflow::agent::AgentSessionStatus::Done,
-                "Agent exited successfully".to_string(),
-            ),
-            1..=125 => (
-                crate::openflow::agent::AgentSessionStatus::Failed,
-                format!("Agent exited with code {}", exit_code),
-            ),
-            126 => (
-                crate::openflow::agent::AgentSessionStatus::Failed,
-                "Command not executable (permission denied or not executable)".to_string(),
-            ),
-            127 => (
-                crate::openflow::agent::AgentSessionStatus::Failed,
-                "Command not found".to_string(),
-            ),
-            128..=255 => {
-                let signal = exit_code - 128;
-                let signal_name = match signal {
-                    1 => "SIGHUP",
-                    2 => "SIGINT",
-                    3 => "SIGQUIT",
-                    4 => "SIGILL",
-                    5 => "SIGTRAP",
-                    6 => "SIGABRT",
-                    7 => "SIGBUS",
-                    8 => "SIGFPE",
-                    9 => "SIGKILL",
-                    10 => "SIGUSR1",
-                    11 => "SIGSEGV",
-                    12 => "SIGUSR2",
-                    13 => "SIGPIPE",
-                    14 => "SIGALRM",
-                    15 => "SIGTERM",
-                    16 => "SIGSTKFLT",
-                    17 => "SIGCHLD",
-                    18 => "SIGCONT",
-                    19 => "SIGSTOP",
-                    20 => "SIGTSTP",
-                    21 => "SIGTTIN",
-                    22 => "SIGTTOU",
-                    23 => "SIGURG",
-                    24 => "SIGXCPU",
-                    25 => "SIGXFSZ",
-                    26 => "SIGVTALRM",
-                    27 => "SIGPROF",
-                    28 => "SIGWINCH",
-                    29 => "SIGIO",
-                    30 => "SIGPWR",
-                    31 => "SIGSYS",
-                    _ => "UNKNOWN",
-                };
-                let reason = if signal == 9 {
-                    "SIGKILL (likely OOM or explicit kill -9)".to_string()
-                } else if signal == 15 {
-                    "SIGTERM (terminated by signal)".to_string()
-                } else {
-                    format!("killed by signal {} ({})", signal, signal_name)
-                };
-                (crate::openflow::agent::AgentSessionStatus::Killed, reason)
-            }
-            _ => (
-                crate::openflow::agent::AgentSessionStatus::Failed,
-                format!("Agent exited with unexpected code {}", exit_code),
-            ),
-        }
-    }
-
-    std::thread::spawn(move || {
-        let payload = match child.wait() {
-            Ok(status) => {
-                let (decoded_status, decoded_msg) = decode_exit_status(status.exit_code() as i32);
-                if let Some(entry) = wait_agent_store
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_mut(&wait_session_id)
-                {
-                    entry.status = decoded_status;
-                }
-                TerminalStatusPayload {
-                    session_id: wait_session_id.clone(),
-                    state: TerminalLifecycleState::Exited,
-                    message: Some(decoded_msg),
-                    exit_code: Some(status.exit_code()),
-                }
-            }
-            Err(error) => {
-                if let Some(entry) = wait_agent_store
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get_mut(&wait_session_id)
-                {
-                    entry.status = crate::openflow::agent::AgentSessionStatus::Failed;
-                }
-                TerminalStatusPayload {
-                    session_id: wait_session_id.clone(),
-                    state: TerminalLifecycleState::Failed,
-                    message: Some(format!("Failed to wait for agent: {error}")),
-                    exit_code: None,
-                }
-            }
-        };
-
-        crate::diagnostics::openflow_breadcrumb(&format!(
-            "agent_exited session_id={} state={:?}",
-            wait_session_id, payload.state
-        ));
-
-        // Send terminal reset sequences to xterm.js before tearing down.
-        const TERMINAL_RESET: &[u8] =
-            b"\x1b[?1049l\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?25h\x1b[0m";
-        queue_or_send_output(&wait_sessions, &wait_session_id, TERMINAL_RESET.to_vec());
-
-        emit_terminal_status(&wait_app, &wait_sessions, payload);
-
-        // Clean up the session runtime to prevent memory leak
-        remove_session_runtime(&wait_sessions, &wait_session_id);
-
-        state::emit_app_state(&wait_app);
-    });
 }
 
 #[cfg(test)]
@@ -3699,29 +3039,6 @@ mod tests {
     }
 
     #[test]
-    fn comm_log_entry_formats_and_filters() {
-        // Real agent output → a tagged, timestamped line.
-        let entry = comm_log_entry_for_chunk("builder-0", b"Implementing the parser\n")
-            .expect("real output should log");
-        assert!(entry.contains("[BUILDER-0]"), "role is upper-cased + tagged: {entry}");
-        assert!(entry.contains("Implementing the parser"));
-        assert!(entry.ends_with('\n'));
-
-        // Noise is dropped: empty / too-short / ANSI-only / known spinners /
-        // block-glyph redraws.
-        assert!(comm_log_entry_for_chunk("b", b"").is_none());
-        assert!(comm_log_entry_for_chunk("b", b"ok").is_none(), "<=2 chars");
-        assert!(comm_log_entry_for_chunk("b", b"\x1b[2J\x1b[H").is_none(), "ansi-only");
-        assert!(
-            comm_log_entry_for_chunk("b", "\u{2588}\u{2588}\u{2580}".as_bytes()).is_none(),
-            "block-glyph redraw"
-        );
-        assert!(
-            comm_log_entry_for_chunk("b", b"No orchestration progress detected yet").is_none(),
-        );
-    }
-
-    #[test]
     fn migrating_state_serializes_to_migrating_discriminant() {
         // The frontend overlay (TerminalStatusPayload union in types.ts) keys
         // off this exact string. If the snake_case rename ever drifts, the
@@ -3755,8 +3072,6 @@ mod tests {
         assert_eq!(strip_ansi_codes("\x1b[2J\x1b[Hhello"), "hello");
         assert_eq!(strip_ansi_codes("\x1b(Bplain"), "plain");
         assert_eq!(strip_ansi_codes("\x1bcreset"), "reset");
-        // A pure title escape is noise, exactly like the CSI-only case.
-        assert!(comm_log_entry_for_chunk("b", b"\x1b]0;bash\x07").is_none());
     }
 
     // ── Regression tests for the cross-machine push spawn bugs ────────
@@ -3988,7 +3303,7 @@ mod tests {
     // ── build_child_path + Windows user-local-bin tests ──────────────
     //
     // `build_child_path` is the cross-platform wrapper used by both
-    // `spawn_pty_for_session` and `spawn_pty_for_agent`. On Unix it's
+    // `spawn_pty_for_session`. On Unix it's
     // a pass-through to `prepend_shim_to_path`. On Windows it *also*
     // prepends `%USERPROFILE%\.local\bin` so Claude Code (installed
     // via `irm claude.ai/install.ps1 | iex`) and similar per-user

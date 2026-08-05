@@ -36,6 +36,9 @@ use codemux_lib::agent_provider::{
     ProviderRuntimeEvent, RequestId, SendTurnInput, SessionStatus, StartSessionInput,
     SubagentStatus, ThreadId, TurnId, TurnStatus,
 };
+use codemux_lib::skills::{
+    ResolvedSkillInvocation, SkillInvocationKind, SkillProvider, SkillScope,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -208,15 +211,17 @@ async fn starts_session_and_reports_ready() {
         evs
     });
 
-    let session = start_session_resilient(&provider, start_input("t-ready")).await.unwrap();
+    let session = start_session_resilient(&provider, start_input("t-ready"))
+        .await
+        .unwrap();
     assert_eq!(session.thread_id.0, "t-ready");
     assert!(matches!(session.status, SessionStatus::Ready));
+    assert_eq!(session.resume_cursor, Some(json!({"threadId": "c-1"})));
 
     let events = handle.await.unwrap();
-    assert!(events.iter().any(|e| matches!(
-        e,
-        ProviderRuntimeEvent::SessionConfigured { .. }
-    )));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, ProviderRuntimeEvent::SessionConfigured { .. })));
     provider.stop_session(ThreadId("t-ready".into())).await.ok();
 }
 
@@ -243,11 +248,11 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
          "method":"turn/completed",
          "params":{"threadId":"c-1","turnId":"t-scripted","status":"succeeded"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-seq")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-seq"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
 
     provider
@@ -259,6 +264,8 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -300,6 +307,53 @@ async fn send_turn_emits_turn_started_then_delta_then_completed() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn send_turn_emits_structured_skill_item_on_the_wire() {
+    let capture_dir = tempfile::tempdir().unwrap();
+    let capture_path = capture_dir.path().join("turn.json");
+    let capture_path_string = capture_path.to_string_lossy().to_string();
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_CAPTURE_TURN", &capture_path_string)]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    start_session_resilient(&provider, start_input("t-skill"))
+        .await
+        .unwrap();
+
+    provider
+        .send_turn(SendTurnInput {
+            thread_id: ThreadId("t-skill".into()),
+            text: "review this".into(),
+            images: vec![],
+            model_override: None,
+            effort_override: None,
+            permission_mode_override: None,
+            client_nonce: None,
+            display_text: Some("/review review this".into()),
+            skill_invocations: vec![ResolvedSkillInvocation {
+                skill_id: "review-id".into(),
+                name: "review".into(),
+                source_provider: SkillProvider::Codex,
+                source_scope: SkillScope::Project,
+                base_dir: Some("/repo/.agents/skills/review".into()),
+                path: Some("/repo/.agents/skills/review/SKILL.md".into()),
+                body: Some("Review carefully.".into()),
+                invocation: SkillInvocationKind::CodexSkillItem,
+            }],
+        })
+        .await
+        .unwrap();
+
+    let captured: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&capture_path).unwrap()).unwrap();
+    assert!(captured["input"].as_array().unwrap().iter().any(|item| {
+        item == &json!({
+            "type": "skill",
+            "name": "review",
+            "path": "/repo/.agents/skills/review/SKILL.md"
+        })
+    }));
+    provider.stop_session(ThreadId("t-skill".into())).await.ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn thread_resume_with_recoverable_error_falls_back_to_start() {
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_FAIL_RESUME", "1")]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
@@ -325,7 +379,43 @@ async fn thread_resume_with_recoverable_error_falls_back_to_start() {
     .await;
     assert!(collect.is_ok(), "timed out waiting for warning");
     assert!(saw_warning, "expected fallback warning");
-    provider.stop_session(ThreadId("t-resume".into())).await.ok();
+    provider
+        .stop_session(ThreadId("t-resume".into()))
+        .await
+        .ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persisted_resume_cursor_reaches_codex_thread_resume() {
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_FAIL_RESUME", "1")]);
+    let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
+    let mut stream = provider.event_stream();
+
+    let mut input = start_input("t-persisted-resume");
+    input.resume_cursor = Some(json!({"resume":"stored-codex-thread"}));
+    let session = start_session_resilient(&provider, input).await.unwrap();
+    assert!(matches!(session.status, SessionStatus::Ready));
+
+    // The fake server emits this warning only if the generic persisted cursor
+    // was translated into a real thread/resume request before fresh fallback.
+    let mut saw_warning = false;
+    let collect = timeout(Duration::from_secs(3), async {
+        while let Some(ev) = stream.next().await {
+            if let ProviderRuntimeEvent::RuntimeWarning { message, .. } = &ev {
+                if message.contains("thread/resume") && message.contains("fall") {
+                    saw_warning = true;
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(collect.is_ok(), "timed out waiting for warning");
+    assert!(saw_warning, "persisted cursor did not reach thread/resume");
+    provider
+        .stop_session(ThreadId("t-persisted-resume".into()))
+        .await
+        .ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -337,11 +427,11 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
          "method":"turn/completed",
          "params":{"threadId":"c-1","turnId":"t-u","status":"succeeded"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-unk")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-unk"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -352,6 +442,8 @@ async fn unknown_notification_surfaces_as_runtime_warning() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -384,11 +476,11 @@ async fn command_approval_request_roundtrip() {
          "method":"item/commandExecution/requestApproval",
          "params":{"turnId":"t-ap","cmd":"ls"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-ap")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-ap"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -399,6 +491,8 @@ async fn command_approval_request_roundtrip() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -441,11 +535,11 @@ async fn command_approval_deny_roundtrip() {
          "method":"item/commandExecution/requestApproval",
          "params":{"turnId":"t-deny","cmd":"rm -rf /"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-deny")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-deny"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -456,6 +550,8 @@ async fn command_approval_deny_roundtrip() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -463,7 +559,10 @@ async fn command_approval_deny_roundtrip() {
     let mut request_id: Option<RequestId> = None;
     let _ = timeout(Duration::from_secs(3), async {
         while let Some(ev) = stream.next().await {
-            if let ProviderRuntimeEvent::RequestOpened { request_id: rid, .. } = ev {
+            if let ProviderRuntimeEvent::RequestOpened {
+                request_id: rid, ..
+            } = ev
+            {
                 request_id = Some(rid);
                 break;
             }
@@ -490,11 +589,11 @@ async fn interrupt_turn_sends_turn_interrupt() {
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
          "params":{"threadId":"c-1","turnId":"t-int-1"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-int")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-int"))
+        .await
+        .unwrap();
     let res = provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-int".into()),
@@ -504,6 +603,8 @@ async fn interrupt_turn_sends_turn_interrupt() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -525,11 +626,11 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
          "params":{"threadId":"c-1","turnId":"t-active"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-mm")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-mm"))
+        .await
+        .unwrap();
     provider
         .send_turn(SendTurnInput {
             thread_id: ThreadId("t-mm".into()),
@@ -539,6 +640,8 @@ async fn interrupt_turn_with_wrong_turn_id_fails_validation() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -575,7 +678,9 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
     ]));
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-ta")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-ta"))
+        .await
+        .unwrap();
     assert!(
         !provider.turn_active(&ThreadId("t-ta".into())).await,
         "no turn yet => false"
@@ -589,6 +694,8 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -613,14 +720,19 @@ async fn turn_active_true_in_flight_then_false_after_settle() {
         }
     })
     .await;
-    assert!(settled.is_ok(), "turn_active must return to false after settle");
+    assert!(
+        settled.is_ok(),
+        "turn_active must return to false after settle"
+    );
     provider.stop_session(ThreadId("t-ta".into())).await.ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_permission_mode_returns_validation_error() {
     let provider = provider_with_fixture();
-    start_session_resilient(&provider, start_input("t-perm")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-perm"))
+        .await
+        .unwrap();
     let err = provider
         .set_permission_mode(ThreadId("t-perm".into()), "acceptEdits".into())
         .await
@@ -632,7 +744,9 @@ async fn set_permission_mode_returns_validation_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn set_model_updates_session_state() {
     let provider = provider_with_fixture();
-    start_session_resilient(&provider, start_input("t-model")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-model"))
+        .await
+        .unwrap();
     provider
         .set_model(ThreadId("t-model".into()), "opus-4-7".into())
         .await
@@ -648,6 +762,8 @@ async fn set_model_updates_session_state() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -657,7 +773,9 @@ async fn set_model_updates_session_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_session_removes_from_list_and_closes_child() {
     let provider = provider_with_fixture();
-    start_session_resilient(&provider, start_input("t-close")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-close"))
+        .await
+        .unwrap();
     assert_eq!(provider.list_sessions().await.unwrap().len(), 1);
     provider
         .stop_session(ThreadId("t-close".into()))
@@ -669,8 +787,13 @@ async fn stop_session_removes_from_list_and_closes_child() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_session_is_idempotent() {
     let provider = provider_with_fixture();
-    start_session_resilient(&provider, start_input("t-idem")).await.unwrap();
-    provider.stop_session(ThreadId("t-idem".into())).await.unwrap();
+    start_session_resilient(&provider, start_input("t-idem"))
+        .await
+        .unwrap();
+    provider
+        .stop_session(ThreadId("t-idem".into()))
+        .await
+        .unwrap();
     let err = provider
         .stop_session(ThreadId("t-idem".into()))
         .await
@@ -690,6 +813,8 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap_err();
@@ -699,8 +824,12 @@ async fn send_turn_on_nonexistent_thread_returns_session_not_found() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn duplicate_start_session_returns_validation_error() {
     let provider = provider_with_fixture();
-    start_session_resilient(&provider, start_input("t-dup")).await.unwrap();
-    let err = start_session_resilient(&provider, start_input("t-dup")).await.unwrap_err();
+    start_session_resilient(&provider, start_input("t-dup"))
+        .await
+        .unwrap();
+    let err = start_session_resilient(&provider, start_input("t-dup"))
+        .await
+        .unwrap_err();
     assert!(matches!(err, ProviderError::ValidationError { .. }));
     provider.stop_session(ThreadId("t-dup".into())).await.ok();
 }
@@ -711,7 +840,9 @@ async fn child_process_crash_emits_error_state() {
     // acknowledged.
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_EXIT_AFTER", "turn/start")]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-crash")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-crash"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     // turn/start succeeds, then the fixture exits. The Ok is guaranteed by
     // JsonRpcChild's exit-drain: the fixture writes the response BEFORE
@@ -728,6 +859,8 @@ async fn child_process_crash_emits_error_state() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -779,7 +912,10 @@ async fn dead_child_is_evicted_and_start_session_rebuilds() {
     start_session_resilient(&provider, start_input("t-evict"))
         .await
         .unwrap();
-    assert!(provider.has_session(&thread).await, "session live after start");
+    assert!(
+        provider.has_session(&thread).await,
+        "session live after start"
+    );
     // Deterministically Ok — the fixture answers turn/start before exiting
     // and JsonRpcChild's exit-drain routes that response (see
     // `child_process_crash_emits_error_state`).
@@ -792,6 +928,8 @@ async fn dead_child_is_evicted_and_start_session_rebuilds() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .expect("send_turn must succeed: the response is written before the exit");
@@ -821,11 +959,11 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
          "params":{"threadId":"c-1","turnId":"t-busy"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-busy")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-busy"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     let first = provider
         .send_turn(SendTurnInput {
@@ -836,6 +974,8 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -850,6 +990,8 @@ async fn concurrent_send_turn_queues_instead_of_erroring() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: Some("nonce-2".into()),
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -886,9 +1028,7 @@ async fn cancel_queued_turn_removes_it_codex() {
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/started",
          "params":{"threadId":"c-1","turnId":"t-cq"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
     start_session_resilient(&provider, start_input("t-cq"))
         .await
@@ -903,6 +1043,8 @@ async fn cancel_queued_turn_removes_it_codex() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -916,6 +1058,8 @@ async fn cancel_queued_turn_removes_it_codex() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap()
@@ -962,7 +1106,10 @@ async fn multiple_concurrent_sessions_are_isolated() {
         assert!(ids.contains(&format!("t-iso-{i}")));
     }
     for i in 0..3 {
-        provider.stop_session(ThreadId(format!("t-iso-{i}"))).await.ok();
+        provider
+            .stop_session(ThreadId(format!("t-iso-{i}")))
+            .await
+            .ok();
     }
 }
 
@@ -971,7 +1118,9 @@ async fn event_stream_subscribers_each_receive_events() {
     let provider = provider_with_fixture();
     let mut a = provider.event_stream();
     let mut b = provider.event_stream();
-    start_session_resilient(&provider, start_input("t-sub")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-sub"))
+        .await
+        .unwrap();
     let got_a = timeout(Duration::from_secs(2), a.next()).await.unwrap();
     let got_b = timeout(Duration::from_secs(2), b.next()).await.unwrap();
     assert!(got_a.is_some());
@@ -982,7 +1131,9 @@ async fn event_stream_subscribers_each_receive_events() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn late_subscriber_does_not_get_old_events() {
     let provider = provider_with_fixture();
-    start_session_resilient(&provider, start_input("t-late")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-late"))
+        .await
+        .unwrap();
     // Wait for the first burst of events to pass.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -999,11 +1150,11 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
         {"after":"turn/start","delay_ms":5,"emit":"notification","method":"turn/completed",
          "params":{"threadId":"c-1","turnId":"t-fail","status":"failed","error":"oops"}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-fail")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-fail"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -1014,6 +1165,8 @@ async fn translate_turn_completed_error_emits_both_events_end_to_end() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -1061,7 +1214,9 @@ async fn thread_token_usage_reaches_the_event_stream_end_to_end() {
     ]));
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-usage")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-usage"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -1072,6 +1227,8 @@ async fn thread_token_usage_reaches_the_event_stream_end_to_end() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -1221,6 +1378,8 @@ async fn bogus_response_to_unknown_jsonrpc_id_does_not_crash_adapter() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -1230,7 +1389,9 @@ async fn bogus_response_to_unknown_jsonrpc_id_does_not_crash_adapter() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_provider_shuts_down_sessions() {
     let provider = provider_with_fixture();
-    start_session_resilient(&provider, start_input("t-drop")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-drop"))
+        .await
+        .unwrap();
     let sessions = provider.list_sessions().await.unwrap();
     assert_eq!(sessions.len(), 1);
     drop(provider);
@@ -1317,7 +1478,9 @@ async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter(
     ]));
     let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-sub")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-sub"))
+        .await
+        .unwrap();
     let mut stream = provider.event_stream();
     provider
         .send_turn(SendTurnInput {
@@ -1328,6 +1491,8 @@ async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter(
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
@@ -1369,13 +1534,9 @@ async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter(
                     }
                 }
                 ProviderRuntimeEvent::ItemCompleted {
-                    item,
-                    subagent_id,
-                    ..
+                    item, subagent_id, ..
                 } => match item {
-                    CompletedItem::AssistantText { text }
-                        if text == "child found the answer" =>
-                    {
+                    CompletedItem::AssistantText { text } if text == "child found the answer" => {
                         assert_eq!(
                             subagent_id.as_deref(),
                             Some("c-child"),
@@ -1421,10 +1582,19 @@ async fn subagent_lifecycle_spawn_child_thread_items_wait_flows_through_adapter(
         }
     })
     .await;
-    assert!(collected.is_ok(), "timed out waiting for subagent lifecycle events");
+    assert!(
+        collected.is_ok(),
+        "timed out waiting for subagent lifecycle events"
+    );
     assert!(saw_child_running, "missing Running SubagentUpdated");
-    assert!(saw_child_model, "missing model gpt-5.4 on a subagent snapshot");
-    assert!(saw_child_name, "missing nickname Explore from child thread/started");
+    assert!(
+        saw_child_model,
+        "missing model gpt-5.4 on a subagent snapshot"
+    );
+    assert!(
+        saw_child_name,
+        "missing nickname Explore from child thread/started"
+    );
     assert!(saw_child_activity, "missing agentsStates activity line");
     assert!(
         saw_child_completed_with_duration,
@@ -1459,11 +1629,11 @@ async fn shutdown_during_event_streaming_does_not_panic() {
          "method":"item/agentMessage/delta",
          "params":{"threadId":"c-1","turnId":"t-race","itemId":"i-r","delta":"."}}
     ]));
-    let wrapper = wrapper_with_env(&[
-        ("FAKE_CODEX_SCRIPT", &script.to_string_lossy()),
-    ]);
+    let wrapper = wrapper_with_env(&[("FAKE_CODEX_SCRIPT", &script.to_string_lossy())]);
     let provider = provider_with_fixture_and_binary(wrapper.to_path_buf());
-    start_session_resilient(&provider, start_input("t-race")).await.unwrap();
+    start_session_resilient(&provider, start_input("t-race"))
+        .await
+        .unwrap();
     // Start a turn that will emit events mid-flight, then stop quickly.
     provider
         .send_turn(SendTurnInput {
@@ -1474,10 +1644,15 @@ async fn shutdown_during_event_streaming_does_not_panic() {
             effort_override: None,
             permission_mode_override: None,
             client_nonce: None,
+            display_text: None,
+            skill_invocations: vec![],
         })
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(5)).await;
-    provider.stop_session(ThreadId("t-race".into())).await.unwrap();
+    provider
+        .stop_session(ThreadId("t-race".into()))
+        .await
+        .unwrap();
     // If we get here without panic, we're good.
 }

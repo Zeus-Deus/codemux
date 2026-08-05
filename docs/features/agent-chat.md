@@ -211,6 +211,30 @@ Fragment, relative, `mailto:`, `javascript:`, and other non-web links are left
 unchanged. The dev mock's rich transcript includes both GitHub and docs
 examples for visual verification.
 
+### Local screenshot links in chat
+
+Assistant and plan Markdown upgrades absolute local image destinations into a
+visual proof card. Both the form agents most often produce —
+`[Terminal screenshot](/absolute/path.png)` — and standard image syntax —
+`![Terminal screenshot](/absolute/path.png)` — render an inline, labelled
+preview instead of a dead underlined filesystem link. Clicking the card opens
+a near-fullscreen lightbox; a missing or reaped temp file becomes a stable
+"Image unavailable" card rather than a broken-image glyph. PNG, JPEG, GIF, and
+WebP are accepted on POSIX paths, Windows drive paths, and local `file://` URLs.
+Relative paths stay ordinary Markdown because a chat message has no durable
+document directory.
+
+`rehypeLocalImageLinks` (`src/lib/agent-chat/local-image-links.ts`) performs the
+narrow HAST upgrade and `MarkdownLocalImage` owns the card/lightbox. Desktop
+WebKit loads the absolute path through Tauri's asset protocol. If that fails in
+the browser dev mock or a web-remote client, `agent_chat_read_local_image`
+returns only an existing, absolute, supported image with the same 25 MB ceiling
+as chat attachments; the frontend caches a bounded blob URL. This is separate
+from `agent_chat_read_image`, whose containment check remains restricted to
+Codemux's persisted chat-image root. Ordinary local non-image links are not
+upgraded. The rich dev transcript includes a local screenshot link so the card
+and lightbox stay visually testable.
+
 ## What Works Today
 
 - **Three end-to-end providers** behind one unified picker:
@@ -381,9 +405,11 @@ examples for visual verification.
     disappearing. `ToolCallCard` auto-expands when a result first gains a
     renderable image (`hasToolResultImages`) so asynchronously arriving
     screenshots become visible without a manual expand, while a later user
-    collapse remains respected. Standalone assistant-authored image
-    blocks (not wrapped in a tool result) are still unsupported — they
-    would need a new backend `CompletedItem` variant. The dev mock seeds
+    collapse remains respected. Standalone provider image blocks (not wrapped
+    in a tool result) are still unsupported — they would need a new backend
+    `CompletedItem` variant. Absolute image paths written into assistant
+    Markdown are supported separately by the local screenshot-link renderer
+    above. The dev mock seeds
     an image `Read` tool result in the demo transcript
     (`richChatTurnEnvelopes`).
 - **Slash command popup** with cross-provider parsing. Five groups:
@@ -399,27 +425,16 @@ examples for visual verification.
     usual textarea refocus for this pick so the popover isn't
     dismissed by focus-outside). Built in `buildModelCommand`.
   - **SKILLS** — dynamic, from the skills registry. Every discovered
-    skill is offered to every provider: the list is **not** filtered by
-    the active pane's provider, which is the whole point of the
-    cross-provider design (a Codex skill is invocable from a Claude
-    pane and vice versa). Provider appears only as a label in the row
-    description and as grouping/sort order. Same-named skills
-    collapse to one row via `dedupeSkillsByName`
-    (`src/lib/agent-chat/skill-groups.ts`, first-wins over the
-    backend's provider → scope → name order). A skill is addressed in
-    the draft by name alone, so every copy of `/omarchy` would insert
-    byte-identical text; one source symlinked into `~/.claude/skills`,
-    `~/.codex/skills`, and `~/.agents/skills` (plus a real directory
-    under `~/.codemux/skills`) previously produced one row per root,
-    and copies reached through symlinks share a skill id — the id is a
-    hash of the *canonical* SKILL.md path — so the popup emitted
-    duplicate React keys and colliding menu values. The send-time
-    resolver `parseSkillTokens` (`skill-tokens.ts`) applies the same
-    first-wins rule, so the row the menu offers is guaranteed to be the
-    body that gets injected; its lookup used to be last-wins, which
-    silently resolved a picked skill to the *lowest*-priority copy.
-    Settings deliberately keeps every copy visible — `detectConflicts`
-    exists to surface exactly these clashes.
+    portable skill is offered when its projection says the active provider can
+    use it. Unique names keep `/name`; collisions get an exact qualified token
+    such as `/claude:user:deploy` or `/codex:project:deploy` (with a short id
+    suffix only when provider + scope + name also collide). `skill-tokens.ts`
+    resolves that token to a stable skill id and removes only the recognized
+    Codemux token before send. The backend re-resolves the id against the
+    thread's current cwd inventory, so the popup selection cannot drift into a
+    different same-named body or carry an arbitrary frontend-supplied path.
+    Native-only entries stay visible in Settings but are omitted from foreign
+    provider popups with their reason.
   - **COMMANDS** — **provider-native slash commands, discovered live**
     (never hardcoded). The claude-agent sidecar's `list-commands`
     JSON-RPC method opens a transient SDK `query()` (same lifecycle as
@@ -467,8 +482,51 @@ examples for visual verification.
     `ide_rc_auto_enable_gate`) rather than a command — deliberately not
     consumed, since Codemux ships its own web remote access
     (`docs/features/web-remote-access.md`).
-- **Cross-provider skill system**: watcher, conflicts, disable, refined
-  compat. Server-side sync (see `docs/features/skills-sync.md`).
+- **Cross-provider skill system**: provider-aware inventory, exact explicit
+  invocation, watcher, conflicts, per-row Codemux availability, and
+  per-target compatibility. Server-side sync remains a separate filesystem
+  concern (see `docs/features/skills-sync.md`).
+  - `SkillInventoryService` merges readable filesystem definitions with the
+    cwd-scoped Codex `skills/list` and OpenCode `GET /skill?directory=...`
+    catalogs. Adapter errors are isolated and returned beside successful
+    results; a provider binary that is not installed is a normal empty catalog,
+    not an error banner. Claude's SDK command list is kept separate because its
+    current response does not prove stable skill provenance; readable Claude
+    files remain portable while unmatched SDK entries stay provider-native
+    commands.
+  - Project discovery walks cwd ancestors for portable definitions, and the
+    filesystem watcher covers those inherited roots as well as the direct cwd.
+    Invalid legacy names remain visible as unavailable Settings rows with the
+    validation reason instead of disappearing from discovery. Canonical
+    SKILL.md paths remain the strongest identity; a provider-catalog identity
+    is used for native-only entries. The provider catalog owns its native
+    enabled state.
+  - Every definition carries a projection for Claude, Codex, and OpenCode:
+    native, explicit-portable, native-only, or unavailable, plus compatibility
+    reasons and the invocation route. Compatibility is no longer calculated
+    once against a hard-coded Claude target.
+  - Sends carry stable `skill_ids`, the token-stripped user text, and the actual
+    `include_plugins` preference over IPC. The backend revalidates them at the
+    persisted thread cwd under that same discovery scope. A cold-cache forced
+    inventory is reused for resolution rather than harvesting both catalogs a
+    second time. Codex receives structured `{type:"skill",
+    name,path}` items for readable selections; one native Claude selection
+    keeps `/name` command semantics only when mode/effort/attachment framing
+    has not changed its arguments, otherwise it uses the portable envelope so
+    wrappers do not become the command's `$ARGUMENTS`. OpenCode and other
+    foreign portable cases receive a normalized envelope containing body,
+    source provenance, and the absolute base directory for relative `scripts/`,
+    `references/`, and `assets/`. Source-specific frontmatter never becomes a
+    permission grant.
+    The durable/optimistic transcript uses `display_text`, so it shows the
+    user's unexpanded command rather than an injected body.
+  - Provider-native automatic invocation is unchanged. The Settings switch is
+    explicitly “available in Codemux”: disabling a row removes it from the
+    Codemux popup and resolver but does not rewrite provider configuration or
+    hide the same skill from its native provider.
+    Pre-inventory path-hash disabled ids migrate opportunistically to the
+    canonical-repository preference id when the same project skill is next
+    discovered, so upgrades do not re-enable it.
   - **Scan roots** (`skills::paths::enumerate_scan_paths` — the single
     source of truth; scanner, watcher, conflict detection and the
     Settings grouping all derive from it, so adding a provider root is
@@ -514,10 +572,17 @@ examples for visual verification.
   `agent_chat_send_turn` — reusing the
   SAME `thread_id` (keeping the attached Channel, pane snapshot, and store
   slice valid) and passing `resume_cursor: {"resume": sdk_session_id}`
-  when the row carries one (falling back to a fresh session, whose
-  transcript still hydrates from the DB, when it does not or when the
-  resume-start fails). Each thread's picker config (`model`, `effort`,
-  `context_window`, `permission_mode`, `fast_mode`) is persisted on the session row —
+  when the row carries one. Codex's adapter returns its provider-native
+  `{"threadId": ...}` cursor at session start; the command layer now persists
+  that id, and the adapter accepts the database/frontend's generic `resume`
+  wrapper before emitting the official `thread/resume { threadId }` RPC. This
+  keeps the prior Codex thread's complete model-visible history, including
+  image inputs, available when the user clicks **Continue run** after an app
+  restart; the Continue turn itself remains a plain follow-up and does not
+  duplicate the prior attachments. The adapters fall back to a fresh session,
+  whose transcript still hydrates from the DB, when no durable provider id
+  exists or when the resume-start fails. Each thread's picker config (`model`,
+  `effort`, `context_window`, `permission_mode`, `fast_mode`) is persisted on the session row —
   written at `agent_chat_start_session`, updated fire-and-forget by the
   picker handlers via `agent_chat_update_session_config`, always persisted
   by `agent_chat_set_model` / `agent_chat_set_permission_mode` (which now
@@ -2451,21 +2516,17 @@ workspace, so any `AgentChatPane` instance's workspace IS the active
 one). It renders:
 
 - the **background-browser indicator** (first in the cluster, mirroring
-  its old bottom-bar position) when the workspace has a live, pane-less
+  the browser control in terminal headers) when the workspace has a live, pane-less
   `agent_browser_sessions` entry — the shared
   `BackgroundBrowserIndicator` + `useBackgroundBrowserSession` pair
-  (`src/components/browser/background-browser-indicator.tsx`, extracted
-  verbatim from `WorkspaceContextBar`, which still consumes them for
-  the terminal-pane/GUI cases where the bar renders). Click opens the
-  peek overlay (`useBrowserPeekStore().open`). The bar's
-  `enableAgentChat && workspace_type !== "open_flow"` gate is implicit
-  in the cluster's mount context (a disabled flag renders a
-  placeholder instead of the pane; OpenFlow never routes through
-  `PaneContainer`);
+  (`src/components/browser/background-browser-indicator.tsx`, shared with
+  the active terminal's compact header control). Click opens the
+  peek overlay (`useBrowserPeekStore().open`). The cluster's
+  `enableAgentChat` gate is implicit in the cluster's mount context (a
+  disabled flag renders a placeholder instead of the pane);
 - a **behind chip** (`↓N`, `text-warning`) when `git_behind > 0`;
-- a **PR chip** (`#N`, tone-tinted via `PR_CHIP_TONE` — the single
-  shared map in `src/components/github/pr-status-icon.tsx`, also used
-  by `WorkspaceContextBar`) that opens `pr_url` on click;
+- a **PR chip** (`#N`, tone-tinted via `PR_CHIP_TONE` in
+  `src/components/github/pr-status-icon.tsx`) that opens `pr_url` on click;
 - a **linked-issue chip** (`Issue #N`) — the shared
   `IssueDetailPopover` (chip variant, `side="top" align="end"`,
   `src/components/github/issue-detail-popover.tsx`) the old bar used,
@@ -2498,13 +2559,11 @@ with a live background browser shows the Browser pill alone, and one
 with only a linked issue shows the Issue chip alone — matching the old
 bar's visibility set (`hasGit || prState || linked_issue || browser`).
 
-**Bottom bar interaction.** While an Agent Chat pane is the active pane
-of the active surface in GUI chrome, `WorkspaceContextBar` renders
-`null` — the Context Row now owns that detail inline. See
-`docs/features/workspace-context-bar.md` and
-`useAgentChatPaneActive()` (`src/hooks/use-gui-chrome.ts`). A terminal
-(or other) pane active in GUI mode keeps the bottom bar; legacy chrome
-(GUI flag off) is unaffected.
+**No global bottom bar.** The full-width `WorkspaceContextBar` was removed.
+The Context Row owns chat-local detail inline; the sidebar and hover card own
+cross-surface workspace detail; and an active terminal places only the live
+background-browser launcher in its existing pane header. See
+`docs/features/workspace-context-bar.md`.
 
 ## Context-window meter (composer)
 
@@ -2800,6 +2859,9 @@ turn that finished between the frontend send and the backend enqueue.
 `TurnStartResult` gained an optional `queued_id` — set when the send was
 queued (its `turn_id` is then an empty placeholder). OpenCode has no busy
 guard and no queue; `cancel_queued_turn` is a trait-default no-op there.
+Pressing Send finalizes attachments and resolves exact skills before this
+enqueue decision; the accepted queue item is an immutable input snapshot, so
+later file edits or Settings changes do not silently rewrite a submitted turn.
 
 **Draining.** On the turn-completion transition (Claude: the SDK `result`
 message → Ready; Codex: `turn/completed` → Ready), and after an explicit
@@ -2957,7 +3019,6 @@ Three ways to flip it on locally:
    ```js
    await window.__TAURI__.invoke("update_feature_flags", {
      flags: {
-       unstable_openflow: true,
        unstable_browser_automation: true,
        unstable_indexing: true,
        enable_agent_chat: true,

@@ -28,7 +28,7 @@ Registered in `src/lib/keybind-registry.ts` and dispatched from `src/hooks/use-k
 | Ctrl+[ | Previous workspace | |
 | Alt+1 through Alt+9 | Jump to workspace by position | Nth visible inbox card counting from the top — cards are newest-first, so Alt+1 is the **newest** workspace (filter-scoped; settled and snoozed rows excluded); holding Alt shows index badges on the cards |
 | Ctrl+Shift+G | Run dev command | Runs the project's configured dev server command |
-| Ctrl+T | New terminal tab | Standard workspaces only (not OpenFlow) |
+| Ctrl+T | New terminal tab | Active workspace |
 | Ctrl+W | Close active tab | Only when workspace has more than one tab |
 | Ctrl+1 through Ctrl+9 | Jump to tab by position | Tab 1 = leftmost |
 | Ctrl+Shift+D | Split active pane right | Horizontal split |

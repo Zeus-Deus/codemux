@@ -137,6 +137,30 @@ impl OpenCodeClient {
         Ok(flatten_provider_list(raw))
     }
 
+    /// Return OpenCode's authoritative skill catalog for one working directory.
+    pub async fn list_skills(
+        &self,
+        directory: &std::path::Path,
+    ) -> Result<Vec<OpenCodeSkill>, String> {
+        let url = format!(
+            "{}/skill?directory={}",
+            self.config.base_url,
+            urlencoding::encode(&directory.to_string_lossy())
+        );
+        let response = self
+            .attach_auth(self.http.get(&url))
+            .send()
+            .await
+            .map_err(format_request_error)?;
+        if !response.status().is_success() {
+            return Err(format!("http_status_{}", response.status().as_u16()));
+        }
+        response
+            .json()
+            .await
+            .map_err(|error| format!("parse_error: {error}"))
+    }
+
     /// Cold-backfill a (sub)session's transcript.
     ///
     /// `GET /session/{id}/message?limit=N` returns the most recent
@@ -206,6 +230,16 @@ impl OpenCodeClient {
             None => request,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenCodeSkill {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub location: String,
+    #[serde(default)]
+    pub content: String,
 }
 
 /// One provider entry surfaced by [`OpenCodeClient::list_models`].
@@ -625,6 +659,32 @@ mod tests {
 
         mock.assert_async().await;
         assert!(providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_skills_passes_directory_and_decodes_catalog() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/skill?directory=%2Frepo%2Fwith%20space")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"[{"name":"review","description":"Review code","location":"/repo/.opencode/skills/review/SKILL.md","content":"Follow the checklist."}]"#,
+            )
+            .create_async()
+            .await;
+        let client =
+            OpenCodeClient::new(OpenCodeClientConfig::new(server.url())).expect("client builds");
+
+        let skills = client
+            .list_skills(std::path::Path::new("/repo/with space"))
+            .await
+            .expect("catalog decodes");
+
+        mock.assert_async().await;
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "review");
+        assert_eq!(skills[0].content, "Follow the checklist.");
     }
 
     #[tokio::test]

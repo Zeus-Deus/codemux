@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tokio::io::AsyncReadExt;
 
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
@@ -213,11 +214,7 @@ impl AgentChatChannelRegistry {
     /// existing subscribers (fan-out — every attached consumer receives
     /// the thread's events). Returns the generation token the caller
     /// must hand back to [`detach`](Self::detach).
-    pub fn attach(
-        &self,
-        thread_id: &str,
-        channel: Channel<AgentChatEventPayload>,
-    ) -> u64 {
+    pub fn attach(&self, thread_id: &str, channel: Channel<AgentChatEventPayload>) -> u64 {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut channels = self.channels.lock().expect("channel registry poisoned");
         channels
@@ -478,9 +475,15 @@ fn workspace_env_overlay(
             "CODEMUX_VERSION".to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
         ),
-        ("CODEMUX_WORKSPACE_ID".to_string(), ws.workspace_id.0.clone()),
+        (
+            "CODEMUX_WORKSPACE_ID".to_string(),
+            ws.workspace_id.0.clone(),
+        ),
         ("CODEMUX_PANE_ID".to_string(), pane_id.to_string()),
-        ("CODEMUX_BROWSER_CMD".to_string(), "codemux browser".to_string()),
+        (
+            "CODEMUX_BROWSER_CMD".to_string(),
+            "codemux browser".to_string(),
+        ),
         ("BROWSER".to_string(), "codemux browser open".to_string()),
     ];
     defaults.extend(crate::terminal::workspace_pty_env(ws));
@@ -625,9 +628,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         )
         .await
         {
-            Ok(()) => eprintln!(
-                "[codemux::agent_chat] mcp prime_for_chat completed within budget"
-            ),
+            Ok(()) => eprintln!("[codemux::agent_chat] mcp prime_for_chat completed within budget"),
             Err(_) => eprintln!(
                 "[codemux::agent_chat] mcp prime_for_chat exceeded {}s budget — \
                  starting session with whatever tools are ready",
@@ -678,19 +679,15 @@ pub async fn agent_chat_start_session<R: Runtime>(
             cwd_for_persist.as_deref(),
             provider_str,
         ) {
-            eprintln!(
-                "[codemux::agent_chat] failed to persist session record: {error}"
-            );
+            eprintln!("[codemux::agent_chat] failed to persist session record: {error}");
         }
         // Persist a provider-returned resume cursor NOW, after the row
         // exists. The async `ResumeCursorUpdated` persist path is a plain
         // UPDATE racing this upsert across a spawned bridge task — when the
         // event wins it updates 0 rows and the cursor is silently lost,
         // leaving the FIRST dead-run rebuild with no conversation context
-        // (OpenCode returns its cursor at start; Claude's SDK id arrives
-        // later by event and Codex's start-time cursor carries no
-        // extractable id, so this is a no-op for them). Best-effort like the
-        // neighboring persists.
+        // (OpenCode and Codex return their cursors at start; Claude's SDK id
+        // arrives later by event). Best-effort like the neighboring persists.
         if let Some(sdk_session_id) = session
             .resume_cursor
             .as_ref()
@@ -711,9 +708,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         if let Err(error) =
             db.update_agent_chat_session_config(&session.thread_id.0, &config_for_persist)
         {
-            eprintln!(
-                "[codemux::agent_chat] failed to persist session config: {error}"
-            );
+            eprintln!("[codemux::agent_chat] failed to persist session config: {error}");
         }
         // Issue #80 — optional rollback checkpoint. Spawned AFTER the
         // provider session is up and the session row is persisted, so
@@ -721,12 +716,7 @@ pub async fn agent_chat_start_session<R: Runtime>(
         // sits on the latency-to-first-token path. The opt-in gate is
         // evaluated inside the task.
         if let Some(cwd) = cwd_for_persist.clone() {
-            spawn_run_checkpoint(
-                &app,
-                session.thread_id.0.clone(),
-                workspace_id.clone(),
-                cwd,
-            );
+            spawn_run_checkpoint(&app, session.thread_id.0.clone(), workspace_id.clone(), cwd);
         }
     }
     crate::state::emit_app_state(&app);
@@ -776,8 +766,7 @@ pub fn create_run_checkpoint_blocking(
 ) -> Result<Option<AgentChatCheckpointRecord>, String> {
     let ref_name = crate::git::checkpoint_ref_name(thread_id);
     let message = format!("codemux checkpoint: before agent run {thread_id}");
-    let Some(snapshot) = crate::git::git_checkpoint_create(repo_path, &ref_name, &message)?
-    else {
+    let Some(snapshot) = crate::git::git_checkpoint_create(repo_path, &ref_name, &message)? else {
         return Ok(None);
     };
     let record = AgentChatCheckpointRecord {
@@ -803,18 +792,15 @@ pub fn create_run_checkpoint_blocking(
             crate::git::CHECKPOINT_KEEP_PER_NAMESPACE,
         ) {
             Ok(pruned) => {
-                if let Err(error) = db.delete_agent_chat_checkpoints_by_refs(
-                    &record.repo_path,
-                    &pruned,
-                ) {
+                if let Err(error) =
+                    db.delete_agent_chat_checkpoints_by_refs(&record.repo_path, &pruned)
+                {
                     eprintln!(
                         "[codemux::agent_chat] failed to drop pruned checkpoint rows: {error}"
                     );
                 }
             }
-            Err(error) => eprintln!(
-                "[codemux::agent_chat] checkpoint prune failed: {error}"
-            ),
+            Err(error) => eprintln!("[codemux::agent_chat] checkpoint prune failed: {error}"),
         }
     }
     // Re-read so the caller (and the emitted event) sees the
@@ -824,13 +810,10 @@ pub fn create_run_checkpoint_blocking(
 
 /// Synchronous core of the restore path. Blocking — run it on a
 /// blocking thread. Public for integration tests.
-pub fn restore_run_checkpoint_blocking(
-    db: &DatabaseStore,
-    thread_id: &str,
-) -> Result<(), String> {
-    let record = db.get_agent_chat_checkpoint(thread_id).ok_or_else(|| {
-        "No checkpoint is recorded for this chat.".to_string()
-    })?;
+pub fn restore_run_checkpoint_blocking(db: &DatabaseStore, thread_id: &str) -> Result<(), String> {
+    let record = db
+        .get_agent_chat_checkpoint(thread_id)
+        .ok_or_else(|| "No checkpoint is recorded for this chat.".to_string())?;
     crate::git::git_checkpoint_restore(
         std::path::Path::new(&record.repo_path),
         &record.snapshot_commit,
@@ -1145,9 +1128,7 @@ pub async fn ensure_live_session<R: Runtime>(
     // dead id. Best-effort clear the column so no later rebuild reuses it.
     // Codex / OpenCode carry their own cursor shapes and are untouched.
     let resume_cursor = match record.sdk_session_id.as_ref() {
-        Some(id)
-            if provider_kind == ProviderKind::Claude && claude_session_file_missing(id) =>
-        {
+        Some(id) if provider_kind == ProviderKind::Claude && claude_session_file_missing(id) => {
             eprintln!(
                 "[codemux::agent_chat] dropping stale resume cursor for thread={} \
                  (Claude session file for {id} is gone); starting fresh",
@@ -1216,7 +1197,10 @@ pub async fn ensure_live_session<R: Runtime>(
         record.model,
     );
 
-    match impl_.start_session(build_input(resume_cursor.clone())).await {
+    match impl_
+        .start_session(build_input(resume_cursor.clone()))
+        .await
+    {
         Ok(_) => Ok(()),
         Err(err) if resume_cursor.is_some() => {
             // Resume-start failed — retry once as a fresh session. The
@@ -1251,6 +1235,20 @@ pub struct SendTurnCommandInput {
     pub thread_id: ThreadId,
     /// Plain-text content of the user message.
     pub text: String,
+    /// User-visible, unexpanded text persisted in the transcript.
+    #[serde(default)]
+    pub display_text: Option<String>,
+    /// Stable skill selections. Body/path data is resolved by the backend.
+    #[serde(default)]
+    pub skill_ids: Vec<String>,
+    /// Skill-token-stripped user text before mode/effort/attachment wrappers.
+    /// Native Claude commands are safe only when this equals `text`.
+    #[serde(default)]
+    pub skill_text: Option<String>,
+    /// Discovery scope selected in Settings. Defaults on for compatibility
+    /// with older clients that predate this field.
+    #[serde(default = "default_include_plugins")]
+    pub include_plugins: bool,
     /// Staged image references, in order.
     #[serde(default)]
     pub images: Vec<ChatImageRef>,
@@ -1265,6 +1263,102 @@ pub struct SendTurnCommandInput {
     /// Optional client-generated correlation token for the follow-up queue.
     #[serde(default)]
     pub client_nonce: Option<String>,
+}
+
+fn default_include_plugins() -> bool {
+    true
+}
+
+fn skill_provider_for(provider: ProviderKind) -> crate::skills::SkillProvider {
+    match provider {
+        ProviderKind::Claude => crate::skills::SkillProvider::Claude,
+        ProviderKind::Codex => crate::skills::SkillProvider::Codex,
+        ProviderKind::OpenCode => crate::skills::SkillProvider::Opencode,
+    }
+}
+
+fn escape_skill_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&apos;")
+}
+
+/// Materialize provider-independent selections after inventory revalidation.
+fn render_skill_invocations(
+    text: &str,
+    skill_text: Option<&str>,
+    provider: ProviderKind,
+    skills: &[crate::skills::ResolvedSkillInvocation],
+) -> Result<String, String> {
+    if skills.is_empty() {
+        return Ok(text.to_string());
+    }
+
+    if provider == ProviderKind::Claude
+        && skills.len() == 1
+        && skills[0].source_provider == crate::skills::SkillProvider::Claude
+        && matches!(
+            skills[0].invocation,
+            crate::skills::SkillInvocationKind::NativeCommand
+        )
+    {
+        if skill_text == Some(text) {
+            let rest = text.trim();
+            return Ok(if rest.is_empty() {
+                format!("/{}", skills[0].name)
+            } else {
+                format!("/{} {}", skills[0].name, rest)
+            });
+        }
+        // Mode, effort, or attachment framing must remain top-level prompt
+        // context. Putting it after `/name` turns it into the command's
+        // `$ARGUMENTS`, so use the readable portable envelope instead.
+    }
+
+    let mut envelopes = Vec::new();
+    for skill in skills {
+        if provider == ProviderKind::Codex
+            && matches!(
+                skill.invocation,
+                crate::skills::SkillInvocationKind::CodexSkillItem
+            )
+            && skill.path.is_some()
+        {
+            continue;
+        }
+        let body = skill
+            .body
+            .as_deref()
+            .filter(|body| !body.trim().is_empty())
+            .ok_or_else(|| format!("skill_content_unavailable: {}", skill.name))?;
+        let (base_dir, supporting_files) = match skill.base_dir.as_deref() {
+            Some(base_dir) if !base_dir.is_empty() => (
+                base_dir,
+                "Relative scripts, references, and assets resolve from the base directory above.",
+            ),
+            _ => (
+                "unavailable",
+                "No local base directory was exposed; relative supporting files are unavailable.",
+            ),
+        };
+        envelopes.push(format!(
+            "<codemux-skill name=\"{}\" source=\"{:?}\" base-dir=\"{}\">\n{} Source-specific permissions are not grants in this session.\n\n{}\n</codemux-skill>",
+            escape_skill_attribute(&skill.name),
+            skill.source_provider,
+            escape_skill_attribute(base_dir),
+            supporting_files,
+            body.trim()
+        ));
+    }
+    if envelopes.is_empty() {
+        return Ok(text.to_string());
+    }
+    Ok(format!("{}\n\n{}", envelopes.join("\n\n"), text)
+        .trim()
+        .to_string())
 }
 
 /// Queue a user turn on an existing session.
@@ -1293,8 +1387,11 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     let impl_ = lookup_provider(&registry, provider).await?;
     // Capture the inputs we need for persistence before dispatching.
     let thread_id_for_persist = input.thread_id.0.clone();
-    let user_text_for_persist = input.text.clone();
-    let first_line = first_line_title(&input.text);
+    let user_text_for_persist = input
+        .display_text
+        .clone()
+        .unwrap_or_else(|| input.text.clone());
+    let first_line = first_line_title(&user_text_for_persist);
     // Finalize the staged image refs NOW: promote each staged file into the
     // thread's dir and read its bytes back for the provider. This replaces
     // the old bytes-writing `save_chat_images` — the transcript records use
@@ -1303,12 +1400,44 @@ pub async fn agent_chat_send_turn<R: Runtime>(
     // image fs failure is logged and skipped inside the helper.
     let (saved_images, image_inputs) =
         finalize_chat_images(&thread_id_for_persist, &input.images).await?;
-    // Build the provider's byte-carrying input from the command DTO. The
-    // provider trait is unchanged — adapters still receive `ImageInput`s.
+    let db: State<'_, DatabaseStore> = app.state();
+    let skill_invocations = if input.skill_ids.is_empty() {
+        Vec::new()
+    } else {
+        let session = db
+            .get_agent_chat_session(&input.thread_id.0)
+            .ok_or_else(|| "skill_resolution_session_not_found".to_string())?;
+        let cwd = session
+            .cwd
+            .ok_or_else(|| "skill_resolution_cwd_missing".to_string())?;
+        let inventory: State<'_, crate::skills::inventory::SkillInventoryService> = app.state();
+        let opencode_manager: State<
+            '_,
+            std::sync::Arc<crate::agent_provider::opencode::OpenCodeServerManager>,
+        > = app.state();
+        inventory
+            .resolve(
+                std::path::Path::new(&cwd),
+                input.include_plugins,
+                skill_provider_for(provider),
+                &input.skill_ids,
+                Some(opencode_manager.inner()),
+            )
+            .await?
+    };
+    let rendered_text = render_skill_invocations(
+        &input.text,
+        input.skill_text.as_deref(),
+        provider,
+        &skill_invocations,
+    )?;
+    // Build the provider's byte-carrying input from the command DTO.
     let provider_input = SendTurnInput {
         thread_id: input.thread_id.clone(),
-        text: input.text.clone(),
+        text: rendered_text,
+        display_text: Some(user_text_for_persist.clone()),
         images: image_inputs,
+        skill_invocations,
         model_override: input.model_override.clone(),
         effort_override: input.effort_override.clone(),
         permission_mode_override: input.permission_mode_override.clone(),
@@ -1334,13 +1463,15 @@ pub async fn agent_chat_send_turn<R: Runtime>(
         let tracker: State<'_, SubagentTracker> = app.state();
         tracker.clear_thread(&thread_id_for_persist);
     }
-    let result = impl_.send_turn(provider_input).await.map_err(provider_err)?;
+    let result = impl_
+        .send_turn(provider_input)
+        .await
+        .map_err(provider_err)?;
 
     // Best-effort: bump last_active_at so the session floats to the
     // top of the dropdown, and set an auto-title from the first user
     // turn if none exists yet. Failures here are non-fatal — a
     // missing persistence row must never block the turn.
-    let db: State<'_, DatabaseStore> = app.state();
     let _ = db.touch_agent_chat_session(&thread_id_for_persist);
     if db.get_agent_chat_title(&thread_id_for_persist).is_none() {
         if let Some(title) = first_line {
@@ -1530,8 +1661,7 @@ fn chat_images_staging_dir() -> Option<std::path::PathBuf> {
 /// The MIME types Agent Chat accepts for an attachment. Everything else is
 /// rejected at the staging boundary so a garbage payload never reaches the
 /// provider or the disk.
-const ACCEPTED_CHAT_IMAGE_MIME: [&str; 4] =
-    ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const ACCEPTED_CHAT_IMAGE_MIME: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// A freshly-staged image the composer can reference on its next send.
 /// Serde field names match [`PersistedChatImage`]'s (`path` / `media_type`)
@@ -1556,7 +1686,7 @@ pub struct ChatImageRef {
     pub media_type: String,
 }
 
-/// The bytes + inferred media type returned by [`agent_chat_read_image`].
+/// The bytes + inferred media type returned by the chat image readers.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatImageBytes {
     pub bytes: Vec<u8>,
@@ -1584,7 +1714,7 @@ fn validate_chat_image_mime(media_type: &str) -> Result<String, String> {
 }
 
 /// Reverse of [`chat_image_extension`]: infer a media type from a stored
-/// file's extension. Used by [`agent_chat_read_image`] so the fallback
+/// file's extension. Used by the image readers so the fallback
 /// loader can label the bytes it returns. Unknown extensions fall back to
 /// the generic binary type rather than guessing.
 fn media_type_from_extension(path: &std::path::Path) -> String {
@@ -1603,6 +1733,27 @@ fn media_type_from_extension(path: &std::path::Path) -> String {
     .to_string()
 }
 
+/// Identify the narrow set of raster formats the local-proof transport may
+/// return. This inspects magic bytes instead of trusting a caller-controlled
+/// extension, so renaming an arbitrary file to `.png` cannot turn the command
+/// into a general file reader.
+fn media_type_from_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    let media_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    };
+    media_type
+        .map(str::to_string)
+        .ok_or_else(|| "validation_error: unsupported local image content".to_string())
+}
+
 /// Verify `candidate` resolves to a path whose parent is inside `root`
 /// (both canonicalized) and return the canonicalized absolute path.
 ///
@@ -1613,10 +1764,7 @@ fn media_type_from_extension(path: &std::path::Path) -> String {
 /// name is re-joined onto the canonical parent. Returns an error when the
 /// candidate has no parent/file component, when the parent cannot be
 /// resolved, or when it escapes `root`.
-fn resolve_within(
-    root: &std::path::Path,
-    candidate: &str,
-) -> Result<std::path::PathBuf, String> {
+fn resolve_within(root: &std::path::Path, candidate: &str) -> Result<std::path::PathBuf, String> {
     let candidate = std::path::Path::new(candidate);
     let file_name = candidate
         .file_name()
@@ -1631,9 +1779,7 @@ fn resolve_within(
         .canonicalize()
         .map_err(|error| format!("validation_error: cannot resolve path parent: {error}"))?;
     if !canon_parent.starts_with(&canon_root) {
-        return Err(
-            "security_error: path escapes the permitted chat-image directory".to_string(),
-        );
+        return Err("security_error: path escapes the permitted chat-image directory".to_string());
     }
     Ok(canon_parent.join(file_name))
 }
@@ -1692,10 +1838,7 @@ fn classify_chat_image_ref(
 /// Move a staged file into its final home, falling back to copy+remove when
 /// a plain rename fails across devices (staging and the thread dir share a
 /// root today, but a symlinked config dir could straddle a mount).
-async fn move_staged_file(
-    src: &std::path::Path,
-    dst: &std::path::Path,
-) -> Result<(), String> {
+async fn move_staged_file(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     if tokio::fs::rename(src, dst).await.is_ok() {
         return Ok(());
     }
@@ -1722,12 +1865,17 @@ async fn move_staged_file(
 async fn finalize_chat_images(
     thread_id: &str,
     refs: &[ChatImageRef],
-) -> Result<(Vec<PersistedChatImage>, Vec<crate::agent_provider::ImageInput>), String> {
+) -> Result<
+    (
+        Vec<PersistedChatImage>,
+        Vec<crate::agent_provider::ImageInput>,
+    ),
+    String,
+> {
     if refs.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let staging = chat_images_staging_dir()
-        .ok_or_else(|| "config_dir_unavailable".to_string())?;
+    let staging = chat_images_staging_dir().ok_or_else(|| "config_dir_unavailable".to_string())?;
     let thread_dir =
         chat_images_dir(thread_id).ok_or_else(|| "config_dir_unavailable".to_string())?;
     // Create the thread dir up front so a rename into it always has a target.
@@ -1825,14 +1973,12 @@ pub async fn agent_chat_stage_image<R: Runtime>(
                 .get("x-media-type")
                 .and_then(|value| value.to_str().ok())
                 .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    "validation_error: missing x-media-type header".to_string()
-                })?;
+                .ok_or_else(|| "validation_error: missing x-media-type header".to_string())?;
             (bytes.clone(), media_type)
         }
         InvokeBody::Json(value) => {
-            let body: StageChatImageJsonBody = serde_json::from_value(value.clone())
-                .map_err(|_| {
+            let body: StageChatImageJsonBody =
+                serde_json::from_value(value.clone()).map_err(|_| {
                     "validation_error: expected a raw image body or \
                      { bytes_base64, media_type }"
                         .to_string()
@@ -1840,9 +1986,7 @@ pub async fn agent_chat_stage_image<R: Runtime>(
             use base64::Engine as _;
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(body.bytes_base64.as_bytes())
-                .map_err(|error| {
-                    format!("validation_error: invalid base64 image body: {error}")
-                })?;
+                .map_err(|error| format!("validation_error: invalid base64 image body: {error}"))?;
             (decoded, body.media_type)
         }
     };
@@ -1858,8 +2002,7 @@ pub async fn agent_chat_stage_image<R: Runtime>(
         ));
     }
 
-    let staging =
-        chat_images_staging_dir().ok_or_else(|| "config_dir_unavailable".to_string())?;
+    let staging = chat_images_staging_dir().ok_or_else(|| "config_dir_unavailable".to_string())?;
     tokio::fs::create_dir_all(&staging)
         .await
         .map_err(|error| format!("failed to create staging dir: {error}"))?;
@@ -1924,8 +2067,7 @@ pub async fn agent_chat_discard_staged_image<R: Runtime>(
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
-    let staging =
-        chat_images_staging_dir().ok_or_else(|| "config_dir_unavailable".to_string())?;
+    let staging = chat_images_staging_dir().ok_or_else(|| "config_dir_unavailable".to_string())?;
     // Ensure the staging root exists so its canonicalization (inside
     // `resolve_within`) succeeds even before the first upload of a session.
     tokio::fs::create_dir_all(&staging)
@@ -1959,6 +2101,73 @@ pub async fn agent_chat_read_image<R: Runtime>(
     let bytes = tokio::fs::read(&resolved)
         .await
         .map_err(|error| format!("failed to read chat image: {error}"))?;
+    Ok(ChatImageBytes { bytes, media_type })
+}
+
+/// Read a local image path referenced by an assistant's Markdown response.
+///
+/// Unlike [`agent_chat_read_image`], this path is not confined to Codemux's
+/// persisted attachment directory: browser automation tools commonly save
+/// visual proof under their own temp directory and return that absolute path
+/// in the final message. Desktop WebKit loads it through the asset protocol;
+/// web-remote and the browser dev mock use this bounded fallback instead.
+///
+/// The command accepts only absolute, existing PNG/JPEG/GIF/WebP files and
+/// applies the same 25 MB ceiling as clipboard attachments. That keeps this a
+/// narrow image transport rather than a general arbitrary-file read endpoint.
+#[tauri::command]
+pub async fn agent_chat_read_local_image<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+) -> Result<ChatImageBytes, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+
+    let candidate = std::path::Path::new(&path);
+    if !candidate.is_absolute() {
+        return Err("validation_error: local image path must be absolute".to_string());
+    }
+
+    let resolved = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(|error| format!("failed to resolve local image: {error}"))?;
+    let metadata = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|error| format!("failed to inspect local image: {error}"))?;
+    if !metadata.is_file() {
+        return Err("validation_error: local image path is not a file".to_string());
+    }
+    if metadata.len() > crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES as u64 {
+        return Err(format!(
+            "validation_error: local image exceeds {} MB limit",
+            crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
+
+    let extension_media_type = media_type_from_extension(&resolved);
+    if !ACCEPTED_CHAT_IMAGE_MIME.contains(&extension_media_type.as_str()) {
+        return Err("validation_error: unsupported local image type".to_string());
+    }
+
+    // Limit the reader itself, not only the pre-read metadata check: the file
+    // can change between stat and read, and must never make this allocation
+    // grow beyond the advertised ceiling.
+    let file = tokio::fs::File::open(&resolved)
+        .await
+        .map_err(|error| format!("failed to read local image: {error}"))?;
+    let max_bytes = crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES;
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("failed to read local image: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "validation_error: local image exceeds {} MB limit",
+            max_bytes / (1024 * 1024),
+        ));
+    }
+    let media_type = media_type_from_image_bytes(&bytes)?;
     Ok(ChatImageBytes { bytes, media_type })
 }
 
@@ -2024,8 +2233,7 @@ struct PendingQueuedTurn {
 /// module-static idiom as [`resume_locks`] to avoid threading a new
 /// managed state through every `forward_event` test harness.
 fn pending_queued_images() -> &'static Mutex<HashMap<String, PendingQueuedTurn>> {
-    static PENDING: OnceLock<Mutex<HashMap<String, PendingQueuedTurn>>> =
-        OnceLock::new();
+    static PENDING: OnceLock<Mutex<HashMap<String, PendingQueuedTurn>>> = OnceLock::new();
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -2074,7 +2282,9 @@ fn persist_user_message(
         user_msg["images"] = serde_json::Value::Array(images_json);
     }
     let payload = serde_json::to_string(&user_msg).ok()?;
-    db.append_agent_chat_message(thread_id, &payload).ok().flatten()
+    db.append_agent_chat_message(thread_id, &payload)
+        .ok()
+        .flatten()
 }
 
 /// Derive a short dropdown title from the first user turn's text.
@@ -2282,9 +2492,7 @@ pub async fn agent_chat_set_permission_mode<R: Runtime>(
             ..AgentChatSessionConfig::default()
         };
         if let Err(error) = db.update_agent_chat_session_config(&thread_id.0, &config) {
-            eprintln!(
-                "[codemux::agent_chat] failed to persist permission_mode config: {error}"
-            );
+            eprintln!("[codemux::agent_chat] failed to persist permission_mode config: {error}");
         }
     }
     match impl_.set_permission_mode(thread_id, mode).await {
@@ -2793,9 +3001,7 @@ fn is_renderable_image_entry(entry: &serde_json::Value) -> bool {
 /// webview will load as an image.
 fn is_safe_image_src(raw: &str) -> bool {
     let url = raw.trim().to_ascii_lowercase();
-    url.starts_with("data:image/")
-        || url.starts_with("http://")
-        || url.starts_with("https://")
+    url.starts_with("data:image/") || url.starts_with("http://") || url.starts_with("https://")
 }
 
 /// Flatten tool-result content to the text the collapsed card would
@@ -2862,9 +3068,7 @@ pub async fn spawn_event_bridge<R: Runtime>(app: AppHandle<R>) {
         let mut stream = provider.event_stream();
         tauri::async_runtime::spawn(async move {
             use futures_util::StreamExt;
-            eprintln!(
-                "[codemux::agent_chat] event bridge started for {kind:?}"
-            );
+            eprintln!("[codemux::agent_chat] event bridge started for {kind:?}");
             while let Some(event) = stream.next().await {
                 forward_event(&app, event);
             }
@@ -2905,22 +3109,14 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
     {
         if let Some(sdk_session_id) = extract_sdk_session_id(resume_cursor) {
             let db: State<'_, DatabaseStore> = app.state();
-            if let Err(error) =
-                db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id)
-            {
-                eprintln!(
-                    "[codemux::agent_chat] failed to persist sdk_session_id: {error}"
-                );
+            if let Err(error) = db.set_agent_chat_sdk_session_id(&thread_id.0, &sdk_session_id) {
+                eprintln!("[codemux::agent_chat] failed to persist sdk_session_id: {error}");
             }
             // Resume creates a fresh DB row (new thread_id) carrying the
             // same sdk_session_id as the original. Collapse the
             // duplicates so the dropdown doesn't grow unboundedly.
-            if let Err(error) =
-                db.collapse_duplicate_agent_chat_sessions(&sdk_session_id)
-            {
-                eprintln!(
-                    "[codemux::agent_chat] failed to collapse duplicates: {error}"
-                );
+            if let Err(error) = db.collapse_duplicate_agent_chat_sessions(&sdk_session_id) {
+                eprintln!("[codemux::agent_chat] failed to collapse duplicates: {error}");
             }
         } else if resume_cursor.is_null() {
             // A JSON-null cursor is the stale-session recovery signal (the
@@ -2932,9 +3128,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             // shortly and re-persists via the branch above.
             let db: State<'_, DatabaseStore> = app.state();
             if let Err(error) = db.clear_agent_chat_sdk_session_id(&thread_id.0) {
-                eprintln!(
-                    "[codemux::agent_chat] failed to clear stale sdk_session_id: {error}"
-                );
+                eprintln!("[codemux::agent_chat] failed to clear stale sdk_session_id: {error}");
             }
         }
     }
@@ -2982,7 +3176,11 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
             // the copy, and a client that attached mid-queue inserts the
             // turn it missed (the later `QueuedTurnDispatched` then finds no
             // `queued` marker on that fresh bubble and leaves it in place).
-            if pending.client_nonce.as_deref().is_some_and(|n| !n.is_empty()) {
+            if pending
+                .client_nonce
+                .as_deref()
+                .is_some_and(|n| !n.is_empty())
+            {
                 fan_out_user_message(
                     app,
                     &thread_id.0,
@@ -3021,9 +3219,9 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
                     let db: State<'_, DatabaseStore> = app.state();
                     match db.append_agent_chat_message(&thread_id.0, &payload) {
                         Ok(row_id) => persisted_id = row_id,
-                        Err(error) => eprintln!(
-                            "[codemux::agent_chat] failed to persist message: {error}"
-                        ),
+                        Err(error) => {
+                            eprintln!("[codemux::agent_chat] failed to persist message: {error}")
+                        }
                     }
                 }
             }
@@ -3059,9 +3257,7 @@ pub fn forward_event<R: Runtime>(app: &AppHandle<R>, event: ProviderRuntimeEvent
         // Thread-less lifecycle/warning traffic is low-frequency; the
         // global event bus stays the simplest transport for it.
         if let Err(error) = app.emit(AGENT_CHAT_EVENT, &payload) {
-            eprintln!(
-                "[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}"
-            );
+            eprintln!("[codemux::agent_chat] Failed to emit {AGENT_CHAT_EVENT}: {error}");
         }
         return;
     }
@@ -3558,9 +3754,7 @@ fn activity_update(
         ProviderRuntimeEvent::TurnCompleted { .. }
         | ProviderRuntimeEvent::RequestResponseFailed { .. }
         | ProviderRuntimeEvent::SessionStateChanged {
-            status: SessionStatus::Ready
-                | SessionStatus::Closed
-                | SessionStatus::Error { .. },
+            status: SessionStatus::Ready | SessionStatus::Closed | SessionStatus::Error { .. },
             ..
         } => ActivityUpdate::Remove,
         // Everything else (Starting/Ready-lifecycle noise, warnings,
@@ -3663,9 +3857,7 @@ pub async fn spawn_stall_watchdog<R: Runtime>(app: AppHandle<R>) {
             let now_wall = SystemTime::now();
             if let Some((prev_mono, prev_wall)) = prev {
                 let mono_delta = now_mono.duration_since(prev_mono);
-                let wall_delta = now_wall
-                    .duration_since(prev_wall)
-                    .unwrap_or_default();
+                let wall_delta = now_wall.duration_since(prev_wall).unwrap_or_default();
                 if wall_delta > mono_delta + WAKE_JUMP_LOG_THRESHOLD {
                     eprintln!(
                         "[codemux::agent_chat] stall watchdog observed a wake-from-sleep jump (wall {wall_delta:?} vs monotonic {mono_delta:?})"
@@ -3734,15 +3926,16 @@ pub fn should_persist_event(event: &ProviderRuntimeEvent) -> bool {
 
 /// Pull the SDK session UUID out of the opaque `resume_cursor` JSON.
 ///
-/// The Claude adapter wraps the id under a `resume` or `sessionId`
-/// key (same shape the adapter accepts on the way in — see
-/// `agent_provider/claude/session.rs`). Extracted so the logic is
-/// unit-testable without spinning up an app handle.
+/// Providers wrap the id under a provider-native key (`threadId` for Codex,
+/// `sessionId` for Claude) or the generic `resume` key accepted when a
+/// persisted scalar is reconstructed. Extracted so the logic is unit-testable
+/// without spinning up an app handle.
 pub fn extract_sdk_session_id(cursor: &serde_json::Value) -> Option<String> {
     cursor
         .get("resume")
         .or_else(|| cursor.get("sessionId"))
         .or_else(|| cursor.get("session_id"))
+        .or_else(|| cursor.get("threadId"))
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
 }
@@ -4037,8 +4230,7 @@ mod tests {
         let payload = tool_result_payload(json!("small"));
         let padded = {
             let mut value: serde_json::Value = serde_json::from_str(&payload).unwrap();
-            value["item"]["tool_name"] =
-                json!("N".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 100));
+            value["item"]["tool_name"] = json!("N".repeat(LAZY_TOOL_RESULT_THRESHOLD_BYTES + 100));
             serde_json::to_string(&value).unwrap()
         };
         assert_eq!(shape_persisted_payload(1, &padded), padded);
@@ -4156,18 +4348,12 @@ mod tests {
 
     #[test]
     fn validate_chat_image_mime_accepts_supported_types() {
-        assert_eq!(
-            validate_chat_image_mime("image/png").unwrap(),
-            "image/png"
-        );
+        assert_eq!(validate_chat_image_mime("image/png").unwrap(), "image/png");
         assert_eq!(
             validate_chat_image_mime("image/jpeg").unwrap(),
             "image/jpeg"
         );
-        assert_eq!(
-            validate_chat_image_mime("image/gif").unwrap(),
-            "image/gif"
-        );
+        assert_eq!(validate_chat_image_mime("image/gif").unwrap(), "image/gif");
         assert_eq!(
             validate_chat_image_mime("image/webp").unwrap(),
             "image/webp"
@@ -4180,7 +4366,10 @@ mod tests {
         assert_eq!(validate_chat_image_mime("image/jpg").unwrap(), "image/jpeg");
         // Casing is folded.
         assert_eq!(validate_chat_image_mime("IMAGE/PNG").unwrap(), "image/png");
-        assert_eq!(validate_chat_image_mime("Image/WebP").unwrap(), "image/webp");
+        assert_eq!(
+            validate_chat_image_mime("Image/WebP").unwrap(),
+            "image/webp"
+        );
     }
 
     #[test]
@@ -4230,6 +4419,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn media_type_from_image_bytes_uses_magic_not_the_filename() {
+        assert_eq!(
+            media_type_from_image_bytes(b"\x89PNG\r\n\x1a\nrest").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            media_type_from_image_bytes(b"GIF89a-rest").unwrap(),
+            "image/gif"
+        );
+        assert!(media_type_from_image_bytes(b"private text wearing a .png suffix").is_err());
+    }
+
     // ── chat image staging: path containment (security boundary) ──
 
     #[test]
@@ -4237,8 +4439,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let file = root.path().join("img.png");
         std::fs::write(&file, b"x").unwrap();
-        let resolved =
-            resolve_within(root.path(), file.to_str().unwrap()).unwrap();
+        let resolved = resolve_within(root.path(), file.to_str().unwrap()).unwrap();
         assert_eq!(resolved, file.canonicalize().unwrap());
     }
 
@@ -4249,8 +4450,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let file = sub.join("img.png");
         std::fs::write(&file, b"x").unwrap();
-        let resolved =
-            resolve_within(root.path(), file.to_str().unwrap()).unwrap();
+        let resolved = resolve_within(root.path(), file.to_str().unwrap()).unwrap();
         assert_eq!(resolved, file.canonicalize().unwrap());
     }
 
@@ -4292,17 +4492,13 @@ mod tests {
         let local = thread_dir.join("l.png");
         std::fs::write(&local, b"x").unwrap();
 
-        match classify_chat_image_ref(&staging, &thread_dir, staged.to_str().unwrap())
-            .unwrap()
-        {
+        match classify_chat_image_ref(&staging, &thread_dir, staged.to_str().unwrap()).unwrap() {
             ChatImageRefLocation::Staged(p) => {
                 assert_eq!(p, staged.canonicalize().unwrap())
             }
             ChatImageRefLocation::ThreadLocal(_) => panic!("expected Staged"),
         }
-        match classify_chat_image_ref(&staging, &thread_dir, local.to_str().unwrap())
-            .unwrap()
-        {
+        match classify_chat_image_ref(&staging, &thread_dir, local.to_str().unwrap()).unwrap() {
             ChatImageRefLocation::ThreadLocal(p) => {
                 assert_eq!(p, local.canonicalize().unwrap())
             }
@@ -4324,19 +4520,13 @@ mod tests {
         // turn — even though it lives under the same chat-image root.
         let foreign = other_thread.join("f.png");
         std::fs::write(&foreign, b"x").unwrap();
-        assert!(
-            classify_chat_image_ref(&staging, &thread_dir, foreign.to_str().unwrap())
-                .is_err()
-        );
+        assert!(classify_chat_image_ref(&staging, &thread_dir, foreign.to_str().unwrap()).is_err());
 
         // A file entirely outside the tree is rejected.
         let outside_dir = tempfile::tempdir().unwrap();
         let outside = outside_dir.path().join("o.png");
         std::fs::write(&outside, b"x").unwrap();
-        assert!(
-            classify_chat_image_ref(&staging, &thread_dir, outside.to_str().unwrap())
-                .is_err()
-        );
+        assert!(classify_chat_image_ref(&staging, &thread_dir, outside.to_str().unwrap()).is_err());
     }
 
     #[tokio::test]
@@ -4487,7 +4677,14 @@ mod tests {
             path: "/tmp/a.png".into(),
             media_type: "image/png".into(),
         }];
-        fan_out_user_message(&handle, "t1", Some(42), "hi there", &images, Some("nonce-1"));
+        fan_out_user_message(
+            &handle,
+            "t1",
+            Some(42),
+            "hi there",
+            &images,
+            Some("nonce-1"),
+        );
 
         for captured in [&desktop_rx, &web_rx] {
             let received = captured.lock().unwrap();
@@ -4549,7 +4746,7 @@ mod tests {
     }
 
     #[test]
-    fn extract_sdk_session_id_handles_all_three_keys() {
+    fn extract_sdk_session_id_handles_all_provider_keys() {
         assert_eq!(
             extract_sdk_session_id(&json!({"resume": "uuid-a"})),
             Some("uuid-a".into())
@@ -4561,6 +4758,10 @@ mod tests {
         assert_eq!(
             extract_sdk_session_id(&json!({"session_id": "uuid-c"})),
             Some("uuid-c".into())
+        );
+        assert_eq!(
+            extract_sdk_session_id(&json!({"threadId": "codex-thread"})),
+            Some("codex-thread".into())
         );
     }
 
@@ -4781,9 +4982,7 @@ mod tests {
         let e = ProviderRuntimeEvent::ItemCompleted {
             thread_id: tid(),
             turn_id: turn(),
-            item: CompletedItem::AssistantText {
-                text: "hi".into(),
-            },
+            item: CompletedItem::AssistantText { text: "hi".into() },
             subagent_id: None,
         };
         assert!(should_persist_event(&e));
@@ -4887,7 +5086,9 @@ mod tests {
     fn running_event() -> ProviderRuntimeEvent {
         ProviderRuntimeEvent::SessionStateChanged {
             thread_id: tid(),
-            status: SessionStatus::Running { active_turn: turn() },
+            status: SessionStatus::Running {
+                active_turn: turn(),
+            },
         }
     }
 
@@ -4915,7 +5116,11 @@ mod tests {
         };
         assert!(matches!(
             activity_update(None, &e, now),
-            ActivityUpdate::Set(ThreadActivity { mid_turn: true, waiting_approval: false, .. })
+            ActivityUpdate::Set(ThreadActivity {
+                mid_turn: true,
+                waiting_approval: false,
+                ..
+            })
         ));
     }
 
@@ -4933,7 +5138,10 @@ mod tests {
         };
         assert!(matches!(
             activity_update(None, &opened, now),
-            ActivityUpdate::Set(ThreadActivity { waiting_approval: true, .. })
+            ActivityUpdate::Set(ThreadActivity {
+                waiting_approval: true,
+                ..
+            })
         ));
         let waiting = ProviderRuntimeEvent::SessionStateChanged {
             thread_id: tid(),
@@ -4941,7 +5149,10 @@ mod tests {
         };
         assert!(matches!(
             activity_update(None, &waiting, now),
-            ActivityUpdate::Set(ThreadActivity { waiting_approval: true, .. })
+            ActivityUpdate::Set(ThreadActivity {
+                waiting_approval: true,
+                ..
+            })
         ));
         // Resolving the approval un-pauses the clock.
         let resolved = ProviderRuntimeEvent::RequestResolved {
@@ -4951,7 +5162,11 @@ mod tests {
         };
         assert!(matches!(
             activity_update(None, &resolved, now),
-            ActivityUpdate::Set(ThreadActivity { waiting_approval: false, mid_turn: true, .. })
+            ActivityUpdate::Set(ThreadActivity {
+                waiting_approval: false,
+                mid_turn: true,
+                ..
+            })
         ));
     }
 
@@ -4964,11 +5179,16 @@ mod tests {
             status: TurnStatus::Success,
             usage: None,
         };
-        assert_eq!(activity_update(None, &completed, now), ActivityUpdate::Remove);
+        assert_eq!(
+            activity_update(None, &completed, now),
+            ActivityUpdate::Remove
+        );
         for status in [
             SessionStatus::Ready,
             SessionStatus::Closed,
-            SessionStatus::Error { message: "x".into() },
+            SessionStatus::Error {
+                message: "x".into(),
+            },
         ] {
             let e = ProviderRuntimeEvent::SessionStateChanged {
                 thread_id: tid(),
@@ -5000,7 +5220,11 @@ mod tests {
         };
         // Just under threshold → not stalled.
         assert_eq!(
-            select_stalled(&a, base + STALL_THRESHOLD - Duration::from_secs(1), STALL_THRESHOLD),
+            select_stalled(
+                &a,
+                base + STALL_THRESHOLD - Duration::from_secs(1),
+                STALL_THRESHOLD
+            ),
             None
         );
         // Exactly at threshold → stalled, reports elapsed seconds.
@@ -5041,7 +5265,10 @@ mod tests {
             .is_empty());
         // Past threshold: surfaced.
         let stalled = tracker.stalled(t0 + STALL_THRESHOLD, STALL_THRESHOLD);
-        assert_eq!(stalled, vec![("thread-a".to_string(), STALL_THRESHOLD.as_secs())]);
+        assert_eq!(
+            stalled,
+            vec![("thread-a".to_string(), STALL_THRESHOLD.as_secs())]
+        );
         // A settling turn removes the entry — the map stays bounded.
         let completed = ProviderRuntimeEvent::TurnCompleted {
             thread_id: ThreadId("thread-a".into()),
@@ -5100,8 +5327,7 @@ mod tests {
         Channel<AgentChatEventPayload>,
         Arc<Mutex<Vec<AgentChatEventPayload>>>,
     ) {
-        let captured: Arc<Mutex<Vec<AgentChatEventPayload>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<AgentChatEventPayload>>> = Arc::new(Mutex::new(Vec::new()));
         let captured_handler = captured.clone();
         let channel = Channel::new(move |body| {
             let payload = body
@@ -5128,11 +5354,7 @@ mod tests {
 
     /// Fan a payload out to every channel the registry holds for a thread,
     /// exactly as `forward_event` does for thread-scoped events.
-    fn fan_out(
-        registry: &AgentChatChannelRegistry,
-        thread: &str,
-        payload: AgentChatEventPayload,
-    ) {
+    fn fan_out(registry: &AgentChatChannelRegistry, thread: &str, payload: AgentChatEventPayload) {
         for channel in registry.channels_for(thread) {
             channel.send(payload.clone()).expect("send ok");
         }
@@ -5199,7 +5421,10 @@ mod tests {
         let g1 = registry.attach("t1", first);
         let _g2 = registry.attach("t1", second);
 
-        assert!(registry.detach("t1", g1), "matching detach removes the entry");
+        assert!(
+            registry.detach("t1", g1),
+            "matching detach removes the entry"
+        );
 
         fan_out(&registry, "t1", delta_payload("t1", "after"));
         assert!(
@@ -5328,7 +5553,9 @@ mod tests {
             map_event_to_pane_status(
                 &ProviderRuntimeEvent::SessionStateChanged {
                     thread_id: tid(),
-                    status: SessionStatus::Running { active_turn: turn() },
+                    status: SessionStatus::Running {
+                        active_turn: turn()
+                    },
                 },
                 &mut st
             ),
@@ -5384,7 +5611,9 @@ mod tests {
             map_event_to_pane_status(
                 &ProviderRuntimeEvent::SessionStateChanged {
                     thread_id: tid(),
-                    status: SessionStatus::Error { message: "boom".into() },
+                    status: SessionStatus::Error {
+                        message: "boom".into()
+                    },
                 },
                 &mut st
             ),
@@ -5535,7 +5764,9 @@ mod tests {
             map_event_to_pane_status(
                 &ProviderRuntimeEvent::SessionStateChanged {
                     thread_id: tid(),
-                    status: SessionStatus::Error { message: "boom".into() },
+                    status: SessionStatus::Error {
+                        message: "boom".into()
+                    },
                 },
                 &mut st
             ),
@@ -5610,7 +5841,9 @@ mod tests {
     fn session_running() -> ProviderRuntimeEvent {
         ProviderRuntimeEvent::SessionStateChanged {
             thread_id: tid(),
-            status: SessionStatus::Running { active_turn: turn() },
+            status: SessionStatus::Running {
+                active_turn: turn(),
+            },
         }
     }
 
@@ -5638,7 +5871,10 @@ mod tests {
             map_event_to_pane_status(&session_running(), &mut st),
             Some(PaneStatus::Working)
         );
-        assert!(st.is_clear(), "new turn resets both running and review_pending");
+        assert!(
+            st.is_clear(),
+            "new turn resets both running and review_pending"
+        );
 
         // Turn 2 finishes with nothing tracked → Review fires normally.
         assert_eq!(
@@ -5656,13 +5892,19 @@ mod tests {
         let tracker = SubagentTracker::default();
         // Turn 1: subagent outlives the turn, Review deferred.
         tracker.decide("t", &subagent_event("bg", SubagentStatus::Running));
-        assert_eq!(tracker.decide("t", &turn_completed()), Some(PaneStatus::Working));
+        assert_eq!(
+            tracker.decide("t", &turn_completed()),
+            Some(PaneStatus::Working)
+        );
 
         // agent_chat_send_turn clears the thread's tracker before turn 2.
         tracker.clear_thread("t");
 
         // Turn 2 completes clean → Review, not a stuck Working.
-        assert_eq!(tracker.decide("t", &turn_completed()), Some(PaneStatus::Review));
+        assert_eq!(
+            tracker.decide("t", &turn_completed()),
+            Some(PaneStatus::Review)
+        );
     }
 
     // Finding 2: a deferred Review must survive parent-scoped output that
@@ -5690,14 +5932,19 @@ mod tests {
                 &ProviderRuntimeEvent::ItemCompleted {
                     thread_id: tid(),
                     turn_id: turn(),
-                    item: CompletedItem::AssistantText { text: "final".into() },
+                    item: CompletedItem::AssistantText {
+                        text: "final".into()
+                    },
                     subagent_id: None,
                 },
                 &mut st
             ),
             Some(PaneStatus::Working)
         );
-        assert!(st.review_pending, "parent-scoped output must not drop the owed Review");
+        assert!(
+            st.review_pending,
+            "parent-scoped output must not drop the owed Review"
+        );
 
         // The last subagent goes terminal → the owed Review finally fires.
         assert_eq!(
@@ -5726,6 +5973,91 @@ mod tests {
             "a terminal for an already-forgotten subagent moves nothing"
         );
         assert!(st.is_clear());
+    }
+
+    fn portable_skill() -> crate::skills::ResolvedSkillInvocation {
+        crate::skills::ResolvedSkillInvocation {
+            skill_id: "skill-1".into(),
+            name: "deploy".into(),
+            source_provider: crate::skills::SkillProvider::Claude,
+            source_scope: crate::skills::SkillScope::User,
+            base_dir: Some("/skills/deploy".into()),
+            path: Some("/skills/deploy/SKILL.md".into()),
+            body: Some("Deploy carefully.".into()),
+            invocation: crate::skills::SkillInvocationKind::PromptPrefix,
+        }
+    }
+
+    #[test]
+    fn portable_skill_envelope_preserves_base_directory() {
+        let rendered = render_skill_invocations(
+            "ship it",
+            Some("ship it"),
+            ProviderKind::OpenCode,
+            &[portable_skill()],
+        )
+        .unwrap();
+        assert!(rendered.contains("base-dir=\"/skills/deploy\""));
+        assert!(rendered.contains("Deploy carefully."));
+        assert!(rendered.ends_with("ship it"));
+    }
+
+    #[test]
+    fn portable_skill_envelope_escapes_attribute_values() {
+        let mut skill = portable_skill();
+        skill.name = "deploy&verify".into();
+        skill.base_dir = Some("/skills/a\"b".into());
+        let rendered =
+            render_skill_invocations("ship", Some("ship"), ProviderKind::OpenCode, &[skill])
+                .unwrap();
+        assert!(rendered.contains("name=\"deploy&amp;verify\""));
+        assert!(rendered.contains("base-dir=\"/skills/a&quot;b\""));
+    }
+
+    #[test]
+    fn native_claude_skill_keeps_native_command_semantics() {
+        let mut skill = portable_skill();
+        skill.invocation = crate::skills::SkillInvocationKind::NativeCommand;
+        let rendered =
+            render_skill_invocations("release", Some("release"), ProviderKind::Claude, &[skill])
+                .unwrap();
+        assert_eq!(rendered, "/deploy release");
+    }
+
+    #[test]
+    fn native_claude_skill_with_wrappers_uses_portable_envelope() {
+        let mut skill = portable_skill();
+        skill.invocation = crate::skills::SkillInvocationKind::NativeCommand;
+        let rendered = render_skill_invocations(
+            "Plan instructions.\n\nrelease",
+            Some("release"),
+            ProviderKind::Claude,
+            &[skill],
+        )
+        .unwrap();
+        assert!(rendered.starts_with("<codemux-skill"));
+        assert!(rendered.ends_with("Plan instructions.\n\nrelease"));
+        assert!(!rendered.starts_with("/deploy"));
+    }
+
+    #[test]
+    fn native_claude_skill_without_original_text_uses_portable_envelope() {
+        let mut skill = portable_skill();
+        skill.invocation = crate::skills::SkillInvocationKind::NativeCommand;
+        let rendered =
+            render_skill_invocations("release", None, ProviderKind::Claude, &[skill]).unwrap();
+        assert!(rendered.starts_with("<codemux-skill"));
+        assert!(rendered.ends_with("release"));
+    }
+
+    #[test]
+    fn codex_skill_item_does_not_duplicate_body_in_text() {
+        let mut skill = portable_skill();
+        skill.invocation = crate::skills::SkillInvocationKind::CodexSkillItem;
+        let rendered =
+            render_skill_invocations("review", Some("review"), ProviderKind::Codex, &[skill])
+                .unwrap();
+        assert_eq!(rendered, "review");
     }
 
     #[test]

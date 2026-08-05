@@ -19,10 +19,10 @@ interface Props {
   issue: LinkedIssue;
   /** Trigger appearance. `"row"` (default) is the tiny dot + `#N` used
    *  inline in the sidebar workspace row; `"chip"` is the bordered
-   *  `Issue #N` button used by the workspace context bar. */
+   *  `Issue #N` button used by the Agent Chat Context Row. */
   variant?: "row" | "chip";
   /** Which side the detail popover opens on. The sidebar row opens
-   *  right (into the content area); the bottom context bar opens up. */
+   *  right (into the content area); the Context Row opens up. */
   side?: "top" | "right" | "bottom" | "left";
   align?: "start" | "center" | "end";
 }
