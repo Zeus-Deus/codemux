@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "codemux",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "identifier": "com.codemux.app",
   "build": {
     "beforeDevCommand": "bash scripts/copy-agent-browser.sh && bash scripts/build-claude-sidecar.sh && bash scripts/build-codemux-remote.sh --profile debug && npm run dev",
