@@ -178,10 +178,9 @@ export function SidebarFooterBar() {
   }
 
   return (
-    // Fixed 42px with a border-top (instead of SidebarSeparator + padding)
-    // so its top edge lands on the exact same pixel row as the workspace
-    // context bar's border-top — the two read as one continuous line
-    // across the bottom of the app. 28px controls + 7px vertical padding.
+    // The sidebar keeps its compact destination footer after the workspace
+    // context bar's removal; it no longer dictates any work-surface height.
+    // 28px controls + 7px vertical padding.
     <div className="flex h-[42px] items-center gap-0.5 border-t border-sidebar-border px-2">
       <button
         type="button"

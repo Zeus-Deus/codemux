@@ -319,8 +319,9 @@ pub struct PortInfo {
 `pub fn detect_listening_ports() -> Vec<PortInfo>` at line 150. Linux:
 parses `/proc/net/tcp` + `/proc/net/tcp6`, resolves PIDs via
 `/proc/*/fd/`. Windows: `netstat -ano` + `tasklist /NH /FO csv`. Other
-platforms return empty. Codemux's internal ranges (`3900-4199`, `>=9222`)
-are filtered out via `is_codemux_internal_port` (line 118). `workspace_id`
+platforms return empty. Codemux's browser-control range (`>=9222`) is
+filtered out via `is_codemux_internal_port` (line 118). Ordinary application
+ports, including `3900-4199`, remain visible. `workspace_id`
 and `label` come from the static `StaticPortsConfig` (line 131) — so a
 `port_list` MCP tool would return `Vec<PortInfo>` directly, no shape work
 needed.

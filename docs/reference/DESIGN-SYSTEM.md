@@ -52,7 +52,7 @@ These are **not** theme colors and are left literal on purpose:
      text-selection pair. The background aliases ember; the foreground is a
      dedicated dark ink that remains above 6:1 contrast across every palette,
      including the transparent Agent Chat composer textarea.
-   - `--accent-violet` — secondary accent (PR merged, OpenFlow).
+   - `--accent-violet` — secondary accent (for example, a merged PR).
    - `--status-open` (green), `--status-working` (amber),
      `--status-attention` (red), `--status-remote` (sky) — status tones,
      **identical across all palettes**.
@@ -150,8 +150,6 @@ Any future surface that draws its own selection layer needs the same
   tall enough to always show a scrollbar — the command palette's result list.
   Thin, token-colored, transparent track. Prefer it over hiding the scrollbar
   (`no-scrollbar`) when the user needs to see how much list is left.
-- OpenFlow role palette stays distinct via tokens (e.g. debugger →
-  `accent-ember`).
 - Streamdown's compiled utility classes are registered as a Tailwind scan
   source (`@source "../node_modules/streamdown/dist/*.js"`) so the streaming
   markdown renderer's classes survive the Tailwind v4 tree-shake.

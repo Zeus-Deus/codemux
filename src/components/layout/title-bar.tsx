@@ -461,11 +461,10 @@ export function TitleBar({ sidebarOpen, onToggleSidebar }: TitleBarProps) {
   // branch below renders the sidebar-matched left cluster that consumes it.
   const sidebarGapWidth = useSidebarGapWidth();
 
-  // GUI chrome renders for a real, non-OpenFlow workspace when the Agent
+  // GUI chrome renders for a real workspace when the Agent
   // Chat Beta is on; a live lazy-creation draft renders the same h-10
   // shell with draft slots instead (mutually exclusive predicates — see
-  // the hook doc comments). OpenFlow keeps its dedicated chrome
-  // untouched. Shared with other GUI-mode-only surfaces via
+  // the hook doc comments). Shared with other GUI-mode-only surfaces via
   // `useGuiChrome`.
   const guiChrome = useGuiChrome();
   const draftGuiChrome = useDraftGuiChrome();

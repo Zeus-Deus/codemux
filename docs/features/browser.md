@@ -33,8 +33,8 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 
 ## Background browser in GUI mode
 
-When the Agent Chat GUI Beta (`enable_agent_chat`) is on for a real,
-non-OpenFlow workspace (the same gate as `docs/features/gui-chrome.md`'s
+When the Agent Chat GUI (`enable_agent_chat`) is on for a real workspace
+(the same gate as `docs/features/gui-chrome.md`'s
 `useGuiChrome`), an agent-opened browser (`codemux browser open` /
 `browser_automation`) no longer splits the chat pane into a browser pane.
 The daemon-level session, streaming, and automation handling are
@@ -52,10 +52,8 @@ should_create = agent_session.pane_id.is_none() && !agent_session
 .user_dismissed;`) is now behind a small pure function,
 `should_create_browser_pane(pane_attached, user_dismissed,
 gui_background_mode)`, unit-tested directly. `gui_background_mode` is
-`observability.agent_chat_enabled() && workspace_type !=
-Some(WorkspaceType::OpenFlow)`, applied on the workspace-scoped path only.
-Flag off, or an OpenFlow workspace, produces byte-identical behavior to
-before this feature — a pane is always created.
+`observability.agent_chat_enabled()` on the workspace-scoped path. With the
+flag off, a pane is created as before.
 
 The **legacy no-`workspace_id` fallback** (empty `workspace_id` and no cwd
 resolution) deliberately ignores the GUI flag and always creates the pane
@@ -114,11 +112,13 @@ already in hand:
   opened in background" + `LIVE` badge while active, the current URL
   (`agent_browser_sessions[].current_url`, already tracked — no new field
   needed), and a "View" affordance. Click opens the peek overlay.
-- **Context-bar indicator** (`src/components/layout/workspace-context-bar.tsx`)
-  — a sky-tinted pill with a blinking amber dot in the right-aligned
-  cluster, shown while the active workspace has a live background session.
-  The bar's "nothing to report" early-return now also checks this, so the
-  bar renders for the indicator alone even with no git/PR/issue. See
+- **Terminal-header indicator**
+  (`src/components/browser/background-browser-indicator.tsx`, mounted by
+  `PaneNode.tsx`) — the active terminal shows a compact sky-tinted Browser
+  control with a blinking amber dot while its workspace has a live detached
+  session. Click opens the same peek overlay. This replaced the full-width
+  workspace context bar, so browser activity stays discoverable without
+  reserving 42px below every terminal. See
   `docs/features/workspace-context-bar.md`.
 - **Peek overlay** (`src/components/browser/BrowserPeekOverlay.tsx`) — a
   440×300 floating panel, absolutely positioned top-right inside the
@@ -247,9 +247,6 @@ timeout-bounded internally, so this never blocks the close command):
 - `close_workspace_with_worktree_impl` (worktree close + the MCP
   `workspace_close` tool). This path previously had **no** agent-browser
   teardown at all — it was the main leak the issue reported.
-- `stop_openflow_run` (`commands/openflow.rs`) — OpenFlow run teardown
-  closes the run's workspace via a direct state-level call, so it wires
-  the same reap (OpenFlow workspaces are prime agent-browser users).
 - The workspaces-sync paths in `commands/workspaces_sync.rs`:
   `workspaces_reconcile_copy` (detaching a standalone-copy card) and the
   two adopt-rollback sites that remove a just-created shell.
@@ -328,6 +325,7 @@ session are never swept, only workspace-scoped ones.
 - `src/components/browser/stream-protocol.ts` — pure helpers for the stream-input protocol (button mapping, click-count chaining, coordinate mapping, cursor sanitization) and the daemon HTTP endpoints (`/api/status` liveness probe, `/api/command` evals; page scripts minified for the single-segment HTTP constraint). Unit-tested in `stream-protocol.test.ts`
 - `src/components/browser/InspectorPanel.tsx` — browser inspector/DevTools panel
 - `src/components/browser/BrowserPeekOverlay.tsx` — GUI-mode background-browser floating peek (see "Background browser in GUI mode" above)
+- `src/components/browser/background-browser-indicator.tsx` — shared detached-session lookup plus Agent Chat and terminal-header controls
 - `src/components/chat/BackgroundBrowserChip.tsx` — the inline conversation chip for a background session
 - `src/hooks/use-gui-chrome.ts` — the shared `useGuiChrome()` gate the chip/indicator/peek key off
 - `src/stores/browser-peek-store.ts` — peek open/closed state (single `openWorkspaceId`; cleared on workspace switch)

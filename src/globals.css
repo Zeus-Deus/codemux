@@ -187,7 +187,7 @@
    * 6:1 in every palette, including the transparent chat composer textarea. */
   --selection-background: var(--accent-ember);
   --selection-foreground: oklch(0.205 0.006 40);
-  --accent-violet:    oklch(0.72 0.13 290);   /* secondary accent — PR merged, openflow   */
+  --accent-violet:    oklch(0.72 0.13 290);   /* secondary accent — PR merged             */
   --status-open:      oklch(0.74 0.14 156);   /* green — open / ready / connected / +    */
   --status-working:   oklch(0.80 0.13 80);    /* amber — agent working / behind / changed */
   --status-attention: oklch(0.685 0.17 22);   /* red   — needs input / destructive / −    */
@@ -684,7 +684,7 @@ body.pane-resizing iframe {
 
 /* Blinking status dot (design wsBlink) shared by several live-status
  * indicators — the subagent breadcrumb, the background-browser chip, the
- * right-panel tab, the workspace context bar. Formerly also used by the
+ * terminal-header browser control, and the right-panel tab. Formerly also used by the
  * now-removed "N subagents running" pane-header / title-bar pills,
  * replaced by the docked SubagentActivityBar. Opacity pulse only, so it
  * reads over any tint; honours reduced-motion. Apply via `cm-blink`. */

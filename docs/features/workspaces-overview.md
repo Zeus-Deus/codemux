@@ -55,7 +55,6 @@ When no live status is set, the static dot falls back to:
 |---|---|
 | Emerald | Currently open in this app (matches `appState.active_workspace_id`) |
 | Sky blue | Lives on a remote host |
-| Violet | OpenFlow workspace |
 | Amber | Push or pull in flight (replaces the action menu with a spinner) |
 | Muted | Local, not currently attached |
 

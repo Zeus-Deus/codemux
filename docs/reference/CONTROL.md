@@ -4,7 +4,7 @@
 - Audience: Agents, scripts, and developers automating the app.
 - Authority: Stable protocol and command reference.
 - Update when: Command families, request shapes, or security assumptions change.
-- Read next: `docs/features/browser.md`, `docs/features/openflow.md`, `AGENTS.md`
+- Read next: `docs/features/browser.md`, `docs/features/workflow-orchestration.md`, `AGENTS.md`
 
 ## Transport
 

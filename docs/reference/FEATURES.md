@@ -10,7 +10,6 @@
 
 - Create workspaces with preset pane layouts (1, 2, 4, 6, or 8 terminal slots, or shell+browser)
 - Create workspaces at a specific directory path
-- Create OpenFlow workspaces for multi-agent orchestration runs
 - Lazy workspace creation (Beta-gated): sidebar `+` and boot-into-Home open a client-side chat draft; the draft is promoted on first message send
 - Switch workspaces via sidebar click or Ctrl+]/[
 - Rename workspaces by double-clicking the active workspace name in the sidebar
@@ -109,22 +108,6 @@
 - Favorites on the model picker with `localStorage` persistence
 - Debug-mode banner with explicit exit dialog
 - Plain-quit on interface toggle flip (no auto-restart) to keep user data intact
-
-## OpenFlow Orchestration
-
-- Dedicated OpenFlow workspace type with agent configuration panel
-- Select agent roles: orchestrator, planner, builder, reviewer, tester, debugger, researcher
-- Choose CLI tool (opencode, claude), model, provider, and thinking mode per agent
-- Run creation with title and goal specification
-- Real-time orchestration view with agent node graph and status indicators
-- Communication panel with full message log between agents
-- User message injection into running orchestration
-- Message delivery tracking (shows which injections have been processed)
-- System marker filtering (hides internal protocol messages)
-- Auto-follow scroll with "jump to latest" button
-- Phase badges showing current orchestration state
-- Pause, cancel, and retry controls for runs
-- Run status sidebar section with pulsing activity indicators
 
 ## Notifications
 

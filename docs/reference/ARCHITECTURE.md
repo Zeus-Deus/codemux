@@ -38,7 +38,6 @@ Rust owns the durable app domain and runtime integration.
 - Tauri composition root: `src-tauri/src/lib.rs`
 - canonical app state: `src-tauri/src/state/`
 - PTY and terminal lifecycle: `src-tauri/src/terminal/`
-- OpenFlow runtime: `src-tauri/src/openflow/`
 - agent-chat providers: `src-tauri/src/agent_provider/` (the `AgentProvider` trait plus per-provider adapters for Codex and Claude; the Claude adapter drives the sidecar binary under `sidecar/claude-agent/`)
 - JSON-RPC stdio helper: `src-tauri/src/json_rpc_child/` (shared framing + routing for long-lived subprocesses both provider adapters use)
 - control server: `src-tauri/src/control.rs` (Unix socket on Linux/macOS via `tokio::net::UnixListener`, named pipe on Windows via `tokio::net::windows::named_pipe::ServerOptions`)
@@ -49,17 +48,17 @@ Rust owns the durable app domain and runtime integration.
 - scheduled runs: `src-tauri/src/automations/`
 - MCP: `src-tauri/src/mcp/` (Codemux as MCP host) and `src-tauri/src/mcp_server.rs` (Codemux as MCP server, 55 tools)
 - skills: `src-tauri/src/skills/` + `src-tauri/src/skills_sync/`
-- auth: `src-tauri/src/auth/`; sandboxing/backends: `src-tauri/src/execution/`; config: `src-tauri/src/config/`
+- auth: `src-tauri/src/auth/`; child-process environment hygiene: `src-tauri/src/execution/`; config: `src-tauri/src/config/`
 - Tauri command modules: `src-tauri/src/commands/`
 
 ## Command Surface
 
 The Tauri command layer is split by domain.
 
-`src-tauri/src/commands/` holds 26 modules, one per domain: `agent_chat`, `ai`, `auth`, `automations`,
+`src-tauri/src/commands/` holds 23 domain modules: `agent_chat`, `ai`, `auth`, `automations`,
 `branch_name`, `browser`, `database`, `files`, `gemini`, `git`, `github`, `hosts`, `mcp`, `opencode`,
-`openflow`, `package_detect`, `permissions`, `presets`, `project_files`, `settings_sync`, `skills`,
-`skills_sync`, `update`, `virtual_display`, `workspace`, `workspaces_sync`. Memory, indexing,
+`package_detect`, `permissions`, `presets`, `project_files`, `settings_sync`, `skills`,
+`skills_sync`, `update`, `workspace`, `workspaces_sync`. Memory, indexing,
 observability, and dialog commands live directly in `commands/mod.rs`.
 
 These command names stay stable at the Tauri boundary even when the internal module layout changes.
@@ -97,13 +96,6 @@ Codemux authenticates against a Better Auth API server at `api.codemux.org` (ove
 
 Per-user settings sync to the server; machine-local settings (sidebar state, window layout, presets) stay in SQLite. The server is the source of truth when reachable; offline cache with dirty flag handles network outages.
 
-## OpenFlow Boundary
+## Workflow Orchestration Boundary
 
-OpenFlow is integrated into Codemux, but it still keeps a separate runtime boundary.
-
-- OpenFlow workspace shell lives in the normal workspace system
-- run state lives in `OpenFlowRuntimeStore` and `AgentSessionStore`
-- orchestration logic and comm-log parsing live under `src-tauri/src/openflow/`
-- OpenFlow browser viewing currently mounts `BrowserPane` on the shared default browser session
-
-OpenFlow workspaces are intentionally treated as runtime-oriented surfaces rather than long-term persisted workspace state.
+Workflow orchestration is an Agent Chat capability, not a separate workspace runtime. Claude `Workflow` tool events are reduced into the normal persisted transcript, rendered by `src/components/workflow/`, and surfaced through the conditional Orchestration panel. See `docs/features/workflow-orchestration.md`.

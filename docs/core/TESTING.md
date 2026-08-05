@@ -32,7 +32,7 @@ The mock lives in `src/dev/` and only loads when no real Tauri runtime is detect
 
 ## Testing Layers
 
-- Rust domain tests for workspaces, pane trees, terminal lifecycle, persistence, notifications, memory, indexing, and OpenFlow runtime logic
+- Rust domain tests for workspaces, pane trees, terminal lifecycle, persistence, notifications, memory, indexing, providers, and workflow state
 - Bun tests in `sidecar/claude-agent/test/` for the Claude Agent SDK sidecar (not run by `npm run verify`)
 - frontend interaction tests for important workspace, pane, and browser flows
 - focused end-to-end coverage later for a few critical workflows rather than every UI detail
@@ -49,7 +49,7 @@ The mock lives in `src/dev/` and only loads when no real Tauri runtime is detect
 
 - Implemented is not the same as verified.
 - A roadmap checkbox is not release proof.
-- Browser and OpenFlow changes need especially careful manual validation because they are still prototype-heavy areas.
+- Browser and remote-runtime changes need especially careful manual validation because they cross process and transport boundaries.
 
 ## High-Value Manual Workflows Right Now
 
@@ -58,4 +58,4 @@ The mock lives in `src/dev/` and only loads when no real Tauri runtime is detect
 - mixed terminal and browser layouts
 - browser toolbar and automation command flows
 - memory, handoff, and indexing workflows
-- OpenFlow run creation, monitoring, control actions, retry, cancel, and stability
+- Agent Chat workflow approval, progress, cancellation, and transcript stability

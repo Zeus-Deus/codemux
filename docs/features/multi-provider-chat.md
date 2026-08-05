@@ -79,7 +79,6 @@ Stale favorites for a now-disconnected provider stay in storage and are silently
 - **No "favorites only" filter** in the rail — favorites bubble up via sort, not via a dedicated filter mode.
 - **No favorites sync across devices.** Codemux doesn't sync UI prefs; favorites live in `localStorage` only.
 - **OpenCode credential management lives in OpenCode.** Codemux never reads or writes upstream API keys (OpenAI / Anthropic / etc.). `opencode auth login` is the one entry point; settings panel only shows the connected/disconnected state.
-- **OpenFlow's CLI-launcher dropdown carries its own hardcoded model registry** (`src-tauri/src/commands/openflow.rs::claude_default_models` / `codex_default_models`). Pre-existing, separate code path from the chat picker; convergence is tracked as future cleanup.
 
 ## Important Touch Points
 
@@ -118,6 +117,5 @@ Stale favorites for a now-disconnected provider stay in storage and are silently
 ## Notes
 
 - **The legacy single-provider `ProviderPicker.tsx` was deleted in Stage 7 cleanup.** Stage 4 replaced it with `MultiProviderModelPicker` and Stage 4's wiring left zero callers; the file was kept around through Stage 6 as a paranoia hedge and removed once dead-code audit confirmed no remaining imports.
-- **OpenFlow capabilities convergence is future cleanup, not a regression.** OpenFlow's `list_models_for_tool` Tauri command has its own model registry that pre-dates the agent-chat capabilities harvest. The Codex fallback file already cross-references this duplication (`src-tauri/src/agent_provider/codex/capabilities.rs:33`). Converging would let Codemux drop two parity-by-comment dependencies, but it's a meaningful refactor that touches OpenFlow's CLI-launcher invariants.
 - **Multi-instance per provider is planned for v2.** `ProviderInstanceId` already exists; the wire format already serializes as a bare provider slug (`"claude"` / `"codex"` / `"opencode"`). The lift is mostly settings UI + capability-harvest fan-out.
 - **Picker keyboard shortcuts shipped** as in-popover-only row jumps (see above); the deferred cross-app namespace question is moot.

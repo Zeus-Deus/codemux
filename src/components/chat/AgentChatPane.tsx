@@ -2651,10 +2651,9 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
 
   const belowComposerSlot = workspaceProjectRoot ? (
     // Context Row (design: `.design-import/Context Row.dc.html`) —
-    // static project/branch labels on the left, the same passive
-    // git/PR status cluster on the right that the old bottom
-    // `WorkspaceContextBar` used to show (now hidden for this pane —
-    // see `useAgentChatPaneActive`). Rendered at every message count:
+    // static project/branch labels on the left, plus the passive git/PR
+    // status cluster on the right that survived the retired workspace
+    // context bar. Rendered at every message count:
     // an empty thread has nothing to choose either (see above), so the
     // strip never changes shape across the first send.
     <div className={SCOPE_STRIP_INSET}>

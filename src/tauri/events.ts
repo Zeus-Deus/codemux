@@ -4,7 +4,6 @@ export type { UnlistenFn };
 import type {
   AppStateSnapshot,
   AuthStatePayload,
-  OrchestratorTriggerResult,
   PresetStoreSnapshot,
   RevisionedDelta,
   RevisionHeartbeat,
@@ -112,11 +111,6 @@ export const onGitCloneProgress = (
   cb: EventCallback<GitCloneProgress>,
 ): Promise<UnlistenFn> =>
   listen<GitCloneProgress>(GIT_CLONE_PROGRESS_EVENT, (e) => cb(e.payload));
-
-export const onOpenflowCycle = (
-  cb: EventCallback<OrchestratorTriggerResult>,
-): Promise<UnlistenFn> =>
-  listen<OrchestratorTriggerResult>("openflow-cycle", (e) => cb(e.payload));
 
 export const onSettingsSynced = (
   cb: EventCallback<UserSettings>,

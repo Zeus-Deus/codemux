@@ -698,7 +698,7 @@ fn register_tools() -> Vec<McpTool> {
         // -- Lifecycle + issue tools (Phase 1.6 vexis-agent integration) --
         McpTool {
             name: "workspace_close",
-            description: "Close a workspace by id. Runs teardown scripts, terminates PTYs, releases the workspace's virtual display, and removes Codemux's entry from the workspace's `.mcp.json`. Optionally also removes the underlying git worktree. Protected project-root checkouts can NEVER have their files deleted through this tool — `delete_worktree: true` on such a workspace errors; use `workspace_archive` instead to close it restorably.",
+            description: "Close a workspace by id. Runs teardown scripts, terminates PTYs, and removes Codemux's entry from the workspace's `.mcp.json`. Optionally also removes the underlying git worktree. Protected project-root checkouts can NEVER have their files deleted through this tool — `delete_worktree: true` on such a workspace errors; use `workspace_archive` instead to close it restorably.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
