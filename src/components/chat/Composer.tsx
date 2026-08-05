@@ -166,7 +166,7 @@ interface Props {
    *  a project picker in when the draft target is Home. Omit
    *  (`undefined`) to keep the default cwd label; pass `null` to
    *  render nothing above the textarea (a running chat keeps its
-   *  scope in the workspace context bar instead). */
+   *  scope in the Context Row below the composer instead). */
   zone1Override?: React.ReactNode;
   /** Thread Scope redesign — optional slot rendered BELOW the composer
    *  card (inside the same max-w-[760px] column), under the footer.

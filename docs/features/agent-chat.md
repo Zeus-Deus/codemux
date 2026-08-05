@@ -2484,19 +2484,17 @@ workspace, so any `AgentChatPane` instance's workspace IS the active
 one). It renders:
 
 - the **background-browser indicator** (first in the cluster, mirroring
-  its old bottom-bar position) when the workspace has a live, pane-less
+  the browser control in terminal headers) when the workspace has a live, pane-less
   `agent_browser_sessions` entry — the shared
   `BackgroundBrowserIndicator` + `useBackgroundBrowserSession` pair
-  (`src/components/browser/background-browser-indicator.tsx`, extracted
-  verbatim from `WorkspaceContextBar`, which still consumes them for
-  the terminal-pane/GUI cases where the bar renders). Click opens the
-  peek overlay (`useBrowserPeekStore().open`). The `enableAgentChat` gate is
-  implicit in the cluster's mount context because a disabled flag renders a
-  placeholder instead of the pane;
+  (`src/components/browser/background-browser-indicator.tsx`, shared with
+  the active terminal's compact header control). Click opens the
+  peek overlay (`useBrowserPeekStore().open`). The cluster's
+  `enableAgentChat` gate is implicit in the cluster's mount context (a
+  disabled flag renders a placeholder instead of the pane);
 - a **behind chip** (`↓N`, `text-warning`) when `git_behind > 0`;
-- a **PR chip** (`#N`, tone-tinted via `PR_CHIP_TONE` — the single
-  shared map in `src/components/github/pr-status-icon.tsx`, also used
-  by `WorkspaceContextBar`) that opens `pr_url` on click;
+- a **PR chip** (`#N`, tone-tinted via `PR_CHIP_TONE` in
+  `src/components/github/pr-status-icon.tsx`) that opens `pr_url` on click;
 - a **linked-issue chip** (`Issue #N`) — the shared
   `IssueDetailPopover` (chip variant, `side="top" align="end"`,
   `src/components/github/issue-detail-popover.tsx`) the old bar used,
@@ -2529,13 +2527,11 @@ with a live background browser shows the Browser pill alone, and one
 with only a linked issue shows the Issue chip alone — matching the old
 bar's visibility set (`hasGit || prState || linked_issue || browser`).
 
-**Bottom bar interaction.** While an Agent Chat pane is the active pane
-of the active surface in GUI chrome, `WorkspaceContextBar` renders
-`null` — the Context Row now owns that detail inline. See
-`docs/features/workspace-context-bar.md` and
-`useAgentChatPaneActive()` (`src/hooks/use-gui-chrome.ts`). A terminal
-(or other) pane active in GUI mode keeps the bottom bar; legacy chrome
-(GUI flag off) is unaffected.
+**No global bottom bar.** The full-width `WorkspaceContextBar` was removed.
+The Context Row owns chat-local detail inline; the sidebar and hover card own
+cross-surface workspace detail; and an active terminal places only the live
+background-browser launcher in its existing pane header. See
+`docs/features/workspace-context-bar.md`.
 
 ## Context-window meter (composer)
 

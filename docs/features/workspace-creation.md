@@ -271,8 +271,6 @@ git-dependent features with honest messaging instead of silence.
 
 ### Surfaces
 
-- **Workspace context bar** — "Not a git repository" + Initialize Git
-  button where the branch/kind cluster would render.
 - **Context Row status cluster** (chat panes) — compact Initialize Git
   chip with an explanatory tooltip.
 - **Changes panel** — "Not a git repository — changes can't be tracked"
@@ -282,6 +280,10 @@ git-dependent features with honest messaging instead of silence.
   projects (gated off the project's workspace snapshot); a stale
   "worktree" draft mode is snapped back to "current"; the scope hint
   says the run lands in the folder and how to unlock worktrees.
+
+The retired full-width workspace context bar no longer supplies a separate
+Initialize Git action; the Context Row and Changes panel are the remaining
+workspace-local surfaces. See `docs/features/workspace-context-bar.md`.
 
 ### Known remaining gaps
 

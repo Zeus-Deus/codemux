@@ -304,7 +304,7 @@ const ISSUE_MOCK: LinkedIssue = {
 };
 
 /** Linked to the agent-chat-demo workspace so the Context Row's
- *  linked-issue chip (relocated from the old bottom bar) is visible and
+ *  linked-issue chip (retained after the old bottom bar's removal) is visible and
  *  clickable under `npm run dev` — the mock's `get_github_issue`
  *  expands this into a full issue for the popover. */
 const ISSUE_CHAT: LinkedIssue = {
@@ -325,6 +325,7 @@ const codemuxUid = "uid-codemux";
 const wsCodemuxMain = makeWorkspace({
   workspace_id: "ws-codemux-main",
   title: "codemux",
+  paneLabel: "Claude Code",
   cwd: codemuxRoot,
   project_root: codemuxRoot,
   project_uid: codemuxUid,
@@ -376,15 +377,31 @@ const wsCodemuxChat: WorkspaceSnapshot = (() => {
 
 /** Detached (pane-less) agent browser session for `wsCodemuxChat` —
  *  drives the "Background browser in GUI mode" chrome (issue: browser
- *  chip + context-bar indicator + peek overlay, `docs/features/browser.md`):
+ *  chip + terminal-header indicator + peek overlay, `docs/features/browser.md`):
  *  the agent opened a browser mid-chat but it stayed off to the side
  *  instead of splitting the chat into a pane. `pane_id: null` + `is_active:
- *  true` is exactly the predicate `MessageList`, `WorkspaceContextBar`, and
- *  `BrowserPeekOverlay` all key off of. */
+ *  true` is exactly the predicate `MessageList`, the terminal-header
+ *  browser control, and `BrowserPeekOverlay` all key off of. */
 const MOCK_AGENT_BROWSER_SESSION: AgentBrowserSession = {
   session_id: "agent-browser-mock-chat",
   workspace_id: wsCodemuxChat.workspace_id,
   cli_session_name: "devmock",
+  stream_url: "ws://127.0.0.1:9777",
+  current_url: "http://localhost:1420",
+  is_active: true,
+  pane_id: null,
+  browser_id: null,
+  user_dismissed: false,
+};
+
+/** CLI-agent counterpart to the chat fixture above. This keeps the visual
+ *  regression case for the retired bottom bar directly reachable under
+ *  `npm run dev`: the primary Codemux workspace's Claude Code terminal owns
+ *  a detached browser surfaced by the compact pane-header control. */
+const MOCK_CLI_AGENT_BROWSER_SESSION: AgentBrowserSession = {
+  session_id: "agent-browser-mock-cli",
+  workspace_id: wsCodemuxMain.workspace_id,
+  cli_session_name: "devmock-cli",
   stream_url: "ws://127.0.0.1:9777",
   current_url: "http://localhost:1420",
   is_active: true,
@@ -712,7 +729,7 @@ const wsSiteRedesign = makeWorkspace({
 
 // Project 4 — scratchpad: a plain non-git folder opened as a project.
 // Exercises the non-git degradation surfaces: no branch/PR chips, the
-// "no git" state + "Initialize Git" affordance in the context bar and
+// "no git" state + "Initialize Git" affordance in the Context Row and
 // Changes panel, and the hidden worktree option in Thread Scope.
 
 const scratchRoot = `${PROJECTS}/scratchpad`;
@@ -1956,7 +1973,10 @@ export function createSeedAppState(): AppStateSnapshot {
     workspaces,
     terminal_sessions: terminalSessions,
     browser_sessions: [],
-    agent_browser_sessions: [MOCK_AGENT_BROWSER_SESSION],
+    agent_browser_sessions: [
+      MOCK_AGENT_BROWSER_SESSION,
+      MOCK_CLI_AGENT_BROWSER_SESSION,
+    ],
     notifications: [],
     detected_ports: [
       {

@@ -672,7 +672,7 @@ body.pane-resizing iframe {
 
 /* Blinking status dot (design wsBlink) shared by several live-status
  * indicators — the subagent breadcrumb, the background-browser chip, the
- * right-panel tab, the workspace context bar. Formerly also used by the
+ * terminal-header browser control, and the right-panel tab. Formerly also used by the
  * now-removed "N subagents running" pane-header / title-bar pills,
  * replaced by the docked SubagentActivityBar. Opacity pulse only, so it
  * reads over any tint; honours reduced-motion. Apply via `cm-blink`. */

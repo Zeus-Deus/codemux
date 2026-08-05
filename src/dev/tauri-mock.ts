@@ -2163,7 +2163,7 @@ const handlers: Record<string, Handler> = {
   check_gh_status: () => ({ status: "Authenticated", username: "mock-dev" }),
   refresh_workspace_pr: (a) => findWorkspace(a.workspaceId)?.pr_number ?? null,
   refresh_workspace_issue: () => null,
-  // Issue detail popover (sidebar row + workspace context bar): expand
+  // Issue detail popover (sidebar row + Agent Chat Context Row): expand
   // the workspace's seeded `linked_issue` into a full GitHubIssue so
   // the popover renders real content instead of an empty shell.
   get_github_issue: (a) => {
