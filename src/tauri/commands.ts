@@ -1486,6 +1486,19 @@ export const readChatImage = async (
   return { bytes: new Uint8Array(res.bytes), media_type: res.media_type };
 };
 
+/** Read an agent-authored absolute image path for chat preview fallback.
+ * Desktop normally uses the asset protocol; browser/web-remote clients reach
+ * this only after that URL fails to load. */
+export const readLocalChatImage = async (
+  path: string,
+): Promise<{ bytes: Uint8Array; media_type: string }> => {
+  const res = await invoke<{ bytes: number[]; media_type: string }>(
+    "agent_chat_read_local_image",
+    { path },
+  );
+  return { bytes: new Uint8Array(res.bytes), media_type: res.media_type };
+};
+
 /** Warm the MCP servers in the background so the up-front prime cost
  *  overlaps composing instead of blocking the first session start.
  *  Returns immediately; safe to fire-and-forget. */

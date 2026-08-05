@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 use tauri::ipc::{Channel, InvokeBody, Request};
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
+use tokio::io::AsyncReadExt;
 
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
@@ -1554,7 +1555,7 @@ pub struct ChatImageRef {
     pub media_type: String,
 }
 
-/// The bytes + inferred media type returned by [`agent_chat_read_image`].
+/// The bytes + inferred media type returned by the chat image readers.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatImageBytes {
     pub bytes: Vec<u8>,
@@ -1582,7 +1583,7 @@ fn validate_chat_image_mime(media_type: &str) -> Result<String, String> {
 }
 
 /// Reverse of [`chat_image_extension`]: infer a media type from a stored
-/// file's extension. Used by [`agent_chat_read_image`] so the fallback
+/// file's extension. Used by the image readers so the fallback
 /// loader can label the bytes it returns. Unknown extensions fall back to
 /// the generic binary type rather than guessing.
 fn media_type_from_extension(path: &std::path::Path) -> String {
@@ -1599,6 +1600,27 @@ fn media_type_from_extension(path: &std::path::Path) -> String {
         _ => "application/octet-stream",
     }
     .to_string()
+}
+
+/// Identify the narrow set of raster formats the local-proof transport may
+/// return. This inspects magic bytes instead of trusting a caller-controlled
+/// extension, so renaming an arbitrary file to `.png` cannot turn the command
+/// into a general file reader.
+fn media_type_from_image_bytes(bytes: &[u8]) -> Result<String, String> {
+    let media_type = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    };
+    media_type
+        .map(str::to_string)
+        .ok_or_else(|| "validation_error: unsupported local image content".to_string())
 }
 
 /// Verify `candidate` resolves to a path whose parent is inside `root`
@@ -1957,6 +1979,73 @@ pub async fn agent_chat_read_image<R: Runtime>(
     let bytes = tokio::fs::read(&resolved)
         .await
         .map_err(|error| format!("failed to read chat image: {error}"))?;
+    Ok(ChatImageBytes { bytes, media_type })
+}
+
+/// Read a local image path referenced by an assistant's Markdown response.
+///
+/// Unlike [`agent_chat_read_image`], this path is not confined to Codemux's
+/// persisted attachment directory: browser automation tools commonly save
+/// visual proof under their own temp directory and return that absolute path
+/// in the final message. Desktop WebKit loads it through the asset protocol;
+/// web-remote and the browser dev mock use this bounded fallback instead.
+///
+/// The command accepts only absolute, existing PNG/JPEG/GIF/WebP files and
+/// applies the same 25 MB ceiling as clipboard attachments. That keeps this a
+/// narrow image transport rather than a general arbitrary-file read endpoint.
+#[tauri::command]
+pub async fn agent_chat_read_local_image<R: Runtime>(
+    app: AppHandle<R>,
+    path: String,
+) -> Result<ChatImageBytes, String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+
+    let candidate = std::path::Path::new(&path);
+    if !candidate.is_absolute() {
+        return Err("validation_error: local image path must be absolute".to_string());
+    }
+
+    let resolved = tokio::fs::canonicalize(candidate)
+        .await
+        .map_err(|error| format!("failed to resolve local image: {error}"))?;
+    let metadata = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|error| format!("failed to inspect local image: {error}"))?;
+    if !metadata.is_file() {
+        return Err("validation_error: local image path is not a file".to_string());
+    }
+    if metadata.len() > crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES as u64 {
+        return Err(format!(
+            "validation_error: local image exceeds {} MB limit",
+            crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES / (1024 * 1024),
+        ));
+    }
+
+    let extension_media_type = media_type_from_extension(&resolved);
+    if !ACCEPTED_CHAT_IMAGE_MIME.contains(&extension_media_type.as_str()) {
+        return Err("validation_error: unsupported local image type".to_string());
+    }
+
+    // Limit the reader itself, not only the pre-read metadata check: the file
+    // can change between stat and read, and must never make this allocation
+    // grow beyond the advertised ceiling.
+    let file = tokio::fs::File::open(&resolved)
+        .await
+        .map_err(|error| format!("failed to read local image: {error}"))?;
+    let max_bytes = crate::commands::files::MAX_CLIPBOARD_IMAGE_BYTES;
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(max_bytes));
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("failed to read local image: {error}"))?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "validation_error: local image exceeds {} MB limit",
+            max_bytes / (1024 * 1024),
+        ));
+    }
+    let media_type = media_type_from_image_bytes(&bytes)?;
     Ok(ChatImageBytes { bytes, media_type })
 }
 
@@ -4227,6 +4316,19 @@ mod tests {
             media_type_from_extension(Path::new("/x/noext")),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn media_type_from_image_bytes_uses_magic_not_the_filename() {
+        assert_eq!(
+            media_type_from_image_bytes(b"\x89PNG\r\n\x1a\nrest").unwrap(),
+            "image/png"
+        );
+        assert_eq!(
+            media_type_from_image_bytes(b"GIF89a-rest").unwrap(),
+            "image/gif"
+        );
+        assert!(media_type_from_image_bytes(b"private text wearing a .png suffix").is_err());
     }
 
     // ── chat image staging: path containment (security boundary) ──
