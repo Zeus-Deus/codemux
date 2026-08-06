@@ -805,20 +805,144 @@ describe("SidebarInbox — settle / un-settle", () => {
       '[data-settled-row="ws-1"]',
     ) as HTMLElement;
     expect(row).not.toBeNull();
-    // Title recedes past the plain muted tone the active cards use.
-    expect(within(row).getByText("Shipped").className).toContain(
-      "text-muted-foreground/60",
+    // Title recedes past the plain muted tone the active cards use, and comes
+    // back on hover *and* keyboard focus.
+    const title = within(row).getByText("Shipped");
+    expect(title.className).toContain("text-muted-foreground/60");
+    expect(title.className).toContain("group-hover/settled:text-foreground");
+    expect(title.className).toContain(
+      "group-focus-within/settled:text-foreground",
     );
-    // Repo avatar desaturates rather than disappearing.
-    expect(within(row).getByText("M").className).toContain("grayscale");
+    // Repo avatar desaturates rather than disappearing, on the same restore.
+    const avatar = within(row).getByText("M");
+    expect(avatar.className).toContain("grayscale");
+    expect(avatar.className).toContain("group-hover/settled:grayscale-0");
+    expect(avatar.className).toContain("group-hover/settled:opacity-100");
+    expect(avatar.className).toContain(
+      "group-focus-within/settled:grayscale-0",
+    );
     // The PR badge is neutral at rest; its state color is a hover variant, so
-    // the settled shelf reads as one grey block until you point at a row.
+    // the settled shelf reads as one grey block until you point at a row. It
+    // rests one step brighter than the avatar because "#87" is its only label.
     const badge = within(row).getByRole("button", {
       name: "Open PR #87 on GitHub — open",
     });
-    expect(badge.className).toContain("text-muted-foreground/40");
+    expect(badge.className).toContain("text-muted-foreground/55");
     expect(badge.className).not.toMatch(/(^|\s)text-status-open\b/);
     expect(badge.className).toContain("group-hover/settled:text-status-open");
+    expect(badge.className).toContain(
+      "group-focus-within/settled:text-status-open",
+    );
+    // The glyph defers to the button's color rather than keeping its own, so
+    // number and icon can never light up at different times.
+    const glyph = badge.querySelector("svg") as SVGElement;
+    expect(glyph.getAttribute("class")).toContain("text-current");
+    expect(glyph.getAttribute("class")).not.toMatch(
+      /(^|\s)text-status-open\b/,
+    );
+  });
+
+  it("keeps the settled row you are standing in at full prominence", async () => {
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [makeWorkspace({ title: "Shipped" })];
+    activeWorkspaceId = "ws-1";
+    const { container } = await flushRender();
+
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(within(row).getByText("Shipped").className).toContain(
+      "text-foreground",
+    );
+    expect(within(row).getByText("M").className).not.toContain("grayscale");
+  });
+
+  it("keeps a multi-selected settled row at full prominence", async () => {
+    const base = Date.now();
+    workspaces = [
+      makeWorkspace({ title: "Ticked" }),
+      makeWorkspace({ title: "Untouched" }),
+    ];
+    persistInbox({
+      settled: workspaces.map((w, i) => ({
+        id: w.workspace_id,
+        at: base - i * 1000,
+      })),
+    });
+    const { container } = await flushRender();
+
+    const rows = [...container.querySelectorAll("[data-settled-row]")];
+    fireEvent.click(rows[0], { ctrlKey: true });
+
+    const ticked = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(ticked.getAttribute("data-selected")).toBe("true");
+    expect(within(ticked).getByText("Ticked").className).toContain(
+      "text-foreground",
+    );
+    expect(within(ticked).getByText("M").className).not.toContain("grayscale");
+    // The row beside it is untouched by the tick and still recedes.
+    const other = container.querySelector(
+      '[data-settled-row="ws-2"]',
+    ) as HTMLElement;
+    expect(within(other).getByText("Untouched").className).toContain(
+      "text-muted-foreground/60",
+    );
+  });
+
+  it("never dims a settled row whose agent is finished and wants review", async () => {
+    // The settle safety net leaves review work parked on purpose, so these
+    // rows are the one thing on the shelf still asking for a human.
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({
+        title: "Wants review",
+        pr_number: 87,
+        pr_state: "OPEN",
+        pr_url: "https://github.com/u/r/pull/87",
+        surfaces: surfaceWithPane("p1"),
+      }),
+    ];
+    paneStatuses = { p1: "review" };
+    const { container } = await flushRender();
+
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(within(row).getByText("Wants review").className).toContain(
+      "text-foreground",
+    );
+    expect(within(row).getByText("M").className).not.toContain("grayscale");
+    // Its PR keeps the state color outright — no hover deferral.
+    const badge = within(row).getByRole("button", {
+      name: "Open PR #87 on GitHub — open",
+    });
+    expect(badge.className).toContain("text-status-open");
+    expect(badge.className).not.toContain("text-muted-foreground/55");
+  });
+
+  it("never dims a settled row holding unread output", async () => {
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({
+        title: "Unseen news",
+        last_active_at: Date.now(),
+        last_visited_at: null,
+      }),
+    ];
+    const { container } = await flushRender();
+
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+    expect(within(row).getByText("Unseen news").className).toContain(
+      "text-foreground",
+    );
+    expect(within(row).getByText("M").className).not.toContain("grayscale");
   });
 
   it("hides the Settle button for live / blocked cards, keeps it for idle / review", async () => {

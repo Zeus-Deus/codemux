@@ -601,8 +601,14 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   as ragged noise down a scrolling list. Right-aligning also makes
                   the chip's own variable width (#7 vs #1234) harmless.
                   The chip is deliberately chrome-free — state-colored icon +
-                  number, no border or fill — so an active card's PR reads
-                  identically to the same PR once the row settles. */}
+                  number, no border or fill — so an active card and a settled
+                  row draw one PR with the same geometry and the same treatment:
+                  settling changes what the badge *is* only by deferring, never
+                  by swapping shape. The settled row parks its state color on
+                  hover (the whole row recedes at rest, see
+                  `prStatusSettledHoverClass`), so at rest the settled copy is
+                  the grey version of this chip and under the pointer it is
+                  this chip exactly. */}
               <div
                 data-meta-line
                 className="mt-[5px] flex min-w-0 items-center gap-2 font-mono text-[11px] leading-tight text-muted-foreground/60"

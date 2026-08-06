@@ -47,7 +47,10 @@ export const PR_CHIP_TONE: Record<PrStatusState, string> = {
  *  state color up on hover. Same colors as `STATE_TO_ICON` — only the timing
  *  differs. The variants name the settled row's own group (`group/settled` in
  *  `sidebar-inbox.tsx`) and are written out in full because Tailwind only
- *  sees class names that appear literally in the source. */
+ *  sees class names that appear literally in the source. Keep the hues in
+ *  lockstep with `STATE_TO_ICON` / `STATE_TO_TONE` / `PR_CHIP_TONE` above —
+ *  they are one palette wearing four sets of chrome, and a state that drifts
+ *  here shows up as a PR that changes color when you point at it. */
 const STATE_TO_SETTLED_HOVER: Record<PrStatusState, string> = {
   merged:
     "group-hover/settled:text-accent-violet group-focus-within/settled:text-accent-violet",

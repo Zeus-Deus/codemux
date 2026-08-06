@@ -175,8 +175,12 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   (open green, merged violet, closed red, draft muted), no border or fill, with
   a hover tint only when there is a `pr_url` to open (dimmed and `disabled`
   otherwise, so the chip itself swallows the click instead of passing it to the
-  card). Active and settled therefore render one PR the same way, so a card
-  settling no longer looks like the badge changed. The spacer sits *before* the
+  card). Active and settled therefore render one PR with the same geometry and
+  the same treatment, so a card settling never looks like the badge changed
+  shape; the settled copy differs only in *timing*, holding its state color
+  back until the row is hovered or focused (see "Settle / un-settle" below), so
+  at rest it is the grey version of this chip and under the pointer it is this
+  chip exactly. The spacer sits *before* the
   PR chip deliberately: with it after, the chip began wherever the branch name
   happened to end, so chips landed at a different x on every card and the column
   read as ragged. Right-aligning also makes the chip's variable width
@@ -255,20 +259,35 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   (store, persistence keys, which surfaces repaint).
 - **Settle / un-settle** (`sidebar-inbox-store.ts`): Settle collapses the card
   (~200ms height/opacity), then moves it onto the "Settled" shelf as a compact
-  one-line row (repo avatar · title · state-colored PR icon + `#number` when
-  linked · elapsed-since-work-ended). The PR badge opens the pull request
+  one-line row (repo avatar · title · PR icon + `#number` when linked ·
+  elapsed-since-work-ended). The PR badge opens the pull request
   directly and remains visible while the row's Un-settle affordance appears.
   With no `pr_url` the badge renders disabled and dimmed, still labeled
   `PR #n — <state>`.
   The shelf takes the background-recede doctrine one step further than the
   cards do: a settled row is history, so at rest the whole row goes grey —
-  desaturated repo avatar, faint title, and a PR badge that gives up its state
-  color (`prStatusSettledHoverClass` defers each state's color to a
-  `group-hover/settled:` variant; the icon carries `text-current` so number and
-  glyph light up together). Hover or keyboard focus restores all three at once,
-  so the tail stays scannable when you are hunting. The workspace you are
-  currently in and any row ticked for a bulk action are excluded — they keep
-  full prominence, the same exclusions the receded cards use.
+  desaturated repo avatar, faint title (`text-muted-foreground/60`), and a PR
+  badge that gives up its state color, dropping to a neutral
+  `text-muted-foreground/55` (held a shade brighter than the avatar's `/40`
+  because `#n` is the badge button's only label). The badge's state hue is not
+  removed, only deferred: `prStatusSettledHoverClass` re-attaches each state's
+  color as a `group-hover/settled:` / `group-focus-within/settled:` variant,
+  and the icon carries `text-current` so number and glyph light up together —
+  which is why a settled PR is the same badge as the card's, just later. Hover
+  or keyboard focus restores all three at once, so the tail stays scannable
+  when you are hunting.
+  **The dimming reuses the active card's `receded` predicate verbatim**, so no
+  workspace can read as "wants you" on a card and "history" on a row: the
+  workspace you are currently in, any row ticked for a bulk action, a row
+  holding **unread** output, and a **review**-status row all keep full
+  prominence. Review is the load-bearing case — the settle safety net
+  deliberately leaves finished-and-wants-review work parked (it only
+  auto-un-settles working/blocked), so those rows are the one thing on the
+  shelf still asking for a human and must not be greyed. `unread` is plumbed
+  into `SettledRow` from the same `isUnread` helper the cards use, which also
+  makes the row's "Mark unread" context action visibly do something. The card's
+  `woke` exclusion has no counterpart because waking is un-snoozing — a
+  just-woken workspace is a card, never a settled row.
   A settled row is itself a button — click or
   Enter/Space activates that workspace without un-settling it. Row activation is
   scoped to the row node by `isRowActivationKey` (`Enter`/`Space` **and**
