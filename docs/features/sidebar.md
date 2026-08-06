@@ -258,6 +258,15 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   directly and remains visible while the row's Un-settle affordance appears.
   With no `pr_url` the badge renders disabled and dimmed, still labeled
   `PR #n — <state>`.
+  The shelf takes the background-recede doctrine one step further than the
+  cards do: a settled row is history, so at rest the whole row goes grey —
+  desaturated repo avatar, faint title, and a PR badge that gives up its state
+  color (`prStatusSettledHoverClass` defers each state's color to a
+  `group-hover/settled:` variant; the icon carries `text-current` so number and
+  glyph light up together). Hover or keyboard focus restores all three at once,
+  so the tail stays scannable when you are hunting. The workspace you are
+  currently in and any row ticked for a bulk action are excluded — they keep
+  full prominence, the same exclusions the receded cards use.
   A settled row is itself a button — click or
   Enter/Space activates that workspace without un-settling it. Row activation is
   scoped to the row node by `isRowActivationKey` (`Enter`/`Space` **and**

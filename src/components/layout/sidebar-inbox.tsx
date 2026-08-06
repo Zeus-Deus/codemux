@@ -61,6 +61,7 @@ import {
   isPrOnCurrentBranch,
   normalizePrState,
   PrStatusIcon,
+  prStatusSettledHoverClass,
   prStatusTextClass,
   type PrStatusState,
 } from "@/components/github/pr-status-icon";
@@ -468,6 +469,16 @@ const SettledRow = memo(function SettledRow({
   const appearance = useProjectAppearance(repo.path);
   const prState = normalizePrState(workspace.pr_state);
 
+  // Settled work is history, so the shelf reads as one grey block at rest:
+  // the repo avatar desaturates, the title drops to a faint muted tone and
+  // the PR badge gives up its state color. Hover (or keyboard focus) restores
+  // all three at once, so the tail stays scannable when you are hunting for a
+  // specific workspace — the same "recede until wanted" rule the active cards
+  // follow, taken one step further because nothing on this shelf wants you.
+  // The workspace you are actually in, and anything ticked for a bulk action,
+  // are excluded: those rows earn their prominence.
+  const dimmed = !isActive && !selected;
+
   const handleClick = (e: React.MouseEvent) => {
     const mode = selectModeFor(e);
     onSelect(workspace.workspace_id, mode);
@@ -542,9 +553,20 @@ const SettledRow = memo(function SettledRow({
         cacheBust={appearance.imageVersion}
         size="sm"
         shape="square"
-        className="font-bold opacity-80"
+        className={cn(
+          "font-bold opacity-80",
+          dimmed &&
+            "opacity-40 grayscale transition-[opacity,filter] duration-150 group-hover/settled:opacity-100 group-hover/settled:grayscale-0 group-focus-within/settled:opacity-100 group-focus-within/settled:grayscale-0",
+        )}
       />
-      <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
+      <span
+        className={cn(
+          "min-w-0 flex-1 truncate text-xs font-medium transition-colors duration-150",
+          dimmed
+            ? "text-muted-foreground/60 group-hover/settled:text-foreground group-focus-within/settled:text-foreground"
+            : "text-foreground",
+        )}
+      >
         {workspace.title}
       </span>
       {prState && (
@@ -562,13 +584,18 @@ const SettledRow = memo(function SettledRow({
           className={cn(
             "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 font-mono text-[10px] font-medium",
             "transition-colors duration-150",
-            prStatusTextClass(prState),
+            dimmed
+              ? cn("text-muted-foreground/40", prStatusSettledHoverClass(prState))
+              : prStatusTextClass(prState),
             workspace.pr_url
               ? "hover:bg-foreground/[0.055]"
               : "cursor-default opacity-65",
           )}
         >
-          <PrStatusIcon state={prState} size={3} className="shrink-0" />
+          {/* `text-current` hands the icon's color to the button above, so
+              the badge's icon and number light up together on hover instead
+              of the icon staying colored while the number is grey. */}
+          <PrStatusIcon state={prState} size={3} className="shrink-0 text-current" />
           {workspace.pr_number != null && <span>#{workspace.pr_number}</span>}
         </button>
       )}

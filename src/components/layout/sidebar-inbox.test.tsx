@@ -789,6 +789,38 @@ describe("SidebarInbox — settle / un-settle", () => {
     }
   });
 
+  it("dims a settled row at rest and defers the PR color to hover", async () => {
+    persistedSettled = JSON.stringify([{ id: "ws-1", at: Date.now() }]);
+    workspaces = [
+      makeWorkspace({
+        title: "Shipped",
+        pr_number: 87,
+        pr_state: "OPEN",
+        pr_url: "https://github.com/u/r/pull/87",
+      }),
+    ];
+    const { container } = await flushRender();
+
+    const row = container.querySelector(
+      '[data-settled-row="ws-1"]',
+    ) as HTMLElement;
+    expect(row).not.toBeNull();
+    // Title recedes past the plain muted tone the active cards use.
+    expect(within(row).getByText("Shipped").className).toContain(
+      "text-muted-foreground/60",
+    );
+    // Repo avatar desaturates rather than disappearing.
+    expect(within(row).getByText("M").className).toContain("grayscale");
+    // The PR badge is neutral at rest; its state color is a hover variant, so
+    // the settled shelf reads as one grey block until you point at a row.
+    const badge = within(row).getByRole("button", {
+      name: "Open PR #87 on GitHub — open",
+    });
+    expect(badge.className).toContain("text-muted-foreground/40");
+    expect(badge.className).not.toMatch(/(^|\s)text-status-open\b/);
+    expect(badge.className).toContain("group-hover/settled:text-status-open");
+  });
+
   it("hides the Settle button for live / blocked cards, keeps it for idle / review", async () => {
     workspaces = [
       makeWorkspace({ title: "Working card", surfaces: surfaceWithPane("p1") }),
