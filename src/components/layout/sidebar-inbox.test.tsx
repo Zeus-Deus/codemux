@@ -2337,9 +2337,22 @@ describe("sidebar-inbox pure helpers", () => {
     // so an old persisted snapshot keeps settling exactly as it used to.
     expect(isPrOnCurrentBranch(null, "fix-ui-borders")).toBe(true);
     expect(isPrOnCurrentBranch(undefined, "fix-ui-borders")).toBe(true);
-    // A PR head branch with no local branch to compare against cannot be
-    // confirmed as this checkout's, so it does not get settlement rights.
-    expect(isPrOnCurrentBranch("some-branch", null)).toBe(false);
+  });
+
+  it("isPrOnCurrentBranch keeps the association when the local branch is unknown", () => {
+    // `git_branch_info` reports no branch on a detached HEAD — mid-rebase,
+    // mid-bisect, `gh pr checkout` of a SHA — while the stored head branch
+    // survives. Treating that unknown as a mismatch would flip `hasPr` off
+    // and offer "Create PR" for a workspace that already has an open one,
+    // for as long as the rebase ran. Missing information must never
+    // un-associate a workspace from its own PR.
+    expect(isPrOnCurrentBranch("fix-ui-borders", null)).toBe(true);
+    expect(isPrOnCurrentBranch("fix-ui-borders", undefined)).toBe(true);
+    expect(isPrOnCurrentBranch("fix-ui-borders", "")).toBe(true);
+    // Both unknown is still a match, for the same reason.
+    expect(isPrOnCurrentBranch(null, null)).toBe(true);
+    // Two *known* names that differ is the only real mismatch.
+    expect(isPrOnCurrentBranch("side-branch", "fix-ui-borders")).toBe(false);
   });
 
   it("nextWorkspaceAfterPark steps forward, wraps, and stays put for background parks", () => {

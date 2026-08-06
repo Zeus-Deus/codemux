@@ -82,15 +82,21 @@ export function normalizePrState(state: string | null | undefined): PrStatusStat
  *  this first. It lives beside `normalizePrState` because both the sidebar and
  *  the hover card need it and neither may import the other.
  *
- *  A missing head branch reads as a match: the field is additive, so absent
- *  means "association predates it" rather than "side branch", and the honest
- *  default for an unknown is the behaviour that shipped before. Real fallback
- *  associations always carry one. */
+ *  Missing information on *either* side reads as a match. An absent head branch
+ *  means "association predates the field" rather than "side branch", so the
+ *  honest default for an unknown is the behaviour that shipped before; real
+ *  fallback associations always carry one. An absent `gitBranch` is the same
+ *  kind of unknown seen from the other end — `git_branch_info` reports no
+ *  branch during a rebase, a bisect, or any detached HEAD, while the stored
+ *  head branch survives — and comparing a known name against that unknown would
+ *  read as "different branch" and silently un-associate a workspace from its
+ *  own open PR for the length of the rebase. Not knowing which branch you are
+ *  on is not evidence that the PR belongs to another one. */
 export function isPrOnCurrentBranch(
   prHeadBranch: string | null | undefined,
   gitBranch: string | null | undefined,
 ): boolean {
-  if (!prHeadBranch) return true;
+  if (!prHeadBranch || !gitBranch) return true;
   return prHeadBranch === gitBranch;
 }
 

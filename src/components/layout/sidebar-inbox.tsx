@@ -159,7 +159,6 @@ export function isWrappingUp(
   return prState === "open" && status === null && !unread && prOnCurrentBranch;
 }
 
-
 /** Completion-driven automatic settlement.
  *
  * A merged/closed PR is itself the completion signal, so it settles as soon as

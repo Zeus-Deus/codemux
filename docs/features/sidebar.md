@@ -439,16 +439,31 @@ visual only — nothing is archived, closed, or deleted.
   `select_branch_pr` policy. Both sides of each record are read (`Y` then `X`)
   so a branch whose arrival scrolled out of the window is still found; the
   current branch, the default branch, and detached-HEAD SHAs are excluded.
-  Recency decides between candidates — the first one with a PR wins outright,
-  because "what this workspace was just doing" is the question being answered.
-  The fallback never runs on the repository **default branch**, where "recently
-  checked out" describes ordinary branch hopping rather than this checkout's
-  work. It costs one repo-wide `gh pr list --state all` matched client-side
-  against every candidate (not one query per candidate), memoized per origin
-  URL for 60s so the 5s active-workspace sweep can't multiply it. A failed
-  fallback collapses to "no PR" rather than `Preserve`: the current branch
-  already answered authoritatively, and a missing bonus badge must not
-  resurrect an old one.
+  Recency decides between candidates — the first one with a qualifying PR wins
+  outright, because "what this workspace was just doing" is the question being
+  answered. The fallback never runs on the repository **default branch**, where
+  "recently checked out" describes ordinary branch hopping rather than this
+  checkout's work. A failed fallback collapses to "no PR" rather than
+  `Preserve`: the current branch already answered authoritatively, and a
+  missing bonus badge must not resurrect an old one.
+- **The fallback badges open PRs only**, unlike the current-branch path, which
+  keeps showing merged and closed state. The case it exists for — "an agent
+  just pushed a PR from a side branch" — is always an open PR, while admitting
+  history would let any branch that passed through this worktree donate its
+  badge: `gh pr checkout <n>` on someone else's merged PR and a switch back
+  would badge the workspace with that PR for the whole reflog window. Both the
+  query (`gh pr list --state open`, which includes drafts) and the client-side
+  selector enforce it, so the two cannot drift.
+- **Cost.** One repo-wide `gh pr list` matched client-side against every
+  candidate (not one query per candidate), memoized per origin URL for 60s, and
+  the local probes memoized per `(worktree, branch)` for the same 60s. Both
+  caches matter: the `gh` memo alone still left a `git reflog` — plus a
+  `git config` read per candidate — running on every 5s active-workspace tick.
+  Owner resolution is also lazy, so it costs `git config` only for a candidate
+  that already matched an open PR. On a repeat tick within the TTL the whole
+  fallback spawns nothing. A branch switch is a new cache key and is answered
+  at once; only a PR opened on an already-scanned branch waits out the TTL,
+  which is the latency the memoized `gh` list imposed anyway.
 - **A side-branch association is a badge and nothing more.** The workspace
   snapshot carries `pr_head_branch` (snapshot-local, serde-defaulted, never
   synced) alongside `pr_number`/`pr_state`/`pr_url`, and the frontend predicate
@@ -468,10 +483,16 @@ visual only — nothing is archived, closed, or deleted.
     badge, and honouring a side-branch PR there would hide "Create PR" for the
     branch the user is actually on.
 
-  A `null` head branch means "association predates the field", not "side
-  branch", and is read as a match so old persisted snapshots settle exactly as
-  they used to. The hover/details card adds a **"PR branch"** row only in the
-  mismatching case, where it answers the question the badge raises.
+  **Missing information on either side reads as a match.** A `null` head branch
+  means "association predates the field", not "side branch", so old persisted
+  snapshots settle exactly as they used to. A `null` `git_branch` is the same
+  unknown from the other end — `git_branch_info` reports no branch during a
+  rebase, a bisect, or any detached HEAD, while the stored head branch survives
+  — and reading that as a mismatch would silently un-associate a workspace from
+  its own open PR for the length of the rebase, down to offering "Create PR" in
+  the Review tab. Only two *known*, differing names count as a side-branch
+  association. The hover/details card adds a **"PR branch"** row only in that
+  case, where it answers the question the badge raises.
 - **The anti-oscillation invariant.** Four states (active / settled / snoozed /
   pinned-active) and five park-mutating effects (auto-settle, the auto-un-settle
   safety net, the snooze hand-raise, the wake sweep, the precise wake timer)

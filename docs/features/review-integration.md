@@ -43,6 +43,13 @@ a branch the user is not on *and* hide the "Create PR" affordance for the
 branch they are. The Review tab's own badge needs no separate guard — it only
 renders from cached PR query data, which a disabled panel never populates.
 
+The guard is a *mismatch* test, not an equality test: when either name is
+unknown it holds the association. `git_branch_info` reports no branch on a
+detached HEAD — mid-rebase, mid-bisect, `gh pr checkout` of a SHA — while
+`pr_head_branch` survives, and treating that unknown as "different branch"
+would offer "Create PR" for a workspace that already has an open one, for as
+long as the rebase ran.
+
 ## What Works Today
 
 - PR creation from panel when no PR exists for the current branch (title, body, base branch, draft toggle)

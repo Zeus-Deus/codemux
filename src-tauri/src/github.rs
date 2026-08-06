@@ -1,7 +1,7 @@
 use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1021,14 +1021,65 @@ const REFLOG_CANDIDATE_LIMIT: usize = 5;
 /// out in the recent past, whose PRs are correspondingly recent.
 const FALLBACK_PR_LIST_LIMIT: &str = "50";
 
-/// How long one repo-wide fallback list is reused. Sized to the 60s PR
-/// poller so the 5s active-workspace sweep can't multiply it: several
-/// no-PR workspaces sharing a repo cost one `gh` call per minute between
-/// them, not one per workspace per sweep.
+/// How long one fallback result is reused. Sized to the 60s PR poller so
+/// the 5s active-workspace sweep can't multiply it.
+///
+/// It gates **both** fallback caches, and between them the whole fallback
+/// costs nothing on a repeat call: several no-PR workspaces sharing a repo
+/// cost one `gh` call per minute between them, and each workspace runs its
+/// local git probes (`reflog show`, plus at most a couple of `config`
+/// reads) at most once a minute — not once per 5s sweep.
 const FALLBACK_PR_LIST_TTL: Duration = Duration::from_secs(60);
 
 type FallbackPrListCache = Mutex<HashMap<String, (Instant, Arc<Vec<serde_json::Value>>)>>;
 static FALLBACK_PR_LIST_CACHE: OnceLock<FallbackPrListCache> = OnceLock::new();
+
+/// Memoized fallback outcome, keyed by `(worktree path, current branch)`.
+///
+/// The reflog is per-worktree and the answer depends on which branch is
+/// checked out, so neither part of the key can be dropped. This is the
+/// cache that keeps the *local* side of the fallback off the 5s sweep: the
+/// `gh` list alone being memoized still left a `git reflog` and a `git
+/// config` per tick.
+///
+/// A branch switch is a new key and is answered immediately; only a PR
+/// opened on an already-scanned branch waits out the TTL, which is the same
+/// latency the memoized `gh` list already imposes.
+type SideBranchPrCache = Mutex<HashMap<(PathBuf, String), (Instant, Option<PullRequestInfo>)>>;
+static SIDE_BRANCH_PR_CACHE: OnceLock<SideBranchPrCache> = OnceLock::new();
+
+/// TTL memoization over a `Mutex<HashMap>`: `compute` runs only when no
+/// entry younger than `ttl` exists for `key`.
+///
+/// Errors are never cached — a dropped network or an expired `gh` token
+/// must be retried on the next call, not pinned for a minute. Expired
+/// entries are swept on write, so the map is bounded by the repos actually
+/// polled in one TTL window.
+///
+/// The lock is released while `compute` runs, so two racing callers may
+/// both compute; the outcome is identical either way and holding a global
+/// mutex across a subprocess would be worse.
+fn memoize_ok<K, V, E>(
+    cache: &Mutex<HashMap<K, (Instant, V)>>,
+    key: K,
+    ttl: Duration,
+    compute: impl FnOnce() -> Result<V, E>,
+) -> Result<V, E>
+where
+    K: Eq + std::hash::Hash,
+    V: Clone,
+{
+    if let Some((fetched_at, value)) = cache.lock().expect("PR fallback cache poisoned").get(&key) {
+        if fetched_at.elapsed() < ttl {
+            return Ok(value.clone());
+        }
+    }
+    let value = compute()?;
+    let mut guard = cache.lock().expect("PR fallback cache poisoned");
+    guard.retain(|_, (fetched_at, _)| fetched_at.elapsed() < ttl);
+    guard.insert(key, (Instant::now(), value.clone()));
+    Ok(value)
+}
 
 /// True for a name that is really a commit id — what `git checkout <sha>`
 /// and `git bisect` write into the reflog. A branch named entirely of hex
@@ -1099,64 +1150,79 @@ fn fallback_pr_list_key(repo_path: &Path) -> String {
         .unwrap_or_else(|| repo_path.to_string_lossy().into_owned())
 }
 
-/// One repo-wide `gh pr list`, memoized for [`FALLBACK_PR_LIST_TTL`].
+/// One repo-wide `gh pr list` of **open** PRs, memoized for
+/// [`FALLBACK_PR_LIST_TTL`].
 ///
 /// Listing the repo once and matching every candidate branch against it
 /// client-side keeps the fallback at a flat one extra `gh` call, instead of
 /// one per candidate.
+///
+/// `--state open` (which includes drafts) rather than `--state all`: the
+/// fallback only ever badges an open PR — see [`select_first_candidate_pr`]
+/// — so fetching history would be paid-for rows that the selector discards.
+/// The selector re-checks the state anyway, so the two cannot drift.
 fn fallback_pr_list(repo_path: &Path) -> Result<Arc<Vec<serde_json::Value>>, String> {
     let key = fallback_pr_list_key(repo_path);
     let cache = FALLBACK_PR_LIST_CACHE.get_or_init(FallbackPrListCache::default);
 
-    if let Some((fetched_at, rows)) = cache.lock().unwrap().get(&key) {
-        if fetched_at.elapsed() < FALLBACK_PR_LIST_TTL {
-            return Ok(Arc::clone(rows));
-        }
-    }
-
-    let output = run_gh_timed(
-        repo_path,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            FALLBACK_PR_LIST_LIMIT,
-            "--json",
-            BRANCH_PR_JSON_FIELDS,
-        ],
-        BRANCH_PR_LOOKUP_TIMEOUT,
-    )?;
-    let value: serde_json::Value =
-        serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
-    let rows = Arc::new(
-        value
-            .as_array()
-            .ok_or_else(|| "Expected JSON array from gh pr list".to_string())?
-            .clone(),
-    );
-
-    let mut guard = cache.lock().unwrap();
-    guard.retain(|_, (fetched_at, _)| fetched_at.elapsed() < FALLBACK_PR_LIST_TTL);
-    guard.insert(key, (Instant::now(), Arc::clone(&rows)));
-    Ok(rows)
+    memoize_ok(cache, key, FALLBACK_PR_LIST_TTL, || {
+        let output = run_gh_timed(
+            repo_path,
+            &[
+                "pr",
+                "list",
+                "--state",
+                "open",
+                "--limit",
+                FALLBACK_PR_LIST_LIMIT,
+                "--json",
+                BRANCH_PR_JSON_FIELDS,
+            ],
+            BRANCH_PR_LOOKUP_TIMEOUT,
+        )?;
+        let value: serde_json::Value =
+            serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+        Ok(Arc::new(
+            value
+                .as_array()
+                .ok_or_else(|| "Expected JSON array from gh pr list".to_string())?
+                .clone(),
+        ))
+    })
 }
 
-/// Badge-only fallback: the PR of a branch this worktree checked out recently.
+/// Badge-only fallback: the open PR of a branch this worktree checked out
+/// recently, memoized per `(worktree, branch)` for
+/// [`FALLBACK_PR_LIST_TTL`].
 ///
 /// Answers the "agent opened the PR from a side branch, then checked the
 /// worktree back" case, where the workspace has visibly produced a pull
 /// request that strict current-branch association cannot see. Candidates are
-/// tried newest-first and the first branch with a PR wins — each one is
-/// resolved through the same [`select_branch_pr`] policy as the current
-/// branch, so open/draft still beats history and fork owners are still
-/// scoped.
+/// tried newest-first and the first branch with an open PR wins; fork owners
+/// are still scoped exactly as on the current-branch path.
+///
+/// The memoization is what makes this affordable on the 5s active-workspace
+/// sweep — see [`SIDE_BRANCH_PR_CACHE`]. Without it every tick of every
+/// no-PR workspace re-ran `git reflog` and a `git config` or three.
 ///
 /// The result is deliberately weaker than a current-branch association: it
 /// carries the PR's own `head_branch`, and auto-settlement refuses any
 /// association whose head branch is not the checked-out one.
 fn get_side_branch_pr(
+    repo_path: &Path,
+    lookup: &BranchPrLookup,
+) -> Result<Option<PullRequestInfo>, String> {
+    let cache = SIDE_BRANCH_PR_CACHE.get_or_init(SideBranchPrCache::default);
+    let key = (repo_path.to_path_buf(), lookup.branch.clone());
+    memoize_ok(cache, key, FALLBACK_PR_LIST_TTL, || {
+        resolve_side_branch_pr(repo_path, lookup)
+    })
+}
+
+/// The uncached body of [`get_side_branch_pr`] — every local git probe the
+/// fallback makes lives here, so the memo above is the only thing standing
+/// between it and the 5s sweep.
+fn resolve_side_branch_pr(
     repo_path: &Path,
     lookup: &BranchPrLookup,
 ) -> Result<Option<PullRequestInfo>, String> {
@@ -1189,28 +1255,54 @@ fn get_side_branch_pr(
     }))
 }
 
-/// Newest-first candidate scan: the first recently-checked-out branch that
-/// has a PR wins outright.
+/// Newest-first candidate scan: the first recently-checked-out branch with
+/// an **open or draft** PR wins outright.
 ///
-/// Recency decides, not PR state. A branch checked out more recently is the
-/// better description of what this workspace was just doing, and ranking an
-/// older branch's open PR above it would resurrect stale work as the badge.
-/// Within a single candidate the ordinary [`select_branch_pr`] policy still
-/// applies, so open/draft beats that branch's own history.
+/// Merged and closed PRs are excluded here, unlike the current-branch path.
+/// The motivating case is narrow — "an agent just pushed a PR from a side
+/// branch" — and it is always an open one. Admitting history instead lets
+/// any branch that passed through this worktree in the last
+/// [`REFLOG_SCAN_ENTRIES`] checkouts donate its badge: `gh pr checkout <n>`
+/// on somebody else's merged PR and a switch back would badge the workspace
+/// with that PR for as long as the checkout stayed in the reflog window.
+/// The current branch's own association keeps showing merged/closed state,
+/// because there branch identity — not recency — owns the badge.
+///
+/// Recency decides between candidates, not PR freshness: a branch checked
+/// out more recently is the better description of what this workspace was
+/// just doing.
 ///
 /// `expected_owner` is injected rather than resolved inline because it costs
 /// a `git config` read per candidate — the caller owns that, the selection
-/// rule stays pure.
+/// rule stays pure. It is consulted **lazily**, only for a candidate that
+/// already has at least one open PR row to disambiguate, so the common
+/// "recently visited branches, none of them with a PR" case spawns no git
+/// processes at all.
 fn select_first_candidate_pr(
     prs: &[PullRequestInfo],
     candidates: &[String],
     expected_owner: &dyn Fn(&str) -> Option<String>,
 ) -> Option<PullRequestInfo> {
+    let open: Vec<&PullRequestInfo> = prs
+        .iter()
+        .filter(|pr| !is_historical_pr_state(&pr.state))
+        .collect();
     candidates.iter().find_map(|candidate| {
-        // Never the default branch — `parse_recent_checkout_branches`
-        // excludes it — so historical PRs stay eligible here.
+        let matching: Vec<PullRequestInfo> = open
+            .iter()
+            .filter(|pr| pr.head_branch.as_deref() == Some(candidate.as_str()))
+            .map(|pr| (*pr).clone())
+            .collect();
+        if matching.is_empty() {
+            // Nothing to disambiguate, so `expected_owner` — and the
+            // `git config` reads behind it — is never reached.
+            return None;
+        }
+        // `is_default_branch` is irrelevant now that only open/draft rows
+        // reach here — it exists to suppress historical PRs — so the
+        // cheaper `false` is passed rather than re-deriving the default.
         select_branch_pr(
-            prs.iter().cloned(),
+            matching,
             candidate,
             expected_owner(candidate).as_deref(),
             false,
@@ -1220,10 +1312,13 @@ fn select_first_candidate_pr(
 
 /// The PR a workspace should show a badge for.
 ///
-/// The current branch owns the association whenever it has one. Only when it
-/// authoritatively has none does the recently-checked-out fallback run, and
-/// never on the repository default branch, where "recently checked out"
-/// describes ordinary branch hopping rather than this checkout's own work.
+/// The current branch owns the association whenever it has one, in any state
+/// — branch identity, not freshness, decides there. Only when the current
+/// branch authoritatively has none does the recently-checked-out fallback
+/// run, and never on the repository default branch, where "recently checked
+/// out" describes ordinary branch hopping rather than this checkout's own
+/// work. The fallback badges **open PRs only**, so a `gh pr checkout` of
+/// somebody's merged PR cannot leave its badge behind.
 ///
 /// The three-way [`BranchPrOutcome`] contract is preserved exactly: an
 /// unanswerable *current-branch* lookup is still `Err` (preserve the badge),
@@ -2092,17 +2187,112 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
     }
 
     #[test]
-    fn test_fallback_takes_the_most_recently_checked_out_branch_with_a_pr() {
-        // Recency decides between candidates: `newer`'s merged PR outranks
-        // `older`'s open one, because "what this workspace was just doing"
-        // is the question being answered.
+    fn test_fallback_takes_the_most_recently_checked_out_branch_with_an_open_pr() {
+        // Recency decides between candidates that both qualify.
         let prs = vec![
             branch_pr(70, "OPEN", "older", "2026-08-05T10:00:00Z", None),
-            branch_pr(71, "MERGED", "newer", "2026-08-04T10:00:00Z", None),
+            branch_pr(71, "OPEN", "newer", "2026-08-04T10:00:00Z", None),
         ];
         let candidates = vec!["newer".to_string(), "older".to_string()];
         let selected = select_first_candidate_pr(&prs, &candidates, &|_| None).unwrap();
         assert_eq!(selected.number, 71);
+    }
+
+    #[test]
+    fn test_fallback_ignores_merged_and_closed_candidate_prs() {
+        // The fallback answers "an agent just pushed a PR from a side
+        // branch", which is always an open PR. Admitting history would let
+        // `gh pr checkout <n>` on somebody else's finished PR badge this
+        // workspace with it for the whole reflog window — so `newer`'s
+        // merged PR is skipped and `older`'s open one wins despite being
+        // less recent, and a candidate with only history contributes
+        // nothing at all.
+        let prs = vec![
+            branch_pr(70, "OPEN", "older", "2026-08-05T10:00:00Z", None),
+            branch_pr(71, "MERGED", "newer", "2026-08-04T10:00:00Z", None),
+            branch_pr(72, "CLOSED", "abandoned", "2026-08-06T10:00:00Z", None),
+        ];
+        let selected = select_first_candidate_pr(
+            &prs,
+            &[
+                "abandoned".to_string(),
+                "newer".to_string(),
+                "older".to_string(),
+            ],
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(selected.number, 70);
+
+        assert!(
+            select_first_candidate_pr(
+                &prs,
+                &["newer".to_string(), "abandoned".to_string()],
+                &|_| None
+            )
+            .is_none(),
+            "a workspace whose recent branches only have finished PRs gets no badge"
+        );
+    }
+
+    #[test]
+    fn test_fallback_resolves_the_owner_only_for_candidates_that_have_a_pr() {
+        // Owner resolution costs `git config` reads, and the common case is
+        // a handful of recently-visited branches with no open PR at all.
+        // Resolving eagerly inside the scan spent those subprocesses on
+        // every 5s active-workspace tick for nothing.
+        let prs = vec![branch_pr(73, "OPEN", "has-pr", "2026-08-05T10:00:00Z", None)];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let selected = select_first_candidate_pr(
+            &prs,
+            &["no-pr-a".to_string(), "no-pr-b".to_string(), "has-pr".to_string()],
+            &|branch| {
+                asked.borrow_mut().push(branch.to_string());
+                None
+            },
+        )
+        .unwrap();
+        assert_eq!(selected.number, 73);
+        assert_eq!(
+            asked.into_inner(),
+            vec!["has-pr".to_string()],
+            "only the candidate with a matching open PR costs a git config read"
+        );
+    }
+
+    #[test]
+    fn test_memoize_ok_reuses_a_fresh_entry_and_never_caches_an_error() {
+        // The seam that keeps the fallback off the 5s sweep: within the TTL
+        // a repeat lookup must not re-run the closure (which is where every
+        // `git`/`gh` subprocess lives).
+        let cache: Mutex<HashMap<String, (Instant, u32)>> = Mutex::new(HashMap::new());
+        let calls = std::cell::Cell::new(0u32);
+        let ttl = Duration::from_secs(60);
+        let mut compute = || -> Result<u32, String> {
+            calls.set(calls.get() + 1);
+            Ok(calls.get())
+        };
+
+        assert_eq!(memoize_ok(&cache, "k".to_string(), ttl, &mut compute), Ok(1));
+        assert_eq!(memoize_ok(&cache, "k".to_string(), ttl, &mut compute), Ok(1));
+        assert_eq!(memoize_ok(&cache, "k".to_string(), ttl, &mut compute), Ok(1));
+        assert_eq!(calls.get(), 1, "one compute per key per TTL window");
+
+        // A different key is a different question — here, another worktree
+        // or the same worktree on a new branch — and is answered at once.
+        assert_eq!(memoize_ok(&cache, "other".to_string(), ttl, &mut compute), Ok(2));
+
+        // A zero TTL expires immediately, so the entry is not reused.
+        assert_eq!(
+            memoize_ok(&cache, "k".to_string(), Duration::ZERO, &mut compute),
+            Ok(3)
+        );
+
+        // Errors are transient (dropped network, expired token) and must be
+        // retried rather than pinned for a minute.
+        let failing = |_: ()| -> Result<u32, String> { Err("gh failed".to_string()) };
+        assert!(memoize_ok(&cache, "err".to_string(), ttl, || failing(())).is_err());
+        assert_eq!(memoize_ok(&cache, "err".to_string(), ttl, &mut compute), Ok(4));
     }
 
     #[test]
@@ -2116,9 +2306,8 @@ ccc9999 HEAD@{8}: checkout: moving from a to b";
 
     #[test]
     fn test_fallback_applies_the_open_over_history_policy_within_one_candidate() {
-        // The fallback resolves each candidate through `select_branch_pr`,
-        // so a reused branch name still prefers its open PR over its own
-        // history.
+        // A reused branch name resolves to its open PR, not the merged one
+        // that happens to be more recently updated.
         let prs = vec![
             branch_pr(80, "MERGED", "reused", "2026-08-05T10:00:00Z", None),
             branch_pr(81, "OPEN", "reused", "2026-08-01T10:00:00Z", None),

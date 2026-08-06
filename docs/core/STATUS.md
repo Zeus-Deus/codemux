@@ -45,11 +45,20 @@ refinement commits that shipped alongside PR #245, grouped by subsystem below:
   Backstop**: the 30s stall-watchdog sweep gained a second pass that
   force-settles an owed `Review` gone silent for the existing 600s
   `STALL_THRESHOLD`, routed through `apply_pane_status` — the helper extracted
-  out of `publish_pane_status`, so the forced settle runs the identical
-  status/release/emit policy instead of a second copy. Real post-turn subagent
-  activity re-arms the clock; a flagged background tick deliberately does not.
-  This can't cut a live turn short — `review_pending` is only ever set by
-  `TurnCompleted`. **(3) Frontend**: live affordances now respect the end of
+  out of `publish_pane_status` — so the `Review`→`Idle` downgrade and the
+  stamped emit are shared rather than copied. Any tick from a real tracked
+  entry re-arms the clock (a flagged background tick deliberately does not), so
+  the threshold means "every remaining blocker has been silent for ten
+  minutes". Silence still cannot prove death — one long `cargo test` inside a
+  live subagent looks identical — so the forced path is deliberately
+  non-destructive: it passes `SettleOrigin::ForcedBackstop`, which **withholds
+  the detached-browser release** (a premature dot is repainted by the next real
+  event; a browser torn down under a live subagent is not recoverable), and it
+  **tombstones** the tracker entry (`forced_settled`) instead of removing it,
+  so a late real completion drains normally, publishes nothing, and leaves no
+  orphaned entry rather than recreating an uncollectable husk. It can't cut a
+  live turn short — `review_pending` is only ever set by `TurnCompleted`.
+  **(3) Frontend**: live affordances now respect the end of
   the run. Background-task rows drop out of `runningSubagentEntries` /
   `countRunningSubagents` once the thread stops streaming (shared
   `isLiveActivity` predicate; the flag merges stickily), and the Tasks chip's
@@ -70,12 +79,17 @@ refinement commits that shipped alongside PR #245, grouped by subsystem below:
   records parsed out of the last 50 per-worktree HEAD reflog entries, up to 5
   distinct names newest-first, excluding the current branch, the default
   branch, and detached-HEAD SHAs — and resolves each through the existing
-  `select_branch_pr` policy, first hit winning. The fallback never runs on the
-  repository default branch, and it costs one repo-wide `gh pr list --state
-  all` matched client-side against every candidate (not one query per
-  candidate), memoized per origin URL for 60s so the 5s active-workspace sweep
-  can't multiply it. A failed fallback collapses to "no PR" rather than
-  `Preserve` — the current branch already answered authoritatively. **The
+  `select_branch_pr` policy, first hit winning. It badges **open PRs only**
+  (unlike the current-branch path, which keeps showing merged/closed state):
+  the case it exists for is always an open PR, and admitting history would let
+  a `gh pr checkout` of someone else's merged PR donate its badge for the whole
+  reflog window. The fallback never runs on the repository default branch, and
+  it costs one repo-wide `gh pr list --state open` matched client-side against
+  every candidate (not one query per candidate) — memoized per origin URL for
+  60s, with the local probes memoized per `(worktree, branch)` for the same
+  60s and owner resolution done lazily, so a repeat 5s active-workspace tick
+  spawns no subprocess at all. A failed fallback collapses to "no PR" rather
+  than `Preserve` — the current branch already answered authoritatively. **The
   association is badge-only.** The workspace snapshot gained
   `pr_head_branch` (snapshot-local, serde-defaulted, never synced) and the
   shared frontend predicate `isPrOnCurrentBranch` compares it to `git_branch`:
@@ -84,8 +98,11 @@ refinement commits that shipped alongside PR #245, grouped by subsystem below:
   that may still hold uncommitted work — such a workspace still ages out via
   the ordinary inactivity rule), the **"Wrapping up"** demotion refuses it,
   and the **Review tab** stays strictly current-branch so "Create PR" is not
-  hidden for the branch the user is actually on. A `null` head branch reads as
-  a match, so existing persisted snapshots settle exactly as before. The
+  hidden for the branch the user is actually on. Missing information on either
+  side reads as a match — a `null` head branch (an association predating the
+  field) *and* a `null` `git_branch` (detached HEAD during a rebase or bisect,
+  where the stored head branch outlives the branch name) — so only two known,
+  differing names ever un-associate a workspace from its PR. The
   hover/details card gains a **"PR branch"** row in the mismatching case only.
   See `docs/features/sidebar.md` §§ "Side-branch PR badges", "A side-branch
   association is a badge and nothing more" and
