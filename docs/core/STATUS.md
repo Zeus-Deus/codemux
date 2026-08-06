@@ -74,6 +74,19 @@ below:
   activity bar", "Agent Tasks panel" and `docs/features/browser.md`
   § "Run-finished release".
 
+- **Settled rows are dimmed until hovered** (PR #256). The Settled shelf is
+  history, so it reads as one grey block at rest rather than a list of
+  full-color rows competing with live work: the repo avatar desaturates, the
+  title drops to a fainter muted tone, and the PR badge gives up its state
+  color (the open/merged/closed hue moves to a hover variant held by the new
+  `prStatusSettledHoverClass`, beside the existing PR color maps; the badge's
+  icon inherits `text-current` so glyph and number light up together). Hover
+  or keyboard focus restores all three at once — nothing is hidden, only
+  ranked — and the currently-open workspace plus any multi-selected row keep
+  full prominence, the same exclusions the receded active cards use. Frontend
+  + docs only; no Rust changes. See `docs/features/sidebar.md`
+  § "Settle / un-settle".
+
 - **A PR opened from a side branch no longer goes unbadged** (sidebar PR
   fallback). An agent working in a workspace that ran `git checkout -b
   side-branch`, committed, pushed, opened a PR, and checked the worktree back
