@@ -54,6 +54,7 @@ import {
   type SnoozePreset,
 } from "./sidebar-snooze";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
+import { isRowActivationKey } from "./sidebar-row-activation";
 import {
   isPrOnCurrentBranch,
   normalizePrState,
@@ -428,19 +429,6 @@ function WrappingUpDivider() {
       <span aria-hidden="true" className="h-px flex-1 bg-border/60" />
     </div>
   );
-}
-
-/** Does this keydown activate the row *itself*?
- *
- *  Settled and snoozed rows are `role="button"` containers that also host their
- *  own buttons (PR badge, Un-settle, Wake now). Those inner buttons stop click
- *  propagation, but a keyboard activation on a focused inner button still
- *  bubbles its `keydown` up to the row — so without a target check, Enter on
- *  the PR badge would open the PR *and* activate the workspace. Only a keydown
- *  whose target is the row node is a row activation. */
-function isRowActivationKey(e: React.KeyboardEvent<HTMLElement>): boolean {
-  if (e.key !== "Enter" && e.key !== " ") return false;
-  return e.target === e.currentTarget;
 }
 
 interface SettledRowProps {

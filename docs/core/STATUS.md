@@ -20,8 +20,12 @@ Codemux is past Linux MVP and shipping cross-platform binaries. The workspace sh
 
 Unreleased after `v0.16.0` — eight merged PRs (#239–#246) plus the
 directly-committed new-turn scroll contract (PR #247), the stuck-"Working"
-run-settlement fix, the side-branch PR badge fallback, and the floating-chrome
-refinement commits that shipped alongside PR #245, grouped by subsystem below:
+run-settlement fix, the side-branch PR badge fallback, the floating-chrome
+refinement commits that shipped alongside PR #245, and the
+AskUserQuestion-panel questionnaire migration (PR #252), grouped by subsystem
+below:
+
+- **AskUserQuestion panel rebuilt on the shadcn Questionnaire component** (PR #252). `ComposerPendingInputPanel`'s hand-rolled option rows, paging chevrons, and hidden `sr-only` inputs are replaced by the newly released shadcn **Questionnaire** primitives (`src/components/ui/questionnaire.tsx` over the new `@shadcn/react` package, installed for the repo's `radix-nova` style): real fieldset/legend semantics per question, radio/checkbox indicator cards with automatically mapped 1–9 shortcut chips, focus-visible rings the old panel lacked, and Previous/Next/Submit navigation. The externally observable contract is unchanged — same `AskUserQuestionOutput` shape (answers keyed by question text, `", "`-joined multiSelect with free text appended, raw `questions` echoed), same composer-docked card on the chat-column rails, same global document-level keyboard layer for focus-outside-the-form digits/arrows/Enter (now guarded against double-handling with the primitive's in-form handler), same `option.preview` HoverCards and test ids. `npm run dev` + `?askq=1` seeds a pending two-question request for browser QA; the mock's `agent_chat_respond_to_request` now resolves it so answering settles the panel into the reply bubble. See `docs/features/agent-chat.md` § "AskUserQuestion panel".
 
 - **A finished run can no longer stay stuck on "Working"** (stuck-status fix).
   A run that launched a background shell command (`Bash { run_in_background:
