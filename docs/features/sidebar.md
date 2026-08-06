@@ -49,6 +49,10 @@ the Settled shelf), or **snoozed** (a row on the Snoozed shelf). A durable
 **workspace pin** is an orthogonal visibility override: while `pinned_at` is
 set the workspace renders as a card in the pinned block regardless of its base
 lifecycle, and unpinning reveals the still-preserved settled/snoozed state.
+The override is against *parking*, not against un-parking: a pinned card's
+preserved entry is never destroyed by a settle or snooze, but the settle safety
+net and the wake sweep still clear it when the agent goes live or the wake time
+elapses (see "The anti-oscillation invariant").
 This is distinct from the inbox store's internal `keepActive` auto-settle
 override created by Un-settle. "Parking" is the shared verb for settling or
 snoozing; parking is visual only — nothing is archived, closed, or deleted.
@@ -106,15 +110,19 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   "Nothing active" empty state while present.
 - **Pinned card block** (`WorkspaceSnapshot.pinned_at`): pinned workspaces render
   before every normal active card, separated by a thin unlabeled hairline. The
-  block uses the same stored-index ordering as the normal list — creation order,
-  not pin-click time — so pinning several workspaces does not make each new pin
-  jump ahead of the others. Pin/unpin is idempotent and persisted in
-  `layout.json`; archive/unarchive preserves membership. A pin suppresses
-  Settle/Snooze actions, excludes the workspace from bulk parking and
-  auto-settle, and overrides any existing shelf presentation without deleting
-  it. The card eyebrow carries a pin glyph and exposes a direct **Unpin** action
-  on hover/focus; every workspace context menu begins with **Pin workspace** or
-  **Unpin workspace**.
+  hairline is a *separator*, so it renders only when there is at least one
+  non-pinned card, pending row, wrapping-up card, or shelf below it — an
+  all-pinned (or empty) list ends cleanly rather than trailing a rule under
+  nothing. The block uses the same stored-index ordering as the normal list —
+  creation order, not pin-click time — so pinning several workspaces does not
+  make each new pin jump ahead of the others. Pin/unpin is idempotent and
+  persisted in `layout.json`; archive/unarchive preserves membership **and the
+  original `pinned_at` timestamp** (restore writes the archived value verbatim
+  rather than re-stamping "now"). A pin suppresses Settle/Snooze actions,
+  excludes the workspace from bulk parking and auto-settle, and overrides any
+  existing shelf presentation without deleting it. The card eyebrow carries a
+  pin glyph and exposes a direct **Unpin** action on hover/focus; every
+  workspace context menu begins with **Pin workspace** or **Unpin workspace**.
 - **Card order — newest first, and static** (`compareNewestFirst` in
   `sidebar-inbox.tsx`): within the pinned and normal blocks, cards sort by
   **stored snapshot index, descending**.
@@ -470,10 +478,21 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
     user wants).
     `unsettle`/`unsnooze` with reason `"user"` sets the pin; `"activity"`
     clears it; `"timer"` leaves it alone.
-  - a **durable workspace pin** blocks all manual, bulk, and automatic parking
-    while it is present. If the workspace was already parked when pinned, its
-    shelf entry is retained but presentation is overridden; no park effect can
-    race it, and unpinning deterministically reveals the preserved lifecycle.
+  - a **durable workspace pin** blocks all manual, bulk, and automatic
+    **parking** while it is present. If the workspace was already parked when
+    pinned, its shelf entry is retained but presentation is overridden, so
+    unpinning reveals that lifecycle instead of a destroyed one.
+    **Un-parking is deliberately not blocked.** A pin governs where a card is
+    shown, not whether its agent went live or its wake time elapsed, so two
+    effects still clear a preserved entry underneath a pinned card: the settle
+    safety net (a settled workspace whose agent goes working/permission
+    resurfaces) and the wake sweep / boundary timer (a snooze ticket that comes
+    due wakes). Both only ever *remove* a shelf entry, never add one, so
+    neither can fight the pin — the card stays on top either way, and unpinning
+    then reveals the up-to-date lifecycle rather than a stale snooze. The one
+    concession to the override is cosmetic: the **"Woke" pill is suppressed
+    while a card is pinned**, because that badge announces a return to a list
+    the pinned card never left.
 
   - the **"Wrapping up" tier is not a fifth state.** It mutates nothing — it is
     a pure partition of the cards auto-settle already left alone, so it can

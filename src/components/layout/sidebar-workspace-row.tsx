@@ -499,45 +499,49 @@ export function WorkspaceContextMenuItems({
 
   return (
     <ContextMenuContent>
-      {/* Lifecycle block. Ordered so the entries that BRING WORK BACK sit
-          first: a user who right-clicked a hidden row is almost always there
-          to undo the hiding, and burying "Wake now" under the deferral
-          options would make the common case the slower one. */}
-      <>
-        <ContextMenuItem onClick={() => void handleTogglePinned()}>
-          {workspace.pinned_at != null ? <PinOff /> : <Pin />}
-          {workspace.pinned_at != null ? "Unpin workspace" : "Pin workspace"}
-        </ContextMenuItem>
-        {workspace.pinned_at == null && (
-          <>
-            {settleAction?.kind === "unsettle" && (
+      {/* Pin/unpin leads the menu: it is the one entry that is always
+          available and always means the same thing, whatever shelf the row is
+          on. It also gates the lifecycle block below, so reading it first
+          explains why those entries may be missing. */}
+      <ContextMenuItem onClick={() => void handleTogglePinned()}>
+        {workspace.pinned_at != null ? <PinOff /> : <Pin />}
+        {workspace.pinned_at != null ? "Unpin workspace" : "Pin workspace"}
+      </ContextMenuItem>
+      {/* Lifecycle block, hidden entirely while pinned — a pin suppresses
+          every park verb, and showing them disabled would only invite the
+          click. Ordered so the entries that BRING WORK BACK sit first: a user
+          who right-clicked a hidden row is almost always there to undo the
+          hiding, and burying "Wake now" under the deferral options would make
+          the common case the slower one. */}
+      {workspace.pinned_at == null && (
+        <>
+          {settleAction?.kind === "unsettle" && (
             <ContextMenuItem onClick={settleAction.onAction}>
               Un-settle workspace
             </ContextMenuItem>
-            )}
-            {snooze?.kind === "wake" && (
-              <ContextMenuItem onClick={snooze.onWake}>Wake now</ContextMenuItem>
-            )}
-            {settleAction?.kind === "settle" && (
-              <ContextMenuItem onClick={settleAction.onAction}>
-                Settle workspace
-              </ContextMenuItem>
-            )}
-            {/* `offered` is the guardrail (a working or blocked workspace is
-                never deferrable). The wake times themselves belong to
-                `SnoozeUntilSubmenu`, which only exists while the menu is open. */}
-            {snooze?.kind === "snooze" && snooze.offered && (
-              <SnoozeUntilSubmenu onSnooze={snooze.onSnooze} />
-            )}
-          </>
-        )}
-        {unreadAction && (
-          <ContextMenuItem onClick={unreadAction.onMarkUnread}>
-            Mark unread
-          </ContextMenuItem>
-        )}
-        <ContextMenuSeparator />
-      </>
+          )}
+          {snooze?.kind === "wake" && (
+            <ContextMenuItem onClick={snooze.onWake}>Wake now</ContextMenuItem>
+          )}
+          {settleAction?.kind === "settle" && (
+            <ContextMenuItem onClick={settleAction.onAction}>
+              Settle workspace
+            </ContextMenuItem>
+          )}
+          {/* `offered` is the guardrail (a working or blocked workspace is
+              never deferrable). The wake times themselves belong to
+              `SnoozeUntilSubmenu`, which only exists while the menu is open. */}
+          {snooze?.kind === "snooze" && snooze.offered && (
+            <SnoozeUntilSubmenu onSnooze={snooze.onSnooze} />
+          )}
+        </>
+      )}
+      {unreadAction && (
+        <ContextMenuItem onClick={unreadAction.onMarkUnread}>
+          Mark unread
+        </ContextMenuItem>
+      )}
+      <ContextMenuSeparator />
       <ContextMenuItem onClick={handleRename}>
         Rename workspace
       </ContextMenuItem>

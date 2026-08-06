@@ -18,18 +18,24 @@ implementation notes (`v0.6.1`–`v0.13.2`) were moved to `docs/archive/release-
 
 Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. The latest released version is **`v0.16.0` (2026-08-02)**, the release in which the Agent Chat GUI became the default interface — it also carries the seven-phase GUI responsiveness program, the unified Ctrl+K switcher, the Agent Tasks and context-window surfaces, the compressed web-remote transport, and the one-command remote bootstrap. `v0.15.6` (2026-07-30) was a follow-up release carrying the chat code-rendering, provider-request-lifecycle, skills-discovery, and sidebar-inbox-detail clusters listed below. `v0.15.5` (2026-07-28) carried the sidebar park-intelligence batch (backend-owned activity stamps, a "Wrapping up" tier, snooze, a bulk-action safety net, an oldest-blocked-first needs-you strip, and a shared hover details card), the chat scope + picker rework, the terminal live-cwd hint, and the Linux WebKitGTK accelerated-scrolling restore. `v0.15.0` (2026-07-25) carried the sidebar workspace inbox, the atomic provider/model selection fix, the provider-native Full-access launch repair, and the Codex-only Standard/Fast speed picker. `v0.14.3` shipped headless serve mode, terminal-hook restart recovery, Codex auth/preset migrations, the new-workspace/titlebar and WebKit composer fixes, and safe inline tool-result images; `v0.14.2` shipped the living sidebar, the first Full-access null-mode launch heal, and the transcript scroll/anchoring fix; `v0.14.1` shipped the preceding Agent Chat reliability and polish batch.
 
-Unreleased after `v0.16.0` — eight merged PRs (#239–#246) plus the
+Unreleased after `v0.16.0` — nine merged PRs (#239–#246, #248) plus the
 directly-committed new-turn scroll contract (PR #247) and the floating-chrome
 refinement commits that shipped alongside PR #245, grouped by subsystem below:
 
-- **Durable workspace pinning.** Any workspace can be pinned from its context
-  menu into a dedicated block above the active inbox; pinned cards keep static
-  creation order, expose a direct hover/focus Unpin action, remain visible in
-  the collapsed rail, and are protected from settle, snooze, auto-settle, and
-  bulk parking. `WorkspaceSnapshot.pinned_at` is persisted by Rust and carried
-  through archive/restore. Pinning is a visibility override rather than a
-  destructive lifecycle transition: an already-settled or snoozed workspace
-  returns to that preserved shelf when unpinned. See `docs/features/sidebar.md`.
+- **Durable workspace pinning** (PR #248). Any workspace can be pinned from its
+  context menu into a dedicated block above the active inbox; pinned cards keep
+  static creation order, expose a direct hover/focus Unpin action, remain
+  visible in the collapsed rail, and are protected from settle, snooze,
+  auto-settle, and bulk parking. `WorkspaceSnapshot.pinned_at` is persisted by
+  Rust and carried through archive/restore with its original timestamp intact.
+  Pinning is a visibility override rather than a destructive lifecycle
+  transition: an already-settled or snoozed workspace keeps that shelf entry and
+  returns to it when unpinned. The override is against *parking* only — the
+  settle safety net and the snooze wake sweep still clear a preserved entry
+  underneath a pinned card when the agent goes live or the wake time elapses, so
+  unpinning reveals the current lifecycle rather than a stale one; the cosmetic
+  "Woke" pill is suppressed while pinned, since the card never left the list.
+  See `docs/features/sidebar.md`.
 
 - **New-turn scroll contract for the chat transcript** (PR #247). A composer submission is now an explicit navigation intent rather than a data update. `AgentChatPane` issues a `sendAnchor` (`{ clientNonce, nonce }`) in the same batch as the optimistic `appendUserMessage`, reusing that bubble's existing correlation token; `MessageList` resolves the matching `user_message` slot **by nonce** (last match wins) — not by last index, which queued follow-ups and control rows break — feeds it to LegendList's `anchoredEndSpace` (`anchorOffset: 16`), and positions the row from the `onReady` measurement callback with an instant `scrollToIndex`, retrying per frame rather than assuming layout finishes in N ms. Three states replace the old one-shot scalar signal: `following-end`, `anchoring-turn`, `free-scrolling`. While an anchor is mounted the built-in `maintainScrollAtEnd` is disabled and an effect advances by exactly `scrollDeltaToRevealEnd`, so the prompt stays parked near the top while the turn fits and moves only enough to reveal the growing tail. Follow is released **only** by `wheel`, `touchmove`, a `pointerdown` that targets the scroll container itself (a scrollbar drag — presses on rows, so plan-accept/approval/expand clicks and text selection, deliberately do not count), or subagent-jump navigation; a generation counter invalidates every in-flight continuation at once, and scrolling back to the edge re-claims follow. The anchor expires on failed-send rollback, on thread switch, and on the falling edge of the live-turn signal, so a settled thread reopens at the latest row and LegendList's own item/footer-layout pin comes back; expiry never re-claims the viewport from a reader already browsing history. "Jump to latest" is shown on a 150ms trailing debounce and hidden immediately, so it no longer flashes during mount/layout settling or sticks on during programmatic anchoring. Geometry lives in the pure, unit-tested `send-scroll-state.ts`. Frontend-only; the previous `scrollToBottomSignal` scalar and its single `scrollToEnd` call are gone. See `docs/features/agent-chat.md` § "Transcript scroller" → "The new-turn scroll contract".
 
