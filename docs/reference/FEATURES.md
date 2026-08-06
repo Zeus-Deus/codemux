@@ -102,6 +102,7 @@
 - Cross-provider subagent card, docked live-activity bar, and read-only child-transcript drill-in
 - Claude workflow orchestration card + conditional right-panel phase/agent drill-in
 - Follow-up queueing with "Send now" steering, dead-run detection, and one-click interrupted-run continuation
+- **Monitoring status** for an agent that finished its deliverable but is still watching something (a CI run, a tailed process, a PR poll): a calm steady-cyan fifth state that never pulses or raises the needs-you strip. Claude watch-loop tasks classify into it automatically; any provider — including a plain terminal agent — can opt in with `codemux monitor start [--reason]` / `codemux monitor stop` / `codemux monitor status`. A docked bar between transcript and composer carries the reason and a Stop button
 - Context Row under the composer plus detached background-browser status/peek/promotion in GUI mode
 - Run checkpoints (opt-in via Settings → Agent): background working-tree snapshot at session start, restore button in the pane header rolls the workspace back to the pre-run state
 - Permission-mode mid-session restart

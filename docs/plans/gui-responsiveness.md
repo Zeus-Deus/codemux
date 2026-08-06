@@ -228,9 +228,9 @@ Adopt only if (1) improves materially **and** (2) is preserved with the manual m
 
 ## Already Landed
 
-All seven phases plus a review-fix round, all 2026-08-01, all unreleased. Current
-behavior for each now lives in the feature doc named on its line — keep it there,
-not here.
+All seven phases plus a review-fix round, all 2026-08-01, all shipped in `v0.16.0`
+(2026-08-02) as PR #235. Current behavior for each now lives in the feature doc named
+on its line — keep it there, not here.
 
 - **Phase 0 — interaction-trace harness.** `src/lib/perf/interaction-trace.ts` (7-phase trace under one id, double-rAF paint stamp, 100-trace ring, feature-detected `longtask`/LoAF observers, p50/p95/max, `exportDiagnostics()` with a `renderer` section), `[codemux::perf::emit]` / `[codemux::perf::job]` backend section timings, and `src/dev/stress-fixture.ts`. Gated on `localStorage["codemux:perf-trace"]` or a dev build; no behavior changed. → `docs/features/observability.md`, `docs/features/dev-mock-runtime.md`.
 - **Phase 1 — optimistic selection.** `pendingActiveWorkspaceId` / `selectActiveWorkspaceId` paint the click in its own task; all ~15 activation sites route through `activateWorkspaceInteraction` (`instrumented-activate.ts`) with id-scoped rollback and a 5 s backstop; the confirming snapshot bypasses the 16 ms coalescer; `cycle_workspace` reached parity via the shared `run_activation_side_effects` (async PTY spawn, git refresh, persistence). → `docs/features/sidebar.md` § "Selection and update cost".
