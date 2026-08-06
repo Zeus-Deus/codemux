@@ -144,12 +144,17 @@ visual only — nothing is archived, closed, or deleted.
   agent is live, worktree name when idle) + issue chip; a red blocker line
   (needs-you only); and a mono meta line. The meta line is **two columns, not
   one flow**: the git-local facts (branch · `↑ahead` · `+/−` diff) flow from the
-  left, then a `flex-1` spacer pins the rest to the right — PR chip (`PR #n`
-  green / `merged` violet, opens the PR) · provider logos · remote cloud icon ·
-  notification badge. The spacer sits *before* the PR chip deliberately: with it
-  after, the chip began wherever the branch name happened to end, so chips landed
-  at a different x on every card and the column read as ragged. Right-aligning
-  also makes the chip's own variable width (`merged` vs `PR #1234`) harmless. The
+  left, then a `flex-1` spacer pins the rest to the right — PR chip · provider
+  logos · remote cloud icon · notification badge. The PR chip is **the same
+  borderless badge settled rows use**: a state-colored `PrStatusIcon` + `#n`
+  (open green, merged violet, closed red, draft muted), no border or fill, with
+  a hover tint only when there is a `pr_url` to open (dimmed and non-interactive
+  otherwise). Active and settled therefore render one PR the same way, so a card
+  settling no longer looks like the badge changed. The spacer sits *before* the
+  PR chip deliberately: with it after, the chip began wherever the branch name
+  happened to end, so chips landed at a different x on every card and the column
+  read as ragged. Right-aligning also makes the chip's variable width
+  (`#7` vs `#1234`) harmless. The
   trailing indicator cluster owns the far-right column and reserves a
   `min-w-[15px]` slot — sized to the *widest* single indicator (the notification
   pill, not the 13px provider logo) so neither a bare card nor a card showing a

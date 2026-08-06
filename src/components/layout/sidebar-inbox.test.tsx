@@ -358,7 +358,7 @@ describe("SidebarInbox — cards", () => {
     expect(screen.queryByText("+124")).not.toBeInTheDocument();
   });
 
-  it("shows a PR chip (merged → violet label)", async () => {
+  it("shows a borderless PR chip (icon + number) on active cards", async () => {
     workspaces = [
       makeWorkspace({
         worktree_path: "/wt/a",
@@ -378,8 +378,12 @@ describe("SidebarInbox — cards", () => {
     // remains available while its agent is running.
     paneStatuses = { p1: "working" };
     await renderInbox();
-    expect(screen.getByText("PR #87")).toBeInTheDocument();
-    expect(screen.getByText("merged")).toBeInTheDocument();
+    // Both states render the same way settled rows do: "#<number>", colored
+    // by PR state, with no "PR" prefix or "merged" word riding along.
+    expect(screen.getByText("#87")).toBeInTheDocument();
+    expect(screen.getByText("#203")).toBeInTheDocument();
+    expect(screen.queryByText("PR #87")).not.toBeInTheDocument();
+    expect(screen.queryByText("merged")).not.toBeInTheDocument();
   });
 
   it("shows the provider logo for agent-chat panes in the workspace", async () => {
