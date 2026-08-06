@@ -1371,6 +1371,13 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
             .map(|w| w.workspace_id.0.clone())
     };
     if let Some(existing_id) = existing {
+        // Carry the ORIGINAL pin timestamp across, not a fresh one: the
+        // archived entry records when the user actually pinned. Only ever
+        // re-applies a pin — an unpinned archive entry must not silently
+        // unpin the live workspace it matched.
+        if entry.pinned_at.is_some() {
+            state.restore_workspace_pinned_at(&existing_id, entry.pinned_at)?;
+        }
         activate_workspace_impl(app.clone(), state, db, existing_id.clone())?;
         let _ = state.remove_archived_workspace(&archive_id);
         crate::state::emit_app_state(&app);
@@ -1491,6 +1498,12 @@ pub(crate) async fn unarchive_workspace_impl<R: tauri::Runtime>(
         state.rename_workspace(&id, entry.title.clone());
         id
     };
+
+    // Same as the reuse branch above: restore the archived timestamp verbatim
+    // rather than stamping the moment of the unarchive.
+    if entry.pinned_at.is_some() {
+        state.restore_workspace_pinned_at(&restored_id, entry.pinned_at)?;
+    }
 
     let _ = state.remove_archived_workspace(&archive_id);
     activate_workspace_impl(app.clone(), state, db, restored_id.clone())?;
@@ -1756,6 +1769,20 @@ pub fn set_workspace_muted<R: tauri::Runtime>(
     } else {
         Err(format!("No workspace found for {workspace_id}"))
     }
+}
+
+/// Pin or unpin a workspace at the top of the workspace inbox.
+#[tauri::command]
+pub fn set_workspace_pinned<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    pinned: bool,
+) -> Result<(), String> {
+    if state.set_workspace_pinned(&workspace_id, pinned)? {
+        crate::state::emit_app_state(&app);
+    }
+    Ok(())
 }
 
 #[tauri::command]

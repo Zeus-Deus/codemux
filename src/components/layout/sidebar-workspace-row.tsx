@@ -36,6 +36,8 @@ import {
   BellOff,
   Cloud,
   Loader2,
+  Pin,
+  PinOff,
   X,
 } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -48,6 +50,7 @@ import {
   renameWorkspace,
   unarchiveWorkspace,
   setWorkspaceMuted,
+  setWorkspacePinned,
   detectEditors,
   openInEditor,
   runWorkspaceSetup,
@@ -465,6 +468,17 @@ export function WorkspaceContextMenuItems({
     ).catch(console.error);
   };
 
+  const handleTogglePinned = async () => {
+    const pinned = workspace.pinned_at != null;
+    try {
+      await setWorkspacePinned(workspace.workspace_id, !pinned);
+    } catch (err) {
+      toast.error(pinned ? "Unpin failed" : "Pin failed", {
+        description: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
   const handleOpenInEditor = (editorId: string) => {
     openInEditor(editorId, workspace.cwd).catch(console.error);
   };
@@ -485,11 +499,21 @@ export function WorkspaceContextMenuItems({
 
   return (
     <ContextMenuContent>
-      {/* Lifecycle block. Ordered so the entries that BRING WORK BACK sit
-          first: a user who right-clicked a hidden row is almost always there
-          to undo the hiding, and burying "Wake now" under the deferral
-          options would make the common case the slower one. */}
-      {(settleAction || snooze || unreadAction) && (
+      {/* Pin/unpin leads the menu: it is the one entry that is always
+          available and always means the same thing, whatever shelf the row is
+          on. It also gates the lifecycle block below, so reading it first
+          explains why those entries may be missing. */}
+      <ContextMenuItem onClick={() => void handleTogglePinned()}>
+        {workspace.pinned_at != null ? <PinOff /> : <Pin />}
+        {workspace.pinned_at != null ? "Unpin workspace" : "Pin workspace"}
+      </ContextMenuItem>
+      {/* Lifecycle block, hidden entirely while pinned — a pin suppresses
+          every park verb, and showing them disabled would only invite the
+          click. Ordered so the entries that BRING WORK BACK sit first: a user
+          who right-clicked a hidden row is almost always there to undo the
+          hiding, and burying "Wake now" under the deferral options would make
+          the common case the slower one. */}
+      {workspace.pinned_at == null && (
         <>
           {settleAction?.kind === "unsettle" && (
             <ContextMenuItem onClick={settleAction.onAction}>
@@ -510,14 +534,14 @@ export function WorkspaceContextMenuItems({
           {snooze?.kind === "snooze" && snooze.offered && (
             <SnoozeUntilSubmenu onSnooze={snooze.onSnooze} />
           )}
-          {unreadAction && (
-            <ContextMenuItem onClick={unreadAction.onMarkUnread}>
-              Mark unread
-            </ContextMenuItem>
-          )}
-          <ContextMenuSeparator />
         </>
       )}
+      {unreadAction && (
+        <ContextMenuItem onClick={unreadAction.onMarkUnread}>
+          Mark unread
+        </ContextMenuItem>
+      )}
+      <ContextMenuSeparator />
       <ContextMenuItem onClick={handleRename}>
         Rename workspace
       </ContextMenuItem>

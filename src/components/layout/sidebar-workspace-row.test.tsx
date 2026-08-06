@@ -20,6 +20,7 @@ const {
   mockCloseWorkspace,
   mockCloseWorkspaceWithWorktree,
   mockGetDefaultBranch,
+  mockSetWorkspacePinned,
   mockSetWorkspaceMuted,
   mockToast,
 } = vi.hoisted(() => ({
@@ -29,6 +30,7 @@ const {
   mockCloseWorkspace: vi.fn(),
   mockCloseWorkspaceWithWorktree: vi.fn(),
   mockGetDefaultBranch: vi.fn().mockResolvedValue("main"),
+  mockSetWorkspacePinned: vi.fn().mockResolvedValue(undefined),
   mockSetWorkspaceMuted: vi.fn().mockResolvedValue(undefined),
   mockToast: {
     success: vi.fn(),
@@ -50,6 +52,7 @@ vi.mock("@/tauri/commands", () => ({
   closeWorkspaceWithWorktree: (...args: unknown[]) =>
     mockCloseWorkspaceWithWorktree(...args),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
+  setWorkspacePinned: (...args: unknown[]) => mockSetWorkspacePinned(...args),
   setWorkspaceMuted: (...args: unknown[]) => mockSetWorkspaceMuted(...args),
   detectEditors: vi.fn().mockResolvedValue([]),
   getDefaultBranch: (...args: unknown[]) => mockGetDefaultBranch(...args),
@@ -235,6 +238,8 @@ beforeEach(() => {
   mockCloseWorkspaceWithWorktree.mockResolvedValue(undefined);
   mockGetDefaultBranch.mockReset();
   mockGetDefaultBranch.mockResolvedValue("main");
+  mockSetWorkspacePinned.mockReset();
+  mockSetWorkspacePinned.mockResolvedValue(undefined);
   mockSetWorkspaceMuted.mockReset();
   mockSetWorkspaceMuted.mockResolvedValue(undefined);
   mockToast.success.mockReset();
@@ -1325,7 +1330,55 @@ describe("Living row — work titles + shipped tally", () => {
   });
 });
 
-describe("Lifecycle context-menu block (settle / snooze / unread)", () => {
+describe("Workspace pin and lifecycle context-menu block", () => {
+  it("pins and unpins through an idempotent workspace command", async () => {
+    const { rerender } = render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace()}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    await userEvent.click(screen.getByRole("menuitem", { name: "Pin workspace" }));
+    expect(mockSetWorkspacePinned).toHaveBeenCalledWith("ws-1", true);
+
+    rerender(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ pinned_at: Date.now() })}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await userEvent.click(screen.getByRole("menuitem", { name: "Unpin workspace" }));
+    expect(mockSetWorkspacePinned).toHaveBeenCalledWith("ws-1", false);
+  });
+
+  it("hides settle and snooze actions while pinned", async () => {
+    render(
+      <WorkspaceContextMenuItems
+        workspace={makeWorkspace({ pinned_at: Date.now() })}
+        settleAction={{ kind: "settle", onAction: () => {} }}
+        snoozeAction={{
+          kind: "snooze",
+          offered: true,
+          onSnooze: () => {},
+          onWake: () => {},
+        }}
+        unreadAction={{ onMarkUnread: () => {} }}
+        onArchiveRequest={() => {}}
+        onDeleteRequest={() => {}}
+      />,
+    );
+    await flushDefaultBranchFetch();
+
+    expect(screen.getByRole("menuitem", { name: "Unpin workspace" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Settle workspace" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Snooze")).not.toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Mark unread" })).toBeInTheDocument();
+  });
+
   it("puts the bring-it-back entries above the deferral ones", async () => {
     render(
       <WorkspaceContextMenuItems
@@ -1347,8 +1400,9 @@ describe("Lifecycle context-menu block (settle / snooze / unread)", () => {
     const labels = screen
       .getAllByRole("menuitem")
       .map((el) => el.textContent)
-      .slice(0, 3);
+      .slice(0, 4);
     expect(labels).toEqual([
+      "Pin workspace",
       "Un-settle workspace",
       "Wake now",
       "Mark unread",

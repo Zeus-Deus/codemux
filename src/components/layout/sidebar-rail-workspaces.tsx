@@ -15,6 +15,7 @@ import { getWorkspaceStatus, STATUS_DOT_CLASS } from "@/lib/pane-status";
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import type { WorkspaceSnapshot } from "@/tauri/types";
+import { Pin } from "lucide-react";
 
 interface RailItemRepo {
   name: string;
@@ -95,6 +96,13 @@ function RailWorkspaceItem({
             size="md"
             shape="square"
           />
+          {workspace.pinned_at != null && (
+            <Pin
+              role="img"
+              aria-label="Pinned workspace"
+              className="absolute bottom-0.5 left-0.5 size-2.5 rounded-sm bg-sidebar p-px text-muted-foreground"
+            />
+          )}
           {status && (
             <span
               className={cn(
@@ -110,9 +118,12 @@ function RailWorkspaceItem({
 
 /**
  * Collapsed (icon-rail) rendering of the workspace inbox: a centered vertical
- * strip with one avatar button per ACTIVE workspace — neither settled nor
- * snoozed — in the same order as the expanded inbox. The repo filter never
- * applies here (the rail always shows every active workspace), and each
+ * strip with one avatar button per visible workspace, in the same order as the
+ * expanded inbox. Visible means active (neither settled nor snoozed) OR pinned
+ * — a pin is a visibility override, so a pinned workspace keeps its rail button
+ * even while parked, exactly as it keeps its card in the expanded list. Pinned
+ * buttons lead, matching the expanded inbox's pinned block. The repo filter
+ * never applies here (the rail always shows every visible workspace), and each
  * button's corner dot mirrors that workspace's own agent status so activity
  * stays visible while collapsed.
  */
@@ -175,23 +186,31 @@ export function SidebarRailWorkspaces() {
     [settled, snoozed],
   );
 
-  // …with the inbox's one exception: the workspace the user is *in* never
-  // hides, whichever shelf it is parked on. The expanded inbox force-renders
-  // its row; here the button's selection fill is the only "you are here" the
-  // collapsed sidebar has, and dropping it would leave the rail claiming the
-  // user is nowhere.
+  // …with the inbox's two exceptions. A **pinned** workspace never hides: the
+  // pin is a durable visibility override that outranks either shelf, and a
+  // rail that dropped it would contradict the expanded list one Ctrl+B away.
+  // And the workspace the user is *in* never hides either, whichever shelf it
+  // is parked on — the expanded inbox force-renders its row; here the button's
+  // selection fill is the only "you are here" the collapsed sidebar has, and
+  // dropping it would leave the rail claiming the user is nowhere.
   //
-  // Same newest-first, status-blind order as the expanded inbox (the shared
+  // Order: the pinned block leads (mirroring the expanded inbox's pinned cards
+  // above the hairline), and within each block the same newest-first,
+  // otherwise status-blind order as the expanded inbox (the shared
   // `compareNewestFirst`), so collapsing the sidebar never re-shuffles the
   // workspaces the user just memorized positions for.
   const railWorkspaces = allWorkspaces
     .map((ws, storedIndex) => ({ ws, storedIndex }))
     .filter(
       ({ ws }) =>
+        ws.pinned_at != null ||
         !parkedIds.has(ws.workspace_id) ||
         ws.workspace_id === activeWorkspaceId,
     )
-    .sort(compareNewestFirst)
+    .sort((a, b) => {
+      const pinPriority = Number(b.ws.pinned_at != null) - Number(a.ws.pinned_at != null);
+      return pinPriority || compareNewestFirst(a, b);
+    })
     .map(({ ws }) => ws);
 
   return (

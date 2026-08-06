@@ -11,7 +11,8 @@
 The left sidebar is the primary navigation surface. Expanded, it is a **flat
 workspace inbox**: a search affordance + new-agent button, a project-filter
 dropdown row, one multi-line card per active workspace (with a "Wrapping up"
-tier of winding-down cards below a static divider), a collapsible
+tier of winding-down cards below a static divider), a durable pinned-card
+block above the normal active list, a collapsible
 "Snoozed" shelf of deferred rows, and a collapsible "Settled" shelf of
 swept-aside one-line rows. Collapsed, it is a narrow icon rail.
 The sidebar surface is **darker than the main pane** (a `--sidebar` override
@@ -43,11 +44,18 @@ Replaced the nested project tree (project groups, drag-reorder, and the
 "Gather on top" LIVE section) with one flat list. The pinned "Needs you"
 strip survived the migration: it is re-mounted in the inbox's sticky header
 (see below).
-A workspace is in exactly one of four states — **active** (a card), **settled**
-(a row on the Settled shelf), **snoozed** (a row on the Snoozed shelf), or
-**pinned-active** (a card carrying a keep-active pin that auto-settle must not
-touch). "Parking" is the shared verb for settling or snoozing; parking is
-visual only — nothing is archived, closed, or deleted.
+A workspace has one base lifecycle — **active** (a card), **settled** (a row on
+the Settled shelf), or **snoozed** (a row on the Snoozed shelf). A durable
+**workspace pin** is an orthogonal visibility override: while `pinned_at` is
+set the workspace renders as a card in the pinned block regardless of its base
+lifecycle, and unpinning reveals the still-preserved settled/snoozed state.
+The override is against *parking*, not against un-parking: a pinned card's
+preserved entry is never destroyed by a settle or snooze, but the settle safety
+net and the wake sweep still clear it when the agent goes live or the wake time
+elapses (see "The anti-oscillation invariant").
+This is distinct from the inbox store's internal `keepActive` auto-settle
+override created by Un-settle. "Parking" is the shared verb for settling or
+snoozing; parking is visual only — nothing is archived, closed, or deleted.
 
 - **Header** (`sidebar-action-row.tsx` expanded variant): a search box-shaped
   button that opens the command palette (shows the resolved `⌘K` keybind) and
@@ -65,8 +73,9 @@ visual only — nothing is archived, closed, or deleted.
   or the repo's mini avatar + name) with a rotating chevron, plus the dashed
   `+` add-repo button pinned right (Open project / New project dropdown).
   The panel lists **All projects** + one row per project (avatar, dedup'd
-  name, right-aligned **active-workspace count** — unsettled and unsnoozed
-  only, so a wrapping-up card still counts as active; All shows the total); the current filter's row is highlighted; picking sets the
+  name, right-aligned **visible-card count** — unsettled and unsnoozed, plus
+  pinned workspaces whose preserved base lifecycle is parked, so a wrapping-up
+  or pinned card still counts; All shows the total); the current filter's row is highlighted; picking sets the
   filter and closes. The filter applies to **both** the active cards and the
   settled rows and resets settled-tail paging; a filtered-empty list shows
   "Nothing active in `<repo>`". Session-only, and self-healing — if the
@@ -99,8 +108,24 @@ visual only — nothing is archived, closed, or deleted.
   rows **below the top-tier cards and above the "Wrapping up" divider** — a
   spinner "creating" row, or a red `AlertCircle` "failed" row. They are filter-scoped like everything else and suppress the
   "Nothing active" empty state while present.
+- **Pinned card block** (`WorkspaceSnapshot.pinned_at`): pinned workspaces render
+  before every normal active card, separated by a thin unlabeled hairline. The
+  hairline is a *separator*, so it renders only when there is at least one
+  non-pinned card, pending row, wrapping-up card, or shelf below it — an
+  all-pinned (or empty) list ends cleanly rather than trailing a rule under
+  nothing. The block uses the same stored-index ordering as the normal list —
+  creation order, not pin-click time — so pinning several workspaces does not
+  make each new pin jump ahead of the others. Pin/unpin is idempotent and
+  persisted in `layout.json`; archive/unarchive preserves membership **and the
+  original `pinned_at` timestamp** (restore writes the archived value verbatim
+  rather than re-stamping "now"). A pin suppresses Settle/Snooze actions,
+  excludes the workspace from bulk parking and auto-settle, and overrides any
+  existing shelf presentation without deleting it. The card eyebrow carries a
+  pin glyph and exposes a direct **Unpin** action on hover/focus; every
+  workspace context menu begins with **Pin workspace** or **Unpin workspace**.
 - **Card order — newest first, and static** (`compareNewestFirst` in
-  `sidebar-inbox.tsx`): cards sort by **stored snapshot index, descending**.
+  `sidebar-inbox.tsx`): within the pinned and normal blocks, cards sort by
+  **stored snapshot index, descending**.
   The backend has no `created_at`, but it appends new workspaces to the
   snapshot array, so a later stored index is a newer workspace. The order is
   derived from that index *only* — never from status, activity, or
@@ -168,7 +193,8 @@ visual only — nothing is archived, closed, or deleted.
   the agent state — Working (configurable `WorkingIndicator`, amber text) /
   Needs you (pulsing red dot) / Done · review (green ✓) / elapsed since the
   workspace last settled into review — and swaps to a **"✓ Settle"** +
-  **"Snooze"** action pair on hover or focus (CSS-only swap, plus a pinned-on
+  **"Snooze"** action pair on hover or focus for a normal card, or a direct
+  **"Unpin"** action for a pinned card (CSS-only swap, plus an action-visible
   state while the Snooze dropdown is open, since Radix portals the menu out of
   the card and would otherwise lose its own trigger). The selected card
   gets a neutral border + clearly lighter fill (selection is lightness, not
@@ -251,11 +277,12 @@ visual only — nothing is archived, closed, or deleted.
   session spent entirely collapsed still trims the blob). The list is flat —
   repo identity is carried by each row's avatar, not by project grouping.
   All three row shapes (card, snoozed row, settled row) share the full workspace
-  right-click menu via `workspace-inbox-menu.tsx`. Its lifecycle block is
-  ordered so the entries that bring work *back* come first — Un-settle, Wake
-  now, then Settle, "Snooze until…", Mark unread — since a user who right-clicks
+  right-click menu via `workspace-inbox-menu.tsx`. It begins with Pin/Unpin;
+  its lifecycle block is ordered so the entries that bring work *back* come
+  first — Un-settle, Wake now, then Settle, "Snooze until…", Mark unread — since a user who right-clicks
   a hidden row is usually there to undo the hiding. Every shape keeps
-  rename / archive / delete / move-to-host below that.
+  rename / archive / delete / move-to-host below that. Settle and Snooze are
+  absent while pinned, while Mark unread remains available.
   Because a parked (settled or snoozed) workspace is still fully open, it also
   stays a valid target in agent chat's "Run in" location picker, which reads
   this same store to split its list into **Active** and **Settled · still
@@ -501,11 +528,12 @@ visual only — nothing is archived, closed, or deleted.
   the Review tab. Only two *known*, differing names count as a side-branch
   association. The hover/details card adds a **"PR branch"** row only in that
   case, where it answers the question the badge raises.
-- **The anti-oscillation invariant.** Four states (active / settled / snoozed /
-  pinned-active) and five park-mutating effects (auto-settle, the auto-un-settle
-  safety net, the snooze hand-raise, the wake sweep, the precise wake timer)
-  share one list, so the guards are what keep a row from being fought over. Each
-  effect is keyed to a status band no other effect touches:
+- **The anti-oscillation invariant.** Three base lifecycles (active / settled /
+  snoozed), the local keep-active auto-settle override, the durable workspace
+  pin visibility override, and five park-mutating effects (auto-settle, the
+  auto-un-settle safety net, the snooze hand-raise, the wake sweep, the precise
+  wake timer) share one list, so the guards are what keep a row from being
+  fought over. Each effect is keyed to a status band no other effect touches:
   - auto-settle refuses **working / permission** status. Idle and completed
     review work may settle; the focused workspace may settle on PR completion
     without navigating away.
@@ -526,6 +554,21 @@ visual only — nothing is archived, closed, or deleted.
     user wants).
     `unsettle`/`unsnooze` with reason `"user"` sets the pin; `"activity"`
     clears it; `"timer"` leaves it alone.
+  - a **durable workspace pin** blocks all manual, bulk, and automatic
+    **parking** while it is present. If the workspace was already parked when
+    pinned, its shelf entry is retained but presentation is overridden, so
+    unpinning reveals that lifecycle instead of a destroyed one.
+    **Un-parking is deliberately not blocked.** A pin governs where a card is
+    shown, not whether its agent went live or its wake time elapsed, so two
+    effects still clear a preserved entry underneath a pinned card: the settle
+    safety net (a settled workspace whose agent goes working/permission
+    resurfaces) and the wake sweep / boundary timer (a snooze ticket that comes
+    due wakes). Both only ever *remove* a shelf entry, never add one, so
+    neither can fight the pin — the card stays on top either way, and unpinning
+    then reveals the up-to-date lifecycle rather than a stale snooze. The one
+    concession to the override is cosmetic: the **"Woke" pill is suppressed
+    while a card is pinned**, because that badge announces a return to a list
+    the pinned card never left.
 
   - the **"Wrapping up" tier is not a fifth state.** It mutates nothing — it is
     a pure partition of the cards auto-settle already left alone, so it can
@@ -646,7 +689,7 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   fill) + a search icon (opens the command palette), then a slim centered
   divider. Add repository lives only in the expanded filter row.
 - **Workspace strip** (`sidebar-rail-workspaces.tsx`): one 28px button per
-  **active (unsettled) workspace** — repo avatar with that workspace's own
+  **active or pinned workspace** — repo avatar with that workspace's own
   status dot (red pulse = needs you, amber = working, green = done-review,
   none = idle), and the shared right-side **hover card** (it replaced the
   title-only tooltip — a 28px avatar is the sidebar's least legible surface,
@@ -658,11 +701,14 @@ Replaced the old project-avatar rail (aggregate dots + hover flyout,
   holding a rail button is the deferral undone. The one exception is also the
   inbox's: the **currently-open** workspace keeps its button whichever shelf it
   is parked on, because the selection fill is the collapsed sidebar's only
-  "you are here". Buttons run **newest-first** via the same
+  "you are here". A pinned workspace is the other exception: it stays visible
+  even when its preserved base lifecycle is parked, carries a small pin badge,
+  and sorts into a pinned block ahead of every normal rail button. Buttons run
+  **newest-first within each block** via the same
   `compareNewestFirst` the expanded inbox sorts with (imported from
   `sidebar-inbox.tsx` — one implementation, shared so the two views can never
   disagree), so collapsing the sidebar never re-shuffles the order the user
-  just memorized. The rail has no tiers: it is a single newest-first list.
+  just memorized. The rail has no Wrapping-up tier or divider.
   It mirrors the cards' **background recede**: a button that is not the open
   workspace, is not unread (`isWorkspaceUnread` on the two backend stamps,
   imported from `sidebar-inbox.tsx` — the rail has no manual-unread override),
@@ -715,6 +761,9 @@ came from.
 - Two-state toggle (expanded inbox ↔ icon rail) via title-bar button and `Ctrl+B`.
 - Flat inbox cards with live agent state, blocker lines, git/PR/issue/remote/
   notification detail, and work-based titling while an agent is live.
+- Durable Pin/Unpin with a pinned-first card block, static creation order,
+  direct card Unpin, archive/restore preservation, and settled/snoozed
+  visibility override without lifecycle data loss.
 - Project dropdown filtering active + snoozed + settled lists (with active
   counts); pinned add-repo button; sticky filter row.
 - A pinned, filter-scoped "Needs you" strip of jump-links in the sticky
@@ -739,9 +788,9 @@ came from.
 - Forward navigation when parking the workspace you are currently viewing.
 - Search affordance opening the command palette; neutral-ghost new-agent button.
 - Show git stats toggle (Settings → Appearance → Sidebar).
-- Rail: one avatar button per active (neither settled nor snoozed) workspace,
-  newest-first, with individual status dots, select-without-expand, and the
-  shared footer destinations.
+- Rail: one avatar button per active or pinned workspace, pinned block first
+  then newest-first within each block, with pin badges, individual status dots,
+  select-without-expand, and the shared footer destinations.
 - Hover details on every workspace surface (card, settled row, snoozed row,
   rail avatar) — full title, complete git picture, PR/issue, ports, device,
   and path on disk.

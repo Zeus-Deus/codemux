@@ -2824,6 +2824,16 @@ const handlers: Record<string, Handler> = {
     }
     return undefined;
   },
+  set_workspace_pinned: (a) => {
+    const ws = findWorkspace(a.workspaceId);
+    if (ws) {
+      const pinned = Boolean(a.pinned);
+      if (pinned && ws.pinned_at == null) ws.pinned_at = Date.now();
+      if (!pinned) ws.pinned_at = null;
+      emitAppState();
+    }
+    return undefined;
+  },
   close_workspace: (a) => removeWorkspace(a.workspaceId),
   close_workspace_with_worktree: (a) => {
     const ws = findWorkspace(a.workspaceId);

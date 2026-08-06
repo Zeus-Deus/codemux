@@ -14,6 +14,8 @@
 //! - `cwd`, `worktree_path`, `pane_statuses`, terminal sessions, surface tree
 //! - Git deltas (ahead/behind/changed_files) — read from the local git tree
 //! - `notification_count`, `notifications_muted` — per-device user state
+//! - `pinned_at` — sidebar-inbox visibility override; where a card sits in
+//!   *this* device's sidebar is not a property of the workspace itself
 //!
 //! Wire model:
 //! - `pull(token)` → GET `/api/workspaces` → upsert each server row
@@ -999,6 +1001,7 @@ mod tests {
             pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
+            pinned_at: None,
             tabs: Vec::new(),
             active_tab_id: String::new(),
             active_surface_id: SurfaceId(String::new()),
