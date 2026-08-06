@@ -358,7 +358,7 @@ describe("SidebarInbox — cards", () => {
     expect(screen.queryByText("+124")).not.toBeInTheDocument();
   });
 
-  it("shows a PR chip (merged → violet label)", async () => {
+  it("shows a borderless PR chip (icon + number) on active cards", async () => {
     workspaces = [
       makeWorkspace({
         worktree_path: "/wt/a",
@@ -378,8 +378,104 @@ describe("SidebarInbox — cards", () => {
     // remains available while its agent is running.
     paneStatuses = { p1: "working" };
     await renderInbox();
-    expect(screen.getByText("PR #87")).toBeInTheDocument();
-    expect(screen.getByText("merged")).toBeInTheDocument();
+    // Both states render the same way settled rows do: a state-colored icon
+    // plus "#<number>", with no "PR" prefix, no "merged" word and none of the
+    // old bordered-pill chrome riding along.
+    const open = screen.getByRole("button", {
+      name: "Pull request #87 — open",
+    });
+    expect(open).toHaveTextContent("#87");
+    expect(open.querySelector("svg")).not.toBeNull();
+    expect(open.className).not.toMatch(/\bborder\b/);
+    const merged = screen.getByRole("button", {
+      name: "Pull request #203 — merged",
+    });
+    expect(merged).toHaveTextContent("#203");
+    expect(merged.querySelector("svg")).not.toBeNull();
+    expect(merged.className).not.toMatch(/\bborder\b/);
+    expect(screen.queryByText("PR #87")).not.toBeInTheDocument();
+    expect(screen.queryByText("merged")).not.toBeInTheDocument();
+  });
+
+  it("renders the PR chip icon alone when the number is unknown", async () => {
+    workspaces = [
+      makeWorkspace({
+        worktree_path: "/wt/a",
+        pr_number: null,
+        pr_state: "OPEN",
+        pr_url: "https://github.com/u/r/pull/87",
+      }),
+    ];
+    await renderInbox();
+
+    // A state with no number still says something worth showing, but it must
+    // not degrade into a bare "#".
+    const pr = screen.getByRole("button", { name: "Pull request — open" });
+    expect(pr.querySelector("svg")).not.toBeNull();
+    expect(pr.textContent).not.toContain("#");
+  });
+
+  it("a PR chip with no URL is inert without leaking the click to the card", async () => {
+    workspaces = [
+      makeWorkspace({
+        worktree_path: "/wt/a",
+        pr_number: 87,
+        pr_state: "OPEN",
+        pr_url: null,
+      }),
+    ];
+    await renderInbox();
+
+    const pr = screen.getByRole("button", { name: "Pull request #87 — open" });
+    expect(pr).toBeDisabled();
+    // The disabled button has to stay the hit target for that to matter:
+    // `pointer-events-none` would pass the click straight through to the card
+    // root, which would select and activate the workspace — and show the
+    // card's `cursor-pointer` over a chip that does nothing. jsdom does no hit
+    // testing, so the class is the observable seam for that half.
+    expect(pr.className).toContain("cursor-default");
+    expect(pr.className).not.toContain("pointer-events-none");
+    await userEvent.click(pr);
+    expect(mockOpenUrl).not.toHaveBeenCalled();
+    expect(activateWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("Enter and Space on an active card's PR chip do not also activate the card", async () => {
+    workspaces = [
+      makeWorkspace({
+        worktree_path: "/wt/a",
+        pr_number: 87,
+        pr_state: "OPEN",
+        pr_url: "https://github.com/u/r/pull/87",
+      }),
+    ];
+    await renderInbox();
+
+    const card = screen
+      .getByRole("button", { name: "Pull request #87 — open" })
+      .closest("[data-inbox-card]") as HTMLElement;
+    const pr = within(card).getByRole("button", {
+      name: "Pull request #87 — open",
+    });
+
+    // Same contract as a settled row: the card is a `role="button"` container,
+    // so a keydown on the chip bubbles into it. Opening the PR and yanking the
+    // main pane onto the workspace are two different intents.
+    fireEvent.keyDown(pr, { key: "Enter" });
+    expect(activateWorkspace).not.toHaveBeenCalled();
+
+    // Space must also survive untouched — the card cancels Space to stop the
+    // sidebar scrolling, and doing that here would eat the button's own native
+    // activation, so the chip would look focusable but never open anything.
+    // A `true` return means nothing called `preventDefault`.
+    expect(fireEvent.keyDown(pr, { key: " " })).toBe(true);
+    expect(activateWorkspace).not.toHaveBeenCalled();
+
+    // Positive control: the same keys on the card itself still open it (and
+    // Space is still cancelled there), so the guard narrows activation rather
+    // than removing it.
+    expect(fireEvent.keyDown(card, { key: " " })).toBe(false);
+    expect(activateWorkspace).toHaveBeenCalledWith("ws-1");
   });
 
   it("shows the provider logo for agent-chat panes in the workspace", async () => {

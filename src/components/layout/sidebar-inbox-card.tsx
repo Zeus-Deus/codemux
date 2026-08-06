@@ -13,8 +13,9 @@ import { ProviderLogo } from "@/components/chat/provider-logo";
 import { WorkingIndicator } from "@/components/ui/working-indicator";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import {
-  PR_CHIP_TONE,
+  PrStatusIcon,
   normalizePrState,
+  prStatusTextClass,
 } from "@/components/github/pr-status-icon";
 import { WorkspaceInboxMenu } from "./workspace-inbox-menu";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
@@ -30,6 +31,7 @@ import {
   permissionBlockerText,
 } from "@/stores/sidebar-density-store";
 import { useProjectAppearance } from "./use-project-appearance";
+import { isRowActivationKey } from "./sidebar-row-activation";
 import { getWorkspaceProviders } from "@/lib/pane-status";
 import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
@@ -207,7 +209,6 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       : workspace.title;
 
   const prState = normalizePrState(workspace.pr_state);
-  const prMerged = prState === "merged";
   const hasAhead = showGitStats && workspace.git_ahead > 0;
   const hasStats =
     showGitStats &&
@@ -344,7 +345,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               data-selected={selected || undefined}
               onClick={handleClick}
               onKeyDown={(e) => {
-                if (e.key !== "Enter" && e.key !== " ") return;
+                // Same guard the settled and snoozed rows use: this card hosts
+                // its own buttons (PR chip, snooze menu), and a key press on
+                // one of those bubbles up here. Without the target check, Enter
+                // on the PR chip would open the PR *and* yank the main pane
+                // onto the workspace, and Space would never reach the button at
+                // all — the preventDefault below would eat its native click.
+                if (!isRowActivationKey(e)) return;
                 // Space would otherwise scroll the sidebar as it activates
                 // the card.
                 if (e.key === " ") e.preventDefault();
@@ -552,7 +559,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   the chip started wherever the branch name happened to end, so
                   chips landed at a different x on every card and the column read
                   as ragged noise down a scrolling list. Right-aligning also makes
-                  the chip's own variable width ("merged" vs "PR #1234") harmless. */}
+                  the chip's own variable width (#7 vs #1234) harmless.
+                  The chip is deliberately chrome-free — state-colored icon +
+                  number, no border or fill — so an active card's PR reads
+                  identically to the same PR once the row settles. */}
               <div
                 data-meta-line
                 className="mt-[5px] flex min-w-0 items-center gap-2 font-mono text-[11px] leading-tight text-muted-foreground/60"
@@ -591,13 +601,24 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                         : `Pull request — ${prState}`
                     }
                     className={cn(
-                      "shrink-0 rounded-[5px] border px-[5px] py-px font-mono text-[10px] font-medium",
+                      "inline-flex shrink-0 items-center gap-1 rounded px-1 py-px font-mono text-[10px] font-medium",
                       "transition-colors duration-150",
-                      PR_CHIP_TONE[prState],
-                      !workspace.pr_url && "pointer-events-none",
+                      prStatusTextClass(prState),
+                      workspace.pr_url
+                        ? "hover:bg-foreground/[0.055]"
+                        : // `cursor-default`, not `pointer-events-none`: the
+                          // chip is already `disabled`, so it swallows the
+                          // click. Letting pointer events pass through instead
+                          // would hand the click to the card root and select
+                          // the workspace, and the cursor would still read as
+                          // the card's `cursor-pointer`.
+                          "cursor-default opacity-65",
                     )}
                   >
-                    {prMerged ? "merged" : `PR #${workspace.pr_number ?? ""}`}
+                    <PrStatusIcon state={prState} size={3} className="shrink-0" />
+                    {workspace.pr_number != null && (
+                      <span>#{workspace.pr_number}</span>
+                    )}
                   </button>
                 )}
                 {/* Trailing indicators keep the far-right column. The reserved
