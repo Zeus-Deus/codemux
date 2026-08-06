@@ -23,8 +23,8 @@ type SliceOverrides = {
   /** Composer text — the Thread Scope deferred-worktree submit tests
    *  seed this so the pane's `draft` (slice.inputDraft) is non-empty. */
   inputDraft?: string;
-  /** Live-turn flag. The send-anchor expiry tests flip this to drive the
-   *  falling edge the pane watches for turn completion. */
+  /** Live-turn flag. The send-anchor persistence test flips this to prove
+   *  a turn settling leaves the anchor untouched. */
   streaming?: boolean;
   /** Durable resume cursor. `undefined` (the default) means "never
    *  hydrated", which sends the mount effect down the cold path. */
@@ -799,10 +799,12 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     await waitFor(() => expect(anchorClientNonce(container)).toBe(""));
   });
 
-  it("expires the anchor when the turn settles", async () => {
-    // The anchor is a live-turn intent. Left in place it would re-park a
-    // finished prompt on the next remount and keep LegendList's built-in
-    // end pin disabled for the rest of the thread's life.
+  it("keeps the anchor when the turn settles", async () => {
+    // The anchor outlives the turn: the reserved space collapsing at settle
+    // is exactly the viewport yank the contract exists to prevent, so the
+    // parked prompt (and the space under it) must not move when the run
+    // finishes. The anchor is replaced by the next send and dropped on
+    // rollback or thread switch instead.
     currentSliceOverrides = {
       "thread-x": { inputDraft: "hello there", streaming: true },
     };
@@ -810,12 +812,15 @@ describe("AgentChatPane new-turn scroll contract (send anchor)", () => {
     fireEvent.click(container.querySelector('[data-testid="composer-submit"]')!);
     await waitFor(() => expect(anchorNonce(container)).toBe("1"));
 
-    // The run finishes.
+    // The run finishes — nothing about the anchor changes.
     currentSliceOverrides = {
       "thread-x": { inputDraft: "hello there", streaming: false },
     };
     rerender(<AgentChatPane pane={pane} />);
-    await waitFor(() => expect(anchorNonce(container)).toBe(""));
+    await waitFor(() =>
+      expect(container.querySelector('[data-testid="transcript"]')).not.toBeNull(),
+    );
+    expect(anchorNonce(container)).toBe("1");
   });
 
   it("clears the anchor when the send fails, so no reserved space is stranded", async () => {

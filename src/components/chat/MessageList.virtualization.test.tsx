@@ -300,13 +300,20 @@ describe("MessageList anchored new-turn contract (windowed list)", () => {
     expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
   });
 
-  it("opens a settled thread at the latest row on remount, with no stale re-park", async () => {
+  it("re-reserves space without re-parking on a remount under a live anchor", async () => {
+    // The anchor outlives the turn, so a remount on the same thread (a
+    // subagent drill-in and back, say) sees the same anchor again. The
+    // pane-owned positioned record keeps the one-time scroll from re-firing;
+    // the geometry keeps the open position right, because with the spacer
+    // mounted the end of content IS the anchored position.
+    const positioned = { current: null as number | null };
     const sent = [...hydratedTranscript(500), prompt];
     const { unmount } = render(
       <MessageList
         messages={sent}
         threadKey="thread-1"
         sendAnchor={{ clientNonce: "nonce-sent", nonce: 1 }}
+        positionedNonceRef={positioned}
         showThinking
         streaming
         {...noopHandlers}
@@ -316,11 +323,34 @@ describe("MessageList anchored new-turn contract (windowed list)", () => {
     await flushFrames();
     // Mid-turn the window is parked on the prompt, not the tail.
     expect(screen.getByText("the prompt I just sent")).toBeInTheDocument();
+    expect(positioned.current).toBe(1);
     unmount();
 
-    // The turn settled, so the pane expired the anchor. A later remount on
-    // the same thread (a subagent drill-in and back, say) must open at the
-    // latest row like any hydrated thread — not re-park a finished prompt.
+    listView.start = null; // `initialScrollAtEnd`
+    render(
+      <MessageList
+        messages={sent}
+        threadKey="thread-1"
+        sendAnchor={{ clientNonce: "nonce-sent", nonce: 1 }}
+        positionedNonceRef={positioned}
+        {...noopHandlers}
+      />,
+    );
+    measureAnchor();
+    await flushFrames();
+
+    // The reserved space is back and the built-in pin stays off…
+    expect(lastListProps.current?.anchoredEndSpace).toMatchObject({
+      anchorIndex: 500,
+    });
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+    expect(screen.getByText("the prompt I just sent")).toBeInTheDocument();
+  });
+
+  it("opens at the latest row on remount once the anchor is gone", async () => {
+    // A rollback or thread switch dropped the anchor. A later remount must
+    // open at the latest row like any hydrated thread.
+    const sent = [...hydratedTranscript(500), prompt];
     listView.start = null; // `initialScrollAtEnd`
     render(
       <MessageList

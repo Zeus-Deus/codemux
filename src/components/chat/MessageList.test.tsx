@@ -51,12 +51,18 @@ const {
   lastListProps,
   listState,
   emitIsAtEnd,
+  scrollDoubleTo,
   resetListDouble,
 } = vi.hoisted(() => {
-  const listeners = new Set<(value: boolean) => void>();
+  const listeners = new Map<string, Set<(value: boolean) => void>>();
   const ROW_HEIGHT = 100;
   const state = {
     isAtEnd: false,
+    // The signal the component actually subscribes to. LegendList derives it
+    // from `onEndReachedThreshold` (default 0.5 — within half a viewport of
+    // the end), which is why it can read true while the anchor glide is still
+    // travelling. Modeled separately from `isAtEnd` so that gap is testable.
+    isNearEnd: false,
     data: [] as unknown[],
     scroll: 0,
     scrollLength: 500,
@@ -68,10 +74,18 @@ const {
       return this.rowHeight;
     },
     elementAtIndex: () => null,
-    listen(_type: string, cb: (value: boolean) => void) {
-      listeners.add(cb);
-      return () => listeners.delete(cb);
+    listen(type: string, cb: (value: boolean) => void) {
+      let set = listeners.get(type);
+      if (!set) {
+        set = new Set();
+        listeners.set(type, set);
+      }
+      set.add(cb);
+      return () => set!.delete(cb);
     },
+  };
+  const notify = (type: string, value: boolean) => {
+    for (const cb of [...(listeners.get(type) ?? [])]) cb(value);
   };
   return {
     scrollToEndSpy: vi.fn(),
@@ -79,13 +93,31 @@ const {
     scrollToOffsetSpy: vi.fn(),
     lastListProps: { current: null as Record<string, any> | null },
     listState: state,
+    /** Both edge signals move together — the shape most tests care about. */
     emitIsAtEnd: (value: boolean) => {
       state.isAtEnd = value;
-      for (const cb of [...listeners]) cb(value);
+      state.isNearEnd = value;
+      notify("isNearEnd", value);
+      notify("isAtEnd", value);
+    },
+    /** Move the viewport and let `isNearEnd` fall out of the real 0.5
+     *  threshold against the modeled content height — the only way to
+     *  exercise a mid-glide near-end transition, which is where the follow
+     *  branch used to steal the viewport from the anchor glide. */
+    scrollDoubleTo: (offset: number) => {
+      state.scroll = offset;
+      const contentHeight = state.data.length * state.rowHeight;
+      const distanceToEnd = contentHeight - (offset + state.scrollLength);
+      const near = distanceToEnd <= 0.5 * state.scrollLength;
+      state.isAtEnd = distanceToEnd <= 0;
+      if (near === state.isNearEnd) return;
+      state.isNearEnd = near;
+      notify("isNearEnd", near);
     },
     resetListDouble: () => {
       listeners.clear();
       state.isAtEnd = false;
+      state.isNearEnd = false;
       state.scroll = 0;
       state.scrollLength = 500;
       state.rowHeight = ROW_HEIGHT;
@@ -1011,7 +1043,23 @@ describe("MessageList new-turn scroll contract", () => {
     });
   });
 
-  it("positions the measured row instantly, 16px below the transcript top", async () => {
+  /** Offset the anchored row (slot index 1, 100px rows) is parked at: its
+   *  top, less the contract's 16px. This is what the glide is aiming for and
+   *  therefore what a genuine `scrollend` must report. */
+  const ANCHOR_LANDING = 84;
+
+  /** The glide's settle handshake: the browser reports the smooth scroll
+   *  finished. Production listens for `scrollend` (with a timer fallback) and
+   *  only trusts an event whose landed offset matches the glide's target, so
+   *  the double places the viewport there first; jsdom never emits the event,
+   *  so tests drive it explicitly. */
+  const settleGlide = (landedOffset = ANCHOR_LANDING) =>
+    act(() => {
+      listState.scroll = landedOffset;
+      viewport().dispatchEvent(new Event("scrollend"));
+    });
+
+  it("glides the measured row to 16px below the transcript top", async () => {
     render(
       <MessageList
         messages={[userTurn, sentTurn]}
@@ -1032,10 +1080,55 @@ describe("MessageList new-turn scroll contract", () => {
     expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
     expect(scrollToIndexSpy).toHaveBeenCalledWith({
       index: 1,
-      animated: false,
+      animated: true,
       viewPosition: 0,
       viewOffset: 16,
     });
+
+    // The settle handshake re-pins the landed offset instantly, killing any
+    // residual smooth-scroll momentum before stream-advance takes over.
+    listState.scroll = 84;
+    settleGlide();
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 84,
+      animated: false,
+    });
+  });
+
+  it("positions instantly when the reader prefers reduced motion", async () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("prefers-reduced-motion"),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      render(
+        <MessageList
+          messages={[userTurn, sentTurn]}
+          sendAnchor={anchor(1)}
+          {...noopHandlers}
+        />,
+      );
+      act(() => {
+        lastListProps.current?.anchoredEndSpace?.onReady?.({
+          anchorIndex: 1,
+          anchorKey: "um-2",
+          size: 400,
+        });
+      });
+      await flushFrames();
+
+      expect(scrollToIndexSpy).toHaveBeenCalledWith({
+        index: 1,
+        animated: false,
+        viewPosition: 0,
+        viewOffset: 16,
+      });
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
   });
 
   it("positions once per send, not on every re-measure", async () => {
@@ -1109,6 +1202,7 @@ describe("MessageList new-turn scroll contract", () => {
       });
     });
     await flushFrames();
+    settleGlide();
     scrollToOffsetSpy.mockClear();
 
     // The answer grows past the viewport: 8 rows x 100px = 800 content.
@@ -1173,6 +1267,7 @@ describe("MessageList new-turn scroll contract", () => {
       });
     });
     await flushFrames();
+    settleGlide();
     scrollToOffsetSpy.mockClear();
 
     const row = document.querySelector<HTMLElement>("[data-message-id]")!;
@@ -1232,7 +1327,7 @@ describe("MessageList new-turn scroll contract", () => {
     expect(scrollToOffsetSpy).not.toHaveBeenCalled();
   });
 
-  it("restores the built-in end pin when the turn settles", () => {
+  it("restores the built-in end pin when the anchor is dropped", () => {
     const { rerender } = render(
       <MessageList
         messages={[userTurn, sentTurn]}
@@ -1242,9 +1337,10 @@ describe("MessageList new-turn scroll contract", () => {
     );
     expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
 
-    // The turn finished, so the pane expired the anchor. LegendList's own
-    // pin has to come back: it covers item/footer layout growth (a
-    // late-loading image) that the anchor's geometry never modelled.
+    // The pane cleared the anchor (a rollback, or a thread switch handing
+    // this list fresh props). LegendList's own pin has to come back: it
+    // covers item/footer layout growth (a late-loading image) whenever no
+    // anchor is reserving space.
     rerender(
       <MessageList
         messages={[userTurn, sentTurn]}
@@ -1264,7 +1360,7 @@ describe("MessageList new-turn scroll contract", () => {
     });
   });
 
-  it("does not steal the viewport back when the turn settles mid-history-read", async () => {
+  it("does not steal the viewport back when the anchor clears mid-history-read", async () => {
     const { rerender } = render(
       <MessageList
         messages={[userTurn, sentTurn]}
@@ -1294,9 +1390,9 @@ describe("MessageList new-turn scroll contract", () => {
     scrollToEndSpy.mockClear();
     scrollToOffsetSpy.mockClear();
 
-    // The turn settles and the pane expires the anchor. That is a lifecycle
-    // event, not a navigation intent: re-claiming here would silently drop
-    // the reader's follow state and take away the pill they are still using.
+    // The pane clears the anchor (rollback). That is a lifecycle event, not
+    // a navigation intent: re-claiming here would silently drop the
+    // reader's follow state and take away the pill they are still using.
     listState.rowHeight = 300;
     rerender(
       <MessageList
@@ -1335,6 +1431,485 @@ describe("MessageList new-turn scroll contract", () => {
     expect(lastListProps.current?.maintainScrollAtEnd).toMatchObject({
       animated: false,
     });
+  });
+
+  it("does not re-run the positioning scroll on a remount under a still-live anchor", async () => {
+    // The anchor outlives the turn, so a MessageList remount (the subagent
+    // drill-in/out swap) sees it again. The pane-owned positioned record is
+    // what tells the fresh mount the prompt was already parked: the reserved
+    // space comes back, the scroll does not.
+    const positioned = { current: null as number | null };
+    const { unmount } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        positionedNonceRef={positioned}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
+    expect(positioned.current).toBe(1);
+    unmount();
+
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        positionedNonceRef={positioned}
+        {...noopHandlers}
+      />,
+    );
+    // The space is reserved again…
+    expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    // …but the prompt is not re-parked.
+    expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
+  });
+
+  /** The anchored turn grown past the viewport: 8 rows x 100px = 800 of
+   *  content against a 500px viewport, so the reveal target is
+   *  800 - (500 - 16) = 316. */
+  const grownTurn = (): ChatViewItem[] => {
+    const grown: ChatViewItem[] = [userTurn, sentTurn];
+    for (let i = 0; i < 6; i++) {
+      grown.push({ ...answer, id: `am-${i}`, seq: 3 + i });
+    }
+    return grown;
+  };
+
+  it("still advances the stream after a remount under a still-live anchor", async () => {
+    // Regression guard. "Positioned" is pane-owned but "settled" is
+    // per-mount, so the fresh mount saw an already-positioned nonce with no
+    // settle handshake in flight — and the advance decision, which waits for
+    // the settle mark, then blocked every advance for the rest of the turn.
+    // The reply streamed on with the viewport frozen.
+    const positioned = { current: null as number | null };
+    const fireReady = () =>
+      act(() => {
+        lastListProps.current?.anchoredEndSpace?.onReady?.({
+          anchorIndex: 1,
+          anchorKey: "um-2",
+          size: 400,
+        });
+      });
+
+    const first = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        positionedNonceRef={positioned}
+        {...noopHandlers}
+      />,
+    );
+    fireReady();
+    await flushFrames();
+    settleGlide();
+    first.unmount();
+
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        positionedNonceRef={positioned}
+        {...noopHandlers}
+      />,
+    );
+    fireReady();
+    await flushFrames();
+    // Still exactly one positioning scroll across both mounts.
+    expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
+    scrollToOffsetSpy.mockClear();
+
+    // The answer keeps streaming into the remounted list.
+    listState.scroll = 84;
+    rerender(
+      <MessageList
+        messages={grownTurn()}
+        sendAnchor={anchor(1)}
+        positionedNonceRef={positioned}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames();
+
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 316,
+      animated: false,
+    });
+  });
+
+  it("holds still for a token that lands mid-glide, and resumes once it settles", async () => {
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
+    scrollToOffsetSpy.mockClear();
+
+    // The first token arrives while the glide is still travelling. Advancing
+    // here would cut the animation to wherever it happened to be.
+    listState.scroll = 40;
+    rerender(
+      <MessageList
+        messages={grownTurn()}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames();
+    expect(scrollToOffsetSpy).not.toHaveBeenCalled();
+
+    // The glide lands and the handshake re-pins it; from here the advance is
+    // armed again.
+    settleGlide();
+    scrollToOffsetSpy.mockClear();
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(120);
+    });
+    await flushFrames();
+
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 316,
+      animated: false,
+    });
+  });
+
+  it("does not let the near-end signal cut the glide with a jump to the tail", async () => {
+    // `isNearEnd` is LegendList's half-a-viewport threshold, so it flips true
+    // partway through the glide. Promoting that to `following-end` would hand
+    // the next token the follow branch, whose instant `scrollToEnd` is a
+    // harder cut than an early anchored advance.
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    scrollToEndSpy.mockClear();
+    scrollToOffsetSpy.mockClear();
+
+    // The reply grows to 800px of content against the 500px viewport while
+    // the glide is still travelling.
+    rerender(
+      <MessageList
+        messages={grownTurn()}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames();
+    expect(scrollToOffsetSpy).not.toHaveBeenCalled();
+
+    // Partway through the travel the viewport crosses the half-a-viewport
+    // threshold and the list starts reporting near-end — truthfully.
+    act(() => scrollDoubleTo(40));
+    expect(listState.isNearEnd).toBe(false);
+    act(() => scrollDoubleTo(60));
+    expect(listState.isNearEnd).toBe(true);
+
+    // The next token must still find the viewport under the glide's control.
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(120);
+    });
+    await flushFrames();
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+    expect(scrollToOffsetSpy).not.toHaveBeenCalled();
+
+    // Proof the turn is still anchored rather than following: growth after
+    // the settle advances by the measured delta, it does not snap to the end.
+    settleGlide();
+    scrollToOffsetSpy.mockClear();
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(120);
+    });
+    await flushFrames();
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 316,
+      animated: false,
+    });
+  });
+
+  it("re-issues the instant placement when no scrollend arrives", async () => {
+    // WebKitGTK never emits `scrollend`, so the fallback timer is the primary
+    // settle path there — and the animation may still be mid-travel when it
+    // fires. Pinning the current offset would park the prompt at an arbitrary
+    // point; the contract's placement has to be re-issued instead.
+    vi.useFakeTimers();
+    try {
+      render(
+        <MessageList
+          messages={[userTurn, sentTurn]}
+          sendAnchor={anchor(1)}
+          {...noopHandlers}
+        />,
+      );
+      act(() => {
+        lastListProps.current?.anchoredEndSpace?.onReady?.({
+          anchorIndex: 1,
+          anchorKey: "um-2",
+          size: 400,
+        });
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(100);
+      });
+      expect(scrollToIndexSpy).toHaveBeenCalledWith({
+        index: 1,
+        animated: true,
+        viewPosition: 0,
+        viewOffset: 16,
+      });
+      scrollToIndexSpy.mockClear();
+      scrollToOffsetSpy.mockClear();
+
+      // Mid-travel when the fallback fires.
+      listState.scroll = 37;
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+
+      expect(scrollToOffsetSpy).not.toHaveBeenCalled();
+      expect(scrollToIndexSpy).toHaveBeenCalledWith({
+        index: 1,
+        animated: false,
+        viewPosition: 0,
+        viewOffset: 16,
+      });
+
+      // And the nonce is settled, so the stream advances again.
+      scrollToOffsetSpy.mockClear();
+      listState.scroll = 84;
+      listState.data = new Array(8);
+      act(() => {
+        lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(120);
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(100);
+      });
+      expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+        offset: 316,
+        animated: false,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("tears down its settle listener and fallback timer on unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const { unmount } = render(
+        <MessageList
+          messages={[userTurn, sentTurn]}
+          sendAnchor={anchor(1)}
+          {...noopHandlers}
+        />,
+      );
+      const node = viewport();
+      const removeListener = vi.spyOn(node, "removeEventListener");
+      act(() => {
+        lastListProps.current?.anchoredEndSpace?.onReady?.({
+          anchorIndex: 1,
+          anchorKey: "um-2",
+          size: 400,
+        });
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(100);
+      });
+      expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
+      scrollToIndexSpy.mockClear();
+      scrollToOffsetSpy.mockClear();
+
+      unmount();
+      expect(removeListener).toHaveBeenCalledWith(
+        "scrollend",
+        expect.any(Function),
+      );
+
+      // Neither a late `scrollend` nor the fallback timer may drive a dead
+      // component's viewport.
+      act(() => {
+        node.dispatchEvent(new Event("scrollend"));
+      });
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(scrollToIndexSpy).not.toHaveBeenCalled();
+      expect(scrollToOffsetSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hands the built-in end pin back once the reserved space is spent", async () => {
+    // The anchor no longer expires, so "pin off while an anchor is mounted"
+    // would otherwise be permanent: once the reply outgrows the reserved
+    // space LegendList clamps the spacer at 0 and stops calling back, and
+    // late layout growth would never reveal the tail again.
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+
+    // Settled, but the spacer is still holding room below the prompt: the pin
+    // must stay off, or re-engaging it would yank the parked prompt.
+    settleGlide();
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(120);
+    });
+    await flushFrames();
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+
+    // The reply has eaten the whole spacer — nothing left to yank.
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(0);
+    });
+    await flushFrames();
+    expect(lastListProps.current?.maintainScrollAtEnd).toMatchObject({
+      animated: false,
+    });
+    // The anchor itself is untouched: it still outlives the turn.
+    expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
+  });
+
+  it("re-runs the advance decision when the reserved space resizes with no data change", async () => {
+    // A late-loading image grows a row without any slot rebuild. While an
+    // anchor is mounted the built-in end pin is off, so the spacer's resize
+    // callback is the only signal left that the tail may have sunk below
+    // the fold.
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    settleGlide();
+    scrollToOffsetSpy.mockClear();
+
+    // Rows silently grew: 2 rows x 400px = 800 content against a 500px
+    // viewport, scroll still at 84.
+    listState.rowHeight = 400;
+    listState.scroll = 84;
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(0);
+    });
+    await flushFrames();
+
+    // lastBottom 800 - usable (500 - 16) = 316 target, from scroll 84.
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 316,
+      animated: false,
+    });
+  });
+
+  it("restores a hairline scroll drift from a spacer resize while free-scrolling", async () => {
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames(2);
+    // The reader has gestured away — the resize must be imperceptible.
+    act(() => {
+      fireEvent.wheel(viewport());
+    });
+    listState.scroll = 100;
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(120);
+    });
+    // The browser drifted the offset by a hair while the spacer resized.
+    listState.scroll = 101;
+    await flushFrames();
+
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 100,
+      animated: false,
+    });
+  });
+
+  it("keeps the anchor mounted after the turn settles", () => {
+    // Settling is invisible to this component now: the pane simply keeps
+    // the same anchor props, so the reserved space stays and nothing scrolls.
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        streaming
+        {...noopHandlers}
+      />,
+    );
+    expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
+    rerender(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        streaming={false}
+        {...noopHandlers}
+      />,
+    );
+    expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
   });
 
   it("drops the anchor when the pane switches threads", () => {
@@ -1501,7 +2076,7 @@ describe("MessageList jump-to-latest pill", () => {
     expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false });
   });
 
-  it("returns to the live edge instantly when used", async () => {
+  it("glides back to the live edge when used", async () => {
     render(<MessageList messages={[userTurn]} {...noopHandlers} />);
     await flushFrames(2);
     act(() => {
@@ -1513,7 +2088,7 @@ describe("MessageList jump-to-latest pill", () => {
     await waitFor(() => expect(pill()).not.toBeNull());
 
     fireEvent.click(pill()!);
-    expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false });
+    expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: true });
     expect(pill()).toBeNull();
   });
 });

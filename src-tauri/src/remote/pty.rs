@@ -158,6 +158,10 @@ impl PtyManager {
         builder.cwd(&cwd);
         // PTYs without a sensible TERM make ncurses-based tools sad.
         builder.env("TERM", "xterm-256color");
+        // Strip AppRun's loader/toolkit rewrites so commands run here resolve
+        // host libraries rather than the AppImage's bundled ones. No-op
+        // outside an AppImage.
+        crate::execution::sanitize_appimage_env_pty(&mut builder);
 
         let child = pair
             .slave

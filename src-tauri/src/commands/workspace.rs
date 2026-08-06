@@ -2113,7 +2113,7 @@ pub fn notify_attention<R: tauri::Runtime>(
         #[cfg(target_os = "linux")]
         {
             let class = format!("class:{}", app.config().identifier);
-            let _ = std::process::Command::new("hyprctl")
+            let _ = crate::execution::host_command("hyprctl")
                 .args(["dispatch", "focuswindow", &class])
                 .output();
         }
@@ -2498,7 +2498,7 @@ pub fn open_in_editor(editor_id: String, path: String) -> Result<(), String> {
         .iter()
         .find(|e| e.id == editor_id)
         .ok_or_else(|| format!("Editor not found: {editor_id}"))?;
-    let mut cmd = std::process::Command::new(&editor.command);
+    let mut cmd = crate::execution::host_command(&editor.command);
     cmd.arg(&path);
     // Intentionally NOT calling `sanitize_gui_env_std` here. The
     // standing project rule strips DISPLAY/WAYLAND_DISPLAY/XDG_* so

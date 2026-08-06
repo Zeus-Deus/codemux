@@ -183,6 +183,27 @@ export function getAnchoredTurnMetrics({
 }
 
 /**
+ * Absolute scroll offset that parks `anchorIndex` exactly `anchorOffset`
+ * below the transcript top — i.e. the offset the positioning
+ * `scrollToIndex({ viewPosition: 0, viewOffset })` is aiming at.
+ *
+ * Used to correlate a `scrollend` event with *this* glide: the event carries
+ * no identity, so an unrelated smooth scroll (the "Jump to latest" pill, for
+ * one) would otherwise settle the send nonce from the middle of the travel.
+ * `null` when the row has no usable measurement, which the caller treats as
+ * "cannot correlate" rather than guessing.
+ */
+export function getSendAnchorTargetOffset(
+  state: Pick<TranscriptMeasurementState, "positionAtIndex">,
+  anchorIndex: number,
+  anchorOffset = SEND_ANCHOR_OFFSET,
+): number | null {
+  const top = state.positionAtIndex(anchorIndex);
+  if (typeof top !== "number" || !Number.isFinite(top)) return null;
+  return Math.max(0, top - anchorOffset);
+}
+
+/**
  * True when the *real* rows overflow the usable viewport.
  *
  * The anchored end space is blank reserved area, so a plain "scroll to the
