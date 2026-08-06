@@ -285,12 +285,23 @@ pub struct AgentBrowserSession {
     pub user_dismissed: bool,
 }
 
+/// What an agent pane is doing right now, as every status surface renders it.
+///
+/// Priority ladder (shared verbatim with `src/lib/pane-status.ts`):
+/// `Permission > Working > Monitoring > Review > Idle`.
+///
+/// [`PaneStatus::Monitoring`] is the calm one: the agent finished its
+/// deliverable but is still babysitting something in the background — a CI
+/// run, a dev server, a PR poll. It outranks `Review` because a workspace with
+/// a live watch loop is still *doing* something, and it sits below `Working`
+/// because nobody needs to look at it. Nothing about it animates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneStatus {
     Idle,
     Working,
     Permission,
+    Monitoring,
     Review,
 }
 
@@ -774,8 +785,25 @@ pub struct AppStateSnapshot {
     #[serde(default)]
     pub detected_ports: Vec<PortInfoSnapshot>,
     /// Per-pane agent status (pane_id → status). Only non-idle entries are stored.
+    ///
+    /// Read through [`AppStateStore::snapshot`] and friends this map is
+    /// already *effective*: the runtime-only [`Self::manual_monitors`] flags
+    /// have been folded in (see [`apply_manual_monitors`]). Under the store's
+    /// own lock it is the raw provider-published status, which is what lets
+    /// `monitor stop` restore whatever the pane was really doing.
     #[serde(default)]
     pub pane_statuses: HashMap<String, PaneStatus>,
+    /// Panes an agent explicitly declared as monitoring, keyed by pane id with
+    /// an optional human reason ("watching CI on #482").
+    ///
+    /// The provider-agnostic half of the Monitoring status: any agent — a
+    /// terminal one, a chat one, one Codemux has no event stream for at all —
+    /// can run `codemux monitor start` and get the calm badge. Purely runtime
+    /// state: it is emitted to the frontend (the chat bar needs the reason)
+    /// but [`persistable_snapshot`] clears it before `layout.json` is written,
+    /// because a flag set by a process that died at quit describes nothing.
+    #[serde(default)]
+    pub manual_monitors: HashMap<String, Option<String>>,
     /// Workspaces the user archived (closed but restorable — see
     /// [`ArchivedWorkspaceSnapshot`]). Additive: old layout.json files
     /// deserialize as an empty list, and persisting/emitting comes for
@@ -862,6 +890,31 @@ fn terminal_count_for_workspace(workspace: &WorkspaceSnapshot) -> usize {
     collect_terminal_sessions(&workspace.surfaces).len()
 }
 
+/// Drop every manual-monitor flag whose pane no longer exists.
+///
+/// A flag is a claim by a live process about a specific pane, so the pane
+/// going away ends it. Closing a *pane* clears its own flag explicitly
+/// ([`AppStateStore::clear_manual_monitors_for_panes`], called from
+/// `close_pane_impl`), but closing or archiving a whole workspace removes
+/// every pane in it in one move without ever naming them — so this runs on
+/// the way out of [`AppStateStore::close_workspace`] and sweeps the lot.
+///
+/// A whole-map prune rather than a walk of the removed workspace's surfaces:
+/// it is the same handful of comparisons (the map is empty in the
+/// overwhelming majority of sessions, and holds single digits otherwise),
+/// and it cannot be defeated by some future removal path that forgets to
+/// call it with the right pane ids.
+fn prune_manual_monitors(snapshot: &mut AppStateSnapshot) {
+    if snapshot.manual_monitors.is_empty() {
+        return;
+    }
+    let workspaces = std::mem::take(&mut snapshot.workspaces);
+    snapshot
+        .manual_monitors
+        .retain(|pane_id, _| find_workspace_id_for_pane(&workspaces, pane_id).is_some());
+    snapshot.workspaces = workspaces;
+}
+
 impl Default for AppStateStore {
     fn default() -> Self {
         Self {
@@ -870,9 +923,55 @@ impl Default for AppStateStore {
     }
 }
 
+/// Fold the runtime-only manual-monitor flags into `pane_statuses`.
+///
+/// **The one place** the two halves of the Monitoring status meet. The
+/// automatic (Claude subagent tracker) half writes `PaneStatus::Monitoring`
+/// straight into `pane_statuses` and never touches this; the provider-agnostic
+/// half (`codemux monitor start`) only sets a flag, and this is what turns
+/// that flag into a status every reader already understands.
+///
+/// Combining on the way *out* rather than at write time is deliberate: the
+/// stored status stays the raw thing the provider published, so
+/// `codemux monitor stop` reveals whatever the pane was really doing
+/// underneath instead of having to remember it separately.
+///
+/// The ladder: `Working`/`Permission` beat the flag outright — an agent that
+/// is mid-run or blocked on the user is not "quietly watching", and a badge
+/// that hides a permission prompt is a bug with a UI. Absent / `Idle` /
+/// `Review` / `Monitoring` all report `Monitoring`.
+/// A flag whose pane has since closed is ignored (and dropped from the clone)
+/// rather than trusted: pane ids are the only thing tying a flag to anything
+/// real, and a badge on a pane that no longer exists cannot be turned off from
+/// the UI. That is a read-side guard on the *snapshot*, not a fix for the
+/// stored map — see [`prune_manual_monitors`], which is what keeps the real
+/// one bounded.
+fn apply_manual_monitors(snapshot: &mut AppStateSnapshot) {
+    if snapshot.manual_monitors.is_empty() {
+        return;
+    }
+    let flagged: Vec<String> = snapshot.manual_monitors.keys().cloned().collect();
+    for pane_id in flagged {
+        if find_workspace_id_for_pane(&snapshot.workspaces, &pane_id).is_none() {
+            snapshot.manual_monitors.remove(&pane_id);
+            continue;
+        }
+        match snapshot.pane_statuses.get(&pane_id) {
+            Some(PaneStatus::Working | PaneStatus::Permission) => {}
+            _ => {
+                snapshot
+                    .pane_statuses
+                    .insert(pane_id, PaneStatus::Monitoring);
+            }
+        }
+    }
+}
+
 impl AppStateStore {
     pub fn snapshot(&self) -> AppStateSnapshot {
-        self.inner.lock().unwrap().clone()
+        let mut snapshot = self.inner.lock().unwrap().clone();
+        apply_manual_monitors(&mut snapshot);
+        snapshot
     }
 
     /// Clone the state and stamp it with the next revision **without releasing
@@ -882,6 +981,7 @@ impl AppStateStore {
     pub fn stamped_snapshot(&self) -> AppStateSnapshot {
         let guard = self.inner.lock().unwrap();
         let mut snapshot = guard.clone();
+        apply_manual_monitors(&mut snapshot);
         snapshot.snapshot_revision = next_revision();
         snapshot.snapshot_instance = instance_token().to_string();
         snapshot
@@ -896,6 +996,7 @@ impl AppStateStore {
     pub fn snapshot_at_current_revision(&self) -> AppStateSnapshot {
         let guard = self.inner.lock().unwrap();
         let mut snapshot = guard.clone();
+        apply_manual_monitors(&mut snapshot);
         snapshot.snapshot_revision = current_revision();
         snapshot.snapshot_instance = instance_token().to_string();
         snapshot
@@ -2613,6 +2714,9 @@ impl AppStateStore {
                 .agent_browser_sessions
                 .retain(|s| s.workspace_id.0 != workspace_id);
             snapshot.active_workspace_id = WorkspaceId("".into());
+            // Every pane in the workspace just went away, and with it any
+            // `codemux monitor start` claim made against one.
+            prune_manual_monitors(&mut snapshot);
             return Ok(CloseWorkspaceResult {
                 fallback: WorkspaceId("".into()),
                 removed_sessions: removed_session_id_strings
@@ -2656,6 +2760,10 @@ impl AppStateStore {
             .map(|workspace| workspace.workspace_id.clone())
             .ok_or_else(|| "No fallback workspace available".to_string())?;
         snapshot.active_workspace_id = fallback_workspace.clone();
+        // Same for the ordinary multi-workspace path: archiving routes
+        // through here too (`close_workspace_with_worktree_impl`), so this is
+        // the one choke point both removals share.
+        prune_manual_monitors(&mut snapshot);
 
         Ok(CloseWorkspaceResult {
             fallback: fallback_workspace,
@@ -3819,11 +3927,113 @@ impl AppStateStore {
     ) -> Option<RevisionedDelta> {
         self.mutate_with_delta(|snapshot| {
             let pane_id = clear_transient_pane_status(snapshot, session_id)?;
-            Some(AppStateDelta::PaneStatus {
-                pane_id,
-                status: None,
-            })
+            // The delta bypasses `apply_manual_monitors` (it ships one map
+            // entry, not a snapshot), so the combination has to be repeated
+            // here — otherwise a terminal agent that ran `codemux monitor
+            // start` and then went quiet would have its badge cleared by the
+            // stuck-status sweep instead of settling to Monitoring.
+            let status = snapshot
+                .manual_monitors
+                .contains_key(&pane_id)
+                .then_some(PaneStatus::Monitoring);
+            Some(AppStateDelta::PaneStatus { pane_id, status })
         })
+    }
+
+    /// Flag `pane_id` as monitoring on behalf of whatever agent owns it, with
+    /// an optional human reason. Returns `false` when nothing changed.
+    ///
+    /// The provider-agnostic entry point behind `codemux monitor start` and the
+    /// `monitor_start` socket command. Deliberately does not care whether the
+    /// pane is a terminal, a chat pane, or which provider drives it — the whole
+    /// point is that an agent Codemux has no event stream for can still say
+    /// "I'm still watching this".
+    pub fn start_manual_monitor(&self, pane_id: &str, reason: Option<String>) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let previous = snapshot
+            .manual_monitors
+            .insert(pane_id.to_string(), reason.clone());
+        // A monitoring agent is doing real (if quiet) work, so it stamps the
+        // workspace exactly like any other non-idle status — a babysat
+        // workspace must not look stale to the idle sweep.
+        if let Some(workspace_id) = find_workspace_id_for_pane(&snapshot.workspaces, pane_id) {
+            stamp_workspace_activity(&mut snapshot, &workspace_id);
+        }
+        previous.map(|prev| prev != reason).unwrap_or(true)
+    }
+
+    /// Clear `pane_id`'s manual monitoring flag. Returns `false` when it was
+    /// not set, so callers can skip a redundant emit. Idempotent.
+    pub fn stop_manual_monitor(&self, pane_id: &str) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        snapshot.manual_monitors.remove(pane_id).is_some()
+    }
+
+    /// `Some(reason)` when `pane_id` carries a manual monitoring flag (the
+    /// inner `Option` is the reason, absent when none was given), `None` when
+    /// it does not. Two levels of `Option` on purpose: "not monitoring" and
+    /// "monitoring, no reason given" are different answers.
+    #[allow(clippy::option_option)]
+    pub fn manual_monitor_reason(&self, pane_id: &str) -> Option<Option<String>> {
+        self.inner.lock().unwrap().manual_monitors.get(pane_id).cloned()
+    }
+
+    /// Resolve the pane a `monitor_start` / `monitor_stop` should target.
+    ///
+    /// Kept deliberately dumb, because the callers are agents reading their own
+    /// injected environment rather than users pointing at things:
+    /// 1. an explicit `pane_id` that exists wins outright;
+    /// 2. otherwise the named workspace (or the active one) hands back its
+    ///    active surface's active pane — the pane the agent is almost
+    ///    certainly running in;
+    /// 3. failing that, the workspace's first pane in tree order.
+    ///
+    /// `None` when nothing resolves at all (unknown ids, no open workspace).
+    pub fn resolve_monitor_pane(
+        &self,
+        pane_id: Option<&str>,
+        workspace_id: Option<&str>,
+    ) -> Option<String> {
+        let snapshot = self.inner.lock().unwrap();
+        if let Some(pane_id) = pane_id.filter(|id| !id.is_empty()) {
+            if find_workspace_id_for_pane(&snapshot.workspaces, pane_id).is_some() {
+                return Some(pane_id.to_string());
+            }
+        }
+        let target = workspace_id
+            .filter(|id| !id.is_empty())
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| snapshot.active_workspace_id.0.clone());
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|ws| ws.workspace_id.0 == target)?;
+        let active = workspace
+            .surfaces
+            .iter()
+            .find(|s| s.surface_id == workspace.active_surface_id)
+            .map(|s| s.active_pane_id.0.clone());
+        active.or_else(|| {
+            workspace
+                .surfaces
+                .iter()
+                .flat_map(|s| collect_pane_ids_from_node(&s.root))
+                .next()
+        })
+    }
+
+    /// Forget every manual monitoring flag for the panes in `pane_ids`.
+    /// Called when panes/workspaces close: a flag outliving its pane would
+    /// keep a dead pane id in the map forever and, worse, resurrect the badge
+    /// if the id were ever reused.
+    pub fn clear_manual_monitors_for_panes(&self, pane_ids: &[String]) {
+        if pane_ids.is_empty() {
+            return;
+        }
+        let mut snapshot = self.inner.lock().unwrap();
+        for pane_id in pane_ids {
+            snapshot.manual_monitors.remove(pane_id);
+        }
     }
 
     pub fn add_notification(
@@ -4893,6 +5103,7 @@ fn default_app_state() -> AppStateSnapshot {
         notifications: vec![],
         detected_ports: vec![],
         pane_statuses: HashMap::new(),
+        manual_monitors: HashMap::new(),
         persistence: PersistenceSchema {
             schema_version: PERSISTENCE_SCHEMA_VERSION,
             stores_layout_metadata: true,
@@ -5141,10 +5352,12 @@ fn persisted_layout_path() -> Option<PathBuf> {
 /// Drop the pane statuses that mean nothing after a restart, keeping the ones
 /// that do.
 ///
-/// `Working` and `Permission` describe a live process. The agent is dead once
-/// the app exits, so restoring a spinner or a permission badge would show the
-/// user a state that no process backs — the reason this whole map used to be
-/// cleared wholesale.
+/// `Working`, `Permission` and `Monitoring` all describe a live process. The
+/// agent is dead once the app exits, so restoring a spinner, a permission badge
+/// or a watch-loop dot would show the user a state that no process backs — the
+/// reason this whole map used to be cleared wholesale. `Monitoring` is the
+/// starkest case of the three: a background watch loop that nothing is running
+/// is not monitoring, it is a lie the sidebar would tell forever.
 ///
 /// `Review` is a different kind of fact: it means "this agent finished and you
 /// have not looked at the result yet", which is just as true after a restart as
@@ -5180,6 +5393,10 @@ fn persistable_snapshot(snapshot: &AppStateSnapshot) -> AppStateSnapshot {
     snapshot = strip_browser_panes_from_snapshot(snapshot);
     // Detected ports are runtime-only state — never persist them.
     snapshot.detected_ports.clear();
+    // Same for the manual-monitor flags: they are claims made by live agent
+    // processes about work they are still doing, and every one of those
+    // processes is gone by the time this file is read again.
+    snapshot.manual_monitors.clear();
     // The revision counter is process-lifetime, not persisted state: it restarts
     // at 0 next launch. Persisting a stamped value would seed the restored store
     // with a revision far above the live counter, and every real emit afterwards
@@ -8120,9 +8337,14 @@ mod tests {
             .create_agent_chat_pane(&ws_id.0, None, None, None)
             .unwrap();
 
+        let watching = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+
         store.set_pane_status(&reviewed.0, PaneStatus::Review);
         store.set_pane_status(&working.0, PaneStatus::Working);
         store.set_pane_status(&prompting.0, PaneStatus::Permission);
+        store.set_pane_status(&watching.0, PaneStatus::Monitoring);
 
         let mut snapshot = store.snapshot();
         retain_persistable_pane_statuses(&mut snapshot);
@@ -8136,6 +8358,171 @@ mod tests {
         // restoring them would render a spinner nothing is driving.
         assert_eq!(snapshot.pane_statuses.get(&working.0), None);
         assert_eq!(snapshot.pane_statuses.get(&prompting.0), None);
+        // Monitoring is the same kind of claim: a background watch loop with
+        // no process behind it is not monitoring anything.
+        assert_eq!(snapshot.pane_statuses.get(&watching.0), None);
+    }
+
+    // ── Manual (provider-agnostic) monitoring flags ──────────────────
+
+    #[test]
+    fn a_manual_monitor_flag_reports_monitoring_and_clears_again() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+
+        assert!(store.start_manual_monitor(&pane.0, Some("CI on #482".into())));
+        assert_eq!(
+            store.snapshot().pane_statuses.get(&pane.0),
+            Some(&PaneStatus::Monitoring),
+            "an idle pane with the flag reads as monitoring",
+        );
+        assert_eq!(
+            store.snapshot().manual_monitors.get(&pane.0),
+            Some(&Some("CI on #482".to_string())),
+            "the reason rides along for the chat bar's title",
+        );
+        // Re-asserting the same reason is not a change (skips a redundant emit).
+        assert!(!store.start_manual_monitor(&pane.0, Some("CI on #482".into())));
+
+        assert!(store.stop_manual_monitor(&pane.0));
+        assert!(store.snapshot().pane_statuses.get(&pane.0).is_none());
+        assert!(!store.stop_manual_monitor(&pane.0), "stop is idempotent");
+    }
+
+    #[test]
+    fn working_and_permission_outrank_a_manual_monitor_flag() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        store.start_manual_monitor(&pane.0, None);
+
+        for status in [PaneStatus::Working, PaneStatus::Permission] {
+            store.set_pane_status(&pane.0, status.clone());
+            assert_eq!(
+                store.snapshot().pane_statuses.get(&pane.0),
+                Some(&status),
+                "a live/blocked agent must not be masked by a monitoring badge",
+            );
+        }
+
+        // A finished run underneath the flag still reads as monitoring: the
+        // deliverable is done but the watch loop is the current truth.
+        store.set_pane_status(&pane.0, PaneStatus::Review);
+        assert_eq!(
+            store.snapshot().pane_statuses.get(&pane.0),
+            Some(&PaneStatus::Monitoring)
+        );
+        // ...and clearing the flag reveals the raw status underneath, which is
+        // the reason the combination happens on read rather than on write.
+        store.stop_manual_monitor(&pane.0);
+        assert_eq!(
+            store.snapshot().pane_statuses.get(&pane.0),
+            Some(&PaneStatus::Review)
+        );
+    }
+
+    #[test]
+    fn manual_monitor_flags_are_never_persisted() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let pane = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+        store.start_manual_monitor(&pane.0, Some("watching the deploy".into()));
+
+        let persisted = persistable_snapshot(&store.snapshot());
+        assert!(persisted.manual_monitors.is_empty());
+        assert!(
+            persisted.pane_statuses.get(&pane.0).is_none(),
+            "and the Monitoring status it produced goes with it",
+        );
+    }
+
+    #[test]
+    fn a_flag_whose_pane_closed_is_dropped_rather_than_trusted() {
+        let store = AppStateStore::default();
+        store.start_manual_monitor("pane-that-never-existed", None);
+        let snapshot = store.snapshot();
+        assert!(snapshot.pane_statuses.is_empty());
+        assert!(snapshot.manual_monitors.is_empty());
+    }
+
+    /// The read-side guard above only cleans the *clone*. Closing or
+    /// archiving a workspace removes every pane in it in one move, without
+    /// ever naming them, so without the prune the flags would sit in the
+    /// stored map for the rest of the process lifetime.
+    ///
+    /// Asserts the INNER map on purpose: `snapshot()` would hide the leak.
+    #[test]
+    fn closing_a_workspace_clears_its_panes_manual_monitor_flags() {
+        let store = AppStateStore::default();
+        let keep = store.snapshot().active_workspace_id.0.clone();
+        let doomed = store.create_workspace().0;
+        let doomed_pane = store
+            .create_agent_chat_pane(&doomed, None, None, None)
+            .unwrap();
+        let kept_pane = store
+            .create_agent_chat_pane(&keep, None, None, None)
+            .unwrap();
+        store.start_manual_monitor(&doomed_pane.0, Some("watching CI".into()));
+        store.start_manual_monitor(&kept_pane.0, None);
+        assert_eq!(store.inner.lock().unwrap().manual_monitors.len(), 2);
+
+        store.close_workspace(&doomed).unwrap();
+
+        let inner = store.inner.lock().unwrap();
+        assert!(
+            !inner.manual_monitors.contains_key(&doomed_pane.0),
+            "the closed workspace's flag must not survive in the stored map",
+        );
+        assert!(
+            inner.manual_monitors.contains_key(&kept_pane.0),
+            "a live pane's flag is untouched",
+        );
+    }
+
+    /// The single-workspace close path is a separate early return in
+    /// `close_workspace`, so it gets its own coverage.
+    #[test]
+    fn closing_the_last_workspace_clears_its_manual_monitor_flags() {
+        let store = AppStateStore::default();
+        let only = store.snapshot().active_workspace_id.0.clone();
+        let pane = store
+            .create_agent_chat_pane(&only, None, None, None)
+            .unwrap();
+        store.start_manual_monitor(&pane.0, None);
+
+        store.close_workspace(&only).unwrap();
+
+        assert!(store.inner.lock().unwrap().manual_monitors.is_empty());
+    }
+
+    #[test]
+    fn resolve_monitor_pane_prefers_explicit_then_active() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().active_workspace_id.clone();
+        let chat = store
+            .create_agent_chat_pane(&ws_id.0, None, None, None)
+            .unwrap();
+
+        // An explicit, existing pane id wins outright.
+        assert_eq!(
+            store.resolve_monitor_pane(Some(&chat.0), None),
+            Some(chat.0.clone())
+        );
+        // An unknown pane id falls through to the workspace's active pane
+        // rather than failing — the agent's env may name a stale pane.
+        let active = store.resolve_monitor_pane(Some("nope"), Some(&ws_id.0));
+        assert!(active.is_some());
+        // No hints at all still resolves against the active workspace.
+        assert!(store.resolve_monitor_pane(None, None).is_some());
+        // An unknown workspace resolves to nothing.
+        assert_eq!(store.resolve_monitor_pane(None, Some("ws-nope")), None);
     }
 
     /// Nothing removes a status when its pane goes away, so the filter has to

@@ -4839,6 +4839,7 @@ mod tests {
             detected_ports: Vec::new(),
             notifications: Vec::new(),
             pane_statuses: std::collections::HashMap::new(),
+            manual_monitors: std::collections::HashMap::new(),
             agent_browser_sessions: Vec::new(),
             archived_workspaces: Vec::new(),
         }

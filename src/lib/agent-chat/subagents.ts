@@ -108,6 +108,9 @@ export function mergeSnapshot(
   if (snap.parent_item_id != null) next.parentItemId = snap.parent_item_id;
   if (snap.name != null) next.name = snap.name;
   if (snap.agent_type != null) next.agentType = snap.agent_type;
+  // Sticky like every other merged field: `task_progress` ticks carry no
+  // `task_kind`, so a null must never un-classify a known watch loop.
+  if (snap.task_kind != null) next.taskKind = snap.task_kind;
   if (snap.model != null) next.model = snap.model;
   if (snap.activity != null) next.activity = snap.activity;
   if (snap.result_text != null) next.resultText = snap.result_text;
@@ -360,19 +363,34 @@ export function subagentRunItems(messages: ChatViewItem[]): SubagentRunItem[] {
 /**
  * Whether a subagent row should read as **live activity** right now.
  *
- * Running/pending is necessary but not sufficient: a provider background
- * task (a background shell command) can legitimately outlive the turn and
- * never report a terminal status, so once the thread stops streaming it is
- * a job that happens to still be alive — not the agent working. Counting
- * it would keep the docked activity bar and its spinner up forever after
- * the run ended, including across a restart (the snapshots are persisted
- * and hydrate-replayed).
+ * Running/pending is necessary but not sufficient, for two independent
+ * reasons:
+ *
+ * - A **watch loop** (`taskKind === "monitor"`) is never agent work at
+ *   all, streaming or not. Counting it would inflate "N subagents
+ *   running" and keep the amber progress bar up for a thread whose only
+ *   remaining activity is a CI poll — the exact thing the calm
+ *   `monitoring` status exists to replace. The task still keeps its
+ *   transcript card, so the user can always see what is being watched.
+ * - A provider **background task** (a background shell command) can
+ *   legitimately outlive the turn and never report a terminal status, so
+ *   once the thread stops streaming it is a job that happens to still be
+ *   alive — not the agent working. Counting it would keep the docked
+ *   activity bar and its spinner up forever after the run ended,
+ *   including across a restart (the snapshots are persisted and
+ *   hydrate-replayed).
+ *
+ * The two classifications are complementary and a row can carry both:
+ * `taskKind` is precise but needs the SDK to report `task_type`, while
+ * `backgroundTask` is derived from the launch registry and works
+ * regardless. Either one alone is enough to drop the row from the bar.
  */
 export function isLiveActivity(
   view: SubagentView,
   streaming: boolean,
 ): boolean {
   if (!isRunning(view)) return false;
+  if (isMonitorTask(view)) return false;
   return streaming || !view.backgroundTask;
 }
 
@@ -431,15 +449,21 @@ export interface RunningSubagentEntry {
   fromLabel: string | null;
 }
 
+/** Whether a row is a background watch loop rather than delegated agent work.
+ *  Absent `taskKind` (every provider but Claude, and Claude on an SDK that
+ *  does not report task types) reads as agent work. */
+export function isMonitorTask(view: SubagentView): boolean {
+  return view.taskKind === "monitor";
+}
+
 /** Every currently-running subagent across every `subagent_run` card in
  *  the thread, no matter which reply spawned it (design "one bar for the
  *  whole thread"). Feeds the docked {@link SubagentActivityBar}: its
  *  `.length` is the bar's count, and each entry carries the "from"
  *  label + jump target for the expand list.
  *
- *  `streaming` is the thread's live-run flag: with the run over, provider
- *  background tasks drop out (see {@link isLiveActivity}) so a background
- *  shell command can't keep the bar spinning after the turn settled. */
+ *  `streaming` is the thread's live-run flag, and watch loops never
+ *  qualify at all — see {@link isLiveActivity} for both exclusions. */
 export function runningSubagentEntries(
   messages: ChatViewItem[],
   streaming = true,

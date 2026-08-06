@@ -26,10 +26,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::agent_provider::{
-    CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent, ProviderSessionId,
-    RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, TaskSnapshotItem, TaskStatus,
-    TasksSnapshot, ThreadId, TurnId, TurnStatus, TurnUsage, WorkflowPhaseSnapshot,
-    WorkflowSnapshot,
+    classify_task_kind, CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent,
+    ProviderSessionId, RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, SubagentTaskKind,
+    TaskSnapshotItem, TaskStatus, TasksSnapshot, ThreadId, TurnId, TurnStatus, TurnUsage,
+    WorkflowPhaseSnapshot, WorkflowSnapshot,
 };
 
 use super::protocol::{SidecarError, SidecarNotification};
@@ -71,6 +71,10 @@ pub struct SubagentDemux {
     /// notification task — so it rides the `&mut` the translator is
     /// already handed rather than inventing a second channel.
     context: ContextUsageTracker,
+    /// `subagent_id` → watch-loop-vs-agent classification, learned from the
+    /// `task_started` message's optional `task_type` and re-stamped onto every
+    /// later snapshot for that subagent (see [`Self::record_task_kind`]).
+    task_kinds: HashMap<String, SubagentTaskKind>,
     /// In-flight Claude TaskCreate/TaskUpdate/TaskList calls, keyed by
     /// tool_use_id until their structured result arrives.
     task_tools: HashMap<String, (String, serde_json::Value)>,
@@ -123,6 +127,20 @@ impl SubagentDemux {
             self.task_to_tool_use
                 .insert(task_id.to_string(), tu.to_string());
         }
+    }
+
+    /// Remember the watch-loop-vs-agent classification for a subagent.
+    ///
+    /// Only `task_started` carries `task_type`; the progress / update /
+    /// notification messages that follow do not. Without this the very next
+    /// `task_progress` tick would ship a snapshot claiming the task is
+    /// ordinary agent work and flip a monitoring pane back to `Working`.
+    fn record_task_kind(&mut self, subagent_id: &str, kind: SubagentTaskKind) {
+        self.task_kinds.insert(subagent_id.to_string(), kind);
+    }
+
+    fn task_kind_for(&self, subagent_id: &str) -> Option<SubagentTaskKind> {
+        self.task_kinds.get(subagent_id).copied()
     }
 
     /// Resolve the subagent id for a task event, preferring an explicit
@@ -818,6 +836,9 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         parent_item_id: Some(tool_use_id.to_string()),
         name,
         agent_type: get("subagent_type"),
+        // Learned from `task_started`'s `task_type`, which arrives later; the
+        // demux re-stamps it onto every subsequent snapshot for this id.
+        task_kind: None,
         model: get("model"),
         status: SubagentStatus::Running,
         activity: None,
@@ -1025,6 +1046,7 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         parent_item_id: Some(subagent_id.to_string()),
         name: None,
         agent_type: None,
+        task_kind: None,
         model: None,
         status: SubagentStatus::Running,
         activity: None,
@@ -1036,31 +1058,53 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         workflow_id: None,
         phase: None,
         // Task-event snapshots stamp this from the demux — see
-        // [`stamp_background_task`].
+        // [`stamp_task_classification`].
         background_task: false,
     }
 }
 
-/// Mark `snap` as a provider background task when its id is not a
-/// registered top-level `Agent`/`Task` launch.
+/// Stamp both halves of a task's classification onto `snap`.
 ///
-/// Claude emits the same `system.task_*` family for a real delegated
-/// subagent **and** for a background tool run (`Bash { run_in_background:
-/// true }`), keyed by the spawning `tool_use_id`. Only a real launch is
-/// registered in the demux ([`SubagentDemux::register_top_level_launch`]),
-/// so "not a top-level launch" is the exact discriminator: those rows can
-/// outlive the turn forever (a dev server never exits, so its terminal
-/// `task_notification` never arrives) and must never pin the workspace to
-/// `Working` after `TurnCompleted`.
+/// The two facts are complementary, not alternatives, and a task can carry
+/// both — so they are learned and replayed together, once per
+/// `translate_task_*` fn, rather than by two stamps that could drift out of
+/// step:
 ///
-/// The discriminator is *top-level* launch, so a **nested** subagent — one
-/// an already-delegated agent spawns — is also stamped `background_task`,
-/// since only the root launch is registered. That is deliberate and benign:
-/// the root stays in the run-blocking set for as long as the whole subtree
-/// is alive, so the nested row has nothing left to hold open, and the flag
-/// only ever means "do not let this row block settlement on its own".
-fn stamp_background_task(snap: &mut SubagentSnapshot, demux: &SubagentDemux) {
+/// * **`background_task`** — the row is not a registered top-level
+///   `Agent`/`Task` launch. Claude emits the same `system.task_*` family for
+///   a real delegated subagent **and** for a background tool run
+///   (`Bash { run_in_background: true }`), keyed by the spawning
+///   `tool_use_id`. Only a real launch is registered in the demux
+///   ([`SubagentDemux::register_top_level_launch`]), so "not a top-level
+///   launch" is the exact discriminator: those rows can outlive the turn
+///   forever (a dev server never exits, so its terminal `task_notification`
+///   never arrives) and must never pin the workspace to `Working` after
+///   `TurnCompleted`.
+///
+///   The discriminator is *top-level* launch, so a **nested** subagent — one
+///   an already-delegated agent spawns — is also stamped `background_task`,
+///   since only the root launch is registered. That is deliberate and benign:
+///   the root stays in the run-blocking set for as long as the whole subtree
+///   is alive, so the nested row has nothing left to hold open, and the flag
+///   only ever means "do not let this row block settlement on its own".
+///
+/// * **`task_kind`** — the watch-loop-vs-agent classification learned from
+///   `task_started`'s optional `task_type`. This is the sibling of
+///   [`stamp_workflow_attribution`], and for the same reason: the per-event
+///   snapshots are partial, so a fact learned once at `task_started` has to
+///   be replayed onto every later snapshot or the consumer's merge sees it
+///   disappear. No-op for tasks whose kind was never learned (an SDK that
+///   predates `task_type`), which reads downstream as ordinary agent work.
+///
+/// The two are independent on purpose. `background_task` is derived from the
+/// launch registry and therefore always available; `task_kind` is precise but
+/// needs the SDK to say so. A background bash watch loop is both: it settles
+/// the run (background) *and* shows the calm Monitoring badge (monitor).
+fn stamp_task_classification(snap: &mut SubagentSnapshot, demux: &SubagentDemux) {
     snap.background_task = !demux.is_top_level_launch(&snap.subagent_id);
+    if let Some(kind) = demux.task_kind_for(&snap.subagent_id) {
+        snap.task_kind = Some(kind);
+    }
 }
 
 /// `type: "user"` — sent by the SDK when a tool_result is appended
@@ -1503,17 +1547,24 @@ fn apply_task_usage(snap: &mut SubagentSnapshot, usage: Option<&serde_json::Valu
     snap.duration_ms = usage.get("duration_ms").and_then(|v| v.as_u64());
 }
 
-/// `system.task_started { task_id, tool_use_id?, description }` — the
-/// subagent has begun. Records the `task_id → tool_use_id` mapping and
+/// `system.task_started { task_id, tool_use_id?, description, task_type? }` —
+/// the subagent has begun. Records the `task_id → tool_use_id` mapping and
 /// emits a `Running` snapshot whose activity is the description.
 /// Ambient / housekeeping tasks (`skip_transcript: true`) are dropped so
 /// they never spawn a card.
 ///
 /// The SDK emits this family for background *tool* runs too (a
 /// `Bash { run_in_background: true }`), keyed by the Bash tool_use_id.
-/// Those are stamped `background_task` (see [`stamp_background_task`]) so
+/// Those are stamped `background_task` (see [`stamp_task_classification`]) so
 /// the pane-status tracker never lets them hold the workspace in
 /// `Working` after the turn ends.
+///
+/// `task_type` is read opportunistically on the same message: it is the only
+/// message in the task family that carries it, and older installed SDK
+/// versions do not send it at all. When it is absent the task classifies as
+/// ordinary agent work and the whole Monitoring feature degrades to exactly
+/// the pre-existing behavior — which is the intended failure mode, not an
+/// oversight.
 fn translate_task_started(
     thread_id: &ThreadId,
     msg: &serde_json::Value,
@@ -1528,13 +1579,17 @@ fn translate_task_started(
     let Some(subagent_id) = demux.subagent_for_task(&task_id, tool_use_id.as_deref()) else {
         return warning(thread_id, "task_started without resolvable tool_use_id", msg);
     };
+    demux.record_task_kind(
+        &subagent_id,
+        classify_task_kind(opt_str_field(msg, "task_type").as_deref()),
+    );
     let mut snap = base_snapshot(&subagent_id);
     snap.status = SubagentStatus::Running;
     let description = str_field(msg, "description");
     if !description.is_empty() {
         snap.activity = Some(description);
     }
-    stamp_background_task(&mut snap, demux);
+    stamp_task_classification(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
@@ -1561,7 +1616,7 @@ fn translate_task_progress(
     snap.status = SubagentStatus::Running;
     snap.activity = opt_str_field(msg, "summary").or_else(|| opt_str_field(msg, "last_tool_name"));
     apply_task_usage(&mut snap, msg.get("usage"));
-    stamp_background_task(&mut snap, demux);
+    stamp_task_classification(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
@@ -1610,7 +1665,7 @@ fn translate_task_updated(
     if !changed {
         return Vec::new();
     }
-    stamp_background_task(&mut snap, demux);
+    stamp_task_classification(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
@@ -1643,7 +1698,7 @@ fn translate_task_notification(
         snap.result_text = Some(summary);
     }
     apply_task_usage(&mut snap, msg.get("usage"));
-    stamp_background_task(&mut snap, demux);
+    stamp_task_classification(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),

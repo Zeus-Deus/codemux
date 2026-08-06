@@ -1034,6 +1034,7 @@ mod tests {
             notifications: Vec::new(),
             detected_ports: Vec::new(),
             pane_statuses: std::collections::HashMap::new(),
+            manual_monitors: std::collections::HashMap::new(),
             archived_workspaces: Vec::new(),
             persistence: PersistenceSchema {
                 schema_version: 1,

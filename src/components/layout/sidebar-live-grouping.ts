@@ -4,11 +4,16 @@ import type { ActivePaneStatus, PaneStatus } from "@/tauri/types";
 import type { ProjectGroup } from "@/stores/app-store";
 import type { LiveEntry } from "./sidebar-live-section";
 
-/** Live-bucket sort rank: reds first, then working, then done. */
+/** Live-bucket sort rank: reds first, then working, then monitoring, then
+ *  done. `monitoring` is listed for completeness — `isWorkspaceLive` never
+ *  admits a monitoring workspace into this bucket (a calm watch loop is not
+ *  something to gather on top of the list), so the rank is unreachable in
+ *  practice and only exists so the map stays exhaustive. */
 const LIVE_RANK: Record<ActivePaneStatus, number> = {
   permission: 0,
   working: 1,
-  review: 2,
+  monitoring: 2,
+  review: 3,
 };
 
 /**

@@ -41,6 +41,7 @@ import {
   MOCK_USER,
   MOCK_USER_IMAGE_DATA_URL,
   MOCK_WEB_REMOTE_PORT,
+  MOCK_MONITORING_THREAD_ID,
   MOCK_WORKFLOW_APPROVAL_THREAD_ID,
   MOCK_WORKFLOW_COMPLETE_THREAD_ID,
   MOCK_WORKFLOW_RUNNING_THREAD_ID,
@@ -50,6 +51,7 @@ import {
   mockWebRemotePairing,
   mockWebRemoteSessions,
   richChatTurnEnvelopes,
+  monitoringEnvelopes,
   subagentTurnEnvelopes,
   workflowApprovalEnvelopes,
   workflowCompleteEnvelopes,
@@ -102,6 +104,31 @@ function findWorkspace(id: unknown): WorkspaceSnapshot | undefined {
 
 /** Re-emit the current snapshot so subscribers (`useAppStateInit`) pick
  *  up an in-memory mutation, mirroring the backend's `emit_app_state`. */
+/** Walk every workspace surface for the `agent_chat` pane bound to
+ *  `threadId` — the mock's stand-in for the backend's thread→pane walk
+ *  (`find_agent_chat_pane_id`). `null` when nothing carries the thread. */
+function findChatPaneIdForThread(threadId: string): string | null {
+  const walk = (node: PaneNodeSnapshot): string | null => {
+    if (node.kind === "split") {
+      for (const child of node.children) {
+        const found = walk(child);
+        if (found) return found;
+      }
+      return null;
+    }
+    return node.kind === "agent_chat" && node.thread_id === threadId
+      ? node.pane_id
+      : null;
+  };
+  for (const ws of appState.workspaces) {
+    for (const surface of ws.surfaces) {
+      const found = walk(surface.root);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
 function emitAppState(): void {
   emitEvent("app-state-changed", appState);
 }
@@ -1031,6 +1058,11 @@ const WORKFLOW_THREAD_BUILDERS: Record<string, () => unknown[]> = {
     workflowRunningEnvelopes(MOCK_WORKFLOW_RUNNING_THREAD_ID),
   [MOCK_WORKFLOW_COMPLETE_THREAD_ID]: () =>
     workflowCompleteEnvelopes(MOCK_WORKFLOW_COMPLETE_THREAD_ID),
+  // Not a workflow, but it rides the same seeded-thread machinery: a
+  // finished turn plus a live watch loop, so the pane settles to the calm
+  // `monitoring` status and the docked MonitoringBar is reachable.
+  [MOCK_MONITORING_THREAD_ID]: () =>
+    monitoringEnvelopes(MOCK_MONITORING_THREAD_ID),
 };
 
 const workflowTranscriptCache = new Map<string, string[]>();
@@ -1063,6 +1095,10 @@ const WORKFLOW_THREAD_WORKSPACE: Record<string, { workspaceId: string; cwd: stri
   [MOCK_WORKFLOW_COMPLETE_THREAD_ID]: {
     workspaceId: "ws-codemux-workflow-complete",
     cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-workflow-complete`,
+  },
+  [MOCK_MONITORING_THREAD_ID]: {
+    workspaceId: "ws-codemux-monitoring",
+    cwd: `${MOCK_HOME_DIR}/.codemux/worktrees/codemux/demo-monitoring`,
   },
 };
 
@@ -2168,6 +2204,33 @@ const handlers: Record<string, Handler> = {
     return undefined;
   },
   agent_chat_interrupt_turn: () => undefined,
+  // The docked MonitoringBar's Stop. Mirrors the real backend closely
+  // enough to be demoable: clear the pane's `monitoring` status + its
+  // manual-monitor reason, then re-emit so the bar unmounts and the
+  // sidebar badge clears in one frame.
+  agent_chat_stop_monitoring: (a) => {
+    // `threadId` is nullable: a pane can be flagged monitoring with no chat
+    // thread bound to it, and Stop has to work there too. The caller's pane
+    // id wins, exactly like the real command.
+    const { threadId, paneId: explicitPaneId } = a as {
+      threadId: string | null;
+      paneId?: string;
+    };
+    const paneId =
+      explicitPaneId || (threadId ? findChatPaneIdForThread(threadId) : null);
+    if (!paneId) return undefined;
+    const paneStatuses = { ...appState.pane_statuses };
+    const manualMonitors = { ...(appState.manual_monitors ?? {}) };
+    if (paneStatuses[paneId] === "monitoring") delete paneStatuses[paneId];
+    delete manualMonitors[paneId];
+    appState = {
+      ...appState,
+      pane_statuses: paneStatuses,
+      manual_monitors: manualMonitors,
+    };
+    emitAppState();
+    return undefined;
+  },
   // Liveness probe used by the remount-hydrate path to tell a live run
   // (whose terminal event simply hasn't persisted yet) apart from a
   // genuinely-interrupted one. The mock tracks in-flight turns in

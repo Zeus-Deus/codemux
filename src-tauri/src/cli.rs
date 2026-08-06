@@ -43,6 +43,19 @@ pub enum CommandSet {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Tell Codemux this pane is watching something in the background — a CI
+    /// run, a tailed process, a PR poll — so its workspace shows the calm
+    /// "Monitoring" status instead of looking finished or stuck at "Working".
+    ///
+    /// Provider-agnostic: any agent with a shell can call this, whatever it is
+    /// running under. The pane is taken from `CODEMUX_PANE_ID` /
+    /// `CODEMUX_WORKSPACE_ID`, which Codemux injects into terminal panes and
+    /// chat-session subprocesses, so the agent flags its OWN pane with no
+    /// arguments. Remember to `codemux monitor stop` when the watch ends.
+    Monitor {
+        #[command(subcommand)]
+        command: MonitorCommand,
+    },
     /// Run Codemux headless as a web-remote server — no desktop GUI. Boots the
     /// full backend, binds the web-remote server, and prints a scannable
     /// pairing QR + link. Ideal over SSH: expose your desktop's UI to a phone
@@ -189,6 +202,32 @@ pub enum RemoteCommand {
     /// Turn web remote access off — unbinds the server and severs every live
     /// connection immediately. Requires the desktop app to be running.
     Disable,
+}
+
+#[derive(Subcommand)]
+pub enum MonitorCommand {
+    /// Mark this pane as monitoring something in the background.
+    Start {
+        /// Short human description of what is being watched — shown next to
+        /// the status ("Monitoring in the background — CI on #482").
+        #[arg(long)]
+        reason: Option<String>,
+        /// Target a specific pane instead of `CODEMUX_PANE_ID`.
+        #[arg(long)]
+        pane_id: Option<String>,
+    },
+    /// Clear this pane's monitoring status.
+    Stop {
+        /// Target a specific pane instead of `CODEMUX_PANE_ID`.
+        #[arg(long)]
+        pane_id: Option<String>,
+    },
+    /// Report whether this pane currently reads as monitoring, and why.
+    Status {
+        /// Target a specific pane instead of `CODEMUX_PANE_ID`.
+        #[arg(long)]
+        pane_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -757,6 +796,44 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
             println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
             Ok(true)
         }
+        Some(CommandSet::Monitor { command }) => {
+            // The pane/workspace ids come from the agent's own injected
+            // environment, so the common call is a bare `codemux monitor
+            // start` from inside the pane that is doing the watching. An
+            // explicit `--pane-id` overrides; with neither, the backend falls
+            // back to the active workspace's active pane.
+            let target = |pane_id: Option<String>| {
+                let mut params = json!({});
+                let pane = pane_id.or_else(|| std::env::var("CODEMUX_PANE_ID").ok());
+                if let Some(id) = pane.filter(|id| !id.is_empty()) {
+                    params["pane_id"] = json!(id);
+                }
+                if let Ok(id) = std::env::var("CODEMUX_WORKSPACE_ID") {
+                    if !id.is_empty() {
+                        params["workspace_id"] = json!(id);
+                    }
+                }
+                params
+            };
+            let (command, params) = match command {
+                MonitorCommand::Start { reason, pane_id } => {
+                    let mut params = target(pane_id);
+                    if let Some(reason) = reason.filter(|r| !r.trim().is_empty()) {
+                        params["reason"] = json!(reason);
+                    }
+                    ("monitor_start", params)
+                }
+                MonitorCommand::Stop { pane_id } => ("monitor_stop", target(pane_id)),
+                MonitorCommand::Status { pane_id } => ("monitor_status", target(pane_id)),
+            };
+            let response = send_control_request(ControlRequest {
+                command: command.into(),
+                params,
+            })
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?);
+            Ok(true)
+        }
         Some(CommandSet::Remote { command }) => {
             match command {
                 RemoteCommand::Pair { name } => {
@@ -968,6 +1045,14 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                             "pair": { "args": "[--name <label>]", "description": "Mint a one-time web-remote pairing code + QR (requires remote access enabled)" }
                         }
                     },
+                    "monitor": {
+                        "description": "Declare that this pane is watching something in the background (calm 'Monitoring' status). Provider-agnostic; targets CODEMUX_PANE_ID / CODEMUX_WORKSPACE_ID",
+                        "subcommands": {
+                            "start": { "args": "[--reason <text>] [--pane-id <id>]", "description": "Mark this pane as monitoring in the background" },
+                            "stop": { "args": "[--pane-id <id>]", "description": "Clear this pane's monitoring status" },
+                            "status": { "args": "[--pane-id <id>]", "description": "Report whether this pane currently reads as monitoring" }
+                        }
+                    },
                     "serve": {
                         "args": "[--scope all|tailscale|loopback] [--port N] [--relay]",
                         "description": "Run headless as a web-remote server (no GUI); prints a pairing QR + link and runs until Ctrl-C"
@@ -997,6 +1082,7 @@ async fn run_control_cli(cli: Cli) -> Result<bool, String> {
                     "CODEMUX": "Set to '1' when running inside Codemux",
                     "CODEMUX_VERSION": "Codemux version",
                     "CODEMUX_WORKSPACE_ID": "Current workspace ID",
+                    "CODEMUX_PANE_ID": "Current pane ID (the default target for `codemux monitor`)",
                     "CODEMUX_BROWSER_CMD": "Command prefix for browser control",
                     "CODEMUX_PASSWORD": "Password for a non-interactive `codemux login` (warns; for automated runs only)",
                     "CODEMUX_API_URL": "Override the Codemux API base URL (default https://api.codemux.org)",

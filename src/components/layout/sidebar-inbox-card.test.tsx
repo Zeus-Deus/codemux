@@ -330,6 +330,15 @@ describe("SidebarInboxCard — background recede", () => {
     expect(card.className).toContain("hover:opacity-100");
   });
 
+  // A watch loop is background presence by definition, so it recedes with
+  // the quietly-working rows rather than competing with the ones that want
+  // a human.
+  it("dims a monitoring background card", () => {
+    const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
+    expect(card.className).toContain("opacity-70");
+    expect(card.className).toContain("hover:opacity-100");
+  });
+
   it("keeps every card that wants a human at full brightness", () => {
     const cases: Array<[string, Partial<CardProps>]> = [
       ["the workspace you are in", { isActive: true, status: "working" }],
@@ -447,5 +456,35 @@ describe("SidebarInboxCard — memo boundary", () => {
     expect(
       (SidebarInboxCard as unknown as { $$typeof?: symbol }).$$typeof,
     ).toBe(Symbol.for("react.memo"));
+  });
+});
+
+describe("SidebarInboxCard — monitoring status", () => {
+  it("labels the eyebrow Monitoring in the dedicated tone", () => {
+    const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
+    expect(screen.getByText("Monitoring")).toBeInTheDocument();
+    expect(card.innerHTML).toContain("text-status-monitoring");
+    expect(card.innerHTML).toContain("bg-status-monitoring");
+  });
+
+  // The whole point of a separate status: monitoring is calm. A pulsing dot
+  // is this app's "look at me" vocabulary and belongs to `permission` alone.
+  it("renders a steady dot with no pulse", () => {
+    const { card } = renderCard({ status: "monitoring" as ActivePaneStatus });
+    const dot = card.querySelector(".bg-status-monitoring") as HTMLElement;
+    expect(dot).not.toBeNull();
+    expect(dot.className).not.toContain("animate");
+  });
+
+  // Settle/Snooze are guarded only against live and blocked agents. A
+  // workspace left babysitting CI is exactly the kind of thing a user parks.
+  it("still offers Settle and Snooze", () => {
+    renderCard({ status: "monitoring" as ActivePaneStatus });
+    expect(
+      screen.getByRole("button", { name: 'Settle "Ship it"' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: 'Snooze "Ship it"' }),
+    ).toBeInTheDocument();
   });
 });

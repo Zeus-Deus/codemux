@@ -191,10 +191,12 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   (`permissionBlockerText()` always returns "Waiting for your input" — it does
   not surface the agent's actual question). The right side of the eyebrow shows
   the agent state — Working (configurable `WorkingIndicator`, amber text) /
-  Needs you (pulsing red dot) / Done · review (green ✓) / elapsed since the
-  workspace last settled into review — and swaps to a **"✓ Settle"** +
-  **"Snooze"** action pair on hover or focus for a normal card, or a direct
-  **"Unpin"** action for a pinned card (CSS-only swap, plus an action-visible
+  Needs you (pulsing red dot) / Monitoring (steady cyan dot, never animated —
+  see `docs/features/monitoring-status.md`) / Done · review (green ✓) /
+  elapsed since the workspace last settled into review — and swaps to a
+  **"✓ Settle"** + **"Snooze"** action pair on hover or focus for a normal
+  card, or a direct **"Unpin"** action for a pinned card (CSS-only swap, plus
+  an action-visible
   state while the Snooze dropdown is open, since Radix portals the menu out of
   the card and would otherwise lose its own trigger). The selected card
   gets a neutral border + clearly lighter fill (selection is lightness, not
@@ -202,8 +204,8 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   sit flat/transparent at rest and lift on hover); needs-you cards a
   red-tinted border; multi-selected cards an **ember ring** layered over
   whatever the card already is. A card that is **none** of those and whose
-  agent is either working or absent (idle) — and that has been read and has no
-  "Woke" pill — **recedes** to `opacity-70`, restored to full by hover or
+  agent is working, monitoring, or absent (idle) — and that has been read and
+  has no "Woke" pill — **recedes** to `opacity-70`, restored to full by hover or
   `focus-within` (the dim is suppressed outright while the card's Snooze menu
   is pinned open, since Radix portals that menu out of the card and neither
   restore would hold). The dim rides the card's own container, not the settle
@@ -619,7 +621,9 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   **Snooze (n)** (with the shared presets) — each only when *every* selected
   workspace can take it. Both verbs ride the per-row guardrail (`isSnoozeable`,
   the same predicate as the card's `canSettle`): a selection containing a
-  working or permission-blocked workspace offers neither, and the menu shows a
+  working or permission-blocked workspace offers neither (a **monitoring**
+  workspace is deliberately parkable — a watch loop is exactly the kind of
+  thing a user defers), and the menu shows a
   disabled line saying why instead of rendering empty — a bulk gesture is not a
   license to park in a batch what no single row offers, and a bulk action that
   silently skipped the busy half would make its own count a lie. Changing the
@@ -807,8 +811,8 @@ came from.
   (chat sessions publish into the same `pane_statuses` snapshot).
 - The done-review checkmark **survives an app restart**. `save_persisted_state`
   keeps `PaneStatus::Review` entries in `layout.json` and drops
-  `Working`/`Permission` (dead processes after a quit) plus entries whose pane
-  no longer exists — see `retain_persistable_pane_statuses` in
+  `Working`/`Permission`/`Monitoring` (dead processes after a quit) plus
+  entries whose pane no longer exists — see `retain_persistable_pane_statuses` in
   `src-tauri/src/state/state_impl.rs`. Previously the whole map was cleared on
   every save, so finished workspaces came back looking already-reviewed. The
   badge still clears the normal way, on activating the workspace/tab.

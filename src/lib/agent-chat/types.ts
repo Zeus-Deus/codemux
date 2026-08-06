@@ -3,11 +3,12 @@ import type {
   ContextUsageSnapshot,
   ProviderRuntimeEvent,
   SubagentStatus,
+  SubagentTaskKind,
   TasksSnapshot,
   TurnStatus,
 } from "@/tauri/events";
 
-export type { SubagentStatus };
+export type { SubagentStatus, SubagentTaskKind };
 
 /**
  * View-only subagent status. `interrupted` never appears on the wire —
@@ -194,6 +195,12 @@ export interface SubagentView {
   id: string;
   name?: string;
   agentType?: string;
+  /** `"monitor"` marks a background watch loop rather than delegated agent
+   *  work. Such a row still gets its transcript card (the user should be able
+   *  to see what is being watched), but it is left out of the docked
+   *  "N subagents running" bar — a watch loop is not a subagent doing work,
+   *  and counting it there is what used to pin a thread at "Working". */
+  taskKind?: SubagentTaskKind;
   model?: string;
   status: SubagentViewStatus;
   /** The spawning tool_use / call id (`SubagentSnapshot.parent_item_id`)
