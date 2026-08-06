@@ -1262,7 +1262,9 @@ impl Drop for ChildGuard {
 /// GTK/WebKit app launched from one (including another Codemux, which would
 /// read the inherited values as a user override and drop to CPU rendering).
 /// `GDK_BACKEND` and the `CODEMUX*` vars are deliberately left in place —
-/// children are expected to inherit those.
+/// children are expected to inherit those. (The AppImage layer separately drops
+/// a `GDK_BACKEND=x11` that came from `AppRun`, which is AppRun's value rather
+/// than ours or the user's; see `execution::appimage_env_fixups`.)
 pub(crate) fn strip_renderer_env(cmd: &mut CommandBuilder) {
     for key in crate::webview_tuning::RENDERER_ENV_VARS {
         cmd.env_remove(key);
@@ -1490,6 +1492,16 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
     let mut cmd = CommandBuilder::new(shell.clone());
     cmd.cwd(cwd);
 
+    // Undo AppRun's loader/toolkit rewrites so system binaries in this shell
+    // link against the host's libraries, not the AppImage's bundled ones.
+    // No-op unless we are running from an AppImage.
+    //
+    // Runs first, like every other spawn site: the sanitizer derives its values
+    // from the *process* environment, so anything set explicitly below (the
+    // CODEMUX_* block, and the CLI shim's PATH in particular) is layered on top
+    // of an already-clean base and wins.
+    crate::execution::sanitize_appimage_env_pty(&mut cmd);
+
     // Declare terminal capabilities — Codemux is the terminal emulator, so it
     // must advertise what it supports.  Without these, CLI tools launched from a
     // desktop shortcut (no parent terminal) lose ANSI color output.
@@ -1585,8 +1597,16 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
     // On Windows, `build_child_path` also prepends `%USERPROFILE%\.local\bin`
     // so Claude Code and similar per-user installs are discoverable even if
     // Codemux's own environment missed the installer's PATH broadcast.
+    //
+    // This must stay AFTER `sanitize_appimage_env_pty` (called near the top of
+    // this function): the sanitizer may set its own cleaned `PATH`, and this
+    // block's `PATH` — built from `sanitized_child_path()` — has to be the one
+    // that wins.
     if let Some((shim_dir, current_exe)) = ensure_cli_shims() {
-        let current_path = env::var("PATH").unwrap_or_default();
+        // Start from the sanitized PATH for the same reason: the raw process
+        // PATH is prefixed with AppDir bin dirs when we run from a bundle, and
+        // those must not shadow the user's own toolchain inside a shell.
+        let current_path = crate::execution::sanitized_child_path();
         let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);

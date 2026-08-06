@@ -2,7 +2,6 @@ use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -164,7 +163,7 @@ pub fn check_gh_status() -> GhStatus {
         return GhStatus::NotInstalled;
     }
 
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::execution::host_command("gh");
     cmd.args(["auth", "status"]);
     // `gh` stores its token in the user's secret-service keyring on
     // Linux desktops (gnome-keyring / kwallet / keepassxc-secret).
@@ -200,7 +199,7 @@ pub fn check_gh_status() -> GhStatus {
 }
 
 fn run_gh(repo_path: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::execution::host_command("gh");
     cmd.args(args).current_dir(repo_path);
     // Keep DBus available so the secret-service keyring round-trip
     // works — every gh subcommand pulls the auth token before
@@ -229,7 +228,7 @@ fn run_gh_json(repo_path: &Path, args: &[&str]) -> Result<serde_json::Value, Str
 
 /// Returns None on non-zero exit (e.g. "no PR for this branch") instead of Err.
 fn run_gh_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::execution::host_command("gh");
     cmd.args(args).current_dir(repo_path);
     // Keep DBus available — see `check_gh_status` rationale.
     sanitize_gui_env_std_keep_dbus(&mut cmd);
@@ -240,7 +239,7 @@ fn run_gh_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
 }
 
 pub fn gh_available() -> bool {
-    let mut cmd = Command::new("which");
+    let mut cmd = crate::execution::host_command("which");
     cmd.arg("gh");
     sanitize_gui_env_std(&mut cmd);
     cmd.output()
@@ -258,7 +257,7 @@ pub fn is_github_repo(repo_path: &Path) -> bool {
     // surface "Not a GitHub repo" copy. Auth state is a separate
     // signal, surfaced via `check_gh_status()`; the UI disambiguates
     // the two failure modes (not a github repo vs. needs auth).
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::execution::host_command("git");
     cmd.args(["remote", "-v"]).current_dir(repo_path);
     sanitize_gui_env_std(&mut cmd);
     let Ok(output) = cmd.output() else {
@@ -391,7 +390,7 @@ fn gh_exit_result(
 }
 
 fn run_gh_timed(repo_path: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::execution::host_command("gh");
     cmd.args(args)
         .current_dir(repo_path)
         .stdout(std::process::Stdio::piped())
@@ -755,7 +754,7 @@ pub fn get_pr_diff(repo_path: &Path, number: u32, full: bool) -> Result<String, 
 const BRANCH_PR_LOOKUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn run_git_optional(repo_path: &Path, args: &[&str]) -> Option<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::execution::host_command("git");
     cmd.args(args).current_dir(repo_path);
     sanitize_gui_env_std(&mut cmd);
     cmd.output()
@@ -1501,7 +1500,7 @@ pub fn get_pr_checks(repo_path: &Path) -> Result<Vec<CheckInfo>, String> {
     // (exit 1) or any have failed (exit 8) but still writes valid
     // JSON to stdout. Bypass `run_gh_optional` (which discards stdout
     // on non-zero exit) and capture stdout regardless.
-    let output = Command::new("gh")
+    let output = crate::execution::host_command("gh")
         .args([
             "pr",
             "checks",

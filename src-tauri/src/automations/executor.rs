@@ -99,7 +99,7 @@ pub fn prepare_worktree(
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create worktree parent directory: {error}"))?;
     }
-    let mut cmd = std::process::Command::new("git");
+    let mut cmd = crate::execution::host_command("git");
     cmd.arg("-C")
         .arg(project)
         .args(["worktree", "add"])
@@ -206,7 +206,7 @@ fn resolve_repo(automation: &AutomationRecord) -> Result<ResolvedRepo, String> {
 /// no token (matching Superset's clone behaviour).
 fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
     if clone_dir.join(".git").exists() {
-        let output = std::process::Command::new("git")
+        let output = crate::execution::host_command("git")
             .arg("-C")
             .arg(clone_dir)
             .args(["fetch", "--prune", "origin"])
@@ -224,7 +224,7 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("Failed to create clone directory: {error}"))?;
     }
-    let output = std::process::Command::new("git")
+    let output = crate::execution::host_command("git")
         .args(["clone", remote])
         .arg(clone_dir)
         .output()
@@ -240,7 +240,7 @@ fn ensure_clone(remote: &str, clone_dir: &Path) -> Result<(), String> {
 
 /// `origin/<default-branch>` for a clone, resolved via `origin/HEAD`.
 fn default_remote_branch(clone_dir: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
+    let output = crate::execution::host_command("git")
         .arg("-C")
         .arg(clone_dir)
         .args(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
@@ -260,7 +260,7 @@ fn default_remote_branch(clone_dir: &Path) -> Option<String> {
 /// Best-effort: the URL of a PR for `branch`, via `gh pr list`. `None`
 /// when `gh` is absent, unauthenticated, or no PR exists.
 fn detect_pr_url(worktree: &Path, branch: &str) -> Option<String> {
-    let output = std::process::Command::new("gh")
+    let output = crate::execution::host_command("gh")
         .arg("pr")
         .arg("list")
         .args(["--head", branch])
@@ -378,7 +378,7 @@ async fn run_inner(
     let (program, args) = agent_command(&automation.agent, &automation.prompt)
         .map_err(|error| (Some(workdir.clone()), error))?;
 
-    let status = tokio::process::Command::new(&program)
+    let status = crate::execution::host_command_tokio(&program)
         .args(&args)
         .current_dir(&worktree_dir)
         .status()

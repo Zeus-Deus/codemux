@@ -535,7 +535,10 @@ pub async fn spawn_pty_for_session_via_daemon<R: Runtime>(
     // its own default PATH from the user's ~/.bashrc / ~/.zshrc.
     if !is_remote {
         if let Some((shim_dir, current_exe)) = super::ensure_cli_shims() {
-            let current_path = std::env::var("PATH").unwrap_or_default();
+            // Sanitized rather than raw PATH: under an AppImage the process
+            // PATH is prefixed with AppDir bin dirs, and shipping those to the
+            // daemon would let the bundle's binaries shadow the user's own.
+            let current_path = crate::execution::sanitized_child_path();
             let prefixed = super::build_child_path(&shim_dir, &current_path);
             env.push(("PATH".into(), prefixed));
             env.push(("CODEMUX_CLI_SAFE_PATH".into(), current_exe));
