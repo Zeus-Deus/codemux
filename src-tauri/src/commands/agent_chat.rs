@@ -2336,17 +2336,27 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
     }
 }
 
-/// Stop the background watch loops a thread is monitoring with.
+/// Stop the background watch loops a pane is monitoring with.
 ///
-/// Backs the docked monitoring bar's Stop button. Three things happen, in this
-/// order and independently of each other's success:
+/// Backs the docked monitoring bar's Stop button. Up to three things happen,
+/// in this order and independently of each other's success:
 ///
-/// 1. the thread's monitor task set is cleared from [`SubagentTracker`] and the
+/// 1. the thread's monitor task set is cleared from [`SubagentTracker`] (which
+///    also blocklists those ids for the rest of the run, so a detached task
+///    that survives the interrupt cannot walk the badge back on) and the
 ///    resulting pane status computed;
-/// 2. any manual (`codemux monitor start`) flag on the thread's pane is
-///    cleared, so a chat pane that was flagged both ways ends up genuinely off;
+/// 2. any manual (`codemux monitor start`) flag on the pane is cleared, so a
+///    pane that was flagged both ways ends up genuinely off;
 /// 3. the provider session is interrupted, best-effort, so the background tasks
 ///    actually die rather than being merely forgotten about.
+///
+/// **`thread_id` is optional, and that is the point.** The two halves of the
+/// Monitoring status are independent: a pane can carry a manual flag with no
+/// chat thread bound to it at all (a terminal pane, or a chat pane whose
+/// session has not started). Requiring a thread would leave the Stop button on
+/// such a pane doing nothing at all — pressed, spinning, never resolving.
+/// Steps 1 and 3 are simply skipped when there is no thread; step 2 is the
+/// part that always applies, and it is what the badge on such a pane came from.
 ///
 /// **The interrupt is the weak link, and deliberately so.** The provider
 /// interrupt path is a *turn* interrupt: with a turn in flight it cancels the
@@ -2355,9 +2365,10 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
 /// completes — Claude's SDK offers no "interrupt the idle session" verb, so the
 /// call is a no-op and a truly detached background task can survive it. Codemux
 /// still clears its own state, because the alternative (refusing to turn the
-/// badge off) leaves the user with a dot they cannot dismiss. Killing a
-/// detached task outright needs a provider-side capability that does not exist
-/// yet; see `docs/features/agent-chat.md` § Monitoring.
+/// badge off) leaves the user with a dot they cannot dismiss. The tracker's
+/// stop-blocklist is what keeps that surviving task from re-lighting the badge;
+/// killing it outright needs a provider-side capability that does not exist
+/// yet. See `docs/features/monitoring-status.md` § Stopping.
 ///
 /// Errors from the interrupt are swallowed for the same reason: the user asked
 /// for the monitoring to stop, and the state clear is the part Codemux can
@@ -2366,16 +2377,28 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
 pub async fn agent_chat_stop_monitoring<R: Runtime>(
     app: AppHandle<R>,
     provider: ProviderKind,
-    thread_id: ThreadId,
+    thread_id: Option<ThreadId>,
+    pane_id: Option<String>,
 ) -> Result<(), String> {
     let observability: State<'_, ObservabilityStore> = app.state();
     feature_flag_on(&observability)?;
 
-    let tracker: State<'_, SubagentTracker> = app.state();
-    let settled = tracker.stop_monitoring(&thread_id.0);
-
+    let thread_id = thread_id.filter(|id| !id.0.is_empty());
     let state: State<'_, AppStateStore> = app.state();
-    let pane_id = state.agent_chat_pane_id_for_thread(&thread_id.0);
+
+    let settled = match thread_id.as_ref() {
+        Some(thread_id) => {
+            let tracker: State<'_, SubagentTracker> = app.state();
+            tracker.stop_monitoring(&thread_id.0)
+        }
+        None => None,
+    };
+
+    // Prefer the caller's pane — it is the pane whose bar was pressed, and on
+    // a thread-less pane it is the only thing identifying the target at all.
+    let pane_id = pane_id
+        .filter(|id| !id.is_empty())
+        .or_else(|| thread_id.as_ref().and_then(|t| state.agent_chat_pane_id_for_thread(&t.0)));
     let manual_cleared = pane_id
         .as_deref()
         .map(|pane_id| state.stop_manual_monitor(pane_id))
@@ -2383,13 +2406,15 @@ pub async fn agent_chat_stop_monitoring<R: Runtime>(
 
     // Best-effort: a dead session (`SessionNotFound`) or a provider that
     // declines the call must not stop the state from clearing.
-    let registry: State<'_, ProviderRegistry> = app.state();
-    if let Ok(impl_) = lookup_provider(&registry, provider).await {
-        if let Err(error) = impl_.interrupt_turn(thread_id.clone(), None).await {
-            eprintln!(
-                "[codemux::agent_chat] stop_monitoring: interrupt was not accepted \
-                 (state cleared anyway): {error:?}"
-            );
+    if let Some(thread_id) = thread_id.as_ref() {
+        let registry: State<'_, ProviderRegistry> = app.state();
+        if let Ok(impl_) = lookup_provider(&registry, provider).await {
+            if let Err(error) = impl_.interrupt_turn(thread_id.clone(), None).await {
+                eprintln!(
+                    "[codemux::agent_chat] stop_monitoring: interrupt was not accepted \
+                     (state cleared anyway): {error:?}"
+                );
+            }
         }
     }
 
@@ -2398,7 +2423,7 @@ pub async fn agent_chat_stop_monitoring<R: Runtime>(
     // in the workspace you are looking at does not raise a review dot for
     // output already on screen.
     let mut status_changed = manual_cleared;
-    if let Some(mut status) = settled {
+    if let (Some(thread_id), Some(mut status)) = (thread_id.as_ref(), settled) {
         if status == PaneStatus::Review && state.is_thread_pane_in_active_workspace(&thread_id.0) {
             status = PaneStatus::Idle;
         }

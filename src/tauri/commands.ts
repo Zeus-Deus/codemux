@@ -1429,22 +1429,30 @@ export const agentChatInterruptTurn = (
     turnId,
   });
 
-/** Stop the background watch loops a thread is monitoring with.
+/** Stop the background watch loops a pane is monitoring with.
  *
- *  Clears the thread's monitor tracking + any `codemux monitor start` flag on
- *  its pane, and best-effort interrupts the provider session so the tasks
- *  actually die. The state clear always happens; the interrupt is only
- *  effective while a turn is in flight (see the Rust command's doc comment for
- *  the limitation). Resolves once the backend has published the recomputed
- *  pane status — the caller's "Stopping…" state is released by the status
- *  leaving `monitoring`, not by this promise. */
+ *  Clears the thread's monitor tracking (and blocklists those ids for the rest
+ *  of the run) plus any `codemux monitor start` flag on the pane, and
+ *  best-effort interrupts the provider session so the tasks actually die. The
+ *  state clear always happens; the interrupt is only effective while a turn is
+ *  in flight (see the Rust command's doc comment for the limitation).
+ *
+ *  `threadId` is nullable on purpose: a pane can carry a manual monitoring
+ *  flag with no chat thread bound to it, and Stop has to work there too —
+ *  otherwise the button spins forever on the one surface that can clear it.
+ *
+ *  Resolves once the backend has published the recomputed pane status — the
+ *  caller's "Stopping…" state is released by the status leaving `monitoring`,
+ *  not by this promise. */
 export const agentChatStopMonitoring = (
   provider: AgentChatProviderKind,
-  threadId: string,
+  threadId: string | null,
+  paneId: string,
 ) =>
   invoke<void>("agent_chat_stop_monitoring", {
     provider,
     threadId,
+    paneId,
   });
 
 /** True iff the thread has a live (non-dead) session whose turn is

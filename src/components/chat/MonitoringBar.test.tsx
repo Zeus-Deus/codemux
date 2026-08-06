@@ -104,6 +104,32 @@ describe("MonitoringBar", () => {
     expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
   });
 
+  // A pane can read `monitoring` purely from a `codemux monitor start` flag,
+  // with no chat thread bound to it at all. Stop has to work there — the bar
+  // is the only UI that can clear that flag, and a handler that quietly
+  // returns on a null thread leaves the button parked at "Stopping…" forever.
+  it("still stops on a pane with no bound thread", async () => {
+    const onStop = vi.fn(() => Promise.resolve());
+    const { rerender } = render(
+      <MonitoringBar
+        monitoring
+        reason="watching the deploy"
+        threadId={null}
+        onStop={onStop}
+      />,
+    );
+    const button = screen.getByRole("button", { name: "Stop" });
+    expect(button).toBeEnabled();
+    fireEvent.click(button);
+    expect(onStop).toHaveBeenCalledTimes(1);
+
+    // And the pending state still releases on the status, so nothing wedges.
+    rerender(
+      <MonitoringBar monitoring={false} threadId={null} onStop={onStop} />,
+    );
+    expect(screen.queryByTestId("monitoring-bar")).toBeNull();
+  });
+
   it("recovers the button when the stop command fails", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     const onStop = vi.fn(() => Promise.reject(new Error("no session")));

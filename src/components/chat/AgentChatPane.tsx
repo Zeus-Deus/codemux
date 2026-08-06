@@ -670,10 +670,15 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const monitoringReason = useAppStore(
     (s) => s.appState?.manual_monitors?.[pane.pane_id] ?? null,
   );
-  const handleStopMonitoring = useCallback(async () => {
-    if (!threadId) return;
-    await agentChatStopMonitoring(provider, threadId);
-  }, [provider, threadId]);
+  // Deliberately runs with or without a thread. A pane can read `monitoring`
+  // purely from a `codemux monitor start` flag — no chat session involved —
+  // and bailing out on a null thread would leave that pane's Stop button
+  // spinning at "Stopping…" forever, on the only surface that can clear it.
+  // The backend skips the thread-scoped half when there is no thread.
+  const handleStopMonitoring = useCallback(
+    () => agentChatStopMonitoring(provider, threadId, pane.pane_id),
+    [provider, threadId, pane.pane_id],
+  );
 
   const {
     model,

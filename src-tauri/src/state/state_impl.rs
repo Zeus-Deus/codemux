@@ -878,6 +878,31 @@ fn terminal_count_for_workspace(workspace: &WorkspaceSnapshot) -> usize {
     collect_terminal_sessions(&workspace.surfaces).len()
 }
 
+/// Drop every manual-monitor flag whose pane no longer exists.
+///
+/// A flag is a claim by a live process about a specific pane, so the pane
+/// going away ends it. Closing a *pane* clears its own flag explicitly
+/// ([`AppStateStore::clear_manual_monitors_for_panes`], called from
+/// `close_pane_impl`), but closing or archiving a whole workspace removes
+/// every pane in it in one move without ever naming them — so this runs on
+/// the way out of [`AppStateStore::close_workspace`] and sweeps the lot.
+///
+/// A whole-map prune rather than a walk of the removed workspace's surfaces:
+/// it is the same handful of comparisons (the map is empty in the
+/// overwhelming majority of sessions, and holds single digits otherwise),
+/// and it cannot be defeated by some future removal path that forgets to
+/// call it with the right pane ids.
+fn prune_manual_monitors(snapshot: &mut AppStateSnapshot) {
+    if snapshot.manual_monitors.is_empty() {
+        return;
+    }
+    let workspaces = std::mem::take(&mut snapshot.workspaces);
+    snapshot
+        .manual_monitors
+        .retain(|pane_id, _| find_workspace_id_for_pane(&workspaces, pane_id).is_some());
+    snapshot.workspaces = workspaces;
+}
+
 impl Default for AppStateStore {
     fn default() -> Self {
         Self {
@@ -906,7 +931,9 @@ impl Default for AppStateStore {
 /// A flag whose pane has since closed is ignored (and dropped from the clone)
 /// rather than trusted: pane ids are the only thing tying a flag to anything
 /// real, and a badge on a pane that no longer exists cannot be turned off from
-/// the UI.
+/// the UI. That is a read-side guard on the *snapshot*, not a fix for the
+/// stored map — see [`prune_manual_monitors`], which is what keeps the real
+/// one bounded.
 fn apply_manual_monitors(snapshot: &mut AppStateSnapshot) {
     if snapshot.manual_monitors.is_empty() {
         return;
@@ -2607,6 +2634,9 @@ impl AppStateStore {
                 .agent_browser_sessions
                 .retain(|s| s.workspace_id.0 != workspace_id);
             snapshot.active_workspace_id = WorkspaceId("".into());
+            // Every pane in the workspace just went away, and with it any
+            // `codemux monitor start` claim made against one.
+            prune_manual_monitors(&mut snapshot);
             return Ok(CloseWorkspaceResult {
                 fallback: WorkspaceId("".into()),
                 removed_sessions: removed_session_id_strings
@@ -2650,6 +2680,10 @@ impl AppStateStore {
             .map(|workspace| workspace.workspace_id.clone())
             .ok_or_else(|| "No fallback workspace available".to_string())?;
         snapshot.active_workspace_id = fallback_workspace.clone();
+        // Same for the ordinary multi-workspace path: archiving routes
+        // through here too (`close_workspace_with_worktree_impl`), so this is
+        // the one choke point both removals share.
+        prune_manual_monitors(&mut snapshot);
 
         Ok(CloseWorkspaceResult {
             fallback: fallback_workspace,
@@ -8282,6 +8316,56 @@ mod tests {
         let snapshot = store.snapshot();
         assert!(snapshot.pane_statuses.is_empty());
         assert!(snapshot.manual_monitors.is_empty());
+    }
+
+    /// The read-side guard above only cleans the *clone*. Closing or
+    /// archiving a workspace removes every pane in it in one move, without
+    /// ever naming them, so without the prune the flags would sit in the
+    /// stored map for the rest of the process lifetime.
+    ///
+    /// Asserts the INNER map on purpose: `snapshot()` would hide the leak.
+    #[test]
+    fn closing_a_workspace_clears_its_panes_manual_monitor_flags() {
+        let store = AppStateStore::default();
+        let keep = store.snapshot().active_workspace_id.0.clone();
+        let doomed = store.create_workspace().0;
+        let doomed_pane = store
+            .create_agent_chat_pane(&doomed, None, None, None)
+            .unwrap();
+        let kept_pane = store
+            .create_agent_chat_pane(&keep, None, None, None)
+            .unwrap();
+        store.start_manual_monitor(&doomed_pane.0, Some("watching CI".into()));
+        store.start_manual_monitor(&kept_pane.0, None);
+        assert_eq!(store.inner.lock().unwrap().manual_monitors.len(), 2);
+
+        store.close_workspace(&doomed).unwrap();
+
+        let inner = store.inner.lock().unwrap();
+        assert!(
+            !inner.manual_monitors.contains_key(&doomed_pane.0),
+            "the closed workspace's flag must not survive in the stored map",
+        );
+        assert!(
+            inner.manual_monitors.contains_key(&kept_pane.0),
+            "a live pane's flag is untouched",
+        );
+    }
+
+    /// The single-workspace close path is a separate early return in
+    /// `close_workspace`, so it gets its own coverage.
+    #[test]
+    fn closing_the_last_workspace_clears_its_manual_monitor_flags() {
+        let store = AppStateStore::default();
+        let only = store.snapshot().active_workspace_id.0.clone();
+        let pane = store
+            .create_agent_chat_pane(&only, None, None, None)
+            .unwrap();
+        store.start_manual_monitor(&pane.0, None);
+
+        store.close_workspace(&only).unwrap();
+
+        assert!(store.inner.lock().unwrap().manual_monitors.is_empty());
     }
 
     #[test]

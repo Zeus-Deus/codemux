@@ -2992,14 +2992,23 @@ payloads and the other providers decode as `false`). The Claude adapter
 stamps it from the exact discriminator it already has:
 `SubagentDemux::is_top_level_launch` is true only for a `tool_use_id`
 registered by a real `Agent`/`Task` launch, so `!is_top_level_launch(id)`
-on a task event means "background job, not subagent". In
-`map_event_to_pane_status` a flagged `running`/`pending` snapshot is never
-inserted into `running`, always returns `None` — even when a `Review` is
-owed, so a progress tick cannot resurrect `Working` after the turn
-settled — and defensively removes the id in case an unflagged variant
-inserted it earlier. Terminal flagged snapshots still `remove` and keep
-the owed-`Review` emptiness check unchanged. Real async `Task` launches
-are untouched: their deferred-`Review` flow above is deliberate.
+on a task event means "background job, not subagent". A flagged
+`running`/`pending` snapshot is therefore **not tracked at all** and
+returns `None` — even after the turn settled, so a progress tick cannot
+resurrect `Working` — and it defensively drops the id in case an
+unflagged variant inserted it earlier. Terminal flagged snapshots still
+drop the id and leave the settled-status computation unchanged. Real
+async `Task` launches are untouched: their deferred-`Review` flow above
+is deliberate.
+
+The one exception is a background job the SDK *also* labels a watch loop
+(`task_kind`, below): that one is tracked, because the badge is the whole
+point of it — but as a monitor, which never blocks the settle either. The
+two classifications are stamped together by one
+`stamp_task_classification` call per `translate_task_*` fn and folded
+into a single `TaskClass` by the tracker; see
+`docs/features/monitoring-status.md` § "Two classifications, not two
+candidates".
 
 **The stall watchdog force-settles an owed `Review` that goes silent.**
 The rule above removes the known cause, but any *other* missed terminal
@@ -3007,13 +3016,19 @@ signal (a crashed notification, a provider quirk) would pin `Working` the
 same way, and `RunStalled` is advisory only — it maps to pane-status
 `None`. So the 30s sweep (`spawn_stall_watchdog`) has a second pass,
 `force_settle_overdue_reviews`. `ThreadSubagentState` tracks
-`review_owed_since`, stamped when `TurnCompleted` defers the `Review` and
-re-armed by *any* tick from a real tracked entry (`refreshes_owed_review`
-— a flagged background-task snapshot deliberately does **not** count, so
-a never-ending shell job can't hold the clock open). Because any real
-tick re-arms it, the 600s `STALL_THRESHOLD` means "every remaining
-blocker has been silent for ten minutes", not "the thread has been quiet
-since the turn ended".
+`review_owed_since`, stamped while a `Review` is owed and re-armed by
+*any* tick from a real agent-class tracked entry (`refreshes_owed_review`
+— a background-task snapshot and a watch-loop snapshot deliberately do
+**not** count, so neither a never-ending shell job nor a chatty CI poll
+can hold the clock open). Because any real tick re-arms it, the 600s
+`STALL_THRESHOLD` means "every remaining blocker has been silent for ten
+minutes", not "the thread has been quiet since the turn ended".
+
+The sweep's scope is an invariant rather than a rule to remember:
+`review_pending` is *derived* as `turn_settled && !forced_settled &&
+has_agents()`, so a thread whose only live entries are watch loops (or
+background rows, which are tracked nowhere) is invisible to it by
+construction and can never be force-settled off its `Monitoring` badge.
 
 **What that threshold cannot prove is that the run is dead.** A single
 long tool call — a `cargo test`, a big build — emits nothing for longer
@@ -3030,22 +3045,22 @@ perfectly alive. The forced path is therefore deliberately
   recoverable. Everything else — the `Review`→`Idle` downgrade in the
   active workspace, the stamped `app-state-changed` emit — is shared.
 - **It tombstones the tracker entry instead of dropping it.**
-  `take_overdue_reviews` clears only what it publishes (`review_pending`,
-  the silence clock) and sets `ThreadSubagentState::forced_settled`,
-  leaving `running` intact. That keeps the settle take-once (a later
-  sweep sees no owed `Review`), and a late-but-real terminal snapshot
-  then drains `running` through the ordinary path, publishes **nothing**
-  (the `Review` was already announced, possibly already cleared by the
-  user), and lets the now-clear entry be dropped. Removing the entry at
-  settle time instead would leave that snapshot to recreate a
-  `review_pending: false` husk that nothing ever collects. The tombstone
-  is cleared by every genuine turn boundary — a new
-  `SessionStatus::Running`, session teardown, or the send-message
-  `clear_thread`.
+  `take_overdue_reviews` clears only what it publishes (the silence
+  clock) and sets `ThreadSubagentState::forced_settled`, leaving the
+  task map intact — which is also what makes the derived
+  `review_pending` read false from then on. That keeps the settle
+  take-once (a later sweep skips it), and a late-but-real terminal
+  snapshot then drains the map through the ordinary path, publishes
+  **nothing** (the `Review` was already announced, possibly already
+  cleared by the user), and lets the now-clear entry be dropped.
+  Removing the entry at settle time instead would leave that snapshot to
+  recreate a husk that nothing ever collects. The tombstone is cleared by
+  every genuine turn boundary — a new `SessionStatus::Running`, session
+  teardown, or the send-message `clear_thread`.
 
 The sweep still runs under the tracker lock, and the mutex is released
 before any `AppStateStore` call. It can never cut a live *turn* short:
-`review_pending` is set exclusively by `TurnCompleted`.
+`review_pending` needs `turn_settled`, which only `TurnCompleted` sets.
 
 Only *live* provider events reach the tracker: transcript hydration/resume
 replays persisted events through the frontend reducer
@@ -3055,18 +3070,22 @@ replays persisted events through the frontend reducer
 thread's tracking so a stuck subagent can never pin the spinner after the
 session is gone.
 
-**Watch loops settle to `Monitoring`, not `Working`.** The tracker's live set
-is split in two — agent tasks and background watch loops (`monitor` /
-`monitor_mcp` / `local_bash` / `shell`, classified from the SDK's optional
-`task_started.task_type`). Once the turn settles with zero agent tasks and at
-least one live watch loop, the thread publishes `PaneStatus::Monitoring`
-instead of holding `Working`, and the owed `Review` fires when the last watch
-loop stops. A watch loop keeps its transcript card but is excluded from the
-`SubagentActivityBar` roster. A docked `MonitoringBar` between transcript and
-composer carries the Stop button (`agent_chat_stop_monitoring`), and any
-provider's agent can reach the same status through `codemux monitor start`.
-Full rules, the combination choke point, and the bare-session interrupt
-limitation: `docs/features/monitoring-status.md`.
+**A settled thread with a live watch loop reads `Monitoring`.** The tracker
+classifies each live task as agent work or a watch loop (`monitor` /
+`monitor_mcp` / `local_bash` / `shell`, from the SDK's optional
+`task_started.task_type`). A watch loop **never defers the settle** — the turn
+completes, the `Review` publishes, `run_finished` fires and the detached
+browser is released exactly as it would with no monitor at all. All it changes
+is *which* settled status is shown: `settled_status()` reads
+`Working` → `Monitoring` → `Review` straight off the live sets, so a monitor
+whose first snapshot lands after the turn settled still lights the badge, and
+the pane falls back to `Review`/`Idle` the moment the last one ends. A watch
+loop keeps its transcript card but is excluded from the `SubagentActivityBar`
+roster. A docked `MonitoringBar` between transcript and composer carries the
+Stop button (`agent_chat_stop_monitoring`, durable via a per-run
+stop-blocklist), and any provider's agent can reach the same status through
+`codemux monitor start`. Full rules, the combination choke point, and the
+bare-session interrupt limitation: `docs/features/monitoring-status.md`.
 
 ## Follow-up queueing
 

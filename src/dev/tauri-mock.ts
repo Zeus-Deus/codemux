@@ -2209,8 +2209,15 @@ const handlers: Record<string, Handler> = {
   // manual-monitor reason, then re-emit so the bar unmounts and the
   // sidebar badge clears in one frame.
   agent_chat_stop_monitoring: (a) => {
-    const { threadId } = a as { threadId: string };
-    const paneId = findChatPaneIdForThread(threadId);
+    // `threadId` is nullable: a pane can be flagged monitoring with no chat
+    // thread bound to it, and Stop has to work there too. The caller's pane
+    // id wins, exactly like the real command.
+    const { threadId, paneId: explicitPaneId } = a as {
+      threadId: string | null;
+      paneId?: string;
+    };
+    const paneId =
+      explicitPaneId || (threadId ? findChatPaneIdForThread(threadId) : null);
     if (!paneId) return undefined;
     const paneStatuses = { ...appState.pane_statuses };
     const manualMonitors = { ...(appState.manual_monitors ?? {}) };
