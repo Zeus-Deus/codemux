@@ -263,7 +263,12 @@ export function effectiveActivityAt(
  *  Same guardrail as Settle, for the same reason: a working agent or one
  *  blocked on a permission prompt can never be put out of sight. Snooze is
  *  worse than settle here — settle at least leaves the row on a shelf the user
- *  is looking at, while a snooze hides it behind a wake time. */
+ *  is looking at, while a snooze hides it behind a wake time.
+ *
+ *  A `monitoring` workspace is deliberately *not* guarded. A background watch
+ *  loop can run for hours, and "I know, wake me later" is the whole reason a
+ *  user would park it — treating it like live work would make the one state
+ *  most worth deferring the one state that cannot be. */
 export function isSnoozeable(status: ActivePaneStatus | null): boolean {
   return status !== "working" && status !== "permission";
 }
@@ -1308,8 +1313,9 @@ export function SidebarInbox() {
   // Settle safety net: a settled workspace whose agent goes live ("working")
   // or blocked ("permission") resurfaces into the active list automatically,
   // so live or blocked work can never stay buried under the divider. Finished
-  // ("review") and idle settled rows stay put — only fresh activity resurfaces
-  // them. Unsettle removes the entry from `settled`, so re-runs converge; we
+  // ("review"), monitoring and idle settled rows stay put — only fresh
+  // activity resurfaces them, and a background watch loop is not news: the
+  // user parked the workspace *because* it was going to keep ticking. Unsettle removes the entry from `settled`, so re-runs converge; we
   // iterate a snapshot and skip ids that aren't currently settled.
   useEffect(() => {
     if (!loaded || !paneStatuses) return;

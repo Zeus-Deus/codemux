@@ -238,6 +238,10 @@ interface WorkspaceSeed extends Partial<WorkspaceSnapshot> {
 
 const terminalSessions: TerminalSessionSnapshot[] = [];
 const paneStatuses: Record<string, PaneStatus> = {};
+/** Runtime-only `codemux monitor start` flags (pane_id → reason). Mirrors
+ *  `AppStateSnapshot.manual_monitors`; `tauri-mock.ts` mutates it when the
+ *  docked bar's Stop button fires. */
+const manualMonitors: Record<string, string | null> = {};
 
 /** Materialize a `WorkspaceSnapshot` from a terse seed, filling in the
  *  many optional/boilerplate fields with sane defaults and wiring the
@@ -515,6 +519,54 @@ const wsCodemuxChatLive = (() => {
   };
 })();
 
+/** Thread id of the seeded "Monitoring" demo. */
+export const MOCK_MONITORING_THREAD_ID = "thread-mock-monitoring";
+
+/** Reason string the seeded monitoring pane carries, as if an agent had run
+ *  `codemux monitor start --reason "…"`. Surfaces in the docked
+ *  `MonitoringBar` title and proves the reason plumbing end to end. */
+export const MOCK_MONITORING_REASON = "CI checks on PR #482";
+
+/** Monitoring demo (`docs/features/monitoring-status.md`): a chat agent that
+ *  finished its deliverable and is now babysitting a CI run. Seeds the calm
+ *  cyan sidebar badge + the docked "Monitoring in the background" bar with a
+ *  working Stop button, so both are screenshot-reachable under `npm run dev`
+ *  without needing a live provider that emits watch-loop tasks. */
+const wsCodemuxMonitoring = (() => {
+  const cwd = `${HOME}/.codemux/worktrees/codemux/demo-monitoring`;
+  const ws = makeWorkspace({
+    workspace_id: "ws-codemux-monitoring",
+    title: "monitoring-demo",
+    cwd,
+    worktree_path: cwd,
+    project_root: codemuxRoot,
+    project_uid: codemuxUid,
+    workspace_kind: "worktree",
+    git_branch: "demo/monitoring",
+    pr_number: 482,
+    pr_state: "open",
+    pr_url: "https://github.com/example/codemux/pull/482",
+  });
+  const { pane, surface, tab } = chatSurface(
+    "Agent Chat",
+    cwd,
+    MOCK_MONITORING_THREAD_ID,
+  );
+  // Steady cyan dot. Seeded through BOTH halves of the feature — the
+  // effective `pane_statuses` entry the sidebar reads, and the runtime-only
+  // `manual_monitors` reason the chat bar reads — because the real backend
+  // publishes them together (`apply_manual_monitors`).
+  paneStatuses[pane.pane_id] = "monitoring";
+  manualMonitors[pane.pane_id] = MOCK_MONITORING_REASON;
+  return {
+    ...ws,
+    tabs: [tab],
+    active_tab_id: tab.tab_id,
+    active_surface_id: surface.surface_id,
+    surfaces: [surface],
+  };
+})();
+
 const wsCodemuxPorts = makeWorkspace({
   workspace_id: "ws-codemux-ports",
   title: "port-detection",
@@ -752,6 +804,7 @@ const ALL_WORKSPACES: WorkspaceSnapshot[] = [
   wsCodemuxSidebar,
   wsCodemuxMock,
   wsCodemuxChatLive,
+  wsCodemuxMonitoring,
   wsCodemuxPorts,
   wsCodemuxWorkflowApproval,
   wsCodemuxWorkflowRunning,
@@ -1898,9 +1951,63 @@ export function workflowCompleteEnvelopes(threadId: string): unknown[] {
   ];
 }
 
+// ── Monitoring demo transcript ───────────────────────────────────────
+//
+// A finished deliverable plus a still-running watch loop, which is exactly
+// the shape that settles a thread to `PaneStatus::Monitoring`: the turn
+// completed, no agent tasks are live, and one `task_kind: "monitor"` subagent
+// is still going. That monitor row deliberately keeps its transcript card
+// (the user should be able to see what is being watched) while being excluded
+// from the docked "N subagents running" bar.
+
+/** Envelopes for {@link MOCK_MONITORING_THREAD_ID}. */
+export function monitoringEnvelopes(threadId: string): unknown[] {
+  const turnId = "turn-monitoring";
+  return [
+    {
+      type: "user_message",
+      thread_id: threadId,
+      text: "Push the auth fix and keep an eye on CI — ping me if it goes red.",
+    },
+    {
+      type: "item_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      item: {
+        kind: "assistant_message",
+        text:
+          "Pushed `fix/token-refresh` and opened **PR #482**. I'll watch the " +
+          "checks in the background and report back if anything fails.",
+      },
+    },
+    {
+      type: "subagent_updated",
+      thread_id: threadId,
+      subagent: {
+        subagent_id: "monitor-ci-482",
+        name: "CI watch",
+        agent_type: "monitor",
+        task_kind: "monitor",
+        model: "haiku",
+        status: "running",
+        activity: "Polling checks on PR #482 (3 of 7 green)",
+        tool_use_count: 12,
+        total_tokens: 4_200,
+      },
+    },
+    {
+      type: "turn_completed",
+      thread_id: threadId,
+      turn_id: turnId,
+      status: { kind: "success" },
+      usage: null,
+    },
+  ];
+}
+
 // ── Stress-fixture scaling ──────────────────────────────────────────
 //
-// The curated 18 workspaces above are a design fixture. Selecting a stress
+// The curated 19 workspaces above are a design fixture. Selecting a stress
 // fixture (`?fixture=large`, see `stress-fixture.ts`) scales that list to the
 // audited real profile so switch latency is measured against something honest.
 // Generated workspaces reuse the same builders, so they carry the same pane /
@@ -1997,6 +2104,7 @@ export function createSeedAppState(): AppStateSnapshot {
       },
     ],
     pane_statuses: paneStatuses,
+    manual_monitors: manualMonitors,
     archived_workspaces: ARCHIVED_WORKSPACES,
     persistence: MOCK_PERSISTENCE,
     config: MOCK_CONFIG,
