@@ -41,6 +41,32 @@ export const PR_CHIP_TONE: Record<PrStatusState, string> = {
     "text-muted-foreground border-muted-foreground/40 bg-muted-foreground/10 hover:bg-muted-foreground/20",
 };
 
+/** Deferred-color variant of `STATE_TO_ICON` for the sidebar's parked rows.
+ *  A settled row is history: it rests grayed out and only lights up under the
+ *  pointer (or keyboard focus), so its PR badge starts neutral and picks the
+ *  state color up on hover. Same colors as `STATE_TO_ICON` — only the timing
+ *  differs. The variants name the settled row's own group (`group/settled` in
+ *  `sidebar-inbox.tsx`) and are written out in full because Tailwind only
+ *  sees class names that appear literally in the source. Keep the hues in
+ *  lockstep with `STATE_TO_ICON` / `STATE_TO_TONE` / `PR_CHIP_TONE` above —
+ *  they are one palette wearing four sets of chrome, and a state that drifts
+ *  here shows up as a PR that changes color when you point at it. */
+const STATE_TO_SETTLED_HOVER: Record<PrStatusState, string> = {
+  merged:
+    "group-hover/settled:text-accent-violet group-focus-within/settled:text-accent-violet",
+  open: "group-hover/settled:text-status-open group-focus-within/settled:text-status-open",
+  closed:
+    "group-hover/settled:text-destructive group-focus-within/settled:text-destructive",
+  draft:
+    "group-hover/settled:text-muted-foreground group-focus-within/settled:text-muted-foreground",
+};
+
+export function prStatusSettledHoverClass(state: string | null | undefined): string | null {
+  const normalized = normalizePrState(state);
+  if (!normalized) return null;
+  return STATE_TO_SETTLED_HOVER[normalized];
+}
+
 export function prStatusToneClass(state: string | null | undefined): string | null {
   const normalized = normalizePrState(state);
   if (!normalized) return null;

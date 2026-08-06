@@ -61,6 +61,7 @@ import {
   isPrOnCurrentBranch,
   normalizePrState,
   PrStatusIcon,
+  prStatusSettledHoverClass,
   prStatusTextClass,
   type PrStatusState,
 } from "@/components/github/pr-status-icon";
@@ -449,6 +450,10 @@ interface SettledRowProps {
   status: ActivePaneStatus | null;
   /** Elapsed-since-work-ended label ("2h"), or null when unknown. */
   time: string | null;
+  /** Unseen output on the row — same derivation the active cards use. Kept as
+   *  a prop rather than re-derived here so a row and its card can never
+   *  disagree, and so "Mark unread" has a visible effect on this shelf. */
+  unread: boolean;
   justSettled: boolean;
   onUnsettle: (workspaceId: string) => void;
   onSelect: (workspaceId: string, mode: SelectMode) => void;
@@ -465,6 +470,7 @@ const SettledRow = memo(function SettledRow({
   selected,
   status,
   time,
+  unread,
   justSettled,
   onUnsettle,
   onSelect,
@@ -472,6 +478,28 @@ const SettledRow = memo(function SettledRow({
 }: SettledRowProps) {
   const appearance = useProjectAppearance(repo.path);
   const prState = normalizePrState(workspace.pr_state);
+
+  // Settled work is history, so the shelf reads as one grey block at rest:
+  // the repo avatar desaturates, the title drops to a faint muted tone and
+  // the PR badge gives up its state color. Hover (or keyboard focus) restores
+  // all three at once, so the tail stays scannable when you are hunting for a
+  // specific workspace — the same "recede until wanted" rule the active cards
+  // follow, taken one step further because nothing on this shelf wants you.
+  //
+  // The exclusion list is the active card's `receded` predicate verbatim (see
+  // `SidebarInboxCard`), so one workspace never reads as "wants you" on a card
+  // and "history" on a row: the workspace you are in, anything ticked for a
+  // bulk action, a row holding output you have not read, and a finished
+  // ("review") agent all keep full prominence. Review matters most here — the
+  // settle safety net deliberately leaves review work parked, so those rows
+  // are the one thing on this shelf that is still asking for a human. The
+  // card's `woke` term has no counterpart because waking is un-snoozing: a
+  // just-woken workspace is a card, never a settled row.
+  const dimmed =
+    !isActive &&
+    !selected &&
+    !unread &&
+    (status === "working" || status === "monitoring" || status === null);
 
   const handleClick = (e: React.MouseEvent) => {
     const mode = selectModeFor(e);
@@ -547,9 +575,20 @@ const SettledRow = memo(function SettledRow({
         cacheBust={appearance.imageVersion}
         size="sm"
         shape="square"
-        className="font-bold opacity-80"
+        className={cn(
+          "font-bold opacity-80",
+          dimmed &&
+            "opacity-40 grayscale transition-[opacity,filter] duration-150 group-hover/settled:opacity-100 group-hover/settled:grayscale-0 group-focus-within/settled:opacity-100 group-focus-within/settled:grayscale-0",
+        )}
       />
-      <span className="min-w-0 flex-1 truncate text-xs font-medium text-muted-foreground">
+      <span
+        className={cn(
+          "min-w-0 flex-1 truncate text-xs font-medium transition-colors duration-150",
+          dimmed
+            ? "text-muted-foreground/60 group-hover/settled:text-foreground group-focus-within/settled:text-foreground"
+            : "text-foreground",
+        )}
+      >
         {workspace.title}
       </span>
       {prState && (
@@ -567,13 +606,29 @@ const SettledRow = memo(function SettledRow({
           className={cn(
             "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 font-mono text-[10px] font-medium",
             "transition-colors duration-150",
-            prStatusTextClass(prState),
+            // Held one step brighter than the avatar's /40: `#87` is this
+            // control's only label, so the badge has to stay legible at rest
+            // even though it has given its state color up. The row still
+            // reads as one grey block — the difference is a shade, not a
+            // second focal point.
+            dimmed
+              ? cn("text-muted-foreground/55", prStatusSettledHoverClass(prState))
+              : prStatusTextClass(prState),
             workspace.pr_url
               ? "hover:bg-foreground/[0.055]"
               : "cursor-default opacity-65",
           )}
         >
-          <PrStatusIcon state={prState} size={3} className="shrink-0" />
+          {/* `text-current` hands the icon's color to the button above, so
+              the badge's icon and number light up together on hover instead
+              of the icon staying colored while the number is grey. It works
+              because `PrStatusIcon` runs its own `STATE_TO_ICON` color through
+              `cn()` *before* this className: tailwind-merge is caller-wins
+              within a conflicting group, so the later `text-current` drops the
+              built-in `text-status-open`/etc. Swap that argument order inside
+              the icon and this badge silently goes back to a colored glyph on
+              a grey number — there is a test pinning it. */}
+          <PrStatusIcon state={prState} size={3} className="shrink-0 text-current" />
           {workspace.pr_number != null && <span>#{workspace.pr_number}</span>}
         </button>
       )}
@@ -1858,6 +1913,7 @@ export function SidebarInbox() {
                       : null
                   }
                   time={formatElapsed(now - resolveSettledTimestamp(entry))}
+                  unread={isUnread(workspace)}
                   justSettled={justSettledId === workspace.workspace_id}
                   onUnsettle={handleUnsettle}
                   onSelect={handleSelect}

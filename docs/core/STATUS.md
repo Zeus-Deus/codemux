@@ -23,8 +23,9 @@ directly-committed new-turn scroll contract (PR #247), its scroll-feel
 follow-up (PR #249), the stuck-"Working" run-settlement fix, the side-branch
 PR badge fallback, the floating-chrome
 refinement commits that shipped alongside PR #245, the
-AskUserQuestion-panel questionnaire migration (PR #252), and the "Monitoring"
-agent status, grouped by subsystem below:
+AskUserQuestion-panel questionnaire migration (PR #252), the "Monitoring"
+agent status, and the dimmed Settled shelf (PR #256), grouped by subsystem
+below:
 
 - **AskUserQuestion panel rebuilt on the shadcn Questionnaire component** (PR #252). `ComposerPendingInputPanel`'s hand-rolled option rows, paging chevrons, and hidden `sr-only` inputs are replaced by the newly released shadcn **Questionnaire** primitives (`src/components/ui/questionnaire.tsx` over the new `@shadcn/react` package, installed for the repo's `radix-nova` style): real fieldset/legend semantics per question, radio/checkbox indicator cards with automatically mapped 1–9 shortcut chips, focus-visible rings the old panel lacked, and Previous/Next/Submit navigation. The externally observable contract is unchanged — same `AskUserQuestionOutput` shape (answers keyed by question text, `", "`-joined multiSelect with free text appended, raw `questions` echoed), same composer-docked card on the chat-column rails, same global document-level keyboard layer for focus-outside-the-form digits/arrows/Enter (now guarded against double-handling with the primitive's in-form handler), same `option.preview` HoverCards and test ids. `npm run dev` + `?askq=1` seeds a pending two-question request for browser QA; the mock's `agent_chat_respond_to_request` now resolves it so answering settles the panel into the reply bubble. See `docs/features/agent-chat.md` § "AskUserQuestion panel".
 
@@ -73,6 +74,26 @@ agent status, grouped by subsystem below:
   `docs/features/agent-chat.md` §§ "Sidebar status indicators", "Docked live
   activity bar", "Agent Tasks panel" and `docs/features/browser.md`
   § "Run-finished release".
+
+- **Settled rows are dimmed until hovered** (PR #256). The Settled shelf is
+  history, so it reads as one grey block at rest rather than a list of
+  full-color rows competing with live work: the repo avatar desaturates, the
+  title drops to a fainter muted tone, and the PR badge gives up its state
+  color (the open/merged/closed hue is deferred, not dropped — it moves to a
+  `group-hover/settled:` variant held by the new `prStatusSettledHoverClass`
+  beside the existing PR color maps, and the badge's icon inherits
+  `text-current` so glyph and number light up together). Hover or keyboard
+  focus restores all three at once — nothing is hidden, only ranked. The
+  exclusions are the active card's `receded` predicate verbatim, so one
+  workspace can't read as "wants you" on a card and "history" on a row: the
+  currently-open workspace, any multi-selected row, an **unread** row (`unread`
+  is now plumbed into `SettledRow`, which also gives the row's "Mark unread"
+  action a visible effect), and a **review**-status row all stay bright — the
+  last one matters because the settle safety net deliberately leaves
+  finished-and-wants-review work parked. The badge rests at
+  `text-muted-foreground/55` rather than the avatar's `/40`, since `#n` is that
+  button's only label. Frontend + docs only; no Rust changes. See
+  `docs/features/sidebar.md` § "Settle / un-settle".
 
 - **A PR opened from a side branch no longer goes unbadged** (sidebar PR
   fallback). An agent working in a workspace that ran `git checkout -b
