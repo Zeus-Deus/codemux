@@ -4626,6 +4626,7 @@ mod tests {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
             tabs: Vec::new(),

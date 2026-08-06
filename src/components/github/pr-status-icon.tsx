@@ -66,6 +66,40 @@ export function normalizePrState(state: string | null | undefined): PrStatusStat
   return null;
 }
 
+/** Does a workspace's PR badge actually describe *this checkout's* work?
+ *
+ *  The backend also shows a badge for a PR opened from a branch the worktree
+ *  merely visited recently — the case an agent creates when it branches off,
+ *  pushes, opens a PR, and checks the worktree back (see the sidebar doc's
+ *  "PR association" section). Surfacing that is right: the workspace visibly
+ *  produced a pull request and the user should be able to reach it. Drawing
+ *  *lifecycle* conclusions from it is not — the branch the user is standing on
+ *  can still be full of uncommitted work, and that PR merging says nothing
+ *  about it.
+ *
+ *  So the badge renders unconditionally, while every rule that moves a card on
+ *  the strength of a PR — auto-settle, and the "Wrapping up" demotion — asks
+ *  this first. It lives beside `normalizePrState` because both the sidebar and
+ *  the hover card need it and neither may import the other.
+ *
+ *  Missing information on *either* side reads as a match. An absent head branch
+ *  means "association predates the field" rather than "side branch", so the
+ *  honest default for an unknown is the behaviour that shipped before; real
+ *  fallback associations always carry one. An absent `gitBranch` is the same
+ *  kind of unknown seen from the other end — `git_branch_info` reports no
+ *  branch during a rebase, a bisect, or any detached HEAD, while the stored
+ *  head branch survives — and comparing a known name against that unknown would
+ *  read as "different branch" and silently un-associate a workspace from its
+ *  own open PR for the length of the rebase. Not knowing which branch you are
+ *  on is not evidence that the PR belongs to another one. */
+export function isPrOnCurrentBranch(
+  prHeadBranch: string | null | undefined,
+  gitBranch: string | null | undefined,
+): boolean {
+  if (!prHeadBranch || !gitBranch) return true;
+  return prHeadBranch === gitBranch;
+}
+
 interface Props {
   state: string | null | undefined;
   /** Size in Tailwind spacing units (1 = 4px). 3.5 = 14px (default). */

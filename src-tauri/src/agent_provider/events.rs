@@ -118,6 +118,16 @@ pub struct SubagentSnapshot {
     /// last planned phase title).
     #[serde(default)]
     pub phase: Option<String>,
+    /// This row is a provider **background task** (e.g. a background
+    /// shell command) rather than a real delegated subagent: it can
+    /// legitimately outlive the turn and never emit a terminal update, so
+    /// it must not hold the workspace in `Working` after `TurnCompleted`.
+    ///
+    /// `#[serde(default)]` like every other additive field, so snapshots
+    /// persisted before this existed — and every provider that never sets
+    /// it — decode as `false` (an ordinary subagent).
+    #[serde(default)]
+    pub background_task: bool,
 }
 
 /// One planned phase of a `Workflow` run, parsed best-effort out of the
@@ -649,6 +659,7 @@ mod tests {
             provider_ref: None,
             workflow_id: None,
             phase: None,
+            background_task: false,
         }
     }
 
@@ -679,6 +690,10 @@ mod tests {
         let snap: SubagentSnapshot = serde_json::from_value(json!({})).unwrap();
         assert_eq!(snap.subagent_id, "");
         assert_eq!(snap.status, SubagentStatus::Pending);
+        assert!(
+            !snap.background_task,
+            "an older payload without the flag decodes as an ordinary subagent"
+        );
     }
 
     #[test]

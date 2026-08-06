@@ -50,6 +50,7 @@ import {
   findSubagentView,
   subagentOrdinal,
 } from "@/lib/agent-chat/subagents";
+import { taskChipSummary } from "@/lib/agent-chat/task-summary";
 import { hasUltrathinkInBodyText } from "@/lib/agent-chat/ultrathink";
 import { basename } from "@/lib/path";
 import { toast } from "@/lib/toast";
@@ -530,14 +531,13 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   const tasks = useAgentChatStore((s) =>
     threadId ? s.threads[threadId]?.tasks ?? null : null,
   );
-  const taskSummary = useMemo(() => {
-    if (!tasks || tasks.tasks.length === 0) return null;
-    return {
-      completed: tasks.tasks.filter((task) => task.status === "completed").length,
-      total: tasks.tasks.length,
-      running: tasks.tasks.some((task) => task.status === "in_progress"),
-    };
-  }, [tasks]);
+  // The chip's spinner is a LIVE affordance, so `taskChipSummary` gates it
+  // on the thread actually streaming rather than on the snapshot alone —
+  // see the helper for why the durable plan can't settle itself.
+  const taskSummary = useMemo(
+    () => taskChipSummary(tasks, streaming),
+    [tasks, streaming],
+  );
   const handleTasksClick = useCallback(() => {
     if (paneWorkspaceId) toggleRightPanel?.(paneWorkspaceId, "tasks");
   }, [paneWorkspaceId, toggleRightPanel]);
@@ -2992,6 +2992,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               <SubagentActivityBar
                 messages={messages}
                 threadId={threadId}
+                streaming={transcriptStreaming}
                 onJump={handleJumpToSubagentCard}
               />
             </div>

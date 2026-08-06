@@ -400,6 +400,9 @@ fn subagent_snapshot(subagent_id: &str, status: SubagentStatus) -> SubagentSnaps
         provider_ref: Some(subagent_id.to_string()),
         workflow_id: None,
         phase: None,
+        // Codex has no background-task concept on this path — every row
+        // here is a real delegated agent.
+        background_task: false,
     }
 }
 
