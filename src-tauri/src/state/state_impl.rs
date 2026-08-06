@@ -1987,6 +1987,37 @@ impl AppStateStore {
         Ok(true)
     }
 
+    /// Write a workspace's `pinned_at` verbatim, for restoring a pin that
+    /// already has a history.
+    ///
+    /// `set_workspace_pinned(id, true)` stamps *now*, which is right for a
+    /// click but wrong for unarchive: the archived entry carries the moment the
+    /// user originally pinned, and re-stamping would silently rewrite it. The
+    /// stored index (not `pinned_at`) drives the pinned block's order, so the
+    /// damage is invisible in the sidebar — which is exactly why it needs a
+    /// dedicated seam rather than trust.
+    ///
+    /// Returns `Ok(true)` only when the value actually changed, matching
+    /// `set_workspace_pinned`'s emit/persist contract.
+    pub fn restore_workspace_pinned_at(
+        &self,
+        workspace_id: &str,
+        pinned_at: Option<i64>,
+    ) -> Result<bool, String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let workspace = snapshot
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No workspace found for {workspace_id}"))?;
+
+        if workspace.pinned_at == pinned_at {
+            return Ok(false);
+        }
+        workspace.pinned_at = pinned_at;
+        Ok(true)
+    }
+
     /// Whether the workspace containing `session_id` has notifications muted.
     /// Used by the hook handler to suppress the completion popup.
     pub fn is_session_workspace_muted(&self, session_id: &str) -> bool {
@@ -8781,6 +8812,70 @@ mod archived_workspace_tests {
         assert_eq!(entry.protected, ws.protected);
         assert_eq!(entry.pinned_at, ws.pinned_at);
         assert!(entry.archived_at > 0, "archived_at must be a real timestamp");
+    }
+
+    #[test]
+    fn restore_workspace_pinned_at_replays_the_archived_timestamp() {
+        // The unarchive path's contract: a workspace that was pinned when it
+        // was archived comes back pinned *at the moment the user pinned it*,
+        // not at the moment they restored it. `set_workspace_pinned` cannot
+        // express this — it always stamps now — so the round trip goes
+        // through the verbatim setter.
+        let store = AppStateStore::default();
+        let ws_id = store.create_workspace_at_path(PathBuf::from("/tmp/archive-restore-pin"));
+        store
+            .set_workspace_pinned(&ws_id.0, true)
+            .expect("workspace exists");
+
+        let pinned_at_of = |id: &WorkspaceId| -> Option<i64> {
+            store
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == *id)
+                .expect("workspace exists")
+                .pinned_at
+        };
+
+        let entry = {
+            let snapshot = store.snapshot();
+            let ws = snapshot
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id == ws_id)
+                .expect("workspace exists");
+            build_archive_entry(ws)
+        };
+        let original_pinned_at = entry.pinned_at.expect("archived entry keeps the pin");
+
+        // Simulate the restore landing on a fresh, unpinned workspace.
+        store
+            .set_workspace_pinned(&ws_id.0, false)
+            .expect("workspace exists");
+        assert_eq!(pinned_at_of(&ws_id), None);
+
+        assert_eq!(
+            store.restore_workspace_pinned_at(&ws_id.0, entry.pinned_at),
+            Ok(true),
+            "restoring a pin onto an unpinned workspace is a real change"
+        );
+        assert_eq!(
+            pinned_at_of(&ws_id),
+            Some(original_pinned_at),
+            "restore must replay the archived timestamp, not stamp a new one"
+        );
+
+        // Idempotent: re-running the restore emits nothing and rewrites
+        // nothing, matching `set_workspace_pinned`'s contract.
+        assert_eq!(
+            store.restore_workspace_pinned_at(&ws_id.0, entry.pinned_at),
+            Ok(false)
+        );
+        assert_eq!(pinned_at_of(&ws_id), Some(original_pinned_at));
+
+        assert!(store
+            .restore_workspace_pinned_at("workspace-does-not-exist", Some(1))
+            .is_err());
     }
 
     #[test]
