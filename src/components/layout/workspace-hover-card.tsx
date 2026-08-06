@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   HoverCard,
   HoverCardContent,
@@ -24,6 +24,11 @@ import {
   formatElapsed,
   useSidebarDensityStore,
 } from "@/stores/sidebar-density-store";
+import {
+  isHoverCardGroupActive,
+  registerOpenHoverCard,
+  useHoverCardGroupActive,
+} from "@/lib/hover-card-group";
 import { useProjectAppearance } from "./use-project-appearance";
 import { cn } from "@/lib/utils";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
@@ -44,11 +49,16 @@ interface Props {
   children: React.ReactNode;
 }
 
-/** How long the pointer must rest on a row before the card opens. Long enough
- *  that sweeping the mouse down the sidebar never flashes a card, short enough
- *  that a deliberate hover feels instant. */
-const OPEN_DELAY_MS = 350;
-const CLOSE_DELAY_MS = 120;
+/** How long the pointer must rest on a row before the FIRST card opens. Long
+ *  enough that sweeping the mouse down the sidebar never flashes a card, short
+ *  enough that a deliberate hover feels instant. Once a card is up the shared
+ *  group phase takes over and the rest open with no delay at all — see
+ *  `@/lib/hover-card-group` for why the second card should not re-pay this. */
+const OPEN_DELAY_MS = 150;
+/** Long enough for the pointer to cross the 10px offset gap into the card and
+ *  select a path — but it never delays a sweep, because a card is superseded
+ *  outright the moment another one opens (`registerOpenHoverCard`). */
+const CLOSE_DELAY_MS = 100;
 
 // `shortenPath`, `STATUS_LABEL`, and the status tone classes are shared with
 // the command palette — see `@/lib/shorten-path` and `@/lib/pane-status`.
@@ -70,17 +80,50 @@ export function WorkspaceHoverCard({
   status,
   children,
 }: Props) {
+  const groupActive = useHoverCardGroupActive();
+  // `instant` is captured when the card opens, not read live: a card that DID
+  // wait its delay should still fade out gracefully, even though the group is
+  // (by definition) active by the time it closes.
+  const [{ open, instant }, setCardState] = useState({
+    open: false,
+    instant: false,
+  });
+
+  const handleOpenChange = useCallback((next: boolean) => {
+    setCardState((prev) => ({
+      open: next,
+      // Read the store directly rather than closing over `groupActive`: this
+      // fires from Radix's own timer, and the answer must be the phase as it
+      // stands right now, before this card joins it below.
+      instant: next ? isHoverCardGroupActive() : prev.instant,
+    }));
+  }, []);
+
+  useEffect(() => {
+    if (!open) return;
+    return registerOpenHoverCard(() =>
+      setCardState((prev) => ({ ...prev, open: false })),
+    );
+  }, [open]);
+
   return (
-    <HoverCard openDelay={OPEN_DELAY_MS} closeDelay={CLOSE_DELAY_MS}>
+    <HoverCard
+      open={open}
+      onOpenChange={handleOpenChange}
+      openDelay={groupActive ? 0 : OPEN_DELAY_MS}
+      closeDelay={CLOSE_DELAY_MS}
+    >
       <HoverCardTrigger asChild>{children}</HoverCardTrigger>
       <HoverCardContent
         side="right"
         align="start"
         sideOffset={10}
+        entrance="subtle"
+        data-instant={instant ? "" : undefined}
         // Pointer events stay enabled so the path and branch can be selected
         // and copied. Radix keeps the card open while the cursor crosses into
-        // it (closeDelay), and side="right" floats it over the main pane —
-        // never between the cursor and another sidebar row.
+        // it, and side="right" floats it over the main pane — never between
+        // the cursor and another sidebar row.
         className="w-[290px] p-0"
       >
         <WorkspaceHoverCardBody
