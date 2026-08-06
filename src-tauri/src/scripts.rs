@@ -5,7 +5,6 @@ use crate::database::DatabaseStore;
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use tauri::{AppHandle, Emitter, Runtime};
 
 /// Default worktree include patterns when no `.codemuxinclude` file or project
@@ -180,7 +179,7 @@ fn copy_matching_files(
     worktree_path: &Path,
     exclude_file: &Path,
 ) -> Result<Vec<String>, String> {
-    let output = Command::new("git")
+    let output = crate::execution::host_command("git")
         .args([
             "ls-files",
             "--others",
@@ -382,7 +381,7 @@ pub fn run_setup_commands(
             total,
         });
 
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = crate::execution::host_command("sh");
         cmd.arg("-c")
             .arg(command)
             .current_dir(workspace_path)
@@ -515,7 +514,7 @@ pub fn run_teardown_scripts(
     let env_vars = script_env(workspace_path, &root_path, None, None);
 
     for command in &config.teardown {
-        let mut cmd = std::process::Command::new("sh");
+        let mut cmd = crate::execution::host_command("sh");
         cmd.arg("-c")
             .arg(command)
             .current_dir(workspace_path)

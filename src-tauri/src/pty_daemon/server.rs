@@ -732,6 +732,17 @@ async fn spawn_pty(
         std::env::var("HOME").ok()
     );
     cmd.cwd(&resolved_cwd);
+
+    // Undo AppRun's loader/toolkit rewrites before the caller's env is layered
+    // on. The daemon is the Codemux binary re-executed, so it still needs the
+    // AppDir libraries itself and cannot be sanitized at launch — the strip has
+    // to happen here, on the leaf child. No-op outside an AppImage.
+    //
+    // Ordering: this runs BEFORE the loop below so an explicit PATH from the
+    // app process (already sanitized, plus the CLI shim dir) takes precedence
+    // over the PATH this derives from the daemon's own environment.
+    crate::execution::sanitize_appimage_env_pty(&mut cmd);
+
     for (k, v) in &env {
         cmd.env(k, v);
     }

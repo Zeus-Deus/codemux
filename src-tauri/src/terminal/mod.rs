@@ -1585,8 +1585,20 @@ fn spawn_pty_for_session_in_process<R: Runtime>(app: AppHandle<R>, session_id: S
     // On Windows, `build_child_path` also prepends `%USERPROFILE%\.local\bin`
     // so Claude Code and similar per-user installs are discoverable even if
     // Codemux's own environment missed the installer's PATH broadcast.
+    // Undo AppRun's loader/toolkit rewrites so system binaries in this shell
+    // link against the host's libraries, not the AppImage's bundled ones.
+    // No-op unless we are running from an AppImage.
+    //
+    // Must run BEFORE the shim block: this sets a cleaned PATH derived from the
+    // process environment, and the shim block then layers its own entry on top
+    // of that already-clean base. Running it after would clobber the shim.
+    crate::execution::sanitize_appimage_env_pty(&mut cmd);
+
     if let Some((shim_dir, current_exe)) = ensure_cli_shims() {
-        let current_path = env::var("PATH").unwrap_or_default();
+        // Start from the sanitized PATH for the same reason: the raw process
+        // PATH is prefixed with AppDir bin dirs when we run from a bundle, and
+        // those must not shadow the user's own toolchain inside a shell.
+        let current_path = crate::execution::sanitized_child_path();
         let prefixed = build_child_path(&shim_dir, &current_path);
         cmd.env("PATH", prefixed);
         cmd.env("CODEMUX_CLI_SAFE_PATH", current_exe);
