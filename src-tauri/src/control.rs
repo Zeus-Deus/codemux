@@ -981,6 +981,83 @@ async fn dispatch_request<R: Runtime>(app: &AppHandle<R>, request: ControlReques
                     })
             })
         }
+        // ── Monitoring (provider-agnostic) ───────────────────────────────
+        //
+        // The escape hatch that makes the Monitoring status work for agents
+        // Codemux has no event stream for. A terminal agent, a Codex/OpenCode
+        // chat agent, anything with a shell: run `codemux monitor start` and
+        // the pane reads as monitoring until `codemux monitor stop`.
+        //
+        // Pane resolution is `resolve_monitor_pane`'s job (explicit pane id →
+        // the workspace's active pane → its first pane). Both commands echo
+        // back the pane they acted on so a script can see what it hit.
+        "monitor_start" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let pane_id = request.params.get("pane_id").and_then(Value::as_str);
+            let workspace_id = request.params.get("workspace_id").and_then(Value::as_str);
+            let reason = request
+                .params
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| r.trim().to_string());
+            match state.resolve_monitor_pane(pane_id, workspace_id) {
+                Some(pane_id) => {
+                    let changed = state.start_manual_monitor(&pane_id, reason.clone());
+                    if changed {
+                        crate::state::emit_app_state(app);
+                    }
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id,
+                        "monitoring": true,
+                        "reason": reason,
+                        "changed": changed,
+                    }))
+                }
+                None => Err("No pane found to monitor".to_string()),
+            }
+        }
+        "monitor_stop" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let pane_id = request.params.get("pane_id").and_then(Value::as_str);
+            let workspace_id = request.params.get("workspace_id").and_then(Value::as_str);
+            match state.resolve_monitor_pane(pane_id, workspace_id) {
+                Some(pane_id) => {
+                    let changed = state.stop_manual_monitor(&pane_id);
+                    if changed {
+                        crate::state::emit_app_state(app);
+                    }
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id,
+                        "monitoring": false,
+                        "changed": changed,
+                    }))
+                }
+                None => Err("No pane found to stop monitoring".to_string()),
+            }
+        }
+        "monitor_status" => {
+            let state: State<'_, AppStateStore> = app.state();
+            let pane_id = request.params.get("pane_id").and_then(Value::as_str);
+            let workspace_id = request.params.get("workspace_id").and_then(Value::as_str);
+            match state.resolve_monitor_pane(pane_id, workspace_id) {
+                Some(pane_id) => {
+                    let manual = state.manual_monitor_reason(&pane_id);
+                    // Report the EFFECTIVE status (the snapshot the sidebar
+                    // reads), not the flag: a pane can be monitoring because
+                    // its provider's watch loops say so, with no flag at all.
+                    let status = state.snapshot().pane_statuses.get(&pane_id).cloned();
+                    Ok(serde_json::json!({
+                        "pane_id": pane_id,
+                        "monitoring": status == Some(crate::state::PaneStatus::Monitoring),
+                        "manual": manual.is_some(),
+                        "reason": manual.flatten(),
+                        "status": status,
+                    }))
+                }
+                None => Err("No pane found".to_string()),
+            }
+        }
         "port_list" => {
             let state: State<'_, AppStateStore> = app.state();
             let workspace_filter = request

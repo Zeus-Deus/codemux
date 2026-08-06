@@ -39,7 +39,7 @@
 
 ## Command Families
 
-`control.rs` dispatches 41 commands. `codemux capabilities` prints the authoritative
+`control.rs` dispatches 45 commands. `codemux capabilities` prints the authoritative
 machine-readable listing — prefer it over this table when scripting.
 
 - app and workspace state: `status`, `get_app_state`, `create_workspace`, `create_worktree_workspace`, `activate_workspace`, `close_workspace`, `split_pane`, `close_pane`
@@ -51,6 +51,7 @@ machine-readable listing — prefer it over this table when scripting.
 - memory and handoff: `get_project_memory`, `update_project_memory`, `add_project_memory_entry`, `generate_handoff`
 - indexing: `rebuild_index`, `index_status`, `search_index`
 - ports: `port_list`
+- monitoring: `monitor_start` (flag a pane as watching something in the background; optional `pane_id`, `workspace_id`, `reason`), `monitor_stop`, `monitor_status`. Provider-agnostic — see `docs/features/monitoring-status.md`
 - GitHub issues: `list_github_issues`, `get_github_issue`, `link_workspace_issue`
 - setup scripts: `rerun_setup`
 - automations: `automation_list`, `automation_get`, `automation_create`, `automation_update`, `automation_set_enabled`, `automation_delete`, `automation_runs` (note: the socket uses `automation_set_enabled`; the MCP surface instead exposes `automation_pause`/`automation_resume`)
@@ -73,6 +74,9 @@ codemux browser create
 codemux browser open https://example.com
 codemux browser snapshot
 codemux memory show
+codemux monitor start --reason "CI checks on PR #482"
+codemux monitor status
+codemux monitor stop
 codemux handoff
 codemux index build
 codemux remote enable
@@ -100,7 +104,7 @@ The examples above are a sampler, not the full surface. Other subcommands:
 source), `codemux app`, `codemux mcp` (stdio MCP server), `codemux pty-daemon
 --socket <path>`, `codemux workspace rerun-setup [workspace_id]`, `codemux
 issue list|view|link`, `codemux memory set|add`, `codemux index status|search`,
-and the full `codemux browser` set beyond `create|open|snapshot`: `click`,
+`codemux monitor start|stop|status`, and the full `codemux browser` set beyond `create|open|snapshot`: `click`,
 `fill`, `screenshot`, `console-logs`, `click-at`, `type-at`, `scroll-at`,
 `key-press`, `drag`, `click-os`, `type-os`, `viewport`, `viewport-presets`
 (documented in `docs/reference/BROWSER-AGENT-COMMANDS.md`).
@@ -134,6 +138,19 @@ reciprocally refuses while `serve` is running. Because `serve` runs its own
 control server, `codemux remote pair` from another SSH session mints fresh
 codes against it. See `docs/features/web-remote-access.md` §
 "Headless server mode".
+
+`codemux monitor start [--reason <text>] [--pane-id <id>]` /
+`codemux monitor stop` / `codemux monitor status` declare that the calling
+pane is watching something in the background — a CI run, a tailed process, a
+PR poll — so its workspace shows the calm "Monitoring" status instead of
+looking finished or stuck at "Working". Provider-agnostic on purpose: any
+agent with a shell can call it, whatever it is running under. With no
+`--pane-id` the target comes from the agent's own injected environment
+(`CODEMUX_PANE_ID`, falling back to `CODEMUX_WORKSPACE_ID`'s active pane), so
+the usual call takes no arguments at all. The flag is runtime-only — never
+persisted, cleared when the pane or workspace closes — and an agent that sets
+one is responsible for calling `stop` when the watch ends. See
+`docs/features/monitoring-status.md`.
 
 `codemux login` / `logout` / `whoami` are **local-only** account commands — no
 control socket, no running instance required (unlike the `remote *`

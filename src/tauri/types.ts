@@ -213,7 +213,18 @@ export interface AgentBrowserSession {
 
 // ── Pane Status ──
 
-export type PaneStatus = "idle" | "working" | "permission" | "review";
+/** Mirror of `state_impl.rs::PaneStatus`. Priority ladder (see
+ *  `src/lib/pane-status.ts`): permission > working > monitoring > review > idle.
+ *
+ *  `monitoring` is the calm one — the agent finished its deliverable but is
+ *  still watching something in the background (a CI run, a tailed process, a
+ *  PR poll). Nothing that renders it animates. */
+export type PaneStatus =
+  | "idle"
+  | "working"
+  | "permission"
+  | "monitoring"
+  | "review";
 export type ActivePaneStatus = Exclude<PaneStatus, "idle">;
 
 // ── Notifications ──
@@ -837,6 +848,12 @@ export interface AppStateSnapshot {
   notifications: NotificationSnapshot[];
   detected_ports: PortInfoSnapshot[];
   pane_statuses: Record<string, PaneStatus>;
+  /** Panes an agent flagged via `codemux monitor start`, mapped to the
+   *  optional reason it gave. The backend has already folded these into
+   *  `pane_statuses` as `monitoring`, so this map exists only so a surface
+   *  can show the *reason* (the docked monitoring bar's title). Runtime-only
+   *  and never persisted; optional because older snapshots lack it. */
+  manual_monitors?: Record<string, string | null>;
   /** Archived (hidden-but-restorable) workspaces. Optional — older
    *  snapshots persisted without the field; treat missing as `[]`. */
   archived_workspaces?: ArchivedWorkspaceSnapshot[];

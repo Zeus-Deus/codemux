@@ -167,6 +167,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
 
   const isWorking = status === "working";
   const isNeeds = status === "permission";
+  const isMonitoring = status === "monitoring";
   const isDone = status === "review";
 
   // Background recede. Prominence is a scarce resource, so it is reserved for
@@ -174,20 +175,22 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // one that is blocked on you, one that has finished and wants a review, one
   // holding output you have not read, and one that just came back from a
   // snooze — plus anything you have ticked for a bulk action. Everything else
-  // is either an agent quietly working (not your problem yet) or an idle row
-  // you have already read, so it sits back at reduced opacity and the ones
-  // that need you read as the bright rows in the list. Hovering or focusing a
-  // receded card restores it in full, so nothing is ever hidden — only ranked.
+  // is either an agent quietly working (not your problem yet), an agent
+  // babysitting something in the background, or an idle row you have already
+  // read, so it sits back at reduced opacity and the ones that need you read
+  // as the bright rows in the list. Hovering or focusing a receded card
+  // restores it in full, so nothing is ever hidden — only ranked.
   const receded =
     !isActive &&
     !selected &&
     !unread &&
     !woke &&
-    (status === "working" || status === null);
+    (status === "working" || status === "monitoring" || status === null);
 
   // Settle safety net: a live or blocked agent can never be swept out of
-  // sight. Only finished ("review") and idle cards offer Settle — sweeping
-  // completed work aside is the whole point of the gesture.
+  // sight. Finished ("review"), monitoring and idle cards all offer Settle —
+  // sweeping completed work aside is the whole point of the gesture, and a
+  // workspace left babysitting CI is exactly the kind of thing a user parks.
   const canSettle = status !== "working" && status !== "permission";
 
   // Snooze hides the card just as thoroughly as Settle does, so it rides the
@@ -256,6 +259,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
             : "group-hover/card:hidden group-focus-within/card:hidden"),
         isWorking && "font-semibold text-status-working",
         isNeeds && "font-semibold text-status-attention",
+        isMonitoring && "font-semibold text-status-monitoring",
         isDone && "font-semibold text-status-open",
         !status && "font-medium text-muted-foreground/70",
       )}
@@ -266,14 +270,21 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
       {isNeeds && (
         <span className="size-1.5 animate-pulse rounded-full bg-status-attention" />
       )}
+      {/* Steady dot, deliberately not the configurable WorkingIndicator and
+          deliberately not animated: monitoring is calm background presence. */}
+      {isMonitoring && (
+        <span className="size-1.5 rounded-full bg-status-monitoring" />
+      )}
       {isDone && <Check className="h-3 w-3" strokeWidth={2.5} />}
       {isWorking
         ? "Working"
         : isNeeds
           ? "Needs you"
-          : isDone
-            ? "Done · review"
-            : idleTime}
+          : isMonitoring
+            ? "Monitoring"
+            : isDone
+              ? "Done · review"
+              : idleTime}
     </span>
   );
 

@@ -2912,6 +2912,19 @@ replays persisted events through the frontend reducer
 thread's tracking so a stuck subagent can never pin the spinner after the
 session is gone.
 
+**Watch loops settle to `Monitoring`, not `Working`.** The tracker's live set
+is split in two — agent tasks and background watch loops (`monitor` /
+`monitor_mcp` / `local_bash` / `shell`, classified from the SDK's optional
+`task_started.task_type`). Once the turn settles with zero agent tasks and at
+least one live watch loop, the thread publishes `PaneStatus::Monitoring`
+instead of holding `Working`, and the owed `Review` fires when the last watch
+loop stops. A watch loop keeps its transcript card but is excluded from the
+`SubagentActivityBar` roster. A docked `MonitoringBar` between transcript and
+composer carries the Stop button (`agent_chat_stop_monitoring`), and any
+provider's agent can reach the same status through `codemux monitor start`.
+Full rules, the combination choke point, and the bare-session interrupt
+limitation: `docs/features/monitoring-status.md`.
+
 ## Follow-up queueing
 
 Sending a chat message while the agent is mid-turn **queues** it instead

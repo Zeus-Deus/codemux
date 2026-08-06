@@ -1980,6 +1980,7 @@ fn build_core_app<R: tauri::Runtime>(
             commands::agent_chat_cancel_queued_turn,
             commands::agent_chat_send_queued_turn_now,
             commands::agent_chat_interrupt_turn,
+            commands::agent_chat_stop_monitoring,
             commands::agent_chat_turn_active,
             commands::agent_chat_respond_to_request,
             commands::agent_chat_set_model,

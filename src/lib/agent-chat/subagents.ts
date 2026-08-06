@@ -103,6 +103,9 @@ export function mergeSnapshot(
   if (snap.parent_item_id != null) next.parentItemId = snap.parent_item_id;
   if (snap.name != null) next.name = snap.name;
   if (snap.agent_type != null) next.agentType = snap.agent_type;
+  // Sticky like every other merged field: `task_progress` ticks carry no
+  // `task_kind`, so a null must never un-classify a known watch loop.
+  if (snap.task_kind != null) next.taskKind = snap.task_kind;
   if (snap.model != null) next.model = snap.model;
   if (snap.activity != null) next.activity = snap.activity;
   if (snap.result_text != null) next.resultText = snap.result_text;
@@ -403,11 +406,25 @@ export interface RunningSubagentEntry {
   fromLabel: string | null;
 }
 
+/** Whether a row is a background watch loop rather than delegated agent work.
+ *  Absent `taskKind` (every provider but Claude, and Claude on an SDK that
+ *  does not report task types) reads as agent work. */
+export function isMonitorTask(view: SubagentView): boolean {
+  return view.taskKind === "monitor";
+}
+
 /** Every currently-running subagent across every `subagent_run` card in
  *  the thread, no matter which reply spawned it (design "one bar for the
  *  whole thread"). Feeds the docked {@link SubagentActivityBar}: its
  *  `.length` is the bar's count, and each entry carries the "from"
- *  label + jump target for the expand list. */
+ *  label + jump target for the expand list.
+ *
+ *  Watch loops are excluded. They are not subagents doing work, and listing
+ *  them here would both inflate "N subagents running" and keep the amber
+ *  progress bar up for a thread whose only remaining activity is a CI poll —
+ *  the exact thing the calm `monitoring` status exists to replace. The task
+ *  still keeps its transcript card, so the user can always see what is being
+ *  watched; it just is not counted as an agent. */
 export function runningSubagentEntries(
   messages: ChatViewItem[],
 ): RunningSubagentEntry[] {
@@ -415,7 +432,7 @@ export function runningSubagentEntries(
   const entries: RunningSubagentEntry[] = [];
   cards.forEach((card, cardIdx) => {
     for (const sub of card.subagents) {
-      if (!isRunning(sub)) continue;
+      if (!isRunning(sub) || isMonitorTask(sub)) continue;
       entries.push({
         subagent: sub,
         cardId: card.id,

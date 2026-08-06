@@ -19,6 +19,14 @@ const STATUS_CONFIG = {
     pulse: true,
     tooltip: "Agent working",
   },
+  // Steady on purpose — a background watch loop is presence, not progress,
+  // and the ping animation is this app's "look at me" signal.
+  monitoring: {
+    pingColor: "",
+    dotColor: "bg-status-monitoring",
+    pulse: false,
+    tooltip: "Monitoring in the background",
+  },
   review: {
     pingColor: "",
     dotColor: "bg-status-open",

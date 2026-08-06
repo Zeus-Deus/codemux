@@ -1977,6 +1977,10 @@ pub(crate) fn close_pane_impl<R: tauri::Runtime>(
 ) -> Result<Option<String>, String> {
     let removed_browser_id = state.pane_browser_id(&pane_id);
     let removed = state.close_pane(&pane_id)?;
+    // A `codemux monitor start` flag belongs to the process that was running
+    // in this pane. The pane is gone, so the claim is too — and a flag with no
+    // pane behind it has no UI left that could ever turn it off.
+    state.clear_manual_monitors_for_panes(&[pane_id.clone()]);
 
     if let Some(ref session_id) = removed {
         // Kill the PTY child + its process group. `state.close_pane` already

@@ -26,10 +26,10 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::agent_provider::{
-    CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent, ProviderSessionId,
-    RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, TaskSnapshotItem, TaskStatus,
-    TasksSnapshot, ThreadId, TurnId, TurnStatus, TurnUsage, WorkflowPhaseSnapshot,
-    WorkflowSnapshot,
+    classify_task_kind, CompletedItem, ContentDelta, ContextUsageTracker, ProviderRuntimeEvent,
+    ProviderSessionId, RequestId, SessionStatus, SubagentSnapshot, SubagentStatus, SubagentTaskKind,
+    TaskSnapshotItem, TaskStatus, TasksSnapshot, ThreadId, TurnId, TurnStatus, TurnUsage,
+    WorkflowPhaseSnapshot, WorkflowSnapshot,
 };
 
 use super::protocol::{SidecarError, SidecarNotification};
@@ -71,6 +71,10 @@ pub struct SubagentDemux {
     /// notification task — so it rides the `&mut` the translator is
     /// already handed rather than inventing a second channel.
     context: ContextUsageTracker,
+    /// `subagent_id` → watch-loop-vs-agent classification, learned from the
+    /// `task_started` message's optional `task_type` and re-stamped onto every
+    /// later snapshot for that subagent (see [`Self::record_task_kind`]).
+    task_kinds: HashMap<String, SubagentTaskKind>,
     /// In-flight Claude TaskCreate/TaskUpdate/TaskList calls, keyed by
     /// tool_use_id until their structured result arrives.
     task_tools: HashMap<String, (String, serde_json::Value)>,
@@ -123,6 +127,20 @@ impl SubagentDemux {
             self.task_to_tool_use
                 .insert(task_id.to_string(), tu.to_string());
         }
+    }
+
+    /// Remember the watch-loop-vs-agent classification for a subagent.
+    ///
+    /// Only `task_started` carries `task_type`; the progress / update /
+    /// notification messages that follow do not. Without this the very next
+    /// `task_progress` tick would ship a snapshot claiming the task is
+    /// ordinary agent work and flip a monitoring pane back to `Working`.
+    fn record_task_kind(&mut self, subagent_id: &str, kind: SubagentTaskKind) {
+        self.task_kinds.insert(subagent_id.to_string(), kind);
+    }
+
+    fn task_kind_for(&self, subagent_id: &str) -> Option<SubagentTaskKind> {
+        self.task_kinds.get(subagent_id).copied()
     }
 
     /// Resolve the subagent id for a task event, preferring an explicit
@@ -818,6 +836,9 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         parent_item_id: Some(tool_use_id.to_string()),
         name,
         agent_type: get("subagent_type"),
+        // Learned from `task_started`'s `task_type`, which arrives later; the
+        // demux re-stamps it onto every subsequent snapshot for this id.
+        task_kind: None,
         model: get("model"),
         status: SubagentStatus::Running,
         activity: None,
@@ -1022,6 +1043,7 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         parent_item_id: Some(subagent_id.to_string()),
         name: None,
         agent_type: None,
+        task_kind: None,
         model: None,
         status: SubagentStatus::Running,
         activity: None,
@@ -1032,6 +1054,18 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         provider_ref: None,
         workflow_id: None,
         phase: None,
+    }
+}
+
+/// Re-stamp the remembered watch-loop classification onto a snapshot.
+///
+/// The sibling of [`stamp_workflow_attribution`], and for the same reason: the
+/// per-event snapshots are partial, so any fact learned once at `task_started`
+/// has to be replayed onto every later snapshot or the consumer's merge sees it
+/// disappear. No-op for tasks whose kind was never learned.
+fn stamp_task_kind(snap: &mut SubagentSnapshot, demux: &SubagentDemux) {
+    if let Some(kind) = demux.task_kind_for(&snap.subagent_id) {
+        snap.task_kind = Some(kind);
     }
 }
 
@@ -1475,11 +1509,17 @@ fn apply_task_usage(snap: &mut SubagentSnapshot, usage: Option<&serde_json::Valu
     snap.duration_ms = usage.get("duration_ms").and_then(|v| v.as_u64());
 }
 
-/// `system.task_started { task_id, tool_use_id?, description }` — the
-/// subagent has begun. Records the `task_id → tool_use_id` mapping and
+/// `system.task_started { task_id, tool_use_id?, description, task_type? }` —
+/// the subagent has begun. Records the `task_id → tool_use_id` mapping and
 /// emits a `Running` snapshot whose activity is the description.
 /// Ambient / housekeeping tasks (`skip_transcript: true`) are dropped so
 /// they never spawn a card.
+///
+/// `task_type` is read opportunistically: it is the only message in the task
+/// family that carries it, and older installed SDK versions do not send it at
+/// all. When it is absent the task classifies as ordinary agent work and the
+/// whole Monitoring feature degrades to exactly the pre-existing behavior —
+/// which is the intended failure mode, not an oversight.
 fn translate_task_started(
     thread_id: &ThreadId,
     msg: &serde_json::Value,
@@ -1494,6 +1534,10 @@ fn translate_task_started(
     let Some(subagent_id) = demux.subagent_for_task(&task_id, tool_use_id.as_deref()) else {
         return warning(thread_id, "task_started without resolvable tool_use_id", msg);
     };
+    demux.record_task_kind(
+        &subagent_id,
+        classify_task_kind(opt_str_field(msg, "task_type").as_deref()),
+    );
     let mut snap = base_snapshot(&subagent_id);
     snap.status = SubagentStatus::Running;
     let description = str_field(msg, "description");
@@ -1501,6 +1545,7 @@ fn translate_task_started(
         snap.activity = Some(description);
     }
     stamp_workflow_attribution(&mut snap, demux);
+    stamp_task_kind(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
         subagent: snap,
@@ -1527,6 +1572,7 @@ fn translate_task_progress(
     snap.activity = opt_str_field(msg, "summary").or_else(|| opt_str_field(msg, "last_tool_name"));
     apply_task_usage(&mut snap, msg.get("usage"));
     stamp_workflow_attribution(&mut snap, demux);
+    stamp_task_kind(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
         subagent: snap,
@@ -1575,6 +1621,7 @@ fn translate_task_updated(
         return Vec::new();
     }
     stamp_workflow_attribution(&mut snap, demux);
+    stamp_task_kind(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
         subagent: snap,
@@ -1607,6 +1654,7 @@ fn translate_task_notification(
     }
     apply_task_usage(&mut snap, msg.get("usage"));
     stamp_workflow_attribution(&mut snap, demux);
+    stamp_task_kind(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
         subagent: snap,

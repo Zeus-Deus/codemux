@@ -199,6 +199,12 @@ export type SubagentStatus =
   | "failed"
   | "stopped";
 
+/** Mirror of `events.rs::SubagentTaskKind`. `"monitor"` is a background watch
+ *  loop (a CI poll, a tailed process) rather than delegated agent work — it is
+ *  what lets a thread settle to the calm `monitoring` pane status, and it is
+ *  excluded from the "N subagents running" roster. */
+export type SubagentTaskKind = "agent" | "monitor";
+
 export interface SubagentSnapshot {
   /** Stable demux key (Claude parent_tool_use_id, Codex child threadId,
    *  OpenCode child sessionID). Required. */
@@ -209,6 +215,10 @@ export interface SubagentSnapshot {
   name?: string | null;
   /** subagent_type / role / agent. */
   agent_type?: string | null;
+  /** Whether this is real delegated work or a background watch loop, when
+   *  the provider reports it. `null`/absent means "not reported", which
+   *  every consumer treats as `"agent"`. */
+  task_kind?: SubagentTaskKind | null;
   model?: string | null;
   status: SubagentStatus;
   /** Live "currently doing X" line pushed by the provider. */

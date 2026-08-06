@@ -202,7 +202,11 @@ export function isReviewExpanded(
 
 /** Whether a workspace counts as "live" for the "gather on top" grouping:
  *  a working or permission agent, or a review row that is still expanded
- *  (unseen and fresh). A settled/seen review row is NOT live. */
+ *  (unseen and fresh). A settled/seen review row is NOT live.
+ *
+ *  Neither is a `monitoring` one. "Gather on top" is for work the user should
+ *  be looking at right now; a watch loop is explicitly the opposite of that,
+ *  so it keeps its dot and its place in the list rather than being promoted. */
 export function isWorkspaceLive(
   status: ActivePaneStatus | null,
   settledAt: number | undefined,

@@ -26,7 +26,8 @@ use tokio::io::AsyncReadExt;
 use crate::agent_provider::{
     AgentProvider, ApprovalDecision, ProviderChatCapabilities, ProviderError, ProviderKind,
     ProviderRuntimeEvent, RequestId, RequestResponseFailureReason, SendTurnInput,
-    SerializableProviderError, StartSessionInput, ThreadId, TurnId, UserMessageImage,
+    SerializableProviderError, StartSessionInput, SubagentTaskKind, ThreadId, TurnId,
+    UserMessageImage,
 };
 use crate::database::{
     AgentChatCheckpointRecord, AgentChatSessionConfig, AgentChatSessionRecord, DatabaseStore,
@@ -367,6 +368,9 @@ pub fn agent_chat_close_pane<R: Runtime>(
     // walk can no longer resolve it, so clear by pane id here while the
     // key is still meaningful.
     state.set_pane_status(&pane_id, PaneStatus::Idle);
+    // Same for a manual monitoring flag: the agent that claimed it is about to
+    // be torn down, so the claim goes with it.
+    state.clear_manual_monitors_for_panes(&[pane_id.clone()]);
     // Forget any running-subagent tracking for this thread. The
     // SessionStateChanged::Closed event below also clears it, but that
     // races the tear-down (and may be dropped if no channel is attached),
@@ -2332,6 +2336,83 @@ pub async fn agent_chat_interrupt_turn<R: Runtime>(
     }
 }
 
+/// Stop the background watch loops a thread is monitoring with.
+///
+/// Backs the docked monitoring bar's Stop button. Three things happen, in this
+/// order and independently of each other's success:
+///
+/// 1. the thread's monitor task set is cleared from [`SubagentTracker`] and the
+///    resulting pane status computed;
+/// 2. any manual (`codemux monitor start`) flag on the thread's pane is
+///    cleared, so a chat pane that was flagged both ways ends up genuinely off;
+/// 3. the provider session is interrupted, best-effort, so the background tasks
+///    actually die rather than being merely forgotten about.
+///
+/// **The interrupt is the weak link, and deliberately so.** The provider
+/// interrupt path is a *turn* interrupt: with a turn in flight it cancels the
+/// run and the watch loops it spawned die with it. With the turn already
+/// settled — the common case, since `Monitoring` only appears after a turn
+/// completes — Claude's SDK offers no "interrupt the idle session" verb, so the
+/// call is a no-op and a truly detached background task can survive it. Codemux
+/// still clears its own state, because the alternative (refusing to turn the
+/// badge off) leaves the user with a dot they cannot dismiss. Killing a
+/// detached task outright needs a provider-side capability that does not exist
+/// yet; see `docs/features/agent-chat.md` § Monitoring.
+///
+/// Errors from the interrupt are swallowed for the same reason: the user asked
+/// for the monitoring to stop, and the state clear is the part Codemux can
+/// always honour.
+#[tauri::command]
+pub async fn agent_chat_stop_monitoring<R: Runtime>(
+    app: AppHandle<R>,
+    provider: ProviderKind,
+    thread_id: ThreadId,
+) -> Result<(), String> {
+    let observability: State<'_, ObservabilityStore> = app.state();
+    feature_flag_on(&observability)?;
+
+    let tracker: State<'_, SubagentTracker> = app.state();
+    let settled = tracker.stop_monitoring(&thread_id.0);
+
+    let state: State<'_, AppStateStore> = app.state();
+    let pane_id = state.agent_chat_pane_id_for_thread(&thread_id.0);
+    let manual_cleared = pane_id
+        .as_deref()
+        .map(|pane_id| state.stop_manual_monitor(pane_id))
+        .unwrap_or(false);
+
+    // Best-effort: a dead session (`SessionNotFound`) or a provider that
+    // declines the call must not stop the state from clearing.
+    let registry: State<'_, ProviderRegistry> = app.state();
+    if let Ok(impl_) = lookup_provider(&registry, provider).await {
+        if let Err(error) = impl_.interrupt_turn(thread_id.clone(), None).await {
+            eprintln!(
+                "[codemux::agent_chat] stop_monitoring: interrupt was not accepted \
+                 (state cleared anyway): {error:?}"
+            );
+        }
+    }
+
+    // Publish whatever the pane settled to. `Review` gets the same
+    // active-workspace downgrade the event path applies, so stopping a monitor
+    // in the workspace you are looking at does not raise a review dot for
+    // output already on screen.
+    let mut status_changed = manual_cleared;
+    if let Some(mut status) = settled {
+        if status == PaneStatus::Review && state.is_thread_pane_in_active_workspace(&thread_id.0) {
+            status = PaneStatus::Idle;
+        }
+        status_changed |= state.set_pane_status_by_thread(&thread_id.0, status);
+    }
+    if status_changed {
+        let snapshot = state.stamped_snapshot();
+        if let Err(error) = app.emit("app-state-changed", &snapshot) {
+            eprintln!("[codemux::agent_chat] failed to emit app state: {error}");
+        }
+    }
+    Ok(())
+}
+
 /// Whether a live turn is currently in flight on a thread.
 ///
 /// Cheap in-memory probe used by the frontend hydrate-on-remount path to
@@ -3367,21 +3448,97 @@ fn fan_out_user_message<R: Runtime>(
 /// All decision logic lives in [`map_event_to_pane_status`], a pure
 /// function over `(event, &mut ThreadSubagentState)` with no `AppHandle`,
 /// so it is directly unit-testable.
+/// The tracker splits live tasks into two buckets because they mean opposite
+/// things to a person reading the sidebar. A running *agent* task is progress
+/// the user is waiting on. A running *monitor* task — a CI watch, a tailed
+/// process, a PR poll — is the agent babysitting something it already finished
+/// with, which is calm background presence, not work in flight.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ThreadSubagentState {
-    /// `subagent_id`s currently `Pending` or `Running`.
+    /// Agent-task `subagent_id`s currently `Pending` or `Running`.
     running: std::collections::BTreeSet<String>,
-    /// A turn finished while `running` was non-empty, so the `Review`
-    /// transition is owed once the last tracked subagent goes terminal.
+    /// Watch-loop `subagent_id`s currently `Pending` or `Running`. Held
+    /// separately so they can hold `Monitoring` without ever holding
+    /// `Working`, and so the two sets can be cleared independently by
+    /// `agent_chat_stop_monitoring`.
+    monitors: std::collections::BTreeSet<String>,
+    /// A turn finished while tasks were still live, so the `Review`
+    /// transition is owed once the last tracked task goes terminal.
+    /// Deliberately survives the `Monitoring` state: monitoring *replaces*
+    /// the owed `Review` while watch loops live, and the review is published
+    /// when the last of them stops.
     review_pending: bool,
 }
 
 impl ThreadSubagentState {
-    /// Whether this thread tracks no live subagents and owes no `Review`
+    /// Whether this thread tracks no live tasks and owes no `Review`
     /// — the entry can be dropped from [`SubagentTracker`] so the map
     /// never grows unbounded.
     fn is_clear(&self) -> bool {
-        self.running.is_empty() && !self.review_pending
+        self.running.is_empty() && self.monitors.is_empty() && !self.review_pending
+    }
+
+    /// Move `id` into the bucket `kind` names, taking it out of the other one.
+    ///
+    /// `None` means the provider reported no classification on *this* snapshot,
+    /// which is not the same as "it is agent work": an already-bucketed id
+    /// stays where it is, and only a genuinely new id defaults to agent. That
+    /// is what keeps a `task_progress` tick (which never carries `task_type`)
+    /// from silently demoting a monitor back into the working set.
+    fn track(&mut self, id: &str, kind: Option<SubagentTaskKind>) {
+        let monitor = match kind {
+            Some(SubagentTaskKind::Monitor) => true,
+            Some(SubagentTaskKind::Agent) => false,
+            None => self.monitors.contains(id),
+        };
+        if monitor {
+            self.running.remove(id);
+            self.monitors.insert(id.to_string());
+        } else {
+            self.monitors.remove(id);
+            self.running.insert(id.to_string());
+        }
+    }
+
+    /// Drop `id` from whichever bucket holds it.
+    fn untrack(&mut self, id: &str) {
+        self.running.remove(id);
+        self.monitors.remove(id);
+    }
+
+    /// Forget everything (new turn, session close, explicit stop).
+    fn reset(&mut self) {
+        self.running.clear();
+        self.monitors.clear();
+        self.review_pending = false;
+    }
+
+    /// **The decision rule**, in one place, for "the parent turn is not
+    /// running — what should the sidebar say?".
+    ///
+    /// - any live agent task → `Working`: the deferred-review behavior that
+    ///   already existed, unchanged.
+    /// - no agent tasks but ≥1 live monitor → `Monitoring`. This is the whole
+    ///   feature: the deliverable is done, but something is still being
+    ///   watched, so the workspace reads as calm-but-alive instead of either
+    ///   pinned at "Working" forever or claiming to be finished.
+    /// - nothing live → `Review`, consuming the owed transition.
+    ///
+    /// Returns `None` when no `Review` was ever owed and nothing is live —
+    /// there is no transition to publish, and inventing one here would move a
+    /// dot that a metadata-only snapshot has no business moving.
+    fn settled_status(&mut self) -> Option<PaneStatus> {
+        if !self.running.is_empty() {
+            return self.review_pending.then_some(PaneStatus::Working);
+        }
+        if !self.monitors.is_empty() {
+            return self.review_pending.then_some(PaneStatus::Monitoring);
+        }
+        if self.review_pending {
+            self.review_pending = false;
+            return Some(PaneStatus::Review);
+        }
+        None
     }
 }
 
@@ -3421,6 +3578,36 @@ impl SubagentTracker {
         let mut threads = self.threads.lock().expect("subagent tracker poisoned");
         threads.remove(thread_id);
     }
+
+    /// Drop `thread_id`'s watch-loop tasks and report the status the pane
+    /// should settle to, backing `agent_chat_stop_monitoring`.
+    ///
+    /// The user pressing Stop is a terminal signal for every monitor at once,
+    /// so they are cleared wholesale instead of waiting for terminal task rows
+    /// that a killed background task may never emit. Agent tasks are left
+    /// alone — Stop is scoped to the monitoring bar, and silently abandoning
+    /// tracking of real in-flight work would strand the spinner.
+    ///
+    /// Returns `Some(status)` to publish, or `None` when there was nothing
+    /// being monitored and nothing owed.
+    pub fn stop_monitoring(&self, thread_id: &str) -> Option<PaneStatus> {
+        let mut threads = self.threads.lock().expect("subagent tracker poisoned");
+        let state = threads.entry(thread_id.to_string()).or_default();
+        let had_monitors = !state.monitors.is_empty();
+        state.monitors.clear();
+        // With the monitors gone the ordinary decision rule already computes
+        // the right answer (`Working` if real work remains, else the owed
+        // `Review`). Only the "nothing was owed and nothing was live" case
+        // needs a nudge: the pane is showing a monitoring dot that came from
+        // somewhere, so clear it explicitly rather than leaving it up.
+        let status = state
+            .settled_status()
+            .or(had_monitors.then_some(PaneStatus::Idle));
+        if state.is_clear() {
+            threads.remove(thread_id);
+        }
+        status
+    }
 }
 
 /// Map a provider runtime event to the sidebar pane status it should
@@ -3443,14 +3630,26 @@ impl SubagentTracker {
 ///   and forget this thread's subagent tracking.
 ///
 /// Subagent semantics (the reason this is stateful):
-/// - `SubagentUpdated` with `Running`/`Pending` records the subagent as
-///   live. It only *restores* `Working` when a `Review` was already owed
-///   (a running snapshot arriving after the parent turn finished); during
-///   an in-flight turn the parent already owns `Working`, so it returns
-///   `None` rather than resurrecting the spinner out of nowhere.
+/// - `SubagentUpdated` with `Running`/`Pending` records the task as live in
+///   the agent or monitor bucket (see [`ThreadSubagentState::track`]). It only
+///   speaks up when a `Review` was already owed (a running snapshot arriving
+///   after the parent turn finished); during an in-flight turn the parent
+///   already owns `Working`, so it returns `None` rather than resurrecting the
+///   spinner out of nowhere.
 /// - `SubagentUpdated` with a terminal status (`Completed`/`Failed`/
-///   `Stopped`) drops the subagent; when the last one clears and a
-///   `Review` was owed, it finally publishes `Review`.
+///   `Stopped`) drops the task; the decision rule then re-picks between
+///   `Working`, `Monitoring` and the finally-published `Review`.
+///
+/// Watch loops (the `Monitoring` half): a task the provider labelled
+/// `monitor` / `monitor_mcp` / `local_bash` / `shell` is a background watch
+/// loop rather than delegated work. Once the parent turn has settled and no
+/// agent tasks remain, live watch loops publish `Monitoring` — a calm,
+/// unanimated "still babysitting something" state that *replaces* the owed
+/// `Review` rather than consuming it. When the last watch loop goes terminal
+/// the owed `Review` is published as usual. Mid-turn nothing changes: the
+/// parent owns `Working`, and `Monitoring` only ever appears after the turn
+/// settles. There is no TTL — monitoring ends only via a terminal task row, a
+/// new turn, session close, or the explicit stop paths.
 ///
 /// A genuine **new user turn** resets the thread's tracker (both
 /// `running` and `review_pending`). The authoritative, provider-agnostic
@@ -3489,35 +3688,34 @@ fn map_event_to_pane_status(
         ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => match subagent.status {
             SubagentStatus::Pending | SubagentStatus::Running => {
                 if !subagent.subagent_id.is_empty() {
-                    state.running.insert(subagent.subagent_id.clone());
+                    state.track(&subagent.subagent_id, subagent.task_kind);
                 }
-                // Keep/restore the spinner only when a `Review` was owed;
-                // otherwise the parent turn owns `Working` and a snapshot
-                // (metadata: activity / tokens) must not move the dot.
-                if state.review_pending {
-                    Some(PaneStatus::Working)
-                } else {
-                    None
-                }
+                // Only speak up once a `Review` was owed; before that the
+                // parent turn owns `Working` and a snapshot (metadata:
+                // activity / tokens) must not move the dot.
+                state.settled_status()
             }
             SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Stopped => {
-                state.running.remove(&subagent.subagent_id);
-                if state.running.is_empty() && state.review_pending {
-                    state.review_pending = false;
-                    Some(PaneStatus::Review)
-                } else {
-                    None
-                }
+                state.untrack(&subagent.subagent_id);
+                // A task *finishing* can only shrink the live sets, so a
+                // `Working` answer here is always the spinner that is already
+                // up — swallowed so an intermediate completion stays the
+                // no-op it has always been. The transitions that matter
+                // (Working → Monitoring, and the finally-owed Review) pass.
+                state
+                    .settled_status()
+                    .filter(|status| *status != PaneStatus::Working)
             }
         },
         ProviderRuntimeEvent::TurnCompleted { .. } => {
-            if state.running.is_empty() {
+            if state.running.is_empty() && state.monitors.is_empty() {
                 Some(PaneStatus::Review)
             } else {
-                // Subagents outlive the parent turn: hold the spinner and
-                // owe a `Review` for when the last of them finishes.
+                // Tasks outlive the parent turn: owe a `Review` for when the
+                // last of them finishes, and let the decision rule pick
+                // between the spinner and the calm monitoring dot.
                 state.review_pending = true;
-                Some(PaneStatus::Working)
+                state.settled_status()
             }
         }
         ProviderRuntimeEvent::SessionStateChanged { status, .. } => match status {
@@ -3534,8 +3732,12 @@ fn map_event_to_pane_status(
                 // (`session.status = busy`); Claude's authoritative reset
                 // is the send-message command clear (see
                 // `agent_chat_send_turn`).
-                state.running.clear();
-                state.review_pending = false;
+                //
+                // Monitors are dropped here too: a genuinely-alive watch loop
+                // re-inserts itself on its next `Running` snapshot, and a new
+                // turn is the user's own signal that the previous turn's
+                // background bookkeeping is no longer what this pane is about.
+                state.reset();
                 Some(PaneStatus::Working)
             }
             SessionStatus::WaitingApproval { .. } => Some(PaneStatus::Permission),
@@ -3543,9 +3745,10 @@ fn map_event_to_pane_status(
                 // Tear-down: drop all tracking so a subagent whose
                 // terminal status is never observed (e.g. Claude's
                 // background `async_launched` task that never emits a
-                // later `task_notification`) cannot pin the spinner.
-                state.running.clear();
-                state.review_pending = false;
+                // later `task_notification`) cannot pin the spinner. Monitors
+                // go with them — the session that owned those watch loops is
+                // gone, so nothing is being monitored any more.
+                state.reset();
                 Some(PaneStatus::Idle)
             }
             SessionStatus::Starting | SessionStatus::Ready => None,
@@ -3615,6 +3818,13 @@ fn publish_pane_status<R: Runtime>(
     // Mirror the terminal path: a turn that finishes in the workspace the
     // user is already looking at clears to Idle instead of nagging with a
     // review dot for output they can already see.
+    //
+    // Scoped to `Review` on purpose — `Monitoring` is deliberately NOT
+    // downgraded. The review dot is a nag about output you can already see;
+    // the monitoring dot is a live fact about a watch loop that is still
+    // running, and it stays true whether or not you are looking at the pane.
+    // Suppressing it in the active workspace would also hide the docked bar
+    // that owns the Stop button, which is the one surface that can end it.
     if status == PaneStatus::Review && state.is_thread_pane_in_active_workspace(&thread_id.0) {
         status = PaneStatus::Idle;
     }
@@ -3652,6 +3862,11 @@ fn publish_pane_status<R: Runtime>(
 /// release the background browser session" policy is unit-testable
 /// without an `AppHandle`/`AppStateStore`. `Working` and `Permission` are
 /// mid-run and must return `false`.
+///
+/// So must `Monitoring`: an agent still running a watch loop may well be
+/// driving the background browser as part of it (polling a dashboard, watching
+/// a deploy), and releasing the session out from under it would kill the very
+/// thing it is monitoring.
 fn run_finished(status: PaneStatus) -> bool {
     matches!(status, PaneStatus::Review | PaneStatus::Idle)
 }
@@ -5665,6 +5880,172 @@ mod tests {
         );
     }
 
+    // ── Monitoring: watch-loop tasks vs agent tasks ──────────────────
+    //
+    // These mirror the deferred-review tests above, but for the second
+    // bucket: a task the provider labelled as a background watch loop
+    // settles the pane to `Monitoring` instead of pinning it at `Working`
+    // or claiming the work is done.
+
+    fn monitor_event(id: &str, status: SubagentStatus) -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::SubagentUpdated {
+            thread_id: tid(),
+            subagent: SubagentSnapshot {
+                subagent_id: id.into(),
+                status,
+                task_kind: Some(SubagentTaskKind::Monitor),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A snapshot with NO `task_kind` — the shape every `task_progress`
+    /// tick has, and the shape an SDK that predates the field always has.
+    fn unclassified_event(id: &str, status: SubagentStatus) -> ProviderRuntimeEvent {
+        subagent_event(id, status)
+    }
+
+    #[test]
+    fn monitor_only_tasks_settle_to_monitoring_after_turn_completed() {
+        let mut st = ThreadSubagentState::default();
+        assert_eq!(
+            map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st),
+            None,
+            "mid-turn the parent still owns Working"
+        );
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Monitoring),
+            "deliverable done, watch loop still live"
+        );
+        assert!(st.review_pending, "the Review is owed, not consumed");
+        assert!(st.monitors.contains("m1"));
+        assert!(st.running.is_empty());
+    }
+
+    #[test]
+    fn agent_task_alongside_a_monitor_still_reports_working() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Working),
+            "real work outranks a watch loop"
+        );
+        // The agent task finishes; only the monitor is left.
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Completed), &mut st),
+            Some(PaneStatus::Monitoring),
+            "Working hands over to Monitoring, not to Review"
+        );
+    }
+
+    #[test]
+    fn last_monitor_terminal_publishes_the_owed_review() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&monitor_event("m2", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+
+        assert_eq!(
+            map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Completed), &mut st),
+            Some(PaneStatus::Monitoring),
+            "one watch loop left — still monitoring"
+        );
+        assert_eq!(
+            map_event_to_pane_status(&monitor_event("m2", SubagentStatus::Stopped), &mut st),
+            Some(PaneStatus::Review),
+            "the last watch loop stops — the deferred Review finally fires"
+        );
+        assert!(!st.review_pending);
+        assert!(st.is_clear());
+    }
+
+    #[test]
+    fn an_unclassified_tick_does_not_demote_a_known_monitor() {
+        // `task_progress` carries no `task_type`. If `None` were read as
+        // "agent", the very first progress tick would move the task back
+        // into the working set and pin the pane at Working forever.
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&unclassified_event("m1", SubagentStatus::Running), &mut st),
+            Some(PaneStatus::Monitoring)
+        );
+        assert!(st.monitors.contains("m1"));
+        assert!(st.running.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_reclassification_moves_the_id_between_buckets() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("x", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert!(st.running.contains("x"));
+        // A later snapshot says it is really a watch loop.
+        assert_eq!(
+            map_event_to_pane_status(&monitor_event("x", SubagentStatus::Running), &mut st),
+            Some(PaneStatus::Monitoring)
+        );
+        assert!(st.monitors.contains("x"));
+        assert!(st.running.is_empty(), "no double-counting across buckets");
+    }
+
+    #[test]
+    fn a_new_turn_and_a_session_close_both_clear_monitors() {
+        for (label, event, expected) in [
+            (
+                "new turn",
+                ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Running { active_turn: turn() },
+                },
+                PaneStatus::Working,
+            ),
+            (
+                "session close",
+                ProviderRuntimeEvent::SessionStateChanged {
+                    thread_id: tid(),
+                    status: SessionStatus::Closed,
+                },
+                PaneStatus::Idle,
+            ),
+        ] {
+            let mut st = ThreadSubagentState::default();
+            map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
+            map_event_to_pane_status(&turn_completed(), &mut st);
+            assert_eq!(map_event_to_pane_status(&event, &mut st), Some(expected), "{label}");
+            assert!(st.monitors.is_empty(), "{label} must drop the watch loops");
+            assert!(st.is_clear(), "{label}");
+        }
+    }
+
+    #[test]
+    fn stop_monitoring_clears_watch_loops_and_publishes_the_owed_review() {
+        let tracker = SubagentTracker::default();
+        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running));
+        tracker.decide("t1", &turn_completed());
+        assert_eq!(tracker.stop_monitoring("t1"), Some(PaneStatus::Review));
+        // Fully settled: the entry is gone, and a second Stop is a no-op
+        // rather than a stray status write.
+        assert_eq!(tracker.stop_monitoring("t1"), None);
+    }
+
+    #[test]
+    fn stop_monitoring_leaves_real_agent_work_alone() {
+        let tracker = SubagentTracker::default();
+        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running));
+        tracker.decide("t1", &subagent_event("s1", SubagentStatus::Running));
+        tracker.decide("t1", &turn_completed());
+        assert_eq!(
+            tracker.stop_monitoring("t1"),
+            Some(PaneStatus::Working),
+            "stopping the watch loops must not abandon a live subagent"
+        );
+    }
+
     #[test]
     fn run_finished_only_for_review_and_idle() {
         // Backs the background-agent-browser release wiring in
@@ -5677,6 +6058,9 @@ mod tests {
         assert!(run_finished(PaneStatus::Idle));
         assert!(!run_finished(PaneStatus::Working));
         assert!(!run_finished(PaneStatus::Permission));
+        // A monitoring agent may still be driving the background browser as
+        // part of the very thing it is watching.
+        assert!(!run_finished(PaneStatus::Monitoring));
     }
 
     // (a) TurnCompleted while a subagent is still running holds Working

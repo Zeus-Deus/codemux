@@ -60,10 +60,13 @@ function RailWorkspaceItem({
     false,
   );
   const receded =
-    !isActive && !unread && (status === "working" || status === null);
+    !isActive &&
+    !unread &&
+    (status === "working" || status === "monitoring" || status === null);
 
-  // Per-workspace status dot: red (pulse) needs-you > amber working >
-  // green review (shared `STATUS_DOT_CLASS`). Idle / null shows nothing.
+  // Per-workspace status dot: red (pulse) needs-you > amber working > cyan
+  // (steady) monitoring > green review (shared `STATUS_DOT_CLASS`). Idle /
+  // null shows nothing.
 
   // Collapsed to a 28px avatar, the rail shows nothing but a status dot — so
   // the same hover card the expanded inbox uses is the only way to tell two
