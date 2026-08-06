@@ -90,7 +90,8 @@ The chat pane stack:
   receipt line — see "Thread receipt" under the Agent Tasks panel),
   `StreamingMarker` (shimmer tail status), `tool-visuals.ts`
   (icon/tint mapping), `PlanProposalBlock`, `ComposerPendingInputPanel`
-  for AskUserQuestion, `PermissionRequestBlock`, `ModePill`,
+  for AskUserQuestion (see "AskUserQuestion panel" below),
+  `PermissionRequestBlock`, `ModePill`,
   `SessionSelector`, `DraftChatSurface`, `ChatHomeLanding`,
   `DebugCleanupBanner`, `DebugExitDialog`, and the picker family under
   `src/components/chat/pickers/`. Shared primitives live in
@@ -101,6 +102,54 @@ The chat pane stack:
   imports replaced by local unions; the AI SDK is NOT a dependency).
   Assistant markdown renders through **Streamdown**
   (`parseIncompleteMarkdown` keeps mid-stream fences/emphasis clean).
+
+### AskUserQuestion panel
+
+`ComposerPendingInputPanel` renders the first *pending* `user-input`
+request as a card docked above the composer (never inline in the
+transcript — `MessageList` reduces `user-input` items to a tiny marker).
+Its interior is the shadcn **Questionnaire** component
+(`src/components/ui/questionnaire.tsx` over `@shadcn/react/questionnaire`);
+the panel keeps the composer's chat-column rails and rounded card so the
+two read as one surface.
+
+- **One question per page.** Every question is mounted at once — the
+  primitive hides the inactive ones with `hidden` + `inert` — so "is Q2
+  in the DOM" proves nothing; the active page is the single un-hidden
+  `[data-slot=questionnaire-item]`. Paging is controlled: `qi` is the
+  source of truth and drives `Root.item` / `onItemChange`, with item
+  names `q-<i>` (question text repeats across questions and cannot be an
+  identity).
+- **`Root.items` is load-bearing.** Each entry advertises
+  `{ name, required, choices: [{ value: <option label> }] }`. The
+  primitive maps the numbered shortcut chips off those choice *values*
+  in order, and dev builds `console.warn` on any drift from the rendered
+  tree (missing item, wrong value, wrong order, required/disabled
+  mismatch). A test asserts that channel stays silent.
+- **Forward navigation is gated by disabled buttons**, not by the
+  primitive's click-then-show-error flow: answered-ness comes from the
+  panel's own pick/free-text state, so Next/Send are simply inert until
+  the question is answered.
+- **Keyboard works in two layers.** The primitive handles digits, arrows
+  and Enter for events originating inside its form. A document-level
+  listener keeps 1-9 / ArrowLeft / ArrowRight / Enter working when focus
+  is outside it (nothing focused, or the composer); it bails on
+  text-entry targets, on modifier chords, and on anything inside the
+  questionnaire form so a keystroke is never applied twice.
+- **Free text always shows.** A `QuestionnaireInput` ("Something else…")
+  sits under the options on every question; typing in it answers the
+  question on its own. Enter there advances or submits via an explicit
+  handler that `preventDefault`s, which the primitive's form-level
+  handler then declines.
+- **Output contract.** `AskUserQuestionOutput.answers` is keyed by
+  question *text*; single-select is the picked label (free text replaces
+  it), multiSelect is labels joined with `", "` (free text appended).
+  `questions` echoes the original tool_use input verbatim so the CLI can
+  assemble the tool_result.
+- **Dev fixture.** `npm run dev` with `?askq=1` seeds a pending
+  two-question AskUserQuestion on the seeded chat thread. It arrives as a
+  *live* channel event, not in the persisted transcript, because cold
+  replay expires orphan pending requests (`finalizeReplay`).
 
 ### Code blocks in chat
 
