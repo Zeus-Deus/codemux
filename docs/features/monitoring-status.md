@@ -131,7 +131,14 @@ from an owed transition:
 
 - A monitor whose **first** `Running` snapshot arrives *after* the turn already
   settled still lights the badge. (An earlier design gated it on a pending
-  `Review`, which lost exactly this race.)
+  `Review`, which lost exactly this race.) The one edge that stays open is a
+  thread that settles with *nothing* tracked at all: `SubagentTracker` collects
+  such an entry, so a later first-snapshot lands on a fresh state that assumes
+  a turn is in flight. That is deliberate — closing it costs an entry per
+  settled thread plus a re-published status on every stray late snapshot, to
+  buy a case the providers do not produce, since tasks are started by tool
+  calls *within* a turn and a watch loop is therefore always tracked before the
+  `TurnCompleted` that settles it.
 - A **monitor-only thread owes no `Review` at all**. `review_pending()` is
   derived as `turn_settled && !forced_settled && has_agents()`, so the 600s
   force-settle watchdog (`select_overdue_review`) cannot see such a thread by

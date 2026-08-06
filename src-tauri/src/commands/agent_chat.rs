@@ -3626,6 +3626,20 @@ impl ThreadSubagentState {
     /// the live ids they were recorded against. A stop-blocklist *is* a
     /// reason — it has to outlive the tasks it names, or the guarantee it
     /// encodes evaporates on the very next tick.
+    ///
+    /// Dropping `turn_settled` with the entry does leave one edge open: a
+    /// thread that settles with **nothing** tracked is collected, so a
+    /// watch loop whose very first snapshot arrives after that lands on a
+    /// fresh state, which assumes a turn is in flight and stays silent.
+    /// That is deliberate rather than overlooked. Closing it means keeping
+    /// an entry per settled thread until its next turn boundary, and
+    /// re-publishing a settled status on every stray late snapshot, to buy
+    /// a case the providers do not produce: tasks are started by tool calls
+    /// *within* a turn, so a watch loop is always tracked before the
+    /// `TurnCompleted` that settles it — which is the path
+    /// [`Self::settled_status`] handles, and the one every monitor
+    /// actually takes. The manual (`codemux monitor start`) half does not
+    /// go through this tracker at all.
     fn is_clear(&self) -> bool {
         self.tasks.is_empty() && self.stopped_monitors.is_empty()
     }
@@ -6664,6 +6678,43 @@ mod tests {
             None,
             "a malformed snapshot must not announce a transition of its own"
         );
+    }
+
+    // The same race, driven through the real tracker rather than a bare
+    // state — which is the path that also has to survive the entry
+    // bookkeeping. A watch loop is always tracked before the
+    // `TurnCompleted` that settles it (tasks are started by tool calls
+    // *within* a turn), so the entry stays alive across the settle and the
+    // badge holds until the monitor actually ends.
+    #[test]
+    fn the_tracker_holds_the_badge_across_a_settle_and_drops_it_after() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        assert_eq!(
+            tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), now),
+            None,
+            "mid-turn the parent owns the dot"
+        );
+        assert_eq!(
+            tracker.decide("t", &turn_completed(), now),
+            Some(PaneStatus::Monitoring)
+        );
+        // Ticks keep answering Monitoring rather than falling back.
+        assert_eq!(
+            tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), now),
+            Some(PaneStatus::Monitoring)
+        );
+        assert_eq!(
+            tracker.tracked_thread_count(),
+            1,
+            "the entry survives the settle because the watch loop does"
+        );
+        assert_eq!(
+            tracker.decide("t", &monitor_event("m1", SubagentStatus::Completed), now),
+            Some(PaneStatus::Review),
+            "and the pane falls to the settled status when it ends"
+        );
+        assert_eq!(tracker.tracked_thread_count(), 0);
     }
 
     #[test]
