@@ -942,8 +942,9 @@ export function SidebarInbox() {
 
   // A pin overrides both parking lifecycles without erasing either persisted
   // shelf entry. Unpinning therefore returns the workspace to the exact shelf
-  // it would otherwise occupy. Like t3code, pinned cards keep the inbox's
-  // static creation order rather than reordering by pin time.
+  // it would otherwise occupy. Pinned cards keep the inbox's static creation
+  // order rather than reordering by pin time, so pinning never shuffles the
+  // list out from under the positions the user has memorized.
   const pinnedCards = allWorkspaces
     .map((ws, storedIndex) => ({ ws, storedIndex }))
     .filter(({ ws }) => ws.pinned_at != null && matchesFilter(ws))
@@ -1060,6 +1061,16 @@ export function SidebarInbox() {
     ? pendingWorkspaces.filter((pw) => pw.projectPath === filter)
     : pendingWorkspaces;
 
+  // Does anything render *after* the pinned block? Every section the list can
+  // draw below the pinned cards, in render order. Only this decides whether the
+  // pinned hairline has a second side to separate.
+  const hasContentBelowPinned =
+    topTier.length > 0 ||
+    filteredPending.length > 0 ||
+    wrappingUpTier.length > 0 ||
+    snoozedRows.length > 0 ||
+    settledRows.length > 0;
+
   const activeCardIds = orderedActiveCards.map((ws) => ws.workspace_id);
   // Every row the user can currently see, in visual order — the universe for
   // range selection and for the bulk menu's counts.
@@ -1155,13 +1166,23 @@ export function SidebarInbox() {
   }, []);
 
   /** Wake a snoozed workspace back into the active list. `reason` follows the
-   *  store's pin rules — only an explicit "Wake now" is a user decision. */
+   *  store's pin rules — only an explicit "Wake now" is a user decision.
+   *
+   *  A wake still runs while a workspace is pinned: the pin overrides where the
+   *  card is *shown*, not whether its snooze ticket comes due, so the preserved
+   *  shelf entry is cleared on schedule and unpinning later reveals an honest
+   *  active card rather than an expired snooze. */
   const wake = useCallback(
     (workspaceId: string, reason: "user" | "activity" | "timer") => {
+      const wasPinned =
+        latest.current.workspaceById.get(workspaceId)?.pinned_at != null;
       useSidebarInboxStore.getState().unsnooze(workspaceId, reason);
       markRowIn(setJustUnsettledId, workspaceId);
-      // A manual wake needs no badge — the user is the one who did it.
-      if (reason === "user") return;
+      // A manual wake needs no badge — the user is the one who did it. Neither
+      // does a pinned card: the "Woke" pill announces a *return* to a list, and
+      // a pinned card never left it, so the badge would flash news that never
+      // happened.
+      if (reason === "user" || wasPinned) return;
       setWokeIds((prev) => {
         if (prev.has(workspaceId)) return prev;
         const next = new Set(prev);
@@ -1422,8 +1443,15 @@ export function SidebarInbox() {
   //     activity (a non-null status un-pins via noteActivity's clearPin);
   //     selecting the workspace is not activity and leaves the pin standing,
   //     and a timer wake deliberately touches no pin at all;
-  //   • a durable workspace pin blocks every park path without mutating a
-  //     preserved settled/snoozed entry; unpinning reveals that base state;
+  //   • a durable workspace pin blocks every PARK path (manual, bulk, and this
+  //     sweep) without mutating a preserved settled/snoozed entry, so unpinning
+  //     reveals that base state. Un-park is deliberately not blocked: the
+  //     settle safety net and the snooze wake sweep still clear a preserved
+  //     entry while the card is pinned, because a pin governs where a card is
+  //     shown, not whether its agent went live or its wake time elapsed. Those
+  //     two only ever REMOVE a shelf entry, so they cannot fight the pin — the
+  //     card is already on top either way, and unpinning then reveals the
+  //     up-to-date lifecycle rather than a stale one;
   //   • the "Wrapping up" tier is not a fifth state and mutates nothing — it is
   //     a pure partition of the cards this sweep already left alone, so it can
   //     neither park a row nor be fought over by anything that can. An open PR
@@ -1709,7 +1737,12 @@ export function SidebarInbox() {
 
         {pinnedCards.map((ws, index) => renderCard(ws, index))}
 
-        {pinnedCards.length > 0 && (
+        {/* Separator, not a section footer: it only earns its pixel row when
+            there is actually something on the other side of it. An all-pinned
+            list (or a filter that leaves only pinned cards) would otherwise
+            trail a hairline under the last card, promising more list and then
+            ending. */}
+        {pinnedCards.length > 0 && hasContentBelowPinned && (
           <div
             aria-hidden="true"
             data-pinned-divider

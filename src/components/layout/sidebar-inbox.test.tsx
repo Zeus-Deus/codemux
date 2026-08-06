@@ -445,6 +445,28 @@ describe("SidebarInbox — cards", () => {
     expect(screen.getByRole("img", { name: "Pinned workspace" })).toBeInTheDocument();
   });
 
+  it("draws no pinned divider when nothing is pinned", async () => {
+    workspaces = [makeWorkspace({ title: "One" }), makeWorkspace({ title: "Two" })];
+
+    const { container } = await renderInbox();
+
+    expect(container.querySelector("[data-pinned-divider]")).toBeNull();
+  });
+
+  it("draws no pinned divider when every card is pinned", async () => {
+    // The hairline separates two blocks. With nothing below it, it would
+    // promise more list and then end.
+    workspaces = [
+      makeWorkspace({ title: "Pinned one", pinned_at: 100 }),
+      makeWorkspace({ title: "Pinned two", pinned_at: 200 }),
+    ];
+
+    const { container } = await renderInbox();
+
+    expect(container.querySelectorAll("[data-inbox-card]")).toHaveLength(2);
+    expect(container.querySelector("[data-pinned-divider]")).toBeNull();
+  });
+
   it("lets a pinned card unpin directly and offers Pin in an unpinned card menu", async () => {
     workspaces = [
       makeWorkspace({ title: "Pinned work", pinned_at: 100 }),
@@ -2487,6 +2509,23 @@ describe("SidebarInbox — unread + woke markers", () => {
       screen.queryByLabelText('"Back again" woke from snooze'),
     ).not.toBeInTheDocument();
   });
+
+  it("suppresses the woke badge on a pinned card, whose snooze still expires", async () => {
+    // A pin overrides where the card is shown, not whether its snooze ticket
+    // comes due — so the shelf entry is still cleared. But the badge announces
+    // a *return* to the list, and a pinned card never left it.
+    const base = Date.now();
+    persistInbox({ snoozed: [{ id: "ws-1", at: base - 1000, until: base - 1 }] });
+    workspaces = [makeWorkspace({ title: "Pinned sleeper", pinned_at: 100 })];
+    const { container } = await flushRender();
+
+    expect(
+      screen.queryByLabelText('"Pinned sleeper" woke from snooze'),
+    ).not.toBeInTheDocument();
+    // The card is on top either way; what changed is the preserved lifecycle.
+    expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+  });
 });
 
 describe("SidebarInbox — bulk actions across cards", () => {
@@ -2537,6 +2576,35 @@ describe("SidebarInbox — bulk actions across cards", () => {
     });
 
     expect(useSidebarInboxStore.getState().settled.map((entry) => entry.id)).toEqual([
+      "ws-2",
+    ]);
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+  });
+
+  it("exempts pinned cards from a mixed bulk snooze", async () => {
+    // Mirror of the bulk-Settle exemption above: both park verbs share one
+    // guardrail, so they must count the selection the same way.
+    workspaces = [
+      makeWorkspace({ title: "Pinned", pinned_at: Date.now() }),
+      makeWorkspace({ title: "Snooze me" }),
+    ];
+    const { container } = await flushRender();
+
+    const cards = [...container.querySelectorAll("[data-inbox-card]")];
+    fireEvent.click(cards[0], { ctrlKey: true });
+    fireEvent.click(cards[1], { ctrlKey: true });
+    fireEvent.contextMenu(cards[0]);
+
+    expect(await screen.findByText("Snooze (1)")).toBeInTheDocument();
+    expect(screen.queryByText("Snooze (2)")).not.toBeInTheDocument();
+
+    await userEvent.hover(screen.getByText("Snooze (1)"));
+    await userEvent.click(await screen.findByText("In 1 hour"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(useSidebarInboxStore.getState().snoozed.map((e) => e.id)).toEqual([
       "ws-2",
     ]);
     expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();

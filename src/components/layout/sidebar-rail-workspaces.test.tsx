@@ -208,6 +208,37 @@ describe("SidebarRailWorkspaces", () => {
     ).not.toBeNull();
   });
 
+  it("keeps a pinned snoozed workspace on the rail while its unpinned peer hides", async () => {
+    // The settled case is covered above; snooze is the other parking
+    // lifecycle, and the pin has to outrank it identically or the rail would
+    // disagree with the expanded inbox one Ctrl+B away.
+    const until = Date.now() + 3_600_000;
+    persistedSettled = JSON.stringify({
+      settled: [],
+      snoozed: [
+        { id: "ws-1", at: Date.now(), until },
+        { id: "ws-2", at: Date.now(), until },
+      ],
+      keepActive: [],
+      activity: {},
+    });
+    workspaces = [
+      makeWorkspace({ title: "Pinned sleeper", pinned_at: 100 }),
+      makeWorkspace({ title: "Plain sleeper" }),
+      makeWorkspace({ title: "Wide awake" }),
+    ];
+    const { container } = await renderRail();
+
+    const buttons = [...container.querySelectorAll("[data-rail-ws]")];
+    expect(buttons.map((button) => button.getAttribute("data-rail-ws"))).toEqual([
+      "ws-1",
+      "ws-3",
+    ]);
+    expect(
+      buttons[0]?.querySelector('[aria-label="Pinned workspace"]'),
+    ).not.toBeNull();
+  });
+
   it("excludes settled workspaces (repo filter never applies)", async () => {
     persistedSettled = JSON.stringify({
       settled: [{ id: "ws-2", at: Date.now() }],
