@@ -86,6 +86,7 @@ describe("useActiveChatTasks", () => {
       threadId: null,
       tasks: null,
       updatedAt: null,
+      streaming: false,
     });
   });
 });

@@ -159,6 +159,7 @@ import {
   shouldAutoSettle,
   MAX_TIMER_DELAY_MS,
 } from "./sidebar-inbox";
+import { isPrOnCurrentBranch } from "@/components/github/pr-status-icon";
 import {
   __resetSidebarInboxStoreForTests,
   useSidebarInboxStore,
@@ -806,6 +807,54 @@ describe("SidebarInbox — settle / un-settle", () => {
       "sidebar.inbox.settled",
       expect.any(String),
     );
+  });
+
+  it("shows a side-branch PR badge but never settles the card on it", async () => {
+    // The workspace is checked out on `fix-ui-borders`; the PR it opened came
+    // off `appimage-child-env-hygiene`, a branch it has since left. The badge
+    // is the whole point of the fallback and must render like any other. The
+    // merge, however, describes a branch the user is not standing on, so the
+    // card stays active — its own checkout is still unfinished.
+    workspaces = [
+      makeWorkspace({
+        title: "Side-branch PR",
+        worktree_path: "/wt/a",
+        git_branch: "fix-ui-borders",
+        pr_number: 250,
+        pr_state: "MERGED",
+        pr_head_branch: "appimage-child-env-hygiene",
+        last_active_at: Date.now(),
+      }),
+    ];
+    const { container } = await flushRender();
+
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+    expect(screen.queryByText("Settled")).not.toBeInTheDocument();
+    // Since the settled-treatment chip landed, an active-card badge renders as
+    // the state icon + #number rather than the word "merged".
+    expect(
+      screen.getByRole("button", { name: "Pull request #250 — merged" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("#250")).toBeInTheDocument();
+  });
+
+  it("still settles on a PR whose head branch IS the checked-out branch", async () => {
+    // The control for the test above: same badge, same state, association
+    // pointing at the branch actually checked out.
+    workspaces = [
+      makeWorkspace({
+        title: "Own-branch PR",
+        worktree_path: "/wt/a",
+        git_branch: "fix-ui-borders",
+        pr_number: 251,
+        pr_state: "MERGED",
+        pr_head_branch: "fix-ui-borders",
+        last_active_at: Date.now(),
+      }),
+    ];
+    const { container } = await flushRender();
+
+    expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
   });
 
   it("auto-settles completed review work when its PR is merged", async () => {
@@ -2355,6 +2404,58 @@ describe("sidebar-inbox pure helpers", () => {
     expect(shouldAutoSettle(null, null, stale, now, null)).toBe(false);
   });
 
+  it("shouldAutoSettle refuses to complete a workspace on a side-branch PR", () => {
+    // The real case: an agent working in a workspace branched off, pushed,
+    // opened a PR, and checked the worktree back — leaving eleven uncommitted
+    // files behind. The badge is real and belongs on the card. Settling that
+    // workspace when the side branch merges would file away work the user
+    // never finished.
+    const now = 10 * 86_400_000;
+    const stale = now - 4 * 86_400_000;
+    const fresh = now - 60_000;
+
+    for (const prState of ["merged", "closed"] as const) {
+      expect(shouldAutoSettle(prState, null, fresh, now, 3, false)).toBe(false);
+      expect(shouldAutoSettle(prState, "review", fresh, now, null, false)).toBe(
+        false,
+      );
+      // Same inputs, current-branch association: settles as it always has.
+      expect(shouldAutoSettle(prState, null, fresh, now, 3, true)).toBe(true);
+      // The guard removes only the PR shortcut. Idle work still ages out —
+      // an unfinished workspace is not made immortal by a side-branch badge.
+      expect(shouldAutoSettle(prState, null, stale, now, 3, false)).toBe(true);
+    }
+  });
+
+  it("isPrOnCurrentBranch treats an unknown head branch as the pre-field case", () => {
+    // Matching association — the ordinary badge.
+    expect(isPrOnCurrentBranch("fix-ui-borders", "fix-ui-borders")).toBe(true);
+    // Side-branch association — badge only.
+    expect(isPrOnCurrentBranch("appimage-child-env-hygiene", "fix-ui-borders")).toBe(
+      false,
+    );
+    // Additive field: absent means "predates the field", not "side branch",
+    // so an old persisted snapshot keeps settling exactly as it used to.
+    expect(isPrOnCurrentBranch(null, "fix-ui-borders")).toBe(true);
+    expect(isPrOnCurrentBranch(undefined, "fix-ui-borders")).toBe(true);
+  });
+
+  it("isPrOnCurrentBranch keeps the association when the local branch is unknown", () => {
+    // `git_branch_info` reports no branch on a detached HEAD — mid-rebase,
+    // mid-bisect, `gh pr checkout` of a SHA — while the stored head branch
+    // survives. Treating that unknown as a mismatch would flip `hasPr` off
+    // and offer "Create PR" for a workspace that already has an open one,
+    // for as long as the rebase ran. Missing information must never
+    // un-associate a workspace from its own PR.
+    expect(isPrOnCurrentBranch("fix-ui-borders", null)).toBe(true);
+    expect(isPrOnCurrentBranch("fix-ui-borders", undefined)).toBe(true);
+    expect(isPrOnCurrentBranch("fix-ui-borders", "")).toBe(true);
+    // Both unknown is still a match, for the same reason.
+    expect(isPrOnCurrentBranch(null, null)).toBe(true);
+    // Two *known* names that differ is the only real mismatch.
+    expect(isPrOnCurrentBranch("side-branch", "fix-ui-borders")).toBe(false);
+  });
+
   it("nextWorkspaceAfterPark steps forward, wraps, and stays put for background parks", () => {
     const ids = ["a", "b", "c"];
     expect(nextWorkspaceAfterPark(["a"], "a", ids)).toBe("b");
@@ -2414,6 +2515,9 @@ describe("sidebar-inbox pure helpers", () => {
     // …and output the user has not seen must never be pushed down.
     expect(isWrappingUp("open", null, true)).toBe(false);
     expect(isWrappingUp("open", null, false)).toBe(true);
+    // …and a PR opened off a side branch is not this workspace winding down:
+    // the checkout in front of the user may not have shipped anything yet.
+    expect(isWrappingUp("open", null, false, false)).toBe(false);
   });
 
   it("isSnoozeable withholds the gesture from live and blocked agents", () => {

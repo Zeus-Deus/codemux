@@ -31,6 +31,25 @@ A successful empty result clears the association, while an unanswerable lookup
 The frontend renders sub-components for each PR aspect. Auth status is checked
 before fetching. The panel updates when workspace state changes.
 
+**The Review tab is strictly current-branch, deliberately.** The sidebar shows
+a PR badge for a *side branch* the worktree merely checked out recently (the
+agent-opened-a-PR-from-a-side-branch case — see `docs/features/sidebar.md`
+§ "Side-branch PR badges"), and the workspace snapshot records that PR's head
+branch in `pr_head_branch`. This panel gates `hasPr` on that head branch
+matching `git_branch`, and its detail queries still call the strict
+`get_branch_pull_request` command. A badge is a pointer at GitHub; this panel
+is a working surface, so honouring a side-branch association here would review
+a branch the user is not on *and* hide the "Create PR" affordance for the
+branch they are. The Review tab's own badge needs no separate guard — it only
+renders from cached PR query data, which a disabled panel never populates.
+
+The guard is a *mismatch* test, not an equality test: when either name is
+unknown it holds the association. `git_branch_info` reports no branch on a
+detached HEAD — mid-rebase, mid-bisect, `gh pr checkout` of a SHA — while
+`pr_head_branch` survives, and treating that unknown as "different branch"
+would offer "Create PR" for a workspace that already has an open one, for as
+long as the rebase ran.
+
 ## What Works Today
 
 - PR creation from panel when no PR exists for the current branch (title, body, base branch, draft toggle)
