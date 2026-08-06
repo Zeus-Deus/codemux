@@ -1,8 +1,10 @@
 use crate::execution::{sanitize_gui_env_std, sanitize_gui_env_std_keep_dbus};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestInfo {
@@ -928,6 +930,34 @@ fn select_branch_pr(
 /// question is unanswerable rather than answered "no PR". Returning `Ok(None)`
 /// there would let a routine rebase clear an OPEN badge.
 pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
+    Ok(resolve_branch_pr(repo_path)?.pr)
+}
+
+/// The `--json` field set every branch-PR query asks for. Shared by the
+/// per-branch lookup and the repo-wide fallback list so `parse_pr_json` can
+/// never be handed a row that is missing a field one caller relies on.
+const BRANCH_PR_JSON_FIELDS: &str = "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid,headRepositoryOwner";
+
+/// The current branch's PR plus the branch context that produced it.
+///
+/// The context is not decoration: the side-branch fallback needs to know
+/// which branch already answered "no PR" (to exclude it from the candidate
+/// list) and whether that branch is the repository default (where no fallback
+/// may run at all), and re-deriving either would mean re-running local git
+/// commands the primary lookup already ran.
+struct BranchPrLookup {
+    branch: String,
+    default_branch: Option<String>,
+    pr: Option<PullRequestInfo>,
+}
+
+impl BranchPrLookup {
+    fn is_default_branch(&self) -> bool {
+        self.default_branch.as_deref() == Some(self.branch.as_str())
+    }
+}
+
+fn resolve_branch_pr(repo_path: &Path) -> Result<BranchPrLookup, String> {
     let Some(branch) = run_git_optional(repo_path, &["branch", "--show-current"]) else {
         return Err("detached HEAD: no branch to resolve a PR for".to_string());
     };
@@ -950,7 +980,7 @@ pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String
             "--limit",
             "100",
             "--json",
-            "number,url,state,title,headRefName,baseRefName,isDraft,mergeable,additions,deletions,reviewDecision,updatedAt,headRefOid,headRepositoryOwner",
+            BRANCH_PR_JSON_FIELDS,
         ],
         BRANCH_PR_LOOKUP_TIMEOUT,
     )?;
@@ -959,14 +989,256 @@ pub fn get_branch_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String
     let rows = value
         .as_array()
         .ok_or_else(|| "Expected JSON array from gh pr list".to_string())?;
-    let is_default_branch = crate::git::find_default_branch(repo_path).as_deref() == Some(&branch);
+    let default_branch = crate::git::find_default_branch(repo_path);
+    let is_default_branch = default_branch.as_deref() == Some(branch.as_str());
 
-    Ok(select_branch_pr(
+    let pr = select_branch_pr(
         rows.iter().map(parse_pr_json),
         &branch,
         expected_owner.as_deref(),
         is_default_branch,
-    ))
+    );
+    Ok(BranchPrLookup {
+        branch,
+        default_branch,
+        pr,
+    })
+}
+
+/// How many HEAD reflog entries the side-branch fallback reads.
+///
+/// The window is bounded by entry count rather than wall-clock age on
+/// purpose: reflog timestamps are rewritten by `git gc` and absent from a
+/// fresh clone, while "the last handful of things this worktree checked out"
+/// is exactly the question the fallback wants answered.
+const REFLOG_SCAN_ENTRIES: usize = 50;
+
+/// How many distinct recently-checked-out branches the fallback considers.
+const REFLOG_CANDIDATE_LIMIT: usize = 5;
+
+/// Repo-wide PR page size for the fallback. Smaller than the per-branch
+/// query's 100 because the fallback only ever asks about branches checked
+/// out in the recent past, whose PRs are correspondingly recent.
+const FALLBACK_PR_LIST_LIMIT: &str = "50";
+
+/// How long one repo-wide fallback list is reused. Sized to the 60s PR
+/// poller so the 5s active-workspace sweep can't multiply it: several
+/// no-PR workspaces sharing a repo cost one `gh` call per minute between
+/// them, not one per workspace per sweep.
+const FALLBACK_PR_LIST_TTL: Duration = Duration::from_secs(60);
+
+type FallbackPrListCache = Mutex<HashMap<String, (Instant, Arc<Vec<serde_json::Value>>)>>;
+static FALLBACK_PR_LIST_CACHE: OnceLock<FallbackPrListCache> = OnceLock::new();
+
+/// True for a name that is really a commit id — what `git checkout <sha>`
+/// and `git bisect` write into the reflog. A branch named entirely of hex
+/// digits is theoretically possible and is deliberately sacrificed: reading
+/// a detached-HEAD SHA as a branch name would send a `gh` query after
+/// something that can never match.
+fn looks_like_commit_id(name: &str) -> bool {
+    (7..=40).contains(&name.len()) && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Branch names this worktree checked out recently, newest first.
+///
+/// Input is raw `git reflog` output for HEAD, which in a linked worktree is
+/// that worktree's own reflog — so the candidates describe where *this*
+/// checkout has been, not the repo at large.
+///
+/// Only `checkout: moving from X to Y` records carry branch identity, and
+/// both sides of one are used: `Y` is the state the worktree entered and `X`
+/// the one it left, so reading `Y` then `X` per record, newest record first,
+/// yields true recency order. Taking only `Y` would miss a branch whose
+/// arrival scrolled off the end of the window while its departure did not.
+///
+/// The current branch is excluded (it already answered "no PR"), as is the
+/// repository default branch (its PR history is reverse-merge noise, the same
+/// reason `select_branch_pr` suppresses historical PRs there).
+///
+/// A branch name containing " to " is ambiguous in this format and is split
+/// at the first occurrence; git writes no delimiter that would resolve it,
+/// and the failure mode is a candidate that matches no PR.
+fn parse_recent_checkout_branches(
+    reflog: &str,
+    current_branch: &str,
+    default_branch: Option<&str>,
+    limit: usize,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    for line in reflog.lines() {
+        let Some((_, moved)) = line.split_once("checkout: moving from ") else {
+            continue;
+        };
+        let Some((from, to)) = moved.split_once(" to ") else {
+            continue;
+        };
+        for name in [to.trim(), from.trim()] {
+            if name.is_empty()
+                || name == current_branch
+                || default_branch == Some(name)
+                || looks_like_commit_id(name)
+                || candidates.iter().any(|existing| existing == name)
+            {
+                continue;
+            }
+            candidates.push(name.to_string());
+            if candidates.len() >= limit {
+                return candidates;
+            }
+        }
+    }
+    candidates
+}
+
+/// Cache key for the repo-wide fallback list: the origin URL, so sibling
+/// worktrees of one repo share a single entry (they share the PR list too).
+/// Repos without an origin fall back to their own path, which is still
+/// correct, just unshared.
+fn fallback_pr_list_key(repo_path: &Path) -> String {
+    run_git_optional(repo_path, &["config", "--get", "remote.origin.url"])
+        .unwrap_or_else(|| repo_path.to_string_lossy().into_owned())
+}
+
+/// One repo-wide `gh pr list`, memoized for [`FALLBACK_PR_LIST_TTL`].
+///
+/// Listing the repo once and matching every candidate branch against it
+/// client-side keeps the fallback at a flat one extra `gh` call, instead of
+/// one per candidate.
+fn fallback_pr_list(repo_path: &Path) -> Result<Arc<Vec<serde_json::Value>>, String> {
+    let key = fallback_pr_list_key(repo_path);
+    let cache = FALLBACK_PR_LIST_CACHE.get_or_init(FallbackPrListCache::default);
+
+    if let Some((fetched_at, rows)) = cache.lock().unwrap().get(&key) {
+        if fetched_at.elapsed() < FALLBACK_PR_LIST_TTL {
+            return Ok(Arc::clone(rows));
+        }
+    }
+
+    let output = run_gh_timed(
+        repo_path,
+        &[
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            FALLBACK_PR_LIST_LIMIT,
+            "--json",
+            BRANCH_PR_JSON_FIELDS,
+        ],
+        BRANCH_PR_LOOKUP_TIMEOUT,
+    )?;
+    let value: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| format!("Failed to parse PR JSON: {e}"))?;
+    let rows = Arc::new(
+        value
+            .as_array()
+            .ok_or_else(|| "Expected JSON array from gh pr list".to_string())?
+            .clone(),
+    );
+
+    let mut guard = cache.lock().unwrap();
+    guard.retain(|_, (fetched_at, _)| fetched_at.elapsed() < FALLBACK_PR_LIST_TTL);
+    guard.insert(key, (Instant::now(), Arc::clone(&rows)));
+    Ok(rows)
+}
+
+/// Badge-only fallback: the PR of a branch this worktree checked out recently.
+///
+/// Answers the "agent opened the PR from a side branch, then checked the
+/// worktree back" case, where the workspace has visibly produced a pull
+/// request that strict current-branch association cannot see. Candidates are
+/// tried newest-first and the first branch with a PR wins — each one is
+/// resolved through the same [`select_branch_pr`] policy as the current
+/// branch, so open/draft still beats history and fork owners are still
+/// scoped.
+///
+/// The result is deliberately weaker than a current-branch association: it
+/// carries the PR's own `head_branch`, and auto-settlement refuses any
+/// association whose head branch is not the checked-out one.
+fn get_side_branch_pr(
+    repo_path: &Path,
+    lookup: &BranchPrLookup,
+) -> Result<Option<PullRequestInfo>, String> {
+    let Some(reflog) = run_git_optional(
+        repo_path,
+        &[
+            "reflog",
+            "show",
+            "--max-count",
+            &REFLOG_SCAN_ENTRIES.to_string(),
+            "HEAD",
+        ],
+    ) else {
+        return Ok(None);
+    };
+    let candidates = parse_recent_checkout_branches(
+        &reflog,
+        &lookup.branch,
+        lookup.default_branch.as_deref(),
+        REFLOG_CANDIDATE_LIMIT,
+    );
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let rows = fallback_pr_list(repo_path)?;
+    let prs: Vec<PullRequestInfo> = rows.iter().map(parse_pr_json).collect();
+    Ok(select_first_candidate_pr(&prs, &candidates, &|candidate| {
+        resolve_branch_head_owner(repo_path, candidate)
+    }))
+}
+
+/// Newest-first candidate scan: the first recently-checked-out branch that
+/// has a PR wins outright.
+///
+/// Recency decides, not PR state. A branch checked out more recently is the
+/// better description of what this workspace was just doing, and ranking an
+/// older branch's open PR above it would resurrect stale work as the badge.
+/// Within a single candidate the ordinary [`select_branch_pr`] policy still
+/// applies, so open/draft beats that branch's own history.
+///
+/// `expected_owner` is injected rather than resolved inline because it costs
+/// a `git config` read per candidate — the caller owns that, the selection
+/// rule stays pure.
+fn select_first_candidate_pr(
+    prs: &[PullRequestInfo],
+    candidates: &[String],
+    expected_owner: &dyn Fn(&str) -> Option<String>,
+) -> Option<PullRequestInfo> {
+    candidates.iter().find_map(|candidate| {
+        // Never the default branch — `parse_recent_checkout_branches`
+        // excludes it — so historical PRs stay eligible here.
+        select_branch_pr(
+            prs.iter().cloned(),
+            candidate,
+            expected_owner(candidate).as_deref(),
+            false,
+        )
+    })
+}
+
+/// The PR a workspace should show a badge for.
+///
+/// The current branch owns the association whenever it has one. Only when it
+/// authoritatively has none does the recently-checked-out fallback run, and
+/// never on the repository default branch, where "recently checked out"
+/// describes ordinary branch hopping rather than this checkout's own work.
+///
+/// The three-way [`BranchPrOutcome`] contract is preserved exactly: an
+/// unanswerable *current-branch* lookup is still `Err` (preserve the badge),
+/// while a failure inside the fallback collapses to `Ok(None)` — the current
+/// branch already answered "no PR" authoritatively, and a missing bonus badge
+/// must not be upgraded into "keep the old one".
+pub fn get_workspace_pr(repo_path: &Path) -> Result<Option<PullRequestInfo>, String> {
+    let lookup = resolve_branch_pr(repo_path)?;
+    if lookup.pr.is_some() {
+        return Ok(lookup.pr);
+    }
+    if lookup.is_default_branch() {
+        return Ok(None);
+    }
+    Ok(get_side_branch_pr(repo_path, &lookup).unwrap_or(None))
 }
 
 /// What a branch-PR lookup should do to a workspace's stored association.
@@ -1718,6 +1990,204 @@ mod tests {
         let descending = select_branch_pr([b, a, c], "feature/reused", None, false).map(|pr| pr.number);
         assert_eq!(ascending, Some(61));
         assert_eq!(descending, Some(61));
+    }
+
+    // ── Side-branch badge fallback ──────────────────────────────
+    //
+    // The case these cover: an agent working in a workspace branches off,
+    // commits, pushes, opens a PR, then checks the worktree back. Strict
+    // current-branch association sees no PR, but the workspace visibly
+    // produced one. The fallback finds it from the worktree's own HEAD
+    // reflog — as a *badge* only. Whether that association may also settle
+    // the workspace is decided downstream, from the PR's head branch.
+
+    /// Real `git reflog` HEAD output shape for exactly that sequence.
+    const SIDE_BRANCH_REFLOG: &str = "\
+7c1a2b3 HEAD@{0}: checkout: moving from appimage-child-env-hygiene to fix-ui-borders
+9d4e5f6 HEAD@{1}: commit: chore: sanitize child env
+1a2b3c4 HEAD@{2}: checkout: moving from fix-ui-borders to appimage-child-env-hygiene
+5e6f7a8 HEAD@{3}: commit: wip: borders
+2b3c4d5 HEAD@{4}: checkout: moving from main to fix-ui-borders";
+
+    #[test]
+    fn test_reflog_candidates_find_the_side_branch_the_worktree_returned_from() {
+        let candidates =
+            parse_recent_checkout_branches(SIDE_BRANCH_REFLOG, "fix-ui-borders", Some("main"), 5);
+        assert_eq!(candidates, vec!["appimage-child-env-hygiene".to_string()]);
+    }
+
+    #[test]
+    fn test_reflog_candidates_exclude_the_current_and_default_branches() {
+        // The current branch already answered "no PR" authoritatively, and
+        // the default branch's PR history is reverse-merge noise rather than
+        // this checkout's work — the same reason `select_branch_pr`
+        // suppresses historical PRs there.
+        let candidates =
+            parse_recent_checkout_branches(SIDE_BRANCH_REFLOG, "fix-ui-borders", Some("main"), 5);
+        assert!(!candidates.iter().any(|b| b == "fix-ui-borders"));
+        assert!(!candidates.iter().any(|b| b == "main"));
+    }
+
+    #[test]
+    fn test_reflog_candidates_are_newest_first_and_deduped() {
+        let reflog = "\
+aaa1111 HEAD@{0}: checkout: moving from third to current
+bbb2222 HEAD@{1}: checkout: moving from second to third
+ccc3333 HEAD@{2}: checkout: moving from third to second
+ddd4444 HEAD@{3}: checkout: moving from first to third
+eee5555 HEAD@{4}: checkout: moving from current to first";
+        let candidates = parse_recent_checkout_branches(reflog, "current", Some("main"), 5);
+        assert_eq!(
+            candidates,
+            vec![
+                "third".to_string(),
+                "second".to_string(),
+                "first".to_string()
+            ],
+            "each branch appears once, at its most recent position"
+        );
+    }
+
+    #[test]
+    fn test_reflog_candidates_skip_detached_head_shas() {
+        // `git checkout <sha>`, `git bisect`, and `gh pr checkout` of a
+        // commit all write a raw object id here. Querying gh for a branch by
+        // that name can only ever miss.
+        let reflog = "\
+aaa1111 HEAD@{0}: checkout: moving from 9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e to current
+bbb2222 HEAD@{1}: checkout: moving from side-branch to 9d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e";
+        let candidates = parse_recent_checkout_branches(reflog, "current", Some("main"), 5);
+        assert_eq!(candidates, vec!["side-branch".to_string()]);
+    }
+
+    #[test]
+    fn test_reflog_candidates_ignore_non_checkout_records_and_respect_the_cap() {
+        // Commits, resets, rebases and merges all live in the same reflog
+        // and carry no branch identity. Only `checkout: moving from X to Y`
+        // is parsed, and the candidate list stays small so a long reflog
+        // can't turn into a long scan.
+        let reflog = "\
+aaa1111 HEAD@{0}: commit: some work
+bbb2222 HEAD@{1}: reset: moving to HEAD~1
+ccc3333 HEAD@{2}: rebase (finish): returning to refs/heads/current
+ddd4444 HEAD@{3}: checkout: moving from f to current
+eee5555 HEAD@{4}: checkout: moving from e to f
+fff6666 HEAD@{5}: checkout: moving from d to e
+aaa7777 HEAD@{6}: checkout: moving from c to d
+bbb8888 HEAD@{7}: checkout: moving from b to c
+ccc9999 HEAD@{8}: checkout: moving from a to b";
+        let candidates = parse_recent_checkout_branches(reflog, "current", Some("main"), 3);
+        assert_eq!(
+            candidates,
+            vec!["f".to_string(), "e".to_string(), "d".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_reflog_candidates_are_empty_without_checkout_history() {
+        // A worktree created and never switched away from has nothing to
+        // fall back to, so the fallback never reaches `gh` at all.
+        let reflog = "aaa1111 HEAD@{0}: commit (initial): first";
+        assert!(parse_recent_checkout_branches(reflog, "current", Some("main"), 5).is_empty());
+    }
+
+    #[test]
+    fn test_fallback_takes_the_most_recently_checked_out_branch_with_a_pr() {
+        // Recency decides between candidates: `newer`'s merged PR outranks
+        // `older`'s open one, because "what this workspace was just doing"
+        // is the question being answered.
+        let prs = vec![
+            branch_pr(70, "OPEN", "older", "2026-08-05T10:00:00Z", None),
+            branch_pr(71, "MERGED", "newer", "2026-08-04T10:00:00Z", None),
+        ];
+        let candidates = vec!["newer".to_string(), "older".to_string()];
+        let selected = select_first_candidate_pr(&prs, &candidates, &|_| None).unwrap();
+        assert_eq!(selected.number, 71);
+    }
+
+    #[test]
+    fn test_fallback_skips_candidates_without_a_pr() {
+        let prs = vec![branch_pr(72, "OPEN", "has-pr", "2026-08-05T10:00:00Z", None)];
+        let candidates = vec!["no-pr".to_string(), "has-pr".to_string()];
+        let selected = select_first_candidate_pr(&prs, &candidates, &|_| None).unwrap();
+        assert_eq!(selected.number, 72);
+        assert_eq!(selected.head_branch.as_deref(), Some("has-pr"));
+    }
+
+    #[test]
+    fn test_fallback_applies_the_open_over_history_policy_within_one_candidate() {
+        // The fallback resolves each candidate through `select_branch_pr`,
+        // so a reused branch name still prefers its open PR over its own
+        // history.
+        let prs = vec![
+            branch_pr(80, "MERGED", "reused", "2026-08-05T10:00:00Z", None),
+            branch_pr(81, "OPEN", "reused", "2026-08-01T10:00:00Z", None),
+        ];
+        let selected =
+            select_first_candidate_pr(&prs, &["reused".to_string()], &|_| None).unwrap();
+        assert_eq!(selected.number, 81);
+    }
+
+    #[test]
+    fn test_fallback_honours_fork_owner_scoping() {
+        // Same client-side fork disambiguation as the current-branch path:
+        // an upstream PR that merely shares a branch name must not attach to
+        // a fork-tracking candidate.
+        let prs = vec![branch_pr_owned_by(
+            90,
+            "OPEN",
+            "shared-name",
+            "2026-08-05T10:00:00Z",
+            Some("upstream"),
+        )];
+        let candidates = vec!["shared-name".to_string()];
+        assert!(
+            select_first_candidate_pr(&prs, &candidates, &|_| Some("contributor".to_string()))
+                .is_none()
+        );
+        assert!(
+            select_first_candidate_pr(&prs, &candidates, &|_| Some("upstream".to_string()))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_default_branch_checkout_is_recognised_so_the_fallback_can_refuse_it() {
+        // A repo-root workspace sitting on the default branch checks out
+        // every branch in the repo over time; "recently checked out" there
+        // means ordinary branch hopping, not this checkout's own work.
+        let on_default = BranchPrLookup {
+            branch: "main".to_string(),
+            default_branch: Some("main".to_string()),
+            pr: None,
+        };
+        assert!(on_default.is_default_branch());
+
+        let on_feature = BranchPrLookup {
+            branch: "fix-ui-borders".to_string(),
+            default_branch: Some("main".to_string()),
+            pr: None,
+        };
+        assert!(!on_feature.is_default_branch());
+    }
+
+    #[test]
+    fn test_a_fallback_association_carries_its_own_head_branch() {
+        // This is what lets settlement tell the two association kinds
+        // apart: the badge is stored with the PR's head branch, which for a
+        // side-branch association is not the workspace's checked-out branch.
+        let prs = vec![branch_pr(
+            250,
+            "OPEN",
+            "appimage-child-env-hygiene",
+            "2026-08-05T10:00:00Z",
+            None,
+        )];
+        let candidates =
+            parse_recent_checkout_branches(SIDE_BRANCH_REFLOG, "fix-ui-borders", Some("main"), 5);
+        let selected = select_first_candidate_pr(&prs, &candidates, &|_| None).unwrap();
+        assert_eq!(selected.number, 250);
+        assert_ne!(selected.head_branch.as_deref(), Some("fix-ui-borders"));
     }
 
     #[test]

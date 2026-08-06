@@ -380,7 +380,9 @@ visual only — nothing is archived, closed, or deleted.
 - **Auto-settle** — the Settled shelf fills itself using PR-completion
   semantics. A workspace whose PR is **merged or closed** settles
   immediately once it is neither working nor blocked; no activity stamp or
-  extra idle grace is required. A completed **review** status is settleable —
+  extra idle grace is required — provided that PR is the **checked-out
+  branch's** and not a badge-only side-branch association (see "Side-branch PR
+  badges" below). A completed **review** status is settleable —
   it says the run finished, not that work is still executing. An **open** PR
   never settles a card by itself; it demotes it into the "Wrapping up" tier
   described above. Work without a finished PR auto-settles when:
@@ -425,6 +427,51 @@ visual only — nothing is archived, closed, or deleted.
   matrix cannot drift between the manual refresh command and the two pollers.
   These rules are what let a real `MERGED`/`CLOSED` transition reach auto-settle
   reliably.
+- **Side-branch PR badges (badge only).** Strict current-branch association has
+  one visible blind spot: an agent that runs `git checkout -b side-branch`,
+  commits, pushes, opens a PR, and checks the worktree back leaves a workspace
+  that plainly produced a pull request and no badge to show for it. So when the
+  checked-out branch resolves to *no* PR, `github::get_workspace_pr` falls back
+  to branches the worktree checked out recently: it parses `checkout: moving
+  from X to Y` records out of the last **50** HEAD reflog entries (that reflog
+  is per-worktree, so it describes this checkout's own history), takes up to
+  **5** distinct branch names newest-first, and resolves them through the same
+  `select_branch_pr` policy. Both sides of each record are read (`Y` then `X`)
+  so a branch whose arrival scrolled out of the window is still found; the
+  current branch, the default branch, and detached-HEAD SHAs are excluded.
+  Recency decides between candidates — the first one with a PR wins outright,
+  because "what this workspace was just doing" is the question being answered.
+  The fallback never runs on the repository **default branch**, where "recently
+  checked out" describes ordinary branch hopping rather than this checkout's
+  work. It costs one repo-wide `gh pr list --state all` matched client-side
+  against every candidate (not one query per candidate), memoized per origin
+  URL for 60s so the 5s active-workspace sweep can't multiply it. A failed
+  fallback collapses to "no PR" rather than `Preserve`: the current branch
+  already answered authoritatively, and a missing bonus badge must not
+  resurrect an old one.
+- **A side-branch association is a badge and nothing more.** The workspace
+  snapshot carries `pr_head_branch` (snapshot-local, serde-defaulted, never
+  synced) alongside `pr_number`/`pr_state`/`pr_url`, and the frontend predicate
+  `isPrOnCurrentBranch` (in `pr-status-icon.tsx`, shared because neither the
+  sidebar nor the hover card may import the other) compares it to `git_branch`.
+  Everything that *renders* the PR ignores the distinction; everything that
+  *draws a conclusion* from it asks first:
+  - **auto-settle** refuses the merged/closed shortcut for a side-branch PR.
+    That branch merging says nothing about the checkout in front of the user,
+    which may still be full of uncommitted work. Such a workspace still ages
+    out through the ordinary inactivity rule — the guard removes the shortcut,
+    not the workspace's eventual settlement.
+  - the **"Wrapping up" tier** likewise refuses it: an open PR off a side
+    branch is not this workspace winding down.
+  - the **Review tab** stays strictly current-branch (see
+    `docs/features/review-integration.md`) — it is a working surface, not a
+    badge, and honouring a side-branch PR there would hide "Create PR" for the
+    branch the user is actually on.
+
+  A `null` head branch means "association predates the field", not "side
+  branch", and is read as a match so old persisted snapshots settle exactly as
+  they used to. The hover/details card adds a **"PR branch"** row only in the
+  mismatching case, where it answers the question the badge raises.
 - **The anti-oscillation invariant.** Four states (active / settled / snoozed /
   pinned-active) and five park-mutating effects (auto-settle, the auto-un-settle
   safety net, the snooze hand-raise, the wake sweep, the precise wake timer)

@@ -55,6 +55,7 @@ import {
 } from "./sidebar-snooze";
 import { WorkspaceHoverCard } from "./workspace-hover-card";
 import {
+  isPrOnCurrentBranch,
   normalizePrState,
   PrStatusIcon,
   prStatusTextClass,
@@ -153,9 +154,11 @@ export function isWrappingUp(
   prState: PrStatusState | null,
   status: ActivePaneStatus | null,
   unread: boolean,
+  prOnCurrentBranch = true,
 ): boolean {
-  return prState === "open" && status === null && !unread;
+  return prState === "open" && status === null && !unread && prOnCurrentBranch;
 }
+
 
 /** Completion-driven automatic settlement.
  *
@@ -164,6 +167,13 @@ export function isWrappingUp(
  * required. Inactivity remains a separate fallback for work without a finished
  * PR. A completed `review` status is deliberately settleable: it says the run
  * finished, not that work is still executing.
+ *
+ * The completion rule requires the PR to belong to the **checked-out branch**
+ * (`prOnCurrentBranch`, from `isPrOnCurrentBranch`). A side-branch badge —
+ * a PR the workspace opened from a branch it has since left — must never
+ * settle the workspace: the checkout it settles is not the checkout the PR
+ * merged. Note the guard only removes the PR shortcut; such a workspace still
+ * reaches the inactivity fallback below on its own idle schedule.
  *
  * Explicit keep-active pins, snoozes, and already-settled ids are handled by
  * the caller because they are persisted inbox lifecycle state rather than
@@ -174,9 +184,11 @@ export function shouldAutoSettle(
   lastActivityAt: number | undefined,
   now: number,
   autoSettleDays: number | null,
+  prOnCurrentBranch = true,
 ): boolean {
   if (status === "working" || status === "permission") return false;
-  if (prState === "merged" || prState === "closed") return true;
+  if (prOnCurrentBranch && (prState === "merged" || prState === "closed"))
+    return true;
   if (autoSettleDays === null || lastActivityAt === undefined) return false;
   return now - lastActivityAt > autoSettleDays * 86_400_000;
 }
@@ -975,6 +987,7 @@ export function SidebarInbox() {
       normalizePrState(ws.pr_state),
       statusOf(ws),
       isUnread(ws),
+      isPrOnCurrentBranch(ws.pr_head_branch, ws.git_branch),
     )
       ? wrappingUpTier
       : topTier;
@@ -1408,7 +1421,16 @@ export function SidebarInbox() {
       const status = getWorkspaceStatus(ws.surfaces, paneStatuses);
       const prState = normalizePrState(ws.pr_state);
       const stamp = effectiveActivityAt(ws.last_active_at, activity[id]);
-      if (shouldAutoSettle(prState, status, stamp, now, autoSettleDays)) {
+      if (
+        shouldAutoSettle(
+          prState,
+          status,
+          stamp,
+          now,
+          autoSettleDays,
+          isPrOnCurrentBranch(ws.pr_head_branch, ws.git_branch),
+        )
+      ) {
         store.settle(id, ws.last_active_at ?? undefined);
         markRowIn(setJustSettledId, id);
       }

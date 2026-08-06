@@ -36,6 +36,7 @@ import type {
   ReviewComment,
   InlineReviewComment,
 } from "@/tauri/types";
+import { isPrOnCurrentBranch } from "@/components/github/pr-status-icon";
 import { ReviewHeader } from "./review/review-header";
 import { ReviewChecks } from "./review/review-checks";
 import { ReviewThreads } from "./review/review-threads";
@@ -357,7 +358,15 @@ function ReviewView({
 
 export function ReviewPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
-  const hasPr = workspace.pr_number != null;
+  // Strictly the checked-out branch's PR. The workspace snapshot may also
+  // carry a *badge-only* side-branch association (a PR the workspace opened
+  // from a branch it has since left — see `isPrOnCurrentBranch`), and this
+  // panel is a working surface, not a badge: honouring one here would review
+  // a branch the user is not on while hiding the "Create PR" affordance for
+  // the branch they actually are on.
+  const hasPr =
+    workspace.pr_number != null &&
+    isPrOnCurrentBranch(workspace.pr_head_branch, workspace.git_branch);
 
   const [ghStatus, setGhStatus] = useState<GhStatus | null>(getCachedGhStatus());
   const [isGithubRepo, setIsGithubRepo] = useState<boolean | null>(

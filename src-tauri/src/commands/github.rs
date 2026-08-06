@@ -303,7 +303,7 @@ pub async fn refresh_workspace_pr<R: tauri::Runtime>(
 
     let cwd_for_pr = cwd.clone();
     let lookup =
-        tokio::task::spawn_blocking(move || crate::github::get_branch_pr(Path::new(&cwd_for_pr)))
+        tokio::task::spawn_blocking(move || crate::github::get_workspace_pr(Path::new(&cwd_for_pr)))
             .await
             .map_err(|e| format!("refresh_workspace_pr task join failed: {e}"))?;
     // Decision matrix, shared with both background pollers via
@@ -318,10 +318,11 @@ pub async fn refresh_workspace_pr<R: tauri::Runtime>(
                 Some(pr.number),
                 Some(pr.display_state()),
                 Some(pr.url),
+                pr.head_branch,
             );
         }
         crate::github::BranchPrOutcome::Clear => {
-            state.update_workspace_pr_info(&workspace_id, None, None, None);
+            state.update_workspace_pr_info(&workspace_id, None, None, None, None);
         }
         crate::github::BranchPrOutcome::Preserve => {}
     }
