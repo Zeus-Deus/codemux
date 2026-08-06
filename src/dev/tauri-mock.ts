@@ -578,6 +578,99 @@ const MOCK_SKILL_INVENTORY = {
 // `window.__codemuxChatMock.streamReply()` triggers one on demand for
 // scroll/perf testing.
 
+// ── Pending AskUserQuestion seed (`?askq=1`) ────────────────────────
+//
+// The seeded transcript carries a RESOLVED `user-input` request so the
+// reply bubble renders. The composer-docked questionnaire panel needs a
+// PENDING one, which a persisted transcript can't provide: cold replay
+// expires orphan requests (`finalizeReplay`), so a pending
+// `request_opened` has to arrive as a LIVE channel event exactly like
+// the real provider sends it. Opt in with `?askq=1` so normal dev flows
+// (and every screenshot of the seeded thread) are unaffected.
+
+const MOCK_ASKQ_REQUEST_ID = "seed-user-input-pending";
+
+/** `?askq=1` — seed a pending AskUserQuestion on the main chat thread. */
+function askQuestionSeedEnabled(): boolean {
+  try {
+    return new URLSearchParams(location.search).get("askq") === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** One pending seed per page load; re-attaching (pane remount, workspace
+ *  switch) must not stack duplicate requests on the same thread. */
+let askQuestionSeeded = false;
+
+const MOCK_ASKQ_PAYLOAD = {
+  questions: [
+    {
+      header: "Migration",
+      question: "How should the settings store be migrated?",
+      multiSelect: false,
+      options: [
+        {
+          label: "Write a versioned migration",
+          description: "Bump the schema version and transform on read.",
+          preview:
+            "// migrations/003_settings.ts\n" +
+            "export function up(prev: SettingsV2): SettingsV3 {\n" +
+            "  return { ...prev, version: 3, theme: prev.theme ?? 'system' };\n" +
+            "}",
+        },
+        {
+          label: "Reset to defaults",
+          description: "Drop the old file; users re-pick their preferences.",
+        },
+        {
+          label: "Read both shapes",
+          description: "Keep a permissive parser and never migrate on disk.",
+        },
+      ],
+    },
+    {
+      header: "Rollout",
+      question: "Which safeguards should ship with it?",
+      multiSelect: true,
+      options: [
+        {
+          label: "Backup the old file",
+          description: "Copy to settings.bak before writing.",
+        },
+        {
+          label: "Log every transform",
+          description: "One line per migrated key, at info level.",
+        },
+        {
+          label: "Feature-flag the rollout",
+          description: "Gate behind CODEMUX_SETTINGS_V3 for one release.",
+        },
+      ],
+    },
+  ],
+};
+
+/** Push the pending request through the freshly-attached channel. The
+ *  small delay lets the pane's cold hydrate settle first, so the live
+ *  event merges onto the replayed transcript instead of racing it. */
+function seedPendingAskQuestion(threadId: string): void {
+  if (askQuestionSeeded || !askQuestionSeedEnabled()) return;
+  if (threadId !== MOCK_CHAT_THREAD_ID) return;
+  askQuestionSeeded = true;
+  setTimeout(() => {
+    emitChatEvent(threadId, {
+      type: "request_opened",
+      thread_id: threadId,
+      turn_id: "seed-askq-turn",
+      request_id: MOCK_ASKQ_REQUEST_ID,
+      request_kind: "user-input",
+      payload: MOCK_ASKQ_PAYLOAD,
+      tool_use_id: null,
+    });
+  }, 600);
+}
+
 const MOCK_CHAT_MODEL: ChatModelInfo = {
   id: "mock-sonnet",
   label: "Mock Sonnet",
@@ -2083,7 +2176,24 @@ const handlers: Record<string, Handler> = {
     const { threadId } = a as { threadId: string };
     return chatActiveTurns.has(threadId);
   },
-  agent_chat_respond_to_request: () => undefined,
+  // Real backend hands the decision to the provider, which resolves the
+  // request and echoes `request_resolved` back over the thread channel.
+  // Mirror that so the `?askq=1` seed actually settles (panel dismounts,
+  // the answer lands as a reply bubble) instead of hanging pending.
+  agent_chat_respond_to_request: (a) => {
+    const { threadId, requestId, decision } = a as {
+      threadId: string;
+      requestId: string;
+      decision: unknown;
+    };
+    emitChatEvent(threadId, {
+      type: "request_resolved",
+      thread_id: threadId,
+      request_id: requestId,
+      decision,
+    });
+    return undefined;
+  },
   agent_chat_set_model: () => undefined,
   agent_chat_set_permission_mode: () => undefined,
   agent_chat_stop_session: () => undefined,
@@ -2133,6 +2243,7 @@ const handlers: Record<string, Handler> = {
       generation,
       nextIndex: 0,
     });
+    seedPendingAskQuestion(threadId);
     return generation;
   },
   detach_agent_chat_output: (a) => {

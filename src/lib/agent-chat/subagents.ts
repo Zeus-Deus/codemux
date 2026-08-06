@@ -100,6 +100,11 @@ export function mergeSnapshot(
       next.statusAssumed = false;
     }
   }
+  // Sticky once set: a provider that only flags the first task event for a
+  // background job must not have a later unflagged snapshot promote it
+  // back to "real subagent" (the same additive-merge rule as every other
+  // field — a snapshot never clobbers a known value with an absent one).
+  if (snap.background_task) next.backgroundTask = true;
   if (snap.parent_item_id != null) next.parentItemId = snap.parent_item_id;
   if (snap.name != null) next.name = snap.name;
   if (snap.agent_type != null) next.agentType = snap.agent_type;
@@ -352,13 +357,36 @@ export function subagentRunItems(messages: ChatViewItem[]): SubagentRunItem[] {
   );
 }
 
+/**
+ * Whether a subagent row should read as **live activity** right now.
+ *
+ * Running/pending is necessary but not sufficient: a provider background
+ * task (a background shell command) can legitimately outlive the turn and
+ * never report a terminal status, so once the thread stops streaming it is
+ * a job that happens to still be alive — not the agent working. Counting
+ * it would keep the docked activity bar and its spinner up forever after
+ * the run ended, including across a restart (the snapshots are persisted
+ * and hydrate-replayed).
+ */
+export function isLiveActivity(
+  view: SubagentView,
+  streaming: boolean,
+): boolean {
+  if (!isRunning(view)) return false;
+  return streaming || !view.backgroundTask;
+}
+
 /** Count of currently-running subagents across the whole thread — feeds
- *  the docked {@link SubagentActivityBar}. */
-export function countRunningSubagents(messages: ChatViewItem[]): number {
+ *  the docked {@link SubagentActivityBar}. `streaming` is the thread's
+ *  live-run flag; see {@link isLiveActivity}. */
+export function countRunningSubagents(
+  messages: ChatViewItem[],
+  streaming = true,
+): number {
   let n = 0;
   for (const card of subagentRunItems(messages)) {
     for (const sub of card.subagents) {
-      if (sub.status === "running") n += 1;
+      if (sub.status === "running" && isLiveActivity(sub, streaming)) n += 1;
     }
   }
   return n;
@@ -407,15 +435,20 @@ export interface RunningSubagentEntry {
  *  the thread, no matter which reply spawned it (design "one bar for the
  *  whole thread"). Feeds the docked {@link SubagentActivityBar}: its
  *  `.length` is the bar's count, and each entry carries the "from"
- *  label + jump target for the expand list. */
+ *  label + jump target for the expand list.
+ *
+ *  `streaming` is the thread's live-run flag: with the run over, provider
+ *  background tasks drop out (see {@link isLiveActivity}) so a background
+ *  shell command can't keep the bar spinning after the turn settled. */
 export function runningSubagentEntries(
   messages: ChatViewItem[],
+  streaming = true,
 ): RunningSubagentEntry[] {
   const cards = subagentRunItems(messages);
   const entries: RunningSubagentEntry[] = [];
   cards.forEach((card, cardIdx) => {
     for (const sub of card.subagents) {
-      if (!isRunning(sub)) continue;
+      if (!isLiveActivity(sub, streaming)) continue;
       entries.push({
         subagent: sub,
         cardId: card.id,

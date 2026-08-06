@@ -239,6 +239,42 @@ describe("WorkspaceHoverCardBody — PR, issue, ports", () => {
     expect(screen.getByText("#140 · merged")).toHaveClass("text-accent-violet");
   });
 
+  it("names the PR's own branch only when it is not the checked-out one", () => {
+    // A side-branch association: the badge is real, but the Branch row says
+    // something else, and this row is what answers "why?". It also explains
+    // why merging that PR will not settle the card.
+    const { unmount } = renderBody(
+      makeWorkspace({
+        git_branch: "fix-ui-borders",
+        pr_number: 250,
+        pr_state: "open",
+        pr_head_branch: "appimage-child-env-hygiene",
+      }),
+    );
+    expect(valueFor("PR branch")).toBe("appimage-child-env-hygiene");
+    unmount();
+
+    // Matching association — the row would only repeat the Branch row above.
+    renderBody(
+      makeWorkspace({
+        git_branch: "fix-ui-borders",
+        pr_number: 251,
+        pr_state: "open",
+        pr_head_branch: "fix-ui-borders",
+      }),
+    );
+    expect(screen.queryByText("PR branch")).not.toBeInTheDocument();
+  });
+
+  it("omits the PR branch row for a pre-field snapshot", () => {
+    // No head branch recorded means "association predates the field", not
+    // "side branch" — inventing a mismatch there would be a lie.
+    renderBody(
+      makeWorkspace({ git_branch: "main", pr_number: 9, pr_state: "open" }),
+    );
+    expect(screen.queryByText("PR branch")).not.toBeInTheDocument();
+  });
+
   it("tones an open issue as success and a closed one as muted", () => {
     const { unmount } = renderBody(
       makeWorkspace({

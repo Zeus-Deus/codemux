@@ -44,6 +44,7 @@
     "@noble/hashes": "^1.8.0",
     "@radix-ui/react-collapsible": "^1.1.12",
     "@radix-ui/react-use-controllable-state": "^1.2.3",
+    "@shadcn/react": "^0.3.0",
     "@streamdown/cjk": "^1.0.3",
     "@streamdown/code": "^1.1.1",
     "@streamdown/math": "^1.0.2",

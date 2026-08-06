@@ -667,7 +667,18 @@ pub(crate) async fn create_worktree_workspace_impl<R: tauri::Runtime>(
     populate_git_info_async(&state, &workspace_id.0, wt_path_buf.clone()).await;
 
     if let Some(pr_num) = pr_number {
-        state.update_workspace_pr_info(&workspace_id.0, Some(pr_num), None, None);
+        // Seed values only — the pollers replace all four the moment they
+        // reach this workspace. The head branch is the branch we just
+        // checked out for the PR, so the association starts out as a
+        // current-branch one (settlement-eligible) rather than looking like
+        // the side-branch fallback's weaker badge.
+        state.update_workspace_pr_info(
+            &workspace_id.0,
+            Some(pr_num),
+            None,
+            None,
+            Some(branch.clone()),
+        );
     }
 
     let snapshot = state.snapshot();

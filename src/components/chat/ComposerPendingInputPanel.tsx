@@ -1,6 +1,8 @@
-import { ChevronLeft, ChevronRight, Pencil } from "lucide-react";
+import { ChevronLeft, Pencil } from "lucide-react";
 import {
+  type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -8,12 +10,27 @@ import {
   useState,
 } from "react";
 
-import { Button } from "@/components/ui/button";
 import {
   HoverCard,
   HoverCardContent,
   HoverCardTrigger,
 } from "@/components/ui/hover-card";
+import {
+  Questionnaire,
+  QuestionnaireActions,
+  QuestionnaireChoice,
+  QuestionnaireChoiceDescription,
+  QuestionnaireChoices,
+  QuestionnaireDescription,
+  QuestionnaireError,
+  QuestionnaireInput,
+  QuestionnaireItem,
+  QuestionnaireNext,
+  QuestionnairePrevious,
+  QuestionnaireProgress,
+  QuestionnaireSubmit,
+  QuestionnaireTitle,
+} from "@/components/ui/questionnaire";
 import { cn } from "@/lib/utils";
 
 import type { PermissionRequestItem } from "@/lib/agent-chat/types";
@@ -44,22 +61,53 @@ interface Props {
 
 const OTHER_LABEL = "Other";
 
+/** Questionnaire items are addressed by *name*, and question text is not
+ *  unique (the same prompt can legitimately repeat across questions), so
+ *  the index is the identity and `q-<i>` is its wire name. */
+const ITEM_NAME_PREFIX = "q-";
+const itemNameFor = (index: number) => `${ITEM_NAME_PREFIX}${index}`;
+function itemIndexFor(name: string): number {
+  const parsed = Number.parseInt(name.slice(ITEM_NAME_PREFIX.length), 10);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
 /**
  * Composer-attached panel for `request_kind: "user-input"`. The
  * panel lives with the composer (not inline in the transcript) and
- * follows the Claude.ai interaction pattern (one question per page,
- * prev/next arrows, numbered options, always-visible "Something
- * else" free-text row as the last option, keyboard-driven).
+ * follows the one-question-per-page interaction pattern (prev/next
+ * paging, numbered option shortcuts, an always-visible "Something
+ * else" free-text row, keyboard-driven).
  *
- * Layout: outer wrapper matches the Composer's own centering/width so
- * the two visually belong together. The panel does NOT alter the
- * composer itself — branch / worktree / model pickers render exactly
- * as before when the panel is mounted above them.
+ * The interior is the shadcn Questionnaire component; the panel keeps
+ * the composer-docked wrapper (chat column rails + rounded card) so the
+ * two visually belong together. The panel does NOT alter the composer
+ * itself — branch / worktree / model pickers render exactly as before
+ * when the panel is mounted above them.
+ *
+ * Every question renders at once (the primitive hides the inactive ones
+ * with `hidden` + `inert`); `qi` is the single source of truth for which
+ * one is active and is wired to the primitive through the controlled
+ * `item` / `onItemChange` pair.
  */
 export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
   const questions = useMemo(
     () => extractQuestions(item.payload),
     [item.payload],
+  );
+
+  /** Root.items drives paging, validation *and* the auto-rendered
+   *  shortcut chips: the primitive maps `shortcuts="numbers"` onto each
+   *  item's `choices` in order, keyed by choice value. The values must
+   *  therefore be the option labels we actually render, or the chips
+   *  silently disappear and dev-mode logs a mismatch warning. */
+  const rootItems = useMemo(
+    () =>
+      questions.map((q, i) => ({
+        name: itemNameFor(i),
+        required: true,
+        choices: q.options.map((o) => ({ value: o.label })),
+      })),
+    [questions],
   );
 
   const [qi, setQi] = useState(0);
@@ -73,14 +121,15 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
   const [otherText, setOtherText] = useState<Record<number, string>>({});
   const [submitted, setSubmitted] = useState(false);
   const submittedRef = useRef(false);
+  const formRef = useRef<HTMLFormElement | null>(null);
 
   // ------- Selection + answer helpers ---------------------------------
 
   const togglePick = useCallback(
-    (label: string, multiSelect: boolean) => {
+    (index: number, label: string, multiSelect: boolean) => {
       setPicks((prev) => {
         const next = { ...prev };
-        const cur = new Set(next[qi] ?? []);
+        const cur = new Set(next[index] ?? []);
         if (multiSelect) {
           if (cur.has(label)) cur.delete(label);
           else cur.add(label);
@@ -91,11 +140,11 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
           cur.clear();
           cur.add(label);
         }
-        next[qi] = cur;
+        next[index] = cur;
         return next;
       });
     },
-    [qi],
+    [],
   );
 
   const questionAnswered = useCallback(
@@ -105,8 +154,8 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
       const p = picks[i];
       const free = (otherText[i] ?? "").trim();
       // Typing into "Something else" counts as selecting Other even if
-      // the user never explicitly clicked the row — matches Claude.ai's
-      // free-text-row behavior.
+      // the user never explicitly clicked the row — the free-text row is
+      // an answer in its own right.
       if (free.length > 0) return true;
       if (!p || p.size === 0) return false;
       // If Other is the only pick but no free text, the question isn't
@@ -158,12 +207,8 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
 
   // ------- Navigation -------------------------------------------------
 
-  const isFirst = qi === 0;
   const isLast = qi === questions.length - 1;
 
-  const goPrev = useCallback(() => {
-    setQi((i) => Math.max(0, i - 1));
-  }, []);
   const goNext = useCallback(() => {
     setQi((i) => Math.min(questions.length - 1, i + 1));
   }, [questions.length]);
@@ -189,11 +234,28 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
     }
   }, [currentAnswered, isLast, handleSubmit, goNext]);
 
+  /** The primitive owns submission: both the Submit button (`type=submit`)
+   *  and its Cmd/Ctrl+Enter path funnel through the form. We never let the
+   *  browser navigate — the payload is assembled from our own state. */
+  const handleFormSubmit = useCallback(
+    (e: FormEvent<HTMLFormElement>) => {
+      e.preventDefault();
+      void handleSubmit();
+    },
+    [handleSubmit],
+  );
+
+  const handleItemChange = useCallback((name: string) => {
+    setQi(itemIndexFor(name));
+  }, []);
+
   // ------- Keyboard shortcuts (global, with input-focus guard) --------
   //
-  // Listen on the document, but only fire when focus is outside an
-  // input / textarea / contenteditable so the composer textarea and
-  // our own "Something else" input keep normal typing semantics.
+  // The primitive already handles digits / arrows / Enter, but only for
+  // events that originate *inside* its form. This document-level layer
+  // keeps the panel drivable when nothing (or the composer) has focus.
+  // It bails on text-entry targets and on anything inside the form, so
+  // the two layers never both handle the same keystroke.
 
   const advanceOrSubmitRef = useRef(advanceOrSubmit);
   advanceOrSubmitRef.current = advanceOrSubmit;
@@ -219,6 +281,9 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
       ) {
         return;
       }
+      // Inside the questionnaire form the primitive's own key handling
+      // is authoritative — bail so a keystroke isn't applied twice.
+      if (target instanceof Node && formRef.current?.contains(target)) return;
 
       // Digit 1-9 → toggle Nth option on the current question.
       const digit = Number.parseInt(e.key, 10);
@@ -229,7 +294,7 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
         const opt = q.options[digit - 1];
         if (!opt) return;
         e.preventDefault();
-        togglePickRef.current(opt.label, q.multiSelect);
+        togglePickRef.current(qi, opt.label, q.multiSelect);
         return;
       }
 
@@ -269,104 +334,126 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
     );
   }
 
-  const q = questions[qi]!;
+  const active = questions[qi]!;
   const nextDisabled = !currentAnswered;
-  const primaryLabel = isLast ? "Send" : "Next";
 
   return (
     <div className={cn(CHAT_COLUMN_OUTER, "pb-2")}>
       <div className={CHAT_COLUMN_INNER}>
-        <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3 space-y-3">
-          {/* Header row: optional uppercase header on the left, pagination on the right. */}
-          <div className="flex items-center gap-2">
-            <span className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">
-              {q.header || "Input requested"}
-            </span>
-            <div className="ml-auto flex items-center gap-1">
-              <NavButton
-                onClick={goPrev}
-                disabled={isFirst}
-                aria-label="Previous question"
-              >
-                <ChevronLeft className="h-3.5 w-3.5" />
-              </NavButton>
-              <span className="px-1 font-mono text-[10px] tabular-nums text-muted-foreground/70">
-                {qi + 1} of {questions.length}
+        <div className="rounded-[20px] border border-border bg-muted/40 shadow-sm px-4 py-3">
+          <Questionnaire
+            ref={formRef}
+            items={rootItems}
+            item={itemNameFor(qi)}
+            onItemChange={handleItemChange}
+            onSubmit={handleFormSubmit}
+            shortcuts="numbers"
+            className="gap-3"
+          >
+            {/* Header row: optional uppercase header on the left,
+                compact pagination on the right. Rendered once, from the
+                active question — every Item is mounted at all times, so
+                a per-item eyebrow would duplicate it. */}
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">
+                {active.header || "Input requested"}
               </span>
-              <NavButton
-                onClick={goNext}
-                disabled={isLast || nextDisabled}
-                aria-label="Next question"
-              >
-                <ChevronRight className="h-3.5 w-3.5" />
-              </NavButton>
+              <QuestionnaireProgress className="ml-auto min-w-0 font-mono text-[10px] text-muted-foreground/70">
+                {qi + 1} of {questions.length}
+              </QuestionnaireProgress>
             </div>
-          </div>
 
-          {/* Question */}
-          <div className="text-sm text-foreground">{q.question}</div>
-          {q.multiSelect && (
-            <p className="text-[11px] text-muted-foreground/70">
-              Select one or more.
-            </p>
-          )}
+            {questions.map((q, i) => (
+              <QuestionnaireItem
+                key={i}
+                name={itemNameFor(i)}
+                multiple={q.multiSelect}
+                required
+                className="gap-2"
+              >
+                <QuestionnaireTitle className="text-sm [&:not(:has(~[data-slot=questionnaire-description]))]:mb-0">
+                  {q.question}
+                </QuestionnaireTitle>
+                {q.multiSelect && (
+                  <QuestionnaireDescription className="text-[11px] text-muted-foreground/70">
+                    Select one or more.
+                  </QuestionnaireDescription>
+                )}
 
-          {/* Option rows */}
-          <div className="space-y-1">
-            {q.options.map((opt, oi) => (
-              <OptionRow
-                key={`${qi}-${oi}`}
-                questionIndex={qi}
-                optionIndex={oi}
-                shortcut={oi + 1}
-                label={opt.label}
-                description={opt.description}
-                preview={opt.preview}
-                checked={picks[qi]?.has(opt.label) ?? false}
-                multiSelect={q.multiSelect}
-                onToggle={() => togglePick(opt.label, q.multiSelect)}
-              />
+                <QuestionnaireChoices className="gap-1.5">
+                  {q.options.map((opt, oi) => (
+                    <OptionChoice
+                      key={`${i}-${oi}`}
+                      questionIndex={i}
+                      optionIndex={oi}
+                      label={opt.label}
+                      description={opt.description}
+                      preview={opt.preview}
+                      checked={picks[i]?.has(opt.label) ?? false}
+                      onToggle={() => togglePick(i, opt.label, q.multiSelect)}
+                    />
+                  ))}
+                </QuestionnaireChoices>
+
+                {/* "Something else" free-text row — always visible.
+                    Typing into it implicitly answers the question; no
+                    explicit selection required. */}
+                <OtherRow
+                  questionIndex={i}
+                  value={otherText[i] ?? ""}
+                  onChange={(val) =>
+                    setOtherText((prev) => ({ ...prev, [i]: val }))
+                  }
+                  onEnter={advanceOrSubmit}
+                />
+
+                <QuestionnaireError className="text-[11px]" />
+              </QuestionnaireItem>
             ))}
 
-            {/* "Something else" free-text row — always visible. Typing
-                into it implicitly selects Other; no explicit click
-                required, matching Claude.ai's flow. */}
-            <OtherRow
-              key={`${qi}-other`}
-              questionIndex={qi}
-              value={otherText[qi] ?? ""}
-              onChange={(val) =>
-                setOtherText((prev) => ({ ...prev, [qi]: val }))
-              }
-              onEnter={advanceOrSubmit}
-            />
-          </div>
-
-          {/* Footer: keyboard hints + primary action */}
-          <div className="flex items-center justify-between gap-3 pt-1">
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground/60">
-              <span>
-                <Kbd>1–9</Kbd> select
-              </span>
-              <span aria-hidden>·</span>
-              <span>
-                <Kbd>←</Kbd> <Kbd>→</Kbd> navigate
-              </span>
-              <span aria-hidden>·</span>
-              <span>
-                <Kbd>Enter</Kbd> {isLast ? "send" : "next"}
-              </span>
-            </div>
-            <Button
-              type="button"
-              size="sm"
-              className="h-7 px-3 text-xs bg-foreground text-background hover:bg-foreground/90"
-              onClick={isLast ? handleSubmit : goNext}
-              disabled={submitted || nextDisabled}
-            >
-              {primaryLabel}
-            </Button>
-          </div>
+            <QuestionnaireActions className="min-h-0 gap-2 sm:min-h-0">
+              {/* Column 1 of the actions grid holds the back chevron plus
+                  the keyboard hints; the numbered chips on each row already
+                  advertise 1-9, so the hint only covers the arrow / Enter
+                  layer that has no on-screen affordance. */}
+              <div className="col-start-1 row-start-1 flex min-w-0 items-center gap-2">
+                <QuestionnairePrevious
+                  aria-label="Previous question"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 min-h-0 w-7 shrink-0 px-0 text-muted-foreground/70 sm:min-h-0"
+                >
+                  <ChevronLeft className="size-3.5" />
+                </QuestionnairePrevious>
+                <div
+                  data-testid="aq-hints"
+                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground/60"
+                >
+                  <span>
+                    <Kbd>←</Kbd> <Kbd>→</Kbd> navigate
+                  </span>
+                  <span aria-hidden>·</span>
+                  <span>
+                    <Kbd>Enter</Kbd> {isLast ? "send" : "next"}
+                  </span>
+                </div>
+              </div>
+              <QuestionnaireNext
+                size="sm"
+                disabled={nextDisabled}
+                className="h-7 min-h-0 px-3 text-xs sm:min-h-0"
+              >
+                Next
+              </QuestionnaireNext>
+              <QuestionnaireSubmit
+                size="sm"
+                disabled={submitted || nextDisabled}
+                className="h-7 min-h-0 px-3 text-xs sm:min-h-0"
+              >
+                Send
+              </QuestionnaireSubmit>
+            </QuestionnaireActions>
+          </Questionnaire>
         </div>
       </div>
     </div>
@@ -377,37 +464,9 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
 // Subcomponents
 // ---------------------------------------------------------------------------
 
-function NavButton({
-  children,
-  disabled,
-  onClick,
-  ...rest
-}: {
-  children: React.ReactNode;
-  disabled: boolean;
-  onClick: () => void;
-} & Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, "children" | "disabled" | "onClick">) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={disabled}
-      className={cn(
-        "flex h-5 w-5 items-center justify-center rounded text-muted-foreground/70 transition-colors",
-        "disabled:opacity-30 disabled:cursor-not-allowed",
-        "enabled:hover:bg-muted/60 enabled:hover:text-foreground",
-      )}
-      {...rest}
-    >
-      {children}
-    </button>
-  );
-}
-
-interface OptionRowProps {
+interface OptionChoiceProps {
   questionIndex: number;
   optionIndex: number;
-  shortcut: number;
   label: string;
   description: string;
   /** Optional `option.preview` from the SDK. When non-null the row is
@@ -415,74 +474,53 @@ interface OptionRowProps {
    *  payload before committing to the choice. */
   preview: string | null;
   checked: boolean;
-  multiSelect: boolean;
   onToggle: () => void;
 }
 
 /**
- * A selectable option row. Native `<input>` stays in the DOM (hidden
- * via `sr-only`) so `role="radio" | "checkbox"` and keyboard a11y keep
- * working for assistive tech; the visible surface is a full-width
- * button-card.
+ * A selectable option row. The primitive renders a `<label>` wrapping a
+ * positioned native radio/checkbox (type comes from the Item's
+ * `multiple`), so role semantics, focus-visible rings and the numbered
+ * shortcut chip all come for free.
  */
-function OptionRow({
+function OptionChoice({
   questionIndex,
   optionIndex,
-  shortcut,
   label,
   description,
   preview,
   checked,
-  multiSelect,
   onToggle,
-}: OptionRowProps) {
-  const inputId = `aq-${questionIndex}-${optionIndex}`;
-  const row = (
-    <label
-      htmlFor={inputId}
+}: OptionChoiceProps) {
+  const choice = (
+    <QuestionnaireChoice
+      value={label}
+      checked={checked}
+      onChange={onToggle}
       data-testid={`aq-option-${questionIndex}-${optionIndex}`}
-      className={cn(
-        "group flex w-full items-start gap-3 rounded-md border px-3 py-2 cursor-pointer transition-colors",
-        checked
-          ? "border-foreground/30 bg-foreground/[0.04]"
-          : "border-border/40 hover:border-border hover:bg-muted/30",
-      )}
+      className="min-h-0 gap-2 rounded-md px-2.5 py-1.5"
     >
-      <input
-        id={inputId}
-        type={multiSelect ? "checkbox" : "radio"}
-        name={`aq-${questionIndex}`}
-        checked={checked}
-        onChange={onToggle}
-        className="sr-only"
-      />
-      <kbd
-        aria-hidden
-        className={cn(
-          "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded font-mono text-[10px] tabular-nums transition-colors",
-          checked
-            ? "bg-foreground text-background"
-            : "bg-muted/50 text-muted-foreground/70 group-hover:bg-muted/70 group-hover:text-muted-foreground",
-        )}
-      >
-        {shortcut}
-      </kbd>
-      <div className="min-w-0 flex-1">
-        <div className="text-sm text-foreground leading-snug">{label}</div>
-        {description && (
-          <div className="mt-0.5 text-xs text-muted-foreground leading-snug">
-            {description}
-          </div>
-        )}
-      </div>
-    </label>
+      <span className="text-sm leading-snug text-foreground">{label}</span>
+      {/* The registry's description slot: besides the muted styling it is
+          what the indicator / shortcut chip alignment classes key off
+          (`group-has-data-[slot=questionnaire-choice-description]`), so a
+          raw span here would misalign both by a fraction of a spacing unit. */}
+      {description && (
+        <QuestionnaireChoiceDescription className="text-xs leading-snug">
+          {description}
+        </QuestionnaireChoiceDescription>
+      )}
+    </QuestionnaireChoice>
   );
 
-  if (!preview) return row;
+  if (!preview) return choice;
 
   return (
     <HoverCard openDelay={300}>
-      <HoverCardTrigger asChild>{row}</HoverCardTrigger>
+      {/* `asChild` clones the Choice element: the primitive merges the
+          extra props (and the ref) straight through onto its `<label>`,
+          so the hover target is the whole row. */}
+      <HoverCardTrigger asChild>{choice}</HoverCardTrigger>
       <HoverCardContent
         align="start"
         side="right"
@@ -508,48 +546,44 @@ interface OtherRowProps {
 }
 
 /**
- * Always-visible "Something else" row. Pencil icon on the left, inline
- * text input on the right. No radio — typing auto-selects Other, per
- * Claude.ai's flow. Enter inside the field advances/submits, so the
- * user can answer the whole panel without leaving the keyboard.
+ * Always-visible "Something else" row. Pencil affordance on the left,
+ * inline text input on the right. No radio — typing auto-answers the
+ * question. Enter inside the field advances/submits so the user can
+ * answer the whole panel without leaving the keyboard; the explicit
+ * handler (rather than the primitive's native Enter path) keeps that
+ * working even when a choice is also selected.
  */
 function OtherRow({ questionIndex, value, onChange, onEnter }: OtherRowProps) {
-  const hasText = value.trim().length > 0;
   const handleKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      onEnter();
-    }
+    if (e.key !== "Enter") return;
+    // The primitive's form-level handler bails on `defaultPrevented`, so
+    // this replaces (never duplicates) its Enter behavior. Shift+Enter is
+    // swallowed rather than forwarded: it has always been inert in this
+    // field, and letting it reach the form would advance/submit.
+    e.preventDefault();
+    if (e.shiftKey) return;
+    onEnter();
   };
   return (
-    <div
-      className={cn(
-        "flex w-full items-center gap-3 rounded-md border px-3 py-2 transition-colors",
-        hasText
-          ? "border-foreground/30 bg-foreground/[0.04]"
-          : "border-border/40",
-      )}
-    >
-      <Pencil
-        aria-hidden
-        className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70"
-      />
-      <input
+    <div className="relative flex w-full items-center">
+      <QuestionnaireInput
         id={`aq-${questionIndex}-other`}
-        type="text"
+        data-testid={`aq-other-${questionIndex}`}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={handleKeyDown}
         placeholder="Something else…"
-        className={cn(
-          "flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground/60 outline-none",
-        )}
+        className="h-8 min-h-0 rounded-md ps-8 text-sm sm:min-h-0 md:text-sm"
+      />
+      <Pencil
+        aria-hidden
+        className="pointer-events-none absolute start-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/70"
       />
     </div>
   );
 }
 
-function Kbd({ children }: { children: React.ReactNode }) {
+function Kbd({ children }: { children: ReactNode }) {
   return (
     <kbd className="rounded bg-muted/60 px-1 py-[1px] font-mono text-[10px] text-muted-foreground/80">
       {children}

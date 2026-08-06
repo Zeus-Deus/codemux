@@ -7,6 +7,7 @@ import {
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { ProviderLogo } from "@/components/chat/provider-logo";
 import {
+  isPrOnCurrentBranch,
   normalizePrState,
   prStatusTextClass,
 } from "@/components/github/pr-status-icon";
@@ -128,6 +129,7 @@ export function WorkspaceHoverCardBody({
 
   const providers = getWorkspaceProviders(workspace.surfaces);
   const prState = normalizePrState(workspace.pr_state);
+  const prHeadBranch = workspace.pr_head_branch ?? null;
   const issue = workspace.linked_issue;
 
   // Elapsed since the current state began. Stamped client-side (the backend
@@ -253,6 +255,15 @@ export function WorkspaceHoverCardBody({
             value={`#${workspace.pr_number ?? ""} · ${prState}`}
             valueClassName={prStatusTextClass(workspace.pr_state) ?? undefined}
           />
+        )}
+        {/* Only when the PR is NOT the checked-out branch's. This is the
+            details surface, so it can afford to answer the question the badge
+            raises: the workspace has a PR, yet the Branch row above says
+            something else. Naming the head branch says the PR came off a side
+            branch — and explains why merging it will not settle this card. On
+            the ordinary matching case the row would be pure repetition. */}
+        {prState && !isPrOnCurrentBranch(prHeadBranch, workspace.git_branch) && (
+          <DetailRow label="PR branch" value={prHeadBranch!} muted />
         )}
         {issue && (
           <DetailRow
