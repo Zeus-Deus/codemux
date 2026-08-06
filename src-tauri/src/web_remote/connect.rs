@@ -123,6 +123,42 @@ pub fn systemd_unit(exec_path: &str, api_url: Option<&str>) -> String {
 
 // ── What the unit should exec ────────────────────────────────────────
 
+/// True for paths that live on an AppImage's throwaway mount.
+///
+/// The AppImage runtime mounts its payload at `$TMPDIR/.mount_XXXXXX` and
+/// unmounts it when the process exits, so any such path is dead the moment the
+/// app closes. A unit file is long-lived by definition; baking one of these
+/// into `ExecStart` produces a service that is permanently broken from the
+/// first reboot on, which is why every candidate is filtered through here.
+fn is_ephemeral_mount_path(path: &std::path::Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, std::path::Component::Normal(name)
+            if name.to_string_lossy().starts_with(".mount_"))
+    })
+}
+
+/// The AppDir root implied by where `current_exe` sits, confirmed by `AppRun`.
+///
+/// An AppDir is laid out `<root>/usr/bin/codemux` with `AppRun` at `<root>`,
+/// so the root is three levels up.
+///
+/// This exists so [`resolve_exec_path`] does not have to trust `$APPDIR`:
+/// Codemux strips the whole AppRun variable set from its own child processes
+/// (see `execution::appimage_env_fixups` — inheriting `LD_LIBRARY_PATH` makes
+/// system binaries link against our bundled libraries), and `codemux connect`
+/// is routinely run from exactly such a child — a workspace setup script or a
+/// terminal pane. Reading `$APPDIR` there would report "not an AppImage" and
+/// write the inner binary's ephemeral path into the unit.
+///
+/// `exists` is injected so the layout rule is testable without a real AppDir.
+fn appdir_from_layout(
+    current_exe: &std::path::Path,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<PathBuf> {
+    let root = current_exe.parent()?.parent()?.parent()?;
+    exists(&root.join("AppRun")).then(|| root.to_path_buf())
+}
+
 /// Decide the command a service unit should run, given how this process was
 /// started.
 ///
@@ -132,29 +168,59 @@ pub fn systemd_unit(exec_path: &str, api_url: Option<&str>) -> String {
 /// exec'ing the real binary. `current_exe()` inside that process points at the
 /// *inner* binary, so putting it straight into `ExecStart` would produce a
 /// service that starts without any of that environment. Native packages
-/// (`.deb`/`.rpm`/AUR) install a plain binary and set no `APPDIR`, so they
-/// take the first branch and nothing changes for them.
+/// (`.deb`/`.rpm`/AUR) install a plain binary and have no AppDir, so they take
+/// the first branch and nothing changes for them.
 ///
-/// Pure — `appdir` and `on_path` are the two facts the caller looks up — so
-/// the branch that only exists on one install shape is still testable.
+/// Candidates are tried most- to least-preferred and the first *durable* one
+/// wins; when every candidate lives on a throwaway AppImage mount this returns
+/// an error rather than writing a unit that can never start again.
+///
+/// Pure — the caller looks up the four facts — so the branches that only exist
+/// on one install shape are still testable.
 fn service_exec_path(
     current_exe: &std::path::Path,
-    appdir: Option<&str>,
+    appdir: Option<&std::path::Path>,
     on_path: Option<PathBuf>,
-) -> PathBuf {
-    let appdir = match appdir.map(str::trim).filter(|d| !d.is_empty()) {
-        // Not launched through AppRun: the running binary is the whole story.
-        None => return current_exe.to_path_buf(),
-        Some(dir) => dir,
-    };
-    // Prefer the wrapper the user's own shell resolves — it is the supported
-    // entry point and survives an in-place upgrade of the payload.
-    match on_path {
-        Some(path) if path != current_exe => path,
-        // No wrapper on PATH (someone ran the inner binary directly, or PATH
-        // is unusual): exec AppRun itself, which is the next best thing.
-        _ => PathBuf::from(appdir).join("AppRun"),
+    appimage_file: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    match appdir {
+        // Not an AppImage of any shape: the running binary is the whole story.
+        None => candidates.push(current_exe.to_path_buf()),
+        Some(dir) => {
+            // Prefer the wrapper the user's own shell resolves — it is the
+            // supported entry point and survives an in-place upgrade of the
+            // payload. Skipped when it resolves to the binary we are already
+            // running, since exec'ing that skips AppRun a second time.
+            if let Some(path) = on_path.filter(|path| path != current_exe) {
+                candidates.push(path);
+            }
+            // No wrapper on PATH (someone ran the inner binary directly, or
+            // PATH is unusual): exec AppRun itself. Durable for an extracted
+            // install, ephemeral for a raw `.AppImage` run.
+            candidates.push(dir.join("AppRun"));
+            // A raw `.AppImage` run: the mount is throwaway but the file the
+            // user double-clicked is not, and re-running it re-mounts.
+            if let Some(image) = appimage_file {
+                candidates.push(image);
+            }
+            candidates.push(current_exe.to_path_buf());
+        }
     }
+
+    candidates
+        .into_iter()
+        .find(|candidate| !is_ephemeral_mount_path(candidate))
+        .ok_or_else(|| {
+            format!(
+                "codemux is running from a temporary AppImage mount ({}), which \
+                 disappears when the app exits — a service pointed at it would \
+                 never start again. Install codemux first (a package, or the \
+                 AppImage installer that puts a `codemux` wrapper on PATH), \
+                 then re-run `codemux connect`.",
+                current_exe.display()
+            )
+        })
 }
 
 /// First executable named `name` on `PATH`. Hand-rolled rather than shelling
@@ -192,11 +258,28 @@ fn is_executable_file(path: &std::path::Path) -> bool {
 fn resolve_exec_path() -> Result<PathBuf, String> {
     let current = std::env::current_exe()
         .map_err(|e| format!("could not resolve the codemux binary path: {e}"))?;
-    Ok(service_exec_path(
+    // `$APPDIR` is only a hint here: it is absent in any process Codemux
+    // spawned (setup scripts, terminal panes), so the layout probe is what
+    // makes the answer the same whichever shell ran the command.
+    let appdir = std::env::var("APPDIR")
+        .ok()
+        .map(|dir| dir.trim().to_string())
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| appdir_from_layout(&current, |path| path.is_file()));
+    // `$APPIMAGE` is stripped from our children too; when it does survive it
+    // names the durable `.AppImage` file, which is the only usable target for
+    // a raw (uninstalled) AppImage run.
+    let appimage_file = std::env::var("APPIMAGE")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|path| path.is_file());
+    service_exec_path(
         &current,
-        std::env::var("APPDIR").ok().as_deref(),
+        appdir.as_deref(),
         find_on_path("codemux"),
-    ))
+        appimage_file,
+    )
 }
 
 // ── Service-manager seam ─────────────────────────────────────────────
@@ -992,6 +1075,7 @@ pub async fn run_connect_off() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::cell::RefCell;
 
     // ── Unit file ────────────────────────────────────────────────
@@ -1047,11 +1131,10 @@ mod tests {
         // .deb / .rpm / AUR: a plain binary, no AppRun in sight.
         let exe = PathBuf::from("/usr/bin/codemux");
         assert_eq!(
-            service_exec_path(&exe, None, Some(PathBuf::from("/usr/bin/codemux"))),
-            exe
+            service_exec_path(&exe, None, Some(PathBuf::from("/usr/bin/codemux")), None),
+            Ok(exe.clone())
         );
-        // An empty APPDIR is not an AppImage either.
-        assert_eq!(service_exec_path(&exe, Some("  "), None), exe);
+        assert_eq!(service_exec_path(&exe, None, None, None), Ok(exe));
     }
 
     #[test]
@@ -1063,24 +1146,119 @@ mod tests {
         let inner = PathBuf::from("/usr/local/lib/codemux/usr/bin/codemux");
         let wrapper = PathBuf::from("/usr/local/bin/codemux");
         assert_eq!(
-            service_exec_path(&inner, Some("/usr/local/lib/codemux"), Some(wrapper.clone())),
-            wrapper
+            service_exec_path(
+                &inner,
+                Some(Path::new("/usr/local/lib/codemux")),
+                Some(wrapper.clone()),
+                None
+            ),
+            Ok(wrapper)
         );
     }
 
     #[test]
     fn an_appimage_with_no_wrapper_on_path_falls_back_to_apprun() {
         let inner = PathBuf::from("/opt/codemux.AppDir/usr/bin/codemux");
+        let appdir = Path::new("/opt/codemux.AppDir");
         assert_eq!(
-            service_exec_path(&inner, Some("/opt/codemux.AppDir"), None),
-            PathBuf::from("/opt/codemux.AppDir/AppRun")
+            service_exec_path(&inner, Some(appdir), None, None),
+            Ok(PathBuf::from("/opt/codemux.AppDir/AppRun"))
         );
         // Same when PATH resolves to the very binary we are already running:
         // exec'ing it again would skip AppRun a second time.
         assert_eq!(
-            service_exec_path(&inner, Some("/opt/codemux.AppDir"), Some(inner.clone())),
-            PathBuf::from("/opt/codemux.AppDir/AppRun")
+            service_exec_path(&inner, Some(appdir), Some(inner.clone()), None),
+            Ok(PathBuf::from("/opt/codemux.AppDir/AppRun"))
         );
+    }
+
+    // ── Ephemeral AppImage mounts never reach the unit ───────────
+
+    #[test]
+    fn the_appdir_is_recovered_from_the_binary_layout() {
+        // The fact that makes this whole path independent of `$APPDIR`, which
+        // Codemux strips from every child process it spawns.
+        let inner = Path::new("/tmp/.mount_codemuXXXXXX/usr/bin/codemux");
+        assert_eq!(
+            appdir_from_layout(inner, |path| path
+                == Path::new("/tmp/.mount_codemuXXXXXX/AppRun")),
+            Some(PathBuf::from("/tmp/.mount_codemuXXXXXX"))
+        );
+        // A plain packaged binary has no AppRun above it, so no AppDir.
+        assert_eq!(
+            appdir_from_layout(Path::new("/usr/bin/codemux"), |_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_raw_appimage_run_execs_the_appimage_file_not_the_mount() {
+        // `/tmp/.mount_*` is unmounted the moment the app exits, so neither the
+        // inner binary nor AppRun may be written into a unit — the `.AppImage`
+        // the user launched is the durable thing.
+        let inner = PathBuf::from("/tmp/.mount_codemuXXXXXX/usr/bin/codemux");
+        let image = PathBuf::from("/home/user/Downloads/codemux.AppImage");
+        assert_eq!(
+            service_exec_path(
+                &inner,
+                Some(Path::new("/tmp/.mount_codemuXXXXXX")),
+                None,
+                Some(image.clone())
+            ),
+            Ok(image)
+        );
+    }
+
+    #[test]
+    fn a_stripped_child_env_still_refuses_the_ephemeral_mount() {
+        // The regression this guards: `codemux connect` run from a workspace
+        // setup script or a terminal pane sees neither `$APPDIR` nor
+        // `$APPIMAGE` (Codemux strips the AppRun variable set from its
+        // children). Resolving to the inner binary would write
+        // `ExecStart=/tmp/.mount_codemuXXXXXX/usr/bin/codemux`, a unit that is
+        // broken the moment the app exits. The layout probe supplies the
+        // AppDir; with nothing durable left, this must fail loudly instead.
+        let inner = PathBuf::from("/tmp/.mount_codemuXXXXXX/usr/bin/codemux");
+        let appdir = appdir_from_layout(&inner, |path| {
+            path == Path::new("/tmp/.mount_codemuXXXXXX/AppRun")
+        })
+        .expect("layout probe finds the AppDir without $APPDIR");
+
+        let resolved = service_exec_path(&inner, Some(&appdir), None, None);
+        let error = resolved.expect_err("must not resolve to the throwaway mount");
+        assert!(
+            error.contains("temporary AppImage mount"),
+            "unhelpful error: {error}"
+        );
+
+        // An installed wrapper on PATH is durable, so the same stripped
+        // environment resolves cleanly.
+        let wrapper = PathBuf::from("/usr/local/bin/codemux");
+        assert_eq!(
+            service_exec_path(&inner, Some(&appdir), Some(wrapper.clone()), None),
+            Ok(wrapper)
+        );
+    }
+
+    #[test]
+    fn an_ephemeral_wrapper_on_path_is_skipped() {
+        // A `codemux` resolved from an AppDir bin dir still on PATH is just as
+        // throwaway as the inner binary.
+        let inner = PathBuf::from("/tmp/.mount_codemuXXXXXX/usr/bin/codemux");
+        let image = PathBuf::from("/home/user/Downloads/codemux.AppImage");
+        assert_eq!(
+            service_exec_path(
+                &inner,
+                Some(Path::new("/tmp/.mount_codemuXXXXXX")),
+                Some(PathBuf::from("/tmp/.mount_codemuXXXXXX/usr/bin/codemux-cli")),
+                Some(image.clone())
+            ),
+            Ok(image)
+        );
+        assert!(is_ephemeral_mount_path(Path::new(
+            "/tmp/.mount_codemuXXXXXX/AppRun"
+        )));
+        assert!(!is_ephemeral_mount_path(Path::new("/usr/local/bin/codemux")));
     }
 
     #[test]

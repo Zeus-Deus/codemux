@@ -739,6 +739,10 @@ export interface WorkspaceSnapshot {
   /** When true, agent-completion desktop notifications for this workspace's
    *  panes are suppressed. Status pills (spinner/dots) are unaffected. */
   notifications_muted: boolean;
+  /** Ms epoch when this workspace was pinned to the top of the workspace
+   *  inbox. Pinning overrides settled/snoozed presentation without deleting
+   *  that underlying lifecycle state. Optional for older snapshots. */
+  pinned_at?: number | null;
   tabs: TabSnapshot[];
   active_tab_id: string;
   active_surface_id: string;
@@ -794,6 +798,8 @@ export interface ArchivedWorkspaceSnapshot {
   is_git: boolean;
   /** Unix seconds when the workspace was archived. */
   archived_at: number;
+  /** Preserve the live workspace's pin across archive/restore. */
+  pinned_at?: number | null;
 }
 
 export interface PersistenceSchema {

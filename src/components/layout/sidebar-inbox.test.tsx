@@ -35,6 +35,7 @@ vi.mock("@/tauri/commands", () => ({
   closeWorkspaceWithWorktree: vi.fn().mockResolvedValue(undefined),
   renameWorkspace: vi.fn().mockResolvedValue(undefined),
   setWorkspaceMuted: vi.fn().mockResolvedValue(undefined),
+  setWorkspacePinned: vi.fn().mockResolvedValue(undefined),
   detectEditors: vi.fn().mockResolvedValue([]),
   getDefaultBranch: vi.fn().mockResolvedValue("main"),
   openInEditor: vi.fn().mockResolvedValue(undefined),
@@ -166,7 +167,11 @@ import {
 } from "@/stores/sidebar-inbox-store";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
-import { activateWorkspace, dbSetUiState } from "@/tauri/commands";
+import {
+  activateWorkspace,
+  dbSetUiState,
+  setWorkspacePinned,
+} from "@/tauri/commands";
 import { getJumpTarget } from "./sidebar-inbox-jump";
 
 let wsCounter = 0;
@@ -518,6 +523,97 @@ describe("SidebarInbox — cards", () => {
     await renderInbox();
     fireEvent.click(screen.getByText("Open me"));
     expect(activateWorkspace).toHaveBeenCalledWith("ws-1");
+  });
+
+  it("renders pinned workspaces first while preserving creation order within each block", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Old pinned", pinned_at: 100 }),
+      makeWorkspace({ title: "Middle normal" }),
+      makeWorkspace({ title: "New normal" }),
+    ];
+
+    const { container } = await renderInbox();
+    const order = [...container.querySelectorAll("[data-inbox-card]")].map(
+      (card) => card.getAttribute("data-inbox-card"),
+    );
+
+    expect(order).toEqual(["ws-1", "ws-3", "ws-2"]);
+    expect(container.querySelector("[data-pinned-divider]")).not.toBeNull();
+    expect(screen.getByRole("img", { name: "Pinned workspace" })).toBeInTheDocument();
+  });
+
+  it("draws no pinned divider when nothing is pinned", async () => {
+    workspaces = [makeWorkspace({ title: "One" }), makeWorkspace({ title: "Two" })];
+
+    const { container } = await renderInbox();
+
+    expect(container.querySelector("[data-pinned-divider]")).toBeNull();
+  });
+
+  it("draws no pinned divider when every card is pinned", async () => {
+    // The hairline separates two blocks. With nothing below it, it would
+    // promise more list and then end.
+    workspaces = [
+      makeWorkspace({ title: "Pinned one", pinned_at: 100 }),
+      makeWorkspace({ title: "Pinned two", pinned_at: 200 }),
+    ];
+
+    const { container } = await renderInbox();
+
+    expect(container.querySelectorAll("[data-inbox-card]")).toHaveLength(2);
+    expect(container.querySelector("[data-pinned-divider]")).toBeNull();
+  });
+
+  it("lets a pinned card unpin directly and offers Pin in an unpinned card menu", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Pinned work", pinned_at: 100 }),
+      makeWorkspace({ title: "Regular work" }),
+    ];
+    await renderInbox();
+
+    fireEvent.click(screen.getByRole("button", { name: 'Unpin "Pinned work"' }));
+    expect(setWorkspacePinned).toHaveBeenCalledWith("ws-1", false);
+
+    const regularCard = screen
+      .getByText("Regular work")
+      .closest("[data-inbox-card]") as HTMLElement;
+    fireEvent.contextMenu(regularCard);
+    fireEvent.click(await screen.findByText("Pin workspace"));
+    expect(setWorkspacePinned).toHaveBeenCalledWith("ws-2", true);
+  });
+
+  it("pinning overrides settled and snoozed presentation without erasing either shelf", async () => {
+    persistedSettled = JSON.stringify({
+      settled: [{ id: "ws-1", at: 1_000 }],
+      snoozed: [{ id: "ws-2", at: 1_000, until: Date.now() + 60_000 }],
+      keepActive: [],
+      activity: {},
+    });
+    workspaces = [
+      makeWorkspace({ title: "Settled underneath", pinned_at: 100 }),
+      makeWorkspace({ title: "Snoozed underneath", pinned_at: 200 }),
+    ];
+
+    const { container, rerender } = await renderInbox();
+    expect(container.querySelectorAll("[data-inbox-card]")).toHaveLength(2);
+    expect(container.querySelector("[data-settled-row]")).toBeNull();
+    expect(container.querySelector("[data-snoozed-row]")).toBeNull();
+    expect(useSidebarInboxStore.getState().settled.map((entry) => entry.id)).toEqual(["ws-1"]);
+    expect(useSidebarInboxStore.getState().snoozed.map((entry) => entry.id)).toEqual(["ws-2"]);
+
+    workspaces = workspaces.map((workspace) =>
+      workspace.workspace_id === "ws-1"
+        ? { ...workspace, pinned_at: null }
+        : workspace,
+    );
+    await rerenderInbox(rerender);
+    expect(container.querySelector('[data-settled-row="ws-1"]')).not.toBeNull();
+    expect(container.querySelector('[data-inbox-card="ws-2"]')).not.toBeNull();
+
+    workspaces = workspaces.map((workspace) => ({ ...workspace, pinned_at: null }));
+    await rerenderInbox(rerender);
+    fireEvent.click(screen.getByRole("button", { name: "Snoozed (1)" }));
+    expect(container.querySelector('[data-snoozed-row="ws-2"]')).not.toBeNull();
   });
 });
 
@@ -1162,6 +1258,26 @@ describe("SidebarInbox — settle / un-settle", () => {
     expect(
       container.querySelector('[data-settled-row="ws-1"]'),
     ).not.toBeNull();
+  });
+
+  it("never auto-settles a pinned workspace", async () => {
+    const old = Date.now() - 4 * 86_400_000;
+    persistedSettled = JSON.stringify({
+      settled: [],
+      keepActive: [],
+      activity: { "ws-1": old },
+    });
+    workspaces = [
+      makeWorkspace({ title: "Pinned stale work", pinned_at: Date.now() }),
+    ];
+    const { container } = await renderInbox();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+    expect(container.querySelector('[data-settled-row="ws-1"]')).toBeNull();
+    expect(useSidebarInboxStore.getState().settled).toEqual([]);
   });
 
   it("does not idle-settle when Auto-settle idle work is off", async () => {
@@ -2593,6 +2709,23 @@ describe("SidebarInbox — unread + woke markers", () => {
       screen.queryByLabelText('"Back again" woke from snooze'),
     ).not.toBeInTheDocument();
   });
+
+  it("suppresses the woke badge on a pinned card, whose snooze still expires", async () => {
+    // A pin overrides where the card is shown, not whether its snooze ticket
+    // comes due — so the shelf entry is still cleared. But the badge announces
+    // a *return* to the list, and a pinned card never left it.
+    const base = Date.now();
+    persistInbox({ snoozed: [{ id: "ws-1", at: base - 1000, until: base - 1 }] });
+    workspaces = [makeWorkspace({ title: "Pinned sleeper", pinned_at: 100 })];
+    const { container } = await flushRender();
+
+    expect(
+      screen.queryByLabelText('"Pinned sleeper" woke from snooze'),
+    ).not.toBeInTheDocument();
+    // The card is on top either way; what changed is the preserved lifecycle.
+    expect(useSidebarInboxStore.getState().snoozed).toEqual([]);
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+  });
 });
 
 describe("SidebarInbox — bulk actions across cards", () => {
@@ -2621,6 +2754,60 @@ describe("SidebarInbox — bulk actions across cards", () => {
     expect(
       useSidebarInboxStore.getState().settled.map((e) => e.id).sort(),
     ).toEqual(["ws-2", "ws-3"]);
+  });
+
+  it("exempts pinned cards from a mixed bulk park operation", async () => {
+    workspaces = [
+      makeWorkspace({ title: "Pinned", pinned_at: Date.now() }),
+      makeWorkspace({ title: "Park me" }),
+    ];
+    const { container } = await flushRender();
+
+    const cards = [...container.querySelectorAll("[data-inbox-card]")];
+    fireEvent.click(cards[0], { ctrlKey: true });
+    fireEvent.click(cards[1], { ctrlKey: true });
+    fireEvent.contextMenu(cards[0]);
+
+    expect(await screen.findByText("Settle (1)")).toBeInTheDocument();
+    expect(screen.queryByText("Settle (2)")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText("Settle (1)"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(useSidebarInboxStore.getState().settled.map((entry) => entry.id)).toEqual([
+      "ws-2",
+    ]);
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
+  });
+
+  it("exempts pinned cards from a mixed bulk snooze", async () => {
+    // Mirror of the bulk-Settle exemption above: both park verbs share one
+    // guardrail, so they must count the selection the same way.
+    workspaces = [
+      makeWorkspace({ title: "Pinned", pinned_at: Date.now() }),
+      makeWorkspace({ title: "Snooze me" }),
+    ];
+    const { container } = await flushRender();
+
+    const cards = [...container.querySelectorAll("[data-inbox-card]")];
+    fireEvent.click(cards[0], { ctrlKey: true });
+    fireEvent.click(cards[1], { ctrlKey: true });
+    fireEvent.contextMenu(cards[0]);
+
+    expect(await screen.findByText("Snooze (1)")).toBeInTheDocument();
+    expect(screen.queryByText("Snooze (2)")).not.toBeInTheDocument();
+
+    await userEvent.hover(screen.getByText("Snooze (1)"));
+    await userEvent.click(await screen.findByText("In 1 hour"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(useSidebarInboxStore.getState().snoozed.map((e) => e.id)).toEqual([
+      "ws-2",
+    ]);
+    expect(container.querySelector('[data-inbox-card="ws-1"]')).not.toBeNull();
   });
 
   it("bulk-snoozes a selection when every workspace can take it", async () => {

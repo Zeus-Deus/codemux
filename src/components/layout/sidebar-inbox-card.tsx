@@ -1,5 +1,5 @@
 import { memo, useEffect, useState } from "react";
-import { AlarmClock, Check, Cloud } from "lucide-react";
+import { AlarmClock, Check, Cloud, Pin, PinOff } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { cn } from "@/lib/utils";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
@@ -62,6 +62,9 @@ interface Props {
   jumpHint?: number | null;
   onSettle: (workspaceId: string) => void;
   onSnooze: (workspaceId: string, until: number) => void;
+  /** A pinned card stays above every lifecycle tier. */
+  pinned?: boolean;
+  onUnpin?: (workspaceId: string) => void;
   /** The agent finished here since the user last opened this workspace. */
   unread: boolean;
   /** Recently returned from a snooze. The list order is static, so a woken
@@ -100,6 +103,8 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   jumpHint,
   onSettle,
   onSnooze,
+  pinned = false,
+  onUnpin,
   unread,
   woke,
   selected,
@@ -193,7 +198,10 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
   // sight. Finished ("review"), monitoring and idle cards all offer Settle —
   // sweeping completed work aside is the whole point of the gesture, and a
   // workspace left babysitting CI is exactly the kind of thing a user parks.
-  const canSettle = status !== "working" && status !== "permission";
+  // Pinned cards are exempt: the pin is a visibility override that parking
+  // would silently defeat.
+  const canSettle =
+    !pinned && status !== "working" && status !== "permission";
 
   // Snooze hides the card just as thoroughly as Settle does, so it rides the
   // same guardrail rather than restating it — a second copy of the condition
@@ -254,7 +262,7 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
         // no re-render churn on pointer moves. Only hide when an action button
         // will actually take its place — a guardrailed card keeps its state
         // visible on hover/focus since there is nothing to swap to.
-        canSettle &&
+        (pinned || canSettle) &&
           (actionsPinned
             ? "hidden"
             : "group-hover/card:hidden group-focus-within/card:hidden"),
@@ -432,6 +440,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                 <span className="min-w-0 truncate text-[11px] font-semibold tracking-[0.01em] text-muted-foreground/80">
                   {repo.name}
                 </span>
+                {pinned && (
+                  <Pin
+                    role="img"
+                    aria-label="Pinned workspace"
+                    className="size-3 shrink-0 text-muted-foreground/65"
+                  />
+                )}
                 <span className="flex-1" />
                 {/* "Woke": the list keeps a stable order, so a card returning
                     from a snooze slots back where it was and nothing about its
@@ -456,6 +471,20 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                   </span>
                 )}
                 {stateCluster}
+                {pinned && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onUnpin?.(workspace.workspace_id);
+                    }}
+                    aria-label={`Unpin "${workspace.title}"`}
+                    className={eyebrowActionClass}
+                  >
+                    <PinOff className="h-2.5 w-2.5" strokeWidth={2.5} />
+                    Unpin
+                  </button>
+                )}
                 {canSettle && (
                   <button
                     type="button"

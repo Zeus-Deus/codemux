@@ -24,6 +24,10 @@ interface Props {
    *  intent; this layer only has to not break the memo boundary, so the
    *  object identity must stay stable between sends. */
   sendAnchor?: SendAnchorRequest | null;
+  /** Pane-owned "which send nonce is already positioned" record — forwarded
+   *  so a MessageList remount under a still-live anchor re-reserves the
+   *  response space without re-running the positioning scroll. */
+  positionedNonceRef?: { current: number | null };
   /** Thread identity — forwarded so the list resets to `following-end` when
    *  the pane switches threads. */
   threadKey?: string | null;
@@ -69,6 +73,7 @@ export const ChatTranscript = memo(function ChatTranscript({
   stalled,
   interrupted,
   sendAnchor,
+  positionedNonceRef,
   threadKey,
   subagentJumpRequest,
   sessionStartedAt,
@@ -95,6 +100,7 @@ export const ChatTranscript = memo(function ChatTranscript({
         stalled={stalled}
         interrupted={interrupted}
         sendAnchor={sendAnchor}
+        positionedNonceRef={positionedNonceRef}
         threadKey={threadKey}
         subagentJumpRequest={subagentJumpRequest}
         sessionStartedAt={sessionStartedAt}

@@ -275,6 +275,13 @@ impl JsonRpcChild {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+
+        // Agent CLIs are ordinary host binaries: under an AppImage they would
+        // otherwise inherit AppRun's LD_LIBRARY_PATH and link against our
+        // bundled libraries. Applied before the caller's overlay so an explicit
+        // env pair from `config` still wins. No-op outside an AppImage.
+        crate::execution::sanitize_appimage_env_tokio(&mut cmd);
+
         for (k, v) in &config.env {
             cmd.env(k, v);
         }

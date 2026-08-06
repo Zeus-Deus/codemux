@@ -1,11 +1,10 @@
 use crate::git::{git_status, scan_files_for_conflict_markers, FileStatus};
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::Duration;
-use tokio::process::Command as AsyncCommand;
 
 pub fn claude_available() -> bool {
-    Command::new("which")
+    crate::execution::host_command("which")
         .arg("claude")
         .output()
         .map(|o| o.status.success())
@@ -146,7 +145,7 @@ pub(crate) async fn run_resolver_cli(
     repo_path: &Path,
     timeout: Duration,
 ) -> Result<Output, ResolverRunError> {
-    let child = AsyncCommand::new(program)
+    let child = crate::execution::host_command_tokio(program)
         .args(args)
         .current_dir(repo_path)
         .stdin(Stdio::null())
@@ -311,7 +310,7 @@ pub async fn generate_commit_message(
     model: Option<&str>,
 ) -> Result<String, String> {
     let diff = {
-        let output = AsyncCommand::new("git")
+        let output = crate::execution::host_command_tokio("git")
             .args(["diff", "--cached"])
             .current_dir(repo_path)
             .stdin(Stdio::null())
