@@ -103,12 +103,18 @@ close that off:
   now carry `SubagentSnapshot.background_task` and are excluded from the
   running-set, so the turn settles and the release fires normally. See
   `docs/features/agent-chat.md` (§ Sidebar status indicators).
-- **A watchdog backstop.** If a `Review` is still owed 10 minutes after
-  the turn completed with no real run activity, the stall-watchdog sweep
-  force-settles it through `apply_pane_status` — the same helper
-  `publish_pane_status` uses — which runs this exact release. So any
-  future missed terminal subagent signal releases the browser on the next
-  sweep instead of never.
+- **A watchdog backstop that stops short of this release.** If a `Review`
+  is still owed 10 minutes after the turn completed with no real run
+  activity, the stall-watchdog sweep force-settles the *pane status*
+  through `apply_pane_status`. It passes `SettleOrigin::ForcedBackstop`,
+  which deliberately withholds the browser release: the trigger is
+  silence, and a subagent sitting inside one long quiet tool call is
+  silent too. Publishing a settled dot early is repainted by the next
+  real event; closing a browser session the agent is still driving is
+  not. So the sidebar unsticks on the next sweep, while the chip clears
+  only on a real terminal transition (or when the pane/session closes).
+  See `docs/features/agent-chat.md` (§ Sidebar status indicators) for the
+  full forced-settle semantics.
 
 Known accepted edge case: if two chat threads are both driving browser
 activity in the *same* workspace, one thread finishing its run releases the

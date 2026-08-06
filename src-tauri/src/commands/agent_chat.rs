@@ -3381,12 +3381,35 @@ struct ThreadSubagentState {
     /// review that is owed but has gone silent. `None` whenever no review
     /// is owed.
     review_owed_since: Option<SystemTime>,
+    /// **Tombstone.** The watchdog already force-settled this thread's owed
+    /// `Review` ([`SubagentTracker::take_overdue_reviews`]) while ids were
+    /// still in `running`.
+    ///
+    /// The entry deliberately survives the forced settle instead of being
+    /// removed. Those ids may belong to a subagent that is genuinely alive
+    /// and merely quiet (one long tool call), and its real terminal
+    /// snapshot can still arrive minutes later. With the entry gone that
+    /// snapshot would land on a fresh `ThreadSubagentState` and leave a
+    /// `review_pending: false` husk behind, tracked until session close.
+    /// With the tombstone, the late terminal snapshot drains `running`
+    /// normally, publishes nothing (the `Review` was already published),
+    /// and the now-clear entry is dropped by [`Self::is_clear`].
+    ///
+    /// Cleared by every genuine turn boundary (a new
+    /// `SessionStatus::Running`, session teardown, or the send-message
+    /// `clear_thread`), so it never outlives the run it describes.
+    forced_settled: bool,
 }
 
 impl ThreadSubagentState {
     /// Whether this thread tracks no live subagents and owes no `Review`
     /// — the entry can be dropped from [`SubagentTracker`] so the map
     /// never grows unbounded.
+    ///
+    /// A [`Self::forced_settled`] tombstone is not itself a reason to keep
+    /// the entry: once the last force-settled id drains out of `running`
+    /// there is nothing left to disambiguate, so the tombstone is bounded
+    /// by the live ids it was recorded against.
     fn is_clear(&self) -> bool {
         self.running.is_empty() && !self.review_pending
     }
@@ -3397,6 +3420,11 @@ impl ThreadSubagentState {
 /// `TurnCompleted`. Refreshes [`ThreadSubagentState::review_owed_since`]
 /// so a genuinely busy async subagent is never force-settled by the
 /// watchdog while it keeps reporting.
+///
+/// *Any* tick from a real subagent counts, not just a state change, which
+/// is what makes the watchdog's threshold mean "every remaining blocker
+/// has been silent for 10 minutes" rather than "the thread has been silent
+/// since the turn ended".
 ///
 /// A `background_task` snapshot deliberately does NOT count: those tick
 /// for as long as the background job lives (forever, for a dev server) and
@@ -3417,9 +3445,22 @@ fn refreshes_owed_review(event: &ProviderRuntimeEvent) -> bool {
 /// Pure sweep predicate: whether `state` owes a `Review` that has gone
 /// silent for at least `threshold` and should therefore be force-settled.
 ///
-/// `review_pending` is only ever set by `TurnCompleted`, so this can never
-/// fire mid-turn — that is the guard that keeps the backstop from cutting
-/// a live run short.
+/// Two guards keep this off a healthy run:
+///
+/// * `review_pending` is only ever set by `TurnCompleted`, so it can never
+///   fire mid-turn.
+/// * `review_owed_since` is re-armed by *any* tick from a real (non
+///   `background_task`) tracked entry — see [`refreshes_owed_review`] —
+///   so the clock only advances while **every** remaining blocker is
+///   silent.
+///
+/// What it therefore cannot rule out is a live-but-quiet subagent: one
+/// long tool call (a `cargo test`, a big build) emits nothing for longer
+/// than the threshold, and the sweep will fire on it. That is accepted
+/// deliberately, and is why the forced path is non-destructive: it
+/// publishes the settled status but leaves the browser session alone and
+/// tombstones the entry rather than dropping it (see
+/// [`SubagentTracker::take_overdue_reviews`] and [`SettleOrigin`]).
 fn select_overdue_review(
     state: &ThreadSubagentState,
     now: SystemTime,
@@ -3487,29 +3528,53 @@ impl SubagentTracker {
     }
 
     /// Force-settle every thread whose owed `Review` has gone silent for
-    /// at least `threshold`: the entries are **removed** and their thread
-    /// ids returned so the caller can publish the settled status once.
+    /// at least `threshold`, returning their thread ids so the caller can
+    /// publish the settled status once.
     ///
     /// The safety net behind [`map_event_to_pane_status`]: even with
-    /// background tasks excluded from the running-set, a future missed
-    /// terminal subagent signal (a crashed notification, a provider quirk)
-    /// would otherwise pin the sidebar to "Working" and block the
-    /// background-browser release forever.
+    /// background tasks excluded from the running-set, a missed terminal
+    /// subagent signal (a crashed notification, a provider quirk) would
+    /// otherwise pin the sidebar to "Working" forever.
     ///
-    /// Removing under the same lock makes this take-once — a later sweep
-    /// can't re-settle the same stall — and releases the mutex before the
-    /// caller touches `AppStateStore`.
+    /// **The entries are tombstoned, not removed.** The sweep cannot prove
+    /// the tracked ids are dead — silence is not death — so it clears only
+    /// what it is publishing (`review_pending`, the silence clock) and
+    /// leaves `running` intact under a
+    /// [`ThreadSubagentState::forced_settled`] marker. That keeps the
+    /// forced settle take-once (a later sweep sees `review_pending: false`
+    /// and skips it) while letting a late-but-real terminal snapshot drain
+    /// `running` through the ordinary path, publish nothing, and drop the
+    /// entry — instead of resurrecting it as an untracked husk.
+    ///
+    /// Mutating under the same lock releases the mutex before the caller
+    /// touches `AppStateStore`, so the two locks are never held together.
     fn take_overdue_reviews(&self, now: SystemTime, threshold: Duration) -> Vec<String> {
         let mut threads = self.threads.lock().expect("subagent tracker poisoned");
-        let overdue: Vec<String> = threads
-            .iter()
-            .filter(|(_, state)| select_overdue_review(state, now, threshold))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in &overdue {
-            threads.remove(id);
+        let mut overdue = Vec::new();
+        for (thread_id, state) in threads.iter_mut() {
+            if !select_overdue_review(state, now, threshold) {
+                continue;
+            }
+            state.review_pending = false;
+            state.review_owed_since = None;
+            state.forced_settled = true;
+            overdue.push(thread_id.clone());
         }
+        // A thread force-settled with nothing left in `running` has no
+        // tombstone left to carry, so it is dropped like any other clear
+        // entry rather than lingering in the map.
+        threads.retain(|_, state| !state.is_clear());
         overdue
+    }
+
+    /// Number of threads currently tracked. Test-only: the leak the
+    /// tombstone exists to prevent is only observable as map growth.
+    #[cfg(test)]
+    fn tracked_thread_count(&self) -> usize {
+        self.threads
+            .lock()
+            .expect("subagent tracker poisoned")
+            .len()
     }
 }
 
@@ -3620,6 +3685,13 @@ fn map_event_to_pane_status(
                     state.review_pending = false;
                     Some(PaneStatus::Review)
                 } else {
+                    // Also the late-completion-after-a-forced-settle case
+                    // (`forced_settled`): the watchdog already published
+                    // this thread's `Review`, so the real terminal snapshot
+                    // must stay silent rather than re-announcing a
+                    // transition the user has already seen and possibly
+                    // already cleared. Draining `running` here is the whole
+                    // point — it is what lets `is_clear` drop the tombstone.
                     None
                 }
             }
@@ -3650,6 +3722,9 @@ fn map_event_to_pane_status(
                 // `agent_chat_send_turn`).
                 state.running.clear();
                 state.review_pending = false;
+                // A new turn supersedes any forced settle of the previous
+                // one, so the tombstone goes with the rest of the state.
+                state.forced_settled = false;
                 Some(PaneStatus::Working)
             }
             SessionStatus::WaitingApproval { .. } => Some(PaneStatus::Permission),
@@ -3660,6 +3735,7 @@ fn map_event_to_pane_status(
                 // later `task_notification`) cannot pin the spinner.
                 state.running.clear();
                 state.review_pending = false;
+                state.forced_settled = false;
                 Some(PaneStatus::Idle)
             }
             SessionStatus::Starting | SessionStatus::Ready => None,
@@ -3725,20 +3801,53 @@ fn publish_pane_status<R: Runtime>(
     let Some(status) = tracker.decide(&thread_id.0, event, SystemTime::now()) else {
         return;
     };
-    apply_pane_status(app, &thread_id.0, status);
+    apply_pane_status(app, &thread_id.0, status, SettleOrigin::ProviderEvent);
+}
+
+/// Where a pane-status write came from. The one policy that differs
+/// between the two callers of [`apply_pane_status`]: whether a terminal
+/// status may also tear down the workspace's detached agent browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleOrigin {
+    /// A real provider transition. The status is *evidence* the run
+    /// reached that state, so the browser session it was using can go.
+    ProviderEvent,
+    /// The stall watchdog's backstop
+    /// ([`force_settle_overdue_reviews`]). Silence is not proof of death:
+    /// the run may still be alive inside one long quiet tool call, and it
+    /// would then keep driving a browser session that this settle has no
+    /// standing to destroy. Publishing a settled dot is recoverable — the
+    /// next real event repaints it — whereas closing a live browser is
+    /// not, so the forced path publishes the status and stops there.
+    ForcedBackstop,
+}
+
+/// Whether a settle at `origin` reaching `status` should release the
+/// workspace's detached agent browser.
+///
+/// Pure, so the "a forced settle never releases the browser" rule is
+/// unit-testable without an `AppHandle`/`AppStateStore`.
+fn should_release_browser(origin: SettleOrigin, status: PaneStatus) -> bool {
+    matches!(origin, SettleOrigin::ProviderEvent) && run_finished(status)
 }
 
 /// Write `status` for `thread_id` into the shared `pane_statuses` store,
-/// release the workspace's background agent browser once the run is over,
-/// and emit a stamped `app-state-changed` snapshot when either actually
-/// changed.
+/// release the workspace's background agent browser once the run is
+/// provably over, and emit a stamped `app-state-changed` snapshot when
+/// either actually changed.
 ///
 /// Extracted from [`publish_pane_status`] so the stall watchdog's forced
-/// settle ([`force_settle_overdue_reviews`]) applies exactly the same
-/// policy — the Review→Idle downgrade, the release, and the stamped emit —
-/// instead of growing a second copy of it. Takes no tracker lock, so the
-/// caller must release the tracker mutex before calling.
-fn apply_pane_status<R: Runtime>(app: &AppHandle<R>, thread_id: &str, mut status: PaneStatus) {
+/// settle ([`force_settle_overdue_reviews`]) shares the Review→Idle
+/// downgrade and the stamped emit instead of growing a second copy of
+/// them. The browser release is the deliberate exception, gated on
+/// `origin` — see [`SettleOrigin`]. Takes no tracker lock, so the caller
+/// must release the tracker mutex before calling.
+fn apply_pane_status<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+    mut status: PaneStatus,
+    origin: SettleOrigin,
+) {
     let state: State<'_, AppStateStore> = app.state();
     // Mirror the terminal path: a turn that finishes in the workspace the
     // user is already looking at clears to Idle instead of nagging with a
@@ -3753,8 +3862,10 @@ fn apply_pane_status<R: Runtime>(app: &AppHandle<R>, thread_id: &str, mut status
     // context-bar indicator stop showing "LIVE" once the agent has nothing
     // left to do. `Working`/`Permission` must NOT release — the tracker
     // already defers `Review` while subagents are still running, so by the
-    // time we see a terminal status here the run really is over.
-    let released = run_finished(status)
+    // time we see a terminal status *from a provider event* the run really
+    // is over. A forced backstop settle carries no such proof and never
+    // releases.
+    let released = should_release_browser(origin, status)
         && state
             .agent_chat_pane_id_for_thread(thread_id)
             .and_then(|pane_id| state.workspace_id_for_pane(&pane_id))
@@ -3961,17 +4072,30 @@ impl RunActivityTracker {
 }
 
 /// Force-settle every thread whose owed `Review` has gone silent past
-/// [`STALL_THRESHOLD`], publishing the settled pane status through the same
-/// policy [`publish_pane_status`] uses (Review, downgraded to Idle in the
-/// active workspace, plus the background-browser release and the stamped
-/// app-state emit).
+/// [`STALL_THRESHOLD`], publishing the settled pane status through
+/// [`apply_pane_status`] (Review, downgraded to Idle in the active
+/// workspace, plus the stamped app-state emit).
 ///
 /// This is the backstop for a missed terminal subagent signal: without it a
 /// thread that completed its turn while something was still tracked as
-/// running stays "Working" — and keeps the browser `LIVE` chip up —
-/// indefinitely, because the only exit is a terminal snapshot that never
-/// arrives. `review_pending` is set exclusively by `TurnCompleted`, so a
-/// mid-flight turn can never be cut short here.
+/// running stays "Working" indefinitely, because the only exit is a
+/// terminal snapshot that never arrives.
+///
+/// **Deliberately non-destructive.** The trigger is silence, and silence
+/// cannot distinguish a dead subagent from a live one sitting inside one
+/// long tool call. So the forced path only ever writes a pane status:
+///
+/// * it passes [`SettleOrigin::ForcedBackstop`], which withholds the
+///   detached-browser release — tearing down the browser under a live
+///   subagent would be unrecoverable, while a premature dot is repainted
+///   by the next real event;
+/// * `take_overdue_reviews` tombstones rather than removes the tracker
+///   entry, so a late real completion drains normally, publishes nothing,
+///   and leaves no orphaned entry behind.
+///
+/// `review_pending` is set exclusively by `TurnCompleted`, so a mid-flight
+/// turn can never be cut short here, and every remaining blocker must have
+/// been silent for the full threshold (see [`refreshes_owed_review`]).
 ///
 /// The tracker mutex is released by `take_overdue_reviews` before any
 /// `AppStateStore` call, so the two locks are never held together.
@@ -3985,7 +4109,7 @@ fn force_settle_overdue_reviews<R: Runtime>(app: &AppHandle<R>, now: SystemTime)
             "[codemux::agent_chat] force-settling an overdue Review for thread {thread_id} (turn completed, no subagent activity for {}s)",
             STALL_THRESHOLD.as_secs()
         );
-        apply_pane_status(app, &thread_id, PaneStatus::Review);
+        apply_pane_status(app, &thread_id, PaneStatus::Review, SettleOrigin::ForcedBackstop);
     }
 }
 
@@ -3999,8 +4123,10 @@ fn force_settle_overdue_reviews<R: Runtime>(app: &AppHandle<R>, now: SystemTime)
 ///
 /// The same sweep also force-settles an **owed `Review`** that has gone
 /// silent for the same threshold (see [`force_settle_overdue_reviews`]).
-/// That case is not a stall — the turn already completed — so it is not
-/// advisory: it actually publishes the settled status the run never got.
+/// That case is not a stall — the turn already completed — so it does more
+/// than advise: it publishes the settled status the run never got. It stops
+/// there, though. It never releases the detached browser and never drops
+/// tracker state, because silence alone cannot prove the run is dead.
 ///
 /// Spawned once from `lib.rs` right after `spawn_event_bridge`, inside the
 /// same `agent_chat_enabled` gate. Generic over the Tauri runtime so the
@@ -6126,6 +6252,7 @@ mod tests {
             running: ["s1".to_string()].into_iter().collect(),
             review_pending: false,
             review_owed_since: Some(stale),
+            forced_settled: false,
         };
         assert!(!select_overdue_review(&mid_turn, now, STALL_THRESHOLD));
 
@@ -6134,6 +6261,7 @@ mod tests {
             running: ["s1".to_string()].into_iter().collect(),
             review_pending: true,
             review_owed_since: Some(now),
+            forced_settled: false,
         };
         assert!(!select_overdue_review(&fresh, now, STALL_THRESHOLD));
 
@@ -6147,7 +6275,7 @@ mod tests {
     }
 
     #[test]
-    fn take_overdue_reviews_settles_once_and_drops_the_entry() {
+    fn take_overdue_reviews_settles_once_and_tombstones_the_entry() {
         let tracker = SubagentTracker::default();
         let start = SystemTime::now();
         tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), start);
@@ -6163,11 +6291,111 @@ mod tests {
             .is_empty());
 
         let later = start + STALL_THRESHOLD + Duration::from_secs(1);
-        assert_eq!(tracker.take_overdue_reviews(later, STALL_THRESHOLD), vec!["t".to_string()]);
-        // Take-once: the entry is gone, so a later sweep re-settles nothing.
+        assert_eq!(
+            tracker.take_overdue_reviews(later, STALL_THRESHOLD),
+            vec!["t".to_string()]
+        );
+        // Take-once: the owed Review was cleared, so a later sweep
+        // re-settles nothing...
         assert!(tracker
             .take_overdue_reviews(later + STALL_THRESHOLD, STALL_THRESHOLD)
             .is_empty());
+        // ...but the entry itself survives as a tombstone, because `s1` may
+        // still be alive and its terminal snapshot still has to land
+        // somewhere that knows a Review was already published.
+        assert_eq!(tracker.tracked_thread_count(), 1);
+    }
+
+    // Finding (b): a forced settle must not strand tracker state. The late
+    // real completion drains the tombstone, publishes nothing, and leaves
+    // the map empty — as opposed to dropping the entry at settle time,
+    // where the same snapshot would recreate a `review_pending: false` husk
+    // that nothing ever collects.
+    #[test]
+    fn a_late_completion_after_a_forced_settle_is_silent_and_leaks_nothing() {
+        let tracker = SubagentTracker::default();
+        let start = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), start);
+        tracker.decide("t", &turn_completed(), start);
+        let settled_at = start + STALL_THRESHOLD + Duration::from_secs(1);
+        assert_eq!(
+            tracker.take_overdue_reviews(settled_at, STALL_THRESHOLD),
+            vec!["t".to_string()]
+        );
+
+        // The subagent was alive all along — just quiet inside one long
+        // tool call — and reports again after the forced settle.
+        assert_eq!(
+            tracker.decide(
+                "t",
+                &subagent_event("s1", SubagentStatus::Running),
+                settled_at + Duration::from_secs(5)
+            ),
+            None,
+            "a post-settle progress tick must not resurrect Working"
+        );
+        assert_eq!(
+            tracker.decide(
+                "t",
+                &subagent_event("s1", SubagentStatus::Completed),
+                settled_at + Duration::from_secs(10)
+            ),
+            None,
+            "the Review was already published; do not re-announce it"
+        );
+        assert_eq!(
+            tracker.tracked_thread_count(),
+            0,
+            "the tombstone is collected once the last tracked id drains"
+        );
+    }
+
+    // A forced settle on a thread whose next turn simply starts again must
+    // behave like any other thread: the tombstone is part of the state a
+    // new turn resets, so turn 2 settles normally.
+    #[test]
+    fn a_new_turn_clears_the_forced_settle_tombstone() {
+        let tracker = SubagentTracker::default();
+        let start = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), start);
+        tracker.decide("t", &turn_completed(), start);
+        let settled_at = start + STALL_THRESHOLD + Duration::from_secs(1);
+        tracker.take_overdue_reviews(settled_at, STALL_THRESHOLD);
+
+        assert_eq!(
+            tracker.decide("t", &session_running(), settled_at + Duration::from_secs(1)),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            tracker.decide("t", &turn_completed(), settled_at + Duration::from_secs(2)),
+            Some(PaneStatus::Review),
+            "turn 2 settles through the ordinary path"
+        );
+        assert_eq!(tracker.tracked_thread_count(), 0);
+    }
+
+    // Finding (a), the destructive half: the watchdog's trigger is silence,
+    // which a live subagent inside one long quiet tool call also produces.
+    // Publishing a settled dot too early is repainted by the next real
+    // event; tearing down the browser session that subagent is driving is
+    // not recoverable, so only a provider event may do it.
+    #[test]
+    fn a_forced_settle_never_releases_the_detached_browser() {
+        for status in [PaneStatus::Review, PaneStatus::Idle] {
+            assert!(
+                should_release_browser(SettleOrigin::ProviderEvent, status.clone()),
+                "a real terminal transition still releases"
+            );
+            assert!(
+                !should_release_browser(SettleOrigin::ForcedBackstop, status),
+                "the watchdog's backstop must never tear down a live browser"
+            );
+        }
+        // Mid-run statuses are unchanged from either origin.
+        for origin in [SettleOrigin::ProviderEvent, SettleOrigin::ForcedBackstop] {
+            assert!(!should_release_browser(origin, PaneStatus::Working));
+            assert!(!should_release_browser(origin, PaneStatus::Permission));
+        }
     }
 
     // Real post-turn subagent activity refreshes the silence clock, so a

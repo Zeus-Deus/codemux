@@ -1052,6 +1052,13 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
 /// outlive the turn forever (a dev server never exits, so its terminal
 /// `task_notification` never arrives) and must never pin the workspace to
 /// `Working` after `TurnCompleted`.
+///
+/// The discriminator is *top-level* launch, so a **nested** subagent — one
+/// an already-delegated agent spawns — is also stamped `background_task`,
+/// since only the root launch is registered. That is deliberate and benign:
+/// the root stays in the run-blocking set for as long as the whole subtree
+/// is alive, so the nested row has nothing left to hold open, and the flag
+/// only ever means "do not let this row block settlement on its own".
 fn stamp_background_task(snap: &mut SubagentSnapshot, demux: &SubagentDemux) {
     snap.background_task = !demux.is_top_level_launch(&snap.subagent_id);
 }

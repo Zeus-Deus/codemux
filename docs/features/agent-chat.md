@@ -2959,18 +2959,43 @@ same way, and `RunStalled` is advisory only — it maps to pane-status
 `None`. So the 30s sweep (`spawn_stall_watchdog`) has a second pass,
 `force_settle_overdue_reviews`. `ThreadSubagentState` tracks
 `review_owed_since`, stamped when `TurnCompleted` defers the `Review` and
-re-armed by real post-turn run activity (`refreshes_owed_review` — a
-flagged background-task snapshot deliberately does **not** count, so a
-busy async subagent is never cut short while a never-ending shell job
-can't stall the clock forever). `SubagentTracker::take_overdue_reviews`
-removes and returns every thread silent past the same `STALL_THRESHOLD`
-(600s), under the tracker lock so the settle happens exactly once and the
-mutex is released before any `AppStateStore` call. Each id then goes
-through `apply_pane_status` — the helper extracted out of
-`publish_pane_status`, so the forced settle applies the identical policy
-(`Review`, downgraded to `Idle` in the active workspace, plus the
-background-browser release and the stamped `app-state-changed` emit)
-rather than a second copy of it. This can never cut a live turn short:
+re-armed by *any* tick from a real tracked entry (`refreshes_owed_review`
+— a flagged background-task snapshot deliberately does **not** count, so
+a never-ending shell job can't hold the clock open). Because any real
+tick re-arms it, the 600s `STALL_THRESHOLD` means "every remaining
+blocker has been silent for ten minutes", not "the thread has been quiet
+since the turn ended".
+
+**What that threshold cannot prove is that the run is dead.** A single
+long tool call — a `cargo test`, a big build — emits nothing for longer
+than ten minutes, so the sweep will sometimes fire on a subagent that is
+perfectly alive. The forced path is therefore deliberately
+*non-destructive*: it publishes a pane status and does nothing else.
+
+- **It never releases the detached browser.** `apply_pane_status` takes a
+  `SettleOrigin`; `publish_pane_status` passes `ProviderEvent` (a real
+  transition is evidence the run reached that state, so the browser
+  session may go) and the watchdog passes `ForcedBackstop`, which
+  withholds the release. A prematurely settled dot is repainted by the
+  next real event; a browser torn down under a live subagent is not
+  recoverable. Everything else — the `Review`→`Idle` downgrade in the
+  active workspace, the stamped `app-state-changed` emit — is shared.
+- **It tombstones the tracker entry instead of dropping it.**
+  `take_overdue_reviews` clears only what it publishes (`review_pending`,
+  the silence clock) and sets `ThreadSubagentState::forced_settled`,
+  leaving `running` intact. That keeps the settle take-once (a later
+  sweep sees no owed `Review`), and a late-but-real terminal snapshot
+  then drains `running` through the ordinary path, publishes **nothing**
+  (the `Review` was already announced, possibly already cleared by the
+  user), and lets the now-clear entry be dropped. Removing the entry at
+  settle time instead would leave that snapshot to recreate a
+  `review_pending: false` husk that nothing ever collects. The tombstone
+  is cleared by every genuine turn boundary — a new
+  `SessionStatus::Running`, session teardown, or the send-message
+  `clear_thread`.
+
+The sweep still runs under the tracker lock, and the mutex is released
+before any `AppStateStore` call. It can never cut a live *turn* short:
 `review_pending` is set exclusively by `TurnCompleted`.
 
 Only *live* provider events reach the tracker: transcript hydration/resume
