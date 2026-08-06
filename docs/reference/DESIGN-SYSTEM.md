@@ -54,8 +54,14 @@ These are **not** theme colors and are left literal on purpose:
      including the transparent Agent Chat composer textarea.
    - `--accent-violet` — secondary accent (for example, a merged PR).
    - `--status-open` (green), `--status-working` (amber),
-     `--status-attention` (red), `--status-remote` (sky) — status tones,
-     **identical across all palettes**.
+     `--status-attention` (red), `--status-monitoring` (cyan),
+     `--status-remote` (sky) — status tones, **identical across all
+     palettes**. `--status-monitoring` marks an agent watching something in
+     the background (see `docs/features/monitoring-status.md`); it is cool and
+     low-chroma on purpose, held apart in hue from the sky `--status-remote`
+     so a monitoring dot and a remote-host chip never read as the same thing.
+     **Nothing that carries it animates** — the pulse is reserved for
+     `--status-attention`, the one state genuinely blocked on a human.
    - Legacy aliases `--success`/`--warning`/`--danger` map onto the status
      tokens as a single value source for existing `text-success` etc.
    - `--sidebar-primary` is overridden here to `--accent-ember`: the shadcn

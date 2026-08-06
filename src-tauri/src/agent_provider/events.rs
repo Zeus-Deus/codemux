@@ -49,6 +49,48 @@ pub enum RequestResponseFailureReason {
     StaleProviderCallback,
 }
 
+/// What kind of work a tracked task actually is.
+///
+/// Providers spawn two very different things down the same task channel: real
+/// delegated agent work, and background watch loops (a `tail -f`, a CI poll, a
+/// long-lived MCP monitor). They deserve opposite treatment in the UI — one is
+/// progress the user is waiting on, the other is calm background presence — so
+/// the distinction is carried on the snapshot rather than re-guessed by every
+/// consumer.
+///
+/// Providers that report nothing send `None`, which every consumer reads as
+/// "ordinary agent work". That is the deliberate graceful degradation: an
+/// installed SDK that predates the `task_type` field simply behaves exactly as
+/// it did before this existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentTaskKind {
+    /// Delegated agent work — a subagent proper. Counts toward "N subagents
+    /// running" and pins the pane to `Working`.
+    #[default]
+    Agent,
+    /// A background watch loop. Never counted as a running subagent, and the
+    /// reason a thread can settle to `Monitoring` instead of `Review`.
+    Monitor,
+}
+
+/// The provider task types that are watch loops rather than agent work.
+///
+/// A closed set on purpose: anything unrecognised — including a task type a
+/// future SDK invents — classifies as agent work, which is the conservative
+/// direction. Mis-labelling a monitor as an agent shows a spinner that is a bit
+/// too eager; mis-labelling an agent as a monitor would quietly stop telling
+/// the user that real work is in flight.
+pub const WATCH_LOOP_TASK_TYPES: [&str; 4] = ["monitor", "monitor_mcp", "local_bash", "shell"];
+
+/// Classify a provider-reported task type string. `None` / unknown → `Agent`.
+pub fn classify_task_kind(task_type: Option<&str>) -> SubagentTaskKind {
+    match task_type {
+        Some(t) if WATCH_LOOP_TASK_TYPES.contains(&t) => SubagentTaskKind::Monitor,
+        _ => SubagentTaskKind::Agent,
+    }
+}
+
 /// A merge-able state snapshot for one subagent.
 ///
 /// Providers dribble a subagent's identity out across many events (its
@@ -78,6 +120,13 @@ pub struct SubagentSnapshot {
     /// `subagent_type` / role / agent slug.
     #[serde(default)]
     pub agent_type: Option<String>,
+    /// Whether this is agent work or a background watch loop, when the
+    /// provider says. `None` means "not reported" rather than "agent": the
+    /// per-thread tracker leaves an already-classified task where it is when a
+    /// later snapshot omits the field, so a `task_progress` tick can never
+    /// silently demote a monitor back to a subagent.
+    #[serde(default)]
+    pub task_kind: Option<SubagentTaskKind>,
     /// Model the subagent runs on, when reported.
     #[serde(default)]
     pub model: Option<String>,
@@ -649,6 +698,7 @@ mod tests {
             parent_item_id: Some("toolu_root".into()),
             name: Some("Explore".into()),
             agent_type: Some("Explore".into()),
+            task_kind: Some(SubagentTaskKind::Agent),
             model: Some("claude-sonnet-4".into()),
             status: SubagentStatus::Running,
             activity: Some("Reading files".into()),
@@ -682,6 +732,46 @@ mod tests {
         assert!(snap.name.is_none());
         assert!(snap.tool_use_count.is_none());
         assert!(snap.provider_ref.is_none());
+        // The graceful-degradation contract: an SDK that never reports a task
+        // type leaves this `None`, and every consumer treats that as agent work.
+        assert!(snap.task_kind.is_none());
+    }
+
+    // ── Watch-loop classification ──
+
+    #[test]
+    fn watch_loop_task_types_classify_as_monitor() {
+        for t in WATCH_LOOP_TASK_TYPES {
+            assert_eq!(
+                classify_task_kind(Some(t)),
+                SubagentTaskKind::Monitor,
+                "{t} should be a watch loop"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_and_missing_task_types_classify_as_agent() {
+        assert_eq!(classify_task_kind(None), SubagentTaskKind::Agent);
+        assert_eq!(classify_task_kind(Some("")), SubagentTaskKind::Agent);
+        assert_eq!(classify_task_kind(Some("subagent")), SubagentTaskKind::Agent);
+        // A task type a future SDK invents must land on the conservative side.
+        assert_eq!(
+            classify_task_kind(Some("some_future_kind")),
+            SubagentTaskKind::Agent
+        );
+    }
+
+    #[test]
+    fn task_kind_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(SubagentTaskKind::Monitor).unwrap(),
+            json!("monitor")
+        );
+        assert_eq!(
+            serde_json::to_value(SubagentTaskKind::Agent).unwrap(),
+            json!("agent")
+        );
     }
 
     #[test]

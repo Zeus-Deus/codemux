@@ -27,7 +27,7 @@ afterEach(() => {
 describe("dev mock seed — stress fixture scaling", () => {
   it("leaves the curated seed untouched when no fixture is selected", async () => {
     const seed = await loadSeed(null);
-    expect(seed.workspaces).toHaveLength(18);
+    expect(seed.workspaces).toHaveLength(19);
     expect(seed.active_workspace_id).toBe("ws-codemux-mock");
   });
 
@@ -49,7 +49,7 @@ describe("dev mock seed — stress fixture scaling", () => {
   it("gives generated workspaces real surfaces, sessions and statuses", async () => {
     const seed = await loadSeed("large");
     const generated = seed.workspaces.filter((w) => w.workspace_id.startsWith("ws-stress-"));
-    expect(generated).toHaveLength(42);
+    expect(generated).toHaveLength(41);
 
     for (const workspace of generated) {
       expect(workspace.surfaces).toHaveLength(1);

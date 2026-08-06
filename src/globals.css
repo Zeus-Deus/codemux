@@ -68,6 +68,7 @@
     --color-status-open: var(--status-open);
     --color-status-working: var(--status-working);
     --color-status-attention: var(--status-attention);
+    --color-status-monitoring: var(--status-monitoring);
     --color-status-remote: var(--status-remote);
     /* Radius scale — fully token-driven from the preset's --radius. Change
      * the preset (or --radius) and every rounded utility re-skins. */
@@ -191,6 +192,12 @@
   --status-open:      oklch(0.74 0.14 156);   /* green — open / ready / connected / +    */
   --status-working:   oklch(0.80 0.13 80);    /* amber — agent working / behind / changed */
   --status-attention: oklch(0.685 0.17 22);   /* red   — needs input / destructive / −    */
+  /* cyan — an agent watching something in the background (CI, a tailed
+   * process, a PR poll). Cool and low-chroma on purpose: monitoring is calm
+   * background presence, never a call for attention, and nothing that carries
+   * this token animates. Held apart in hue from --status-remote (sky) so a
+   * monitoring dot and a remote-host chip never read as the same thing. */
+  --status-monitoring: oklch(0.78 0.09 196);
   --status-remote:    oklch(0.74 0.10 232);   /* sky   — on host / other device / cloud   */
   /* Legacy semantic aliases kept as one value source for existing
    * text-success / bg-warning / text-danger utilities. */

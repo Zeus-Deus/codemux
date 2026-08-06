@@ -6,11 +6,18 @@ import type {
   SurfaceSnapshot,
 } from "@/tauri/types";
 
+/** The one priority ladder, shared verbatim with `state_impl.rs::PaneStatus`.
+ *
+ *  `monitoring` sits between `review` and `working`: a workspace with a live
+ *  watch loop is still doing something (so it outranks a finished-and-waiting
+ *  review), but nobody has to look at it (so it never outranks real work or a
+ *  blocked prompt). */
 const STATUS_PRIORITY: Record<PaneStatus, number> = {
   idle: 0,
   review: 1,
-  working: 2,
-  permission: 3,
+  monitoring: 2,
+  working: 3,
+  permission: 4,
 };
 
 /** How much a status outranks the others when sorting workspaces "most
@@ -27,6 +34,7 @@ export function statusRank(status: ActivePaneStatus | null | undefined): number 
 export const STATUS_LABEL: Record<ActivePaneStatus, string> = {
   working: "Working",
   permission: "Needs you",
+  monitoring: "Monitoring",
   review: "Done · review",
 };
 
@@ -35,13 +43,20 @@ export const STATUS_LABEL: Record<ActivePaneStatus, string> = {
 export const STATUS_TEXT_CLASS: Record<ActivePaneStatus, string> = {
   working: "text-status-working",
   permission: "text-status-attention",
+  monitoring: "text-status-monitoring",
   review: "text-status-open",
 };
 
-/** Matching dot colour, with the attention pulse the inbox and rail use. */
+/** Matching dot colour, with the attention pulse the inbox and rail use.
+ *
+ *  The monitoring dot is deliberately steady — no `animate-pulse`. A watch
+ *  loop is background presence, not progress, and a pulsing dot is the app's
+ *  vocabulary for "look at me". A workspace babysitting CI overnight should be
+ *  something the eye can rest on. */
 export const STATUS_DOT_CLASS: Record<ActivePaneStatus, string> = {
   working: "bg-status-working",
   permission: "bg-status-attention animate-pulse",
+  monitoring: "bg-status-monitoring",
   review: "bg-status-open",
 };
 

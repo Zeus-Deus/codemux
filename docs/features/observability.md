@@ -156,7 +156,7 @@ terminal cleanup, or background contention owned each millisecond. See
 - Adjacent, not `perf::`-tagged: `[codemux::workspace] activate_workspace(<id>)
   returned in <ms>ms (mutate=… emit=… persist=…)`, gated above 8 ms.
 
-**Measuring against something real.** The curated dev seed is 18 workspaces,
+**Measuring against something real.** The curated dev seed is 19 workspaces,
 far below the audited profile, so numbers taken on it flatter everything.
 `src/dev/stress-fixture.ts` scales the dev-mock seed to `small` / `medium` /
 `large` / `xl` (the audited profile: 80 workspaces, 5,000 persisted events,

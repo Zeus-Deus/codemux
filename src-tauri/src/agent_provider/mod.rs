@@ -19,10 +19,11 @@ pub mod types;
 pub use context_usage::ContextUsageTracker;
 pub use errors::{ProviderError, SerializableProviderError};
 pub use events::{
-    child_exit_events, CompletedItem, ContentDelta, ContextUsageSnapshot, ProviderRuntimeEvent,
-    RequestResponseFailureReason, SubagentSnapshot, SubagentStatus, TaskSnapshotItem, TaskStatus,
-    TasksSnapshot, TurnStatus, TurnUsage, UserMessageImage, WorkflowPhaseSnapshot,
-    WorkflowSnapshot, CHILD_EXITED_SUBTYPE,
+    child_exit_events, classify_task_kind, CompletedItem, ContentDelta, ContextUsageSnapshot,
+    ProviderRuntimeEvent, RequestResponseFailureReason, SubagentSnapshot, SubagentStatus,
+    SubagentTaskKind, TaskSnapshotItem, TaskStatus, TasksSnapshot, TurnStatus, TurnUsage,
+    UserMessageImage, WorkflowPhaseSnapshot, WorkflowSnapshot, CHILD_EXITED_SUBTYPE,
+    WATCH_LOOP_TASK_TYPES,
 };
 pub use instance::ProviderInstanceId;
 pub use provider::{AgentProvider, ProviderEventStream};

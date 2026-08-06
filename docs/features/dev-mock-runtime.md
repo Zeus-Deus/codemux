@@ -37,7 +37,7 @@ Command handling:
 
 ### Stress fixtures
 
-The curated seed is a *design* fixture (18 workspaces), far below the audited real profile — measuring responsiveness against it flatters every number. `src/dev/stress-fixture.ts` scales the same seed on demand, selected by URL param or localStorage:
+The curated seed is a *design* fixture (19 workspaces), far below the audited real profile — measuring responsiveness against it flatters every number. `src/dev/stress-fixture.ts` scales the same seed on demand, selected by URL param or localStorage:
 
 ```
 http://localhost:1420/?fixture=large

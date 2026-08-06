@@ -85,6 +85,7 @@ import {
   agentChatSetModel,
   agentChatSetPermissionMode,
   agentChatStartSession,
+  agentChatStopMonitoring,
   agentChatStopSession,
   agentChatUpdateSessionConfig,
   checkGhStatus,
@@ -114,6 +115,7 @@ import type {
 import { ChatTranscript } from "./ChatTranscript";
 import { ChatHomeLanding } from "./ChatHomeLanding";
 import { Composer } from "./Composer";
+import { MonitoringBar } from "./MonitoringBar";
 import { SubagentActivityBar } from "./SubagentActivityBar";
 import { SubagentBreadcrumb } from "./SubagentBreadcrumb";
 import { SubagentView } from "./SubagentView";
@@ -652,6 +654,27 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       })),
     [],
   );
+  // Monitoring: this pane's own status, straight off the shared
+  // `pane_statuses` map the sidebar reads, so the docked bar and the sidebar
+  // badge can never disagree about whether a watch loop is live. The reason
+  // (when an agent supplied one via `codemux monitor start --reason`) rides
+  // alongside in the runtime-only `manual_monitors` map.
+  const isMonitoring = useAppStore(
+    (s) => s.appState?.pane_statuses?.[pane.pane_id] === "monitoring",
+  );
+  const monitoringReason = useAppStore(
+    (s) => s.appState?.manual_monitors?.[pane.pane_id] ?? null,
+  );
+  // Deliberately runs with or without a thread. A pane can read `monitoring`
+  // purely from a `codemux monitor start` flag — no chat session involved —
+  // and bailing out on a null thread would leave that pane's Stop button
+  // spinning at "Stopping…" forever, on the only surface that can clear it.
+  // The backend skips the thread-scoped half when there is no thread.
+  const handleStopMonitoring = useCallback(
+    () => agentChatStopMonitoring(provider, threadId, pane.pane_id),
+    [provider, threadId, pane.pane_id],
+  );
+
   const {
     model,
     effort,
@@ -2994,6 +3017,16 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
                 threadId={threadId}
                 streaming={transcriptStreaming}
                 onJump={handleJumpToSubagentCard}
+              />
+              {/* Same slot, opposite temperature: the activity bar is
+                  progress you wait on, this is a watch loop you can end.
+                  They are mutually exclusive in practice — a thread with
+                  live agent tasks reports `working`, not `monitoring`. */}
+              <MonitoringBar
+                monitoring={!!isMonitoring}
+                reason={monitoringReason}
+                threadId={threadId}
+                onStop={handleStopMonitoring}
               />
             </div>
           )}

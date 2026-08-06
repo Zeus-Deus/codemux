@@ -9,6 +9,7 @@ import {
   formatElapsed,
   interruptRunningSubagents,
   isDone,
+  isMonitorTask,
   mergeSnapshot,
   mergeStatus,
   newSubagentView,
@@ -93,6 +94,20 @@ describe("mergeStatus", () => {
 describe("mergeSnapshot revive / statusAssumed (issue #153)", () => {
   const snap = (status: SubagentSnapshot["status"]): SubagentSnapshot =>
     ({ subagent_id: "s1", status }) as SubagentSnapshot;
+
+  // `task_progress` ticks carry no `task_kind`, so a null must never
+  // un-classify a watch loop — that would demote it back into the running
+  // roster and pin the thread at "Working" forever.
+  it("keeps a learned task kind across snapshots that omit it", () => {
+    const classified = mergeSnapshot(view({ id: "m" }), {
+      subagent_id: "m",
+      status: "running",
+      task_kind: "monitor",
+    } as SubagentSnapshot);
+    expect(classified.taskKind).toBe("monitor");
+    const ticked = mergeSnapshot(classified, snap("running"));
+    expect(ticked.taskKind).toBe("monitor");
+  });
 
   it("stamps backgroundTask once and never unsets it from a later snapshot", () => {
     const merged = mergeSnapshot(view({ id: "bg" }), {
@@ -414,6 +429,40 @@ describe("whole-thread lookups", () => {
     expect(entries.map((e) => e.subagent.id)).toEqual(["a", "c"]);
     expect(entries.every((e) => e.cardId === "run-1")).toBe(true);
     expect(entries.every((e) => e.fromLabel === null)).toBe(true);
+  });
+
+  // A watch loop is not a subagent doing work. Counting it here would both
+  // inflate "N subagents running" and keep the amber progress bar up for a
+  // thread whose only remaining activity is a CI poll — exactly what the calm
+  // `monitoring` status exists to replace. The card itself stays in the
+  // transcript so the user can still see what is being watched.
+  it("leaves background watch loops out of the running roster", () => {
+    const withMonitor: ChatViewItem[] = [
+      {
+        kind: "subagent_run",
+        id: "run-m",
+        seq: 2,
+        turn_id: "t3",
+        subagents: [
+          view({ id: "watch", status: "running", taskKind: "monitor" }),
+          view({ id: "real", status: "running" }),
+        ],
+      },
+    ];
+    // Excluded whether or not the thread is streaming: a watch loop is
+    // never agent work, unlike a background task (which only drops out
+    // once the run is over).
+    for (const streaming of [true, false]) {
+      const entries = runningSubagentEntries(withMonitor, streaming);
+      expect(entries.map((e) => e.subagent.id)).toEqual(["real"]);
+      expect(countRunningSubagents(withMonitor, streaming)).toBe(1);
+    }
+  });
+
+  it("treats an unreported task kind as ordinary agent work", () => {
+    expect(isMonitorTask(view({ id: "x" }))).toBe(false);
+    expect(isMonitorTask(view({ id: "x", taskKind: "agent" }))).toBe(false);
+    expect(isMonitorTask(view({ id: "x", taskKind: "monitor" }))).toBe(true);
   });
 
   it("drops background tasks from live activity once the thread stops streaming", () => {

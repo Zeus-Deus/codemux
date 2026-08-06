@@ -390,6 +390,9 @@ fn subagent_snapshot(subagent_id: &str, status: SubagentStatus) -> SubagentSnaps
         parent_item_id: None,
         name: None,
         agent_type: None,
+        // Neither provider reports a watch-loop-vs-agent distinction yet;
+        // `None` reads as ordinary agent work everywhere downstream.
+        task_kind: None,
         model: None,
         status,
         activity: None,

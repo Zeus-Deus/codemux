@@ -378,11 +378,13 @@ function LocalRow({
       ? "bg-status-working"
       : workspaceStatus === "permission"
         ? "bg-status-attention"
-        : workspaceStatus === "review"
-          ? "bg-status-open"
-          : isAttached
+        : workspaceStatus === "monitoring"
+          ? "bg-status-monitoring"
+          : workspaceStatus === "review"
             ? "bg-status-open"
-            : null;
+            : isAttached
+              ? "bg-status-open"
+              : null;
 
   return (
     <div
@@ -486,6 +488,11 @@ function LocalRow({
             )}
             {!isWorking && workspaceStatus === "permission" && (
               <span className="ml-1.5 text-status-attention/90">· needs input</span>
+            )}
+            {!isWorking && workspaceStatus === "monitoring" && (
+              <span className="ml-1.5 text-status-monitoring/90">
+                · monitoring
+              </span>
             )}
             {!isWorking && workspaceStatus === "review" && (
               <span className="ml-1.5 text-status-open/90">
