@@ -239,6 +239,12 @@ export interface SubagentSnapshot {
    *  provider's task label. `null` when no hint was found — the reducer
    *  falls back to the workflow's last planned phase title. */
   phase?: string | null;
+  /** True when this row is a provider *background task* (e.g. a
+   *  background shell command) rather than a real delegated subagent. It
+   *  can legitimately outlive the turn and never emit a terminal update,
+   *  so it never counts as live activity once the thread stops streaming.
+   *  Absent / false on every provider that has no such concept. */
+  background_task?: boolean | null;
 }
 
 // ── Workflows (Claude dynamic-workflow orchestration) ──

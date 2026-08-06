@@ -100,6 +100,11 @@ export function mergeSnapshot(
       next.statusAssumed = false;
     }
   }
+  // Sticky once set: a provider that only flags the first task event for a
+  // background job must not have a later unflagged snapshot promote it
+  // back to "real subagent" (the same additive-merge rule as every other
+  // field — a snapshot never clobbers a known value with an absent one).
+  if (snap.background_task) next.backgroundTask = true;
   if (snap.parent_item_id != null) next.parentItemId = snap.parent_item_id;
   if (snap.name != null) next.name = snap.name;
   if (snap.agent_type != null) next.agentType = snap.agent_type;
@@ -355,13 +360,51 @@ export function subagentRunItems(messages: ChatViewItem[]): SubagentRunItem[] {
   );
 }
 
+/**
+ * Whether a subagent row should read as **live activity** right now.
+ *
+ * Running/pending is necessary but not sufficient, for two independent
+ * reasons:
+ *
+ * - A **watch loop** (`taskKind === "monitor"`) is never agent work at
+ *   all, streaming or not. Counting it would inflate "N subagents
+ *   running" and keep the amber progress bar up for a thread whose only
+ *   remaining activity is a CI poll — the exact thing the calm
+ *   `monitoring` status exists to replace. The task still keeps its
+ *   transcript card, so the user can always see what is being watched.
+ * - A provider **background task** (a background shell command) can
+ *   legitimately outlive the turn and never report a terminal status, so
+ *   once the thread stops streaming it is a job that happens to still be
+ *   alive — not the agent working. Counting it would keep the docked
+ *   activity bar and its spinner up forever after the run ended,
+ *   including across a restart (the snapshots are persisted and
+ *   hydrate-replayed).
+ *
+ * The two classifications are complementary and a row can carry both:
+ * `taskKind` is precise but needs the SDK to report `task_type`, while
+ * `backgroundTask` is derived from the launch registry and works
+ * regardless. Either one alone is enough to drop the row from the bar.
+ */
+export function isLiveActivity(
+  view: SubagentView,
+  streaming: boolean,
+): boolean {
+  if (!isRunning(view)) return false;
+  if (isMonitorTask(view)) return false;
+  return streaming || !view.backgroundTask;
+}
+
 /** Count of currently-running subagents across the whole thread — feeds
- *  the docked {@link SubagentActivityBar}. */
-export function countRunningSubagents(messages: ChatViewItem[]): number {
+ *  the docked {@link SubagentActivityBar}. `streaming` is the thread's
+ *  live-run flag; see {@link isLiveActivity}. */
+export function countRunningSubagents(
+  messages: ChatViewItem[],
+  streaming = true,
+): number {
   let n = 0;
   for (const card of subagentRunItems(messages)) {
     for (const sub of card.subagents) {
-      if (sub.status === "running") n += 1;
+      if (sub.status === "running" && isLiveActivity(sub, streaming)) n += 1;
     }
   }
   return n;
@@ -419,20 +462,17 @@ export function isMonitorTask(view: SubagentView): boolean {
  *  `.length` is the bar's count, and each entry carries the "from"
  *  label + jump target for the expand list.
  *
- *  Watch loops are excluded. They are not subagents doing work, and listing
- *  them here would both inflate "N subagents running" and keep the amber
- *  progress bar up for a thread whose only remaining activity is a CI poll —
- *  the exact thing the calm `monitoring` status exists to replace. The task
- *  still keeps its transcript card, so the user can always see what is being
- *  watched; it just is not counted as an agent. */
+ *  `streaming` is the thread's live-run flag, and watch loops never
+ *  qualify at all — see {@link isLiveActivity} for both exclusions. */
 export function runningSubagentEntries(
   messages: ChatViewItem[],
+  streaming = true,
 ): RunningSubagentEntry[] {
   const cards = subagentRunItems(messages);
   const entries: RunningSubagentEntry[] = [];
   cards.forEach((card, cardIdx) => {
     for (const sub of card.subagents) {
-      if (!isRunning(sub) || isMonitorTask(sub)) continue;
+      if (!isLiveActivity(sub, streaming)) continue;
       entries.push({
         subagent: sub,
         cardId: card.id,

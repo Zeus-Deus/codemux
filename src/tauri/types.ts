@@ -724,6 +724,17 @@ export interface WorkspaceSnapshot {
   pr_number: number | null;
   pr_state: string | null;
   pr_url: string | null;
+  /** Head branch of the associated PR, as GitHub reports it.
+   *
+   *  Usually equal to `git_branch`. It differs when the badge came from the
+   *  backend's side-branch fallback — a PR opened from a branch this worktree
+   *  checked out recently and then left. The badge is worth showing either
+   *  way; the *inferences* drawn from a PR are not, so auto-settle requires
+   *  this to match the checked-out branch (see `isPrOnCurrentBranch`).
+   *
+   *  Optional because older persisted snapshots have no such field; `null` /
+   *  absent is read as the pre-field case and settles as before. */
+  pr_head_branch?: string | null;
   linked_issue: LinkedIssue | null;
   /** When true, agent-completion desktop notifications for this workspace's
    *  panes are suppressed. Status pills (spinner/dots) are unaffected. */

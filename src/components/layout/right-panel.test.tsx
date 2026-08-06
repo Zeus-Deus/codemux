@@ -24,6 +24,10 @@ vi.mock("@/components/workflow/orchestration-panel", () => ({
 const mocks = vi.hoisted(() => ({
   workflow: { run: null as WorkflowRunItem | null, threadId: null as string | null },
   tasks: null as TasksSnapshot | null,
+  // Whether the focused chat thread is mid-run. The live tab dot is gated
+  // on it so a plan the provider left with an `in_progress` row can't blink
+  // forever after the turn settled.
+  tasksStreaming: true,
   // `titlebarOverlay` = "TitleBar renders the floating overlay, not the
   // in-flow legacy h-9 bar"; `remote` = the web remote client, which has no
   // native window controls and (therefore) no overlay drag layer either.
@@ -34,7 +38,11 @@ vi.mock("@/components/workflow/use-workspace-workflow", () => ({
   useWorkspaceWorkflow: () => mocks.workflow,
 }));
 vi.mock("@/hooks/use-active-chat-tasks", () => ({
-  useActiveChatTasks: () => ({ threadId: "thread-1", tasks: mocks.tasks }),
+  useActiveChatTasks: () => ({
+    threadId: "thread-1",
+    tasks: mocks.tasks,
+    streaming: mocks.tasksStreaming,
+  }),
 }));
 vi.mock("@/hooks/use-gui-chrome", () => ({
   useTitlebarOverlay: () => mocks.titlebarOverlay,
@@ -114,6 +122,7 @@ afterEach(() => {
   cleanup();
   mocks.workflow = { run: null, threadId: null };
   mocks.tasks = null;
+  mocks.tasksStreaming = true;
   mocks.titlebarOverlay = true;
   mocks.remote = false;
 });
@@ -182,6 +191,23 @@ describe("RightPanel Tasks tab", () => {
 
     rerender(<RightPanel workspace={makeWorkspace()} activeTab="tasks" />);
     expect(screen.queryByTestId("tasks-live-dot")).toBeNull();
+  });
+
+  // The snapshot is durable state that outlives the run, so a plan the
+  // provider left with an `in_progress` row must not blink forever once
+  // the turn settled (it would also survive a restart via hydrate-replay).
+  it("stops the live dot once the thread is no longer streaming", () => {
+    mocks.tasks = {
+      tasks: [
+        { task_id: "1", title: "Done", status: "completed", blocked_by: [] },
+        { task_id: "2", title: "Working", status: "in_progress", blocked_by: [] },
+      ],
+    };
+    mocks.tasksStreaming = false;
+    render(<RightPanel workspace={makeWorkspace()} activeTab="files" />);
+    expect(screen.queryByTestId("tasks-live-dot")).toBeNull();
+    // The tab itself stays — the plan is still worth showing.
+    expect(screen.getByTestId("tasks-tab")).toHaveTextContent("1/2");
   });
 });
 

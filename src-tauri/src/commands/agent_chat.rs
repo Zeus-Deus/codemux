@@ -3434,112 +3434,380 @@ fn fan_out_user_message<R: Runtime>(
 
 // ── Per-thread running-subagent tracking ─────────────────────────────
 
-/// Per-thread bookkeeping that keeps the sidebar "working" spinner alive
-/// while subagents outlive the parent chat turn.
+/// How a tracked task reads to a person looking at the sidebar.
 ///
-/// The primary chat turn can finish (`TurnCompleted`) while subagents it
-/// spawned are still running. The old stateless mapper published `Review`
-/// at that point, dropping the spinner even though work continued in the
-/// child transcripts. This struct remembers which subagents are still
-/// running/pending per thread, plus whether a `Review` transition is
-/// *owed* — i.e. the turn completed while subagents were still live and
-/// the sidebar should flip to `Review` only once the last one finishes.
+/// The two classifications the providers hand us are complementary rather
+/// than alternative, and a single task can be both:
+///
+/// * `SubagentSnapshot::background_task` — derived from the launch
+///   registry, so it is always available: the row is not a registered
+///   top-level `Agent`/`Task` launch, which means it can outlive the turn
+///   forever and must never block settlement.
+/// * `SubagentSnapshot::task_kind` — precise but optional: it needs the
+///   SDK to report a `task_type`, and says the row is a background watch
+///   loop (a CI poll, a tailed process, a long-lived MCP monitor).
+///
+/// A background bash watch loop carries both, which is exactly the
+/// interesting case: it settles the run *and* shows the calm badge. So the
+/// tracker collapses them into one derived class per id, with `Monitor`
+/// winning over the mere fact of being background.
+///
+/// There is deliberately no `Background` variant. A background row that is
+/// not a monitor is *not tracked at all* — that is the whole point of it —
+/// so a variant for it would only ever be an inert map entry that
+/// [`ThreadSubagentState::is_clear`] could never drain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskClass {
+    /// Real delegated agent work. Blocks settlement: the turn's `Review` is
+    /// deferred until every one of these goes terminal.
+    Agent,
+    /// A background watch loop. Never blocks settlement, never holds the
+    /// owed `Review` open, never keeps the detached browser alive — it only
+    /// makes the *settled* status read `Monitoring` while it lives.
+    Monitor,
+}
+
+/// What one snapshot says about its task's class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotClass {
+    /// The provider was explicit.
+    Known(TaskClass),
+    /// The provider said nothing on *this* snapshot — the shape every
+    /// `task_progress` tick has, and the only shape an SDK that predates
+    /// `task_type` ever sends. Not the same as "agent": the tracker keeps
+    /// whatever it already knows about the id
+    /// ([`ThreadSubagentState::track`]), defaulting to agent work for an id
+    /// it has never seen.
+    Unreported,
+    /// A background job that is not a watch loop. Never tracked at all: it
+    /// can outlive the turn forever and never go terminal, so it must not
+    /// be able to block the settle *or* light a badge.
+    Untracked,
+}
+
+/// Fold a snapshot's two classification fields into one answer.
+///
+/// Order matters, and encodes the unified policy:
+///
+/// 1. an explicit **monitor** wins over everything — a background bash
+///    watch loop is exactly that case, and it must show the badge;
+/// 2. otherwise **background** wins over any agent claim, including a
+///    nested subagent's, because a row that is not a registered top-level
+///    launch must never be what holds the run open;
+/// 3. otherwise the provider's explicit word, or silence.
+fn classify_snapshot(snapshot: &crate::agent_provider::SubagentSnapshot) -> SnapshotClass {
+    if snapshot.task_kind == Some(SubagentTaskKind::Monitor) {
+        return SnapshotClass::Known(TaskClass::Monitor);
+    }
+    if snapshot.background_task {
+        return SnapshotClass::Untracked;
+    }
+    match snapshot.task_kind {
+        Some(SubagentTaskKind::Agent) => SnapshotClass::Known(TaskClass::Agent),
+        Some(SubagentTaskKind::Monitor) => unreachable!("handled above"),
+        None => SnapshotClass::Unreported,
+    }
+}
+
+/// Per-thread bookkeeping behind the sidebar dot for a chat pane.
+///
+/// Two independent facts live here, and keeping them independent is the
+/// whole design:
+///
+/// 1. **Does the run still have real work in it?** The primary chat turn
+///    can finish (`TurnCompleted`) while subagents it spawned are still
+///    running. The old stateless mapper published `Review` at that point,
+///    dropping the spinner even though work continued in the child
+///    transcripts. So `Agent`-class tasks defer the `Review` until the last
+///    one goes terminal.
+/// 2. **Is anything still being watched?** A `Monitor`-class task — a CI
+///    watch, a tailed process, a PR poll — is the agent babysitting
+///    something it has already finished with. It is calm background
+///    presence, not work in flight, so it never defers anything: the run
+///    settles on schedule (the `Review` publishes, `run_finished` fires,
+///    the detached browser is released) and the *settled* status simply
+///    reads `Monitoring` for as long as a watch loop lives. When the last
+///    one ends the pane falls to the `Review`/`Idle` it would otherwise
+///    have shown.
 ///
 /// All decision logic lives in [`map_event_to_pane_status`], a pure
 /// function over `(event, &mut ThreadSubagentState)` with no `AppHandle`,
 /// so it is directly unit-testable.
-/// The tracker splits live tasks into two buckets because they mean opposite
-/// things to a person reading the sidebar. A running *agent* task is progress
-/// the user is waiting on. A running *monitor* task — a CI watch, a tailed
-/// process, a PR poll — is the agent babysitting something it already finished
-/// with, which is calm background presence, not work in flight.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct ThreadSubagentState {
-    /// Agent-task `subagent_id`s currently `Pending` or `Running`.
-    running: std::collections::BTreeSet<String>,
-    /// Watch-loop `subagent_id`s currently `Pending` or `Running`. Held
-    /// separately so they can hold `Monitoring` without ever holding
-    /// `Working`, and so the two sets can be cleared independently by
-    /// `agent_chat_stop_monitoring`.
-    monitors: std::collections::BTreeSet<String>,
-    /// A turn finished while tasks were still live, so the `Review`
-    /// transition is owed once the last tracked task goes terminal.
-    /// Deliberately survives the `Monitoring` state: monitoring *replaces*
-    /// the owed `Review` while watch loops live, and the review is published
-    /// when the last of them stops.
-    review_pending: bool,
+    /// Every live (`Pending`/`Running`) tracked task, with its derived
+    /// class. One map rather than a set per class so an id can only ever
+    /// be in one bucket — a later snapshot that reclassifies it moves it
+    /// instead of double-counting it.
+    tasks: std::collections::BTreeMap<String, TaskClass>,
+    /// The parent turn has completed for the current run, so the dot
+    /// belongs to [`Self::settled_status`] rather than to the turn.
+    /// Cleared by every genuine turn boundary.
+    ///
+    /// This — not an owed-`Review` flag — is what makes `Monitoring`
+    /// visible: a monitor whose first `Running` snapshot arrives *after*
+    /// the turn settled still surfaces the badge, because the badge is
+    /// derived from the live sets and this flag, never from a transition
+    /// that may already have been consumed.
+    turn_settled: bool,
+    /// Wall clock of the last event that could still justify deferring the
+    /// owed `Review`. Stamped while [`Self::review_pending`] holds and
+    /// refreshed by real post-turn run activity (see
+    /// [`refreshes_owed_review`]), so the watchdog can force-settle a
+    /// review that is owed but has gone silent. `None` whenever no review
+    /// is owed.
+    review_owed_since: Option<SystemTime>,
+    /// **Tombstone.** The watchdog already force-settled this thread's owed
+    /// `Review` ([`SubagentTracker::take_overdue_reviews`]) while agent
+    /// tasks were still tracked.
+    ///
+    /// The entry deliberately survives the forced settle instead of being
+    /// removed. Those ids may belong to a subagent that is genuinely alive
+    /// and merely quiet (one long tool call), and its real terminal
+    /// snapshot can still arrive minutes later. With the entry gone that
+    /// snapshot would land on a fresh `ThreadSubagentState` and leave a
+    /// husk behind, tracked until session close. With the tombstone, the
+    /// late terminal snapshot drains the task map normally, publishes
+    /// nothing (the `Review` was already published), and the now-clear
+    /// entry is dropped by [`Self::is_clear`].
+    ///
+    /// Cleared by every genuine turn boundary (a new
+    /// `SessionStatus::Running`, session teardown, or the send-message
+    /// `clear_thread`), so it never outlives the run it describes.
+    forced_settled: bool,
+    /// Monitor ids the user explicitly stopped this run.
+    ///
+    /// Stop has to be durable. The Claude demux remembers a task's kind for
+    /// the whole session and re-stamps it onto every later tick, so a
+    /// detached watch loop that survives the interrupt would otherwise walk
+    /// straight back into the monitor set on its next `task_progress` and
+    /// drift the pane back to `Monitoring`. Blocklisting the ids until the
+    /// next turn boundary is what makes the button mean something.
+    ///
+    /// Bounded by the run, exactly like [`Self::forced_settled`]: cleared
+    /// by [`Self::reset`] on a new turn / session close, and by
+    /// `clear_thread` on send. It does keep the entry alive until then,
+    /// which is the price of the guarantee.
+    stopped_monitors: std::collections::BTreeSet<String>,
 }
 
 impl ThreadSubagentState {
-    /// Whether this thread tracks no live tasks and owes no `Review`
-    /// — the entry can be dropped from [`SubagentTracker`] so the map
-    /// never grows unbounded.
+    /// Whether this thread remembers nothing at all — the entry can be
+    /// dropped from [`SubagentTracker`] so the map never grows unbounded.
+    ///
+    /// Neither the [`Self::forced_settled`] tombstone nor `turn_settled` is
+    /// itself a reason to keep the entry: once the last tracked id drains
+    /// out there is nothing left to disambiguate, so both are bounded by
+    /// the live ids they were recorded against. A stop-blocklist *is* a
+    /// reason — it has to outlive the tasks it names, or the guarantee it
+    /// encodes evaporates on the very next tick.
     fn is_clear(&self) -> bool {
-        self.running.is_empty() && self.monitors.is_empty() && !self.review_pending
+        self.tasks.is_empty() && self.stopped_monitors.is_empty()
     }
 
-    /// Move `id` into the bucket `kind` names, taking it out of the other one.
+    /// Whether any live task is real agent work, i.e. still blocking the
+    /// run from settling.
+    fn has_agents(&self) -> bool {
+        self.tasks.values().any(|c| *c == TaskClass::Agent)
+    }
+
+    /// Whether any live task is a watch loop.
+    fn has_monitors(&self) -> bool {
+        self.tasks.values().any(|c| *c == TaskClass::Monitor)
+    }
+
+    /// Whether a `Review` transition is owed: the turn is over but real
+    /// agent work is still holding it open.
     ///
-    /// `None` means the provider reported no classification on *this* snapshot,
-    /// which is not the same as "it is agent work": an already-bucketed id
-    /// stays where it is, and only a genuinely new id defaults to agent. That
-    /// is what keeps a `task_progress` tick (which never carries `task_type`)
-    /// from silently demoting a monitor back into the working set.
-    fn track(&mut self, id: &str, kind: Option<SubagentTaskKind>) {
-        let monitor = match kind {
-            Some(SubagentTaskKind::Monitor) => true,
-            Some(SubagentTaskKind::Agent) => false,
-            None => self.monitors.contains(id),
+    /// Derived rather than stored, and that derivation is the load-bearing
+    /// part of the watchdog scoping: a thread whose only live entries are
+    /// monitors (or background rows, which are not tracked at all) owes no
+    /// `Review` by construction, so
+    /// [`SubagentTracker::take_overdue_reviews`] can never force-settle it
+    /// out of its `Monitoring` badge.
+    fn review_pending(&self) -> bool {
+        self.turn_settled && !self.forced_settled && self.has_agents()
+    }
+
+    /// Record `id` as live under `class`, resolving an unreported class
+    /// against what the tracker already knows.
+    ///
+    /// `None` means the provider said nothing on *this* snapshot, which is
+    /// not the same as "it is agent work": an already-classified id keeps
+    /// its class. That is what keeps a `task_progress` tick (which never
+    /// carries `task_type`) from silently demoting a monitor into the
+    /// blocking set.
+    ///
+    /// Returns `false` when the id was refused because the user stopped it
+    /// — the caller then treats the snapshot as the no-op it is.
+    fn track(&mut self, id: &str, class: SnapshotClass) -> bool {
+        let class = match class {
+            SnapshotClass::Known(class) => class,
+            SnapshotClass::Unreported => {
+                self.tasks.get(id).copied().unwrap_or(TaskClass::Agent)
+            }
+            SnapshotClass::Untracked => {
+                self.tasks.remove(id);
+                return false;
+            }
         };
-        if monitor {
-            self.running.remove(id);
-            self.monitors.insert(id.to_string());
-        } else {
-            self.monitors.remove(id);
-            self.running.insert(id.to_string());
+        if class == TaskClass::Monitor && self.stopped_monitors.contains(id) {
+            // The user stopped this watch loop; a surviving detached task's
+            // later ticks must not resurrect the badge.
+            self.tasks.remove(id);
+            return false;
         }
+        // Real agent work is never blocklisted — an id coming back as a
+        // genuine subagent is a different claim than the one Stop refused.
+        self.stopped_monitors.remove(id);
+        self.tasks.insert(id.to_string(), class);
+        true
     }
 
-    /// Drop `id` from whichever bucket holds it.
+    /// Drop `id` from tracking, whatever class it held.
     fn untrack(&mut self, id: &str) {
-        self.running.remove(id);
-        self.monitors.remove(id);
+        self.tasks.remove(id);
     }
 
-    /// Forget everything (new turn, session close, explicit stop).
+    /// Forget everything (new turn, session close).
     fn reset(&mut self) {
-        self.running.clear();
-        self.monitors.clear();
-        self.review_pending = false;
+        self.tasks.clear();
+        self.turn_settled = false;
+        self.forced_settled = false;
+        self.review_owed_since = None;
+        self.stopped_monitors.clear();
     }
 
-    /// **The decision rule**, in one place, for "the parent turn is not
-    /// running — what should the sidebar say?".
+    /// **The decision table**, in one place: what should the sidebar say
+    /// once the parent turn is no longer the thing driving the dot?
     ///
-    /// - any live agent task → `Working`: the deferred-review behavior that
-    ///   already existed, unchanged.
-    /// - no agent tasks but ≥1 live monitor → `Monitoring`. This is the whole
-    ///   feature: the deliverable is done, but something is still being
-    ///   watched, so the workspace reads as calm-but-alive instead of either
-    ///   pinned at "Working" forever or claiming to be finished.
-    /// - nothing live → `Review`, consuming the owed transition.
+    /// | turn settled | forced | live agents | live monitors | status       |
+    /// |--------------|--------|-------------|---------------|--------------|
+    /// | no           | –      | –           | –             | `None`       |
+    /// | yes          | yes    | –           | –             | `None`       |
+    /// | yes          | no     | ≥1          | –             | `Working`    |
+    /// | yes          | no     | 0           | ≥1            | `Monitoring` |
+    /// | yes          | no     | 0           | 0             | `Review`     |
     ///
-    /// Returns `None` when no `Review` was ever owed and nothing is live —
-    /// there is no transition to publish, and inventing one here would move a
-    /// dot that a metadata-only snapshot has no business moving.
-    fn settled_status(&mut self) -> Option<PaneStatus> {
-        if !self.running.is_empty() {
-            return self.review_pending.then_some(PaneStatus::Working);
+    /// Read straight off the live sets — no owed-transition flag is
+    /// consulted — so the badge is a fact about what is running, not a
+    /// side effect of a transition that may already have been consumed.
+    /// That is what lets a monitor whose first snapshot lands *after* the
+    /// turn settled still light the badge, and what makes it go out the
+    /// moment the last one ends.
+    ///
+    /// `None` mid-turn is the existing rule: the parent owns `Working`, so
+    /// a metadata-only snapshot must not move the dot. `None` after a
+    /// forced settle is [`Self::forced_settled`]'s rule: the watchdog
+    /// already published this thread's status, and a late drain must stay
+    /// silent rather than re-announcing a transition the user has seen.
+    fn settled_status(&self) -> Option<PaneStatus> {
+        if !self.turn_settled || self.forced_settled {
+            return None;
         }
-        if !self.monitors.is_empty() {
-            return self.review_pending.then_some(PaneStatus::Monitoring);
+        if self.has_agents() {
+            return Some(PaneStatus::Working);
         }
-        if self.review_pending {
-            self.review_pending = false;
-            return Some(PaneStatus::Review);
+        if self.has_monitors() {
+            return Some(PaneStatus::Monitoring);
         }
-        None
+        Some(PaneStatus::Review)
     }
+
+    /// Stop every watch loop and blocklist its id for the rest of the run.
+    /// Returns whether anything was actually being monitored.
+    fn stop_monitors(&mut self) -> bool {
+        let stopped: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(_, class)| **class == TaskClass::Monitor)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stopped {
+            self.tasks.remove(id);
+        }
+        let had = !stopped.is_empty();
+        self.stopped_monitors.extend(stopped);
+        had
+    }
+}
+
+/// Whether `event` is evidence that a thread's owed `Review` may still
+/// legitimately be deferred — i.e. real run activity arriving after
+/// `TurnCompleted`. Refreshes [`ThreadSubagentState::review_owed_since`]
+/// so a genuinely busy async subagent is never force-settled by the
+/// watchdog while it keeps reporting.
+///
+/// *Any* tick from a real subagent counts, not just a state change, which
+/// is what makes the watchdog's threshold mean "every remaining blocker
+/// has been silent for 10 minutes" rather than "the thread has been silent
+/// since the turn ended".
+///
+/// A `background_task` snapshot deliberately does NOT count: those tick
+/// for as long as the background job lives (forever, for a dev server) and
+/// must never keep a finished run pinned to `Working`. A **monitor** tick
+/// is excluded for exactly the same reason and by exactly the same logic —
+/// a watch loop reports for as long as it is watching, which is the one
+/// thing that must never be read as "the deliverable is still coming".
+/// Both exclusions land on the same rule: only a snapshot that could still
+/// be blocking the run re-arms the clock, which is precisely
+/// [`TaskClass::Agent`].
+///
+/// Classified from the event alone rather than from the tracker, which is
+/// exact in practice: the Claude demux re-stamps `task_kind` onto *every*
+/// tick for a task it has classified (see `stamp_task_classification`), so
+/// an unclassified tick can only come from a provider that reports no task
+/// types at all — and such a provider has no monitors to mis-read.
+fn refreshes_owed_review(event: &ProviderRuntimeEvent) -> bool {
+    match event {
+        ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => matches!(
+            classify_snapshot(subagent),
+            SnapshotClass::Known(TaskClass::Agent) | SnapshotClass::Unreported
+        ),
+        ProviderRuntimeEvent::ContentDelta { .. }
+        | ProviderRuntimeEvent::ItemCompleted { .. }
+        | ProviderRuntimeEvent::RequestOpened { .. }
+        | ProviderRuntimeEvent::RequestResolved { .. }
+        | ProviderRuntimeEvent::WorkflowUpdated { .. }
+        | ProviderRuntimeEvent::TasksUpdated { .. } => true,
+        _ => false,
+    }
+}
+
+/// Pure sweep predicate: whether `state` owes a `Review` that has gone
+/// silent for at least `threshold` and should therefore be force-settled.
+///
+/// Three guards keep this off a healthy run:
+///
+/// * [`ThreadSubagentState::review_pending`] needs `turn_settled`, which
+///   only `TurnCompleted` sets, so it can never fire mid-turn.
+/// * It also needs a live [`TaskClass::Agent`], so a thread whose only
+///   live entries are watch loops (or background rows, which are never
+///   tracked) is invisible to this sweep **by construction** — the
+///   watchdog can never force a `Monitoring` pane off its badge.
+/// * `review_owed_since` is re-armed by *any* tick from a real agent-class
+///   entry — see [`refreshes_owed_review`] — so the clock only advances
+///   while **every** remaining blocker is silent.
+///
+/// What it therefore cannot rule out is a live-but-quiet subagent: one
+/// long tool call (a `cargo test`, a big build) emits nothing for longer
+/// than the threshold, and the sweep will fire on it. That is accepted
+/// deliberately, and is why the forced path is non-destructive: it
+/// publishes the settled status but leaves the browser session alone and
+/// tombstones the entry rather than dropping it (see
+/// [`SubagentTracker::take_overdue_reviews`] and [`SettleOrigin`]).
+fn select_overdue_review(
+    state: &ThreadSubagentState,
+    now: SystemTime,
+    threshold: Duration,
+) -> bool {
+    if !state.review_pending() {
+        return false;
+    }
+    let Some(since) = state.review_owed_since else {
+        return false;
+    };
+    now.duration_since(since).unwrap_or_default() >= threshold
 }
 
 /// Tauri-managed, per-thread running-subagent tracker.
@@ -3561,10 +3829,25 @@ impl SubagentTracker {
     /// Run the pane-status decision for `event` against `thread_id`'s
     /// tracked subagent state, mutating it in place. Drops the entry once
     /// it returns to the clear state so the map stays bounded.
-    fn decide(&self, thread_id: &str, event: &ProviderRuntimeEvent) -> Option<PaneStatus> {
+    ///
+    /// `now` also maintains the owed-`Review` silence clock read by
+    /// [`SubagentTracker::take_overdue_reviews`].
+    fn decide(
+        &self,
+        thread_id: &str,
+        event: &ProviderRuntimeEvent,
+        now: SystemTime,
+    ) -> Option<PaneStatus> {
         let mut threads = self.threads.lock().expect("subagent tracker poisoned");
         let state = threads.entry(thread_id.to_string()).or_default();
         let status = map_event_to_pane_status(event, state);
+        if state.review_pending() {
+            if state.review_owed_since.is_none() || refreshes_owed_review(event) {
+                state.review_owed_since = Some(now);
+            }
+        } else {
+            state.review_owed_since = None;
+        }
         if state.is_clear() {
             threads.remove(thread_id);
         }
@@ -3588,25 +3871,93 @@ impl SubagentTracker {
     /// alone — Stop is scoped to the monitoring bar, and silently abandoning
     /// tracking of real in-flight work would strand the spinner.
     ///
-    /// Returns `Some(status)` to publish, or `None` when there was nothing
-    /// being monitored and nothing owed.
+    /// The stopped ids are blocklisted for the rest of the run (see
+    /// [`ThreadSubagentState::stopped_monitors`]) so a detached task that
+    /// survives the provider interrupt cannot walk the badge back on with its
+    /// next tick.
+    ///
+    /// Returns `Some(status)` to publish, or `None` when there was nothing to
+    /// change — nothing monitored, or a turn still in flight that already owns
+    /// the dot.
     pub fn stop_monitoring(&self, thread_id: &str) -> Option<PaneStatus> {
         let mut threads = self.threads.lock().expect("subagent tracker poisoned");
         let state = threads.entry(thread_id.to_string()).or_default();
-        let had_monitors = !state.monitors.is_empty();
-        state.monitors.clear();
-        // With the monitors gone the ordinary decision rule already computes
-        // the right answer (`Working` if real work remains, else the owed
-        // `Review`). Only the "nothing was owed and nothing was live" case
-        // needs a nudge: the pane is showing a monitoring dot that came from
-        // somewhere, so clear it explicitly rather than leaving it up.
-        let status = state
-            .settled_status()
-            .or(had_monitors.then_some(PaneStatus::Idle));
+        // Nothing was being monitored → nothing to publish. Stop is then a
+        // pure no-op rather than a stray status write (and pressing it twice
+        // must not repaint the dot).
+        let status = if state.stop_monitors() {
+            // With the monitors gone the decision table already computes the
+            // right answer: `Working` if real work remains, else the settled
+            // `Review` (the caller applies the usual active-workspace
+            // downgrade). It abstains for a force-settled thread, which still
+            // has a monitoring dot up that the user just asked to be rid of —
+            // so fall back to the settled `Review` there. Mid-turn there is
+            // deliberately no fallback: the turn owns the dot.
+            state
+                .settled_status()
+                .or_else(|| state.turn_settled.then_some(PaneStatus::Review))
+        } else {
+            None
+        };
         if state.is_clear() {
             threads.remove(thread_id);
         }
         status
+    }
+
+    /// Force-settle every thread whose owed `Review` has gone silent for
+    /// at least `threshold`, returning their thread ids so the caller can
+    /// publish the settled status once.
+    ///
+    /// The safety net behind [`map_event_to_pane_status`]: even with
+    /// background tasks excluded from the blocking set, a missed terminal
+    /// subagent signal (a crashed notification, a provider quirk) would
+    /// otherwise pin the sidebar to "Working" forever.
+    ///
+    /// **Scoped to threads that are actually blocked by real agent work.**
+    /// [`ThreadSubagentState::review_pending`] derives from a live
+    /// [`TaskClass::Agent`], so a monitor-only thread — which settled at
+    /// `TurnCompleted` and owes nothing — is never a candidate, and the
+    /// sweep can never knock a pane off its `Monitoring` badge.
+    ///
+    /// **The entries are tombstoned, not removed.** The sweep cannot prove
+    /// the tracked ids are dead — silence is not death — so it clears only
+    /// what it is publishing (the silence clock) and leaves the task map
+    /// intact under a [`ThreadSubagentState::forced_settled`] marker, which
+    /// is also what makes `review_pending` read false from then on. That
+    /// keeps the forced settle take-once (a later sweep skips it) while
+    /// letting a late-but-real terminal snapshot drain the map through the
+    /// ordinary path, publish nothing, and drop the entry — instead of
+    /// resurrecting it as an untracked husk.
+    ///
+    /// Mutating under the same lock releases the mutex before the caller
+    /// touches `AppStateStore`, so the two locks are never held together.
+    fn take_overdue_reviews(&self, now: SystemTime, threshold: Duration) -> Vec<String> {
+        let mut threads = self.threads.lock().expect("subagent tracker poisoned");
+        let mut overdue = Vec::new();
+        for (thread_id, state) in threads.iter_mut() {
+            if !select_overdue_review(state, now, threshold) {
+                continue;
+            }
+            state.review_owed_since = None;
+            state.forced_settled = true;
+            overdue.push(thread_id.clone());
+        }
+        // A thread force-settled with nothing left tracked has no tombstone
+        // left to carry, so it is dropped like any other clear entry rather
+        // than lingering in the map.
+        threads.retain(|_, state| !state.is_clear());
+        overdue
+    }
+
+    /// Number of threads currently tracked. Test-only: the leak the
+    /// tombstone exists to prevent is only observable as map growth.
+    #[cfg(test)]
+    fn tracked_thread_count(&self) -> usize {
+        self.threads
+            .lock()
+            .expect("subagent tracker poisoned")
+            .len()
     }
 }
 
@@ -3622,44 +3973,57 @@ impl SubagentTracker {
 ///   request (the turn resumes) → `Working`
 /// - a user-facing request opened (tool approval, plan, AskUserQuestion)
 ///   or the session parked on an approval → `Permission`
-/// - the turn finished → `Review` (the caller downgrades to `Idle` when
-///   the pane's workspace is already active, matching
-///   `handle_lifecycle_event`) — **but** if subagents are still running,
-///   hold `Working` and defer `Review` until the last one finishes.
+/// - the turn finished → the settled status from
+///   [`ThreadSubagentState::settled_status`]: `Working` while real
+///   subagents outlive the turn, `Monitoring` while only watch loops do,
+///   otherwise `Review` (the caller downgrades that to `Idle` when the
+///   pane's workspace is already active, matching `handle_lifecycle_event`)
 /// - the session closed or errored → `Idle` (clear any stuck indicator),
-///   and forget this thread's subagent tracking.
+///   and forget this thread's task tracking.
 ///
-/// Subagent semantics (the reason this is stateful):
-/// - `SubagentUpdated` with `Running`/`Pending` records the task as live in
-///   the agent or monitor bucket (see [`ThreadSubagentState::track`]). It only
-///   speaks up when a `Review` was already owed (a running snapshot arriving
-///   after the parent turn finished); during an in-flight turn the parent
-///   already owns `Working`, so it returns `None` rather than resurrecting the
-///   spinner out of nowhere.
+/// Task semantics (the reason this is stateful):
+/// - `SubagentUpdated` with `Running`/`Pending` records the task as live
+///   under its class (see [`ThreadSubagentState::track`]) and then re-reads
+///   the decision table. Mid-turn that answers `None`: the parent already
+///   owns `Working`, so a metadata snapshot (activity / tokens) must not
+///   move the dot.
 /// - `SubagentUpdated` with a terminal status (`Completed`/`Failed`/
-///   `Stopped`) drops the task; the decision rule then re-picks between
+///   `Stopped`) drops the task; the decision table then re-picks between
 ///   `Working`, `Monitoring` and the finally-published `Review`.
 ///
-/// Watch loops (the `Monitoring` half): a task the provider labelled
-/// `monitor` / `monitor_mcp` / `local_bash` / `shell` is a background watch
-/// loop rather than delegated work. Once the parent turn has settled and no
-/// agent tasks remain, live watch loops publish `Monitoring` — a calm,
-/// unanimated "still babysitting something" state that *replaces* the owed
-/// `Review` rather than consuming it. When the last watch loop goes terminal
-/// the owed `Review` is published as usual. Mid-turn nothing changes: the
-/// parent owns `Working`, and `Monitoring` only ever appears after the turn
-/// settles. There is no TTL — monitoring ends only via a terminal task row, a
-/// new turn, session close, or the explicit stop paths.
+/// **Background tasks never block settlement.** A snapshot carrying
+/// `background_task` is a provider background job (Claude emits the same
+/// `system.task_*` family for `Bash { run_in_background: true }`, keyed by
+/// the Bash tool_use_id). A dev server never exits, so its terminal
+/// notification never arrives — treating it as agent work would defer the
+/// owed `Review` forever and pin the sidebar to "Working" (and, downstream,
+/// keep the background-browser `LIVE` chip up, since the release only fires
+/// on a settled status). So a background row that is not also a watch loop
+/// is never tracked at all, and its live snapshots return `None` — even
+/// after the turn settled, so a progress tick cannot resurrect `Working`.
 ///
-/// A genuine **new user turn** resets the thread's tracker (both
-/// `running` and `review_pending`). The authoritative, provider-agnostic
-/// anchor is the send-message command path
+/// **Watch loops are orthogonal to all of that** (the `Monitoring` half). A
+/// task the provider labelled `monitor` / `monitor_mcp` / `local_bash` /
+/// `shell` is a background watch loop rather than delegated work. It does
+/// **not** defer anything: the run settles exactly as it would without it,
+/// so `TurnCompleted` publishes a settled status, `run_finished` fires and
+/// the detached browser is released on the genuine transition. What a live
+/// watch loop changes is only which settled status is shown — `Monitoring`
+/// instead of `Review` — and the moment the last one ends the pane falls to
+/// the `Review`/`Idle` it would otherwise have had.
+///
+/// A background bash watch loop is *both* things at once, which is the
+/// point: it settles the run (background) and shows the calm badge
+/// (monitor). There is no TTL — monitoring ends only via a terminal task
+/// row, a new turn, session close, or the explicit stop paths.
+///
+/// A genuine **new user turn** resets the thread's tracker wholesale. The
+/// authoritative, provider-agnostic anchor is the send-message command path
 /// ([`agent_chat_send_turn`] calls [`SubagentTracker::clear_thread`]);
 /// `SessionStateChanged::Running` also resets here (reliably per-turn for
-/// Codex/OpenCode). `review_pending` is therefore cleared only by:
-/// publishing the owed/normal `Review`, a new-turn reset, session
-/// `Closed`/`Error`, or `agent_chat_close_pane` — never by a stray
-/// streaming delta.
+/// Codex/OpenCode). The settled state is therefore cleared only by: a
+/// new-turn reset, session `Closed`/`Error`, or `agent_chat_close_pane` —
+/// never by a stray streaming delta.
 ///
 /// Everything else leaves the indicator alone. In particular
 /// `SessionConfigured` and the `Starting` / `Ready` lifecycle phases map
@@ -3671,15 +4035,14 @@ fn map_event_to_pane_status(
 ) -> Option<PaneStatus> {
     use crate::agent_provider::{SessionStatus, SubagentStatus};
     match event {
-        // Streaming output keeps the spinner alive but must NOT touch
-        // `review_pending`. Parent-scoped output (`subagent_id == None`)
-        // can still trickle in *after* a deferred `TurnCompleted` (e.g. a
-        // final result item) while subagents keep running; clearing the
-        // owed `Review` here would silently drop it and strand the pane at
-        // `Working`. A genuine new turn is what resets `review_pending` —
-        // via the send-message command clear (authoritative,
-        // provider-agnostic) or a `SessionStateChanged::Running` snapshot
-        // — never a stray delta.
+        // Streaming output keeps the spinner alive but must NOT clear the
+        // settled state. Parent-scoped output (`subagent_id == None`) can
+        // still trickle in *after* a deferred `TurnCompleted` (e.g. a final
+        // result item) while subagents keep running; clearing `turn_settled`
+        // here would silently drop the owed `Review` and strand the pane at
+        // `Working`. A genuine new turn is what resets it — via the
+        // send-message command clear (authoritative, provider-agnostic) or a
+        // `SessionStateChanged::Running` snapshot — never a stray delta.
         ProviderRuntimeEvent::ContentDelta { .. }
         | ProviderRuntimeEvent::ItemCompleted { .. }
         | ProviderRuntimeEvent::RequestResolved { .. } => Some(PaneStatus::Working),
@@ -3687,12 +4050,29 @@ fn map_event_to_pane_status(
         ProviderRuntimeEvent::RequestResponseFailed { .. } => Some(PaneStatus::Review),
         ProviderRuntimeEvent::SubagentUpdated { subagent, .. } => match subagent.status {
             SubagentStatus::Pending | SubagentStatus::Running => {
-                if !subagent.subagent_id.is_empty() {
-                    state.track(&subagent.subagent_id, subagent.task_kind);
+                if subagent.subagent_id.is_empty() {
+                    // A malformed snapshot with no id joins nothing and
+                    // leaves nothing, so it must not be allowed to *conclude*
+                    // anything either — above all it must never consume the
+                    // owed `Review`, which is what publishing one here would
+                    // do. Pre-existing behavior: hold whatever is already up.
+                    return state
+                        .settled_status()
+                        .filter(|status| *status != PaneStatus::Review);
                 }
-                // Only speak up once a `Review` was owed; before that the
-                // parent turn owns `Working` and a snapshot (metadata:
-                // activity / tokens) must not move the dot.
+                // A refusal — a background job that is not a watch loop, or a
+                // watch loop the user already stopped — moves nothing. Not
+                // even to restore `Working` after the turn settled: a
+                // progress tick from something that cannot block the run must
+                // not repaint the dot at all. `track` also drops any stale
+                // entry for the id, covering a snapshot that arrived earlier
+                // in the session before the flag was set.
+                if !state.track(&subagent.subagent_id, classify_snapshot(subagent)) {
+                    return None;
+                }
+                // Mid-turn this abstains; after the turn settled it is what
+                // lights `Monitoring` for a watch loop whose first snapshot
+                // only arrives now.
                 state.settled_status()
             }
             SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Stopped => {
@@ -3702,41 +4082,45 @@ fn map_event_to_pane_status(
                 // up — swallowed so an intermediate completion stays the
                 // no-op it has always been. The transitions that matter
                 // (Working → Monitoring, and the finally-owed Review) pass.
+                //
+                // The late-completion-after-a-forced-settle case is handled
+                // inside the decision table, which stays silent for a
+                // tombstoned thread: the watchdog already published this
+                // thread's `Review`, so the real terminal snapshot must not
+                // re-announce a transition the user has already seen and
+                // possibly already cleared. Draining the map here is the
+                // whole point — it is what lets `is_clear` drop the tombstone.
                 state
                     .settled_status()
                     .filter(|status| *status != PaneStatus::Working)
             }
         },
         ProviderRuntimeEvent::TurnCompleted { .. } => {
-            if state.running.is_empty() && state.monitors.is_empty() {
-                Some(PaneStatus::Review)
-            } else {
-                // Tasks outlive the parent turn: owe a `Review` for when the
-                // last of them finishes, and let the decision rule pick
-                // between the spinner and the calm monitoring dot.
-                state.review_pending = true;
-                state.settled_status()
-            }
+            // The run is over as far as the parent is concerned. Whether it
+            // *settles* depends only on real agent work still being tracked;
+            // watch loops deliberately do not hold it open, they only change
+            // which settled status is shown.
+            state.turn_settled = true;
+            state.settled_status()
         }
         ProviderRuntimeEvent::SessionStateChanged { status, .. } => match status {
             SessionStatus::Running { .. } => {
-                // A fresh turn started: reset the whole tracker. Both the
-                // owed `Review` *and* any still-`running` set from the
-                // previous turn are stale — a leftover id would otherwise
-                // hold `Working` and suppress `Review` for every future
-                // turn until session close (Finding 1). A genuinely-alive
-                // background subagent re-inserts itself on its next
-                // `Running` snapshot (Claude re-emits these via
-                // `task_progress` ticks), so clearing here is safe.
-                // Reliable per-turn for Codex (`turn/started`) and OpenCode
-                // (`session.status = busy`); Claude's authoritative reset
-                // is the send-message command clear (see
-                // `agent_chat_send_turn`).
+                // A fresh turn started: reset the whole tracker. Every part of
+                // the previous turn's state is stale — a leftover id would
+                // otherwise hold `Working` and suppress `Review` for every
+                // future turn until session close (Finding 1). A
+                // genuinely-alive background subagent re-inserts itself on its
+                // next `Running` snapshot (Claude re-emits these via
+                // `task_progress` ticks), so clearing here is safe. Reliable
+                // per-turn for Codex (`turn/started`) and OpenCode
+                // (`session.status = busy`); Claude's authoritative reset is
+                // the send-message command clear (see `agent_chat_send_turn`).
                 //
-                // Monitors are dropped here too: a genuinely-alive watch loop
-                // re-inserts itself on its next `Running` snapshot, and a new
-                // turn is the user's own signal that the previous turn's
-                // background bookkeeping is no longer what this pane is about.
+                // Monitors and the stop-blocklist go with the rest: a
+                // genuinely-alive watch loop re-inserts itself, and a new turn
+                // is the user's own signal that the previous turn's background
+                // bookkeeping is no longer what this pane is about. The
+                // forced-settle tombstone is superseded for the same reason.
                 state.reset();
                 Some(PaneStatus::Working)
             }
@@ -3745,9 +4129,9 @@ fn map_event_to_pane_status(
                 // Tear-down: drop all tracking so a subagent whose
                 // terminal status is never observed (e.g. Claude's
                 // background `async_launched` task that never emits a
-                // later `task_notification`) cannot pin the spinner. Monitors
-                // go with them — the session that owned those watch loops is
-                // gone, so nothing is being monitored any more.
+                // later `task_notification`) cannot pin the spinner. Watch
+                // loops go with them — the session that owned them is gone,
+                // so nothing is being monitored any more.
                 state.reset();
                 Some(PaneStatus::Idle)
             }
@@ -3811,9 +4195,56 @@ fn publish_pane_status<R: Runtime>(
     // The status decision is per-thread and stateful (subagents can
     // outlive the parent turn), so resolve the thread first and route the
     // event through that thread's tracker.
-    let Some(mut status) = tracker.decide(&thread_id.0, event) else {
+    let Some(status) = tracker.decide(&thread_id.0, event, SystemTime::now()) else {
         return;
     };
+    apply_pane_status(app, &thread_id.0, status, SettleOrigin::ProviderEvent);
+}
+
+/// Where a pane-status write came from. The one policy that differs
+/// between the two callers of [`apply_pane_status`]: whether a terminal
+/// status may also tear down the workspace's detached agent browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettleOrigin {
+    /// A real provider transition. The status is *evidence* the run
+    /// reached that state, so the browser session it was using can go.
+    ProviderEvent,
+    /// The stall watchdog's backstop
+    /// ([`force_settle_overdue_reviews`]). Silence is not proof of death:
+    /// the run may still be alive inside one long quiet tool call, and it
+    /// would then keep driving a browser session that this settle has no
+    /// standing to destroy. Publishing a settled dot is recoverable — the
+    /// next real event repaints it — whereas closing a live browser is
+    /// not, so the forced path publishes the status and stops there.
+    ForcedBackstop,
+}
+
+/// Whether a settle at `origin` reaching `status` should release the
+/// workspace's detached agent browser.
+///
+/// Pure, so the "a forced settle never releases the browser" rule is
+/// unit-testable without an `AppHandle`/`AppStateStore`.
+fn should_release_browser(origin: SettleOrigin, status: PaneStatus) -> bool {
+    matches!(origin, SettleOrigin::ProviderEvent) && run_finished(status)
+}
+
+/// Write `status` for `thread_id` into the shared `pane_statuses` store,
+/// release the workspace's background agent browser once the run is
+/// provably over, and emit a stamped `app-state-changed` snapshot when
+/// either actually changed.
+///
+/// Extracted from [`publish_pane_status`] so the stall watchdog's forced
+/// settle ([`force_settle_overdue_reviews`]) shares the Review→Idle
+/// downgrade and the stamped emit instead of growing a second copy of
+/// them. The browser release is the deliberate exception, gated on
+/// `origin` — see [`SettleOrigin`]. Takes no tracker lock, so the caller
+/// must release the tracker mutex before calling.
+fn apply_pane_status<R: Runtime>(
+    app: &AppHandle<R>,
+    thread_id: &str,
+    mut status: PaneStatus,
+    origin: SettleOrigin,
+) {
     let state: State<'_, AppStateStore> = app.state();
     // Mirror the terminal path: a turn that finishes in the workspace the
     // user is already looking at clears to Idle instead of nagging with a
@@ -3825,20 +4256,22 @@ fn publish_pane_status<R: Runtime>(
     // running, and it stays true whether or not you are looking at the pane.
     // Suppressing it in the active workspace would also hide the docked bar
     // that owns the Stop button, which is the one surface that can end it.
-    if status == PaneStatus::Review && state.is_thread_pane_in_active_workspace(&thread_id.0) {
+    if status == PaneStatus::Review && state.is_thread_pane_in_active_workspace(thread_id) {
         status = PaneStatus::Idle;
     }
-    let status_changed = state.set_pane_status_by_thread(&thread_id.0, status.clone());
+    let status_changed = state.set_pane_status_by_thread(thread_id, status.clone());
     // A finished run (turn complete and settled to `Review`/`Idle`, or the
     // session closed/errored into `Idle`) releases the workspace's
     // background agent browser session, if any, so the GUI-mode chip /
     // context-bar indicator stop showing "LIVE" once the agent has nothing
     // left to do. `Working`/`Permission` must NOT release — the tracker
     // already defers `Review` while subagents are still running, so by the
-    // time we see a terminal status here the run really is over.
-    let released = run_finished(status)
+    // time we see a terminal status *from a provider event* the run really
+    // is over. A forced backstop settle carries no such proof and never
+    // releases.
+    let released = should_release_browser(origin, status)
         && state
-            .agent_chat_pane_id_for_thread(&thread_id.0)
+            .agent_chat_pane_id_for_thread(thread_id)
             .and_then(|pane_id| state.workspace_id_for_pane(&pane_id))
             .map(|workspace_id| state.release_detached_agent_browser(&workspace_id))
             .unwrap_or(false);
@@ -3857,18 +4290,25 @@ fn publish_pane_status<R: Runtime>(
 }
 
 /// Whether `status` represents the agent-chat run being over — a turn
-/// settled to `Review`/`Idle`, or the underlying session closing/erroring
-/// into `Idle`. Extracted from [`publish_pane_status`] so the "should we
-/// release the background browser session" policy is unit-testable
-/// without an `AppHandle`/`AppStateStore`. `Working` and `Permission` are
-/// mid-run and must return `false`.
+/// settled to `Review`/`Monitoring`/`Idle`, or the underlying session
+/// closing/erroring into `Idle`. Extracted from [`publish_pane_status`] so
+/// the "should we release the background browser session" policy is
+/// unit-testable without an `AppHandle`/`AppStateStore`. `Working` and
+/// `Permission` are mid-run and must return `false`.
 ///
-/// So must `Monitoring`: an agent still running a watch loop may well be
-/// driving the background browser as part of it (polling a dashboard, watching
-/// a deploy), and releasing the session out from under it would kill the very
-/// thing it is monitoring.
+/// `Monitoring` counts as finished, and that is the deliberate call. A watch
+/// loop is not the run: the deliverable is done and the turn has settled, so
+/// the browser session the run was using has no owner left. Letting a monitor
+/// hold it would put the "is the run over?" question back at the mercy of a
+/// task that may never terminate — precisely the failure the background-task
+/// classification exists to prevent, and it would leave the GUI-mode `LIVE`
+/// chip up indefinitely. A monitor that genuinely needs a browser opens one;
+/// it does not get to squat on the finished run's.
 fn run_finished(status: PaneStatus) -> bool {
-    matches!(status, PaneStatus::Review | PaneStatus::Idle)
+    matches!(
+        status,
+        PaneStatus::Review | PaneStatus::Monitoring | PaneStatus::Idle
+    )
 }
 
 // ── Per-thread run-activity tracking (stall watchdog) ─────────────────
@@ -4047,6 +4487,48 @@ impl RunActivityTracker {
     }
 }
 
+/// Force-settle every thread whose owed `Review` has gone silent past
+/// [`STALL_THRESHOLD`], publishing the settled pane status through
+/// [`apply_pane_status`] (Review, downgraded to Idle in the active
+/// workspace, plus the stamped app-state emit).
+///
+/// This is the backstop for a missed terminal subagent signal: without it a
+/// thread that completed its turn while something was still tracked as
+/// running stays "Working" indefinitely, because the only exit is a
+/// terminal snapshot that never arrives.
+///
+/// **Deliberately non-destructive.** The trigger is silence, and silence
+/// cannot distinguish a dead subagent from a live one sitting inside one
+/// long tool call. So the forced path only ever writes a pane status:
+///
+/// * it passes [`SettleOrigin::ForcedBackstop`], which withholds the
+///   detached-browser release — tearing down the browser under a live
+///   subagent would be unrecoverable, while a premature dot is repainted
+///   by the next real event;
+/// * `take_overdue_reviews` tombstones rather than removes the tracker
+///   entry, so a late real completion drains normally, publishes nothing,
+///   and leaves no orphaned entry behind.
+///
+/// `review_pending` is set exclusively by `TurnCompleted`, so a mid-flight
+/// turn can never be cut short here, and every remaining blocker must have
+/// been silent for the full threshold (see [`refreshes_owed_review`]).
+///
+/// The tracker mutex is released by `take_overdue_reviews` before any
+/// `AppStateStore` call, so the two locks are never held together.
+fn force_settle_overdue_reviews<R: Runtime>(app: &AppHandle<R>, now: SystemTime) {
+    let overdue = {
+        let tracker: State<'_, SubagentTracker> = app.state();
+        tracker.take_overdue_reviews(now, STALL_THRESHOLD)
+    };
+    for thread_id in overdue {
+        eprintln!(
+            "[codemux::agent_chat] force-settling an overdue Review for thread {thread_id} (turn completed, no subagent activity for {}s)",
+            STALL_THRESHOLD.as_secs()
+        );
+        apply_pane_status(app, &thread_id, PaneStatus::Review, SettleOrigin::ForcedBackstop);
+    }
+}
+
 /// Background sweep: every [`STALL_SWEEP_INTERVAL`] flag any thread that
 /// has been mid-turn and silent for at least [`STALL_THRESHOLD`] by
 /// forwarding a [`ProviderRuntimeEvent::RunStalled`]. Advisory only — the
@@ -4054,6 +4536,13 @@ impl RunActivityTracker {
 /// stalled is intentional: it keeps the UI's "no activity for Nm" duration
 /// fresh, and the event is transient (never persisted, cleared by the
 /// frontend on the next real activity).
+///
+/// The same sweep also force-settles an **owed `Review`** that has gone
+/// silent for the same threshold (see [`force_settle_overdue_reviews`]).
+/// That case is not a stall — the turn already completed — so it does more
+/// than advise: it publishes the settled status the run never got. It stops
+/// there, though. It never releases the detached browser and never drops
+/// tracker state, because silence alone cannot prove the run is dead.
 ///
 /// Spawned once from `lib.rs` right after `spawn_event_bridge`, inside the
 /// same `agent_chat_enabled` gate. Generic over the Tauri runtime so the
@@ -4094,6 +4583,10 @@ pub async fn spawn_stall_watchdog<R: Runtime>(app: AppHandle<R>) {
                     },
                 );
             }
+            // Second pass: a turn that already completed but never got its
+            // owed `Review` published. Runs after the stall pass so a
+            // forced settle is never masked by the advisory notice.
+            force_settle_overdue_reviews(&app, now_wall);
         }
     });
 }
@@ -5078,6 +5571,7 @@ mod tests {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
             tabs: Vec::new(),
@@ -5883,9 +6377,9 @@ mod tests {
     // ── Monitoring: watch-loop tasks vs agent tasks ──────────────────
     //
     // These mirror the deferred-review tests above, but for the second
-    // bucket: a task the provider labelled as a background watch loop
-    // settles the pane to `Monitoring` instead of pinning it at `Working`
-    // or claiming the work is done.
+    // class: a task the provider labelled as a background watch loop makes
+    // the *settled* status read `Monitoring` without ever deferring the
+    // settle itself.
 
     fn monitor_event(id: &str, status: SubagentStatus) -> ProviderRuntimeEvent {
         ProviderRuntimeEvent::SubagentUpdated {
@@ -5899,6 +6393,21 @@ mod tests {
         }
     }
 
+    /// The interesting intersection: a `Bash { run_in_background: true }`
+    /// watch loop. Both classifications are true of it at once.
+    fn background_monitor_event(id: &str, status: SubagentStatus) -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::SubagentUpdated {
+            thread_id: tid(),
+            subagent: SubagentSnapshot {
+                subagent_id: id.into(),
+                status,
+                task_kind: Some(SubagentTaskKind::Monitor),
+                background_task: true,
+                ..Default::default()
+            },
+        }
+    }
+
     /// A snapshot with NO `task_kind` — the shape every `task_progress`
     /// tick has, and the shape an SDK that predates the field always has.
     fn unclassified_event(id: &str, status: SubagentStatus) -> ProviderRuntimeEvent {
@@ -5906,7 +6415,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_only_tasks_settle_to_monitoring_after_turn_completed() {
+    fn monitor_only_tasks_settle_the_run_and_read_as_monitoring() {
         let mut st = ThreadSubagentState::default();
         assert_eq!(
             map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st),
@@ -5918,9 +6427,45 @@ mod tests {
             Some(PaneStatus::Monitoring),
             "deliverable done, watch loop still live"
         );
-        assert!(st.review_pending, "the Review is owed, not consumed");
-        assert!(st.monitors.contains("m1"));
-        assert!(st.running.is_empty());
+        // The run genuinely settled: no `Review` is owed, so nothing can
+        // hold the spinner and the watchdog has nothing to sweep.
+        assert!(
+            !st.review_pending(),
+            "a watch loop must never hold a Review open"
+        );
+        assert_eq!(st.tasks.get("m1"), Some(&TaskClass::Monitor));
+        assert!(!st.has_agents());
+    }
+
+    // The intersection case #254 and #251 disagreed about: a background
+    // bash watch loop. It must settle the run (so `run_finished` fires and
+    // the detached browser is released) *and* show the calm badge.
+    #[test]
+    fn a_background_watch_loop_settles_the_run_and_still_shows_the_badge() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(
+            &background_monitor_event("bg", SubagentStatus::Running),
+            &mut st,
+        );
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Monitoring)
+        );
+        assert!(!st.review_pending());
+        assert!(
+            run_finished(PaneStatus::Monitoring),
+            "the settle must release the browser like any other finished run"
+        );
+        // And it goes out when the watch loop does.
+        assert_eq!(
+            map_event_to_pane_status(
+                &background_monitor_event("bg", SubagentStatus::Completed),
+                &mut st
+            ),
+            Some(PaneStatus::Review),
+            "the pane falls to the settled status it would otherwise show"
+        );
+        assert!(st.is_clear());
     }
 
     #[test]
@@ -5933,16 +6478,18 @@ mod tests {
             Some(PaneStatus::Working),
             "real work outranks a watch loop"
         );
+        assert!(st.review_pending(), "the agent task owes the Review");
         // The agent task finishes; only the monitor is left.
         assert_eq!(
             map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Completed), &mut st),
             Some(PaneStatus::Monitoring),
             "Working hands over to Monitoring, not to Review"
         );
+        assert!(!st.review_pending());
     }
 
     #[test]
-    fn last_monitor_terminal_publishes_the_owed_review() {
+    fn the_last_monitor_ending_falls_back_to_the_settled_review() {
         let mut st = ThreadSubagentState::default();
         map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
         map_event_to_pane_status(&monitor_event("m2", SubagentStatus::Running), &mut st);
@@ -5956,17 +6503,41 @@ mod tests {
         assert_eq!(
             map_event_to_pane_status(&monitor_event("m2", SubagentStatus::Stopped), &mut st),
             Some(PaneStatus::Review),
-            "the last watch loop stops — the deferred Review finally fires"
+            "the last watch loop stops — the pane falls to Review"
         );
-        assert!(!st.review_pending);
         assert!(st.is_clear());
+    }
+
+    // Finding 4: the badge is derived from the live sets, never from an
+    // owed transition — so a monitor whose first snapshot lands *after*
+    // the turn already settled still lights it, and clears it again.
+    #[test]
+    fn a_monitor_starting_after_the_turn_settled_still_surfaces_monitoring() {
+        let mut st = ThreadSubagentState::default();
+        // A clean turn with nothing outstanding: Review published, done.
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Review)
+        );
+        assert!(!st.review_pending(), "nothing was ever owed");
+        // Only now does the watch loop report itself.
+        assert_eq!(
+            map_event_to_pane_status(&monitor_event("late", SubagentStatus::Running), &mut st),
+            Some(PaneStatus::Monitoring),
+            "the badge must not depend on a pending Review"
+        );
+        assert_eq!(
+            map_event_to_pane_status(&monitor_event("late", SubagentStatus::Completed), &mut st),
+            Some(PaneStatus::Review),
+            "and it clears when the monitor ends"
+        );
     }
 
     #[test]
     fn an_unclassified_tick_does_not_demote_a_known_monitor() {
         // `task_progress` carries no `task_type`. If `None` were read as
         // "agent", the very first progress tick would move the task back
-        // into the working set and pin the pane at Working forever.
+        // into the blocking set and pin the pane at Working forever.
         let mut st = ThreadSubagentState::default();
         map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
         map_event_to_pane_status(&turn_completed(), &mut st);
@@ -5974,23 +6545,23 @@ mod tests {
             map_event_to_pane_status(&unclassified_event("m1", SubagentStatus::Running), &mut st),
             Some(PaneStatus::Monitoring)
         );
-        assert!(st.monitors.contains("m1"));
-        assert!(st.running.is_empty());
+        assert_eq!(st.tasks.get("m1"), Some(&TaskClass::Monitor));
+        assert!(!st.has_agents());
     }
 
     #[test]
-    fn an_explicit_reclassification_moves_the_id_between_buckets() {
+    fn an_explicit_reclassification_moves_the_id_between_classes() {
         let mut st = ThreadSubagentState::default();
         map_event_to_pane_status(&subagent_event("x", SubagentStatus::Running), &mut st);
         map_event_to_pane_status(&turn_completed(), &mut st);
-        assert!(st.running.contains("x"));
+        assert_eq!(st.tasks.get("x"), Some(&TaskClass::Agent));
         // A later snapshot says it is really a watch loop.
         assert_eq!(
             map_event_to_pane_status(&monitor_event("x", SubagentStatus::Running), &mut st),
             Some(PaneStatus::Monitoring)
         );
-        assert!(st.monitors.contains("x"));
-        assert!(st.running.is_empty(), "no double-counting across buckets");
+        assert_eq!(st.tasks.get("x"), Some(&TaskClass::Monitor));
+        assert_eq!(st.tasks.len(), 1, "no double-counting across classes");
     }
 
     #[test]
@@ -6017,28 +6588,77 @@ mod tests {
             map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
             map_event_to_pane_status(&turn_completed(), &mut st);
             assert_eq!(map_event_to_pane_status(&event, &mut st), Some(expected), "{label}");
-            assert!(st.monitors.is_empty(), "{label} must drop the watch loops");
+            assert!(st.tasks.is_empty(), "{label} must drop the watch loops");
             assert!(st.is_clear(), "{label}");
         }
     }
 
+    // Finding 7: a `Running` snapshot with an empty subagent_id is
+    // malformed — it joins nothing and leaves nothing, so it must never be
+    // the thing that publishes (and consumes) the owed Review.
     #[test]
-    fn stop_monitoring_clears_watch_loops_and_publishes_the_owed_review() {
+    fn an_empty_subagent_id_never_publishes_or_consumes_a_review() {
+        let empty = |status| {
+            ProviderRuntimeEvent::SubagentUpdated {
+                thread_id: tid(),
+                subagent: SubagentSnapshot {
+                    subagent_id: String::new(),
+                    status,
+                    ..Default::default()
+                },
+            }
+        };
+
+        // Mid-turn: no-op, exactly as before.
+        let mut st = ThreadSubagentState::default();
+        assert_eq!(map_event_to_pane_status(&empty(SubagentStatus::Running), &mut st), None);
+        assert!(st.tasks.is_empty(), "nothing may be tracked under an empty id");
+
+        // After a settle with a real subagent still live: hold the spinner.
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&empty(SubagentStatus::Running), &mut st),
+            Some(PaneStatus::Working)
+        );
+        assert!(st.review_pending(), "the owed Review survives untouched");
+
+        // After a settle with nothing live: silence, NOT a Review.
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&empty(SubagentStatus::Running), &mut st),
+            Some(PaneStatus::Monitoring),
+            "a live watch loop is still the truth"
+        );
+        map_event_to_pane_status(&monitor_event("m1", SubagentStatus::Completed), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&empty(SubagentStatus::Running), &mut st),
+            None,
+            "a malformed snapshot must not announce a transition of its own"
+        );
+    }
+
+    #[test]
+    fn stop_monitoring_clears_watch_loops_and_settles_the_pane() {
         let tracker = SubagentTracker::default();
-        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running));
-        tracker.decide("t1", &turn_completed());
+        let now = SystemTime::now();
+        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running), now);
+        tracker.decide("t1", &turn_completed(), now);
         assert_eq!(tracker.stop_monitoring("t1"), Some(PaneStatus::Review));
-        // Fully settled: the entry is gone, and a second Stop is a no-op
-        // rather than a stray status write.
+        // A second Stop is a no-op rather than a stray status write.
         assert_eq!(tracker.stop_monitoring("t1"), None);
     }
 
     #[test]
     fn stop_monitoring_leaves_real_agent_work_alone() {
         let tracker = SubagentTracker::default();
-        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running));
-        tracker.decide("t1", &subagent_event("s1", SubagentStatus::Running));
-        tracker.decide("t1", &turn_completed());
+        let now = SystemTime::now();
+        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running), now);
+        tracker.decide("t1", &subagent_event("s1", SubagentStatus::Running), now);
+        tracker.decide("t1", &turn_completed(), now);
         assert_eq!(
             tracker.stop_monitoring("t1"),
             Some(PaneStatus::Working),
@@ -6046,21 +6666,142 @@ mod tests {
         );
     }
 
+    // Finding 8: Stop has to survive the demux's memory. The Claude
+    // translator re-stamps `task_kind` onto every later tick of a task it
+    // classified, so a detached watch loop that outlives the interrupt
+    // would otherwise walk straight back into the monitor set.
     #[test]
-    fn run_finished_only_for_review_and_idle() {
+    fn a_stopped_monitor_cannot_walk_back_in_on_its_next_tick() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running), now);
+        tracker.decide("t1", &turn_completed(), now);
+        assert_eq!(tracker.stop_monitoring("t1"), Some(PaneStatus::Review));
+
+        // The surviving task keeps ticking, still labelled a monitor.
+        assert_eq!(
+            tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running), now),
+            None,
+            "a stopped monitor's later ticks must not re-light the badge"
+        );
+        assert_eq!(
+            tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running), now),
+            None
+        );
+
+        // A new turn is the boundary: the blocklist goes with the rest of
+        // the run's state, so a monitor started by the *next* turn counts.
+        tracker.decide("t1", &session_running(), now);
+        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running), now);
+        assert_eq!(
+            tracker.decide("t1", &turn_completed(), now),
+            Some(PaneStatus::Monitoring),
+            "the blocklist is scoped to the run it was recorded in"
+        );
+    }
+
+    #[test]
+    fn stop_monitoring_blocklist_does_not_leak_the_tracker_entry() {
+        let tracker = SubagentTracker::default();
+        let now = SystemTime::now();
+        tracker.decide("t1", &monitor_event("m1", SubagentStatus::Running), now);
+        tracker.decide("t1", &turn_completed(), now);
+        tracker.stop_monitoring("t1");
+        assert_eq!(
+            tracker.tracked_thread_count(),
+            1,
+            "the blocklist has to outlive the tasks it names"
+        );
+        // ...but only until the run boundary that supersedes it.
+        tracker.decide(
+            "t1",
+            &ProviderRuntimeEvent::SessionStateChanged {
+                thread_id: tid(),
+                status: SessionStatus::Closed,
+            },
+            now,
+        );
+        assert_eq!(tracker.tracked_thread_count(), 0);
+    }
+
+    // Finding 3's invariant, stated as a test: a monitor-only thread owes
+    // no Review at all, so the 600s watchdog can never force-settle it out
+    // of its badge no matter how long the watch loop runs quietly.
+    #[test]
+    fn the_watchdog_never_force_settles_a_monitor_only_thread() {
+        let tracker = SubagentTracker::default();
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), start);
+        assert_eq!(
+            tracker.decide("t", &turn_completed(), start),
+            Some(PaneStatus::Monitoring)
+        );
+        // Hours of silence later, and after further monitor ticks.
+        let much_later = start + Duration::from_secs(6 * 3600);
+        tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), much_later);
+        assert!(
+            tracker
+                .take_overdue_reviews(much_later, STALL_THRESHOLD)
+                .is_empty(),
+            "a monitor-only thread is invisible to the sweep"
+        );
+        // And the badge is still the truth.
+        assert_eq!(
+            tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), much_later),
+            Some(PaneStatus::Monitoring)
+        );
+    }
+
+    // Finding 3's other half: a monitor tick must not re-arm the silence
+    // clock for a thread that *is* blocked by a real subagent, or a
+    // chatty watch loop would keep the backstop from ever firing.
+    #[test]
+    fn a_monitor_tick_does_not_re_arm_the_owed_review_clock() {
+        assert!(!refreshes_owed_review(&monitor_event(
+            "m1",
+            SubagentStatus::Running
+        )));
+        assert!(!refreshes_owed_review(&background_monitor_event(
+            "bg",
+            SubagentStatus::Running
+        )));
+        assert!(refreshes_owed_review(&subagent_event(
+            "s1",
+            SubagentStatus::Running
+        )));
+
+        let tracker = SubagentTracker::default();
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), start);
+        tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), start);
+        tracker.decide("t", &turn_completed(), start);
+        // The subagent goes silent while the watch loop keeps chattering.
+        let overdue_at = start + STALL_THRESHOLD;
+        tracker.decide("t", &monitor_event("m1", SubagentStatus::Running), overdue_at);
+        assert_eq!(
+            tracker.take_overdue_reviews(overdue_at, STALL_THRESHOLD),
+            vec!["t".to_string()],
+            "a chatty monitor must not shield a silent subagent"
+        );
+    }
+
+    #[test]
+    fn run_finished_covers_every_settled_status() {
         // Backs the background-agent-browser release wiring in
-        // `publish_pane_status`: a run is only "over" once the tracker
-        // settles to Review (turn done, nothing left in flight) or Idle
-        // (turn done and already seen, or session closed/errored). A
-        // mid-run Working or an approval prompt must never release the
-        // chip out from under a still-live agent.
+        // `publish_pane_status`: a run is over once the tracker settles to
+        // Review (turn done, nothing left in flight), Monitoring (turn
+        // done, only watch loops left) or Idle (turn done and already
+        // seen, or session closed/errored). A mid-run Working or an
+        // approval prompt must never release the chip out from under a
+        // still-live agent.
         assert!(run_finished(PaneStatus::Review));
         assert!(run_finished(PaneStatus::Idle));
         assert!(!run_finished(PaneStatus::Working));
         assert!(!run_finished(PaneStatus::Permission));
-        // A monitoring agent may still be driving the background browser as
-        // part of the very thing it is watching.
-        assert!(!run_finished(PaneStatus::Monitoring));
+        // A watch loop is not the run: letting it hold the browser session
+        // would put "is the run over?" back at the mercy of a task that
+        // may never terminate.
+        assert!(run_finished(PaneStatus::Monitoring));
     }
 
     // (a) TurnCompleted while a subagent is still running holds Working
@@ -6080,8 +6821,8 @@ mod tests {
             Some(PaneStatus::Working),
             "spinner holds while the subagent runs"
         );
-        assert!(st.review_pending, "a Review is now owed");
-        assert!(st.running.contains("s1"));
+        assert!(st.review_pending(), "a Review is now owed");
+        assert!(st.tasks.contains_key("s1"));
     }
 
     // (b) The last subagent going terminal after TurnCompleted publishes
@@ -6098,7 +6839,7 @@ mod tests {
             map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Completed), &mut st),
             None
         );
-        assert!(st.review_pending);
+        assert!(st.review_pending());
         // Last subagent finishes — the deferred Review fires.
         assert_eq!(
             map_event_to_pane_status(&subagent_event("s2", SubagentStatus::Failed), &mut st),
@@ -6201,25 +6942,342 @@ mod tests {
         let tracker = SubagentTracker::default();
         // Live turn with a subagent that outlives it.
         assert_eq!(
-            tracker.decide("t", &subagent_event("s1", SubagentStatus::Running)),
+            tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), SystemTime::now()),
             None
         );
         assert_eq!(
-            tracker.decide("t", &turn_completed()),
+            tracker.decide("t", &turn_completed(), SystemTime::now()),
             Some(PaneStatus::Working)
         );
         assert_eq!(
-            tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed)),
+            tracker.decide(
+                "t",
+                &subagent_event("s1", SubagentStatus::Completed),
+                SystemTime::now()
+            ),
             Some(PaneStatus::Review)
         );
         // Entry is dropped; a stray duplicate terminal is a harmless None.
         assert_eq!(
-            tracker.decide("t", &subagent_event("s1", SubagentStatus::Completed)),
+            tracker.decide(
+                "t",
+                &subagent_event("s1", SubagentStatus::Completed),
+                SystemTime::now()
+            ),
             None
         );
         // clear_thread is idempotent on an already-gone thread.
         tracker.clear_thread("t");
         tracker.clear_thread("does-not-exist");
+    }
+
+    // ── Background tasks must not block run settlement ──
+
+    /// A `SubagentUpdated` for a provider **background task** (Claude's
+    /// `Bash { run_in_background: true }` shape), which never emits a
+    /// terminal update when the job outlives the turn.
+    fn background_task_event(id: &str, status: SubagentStatus) -> ProviderRuntimeEvent {
+        ProviderRuntimeEvent::SubagentUpdated {
+            thread_id: tid(),
+            subagent: SubagentSnapshot {
+                subagent_id: id.into(),
+                status,
+                background_task: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    // The root-cause regression: a turn that launched a background shell
+    // command (a dev server that never exits, so no terminal
+    // `task_notification` ever arrives) must still settle to `Review` on
+    // `TurnCompleted` — no owed Review, no stuck "Working", so the
+    // background-browser release downstream actually fires.
+    #[test]
+    fn background_task_does_not_defer_review_on_turn_completed() {
+        let mut st = ThreadSubagentState::default();
+        let bg_running = background_task_event("toolu_bash", SubagentStatus::Running);
+        assert_eq!(
+            map_event_to_pane_status(&bg_running, &mut st),
+            None,
+            "a background task never moves the dot on its own"
+        );
+        assert!(
+            st.tasks.is_empty(),
+            "a background task is never tracked as a live subagent"
+        );
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Review),
+            "the turn settles even though the background job is still alive"
+        );
+        assert!(!st.review_pending(), "no Review is owed");
+        assert!(st.is_clear());
+    }
+
+    // A background-task progress tick arriving AFTER the run settled must
+    // not resurrect `Working` — that is what kept the sidebar spinning and
+    // the browser chip on `LIVE` overnight.
+    #[test]
+    fn background_task_tick_after_settle_does_not_resurrect_working() {
+        let bg_running = background_task_event("toolu_bash", SubagentStatus::Running);
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&bg_running, &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert_eq!(map_event_to_pane_status(&bg_running, &mut st), None);
+
+        // Even with a genuine subagent owing a Review, a background tick
+        // must stay silent rather than re-publishing Working.
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        map_event_to_pane_status(&turn_completed(), &mut st);
+        assert!(st.review_pending());
+        assert_eq!(map_event_to_pane_status(&bg_running, &mut st), None);
+        assert!(st.review_pending(), "the real subagent still owes its Review");
+    }
+
+    // Defensive path: an id inserted by an earlier unflagged snapshot (an
+    // older build, a provider that learns the shape late) is dropped from
+    // the running-set the moment a flagged snapshot for it arrives.
+    #[test]
+    fn flagged_snapshot_evicts_a_previously_unflagged_background_id() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("toolu_bash", SubagentStatus::Running), &mut st);
+        assert!(st.tasks.contains_key("toolu_bash"));
+        let bg_running = background_task_event("toolu_bash", SubagentStatus::Running);
+        map_event_to_pane_status(&bg_running, &mut st);
+        assert!(st.tasks.is_empty());
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Review)
+        );
+    }
+
+    // The deliberate async-subagent flow must be untouched: a real
+    // (unflagged) subagent still holds `Working` past `TurnCompleted` and
+    // its terminal snapshot still publishes the owed `Review`.
+    #[test]
+    fn real_subagent_still_defers_review_until_it_finishes() {
+        let mut st = ThreadSubagentState::default();
+        map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Running), &mut st);
+        assert_eq!(
+            map_event_to_pane_status(&turn_completed(), &mut st),
+            Some(PaneStatus::Working)
+        );
+        assert!(st.review_pending());
+        assert_eq!(
+            map_event_to_pane_status(&subagent_event("s1", SubagentStatus::Completed), &mut st),
+            Some(PaneStatus::Review)
+        );
+        assert!(st.is_clear());
+    }
+
+    // ── Watchdog force-settle of an owed Review ──
+
+    #[test]
+    fn select_overdue_review_only_fires_on_a_silent_owed_review() {
+        let now = SystemTime::now();
+        let stale = now - STALL_THRESHOLD - Duration::from_secs(1);
+
+        let agent_task = || {
+            [("s1".to_string(), TaskClass::Agent)]
+                .into_iter()
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+
+        // Nothing owed (the turn is still in flight) → never overdue,
+        // however old the state is.
+        let mid_turn = ThreadSubagentState {
+            tasks: agent_task(),
+            turn_settled: false,
+            review_owed_since: Some(stale),
+            ..Default::default()
+        };
+        assert!(!select_overdue_review(&mid_turn, now, STALL_THRESHOLD));
+
+        // Owed but still fresh → the deferred Review is allowed to stand.
+        let fresh = ThreadSubagentState {
+            tasks: agent_task(),
+            turn_settled: true,
+            review_owed_since: Some(now),
+            ..Default::default()
+        };
+        assert!(!select_overdue_review(&fresh, now, STALL_THRESHOLD));
+
+        // Owed and silent past the threshold → force-settle.
+        let overdue = ThreadSubagentState {
+            review_owed_since: Some(stale),
+            ..fresh.clone()
+        };
+        assert!(select_overdue_review(&overdue, now, STALL_THRESHOLD));
+
+        // Nothing *blocking* the settle → never overdue, whatever the
+        // clock says. A monitor-only thread settled at `TurnCompleted`
+        // and owes no Review, so the sweep can never take its badge.
+        let monitor_only = ThreadSubagentState {
+            tasks: [("m1".to_string(), TaskClass::Monitor)]
+                .into_iter()
+                .collect(),
+            turn_settled: true,
+            review_owed_since: Some(stale),
+            ..Default::default()
+        };
+        assert!(!select_overdue_review(&monitor_only, now, STALL_THRESHOLD));
+    }
+
+    #[test]
+    fn take_overdue_reviews_settles_once_and_tombstones_the_entry() {
+        let tracker = SubagentTracker::default();
+        let start = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), start);
+        assert_eq!(
+            tracker.decide("t", &turn_completed(), start),
+            Some(PaneStatus::Working),
+            "Review deferred behind a subagent that never goes terminal"
+        );
+
+        // Not yet silent long enough.
+        assert!(tracker
+            .take_overdue_reviews(start + Duration::from_secs(60), STALL_THRESHOLD)
+            .is_empty());
+
+        let later = start + STALL_THRESHOLD + Duration::from_secs(1);
+        assert_eq!(
+            tracker.take_overdue_reviews(later, STALL_THRESHOLD),
+            vec!["t".to_string()]
+        );
+        // Take-once: the owed Review was cleared, so a later sweep
+        // re-settles nothing...
+        assert!(tracker
+            .take_overdue_reviews(later + STALL_THRESHOLD, STALL_THRESHOLD)
+            .is_empty());
+        // ...but the entry itself survives as a tombstone, because `s1` may
+        // still be alive and its terminal snapshot still has to land
+        // somewhere that knows a Review was already published.
+        assert_eq!(tracker.tracked_thread_count(), 1);
+    }
+
+    // Finding (b): a forced settle must not strand tracker state. The late
+    // real completion drains the tombstone, publishes nothing, and leaves
+    // the map empty — as opposed to dropping the entry at settle time,
+    // where the same snapshot would recreate a `review_pending: false` husk
+    // that nothing ever collects.
+    #[test]
+    fn a_late_completion_after_a_forced_settle_is_silent_and_leaks_nothing() {
+        let tracker = SubagentTracker::default();
+        let start = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), start);
+        tracker.decide("t", &turn_completed(), start);
+        let settled_at = start + STALL_THRESHOLD + Duration::from_secs(1);
+        assert_eq!(
+            tracker.take_overdue_reviews(settled_at, STALL_THRESHOLD),
+            vec!["t".to_string()]
+        );
+
+        // The subagent was alive all along — just quiet inside one long
+        // tool call — and reports again after the forced settle.
+        assert_eq!(
+            tracker.decide(
+                "t",
+                &subagent_event("s1", SubagentStatus::Running),
+                settled_at + Duration::from_secs(5)
+            ),
+            None,
+            "a post-settle progress tick must not resurrect Working"
+        );
+        assert_eq!(
+            tracker.decide(
+                "t",
+                &subagent_event("s1", SubagentStatus::Completed),
+                settled_at + Duration::from_secs(10)
+            ),
+            None,
+            "the Review was already published; do not re-announce it"
+        );
+        assert_eq!(
+            tracker.tracked_thread_count(),
+            0,
+            "the tombstone is collected once the last tracked id drains"
+        );
+    }
+
+    // A forced settle on a thread whose next turn simply starts again must
+    // behave like any other thread: the tombstone is part of the state a
+    // new turn resets, so turn 2 settles normally.
+    #[test]
+    fn a_new_turn_clears_the_forced_settle_tombstone() {
+        let tracker = SubagentTracker::default();
+        let start = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), start);
+        tracker.decide("t", &turn_completed(), start);
+        let settled_at = start + STALL_THRESHOLD + Duration::from_secs(1);
+        tracker.take_overdue_reviews(settled_at, STALL_THRESHOLD);
+
+        assert_eq!(
+            tracker.decide("t", &session_running(), settled_at + Duration::from_secs(1)),
+            Some(PaneStatus::Working)
+        );
+        assert_eq!(
+            tracker.decide("t", &turn_completed(), settled_at + Duration::from_secs(2)),
+            Some(PaneStatus::Review),
+            "turn 2 settles through the ordinary path"
+        );
+        assert_eq!(tracker.tracked_thread_count(), 0);
+    }
+
+    // Finding (a), the destructive half: the watchdog's trigger is silence,
+    // which a live subagent inside one long quiet tool call also produces.
+    // Publishing a settled dot too early is repainted by the next real
+    // event; tearing down the browser session that subagent is driving is
+    // not recoverable, so only a provider event may do it.
+    #[test]
+    fn a_forced_settle_never_releases_the_detached_browser() {
+        for status in [PaneStatus::Review, PaneStatus::Idle] {
+            assert!(
+                should_release_browser(SettleOrigin::ProviderEvent, status.clone()),
+                "a real terminal transition still releases"
+            );
+            assert!(
+                !should_release_browser(SettleOrigin::ForcedBackstop, status),
+                "the watchdog's backstop must never tear down a live browser"
+            );
+        }
+        // Mid-run statuses are unchanged from either origin.
+        for origin in [SettleOrigin::ProviderEvent, SettleOrigin::ForcedBackstop] {
+            assert!(!should_release_browser(origin, PaneStatus::Working));
+            assert!(!should_release_browser(origin, PaneStatus::Permission));
+        }
+    }
+
+    // Real post-turn subagent activity refreshes the silence clock, so a
+    // busy async subagent is never force-settled out from under a live run.
+    #[test]
+    fn real_subagent_activity_defers_the_forced_settle() {
+        let tracker = SubagentTracker::default();
+        let start = SystemTime::now();
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), start);
+        tracker.decide("t", &turn_completed(), start);
+
+        let almost = start + STALL_THRESHOLD - Duration::from_secs(1);
+        tracker.decide("t", &subagent_event("s1", SubagentStatus::Running), almost);
+        assert!(
+            tracker
+                .take_overdue_reviews(almost + Duration::from_secs(2), STALL_THRESHOLD)
+                .is_empty(),
+            "a live subagent snapshot re-arms the clock"
+        );
+
+        // A background-task tick, by contrast, is not activity — the clock
+        // keeps running from the last real signal.
+        tracker.decide(
+            "t",
+            &background_task_event("toolu_bash", SubagentStatus::Running),
+            almost + Duration::from_secs(2),
+        );
+        assert_eq!(
+            tracker.take_overdue_reviews(almost + STALL_THRESHOLD, STALL_THRESHOLD),
+            vec!["t".to_string()]
+        );
     }
 
     fn session_running() -> ProviderRuntimeEvent {
@@ -6247,8 +7305,8 @@ mod tests {
             Some(PaneStatus::Working),
             "turn 1 defers Review while the background subagent runs"
         );
-        assert!(st.review_pending);
-        assert!(st.running.contains("bg"));
+        assert!(st.review_pending());
+        assert!(st.tasks.contains_key("bg"));
 
         // Turn 2 starts: the new-turn reset drains the stale tracking.
         assert_eq!(
@@ -6275,9 +7333,9 @@ mod tests {
     fn send_command_clear_resets_tracking_across_turns() {
         let tracker = SubagentTracker::default();
         // Turn 1: subagent outlives the turn, Review deferred.
-        tracker.decide("t", &subagent_event("bg", SubagentStatus::Running));
+        tracker.decide("t", &subagent_event("bg", SubagentStatus::Running), SystemTime::now());
         assert_eq!(
-            tracker.decide("t", &turn_completed()),
+            tracker.decide("t", &turn_completed(), SystemTime::now()),
             Some(PaneStatus::Working)
         );
 
@@ -6286,7 +7344,7 @@ mod tests {
 
         // Turn 2 completes clean → Review, not a stuck Working.
         assert_eq!(
-            tracker.decide("t", &turn_completed()),
+            tracker.decide("t", &turn_completed(), SystemTime::now()),
             Some(PaneStatus::Review)
         );
     }
@@ -6306,7 +7364,7 @@ mod tests {
             Some(PaneStatus::Working),
             "Review deferred while the subagent runs"
         );
-        assert!(st.review_pending);
+        assert!(st.review_pending());
 
         // A late parent-scoped item (subagent_id == None) arrives after the
         // deferred TurnCompleted. It keeps Working but leaves the owed
@@ -6326,7 +7384,7 @@ mod tests {
             Some(PaneStatus::Working)
         );
         assert!(
-            st.review_pending,
+            st.review_pending(),
             "parent-scoped output must not drop the owed Review"
         );
 

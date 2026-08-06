@@ -1134,7 +1134,7 @@ fn build_core_app<R: tauri::Runtime>(
                             // failed lookup preserves the last known state;
                             // a successful empty result is authoritative and
                             // clears any stale association.
-                            let lookup = github::get_branch_pr(&path);
+                            let lookup = github::get_workspace_pr(&path);
                             match &lookup {
                                 Err(e) => {
                                     let message = format!(
@@ -1163,11 +1163,13 @@ fn build_core_app<R: tauri::Runtime>(
                                         Some(pr.number),
                                         Some(pr.display_state()),
                                         Some(pr.url),
+                                        pr.head_branch,
                                     );
                                 }
                                 github::BranchPrOutcome::Clear => {
                                     changed |= state.update_workspace_pr_info(
                                         &workspace_id,
+                                        None,
                                         None,
                                         None,
                                         None,
@@ -1566,7 +1568,7 @@ fn build_core_app<R: tauri::Runtime>(
                         let pr_result = tokio::time::timeout(
                             std::time::Duration::from_secs(PER_CALL_TIMEOUT_SECS),
                             tokio::task::spawn_blocking(move || {
-                                github::get_branch_pr(&path_for_pr)
+                                github::get_workspace_pr(&path_for_pr)
                             }),
                         )
                         .await;
@@ -1575,7 +1577,7 @@ fn build_core_app<R: tauri::Runtime>(
                             Ok(Ok(lookup)) => {
                                 if let Err(e) = &lookup {
                                     eprintln!(
-                                        "[codemux::pr-poll] get_branch_pr failed for {workspace_id}: {e}"
+                                        "[codemux::pr-poll] get_workspace_pr failed for {workspace_id}: {e}"
                                     );
                                 }
                                 // Shared matrix: match -> write, successful
@@ -1597,12 +1599,14 @@ fn build_core_app<R: tauri::Runtime>(
                                             Some(pr.number),
                                             Some(pr.display_state()),
                                             Some(pr.url),
+                                            pr.head_branch,
                                         );
                                         refreshed += 1;
                                     }
                                     github::BranchPrOutcome::Clear => {
                                         changed |= state.update_workspace_pr_info(
                                             &workspace_id,
+                                            None,
                                             None,
                                             None,
                                             None,

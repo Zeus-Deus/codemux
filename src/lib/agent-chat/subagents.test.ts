@@ -109,6 +109,26 @@ describe("mergeSnapshot revive / statusAssumed (issue #153)", () => {
     expect(ticked.taskKind).toBe("monitor");
   });
 
+  it("stamps backgroundTask once and never unsets it from a later snapshot", () => {
+    const merged = mergeSnapshot(view({ id: "bg" }), {
+      subagent_id: "bg",
+      status: "running",
+      background_task: true,
+    } as SubagentSnapshot);
+    expect(merged.backgroundTask).toBe(true);
+    // A later snapshot that simply omits the flag must not promote the row
+    // back to "real subagent" (same additive-merge rule as every field).
+    expect(
+      mergeSnapshot(merged, { subagent_id: "bg", status: "running" } as SubagentSnapshot)
+        .backgroundTask,
+    ).toBe(true);
+    // A row that was never flagged stays shape-identical (no stray key).
+    expect(
+      "backgroundTask" in
+        mergeSnapshot(view(), { subagent_id: "s1", status: "running" } as SubagentSnapshot),
+    ).toBe(false);
+  });
+
   it("a real running snapshot revives an interrupted row and clears assumed", () => {
     const v = view({ status: "interrupted", statusAssumed: true });
     const next = mergeSnapshot(v, snap("running"));
@@ -429,14 +449,48 @@ describe("whole-thread lookups", () => {
         ],
       },
     ];
-    const entries = runningSubagentEntries(withMonitor);
-    expect(entries.map((e) => e.subagent.id)).toEqual(["real"]);
+    // Excluded whether or not the thread is streaming: a watch loop is
+    // never agent work, unlike a background task (which only drops out
+    // once the run is over).
+    for (const streaming of [true, false]) {
+      const entries = runningSubagentEntries(withMonitor, streaming);
+      expect(entries.map((e) => e.subagent.id)).toEqual(["real"]);
+      expect(countRunningSubagents(withMonitor, streaming)).toBe(1);
+    }
   });
 
   it("treats an unreported task kind as ordinary agent work", () => {
     expect(isMonitorTask(view({ id: "x" }))).toBe(false);
     expect(isMonitorTask(view({ id: "x", taskKind: "agent" }))).toBe(false);
     expect(isMonitorTask(view({ id: "x", taskKind: "monitor" }))).toBe(true);
+  });
+
+  it("drops background tasks from live activity once the thread stops streaming", () => {
+    const bgCard: SubagentRunItem = {
+      kind: "subagent_run",
+      id: "run-bg",
+      seq: 2,
+      turn_id: "t3",
+      subagents: [
+        view({ id: "bg", status: "running", backgroundTask: true }),
+        view({ id: "real", status: "running" }),
+      ],
+    };
+    const withBg: ChatViewItem[] = [bgCard];
+
+    // Mid-run both read as live.
+    expect(countRunningSubagents(withBg, true)).toBe(2);
+    expect(runningSubagentEntries(withBg, true).map((e) => e.subagent.id)).toEqual([
+      "bg",
+      "real",
+    ]);
+
+    // Run over: the never-terminating background job stops counting, so
+    // the docked bar can't spin forever after the turn settled.
+    expect(countRunningSubagents(withBg, false)).toBe(1);
+    expect(runningSubagentEntries(withBg, false).map((e) => e.subagent.id)).toEqual([
+      "real",
+    ]);
   });
 
   it("labels each running subagent with its originating card once several cards exist", () => {

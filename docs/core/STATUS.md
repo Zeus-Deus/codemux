@@ -18,11 +18,101 @@ implementation notes (`v0.6.1`–`v0.13.2`) were moved to `docs/archive/release-
 
 Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. The latest released version is **`v0.16.0` (2026-08-02)**, the release in which the Agent Chat GUI became the default interface — it also carries the seven-phase GUI responsiveness program, the unified Ctrl+K switcher, the Agent Tasks and context-window surfaces, the compressed web-remote transport, and the one-command remote bootstrap. `v0.15.6` (2026-07-30) was a follow-up release carrying the chat code-rendering, provider-request-lifecycle, skills-discovery, and sidebar-inbox-detail clusters listed below. `v0.15.5` (2026-07-28) carried the sidebar park-intelligence batch (backend-owned activity stamps, a "Wrapping up" tier, snooze, a bulk-action safety net, an oldest-blocked-first needs-you strip, and a shared hover details card), the chat scope + picker rework, the terminal live-cwd hint, and the Linux WebKitGTK accelerated-scrolling restore. `v0.15.0` (2026-07-25) carried the sidebar workspace inbox, the atomic provider/model selection fix, the provider-native Full-access launch repair, and the Codex-only Standard/Fast speed picker. `v0.14.3` shipped headless serve mode, terminal-hook restart recovery, Codex auth/preset migrations, the new-workspace/titlebar and WebKit composer fixes, and safe inline tool-result images; `v0.14.2` shipped the living sidebar, the first Full-access null-mode launch heal, and the transcript scroll/anchoring fix; `v0.14.1` shipped the preceding Agent Chat reliability and polish batch.
 
-Unreleased after `v0.16.0` — the "Monitoring" agent status, eight merged PRs (#239–#246) plus the
-directly-committed new-turn scroll contract (PR #247) and the floating-chrome
-refinement commits that shipped alongside PR #245, grouped by subsystem below:
+Unreleased after `v0.16.0` — eight merged PRs (#239–#246) plus the
+directly-committed new-turn scroll contract (PR #247), the stuck-"Working"
+run-settlement fix, the side-branch PR badge fallback, the floating-chrome
+refinement commits that shipped alongside PR #245, the
+AskUserQuestion-panel questionnaire migration (PR #252), and the "Monitoring"
+agent status, grouped by subsystem below:
 
-- **"Monitoring" agent status for background watch loops.** A fifth `PaneStatus` (`Monitoring`) for the state Codemux previously had no vocabulary for: an agent that finished its deliverable but is still babysitting something — a CI run, a tailed process, a PR poll. Two ways in, meeting at one choke point. **Automatic (Claude):** `task_started`'s optional `task_type` is classified against a closed watch-loop set (`monitor` / `monitor_mcp` / `local_bash` / `shell`), remembered per subagent in `SubagentDemux` and re-stamped onto every later snapshot (only `task_started` carries the field); `ThreadSubagentState` now splits its live set into agent tasks and monitors, and once a turn settles with zero agent tasks and ≥1 live monitor it publishes `Monitoring` **in place of** the owed `Review`, which fires when the last watch loop stops. Claude background tasks therefore stop pinning the sidebar at "Working" forever. An SDK that never sends `task_type` classifies everything as agent work and behaves exactly as before — deliberate graceful degradation. **Provider-agnostic:** runtime-only `manual_monitors` flags set by `codemux monitor start [--reason]` / cleared by `codemux monitor stop` (plus `monitor status`, and the matching `monitor_start`/`monitor_stop`/`monitor_status` socket commands), targeting the agent's own pane from injected `CODEMUX_PANE_ID`/`CODEMUX_WORKSPACE_ID` — so a terminal, Codex, or OpenCode agent gets the same badge. The two halves combine in exactly one place, `apply_manual_monitors`, on the way *out* of the state store (`Working`/`Permission` beat the flag; combining on read is what lets `monitor stop` reveal the raw status underneath). Never persisted: `retain_persistable_pane_statuses` drops `Monitoring` like `Working`/`Permission`. UI is deliberately calm — a new steady cyan `--status-monitoring` token with **no** pulse or spinner on the inbox card, rail dot, hover card, tab dot, palette row and overview row; monitoring cards recede like quietly-working ones, never raise the needs-you strip, and stay settleable/snoozeable. A docked `MonitoringBar` between transcript and composer carries the reason and a **Stop** button (`agent_chat_stop_monitoring`) that clears the monitor set + flag and best-effort interrupts the session — with the honest limitation that once the turn has settled there is no bare-session interrupt, so a detached task can survive the state clear. Watch loops keep their transcript card but are excluded from the `SubagentActivityBar` roster. Covered by Rust tracker/state tests, `pane-status`/`MonitoringBar`/sidebar-card vitest suites, and a headless `scripts/e2e/monitoring-status-e2e.sh` that drives `codemux serve` over an isolated control socket. See `docs/features/monitoring-status.md`.
+- **AskUserQuestion panel rebuilt on the shadcn Questionnaire component** (PR #252). `ComposerPendingInputPanel`'s hand-rolled option rows, paging chevrons, and hidden `sr-only` inputs are replaced by the newly released shadcn **Questionnaire** primitives (`src/components/ui/questionnaire.tsx` over the new `@shadcn/react` package, installed for the repo's `radix-nova` style): real fieldset/legend semantics per question, radio/checkbox indicator cards with automatically mapped 1–9 shortcut chips, focus-visible rings the old panel lacked, and Previous/Next/Submit navigation. The externally observable contract is unchanged — same `AskUserQuestionOutput` shape (answers keyed by question text, `", "`-joined multiSelect with free text appended, raw `questions` echoed), same composer-docked card on the chat-column rails, same global document-level keyboard layer for focus-outside-the-form digits/arrows/Enter (now guarded against double-handling with the primitive's in-form handler), same `option.preview` HoverCards and test ids. `npm run dev` + `?askq=1` seeds a pending two-question request for browser QA; the mock's `agent_chat_respond_to_request` now resolves it so answering settles the panel into the reply bubble. See `docs/features/agent-chat.md` § "AskUserQuestion panel".
+
+- **A finished run can no longer stay stuck on "Working"** (stuck-status fix).
+  A run that launched a background shell command (`Bash { run_in_background:
+  true }`) kept the sidebar spinner, the background-browser `LIVE` chip, the
+  docked subagent activity bar, and the composer's `Tasks N/M` spinner alive
+  indefinitely after the turn finished. Claude emits the same `system.task_*`
+  family for a background tool run as for a real subagent, so the pane-status
+  tracker put a dev server — which never exits, and therefore never sends the
+  terminal `task_notification` — into the per-thread running-set;
+  `TurnCompleted` then deferred `Review` forever, and because
+  `release_detached_agent_browser` only fires on a settled status, the browser
+  chip never cleared either. Three-part fix. **(1) Root cause**:
+  `SubagentSnapshot` gained an additive `background_task: bool`
+  (`#[serde(default)]`) stamped by the Claude adapter from the discriminator
+  it already had — only a real `Agent`/`Task` launch is registered as a
+  top-level launch in `SubagentDemux` — and `map_event_to_pane_status` never
+  tracks a flagged row, returns `None` for it even when a `Review` is owed
+  (so a progress tick can't resurrect `Working` after the run settled), and
+  defensively evicts an id an unflagged snapshot inserted earlier. Real async
+  `Task` launches keep their deliberate deferred-`Review` flow. **(2)
+  Backstop**: the 30s stall-watchdog sweep gained a second pass that
+  force-settles an owed `Review` gone silent for the existing 600s
+  `STALL_THRESHOLD`, routed through `apply_pane_status` — the helper extracted
+  out of `publish_pane_status` — so the `Review`→`Idle` downgrade and the
+  stamped emit are shared rather than copied. Any tick from a real tracked
+  entry re-arms the clock (a flagged background tick deliberately does not), so
+  the threshold means "every remaining blocker has been silent for ten
+  minutes". Silence still cannot prove death — one long `cargo test` inside a
+  live subagent looks identical — so the forced path is deliberately
+  non-destructive: it passes `SettleOrigin::ForcedBackstop`, which **withholds
+  the detached-browser release** (a premature dot is repainted by the next real
+  event; a browser torn down under a live subagent is not recoverable), and it
+  **tombstones** the tracker entry (`forced_settled`) instead of removing it,
+  so a late real completion drains normally, publishes nothing, and leaves no
+  orphaned entry rather than recreating an uncollectable husk. It can't cut a
+  live turn short — `review_pending` is only ever set by `TurnCompleted`.
+  **(3) Frontend**: live affordances now respect the end of
+  the run. Background-task rows drop out of `runningSubagentEntries` /
+  `countRunningSubagents` once the thread stops streaming (shared
+  `isLiveActivity` predicate; the flag merges stickily), and the Tasks chip's
+  spinner and the Tasks tab's blinking dot are gated on `streaming` rather
+  than on an `in_progress` row in the durable snapshot — the chip stays and
+  renders its counts statically instead of disappearing. See
+  `docs/features/agent-chat.md` §§ "Sidebar status indicators", "Docked live
+  activity bar", "Agent Tasks panel" and `docs/features/browser.md`
+  § "Run-finished release".
+
+- **A PR opened from a side branch no longer goes unbadged** (sidebar PR
+  fallback). An agent working in a workspace that ran `git checkout -b
+  side-branch`, committed, pushed, opened a PR, and checked the worktree back
+  left the sidebar with no PR badge at all: association is strictly by
+  checked-out branch, and the checked-out branch had none. When the current
+  branch resolves to no PR, `github::get_workspace_pr` now falls back to
+  branches this worktree checked out recently — `checkout: moving from X to Y`
+  records parsed out of the last 50 per-worktree HEAD reflog entries, up to 5
+  distinct names newest-first, excluding the current branch, the default
+  branch, and detached-HEAD SHAs — and resolves each through the existing
+  `select_branch_pr` policy, first hit winning. It badges **open PRs only**
+  (unlike the current-branch path, which keeps showing merged/closed state):
+  the case it exists for is always an open PR, and admitting history would let
+  a `gh pr checkout` of someone else's merged PR donate its badge for the whole
+  reflog window. The fallback never runs on the repository default branch, and
+  it costs one repo-wide `gh pr list --state open` matched client-side against
+  every candidate (not one query per candidate) — memoized per origin URL for
+  60s, with the local probes memoized per `(worktree, branch)` for the same
+  60s and owner resolution done lazily, so a repeat 5s active-workspace tick
+  spawns no subprocess at all. A failed fallback collapses to "no PR" rather
+  than `Preserve` — the current branch already answered authoritatively. **The
+  association is badge-only.** The workspace snapshot gained
+  `pr_head_branch` (snapshot-local, serde-defaulted, never synced) and the
+  shared frontend predicate `isPrOnCurrentBranch` compares it to `git_branch`:
+  the badge renders identically everywhere, but PR-completion **auto-settle**
+  refuses a side-branch PR (that branch merging says nothing about a checkout
+  that may still hold uncommitted work — such a workspace still ages out via
+  the ordinary inactivity rule), the **"Wrapping up"** demotion refuses it,
+  and the **Review tab** stays strictly current-branch so "Create PR" is not
+  hidden for the branch the user is actually on. Missing information on either
+  side reads as a match — a `null` head branch (an association predating the
+  field) *and* a `null` `git_branch` (detached HEAD during a rebase or bisect,
+  where the stored head branch outlives the branch name) — so only two known,
+  differing names ever un-associate a workspace from its PR. The
+  hover/details card gains a **"PR branch"** row in the mismatching case only.
+  See `docs/features/sidebar.md` §§ "Side-branch PR badges", "A side-branch
+  association is a badge and nothing more" and
+  `docs/features/review-integration.md`.
+
+- **"Monitoring" agent status for background watch loops.** A fifth `PaneStatus` (`Monitoring`) for the state Codemux previously had no vocabulary for: an agent that finished its deliverable but is still babysitting something — a CI run, a tailed process, a PR poll. Two ways in, meeting at one choke point. **Automatic (Claude):** `task_started`'s optional `task_type` is classified against a closed watch-loop set (`monitor` / `monitor_mcp` / `local_bash` / `shell`), remembered per subagent in `SubagentDemux` and re-stamped onto every later snapshot (only `task_started` carries the field). This is the *second* classification on `SubagentSnapshot`, and it composes with the `background_task` flag from the run-settlement fix above rather than competing with it: one `stamp_task_classification` in each `translate_task_*` fn stamps both, and the tracker folds them into one `TaskClass` per id — `Monitor` when the SDK says so, `Untracked` for a background row that is not a watch loop, `Agent` otherwise. **Monitoring is orthogonal to settlement, not a replacement for it.** A watch loop never defers anything: the turn still settles on schedule (`Review` publishes, `run_finished` fires, the detached browser is released on the genuine transition), and all a live monitor changes is *which* settled status is shown. `settled_status()` is a decision table read straight off the live sets — `Permission > Working > Monitoring > Review > Idle` — so a monitor whose first snapshot arrives *after* the turn settled still lights the badge, and the moment the last one ends the pane falls to the `Review`/`Idle` it would otherwise have shown. Because a monitor-only thread owes no `Review` at all, the 600s force-settle watchdog cannot see it, and a chatty watch loop cannot re-arm the silence clock for a thread that a real subagent *is* blocking. An SDK that never sends `task_type` classifies everything as agent work and behaves exactly as before — deliberate graceful degradation. **Provider-agnostic:** runtime-only `manual_monitors` flags set by `codemux monitor start [--reason]` / cleared by `codemux monitor stop` (plus `monitor status`, and the matching `monitor_start`/`monitor_stop`/`monitor_status` socket commands), targeting the agent's own pane from injected `CODEMUX_PANE_ID`/`CODEMUX_WORKSPACE_ID` — so a terminal, Codex, or OpenCode agent gets the same badge. The two halves combine in exactly one place, `apply_manual_monitors`, on the way *out* of the state store (`Working`/`Permission` beat the flag; combining on read is what lets `monitor stop` reveal the raw status underneath). Never persisted: `retain_persistable_pane_statuses` drops `Monitoring` like `Working`/`Permission`, and flags are cleared when their pane, workspace, or archived workspace goes away. UI is deliberately calm — a new steady cyan `--status-monitoring` token with **no** pulse or spinner on the inbox card, rail dot, hover card, tab dot, palette row and overview row; monitoring cards recede like quietly-working ones, never raise the needs-you strip, and stay settleable/snoozeable. A docked `MonitoringBar` between transcript and composer carries the reason and a **Stop** button that clears the monitor set + flag and best-effort interrupts the session; Stop is durable (stopped ids are blocklisted until the next turn boundary, so a surviving detached task's later ticks cannot walk the badge back on) and works on a pane with no bound thread, with the honest limitation that once the turn has settled there is no bare-session interrupt, so a detached process can outlive the state clear. Watch loops keep their transcript card but are excluded from the `SubagentActivityBar` roster. Covered by Rust tracker/state tests, `pane-status`/`MonitoringBar`/sidebar-card vitest suites, and a headless `scripts/e2e/monitoring-status-e2e.sh` that drives `codemux serve` over an isolated control socket. See `docs/features/monitoring-status.md`.
 
 - **New-turn scroll contract for the chat transcript** (PR #247). A composer submission is now an explicit navigation intent rather than a data update. `AgentChatPane` issues a `sendAnchor` (`{ clientNonce, nonce }`) in the same batch as the optimistic `appendUserMessage`, reusing that bubble's existing correlation token; `MessageList` resolves the matching `user_message` slot **by nonce** (last match wins) — not by last index, which queued follow-ups and control rows break — feeds it to LegendList's `anchoredEndSpace` (`anchorOffset: 16`), and positions the row from the `onReady` measurement callback with an instant `scrollToIndex`, retrying per frame rather than assuming layout finishes in N ms. Three states replace the old one-shot scalar signal: `following-end`, `anchoring-turn`, `free-scrolling`. While an anchor is mounted the built-in `maintainScrollAtEnd` is disabled and an effect advances by exactly `scrollDeltaToRevealEnd`, so the prompt stays parked near the top while the turn fits and moves only enough to reveal the growing tail. Follow is released **only** by `wheel`, `touchmove`, a `pointerdown` that targets the scroll container itself (a scrollbar drag — presses on rows, so plan-accept/approval/expand clicks and text selection, deliberately do not count), or subagent-jump navigation; a generation counter invalidates every in-flight continuation at once, and scrolling back to the edge re-claims follow. The anchor expires on failed-send rollback, on thread switch, and on the falling edge of the live-turn signal, so a settled thread reopens at the latest row and LegendList's own item/footer-layout pin comes back; expiry never re-claims the viewport from a reader already browsing history. "Jump to latest" is shown on a 150ms trailing debounce and hidden immediately, so it no longer flashes during mount/layout settling or sticks on during programmatic anchoring. Geometry lives in the pure, unit-tested `send-scroll-state.ts`. Frontend-only; the previous `scrollToBottomSignal` scalar and its single `scrollToEnd` call are gone. See `docs/features/agent-chat.md` § "Transcript scroller" → "The new-turn scroll contract".
 

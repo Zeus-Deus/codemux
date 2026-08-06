@@ -457,6 +457,23 @@ pub struct WorkspaceSnapshot {
     pub pr_state: Option<String>,
     #[serde(default)]
     pub pr_url: Option<String>,
+    /// Head branch of the associated PR, as GitHub reports it.
+    ///
+    /// Normally this equals `git_branch`. It differs when the association
+    /// came from the sidebar's badge-only fallback — a PR opened from a
+    /// branch this worktree checked out recently and then left (an agent
+    /// that branched off, pushed, opened a PR, and checked the worktree
+    /// back). That badge is worth showing; the *conclusions* drawn from a
+    /// PR are not, so the sidebar's PR-completion auto-settle requires this
+    /// to match the checked-out branch. A side branch merging says nothing
+    /// about whether this workspace's own work is finished.
+    ///
+    /// Snapshot-local, like the other derived git fields: it is re-derived
+    /// on every poll from the checkout in front of us and is never synced
+    /// across devices. Additive — old persisted state reads as `None`,
+    /// which the frontend treats as the pre-field (matching) case.
+    #[serde(default)]
+    pub pr_head_branch: Option<String>,
     #[serde(default)]
     pub linked_issue: Option<crate::github::LinkedIssue>,
     /// When true, agent-completion desktop notifications for panes in this
@@ -1252,6 +1269,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
             notification_count: 0,
@@ -1333,6 +1351,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
             notification_count: 0,
@@ -1405,6 +1424,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
             notification_count: 0,
@@ -1508,6 +1528,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
             notification_count: 0,
@@ -1653,6 +1674,7 @@ impl AppStateStore {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
             notification_count: 0,
@@ -2085,6 +2107,7 @@ impl AppStateStore {
         pr_number: Option<u32>,
         pr_state: Option<String>,
         pr_url: Option<String>,
+        pr_head_branch: Option<String>,
     ) -> bool {
         let mut snapshot = self.inner.lock().unwrap();
         let Some(workspace) = snapshot
@@ -2094,15 +2117,22 @@ impl AppStateStore {
         else {
             return false;
         };
+        // The head branch joins the equality gate rather than riding along
+        // silently: a badge that stays numerically identical while moving
+        // from the current branch to a side branch (or back) changes whether
+        // auto-settle may act on it, and an ungated write would leave that
+        // switch unemitted.
         if workspace.pr_number == pr_number
             && workspace.pr_state == pr_state
             && workspace.pr_url == pr_url
+            && workspace.pr_head_branch == pr_head_branch
         {
             return false;
         }
         workspace.pr_number = pr_number;
         workspace.pr_state = pr_state;
         workspace.pr_url = pr_url;
+        workspace.pr_head_branch = pr_head_branch;
         true
     }
 
@@ -4909,6 +4939,7 @@ fn default_app_state() -> AppStateSnapshot {
             pr_number: None,
             pr_state: None,
             pr_url: None,
+            pr_head_branch: None,
             linked_issue: None,
             notifications_muted: false,
             notification_count: 0,
@@ -9620,24 +9651,64 @@ mod metadata_change_tests {
             Some(7),
             Some("OPEN".into()),
             Some("https://example.test/7".into()),
+            Some("feature".into()),
         ));
         assert!(!store.update_workspace_pr_info(
             &id,
             Some(7),
             Some("OPEN".into()),
             Some("https://example.test/7".into()),
+            Some("feature".into()),
         ));
         assert!(
-            store.update_workspace_pr_info(&id, Some(7), Some("MERGED".into()), None),
+            store.update_workspace_pr_info(&id, Some(7), Some("MERGED".into()), None, None),
             "a state transition is a change"
         );
         assert!(
-            store.update_workspace_pr_info(&id, None, None, None),
+            store.update_workspace_pr_info(&id, None, None, None, None),
             "clearing a populated pill is a change"
         );
         assert!(
-            !store.update_workspace_pr_info(&id, None, None, None),
+            !store.update_workspace_pr_info(&id, None, None, None, None),
             "clearing an empty pill is not"
+        );
+    }
+
+    #[test]
+    fn pr_head_branch_is_stored_and_gates_the_change_flag() {
+        // The head branch is what lets the sidebar tell a current-branch
+        // association from the badge-only side-branch fallback, and only the
+        // former may auto-settle a workspace. A badge whose number and state
+        // hold still while its head branch moves has therefore changed
+        // meaning, and must still be emitted.
+        let store = AppStateStore::default();
+        let id = store.create_workspace().0;
+
+        assert!(store.update_workspace_pr_info(
+            &id,
+            Some(250),
+            Some("OPEN".into()),
+            Some("https://example.test/250".into()),
+            Some("side-branch".into()),
+        ));
+        assert_eq!(
+            store
+                .snapshot()
+                .workspaces
+                .iter()
+                .find(|w| w.workspace_id.0 == id)
+                .and_then(|w| w.pr_head_branch.clone()),
+            Some("side-branch".to_string()),
+        );
+        assert!(
+            store.update_workspace_pr_info(
+                &id,
+                Some(250),
+                Some("OPEN".into()),
+                Some("https://example.test/250".into()),
+                Some("current-branch".into()),
+            ),
+            "the same PR re-associating to a different head branch is a change"
         );
     }
 
