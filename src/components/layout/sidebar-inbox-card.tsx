@@ -31,6 +31,7 @@ import {
   permissionBlockerText,
 } from "@/stores/sidebar-density-store";
 import { useProjectAppearance } from "./use-project-appearance";
+import { isRowActivationKey } from "./sidebar-row-activation";
 import { getWorkspaceProviders } from "@/lib/pane-status";
 import { computeSnoozePresets, type SnoozePreset } from "./sidebar-snooze";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
@@ -344,7 +345,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
               data-selected={selected || undefined}
               onClick={handleClick}
               onKeyDown={(e) => {
-                if (e.key !== "Enter" && e.key !== " ") return;
+                // Same guard the settled and snoozed rows use: this card hosts
+                // its own buttons (PR chip, snooze menu), and a key press on
+                // one of those bubbles up here. Without the target check, Enter
+                // on the PR chip would open the PR *and* yank the main pane
+                // onto the workspace, and Space would never reach the button at
+                // all — the preventDefault below would eat its native click.
+                if (!isRowActivationKey(e)) return;
                 // Space would otherwise scroll the sidebar as it activates
                 // the card.
                 if (e.key === " ") e.preventDefault();
@@ -599,7 +606,13 @@ export const SidebarInboxCard = memo(function SidebarInboxCard({
                       prStatusTextClass(prState),
                       workspace.pr_url
                         ? "hover:bg-foreground/[0.055]"
-                        : "pointer-events-none opacity-65",
+                        : // `cursor-default`, not `pointer-events-none`: the
+                          // chip is already `disabled`, so it swallows the
+                          // click. Letting pointer events pass through instead
+                          // would hand the click to the card root and select
+                          // the workspace, and the cursor would still read as
+                          // the card's `cursor-pointer`.
+                          "cursor-default opacity-65",
                     )}
                   >
                     <PrStatusIcon state={prState} size={3} className="shrink-0" />

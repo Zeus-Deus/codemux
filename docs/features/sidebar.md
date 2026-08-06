@@ -148,8 +148,9 @@ visual only — nothing is archived, closed, or deleted.
   logos · remote cloud icon · notification badge. The PR chip is **the same
   borderless badge settled rows use**: a state-colored `PrStatusIcon` + `#n`
   (open green, merged violet, closed red, draft muted), no border or fill, with
-  a hover tint only when there is a `pr_url` to open (dimmed and non-interactive
-  otherwise). Active and settled therefore render one PR the same way, so a card
+  a hover tint only when there is a `pr_url` to open (dimmed and `disabled`
+  otherwise, so the chip itself swallows the click instead of passing it to the
+  card). Active and settled therefore render one PR the same way, so a card
   settling no longer looks like the badge changed. The spacer sits *before* the
   PR chip deliberately: with it after, the chip began wherever the branch name
   happened to end, so chips landed at a different x on every card and the column
@@ -236,7 +237,9 @@ visual only — nothing is archived, closed, or deleted.
   scoped to the row node by `isRowActivationKey` (`Enter`/`Space` **and**
   `e.target === e.currentTarget`), so pressing Enter/Space on an inner control —
   the PR badge, Un-settle, Wake now — runs only that control's action instead of
-  also activating the workspace. Snoozed rows use the same guard. Because it is
+  also activating the workspace. Snoozed rows and active inbox cards share the
+  same guard (`sidebar-row-activation.ts`), so Enter/Space on a card's PR chip
+  opens the PR without also yanking the main pane onto the workspace. Because it is
   DOM-identity based, any inner interactive element added later is exempt
   automatically. Hover/focus
   reveals **Un-settle**, which reverses it (the returning card eases back in
