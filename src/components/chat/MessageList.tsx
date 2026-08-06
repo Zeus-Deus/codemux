@@ -57,6 +57,7 @@ import {
 } from "./transcript-fade";
 import {
   getAnchoredTurnMetrics,
+  getSendAnchorTargetOffset,
   realContentOverflowsViewport,
   resolveSendAnchorIndex,
   SEND_ANCHOR_OFFSET,
@@ -303,8 +304,26 @@ export const MessageList = memo(function MessageList({
   const localPositionedNonceRef = useRef<number | null>(null);
   const positionedRef = positionedNonceRef ?? localPositionedNonceRef;
   const settledNonceRef = useRef<number | null>(null);
+  // Which nonce *this mount* actually issued the glide for. "Positioned" is
+  // pane-owned and "settled" is per-mount, so without this the two records
+  // disagree after a remount: the fresh mount sees an already-positioned
+  // nonce, has no settle handshake in flight, and would gate the
+  // stream-advance for the rest of the turn.
+  const glideOwnerNonceRef = useRef<number | null>(null);
+  // A positioning chain waiting on a frame. Nonce-keyed so a re-fired
+  // `onReady` joins the in-flight attempt instead of starting a second one.
+  const pendingPositionNonceRef = useRef<number | null>(null);
   const settleCleanupRef = useRef<(() => void) | null>(null);
   const anchorFrameRef = useRef<number | null>(null);
+  const driftFrameRef = useRef<number | null>(null);
+  // The anchored turn's reserved space has collapsed to nothing — the reply
+  // outgrew it, so LegendList stops firing `onSizeChanged` from here on.
+  const spacerCollapsedNonceRef = useRef<number | null>(null);
+  // Render-visible half of the same fact: which nonce's turn has handed the
+  // built-in end pin back (spacer spent *and* glide settled).
+  const [endPinRestoredNonce, setEndPinRestoredNonce] = useState<number | null>(
+    null,
+  );
 
   const ownsScroll = useCallback(
     () => followGenerationRef.current === userScrollGenerationRef.current,
@@ -320,7 +339,33 @@ export const MessageList = memo(function MessageList({
     isAtEndRef.current = true;
     followGenerationRef.current = userScrollGenerationRef.current;
     anchorIndexRef.current = null;
+    spacerCollapsedNonceRef.current = null;
     pillEpochRef.current += 1;
+  }, []);
+
+  /** True while this send's positioning glide is in flight — the row has been
+   *  positioned but no settle handshake has confirmed it landed. Reads the
+   *  nonce through a ref so the callback identity stays stable across sends
+   *  (the edge listener below is subscribed with it). */
+  const sendNonceRef = useRef<number | null>(null);
+  const glideInFlight = useCallback(() => {
+    const nonce = sendNonceRef.current;
+    return (
+      nonce !== null &&
+      positionedRef.current === nonce &&
+      settledNonceRef.current !== nonce
+    );
+  }, [positionedRef]);
+
+  /** Hand the built-in end pin back, but only once the anchored turn is
+   *  genuinely spent: the reserved space has collapsed to 0 (so nothing is
+   *  left to yank the parked prompt) *and* the glide has settled. Both facts
+   *  arrive asynchronously and in either order, so both producers call this. */
+  const maybeRestoreEndPin = useCallback((nonce: number | null) => {
+    if (nonce === null) return;
+    if (spacerCollapsedNonceRef.current !== nonce) return;
+    if (settledNonceRef.current !== nonce) return;
+    setEndPinRestoredNonce((current) => (current === nonce ? current : nonce));
   }, []);
 
   const hideJumpToLatest = useCallback(() => {
@@ -379,6 +424,7 @@ export const MessageList = memo(function MessageList({
   // measures that row.
   const anchorClientNonce = sendAnchor?.clientNonce ?? null;
   const sendNonce = sendAnchor?.nonce ?? null;
+  sendNonceRef.current = sendNonce;
   // Deliberately seeded `null`, not with the current nonce: a list that
   // mounts with an anchor already in hand (a pane remounting after a
   // workspace switch) still has to honour it.
@@ -391,8 +437,10 @@ export const MessageList = memo(function MessageList({
     lastSendNonceRef.current = sendNonce;
     claimScroll("following-end");
     setShowJumpToLatest(false);
+    setEndPinRestoredNonce(null);
   } else if (sendNonce !== lastSendNonceRef.current) {
     lastSendNonceRef.current = sendNonce;
+    setEndPinRestoredNonce(null);
     if (sendAnchor) {
       claimScroll("anchoring-turn");
       setShowJumpToLatest(false);
@@ -420,6 +468,13 @@ export const MessageList = memo(function MessageList({
       if (anchorFrameRef.current !== null) {
         cancelAnimationFrame(anchorFrameRef.current);
       }
+      if (driftFrameRef.current !== null) {
+        cancelAnimationFrame(driftFrameRef.current);
+      }
+      // A chain still waiting on a frame must not resume after unmount, and
+      // a nonce that never reached the positioning step must not read as
+      // positioned to the next mount.
+      pendingPositionNonceRef.current = null;
       settleCleanupRef.current?.();
     },
     [],
@@ -441,6 +496,18 @@ export const MessageList = memo(function MessageList({
         hideJumpToLatest();
         return;
       }
+      if (atEnd && ownsScroll() && glideInFlight()) {
+        // Mid-glide the viewport passes inside LegendList's near-end
+        // threshold (half a viewport), so the list truthfully reports "at
+        // end" while we are still travelling. Promoting that to
+        // `following-end` would hand the next streamed token the follow
+        // branch, whose instant `scrollToEnd` cuts the glide to wherever it
+        // happened to be. Stay in `anchoring-turn` until the settle
+        // handshake lands; a real reader gesture still wins, because it
+        // drops the follow claim and `ownsScroll()` goes false.
+        hideJumpToLatest();
+        return;
+      }
       if (!changed) return;
       if (atEnd) {
         // Scrolling back to the edge re-claims live follow, even after a
@@ -454,7 +521,7 @@ export const MessageList = memo(function MessageList({
         scheduleJumpToLatest();
       }
     },
-    [hideJumpToLatest, ownsScroll, scheduleJumpToLatest],
+    [glideInFlight, hideJumpToLatest, ownsScroll, scheduleJumpToLatest],
   );
 
   // The edge signal is `isNearEnd` (LegendList's `onEndReachedThreshold`,
@@ -522,69 +589,132 @@ export const MessageList = memo(function MessageList({
       if (!clientNonce || nonce === null || anchorIndex === undefined) return;
       // Always refresh the index: rows landing above the prompt shift it.
       anchorIndexRef.current = anchorIndex;
-      if (positionedRef.current === nonce) return;
-      positionedRef.current = nonce;
+
+      if (positionedRef.current === nonce) {
+        // Already parked. If *this* mount ran the glide, its settle handshake
+        // owns the settled mark and must not be short-circuited here — a
+        // re-fired `onReady` mid-glide would otherwise open the advance gate
+        // and cut the animation. If it did not, this is a remount under a
+        // still-live anchor: there is no glide in flight and nothing else
+        // will ever mark the nonce, so record it now. Without this the
+        // advance decision stays gated for the rest of the turn.
+        if (glideOwnerNonceRef.current !== nonce) {
+          settledNonceRef.current = nonce;
+          maybeRestoreEndPin(nonce);
+        }
+        return;
+      }
+      // A chain for this nonce is already waiting on a frame — the refreshed
+      // index above is all it needed.
+      if (pendingPositionNonceRef.current === nonce) return;
+      pendingPositionNonceRef.current = nonce;
 
       const position = (attemptsLeft: number) => {
         anchorFrameRef.current = requestAnimationFrame(() => {
           anchorFrameRef.current = null;
-          if (positionedRef.current !== nonce) return;
-          if (!ownsScroll()) return;
+          if (pendingPositionNonceRef.current !== nonce) return;
+          if (!ownsScroll()) {
+            pendingPositionNonceRef.current = null;
+            return;
+          }
           const list = listRef.current;
           if (!list) {
             // The ref can still be empty on the frame the list mounts;
             // retry on later frames rather than assuming a fixed delay.
             if (attemptsLeft > 0) position(attemptsLeft - 1);
+            else pendingPositionNonceRef.current = null;
             return;
           }
+          pendingPositionNonceRef.current = null;
+          // Recorded HERE, not before the frame: everything above can bail
+          // (unmount, a reader gesture, a list ref that never appears), and a
+          // nonce marked positioned on a path that never parks it and never
+          // settles it gates the stream-advance for the whole turn.
+          positionedRef.current = nonce;
+          glideOwnerNonceRef.current = nonce;
+
+          const targetIndex = anchorIndexRef.current ?? anchorIndex;
+          const reposition = (animated: boolean) =>
+            listRef.current?.scrollToIndex({
+              index: anchorIndexRef.current ?? targetIndex,
+              animated,
+              viewPosition: 0,
+              viewOffset: SEND_ANCHOR_OFFSET,
+            });
+
           const animated = !prefersReducedMotion();
           if (animated) {
             const viewport = list.getScrollableNode();
             settleCleanupRef.current?.();
             let finished = false;
-            const finish = () => {
+            /** `viaTimeout` distinguishes the two ways a glide can end, which
+             *  need different landings — see the branches below. */
+            const settle = (viaTimeout: boolean) => {
               if (finished) return;
               finished = true;
               window.clearTimeout(fallback);
-              viewport?.removeEventListener("scrollend", finish);
+              viewport?.removeEventListener("scrollend", onScrollEnd);
               settleCleanupRef.current = null;
               settledNonceRef.current = nonce;
+              maybeRestoreEndPin(nonce);
               // A newer send or a reader gesture owns the viewport now —
-              // freezing it at "wherever the old glide got to" would fight
-              // the new owner.
+              // re-pinning would fight the new owner.
               if (positionedRef.current !== nonce || !ownsScroll()) return;
               const current = listRef.current;
               if (!current) return;
+              if (viaTimeout) {
+                // No `scrollend` arrived. On WebKitGTK the event is never
+                // emitted at all, so this is the *primary* path there and the
+                // animation may still be mid-travel: pinning the current
+                // offset would park the prompt at an arbitrary point. Re-issue
+                // the instant placement instead — it kills the momentum AND
+                // lands on the contract's 16px offset.
+                void reposition(false);
+                return;
+              }
               void current.scrollToOffset({
                 offset: current.getState().scroll,
                 animated: false,
               });
             };
+            /** `scrollend` carries no identity, so correlate it with this
+             *  glide's intended landing before trusting it. A stray event from
+             *  an unrelated smooth scroll (the "Jump to latest" pill) would
+             *  otherwise settle the nonce from the middle of the travel. A
+             *  rejected event costs nothing: the fallback timer below still
+             *  bounds the wait, and it lands on the target authoritatively. */
+            const onScrollEnd = () => {
+              if (finished) return;
+              if (!landedOnAnchorTarget(listRef.current, anchorIndexRef.current ?? targetIndex)) {
+                // Not our glide (or not there yet) — keep listening.
+                viewport?.addEventListener("scrollend", onScrollEnd, {
+                  once: true,
+                });
+                return;
+              }
+              settle(false);
+            };
             const fallback = window.setTimeout(
-              finish,
+              () => settle(true),
               SEND_ANCHOR_SETTLE_FALLBACK_MS,
             );
-            viewport?.addEventListener("scrollend", finish, { once: true });
+            viewport?.addEventListener("scrollend", onScrollEnd, { once: true });
             settleCleanupRef.current = () => {
               finished = true;
               window.clearTimeout(fallback);
-              viewport?.removeEventListener("scrollend", finish);
+              viewport?.removeEventListener("scrollend", onScrollEnd);
               settleCleanupRef.current = null;
             };
           } else {
             settledNonceRef.current = nonce;
+            maybeRestoreEndPin(nonce);
           }
-          void list.scrollToIndex({
-            index: anchorIndexRef.current ?? anchorIndex,
-            animated,
-            viewPosition: 0,
-            viewOffset: SEND_ANCHOR_OFFSET,
-          });
+          void reposition(animated);
         });
       };
       position(ANCHOR_POSITION_ATTEMPTS);
     },
-    [anchorClientNonce, ownsScroll, positionedRef, sendNonce],
+    [anchorClientNonce, maybeRestoreEndPin, ownsScroll, positionedRef, sendNonce],
   );
 
   // Two nested frames let LegendList lay out and measure new content before
@@ -621,24 +751,63 @@ export const MessageList = memo(function MessageList({
    *  LegendList's disabled end pin can no longer do while an anchor is
    *  mounted. Free-scrolling: restore the captured offset if the browser
    *  drifted it by a hair, so the resize is imperceptible. */
-  const handleAnchorSizeChanged = useCallback(() => {
-    if (ownsScroll()) {
-      scheduleAdvance();
-      return;
-    }
-    const list = listRef.current;
-    if (!list) return;
-    const offset = list.getState().scroll;
-    requestAnimationFrame(() => {
-      if (ownsScroll()) return;
-      const current = listRef.current;
-      if (!current) return;
-      const drifted = current.getState().scroll;
-      if (drifted !== offset && Math.abs(drifted - offset) <= 2) {
-        void current.scrollToOffset({ offset, animated: false });
+  const handleAnchorSizeChanged = useCallback(
+    (size?: number) => {
+      // The reply has eaten the whole reserved space. LegendList pins the
+      // spacer at 0 and stops calling back from here on, so this is the last
+      // chance to bound the window in which the built-in end pin stays off —
+      // otherwise, with the anchor no longer expiring, late layout growth
+      // would never reveal the tail again for the rest of the thread.
+      if (typeof size === "number" && size <= 0) {
+        const nonce = sendNonceRef.current;
+        if (nonce !== null) {
+          spacerCollapsedNonceRef.current = nonce;
+          maybeRestoreEndPin(nonce);
+        }
       }
-    });
-  }, [ownsScroll, scheduleAdvance]);
+      if (ownsScroll()) {
+        scheduleAdvance();
+        return;
+      }
+      const list = listRef.current;
+      if (!list) return;
+      const offset = list.getState().scroll;
+      // Coalesce like every other scheduled correction here: a burst of
+      // resizes must settle on one restore, against the offset captured by
+      // the newest of them.
+      if (driftFrameRef.current !== null) {
+        cancelAnimationFrame(driftFrameRef.current);
+      }
+      driftFrameRef.current = requestAnimationFrame(() => {
+        driftFrameRef.current = null;
+        if (ownsScroll()) return;
+        const current = listRef.current;
+        if (!current) return;
+        // Already clamped at the bottom of a now-shorter scroll range: the
+        // "drift" is the browser enforcing that range, and restoring would
+        // just be undone on the next frame.
+        const node = current.getScrollableNode();
+        if (
+          node &&
+          node.scrollHeight > node.clientHeight &&
+          node.scrollTop >= node.scrollHeight - node.clientHeight - 1
+        ) {
+          return;
+        }
+        const drifted = current.getState().scroll;
+        if (drifted !== offset && Math.abs(drifted - offset) <= 2) {
+          void current.scrollToOffset({ offset, animated: false });
+        }
+      });
+    },
+    [maybeRestoreEndPin, ownsScroll, scheduleAdvance],
+  );
+
+  /** The anchored turn is spent — reserved space consumed and glide settled —
+   *  so LegendList's own end pin has been handed back for the rest of this
+   *  thread. Nonce-scoped: the next send re-takes it. */
+  const endPinReleased =
+    endPinRestoredNonce !== null && endPinRestoredNonce === sendNonce;
 
   // The reserved response area. Resolving by `clientNonce` (last match wins)
   // rather than "the last row" is what keeps the anchor on the prompt the
@@ -670,18 +839,16 @@ export const MessageList = memo(function MessageList({
     const list = listRef.current;
     if (!list) return;
     const state = list.getState();
+    // The positioning glide owns the viewport until it settles; any advance
+    // mid-glide — anchored OR following — would cut the animation to wherever
+    // it happened to be. Hoisted above the mode branch because the edge
+    // listener can legitimately see "at end" mid-glide, and the follow
+    // branch's instant `scrollToEnd` is the harsher of the two cuts.
+    if (glideInFlight()) return;
     if (modeRef.current === "anchoring-turn") {
       const anchorIndex = anchorIndexRef.current;
       // Not measured yet — `onReady` owns the first positioning.
       if (anchorIndex === null) return;
-      // The positioning glide owns the viewport until it settles; advancing
-      // mid-glide would cut the animation to wherever it happened to be.
-      if (
-        positionedRef.current === sendNonce &&
-        settledNonceRef.current !== sendNonce
-      ) {
-        return;
-      }
       const metrics = getAnchoredTurnMetrics({ state, anchorIndex });
       if (!metrics || metrics.scrollDeltaToRevealEnd <= 1) return;
       void list.scrollToOffset({
@@ -691,11 +858,11 @@ export const MessageList = memo(function MessageList({
       return;
     }
     if (modeRef.current !== "following-end") return;
-    // With no anchor mounted, LegendList's own end pin is enabled and
-    // already owns this — driving it twice would be redundant work on
-    // every streamed token. We only take over for the window where an
-    // anchor has disabled that pin but the reader is back at the edge.
-    if (!anchoredEndSpace) return;
+    // Whenever LegendList's own end pin is enabled it already owns this —
+    // driving it twice would be redundant work on every streamed token. We
+    // only take over for the window where an anchor has disabled that pin
+    // but the reader is back at the edge.
+    if (!anchoredEndSpace || endPinReleased) return;
     // Without this the reserved blank space would be a scroll target.
     if (!realContentOverflowsViewport(state)) return;
     void list.scrollToEnd({ animated: false });
@@ -939,9 +1106,14 @@ export const MessageList = memo(function MessageList({
         // for the same viewport, so they must not both be live. While an
         // anchor is reserving response space, the effect above is the sole
         // driver — otherwise the built-in end pin would immediately yank the
-        // freshly parked prompt off the top of the screen.
+        // freshly parked prompt off the top of the screen. That hand-off is
+        // bounded to the anchored turn: once the reply has consumed the whole
+        // reserved space AND the glide has settled, there is nothing left to
+        // yank and the pin comes back, so item/footer layout growth the
+        // anchor does not model (a late-loading image) still reveals the tail
+        // for the rest of the thread's life.
         maintainScrollAtEnd={
-          anchoredEndSpace ? false : MAINTAIN_SCROLL_AT_END
+          anchoredEndSpace && !endPinReleased ? false : MAINTAIN_SCROLL_AT_END
         }
         maintainScrollAtEndThreshold={0.03}
         maintainVisibleContentPosition={{ data: true, size: false }}
@@ -991,6 +1163,35 @@ const ANCHOR_POSITION_ATTEMPTS = 12;
  *  waiting for `scrollend` — the event is not implemented everywhere this
  *  webview runs, and a glide that covers no distance may never emit one. */
 const SEND_ANCHOR_SETTLE_FALLBACK_MS = 750;
+
+/** How close to the intended landing offset a `scrollend` has to be before it
+ *  counts as "this glide finished". Wide enough to absorb sub-pixel rounding
+ *  in the platform's smooth-scroll implementation, tight enough that an
+ *  unrelated animated scroll cannot pass for the anchor's. */
+const SEND_ANCHOR_SETTLE_TOLERANCE_PX = 4;
+
+/** Correlate a `scrollend` with the anchor glide: did the viewport actually
+ *  land where `scrollToIndex({ viewPosition: 0, viewOffset })` was aiming?
+ *  Clamped against the scroller's real maximum, because a target past the end
+ *  of the scroll range legitimately lands short. Falls back to trusting the
+ *  event when nothing is measurable (an unmeasured row, a list double with no
+ *  layout) rather than stalling the handshake on the fallback timer. */
+function landedOnAnchorTarget(
+  list: LegendListRef | null,
+  anchorIndex: number,
+): boolean {
+  if (!list) return true;
+  const state = list.getState();
+  const target = getSendAnchorTargetOffset(state, anchorIndex);
+  if (target === null) return true;
+  const node = list.getScrollableNode();
+  const maxScroll =
+    node && node.scrollHeight > node.clientHeight
+      ? node.scrollHeight - node.clientHeight
+      : null;
+  const reachable = maxScroll === null ? target : Math.min(target, maxScroll);
+  return Math.abs(state.scroll - reachable) <= SEND_ANCHOR_SETTLE_TOLERANCE_PX;
+}
 
 /** Smooth scrolling is a comfort feature, not a contract — readers who ask
  *  the platform for reduced motion get the instant placement instead. */

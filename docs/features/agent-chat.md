@@ -1077,14 +1077,30 @@ Contract preserved from the pre-redesign renderer:
     re-resolves the reserved space but skips the one-time positioning scroll.
     The geometry keeps the open position honest anyway: with the spacer
     mounted, the end of content *is* the anchored position, so
-    `initialScrollAtEnd` lands where the reader left off.
+    `initialScrollAtEnd` lands where the reader left off. The fresh mount
+    also marks that nonce **settled** on the way past: "settled" is a
+    property of a glide, and a remount has none in flight, so leaving it
+    unmarked would gate the stream-advance (which waits for it) for the rest
+    of the turn and freeze the viewport under a live reply.
   - *Layout growth still reveals the tail.* The built-in end pin stays off
     while an anchor is mounted, so `anchoredEndSpace.onSizeChanged` re-runs
     the advance decision. Item/footer growth that arrives with **no data
     change** (a late-loading image) shrinks the spacer, fires the callback,
     and the tail is kept on screen — the job the disabled pin used to do.
     The same callback, while the reader is `free-scrolling`, restores a ≤2px
-    browser drift of the scroll offset so a spacer resize is imperceptible.
+    browser drift of the scroll offset so a spacer resize is imperceptible
+    (coalesced to one restore per burst, and skipped when the offset is
+    already clamped at the bottom of a shortened scroll range).
+
+    That hand-off is **bounded to the anchored turn**, because the anchor
+    itself no longer expires. Once the reply has consumed the whole reserved
+    space LegendList clamps the spacer at 0 and stops calling back — so that
+    moment, combined with the glide having settled, is when
+    `maintainScrollAtEnd` is handed back. Otherwise the pin would stay off
+    for the remaining life of the thread and late layout growth would never
+    reveal the tail again. Re-engaging it then is safe precisely because the
+    spacer is already spent: there is no reserved space left to collapse, so
+    nothing can yank the parked prompt. The next send takes the pin back.
 
   **Anchor after measurement, never on a timer — and as a glide.** The
   resolved slot index feeds LegendList's `anchoredEndSpace` (`anchorOffset:
@@ -1092,19 +1108,45 @@ Contract preserved from the pre-redesign renderer:
   reserved space sized — is what positions the row, via `scrollToIndex({
   animated: true, viewPosition: 0, viewOffset: 16 })`: a follow-up in a long
   thread visibly travels to its parked spot instead of teleporting, which is
-  most of what makes a send *feel* like navigation. A settle handshake —
-  `scrollend`, with a `SEND_ANCHOR_SETTLE_FALLBACK_MS` (750ms) timer where
-  the event is unsupported or the glide covers no distance — then re-pins
-  the landed offset instantly to kill residual momentum and marks the nonce
-  settled. The stream-advance effect waits for that settle mark, so a fast
-  first token cannot cut the glide short; a reader gesture mid-glide still
-  wins through the usual generation counter. `prefers-reduced-motion`
-  falls back to instant placement. If the list ref is not live yet the
-  positioner retries per frame (a frame budget, not an assumption that
-  layout completes in N ms). While an anchor is mounted the built-in
-  `maintainScrollAtEnd` is switched **off**: follow-the-tail and
-  anchor-the-new-turn are two targets for one viewport and must not both
-  drive it. As the answer grows, the advance moves by exactly
+  most of what makes a send *feel* like navigation. A settle handshake then
+  confirms the glide finished and marks the nonce settled, by one of two
+  paths:
+
+  - `scrollend` — but only when the landed offset matches the placement the
+    glide was aiming for (`getSendAnchorTargetOffset`, clamped against the
+    scroller's real maximum, ±4px). The event carries no identity, so an
+    unrelated smooth scroll — the "Jump to latest" pill's animated
+    `scrollToEnd`, for one — would otherwise settle the nonce from the
+    middle of the travel. A rejected event costs nothing; the timer below
+    still bounds the wait.
+  - the `SEND_ANCHOR_SETTLE_FALLBACK_MS` (750ms) timer, where `scrollend` is
+    unsupported (WebKitGTK never emits it, so there this is the *primary*
+    path) or the glide covers no distance. Because the animation may still
+    be mid-travel when it fires, this path does **not** pin wherever the
+    scroll happens to be — it re-issues `scrollToIndex({ animated: false,
+    viewPosition: 0, viewOffset: 16 })`, which kills the momentum *and*
+    guarantees the contract's landing position.
+
+  A `scrollend` that did correlate re-pins the landed offset instantly, to
+  kill residual momentum. Both the anchored *and* the follow advance branches
+  wait for the settle mark, so a fast first token cannot cut the glide short.
+  The follow branch matters as much as the anchored one: `isNearEnd` is
+  LegendList's half-a-viewport threshold, so it legitimately flips true
+  partway through the glide, and the edge listener is therefore also blocked
+  from leaving `anchoring-turn` while the nonce is unsettled — otherwise the
+  next token would take the follow branch and its instant `scrollToEnd` would
+  cut the animation harder than an early advance would. A reader gesture
+  mid-glide still wins through the usual generation counter.
+  `prefers-reduced-motion` falls back to instant placement. If the list ref
+  is not live yet the positioner retries per frame (a frame budget, not an
+  assumption that layout completes in N ms); the nonce is recorded as
+  positioned only at the moment the placement actually runs, so a mount that
+  bails in that window cannot leave a nonce marked positioned that nothing
+  will ever settle. While an anchor is mounted the built-in
+  `maintainScrollAtEnd` is switched **off** for the duration of that turn
+  (see the bound above): follow-the-tail and anchor-the-new-turn are two
+  targets for one viewport and must not both drive it. As the answer grows,
+  the advance moves by exactly
   `scrollDeltaToRevealEnd` — zero while the turn still fits, so the prompt
   stays near the top, then just enough to keep the growing tail on screen.
   The geometry is pure and unit-tested (`send-scroll-state.test.ts`).
