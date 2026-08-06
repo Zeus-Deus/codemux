@@ -137,6 +137,10 @@ pub fn sanitize_gui_env_tokio_keep_dbus(cmd: &mut tokio::process::Command) {
 ///
 /// AppRun *prepends* AppDir entries to these, so the user's original entries
 /// are still present and must be preserved. Only AppDir entries are dropped.
+///
+/// `LD_PRELOAD` deliberately does **not** belong here: it is space-*or*-colon
+/// separated, so the `:` split would mangle a space-separated value, and no
+/// AppRun variant sets it — every value we could see is the user's own.
 const APPIMAGE_PATH_LIST_KEYS: &[&str] = &[
     "PATH",
     "LD_LIBRARY_PATH",
@@ -152,7 +156,6 @@ const APPIMAGE_PATH_LIST_KEYS: &[&str] = &[
     "GST_PLUGIN_SYSTEM_PATH",
     "GST_PLUGIN_SYSTEM_PATH_1_0",
     "GST_PLUGIN_PATH",
-    "LD_PRELOAD",
 ];
 
 /// Variables whose value is a single AppDir-rooted path or prefix.
@@ -179,6 +182,34 @@ const APPIMAGE_SCALAR_KEYS: &[&str] = &[
 /// a child has no business seeing them and tools that probe `APPIMAGE` to
 /// detect a bundle should conclude "not bundled".
 const APPIMAGE_MARKER_KEYS: &[&str] = &["APPIMAGE", "APPIMAGE_UUID", "ARGV0", "OWD"];
+
+/// Variables AppRun *overwrites* with a value it computes for itself.
+///
+/// Unlike the scalar class these are not AppDir-rooted, so there is no prefix
+/// to test — but there is also nothing of the user's left in them: whatever
+/// they held before launch was clobbered. The GTK theme pair is the concrete
+/// case (`linuxdeploy-plugin-gtk.sh` sets `GTK_THEME="$APPIMAGE_GTK_THEME"`
+/// with the comment "Custom themes are broken"), which otherwise forces every
+/// GTK program started from a Codemux terminal to `Adwaita:dark` regardless of
+/// the user's desktop theme.
+const APPIMAGE_OVERWRITTEN_KEYS: &[&str] = &["GTK_THEME", "APPIMAGE_GTK_THEME"];
+
+/// Variables AppRun sets to a fixed literal, removed only when still that
+/// literal.
+///
+/// Strictly speaking AppRun clobbers these too, so an unconditional rule would
+/// also be correct — the value match is cheap insurance in case a future AppRun
+/// stops setting them and a user value shows through instead.
+///
+/// - `GDK_BACKEND=x11` (the GTK plugin's Wayland-crash workaround) forces every
+///   GTK child of a terminal through XWayland on a Wayland session.
+/// - `PYTHONDONTWRITEBYTECODE=1` (set by the AppImage runtime) silently changes
+///   how the user's `python3` behaves.
+///
+/// `GDK_BACKEND` is also in [`gui_env_keys`], which covers backend helpers;
+/// this entry is what closes the same hole for interactive terminals.
+const APPIMAGE_FIXED_VALUE_KEYS: &[(&str, &str)] =
+    &[("GDK_BACKEND", "x11"), ("PYTHONDONTWRITEBYTECODE", "1")];
 
 /// The AppDir mount root, when running from an AppImage.
 fn appdir_root() -> Option<String> {
@@ -219,14 +250,19 @@ fn compute_appimage_fixups(
 
     for key in APPIMAGE_PATH_LIST_KEYS {
         let Some(value) = lookup(key) else { continue };
-        let original: Vec<&str> = value.split(':').filter(|e| !e.is_empty()).collect();
+        // Empty entries are dropped along with AppDir entries, uniformly: an
+        // empty field means "the current directory", which is never what the
+        // user asked for and is exactly what AppRun's trailing `:` leaves
+        // behind. Dropping them only when an AppDir entry happened to be
+        // present too would make the rule depend on unrelated input.
+        let original: Vec<&str> = value.split(':').collect();
         let kept: Vec<&str> = original
             .iter()
             .copied()
-            .filter(|entry| !is_under_appdir(entry, appdir))
+            .filter(|entry| !entry.is_empty() && !is_under_appdir(entry, appdir))
             .collect();
         if kept.len() == original.len() {
-            continue; // nothing of ours in here; leave it untouched
+            continue; // nothing of ours (and no empties) in here; leave it alone
         }
         if kept.is_empty() {
             fixups.push(((*key).to_string(), None));
@@ -242,8 +278,14 @@ fn compute_appimage_fixups(
         }
     }
 
-    for key in APPIMAGE_MARKER_KEYS {
+    for key in APPIMAGE_MARKER_KEYS.iter().chain(APPIMAGE_OVERWRITTEN_KEYS) {
         if lookup(key).is_some() {
+            fixups.push(((*key).to_string(), None));
+        }
+    }
+
+    for (key, apprun_value) in APPIMAGE_FIXED_VALUE_KEYS {
+        if lookup(key).as_deref() == Some(*apprun_value) {
             fixups.push(((*key).to_string(), None));
         }
     }
@@ -492,6 +534,78 @@ mod tests {
             env_of(&[("APPIMAGE", "/home/zeus/Downloads/codemux_0.17.0_amd64.AppImage")]),
         );
         assert_eq!(fixup(&fixups, "APPIMAGE"), Some(&None));
+    }
+
+    #[test]
+    fn appimage_fixups_drop_empty_path_entries_uniformly() {
+        // A trailing/duplicated `:` means "current directory". Whether the
+        // list also happened to contain an AppDir entry must not change what
+        // happens to the empties, so this list (empties only, no AppDir) is
+        // still rewritten.
+        let fixups = compute_appimage_fixups(
+            APPDIR,
+            env_of(&[("PYTHONPATH", "/opt/py::/usr/lib/py:")]),
+        );
+        assert_eq!(
+            fixup(&fixups, "PYTHONPATH"),
+            Some(&Some("/opt/py:/usr/lib/py".to_string())),
+            "empty entries must be dropped whether or not an AppDir entry was present"
+        );
+    }
+
+    #[test]
+    fn appimage_fixups_leave_ld_preload_alone() {
+        // LD_PRELOAD is space-or-colon separated and never set by AppRun, so
+        // splitting it on `:` would corrupt a legitimate user value.
+        let fixups = compute_appimage_fixups(
+            APPDIR,
+            env_of(&[("LD_PRELOAD", "/opt/a.so /opt/b.so")]),
+        );
+        assert!(
+            fixup(&fixups, "LD_PRELOAD").is_none(),
+            "LD_PRELOAD must not be rewritten, got {fixups:?}"
+        );
+    }
+
+    #[test]
+    fn appimage_fixups_drop_apprun_toolkit_overrides() {
+        // AppRun clobbers the GTK theme pair and pins GDK_BACKEND/python's
+        // bytecode flag. Left in place they force every GTK child of a
+        // terminal to Adwaita:dark through XWayland.
+        let fixups = compute_appimage_fixups(
+            APPDIR,
+            env_of(&[
+                ("GTK_THEME", "Adwaita:dark"),
+                ("APPIMAGE_GTK_THEME", "Adwaita:dark"),
+                ("GDK_BACKEND", "x11"),
+                ("PYTHONDONTWRITEBYTECODE", "1"),
+            ]),
+        );
+        for key in [
+            "GTK_THEME",
+            "APPIMAGE_GTK_THEME",
+            "GDK_BACKEND",
+            "PYTHONDONTWRITEBYTECODE",
+        ] {
+            assert_eq!(fixup(&fixups, key), Some(&None), "{key} must be removed");
+        }
+    }
+
+    #[test]
+    fn appimage_fixups_keep_fixed_value_keys_with_other_values() {
+        // The value match is what keeps this conservative: a GDK_BACKEND that
+        // is not AppRun's `x11` did not come from AppRun.
+        let fixups = compute_appimage_fixups(
+            APPDIR,
+            env_of(&[
+                ("GDK_BACKEND", "wayland"),
+                ("PYTHONDONTWRITEBYTECODE", "0"),
+            ]),
+        );
+        assert!(
+            fixups.is_empty(),
+            "non-AppRun values must survive, got {fixups:?}"
+        );
     }
 
     #[test]

@@ -36,11 +36,12 @@ This layer is separate from GUI hygiene and applies to *interactive* terminals t
 
 When Codemux runs from an AppImage, `AppRun` rewrites loader and toolkit variables to point into the mounted AppDir (`/tmp/.mount_codemuXXXXXX`) so the bundled binary finds its bundled libraries. Those values are correct for Codemux and wrong for every child: a shell that inherits `LD_LIBRARY_PATH` resolves system binaries against our bundled `libssl`/`libpcre2`. On a host whose libraries are newer than the bundle this fails before `main` — e.g. `cargo` dying with ``version `OPENSSL_3.5.0' not found`` without ever reading `Cargo.toml`. `PYTHONHOME` and `PATH` break system `python3` and shadow the user's toolchain the same way.
 
-Three rule classes, all keyed off `APPDIR`:
+Four rule classes, all keyed off `APPDIR`:
 
-- **Path lists** (`PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`, `XDG_DATA_DIRS`, …) — AppRun *prepends*, so only AppDir entries are dropped and the user's entries survive. A list left with nothing is removed entirely rather than set to empty.
+- **Path lists** (`PATH`, `LD_LIBRARY_PATH`, `PYTHONPATH`, `XDG_DATA_DIRS`, …) — AppRun *prepends*, so only AppDir entries are dropped and the user's entries survive. A list left with nothing is removed entirely rather than set to empty. Empty entries (an empty field means "the current directory", and AppRun's trailing `:` leaves one) are dropped uniformly whenever the list is rewritten, so the rule never depends on whether an AppDir entry happened to be present. `LD_PRELOAD` is deliberately *not* in this class: it is space-or-colon separated and no AppRun variant sets it, so any value seen is the user's own.
 - **AppDir-rooted scalars** (`PYTHONHOME`, `GTK_EXE_PREFIX`, `GDK_PIXBUF_MODULE_FILE`, …) — removed only when the value actually points into the AppDir, so a user's own value survives.
-- **Launch markers** (`APPIMAGE`, `APPIMAGE_UUID`, `ARGV0`, `OWD`) — not AppDir-rooted, so removed unconditionally when running from a bundle.
+- **Launch markers** (`APPIMAGE`, `APPIMAGE_UUID`, `ARGV0`, `OWD`) and **AppRun-overwritten values** (`GTK_THEME`, `APPIMAGE_GTK_THEME`) — not AppDir-rooted, but nothing of the user's is left in them either, so they are removed unconditionally when running from a bundle. The GTK theme pair otherwise pins every GTK program started from a terminal to `Adwaita:dark` regardless of the desktop theme.
+- **Fixed AppRun literals** (`GDK_BACKEND=x11`, `PYTHONDONTWRITEBYTECODE=1`) — removed only when the value still matches what AppRun sets. `GDK_BACKEND=x11` (the plugin's Wayland-crash workaround) otherwise drags every GTK child through XWayland; `GDK_BACKEND` is also in `gui_env_keys()`, which covers backend helpers, and this class is what closes the same hole for interactive terminals.
 
 Entry points, mirroring the GUI helpers:
 
@@ -54,10 +55,11 @@ Prefer `host_command("git")` over `std::process::Command::new("git")` anywhere C
 
 `host_command` is orthogonal to the GUI sanitizers — it touches only loader/toolkit path variables and never `DISPLAY`/`WAYLAND_DISPLAY`. That is what makes it safe at sites that must *keep* the desktop environment, such as `open_in_editor`, which deliberately skips `sanitize_gui_env_std` so the editor can actually show a window.
 
-Two invariants that are easy to break:
+Three invariants that are easy to break:
 
 1. **Leaf spawns only.** The pty-daemon is the Codemux binary re-executed and still needs the AppDir libraries itself, so the strip must never move up to `pty_daemon/supervisor.rs` — doing so stops the daemon from launching.
-2. **Sanitize before layering `PATH`.** These helpers derive `PATH` from the *process* environment. Any call site that then sets its own `PATH` (CLI shim injection) must run after the sanitizer and start from `sanitized_child_path()`, or it re-introduces the AppDir entries.
+2. **Sanitize before layering `PATH`.** These helpers derive `PATH` from the *process* environment. Any call site that then sets its own `PATH` (CLI shim injection) must run after the sanitizer and start from `sanitized_child_path()`, or it re-introduces the AppDir entries. Every call site applies the sanitizer first and lets its own explicit pairs win.
+3. **Nothing in-tree may read `$APPDIR`/`$APPIMAGE` to learn how it was installed.** Those variables are gone in any process Codemux spawned, so a `codemux` CLI run from a terminal pane or a setup script sees "not an AppImage". `web_remote/connect.rs` is the live example: it needs to know the install shape to pick a `systemd` `ExecStart`, and derives the AppDir from `current_exe()`'s layout (an `AppRun` three levels up) instead, refusing any candidate under a throwaway `/tmp/.mount_*` mount.
 
 Call sites:
 
@@ -81,4 +83,4 @@ Any future sandbox should be introduced as a new, independently reviewed boundar
 - `src-tauri/tests/appimage_env_hygiene.rs` re-executes the test binary under a simulated AppImage environment and asserts a real PTY child and a real Tokio child come out clean; it also pins the non-AppImage no-op
 - `cargo test --manifest-path src-tauri/Cargo.toml` covers the module and integration tests
 
-The AppImage sanitizers only act when `APPDIR` is set, so a test that needs them active cannot simply call them — the test process must itself have `APPDIR`. Mutating the current process's environment is racy under parallel tests and `unsafe`, hence the re-exec pattern in `appimage_env_hygiene.rs`. That harness asserts the child printed `1 passed`, because a libtest filter matching nothing still exits 0 and would otherwise make the test vacuously green.
+The AppImage sanitizers only act when `APPDIR` is set, so a test that needs them active cannot simply call them — the test process must itself have `APPDIR`. Mutating the current process's environment is racy under parallel tests and `unsafe`, hence the re-exec pattern in `appimage_env_hygiene.rs`. Every assertion about the sanitizers must go through `run_inner_test`; run outside it, the fixup list is empty and the assertions pass vacuously. The harness asserts the child printed `test result: ok. 1 passed` (the full summary line, since a bare `1 passed` also matches `11 passed`), because a libtest filter matching nothing still exits 0 and would otherwise make the test green for the wrong reason.

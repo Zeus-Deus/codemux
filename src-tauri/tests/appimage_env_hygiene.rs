@@ -54,6 +54,12 @@ fn run_inner_test(name: &str) {
             "PATH",
             format!("{FAKE_APPDIR}/usr/bin/:{FAKE_APPDIR}/bin/:{host_path}"),
         )
+        // AppRun's toolkit overrides: not AppDir-rooted, but nothing of the
+        // user's is left in them either.
+        .env("GTK_THEME", "Adwaita:dark")
+        .env("APPIMAGE_GTK_THEME", "Adwaita:dark")
+        .env("GDK_BACKEND", "x11")
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .output()
         .expect("re-exec test binary");
 
@@ -67,8 +73,10 @@ fn run_inner_test(name: &str) {
     // A libtest filter that matches nothing still exits 0, which would make
     // this whole test vacuously green if the inner test were ever renamed.
     // Require positive evidence that exactly one test actually ran.
+    // Match the full libtest summary: a bare "1 passed" is also a substring of
+    // "11 passed", which would let an unrelated run satisfy this check.
     assert!(
-        stdout.contains("1 passed"),
+        stdout.contains("test result: ok. 1 passed"),
         "inner test `{name}` did not run (filter matched nothing?)\
          \n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
     );
@@ -145,6 +153,22 @@ fn inner_pty_child_env_is_clean() {
     // Launch markers must not convince a child it is running inside a bundle.
     assert!(!env.contains_key("APPDIR"), "APPDIR leaked");
     assert!(!env.contains_key("APPIMAGE"), "APPIMAGE leaked");
+
+    // AppRun's toolkit overrides: `GDK_BACKEND=x11` drags every GTK program
+    // started from a terminal through XWayland, and the GTK theme pair pins
+    // them to Adwaita:dark whatever the user's desktop theme is.
+    for key in [
+        "GDK_BACKEND",
+        "GTK_THEME",
+        "APPIMAGE_GTK_THEME",
+        "PYTHONDONTWRITEBYTECODE",
+    ] {
+        assert!(
+            !env.contains_key(key),
+            "{key} leaked into PTY child: {:?}",
+            env.get(key)
+        );
+    }
 
     // PATH keeps the host entries but loses the AppDir bin dirs, so the
     // bundle's binaries cannot shadow the user's toolchain.
@@ -230,6 +254,19 @@ fn inner_host_command_env_is_clean() {
 
 #[test]
 fn host_command_preserves_gui_env_for_editor_launch() {
+    if is_child() {
+        return;
+    }
+    // Must go through the re-exec harness like the others: without APPDIR the
+    // fixup list is empty and every assertion below holds trivially.
+    run_inner_test("inner_host_command_keeps_gui_env");
+}
+
+#[test]
+#[ignore = "re-executed by host_command_preserves_gui_env_for_editor_launch"]
+fn inner_host_command_keeps_gui_env() {
+    assert!(is_child(), "inner test must only run via its re-exec parent");
+
     // `open_in_editor` deliberately does NOT call the GUI sanitizers: the user
     // clicked "open this file", so the editor must inherit DISPLAY/WAYLAND to
     // put a window on screen. AppImage hygiene is orthogonal and must not
@@ -256,6 +293,9 @@ fn host_command_preserves_gui_env_for_editor_launch() {
         env.get("XAUTHORITY").map(String::as_str),
         Some("/home/user/.Xauthority")
     );
+    // Meanwhile the AppImage layer still did its job in the same spawn.
+    assert!(!env.contains_key("LD_LIBRARY_PATH"), "LD_LIBRARY_PATH leaked");
+    assert!(!env.contains_key("APPDIR"), "APPDIR leaked");
 }
 
 // ── Non-AppImage installs (AUR / deb / rpm) ─────────────────────────────
