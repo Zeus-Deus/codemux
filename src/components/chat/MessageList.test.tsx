@@ -1011,7 +1011,15 @@ describe("MessageList new-turn scroll contract", () => {
     });
   });
 
-  it("positions the measured row instantly, 16px below the transcript top", async () => {
+  /** The glide's settle handshake: the browser reports the smooth scroll
+   *  finished. Production listens for `scrollend` (with a timer fallback);
+   *  jsdom never emits it, so tests drive it explicitly. */
+  const settleGlide = () =>
+    act(() => {
+      viewport().dispatchEvent(new Event("scrollend"));
+    });
+
+  it("glides the measured row to 16px below the transcript top", async () => {
     render(
       <MessageList
         messages={[userTurn, sentTurn]}
@@ -1032,10 +1040,55 @@ describe("MessageList new-turn scroll contract", () => {
     expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
     expect(scrollToIndexSpy).toHaveBeenCalledWith({
       index: 1,
-      animated: false,
+      animated: true,
       viewPosition: 0,
       viewOffset: 16,
     });
+
+    // The settle handshake re-pins the landed offset instantly, killing any
+    // residual smooth-scroll momentum before stream-advance takes over.
+    listState.scroll = 84;
+    settleGlide();
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 84,
+      animated: false,
+    });
+  });
+
+  it("positions instantly when the reader prefers reduced motion", async () => {
+    const originalMatchMedia = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes("prefers-reduced-motion"),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      render(
+        <MessageList
+          messages={[userTurn, sentTurn]}
+          sendAnchor={anchor(1)}
+          {...noopHandlers}
+        />,
+      );
+      act(() => {
+        lastListProps.current?.anchoredEndSpace?.onReady?.({
+          anchorIndex: 1,
+          anchorKey: "um-2",
+          size: 400,
+        });
+      });
+      await flushFrames();
+
+      expect(scrollToIndexSpy).toHaveBeenCalledWith({
+        index: 1,
+        animated: false,
+        viewPosition: 0,
+        viewOffset: 16,
+      });
+    } finally {
+      window.matchMedia = originalMatchMedia;
+    }
   });
 
   it("positions once per send, not on every re-measure", async () => {
@@ -1109,6 +1162,7 @@ describe("MessageList new-turn scroll contract", () => {
       });
     });
     await flushFrames();
+    settleGlide();
     scrollToOffsetSpy.mockClear();
 
     // The answer grows past the viewport: 8 rows x 100px = 800 content.
@@ -1173,6 +1227,7 @@ describe("MessageList new-turn scroll contract", () => {
       });
     });
     await flushFrames();
+    settleGlide();
     scrollToOffsetSpy.mockClear();
 
     const row = document.querySelector<HTMLElement>("[data-message-id]")!;
@@ -1232,7 +1287,7 @@ describe("MessageList new-turn scroll contract", () => {
     expect(scrollToOffsetSpy).not.toHaveBeenCalled();
   });
 
-  it("restores the built-in end pin when the turn settles", () => {
+  it("restores the built-in end pin when the anchor is dropped", () => {
     const { rerender } = render(
       <MessageList
         messages={[userTurn, sentTurn]}
@@ -1242,9 +1297,10 @@ describe("MessageList new-turn scroll contract", () => {
     );
     expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
 
-    // The turn finished, so the pane expired the anchor. LegendList's own
-    // pin has to come back: it covers item/footer layout growth (a
-    // late-loading image) that the anchor's geometry never modelled.
+    // The pane cleared the anchor (a rollback, or a thread switch handing
+    // this list fresh props). LegendList's own pin has to come back: it
+    // covers item/footer layout growth (a late-loading image) whenever no
+    // anchor is reserving space.
     rerender(
       <MessageList
         messages={[userTurn, sentTurn]}
@@ -1264,7 +1320,7 @@ describe("MessageList new-turn scroll contract", () => {
     });
   });
 
-  it("does not steal the viewport back when the turn settles mid-history-read", async () => {
+  it("does not steal the viewport back when the anchor clears mid-history-read", async () => {
     const { rerender } = render(
       <MessageList
         messages={[userTurn, sentTurn]}
@@ -1294,9 +1350,9 @@ describe("MessageList new-turn scroll contract", () => {
     scrollToEndSpy.mockClear();
     scrollToOffsetSpy.mockClear();
 
-    // The turn settles and the pane expires the anchor. That is a lifecycle
-    // event, not a navigation intent: re-claiming here would silently drop
-    // the reader's follow state and take away the pill they are still using.
+    // The pane clears the anchor (rollback). That is a lifecycle event, not
+    // a navigation intent: re-claiming here would silently drop the
+    // reader's follow state and take away the pill they are still using.
     listState.rowHeight = 300;
     rerender(
       <MessageList
@@ -1335,6 +1391,145 @@ describe("MessageList new-turn scroll contract", () => {
     expect(lastListProps.current?.maintainScrollAtEnd).toMatchObject({
       animated: false,
     });
+  });
+
+  it("does not re-run the positioning scroll on a remount under a still-live anchor", async () => {
+    // The anchor outlives the turn, so a MessageList remount (the subagent
+    // drill-in/out swap) sees it again. The pane-owned positioned record is
+    // what tells the fresh mount the prompt was already parked: the reserved
+    // space comes back, the scroll does not.
+    const positioned = { current: null as number | null };
+    const { unmount } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        positionedNonceRef={positioned}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
+    expect(positioned.current).toBe(1);
+    unmount();
+
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        positionedNonceRef={positioned}
+        {...noopHandlers}
+      />,
+    );
+    // The space is reserved again…
+    expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    // …but the prompt is not re-parked.
+    expect(scrollToIndexSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-runs the advance decision when the reserved space resizes with no data change", async () => {
+    // A late-loading image grows a row without any slot rebuild. While an
+    // anchor is mounted the built-in end pin is off, so the spacer's resize
+    // callback is the only signal left that the tail may have sunk below
+    // the fold.
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onReady?.({
+        anchorIndex: 1,
+        anchorKey: "um-2",
+        size: 400,
+      });
+    });
+    await flushFrames();
+    settleGlide();
+    scrollToOffsetSpy.mockClear();
+
+    // Rows silently grew: 2 rows x 400px = 800 content against a 500px
+    // viewport, scroll still at 84.
+    listState.rowHeight = 400;
+    listState.scroll = 84;
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(0);
+    });
+    await flushFrames();
+
+    // lastBottom 800 - usable (500 - 16) = 316 target, from scroll 84.
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 316,
+      animated: false,
+    });
+  });
+
+  it("restores a hairline scroll drift from a spacer resize while free-scrolling", async () => {
+    render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        {...noopHandlers}
+      />,
+    );
+    await flushFrames(2);
+    // The reader has gestured away — the resize must be imperceptible.
+    act(() => {
+      fireEvent.wheel(viewport());
+    });
+    listState.scroll = 100;
+    act(() => {
+      lastListProps.current?.anchoredEndSpace?.onSizeChanged?.(120);
+    });
+    // The browser drifted the offset by a hair while the spacer resized.
+    listState.scroll = 101;
+    await flushFrames();
+
+    expect(scrollToOffsetSpy).toHaveBeenCalledWith({
+      offset: 100,
+      animated: false,
+    });
+  });
+
+  it("keeps the anchor mounted after the turn settles", () => {
+    // Settling is invisible to this component now: the pane simply keeps
+    // the same anchor props, so the reserved space stays and nothing scrolls.
+    const { rerender } = render(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        streaming
+        {...noopHandlers}
+      />,
+    );
+    expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
+    rerender(
+      <MessageList
+        messages={[userTurn, sentTurn]}
+        sendAnchor={anchor(1)}
+        streaming={false}
+        {...noopHandlers}
+      />,
+    );
+    expect(lastListProps.current?.anchoredEndSpace).toBeDefined();
+    expect(lastListProps.current?.maintainScrollAtEnd).toBe(false);
+    expect(scrollToEndSpy).not.toHaveBeenCalled();
   });
 
   it("drops the anchor when the pane switches threads", () => {
@@ -1501,7 +1696,7 @@ describe("MessageList jump-to-latest pill", () => {
     expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false });
   });
 
-  it("returns to the live edge instantly when used", async () => {
+  it("glides back to the live edge when used", async () => {
     render(<MessageList messages={[userTurn]} {...noopHandlers} />);
     await flushFrames(2);
     act(() => {
@@ -1513,7 +1708,7 @@ describe("MessageList jump-to-latest pill", () => {
     await waitFor(() => expect(pill()).not.toBeNull());
 
     fireEvent.click(pill()!);
-    expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: false });
+    expect(scrollToEndSpy).toHaveBeenCalledWith({ animated: true });
     expect(pill()).toBeNull();
   });
 });

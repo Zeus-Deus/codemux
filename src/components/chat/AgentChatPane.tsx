@@ -620,31 +620,26 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       current !== null && current.clientNonce !== clientNonce ? current : null,
     );
   }, []);
+  // Which send nonce the transcript has already run its one-time positioning
+  // scroll for. Owned here — above `MessageList` — because the anchor now
+  // OUTLIVES the turn: it persists until the next send, a rollback, or a
+  // thread switch, so the reserved space collapsing can never yank a parked
+  // prompt mid-read. The price of that persistence is that a `MessageList`
+  // remount on the same thread (the subagent drill-in/out swap below) sees
+  // the still-live anchor again; this record is what tells it the prompt was
+  // already parked, so it re-reserves the space without re-scrolling. (The
+  // geometry makes that safe: with the spacer mounted, the end of content IS
+  // the anchored position, so a remount's `initialScrollAtEnd` lands there.)
+  const sendAnchorPositionedNonceRef = useRef<number | null>(null);
   // Switching threads within the pane must not resume the previous thread's
   // anchor; the transcript treats the change as a fresh hydrated open.
   useEffect(() => {
     setSendAnchor(null);
+    sendAnchorPositionedNonceRef.current = null;
   }, [threadId]);
-  // The anchor is a LIVE-TURN intent, not a durable property of the thread,
-  // so it expires when the turn settles. Two things go wrong if it lingers:
-  // a later `MessageList` remount on the same thread (the subagent
-  // drill-in/out swap below, for one) would re-park a long-finished prompt
-  // near the top instead of opening at the latest row, and LegendList's
-  // built-in end pin — which an anchor deliberately disables — would never
-  // come back for the item/footer layout growth an anchor does not model
-  // (a late-loading image growing a row with no data change).
-  //
-  // Watches the same combined signal the transcript gets, so the optimistic
-  // window between Enter and the backend's first `Running` counts as live.
+  // Combined live signal, so the optimistic window between Enter and the
+  // backend's first `Running` reads as streaming in the transcript.
   const transcriptStreaming = streaming || isSending;
-  const prevTranscriptStreamingRef = useRef(transcriptStreaming);
-  useEffect(() => {
-    const wasStreaming = prevTranscriptStreamingRef.current;
-    prevTranscriptStreamingRef.current = transcriptStreaming;
-    // Falling edge only. Seeded with the current value so mounting onto an
-    // already-settled thread is not itself treated as a completion.
-    if (wasStreaming && !transcriptStreaming) setSendAnchor(null);
-  }, [transcriptStreaming]);
   const [subagentJumpRequest, setSubagentJumpRequest] = useState<{
     cardId: string;
     nonce: number;
@@ -2974,6 +2969,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
               stalled={stalled}
               interrupted={interrupted}
               sendAnchor={sendAnchor}
+              positionedNonceRef={sendAnchorPositionedNonceRef}
               threadKey={threadId}
               subagentJumpRequest={subagentJumpRequest}
               sessionStartedAt={sessionStartedAt}

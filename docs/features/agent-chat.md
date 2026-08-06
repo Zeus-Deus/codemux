@@ -1057,33 +1057,54 @@ Contract preserved from the pre-redesign renderer:
   bubble stays queued, so there is no rollback to ride along with), and so
   does switching threads.
 
-  **The anchor expires when the turn settles.** It is a live-turn intent, not
-  a durable property of the thread, so `AgentChatPane` clears it on the
-  falling edge of the same combined live signal the transcript gets
-  (`streaming || isSending`, so the optimistic window between Enter and the
-  backend's first `Running` counts as live). Two things would otherwise go
-  wrong once a run finished: a later `MessageList` remount on the same thread
-  — the subagent drill-in/out swap, for instance — would re-park a
-  long-finished prompt near the top instead of opening at the latest row, and
-  LegendList's built-in end pin, which an anchor deliberately disables, would
-  never come back for the item/footer layout growth the anchor's geometry does
-  not model (a late-loading image growing a row with no data change).
-  Expiry is a lifecycle event, not navigation: if the reader has already
-  gestured into `free-scrolling`, the transcript drops the anchor bookkeeping
-  **without** re-claiming the viewport, so a turn finishing never yanks
-  someone browsing history back to the tail or takes away the pill they are
-  using to get there.
+  **The anchor outlives the turn.** It persists until the *next* send
+  replaces it, a failed-send rollback clears it, or the thread/pane changes —
+  a turn settling changes nothing on screen. The alternative (expiring the
+  anchor on the falling edge of `streaming || isSending`, as this contract
+  originally did) collapses the reserved end space in one frame: total
+  content height shrinks, the end pin re-engages, and the parked prompt is
+  visibly yanked from the top to mid-viewport at the exact moment the reader
+  is absorbing the finished answer. The leftover blank space below a
+  completed reply is the deliberate price of that no-jump guarantee — it
+  reads as room for what happens next.
 
-  **Anchor after measurement, never on a timer.** The resolved slot index
-  feeds LegendList's `anchoredEndSpace` (`anchorOffset: 16`). Its `onReady`
-  callback — fired once the row is measured and the reserved space sized — is
-  what positions the row, via `scrollToIndex({ animated: false, viewPosition:
-  0, viewOffset: 16 })`, instant per Codemux's "immediate" contract. If the
-  list ref is not live yet it retries per frame (a frame budget, not an
-  assumption that layout completes in N ms). While an anchor is mounted the
-  built-in `maintainScrollAtEnd` is switched **off**: follow-the-tail and
-  anchor-the-new-turn are two targets for one viewport and must not both drive
-  it. As the answer grows, an effect advances by exactly
+  Persistence is what makes the two bookkeeping choices below matter:
+
+  - *Remounts never re-park.* "Which send nonce has already been positioned"
+    lives in a pane-owned ref (`sendAnchorPositionedNonceRef`, threaded down
+    as `positionedNonceRef`), not in the list component. A `MessageList`
+    remount under a still-live anchor — the subagent drill-in/out swap —
+    re-resolves the reserved space but skips the one-time positioning scroll.
+    The geometry keeps the open position honest anyway: with the spacer
+    mounted, the end of content *is* the anchored position, so
+    `initialScrollAtEnd` lands where the reader left off.
+  - *Layout growth still reveals the tail.* The built-in end pin stays off
+    while an anchor is mounted, so `anchoredEndSpace.onSizeChanged` re-runs
+    the advance decision. Item/footer growth that arrives with **no data
+    change** (a late-loading image) shrinks the spacer, fires the callback,
+    and the tail is kept on screen — the job the disabled pin used to do.
+    The same callback, while the reader is `free-scrolling`, restores a ≤2px
+    browser drift of the scroll offset so a spacer resize is imperceptible.
+
+  **Anchor after measurement, never on a timer — and as a glide.** The
+  resolved slot index feeds LegendList's `anchoredEndSpace` (`anchorOffset:
+  16`). Its `onReady` callback — fired once the row is measured and the
+  reserved space sized — is what positions the row, via `scrollToIndex({
+  animated: true, viewPosition: 0, viewOffset: 16 })`: a follow-up in a long
+  thread visibly travels to its parked spot instead of teleporting, which is
+  most of what makes a send *feel* like navigation. A settle handshake —
+  `scrollend`, with a `SEND_ANCHOR_SETTLE_FALLBACK_MS` (750ms) timer where
+  the event is unsupported or the glide covers no distance — then re-pins
+  the landed offset instantly to kill residual momentum and marks the nonce
+  settled. The stream-advance effect waits for that settle mark, so a fast
+  first token cannot cut the glide short; a reader gesture mid-glide still
+  wins through the usual generation counter. `prefers-reduced-motion`
+  falls back to instant placement. If the list ref is not live yet the
+  positioner retries per frame (a frame budget, not an assumption that
+  layout completes in N ms). While an anchor is mounted the built-in
+  `maintainScrollAtEnd` is switched **off**: follow-the-tail and
+  anchor-the-new-turn are two targets for one viewport and must not both
+  drive it. As the answer grows, the advance moves by exactly
   `scrollDeltaToRevealEnd` — zero while the turn still fits, so the prompt
   stays near the top, then just enough to keep the growing tail on screen.
   The geometry is pure and unit-tested (`send-scroll-state.test.ts`).
@@ -1101,16 +1122,21 @@ Contract preserved from the pre-redesign renderer:
   every programmatic correction emits one, and trusting those is what used to
   leave the pill stuck on. A generation counter pairs "we still own the
   viewport" against "a gesture has happened", and every async continuation
-  re-checks it, so a gesture landing mid-flight wins. Scrolling back to the
+  re-checks it, so a gesture landing mid-flight wins. Scrolling back near the
   edge re-claims follow. Incoming tokens never move a reader who is already
   free-scrolling.
 
-  **Pill honesty.** "Jump to latest" is *shown* on a 150ms trailing debounce
-  and *hidden* immediately — raw `isAtEnd` reads false throughout mount and
+  **Pill honesty.** The edge signal is LegendList's `isNearEnd`
+  (`onEndReachedThreshold` 0.5 — within half a viewport of the end), not the
+  hairline `isAtEnd`: the pill only appears once the reader is meaningfully
+  away from the live edge, and drifting back within half a viewport
+  re-claims follow. "Jump to latest" is *shown* on a 150ms trailing debounce
+  and *hidden* immediately — the raw signal reads false throughout mount and
   layout settling, so an undebounced show flashes it on every thread open.
   A send hides it synchronously in the same render that first sees the anchor.
   Using the pill re-claims follow (it is the deliberate way back) rather than
-  cancelling it.
+  cancelling it, and it glides (`scrollToEnd({ animated: true })`) for the
+  same reason the send positioning does.
 - **Variable heights.** LegendList measures rows and observes layout changes;
   Activity blocks can expand in place while retaining the correct scroll
   position and cached size model.
