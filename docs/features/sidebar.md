@@ -219,7 +219,7 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
 - **Hover details** (`workspace-hover-card.tsx`): resting the pointer on any
   workspace surface — an active card, a settled or snoozed one-line row, or a
   collapsed rail avatar — opens a shared read-only `HoverCard` to the right
-  (350ms open, 120ms close, `side="right" align="start"`, 290px). It exists
+  (150ms open, 100ms close, `side="right" align="start"`, 290px). It exists
   because every sidebar surface is lossy: the card truncates its title and
   drops `git_behind` / `git_changed_files` entirely, the settled and snoozed
   rows show only a title, and the rail shows nothing but an avatar. Contents, all conditional
@@ -240,11 +240,34 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   (`WorkspaceStatusCluster`), and needs **no new Tauri command** — every field
   is already on `WorkspaceSnapshot` or in `appState.detected_ports`. The card
   keeps pointer events enabled so the path and branch can be selected and
-  copied (Radix holds it open while the cursor crosses into it), and its
+  copied (Radix holds it open while the cursor crosses the offset gap into it),
+  and its
   body is a separate component so Radix's unmount-when-closed keeps a sidebar
   of N workspaces from subscribing N× to the ports/hosts stores at rest. It
   mounts *inside* `WorkspaceInboxMenu` on a different node than
   `ContextMenuTrigger`, so the two `asChild` triggers never collide.
+  **Group phase** (`src/lib/hover-card-group.ts`): the open delay only buys
+  protection against a card flashing while the pointer sweeps past a row, and
+  once one card IS up that reasoning is spent — so a module-level phase (Radix
+  gives `HoverCard` no provider to hang one on) makes every *subsequent* card
+  open at `openDelay={0}` and skip its entrance animation, marked by a
+  `data-instant` attribute that zeroes the duration of the `entrance="subtle"`
+  fade. The phase survives 400ms past the last close, so crossing the gap
+  between two rows does not put the user back at square one, and it cannot
+  expire while a card is still open. `data-instant` zeroes the *exit* animation
+  too: a card that opened instantly hard-cuts on close, which only ever happens
+  mid-sweep, where a fade would play over its replacement. Cards that did wait
+  the full delay keep both halves.
+  **Supersede on open**: opening any card force-retires the previous one in the
+  same frame, ignoring the close delay. This deliberately overrides Radix's
+  keep-it-open-while-you-interact behaviour — a card is retired even
+  mid-text-selection once the pointer reaches another row, because the
+  alternative is the old card sitting opaque over the row the user has moved
+  on to. In a browser the outgoing card still plays its exit fade, so the two
+  crossfade briefly; jsdom has no animations and unmounts synchronously, which
+  is why the tests can assert a single card outright. The one card outside the
+  invariant is the row's nested "n shipped" tally popover, which stays
+  ungrouped precisely because it lives inside the workspace card's own trigger.
 - **Project section of the workspace menu** (`project-appearance-menu.tsx`): all
   three row shapes' right-click menus (active card, settled row, snoozed row)
   carry a `Project "<name>"` submenu between the workspace actions and the

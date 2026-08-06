@@ -1,6 +1,13 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
+import { StrictMode } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, cleanup, act } from "@testing-library/react";
+import {
+  render,
+  screen,
+  cleanup,
+  act,
+  fireEvent,
+} from "@testing-library/react";
 import { useSidebarDensityStore } from "@/stores/sidebar-density-store";
 import type {
   AppStateSnapshot,
@@ -39,7 +46,11 @@ vi.mock("./use-project-appearance", () => ({
   }),
 }));
 
-import { WorkspaceHoverCardBody } from "./workspace-hover-card";
+import {
+  WorkspaceHoverCard,
+  WorkspaceHoverCardBody,
+} from "./workspace-hover-card";
+import { __resetHoverCardGroupForTests } from "@/lib/hover-card-group";
 
 function makeWorkspace(
   overrides: Partial<WorkspaceSnapshot> = {},
@@ -395,5 +406,172 @@ describe("WorkspaceHoverCardBody — location, mute, path", () => {
     );
     // Not under $HOME, so it stays absolute rather than gaining a bogus "~".
     expect(screen.getByText("/srv/work/myapp")).toBeInTheDocument();
+  });
+});
+
+describe("WorkspaceHoverCard — hover timing", () => {
+  const OPEN_DELAY_MS = 150;
+  const CLOSE_DELAY_MS = 100;
+  const GROUP_TIMEOUT_MS = 400;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    __resetHoverCardGroupForTests();
+  });
+
+  afterEach(() => {
+    __resetHoverCardGroupForTests();
+    vi.useRealTimers();
+  });
+
+  /** Two sidebar rows, as the inbox renders them. `strict` double-invokes
+   *  render and state updaters, which is how the app itself runs. */
+  function renderRows({ strict = false }: { strict?: boolean } = {}) {
+    const rows = (
+      <>
+        {["alpha", "beta"].map((title) => (
+          <WorkspaceHoverCard
+            key={title}
+            workspace={makeWorkspace({ workspace_id: title, title })}
+            repo={{ name: "myapp", path: "/home/u/projects/myapp" }}
+            status={null}
+          >
+            <button type="button">{`row-${title}`}</button>
+          </WorkspaceHoverCard>
+        ))}
+      </>
+    );
+    render(strict ? <StrictMode>{rows}</StrictMode> : rows);
+    return {
+      alpha: screen.getByText("row-alpha"),
+      beta: screen.getByText("row-beta"),
+    };
+  }
+
+  // React synthesises onPointerEnter/Leave from pointerover/pointerout, so
+  // firing the enter/leave events directly would never reach Radix.
+  function pointerEnter(el: HTMLElement) {
+    act(() => {
+      fireEvent.pointerOver(el, { pointerType: "mouse", relatedTarget: null });
+    });
+  }
+  function pointerLeave(el: HTMLElement) {
+    act(() => {
+      fireEvent.pointerOut(el, {
+        pointerType: "mouse",
+        relatedTarget: document.body,
+      });
+    });
+  }
+  function advance(ms: number) {
+    act(() => {
+      vi.advanceTimersByTime(ms);
+    });
+  }
+
+  /** The open card's content element, or null. */
+  function card(): HTMLElement | null {
+    return document.querySelector("[data-slot='hover-card-content']");
+  }
+
+  it("holds the first card back by the open delay, so a sweep past a row never flashes it", () => {
+    const { alpha } = renderRows();
+    pointerEnter(alpha);
+
+    advance(OPEN_DELAY_MS - 1);
+    expect(card()).toBeNull();
+
+    advance(1);
+    expect(card()).not.toBeNull();
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+  });
+
+  it("opens the NEXT row's card with no delay at all once a card is already up", () => {
+    const { alpha, beta } = renderRows();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+
+    pointerLeave(alpha);
+    pointerEnter(beta);
+    // Not one tick of delay — the timer still has to fire, but at 0ms.
+    advance(0);
+    expect(screen.getByText("beta")).toBeInTheDocument();
+  });
+
+  it("retires the previous card the instant the next one opens, instead of holding it for its close delay", () => {
+    const { alpha, beta } = renderRows();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+
+    pointerLeave(alpha);
+    pointerEnter(beta);
+    advance(0);
+
+    // `alpha` would otherwise linger for its close delay, stacked over `beta`.
+    // jsdom runs no animations and unmounts synchronously, so the retiring card
+    // is simply gone here; a browser plays its exit fade over `beta`, i.e. a
+    // brief crossfade rather than a hard cut.
+    expect(screen.queryByText("alpha")).not.toBeInTheDocument();
+    expect(document.querySelectorAll("[data-slot='hover-card-content']")).toHaveLength(1);
+  });
+
+  it("keeps the close delay for the pointer travelling into the card itself", () => {
+    const { alpha } = renderRows();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+
+    pointerLeave(alpha);
+    advance(CLOSE_DELAY_MS - 1);
+    // Still up: this is the window in which the pointer crosses the offset gap
+    // to select the path or the branch.
+    expect(screen.getByText("alpha")).toBeInTheDocument();
+
+    advance(1);
+    expect(screen.queryByText("alpha")).not.toBeInTheDocument();
+  });
+
+  it("marks only the cards that skipped the delay as instant, so a deliberate hover still animates in", () => {
+    const { alpha, beta } = renderRows();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toHaveAttribute("data-instant");
+
+    pointerLeave(alpha);
+    pointerEnter(beta);
+    advance(0);
+    expect(card()).toHaveAttribute("data-instant");
+  });
+
+  it("marks instant the same way under StrictMode, where state updaters run twice", () => {
+    // The phase is read once, before `setCardState`, precisely so the answer
+    // cannot depend on how many times React chooses to run the updater — by
+    // the second run this card has already joined the phase it is asking about.
+    const { alpha, beta } = renderRows({ strict: true });
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toHaveAttribute("data-instant");
+
+    pointerLeave(alpha);
+    pointerEnter(beta);
+    advance(0);
+    expect(card()).toHaveAttribute("data-instant");
+  });
+
+  it("goes back to the full delay once the group phase has lapsed", () => {
+    const { alpha, beta } = renderRows();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    pointerLeave(alpha);
+    // Two steps: the grace window is only armed once the close has committed
+    // and the card's effect cleanup has run, which act() defers to its flush.
+    advance(CLOSE_DELAY_MS);
+    advance(GROUP_TIMEOUT_MS);
+
+    pointerEnter(beta);
+    advance(OPEN_DELAY_MS - 1);
+    expect(card()).toBeNull();
+    advance(1);
+    expect(screen.getByText("beta")).toBeInTheDocument();
   });
 });
