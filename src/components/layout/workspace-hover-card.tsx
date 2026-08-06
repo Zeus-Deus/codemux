@@ -81,21 +81,29 @@ export function WorkspaceHoverCard({
   children,
 }: Props) {
   const groupActive = useHoverCardGroupActive();
-  // `instant` is captured when the card opens, not read live: a card that DID
-  // wait its delay should still fade out gracefully, even though the group is
-  // (by definition) active by the time it closes.
+  // `instant` is captured when the card opens, not read live, and it governs
+  // BOTH ends of the card's motion (see `data-instant` in
+  // `@/components/ui/hover-card`). A card that DID wait its delay animates in
+  // and fades out, even though the group is — by definition — active by the
+  // time it closes. A card that skipped the delay gets neither: it appears at
+  // once and hard-cuts on close, which is only ever mid-sweep, where a
+  // fade-out would linger over the card that just replaced it.
   const [{ open, instant }, setCardState] = useState({
     open: false,
     instant: false,
   });
 
   const handleOpenChange = useCallback((next: boolean) => {
+    // Read the store directly rather than closing over `groupActive`: this
+    // fires from Radix's own timer, and the answer must be the phase as it
+    // stands right now, before this card joins it below. Read OUTSIDE the
+    // updater because updaters must be pure — React is free to re-run one
+    // (StrictMode, a concurrent retry), and a second read could land after
+    // this very card has joined the phase.
+    const wasActive = isHoverCardGroupActive();
     setCardState((prev) => ({
       open: next,
-      // Read the store directly rather than closing over `groupActive`: this
-      // fires from Radix's own timer, and the answer must be the phase as it
-      // stands right now, before this card joins it below.
-      instant: next ? isHoverCardGroupActive() : prev.instant,
+      instant: next ? wasActive : prev.instant,
     }));
   }, []);
 
@@ -123,7 +131,9 @@ export function WorkspaceHoverCard({
         // Pointer events stay enabled so the path and branch can be selected
         // and copied. Radix keeps the card open while the cursor crosses into
         // it, and side="right" floats it over the main pane — never between
-        // the cursor and another sidebar row.
+        // the cursor and another sidebar row. The one exception is supersede:
+        // reaching another row retires this card even mid-selection, because a
+        // card held open over the row the user has moved on to is worse.
         className="w-[290px] p-0"
       >
         <WorkspaceHoverCardBody

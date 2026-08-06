@@ -53,8 +53,18 @@ export function isHoverCardGroupActive(): boolean {
  * `onSuperseded` closes this card the moment a different one opens. Cards keep
  * a close delay so the pointer can cross the offset gap into the card and
  * select text — but that delay must not apply when the pointer has moved to
- * ANOTHER row, because the new card now opens instantly and the two would
- * overlap on screen. Superseding collapses that window to nothing.
+ * ANOTHER row, because the new card now opens instantly and the old one would
+ * sit over it, fully opaque, for the whole close delay. Superseding collapses
+ * that window: the old card starts leaving in the same frame the new one
+ * arrives. It is a crossfade, not a cut — a browser still plays the outgoing
+ * card's ~150ms exit fade (unless it opened instantly, which zeroes both ends
+ * of its animation), so the two do briefly share the screen. jsdom has no
+ * animations and unmounts synchronously, which is why the tests can assert a
+ * single card outright.
+ *
+ * This deliberately overrides Radix's "keep the card up while the user is
+ * interacting with it" behaviour: a card is retired even mid-text-selection if
+ * the pointer has reached another row.
  */
 export function registerOpenHoverCard(onSuperseded: () => void): () => void {
   const previous = supersede;

@@ -56,7 +56,7 @@ describe("hover card group phase", () => {
     expect(isHoverCardGroupActive()).toBe(false);
   });
 
-  it("supersedes the previous card when a new one opens, so two never overlap", () => {
+  it("supersedes the previous card when a new one opens, so the old one starts leaving in the same frame", () => {
     const closeA = vi.fn();
     registerOpenHoverCard(closeA);
     expect(closeA).not.toHaveBeenCalled();

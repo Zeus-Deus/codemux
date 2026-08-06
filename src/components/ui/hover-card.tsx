@@ -47,7 +47,11 @@ function HoverCardContent({
           ENTRANCE_CLASS[entrance],
           // Set by a card that opened inside a group phase (see
           // `@/lib/hover-card-group`): it did not wait, so it must not spend
-          // another 150ms arriving either.
+          // another 150ms arriving either. This zeroes the EXIT animation as
+          // well, so such a card also hard-cuts on close — deliberate, not an
+          // oversight: a card that opened instantly only ever closes mid-sweep,
+          // where its fade-out would play on top of the card that just
+          // superseded it. Cards that did wait their delay keep both halves.
           "data-instant:animation-duration-0",
           className
         )}

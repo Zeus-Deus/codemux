@@ -1,4 +1,5 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
+import { StrictMode } from "react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   render,
@@ -423,9 +424,10 @@ describe("WorkspaceHoverCard — hover timing", () => {
     vi.useRealTimers();
   });
 
-  /** Two sidebar rows, as the inbox renders them. */
-  function renderRows() {
-    render(
+  /** Two sidebar rows, as the inbox renders them. `strict` double-invokes
+   *  render and state updaters, which is how the app itself runs. */
+  function renderRows({ strict = false }: { strict?: boolean } = {}) {
+    const rows = (
       <>
         {["alpha", "beta"].map((title) => (
           <WorkspaceHoverCard
@@ -437,8 +439,9 @@ describe("WorkspaceHoverCard — hover timing", () => {
             <button type="button">{`row-${title}`}</button>
           </WorkspaceHoverCard>
         ))}
-      </>,
+      </>
     );
+    render(strict ? <StrictMode>{rows}</StrictMode> : rows);
     return {
       alpha: screen.getByText("row-alpha"),
       beta: screen.getByText("row-beta"),
@@ -496,7 +499,7 @@ describe("WorkspaceHoverCard — hover timing", () => {
     expect(screen.getByText("beta")).toBeInTheDocument();
   });
 
-  it("retires the previous card the instant the next one opens, so the two never overlap", () => {
+  it("retires the previous card the instant the next one opens, instead of holding it for its close delay", () => {
     const { alpha, beta } = renderRows();
     pointerEnter(alpha);
     advance(OPEN_DELAY_MS);
@@ -506,6 +509,9 @@ describe("WorkspaceHoverCard — hover timing", () => {
     advance(0);
 
     // `alpha` would otherwise linger for its close delay, stacked over `beta`.
+    // jsdom runs no animations and unmounts synchronously, so the retiring card
+    // is simply gone here; a browser plays its exit fade over `beta`, i.e. a
+    // brief crossfade rather than a hard cut.
     expect(screen.queryByText("alpha")).not.toBeInTheDocument();
     expect(document.querySelectorAll("[data-slot='hover-card-content']")).toHaveLength(1);
   });
@@ -527,6 +533,21 @@ describe("WorkspaceHoverCard — hover timing", () => {
 
   it("marks only the cards that skipped the delay as instant, so a deliberate hover still animates in", () => {
     const { alpha, beta } = renderRows();
+    pointerEnter(alpha);
+    advance(OPEN_DELAY_MS);
+    expect(card()).not.toHaveAttribute("data-instant");
+
+    pointerLeave(alpha);
+    pointerEnter(beta);
+    advance(0);
+    expect(card()).toHaveAttribute("data-instant");
+  });
+
+  it("marks instant the same way under StrictMode, where state updaters run twice", () => {
+    // The phase is read once, before `setCardState`, precisely so the answer
+    // cannot depend on how many times React chooses to run the updater — by
+    // the second run this card has already joined the phase it is asking about.
+    const { alpha, beta } = renderRows({ strict: true });
     pointerEnter(alpha);
     advance(OPEN_DELAY_MS);
     expect(card()).not.toHaveAttribute("data-instant");

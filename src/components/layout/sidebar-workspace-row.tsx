@@ -1172,6 +1172,12 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         button, mirroring the idle row's issue cluster, rather
                         than fading like the non-interactive notification
                         badge. */}
+                    {/* Outside the shared hover-card group (`@/lib/hover-card-group`):
+                        it is nested inside the row's own workspace card's trigger, so
+                        joining the group would have it supersede — and force-close —
+                        the very card it sits on top of. It can therefore still stack
+                        over the workspace card, which the group invariant otherwise
+                        rules out. */}
                     {showTally && (
                       <HoverCard openDelay={120} closeDelay={80}>
                         <HoverCardTrigger asChild>
