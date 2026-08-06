@@ -111,12 +111,20 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
   // down, so any clearance here would be a blank band above the tabs.
   const titlebarOverlay = useTitlebarOverlay();
   const workspaceWorkflow = useWorkspaceWorkflow(workspace);
-  const { tasks: activeChatTasks, updatedAt: tasksUpdatedAt } =
-    useActiveChatTasks(workspace);
+  const {
+    tasks: activeChatTasks,
+    updatedAt: tasksUpdatedAt,
+    streaming: tasksThreadStreaming = false,
+  } = useActiveChatTasks(workspace);
   const tasksSnapshot =
     activeChatTasks && activeChatTasks.tasks.length > 0 ? activeChatTasks : null;
+  // The blinking tab dot is a live affordance: gate it on the thread
+  // actually running, not on the durable snapshot. A plan the provider
+  // left with an `in_progress` row survives the turn (and a restart, via
+  // hydrate-replay) and would otherwise blink forever.
   const tasksRunning =
-    tasksSnapshot?.tasks.some((task) => task.status === "in_progress") ?? false;
+    tasksThreadStreaming &&
+    (tasksSnapshot?.tasks.some((task) => task.status === "in_progress") ?? false);
   // The Orchestration tab appears only once a run is approved (design:
   // the approval card in the thread owns the pending_approval state; the
   // panel would just duplicate the planned phases as "queued").

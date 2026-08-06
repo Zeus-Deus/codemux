@@ -45,13 +45,19 @@ const FINISHED_FLASH_MS = 2500;
 export const SubagentActivityBar = memo(function SubagentActivityBar({
   messages,
   threadId,
+  streaming,
   onJump,
 }: {
   messages: ChatViewItem[];
   threadId: string | null;
+  /** The thread's live-run flag. With the run over, provider background
+   *  tasks (a background shell command that legitimately outlives the
+   *  turn) stop counting as live activity, so the bar can't spin forever
+   *  after the turn settled. */
+  streaming: boolean;
   onJump: (cardId: string) => void;
 }) {
-  const entries = runningSubagentEntries(messages);
+  const entries = runningSubagentEntries(messages, streaming);
   const count = entries.length;
 
   const listId = useId();

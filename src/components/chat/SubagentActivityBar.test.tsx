@@ -38,7 +38,7 @@ describe("SubagentActivityBar", () => {
       card("run-1", [subagent({ id: "a", status: "completed" })]),
     ];
     const { container } = render(
-      <SubagentActivityBar messages={messages} threadId="t1" onJump={() => {}} />,
+      <SubagentActivityBar messages={messages} threadId="t1" streaming onJump={() => {}} />,
     );
     expect(container.firstChild).toBeNull();
   });
@@ -55,7 +55,7 @@ describe("SubagentActivityBar", () => {
         }),
       ]),
     ];
-    render(<SubagentActivityBar messages={messages} threadId="t1" onJump={onJump} />);
+    render(<SubagentActivityBar messages={messages} threadId="t1" streaming onJump={onJump} />);
 
     expect(screen.getByText("1 subagent running")).toBeInTheDocument();
     expect(screen.getByText("View")).toBeInTheDocument();
@@ -75,7 +75,7 @@ describe("SubagentActivityBar", () => {
       card("run-1", [subagent({ id: "a", name: "Explore", status: "running" })]),
       card("run-2", [subagent({ id: "b", name: "Implement", status: "running" })]),
     ];
-    render(<SubagentActivityBar messages={messages} threadId="t1" onJump={onJump} />);
+    render(<SubagentActivityBar messages={messages} threadId="t1" streaming onJump={onJump} />);
 
     expect(screen.getByText("2 subagents running")).toBeInTheDocument();
     expect(screen.getByText("Show all")).toBeInTheDocument();
@@ -120,7 +120,7 @@ describe("SubagentActivityBar", () => {
       card("run-3", [subagent({ id: "c", name: "Verify", status: "running" })]),
     ];
     const { rerender } = render(
-      <SubagentActivityBar messages={two} threadId="t1" onJump={() => {}} />,
+      <SubagentActivityBar messages={two} threadId="t1" streaming onJump={() => {}} />,
     );
 
     // Open the expand list while two are running.
@@ -129,14 +129,14 @@ describe("SubagentActivityBar", () => {
 
     // One finishes: single-running state, list hidden by design.
     rerender(
-      <SubagentActivityBar messages={one} threadId="t1" onJump={() => {}} />,
+      <SubagentActivityBar messages={one} threadId="t1" streaming onJump={() => {}} />,
     );
     expect(screen.queryByTestId("subagent-activity-bar-list")).toBeNull();
 
     // A new subagent starts (back to 2): the list must NOT pop open with
     // no click — the stale `open` was reset on the multi → single drop.
     rerender(
-      <SubagentActivityBar messages={twoAgain} threadId="t1" onJump={() => {}} />,
+      <SubagentActivityBar messages={twoAgain} threadId="t1" streaming onJump={() => {}} />,
     );
     expect(screen.queryByTestId("subagent-activity-bar-list")).toBeNull();
     expect(screen.getByText("Show all")).toBeInTheDocument();
@@ -152,7 +152,7 @@ describe("SubagentActivityBar", () => {
       card("run-1", [subagent({ id: "a", status: "completed" })]),
     ];
     const { rerender, queryByTestId, getByTestId } = render(
-      <SubagentActivityBar messages={running} threadId="t1" onJump={onJump} />,
+      <SubagentActivityBar messages={running} threadId="t1" streaming onJump={onJump} />,
     );
     expect(getByTestId("subagent-activity-bar")).toHaveAttribute(
       "data-tone",
@@ -160,7 +160,7 @@ describe("SubagentActivityBar", () => {
     );
 
     rerender(
-      <SubagentActivityBar messages={finished} threadId="t1" onJump={onJump} />,
+      <SubagentActivityBar messages={finished} threadId="t1" streaming onJump={onJump} />,
     );
     expect(getByTestId("subagent-activity-bar")).toHaveAttribute(
       "data-tone",
@@ -186,9 +186,37 @@ describe("SubagentActivityBar", () => {
     const messages: ChatViewItem[] = [
       card("run-1", [subagent({ id: "a", status: "completed" })]),
     ];
-    render(<SubagentActivityBar messages={messages} threadId="t1" onJump={() => {}} />);
+    render(<SubagentActivityBar messages={messages} threadId="t1" streaming onJump={() => {}} />);
     expect(screen.queryByTestId("subagent-activity-bar")).toBeNull();
     expect(screen.queryByText("Subagents finished")).toBeNull();
+  });
+
+  it("ignores a background task once the run is over", () => {
+    const messages: ChatViewItem[] = [
+      card("run-1", [
+        subagent({ id: "bg", status: "running", backgroundTask: true }),
+      ]),
+    ];
+    // Mid-run a background job still reads as activity.
+    const { rerender, queryByTestId } = render(
+      <SubagentActivityBar messages={messages} threadId="t1" streaming onJump={() => {}} />,
+    );
+    expect(queryByTestId("subagent-activity-bar")).not.toBeNull();
+    expect(screen.getByText("1 subagent running")).toBeInTheDocument();
+
+    // Turn over: a background shell command that never reports a terminal
+    // status must not keep the live count (and its spinner) up. The count
+    // going to zero is a normal finish, so the bar plays its green flash
+    // and then unmounts — it never sits there claiming live activity.
+    rerender(
+      <SubagentActivityBar
+        messages={messages}
+        threadId="t1"
+        streaming={false}
+        onJump={() => {}}
+      />,
+    );
+    expect(screen.queryByText("1 subagent running")).toBeNull();
   });
 
   it("does not flash when switching to a different thread with zero running subagents", () => {
@@ -199,12 +227,12 @@ describe("SubagentActivityBar", () => {
       card("run-2", [subagent({ id: "b", status: "completed" })]),
     ];
     const { rerender, queryByTestId } = render(
-      <SubagentActivityBar messages={runningThreadA} threadId="thread-a" onJump={() => {}} />,
+      <SubagentActivityBar messages={runningThreadA} threadId="thread-a" streaming onJump={() => {}} />,
     );
     expect(queryByTestId("subagent-activity-bar")).not.toBeNull();
 
     rerender(
-      <SubagentActivityBar messages={idleThreadB} threadId="thread-b" onJump={() => {}} />,
+      <SubagentActivityBar messages={idleThreadB} threadId="thread-b" streaming onJump={() => {}} />,
     );
     // Different thread — this is a hydrate, not an observed transition.
     expect(queryByTestId("subagent-activity-bar")).toBeNull();

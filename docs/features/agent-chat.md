@@ -796,6 +796,18 @@ the plan and progress but cannot check, reorder, or rewrite its rows.
   turns amber with a spinner while a step is in flight and green with a check
   once every row is done, and the Tasks tab shows a blinking amber dot while a
   step is running and the tab is not the active one.
+- **Live affordances end with the run.** The snapshot is durable and
+  nothing rewrites it when a turn finishes, so an `in_progress` row is not
+  evidence that work is happening — the thread's `streaming` flag is. Both
+  live affordances are therefore gated on it: the composer chip's spinner
+  (`taskChipSummary` in `src/lib/agent-chat/task-summary.ts`, consumed by
+  `AgentChatPane`) and the Tasks tab's blinking dot (`right-panel.tsx`, via
+  the `streaming` field `useActiveChatTasks` now returns). A plan the
+  provider left mid-step otherwise spun forever, including across a restart
+  (`TasksUpdated` is persisted and hydrate-replayed). The chip is **not**
+  hidden when the run ends — the durable snapshot is by design — it simply
+  renders the same `N/M` counts statically. Rows inside the panel keep
+  their provider-reported state.
 - **Presentation.** The read-only panel preserves provider order and renders
   flat, numbered rows (no per-row card chrome) with three visually distinct
   states — done (green circled check, dimmed, struck through), in-progress
@@ -1441,13 +1453,25 @@ composer, hidden while `enteredSubagentId` is set (design: the bar only
 shows in the conversation view) and rendered as `null` entirely while
 idle — no resting state.
 
-- **Whole-thread rollup.** `runningSubagentEntries` (`subagents.ts`)
-  flattens every `running`/`pending` subagent across **every**
-  `subagent_run` card in the thread, tagging each with its card id and a
-  `from task N` label (omitted when the thread has only one card — there
-  is nothing to disambiguate). The bar's count and expand-list both key
-  off this list, so scattered work from different replies still reads as
-  one signal.
+- **Whole-thread rollup.** `runningSubagentEntries(messages, streaming)`
+  (`subagents.ts`) flattens every `running`/`pending` subagent across
+  **every** `subagent_run` card in the thread, tagging each with its card
+  id and a `from task N` label (omitted when the thread has only one card
+  — there is nothing to disambiguate). The bar's count and expand-list
+  both key off this list, so scattered work from different replies still
+  reads as one signal.
+- **Live activity respects the end of the run.** `isLiveActivity` (the
+  shared predicate behind `runningSubagentEntries` and
+  `countRunningSubagents`) drops rows carrying `backgroundTask` once
+  `streaming` is false. That flag mirrors the wire
+  `SubagentSnapshot.background_task` (see [Sidebar status
+  indicators](#sidebar-status-indicators)) and is merged **stickily** in
+  `mergeSnapshot` — a later snapshot that omits it never promotes the row
+  back to "real subagent". Without this, a background shell command that
+  never reports a terminal status kept the bar and its spinner up forever
+  after the turn settled, including across a restart (subagent snapshots
+  are persisted and hydrate-replayed). `AgentChatPane` passes the thread's
+  streaming flag; mid-run nothing changes.
 - **1 running** → the whole bar is one click target labelled "View";
   clicking jumps straight to that subagent's card.
 - **>1 running** → the action chip reads "Show all" / "Hide" with a
@@ -2903,6 +2927,51 @@ parent-scoped `content_delta`/`item_completed` (`subagent_id == None`) do
 pane at `Working`. `review_pending` is cleared only by publishing the
 owed/normal `Review`, a new-turn reset, session `Closed`/`Error`, or
 `agent_chat_close_pane`.
+
+**Background tasks are excluded from all of that.** Claude emits the same
+`system.task_started` / `task_progress` / `task_updated` /
+`task_notification` family for a background *tool* run — a
+`Bash { run_in_background: true }` — keyed by the Bash `tool_use_id`.
+Such a job can legitimately outlive the turn and never report a terminal
+status (a dev server never exits, so its `task_notification` never
+arrives), so tracking it as a subagent deferred the owed `Review`
+**forever**: the sidebar stayed "Working" and, downstream,
+`release_detached_agent_browser` never fired, leaving the background
+browser chip on `LIVE` indefinitely. `SubagentSnapshot` therefore carries
+an additive `background_task: bool` (`#[serde(default)]`, so old persisted
+payloads and the other providers decode as `false`). The Claude adapter
+stamps it from the exact discriminator it already has:
+`SubagentDemux::is_top_level_launch` is true only for a `tool_use_id`
+registered by a real `Agent`/`Task` launch, so `!is_top_level_launch(id)`
+on a task event means "background job, not subagent". In
+`map_event_to_pane_status` a flagged `running`/`pending` snapshot is never
+inserted into `running`, always returns `None` — even when a `Review` is
+owed, so a progress tick cannot resurrect `Working` after the turn
+settled — and defensively removes the id in case an unflagged variant
+inserted it earlier. Terminal flagged snapshots still `remove` and keep
+the owed-`Review` emptiness check unchanged. Real async `Task` launches
+are untouched: their deferred-`Review` flow above is deliberate.
+
+**The stall watchdog force-settles an owed `Review` that goes silent.**
+The rule above removes the known cause, but any *other* missed terminal
+signal (a crashed notification, a provider quirk) would pin `Working` the
+same way, and `RunStalled` is advisory only — it maps to pane-status
+`None`. So the 30s sweep (`spawn_stall_watchdog`) has a second pass,
+`force_settle_overdue_reviews`. `ThreadSubagentState` tracks
+`review_owed_since`, stamped when `TurnCompleted` defers the `Review` and
+re-armed by real post-turn run activity (`refreshes_owed_review` — a
+flagged background-task snapshot deliberately does **not** count, so a
+busy async subagent is never cut short while a never-ending shell job
+can't stall the clock forever). `SubagentTracker::take_overdue_reviews`
+removes and returns every thread silent past the same `STALL_THRESHOLD`
+(600s), under the tracker lock so the settle happens exactly once and the
+mutex is released before any `AppStateStore` call. Each id then goes
+through `apply_pane_status` — the helper extracted out of
+`publish_pane_status`, so the forced settle applies the identical policy
+(`Review`, downgraded to `Idle` in the active workspace, plus the
+background-browser release and the stamped `app-state-changed` emit)
+rather than a second copy of it. This can never cut a live turn short:
+`review_pending` is set exclusively by `TurnCompleted`.
 
 Only *live* provider events reach the tracker: transcript hydration/resume
 replays persisted events through the frontend reducer

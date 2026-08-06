@@ -23,6 +23,11 @@ export function useActiveChatTasks(workspace: WorkspaceSnapshot | null): {
   tasks: TasksSnapshot | null;
   /** When the snapshot was last applied (ms), for the panel caption. */
   updatedAt?: number | null;
+  /** Whether that thread is mid-run. The task snapshot is durable state
+   *  that outlives the turn, so any *live* affordance driven by it (the
+   *  blinking tab dot, the composer chip's spinner) must be gated on this
+   *  rather than on an `in_progress` row alone. */
+  streaming?: boolean;
 } {
   const threadId = useMemo(() => {
     if (!workspace) return null;
@@ -40,5 +45,8 @@ export function useActiveChatTasks(workspace: WorkspaceSnapshot | null): {
   const updatedAt = useAgentChatStore((state) =>
     threadId ? (state.threads[threadId]?.tasksUpdatedAt ?? null) : null,
   );
-  return { threadId, tasks, updatedAt };
+  const streaming = useAgentChatStore((state) =>
+    threadId ? (state.threads[threadId]?.streaming ?? false) : false,
+  );
+  return { threadId, tasks, updatedAt, streaming };
 }

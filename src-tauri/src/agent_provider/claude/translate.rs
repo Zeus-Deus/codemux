@@ -828,6 +828,9 @@ fn snapshot_from_launch(tool_use_id: &str, input: &serde_json::Value) -> Subagen
         provider_ref: None,
         workflow_id: None,
         phase: None,
+        // A launch snapshot only ever comes from a real `Agent`/`Task`
+        // tool_use block, so it is by definition not a background task.
+        background_task: false,
     }
 }
 
@@ -1032,7 +1035,25 @@ fn base_snapshot(subagent_id: &str) -> SubagentSnapshot {
         provider_ref: None,
         workflow_id: None,
         phase: None,
+        // Task-event snapshots stamp this from the demux — see
+        // [`stamp_background_task`].
+        background_task: false,
     }
+}
+
+/// Mark `snap` as a provider background task when its id is not a
+/// registered top-level `Agent`/`Task` launch.
+///
+/// Claude emits the same `system.task_*` family for a real delegated
+/// subagent **and** for a background tool run (`Bash { run_in_background:
+/// true }`), keyed by the spawning `tool_use_id`. Only a real launch is
+/// registered in the demux ([`SubagentDemux::register_top_level_launch`]),
+/// so "not a top-level launch" is the exact discriminator: those rows can
+/// outlive the turn forever (a dev server never exits, so its terminal
+/// `task_notification` never arrives) and must never pin the workspace to
+/// `Working` after `TurnCompleted`.
+fn stamp_background_task(snap: &mut SubagentSnapshot, demux: &SubagentDemux) {
+    snap.background_task = !demux.is_top_level_launch(&snap.subagent_id);
 }
 
 /// `type: "user"` — sent by the SDK when a tool_result is appended
@@ -1480,6 +1501,12 @@ fn apply_task_usage(snap: &mut SubagentSnapshot, usage: Option<&serde_json::Valu
 /// emits a `Running` snapshot whose activity is the description.
 /// Ambient / housekeeping tasks (`skip_transcript: true`) are dropped so
 /// they never spawn a card.
+///
+/// The SDK emits this family for background *tool* runs too (a
+/// `Bash { run_in_background: true }`), keyed by the Bash tool_use_id.
+/// Those are stamped `background_task` (see [`stamp_background_task`]) so
+/// the pane-status tracker never lets them hold the workspace in
+/// `Working` after the turn ends.
 fn translate_task_started(
     thread_id: &ThreadId,
     msg: &serde_json::Value,
@@ -1500,6 +1527,7 @@ fn translate_task_started(
     if !description.is_empty() {
         snap.activity = Some(description);
     }
+    stamp_background_task(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
@@ -1526,6 +1554,7 @@ fn translate_task_progress(
     snap.status = SubagentStatus::Running;
     snap.activity = opt_str_field(msg, "summary").or_else(|| opt_str_field(msg, "last_tool_name"));
     apply_task_usage(&mut snap, msg.get("usage"));
+    stamp_background_task(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
@@ -1574,6 +1603,7 @@ fn translate_task_updated(
     if !changed {
         return Vec::new();
     }
+    stamp_background_task(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
@@ -1606,6 +1636,7 @@ fn translate_task_notification(
         snap.result_text = Some(summary);
     }
     apply_task_usage(&mut snap, msg.get("usage"));
+    stamp_background_task(&mut snap, demux);
     stamp_workflow_attribution(&mut snap, demux);
     vec![ProviderRuntimeEvent::SubagentUpdated {
         thread_id: thread_id.clone(),
@@ -2774,6 +2805,88 @@ mod tests {
         let snap = only_subagent(&translate_sdk_message_with(&tid(), &updated, &mut demux)).clone();
         assert_eq!(snap.subagent_id, "toolu_root");
         assert_eq!(snap.status, SubagentStatus::Completed);
+    }
+
+    // A background *tool* run (`Bash { run_in_background: true }`) rides
+    // the same `system.task_*` family as a real subagent, keyed by the
+    // Bash tool_use_id — which is never registered as a top-level
+    // `Agent`/`Task` launch. Those snapshots must carry `background_task`
+    // so the pane-status tracker refuses to let a never-exiting dev server
+    // hold the workspace in "Working" after the turn ends.
+    #[test]
+    fn background_shell_task_events_are_flagged_as_background_tasks() {
+        let mut demux = SubagentDemux::default();
+        // No `register_top_level_launch` — a Bash tool_use never registers.
+        let started = json!({
+            "type": "system", "subtype": "task_started",
+            "task_id": "task_bg", "tool_use_id": "toolu_bash",
+            "description": "npm run dev"
+        });
+        let snap = only_subagent(&translate_sdk_message_with(&tid(), &started, &mut demux)).clone();
+        assert_eq!(snap.subagent_id, "toolu_bash");
+        assert!(
+            snap.background_task,
+            "an unregistered tool_use id is a background task, not a subagent"
+        );
+
+        // The same flag rides progress / updated / notification, so no
+        // later event can quietly re-enter the running-set unflagged.
+        let progress = json!({
+            "type": "system", "subtype": "task_progress",
+            "task_id": "task_bg", "tool_use_id": "toolu_bash",
+            "last_tool_name": "Bash"
+        });
+        let snap =
+            only_subagent(&translate_sdk_message_with(&tid(), &progress, &mut demux)).clone();
+        assert!(snap.background_task);
+
+        let updated = json!({
+            "type": "system", "subtype": "task_updated",
+            "task_id": "task_bg", "patch": {"status": "running"}
+        });
+        let snap = only_subagent(&translate_sdk_message_with(&tid(), &updated, &mut demux)).clone();
+        assert!(snap.background_task);
+
+        let note = json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "task_bg", "tool_use_id": "toolu_bash",
+            "status": "completed", "summary": "server stopped"
+        });
+        let snap = only_subagent(&translate_sdk_message_with(&tid(), &note, &mut demux)).clone();
+        assert!(snap.background_task);
+        assert_eq!(snap.status, SubagentStatus::Completed);
+    }
+
+    // The counterpart: a real `Agent`/`Task` launch is registered in the
+    // demux, so its task events stay unflagged and keep the deliberate
+    // deferred-`Review` behavior.
+    #[test]
+    fn real_agent_launch_task_events_are_not_background_tasks() {
+        let mut demux = SubagentDemux::default();
+        let launch = translate_sdk_message_with(
+            &tid(),
+            &launch_msg("Agent", "toolu_root", json!({"subagent_type": "Explore"})),
+            &mut demux,
+        );
+        assert!(
+            !only_subagent(&launch).background_task,
+            "the launch snapshot itself is never a background task"
+        );
+        let started = json!({
+            "type": "system", "subtype": "task_started",
+            "task_id": "task_1", "tool_use_id": "toolu_root",
+            "description": "Exploring the tree"
+        });
+        let snap = only_subagent(&translate_sdk_message_with(&tid(), &started, &mut demux)).clone();
+        assert!(!snap.background_task);
+
+        let note = json!({
+            "type": "system", "subtype": "task_notification",
+            "task_id": "task_1", "tool_use_id": "toolu_root",
+            "status": "completed", "summary": "done"
+        });
+        let snap = only_subagent(&translate_sdk_message_with(&tid(), &note, &mut demux)).clone();
+        assert!(!snap.background_task);
     }
 
     #[test]
