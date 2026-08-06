@@ -207,6 +207,12 @@ export interface SubagentView {
    *  terminal snapshot clears it; a real `running` snapshot revives an
    *  assumed/interrupted row back to `running` and clears it. */
   statusAssumed?: boolean;
+  /** True when the provider reported this row as a *background task*
+   *  (e.g. a background shell command) rather than a delegated subagent.
+   *  Such a job can outlive the turn indefinitely and never report a
+   *  terminal status, so it must not read as live activity once the
+   *  thread stops streaming (see `runningSubagentEntries`). */
+  backgroundTask?: boolean;
   /** Provider-pushed "currently doing X" line, when supplied. */
   activity?: string;
   /** Final report first surfaced on completion. */

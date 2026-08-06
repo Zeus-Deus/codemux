@@ -14,6 +14,19 @@ import { ComposerPendingInputPanel } from "./ComposerPendingInputPanel";
 
 afterEach(() => cleanup());
 
+/**
+ * The Questionnaire primitive mounts *every* question at once and hides
+ * the inactive ones (`hidden` + `inert`), so "is Q2 in the document" no
+ * longer proves navigation happened. Read the active page off the one
+ * un-hidden fieldset instead.
+ */
+function activeQuestion(container: HTMLElement): string | null {
+  const active = container.querySelector(
+    "[data-slot=questionnaire-item][data-active]:not([hidden])",
+  );
+  return active?.querySelector("legend")?.textContent ?? null;
+}
+
 function makeAskItem(
   overrides: Partial<PermissionRequestItem> = {},
 ): PermissionRequestItem {
@@ -165,11 +178,11 @@ describe("ComposerPendingInputPanel", () => {
       },
     });
     const onSubmit = vi.fn().mockResolvedValue(undefined);
-    render(
+    const { container } = render(
       <ComposerPendingInputPanel item={item} onSubmit={onSubmit} />,
     );
     // Start at question 1.
-    expect(screen.getByText("Q1?")).toBeInTheDocument();
+    expect(activeQuestion(container)).toBe("Q1?");
     expect(screen.getByText(/1 of 2/)).toBeInTheDocument();
     // Next is disabled until Q1 is answered.
     const next = screen.getByText("Next") as HTMLButtonElement;
@@ -178,7 +191,7 @@ describe("ComposerPendingInputPanel", () => {
     expect(next).not.toBeDisabled();
     // Advance.
     fireEvent.click(next);
-    expect(screen.getByText("Q2?")).toBeInTheDocument();
+    expect(activeQuestion(container)).toBe("Q2?");
     expect(screen.getByText(/2 of 2/)).toBeInTheDocument();
     // Primary action is now Send.
     const send = screen.getByText("Send") as HTMLButtonElement;
@@ -215,28 +228,28 @@ describe("ComposerPendingInputPanel", () => {
         ],
       },
     });
-    render(
+    const { container } = render(
       <ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />,
     );
     fireEvent.click(screen.getByText("A1"));
     fireEvent.click(screen.getByText("Next"));
-    expect(screen.getByText("Q2?")).toBeInTheDocument();
+    expect(activeQuestion(container)).toBe("Q2?");
     // Prev button (aria-label) goes back.
     fireEvent.click(screen.getByLabelText("Previous question"));
-    expect(screen.getByText("Q1?")).toBeInTheDocument();
+    expect(activeQuestion(container)).toBe("Q1?");
     // A1 is still the selected pick — Next remains enabled immediately.
     const next = screen.getByText("Next") as HTMLButtonElement;
     expect(next).not.toBeDisabled();
   });
 
   it("digit keys 1-9 toggle the matching option on the current question", () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
     render(
-      <ComposerPendingInputPanel
-        item={makeAskItem()}
-        onSubmit={vi.fn()}
-      />,
+      <ComposerPendingInputPanel item={makeAskItem()} onSubmit={onSubmit} />,
     );
-    // No input focus → digit key lands on the global handler.
+    // No input focus → the digit key lands on the document-level
+    // handler (the primitive's own shortcut handling only sees events
+    // that originate inside its form).
     act(() => {
       document.dispatchEvent(
         new KeyboardEvent("keydown", { key: "2", bubbles: true }),
@@ -244,13 +257,240 @@ describe("ComposerPendingInputPanel", () => {
     });
     const send = screen.getByText("Send") as HTMLButtonElement;
     expect(send).not.toBeDisabled();
-    // The Vue option (index 2) should now be selected — its row
-    // carries the "foreground/30" border-class, but a simpler assert:
-    // picking Send emits Vue as the answer.
+    // Option 2 (Vue) is the pick, so it is what gets submitted.
     fireEvent.click(send);
-    // Don't assert the onSubmit payload here (wired to vi.fn() with no
-    // capture). Instead, the enabled-Send assertion is sufficient
-    // evidence the keyboard shortcut toggled the pick.
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        answers: { "Which framework should we use?": "Vue" },
+      }),
+    );
+  });
+
+  it("ArrowLeft / ArrowRight page while focus is outside the form", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "A",
+            question: "Q1?",
+            multiSelect: false,
+            options: [{ label: "A1", description: "" }],
+          },
+          {
+            header: "B",
+            question: "Q2?",
+            multiSelect: false,
+            options: [{ label: "B1", description: "" }],
+          },
+        ],
+      },
+    });
+    const { container } = render(
+      <ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />,
+    );
+    expect(activeQuestion(container)).toBe("Q1?");
+    act(() => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true }),
+      );
+    });
+    expect(activeQuestion(container)).toBe("Q2?");
+    expect(screen.getByText(/2 of 2/)).toBeInTheDocument();
+    act(() => {
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true }),
+      );
+    });
+    expect(activeQuestion(container)).toBe("Q1?");
+  });
+
+  it("Enter outside the form advances, then submits on the last question", () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "A",
+            question: "Q1?",
+            multiSelect: false,
+            options: [{ label: "A1", description: "" }],
+          },
+          {
+            header: "B",
+            question: "Q2?",
+            multiSelect: false,
+            options: [{ label: "B1", description: "" }],
+          },
+        ],
+      },
+    });
+    const { container } = render(
+      <ComposerPendingInputPanel item={item} onSubmit={onSubmit} />,
+    );
+    const enter = () =>
+      act(() => {
+        document.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+        );
+      });
+    // Unanswered → Enter is inert (gated forward navigation).
+    enter();
+    expect(activeQuestion(container)).toBe("Q1?");
+    fireEvent.click(screen.getByText("A1"));
+    enter();
+    expect(activeQuestion(container)).toBe("Q2?");
+    expect(onSubmit).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("B1"));
+    enter();
+    expect(onSubmit).toHaveBeenCalledWith(
+      expect.objectContaining({ answers: { "Q1?": "A1", "Q2?": "B1" } }),
+    );
+  });
+
+  it("submits once — a second Send click is swallowed by the in-flight guard", () => {
+    const onSubmit = vi.fn(() => new Promise<void>(() => {}));
+    render(
+      <ComposerPendingInputPanel item={makeAskItem()} onSubmit={onSubmit} />,
+    );
+    fireEvent.click(screen.getByText("React"));
+    const send = screen.getByText("Send") as HTMLButtonElement;
+    fireEvent.click(send);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+    // The button is disabled while the request is in flight, and the
+    // ref guard covers the keyboard path too.
+    expect(send).toBeDisabled();
+    fireEvent.click(send);
+    expect(onSubmit).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-enables Send when the submit promise rejects", async () => {
+    const onSubmit = vi.fn().mockRejectedValue(new Error("ipc down"));
+    render(
+      <ComposerPendingInputPanel item={makeAskItem()} onSubmit={onSubmit} />,
+    );
+    fireEvent.click(screen.getByText("React"));
+    const send = screen.getByText("Send") as HTMLButtonElement;
+    await act(async () => {
+      fireEvent.click(send);
+    });
+    expect(send).not.toBeDisabled();
+    await act(async () => {
+      fireEvent.click(send);
+    });
+    expect(onSubmit).toHaveBeenCalledTimes(2);
+  });
+
+  it("options render real radio/checkbox controls with numbered shortcut chips", () => {
+    const { container } = render(
+      <ComposerPendingInputPanel item={makeAskItem()} onSubmit={vi.fn()} />,
+    );
+    // Single-select ⇒ radios grouped under the item name.
+    expect(screen.getAllByRole("radio")).toHaveLength(3);
+    // Root.items advertises the option labels as choice values, which is
+    // what the primitive keys its 1-9 shortcut map off — a mismatch
+    // would silently drop the chips.
+    expect(
+      [
+        ...container.querySelectorAll(
+          "[data-slot=questionnaire-choice-shortcut]",
+        ),
+      ].map((el) => el.textContent),
+    ).toEqual(["1", "2", "3"]);
+
+    cleanup();
+    render(
+      <ComposerPendingInputPanel
+        item={makeAskItem({
+          payload: {
+            questions: [
+              {
+                header: "Features",
+                question: "Which features?",
+                multiSelect: true,
+                options: [
+                  { label: "Auth", description: "" },
+                  { label: "Billing", description: "" },
+                ],
+              },
+            ],
+          },
+        })}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+  });
+
+  it("mounts every question at once and keeps a free-text row on each", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "A",
+            question: "Q1?",
+            multiSelect: false,
+            options: [{ label: "A1", description: "" }],
+          },
+          {
+            header: "B",
+            question: "Q2?",
+            multiSelect: false,
+            options: [{ label: "B1", description: "" }],
+          },
+        ],
+      },
+    });
+    const { container } = render(
+      <ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />,
+    );
+    // Both pages exist; only the active one is visible.
+    expect(
+      container.querySelectorAll("[data-slot=questionnaire-item]"),
+    ).toHaveLength(2);
+    expect(activeQuestion(container)).toBe("Q1?");
+    expect(screen.getByTestId("aq-other-0")).toBeInTheDocument();
+    expect(screen.getByTestId("aq-other-1")).toBeInTheDocument();
+  });
+
+  it("registers no Root.items ↔ rendered-item mismatches in dev mode", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "A",
+            question: "Q1?",
+            multiSelect: false,
+            options: [
+              { label: "A1", description: "" },
+              { label: "A2", description: "" },
+            ],
+          },
+          {
+            header: "B",
+            question: "Q2?",
+            multiSelect: true,
+            options: [{ label: "B1", description: "" }],
+          },
+        ],
+      },
+    });
+    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    // The primitive validates Root.items against the rendered tree in a
+    // microtask and warns on any drift (missing item, wrong choice value
+    // or order, required/disabled mismatch).
+    await act(async () => {
+      await Promise.resolve();
+    });
+    fireEvent.click(screen.getByText("A1"));
+    fireEvent.click(screen.getByText("Next"));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(
+      warn.mock.calls.filter((c) => String(c[0]).includes("[Questionnaire]")),
+    ).toEqual([]);
+    warn.mockRestore();
   });
 
   it("digit keys do NOT fire when focus is in the free-text input (composer typing is safe)", () => {
@@ -276,6 +516,122 @@ describe("ComposerPendingInputPanel", () => {
     // the question remains unanswered.
     const send = screen.getByText("Send") as HTMLButtonElement;
     expect(send).toBeDisabled();
+  });
+
+  it("Shift+Enter in the free-text input is inert (never advances or submits)", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "A",
+            question: "Q1?",
+            multiSelect: false,
+            options: [{ label: "A1", description: "" }],
+          },
+          {
+            header: "B",
+            question: "Q2?",
+            multiSelect: false,
+            options: [{ label: "B1", description: "" }],
+          },
+        ],
+      },
+    });
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(
+      <ComposerPendingInputPanel item={item} onSubmit={onSubmit} />,
+    );
+    const free = screen.getByTestId("aq-other-0") as HTMLInputElement;
+    fireEvent.change(free, { target: { value: "my own answer" } });
+    // Shift+Enter must not reach the primitive's form-level Enter branch.
+    fireEvent.keyDown(free, { key: "Enter", shiftKey: true });
+    expect(activeQuestion(container)).toBe("Q1?");
+    expect(onSubmit).not.toHaveBeenCalled();
+    // Plain Enter still advances, so the guard is narrow.
+    fireEvent.keyDown(free, { key: "Enter" });
+    expect(activeQuestion(container)).toBe("Q2?");
+    expect(onSubmit).not.toHaveBeenCalled();
+    // ...and Shift+Enter on the last question does not submit either.
+    const lastFree = screen.getByTestId("aq-other-1") as HTMLInputElement;
+    fireEvent.change(lastFree, { target: { value: "another" } });
+    fireEvent.keyDown(lastFree, { key: "Enter", shiftKey: true });
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("renders the keyboard hint row, flipping Enter next -> send on the last question", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "A",
+            question: "Q1?",
+            multiSelect: false,
+            options: [{ label: "A1", description: "" }],
+          },
+          {
+            header: "B",
+            question: "Q2?",
+            multiSelect: false,
+            options: [{ label: "B1", description: "" }],
+          },
+        ],
+      },
+    });
+    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    const hints = screen.getByTestId("aq-hints");
+    expect(hints).toBeInTheDocument();
+    expect(hints).toHaveTextContent("navigate");
+    expect(hints).toHaveTextContent("next");
+    // The arrow keys the hint advertises are real <kbd> chips.
+    expect(
+      [...hints.querySelectorAll("kbd")].map((k) => k.textContent),
+    ).toEqual(["←", "→", "Enter"]);
+    // Last question: the Enter hint tracks the primary action.
+    fireEvent.click(screen.getByText("A1"));
+    fireEvent.click(screen.getByText("Next"));
+    expect(screen.getByTestId("aq-hints")).toHaveTextContent("send");
+  });
+
+  it("option descriptions render through the registry's choice-description slot", () => {
+    const { container } = render(
+      <ComposerPendingInputPanel item={makeAskItem()} onSubmit={vi.fn()} />,
+    );
+    // The indicator / shortcut alignment classes key off this slot, so the
+    // description must not be a plain span.
+    const described = container.querySelectorAll(
+      "[data-slot=questionnaire-choice-description]",
+    );
+    expect([...described].map((n) => n.textContent)).toEqual([
+      "Most popular",
+      "Simpler",
+      "Compiler-based",
+    ]);
+    expect(
+      screen
+        .getByTestId("aq-option-0-0")
+        .querySelector("[data-slot=questionnaire-choice-description]"),
+    ).toHaveTextContent("Most popular");
+    // Options without a description render no slot node at all.
+    const { container: bare } = render(
+      <ComposerPendingInputPanel
+        item={makeAskItem({
+          payload: {
+            questions: [
+              {
+                header: "A",
+                question: "Q1?",
+                multiSelect: false,
+                options: [{ label: "A1", description: "" }],
+              },
+            ],
+          },
+        })}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(
+      bare.querySelectorAll("[data-slot=questionnaire-choice-description]"),
+    ).toHaveLength(0);
   });
 
   it("renders an option.preview popover only for options that supplied one", async () => {
@@ -418,7 +774,9 @@ describe("ComposerPendingInputPanel", () => {
         ],
       },
     });
-    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    const { container } = render(
+      <ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />,
+    );
     // Q1 page: option 0 has preview, option 1 does not.
     expect(screen.getByTestId("aq-option-0-0")).toHaveAttribute("data-state");
     expect(screen.getByTestId("aq-option-0-1")).not.toHaveAttribute(
@@ -427,6 +785,7 @@ describe("ComposerPendingInputPanel", () => {
     // Advance to Q2.
     fireEvent.click(screen.getByText("A1"));
     fireEvent.click(screen.getByText("Next"));
+    expect(activeQuestion(container)).toBe("Q2?");
     // Q2 page: option 0 has no preview, option 1 has the preview.
     expect(screen.getByTestId("aq-option-1-0")).not.toHaveAttribute(
       "data-state",

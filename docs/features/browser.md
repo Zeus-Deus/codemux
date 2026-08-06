@@ -92,6 +92,30 @@ explicit-close path, the session's URL and `cli_session_name` are kept, so
 the agent's next browser action simply re-marks it active and the chip
 returns. Daemon-death detection remains out of scope either way.
 
+Because the release is gated on that settled status, anything that stopped
+the turn from settling also stopped the chip from clearing. Two changes
+close that off:
+
+- **A background shell task can no longer block the release.** A
+  `Bash { run_in_background: true }` used to be tracked as a subagent, and
+  a dev server never exits — so the tracker deferred `Review` forever and
+  the chip sat on `LIVE · agent is navigating…` indefinitely. Those rows
+  now carry `SubagentSnapshot.background_task` and are excluded from the
+  running-set, so the turn settles and the release fires normally. See
+  `docs/features/agent-chat.md` (§ Sidebar status indicators).
+- **A watchdog backstop that stops short of this release.** If a `Review`
+  is still owed 10 minutes after the turn completed with no real run
+  activity, the stall-watchdog sweep force-settles the *pane status*
+  through `apply_pane_status`. It passes `SettleOrigin::ForcedBackstop`,
+  which deliberately withholds the browser release: the trigger is
+  silence, and a subagent sitting inside one long quiet tool call is
+  silent too. Publishing a settled dot early is repainted by the next
+  real event; closing a browser session the agent is still driving is
+  not. So the sidebar unsticks on the next sweep, while the chip clears
+  only on a real terminal transition (or when the pane/session closes).
+  See `docs/features/agent-chat.md` (§ Sidebar status indicators) for the
+  full forced-settle semantics.
+
 Known accepted edge case: if two chat threads are both driving browser
 activity in the *same* workspace, one thread finishing its run releases the
 chip even while the other thread is still mid-run. This self-heals — the

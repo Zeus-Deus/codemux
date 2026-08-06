@@ -686,6 +686,9 @@ fn empty_snapshot(id: &str) -> SubagentSnapshot {
         provider_ref: None,
         workflow_id: None,
         phase: None,
+        // OpenCode's `task` tool always spawns a real child session — it
+        // has no background-task shape on this path.
+        background_task: false,
     }
 }
 
