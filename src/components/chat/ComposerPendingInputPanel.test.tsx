@@ -518,6 +518,122 @@ describe("ComposerPendingInputPanel", () => {
     expect(send).toBeDisabled();
   });
 
+  it("Shift+Enter in the free-text input is inert (never advances or submits)", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "A",
+            question: "Q1?",
+            multiSelect: false,
+            options: [{ label: "A1", description: "" }],
+          },
+          {
+            header: "B",
+            question: "Q2?",
+            multiSelect: false,
+            options: [{ label: "B1", description: "" }],
+          },
+        ],
+      },
+    });
+    const onSubmit = vi.fn().mockResolvedValue(undefined);
+    const { container } = render(
+      <ComposerPendingInputPanel item={item} onSubmit={onSubmit} />,
+    );
+    const free = screen.getByTestId("aq-other-0") as HTMLInputElement;
+    fireEvent.change(free, { target: { value: "my own answer" } });
+    // Shift+Enter must not reach the primitive's form-level Enter branch.
+    fireEvent.keyDown(free, { key: "Enter", shiftKey: true });
+    expect(activeQuestion(container)).toBe("Q1?");
+    expect(onSubmit).not.toHaveBeenCalled();
+    // Plain Enter still advances, so the guard is narrow.
+    fireEvent.keyDown(free, { key: "Enter" });
+    expect(activeQuestion(container)).toBe("Q2?");
+    expect(onSubmit).not.toHaveBeenCalled();
+    // ...and Shift+Enter on the last question does not submit either.
+    const lastFree = screen.getByTestId("aq-other-1") as HTMLInputElement;
+    fireEvent.change(lastFree, { target: { value: "another" } });
+    fireEvent.keyDown(lastFree, { key: "Enter", shiftKey: true });
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("renders the keyboard hint row, flipping Enter next -> send on the last question", () => {
+    const item = makeAskItem({
+      payload: {
+        questions: [
+          {
+            header: "A",
+            question: "Q1?",
+            multiSelect: false,
+            options: [{ label: "A1", description: "" }],
+          },
+          {
+            header: "B",
+            question: "Q2?",
+            multiSelect: false,
+            options: [{ label: "B1", description: "" }],
+          },
+        ],
+      },
+    });
+    render(<ComposerPendingInputPanel item={item} onSubmit={vi.fn()} />);
+    const hints = screen.getByTestId("aq-hints");
+    expect(hints).toBeInTheDocument();
+    expect(hints).toHaveTextContent("navigate");
+    expect(hints).toHaveTextContent("next");
+    // The arrow keys the hint advertises are real <kbd> chips.
+    expect(
+      [...hints.querySelectorAll("kbd")].map((k) => k.textContent),
+    ).toEqual(["←", "→", "Enter"]);
+    // Last question: the Enter hint tracks the primary action.
+    fireEvent.click(screen.getByText("A1"));
+    fireEvent.click(screen.getByText("Next"));
+    expect(screen.getByTestId("aq-hints")).toHaveTextContent("send");
+  });
+
+  it("option descriptions render through the registry's choice-description slot", () => {
+    const { container } = render(
+      <ComposerPendingInputPanel item={makeAskItem()} onSubmit={vi.fn()} />,
+    );
+    // The indicator / shortcut alignment classes key off this slot, so the
+    // description must not be a plain span.
+    const described = container.querySelectorAll(
+      "[data-slot=questionnaire-choice-description]",
+    );
+    expect([...described].map((n) => n.textContent)).toEqual([
+      "Most popular",
+      "Simpler",
+      "Compiler-based",
+    ]);
+    expect(
+      screen
+        .getByTestId("aq-option-0-0")
+        .querySelector("[data-slot=questionnaire-choice-description]"),
+    ).toHaveTextContent("Most popular");
+    // Options without a description render no slot node at all.
+    const { container: bare } = render(
+      <ComposerPendingInputPanel
+        item={makeAskItem({
+          payload: {
+            questions: [
+              {
+                header: "A",
+                question: "Q1?",
+                multiSelect: false,
+                options: [{ label: "A1", description: "" }],
+              },
+            ],
+          },
+        })}
+        onSubmit={vi.fn()}
+      />,
+    );
+    expect(
+      bare.querySelectorAll("[data-slot=questionnaire-choice-description]"),
+    ).toHaveLength(0);
+  });
+
   it("renders an option.preview popover only for options that supplied one", async () => {
     const item = makeAskItem({
       payload: {

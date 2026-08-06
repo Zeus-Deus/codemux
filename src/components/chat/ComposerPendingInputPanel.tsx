@@ -2,6 +2,7 @@ import { ChevronLeft, Pencil } from "lucide-react";
 import {
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -18,6 +19,7 @@ import {
   Questionnaire,
   QuestionnaireActions,
   QuestionnaireChoice,
+  QuestionnaireChoiceDescription,
   QuestionnaireChoices,
   QuestionnaireDescription,
   QuestionnaireError,
@@ -410,14 +412,32 @@ export function ComposerPendingInputPanel({ item, onSubmit }: Props) {
             ))}
 
             <QuestionnaireActions className="min-h-0 gap-2 sm:min-h-0">
-              <QuestionnairePrevious
-                aria-label="Previous question"
-                size="sm"
-                variant="ghost"
-                className="h-7 min-h-0 w-7 px-0 text-muted-foreground/70 sm:min-h-0"
-              >
-                <ChevronLeft className="size-3.5" />
-              </QuestionnairePrevious>
+              {/* Column 1 of the actions grid holds the back chevron plus
+                  the keyboard hints; the numbered chips on each row already
+                  advertise 1-9, so the hint only covers the arrow / Enter
+                  layer that has no on-screen affordance. */}
+              <div className="col-start-1 row-start-1 flex min-w-0 items-center gap-2">
+                <QuestionnairePrevious
+                  aria-label="Previous question"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 min-h-0 w-7 shrink-0 px-0 text-muted-foreground/70 sm:min-h-0"
+                >
+                  <ChevronLeft className="size-3.5" />
+                </QuestionnairePrevious>
+                <div
+                  data-testid="aq-hints"
+                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground/60"
+                >
+                  <span>
+                    <Kbd>←</Kbd> <Kbd>→</Kbd> navigate
+                  </span>
+                  <span aria-hidden>·</span>
+                  <span>
+                    <Kbd>Enter</Kbd> {isLast ? "send" : "next"}
+                  </span>
+                </div>
+              </div>
               <QuestionnaireNext
                 size="sm"
                 disabled={nextDisabled}
@@ -481,10 +501,14 @@ function OptionChoice({
       className="min-h-0 gap-2 rounded-md px-2.5 py-1.5"
     >
       <span className="text-sm leading-snug text-foreground">{label}</span>
+      {/* The registry's description slot: besides the muted styling it is
+          what the indicator / shortcut chip alignment classes key off
+          (`group-has-data-[slot=questionnaire-choice-description]`), so a
+          raw span here would misalign both by a fraction of a spacing unit. */}
       {description && (
-        <span className="text-xs leading-snug text-muted-foreground">
+        <QuestionnaireChoiceDescription className="text-xs leading-snug">
           {description}
-        </span>
+        </QuestionnaireChoiceDescription>
       )}
     </QuestionnaireChoice>
   );
@@ -531,12 +555,14 @@ interface OtherRowProps {
  */
 function OtherRow({ questionIndex, value, onChange, onEnter }: OtherRowProps) {
   const handleKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter" && !e.shiftKey) {
-      // The primitive's form-level handler bails on `defaultPrevented`,
-      // so this replaces (never duplicates) its Enter behavior.
-      e.preventDefault();
-      onEnter();
-    }
+    if (e.key !== "Enter") return;
+    // The primitive's form-level handler bails on `defaultPrevented`, so
+    // this replaces (never duplicates) its Enter behavior. Shift+Enter is
+    // swallowed rather than forwarded: it has always been inert in this
+    // field, and letting it reach the form would advance/submit.
+    e.preventDefault();
+    if (e.shiftKey) return;
+    onEnter();
   };
   return (
     <div className="relative flex w-full items-center">
@@ -554,6 +580,14 @@ function OtherRow({ questionIndex, value, onChange, onEnter }: OtherRowProps) {
         className="pointer-events-none absolute start-2.5 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground/70"
       />
     </div>
+  );
+}
+
+function Kbd({ children }: { children: ReactNode }) {
+  return (
+    <kbd className="rounded bg-muted/60 px-1 py-[1px] font-mono text-[10px] text-muted-foreground/80">
+      {children}
+    </kbd>
   );
 }
 
