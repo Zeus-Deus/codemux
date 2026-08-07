@@ -18,10 +18,15 @@
 //!
 //! | Family   | Model flag                 | Reasoning flag                       |
 //! |----------|----------------------------|--------------------------------------|
-//! | Claude   | `--model <id>`             | `--effort <low..max>`                |
+//! | Claude   | `--model <id>`             | `--effort <low..max>` + `--settings` |
 //! | Codex    | `--model <id>`             | `-c model_reasoning_effort=<id>`     |
 //! | OpenCode | `--model <provider/model>` | — (TUI exposes none)                 |
 //! | Gemini   | `--model <id>`             | — (CLI exposes none)                 |
+//!
+//! Claude's `ultracode` is the one reasoning level that is not itself an
+//! `--effort` value: it is xhigh effort plus a setting, so it splices as
+//! `--effort xhigh --settings '{"ultracode":true}'`. Every other level
+//! emits `--effort` alone and no `--settings`.
 //!
 //! Injection happens on the raw preset command *before*
 //! [`crate::agent_context::inject_agent_context`] wraps it, so the
@@ -171,6 +176,40 @@ fn strip_flag(tokens: &mut Vec<String>, long: &str, short: Option<&str>) {
     }
 }
 
+/// The `--settings` value that switches Claude's `ultracode` level on:
+/// compact JSON (no spaces, so it survives the whitespace tokenization
+/// this module does), single-quoted so the braces and inner double
+/// quotes reach the CLI intact.
+///
+/// Quoting note — the spliced command is typed into the user's own
+/// interactive shell, so the quoting has to hold there rather than in an
+/// argv vector. Single quotes are a literal-string quote in every shell
+/// Codemux launches into except the two already documented as
+/// unsupported for shell-expanded flags (`cmd.exe`, and Windows
+/// PowerShell 5.1, whose native-argument passing drops the inner double
+/// quotes instead of re-escaping them). This is the same trade-off the
+/// `[1m]` model suffix above already makes.
+const ULTRACODE_SETTINGS_ARG: &str = "'{\"ultracode\":true}'";
+
+/// Drop a `--settings` pair this function spliced on an earlier pass.
+///
+/// Matched on the exact value, not on the flag alone: a preset may
+/// legitimately carry the user's own `--settings <path-or-json>`, and
+/// re-applying a selection must not eat it. Only the token this module
+/// itself emits is removed, which is what makes the ultracode splice
+/// idempotent — and what lets a later switch to a plain effort level
+/// clear the stale setting.
+fn strip_ultracode_settings(tokens: &mut Vec<String>) {
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        if tokens[i] == "--settings" && tokens[i + 1] == ULTRACODE_SETTINGS_ARG {
+            tokens.drain(i..i + 2);
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Drop a baked-in `-c model_reasoning_effort=<value>` Codex override
 /// (and the `-c` / `--config` flag preceding it).
 fn strip_codex_reasoning(tokens: &mut Vec<String>) {
@@ -247,8 +286,23 @@ pub fn apply_model_selection(command: &str, selection: Option<&ModelSelection>) 
             match family {
                 AgentFamily::Claude => {
                     strip_flag(&mut tokens, "--effort", None);
-                    tokens.push("--effort".into());
-                    tokens.push(reasoning.to_string());
+                    strip_ultracode_settings(&mut tokens);
+                    if reasoning == "ultracode" {
+                        // `ultracode` is not a value the CLI accepts for
+                        // `--effort` ("Valid values: low, medium, high,
+                        // xhigh, max"). It is xhigh effort plus standing
+                        // dynamic-workflow orchestration, switched on by
+                        // a setting — so it splices as that pair of
+                        // flags, matching how the agent-chat sidecar
+                        // normalizes the same selection.
+                        tokens.push("--effort".into());
+                        tokens.push("xhigh".into());
+                        tokens.push("--settings".into());
+                        tokens.push(ULTRACODE_SETTINGS_ARG.into());
+                    } else {
+                        tokens.push("--effort".into());
+                        tokens.push(reasoning.to_string());
+                    }
                     changed = true;
                 }
                 AgentFamily::Codex => {
@@ -358,6 +412,77 @@ mod tests {
             out,
             "claude --dangerously-skip-permissions --model opus --effort high"
         );
+    }
+
+    #[test]
+    fn claude_ultracode_splices_xhigh_plus_the_settings_flag() {
+        // `ultracode` is not a CLI `--effort` value — it lands as xhigh
+        // effort plus the setting that switches the level on.
+        let out = apply_model_selection(
+            "claude --dangerously-skip-permissions",
+            Some(&sel(Some("opus"), Some("ultracode"))),
+        );
+        assert_eq!(
+            out,
+            "claude --dangerously-skip-permissions --model opus \
+             --effort xhigh --settings '{\"ultracode\":true}'"
+        );
+    }
+
+    #[test]
+    fn claude_ultracode_splice_is_idempotent() {
+        // Re-applying the same selection over an already-spliced command
+        // must not stack a second `--effort` / `--settings` pair.
+        let once = apply_model_selection(
+            "claude --foo",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        let twice = apply_model_selection(&once, Some(&sel(None, Some("ultracode"))));
+        assert_eq!(twice, once);
+        assert_eq!(
+            once,
+            "claude --foo --effort xhigh --settings '{\"ultracode\":true}'"
+        );
+    }
+
+    #[test]
+    fn switching_off_ultracode_clears_the_settings_flag() {
+        // Downgrading to a plain effort level must remove the setting —
+        // otherwise the session would still run with workflows on.
+        let ultra = apply_model_selection(
+            "claude --foo",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        let plain = apply_model_selection(&ultra, Some(&sel(None, Some("high"))));
+        assert_eq!(plain, "claude --foo --effort high");
+    }
+
+    #[test]
+    fn ultracode_splice_leaves_a_user_settings_flag_alone() {
+        // Only the token this module emits is stripped: a preset that
+        // carries the user's own settings file keeps it.
+        let out = apply_model_selection(
+            "claude --settings ~/my-settings.json",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        assert_eq!(
+            out,
+            "claude --settings ~/my-settings.json \
+             --effort xhigh --settings '{\"ultracode\":true}'"
+        );
+    }
+
+    #[test]
+    fn non_claude_families_never_see_the_ultracode_settings_flag() {
+        // The level and its setting are Claude-specific — no other
+        // family's command may grow a `--settings` flag from it.
+        for cmd in ["codex --full-auto", "opencode", "gemini --yolo"] {
+            let out = apply_model_selection(cmd, Some(&sel(None, Some("ultracode"))));
+            assert!(
+                !out.contains("--settings"),
+                "{cmd} must not receive Claude's ultracode setting, got: {out}"
+            );
+        }
     }
 
     #[test]

@@ -25,6 +25,26 @@ directly-committed side-branch PR badge fallback, grouped by subsystem below.
 Everything in this block is on `main` and has not shipped in a published
 build:
 
+- **Ultracode reasoning level for Claude + Codex effort-picker polish** (branch
+  `add-ultracode-claude-provider`, unmerged). The reasoning picker now offers
+  **Ultracode** on every xhigh-capable Claude model: `ensure_ultracode_effort`
+  (`agent_provider/claude/capabilities.rs`) appends the level at all three
+  capability-producer paths (maintained fallback, sidecar-harvest merge — so
+  live-harvested models like Opus 5 get it — and API harvest). Because the
+  headless CLI rejects `--effort ultracode`, the level is normalized at the
+  launch boundaries: the sidecar's `buildQueryOptions` sends SDK
+  `effort: "xhigh"` + `settings: {ultracode: true}` (standing multi-agent
+  workflow orchestration, pairing with the existing Workflow orchestration
+  card), and the terminal-preset splice (`agent_capability.rs`) emits
+  `--effort xhigh --settings '{"ultracode":true}'` idempotently. On the Codex
+  side, the catalog-advertised `max`/`ultra` levels (already sent verbatim on
+  `turn/start`, which is protocol-correct — `ultra` also enables the
+  provider's proactive multi-agent mode) now render Title-Case labels, and a
+  new additive `ChatModelInfo.effort_descriptions` map carries the Codex
+  catalog's per-effort descriptions into the picker's description line, with
+  built-in fallbacks for `ultra`/`ultracode` in `ReasoningPicker.tsx`. See
+  `docs/features/agent-chat.md` § "Reasoning picker (effort)".
+
 - **AskUserQuestion panel rebuilt on the shadcn Questionnaire component** (PR #252). `ComposerPendingInputPanel`'s hand-rolled option rows, paging chevrons, and hidden `sr-only` inputs are replaced by the newly released shadcn **Questionnaire** primitives (`src/components/ui/questionnaire.tsx` over the new `@shadcn/react` package, installed for the repo's `radix-nova` style): real fieldset/legend semantics per question, radio/checkbox indicator cards with automatically mapped 1–9 shortcut chips, focus-visible rings the old panel lacked, and Previous/Next/Submit navigation. The externally observable contract is unchanged — same `AskUserQuestionOutput` shape (answers keyed by question text, `", "`-joined multiSelect with free text appended, raw `questions` echoed), same composer-docked card on the chat-column rails, same global document-level keyboard layer for focus-outside-the-form digits/arrows/Enter (now guarded against double-handling with the primitive's in-form handler), same `option.preview` HoverCards and test ids. `npm run dev` + `?askq=1` seeds a pending two-question request for browser QA; the mock's `agent_chat_respond_to_request` now resolves it so answering settles the panel into the reply bubble. See `docs/features/agent-chat.md` § "AskUserQuestion panel".
 
 - **A finished run can no longer stay stuck on "Working"** (PR #254).

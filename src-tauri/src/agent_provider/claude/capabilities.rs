@@ -57,12 +57,14 @@ fn claude_effort_label_map() -> HashMap<String, String> {
         ("high", "High"),
         ("xhigh", "Extra High"),
         ("max", "Max"),
-        // `ultracode` (xhigh + workflows) exists only in Claude Code's
-        // TUI `/model` effort slider. The headless CLI rejects it as an
-        // `--effort` value ("Valid values: low, medium, high, xhigh,
-        // max" as of claude 2.1.170), so no maintained entry lists it —
-        // the label stays only so a future SDK-reported level renders
-        // nicely instead of falling back to the raw token.
+        // `ultracode` is xhigh effort plus standing dynamic-workflow
+        // orchestration, so it is offered on every xhigh-capable model
+        // (see `ensure_ultracode_effort`). It is not a valid `--effort`
+        // value — the CLI rejects it with "Valid values: low, medium,
+        // high, xhigh, max" — so the launch boundaries normalize it:
+        // the sidecar sends `--effort xhigh` plus the settings JSON
+        // `{"ultracode":true}`, and the terminal-preset splicer emits
+        // the same pair of flags.
         ("ultracode", "Ultracode"),
         ("ultrathink", "Ultrathink"),
     ];
@@ -70,6 +72,31 @@ fn claude_effort_label_map() -> HashMap<String, String> {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+}
+
+/// Offer `ultracode` on any model that supports `xhigh`.
+///
+/// Ultracode is xhigh effort plus standing dynamic-workflow
+/// orchestration, so it is only meaningful on an xhigh-capable model —
+/// a model whose vocabulary tops out below `xhigh` (Sonnet, the older
+/// Opus rows) never gains it. No capability source reports the level on
+/// its own: the CLI rejects it as an `--effort` value, so neither the
+/// maintained table nor the SDK's `supportedEffortLevels` lists it. It
+/// is appended here instead, at the END of the native list past `max`,
+/// so the picker orders it as the top rung.
+///
+/// Called from all three `ChatModelInfo` producers in this module —
+/// [`models`], [`infer_model_info`], and [`merge_sdk_with_maintained`] —
+/// which between them are the only sources every capabilities bundle
+/// draws from. In particular the merge case must apply it *after* the
+/// SDK-wins effort assignment, or a live-harvested flagship would never
+/// offer the level.
+fn ensure_ultracode_effort(model: &mut ChatModelInfo) {
+    let has_xhigh = model.effort_levels.iter().any(|l| l == "xhigh");
+    let has_ultracode = model.effort_levels.iter().any(|l| l == "ultracode");
+    if has_xhigh && !has_ultracode {
+        model.effort_levels.push("ultracode".into());
+    }
 }
 
 // Model-level `max_context_tokens` stays `None` across this table on
@@ -80,8 +107,12 @@ fn claude_effort_label_map() -> HashMap<String, String> {
 // window stated anywhere in the registry, and a guessed denominator is
 // worse than none: the meter degrades to a bare token count until the
 // provider reports its own figure at turn end.
+//
+// `effort_descriptions` likewise stays empty across this table: the
+// Claude SDK's model catalog carries no per-effort blurbs, so the
+// picker falls back to its own built-in descriptions.
 fn models() -> Vec<ChatModelInfo> {
-    vec![
+    let mut maintained = vec![
         // Opus 4.8 — the recommended default, effort defaults to high
         // (the level Claude Code's own `/model` slider marks as
         // "(default)"), supports ultrathink + 1M. The CLI's picker
@@ -106,6 +137,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            effort_descriptions: Default::default(),
             max_context_tokens: None,
         },
         // Fable 5 — top tier above Opus. The deployed CLI reports it
@@ -132,6 +164,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            effort_descriptions: Default::default(),
             max_context_tokens: None,
         },
         // Opus 4.7 — previous flagship.
@@ -155,6 +188,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            effort_descriptions: Default::default(),
             max_context_tokens: None,
         },
         // Opus 4.6 — default effort is high, supports ultrathink + 1M.
@@ -179,6 +213,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            effort_descriptions: Default::default(),
             max_context_tokens: None,
         },
         // Opus 4.5 — no ultrathink, no 1M context.
@@ -201,6 +236,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            effort_descriptions: Default::default(),
             max_context_tokens: None,
         },
         // Sonnet 4.6 — narrower effort range, supports ultrathink + 1M.
@@ -218,6 +254,7 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            effort_descriptions: Default::default(),
             max_context_tokens: None,
         },
         // Haiku 4.5 — no effort, no context-window picker. Has a thinking
@@ -236,9 +273,18 @@ fn models() -> Vec<ChatModelInfo> {
             supports_images: true,
             sub_provider: None,
             is_free: false,
+            effort_descriptions: Default::default(),
             max_context_tokens: None,
         },
-    ]
+    ];
+    // The table above lists only levels the CLI accepts as `--effort`
+    // values; `ultracode` rides on top of `xhigh` and is appended here
+    // so every consumer of the maintained table (the fallback bundle,
+    // the API-harvest merge, the family backfill) offers it uniformly.
+    for m in &mut maintained {
+        ensure_ultracode_effort(m);
+    }
+    maintained
 }
 
 fn claude_permission_modes() -> Vec<PermissionModeOption> {
@@ -576,7 +622,7 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
         _ => (vec![], None, vec![], vec![]),
     };
     let context_window_options = with_pinned_default(ctx, pinned_window(id));
-    ChatModelInfo {
+    let mut info = ChatModelInfo {
         id: base_id.to_string(),
         label,
         description: None,
@@ -590,8 +636,11 @@ fn infer_model_info(id: &str, display_name: &str) -> ChatModelInfo {
         supports_images: true,
         sub_provider: None,
         is_free: false,
+        effort_descriptions: Default::default(),
         max_context_tokens: None,
-    }
+    };
+    ensure_ultracode_effort(&mut info);
+    info
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1114,7 +1163,7 @@ fn merge_sdk_with_maintained(
     // full-id rows keep the SDK label + description untouched.
     let (label, description) = promote_alias_row(&base_id, label, description, maintained);
 
-    ChatModelInfo {
+    let mut merged = ChatModelInfo {
         id: base_id,
         label,
         description,
@@ -1145,8 +1194,15 @@ fn merge_sdk_with_maintained(
         supports_images: true,
         sub_provider: None,
         is_free: false,
+        effort_descriptions: Default::default(),
         max_context_tokens: None,
-    }
+    };
+    // Applied last, on the already-resolved vocabulary: the SDK-wins
+    // branch above replaces the maintained list wholesale, so a
+    // live-harvested flagship would otherwise lose the level the
+    // maintained table carries.
+    ensure_ultracode_effort(&mut merged);
+    merged
 }
 
 #[cfg(test)]
@@ -1339,10 +1395,12 @@ mod tests {
 
     #[test]
     fn maintained_effort_vocab_matches_the_deployed_cli() {
-        // The headless CLI accepts exactly low..max as `--effort`
-        // values (`ultracode` is TUI-slider-only and is rejected with
-        // a warning as of claude 2.1.170). Maintained flagship entries
-        // must never list a level the CLI would refuse at launch.
+        // Every level a flagship offers must normalize to a `--effort`
+        // value the headless CLI accepts (low..max). `ultracode` is the
+        // one level that is not itself such a value: it normalizes at
+        // the launch boundaries to `--effort xhigh` plus the settings
+        // JSON `{"ultracode":true}`, and rides last in the list because
+        // it sits a rung above `max`.
         let caps = claude_fallback_capabilities();
         for id in ["claude-fable-5", "claude-opus-4-8", "claude-opus-4-7"] {
             let m = caps
@@ -1352,7 +1410,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id} should be in the maintained list"));
             assert_eq!(
                 m.effort_levels,
-                vec!["low", "medium", "high", "xhigh", "max"],
+                vec!["low", "medium", "high", "xhigh", "max", "ultracode"],
                 "{id} effort vocabulary must mirror the deployed CLI"
             );
             assert_eq!(
@@ -1405,7 +1463,7 @@ mod tests {
         let info = infer_model_info("claude-opus-9-9", "Claude Opus 9.9");
         assert_eq!(
             info.effort_levels,
-            vec!["low", "medium", "high", "xhigh", "max"]
+            vec!["low", "medium", "high", "xhigh", "max", "ultracode"]
         );
         assert_eq!(info.default_effort.as_deref(), Some("high"));
         assert!(
@@ -1535,7 +1593,7 @@ mod tests {
         assert_eq!(new.label, "Claude Opus 9.9");
         assert_eq!(
             new.effort_levels,
-            vec!["low", "medium", "high", "xhigh", "max"]
+            vec!["low", "medium", "high", "xhigh", "max", "ultracode"]
         );
     }
 
@@ -1734,11 +1792,12 @@ mod tests {
 
     #[test]
     fn sdk_merge_uses_sdk_effort_levels_for_a_known_id() {
-        // SDK reports an effort vocabulary with levels the maintained
-        // Opus 4.7 entry doesn't list (`ultracode`, `newlevel`) — the
-        // SDK value wins verbatim (regression guard for when the
-        // deployed CLI ships a level the maintained list hasn't been
-        // bumped for yet).
+        // SDK reports an effort vocabulary with a level the maintained
+        // Opus 4.7 entry doesn't list (`newlevel`) — the SDK value wins
+        // verbatim (regression guard for when the deployed CLI ships a
+        // level the maintained list hasn't been bumped for yet). The
+        // SDK list already carries `ultracode` here, so the append must
+        // not duplicate it.
         let live = vec![sdk_model(
             "claude-opus-4-7",
             "Claude Opus 4.7",
@@ -1749,6 +1808,11 @@ mod tests {
         let caps = build_capabilities_from_sdk(live);
         let opus = &caps.models[0];
         assert!(opus.effort_levels.contains(&"newlevel".to_string()));
+        assert_eq!(
+            opus.effort_levels.iter().filter(|l| *l == "ultracode").count(),
+            1,
+            "an SDK-reported `ultracode` must not be appended a second time"
+        );
         // Maintained metadata still fills in context windows + ultrathink.
         assert!(opus.context_window_options.iter().any(|o| o.value == "1m"));
         assert!(
@@ -1765,7 +1829,7 @@ mod tests {
         let live = vec![sdk_model(
             "claude-opus-5-0",
             "Claude Opus 5.0",
-            &["low", "medium", "high", "xhigh", "max", "ultracode"],
+            &["low", "medium", "high", "xhigh", "max"],
             Some(true),
             Some(false),
         )];
@@ -1773,12 +1837,38 @@ mod tests {
         let new = &caps.models[0];
         assert_eq!(new.id, "claude-opus-5-0");
         assert_eq!(new.label, "Claude Opus 5.0");
-        assert!(new.effort_levels.contains(&"ultracode".to_string()));
+        // The live roster reports no `ultracode` — it is appended after
+        // the SDK-wins assignment because the row supports `xhigh`, and
+        // lands last so the picker orders it above `max`.
+        assert_eq!(
+            new.effort_levels,
+            vec!["low", "medium", "high", "xhigh", "max", "ultracode"]
+        );
         assert!(new.context_window_options.iter().any(|o| o.value == "1m"));
         assert!(
             new.prompt_injected_effort_levels
                 .contains(&"ultrathink".to_string())
         );
+    }
+
+    #[test]
+    fn sdk_merge_withholds_ultracode_without_xhigh() {
+        // Ultracode is xhigh effort plus workflow orchestration, so a
+        // row whose vocabulary tops out below `xhigh` must not offer it.
+        let live = vec![sdk_model(
+            "claude-sonnet-4-6",
+            "Claude Sonnet 4.6",
+            &["low", "medium", "high"],
+            Some(false),
+            None,
+        )];
+        let caps = build_capabilities_from_sdk(live);
+        let sonnet = caps
+            .models
+            .iter()
+            .find(|m| m.id == "claude-sonnet-4-6")
+            .expect("the live Sonnet row should survive the merge");
+        assert_eq!(sonnet.effort_levels, vec!["low", "medium", "high"]);
     }
 
     #[test]
@@ -1788,10 +1878,11 @@ mod tests {
         let live = vec![sdk_model("claude-opus-4-7", "Claude Opus 4.7", &[], None, None)];
         let caps = build_capabilities_from_sdk(live);
         let opus = &caps.models[0];
-        // Maintained Opus 4.7 mirrors the deployed CLI: low..max.
+        // Maintained Opus 4.7 mirrors the deployed CLI (low..max), plus
+        // the `ultracode` rung every xhigh-capable model offers.
         assert_eq!(
             opus.effort_levels,
-            vec!["low", "medium", "high", "xhigh", "max"]
+            vec!["low", "medium", "high", "xhigh", "max", "ultracode"]
         );
     }
 

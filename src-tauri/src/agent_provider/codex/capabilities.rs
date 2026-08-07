@@ -260,6 +260,17 @@ fn model_entry_to_chat_info(entry: ModelEntry) -> ChatModelInfo {
         .map(|opt| opt.reasoning_effort.clone())
         .filter(|level| level != "none")
         .collect();
+    // The catalog ships a blurb per effort level; carry it through so the
+    // picker can render the provider's own wording instead of a frontend
+    // guess. Entries with an empty description are skipped rather than
+    // mapped to "" — the picker's built-in fallback reads better than a
+    // blank second line.
+    let effort_descriptions: HashMap<String, String> = entry
+        .supported_reasoning_efforts
+        .iter()
+        .filter(|opt| !opt.description.is_empty())
+        .map(|opt| (opt.reasoning_effort.clone(), opt.description.clone()))
+        .collect();
     let default_effort = if effort_levels.is_empty() {
         None
     } else if entry.default_reasoning_effort != "none"
@@ -284,6 +295,7 @@ fn model_entry_to_chat_info(entry: ModelEntry) -> ChatModelInfo {
         },
         effort_levels,
         default_effort,
+        effort_descriptions,
         prompt_injected_effort_levels: vec![],
         context_window_options: vec![],
         supports_adaptive_thinking: false,
@@ -302,8 +314,9 @@ fn model_entry_to_chat_info(entry: ModelEntry) -> ChatModelInfo {
     }
 }
 
-/// Canonical labels for Codex reasoning-effort strings. Static — the SDK
-/// uses a fixed set that hasn't changed since the V2 release.
+/// Canonical labels for Codex reasoning-effort strings. Static — the
+/// SDK's vocabulary only ever grows at the top end, so unknown levels
+/// fall through to the raw id rather than being dropped.
 pub fn codex_effort_label_map() -> HashMap<String, String> {
     let pairs = [
         ("none", "None"),
@@ -312,6 +325,11 @@ pub fn codex_effort_label_map() -> HashMap<String, String> {
         ("medium", "Medium"),
         ("high", "High"),
         ("xhigh", "Extra High"),
+        // Catalog-advertised levels on newer models. Without these the
+        // picker fell through to the raw lowercase id while every other
+        // row rendered Title Case.
+        ("max", "Max"),
+        ("ultra", "Ultra"),
     ];
     pairs
         .iter()
@@ -506,6 +524,65 @@ mod tests {
         cache.invalidate().await;
         let guard = cache.inner.lock().await;
         assert!(guard.is_none());
+    }
+
+    // ── Effort labels & descriptions ──
+
+    #[test]
+    fn effort_label_map_titlecases_every_catalog_level() {
+        // Regression: `max` and `ultra` used to be missing, so the
+        // picker rendered the raw lowercase id next to Title Case rows.
+        let map = codex_effort_label_map();
+        for (level, expected) in [
+            ("minimal", "Minimal"),
+            ("low", "Low"),
+            ("medium", "Medium"),
+            ("high", "High"),
+            ("xhigh", "Extra High"),
+            ("max", "Max"),
+            ("ultra", "Ultra"),
+        ] {
+            assert_eq!(
+                map.get(level).map(String::as_str),
+                Some(expected),
+                "missing label for {level}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_effort_descriptions_land_on_the_model() {
+        let mut e = entry("m", false, vec!["text"]);
+        e.supported_reasoning_efforts = vec![
+            super::super::protocol::ReasoningEffortOption {
+                reasoning_effort: "high".into(),
+                description: "High reasoning depth".into(),
+            },
+            super::super::protocol::ReasoningEffortOption {
+                reasoning_effort: "ultra".into(),
+                description: "Maximum reasoning with automatic task delegation".into(),
+            },
+        ];
+        e.default_reasoning_effort = "high".into();
+        let info = model_entry_to_chat_info(e);
+        assert_eq!(
+            info.effort_descriptions.get("high").map(String::as_str),
+            Some("High reasoning depth")
+        );
+        assert_eq!(
+            info.effort_descriptions.get("ultra").map(String::as_str),
+            Some("Maximum reasoning with automatic task delegation")
+        );
+    }
+
+    #[test]
+    fn efforts_without_a_description_produce_no_entry() {
+        // The fixture builder leaves every description empty. Mapping
+        // those to "" would blank out the picker's second line instead
+        // of letting its built-in fallback text through.
+        let info = model_entry_to_chat_info(entry("m", false, vec!["text"]));
+        assert!(!info.effort_levels.is_empty());
+        assert!(info.effort_descriptions.is_empty());
     }
 
     // ── Numeric context window ──
