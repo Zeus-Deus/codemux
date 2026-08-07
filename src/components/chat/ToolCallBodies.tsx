@@ -94,7 +94,7 @@ export function BashToolBody({ item, input }: BodyProps) {
   return (
     <div className="space-y-2">
       {command && (
-        <div className="rounded-md bg-muted/40 px-3 py-2 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
+        <div className="select-text rounded-md bg-muted/40 px-3 py-2 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
           <span className="text-muted-foreground/70">$ </span>
           {command}
           {description && (
@@ -388,7 +388,7 @@ function LazyToolResultBody({ stub }: { stub: LazyToolResultStub }) {
   const hidden = Math.max(stub.line_count - previewLineCount(stub.preview), 0);
 
   return (
-    <div className="rounded-md bg-muted/40 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
+    <div className="select-text rounded-md bg-muted/40 font-mono text-[12px] leading-5 text-foreground whitespace-pre-wrap break-words">
       <div className="px-3 py-2">
         {stub.preview}
         <span className="text-muted-foreground/60">{"\n"}…</span>

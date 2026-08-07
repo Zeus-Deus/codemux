@@ -50,7 +50,7 @@ export const DiffUnifiedView = forwardRef<DiffViewHandle, Props>(
     return (
       <div
         ref={containerRef}
-        className="flex-1 overflow-auto bg-card font-mono text-xs leading-[18px]"
+        className="select-text flex-1 overflow-auto bg-card font-mono text-xs leading-[18px]"
       >
         <div className="py-0.5">
           {lines.map((line, i) => {

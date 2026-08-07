@@ -341,6 +341,47 @@ body.pane-resizing iframe {
     }
   body {
     @apply bg-background text-foreground;
+    /* Desktop-app selection model: UI chrome (sidebar cards, settings rows,
+     * buttons, panel labels, layout whitespace) is NOT selectable — only real
+     * content is. Selectable-everything is a website default; native apps
+     * restrict selection to content, so the document opts out once here and
+     * content surfaces opt back in below (or via the `select-text` utility,
+     * which wins over these base-layer rules). The -webkit- prefix is
+     * required by WebKitGTK. `cursor: default` keeps the I-beam off
+     * non-selectable chrome text. */
+    -webkit-user-select: none;
+    user-select: none;
+    cursor: default;
+    }
+  /* Content opt-ins. `user-select` inherits, so a rule on a content root
+   * (e.g. `.chat-markdown`) re-enables its whole subtree. Element-level
+   * entries (pre/code/kbd, form fields, CodeMirror's contenteditable) cover
+   * most surfaces automatically so new content stays selectable without
+   * remembering a class. Chrome inside these (a code-block header, a kbd hint
+   * in a menu) can opt out again with `select-none`. `cursor: auto` restores
+   * the I-beam over the re-enabled text. */
+  input,
+  textarea,
+  [contenteditable="true"],
+  [contenteditable="plaintext-only"],
+  pre,
+  code,
+  kbd,
+  samp,
+  .cm-content,
+  .chat-markdown,
+  .markdown-rendered,
+  [data-sonner-toast] [data-title],
+  [data-sonner-toast] [data-description] {
+    -webkit-user-select: text;
+    user-select: text;
+    cursor: auto;
+    }
+  /* Companion cursor for one-off `select-text` opt-ins (the utility itself
+   * only sets user-select; without this the body's `cursor: default` would
+   * leave selectable text without an I-beam). */
+  .select-text {
+    cursor: auto;
     }
   html {
     @apply font-sans;

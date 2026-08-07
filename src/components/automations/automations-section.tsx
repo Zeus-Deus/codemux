@@ -638,7 +638,7 @@ function AutomationDetail({
         <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground/60">
           Prompt
         </p>
-        <div className="rounded-lg border border-border/60 bg-muted/30 p-3 text-[13px] text-foreground/90 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
+        <div className="select-text rounded-lg border border-border/60 bg-muted/30 p-3 text-[13px] text-foreground/90 leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto">
           {automation.prompt}
         </div>
       </div>
