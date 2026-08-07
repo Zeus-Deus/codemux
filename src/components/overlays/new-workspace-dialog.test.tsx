@@ -1043,9 +1043,19 @@ describe("Clipboard image paste", () => {
       "What do you want to do?",
     );
     firePaste(textarea);
-    await waitFor(() => {
-      expect(within(dialog).getAllByText("Pasted image").length).toBe(1);
-    });
+    // Same Windows-CI-runner slowness the sibling chip test above
+    // documents: the paste → await mock → setAttachments → React
+    // commit chain can exceed the default 1000ms budget under load,
+    // so the first chip isn't mounted yet when waitFor gives up.
+    // Kept just under vitest's 5000ms per-test timeout so a real
+    // failure still surfaces waitFor's DOM dump instead of a bare
+    // "test timed out" with no diagnostic.
+    await waitFor(
+      () => {
+        expect(within(dialog).getAllByText("Pasted image").length).toBe(1);
+      },
+      { timeout: 4000 },
+    );
 
     firePaste(textarea);
     await waitFor(() => {
