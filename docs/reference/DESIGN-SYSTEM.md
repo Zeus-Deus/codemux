@@ -128,7 +128,11 @@ Rules of thumb:
   opts out again with `select-none`; Tailwind utilities beat the base-layer
   opt-ins, so precedence works in both directions.
 - Never re-disable selection on error text, paths, IDs, or anything a user
-  might legitimately copy.
+  might legitimately copy. Rendered diffs, file-path headers, grep matches,
+  ssh targets, and inline error/notice lines all count as content.
+- `cursor` inherits from the body opt-out too, so a base-layer `a { cursor:
+  pointer }` keeps links clickable-looking; any other custom cursor still
+  needs its own rule or utility.
 
 ### Highlight colors
 

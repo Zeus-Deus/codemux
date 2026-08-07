@@ -383,6 +383,12 @@ body.pane-resizing iframe {
   .select-text {
     cursor: auto;
     }
+  /* Links keep their pointer. The body's `cursor: default` would otherwise
+   * inherit down into anchors that carry no explicit cursor utility, making
+   * chrome links (docs links in settings, review headers) read as dead text. */
+  a {
+    cursor: pointer;
+    }
   html {
     @apply font-sans;
     }

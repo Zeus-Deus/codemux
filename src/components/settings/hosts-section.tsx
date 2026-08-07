@@ -604,7 +604,7 @@ export function HostsSection() {
                   </span>
                 )}
               </div>
-              <p className="font-mono text-[12px] text-muted-foreground/85">
+              <p className="select-text font-mono text-[12px] text-muted-foreground/85">
                 {selected.ssh_target}
               </p>
             </div>
