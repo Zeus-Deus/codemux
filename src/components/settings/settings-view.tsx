@@ -1608,11 +1608,11 @@ export function SettingsView() {
               {authUser ? (
                 <>
                   <SettingRow label="Email" description="Your sign-in email address.">
-                    <span className="font-mono text-[13px] text-muted-foreground">{authUser.email}</span>
+                    <span className="select-text font-mono text-[13px] text-muted-foreground">{authUser.email}</span>
                   </SettingRow>
                   <Separator />
                   <SettingRow label="Name" description="Your display name.">
-                    <span className="text-sm text-muted-foreground">{authUser.name ?? "—"}</span>
+                    <span className="select-text text-sm text-muted-foreground">{authUser.name ?? "—"}</span>
                   </SettingRow>
                   {isDevBypass && (
                     <>

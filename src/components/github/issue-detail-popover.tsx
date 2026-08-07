@@ -157,7 +157,7 @@ export function IssueDetailPopover({
               {/* Body */}
               {fullIssue.body ? (
                 <div className="max-h-[300px] overflow-y-auto">
-                  <p className="text-xs text-muted-foreground whitespace-pre-wrap break-words leading-relaxed">
+                  <p className="select-text text-xs text-muted-foreground whitespace-pre-wrap break-words leading-relaxed">
                     {fullIssue.body}
                   </p>
                 </div>

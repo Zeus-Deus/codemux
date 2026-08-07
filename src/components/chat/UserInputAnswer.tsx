@@ -50,7 +50,7 @@ export const UserInputAnswer = memo(function UserInputAnswer({
                   {line.header}
                 </div>
               ) : null}
-              <div className="whitespace-pre-wrap break-words">
+              <div className="select-text whitespace-pre-wrap break-words">
                 {line.value}
               </div>
             </div>
