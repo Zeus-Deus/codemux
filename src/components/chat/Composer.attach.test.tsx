@@ -475,7 +475,7 @@ describe("Composer command menu — search + structure (redesign)", () => {
     // Contract: outside a GitHub repo the Issue / PR rows must NOT
     // disappear — they render at reduced opacity, non-selectable, with
     // the reason swapped into the description slot.
-    const { getByTestId } = renderControlled({ isGithubRepo: false });
+    const { getByTestId } = renderControlled({ repoSupported: false });
     fireEvent.click(getByTestId("composer-attach-button"));
     const issue = getByTestId("slash-item-attach:issue");
     expect(issue).toBeInTheDocument();
@@ -499,8 +499,8 @@ describe("Composer command menu — search + structure (redesign)", () => {
 });
 
 describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
-  it("disables the GitHub Issue row when isGithubRepo is false", () => {
-    const { getByTestId } = renderControlled({ isGithubRepo: false });
+  it("disables the GitHub Issue row when repoSupported is false", () => {
+    const { getByTestId } = renderControlled({ repoSupported: false });
     fireEvent.click(getByTestId("composer-attach-button"));
     const row = getByTestId("slash-item-attach:issue");
     expect(row.getAttribute("data-disabled")).toBe("true");
@@ -509,8 +509,8 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
 
   it("disables the GitHub Issue row when gh is not authenticated", () => {
     const { getByTestId } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: false,
+      repoSupported: true,
+      providerAuthenticated: false,
     });
     fireEvent.click(getByTestId("composer-attach-button"));
     const row = getByTestId("slash-item-attach:issue");
@@ -520,8 +520,8 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
 
   it("enables the GitHub Issue row when preflight passes", () => {
     const { getByTestId } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
     });
     fireEvent.click(getByTestId("composer-attach-button"));
     const row = getByTestId("slash-item-attach:issue");
@@ -543,12 +543,12 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
   // must NEVER show the "Not a GitHub repo" disabled copy regardless
   // of the auth signal. (The backend test suite covers the matching
   // contract on the Rust side via remote_text_points_at_github_*.)
-  it("never shows 'Not a GitHub repo' when isGithubRepo is true", () => {
-    for (const ghAuthenticated of [true, false, null] as const) {
+  it("never shows 'Not a GitHub repo' when repoSupported is true", () => {
+    for (const providerAuthenticated of [true, false, null] as const) {
       cleanup();
       const { getByTestId } = renderControlled({
-        isGithubRepo: true,
-        ghAuthenticated,
+        repoSupported: true,
+        providerAuthenticated,
       });
       fireEvent.click(getByTestId("composer-attach-button"));
       const row = getByTestId("slash-item-attach:issue");
@@ -562,8 +562,8 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
       makeIssue({ number: 70, title: "Dark mode toggle", state: "Closed" }),
     ]);
     const { getByTestId, findByText } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
     });
     fireEvent.click(getByTestId("composer-attach-button"));
     fireEvent.click(getByTestId("slash-item-attach:issue"));
@@ -580,8 +580,8 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
     const onAttachIssue = vi.fn();
     const onDraftChange = vi.fn();
     const { getByTestId, findByText } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
       onAttachIssue,
       onDraftChange,
     });
@@ -602,8 +602,8 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
     // prompt. We pin the generic branch here.
     listGithubIssuesMock.mockRejectedValue(new Error("rate-limited"));
     const { getByTestId, findByText } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
     });
     fireEvent.click(getByTestId("composer-attach-button"));
     fireEvent.click(getByTestId("slash-item-attach:issue"));
@@ -615,8 +615,8 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
       new Error("gh CLI is not authenticated. Run: gh auth login"),
     );
     const { getByTestId, findByText } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
     });
     fireEvent.click(getByTestId("composer-attach-button"));
     fireEvent.click(getByTestId("slash-item-attach:issue"));
@@ -631,8 +631,8 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
       makeIssue({ number: 70, title: "Dark mode toggle", state: "Closed" }),
     ]);
     const { getByTestId, findByText, container } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
     });
     fireEvent.click(getByTestId("composer-attach-button"));
     fireEvent.click(getByTestId("slash-item-attach:issue"));
@@ -657,8 +657,8 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
   it("mounts the IssuePickerPanel (with search input) on issue submode", async () => {
     listGithubIssuesMock.mockResolvedValue([]);
     const { getByTestId, getByPlaceholderText } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
     });
     fireEvent.click(getByTestId("composer-attach-button"));
     fireEvent.click(getByTestId("slash-item-attach:issue"));

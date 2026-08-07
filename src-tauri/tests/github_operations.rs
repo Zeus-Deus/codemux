@@ -307,12 +307,12 @@ fn gh_available_returns_bool() {
 
 #[test]
 #[ignore]
-fn is_github_repo_detects_correctly() {
+fn provider_detection_runs_against_a_real_checkout() {
     // Run against the codemux repo root
     let repo_root = std::env::current_dir().expect("cwd");
-    let result = is_github_repo(&repo_root);
+    let detected = codemux_lib::git_provider::detect_provider(&repo_root);
     // This test assumes we're in the codemux repo
-    println!("is_github_repo: {}", result);
+    println!("detected provider: {detected:?}");
 }
 
 #[test]

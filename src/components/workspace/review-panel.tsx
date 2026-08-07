@@ -18,7 +18,6 @@ import {
   ChevronLeft,
 } from "lucide-react";
 import {
-  checkGhStatus,
   checkGithubRepo,
   getBranchPullRequest,
   createPullRequest,
@@ -31,11 +30,22 @@ import {
 import type {
   WorkspaceSnapshot,
   GhStatus,
+  ProviderAuthStatus,
   PullRequestInfo,
   CheckInfo,
   ReviewComment,
   InlineReviewComment,
 } from "@/tauri/types";
+import {
+  providerForWorkspace,
+  type ProviderPresentation,
+} from "@/lib/source-control";
+import {
+  fetchProviderAuth,
+  getCachedProviderAuth,
+  PROVIDER_AUTH_TTL_MS,
+  _resetProviderAuthCache,
+} from "@/lib/provider-auth";
 import { isPrOnCurrentBranch } from "@/components/github/pr-status-icon";
 import { ReviewHeader } from "./review/review-header";
 import { ReviewChecks } from "./review/review-checks";
@@ -49,28 +59,25 @@ interface Props {
 // ── Module-level caches with TTL ──
 //
 // Only successful results are cached. NotAuthenticated/NotInstalled and
-// "not a GitHub repo" responses bypass the cache so the user sees the
-// recovery (e.g. after `gh auth login` or after a `git remote add origin`)
-// on the very next render, not 60 seconds later.
-export const CACHE_TTL_MS = 60_000;
+// "no integration for this repo" responses bypass the cache so the user
+// sees the recovery (e.g. after a CLI login or after a `git remote add
+// origin`) on the very next render, not 60 seconds later.
+//
+// The auth half of this lives in `@/lib/provider-auth`, shared with the
+// composer and the new-workspace preflight and keyed by *path* as well
+// as product — a slot keyed by product alone would serve one self-hosted
+// instance's login for another's workspace, which is the very thing the
+// host-scoped probe exists to prevent.
+export const CACHE_TTL_MS = PROVIDER_AUTH_TTL_MS;
 
 interface CacheEntry<T> { value: T; ts: number; }
 
-let ghStatusCache: CacheEntry<GhStatus> | null = null;
 const repoCheckCache = new Map<string, CacheEntry<boolean>>();
 
-export function getCachedGhStatus(): GhStatus | null {
-  if (!ghStatusCache || Date.now() - ghStatusCache.ts > CACHE_TTL_MS) {
-    ghStatusCache = null;
-    return null;
-  }
-  return ghStatusCache.value;
-}
-
-/** Stores only successful auth statuses; failures are dropped on the floor. */
-export function setCachedGhStatus(value: GhStatus): void {
-  if (value.status !== "Authenticated") return;
-  ghStatusCache = { value, ts: Date.now() };
+/** Auth status for one checkout, if a usable verdict is still warm. */
+function cachedStatus(cwd: string, kind: string): GhStatus | null {
+  const cached = getCachedProviderAuth(cwd, kind);
+  return cached ? toGhStatus(cached) : null;
 }
 
 export function getCachedRepoCheck(key: string): boolean | undefined {
@@ -82,7 +89,8 @@ export function getCachedRepoCheck(key: string): boolean | undefined {
   return entry.value;
 }
 
-/** Stores only positive repo-check results; non-GitHub paths re-check every call. */
+/** Stores only positive repo-check results; unsupported paths re-check
+ *  every call. */
 export function setCachedRepoCheck(key: string, value: boolean): void {
   if (!value) return;
   repoCheckCache.set(key, { value, ts: Date.now() });
@@ -90,8 +98,32 @@ export function setCachedRepoCheck(key: string, value: boolean): void {
 
 /** Reset all caches — for tests only. */
 export function _resetCaches(): void {
-  ghStatusCache = null;
   repoCheckCache.clear();
+  _resetProviderAuthCache();
+}
+
+/**
+ * Auth status for whichever product serves this workspace.
+ *
+ * One host-scoped probe for every product, including GitHub: the backend
+ * resolves the checkout's provider and asks *that* adapter, which for
+ * GitHub is the same `gh auth status` call this used to make directly.
+ * The previous non-GitHub path ran the whole settings-pane sweep, which
+ * probed every CLI and answered for no instance in particular — wrong on
+ * a self-hosted deployment and wasteful everywhere.
+ */
+async function fetchProviderAuthStatus(
+  cwd: string,
+  provider: ProviderPresentation,
+): Promise<GhStatus> {
+  return toGhStatus(await fetchProviderAuth(cwd, provider.kind));
+}
+
+/** The probe's tri-state in the vocabulary this panel already renders. */
+function toGhStatus(status: ProviderAuthStatus): GhStatus {
+  if (!status.supported || !status.installed) return { status: "NotInstalled" };
+  if (!status.authenticated) return { status: "NotAuthenticated" };
+  return { status: "Authenticated", username: status.username ?? "" };
 }
 
 // ── Helpers ──
@@ -148,11 +180,13 @@ function ReviewSkeleton() {
 function CreatePrForm({
   cwd,
   branchName,
+  provider,
   onCreated,
   onCancel,
 }: {
   cwd: string;
   branchName: string | null;
+  provider: ProviderPresentation;
   onCreated: (pr: PullRequestInfo) => void;
   onCancel: () => void;
 }) {
@@ -210,11 +244,11 @@ function CreatePrForm({
           <ChevronLeft className="h-3 w-3" />
         </Button>
         <p className="text-xs font-medium text-muted-foreground">
-          Create Pull Request
+          Create {provider.nounTitleCase}
         </p>
       </div>
       <Input
-        placeholder="PR title"
+        placeholder={`${provider.shortNoun} title`}
         value={title}
         onChange={(e) => setTitle(e.target.value)}
         onKeyDown={(e) => e.key === "Enter" && handleCreate()}
@@ -269,7 +303,7 @@ function CreatePrForm({
         disabled={!title.trim() || creating}
         onClick={handleCreate}
       >
-        {creating ? "Creating..." : "Create PR"}
+        {creating ? "Creating..." : `Create ${provider.shortNoun}`}
       </Button>
       {error && <p className="text-xs text-danger break-words">{error}</p>}
     </div>
@@ -281,10 +315,12 @@ function CreatePrForm({
 function NoReviewView({
   cwd,
   branchName,
+  provider,
   onCreated,
 }: {
   cwd: string;
   branchName: string | null;
+  provider: ProviderPresentation;
   onCreated: (pr: PullRequestInfo) => void;
 }) {
   const [showForm, setShowForm] = useState(false);
@@ -294,6 +330,7 @@ function NoReviewView({
       <CreatePrForm
         cwd={cwd}
         branchName={branchName}
+        provider={provider}
         onCreated={onCreated}
         onCancel={() => setShowForm(false)}
       />
@@ -304,10 +341,10 @@ function NoReviewView({
     <div className="flex flex-col items-center justify-center py-8 gap-3">
       <GitPullRequest className="h-8 w-8 text-muted-foreground/30" />
       <p className="text-xs text-muted-foreground">
-        No pull request for this branch
+        No {provider.noun} for this branch
       </p>
       <Button variant="secondary" size="xs" className="text-xs" onClick={() => setShowForm(true)}>
-        Create Pull Request
+        Create {provider.nounTitleCase}
       </Button>
     </div>
   );
@@ -358,6 +395,7 @@ function ReviewView({
 
 export function ReviewPanel({ workspace }: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
+  const provider = providerForWorkspace(workspace);
   // Strictly the checked-out branch's PR. The workspace snapshot may also
   // carry a *badge-only* side-branch association (a PR the workspace opened
   // from a branch it has since left — see `isPrOnCurrentBranch`), and this
@@ -368,12 +406,15 @@ export function ReviewPanel({ workspace }: Props) {
     workspace.pr_number != null &&
     isPrOnCurrentBranch(workspace.pr_head_branch, workspace.git_branch);
 
-  const [ghStatus, setGhStatus] = useState<GhStatus | null>(getCachedGhStatus());
-  const [isGithubRepo, setIsGithubRepo] = useState<boolean | null>(
+  const [ghStatus, setGhStatus] = useState<GhStatus | null>(
+    cachedStatus(cwd, provider.kind),
+  );
+  const [repoSupported, setRepoSupported] = useState<boolean | null>(
     getCachedRepoCheck(cwd) ?? null,
   );
   const [initialLoading, setInitialLoading] = useState(
-    getCachedGhStatus() === null || getCachedRepoCheck(cwd) === undefined,
+    cachedStatus(cwd, provider.kind) === null ||
+      getCachedRepoCheck(cwd) === undefined,
   );
 
   const queryClient = useQueryClient();
@@ -396,11 +437,9 @@ export function ReviewPanel({ workspace }: Props) {
     let cancelled = false;
     (async () => {
       try {
-        let status = getCachedGhStatus();
-        if (!status) {
-          status = await checkGhStatus();
-          setCachedGhStatus(status);
-        }
+        // `fetchProviderAuth` owns the TTL cache, so this is a
+        // no-op call when a usable verdict is still warm.
+        const status = await fetchProviderAuthStatus(cwd, provider);
         if (cancelled) return;
         setGhStatus(status);
 
@@ -415,9 +454,9 @@ export function ReviewPanel({ workspace }: Props) {
           setCachedRepoCheck(cwd, isRepo);
         }
         if (cancelled) return;
-        setIsGithubRepo(isRepo);
+        setRepoSupported(isRepo);
       } catch (err) {
-        console.error("PR auth init failed:", err);
+        console.error("Source control auth init failed:", err);
       } finally {
         if (!cancelled) setInitialLoading(false);
       }
@@ -425,7 +464,9 @@ export function ReviewPanel({ workspace }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [cwd]);
+    // `provider` is a stable module-level singleton per kind, so this
+    // re-runs only when the workspace actually changes product.
+  }, [cwd, provider]);
 
   // ── React Query: PR data ──
   //
@@ -446,7 +487,7 @@ export function ReviewPanel({ workspace }: Props) {
   const detailsEnabled =
     !initialLoading &&
     ghStatus?.status === "Authenticated" &&
-    isGithubRepo === true &&
+    repoSupported === true &&
     hasPr;
 
   // Cadence per Superset (`ChangesView.tsx:105` polls at 2500ms when
@@ -534,7 +575,11 @@ export function ReviewPanel({ workspace }: Props) {
     return (
       <StatusMessage
         icon={<AlertCircle className="h-6 w-6 opacity-40" />}
-        message="GitHub CLI (gh) is not installed. Install it from cli.github.com"
+        message={
+          provider.cliLabel
+            ? `${provider.cliLabel} is not installed. Install it from ${provider.installUrl}`
+            : `Codemux has no ${provider.name} integration yet.`
+        }
       />
     );
   }
@@ -543,16 +588,16 @@ export function ReviewPanel({ workspace }: Props) {
     return (
       <StatusMessage
         icon={<AlertCircle className="h-6 w-6 opacity-40" />}
-        message="Not authenticated. Run: gh auth login"
+        message={`Not authenticated. Run: ${provider.loginCommand}`}
       />
     );
   }
 
-  if (isGithubRepo === false) {
+  if (repoSupported === false) {
     return (
       <StatusMessage
         icon={<GitPullRequest className="h-6 w-6 opacity-40" />}
-        message="Not a GitHub repository"
+        message={`Not a ${provider.name} repository`}
       />
     );
   }
@@ -584,12 +629,14 @@ export function ReviewPanel({ workspace }: Props) {
           cwd={cwd}
           baseBranch={defaultBranch!}
           projectRoot={workspace.project_root ?? workspace.cwd}
+          providerKind={workspace.provider_kind}
           refreshKey={incomingRefreshKey}
         />
       ) : (
         <NoReviewView
           cwd={cwd}
           branchName={workspace.git_branch}
+          provider={provider}
           onCreated={handlePrCreated}
         />
       )}

@@ -292,7 +292,7 @@ describe("Composer @ mention popup (Step 8 Stage 2)", () => {
 describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
   it("routes @issue:<query> through listGithubIssuesByPath", async () => {
     listGithubIssuesMock.mockResolvedValue([makeIssue({ title: "bug fix" })]);
-    renderComposer({ isGithubRepo: true, ghAuthenticated: true });
+    renderComposer({ repoSupported: true, providerAuthenticated: true });
     typeIntoTextarea("@issue:bug");
     await waitFor(() => {
       expect(listGithubIssuesMock).toHaveBeenCalled();
@@ -306,7 +306,7 @@ describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
 
   it("direct-fetches when the filter is numeric (@issue:1234)", async () => {
     getGithubIssueMock.mockResolvedValue(makeIssue());
-    renderComposer({ isGithubRepo: true, ghAuthenticated: true });
+    renderComposer({ repoSupported: true, providerAuthenticated: true });
     typeIntoTextarea("@issue:1234");
     await waitFor(() => {
       expect(getGithubIssueMock).toHaveBeenCalled();
@@ -324,8 +324,8 @@ describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
       makeIssue({ number: 70, title: "Dark mode toggle", state: "Closed" }),
     ]);
     const { findByText } = renderComposer({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
     });
     typeIntoTextarea("@issue:");
     expect(await findByText("Backend endpoints")).toBeInTheDocument();
@@ -338,8 +338,8 @@ describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
     const onAttachIssue = vi.fn();
     const onDraftChange = vi.fn();
     const { findByText } = renderControlled({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
       onAttachIssue,
       onDraftChange,
     });
@@ -353,7 +353,7 @@ describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
   });
 
   it("shows the not-a-github-repo footer when preflight reports false", async () => {
-    const { findByText } = renderComposer({ isGithubRepo: false });
+    const { findByText } = renderComposer({ repoSupported: false });
     typeIntoTextarea("@issue:foo");
     expect(await findByText("Not a GitHub repo.")).toBeInTheDocument();
     // Don't call gh when we already know it'd fail.
@@ -362,8 +362,8 @@ describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
 
   it("shows the gh-auth footer when authentication is missing", async () => {
     const { findByText } = renderComposer({
-      isGithubRepo: true,
-      ghAuthenticated: false,
+      repoSupported: true,
+      providerAuthenticated: false,
     });
     typeIntoTextarea("@issue:foo");
     expect(await findByText("Sign in with: gh auth login")).toBeInTheDocument();
@@ -382,8 +382,8 @@ describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
       makeIssue({ number: 70, title: "Closed thing", state: "Closed" }),
     ]);
     const { container, findByText } = renderComposer({
-      isGithubRepo: true,
-      ghAuthenticated: true,
+      repoSupported: true,
+      providerAuthenticated: true,
     });
     typeIntoTextarea("@issue:");
     await findByText("Open thing");

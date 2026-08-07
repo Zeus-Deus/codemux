@@ -16,14 +16,20 @@ import { useAppStore } from "@/stores/app-store";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { toast } from "@/lib/toast";
 import type { IncomingPrItem, WorkspaceSnapshot } from "@/tauri/types";
+import {
+  changeRequestListUrl,
+  providerRef,
+  resolveProvider,
+  type ProviderPresentation,
+} from "@/lib/source-control";
 
 // ── Module-level cache ──
 //
-// On a repo with thousands of PRs the `gh pr list` shell-out is the
+// On a repo with thousands of change requests the CLI shell-out is the
 // expensive part — even with the new 15s backend timeout we don't want
 // to re-run it every time the user toggles into the Review tab. A
 // 30-second TTL keyed by (cwd, baseBranch) makes re-mounts feel
-// instant while still picking up new PRs on a normal browse cadence.
+// instant while still picking up new ones on a normal browse cadence.
 // `refreshKey` (bumped by the parent on commit/push events) bypasses
 // the cache by forcing a fresh fetch.
 const INCOMING_CACHE_TTL_MS = 30_000;
@@ -81,9 +87,12 @@ interface RowProps {
   // workspaces. `existingWs` is null when no checked-out worktree
   // matches this PR's head branch.
   existingWs: WorkspaceSnapshot | null;
+  /** Resolved once at the parent — a stable singleton, so passing it
+   *  down does not break the row's memoization. */
+  provider: ProviderPresentation;
 }
 
-function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
+function IncomingPrRowImpl({ pr, projectRoot, existingWs, provider }: RowProps) {
   const handleView = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (pr.url) openUrl(pr.url);
@@ -112,7 +121,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
     >
       <div className="flex items-center gap-1.5 min-w-0 h-5">
         <ChecksIndicator status={pr.checks_status} />
-        <span className="text-muted-foreground/60 font-mono text-[11px] tabular-nums shrink-0">#{pr.number}</span>
+        <span className="text-muted-foreground/60 font-mono text-[11px] tabular-nums shrink-0">{providerRef(provider, pr.number)}</span>
         <span className={`truncate flex-1 min-w-0 text-xs ${pr.is_draft ? "italic text-muted-foreground" : "text-foreground"}`}>
           {pr.title}
         </span>
@@ -153,7 +162,7 @@ function IncomingPrRowImpl({ pr, projectRoot, existingWs }: RowProps) {
             variant="ghost"
             className="h-5 px-1.5 text-[10px] text-muted-foreground hover:text-foreground"
             onClick={handleView}
-            title="View on GitHub"
+            title={`View on ${provider.name}`}
           >
             <ExternalLink className="h-2.5 w-2.5 mr-0.5" />
             View
@@ -186,10 +195,20 @@ interface Props {
   cwd: string;
   baseBranch: string;
   projectRoot: string;
+  /** Raw `provider_kind` off the workspace snapshot; absent means
+   *  GitHub, matching the rest of the app. */
+  providerKind?: string | null;
   refreshKey: number;
 }
 
-export function IncomingPrsView({ cwd, baseBranch, projectRoot, refreshKey }: Props) {
+export function IncomingPrsView({
+  cwd,
+  baseBranch,
+  projectRoot,
+  providerKind,
+  refreshKey,
+}: Props) {
+  const provider = resolveProvider(providerKind);
   // Seed from the cache so a re-mount within the TTL paints instantly
   // instead of flashing the skeleton while the fetch is in flight.
   const cached = incomingCache.get(cacheKey(cwd, baseBranch));
@@ -249,7 +268,7 @@ export function IncomingPrsView({ cwd, baseBranch, projectRoot, refreshKey }: Pr
     <div className="flex flex-col">
       <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
         <span className="text-[11px] font-medium text-muted-foreground tracking-wide truncate">
-          Pull Requests
+          {provider.nounTitleCase}s
         </span>
         {!loading && prs.length > 0 && (
           <span className="ml-1.5 text-[10px] tabular-nums text-muted-foreground/60">
@@ -281,7 +300,7 @@ export function IncomingPrsView({ cwd, baseBranch, projectRoot, refreshKey }: Pr
         {!loading && !error && prs.length === 0 && (
           <div className="flex flex-col items-center justify-center py-10 text-muted-foreground">
             <GitPullRequest className="h-7 w-7 opacity-25 mb-2" />
-            <p className="text-[11px]">No open pull requests</p>
+            <p className="text-[11px]">No open {provider.nounPlural}</p>
           </div>
         )}
 
@@ -293,17 +312,18 @@ export function IncomingPrsView({ cwd, baseBranch, projectRoot, refreshKey }: Pr
                 pr={pr}
                 projectRoot={projectRoot}
                 existingWs={(pr.head_branch && wsByBranch.get(pr.head_branch)) || null}
+                provider={provider}
               />
             ))}
             {prs.length >= 50 && (
               <button
                 className="text-[10px] text-muted-foreground/60 hover:text-foreground px-2.5 py-1 mt-1 transition-colors text-left"
                 onClick={() => {
-                  const repoUrl = prs[0]?.url?.replace(/\/pull\/\d+$/, "/pulls");
+                  const repoUrl = changeRequestListUrl(provider, prs[0]?.url);
                   if (repoUrl) openUrl(repoUrl);
                 }}
               >
-                View all on GitHub &rarr;
+                View all on {provider.name} &rarr;
               </button>
             )}
           </div>
