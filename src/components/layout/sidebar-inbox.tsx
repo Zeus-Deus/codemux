@@ -22,6 +22,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
+import { MENU_ROW_TWO_LINE, MenuKeycap } from "@/components/ui/menu-chrome";
 import {
   selectActiveWorkspaceId,
   useAppStore,
@@ -1764,17 +1765,40 @@ export function SidebarInbox() {
                 +
               </button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent side="bottom" align="start">
-              <DropdownMenuItem onClick={() => openProject()} className="text-xs">
-                <FolderOpen className="mr-2 h-3.5 w-3.5" />
-                Open project
+            {/* Two-line rows: "Open project" and "New project" are one word
+                apart and mean opposite things (adopt what's on disk vs clone
+                from a remote), so each carries the sentence that tells them
+                apart rather than making the user find out by clicking. */}
+            <DropdownMenuContent side="bottom" align="start" className="w-[246px]">
+              <DropdownMenuItem
+                onClick={() => openProject()}
+                className={MENU_ROW_TWO_LINE}
+              >
+                <FolderOpen />
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="flex items-center gap-2">
+                    <span className="flex-1">Open project</span>
+                    <MenuKeycap actionId="openProject" />
+                  </span>
+                  <span className="text-[11px] leading-snug text-muted-foreground/70">
+                    Pick a repo already on this machine
+                  </span>
+                </span>
               </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => setShowNewProjectScreen(true)}
-                className="text-xs"
+                className={MENU_ROW_TWO_LINE}
               >
-                <FolderPlus className="mr-2 h-3.5 w-3.5" />
-                New project
+                <FolderPlus />
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="flex items-center gap-2">
+                    <span className="flex-1">New project</span>
+                    <MenuKeycap keys="Ctrl+Shift+N" />
+                  </span>
+                  <span className="text-[11px] leading-snug text-muted-foreground/70">
+                    Clone from a Git remote
+                  </span>
+                </span>
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
