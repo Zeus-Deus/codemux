@@ -110,9 +110,11 @@ interface KeycapProps {
    *  a rebound shortcut shows the binding that actually fires. */
   actionId?: string;
   /**
-   * A literal combo for a row that has no registry entry. Display-only: it
-   * documents the gesture the design specifies without registering a global
-   * binding.
+   * A literal combo for a row whose gesture is handled locally rather than
+   * through the registry (row-scoped keys like F2). Only use it for a combo
+   * nothing else claims — a display-only keycap that duplicates a registry
+   * binding for a different action promises a gesture that does something
+   * else entirely.
    */
   keys?: string;
   className?: string;
@@ -138,22 +140,6 @@ export function MenuKeycap({ actionId, keys, className }: KeycapProps) {
       )}
     >
       {formatKeyCombo(resolved)}
-    </kbd>
-  );
-}
-
-/** The destructive tail's keycap, tinted toward the row's red. */
-export function MenuDestructiveKeycap({ keys }: { keys: string }) {
-  return (
-    <kbd
-      aria-hidden
-      className="ml-auto shrink-0 font-mono text-[9.5px] font-normal tracking-normal"
-      style={{
-        color:
-          "color-mix(in oklch, var(--destructive) 72%, var(--muted-foreground))",
-      }}
-    >
-      {formatKeyCombo(keys)}
     </kbd>
   );
 }

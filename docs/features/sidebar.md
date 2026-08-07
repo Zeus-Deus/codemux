@@ -286,8 +286,12 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   / **Organize** — instead of separated by bare rules; only the destructive
   tail keeps a real divider. Keycaps render only where a binding exists:
   Settings / Command palette / Keyboard shortcuts / Open project resolve
-  through `keybind-registry` (so a rebind shows), the rest are static display
-  hints for the gesture the design specifies and register nothing.
+  through `keybind-registry` (so a rebind shows), and Rename carries a static
+  `F2` for its row-scoped gesture. Rows with no binding get no keycap — a
+  display-only hint for a combo the registry already gives to a *different*
+  action (Ctrl+Shift+P is file search, Ctrl+Shift+N is
+  new-workspace-in-project) promises a gesture that does something else
+  entirely.
   "Move to device…" is always a submenu, listing this device plus each
   configured host with its state line, and saying "No other devices signed in."
   in place of the old disabled `Move to device… (no devices configured)` row.
@@ -772,7 +776,13 @@ click. The update state comes from `src/stores/update-status-store.ts`, a
 mirror published by the single `useUpdateChecker` that `UpdateToast` mounts —
 the menu must not mount a second checker, which would double the 4-hour poll.
 The "update available" and "restart to update" states are clickable and drive
-the checker's own download/relaunch callbacks.
+the checker's own download/relaunch callbacks — except on the web remote
+client, where the mirror's `isRemote` routes the click to
+`requestDesktopUpdate` (the strip reads **Update desktop**), because a browser
+has no updater plugin and `startDownload` there is a no-op. Until a checker
+publishes, the strip shows the version and no status at all: "Up to date" is a
+claim nothing has verified yet (and never would in a dev build, where the
+check does not run).
 Collapsed: the same four, restacked vertically in the same order — Automations,
 Workspaces, and the app menu get right-side tooltips; `SidebarPortsPopover`
 hardcodes `side="top"` for both its tooltip and its popover in both states.

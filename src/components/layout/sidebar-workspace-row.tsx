@@ -60,7 +60,6 @@ import {
   MENU_ROW_TWO_LINE_COMPACT,
   MENU_SECTION_LABEL,
   MENU_SEPARATOR,
-  MenuDestructiveKeycap,
   MenuKeycap,
 } from "@/components/ui/menu-chrome";
 import { useProjectAppearance } from "./use-project-appearance";
@@ -703,9 +702,6 @@ export function WorkspaceContextMenuItems({
         <span className="flex-1">
           {workspace.pinned_at != null ? "Unpin workspace" : "Pin workspace"}
         </span>
-        {/* No registry entry backs this yet — the keycap documents the
-            gesture the design specifies without claiming a global binding. */}
-        <MenuKeycap keys="Ctrl+Shift+P" />
       </ContextMenuItem>
       {/* Lifecycle block, hidden entirely while pinned — a pin suppresses
           every park verb, and showing them disabled would only invite the
@@ -814,7 +810,6 @@ export function WorkspaceContextMenuItems({
       >
         <Copy />
         <span className="flex-1">Copy branch name</span>
-        <MenuKeycap keys="Ctrl+Shift+C" />
       </ContextMenuItem>
       {showCheckoutDefault && (
         <ContextMenuItem
@@ -910,7 +905,6 @@ export function WorkspaceContextMenuItems({
         >
           <Trash2 />
           <span className="flex-1">Delete Worktree…</span>
-          <MenuDestructiveKeycap keys="Ctrl+Backspace" />
         </ContextMenuItem>
       )}
     </ContextMenuContent>

@@ -30,8 +30,9 @@ build:
   one chrome (`src/components/ui/menu-chrome.tsx` + `.cm-menu-surface` in
   `globals.css`): 13px radius, hairline border, one elevation, 32px rows with
   a 14px icon on every row, and right-aligned mono keycaps — resolved through
-  `keybind-registry` where a binding exists, static display hints where it does
-  not (no new global bindings were registered). The item lists are unchanged.
+  `keybind-registry` where a binding exists, omitted where none does (no new
+  global bindings were registered, and a keycap is never shown for a combo the
+  registry hands to a different action). The item lists are unchanged.
   New presentation: an identity header on the workspace menu (avatar,
   workspace, project, `+A −D`), named **Workspace / Actions / Organize** groups
   instead of bare dividers, a red-tinted destructive tail, the project colour

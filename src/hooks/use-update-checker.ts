@@ -346,29 +346,6 @@ export function useUpdateChecker(): UpdateCheckerResult {
     };
   }, [isRemote]);
 
-  // ── Publish to the shared status store ────────────────────────────
-  //
-  // This hook owns the only poll, so anything else that wants to show update
-  // state (the app-menu footer strip) reads the mirror instead of mounting a
-  // second checker and doubling the round trips.
-  const publishUpdateStatus = useUpdateStatusStore((s) => s.publish);
-  useEffect(() => {
-    publishUpdateStatus({
-      state,
-      updateVersion,
-      downloadProgress,
-      startDownload,
-      installAndRestart,
-    });
-  }, [
-    publishUpdateStatus,
-    state,
-    updateVersion,
-    downloadProgress,
-    startDownload,
-    installAndRestart,
-  ]);
-
   const requestDesktopUpdate = useCallback(() => {
     setUpdateRequested(true);
     webRemoteRequestUpdate().catch((e) => {
@@ -376,6 +353,36 @@ export function useUpdateChecker(): UpdateCheckerResult {
       setUpdateRequested(false);
     });
   }, []);
+
+  // ── Publish to the shared status store ────────────────────────────
+  //
+  // This hook owns the only poll, so anything else that wants to show update
+  // state (the app-menu footer strip) reads the mirror instead of mounting a
+  // second checker and doubling the round trips. `isRemote` and
+  // `requestDesktopUpdate` ride along because on the web client `startDownload`
+  // is a no-op — a reader that acts on the state needs the same remote branch
+  // the toast takes.
+  const publishUpdateStatus = useUpdateStatusStore((s) => s.publish);
+  useEffect(() => {
+    publishUpdateStatus({
+      state,
+      updateVersion,
+      downloadProgress,
+      isRemote,
+      startDownload,
+      installAndRestart,
+      requestDesktopUpdate,
+    });
+  }, [
+    publishUpdateStatus,
+    state,
+    updateVersion,
+    downloadProgress,
+    isRemote,
+    startDownload,
+    installAndRestart,
+    requestDesktopUpdate,
+  ]);
 
   return {
     state,

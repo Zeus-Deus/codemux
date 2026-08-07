@@ -47,9 +47,14 @@ import { SidebarPortsPopover } from "./sidebar-ports-popover";
  */
 function AppMenuFooter({ version }: { version: string | null }) {
   const state = useUpdateStatusStore((s) => s.state);
+  const published = useUpdateStatusStore((s) => s.published);
   const updateVersion = useUpdateStatusStore((s) => s.updateVersion);
+  const isRemote = useUpdateStatusStore((s) => s.isRemote);
   const startDownload = useUpdateStatusStore((s) => s.startDownload);
   const installAndRestart = useUpdateStatusStore((s) => s.installAndRestart);
+  const requestDesktopUpdate = useUpdateStatusStore(
+    (s) => s.requestDesktopUpdate,
+  );
 
   // Copy stays short enough to sit on one line beside the version: the strip
   // is a status readout, not the update flow — the toast owns that.
@@ -60,9 +65,12 @@ function AppMenuFooter({ version }: { version: string | null }) {
     label = "Checking…";
     tone = "text-muted-foreground";
   } else if (state === "update-available") {
-    label = "Update available";
+    // The remote client has no updater plugin, so `startDownload` there is a
+    // no-op; its only route is asking the desktop to update itself, exactly as
+    // the toast's "Update & restart desktop" button does.
+    label = isRemote ? "Update desktop" : "Update available";
     tone = "text-status-working";
-    action = startDownload;
+    action = isRemote ? requestDesktopUpdate : startDownload;
   } else if (state === "downloading") {
     label = "Downloading…";
     tone = "text-status-working";
@@ -88,7 +96,10 @@ function AppMenuFooter({ version }: { version: string | null }) {
         Codemux {version ? `v${version}` : ""}
       </span>
       <span className="flex-1" />
-      {action ? (
+      {/* No checker has published yet (the first check is still pending, or
+          this is a dev build where it never runs). The version alone is still
+          a fact; "Up to date" would be a claim nothing has verified. */}
+      {!published ? null : action ? (
         <button
           type="button"
           onClick={action}

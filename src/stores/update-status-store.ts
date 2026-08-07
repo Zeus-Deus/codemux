@@ -20,7 +20,9 @@ export type UpdateState =
  * readers.
  *
  * The actions are the checker's own callbacks, forwarded verbatim, so a click
- * in the menu footer drives exactly the flow the toast's buttons drive.
+ * in the menu footer drives exactly the flow the toast's buttons drive —
+ * including `isRemote`, because the web client has no updater plugin and its
+ * only route to an update is asking the desktop to run one.
  */
 interface UpdateStatusStore {
   state: UpdateState;
@@ -28,12 +30,22 @@ interface UpdateStatusStore {
   downloadProgress: number;
   /** False until a checker has mounted and published at least once. */
   published: boolean;
+  /** True on the web (remote) client, where `startDownload` cannot work. */
+  isRemote: boolean;
   startDownload: (() => void) | null;
   installAndRestart: (() => void) | null;
+  /** Web only: ask the desktop to run its update + restart flow. */
+  requestDesktopUpdate: (() => void) | null;
   publish: (
     snapshot: Pick<
       UpdateStatusStore,
-      "state" | "updateVersion" | "downloadProgress" | "startDownload" | "installAndRestart"
+      | "state"
+      | "updateVersion"
+      | "downloadProgress"
+      | "isRemote"
+      | "startDownload"
+      | "installAndRestart"
+      | "requestDesktopUpdate"
     >,
   ) => void;
 }
@@ -43,8 +55,10 @@ const INITIAL = {
   updateVersion: null,
   downloadProgress: 0,
   published: false,
+  isRemote: false,
   startDownload: null,
   installAndRestart: null,
+  requestDesktopUpdate: null,
 };
 
 export const useUpdateStatusStore = create<UpdateStatusStore>((set) => ({

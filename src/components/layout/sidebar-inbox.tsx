@@ -1793,7 +1793,6 @@ export function SidebarInbox() {
                 <span className="flex min-w-0 flex-1 flex-col gap-0.5">
                   <span className="flex items-center gap-2">
                     <span className="flex-1">New project</span>
-                    <MenuKeycap keys="Ctrl+Shift+N" />
                   </span>
                   <span className="text-[11px] leading-snug text-muted-foreground/70">
                     Clone from a Git remote
