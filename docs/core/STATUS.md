@@ -26,6 +26,31 @@ source-control seam, grouped by subsystem below.
 Everything in this block is on `main` and has not shipped in a published
 build:
 
+- **Ultracode reasoning level for Claude + Codex effort-picker polish**
+  (PR #261). The reasoning picker now offers
+  **Ultracode** on every xhigh-capable Claude model: `ensure_ultracode_effort`
+  (`agent_provider/claude/capabilities.rs`) appends the level at all three
+  capability-producer paths (maintained fallback, sidecar-harvest merge — so
+  live-harvested models like Opus 5 get it — and API harvest). Because older
+  headless CLIs reject `--effort ultracode`, the level is normalized at the
+  launch boundaries: the sidecar's `buildQueryOptions` sends SDK
+  `effort: "xhigh"` + `settings: {ultracode: true}` (standing multi-agent
+  workflow orchestration, pairing with the existing Workflow orchestration
+  card), and the terminal-preset splice (`agent_capability.rs`) emits
+  `--effort xhigh --settings '{"ultracode":true}'` idempotently — unless the
+  preset already carries a `--settings` of its own, which the CLI resolves
+  last-wins rather than merging. Then the splice folds `"ultracode": true`
+  into an inline-JSON value (a single merged flag), or falls back to
+  `--effort ultracode` for a file-path value, so a user's hooks and
+  permissions are never silently dropped. On the Codex
+  side, the catalog-advertised `max`/`ultra` levels (already sent verbatim on
+  `turn/start`, which is protocol-correct — `ultra` also enables the
+  provider's proactive multi-agent mode) now render Title-Case labels, and a
+  new additive `ChatModelInfo.effort_descriptions` map carries the Codex
+  catalog's per-effort descriptions into the picker's description line, with
+  built-in fallbacks for `ultra`/`ultracode` in `ReasoningPicker.tsx`. See
+  `docs/features/agent-chat.md` § "Reasoning picker (effort)".
+
 - **Popup menus restyled onto the command-palette surface.** The workspace
   right-click menu, the footer gear menu and the projects `+` menu now share
   one chrome (`src/components/ui/menu-chrome.tsx` + `.cm-menu-surface` in

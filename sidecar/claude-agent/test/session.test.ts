@@ -640,7 +640,37 @@ test("effort option is passed through opaquely even for future values", () => {
     emit,
   );
   expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
+  // A plain xhigh selection is exactly that — no workflow setting.
+  expect(fake.capturedOptions?.settings).toBeUndefined();
   void session;
+});
+
+test("ultracode normalizes to xhigh effort plus the ultracode setting", () => {
+  // The CLI rejects `ultracode` as an `--effort` value; it is xhigh
+  // effort plus the session-scoped `ultracode` setting.
+  const { emit } = recordingEmitter();
+  new ClaudeSession(minimalInput({ effort: "ultracode" }), emit);
+  expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
+  expect(fake.capturedOptions?.settings).toEqual({ ultracode: true });
+});
+
+test("ultracode composes with fast mode and caller-supplied settings", () => {
+  const { emit } = recordingEmitter();
+  new ClaudeSession(
+    minimalInput({
+      effort: "ultracode",
+      fastMode: true,
+      settings: { theme: "dark" },
+    }),
+    emit,
+  );
+  expect((fake.capturedOptions as { effort?: string })?.effort).toBe("xhigh");
+  expect(fake.capturedOptions?.settings).toEqual({
+    theme: "dark",
+    fastMode: true,
+    fastModePerSessionOptIn: true,
+    ultracode: true,
+  });
 });
 
 test("allowDangerouslySkipPermissions only set when permissionMode=bypass", () => {

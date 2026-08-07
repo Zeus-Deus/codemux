@@ -29,6 +29,9 @@ const DEFAULT_EFFORT_DESCRIPTIONS: Record<string, string> = {
   high: "Thorough reasoning",
   xhigh: "Extra-thorough reasoning",
   max: "Deepest reasoning",
+  ultra: "Deepest reasoning with automatic task delegation",
+  ultracode:
+    "Extra-thorough reasoning plus standing multi-agent workflow orchestration",
   ultrathink:
     'Prepends "Ultrathink:" to your prompt for extra-thorough reasoning',
 };
@@ -61,8 +64,12 @@ function effortLabel(labelMap: Record<string, string>, id: string): string {
   return labelMap[id] ?? id;
 }
 
-function effortDescription(id: string): string {
-  return DEFAULT_EFFORT_DESCRIPTIONS[id] ?? "";
+// The provider's own catalog text wins when it ships one (Codex reports
+// a blurb per effort level over `model/list`), so a level added upstream
+// reads correctly without a frontend bump. The built-in map covers
+// providers that report nothing.
+function effortDescription(model: ChatModelInfo, id: string): string {
+  return model.effort_descriptions?.[id] ?? DEFAULT_EFFORT_DESCRIPTIONS[id] ?? "";
 }
 
 /**
@@ -185,7 +192,7 @@ export function ReasoningPicker({
                 {effortLevels.map((level) => {
                   const isDefault = level === model.default_effort;
                   const title = effortLabel(labelMap, level);
-                  const description = effortDescription(level);
+                  const description = effortDescription(model, level);
                   return (
                     <CommandItem
                       key={`effort-${level}`}

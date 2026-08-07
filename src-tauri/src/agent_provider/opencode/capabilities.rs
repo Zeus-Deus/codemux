@@ -187,6 +187,9 @@ fn flatten_model(
         // in `client.rs`). OpenCode federates hundreds of models with
         // wildly different windows, so this is the only trustworthy
         // source — `None` whenever the upstream stays silent.
+        // OpenCode reports no per-effort text; the picker falls back
+        // to its built-in descriptions.
+        effort_descriptions: Default::default(),
         max_context_tokens: model.context_window,
     }
 }

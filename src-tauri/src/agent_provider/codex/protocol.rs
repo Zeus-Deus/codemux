@@ -427,9 +427,14 @@ pub struct ModelEntry {
 #[serde(rename_all = "camelCase")]
 pub struct ReasoningEffortOption {
     /// Effort level identifier — one of `"none" | "minimal" | "low" |
-    /// "medium" | "high" | "xhigh"`.
+    /// "medium" | "high" | "xhigh" | "max" | "ultra"`. Kept as a plain
+    /// string so a level added upstream still round-trips instead of
+    /// failing the whole `model/list` decode.
     pub reasoning_effort: String,
-    /// Human-readable description.
+    /// Human-readable description of the level, authored by the model
+    /// catalog. Surfaced in the picker as each effort row's second line
+    /// (see [`ChatModelInfo::effort_descriptions`](crate::agent_provider::ChatModelInfo::effort_descriptions)).
+    /// Empty when the catalog omits one.
     #[serde(default)]
     pub description: String,
 }

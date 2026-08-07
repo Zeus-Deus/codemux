@@ -341,6 +341,38 @@ and lightbox stay visually testable.
   + exit dialog.
 - **Mode pills**: Ask / Allow always / Plan / Debug, with Shift+Tab cycling
   and silent-restart on pill removal.
+- **Reasoning picker (effort)**: `ReasoningPicker` lists each model's
+  `effort_levels` plus prompt-injected pseudo-levels (`ultrathink`, which
+  prepends `Ultrathink:\n` to the draft instead of setting the slice).
+  Labels come from the provider's `effort_label_map`; the description
+  line prefers the provider-reported `effort_descriptions` (populated
+  from the Codex `model/list` catalog's per-effort descriptions — e.g.
+  `ultra` = deepest reasoning with automatic task delegation) and falls
+  back to the built-in map in `ReasoningPicker.tsx`. **Claude offers
+  `ultracode` on every xhigh-capable model** (appended by
+  `ensure_ultracode_effort` at all three capability-producer paths in
+  `agent_provider/claude/capabilities.rs`, so live-harvested models like
+  Opus 5 get it too). Because older headless CLIs reject
+  `--effort ultracode`, the level is normalized at the launch
+  boundaries: the sidecar's `buildQueryOptions` sends SDK
+  `effort: "xhigh"` + `settings: {ultracode: true}` (standing
+  multi-agent workflow orchestration — pairs with the Workflow
+  orchestration card, `docs/features/workflow-orchestration.md`), and
+  the terminal-preset splice in `agent_capability.rs` emits
+  `--effort xhigh --settings '{"ultracode":true}'` idempotently — but
+  only when the preset carries no `--settings` of its own. The CLI
+  resolves a repeated `--settings` **last-wins** rather than merging, so
+  a preset that already has one would silently lose the user's
+  hooks / permissions / env layer. There the splice instead folds
+  `"ultracode": true` into an inline-JSON value (one merged
+  `--settings` + `--effort xhigh`), or, for a file-path value, emits
+  `--effort ultracode` and leaves the flag untouched — current CLIs take
+  that level natively, older ones warn and run at the default effort.
+  Downgrading to a plain level removes the merged key again. Codex
+  `max`/`ultra` are catalog-advertised levels sent verbatim on
+  `turn/start` (protocol-valid; `ultra` additionally enables the
+  provider's proactive multi-agent mode) and are Title-Case labeled via
+  `codex_effort_label_map`.
 - **Capability-gated speed picker**: models that advertise
   `supports_fast_mode` show an explicit Standard / Fast picker beside the
   reasoning control. Fast is a premium-usage choice, persists per thread,
@@ -2161,7 +2193,10 @@ from this list — `update-mcp-tools` wraps it.)
 
 Exactly 16 SDK `Options` fields are populated (`cwd`, `model`,
 `pathToClaudeCodeExecutable`, `settingSources: ["user","project","local"]`,
-`effort` (cast through `unknown` for forward-compat), `permissionMode`,
+`effort` (cast through `unknown` for forward-compat; the pseudo-level
+`"ultracode"` is normalized here to `effort: "xhigh"` plus
+`settings: {ultracode: true}` because the CLI rejects it as a raw
+`--effort` value), `permissionMode`,
 `allowDangerouslySkipPermissions` (only with `bypassPermissions`),
 `settings` (when non-empty), `resume`, `sessionId`,
 `includePartialMessages: true`, `agentProgressSummaries: true` (so

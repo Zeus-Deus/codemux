@@ -335,3 +335,51 @@ describe("ReasoningPicker — interaction", () => {
     expect(onContextWindowChange).toHaveBeenCalledWith("200k");
   });
 });
+
+describe("ReasoningPicker — effort descriptions", () => {
+  // Codex ships a blurb per effort level over `model/list`; Claude and
+  // OpenCode report none. Both shapes have to read correctly.
+  const CODEX_MODEL: ChatModelInfo = {
+    ...OPUS_4_7,
+    id: "gpt-5.4",
+    effort_levels: ["medium", "high", "xhigh", "max", "ultra"],
+    default_effort: "medium",
+    prompt_injected_effort_levels: [],
+    context_window_options: [],
+    effort_descriptions: {
+      high: "Provider-authored wording",
+      max: "Maximum reasoning depth for the hardest problems",
+    },
+  };
+
+  it("prefers the provider-reported description over the built-in map", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker({ model: CODEX_MODEL });
+    await user.click(trigger!);
+    expect(
+      await screen.findByText("Provider-authored wording"),
+    ).toBeInTheDocument();
+    // The built-in text for `high` must not also render.
+    expect(screen.queryByText("Thorough reasoning")).toBeNull();
+  });
+
+  it("falls back to the built-in description when the model reports none", async () => {
+    const user = userEvent.setup();
+    const { trigger } = renderPicker({ model: CODEX_MODEL });
+    await user.click(trigger!);
+    // `ultra` has no provider blurb in this payload, so the picker's
+    // own fallback line has to fill the row's second line.
+    expect(
+      await screen.findByText("Deepest reasoning with automatic task delegation"),
+    ).toBeInTheDocument();
+  });
+
+  it("uses the built-in map throughout when effort_descriptions is absent", async () => {
+    const user = userEvent.setup();
+    // OPUS_4_7 omits the field entirely — the pre-existing payload shape.
+    const { trigger } = renderPicker();
+    await user.click(trigger!);
+    expect(await screen.findByText("Thorough reasoning")).toBeInTheDocument();
+    expect(screen.getByText("Extra-thorough reasoning")).toBeInTheDocument();
+  });
+});

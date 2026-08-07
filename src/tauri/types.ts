@@ -672,6 +672,12 @@ export interface ChatModelInfo {
   description: string | null;
   effort_levels: string[];
   default_effort: string | null;
+  /** Per-effort human descriptions reported by the provider's own model
+   *  catalog, keyed by effort level. Rendered as each effort row's
+   *  second line in the reasoning picker, winning over the built-in
+   *  fallback text. Absent/empty when the provider ships no blurbs
+   *  (Claude, OpenCode) — optional so older payloads still decode. */
+  effort_descriptions?: Record<string, string>;
   prompt_injected_effort_levels: string[];
   context_window_options: ContextWindowOption[];
   supports_adaptive_thinking: boolean;
