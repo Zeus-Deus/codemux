@@ -11,13 +11,14 @@ vi.mock("@/tauri/commands", () => ({
   createEmptyWorkspace: vi.fn().mockResolvedValue("ws-new"),
   agentChatCreatePane: vi.fn().mockResolvedValue("pane-new"),
   runProjectDevCommand: vi.fn().mockResolvedValue(undefined),
+  undockBrowserFromRightPanel: vi.fn().mockResolvedValue(undefined),
 }));
 
 import { dispatch } from "./use-keyboard-shortcuts";
-import { useUIStore } from "@/stores/ui-store";
+import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
-import { activateWorkspace } from "@/tauri/commands";
+import { activateWorkspace, undockBrowserFromRightPanel } from "@/tauri/commands";
 import {
   setJumpTargets,
 } from "@/components/layout/sidebar-inbox-jump";
@@ -207,5 +208,74 @@ describe("use-keyboard-shortcuts dispatch — closeOverlay precedence", () => {
       expect(handled).toBe(true);
       expect(activateWorkspace).not.toHaveBeenCalled();
     });
+  });
+});
+
+// Ctrl+Shift+B is a fourth way to collapse the panel, and it used to write
+// the tab straight to `null`. A collapsed panel is not a surface: leaving
+// the agent's browser docked would keep the backend believing it is on
+// screen, so it would neither split a pane for it nor raise the background
+// chip — invisible and unrevealable until the panel came back.
+describe("use-keyboard-shortcuts dispatch — toggleRightPanel", () => {
+  function seedWorkspace(browserDocked: boolean) {
+    useAppStore.setState({
+      appState: {
+        active_workspace_id: "ws-1",
+        workspaces: [{ workspace_id: "ws-1", surfaces: [] }],
+        agent_browser_sessions: [
+          { workspace_id: "ws-1", right_panel_docked: browserDocked },
+        ],
+      } as unknown as NonNullable<ReturnType<typeof useAppStore.getState>["appState"]>,
+    });
+  }
+
+  beforeEach(() => {
+    vi.mocked(undockBrowserFromRightPanel).mockClear();
+    useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
+  });
+
+  it("undocks the agent browser when it collapses the panel", () => {
+    seedWorkspace(true);
+    useUIStore.getState().setRightPanelTab("ws-1", "browser");
+
+    const handled = dispatch("toggleRightPanel", FAKE_EVENT);
+
+    expect(handled).toBe(true);
+    expect(undockBrowserFromRightPanel).toHaveBeenCalledWith("ws-1", false);
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBeNull();
+    // Not a dismissal — the tab stays in the deck for the next open.
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toContain(
+      "browser",
+    );
+  });
+
+  it("opens onto the picker rather than force-opening Files", () => {
+    seedWorkspace(false);
+    // The user had closed the Files pane; re-opening the panel must not
+    // silently undo that dismissal.
+    useUIStore.setState({
+      rightPanelPanes: { "ws-1": ["changes"] },
+      rightPanelDismissedPanes: { "ws-1": ["files"] },
+    });
+
+    const handled = dispatch("toggleRightPanel", FAKE_EVENT);
+
+    expect(handled).toBe(true);
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBe(
+      RIGHT_PANEL_EMPTY,
+    );
+    expect(useUIStore.getState().getRightPanelPanes("ws-1")).toEqual([
+      "changes",
+    ]);
+  });
+
+  it("leaves a browser that is not docked alone", () => {
+    seedWorkspace(false);
+    useUIStore.getState().setRightPanelTab("ws-1", "files");
+
+    dispatch("toggleRightPanel", FAKE_EVENT);
+
+    expect(undockBrowserFromRightPanel).not.toHaveBeenCalled();
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBeNull();
   });
 });

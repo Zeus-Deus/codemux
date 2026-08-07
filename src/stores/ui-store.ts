@@ -4,6 +4,8 @@ import {
   RIGHT_PANEL_MAX_STORED_WIDTH,
   RIGHT_PANEL_MIN_WIDTH,
 } from "@/lib/right-panel-width";
+import { useAppStore } from "@/stores/app-store";
+import { undockBrowserFromRightPanel } from "@/tauri/commands";
 import type { ModelSelection, PendingWorkspace } from "@/tauri/types";
 
 /** Panes the right-panel deck can host that aren't tied to a file path. */
@@ -52,6 +54,17 @@ function withPane(
   pane: RightPanelTab,
 ): RightPanelTab[] {
   return list.includes(pane) ? [...list] : [...list, pane];
+}
+
+/** Is this workspace's agent browser session currently hosted by the deck? */
+function isBrowserDocked(workspaceId: string): boolean {
+  return (
+    useAppStore
+      .getState()
+      .appState?.agent_browser_sessions?.some(
+        (abs) => abs.workspace_id === workspaceId && abs.right_panel_docked,
+      ) === true
+  );
 }
 
 interface UIStore {
@@ -135,6 +148,11 @@ interface UIStore {
    *  in-thread "Open tasks"/"Open orchestration" links — lands on a tab
    *  that's actually in the strip. */
   setRightPanelTab: (workspaceId: string, tab: RightPanelTab | null) => void;
+  /** Hide the panel. The one collapse path — every caller (titlebar cluster,
+   *  the panel's own close button, the keybind, the legacy tab bar) routes
+   *  here, and `setRightPanelTab(ws, null)` delegates to it, so the "a
+   *  collapsed panel is not a surface" rule cannot be bypassed. */
+  collapseRightPanel: (workspaceId: string) => void;
   toggleRightPanel: (workspaceId: string, tab: RightPanelTab) => void;
   getRightPanelPanes: (workspaceId: string) => RightPanelTab[];
   /** Open a pane in the background (no focus change) — used by the
@@ -210,15 +228,16 @@ export const useUIStore = create<UIStore>()(
 
       getRightPanelTab: (workspaceId) => get().rightPanelTabs[workspaceId] ?? null,
 
-      setRightPanelTab: (workspaceId, tab) =>
+      setRightPanelTab: (workspaceId, tab) => {
+        // Collapsing is its own action (it has a backend consequence, see
+        // `collapseRightPanel`); route it there rather than duplicating the
+        // rule at every call site that happens to pass `null`.
+        if (tab === null) {
+          get().collapseRightPanel(workspaceId);
+          return;
+        }
         set((s) => {
           const tabs = { ...s.rightPanelTabs, [workspaceId]: tab };
-          // Collapsing always drops full-expand: a maximized panel that is
-          // no longer on screen would leave the workspace column at zero
-          // width with nothing beside it.
-          if (tab === null) {
-            return { rightPanelTabs: tabs, rightPanelMaximized: false };
-          }
           // The picker sentinel is a view state, not a pane — it must never
           // join the deck or clear a dismissal.
           if (tab === RIGHT_PANEL_EMPTY) return { rightPanelTabs: tabs };
@@ -235,7 +254,29 @@ export const useUIStore = create<UIStore>()(
               [workspaceId]: dismissed.filter((p) => p !== tab),
             },
           };
-        }),
+        });
+      },
+
+      collapseRightPanel: (workspaceId) => {
+        // A collapsed panel is not a surface. Leaving the session docked
+        // would tell the backend the user can see a browser they can't: the
+        // pane gate would keep believing it is surfaced, so the agent would
+        // neither split a pane for it nor raise the background chip, and the
+        // browser would be invisible *and* unrevealable until the panel came
+        // back. `dismissed: false` — collapsing the panel is not "close this
+        // browser", so the agent may still surface it, the tab stays in the
+        // deck, and re-opening the panel re-docks it.
+        if (isBrowserDocked(workspaceId)) {
+          undockBrowserFromRightPanel(workspaceId, false).catch(console.error);
+        }
+        set((s) => ({
+          rightPanelTabs: { ...s.rightPanelTabs, [workspaceId]: null },
+          // Collapsing always drops full-expand: a maximized panel that is
+          // no longer on screen would leave the workspace column at zero
+          // width with nothing beside it.
+          rightPanelMaximized: false,
+        }));
+      },
 
       toggleRightPanel: (workspaceId, tab) => {
         const current = get().rightPanelTabs[workspaceId] ?? null;

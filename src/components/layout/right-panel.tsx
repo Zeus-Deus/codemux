@@ -211,6 +211,7 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
   const cwd = workspace.worktree_path ?? workspace.cwd;
 
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
+  const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
   const addRightPanelPane = useUIStore((s) => s.addRightPanelPane);
   const closeRightPanelPane = useUIStore((s) => s.closeRightPanelPane);
   const setShowFileSearch = useUIStore((s) => s.setShowFileSearch);
@@ -332,29 +333,58 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
   // Tracks whether the deck has actually held the session, which is what
   // separates the two reasons `browserDocked` can be false while the tab is
   // open: we haven't docked yet, or a main-area pane took the session.
-  const heldBrowserRef = useRef(false);
+  //
+  // The panel is one un-keyed component instance that every workspace flows
+  // through, so the answer has to carry the workspace it is about — a bare
+  // boolean would let workspace A's "yes, we held it" decide workspace B's
+  // branch and close B's Browser tab on a switch.
+  const heldBrowserRef = useRef<{ wsId: string; held: boolean }>({
+    wsId: workspaceId,
+    held: false,
+  });
 
   useEffect(() => {
+    if (heldBrowserRef.current.wsId !== workspaceId) {
+      heldBrowserRef.current = { wsId: workspaceId, held: false };
+    }
     if (!browserOpen) {
-      heldBrowserRef.current = false;
+      heldBrowserRef.current.held = false;
       return;
     }
     if (browserDocked) {
-      heldBrowserRef.current = true;
+      heldBrowserRef.current.held = true;
       return;
     }
-    if (heldBrowserRef.current && browserAttachedToPane) {
+    if (heldBrowserRef.current.held && browserAttachedToPane) {
       // Something opened a browser in the main area, which re-attaches this
       // session to a pane-tree node. One session, one surface — so the deck
       // yields its tab rather than mirroring the same Chromium twice.
-      heldBrowserRef.current = false;
+      heldBrowserRef.current.held = false;
       closeRightPanelPane(workspaceId, "browser");
       return;
     }
     // First open (or a re-open after the agent detached it). Docking adopts
     // a main-area browser pane for this session if one exists, so this is
     // also the "there's already a browser, use that one" path.
-    dockBrowserInRightPanel(workspaceId).catch(console.error);
+    dockBrowserInRightPanel(workspaceId)
+      .then(() => {
+        // Docking is a round trip (it allocates a port), and the user can
+        // close the tab or collapse the panel while it is in flight. Their
+        // undock would run first and no-op — the session wasn't docked yet —
+        // and this reply would then mark it docked with nothing on screen
+        // hosting it: surfaced to the backend, invisible to the user. So
+        // re-check the deck now and hand the session back if it moved on.
+        const ui = useUIStore.getState();
+        const stillOpen = ui.getRightPanelPanes(workspaceId).includes("browser");
+        const panelUp = ui.getRightPanelTab(workspaceId) !== null;
+        if (stillOpen && panelUp) return;
+        // Mirror the intent that raced us: closing the tab is an explicit
+        // dismissal, collapsing the panel is not.
+        undockBrowserFromRightPanel(workspaceId, !stillOpen).catch(
+          console.error,
+        );
+      })
+      .catch(console.error);
   }, [
     browserOpen,
     browserDocked,
@@ -495,18 +525,12 @@ export const RightPanel = memo(function RightPanel({ workspace, activeTab }: Pro
     dbSetUiState("right_panel_width", String(next)).catch(console.error);
   }, [expanded, panelMaxWidth, setRightPanelWidth]);
 
+  // The store owns collapsing (it undocks a docked agent browser — a
+  // collapsed panel is not a surface), so every entry point behaves the same
+  // whether it is this button, the titlebar cluster or the keybind.
   const handleCollapsePanel = useCallback(() => {
-    // A collapsed panel is not a surface. Leaving the session docked would
-    // tell the backend the user can see a browser they can't — the agent
-    // would then neither split a pane nor raise the background chip for it.
-    // `dismissed: false`: collapsing the panel is not "close this browser",
-    // so the agent may still surface it. The browser tab stays in the deck,
-    // and re-opening the panel re-docks it.
-    if (browserOpen) {
-      undockBrowserFromRightPanel(workspaceId, false).catch(console.error);
-    }
-    setRightPanelTab(workspaceId, null);
-  }, [browserOpen, setRightPanelTab, workspaceId]);
+    collapseRightPanel(workspaceId);
+  }, [collapseRightPanel, workspaceId]);
 
   const handleCopyDoc = useCallback(() => {
     if (!activeDocPath) return;

@@ -91,6 +91,21 @@ a collapsed panel is not a surface, so leaving the session docked would
 hide the browser from both the agent's pane gate and the background chip.
 The tab stays in the deck, so re-opening the panel re-docks it.
 
+That rule lives in **one place**: `collapseRightPanel(workspaceId)` on the
+UI store. The titlebar cluster, the panel's own close button, the
+`toggleRightPanel` keybind (Ctrl+Shift+B) and the legacy tab-bar toggle all
+route through it, and `setRightPanelTab(ws, null)` delegates to it, so a new
+collapse path cannot bypass the undock. Opening is symmetrical everywhere:
+the panel comes back on `RIGHT_PANEL_EMPTY`, the picker sentinel, rather
+than force-opening Files over a pane the user had closed.
+
+Docking is a round trip (it allocates a port), so the deck re-checks itself
+when the promise resolves: if the tab was closed or the panel collapsed
+while it was in flight, the user's own undock no-opped on the not-yet-docked
+session, and the reply would otherwise mark it surfaced with nothing hosting
+it. The deck undocks again in that case, carrying the intent that raced it
+(`dismissed: true` for a closed tab, `false` for a collapsed panel).
+
 **Entry points, and what each one does now:**
 
 | Entry point | Behavior |

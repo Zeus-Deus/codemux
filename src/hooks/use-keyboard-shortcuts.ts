@@ -12,7 +12,7 @@ import {
   runProjectDevCommand,
 } from "@/tauri/commands";
 import { useAppStore } from "@/stores/app-store";
-import { useUIStore } from "@/stores/ui-store";
+import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import { useChatDraftStore } from "@/stores/chat-draft-store";
 import { openProjectFlow } from "@/hooks/use-project-actions";
@@ -214,12 +214,17 @@ export function dispatch(actionId: string, _e?: KeyboardEvent): boolean {
   }
 
   // ── Toggle right panel ──
-  // True toggle: any open tab closes the panel; closed opens straight to
-  // Files. Mirrors the tab-bar button — using the store's by-tab-identity
-  // `toggleRightPanel` would switch tabs instead of closing.
+  // True toggle: any open tab closes the panel; closed opens on the picker
+  // sentinel, which resolves to whatever panes the deck already has instead
+  // of force-opening Files (and silently clearing a Files dismissal).
+  // Mirrors the titlebar cluster — using the store's by-tab-identity
+  // `toggleRightPanel` would switch tabs instead of closing. Collapsing runs
+  // through `collapseRightPanel`, the one path that releases a docked agent
+  // browser: a collapsed panel is not a surface.
   if (actionId === "toggleRightPanel") {
     const current = ui.getRightPanelTab(ws.workspace_id);
-    ui.setRightPanelTab(ws.workspace_id, current == null ? "files" : null);
+    if (current == null) ui.setRightPanelTab(ws.workspace_id, RIGHT_PANEL_EMPTY);
+    else ui.collapseRightPanel(ws.workspace_id);
     return true;
   }
 

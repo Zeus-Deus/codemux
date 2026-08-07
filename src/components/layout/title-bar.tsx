@@ -62,7 +62,6 @@ import {
   applyPreset,
   detectEditors,
   openInEditor,
-  undockBrowserFromRightPanel,
 } from "@/tauri/commands";
 import { cn } from "@/lib/utils";
 import {
@@ -270,31 +269,22 @@ function SidebarToggleButton({
 
 function RightPanelChromeCluster({ workspaceId }: { workspaceId: string }) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
+  const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
   const toggleMaximized = useUIStore((s) => s.toggleRightPanelMaximized);
   const maximized = useUIStore((s) => s.rightPanelMaximized);
   const rightPanelTab = useUIStore(
     (s) => s.rightPanelTabs[workspaceId] ?? null,
   );
   const open = rightPanelTab !== null;
-  const browserDocked = useAppStore(
-    (s) =>
-      s.appState?.agent_browser_sessions?.some(
-        (abs) => abs.workspace_id === workspaceId && abs.right_panel_docked,
-      ) === true,
-  );
 
   // True toggle. Opening lands on the picker sentinel, which resolves to
   // whatever panes the deck already has — and to the surface picker when it
   // has none, instead of force-opening Files over the user's last choice.
+  // Collapsing goes through the store's one collapse path, which owns the
+  // "a collapsed panel is not a surface" rule (it undocks the agent browser).
   const togglePanel = () => {
-    if (open && browserDocked) {
-      // A collapsed panel is not a surface: leaving the session docked would
-      // tell the backend the user can see a browser they can't.
-      // `dismissed: false` — collapsing the panel is not "close this
-      // browser", so the agent may still surface it, and reopening re-docks.
-      undockBrowserFromRightPanel(workspaceId, false).catch(console.error);
-    }
-    setRightPanelTab(workspaceId, open ? null : RIGHT_PANEL_EMPTY);
+    if (open) collapseRightPanel(workspaceId);
+    else setRightPanelTab(workspaceId, RIGHT_PANEL_EMPTY);
   };
 
   return (

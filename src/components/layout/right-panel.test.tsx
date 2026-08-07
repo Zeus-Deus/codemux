@@ -670,6 +670,74 @@ describe("RightPanel browser pane", () => {
     expect(useUIStore.getState().getRightPanelPanes("ws-1")).toContain("browser");
   });
 
+  // Docking is a round trip (it allocates a port). Anything the user does to
+  // the deck while it is in flight lands on a session that isn't docked yet,
+  // so their undock no-ops on the backend — and the dock's reply would then
+  // mark the session surfaced with nothing hosting it.
+  describe("dock/close race", () => {
+    /** Start a dock the test can resolve by hand. */
+    function deferDock() {
+      let resolve = () => {};
+      mocks.dock.mockReturnValueOnce(
+        new Promise<void>((r) => {
+          resolve = () => r();
+        }),
+      );
+      return () => resolve();
+    }
+
+    it("hands the session back when the panel collapses mid-dock", async () => {
+      // Legacy chrome keeps the collapse button inside the panel's own row.
+      mocks.titlebarOverlay = false;
+      seedBrowserSession(makeBrowserSession({ right_panel_docked: false }));
+      openBrowserPane();
+      const finishDock = deferDock();
+      renderDeck({ activeTab: "browser" });
+      expect(mocks.dock).toHaveBeenCalledWith("ws-1");
+
+      await userEvent.click(screen.getByRole("button", { name: "Close panel" }));
+      // Nothing was sent: the session isn't docked yet, so the collapse had
+      // no browser to release. This is the window the fix closes.
+      expect(mocks.undock).not.toHaveBeenCalled();
+
+      finishDock();
+      await vi.waitFor(() => {
+        expect(mocks.undock).toHaveBeenCalledWith("ws-1", false);
+      });
+    });
+
+    it("hands the session back when the tab is closed mid-dock", async () => {
+      seedBrowserSession(makeBrowserSession({ right_panel_docked: false }));
+      openBrowserPane();
+      const finishDock = deferDock();
+      renderDeck({ activeTab: "browser" });
+
+      await userEvent.click(
+        screen.getByRole("button", { name: "Close Browser" }),
+      );
+      // The user's own undock reached the backend first and no-opped there.
+      expect(mocks.undock).toHaveBeenCalledWith("ws-1", true);
+      mocks.undock.mockClear();
+
+      finishDock();
+      // Closing the tab is an explicit dismissal, so the repair carries it.
+      await vi.waitFor(() => {
+        expect(mocks.undock).toHaveBeenCalledWith("ws-1", true);
+      });
+    });
+
+    it("keeps the session when the deck is still hosting it", async () => {
+      seedBrowserSession(makeBrowserSession({ right_panel_docked: false }));
+      openBrowserPane();
+      const finishDock = deferDock();
+      renderDeck({ activeTab: "browser" });
+
+      finishDock();
+      await vi.waitFor(() => expect(mocks.dock).toHaveBeenCalledTimes(1));
+      expect(mocks.undock).not.toHaveBeenCalled();
+    });
+  });
+
   it("yields its tab when the session moves into a main-area pane", async () => {
     seedBrowserSession(makeBrowserSession({ right_panel_docked: true }));
     openBrowserPane();
@@ -695,5 +763,50 @@ describe("RightPanel browser pane", () => {
     });
     // Crucially it did NOT re-dock and fight the pane for the session.
     expect(mocks.dock).not.toHaveBeenCalled();
+  });
+
+  // The panel is one un-keyed component instance that every workspace flows
+  // through, so "the deck has held this session" has to be recorded per
+  // workspace. Sharing one boolean let workspace A's answer decide workspace
+  // B's branch on a switch — and close B's Browser tab.
+  it("does not carry one workspace's browser state into the next", async () => {
+    seedBrowserSession(makeBrowserSession({ right_panel_docked: true }));
+    openBrowserPane();
+    const view = renderDeck({ activeTab: "browser" });
+    expect(screen.getByTestId("browser-pane-stub")).toBeInTheDocument();
+    mocks.dock.mockClear();
+
+    // Switch to a workspace whose deck also has the Browser tab open, but
+    // whose session currently sits in a main-area pane.
+    useUIStore.setState({
+      rightPanelPanes: {
+        "ws-1": [...DEFAULT_RIGHT_PANEL_PANES, "browser"],
+        "ws-2": [...DEFAULT_RIGHT_PANEL_PANES, "browser"],
+      },
+      rightPanelTabs: { "ws-1": "browser", "ws-2": "browser" },
+    });
+    seedBrowserSession(
+      makeBrowserSession({
+        workspace_id: "ws-2",
+        right_panel_docked: false,
+        pane_id: "pane-9",
+      }),
+    );
+    view.rerender(
+      <TooltipProvider>
+        <RightPanel
+          workspace={makeWorkspace({ workspace_id: "ws-2" })}
+          activeTab="browser"
+        />
+      </TooltipProvider>,
+    );
+
+    // ws-2 gets the first-open treatment — dock, which adopts the existing
+    // main-area pane — instead of inheriting ws-1's "we already held it" and
+    // closing a tab ws-2 never yielded.
+    await vi.waitFor(() => expect(mocks.dock).toHaveBeenCalledWith("ws-2"));
+    expect(useUIStore.getState().getRightPanelPanes("ws-2")).toContain(
+      "browser",
+    );
   });
 });

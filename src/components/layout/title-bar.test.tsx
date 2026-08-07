@@ -26,8 +26,8 @@ const state = {
   rightPanelTab: null as "files" | null,
   rightPanelRowWidth: 0,
   rightPanelMaximized: false,
-  browserDocked: false,
   setRightPanelTab: vi.fn(),
+  collapseRightPanel: vi.fn(),
   toggleMaximized: vi.fn(),
 };
 
@@ -110,9 +110,6 @@ vi.mock("@/stores/app-store", () => ({
             workspace_type: state.workspaceType,
           },
         ],
-        agent_browser_sessions: [
-          { workspace_id: "ws-1", right_panel_docked: state.browserDocked },
-        ],
       },
     }),
   ),
@@ -164,6 +161,7 @@ vi.mock("@/stores/ui-store", () => ({
         rightPanelRowWidth: state.rightPanelRowWidth,
         rightPanelMaximized: state.rightPanelMaximized,
         setRightPanelTab: state.setRightPanelTab,
+        collapseRightPanel: state.collapseRightPanel,
         toggleRightPanelMaximized: state.toggleMaximized,
       }),
     ),
@@ -220,11 +218,7 @@ function makeWorkspace(): WorkspaceSnapshot {
 }
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import {
-  agentChatCreatePane,
-  applyPreset,
-  undockBrowserFromRightPanel,
-} from "@/tauri/commands";
+import { agentChatCreatePane, applyPreset } from "@/tauri/commands";
 import { useTitlebarPinsStore } from "@/stores/titlebar-pins-store";
 import { useRemoteConnectionStore } from "@/remote/remote-connection-store";
 import {
@@ -271,13 +265,12 @@ beforeEach(() => {
   state.rightPanelTab = null;
   state.rightPanelRowWidth = 0;
   state.rightPanelMaximized = false;
-  state.browserDocked = false;
   state.setRightPanelTab.mockClear();
+  state.collapseRightPanel.mockClear();
   state.toggleMaximized.mockClear();
   presetSnapshot = chatPresetSnapshot;
   vi.mocked(agentChatCreatePane).mockClear();
   vi.mocked(applyPreset).mockClear();
-  vi.mocked(undockBrowserFromRightPanel).mockClear();
   // Titlebar tile pins are opt-in and persisted (localStorage) — reset to
   // the real default (empty) before every test so tests don't leak into
   // each other or depend on ordering.
@@ -631,19 +624,18 @@ describe("TitleBar GUI chrome — fixed panel cluster", () => {
     expect(state.setRightPanelTab).toHaveBeenCalledWith("ws-1", "empty");
   });
 
-  // A collapsed panel is not a surface: leaving the session docked would tell
-  // the backend the user can see a browser they can't.
-  it("undocks a docked browser when it collapses the panel", () => {
+  // A collapsed panel is not a surface: leaving the agent browser docked
+  // would tell the backend the user can see a browser they can't. That rule
+  // lives in the store's one collapse path (`ui-store.test.ts` covers the
+  // undock itself) — what matters here is that the cluster routes through it
+  // instead of writing `null` past it.
+  it("collapses through the store's collapse path, not a raw tab write", () => {
     state.enableAgentChat = true;
     state.rightPanelTab = "files";
-    state.browserDocked = true;
     const { getByRole } = renderBar();
     fireEvent.click(getByRole("button", { name: "Close panel" }));
-    expect(vi.mocked(undockBrowserFromRightPanel)).toHaveBeenCalledWith(
-      "ws-1",
-      false,
-    );
-    expect(state.setRightPanelTab).toHaveBeenCalledWith("ws-1", null);
+    expect(state.collapseRightPanel).toHaveBeenCalledWith("ws-1");
+    expect(state.setRightPanelTab).not.toHaveBeenCalled();
   });
 });
 
