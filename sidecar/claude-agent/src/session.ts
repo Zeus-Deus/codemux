@@ -213,7 +213,16 @@ function buildQueryOptions(
     // and newer versions have historically tightened/loosened this
     // union. Cast through `unknown` so the literal string is passed
     // straight to the CLI regardless of the published type.
-    opts.effort = input.effort as unknown as NonNullable<Options["effort"]>;
+    //
+    // `ultracode` is the one level that is not a CLI `--effort` value
+    // ("Valid values: low, medium, high, xhigh, max"). It is xhigh
+    // effort plus standing dynamic-workflow orchestration, activated by
+    // the `ultracode` setting — so it normalizes here to `xhigh` on the
+    // wire, with the setting merged in below. `this.effort` keeps the
+    // raw selection, so the ultrathink prompt-prefix path is unaffected.
+    opts.effort = (input.effort === "ultracode"
+      ? "xhigh"
+      : input.effort) as unknown as NonNullable<Options["effort"]>;
   }
   if (input.permissionMode !== undefined) opts.permissionMode = input.permissionMode;
   if (input.permissionMode === "bypassPermissions") {
@@ -224,6 +233,14 @@ function buildQueryOptions(
   if (input.fastMode !== undefined) {
     flagSettings.fastMode = input.fastMode;
     flagSettings.fastModePerSessionOptIn = true;
+  }
+  if (input.effort === "ultracode") {
+    // The other half of the `ultracode` → `xhigh` normalization above:
+    // the level is activated by this session-scoped setting, which the
+    // SDK forwards to the CLI as `--settings`. The bundled 0.2.114
+    // `Settings` type doesn't declare the key, so it rides along as a
+    // plain property and reaches `opts.settings` through the cast below.
+    flagSettings.ultracode = true;
   }
   if (Object.keys(flagSettings).length > 0) {
     opts.settings = flagSettings as unknown as NonNullable<Options["settings"]>;

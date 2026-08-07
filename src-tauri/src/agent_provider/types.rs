@@ -243,6 +243,13 @@ pub struct ChatModelInfo {
     /// Which effort level should be selected when none is configured.
     #[serde(default)]
     pub default_effort: Option<String>,
+    /// Per-effort human descriptions reported by the provider's own
+    /// catalog, keyed by effort level. Empty when the provider reports
+    /// none (Claude, OpenCode) — the picker then falls back to its
+    /// built-in descriptions. Provider-reported text wins so a newly
+    /// advertised level reads correctly without a frontend bump.
+    #[serde(default)]
+    pub effort_descriptions: std::collections::HashMap<String, String>,
     /// Effort levels that the UI implements via a prompt-prepend rather
     /// than the SDK/RPC param. Claude uses this for `ultrathink`.
     #[serde(default)]

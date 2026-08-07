@@ -18,10 +18,30 @@
 //!
 //! | Family   | Model flag                 | Reasoning flag                       |
 //! |----------|----------------------------|--------------------------------------|
-//! | Claude   | `--model <id>`             | `--effort <low..max>`                |
+//! | Claude   | `--model <id>`             | `--effort <low..max>` + `--settings` |
 //! | Codex    | `--model <id>`             | `-c model_reasoning_effort=<id>`     |
 //! | OpenCode | `--model <provider/model>` | — (TUI exposes none)                 |
 //! | Gemini   | `--model <id>`             | — (CLI exposes none)                 |
+//!
+//! Claude's `ultracode` is the one reasoning level that is not itself an
+//! `--effort` value on older CLIs: it is xhigh effort plus a setting, so
+//! by default it splices as
+//! `--effort xhigh --settings '{"ultracode":true}'`. Every other level
+//! emits `--effort` alone and no `--settings`.
+//!
+//! That default only holds when the preset carries no `--settings` of its
+//! own, because the CLI resolves a repeated `--settings` **last-wins**
+//! rather than merging: appending ours would silently drop the user's
+//! hooks / permissions / env layer for the session. So when the preset
+//! already has one, the splice instead
+//!
+//! * folds `"ultracode": true` into the user's value when it is inline
+//!   JSON, emitting a single merged `--settings` (plus `--effort xhigh`);
+//! * emits `--effort ultracode` and leaves the flag untouched when the
+//!   value is a file path (or anything else that is not a JSON object).
+//!   Current CLIs accept that level natively; older ones warn and fall
+//!   back to the default effort — a degradation, but never a silent loss
+//!   of the user's settings.
 //!
 //! Injection happens on the raw preset command *before*
 //! [`crate::agent_context::inject_agent_context`] wraps it, so the
@@ -171,6 +191,152 @@ fn strip_flag(tokens: &mut Vec<String>, long: &str, short: Option<&str>) {
     }
 }
 
+/// The `--settings` value that switches Claude's `ultracode` level on:
+/// compact JSON (no spaces, so it survives the whitespace tokenization
+/// this module does), single-quoted so the braces and inner double
+/// quotes reach the CLI intact.
+///
+/// Quoting note — the spliced command is typed into the user's own
+/// interactive shell, so the quoting has to hold there rather than in an
+/// argv vector. Single quotes are a literal-string quote in every shell
+/// Codemux launches into except the two already documented as
+/// unsupported for shell-expanded flags (`cmd.exe`, and Windows
+/// PowerShell 5.1, whose native-argument passing drops the inner double
+/// quotes instead of re-escaping them). This is the same trade-off the
+/// `[1m]` model suffix above already makes.
+const ULTRACODE_SETTINGS_ARG: &str = "'{\"ultracode\":true}'";
+
+/// Drop a `--settings` pair this function spliced on an earlier pass.
+///
+/// Matched on the exact value, not on the flag alone: a preset may
+/// legitimately carry the user's own `--settings <path-or-json>`, and
+/// re-applying a selection must not eat it. Only the token this module
+/// itself emits is removed, which is what makes the ultracode splice
+/// idempotent — and what lets a later switch to a plain effort level
+/// clear the stale setting.
+fn strip_ultracode_settings(tokens: &mut Vec<String>) {
+    let mut i = 0;
+    while i + 1 < tokens.len() {
+        if tokens[i] == "--settings" && tokens[i + 1] == ULTRACODE_SETTINGS_ARG {
+            tokens.drain(i..i + 2);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Locate a `--settings` value the preset carries, in either the
+/// separate-token (`--settings <value>`) or `=`-joined form.
+///
+/// Returns the index of the token that *holds* the value together with
+/// the prefix that has to be re-emitted in front of a rewritten value
+/// (empty for the separate-token form, `--settings=` for the other).
+fn find_settings_slot(tokens: &[String]) -> Option<(usize, &'static str)> {
+    for (i, tok) in tokens.iter().enumerate() {
+        if tok == "--settings" && i + 1 < tokens.len() {
+            return Some((i + 1, ""));
+        }
+        if tok.starts_with("--settings=") {
+            return Some((i, "--settings="));
+        }
+    }
+    None
+}
+
+/// Strip one layer of matching shell quotes from a token value.
+fn unquote(value: &str) -> &str {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next_back()) {
+        (Some(open @ ('\'' | '"')), Some(close)) if open == close => chars.as_str(),
+        _ => value,
+    }
+}
+
+/// Parse a `--settings` value as an inline JSON object, or `None` when it
+/// is a file path / any non-object JSON.
+fn parse_settings_object(value: &str) -> Option<serde_json::Map<String, serde_json::Value>> {
+    match serde_json::from_str(unquote(value)) {
+        Ok(serde_json::Value::Object(object)) => Some(object),
+        _ => None,
+    }
+}
+
+/// Render a settings object back into a single-quoted command token, or
+/// `None` when it cannot survive the round trip.
+///
+/// The rejoin is whitespace-delimited and the wrapper is a single quote,
+/// so a value carrying either would come back mangled — better to refuse
+/// the rewrite (and let the caller fall back) than emit a broken command.
+fn render_settings_arg(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let json = serde_json::to_string(object).ok()?;
+    if json.contains(char::is_whitespace) || json.contains('\'') {
+        return None;
+    }
+    Some(format!("'{json}'"))
+}
+
+/// How `ultracode` had to be folded into the preset's existing settings.
+enum UltracodeSettings {
+    /// The preset carries no `--settings` — emit our own flag.
+    Absent,
+    /// The user's inline JSON absorbed the key; nothing more to emit.
+    Merged,
+    /// The user's value is a file path (or not a JSON object). It must
+    /// not be shadowed by a second `--settings`, which the CLI resolves
+    /// last-wins rather than merging.
+    Opaque,
+}
+
+/// Fold `"ultracode": true` into a user-supplied inline-JSON `--settings`
+/// value, rewriting it in place. See [`UltracodeSettings`].
+fn fold_ultracode_into_settings(tokens: &mut [String]) -> UltracodeSettings {
+    let (idx, prefix) = match find_settings_slot(tokens) {
+        Some(slot) => slot,
+        None => return UltracodeSettings::Absent,
+    };
+    let mut object = match parse_settings_object(&tokens[idx][prefix.len()..]) {
+        Some(object) => object,
+        None => return UltracodeSettings::Opaque,
+    };
+    object.insert("ultracode".into(), serde_json::Value::Bool(true));
+    match render_settings_arg(&object) {
+        Some(arg) => {
+            tokens[idx] = format!("{prefix}{arg}");
+            UltracodeSettings::Merged
+        }
+        None => UltracodeSettings::Opaque,
+    }
+}
+
+/// Remove an `ultracode` key a previous pass folded into a user's inline
+/// JSON `--settings`, so switching down to a plain effort level does not
+/// leave the level standing. Drops the whole flag when nothing else is
+/// left in the object; leaves file-path values alone.
+fn clear_ultracode_from_settings(tokens: &mut Vec<String>) {
+    let (idx, prefix) = match find_settings_slot(tokens) {
+        Some(slot) => slot,
+        None => return,
+    };
+    let mut object = match parse_settings_object(&tokens[idx][prefix.len()..]) {
+        Some(object) => object,
+        None => return,
+    };
+    if object.remove("ultracode").is_none() {
+        return;
+    }
+    if object.is_empty() {
+        if prefix.is_empty() {
+            tokens.drain(idx - 1..=idx);
+        } else {
+            tokens.remove(idx);
+        }
+        return;
+    }
+    if let Some(arg) = render_settings_arg(&object) {
+        tokens[idx] = format!("{prefix}{arg}");
+    }
+}
+
 /// Drop a baked-in `-c model_reasoning_effort=<value>` Codex override
 /// (and the `-c` / `--config` flag preceding it).
 fn strip_codex_reasoning(tokens: &mut Vec<String>) {
@@ -247,8 +413,45 @@ pub fn apply_model_selection(command: &str, selection: Option<&ModelSelection>) 
             match family {
                 AgentFamily::Claude => {
                     strip_flag(&mut tokens, "--effort", None);
-                    tokens.push("--effort".into());
-                    tokens.push(reasoning.to_string());
+                    strip_ultracode_settings(&mut tokens);
+                    if reasoning == "ultracode" {
+                        // Older CLIs reject `ultracode` as an `--effort`
+                        // value ("Valid values: low, medium, high, xhigh,
+                        // max"): there it is xhigh effort plus standing
+                        // dynamic-workflow orchestration switched on by a
+                        // setting, matching how the agent-chat sidecar
+                        // normalizes the same selection. Which encoding
+                        // is safe depends on the preset's own
+                        // `--settings`, because the CLI takes the *last*
+                        // occurrence of that flag wholesale instead of
+                        // merging the two.
+                        match fold_ultracode_into_settings(&mut tokens) {
+                            UltracodeSettings::Absent => {
+                                tokens.push("--effort".into());
+                                tokens.push("xhigh".into());
+                                tokens.push("--settings".into());
+                                tokens.push(ULTRACODE_SETTINGS_ARG.into());
+                            }
+                            UltracodeSettings::Merged => {
+                                tokens.push("--effort".into());
+                                tokens.push("xhigh".into());
+                            }
+                            UltracodeSettings::Opaque => {
+                                // A second `--settings` would shadow the
+                                // user's file. Ask the CLI for the level
+                                // directly instead: current versions
+                                // accept it, older ones warn and run at
+                                // the default effort — a lesser evil than
+                                // dropping their hooks and permissions.
+                                tokens.push("--effort".into());
+                                tokens.push("ultracode".into());
+                            }
+                        }
+                    } else {
+                        clear_ultracode_from_settings(&mut tokens);
+                        tokens.push("--effort".into());
+                        tokens.push(reasoning.to_string());
+                    }
                     changed = true;
                 }
                 AgentFamily::Codex => {
@@ -358,6 +561,184 @@ mod tests {
             out,
             "claude --dangerously-skip-permissions --model opus --effort high"
         );
+    }
+
+    #[test]
+    fn claude_ultracode_splices_xhigh_plus_the_settings_flag() {
+        // `ultracode` is not a CLI `--effort` value — it lands as xhigh
+        // effort plus the setting that switches the level on.
+        let out = apply_model_selection(
+            "claude --dangerously-skip-permissions",
+            Some(&sel(Some("opus"), Some("ultracode"))),
+        );
+        assert_eq!(
+            out,
+            "claude --dangerously-skip-permissions --model opus \
+             --effort xhigh --settings '{\"ultracode\":true}'"
+        );
+    }
+
+    #[test]
+    fn claude_ultracode_splice_is_idempotent() {
+        // Re-applying the same selection over an already-spliced command
+        // must not stack a second `--effort` / `--settings` pair.
+        let once = apply_model_selection(
+            "claude --foo",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        let twice = apply_model_selection(&once, Some(&sel(None, Some("ultracode"))));
+        assert_eq!(twice, once);
+        assert_eq!(
+            once,
+            "claude --foo --effort xhigh --settings '{\"ultracode\":true}'"
+        );
+    }
+
+    #[test]
+    fn switching_off_ultracode_clears_the_settings_flag() {
+        // Downgrading to a plain effort level must remove the setting —
+        // otherwise the session would still run with workflows on.
+        let ultra = apply_model_selection(
+            "claude --foo",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        let plain = apply_model_selection(&ultra, Some(&sel(None, Some("high"))));
+        assert_eq!(plain, "claude --foo --effort high");
+    }
+
+    #[test]
+    fn ultracode_never_shadows_a_user_settings_file() {
+        // The CLI resolves a repeated `--settings` last-wins, so
+        // appending ours would silently drop the user's settings file
+        // (their hooks / permissions / env layer). Ask for the level
+        // natively instead and leave their flag exactly as written.
+        let out = apply_model_selection(
+            "claude --settings ~/my-settings.json",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        assert_eq!(
+            out,
+            "claude --settings ~/my-settings.json --effort ultracode"
+        );
+        assert_eq!(out.matches("--settings").count(), 1);
+    }
+
+    #[test]
+    fn ultracode_merges_into_inline_json_settings() {
+        // An inline JSON value *can* carry the key, so it is merged into
+        // a single flag rather than duplicated — the user's other keys
+        // survive verbatim.
+        let out = apply_model_selection(
+            "claude --settings '{\"env\":{\"FOO\":\"bar\"},\"permissions\":{\"deny\":[]}}'",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        assert_eq!(
+            out,
+            "claude --settings \
+             '{\"env\":{\"FOO\":\"bar\"},\"permissions\":{\"deny\":[]},\"ultracode\":true}' \
+             --effort xhigh"
+        );
+        assert_eq!(out.matches("--settings").count(), 1);
+    }
+
+    #[test]
+    fn ultracode_merge_overwrites_a_user_ultracode_key() {
+        let out = apply_model_selection(
+            "claude --settings '{\"env\":{},\"ultracode\":false}'",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        assert_eq!(
+            out,
+            "claude --settings '{\"env\":{},\"ultracode\":true}' --effort xhigh"
+        );
+    }
+
+    #[test]
+    fn ultracode_merges_into_the_eq_form_settings_flag() {
+        let out = apply_model_selection(
+            "claude --settings={\"env\":{}}",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        assert_eq!(
+            out,
+            "claude --settings='{\"env\":{},\"ultracode\":true}' --effort xhigh"
+        );
+    }
+
+    #[test]
+    fn unparseable_inline_settings_falls_back_to_the_native_level() {
+        // Not a JSON object (truncated brace soup, a bare scalar, a
+        // path-like value) → treated as opaque, never rewritten.
+        for cmd in [
+            "claude --settings '{\"env\":'",
+            "claude --settings '[1,2]'",
+            "claude --settings ./team-settings.json",
+        ] {
+            let out = apply_model_selection(cmd, Some(&sel(None, Some("ultracode"))));
+            assert_eq!(out, format!("{cmd} --effort ultracode"));
+        }
+    }
+
+    #[test]
+    fn ultracode_splice_is_idempotent_across_every_settings_shape() {
+        // Re-applying the same selection over an already-spliced command
+        // must not stack flags or re-mangle the merged JSON.
+        for cmd in [
+            "claude --foo",                                    // no user settings
+            "claude --settings ~/my-settings.json",            // file path
+            "claude --settings '{\"env\":{\"FOO\":\"bar\"}}'", // inline JSON
+            "claude --settings={\"env\":{}}",                  // eq form
+            "claude --settings '{\"env\":'",                   // unparseable
+        ] {
+            let once = apply_model_selection(cmd, Some(&sel(None, Some("ultracode"))));
+            let twice = apply_model_selection(&once, Some(&sel(None, Some("ultracode"))));
+            assert_eq!(twice, once, "second pass changed {cmd}");
+            let thrice = apply_model_selection(&twice, Some(&sel(None, Some("ultracode"))));
+            assert_eq!(thrice, once, "third pass changed {cmd}");
+            assert_eq!(
+                once.matches("--settings").count(),
+                cmd.matches("--settings").count().max(1),
+                "flag count drifted for {cmd}: {once}"
+            );
+        }
+    }
+
+    #[test]
+    fn switching_off_ultracode_clears_a_merged_settings_key() {
+        // The merged key is part of the user's own object, so downgrading
+        // has to reach inside it — otherwise the level would stand.
+        let ultra = apply_model_selection(
+            "claude --settings '{\"env\":{\"FOO\":\"bar\"}}'",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        let plain = apply_model_selection(&ultra, Some(&sel(None, Some("high"))));
+        assert_eq!(
+            plain,
+            "claude --settings '{\"env\":{\"FOO\":\"bar\"}}' --effort high"
+        );
+    }
+
+    #[test]
+    fn switching_off_ultracode_leaves_a_user_settings_file_alone() {
+        let ultra = apply_model_selection(
+            "claude --settings ~/my-settings.json",
+            Some(&sel(None, Some("ultracode"))),
+        );
+        let plain = apply_model_selection(&ultra, Some(&sel(None, Some("high"))));
+        assert_eq!(plain, "claude --settings ~/my-settings.json --effort high");
+    }
+
+    #[test]
+    fn non_claude_families_never_see_the_ultracode_settings_flag() {
+        // The level and its setting are Claude-specific — no other
+        // family's command may grow a `--settings` flag from it.
+        for cmd in ["codex --full-auto", "opencode", "gemini --yolo"] {
+            let out = apply_model_selection(cmd, Some(&sel(None, Some("ultracode"))));
+            assert!(
+                !out.contains("--settings"),
+                "{cmd} must not receive Claude's ultracode setting, got: {out}"
+            );
+        }
     }
 
     #[test]
