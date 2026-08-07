@@ -171,7 +171,11 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   one flow**: the git-local facts (branch · `↑ahead` · `+/−` diff) flow from the
   left, then a `flex-1` spacer pins the rest to the right — PR chip · provider
   logos · remote cloud icon · notification badge. The PR chip is **the same
-  borderless badge settled rows use**: a state-colored `PrStatusIcon` + `#n`
+  borderless badge settled rows use**: a state-colored `PrStatusIcon` + the
+  change request's reference (`#n` on GitHub, `!n` on GitLab — the sigil and the
+  surrounding label copy come from the workspace's `provider_kind` via
+  `src/lib/source-control.ts`; absent means GitHub, so existing cards are
+  unchanged — see `docs/features/source-control-providers.md`)
   (open green, merged violet, closed red, draft muted), no border or fill, with
   a hover tint only when there is a `pr_url` to open (dimmed and `disabled`
   otherwise, so the chip itself swallows the click instead of passing it to the
@@ -514,7 +518,11 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   through one `branch_pr_outcome` helper (`Write` / `Clear` / `Preserve`) so the
   matrix cannot drift between the manual refresh command and the two pollers.
   These rules are what let a real `MERGED`/`CLOSED` transition reach auto-settle
-  reliably.
+  reliably. Both pollers now resolve the checkout's hosting product first and
+  ask *that* adapter (the paragraph above describes the GitHub one); a workspace
+  on an unserved host is skipped rather than shelled out to, and the auth gate is
+  keyed per product **and** host so one signed-out product cannot stall another's
+  workspaces. See `docs/features/source-control-providers.md`.
 - **Side-branch PR badges (badge only).** Strict current-branch association has
   one visible blind spot: an agent that runs `git checkout -b side-branch`,
   commits, pushes, opens a PR, and checks the worktree back leaves a workspace

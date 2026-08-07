@@ -36,6 +36,8 @@ UserSettings
     cursor_style: string       (default: "bar")
   git
     default_base_branch: string (default: "main")
+  source_control
+    custom_hosts: Record<string, string> (default: {}, editable via Settings > Source Control — maps a bare hostname to a hosting product, e.g. {"git.acme.internal": "gitlab"}, for self-hosted instances whose domain gives nothing away. Highest-priority input to backend provider detection; values are read leniently so an entry naming a product this build doesn't know is skipped rather than failing the blob. A write clears the detection cache so the mapping takes effect immediately — docs/features/source-control-providers.md)
   keyboard
     shortcuts: Record<string, string> (default: {}, editable via Settings > Shortcuts)
   notifications
@@ -93,7 +95,7 @@ Serde default annotations ensure backward compatibility — missing fields deser
 
 ## Settings UI
 
-Opened via the settings button or command palette. The Settings panel has 19 sections (`ALL_SECTION_IDS` in `settings-view.tsx`; `docs/features/settings.md` is the canonical per-section list). The table below covers only the sync-relevant ones:
+Opened via the settings button or command palette. The Settings panel has 20 sections (`ALL_SECTION_IDS` in `settings-view.tsx`; `docs/features/settings.md` is the canonical per-section list). The table below covers only the sync-relevant ones:
 
 | Section | Category | What It Controls | Synced |
 |---------|----------|-----------------|--------|
@@ -106,6 +108,7 @@ Opened via the settings button or command palette. The Settings panel has 19 sec
 | Presets | Editor & Workflow | Terminal preset management | No (local) |
 | Projects | Editor & Workflow | Setup/teardown/run scripts | No (local) |
 | Git | Editor & Workflow | Default base branch | Yes |
+| Source Control | Editor & Workflow | Hosting-provider diagnostics (probe results, not settings) + self-hosted host→product mapping | Partial (custom_hosts syncs) |
 | Agent | Editor & Workflow | AI commit/resolver config + auto-MCP toggle | No (local except auto-MCP) |
 | Browser | Editor & Workflow | Default agent-browser viewport + browser data management (clear cookies / all data) | Partial (default_viewport syncs) |
 | Session Restore | Editor & Workflow | Enable/disable, scrollback lines, disk limit | Yes |

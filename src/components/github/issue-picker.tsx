@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
+import { resolveProvider } from "@/lib/source-control";
 import { CircleDot, CircleCheck, Search, Loader2 } from "lucide-react";
 import { listGithubIssues, listGithubIssuesByPath } from "@/tauri/commands";
 import type { GitHubIssue } from "@/tauri/types";
@@ -65,15 +66,20 @@ export function IssuePickerPanel({
   workspaceId,
   projectPath,
   open,
+  providerKind = null,
   onSelect,
   onClose,
 }: {
   workspaceId?: string;
   projectPath?: string;
   open: boolean;
+  /** Hosting product of the repo being picked from. Absent means
+   *  GitHub, so existing call sites keep their exact wording. */
+  providerKind?: string | null;
   onSelect: (issue: GitHubIssue) => void;
   onClose: () => void;
 }) {
+  const provider = resolveProvider(providerKind);
   const [issues, setIssues] = useState<GitHubIssue[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -248,9 +254,9 @@ export function IssuePickerPanel({
           <div className="px-3 py-4 text-center">
             <p className="text-xs text-muted-foreground">
               {error.includes("not authenticated") || error.includes("auth")
-                ? "Connect GitHub to link issues"
+                ? `Connect ${provider.name} to link issues`
                 : error.includes("not installed")
-                  ? "Install GitHub CLI (gh) to link issues"
+                  ? `Install ${provider.cliLabel} to link issues`
                   : "Failed to load issues"}
             </p>
           </div>

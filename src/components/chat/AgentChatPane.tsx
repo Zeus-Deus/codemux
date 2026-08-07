@@ -88,8 +88,6 @@ import {
   agentChatStopMonitoring,
   agentChatStopSession,
   agentChatUpdateSessionConfig,
-  checkGhStatus,
-  checkGithubRepo,
   getGithubIssueByPath,
   getGithubPrByPath,
   getGithubPrDiffByPath,
@@ -100,6 +98,7 @@ import {
   type AgentChatSessionConfigUpdate,
   type AgentChatSessionRecord,
 } from "@/tauri/commands";
+import { fetchProviderAuth } from "@/lib/provider-auth";
 import { autoNameWorkspace } from "@/lib/agent-chat/materialize";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import type { AgentChatEventPayload, ApprovalDecision } from "@/tauri/events";
@@ -258,29 +257,32 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // entry flip from enabled to disabled. Errors fall back to `false`
   // (treat as not-a-github-repo) which gives the user a reachable
   // disabled-state instead of a crashing popup.
-  const [isGithubRepo, setIsGithubRepo] = useState<boolean | null>(null);
-  const [ghAuthenticated, setGhAuthenticated] = useState<boolean | null>(null);
+  const [repoSupported, setRepoSupported] = useState<boolean | null>(null);
+  const [providerCliInstalled, setProviderCliInstalled] = useState<boolean | null>(null);
+  const [providerAuthenticated, setProviderAuthenticated] = useState<boolean | null>(null);
   useEffect(() => {
     if (!cwd) {
-      setIsGithubRepo(false);
-      setGhAuthenticated(null);
+      setRepoSupported(false);
+      setProviderCliInstalled(null);
+      setProviderAuthenticated(null);
       return;
     }
     let cancelled = false;
     void (async () => {
-      try {
-        const [repo, gh] = await Promise.all([
-          checkGithubRepo(cwd),
-          checkGhStatus(),
-        ]);
-        if (cancelled) return;
-        setIsGithubRepo(repo);
-        setGhAuthenticated(gh.status === "Authenticated");
-      } catch {
-        if (cancelled) return;
-        setIsGithubRepo(false);
-        setGhAuthenticated(null);
-      }
+      // One host-scoped probe answers all three halves. Asking `gh`
+      // whether it is signed in — as this used to — said nothing about a
+      // GitLab checkout, so the menu offered entries the CLI could not
+      // serve while the copy beside them named a different tool.
+      const status = await fetchProviderAuth(cwd);
+      if (cancelled) return;
+      setRepoSupported(status.supported);
+      setProviderCliInstalled(status.installed);
+      // A missing CLI cannot be signed in, so it counts as not
+      // authenticated: leaving this `null` ("question doesn't apply")
+      // read as "not known to be broken" downstream and left the
+      // hosting attach rows enabled onto a picker that can only error.
+      // `providerCliInstalled` carries the difference in the hint copy.
+      setProviderAuthenticated(status.installed && status.authenticated);
     })();
     return () => {
       cancelled = true;
@@ -392,6 +394,17 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
         w.workspace_id === (workspaceIdForPane ?? s.appState!.active_workspace_id),
     );
     return ws?.project_root ?? ws?.cwd ?? null;
+  });
+  // Which hosting product this pane's workspace talks to, so the
+  // composer's attach rows and preflight hints name the right product
+  // and CLI. A scalar selector, so it only re-renders on a real change.
+  const workspaceProviderKind = useAppStore((s) => {
+    if (!s.appState) return null;
+    const ws = s.appState.workspaces.find(
+      (w) =>
+        w.workspace_id === (workspaceIdForPane ?? s.appState!.active_workspace_id),
+    );
+    return ws?.provider_kind ?? null;
   });
   const isHomeWorkspace =
     homeDir !== null && workspaceProjectRoot === homeDir;
@@ -2936,8 +2949,10 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       onAttachPr={handleAttachPr}
       onAttachImage={handleAttachImage}
       modelSupportsImages={activeModel?.supports_images ?? false}
-      isGithubRepo={isGithubRepo}
-      ghAuthenticated={ghAuthenticated}
+      repoSupported={repoSupported}
+      providerKind={workspaceProviderKind}
+      providerCliInstalled={providerCliInstalled}
+      providerAuthenticated={providerAuthenticated}
       onDraftChange={(next) => {
         if (!threadId) return;
         setInputDraft(threadId, next);

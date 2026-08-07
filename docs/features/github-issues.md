@@ -12,7 +12,7 @@ Workspaces can be linked to GitHub issues. Once linked, the issue appears as a c
 
 ## Current Model
 
-Issues are fetched via the `gh` CLI routed through Rust. A workspace holds at most one linked issue at a time. Linking is optional and happens **during workspace creation only** — `linkWorkspaceIssue` is called solely from `new-workspace-dialog.tsx`. There is no sidebar or context-menu link action.
+Issues are fetched through the `git_provider` registry — the checkout's detected hosting product is served by its own CLI (`gh` for GitHub, `glab` for GitLab), normalized onto the same `GitHubIssue` struct, so the surfaces below are unchanged. Picker and popover copy names the detected product ("Connect GitLab to link issues", "Open on GitLab"); issue references stay `#N` on every product. A workspace holds at most one linked issue at a time. Linking is optional and happens **during workspace creation only** — `linkWorkspaceIssue` is called solely from `new-workspace-dialog.tsx`. There is no sidebar or context-menu link action.
 
 ## What Works Today
 
@@ -29,7 +29,7 @@ Issues are fetched via the `gh` CLI routed through Rust. A workspace holds at mo
 
 ## Current Constraints
 
-- requires `gh` CLI installed and authenticated
+- requires the detected product's CLI installed and authenticated (`gh` / `glab`); Bitbucket and Azure DevOps are recognised but not served — see `docs/features/source-control-providers.md`
 - one issue per workspace (no multi-issue linking)
 - issue state is fetched on demand, not continuously polled
 - no issue creation from within Codemux
@@ -45,7 +45,8 @@ reopened. Wiring either one is a small change if the affordance is wanted.
 
 ## Important Touch Points
 
-- `src-tauri/src/github.rs` — issue fetching via `gh`
+- `src-tauri/src/git_provider/` — provider detection + adapters the issue commands route through
+- `src-tauri/src/github.rs` — issue fetching via `gh` (behind the GitHub adapter)
 - `src-tauri/src/commands/github.rs` — Tauri commands: `list_github_issues`, `get_github_issue`, `link_workspace_issue`, `unlink_workspace_issue`, `refresh_workspace_issue`, `suggest_issue_branch_name`
 - `src-tauri/src/cli.rs` — CLI `issue` subcommands
 - `src-tauri/src/control.rs` — socket commands for issue operations

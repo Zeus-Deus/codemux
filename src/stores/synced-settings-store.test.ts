@@ -34,6 +34,7 @@ const DARK_SETTINGS: UserSettings = {
   editor: { default_ide: "cursor" },
   terminal: { scrollback_limit: 5000, cursor_style: "block" },
   git: { default_base_branch: "develop" },
+  source_control: { custom_hosts: {} },
   keyboard: { shortcuts: { "ctrl+s": "save" } },
   notifications: { sound_enabled: false, desktop_enabled: true },
   file_tree: { show_hidden_files: true },

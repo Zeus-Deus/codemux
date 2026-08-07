@@ -60,8 +60,6 @@ import {
 } from "@/stores/provider-capabilities-store";
 import { capabilityDefaults } from "@/lib/agent-chat/capability-defaults";
 import {
-  checkGhStatus,
-  checkGithubRepo,
   getGithubIssueByPath,
   getGithubPrByPath,
   getGithubPrDiffByPath,
@@ -69,6 +67,7 @@ import {
   readFileForAttachment,
   readFolderForAttachment,
 } from "@/tauri/commands";
+import { fetchProviderAuth } from "@/lib/provider-auth";
 import type {
   FileMatch,
   FolderMatch,
@@ -226,6 +225,19 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
     const wsId = draft.target.workspaceId;
     const ws = s.appState?.workspaces.find((w) => w.workspace_id === wsId);
     return ws?.project_root ?? ws?.cwd ?? null;
+  });
+
+  // Hosting product of the targeted workspace, so the composer's attach
+  // rows name the right product and CLI. Null for a home draft, which
+  // has no checkout yet — the composer then falls back to GitHub
+  // wording, matching every other unclassified surface.
+  const existingWorkspaceProviderKind = useAppStore((s) => {
+    if (draft.target.kind !== "existing_workspace") return null;
+    const wsId = draft.target.workspaceId;
+    return (
+      s.appState?.workspaces.find((w) => w.workspace_id === wsId)
+        ?.provider_kind ?? null
+    );
   });
 
   // Thread Scope redesign — resolved project root fed to `ThreadScopeRow`
@@ -790,29 +802,29 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // Step 8 Stage 4 — preflight GitHub status. Mirrors AgentChatPane.
   // `null` means "not yet known"; the popup keeps GitHub entries
   // disabled while the preflight is in flight to avoid a flicker.
-  const [isGithubRepo, setIsGithubRepo] = useState<boolean | null>(null);
-  const [ghAuthenticated, setGhAuthenticated] = useState<boolean | null>(null);
+  const [repoSupported, setRepoSupported] = useState<boolean | null>(null);
+  const [providerCliInstalled, setProviderCliInstalled] = useState<boolean | null>(null);
+  const [providerAuthenticated, setProviderAuthenticated] = useState<boolean | null>(null);
   useEffect(() => {
     if (!displayCwd) {
-      setIsGithubRepo(false);
-      setGhAuthenticated(null);
+      setRepoSupported(false);
+      setProviderCliInstalled(null);
+      setProviderAuthenticated(null);
       return;
     }
     let cancelled = false;
     void (async () => {
-      try {
-        const [repo, gh] = await Promise.all([
-          checkGithubRepo(displayCwd),
-          checkGhStatus(),
-        ]);
-        if (cancelled) return;
-        setIsGithubRepo(repo);
-        setGhAuthenticated(gh.status === "Authenticated");
-      } catch {
-        if (cancelled) return;
-        setIsGithubRepo(false);
-        setGhAuthenticated(null);
-      }
+      // One host-scoped probe answers all three halves. Asking `gh`
+      // whether it is signed in — as this used to — said nothing about a
+      // GitLab checkout, so the menu offered entries the CLI could not
+      // serve while the copy beside them named a different tool.
+      const status = await fetchProviderAuth(displayCwd);
+      if (cancelled) return;
+      setRepoSupported(status.supported);
+      setProviderCliInstalled(status.installed);
+      // A missing CLI cannot be signed in — see AgentChatPane for why
+      // this is `false` rather than "doesn't apply".
+      setProviderAuthenticated(status.installed && status.authenticated);
     })();
     return () => {
       cancelled = true;
@@ -1008,8 +1020,10 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       onAttachPr={handleAttachPr}
       onAttachImage={handleAttachImage}
       modelSupportsImages={activeModel?.supports_images ?? false}
-      isGithubRepo={isGithubRepo}
-      ghAuthenticated={ghAuthenticated}
+      repoSupported={repoSupported}
+      providerKind={existingWorkspaceProviderKind}
+      providerCliInstalled={providerCliInstalled}
+      providerAuthenticated={providerAuthenticated}
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}
       onStop={handleStop}

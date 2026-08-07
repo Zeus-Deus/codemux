@@ -64,6 +64,11 @@ import {
   shouldSkipPushConfirm,
 } from "@/components/overlays/confirm-push-dialog";
 import type { WorkspaceSnapshot, EditorInfo, ActivePaneStatus } from "@/tauri/types";
+import {
+  providerForWorkspace,
+  providerRef,
+  providerRefLabel,
+} from "@/lib/source-control";
 import { useAppStore } from "@/stores/app-store";
 import {
   useTunnelStatusStore,
@@ -868,6 +873,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
   );
 
   const prHumanState = humanizePrState(workspace.pr_state);
+  const provider = providerForWorkspace(workspace);
   const handlePrClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (workspace.pr_url) {
@@ -1063,8 +1069,8 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                           disabled={!workspace.pr_url}
                           aria-label={
                             workspace.pr_number
-                              ? `Open PR #${workspace.pr_number} on GitHub — ${prHumanState ?? "Pull request"}`
-                              : `Open pull request on GitHub — ${prHumanState ?? ""}`
+                              ? `Open ${providerRefLabel(provider, workspace.pr_number)} on ${provider.name} — ${prHumanState ?? provider.nounTitle}`
+                              : `Open ${provider.noun} on ${provider.name} — ${prHumanState ?? ""}`
                           }
                           className={cn(
                             "inline-flex items-center justify-center rounded transition-opacity",
@@ -1075,8 +1081,12 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                         </button>
                       </TooltipTrigger>
                       <TooltipContent side="bottom" sideOffset={4} className="text-xs">
-                        {prHumanState ? `${prHumanState} PR` : "Pull request"}
-                        {workspace.pr_number ? ` #${workspace.pr_number}` : ""}
+                        {prHumanState
+                          ? `${prHumanState} ${provider.shortNoun}`
+                          : provider.nounTitle}
+                        {workspace.pr_number
+                          ? ` ${providerRef(provider, workspace.pr_number)}`
+                          : ""}
                         {workspace.pr_url ? " — click to open" : ""}
                       </TooltipContent>
                     </Tooltip>
@@ -1140,6 +1150,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                     cards; idle rows keep it in the git line (below). */}
                 {issueOnTitleLine && workspace.linked_issue && (
                   <IssueDetailPopover
+                    providerKind={workspace.provider_kind}
                     workspaceId={workspace.workspace_id}
                     issue={workspace.linked_issue}
                   />
@@ -1379,6 +1390,7 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                       )}
                       {workspace.linked_issue && (
                         <IssueDetailPopover
+                          providerKind={workspace.provider_kind}
                           workspaceId={workspace.workspace_id}
                           issue={workspace.linked_issue}
                         />

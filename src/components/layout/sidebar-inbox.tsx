@@ -72,6 +72,11 @@ import {
   DEFAULT_JUMP_MODIFIER,
 } from "./sidebar-inbox-jump";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
+import {
+  providerForWorkspace,
+  providerRef,
+  providerRefLabel,
+} from "@/lib/source-control";
 
 /** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
 const MAX_JUMP_HINTS = 9;
@@ -478,6 +483,7 @@ const SettledRow = memo(function SettledRow({
 }: SettledRowProps) {
   const appearance = useProjectAppearance(repo.path);
   const prState = normalizePrState(workspace.pr_state);
+  const provider = providerForWorkspace(workspace);
 
   // Settled work is history, so the shelf reads as one grey block at rest:
   // the repo avatar desaturates, the title drops to a faint muted tone and
@@ -599,9 +605,9 @@ const SettledRow = memo(function SettledRow({
           aria-label={
             workspace.pr_number
               ? workspace.pr_url
-                ? `Open PR #${workspace.pr_number} on GitHub — ${prState}`
-                : `PR #${workspace.pr_number} — ${prState}`
-              : `Pull request — ${prState}`
+                ? `Open ${providerRefLabel(provider, workspace.pr_number)} on ${provider.name} — ${prState}`
+                : `${providerRefLabel(provider, workspace.pr_number)} — ${prState}`
+              : `${provider.nounTitle} — ${prState}`
           }
           className={cn(
             "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 font-mono text-[10px] font-medium",
@@ -629,7 +635,9 @@ const SettledRow = memo(function SettledRow({
               the icon and this badge silently goes back to a colored glyph on
               a grey number — there is a test pinning it. */}
           <PrStatusIcon state={prState} size={3} className="shrink-0 text-current" />
-          {workspace.pr_number != null && <span>#{workspace.pr_number}</span>}
+          {workspace.pr_number != null && (
+            <span>{providerRef(provider, workspace.pr_number)}</span>
+          )}
         </button>
       )}
       {time && (

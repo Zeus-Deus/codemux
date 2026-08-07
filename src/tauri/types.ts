@@ -29,6 +29,71 @@ export interface GitSyncSettings {
   default_base_branch: string;
 }
 
+/** Mirrors src-tauri/src/settings_sync.rs:SourceControlSettings.
+ *  `custom_hosts` maps a bare hostname to a hosting product
+ *  (`{"git.acme.internal": "gitlab"}`) for self-hosted instances whose
+ *  domain gives nothing away. It is the highest-priority input to
+ *  backend provider detection. Edited in Settings → Source Control. */
+export interface SourceControlSyncSettings {
+  custom_hosts: Record<string, string>;
+}
+
+/** One hosting product's readiness, from `discover_source_control`.
+ *  Mirrors src-tauri/src/commands/source_control.rs:ProviderDiagnostic.
+ *
+ *  Probe results only — the product name, CLI name, login command and
+ *  install URL come from the presentation map in
+ *  `src/lib/source-control.ts` so copy has one source of truth. */
+export interface ProviderDiagnostic {
+  /** Wire form of the backend's ProviderKind: "github", "gitlab", … */
+  kind: string;
+  /** False for products Codemux has no adapter for; those rows render
+   *  dimmed and are never probed. */
+  supported: boolean;
+  cli_installed: boolean;
+  /** First line of `<cli> --version`, or null when missing/timed out. */
+  cli_version: string | null;
+  authenticated: boolean;
+  /** Account the CLI reports, when it names one. Never a token. */
+  account: string | null;
+  /** One sanitized sentence explaining a non-ready state. */
+  detail: string | null;
+  /** What the adapter serves. Declared by the backend adapter so the UI
+   *  does not restate it. All-false on an unsupported row. */
+  capabilities: ProviderCapabilities;
+}
+
+/** Mirrors src-tauri/src/git_provider/provider.rs:Capabilities. */
+export interface ProviderCapabilities {
+  has_pull_requests: boolean;
+  has_checks: boolean;
+  has_issues: boolean;
+  has_inline_comments: boolean;
+  has_review_threads: boolean;
+  has_deployments: boolean;
+  has_reviews: boolean;
+  has_fork_pr_fetch: boolean;
+}
+
+/** Host-scoped readiness for one checkout.
+ *  Mirrors src-tauri/src/commands/source_control.rs:ProviderAuthStatus.
+ *
+ *  Unlike `ProviderDiagnostic`, this is scoped to a repository: it
+ *  answers "can Codemux act on *this* checkout right now", which for a
+ *  self-hosted instance is a different question from whether the CLI is
+ *  logged in to some other instance. */
+export interface ProviderAuthStatus {
+  /** Wire form of the detected ProviderKind; "unknown" when nothing
+   *  classified, which is an answer rather than an error. */
+  kind: string;
+  /** Does Codemux ship an adapter for this checkout's product? */
+  supported: boolean;
+  installed: boolean;
+  authenticated: boolean;
+  /** Account the CLI reports, when it names one. Never a token. */
+  username: string | null;
+}
+
 export interface KeyboardSettings {
   shortcuts: Record<string, string>;
 }
@@ -76,6 +141,7 @@ export interface UserSettings {
   editor: EditorSettings;
   terminal: TerminalSyncSettings;
   git: GitSyncSettings;
+  source_control: SourceControlSyncSettings;
   keyboard: KeyboardSettings;
   notifications: NotificationSyncSettings;
   file_tree: FileTreeSyncSettings;
@@ -735,6 +801,14 @@ export interface WorkspaceSnapshot {
    *  Optional because older persisted snapshots have no such field; `null` /
    *  absent is read as the pre-field case and settles as before. */
   pr_head_branch?: string | null;
+  /** Which hosting product this checkout's remotes point at — `"github"`,
+   *  `"gitlab"`, `"bitbucket"`, `"azure_devops"`. `null` when there is no
+   *  remote or the host isn't recognised.
+   *
+   *  Re-derived by the backend pollers alongside the PR pill, never
+   *  synced. Optional for older snapshots; absent means GitHub wording
+   *  for back-compat (see src/lib/source-control.ts). */
+  provider_kind?: string | null;
   linked_issue: LinkedIssue | null;
   /** When true, agent-completion desktop notifications for this workspace's
    *  panes are suppressed. Status pills (spinner/dots) are unaffected. */

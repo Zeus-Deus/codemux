@@ -38,6 +38,7 @@ import { useAppStore } from "@/stores/app-store";
 import { useUIStore } from "@/stores/ui-store";
 import { PresetIcon } from "@/components/icons/preset-icon";
 import { ProjectPicker } from "./project-picker";
+import { resolveProvider } from "@/lib/source-control";
 import { IssuePickerPanel } from "@/components/github/issue-picker";
 import { PrPickerPanel } from "@/components/github/pr-picker";
 import { useDefaultBranch } from "@/components/layout/default-branch-cache";
@@ -57,8 +58,6 @@ import {
   dbAddRecentProject,
   generateBranchName,
   generateRandomBranchName,
-  checkGhAvailable,
-  checkGithubRepo,
   listPullRequests,
   pasteClipboardImageToFile,
   suggestIssueBranchName,
@@ -67,6 +66,7 @@ import {
   applyPreset,
   renameWorkspace,
 } from "@/tauri/commands";
+import { fetchProviderAuth } from "@/lib/provider-auth";
 import { activateWorkspaceInteraction } from "@/lib/perf/instrumented-activate";
 import { pickFiles } from "@/lib/file-dialog";
 import type { TerminalPreset, WorktreeInfo, BranchDetail, PullRequestInfo, GitHubIssue, LinkedIssue, ModelSelection } from "@/tauri/types";
@@ -94,11 +94,14 @@ export function buildPromptWithIssueContext(
   userPrompt: string,
   issue: Pick<LinkedIssue, "number" | "title" | "state" | "labels"> | null,
   issueBody: string | null,
+  /** Hosting product the issue came from. Defaults to GitHub so callers
+   *  that never learned about detection keep their exact prompt text. */
+  providerName = "GitHub",
 ): string {
   if (!issue) return userPrompt;
 
   const lines: string[] = [
-    "The following GitHub issue is linked to this workspace:",
+    `The following ${providerName} issue is linked to this workspace:`,
     "",
     `Issue #${issue.number}: ${issue.title}`,
     `Status: ${issue.state}`,
@@ -237,7 +240,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [isGitRepo, setIsGitRepo] = useState<boolean | null>(null);
   const [prBranches, setPrBranches] = useState<Set<string>>(new Set());
-  const [ghAvailable, setGhAvailable] = useState(false);
+  const [providerUsable, setProviderUsable] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const issuePickerRef = useRef<HTMLDivElement>(null);
@@ -338,12 +341,16 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
         });
       });
 
-      // Fetch open PRs for branch badges and "+" menu (non-blocking)
-      Promise.all([checkGhAvailable(), checkGithubRepo(projectDir)])
-        .then(([available, isGhRepo]) => {
+      // Fetch open change requests for branch badges and "+" menu
+      // (non-blocking). The gate is the *detected* product's CLI, not
+      // `gh` specifically — gating a GitLab project on a gh binary hid
+      // affordances glab could serve perfectly well.
+      fetchProviderAuth(projectDir)
+        .then((status) => {
           if (cancelled) return;
-          setGhAvailable(available && isGhRepo);
-          if (!available || !isGhRepo) return;
+          const usable = status.supported && status.installed;
+          setProviderUsable(usable);
+          if (!usable) return;
           listPullRequests(projectDir, "open")
             .then((prs) => {
               if (cancelled) return;
@@ -451,8 +458,20 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
     return ws?.workspace_id ?? null;
   }, [appState, projectDir]);
 
-  // Whether the issue picker is available (needs gh + a GitHub repo)
-  const isGithubRepo = ghAvailable;
+  // Hosting product of the project being branched from, taken from any
+  // already-open workspace on it. Null before the project has one, in
+  // which case every consumer falls back to GitHub wording.
+  const projectProviderKind = useMemo(() => {
+    if (!appState || !projectDir) return null;
+    const ws = appState.workspaces.find(
+      (w) => w.project_root === projectDir || w.cwd === projectDir,
+    );
+    return ws?.provider_kind ?? null;
+  }, [appState, projectDir]);
+
+  // Whether the issue picker is available: a supported product backs
+  // this checkout and its CLI is installed.
+  const repoSupported = providerUsable;
 
   // Selected agent preset
   const selectedAgent = useMemo(
@@ -704,7 +723,12 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
       } catch {
         // Non-blocking: proceed without body
       }
-      userPrompt = buildPromptWithIssueContext(userPrompt, linkedIssue, issueBody);
+      userPrompt = buildPromptWithIssueContext(
+        userPrompt,
+        linkedIssue,
+        issueBody,
+        resolveProvider(projectProviderKind).name,
+      );
     }
 
     const fullPrompt = userPrompt;
@@ -1312,7 +1336,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 </Tooltip>
 
                 {/* Link pull request */}
-                {ghAvailable && (
+                {providerUsable && (
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <button
@@ -1332,7 +1356,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
                 )}
 
                 {/* Link issue */}
-                {isGithubRepo && !linkedIssue && (
+                {repoSupported && !linkedIssue && (
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <button
@@ -1379,6 +1403,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
               <IssuePickerPanel
                 workspaceId={projectWorkspaceId ?? undefined}
                 projectPath={projectDir}
+                providerKind={projectProviderKind}
                 open={issuePickerOpen}
                 onSelect={handleIssueSelect}
                 onClose={() => setIssuePickerOpen(false)}
@@ -1394,6 +1419,7 @@ export function NewWorkspaceDialog({ open, onOpenChange }: Props) {
             >
               <PrPickerPanel
                 projectPath={projectDir}
+                providerKind={projectProviderKind}
                 open={prPickerOpen}
                 onSelect={handlePrSelect}
                 onClose={() => setPrPickerOpen(false)}

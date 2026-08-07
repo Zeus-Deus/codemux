@@ -13,7 +13,13 @@ globalThis.ResizeObserver = class {
 
 // ── Mock Tauri commands ──
 
-const mockCheckGhStatus = vi.fn().mockResolvedValue({ status: "Authenticated", username: "test" });
+const mockCheckProviderAuth = vi.fn().mockResolvedValue({
+  kind: "github",
+  supported: true,
+  installed: true,
+  authenticated: true,
+  username: "test",
+});
 const mockCheckGithubRepo = vi.fn().mockResolvedValue(true);
 const mockGetBranchPullRequest = vi.fn().mockResolvedValue(null);
 const mockRefreshWorkspacePr = vi.fn().mockResolvedValue(undefined);
@@ -23,9 +29,8 @@ const mockGetPrInlineComments = vi.fn().mockResolvedValue([]);
 const mockListBranches = vi.fn().mockResolvedValue([]);
 const mockCreatePullRequest = vi.fn().mockResolvedValue(undefined);
 const mockGetDefaultBranch = vi.fn().mockResolvedValue("main");
-
 vi.mock("@/tauri/commands", () => ({
-  checkGhStatus: (...args: unknown[]) => mockCheckGhStatus(...args),
+  checkProviderAuth: (...args: unknown[]) => mockCheckProviderAuth(...args),
   checkGithubRepo: (...args: unknown[]) => mockCheckGithubRepo(...args),
   getBranchPullRequest: (...args: unknown[]) => mockGetBranchPullRequest(...args),
   refreshWorkspacePr: (...args: unknown[]) => mockRefreshWorkspacePr(...args),
@@ -47,8 +52,6 @@ import { ReviewPanel } from "./review-panel";
 import type { WorkspaceSnapshot, PullRequestInfo } from "@/tauri/types";
 // Access the cache helpers exported at module level for cache TTL tests
 import {
-  getCachedGhStatus,
-  setCachedGhStatus,
   getCachedRepoCheck,
   setCachedRepoCheck,
   CACHE_TTL_MS,
@@ -124,7 +127,13 @@ beforeEach(() => {
   cleanup();
   vi.clearAllMocks();
   _resetCaches();
-  mockCheckGhStatus.mockResolvedValue({ status: "Authenticated", username: "test" });
+  mockCheckProviderAuth.mockResolvedValue({
+    kind: "github",
+    supported: true,
+    installed: true,
+    authenticated: true,
+    username: "test",
+  });
   mockCheckGithubRepo.mockResolvedValue(true);
   mockGetBranchPullRequest.mockResolvedValue(null);
   mockRefreshWorkspacePr.mockResolvedValue(undefined);
@@ -158,25 +167,8 @@ describe("auto-fetch on mount", () => {
 // ── Bug 2: Cache TTL expiry ──
 
 describe("cache TTL", () => {
-  it("ghStatusCache expires after TTL", () => {
-    vi.useFakeTimers();
-    setCachedGhStatus({ status: "Authenticated", username: "test" });
-
-    // Before expiry
-    expect(getCachedGhStatus()).toEqual({ status: "Authenticated", username: "test" });
-
-    // After expiry
-    vi.advanceTimersByTime(CACHE_TTL_MS + 1);
-    expect(getCachedGhStatus()).toBeNull();
-  });
-
-  it("ghStatusCache returns value before TTL", () => {
-    vi.useFakeTimers();
-    setCachedGhStatus({ status: "Authenticated", username: "alice" });
-
-    vi.advanceTimersByTime(CACHE_TTL_MS - 1000);
-    expect(getCachedGhStatus()).toEqual({ status: "Authenticated", username: "alice" });
-  });
+  // The auth cache's own TTL and never-cache-a-failure rules are covered
+  // where it lives, in `src/lib/provider-auth.test.ts`.
 
   it("repoCheckCache expires after TTL", () => {
     vi.useFakeTimers();
@@ -202,16 +194,34 @@ describe("cache TTL", () => {
   });
 
   it("warm caches skip the auth + repo init calls", async () => {
-    // Pre-populate caches so auth init won't call checkGhStatus/checkGithubRepo
-    setCachedGhStatus({ status: "Authenticated", username: "test" });
-    setCachedRepoCheck("/home/user/project", true);
+    // One render populates both caches; the second must reach neither
+    // backend command.
+    const { unmount } = renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    unmount();
+    vi.clearAllMocks();
 
     renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
     await flushPromises();
 
-    // Auth init should NOT have called these (cache was warm)
-    expect(mockCheckGhStatus).not.toHaveBeenCalled();
+    expect(mockCheckProviderAuth).not.toHaveBeenCalled();
     expect(mockCheckGithubRepo).not.toHaveBeenCalled();
+  });
+
+  /// The auth slot is keyed by path as well as product: two checkouts on
+  /// two self-hosted instances of the same product are two separate
+  /// logins, and one must never answer for the other.
+  it("does not reuse one checkout's auth verdict for another path", async () => {
+    const { unmount } = renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    unmount();
+    vi.clearAllMocks();
+
+    renderPanel(
+      <ReviewPanel workspace={makeWorkspace({ cwd: "/home/user/elsewhere" })} />,
+    );
+    await flushPromises();
+    expect(mockCheckProviderAuth).toHaveBeenCalledWith("/home/user/elsewhere");
   });
 
   it("failures are not cached — recovery is immediate, no TTL wait", async () => {
@@ -235,17 +245,6 @@ describe("cache TTL", () => {
     await flushPromises();
 
     expect(screen.queryByText("Not a GitHub repository")).not.toBeInTheDocument();
-  });
-
-  it("setCachedGhStatus drops non-Authenticated values", () => {
-    setCachedGhStatus({ status: "NotAuthenticated" });
-    expect(getCachedGhStatus()).toBeNull();
-
-    setCachedGhStatus({ status: "NotInstalled" });
-    expect(getCachedGhStatus()).toBeNull();
-
-    setCachedGhStatus({ status: "Authenticated", username: "test" });
-    expect(getCachedGhStatus()).toEqual({ status: "Authenticated", username: "test" });
   });
 
   it("setCachedRepoCheck drops false values", () => {
@@ -338,5 +337,161 @@ describe("incoming PRs on base branch", () => {
       expect(screen.getByTestId("pr-header")).toBeInTheDocument();
     });
     expect(screen.queryByTestId("incoming-prs-view")).not.toBeInTheDocument();
+  });
+});
+
+// ── Provider-aware copy ──
+//
+// Two properties matter here, and they pull in opposite directions:
+// a GitHub workspace must render byte-identical copy to what it rendered
+// before detection existed, and a GitLab workspace must not borrow
+// GitHub's nouns, CLI, or install URL.
+
+describe("provider-aware copy", () => {
+  function auth(over: Record<string, unknown> = {}) {
+    return {
+      kind: "github",
+      supported: true,
+      installed: true,
+      authenticated: true,
+      username: "test",
+      ...over,
+    };
+  }
+
+  beforeEach(() => {
+    _resetCaches();
+    mockCheckProviderAuth.mockResolvedValue(auth());
+  });
+
+  /// The whole point of the host-scoped probe: the panel asks about the
+  /// checkout in front of it, not about `gh`'s global login and not by
+  /// sweeping every CLI on the machine.
+  it("probes the workspace path rather than a product-wide login", async () => {
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "gitlab" })} />);
+    await flushPromises();
+    expect(mockCheckProviderAuth).toHaveBeenCalledWith("/home/user/project");
+  });
+
+  it("does not let one product's cached auth answer for another", async () => {
+    mockCheckProviderAuth.mockResolvedValue(auth({ kind: "gitlab" }));
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "gitlab" })} />);
+    await flushPromises();
+    expect(mockCheckProviderAuth).toHaveBeenCalled();
+    mockCheckProviderAuth.mockClear();
+    cleanup();
+
+    // A different workspace on a different product re-probes rather than
+    // reusing the warm slot.
+    renderPanel(
+      <ReviewPanel
+        workspace={makeWorkspace({ provider_kind: "github", cwd: "/home/user/other" })}
+      />,
+    );
+    await flushPromises();
+    expect(mockCheckProviderAuth).toHaveBeenCalledWith("/home/user/other");
+  });
+
+  it("names glab in the not-installed and signed-out states", async () => {
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ kind: "gitlab", installed: false, authenticated: false, username: null }),
+    );
+    const { unmount } = renderPanel(
+      <ReviewPanel workspace={makeWorkspace({ provider_kind: "gitlab" })} />,
+    );
+    await flushPromises();
+    expect(
+      screen.getByText("GitLab CLI (glab) is not installed. Install it from gitlab.com/gitlab-org/cli"),
+    ).toBeInTheDocument();
+    unmount();
+    _resetCaches();
+
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ kind: "gitlab", authenticated: false, username: null }),
+    );
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "gitlab" })} />);
+    await flushPromises();
+    expect(screen.getByText("Not authenticated. Run: glab auth login")).toBeInTheDocument();
+  });
+
+  it("keeps the exact GitHub wording it had before detection existed", async () => {
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ installed: false, authenticated: false, username: null }),
+    );
+    const { unmount } = renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    expect(
+      screen.getByText("GitHub CLI (gh) is not installed. Install it from cli.github.com"),
+    ).toBeInTheDocument();
+    unmount();
+    _resetCaches();
+
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ authenticated: false, username: null }),
+    );
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    expect(screen.getByText("Not authenticated. Run: gh auth login")).toBeInTheDocument();
+  });
+
+  it("says merge request, not pull request, on the GitLab create affordance", async () => {
+    mockCheckGithubRepo.mockResolvedValue(true);
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "gitlab" })} />);
+    await flushPromises();
+    expect(screen.getByText("No merge request for this branch")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Create Merge Request" }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the GitHub create affordance in title case", async () => {
+    mockCheckGithubRepo.mockResolvedValue(true);
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    expect(screen.getByText("No pull request for this branch")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Create Pull Request" }),
+    ).toBeInTheDocument();
+  });
+
+  /// A host Codemux cannot serve is not a missing-CLI problem: `gh` may
+  /// well be installed and working. Sending that user to cli.github.com
+  /// to fix nothing was the pre-fix behavior — the empty state must say
+  /// what is actually true, that this checkout is not one Codemux acts
+  /// on.
+  it("does not blame a missing CLI for a host it cannot serve", async () => {
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ supported: false, installed: true, authenticated: true }),
+    );
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    expect(screen.getByText("Not a GitHub repository")).toBeInTheDocument();
+    expect(screen.queryByText(/is not installed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cli\.github\.com/)).not.toBeInTheDocument();
+  });
+
+  /// Detection classified nothing, so there is no product to name —
+  /// borrowing one would put a vendor's name on a checkout it does not
+  /// serve.
+  it("stays generic when the host classified as nothing at all", async () => {
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ kind: "unknown", supported: false, installed: true, authenticated: true }),
+    );
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "unknown" })} />);
+    await flushPromises();
+    expect(
+      screen.getByText("No supported source control host for this repository"),
+    ).toBeInTheDocument();
+  });
+
+  it("reports an unsupported product without inventing a CLI to install", async () => {
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ kind: "bitbucket", supported: false, installed: false, authenticated: false, username: null }),
+    );
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "bitbucket" })} />);
+    await flushPromises();
+    expect(
+      screen.getByText("Codemux has no Bitbucket integration yet."),
+    ).toBeInTheDocument();
   });
 });

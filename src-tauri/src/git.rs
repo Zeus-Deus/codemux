@@ -2708,10 +2708,16 @@ pub fn git_create_worktree(
         if find_remote_ref(repo_path, branch).is_none() {
             // Try direct branch fetch (same-repo PRs / remote branches)
             if run_git(repo_path, &["fetch", "origin", &format!("{branch}:{branch}")]).is_err() {
-                // Fork PRs: branch lives under pull/<number>/head on origin
+                // Fork PRs: the head lives under a provider-specific ref on
+                // the base repo's remote. A provider that exposes no such
+                // ref yields `None` and the fetch is simply skipped — the
+                // same outcome the ignored-error fetch had for those hosts.
                 if let Some(pr_num) = pr_number {
-                    let refspec = format!("pull/{pr_num}/head:{branch}");
-                    let _ = run_git(repo_path, &["fetch", "origin", &refspec]);
+                    if let Some(refspec) = crate::git_provider::provider_for_path_or_default(repo_path)
+                        .fork_pr_fetch_refspec(pr_num, branch)
+                    {
+                        let _ = run_git(repo_path, &["fetch", "origin", &refspec]);
+                    }
                 }
             }
         }
