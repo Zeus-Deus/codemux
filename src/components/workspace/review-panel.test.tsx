@@ -454,6 +454,36 @@ describe("provider-aware copy", () => {
     ).toBeInTheDocument();
   });
 
+  /// A host Codemux cannot serve is not a missing-CLI problem: `gh` may
+  /// well be installed and working. Sending that user to cli.github.com
+  /// to fix nothing was the pre-fix behavior — the empty state must say
+  /// what is actually true, that this checkout is not one Codemux acts
+  /// on.
+  it("does not blame a missing CLI for a host it cannot serve", async () => {
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ supported: false, installed: true, authenticated: true }),
+    );
+    renderPanel(<ReviewPanel workspace={makeWorkspace()} />);
+    await flushPromises();
+    expect(screen.getByText("Not a GitHub repository")).toBeInTheDocument();
+    expect(screen.queryByText(/is not installed/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/cli\.github\.com/)).not.toBeInTheDocument();
+  });
+
+  /// Detection classified nothing, so there is no product to name —
+  /// borrowing one would put a vendor's name on a checkout it does not
+  /// serve.
+  it("stays generic when the host classified as nothing at all", async () => {
+    mockCheckProviderAuth.mockResolvedValue(
+      auth({ kind: "unknown", supported: false, installed: true, authenticated: true }),
+    );
+    renderPanel(<ReviewPanel workspace={makeWorkspace({ provider_kind: "unknown" })} />);
+    await flushPromises();
+    expect(
+      screen.getByText("No supported source control host for this repository"),
+    ).toBeInTheDocument();
+  });
+
   it("reports an unsupported product without inventing a CLI to install", async () => {
     mockCheckProviderAuth.mockResolvedValue(
       auth({ kind: "bitbucket", supported: false, installed: false, authenticated: false, username: null }),

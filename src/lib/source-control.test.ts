@@ -9,6 +9,7 @@ import {
   providerRef,
   providerRefLabel,
   resolveProvider,
+  unsupportedRepoMessage,
   type ProviderKind,
 } from "./source-control";
 
@@ -222,5 +223,30 @@ describe("providerHostLabel", () => {
   it("falls back to the bare product name without a host", () => {
     expect(providerHostLabel(resolveProvider("github"), null)).toBe("GitHub");
     expect(providerHostLabel(resolveProvider("github"), "  ")).toBe("GitHub");
+  });
+});
+
+describe("unsupportedRepoMessage", () => {
+  it("says the checkout is not that product's when the product is served", () => {
+    // A supported product reaching this state means the checkout simply
+    // is not one — not that anything is missing from the machine.
+    expect(unsupportedRepoMessage(resolveProvider("github"))).toBe(
+      "Not a GitHub repository",
+    );
+    expect(unsupportedRepoMessage(resolveProvider("gitlab"))).toBe(
+      "Not a GitLab repository",
+    );
+  });
+
+  it("owns the gap for a product Codemux recognises but cannot serve", () => {
+    expect(unsupportedRepoMessage(resolveProvider("bitbucket"))).toBe(
+      "Codemux has no Bitbucket integration yet.",
+    );
+  });
+
+  it("stays generic when there is no product to name", () => {
+    expect(unsupportedRepoMessage(resolveProvider("unknown"))).toBe(
+      "No supported source control host for this repository",
+    );
   });
 });

@@ -803,23 +803,28 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
   // `null` means "not yet known"; the popup keeps GitHub entries
   // disabled while the preflight is in flight to avoid a flicker.
   const [repoSupported, setRepoSupported] = useState<boolean | null>(null);
+  const [providerCliInstalled, setProviderCliInstalled] = useState<boolean | null>(null);
   const [providerAuthenticated, setProviderAuthenticated] = useState<boolean | null>(null);
   useEffect(() => {
     if (!displayCwd) {
       setRepoSupported(false);
+      setProviderCliInstalled(null);
       setProviderAuthenticated(null);
       return;
     }
     let cancelled = false;
     void (async () => {
-      // One host-scoped probe answers both halves. Asking `gh` whether
-      // it is signed in — as this used to — said nothing about a GitLab
-      // checkout, so the menu offered entries the CLI could not serve
-      // while the copy beside them named a different tool.
+      // One host-scoped probe answers all three halves. Asking `gh`
+      // whether it is signed in — as this used to — said nothing about a
+      // GitLab checkout, so the menu offered entries the CLI could not
+      // serve while the copy beside them named a different tool.
       const status = await fetchProviderAuth(displayCwd);
       if (cancelled) return;
       setRepoSupported(status.supported);
-      setProviderAuthenticated(status.installed ? status.authenticated : null);
+      setProviderCliInstalled(status.installed);
+      // A missing CLI cannot be signed in — see AgentChatPane for why
+      // this is `false` rather than "doesn't apply".
+      setProviderAuthenticated(status.installed && status.authenticated);
     })();
     return () => {
       cancelled = true;
@@ -1017,6 +1022,7 @@ function DraftChatSurfaceInner({ draft }: { draft: ChatDraft }) {
       modelSupportsImages={activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
       providerKind={existingWorkspaceProviderKind}
+      providerCliInstalled={providerCliInstalled}
       providerAuthenticated={providerAuthenticated}
       onDraftChange={(next) => updateDraftInput(draft.draftId, next)}
       onSubmit={handleSubmit}

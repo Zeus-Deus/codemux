@@ -518,9 +518,50 @@ describe("Composer + popup → GitHub Issue submode (Step 8 Stage 4)", () => {
     expect(row.textContent).toContain("gh auth login");
   });
 
+  // Regression: a missing CLI used to leave the hosting rows ENABLED —
+  // the preflight reported "not installed" as "the auth question does
+  // not apply", which the gate read as "nothing known to be wrong". The
+  // row opened a picker that could only error. A CLI that is not on
+  // PATH cannot serve a picker, so the rows gate on it too, and the
+  // copy names the download rather than a login for a binary that isn't
+  // there.
+  it("disables the hosting rows when the provider CLI is not installed", () => {
+    for (const providerAuthenticated of [false, null] as const) {
+      cleanup();
+      const { getByTestId } = renderControlled({
+        repoSupported: true,
+        providerCliInstalled: false,
+        providerAuthenticated,
+      });
+      fireEvent.click(getByTestId("composer-attach-button"));
+      for (const id of ["attach:issue", "attach:pr"]) {
+        const row = getByTestId(`slash-item-${id}`);
+        expect(row.getAttribute("data-disabled")).toBe("true");
+        expect(row.textContent).toContain("Install gh from cli.github.com");
+        expect(row.textContent).not.toContain("gh auth login");
+      }
+    }
+  });
+
+  it("names the checkout's own CLI in the not-installed hint", () => {
+    const { getByTestId } = renderControlled({
+      repoSupported: true,
+      providerKind: "gitlab",
+      providerCliInstalled: false,
+      providerAuthenticated: false,
+    });
+    fireEvent.click(getByTestId("composer-attach-button"));
+    const row = getByTestId("slash-item-attach:pr");
+    expect(row.getAttribute("data-disabled")).toBe("true");
+    expect(row.textContent).toContain(
+      "Install glab from gitlab.com/gitlab-org/cli",
+    );
+  });
+
   it("enables the GitHub Issue row when preflight passes", () => {
     const { getByTestId } = renderControlled({
       repoSupported: true,
+      providerCliInstalled: true,
       providerAuthenticated: true,
     });
     fireEvent.click(getByTestId("composer-attach-button"));

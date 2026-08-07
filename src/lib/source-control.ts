@@ -236,6 +236,26 @@ export function changeRequestListUrl(
   }
 }
 
+/**
+ * Empty-state line for a checkout Codemux cannot act on.
+ *
+ * Three shapes, because the reasons are three different things and only
+ * one of them is about a CLI: a product Codemux *does* serve is simply
+ * not what this checkout points at; a product it does not serve is a gap
+ * Codemux owns; and a host detection could not classify has no product
+ * to name at all. None of them are fixed by installing anything, so this
+ * must never be rendered as an install prompt.
+ */
+export function unsupportedRepoMessage(
+  provider: ProviderPresentation,
+): string {
+  if (provider.supported) return `Not a ${provider.name} repository`;
+  if (provider.kind === "unknown") {
+    return "No supported source control host for this repository";
+  }
+  return `Codemux has no ${provider.name} integration yet.`;
+}
+
 /** "GitLab · gitlab.example.com" — the subtle detected-provider line.
  *  Host omitted when it adds nothing (the product's own domain). */
 export function providerHostLabel(

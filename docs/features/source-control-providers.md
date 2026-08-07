@@ -72,6 +72,8 @@ One table turns `provider_kind` into copy — product name, `PR`/`MR` short noun
 
 Issue references stay `#` on every product (GitLab uses `#` for issues too); only change-request references switch sigil.
 
+The composer's hosting attach rows (`GitHub Issue…` / `GitHub PR…` and their per-product equivalents) gate on all three answers of the preflight — a served host, a CLI on PATH, and a signed-in CLI — because a picker backed by a missing binary can only error. The chat panes therefore hand `providerAuthenticated={false}` for a CLI that is not installed and carry the difference in `providerCliInstalled`, which flips the disabled-row hint from the login command to the download.
+
 Provider-aware surfaces: the review panel (empty state, create form, all three status messages), the incoming list (header, row refs, "View all on <product>" with a provider-aware list-URL rewrite), the Context Row PR chip, sidebar inbox cards / settled rows / workspace rows (chip text and aria/tooltip copy), the workspace hover card (label, `MR branch` row, and a new **Hosting** row rendered only when `provider_kind` is set), the composer attach popup and `@issue:`/`@pr:` mention footers, the issue/PR pickers and issue detail popover, and the new-workspace dialog (its injected issue-context prompt now names the detected product).
 
 ### Settings → Source Control

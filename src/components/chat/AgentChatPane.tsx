@@ -258,23 +258,31 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
   // (treat as not-a-github-repo) which gives the user a reachable
   // disabled-state instead of a crashing popup.
   const [repoSupported, setRepoSupported] = useState<boolean | null>(null);
+  const [providerCliInstalled, setProviderCliInstalled] = useState<boolean | null>(null);
   const [providerAuthenticated, setProviderAuthenticated] = useState<boolean | null>(null);
   useEffect(() => {
     if (!cwd) {
       setRepoSupported(false);
+      setProviderCliInstalled(null);
       setProviderAuthenticated(null);
       return;
     }
     let cancelled = false;
     void (async () => {
-      // One host-scoped probe answers both halves. Asking `gh` whether
-      // it is signed in — as this used to — said nothing about a GitLab
-      // checkout, so the menu offered entries the CLI could not serve
-      // while the copy beside them named a different tool.
+      // One host-scoped probe answers all three halves. Asking `gh`
+      // whether it is signed in — as this used to — said nothing about a
+      // GitLab checkout, so the menu offered entries the CLI could not
+      // serve while the copy beside them named a different tool.
       const status = await fetchProviderAuth(cwd);
       if (cancelled) return;
       setRepoSupported(status.supported);
-      setProviderAuthenticated(status.installed ? status.authenticated : null);
+      setProviderCliInstalled(status.installed);
+      // A missing CLI cannot be signed in, so it counts as not
+      // authenticated: leaving this `null` ("question doesn't apply")
+      // read as "not known to be broken" downstream and left the
+      // hosting attach rows enabled onto a picker that can only error.
+      // `providerCliInstalled` carries the difference in the hint copy.
+      setProviderAuthenticated(status.installed && status.authenticated);
     })();
     return () => {
       cancelled = true;
@@ -2943,6 +2951,7 @@ export function AgentChatPane({ pane }: { pane: AgentChatPaneNode }) {
       modelSupportsImages={activeModel?.supports_images ?? false}
       repoSupported={repoSupported}
       providerKind={workspaceProviderKind}
+      providerCliInstalled={providerCliInstalled}
       providerAuthenticated={providerAuthenticated}
       onDraftChange={(next) => {
         if (!threadId) return;

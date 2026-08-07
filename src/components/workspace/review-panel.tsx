@@ -38,6 +38,7 @@ import type {
 } from "@/tauri/types";
 import {
   providerForWorkspace,
+  unsupportedRepoMessage,
   type ProviderPresentation,
 } from "@/lib/source-control";
 import {
@@ -72,12 +73,23 @@ export const CACHE_TTL_MS = PROVIDER_AUTH_TTL_MS;
 
 interface CacheEntry<T> { value: T; ts: number; }
 
+/**
+ * The probe's verdict in the vocabulary this panel renders.
+ *
+ * `GhStatus` covers the three states a CLI can be in. "Unsupported" is
+ * the fourth and it is not one of them: a checkout on a host Codemux has
+ * no adapter for has no CLI to install or sign in to, so it must render
+ * the not-a-supported-repo state rather than an install prompt for a
+ * tool that is very possibly already installed.
+ */
+type ProviderGate = GhStatus | { status: "Unsupported" };
+
 const repoCheckCache = new Map<string, CacheEntry<boolean>>();
 
 /** Auth status for one checkout, if a usable verdict is still warm. */
-function cachedStatus(cwd: string, kind: string): GhStatus | null {
+function cachedStatus(cwd: string, kind: string): ProviderGate | null {
   const cached = getCachedProviderAuth(cwd, kind);
-  return cached ? toGhStatus(cached) : null;
+  return cached ? toProviderGate(cached) : null;
 }
 
 export function getCachedRepoCheck(key: string): boolean | undefined {
@@ -115,13 +127,14 @@ export function _resetCaches(): void {
 async function fetchProviderAuthStatus(
   cwd: string,
   provider: ProviderPresentation,
-): Promise<GhStatus> {
-  return toGhStatus(await fetchProviderAuth(cwd, provider.kind));
+): Promise<ProviderGate> {
+  return toProviderGate(await fetchProviderAuth(cwd, provider.kind));
 }
 
-/** The probe's tri-state in the vocabulary this panel already renders. */
-function toGhStatus(status: ProviderAuthStatus): GhStatus {
-  if (!status.supported || !status.installed) return { status: "NotInstalled" };
+/** The probe's verdict in the vocabulary this panel already renders. */
+function toProviderGate(status: ProviderAuthStatus): ProviderGate {
+  if (!status.supported) return { status: "Unsupported" };
+  if (!status.installed) return { status: "NotInstalled" };
   if (!status.authenticated) return { status: "NotAuthenticated" };
   return { status: "Authenticated", username: status.username ?? "" };
 }
@@ -406,7 +419,7 @@ export function ReviewPanel({ workspace }: Props) {
     workspace.pr_number != null &&
     isPrOnCurrentBranch(workspace.pr_head_branch, workspace.git_branch);
 
-  const [ghStatus, setGhStatus] = useState<GhStatus | null>(
+  const [ghStatus, setGhStatus] = useState<ProviderGate | null>(
     cachedStatus(cwd, provider.kind),
   );
   const [repoSupported, setRepoSupported] = useState<boolean | null>(
@@ -571,6 +584,19 @@ export function ReviewPanel({ workspace }: Props) {
     return <ReviewSkeleton />;
   }
 
+  // Both no-adapter-for-this-host and no-repo-behind-this-checkout land
+  // here, and both must be answered before the CLI states below: an
+  // unsupported host is not a missing-CLI problem, and telling a user
+  // with `gh` on their PATH to go install it is simply wrong.
+  if (ghStatus?.status === "Unsupported" || repoSupported === false) {
+    return (
+      <StatusMessage
+        icon={<GitPullRequest className="h-6 w-6 opacity-40" />}
+        message={unsupportedRepoMessage(provider)}
+      />
+    );
+  }
+
   if (ghStatus?.status === "NotInstalled") {
     return (
       <StatusMessage
@@ -578,7 +604,7 @@ export function ReviewPanel({ workspace }: Props) {
         message={
           provider.cliLabel
             ? `${provider.cliLabel} is not installed. Install it from ${provider.installUrl}`
-            : `Codemux has no ${provider.name} integration yet.`
+            : unsupportedRepoMessage(provider)
         }
       />
     );
@@ -589,15 +615,6 @@ export function ReviewPanel({ workspace }: Props) {
       <StatusMessage
         icon={<AlertCircle className="h-6 w-6 opacity-40" />}
         message={`Not authenticated. Run: ${provider.loginCommand}`}
-      />
-    );
-  }
-
-  if (repoSupported === false) {
-    return (
-      <StatusMessage
-        icon={<GitPullRequest className="h-6 w-6 opacity-40" />}
-        message={`Not a ${provider.name} repository`}
       />
     );
   }

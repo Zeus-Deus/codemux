@@ -46,8 +46,11 @@ deployments of the same product therefore no longer share a login verdict. The
 three status messages name the resolved product: "GitLab CLI (glab) is not
 installed. Install it from …", "Not authenticated. Run: glab auth login", "Not a
 GitLab repository" — plus a new "Codemux has no <product> integration yet." for a
-recognised-but-unserved host. Only usable verdicts are cached (60s), so a fresh
-login shows up on the next render.
+recognised-but-unserved host and "No supported source control host for this
+repository" when detection classified nothing at all. A host Codemux cannot
+serve is answered *before* the CLI states, so a checkout on an unclassifiable
+host never gets told to install a CLI it may well already have. Only usable
+verdicts are cached (60s), so a fresh login shows up on the next render.
 
 **Terminology is provider-aware.** Nouns, sigils, CLI names and login commands
 come from the presentation map in `src/lib/source-control.ts`, keyed on the

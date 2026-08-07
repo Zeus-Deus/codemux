@@ -370,6 +370,19 @@ describe("Composer @issue: mention popup (Step 8 Stage 4)", () => {
     expect(listGithubIssuesMock).not.toHaveBeenCalled();
   });
 
+  it("points at the download, not a login, when the CLI is missing", async () => {
+    const { findByText } = renderComposer({
+      repoSupported: true,
+      providerCliInstalled: false,
+      providerAuthenticated: false,
+    });
+    typeIntoTextarea("@issue:foo");
+    expect(
+      await findByText("Install gh from cli.github.com"),
+    ).toBeInTheDocument();
+    expect(listGithubIssuesMock).not.toHaveBeenCalled();
+  });
+
   it("renders open issues with CircleDot + text-success and closed with CircleCheck + muted", async () => {
     // Stage 4 polish — the mention popup must visually match the
     // IssuePickerPanel that the `+ → Issue…` path mounts. Both

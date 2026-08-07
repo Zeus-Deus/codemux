@@ -243,10 +243,18 @@ interface Props {
    *  hosting entries disabled so a slow preflight can't flash an
    *  enabled-then-disabled affordance. */
   repoSupported?: boolean | null;
+  /** Is that product's CLI on PATH at all? `false` gates the hosting
+   *  entries the same way a signed-out CLI does — neither can serve a
+   *  picker — but the hint names the download rather than the login
+   *  command, since there is nothing to sign in to yet. `null` means
+   *  not yet known. */
+  providerCliInstalled?: boolean | null;
   /** Is that product's CLI signed in to the instance this checkout
    *  points at? `false` surfaces the auth-recovery hint in the popup
-   *  footer, naming that product's own login command. `null` means the
-   *  question does not apply (no CLI, or not yet known). */
+   *  footer, naming that product's own login command. A CLI that is not
+   *  installed is `false` here too — it cannot act on the checkout —
+   *  with `providerCliInstalled` carrying the difference in the copy.
+   *  `null` means not yet known. */
   providerAuthenticated?: boolean | null;
   /** `provider_kind` of the workspace this composer is bound to, so the
    *  attach rows and footer hints name the right product and CLI.
@@ -318,6 +326,7 @@ export function Composer({
   onAttachImage,
   modelSupportsImages = false,
   repoSupported = null,
+  providerCliInstalled = null,
   providerAuthenticated = null,
   providerKind = null,
   onDraftChange,
@@ -722,7 +731,7 @@ export function Composer({
       setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
       return;
     }
-    if (providerAuthenticated === false) {
+    if (providerCliInstalled === false || providerAuthenticated === false) {
       setMentionIssueMatches(EMPTY_ISSUE_MATCHES);
       return;
     }
@@ -758,6 +767,7 @@ export function Composer({
     parsedMention.filter,
     cwd,
     repoSupported,
+    providerCliInstalled,
     providerAuthenticated,
   ]);
 
@@ -773,7 +783,7 @@ export function Composer({
       setMentionPrMatches(EMPTY_PR_MATCHES);
       return;
     }
-    if (providerAuthenticated === false) {
+    if (providerCliInstalled === false || providerAuthenticated === false) {
       setMentionPrMatches(EMPTY_PR_MATCHES);
       return;
     }
@@ -811,6 +821,7 @@ export function Composer({
     parsedMention.filter,
     cwd,
     repoSupported,
+    providerCliInstalled,
     providerAuthenticated,
   ]);
 
@@ -1071,10 +1082,33 @@ export function Composer({
     fileMatches,
   ]);
 
+  // Why the hosting affordances are inert, in the product's own words:
+  // no host Codemux serves, no CLI on PATH, or a CLI that is signed
+  // out. Ordered most-fundamental first — a missing CLI is not a login
+  // problem, so it must be named before the login command is. `null`
+  // when nothing is blocking them.
+  const hostingBlockedHint = useMemo<string | null>(() => {
+    if (repoSupported === false) return `Not a ${scProvider.name} repo`;
+    if (providerCliInstalled === false && scProvider.cli) {
+      return `Install ${scProvider.cli} from ${scProvider.installUrl}`;
+    }
+    if (providerAuthenticated === false) return `Run ${scProvider.loginCommand}`;
+    return null;
+  }, [repoSupported, providerCliInstalled, providerAuthenticated, scProvider]);
+
+  // Both hosting attach rows gate on the same three answers; a row that
+  // stays enabled while any of them is negative opens a picker that can
+  // only error.
+  const hostingAttachDisabled =
+    repoSupported !== true ||
+    providerCliInstalled === false ||
+    providerAuthenticated === false;
+
   // Footer hint per category. File hints stay file-flavoured; issue
   // and pr hints surface the hosting-product failure modes (not a
-  // supported repo, CLI not authenticated). Keeps the user oriented
-  // when the popup is empty for *reasons* rather than just no-matches.
+  // supported repo, CLI missing, CLI not authenticated). Keeps the user
+  // oriented when the popup is empty for *reasons* rather than just
+  // no-matches.
   const mentionPopupFooter = useMemo(() => {
     if (
       parsedMention.category === "issue" ||
@@ -1096,6 +1130,12 @@ export function Composer({
           message: `Not a ${scProvider.name} repo.`,
         };
       }
+      if (providerCliInstalled === false && scProvider.cli) {
+        return {
+          tone: "muted" as const,
+          message: `Install ${scProvider.cli} from ${scProvider.installUrl}`,
+        };
+      }
       if (providerAuthenticated === false) {
         return {
           tone: "muted" as const,
@@ -1111,7 +1151,14 @@ export function Composer({
       };
     }
     return null;
-  }, [parsedMention.category, cwd, repoSupported, providerAuthenticated]);
+  }, [
+    parsedMention.category,
+    cwd,
+    repoSupported,
+    providerCliInstalled,
+    providerAuthenticated,
+    scProvider,
+  ]);
 
   // ─── Attach popup items + pick handler ───────────────────────────
   // Items are derived per-submode. The `main` view is static
@@ -1208,42 +1255,31 @@ export function Composer({
         {
           id: "attach:issue",
           label: `${scProvider.name} Issue…`,
-          // Stage 4 — three flavours of disabled-state copy so the
-          // user knows whether the row is disabled because the repo
-          // has no supported host, because the CLI is signed out, or
-          // because the preflight is still running. The row stays
+          // Stage 4 — flavoured disabled-state copy so the user knows
+          // whether the row is disabled because the repo has no
+          // supported host, because the CLI is missing or signed out,
+          // or because the preflight is still running. The row stays
           // VISIBLE and dimmed with its reason in the description;
-          // once the preflight resolves to true + authenticated it
-          // enables and the copy returns to the active-affordance line.
-          description:
-            repoSupported === false
-              ? `Not a ${scProvider.name} repo`
-              : providerAuthenticated === false
-                ? `Run ${scProvider.loginCommand}`
-                : "Pick an issue from this repo",
+          // once the preflight resolves to a usable CLI it enables and
+          // the copy returns to the active-affordance line.
+          description: hostingBlockedHint ?? "Pick an issue from this repo",
           command: "",
           icon: CircleDot,
           tone: "muted",
           group: "ATTACH",
-          disabled:
-            repoSupported !== true || providerAuthenticated === false,
+          disabled: hostingAttachDisabled,
           onSelect: () => {},
         },
         {
           id: "attach:pr",
           label: `${scProvider.name} ${scProvider.shortNoun}…`,
           description:
-            repoSupported === false
-              ? `Not a ${scProvider.name} repo`
-              : providerAuthenticated === false
-                ? `Run ${scProvider.loginCommand}`
-                : `Pick a ${scProvider.noun} from this repo`,
+            hostingBlockedHint ?? `Pick a ${scProvider.noun} from this repo`,
           command: "",
           icon: GitPullRequest,
           tone: "muted",
           group: "ATTACH",
-          disabled:
-            repoSupported !== true || providerAuthenticated === false,
+          disabled: hostingAttachDisabled,
           onSelect: () => {},
         },
         {
@@ -1332,8 +1368,9 @@ export function Composer({
     mcpDisabledIds,
     mcpToggleDisabled,
     mode,
-    repoSupported,
-    providerAuthenticated,
+    hostingBlockedHint,
+    hostingAttachDisabled,
+    scProvider,
     modelSupportsImages,
     workflowCommand,
   ]);
