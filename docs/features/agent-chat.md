@@ -352,14 +352,23 @@ and lightbox stay visually testable.
   `ultracode` on every xhigh-capable model** (appended by
   `ensure_ultracode_effort` at all three capability-producer paths in
   `agent_provider/claude/capabilities.rs`, so live-harvested models like
-  Opus 5 get it too). Because the headless CLI rejects
+  Opus 5 get it too). Because older headless CLIs reject
   `--effort ultracode`, the level is normalized at the launch
   boundaries: the sidecar's `buildQueryOptions` sends SDK
   `effort: "xhigh"` + `settings: {ultracode: true}` (standing
   multi-agent workflow orchestration — pairs with the Workflow
   orchestration card, `docs/features/workflow-orchestration.md`), and
   the terminal-preset splice in `agent_capability.rs` emits
-  `--effort xhigh --settings '{"ultracode":true}'` idempotently. Codex
+  `--effort xhigh --settings '{"ultracode":true}'` idempotently — but
+  only when the preset carries no `--settings` of its own. The CLI
+  resolves a repeated `--settings` **last-wins** rather than merging, so
+  a preset that already has one would silently lose the user's
+  hooks / permissions / env layer. There the splice instead folds
+  `"ultracode": true` into an inline-JSON value (one merged
+  `--settings` + `--effort xhigh`), or, for a file-path value, emits
+  `--effort ultracode` and leaves the flag untouched — current CLIs take
+  that level natively, older ones warn and run at the default effort.
+  Downgrading to a plain level removes the merged key again. Codex
   `max`/`ultra` are catalog-advertised levels sent verbatim on
   `turn/start` (protocol-valid; `ultra` additionally enables the
   provider's proactive multi-agent mode) and are Title-Case labeled via
