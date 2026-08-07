@@ -1,6 +1,8 @@
 import { Check, ChevronDown, CircleCheck, LoaderCircle, X } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
+import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
 import { cn } from "@/lib/utils";
 
 import type { ActivityStep } from "./transcript-slots";
@@ -98,11 +100,13 @@ function WorkingHeader({
       aria-expanded={open}
       className="flex w-full items-center gap-2.5 px-3 py-2.5 text-left"
     >
-      <LoaderCircle
-        className="h-[17px] w-[17px] shrink-0 animate-spin text-status-working"
-        strokeWidth={1.9}
-        aria-hidden
-      />
+      {/* The turn's live orb. While a tool is running this block owns the
+          thread's "in progress" signal — the transcript-tail marker stands
+          down (see `shouldShowThinkingIndicator`) — so there is never a
+          second orb competing with this one. */}
+      <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+        <AgentOrb size={20} {...turnOrbActivity(steps)} aria-hidden />
+      </span>
       <span className="shrink-0 text-[13px] font-bold text-foreground">
         Working
       </span>

@@ -26,6 +26,7 @@ import {
   publishTitlebarContentUnder,
   registerTitlebarTranscript,
 } from "@/lib/titlebar-content-under";
+import { selectBackgroundBrowserSession } from "@/components/browser/background-browser-indicator";
 import { useAppStore } from "@/stores/app-store";
 import { useFeatureFlags } from "@/stores/feature-flags";
 import type { ApprovalDecision } from "@/tauri/events";
@@ -188,14 +189,9 @@ export const MessageList = memo(function MessageList({
   // `workspaceId` is absent for legacy/non-workspace-scoped callers, so
   // the chip never renders there — byte-identical output preserved.
   const enableAgentChat = useFeatureFlags((s) => s.enableAgentChat);
-  const backgroundBrowserSession = useAppStore((s) => {
-    if (!workspaceId) return null;
-    const session = s.appState?.agent_browser_sessions?.find(
-      (abs) => abs.workspace_id === workspaceId,
-    );
-    if (!session || !session.is_active || session.pane_id) return null;
-    return session;
-  });
+  const backgroundBrowserSession = useAppStore((s) =>
+    selectBackgroundBrowserSession(s.appState, workspaceId),
+  );
   const showBrowserChip =
     !!workspaceId &&
     enableAgentChat &&

@@ -1,20 +1,26 @@
-import { LoaderCircle } from "lucide-react";
 import { useEffect, useMemo, useRef } from "react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
+import { turnOrbActivity } from "@/lib/agent-chat/orb-activity";
 import type { ChatViewItem } from "@/lib/agent-chat/types";
 
 import { formatActivityDuration } from "./activity-steps";
 
 /**
  * Tail "working" marker (design D9) — the last row inside the scroller
- * while a turn is in flight and no approval is pending. An ember spinner
- * sits in the 29px turn gutter (aligned under the assistant avatar) next
- * to a shimmering status line, followed by a live elapsed-time suffix
- * (e.g. "Writing… · 40s"). Gating lives in `shouldShowThinkingIndicator`;
- * this component derives the label + turn start.
+ * while a turn is in flight and no approval is pending. The agent orb sits
+ * in the 29px turn gutter (aligned under the assistant avatar) next to a
+ * shimmering status line, followed by a live elapsed-time suffix (e.g.
+ * "Writing… · 40s"). Gating lives in `shouldShowThinkingIndicator`; this
+ * component derives the label, the orb's activity, and the turn start.
+ *
+ * This is the thread's one live orb: it stands for the turn as a whole, so
+ * individual tool-call rows above it stay still (see `docs/features/
+ * agent-chat.md` — one orb per live thing).
  */
 export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
   const label = deriveStreamingLabel(messages);
+  const activity = useMemo(() => turnOrbActivity(messages), [messages]);
   const startedAt = useMemo(() => deriveTurnStartedAt(messages), [messages]);
   const elapsedRef = useRef<HTMLSpanElement>(null);
 
@@ -40,11 +46,10 @@ export function StreamingMarker({ messages }: { messages: ChatViewItem[] }) {
       aria-label="Agent is working"
     >
       <span className="flex w-[29px] shrink-0 justify-center">
-        <LoaderCircle
-          className="h-[15px] w-[15px] animate-spin text-accent-ember"
-          strokeWidth={1.6}
-          aria-hidden
-        />
+        {/* The row already announces itself via role="status", so the orb
+            is decorative here — its per-state label would otherwise be
+            read out as a second, competing status. */}
+        <AgentOrb size={20} {...activity} aria-hidden />
       </span>
       <span className="flex min-w-0 items-baseline gap-1.5">
         <span className="shimmer text-[13px] font-semibold">{label}</span>

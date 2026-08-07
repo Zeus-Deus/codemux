@@ -1018,7 +1018,7 @@ describe("State-driven row density", () => {
     expect(container.textContent).toContain("↑2");
   });
 
-  it("working: 3-line card — spinner glyph, activity fallback, and git line", () => {
+  it("working: 3-line card — agent orb, activity fallback, and git line", () => {
     useSidebarDensityStore.setState({
       statusSince: { "ws-1": { status: "working", at: Date.now() - 6 * 60_000 } },
       settledAt: {},
@@ -1028,7 +1028,7 @@ describe("State-driven row density", () => {
     const { container } = renderRow(
       wsWithStats({ surfaces: [surfaceWithPane("p-work")] }),
     );
-    // The braille spinner replaces the leading icon (agent-working glyph).
+    // The agent orb replaces the leading icon.
     expect(
       container.querySelector("[aria-label='Agent working']"),
     ).not.toBeNull();

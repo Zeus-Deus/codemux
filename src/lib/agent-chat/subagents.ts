@@ -169,6 +169,50 @@ export function subagentMetaLine(view: SubagentView, now: number): string {
   return parts.join(" · ");
 }
 
+/** Whole-group rollup for one spawn group's settled one-line summary.
+ *
+ *  Every field is nullable on purpose: the settled line prints what the app
+ *  actually knows and omits the rest rather than fabricating a number.
+ *
+ *  - `elapsedMs` is the **longest** row, not the sum. Subagents in a group
+ *    run in parallel, so summing them would report several minutes of
+ *    wall-clock for a run the user watched take one.
+ *  - `totalTokens` is null unless at least one provider reported usage;
+ *    summing a partial set would silently under-report.
+ *  - `toolCount` always resolves (provider count, else counted child tool
+ *    calls), so it is a plain number. */
+export interface SubagentGroupRollup {
+  doneCount: number;
+  activeCount: number;
+  elapsedMs: number | null;
+  totalTokens: number | null;
+  toolCount: number;
+}
+
+export function subagentGroupRollup(
+  views: readonly SubagentView[],
+  now: number,
+): SubagentGroupRollup {
+  let doneCount = 0;
+  let activeCount = 0;
+  let elapsedMs: number | null = null;
+  let totalTokens: number | null = null;
+  let toolCount = 0;
+
+  for (const view of views) {
+    if (isRunning(view)) activeCount += 1;
+    if (isDone(view)) doneCount += 1;
+    const elapsed = subagentElapsedMs(view, now);
+    if (elapsed != null) elapsedMs = Math.max(elapsedMs ?? 0, elapsed);
+    if (view.totalTokens != null) {
+      totalTokens = (totalTokens ?? 0) + view.totalTokens;
+    }
+    toolCount += subagentToolCount(view);
+  }
+
+  return { doneCount, activeCount, elapsedMs, totalTokens, toolCount };
+}
+
 const VERB_BY_TOOL: Record<string, string> = {
   Read: "read",
   Write: "write",
@@ -277,6 +321,30 @@ export function subagentActivityLine(view: SubagentView): string {
     default:
       return "Pending";
   }
+}
+
+/**
+ * The row's latest output, for the inline expansion under a rail row.
+ *
+ * Unlike {@link subagentActivityLine} — a single ellipsized line for the
+ * collapsed row — this keeps the provider's full multi-line result so the
+ * expansion can render it `pre-wrap`. Precedence mirrors the activity line
+ * (result → provider summary → latest tool call) and returns `null` rather
+ * than a placeholder, so the caller decides how to say "nothing yet".
+ */
+export function subagentLatestOutput(view: SubagentView): string | null {
+  const result = view.resultText?.trim();
+  if (result) return result;
+  const activity = view.activity?.trim();
+  if (activity) return activity;
+  const tool = latestToolCall(view);
+  if (tool) {
+    const { verb, target, meta } = describeToolCall(tool);
+    return [target ? `${verb} ${target}` : verb, meta]
+      .filter((part) => part.length > 0)
+      .join(" · ");
+  }
+  return null;
 }
 
 /** Status label for the breadcrumb / banner. */

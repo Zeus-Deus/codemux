@@ -200,7 +200,7 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
   The blocker line is a fixed string
   (`permissionBlockerText()` always returns "Waiting for your input" — it does
   not surface the agent's actual question). The right side of the eyebrow shows
-  the agent state — Working (configurable `WorkingIndicator`, amber text) /
+  the agent state — Working (the `AgentOrb`, amber text) /
   Needs you (pulsing red dot) / Monitoring (steady cyan dot, never animated —
   see `docs/features/monitoring-status.md`) / Done · review (green ✓) /
   elapsed since the workspace last settled into review — and swaps to a
@@ -760,9 +760,21 @@ snoozing; parking is visual only — nothing is archived, closed, or deleted.
 - **Settings** (Settings → Appearance → Sidebar): **Show git stats**
   (`sidebar.show_git_stats`, default on) hides the `↑ahead` and `+/−` numbers
   on cards when off; the branch name always shows. The `sidebar.live_agents`
-  grouping setting was removed with the tree; the working-indicator settings
-  (`sidebar.working_indicator`, `sidebar.working_indicator_color`) remain and
-  drive the card's working glyph.
+  grouping setting was removed with the tree.
+- **Working indicator**: a working card shows the shared **agent orb**
+  (`src/components/ui/agent-orb.tsx`, wrapping the `thinking-orbs` library) in
+  place of its leading icon. It is always monochrome — the library inks white
+  on dark and black on light — so it never competes with the accent, and red
+  stays reserved for cards that need a human. The orb is **neutral here on
+  purpose**: the sidebar reads `pane_statuses`, a five-value enum carrying no
+  tool name, so a card can honestly say "something is alive" but not what. The
+  activity-matched states appear where the tool is actually visible (the thread
+  and its subagents — see `docs/features/agent-chat.md`). This replaced the
+  configurable glyph picker: `sidebar.working_indicator` (braille / ring /
+  blink / sweep / typing) and `sidebar.working_indicator_color` are **deleted**,
+  along with `WorkingIndicator` and `AsciiSpinner`. Old values are dropped on
+  read, not migrated — the settings table is free-form key/value, so a leftover
+  row is inert and is never written back.
 
 ### Footer nav (fixed chrome, both states)
 
@@ -1122,7 +1134,8 @@ quietly rather than loudly.
 - `src/components/layout/sidebar-workspace-row.tsx` — shared `WorkspaceContextMenuItems` + `DeleteWorktreeDialog` + `SettleMenuAction` / `SnoozeMenuAction` (the row component itself is unmounted)
 - `src/components/layout/use-project-appearance.ts` — shared avatar appearance loader
 - `src/components/ui/sidebar.tsx` — width defaults (288px expanded, 52px rail)
-- `src/components/ui/working-indicator.tsx` — configurable working indicator
+- `src/components/ui/agent-orb.tsx` — the shared agent activity orb (applies the
+  Settings match-activity pin); mapping in `src/lib/orb-state.ts`
 - `src/stores/sidebar-density-store.ts` — non-persisted status-transition timestamps
 - `src/lib/pane-status.ts` — `getWorkspaceStatus` / `getProjectStatus` helpers
 - `src/stores/app-store.ts` — project grouping + duplicate-label disambiguation

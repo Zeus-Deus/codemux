@@ -15,7 +15,6 @@ import {
   TooltipContent,
 } from "@/components/ui/tooltip";
 import {
-  RefreshCw,
   Loader2,
   Sparkles,
   GitBranch,
@@ -79,8 +78,19 @@ import type {
   MergeState,
 } from "@/tauri/types";
 
+/** Which file sections the panel lists. Driven by the deck's pane-bar
+ *  filter; `"all"` is the historic behavior. */
+export type ChangesSectionFilter = "all" | "staged" | "unstaged" | "conflicts";
+
 interface Props {
   workspace: WorkspaceSnapshot;
+  /** Bumped by the deck's pane-bar Refresh — the panel's own header (and
+   *  the refresh button in it) moved into the shared pane bar. */
+  refreshKey?: number;
+  sectionFilter?: ChangesSectionFilter;
+  /** Where a file row's diff opens. Defaults to a main-area diff tab; the
+   *  deck routes it to its own Diff pane so the click stays in the panel. */
+  onOpenDiff?: (filePath: string, staged: boolean) => void;
 }
 
 // ── File-status icon mapping ──
@@ -285,7 +295,12 @@ function BranchPill({ info }: { info: GitBranchInfo | null }) {
 
 // ── ChangesPanel ──
 
-export function ChangesPanel({ workspace }: Props) {
+export function ChangesPanel({
+  workspace,
+  refreshKey = 0,
+  sectionFilter = "all",
+  onOpenDiff: onOpenDiffOverride,
+}: Props) {
   const cwd = workspace.worktree_path ?? workspace.cwd;
   const queryClient = useQueryClient();
 
@@ -346,6 +361,21 @@ export function ChangesPanel({ workspace }: Props) {
     };
   }, [refresh]);
 
+  // The pane bar's Refresh: fetch remote refs, then re-read status. Same
+  // work the panel's old header button did, driven from the shared bar.
+  useEffect(() => {
+    if (refreshKey === 0 || !cwd) return;
+    setBusy("fetch");
+    gitFetchChanges(cwd)
+      .catch(() => {})
+      .finally(() => {
+        setBusy(null);
+        refresh();
+      });
+    // `refresh`/`cwd` are stable per workspace; the bump is the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
+
   useEffect(() => {
     if (aiEnabled) {
       checkClaudeAvailable().then(setClaudeReady).catch(() => setClaudeReady(false));
@@ -364,6 +394,10 @@ export function ChangesPanel({ workspace }: Props) {
 
   const openDiff = useCallback(
     async (filePath: string, isStaged: boolean) => {
+      if (onOpenDiffOverride) {
+        onOpenDiffOverride(filePath, isStaged);
+        return;
+      }
       const existing = workspace.tabs.find((t) => t.kind === "diff");
       if (existing) {
         await activateTab(workspace.workspace_id, existing.tab_id).catch(console.error);
@@ -377,7 +411,7 @@ export function ChangesPanel({ workspace }: Props) {
         console.error("Failed to create diff tab:", err);
       }
     },
-    [workspace, diffSetFile, diffInitTab],
+    [workspace, diffSetFile, diffInitTab, onOpenDiffOverride],
   );
 
   // ── Commit flow ──
@@ -601,32 +635,8 @@ export function ChangesPanel({ workspace }: Props) {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-center h-7 shrink-0 pl-2.5 pr-1 border-b border-border/60">
-        <span className="text-[11px] font-medium text-muted-foreground tracking-wide">
-          Changes
-        </span>
-        {totalChanges > 0 && (
-          <span className="ml-1.5 text-[10px] tabular-nums text-muted-foreground/60">
-            {totalChanges}
-          </span>
-        )}
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              variant="ghost"
-              size="icon-xs"
-              className="ml-auto"
-              onClick={() => { setBusy("fetch"); gitFetchChanges(cwd).catch(() => {}).finally(() => { setBusy(null); refresh(); }); }}
-              aria-label="Refresh"
-              disabled={busy !== null}
-            >
-              <RefreshCw className={cn("size-3", busy === "fetch" && "animate-spin")} />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom" sideOffset={4}>Refresh</TooltipContent>
-        </Tooltip>
-      </div>
-
+      {/* No header row: the title, the change count and Refresh moved to
+          the deck's shared pane bar, which also carries the +N/−N totals. */}
       <BranchPill info={branchInfo} />
 
       {isMerging && (
@@ -693,30 +703,36 @@ export function ChangesPanel({ workspace }: Props) {
             )
           ) : (
             <>
-              <FileSection
-                label="Staged"
-                files={staged}
-                staged
-                cwd={cwd}
-                onRefresh={refresh}
-                onOpenDiff={openDiff}
-              />
-              <FileSection
-                label="Changed"
-                files={unstaged.filter((f) => f.status !== "conflicted")}
-                staged={false}
-                cwd={cwd}
-                onRefresh={refresh}
-                onOpenDiff={openDiff}
-              />
-              <FileSection
-                label="Conflicts"
-                files={conflicted}
-                staged={false}
-                cwd={cwd}
-                onRefresh={refresh}
-                onOpenDiff={openDiff}
-              />
+              {(sectionFilter === "all" || sectionFilter === "staged") && (
+                <FileSection
+                  label="Staged"
+                  files={staged}
+                  staged
+                  cwd={cwd}
+                  onRefresh={refresh}
+                  onOpenDiff={openDiff}
+                />
+              )}
+              {(sectionFilter === "all" || sectionFilter === "unstaged") && (
+                <FileSection
+                  label="Changed"
+                  files={unstaged.filter((f) => f.status !== "conflicted")}
+                  staged={false}
+                  cwd={cwd}
+                  onRefresh={refresh}
+                  onOpenDiff={openDiff}
+                />
+              )}
+              {(sectionFilter === "all" || sectionFilter === "conflicts") && (
+                <FileSection
+                  label="Conflicts"
+                  files={conflicted}
+                  staged={false}
+                  cwd={cwd}
+                  onRefresh={refresh}
+                  onOpenDiff={openDiff}
+                />
+              )}
             </>
           )}
         </div>

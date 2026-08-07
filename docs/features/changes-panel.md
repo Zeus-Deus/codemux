@@ -8,7 +8,7 @@
 
 ## What This Feature Is
 
-The Changes panel is a right-sidebar tab covering staging, committing, stashing, pushing/pulling, and merge-state handling.
+The Changes panel is a pane in the right-panel deck covering staging, committing, stashing, pushing/pulling, and merge-state handling.
 
 > The refined-minimal UI pass (`92965c9`, "slim Changes panel + ADE-native right sidebar") removed a large amount of this panel's surface. See "Removed by the slim-panel pass" below — several of those removals look unintentional, since their backends, command wrappers, and settings rows were all left in place.
 
@@ -29,7 +29,8 @@ The panel reads git state from the Rust backend via Tauri commands (`getGitStatu
 - Branch info display (name, ahead/behind counts)
 - Merge-state banner when a merge/rebase is in progress (started outside the panel, e.g. from a terminal): "Merge in progress", conflict count, **Abort**, and **Continue** (rendered only at zero conflicts)
 - Commits are disabled while unresolved conflicts exist
-- Click a file to open the full diff viewer
+- Click a file to open its diff. The default is a main-area diff tab; the deck passes an `onOpenDiff` override so a click inside the panel opens the panel's own Diff pane on that file
+- The panel has **no header of its own**. The title, the change count and Refresh moved into the deck's single row of panel chrome, which also shows the working tree's `+N`/`−N` totals from the git watcher (`git_additions`/`git_deletions`) and a **section filter** (All / Staged only / Changed only / Conflicts only, fed to the panel as `sectionFilter`). Refresh arrives as a `refreshKey` bump that runs `gitFetchChanges` then re-reads status — the same work the old header button did
 
 ## Removed by the slim-panel pass
 
@@ -57,7 +58,8 @@ The sidebar panel's inline per-file diffs are deliberately compact. For a full-t
 
 ## Important Touch Points
 
-- `src/components/workspace/changes-panel.tsx` — main panel component
+- `src/components/workspace/changes-panel.tsx` — main panel component (props: `refreshKey`, `sectionFilter`, `onOpenDiff`)
+- `src/components/layout/right-panel.tsx` — the deck that hosts it and owns its tab-row controls
 - `src/stores/ai-commit-store.ts` — AI commit message generation
 - `src/stores/ai-merge-store.ts` — merge conflict resolution state (**no importers**; see `docs/features/merge-resolver.md`)
 - `src-tauri/src/git.rs` — git operations backend

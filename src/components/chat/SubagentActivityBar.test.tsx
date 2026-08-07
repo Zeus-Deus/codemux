@@ -33,6 +33,33 @@ function card(id: string, subagents: SubagentView[]): SubagentRunItem {
 }
 
 describe("SubagentActivityBar", () => {
+  it("is a 32px strip for the composer's top edge, with a 1px accent sweep and no filled bar", () => {
+    const messages: ChatViewItem[] = [
+      card("run-1", [subagent({ id: "a", status: "running" })]),
+    ];
+    const { container } = render(
+      <SubagentActivityBar
+        messages={messages}
+        threadId="t1"
+        streaming
+        onJump={() => {}}
+      />,
+    );
+    const strip = screen.getByTestId("subagent-activity-bar");
+    // Welded inside the composer card: strip height, top corners only,
+    // hairline bottom border, faint fg-mix background (well under the 8%
+    // "tints above this are a bug" ceiling).
+    expect(strip.className).toContain("h-8");
+    expect(strip.className).toContain("rounded-t-[19px]");
+    expect(strip.className).toContain("border-b");
+    expect(strip.className).toContain("bg-foreground/[0.03]");
+    // The moving mark is a 1px accent light, not a saturated progress bar.
+    const sweep = container.querySelector(".cm-sweep");
+    expect(sweep).not.toBeNull();
+    expect(sweep?.className).toContain("h-px");
+    expect(sweep?.className).toContain("via-accent-ember");
+  });
+
   it("renders nothing when no subagent is running", () => {
     const messages: ChatViewItem[] = [
       card("run-1", [subagent({ id: "a", status: "completed" })]),
@@ -59,9 +86,9 @@ describe("SubagentActivityBar", () => {
 
     expect(screen.getByText("1 subagent running")).toBeInTheDocument();
     expect(screen.getByText("View")).toBeInTheDocument();
-    expect(
-      screen.getByText("Verify · reading diff for timing regressions…"),
-    ).toBeInTheDocument();
+    // The mono label names what KIND of busy the run is, from the shared
+    // orb-state vocabulary — not a name + free-text activity line.
+    expect(screen.getByText("working")).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("subagent-activity-bar"));
     expect(onJump).toHaveBeenCalledWith("run-1");
@@ -236,5 +263,74 @@ describe("SubagentActivityBar", () => {
     );
     // Different thread — this is a hydrate, not an observed transition.
     expect(queryByTestId("subagent-activity-bar")).toBeNull();
+  });
+});
+
+// ── Agent orbs (one per live thing) ──
+
+describe("SubagentActivityBar — agent orbs", () => {
+  function tool(name: string, status: "running" | "done" | "error", input: unknown = {}) {
+    return {
+      kind: "tool_call" as const,
+      id: `tc-${name}-${status}`,
+      seq: 1,
+      tool_use_id: `tu-${name}`,
+      tool_name: name,
+      input,
+      status,
+      result_content: null,
+      approval_request_id: null,
+    };
+  }
+  const orbStates = () =>
+    [...document.querySelectorAll("canvas[data-orb-state]")].map((c) =>
+      c.getAttribute("data-orb-state"),
+    );
+
+  it("keeps the bar's own orb neutral — it stands for the whole run", () => {
+    const messages: ChatViewItem[] = [
+      card("run-1", [
+        subagent({ id: "a", status: "running", items: [tool("Grep", "running")] }),
+      ]),
+    ];
+    render(<SubagentActivityBar messages={messages} threadId="t1" streaming onJump={() => {}} />);
+    // Collapsed: only the bar orb is mounted, and it must not borrow the
+    // single subagent's "searching".
+    expect(orbStates()).toEqual(["working"]);
+  });
+
+  it("gives each expanded row its own activity-matched orb", () => {
+    const messages: ChatViewItem[] = [
+      card("run-1", [
+        subagent({ id: "a", status: "running", items: [tool("Grep", "running")] }),
+        subagent({
+          id: "b",
+          status: "running",
+          items: [tool("Bash", "running", { command: "git push origin HEAD" })],
+        }),
+      ]),
+    ];
+    render(<SubagentActivityBar messages={messages} threadId="t1" streaming onJump={() => {}} />);
+    fireEvent.click(screen.getByText("2 subagents running"));
+    // Bar orb stays neutral; the two rows describe themselves.
+    expect(orbStates()).toEqual(["searching", "connecting", "working"]);
+  });
+
+  it("shows a flat check and no orb once the run finishes", () => {
+    vi.useFakeTimers();
+    const running: ChatViewItem[] = [card("run-1", [subagent({ id: "a", status: "running" })])];
+    const { rerender } = render(
+      <SubagentActivityBar messages={running} threadId="t1" streaming onJump={() => {}} />,
+    );
+    expect(orbStates()).toHaveLength(1);
+
+    const done: ChatViewItem[] = [card("run-1", [subagent({ id: "a", status: "completed" })])];
+    act(() => {
+      rerender(
+        <SubagentActivityBar messages={done} threadId="t1" streaming onJump={() => {}} />,
+      );
+    });
+    expect(screen.getByText("Subagents finished")).toBeInTheDocument();
+    expect(orbStates()).toHaveLength(0);
   });
 });

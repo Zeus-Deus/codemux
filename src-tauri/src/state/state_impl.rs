@@ -283,6 +283,30 @@ pub struct AgentBrowserSession {
     /// Prevents auto-recreation until user manually reopens.
     #[serde(default)]
     pub user_dismissed: bool,
+    /// The session is hosted by the right-panel deck's `browser` pane
+    /// rather than by a node in the workspace pane tree.
+    ///
+    /// The deck lives entirely in the frontend, so there is no `PaneId`
+    /// to record — but for every purpose that `pane_id` serves (the
+    /// agent must not spawn a second surface; the background chip /
+    /// peek overlay must stop offering to reveal a browser the user can
+    /// already see) a docked session behaves exactly like an attached
+    /// one. Read both through [`AgentBrowserSession::is_surfaced`]
+    /// rather than testing `pane_id` alone.
+    ///
+    /// Mutually exclusive with `pane_id` by construction: docking closes
+    /// the tree pane, and `attach_agent_browser_to_pane` clears this —
+    /// one session, one visible surface.
+    #[serde(default)]
+    pub right_panel_docked: bool,
+}
+
+impl AgentBrowserSession {
+    /// Whether the user already has a visible surface for this browser —
+    /// a workspace pane-tree node *or* the right-panel deck's browser pane.
+    pub fn is_surfaced(&self) -> bool {
+        self.pane_id.is_some() || self.right_panel_docked
+    }
 }
 
 /// What an agent pane is doing right now, as every status surface renders it.
@@ -3369,6 +3393,7 @@ impl AppStateStore {
             pane_id: None,
             browser_id: None,
             user_dismissed: false,
+            right_panel_docked: false,
         };
         // Only persist the record when the workspace actually exists
         // (issue #126 review): an in-flight `browser_automation` racing a
@@ -3403,7 +3428,72 @@ impl AppStateStore {
         session.browser_id = Some(browser_id.clone());
         session.is_active = true;
         session.user_dismissed = false;
+        // One session, one visible surface: moving into a tree pane
+        // un-docks it from the right-panel deck.
+        session.right_panel_docked = false;
         Ok(())
+    }
+
+    /// Host a workspace's agent browser session in the right-panel deck.
+    ///
+    /// The mirror of [`attach_agent_browser_to_pane`](Self::attach_agent_browser_to_pane)
+    /// for the deck: same liveness and dismissal bookkeeping, but no
+    /// `PaneId` because the deck is a frontend surface. Returns the
+    /// session (so the caller can hand `cli_session_name` + `stream_url`
+    /// straight back to the frontend) along with the `PaneId` of a
+    /// tree pane that was adopted, if any.
+    ///
+    /// Adoption: when the session is currently attached to a workspace
+    /// pane, that pane is the *same* Chromium — the caller closes it so
+    /// the browser moves into the panel instead of being mirrored by two
+    /// surfaces. The daemon, port, cookies and page state are untouched;
+    /// only the surface hosting the stream changes.
+    pub fn dock_agent_browser_in_right_panel(
+        &self,
+        workspace_id: &str,
+    ) -> Result<(AgentBrowserSession, Option<PaneId>), String> {
+        let mut snapshot = self.inner.lock().unwrap();
+        let session = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+            .ok_or_else(|| format!("No agent browser session for workspace {workspace_id}"))?;
+        let adopted = session.pane_id.take();
+        session.browser_id = None;
+        session.right_panel_docked = true;
+        session.is_active = true;
+        session.user_dismissed = false;
+        Ok((session.clone(), adopted))
+    }
+
+    /// Remove a workspace's agent browser session from the right-panel deck.
+    ///
+    /// The mirror of [`detach_agent_browser_from_pane`](Self::detach_agent_browser_from_pane):
+    /// `dismissed` records an explicit user close (the deck tab's ×), which
+    /// stops the agent re-surfacing the browser on its next command. Closing
+    /// the whole panel passes `false` so the agent may still reopen it.
+    /// Returns `false` when the workspace has no session or it was not docked.
+    pub fn undock_agent_browser_from_right_panel(
+        &self,
+        workspace_id: &str,
+        dismissed: bool,
+    ) -> bool {
+        let mut snapshot = self.inner.lock().unwrap();
+        let Some(session) = snapshot
+            .agent_browser_sessions
+            .iter_mut()
+            .find(|s| s.workspace_id.0 == workspace_id)
+        else {
+            return false;
+        };
+        if !session.right_panel_docked {
+            return false;
+        }
+        session.right_panel_docked = false;
+        if dismissed {
+            session.user_dismissed = true;
+        }
+        true
     }
 
     /// Unlink a pane from its agent browser session but keep the session alive.
@@ -3546,10 +3636,12 @@ impl AppStateStore {
     /// GUI-mode background chip / context-bar indicator (which key off
     /// `is_active`) would show "LIVE" forever after the turn is long done.
     /// Only flips the flag — and only returns `true` — when the session
-    /// exists, is currently active, AND has no `pane_id` (i.e. it is in
-    /// background/detached mode, not the legacy split-pane flow). A
-    /// pane-attached session has its own lifecycle (explicit user close /
-    /// pane close) and must be left untouched here. The session itself
+    /// exists, is currently active, AND is not surfaced (i.e. it is in
+    /// background/detached mode, not the legacy split-pane flow and not
+    /// docked in the right-panel deck). A surfaced session has its own
+    /// lifecycle (explicit user close / pane close / deck tab close) and
+    /// must be left untouched here — the user is looking at it, so it
+    /// stays live past the end of the run. The session itself
     /// (URL, cli_session_name) is kept so a later browser action from the
     /// agent simply re-marks it active and the chip returns.
     pub fn release_detached_agent_browser(&self, workspace_id: &str) -> bool {
@@ -3561,7 +3653,7 @@ impl AppStateStore {
         else {
             return false;
         };
-        if !session.is_active || session.pane_id.is_some() {
+        if !session.is_active || session.is_surfaced() {
             return false;
         }
         session.is_active = false;
@@ -7797,6 +7889,111 @@ mod tests {
         store.resolve_agent_browser_session(&ws_id.0, 9223);
         // Freshly resolved session starts inactive.
         assert!(!store.release_detached_agent_browser(&ws_id.0));
+    }
+
+    // ── Right-panel deck hosting ──
+    //
+    // The deck's browser pane must be the *same* session as everything else,
+    // just hosted somewhere the pane tree can't reach. These pin the two
+    // invariants that keeps honest: one visible surface at a time, and
+    // "surfaced" meaning either host.
+
+    #[test]
+    fn docking_adopts_the_session_from_its_pane_instead_of_duplicating_it() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        let session = store.resolve_agent_browser_session(&ws_id.0, 9223);
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+
+        let (docked, adopted) = store
+            .dock_agent_browser_in_right_panel(&ws_id.0)
+            .unwrap();
+
+        // The caller is handed the pane to close — the browser moved, it
+        // was not cloned.
+        assert_eq!(adopted, Some(pane_id));
+        assert!(docked.right_panel_docked);
+        assert!(docked.pane_id.is_none());
+        assert!(docked.is_active);
+        // Same daemon: the session name (and therefore the port, the
+        // cookies and the page) is untouched by the move.
+        assert_eq!(docked.cli_session_name, session.cli_session_name);
+        assert_eq!(docked.session_id, session.session_id);
+    }
+
+    #[test]
+    fn a_docked_session_counts_as_surfaced_so_no_second_pane_is_spawned() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        let (docked, adopted) = store
+            .dock_agent_browser_in_right_panel(&ws_id.0)
+            .unwrap();
+
+        assert_eq!(adopted, None);
+        // This is what `control.rs`'s auto-create gate reads.
+        assert!(docked.is_surfaced());
+    }
+
+    #[test]
+    fn attaching_to_a_pane_undocks_the_panel_so_only_one_surface_holds_it() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        store.dock_agent_browser_in_right_panel(&ws_id.0).unwrap();
+
+        let active_pane = store.snapshot().workspaces[0].surfaces[0]
+            .active_pane_id.clone();
+        let (pane_id, browser_id) = store
+            .create_browser_pane(&active_pane.0, None)
+            .unwrap();
+        store
+            .attach_agent_browser_to_pane(&ws_id.0, &pane_id, &browser_id)
+            .unwrap();
+
+        let snap = store.snapshot();
+        assert!(!snap.agent_browser_sessions[0].right_panel_docked);
+        assert!(snap.agent_browser_sessions[0].pane_id.is_some());
+    }
+
+    #[test]
+    fn undocking_records_an_explicit_close_but_keeps_the_session() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        store.dock_agent_browser_in_right_panel(&ws_id.0).unwrap();
+
+        assert!(store.undock_agent_browser_from_right_panel(&ws_id.0, true));
+        let snap = store.snapshot();
+        assert!(!snap.agent_browser_sessions[0].right_panel_docked);
+        assert!(snap.agent_browser_sessions[0].user_dismissed);
+        // The session (and its Chromium) survives the tab closing.
+        assert_eq!(snap.agent_browser_sessions.len(), 1);
+
+        // Not docked any more, so a second undock is a no-op.
+        assert!(!store.undock_agent_browser_from_right_panel(&ws_id.0, true));
+    }
+
+    #[test]
+    fn a_run_ending_does_not_kill_a_browser_the_user_is_looking_at() {
+        let store = AppStateStore::default();
+        let ws_id = store.snapshot().workspaces[0].workspace_id.clone();
+        store.resolve_agent_browser_session(&ws_id.0, 9223);
+        store.dock_agent_browser_in_right_panel(&ws_id.0).unwrap();
+
+        // `release_detached_agent_browser` reaps *background* sessions when
+        // the run that opened them settles. A docked one has a surface and
+        // its own lifecycle, exactly like a pane-attached one.
+        assert!(!store.release_detached_agent_browser(&ws_id.0));
+        assert!(store.snapshot().agent_browser_sessions[0].is_active);
     }
 
     #[test]

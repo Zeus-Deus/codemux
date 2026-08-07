@@ -24,13 +24,20 @@ Beta opt-in) and a real workspace is active; every other case
 keeps the in-flow legacy `h-9` bar.
 
 **Chrome-mode gate for adjacent surfaces.** Every surface that reaches the
-physical top edge in overlay mode reserves a local 40px collision zone, and
-that clearance is gated on `useTitlebarOverlay()`
-(`src/hooks/use-gui-chrome.ts` — `useGuiChrome() || useDraftGuiChrome()`,
-i.e. "the titlebar is floating"). Gating on anything weaker is a bug: with
-the flag off, the legacy bar already occupies that space in normal flow, so
-unconditional clearance renders as a dead band above the sidebar search row
-and the right-panel tabs.
+physical top edge in overlay mode adapts to it, gated on
+`useTitlebarOverlay()` (`src/hooks/use-gui-chrome.ts` — `useGuiChrome() ||
+useDraftGuiChrome()`, i.e. "the titlebar is floating"). Gating on anything
+weaker is a bug: with the flag off, the legacy bar already occupies that
+space in normal flow, so unconditional clearance renders as a dead band above
+the sidebar search row and the right-panel tabs.
+
+There are two ways to adapt, and which one is right depends on whether the
+surface has chrome of its own to put there. The sidebar and the workspace
+content box **reserve** a 40px collision zone. The right panel **participates
+instead**: its own tab row grows to `h-10`, sits flush with the window's top
+edge, and becomes the panel's slice of the band. It used to reserve like the
+others (`mt-10`), which drew an empty 40px header across the top of the panel
+— see "Band geometry" below.
 
 ## Current Model
 
@@ -50,7 +57,11 @@ bar in normal document flow. Workspace GUI chrome is absolutely positioned
 over the full app shell and composes four independent control clusters on
 desktop (the native-controls cluster is absent on a web remote client):
 
-`[sidebar toggle]    [tabs | + launcher | pinned preset tiles] …drag region… [RunButton split | ResourceMonitor | IdeLauncher compact | right-panel toggle]    [WindowControls]`
+`[sidebar toggle]    [tabs | + launcher | pinned preset tiles] …drag region… [RunButton split | ResourceMonitor | IdeLauncher compact]  ‖  [right-panel tab row] …drag gap… [pane actions]    [⤢ | right-panel toggle]  [WindowControls]`
+
+The `‖` is the right panel's left edge. Everything left of it belongs to the
+workspace column; everything right of it is the panel's own tab row, which
+**renders inside this band** rather than below it.
 
 The far-left cluster contains **only the sidebar toggle**. The workspace band
 starts just after the live sidebar width (`useSidebarGapWidth()` in
@@ -59,16 +70,54 @@ starts just after the live sidebar width (`useSidebarGapWidth()` in
 renders outside `SidebarProvider`). Its right edge moves left when the right
 panel opens, using the persisted panel width, **for the workspace branch
 only** — during a draft the backend's active workspace is not what's on
-screen, so its panel state is ignored and the band spans full width. Native
-window controls remain a separate cluster at the physical top-right corner.
+screen, so its panel state is ignored and the band spans full width.
 
-Unoccupied overlay space is a Tauri drag region on **desktop only**: both the
-full-width `inset-0` layer and the calm gap between the two islands drop
-`pointer-events` on the web remote client. `data-tauri-drag-region` does
-nothing in a browser, so there those layers were pure pointer sinks — the
-full-width one covered the top 40px of everything beneath it, most visibly
-the right panel's 45px tab row, whose triggers became unclickable. Each
-interactive cluster opts back into pointer events in both modes.
+### Band geometry: the fixed top-right corner
+
+`src/lib/titlebar-geometry.ts` is the single place the numbers live, because
+two React trees have to agree on them: the overlay (`title-bar.tsx`, rendered
+outside the layout) and the right panel's tab row (`right-panel/
+pane-tab-strip.tsx`, rendered inside it).
+
+The rule is that **the top-right cluster never moves**. `⤢` (full expand) and
+the right-panel toggle sit at `right: 104px` on desktop (`6px` on the web
+client, which draws no window buttons) whether the panel is open, closed,
+narrow, wide or fully expanded. Everything else is derived from that corner:
+
+- the workspace band stops at `topRightReserve()` = `104 + 56 + 6` = **166px**
+  when the panel is closed, and at the panel's left edge (`panelWidth + 8`)
+  when it is open;
+- the panel's tab row runs to the physical window edge and pads its right
+  side by that same `166px` (68px on the web client) to clear the cluster and
+  the window buttons drawn above it.
+
+This replaced the previous geometry, where the action island's right edge
+tracked `rightPanelWidth + 8` in *all* states and the panel reserved a blank
+`mt-10` strip for the overlay. That produced the two defects this rework
+targets: a ~40px empty band across the top of the panel (the panel read as a
+pane inside a pane with a blank header), and a right-panel toggle that
+teleported from the window's top-right corner to the panel's left edge every
+time the panel opened. A draft keeps the old `104px` reserve — it renders no
+right panel, so it has no cluster to clear.
+
+Unoccupied overlay space is a Tauri drag region on **desktop only**, and the
+overlay's drag layer now **stops at the panel's left edge** (`inset-y-0
+left-0` with a computed `right`) instead of spanning the window. It has to:
+the panel's tabs, `+` and pane actions now live under that layer, and a
+full-width one would swallow every click on them. The panel supplies its own
+drag surface in the flex gap after its tabs
+(`[data-testid="right-panel-drag-gap"]`), so the whole band is still
+draggable end to end. The gap between the workspace band's two islands stays
+a drag region as before. On the web remote client every one of these layers
+drops `pointer-events` / the attribute: `data-tauri-drag-region` does nothing
+in a browser, so there they are pure pointer sinks. Each interactive cluster
+opts back into pointer events in both modes.
+
+While the panel is **fully expanded** the workspace band is `hidden`
+outright — the panel owns the whole content row, so workspace tabs would be
+chrome for a zero-width column drawn on top of the panel's own row. The
+sidebar toggle, the panel cluster and the window buttons stay. Restoring
+brings the band straight back.
 
 - **`TitleBarTabs`** (`src/components/layout/title-bar-tabs.tsx`) — the
   workspace's backend-owned tabs as compact pills (h-7, rounded-lg) with a
@@ -188,8 +237,10 @@ titlebar tab share one implementation (see "Important Touch Points").
   with active-session dot and delete-on-hover).
 - `+` launcher covering GUI chat presets, CLI agents (with Shift-split),
   Terminal/Browser panes, and Manage presets.
-- Inline ember chat favorite; rehomed RunButton plus a right-panel toggle in
-  an action cluster that tracks the right-panel edge. (The
+- Inline ember chat favorite; rehomed RunButton in an action cluster that
+  tracks the right-panel edge. The panel's own controls (`⤢` full expand and
+  the right-panel toggle) are **not** in that cluster — they sit in a fixed
+  top-right cluster that never moves. (The
   "N subagents running" status pill that originally rehomed next to the
   active chat tab was later removed — subagent status now lives in the
   docked `SubagentActivityBar` above the composer; see
@@ -241,6 +292,9 @@ for the full pipeline (Claude-only `Workflow` tool tap, the in-thread
   source of truth, extracted from `title-bar.tsx`), the sibling
   `useDraftGuiChrome()` draft predicate, and `useTitlebarOverlay()` (their
   union) — the one gate every top-edge collision clearance must use.
+- `src/lib/titlebar-geometry.ts` — the band's height and the fixed
+  top-right reserve, shared by the overlay and the right panel's tab row.
+  Change a number here, not in a component.
 - `src/components/layout/title-bar.tsx` — consumes `useGuiChrome()` +
   `useDraftGuiChrome()` for the slot-composition branch, `RightPanelToggle`,
   `PinnedPresetTiles`, `TitleBarWorkspaceSlots`, `TitleBarDraftSlots`, and the

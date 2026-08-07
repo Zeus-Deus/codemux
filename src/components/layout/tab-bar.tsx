@@ -25,7 +25,7 @@ import {
   renameTab,
   splitPane,
 } from "@/tauri/commands";
-import { useUIStore } from "@/stores/ui-store";
+import { RIGHT_PANEL_EMPTY, useUIStore } from "@/stores/ui-store";
 import type { WorkspaceSnapshot, TabKind, ActivePaneStatus, PaneStatus, PaneNodeSnapshot } from "@/tauri/types";
 import { useAppStore } from "@/stores/app-store";
 import { useEditorStore } from "@/stores/editor-store";
@@ -50,16 +50,24 @@ function collectPaneIds(node: PaneNodeSnapshot): string[] {
 
 function TabBarImpl({ workspace }: Props) {
   const setRightPanelTab = useUIStore((s) => s.setRightPanelTab);
+  const collapseRightPanel = useUIStore((s) => s.collapseRightPanel);
   const rightPanelTab = useUIStore(
     (s) => s.rightPanelTabs[workspace.workspace_id] ?? null,
   );
 
-  // True toggle: any open tab closes the panel; closed state opens
-  // straight to Files. `toggleRightPanel` on the store flips by *tab
-  // identity*, which would switch from Review→Files instead of closing,
-  // taking two clicks to dismiss.
+  // True toggle: any open tab closes the panel; closed state opens on the
+  // picker sentinel, which resolves to the panes the deck already has (and
+  // never re-opens a Files pane the user closed). `toggleRightPanel` on the
+  // store flips by *tab identity*, which would switch from Review→Files
+  // instead of closing, taking two clicks to dismiss. Collapsing goes
+  // through `collapseRightPanel` so the docked agent browser is released —
+  // a collapsed panel is not a surface.
   const togglePanel = () => {
-    setRightPanelTab(workspace.workspace_id, rightPanelTab == null ? "files" : null);
+    if (rightPanelTab == null) {
+      setRightPanelTab(workspace.workspace_id, RIGHT_PANEL_EMPTY);
+    } else {
+      collapseRightPanel(workspace.workspace_id);
+    }
   };
 
   // Compute per-tab status from pane statuses

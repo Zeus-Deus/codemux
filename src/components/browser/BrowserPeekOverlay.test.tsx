@@ -6,6 +6,7 @@ import userEvent from "@testing-library/user-event";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useAppStore } from "@/stores/app-store";
 import { useBrowserPeekStore } from "@/stores/browser-peek-store";
+import { useUIStore } from "@/stores/ui-store";
 import type { AgentBrowserSession, AppStateSnapshot, WorkspaceSnapshot } from "@/tauri/types";
 
 // The overlay's job is positioning/promote/close chrome — the actual
@@ -25,7 +26,7 @@ vi.mock("@/components/browser/BrowserPane", () => ({
 
 const mocks = vi.hoisted(() => ({
   guiChrome: true,
-  createBrowserPane: vi.fn().mockResolvedValue("pane-b"),
+  dockBrowserInRightPanel: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@/hooks/use-gui-chrome", () => ({
@@ -33,7 +34,8 @@ vi.mock("@/hooks/use-gui-chrome", () => ({
 }));
 
 vi.mock("@/tauri/commands", () => ({
-  createBrowserPane: (...a: unknown[]) => mocks.createBrowserPane(...a),
+  dockBrowserInRightPanel: (...a: unknown[]) =>
+    mocks.dockBrowserInRightPanel(...a),
 }));
 
 import { BrowserPeekOverlay } from "./BrowserPeekOverlay";
@@ -123,7 +125,8 @@ function renderOverlay() {
 
 beforeEach(() => {
   mocks.guiChrome = true;
-  mocks.createBrowserPane.mockClear();
+  mocks.dockBrowserInRightPanel.mockClear();
+  useUIStore.setState({ rightPanelTabs: {}, rightPanelPanes: {} });
   useBrowserPeekStore.setState({ openWorkspaceId: null });
 });
 
@@ -182,15 +185,30 @@ describe("BrowserPeekOverlay", () => {
     expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
   });
 
-  it("promotes to a pane via createBrowserPane and closes the peek", async () => {
+  // Promote docks the session into the right-panel deck rather than
+  // splitting a pane: the deck is the browser's one persistent home, so the
+  // peek graduates into it instead of creating a second place to live.
+  it("promotes into the right-panel deck and closes the peek", async () => {
     setAppState([makeSession()]);
     useBrowserPeekStore.getState().open("ws-1");
     renderOverlay();
-    await userEvent.click(screen.getByRole("button", { name: "Open as pane" }));
-    expect(mocks.createBrowserPane).toHaveBeenCalledWith("pane-1");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Open in side panel" }),
+    );
+    expect(mocks.dockBrowserInRightPanel).toHaveBeenCalledWith("ws-1");
+    expect(useUIStore.getState().getRightPanelTab("ws-1")).toBe("browser");
     await vi.waitFor(() => {
       expect(useBrowserPeekStore.getState().isOpen("ws-1")).toBe(false);
     });
+  });
+
+  // A session the user can already see in the deck is not a "background"
+  // session — offering to reveal it would be offering a second copy.
+  it("does not render for a session docked in the right panel", () => {
+    setAppState([makeSession({ right_panel_docked: true })]);
+    useBrowserPeekStore.getState().open("ws-1");
+    renderOverlay();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("closes the peek when the active workspace changes (no unprompted re-open on return)", () => {

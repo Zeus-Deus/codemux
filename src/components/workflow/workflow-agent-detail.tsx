@@ -1,5 +1,7 @@
-import { CheckCircle2, LoaderCircle } from "lucide-react";
+import { CheckCircle2 } from "lucide-react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
+import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { basename } from "@/lib/path";
@@ -90,7 +92,10 @@ export function WorkflowAgentDetail({
         )}
       >
         {running ? (
-          <LoaderCircle className={cn("h-4 w-4 shrink-0 animate-spin", tone.text)} strokeWidth={1.8} aria-hidden />
+          <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+            {/* One agent, so this orb can carry its actual activity. */}
+            <AgentOrb size={20} {...subagentOrbActivity(agent)} aria-hidden />
+          </span>
         ) : (
           <CheckCircle2 className={cn("h-4 w-4 shrink-0", tone.text)} strokeWidth={1.8} aria-hidden />
         )}

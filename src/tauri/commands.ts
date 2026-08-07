@@ -5,6 +5,7 @@ import { isRemoteClient } from "@/components/remote/is-remote-client";
 
 export { Channel };
 import type {
+  AgentBrowserSession,
   AgentChatProviderKind,
   ModelSelection,
   OpenCodeAvailability,
@@ -393,6 +394,22 @@ export const setNotificationSoundEnabled = (enabled: boolean) =>
 
 export const createBrowserPane = (paneId: string, url?: string) =>
   invoke<string>("create_browser_pane", { paneId, url: url ?? null });
+
+/** Host this workspace's agent browser session in the right-panel deck.
+ *  Returns the session so the caller can mount `BrowserPane` against the
+ *  canonical `cli_session_name` — the same daemon key the `codemux browser`
+ *  CLI and MCP tools resolve to. Adopts (and closes) an existing main-area
+ *  browser pane for the session rather than showing it twice. */
+export const dockBrowserInRightPanel = (workspaceId: string) =>
+  invoke<AgentBrowserSession>("dock_browser_in_right_panel", { workspaceId });
+
+/** Remove the workspace's agent browser session from the right-panel deck.
+ *  `dismissed` marks an explicit user close (the tab's ×), which stops the
+ *  agent re-surfacing the browser on its next command. */
+export const undockBrowserFromRightPanel = (
+  workspaceId: string,
+  dismissed: boolean,
+) => invoke("undock_browser_from_right_panel", { workspaceId, dismissed });
 
 export const createTab = (workspaceId: string, kind: TabKind) =>
   invoke<string>("create_tab", { workspaceId, kind });

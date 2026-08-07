@@ -112,14 +112,9 @@ import {
   HoverCardContent,
   HoverCardTrigger,
 } from "@/components/ui/hover-card";
-import {
-  useSettingsStore,
-  selectWorkingIndicator,
-  selectWorkingIndicatorColor,
-} from "@/stores/settings-store";
 import { useCoarseClock } from "@/lib/use-coarse-clock";
 import { StatusIndicator } from "@/components/ui/status-indicator";
-import { WorkingIndicator } from "@/components/ui/working-indicator";
+import { AgentOrb } from "@/components/ui/agent-orb";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
 import { IssueDetailPopover } from "@/components/github/issue-detail-popover";
 import { toast } from "@/lib/toast";
@@ -974,10 +969,6 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
     return getWorkspaceStatus(workspace.surfaces, s.appState.pane_statuses);
   });
 
-  // Configurable working glyph (Settings → Appearance → Agents).
-  const indicatorVariant = useSettingsStore(selectWorkingIndicator);
-  const indicatorColor = useSettingsStore(selectWorkingIndicatorColor);
-
   const handleActivate = () => {
     // Paints the selection in this click's own task (the helper clears the
     // active draft too); a transition here would only delay it.
@@ -1292,10 +1283,9 @@ export function SidebarWorkspaceRow({ workspace, isActive, projectChip }: Props)
                 PR-state-colored button that opens the PR URL on click. */}
             <div className="relative size-5 flex items-center justify-center shrink-0 mr-2">
               {workspaceStatus === "working" ? (
-                <WorkingIndicator
-                  variant={indicatorVariant}
-                  color={indicatorColor}
-                />
+                // Neutral state: this row reads `pane_statuses`, which
+                // carries no tool name. See sidebar-inbox-card.tsx.
+                <AgentOrb size={20} aria-label="Agent working" />
               ) : (
                 <>
                   {showWorkspaceIconAsPr ? (

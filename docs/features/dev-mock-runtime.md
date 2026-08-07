@@ -88,8 +88,11 @@ One gotcha worth keeping: **the named presets never trip the threshold.** They s
     and `window.__codemuxChatMock.streamReply()` triggers a live
     streamed reply on demand (`{ emptyGapTicks: N }` reproduces the
     issue #155 stream shape — an empty first text delta then N silent
-    ticks before prose — for verifying the working indicator never
-    drops out mid-turn).
+    ticks before prose — for verifying the agent orb never drops out
+    mid-turn). `streamSubagents(threadId, { intervalMs })` drives a full
+    two-subagent lifecycle; a large `intervalMs` holds the running
+    subagent rows and the docked composer strip up long enough to
+    inspect or screenshot their orbs.
   - `chat-streaming` — its pane has no thread bound, walking the
     fresh-session flow: `agent_chat_start_session`, then the
     per-thread channel pair
@@ -127,6 +130,20 @@ One gotcha worth keeping: **the named presets never trip the threshold.** They s
   recency-sorted branch list whose names overlap the seeded codemux
   worktree workspaces — so the "from ⑂ branch" picker's All/Worktrees
   tabs, WORKTREE badges, kind icons, and ages all light up in dev.
+- **File search + file reads mocked**, so the right panel's doc panes and
+  the file-search dialog are exercisable. `search_file_names` returns a
+  small repo-shaped path list filtered by the query; before it existed the
+  router fell through to the shape-safe `undefined` default and the dialog
+  crashed on `results.map`. `read_file` (`mockReadFile`) serves real
+  markdown for `.md` paths so the rendered/raw toggle, soft wrap and copy
+  have something to act on, and a short stand-in for everything else.
+  `list_directory` serves the same small static tree and still rejects
+  genuinely unknown paths on purpose (manual-path validation), but it now
+  also resolves `~/.codemux/worktrees/<project>/<slug>` roots against
+  `~/projects/<project>`, re-rooting each child so expansion resolves back
+  through the same rewrite. A worktree checkout is a copy of its project,
+  and without that alias every seeded workspace's Files pane rendered
+  "No files" — the one deck pane you could not look at in browser dev.
 
 ## Current Constraints
 

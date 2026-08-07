@@ -3,6 +3,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ArrowLeft, ArrowRight, RotateCw, Loader2, Crosshair } from "lucide-react";
 import { agentBrowserRun } from "@/tauri/commands";
+import { normalizeBrowserUrl, runBrowserNav } from "./browser-nav";
 
 interface Props {
   browserId: string;
@@ -25,7 +26,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
   }, [currentUrl]);
 
   const navigate = async (url: string) => {
-    const normalized = url.includes("://") || url.startsWith("data:") || url.startsWith("about:") ? url : `https://${url}`;
+    const normalized = normalizeBrowserUrl(url);
     setNavigating(true);
     try {
       await agentBrowserRun(cmdId, "open", { url: normalized });
@@ -51,7 +52,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         variant="ghost"
         size="icon-xs"
         aria-label="Back"
-        onClick={() => agentBrowserRun(cmdId, "back", {}).catch(console.error)}
+        onClick={() => runBrowserNav(cmdId, "back").catch(console.error)}
       >
         <ArrowLeft className="h-3 w-3" />
       </Button>
@@ -59,7 +60,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         variant="ghost"
         size="icon-xs"
         aria-label="Forward"
-        onClick={() => agentBrowserRun(cmdId, "forward", {}).catch(console.error)}
+        onClick={() => runBrowserNav(cmdId, "forward").catch(console.error)}
       >
         <ArrowRight className="h-3 w-3" />
       </Button>
@@ -67,7 +68,7 @@ export function BrowserToolbar({ browserId, sessionId, currentUrl, onUrlChange, 
         variant="ghost"
         size="icon-xs"
         aria-label="Refresh"
-        onClick={() => agentBrowserRun(cmdId, "reload", {}).catch(console.error)}
+        onClick={() => runBrowserNav(cmdId, "reload").catch(console.error)}
       >
         {navigating || loading ? (
           <Loader2 className="h-3 w-3 animate-spin" />

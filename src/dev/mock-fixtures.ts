@@ -399,6 +399,7 @@ const MOCK_AGENT_BROWSER_SESSION: AgentBrowserSession = {
   pane_id: null,
   browser_id: null,
   user_dismissed: false,
+  right_panel_docked: false,
 };
 
 /** CLI-agent counterpart to the chat fixture above. This keeps the visual
@@ -415,6 +416,7 @@ const MOCK_CLI_AGENT_BROWSER_SESSION: AgentBrowserSession = {
   pane_id: null,
   browser_id: null,
   user_dismissed: false,
+  right_panel_docked: false,
 };
 
 /** Browser-pane workspace: a single `browser` pane streaming from the
@@ -1020,6 +1022,29 @@ const MOCK_DIR_TREE: Record<string, FileEntry[]> = {
   ],
 };
 
+const WORKTREES = `${HOME}/.codemux/worktrees`;
+
+/**
+ * A worktree checkout is a copy of its project, so the fake FS serves the
+ * project's own shape under every `~/.codemux/worktrees/<project>/<slug>`
+ * root (and below it).
+ *
+ * Without this, `list_directory` threw for all but the three project-root
+ * workspaces, and the right panel's Files pane rendered "No files" for
+ * most of the seed — which made the file tree the one deck pane you could
+ * not actually look at in browser dev.
+ */
+function worktreeListing(path: string): FileEntry[] | null {
+  if (!path.startsWith(`${WORKTREES}/`)) return null;
+  const [project, slug, ...deeper] = path.slice(WORKTREES.length + 1).split("/");
+  if (!project || !slug) return null;
+  const entries = MOCK_DIR_TREE[[`${PROJECTS}/${project}`, ...deeper].join("/")];
+  if (!entries) return null;
+  // Re-root each child so expanding a directory asks for a path that
+  // resolves back through this same rewrite.
+  return entries.map((entry) => ({ ...entry, path: `${path}/${entry.name}` }));
+}
+
 /** Mock twin of the `list_directory` command. Mirrors the backend's
  *  contract: rejects on an unknown path (so the picker's manual-path
  *  validation is exercisable) and hides dot-entries unless
@@ -1028,13 +1053,47 @@ export function mockListDirectory(
   path: string,
   showHidden: boolean,
 ): FileEntry[] {
-  const entries = MOCK_DIR_TREE[path];
+  const entries = MOCK_DIR_TREE[path] ?? worktreeListing(path);
   if (!entries) {
     throw new Error(`Not a directory: ${path}`);
   }
   return showHidden
     ? entries
     : entries.filter((e) => !e.name.startsWith("."));
+}
+
+const MOCK_MARKDOWN = `# Pane deck
+
+The right panel is a deck of openable panes rather than a fixed set of
+tabs. Panes are declared in \`pane-registry.ts\`, opened from the \`+\`
+menu, and persisted per workspace.
+
+## Rows
+
+Every pane sits under the same two rows:
+
+\`\`\`text
+tab strip   38px   closable icon tabs + the "+" menu
+pane bar    32px   breadcrumb on the left, pane actions on the right
+status foot 26px   active pane's status + running token total
+\`\`\`
+
+## Notes
+
+- Pane controls live in the shared bar, never in a per-pane header.
+- Badges are plain counts; the working affordance is the orb.
+- Colour comes from tokens only — nothing hardcodes a palette value.
+`;
+
+/** Mock twin of the `read_file` command. Markdown paths get real prose so
+ *  the rendered/raw toggle has something to switch between; anything else
+ *  gets a short plain-text stand-in. */
+export function mockReadFile(path: string): string {
+  if (/\.(md|mdx|markdown)$/i.test(path)) return MOCK_MARKDOWN;
+  if (path.endsWith(".json")) {
+    return `{\n  "name": "codemux",\n  "private": true,\n  "mock": true\n}\n`;
+  }
+  return `// ${path}\n// Mock contents — no filesystem in browser dev.\n`;
 }
 
 /**

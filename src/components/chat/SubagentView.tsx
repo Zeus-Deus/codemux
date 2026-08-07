@@ -1,6 +1,8 @@
-import { LoaderCircle, Lock } from "lucide-react";
+import { Lock } from "lucide-react";
 import { useMemo } from "react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
+import { subagentOrbActivity } from "@/lib/agent-chat/orb-activity";
 import {
   isRunning,
   statusTone,
@@ -98,11 +100,13 @@ export function SubagentView({
               tone.border,
             )}
           >
-            <LoaderCircle
-              className={cn("h-4 w-4 shrink-0 animate-spin", tone.text)}
-              strokeWidth={1.9}
-              aria-hidden
-            />
+            <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+              <AgentOrb
+                size={20}
+                {...subagentOrbActivity(subagent)}
+                aria-hidden
+              />
+            </span>
             <span className="shimmer font-mono text-[12px]">
               {subagentActivityLine(subagent)}
             </span>

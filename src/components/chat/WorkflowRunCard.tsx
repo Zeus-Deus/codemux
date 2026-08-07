@@ -4,11 +4,11 @@ import {
   Ban,
   CheckCircle2,
   ChevronRight,
-  LoaderCircle,
   Workflow as WorkflowIcon,
   XCircle,
 } from "lucide-react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -295,11 +295,11 @@ function WorkflowRunningRow({
       className="cursor-pointer overflow-hidden rounded-[12px] border border-border bg-foreground/[0.025] hover:border-muted-foreground/60"
     >
       <div className="flex items-center gap-2.5 px-3.5 py-2.5">
-        <LoaderCircle
-          className="h-[17px] w-[17px] shrink-0 animate-spin text-status-working"
-          strokeWidth={1.9}
-          aria-hidden
-        />
+        {/* Stands for the whole run, like the Subagents card header, so it
+            stays neutral — the per-agent orbs live in the phase drill-in. */}
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center">
+          <AgentOrb size={20} aria-hidden />
+        </span>
         <span className="shrink-0 text-[13px] font-bold text-foreground">
           Workflow running
         </span>

@@ -55,6 +55,73 @@ pub fn create_browser_pane<R: tauri::Runtime>(
     create_browser_pane_impl(app, &state, pane_id, url)
 }
 
+/// Host this workspace's agent browser session in the right-panel deck.
+///
+/// The deck's `browser` pane is not a second browser — it is the *same*
+/// `AgentBrowserSession` the `codemux browser` CLI and the MCP tools drive,
+/// rendered by a `BrowserPane` mounted in the panel instead of in the pane
+/// tree. That is why this returns the session: the frontend needs
+/// `cli_session_name` (the daemon key every agent command resolves to) and
+/// `stream_url` to mount the stream, and must not try to re-derive either.
+///
+/// Sequence mirrors the `browser_automation` handler in `control.rs` so a
+/// user-opened browser and an agent-opened one converge on one daemon:
+/// resolve-or-create the session, allocate its port under
+/// `cli_session_name`, write the port back, then mark it docked.
+///
+/// Adopts rather than duplicates. If the session is currently attached to a
+/// pane-tree node, that node is closed here — same Chromium, same port, same
+/// cookies, just a different surface hosting the stream. `dock_...` clears
+/// `pane_id`/`browser_id` before the close so the pane teardown can't mark
+/// the session user-dismissed on the way out.
+#[tauri::command]
+pub async fn dock_browser_in_right_panel<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    agent_browser: State<'_, AgentBrowserManager>,
+    workspace_id: String,
+) -> Result<crate::state::AgentBrowserSession, String> {
+    let placeholder_port = state
+        .agent_browser_stream_port_for_workspace(&workspace_id)
+        .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
+    let session_for_naming =
+        state.resolve_agent_browser_session(&workspace_id, placeholder_port);
+    let stream_port = agent_browser
+        .allocate_port(&session_for_naming.cli_session_name)
+        .await
+        .unwrap_or(crate::agent_browser::DEFAULT_STREAM_PORT);
+    let _ = state.update_agent_browser_stream_port(&workspace_id, stream_port);
+
+    let (session, adopted_pane) = state.dock_agent_browser_in_right_panel(&workspace_id)?;
+    if let Some(pane_id) = adopted_pane {
+        // Best-effort: the pane may already be gone (closed in the same
+        // tick). The session is docked either way.
+        let _ = state.close_pane(&pane_id.0);
+    }
+
+    crate::state::emit_app_state(&app);
+    Ok(session)
+}
+
+/// Remove this workspace's agent browser session from the right-panel deck.
+///
+/// Mirrors closing a browser pane: the Chromium daemon keeps running so the
+/// agent can carry on driving it headlessly, and `dismissed` (the deck tab's
+/// ×, as opposed to collapsing the whole panel) stops the agent re-surfacing
+/// it on its next command.
+#[tauri::command]
+pub fn undock_browser_from_right_panel<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppStateStore>,
+    workspace_id: String,
+    dismissed: bool,
+) -> Result<(), String> {
+    if state.undock_agent_browser_from_right_panel(&workspace_id, dismissed) {
+        crate::state::emit_app_state(&app);
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn browser_open_url<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,

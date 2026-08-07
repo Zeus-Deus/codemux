@@ -18,6 +18,8 @@ import {
   settleSubagentsForToolResult,
   subagentActivityLine,
   subagentElapsedMs,
+  subagentGroupRollup,
+  subagentLatestOutput,
   subagentMetaLine,
   subagentOrdinal,
   subagentStatusLabel,
@@ -508,5 +510,91 @@ describe("whole-thread lookups", () => {
       ["c", "run-1", "task 1"],
       ["d", "run-2", "task 2"],
     ]);
+  });
+});
+
+describe("subagentGroupRollup", () => {
+  it("reports the LONGEST row's elapsed, not the sum — the group ran in parallel", () => {
+    const rollup = subagentGroupRollup(
+      [
+        view({ id: "a", status: "completed", durationMs: 74_000 }),
+        view({ id: "b", status: "completed", durationMs: 41_000 }),
+      ],
+      0,
+    );
+    expect(rollup.elapsedMs).toBe(74_000);
+  });
+
+  it("sums usage and tool counts, and counts done vs active", () => {
+    const rollup = subagentGroupRollup(
+      [
+        view({
+          id: "a",
+          status: "completed",
+          totalTokens: 20_000,
+          toolUseCount: 6,
+        }),
+        view({ id: "b", status: "running", totalTokens: 18_800, toolUseCount: 3 }),
+      ],
+      0,
+    );
+    expect(rollup.totalTokens).toBe(38_800);
+    expect(rollup.toolCount).toBe(9);
+    expect(rollup.doneCount).toBe(1);
+    expect(rollup.activeCount).toBe(1);
+  });
+
+  it("leaves usage null when no provider reported any, rather than summing to a fake 0", () => {
+    const rollup = subagentGroupRollup(
+      [view({ id: "a", status: "completed" })],
+      0,
+    );
+    expect(rollup.totalTokens).toBeNull();
+  });
+
+  it("falls back to counted child tool calls when the provider reported no count", () => {
+    const rollup = subagentGroupRollup(
+      [view({ id: "a", status: "completed", items: [toolCall(), toolCall()] })],
+      0,
+    );
+    expect(rollup.toolCount).toBe(2);
+  });
+
+  it("derives elapsed from the start stamp when no duration was reported", () => {
+    const rollup = subagentGroupRollup(
+      [view({ id: "a", status: "completed", startedAt: 1_000 })],
+      6_000,
+    );
+    expect(rollup.elapsedMs).toBe(5_000);
+  });
+});
+
+describe("subagentLatestOutput", () => {
+  it("keeps the provider's FULL multi-line result (the row summary keeps one line)", () => {
+    const sub = view({
+      status: "completed",
+      resultText: "Mechanism is solid.\nAll four CI jobs green.",
+    });
+    expect(subagentLatestOutput(sub)).toBe(
+      "Mechanism is solid.\nAll four CI jobs green.",
+    );
+    expect(subagentActivityLine(sub)).toBe("Mechanism is solid.");
+  });
+
+  it("falls back to the live activity, then to the latest tool call", () => {
+    expect(subagentLatestOutput(view({ activity: "reconciling parity" }))).toBe(
+      "reconciling parity",
+    );
+    expect(
+      subagentLatestOutput(
+        view({
+          items: [toolCall({ tool_name: "Bash", input: { command: "cargo test" } })],
+        }),
+      ),
+    ).toBe("run cargo test · ok");
+  });
+
+  it("returns null when there is nothing real to show", () => {
+    expect(subagentLatestOutput(view({}))).toBeNull();
   });
 });

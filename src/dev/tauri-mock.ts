@@ -47,6 +47,7 @@ import {
   MOCK_WORKFLOW_RUNNING_THREAD_ID,
   createSeedAppState,
   mockListDirectory,
+  mockReadFile,
   mockWebRemoteEndpoints,
   mockWebRemotePairing,
   mockWebRemoteSessions,
@@ -68,6 +69,7 @@ import type {
   ScrollbackRestore,
 } from "@/tauri/commands";
 import type {
+  AgentBrowserSession,
   AppStateSnapshot,
   ArchivedWorkspaceSnapshot,
   ChatModelInfo,
@@ -1907,6 +1909,55 @@ const handlers: Record<string, Handler> = {
   // real app; the mock accepts and ignores them.
   agent_browser_run: () => null,
 
+  // The right-panel deck's browser pane hosts the workspace's ONE agent
+  // browser session (`docs/features/browser.md`). The mock mirrors the real
+  // command's contract — flip `right_panel_docked`, hand the session back so
+  // the pane knows which `cli_session_name` to stream — but there is no
+  // pane tree to adopt from here, so the adopt branch has nothing to do.
+  dock_browser_in_right_panel: (a) => {
+    const workspaceId = a.workspaceId as string;
+    const session = appState.agent_browser_sessions.find(
+      (abs) => abs.workspace_id === workspaceId,
+    );
+    // Mirrors `resolve_agent_browser_session`: the session is minted on
+    // first use, keyed by workspace, with a name derived from its cwd.
+    if (!session) {
+      const ws = appState.workspaces.find((w) => w.workspace_id === workspaceId);
+      const fresh: AgentBrowserSession = {
+        session_id: `agent-browser-${workspaceId}`,
+        workspace_id: workspaceId,
+        cli_session_name: `devmock-${(ws?.title ?? workspaceId).replace(/\W+/g, "-")}`,
+        stream_url: "ws://127.0.0.1:9777",
+        current_url: "http://localhost:1420",
+        is_active: true,
+        pane_id: null,
+        browser_id: null,
+        user_dismissed: false,
+        right_panel_docked: true,
+      };
+      appState.agent_browser_sessions.push(fresh);
+      emitAppState();
+      return structuredClone(fresh);
+    }
+    session.pane_id = null;
+    session.browser_id = null;
+    session.right_panel_docked = true;
+    session.is_active = true;
+    session.user_dismissed = false;
+    emitAppState();
+    return structuredClone(session);
+  },
+  undock_browser_from_right_panel: (a) => {
+    const session = appState.agent_browser_sessions.find(
+      (abs) => abs.workspace_id === (a.workspaceId as string),
+    );
+    if (!session?.right_panel_docked) return null;
+    session.right_panel_docked = false;
+    if (a.dismissed) session.user_dismissed = true;
+    emitAppState();
+    return null;
+  },
+
   // ── Core state ──
   get_app_state: () => appState,
   get_home_dir: () => MOCK_HOME_DIR,
@@ -1958,6 +2009,33 @@ const handlers: Record<string, Handler> = {
   // `list_directory` so manual-path validation is exercisable in dev.
   list_directory: (a) =>
     mockListDirectory(String(a.path ?? "/"), Boolean(a.showHidden)),
+
+  // Without a handler the mock returned its `undefined` default and the
+  // file-search dialog crashed on `results.map`. Serve a small repo-shaped
+  // list so "Open file…" (and the right panel's doc panes) are exercisable
+  // in browser dev.
+  search_file_names: (a) => {
+    const query = String(a.query ?? "").toLowerCase();
+    const paths = [
+      "AGENTS.md",
+      "README.md",
+      "CLAUDE.md",
+      "package.json",
+      "docs/INDEX.md",
+      "docs/core/STATUS.md",
+      "src/components/layout/right-panel.tsx",
+      "src/stores/ui-store.ts",
+      "src-tauri/Cargo.toml",
+    ];
+    return query
+      ? paths.filter((p) => p.toLowerCase().includes(query))
+      : paths;
+  },
+
+  // Enough content for the editor surfaces (main-area tab and the right
+  // panel's doc panes) to exercise rendered-vs-raw markdown, soft wrap and
+  // copy without a real filesystem.
+  read_file: (a) => mockReadFile(String(a.path ?? "")),
 
   // ── Theme / appearance ──
   get_current_theme: () => THEME,

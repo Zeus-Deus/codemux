@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { CheckCircle2, ChevronRight, LoaderCircle } from "lucide-react";
 
+import { AgentOrb } from "@/components/ui/agent-orb";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { formatCompactTokens } from "@/components/chat/WorkflowRunCard";
 import { formatElapsed } from "@/lib/agent-chat/subagents";
@@ -102,7 +103,8 @@ function PhaseCard({
   const statusIcon = (
     <span className="flex h-[22px] w-[22px] shrink-0 items-center justify-center">
       {status === "running" ? (
-        <LoaderCircle className={cn("h-[17px] w-[17px] animate-spin", tone.text)} strokeWidth={1.9} aria-hidden />
+        // Neutral: a phase is many agents, so it carries no single activity.
+        <AgentOrb size={20} aria-hidden />
       ) : status === "pending" ? (
         <span className="h-[9px] w-[9px] rounded-full border-[1.6px] border-muted-foreground" aria-hidden />
       ) : (

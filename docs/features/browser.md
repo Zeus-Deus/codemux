@@ -12,6 +12,7 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 
 ## What Works Today
 
+- open the browser inside the right panel as a real closable deck pane (the same session the agent drives — see "The browser in the right-panel deck")
 - create a browser pane inside a workspace
 - navigate with the address bar or `codemux browser open`
 - keep browser panes inside split layouts next to terminals
@@ -30,6 +31,104 @@ The browser pane uses a screenshot-driven Chromium session backed by `agent-brow
 - stream stability across concurrent worktrees: daemons are PID-tracked (not port-tracked), the workspace-id map is the single canonical key, `close()` is atomic (remove entry → kill PID → await exit → verify port free), `allocate_port()` runs a symmetric `TcpListener::bind` probe on every OS, and `BrowserPane.tsx` reactively reconnects when `stream_url` changes. Replaces the older flow where the manager could lose track of which port belonged to which workspace, leak daemons, and leave panes stuck at the right URL with no frames. See `docs/archive/browser-stream-fix.md` for the full landed plan.
 - workspace-correct routing for env-less callers: `browser_automation` requests carry both the caller's `CODEMUX_WORKSPACE_ID` (injected into terminal PTYs and, since the agent-chat fix, into Claude/Codex chat sidecars) and a best-effort `cwd` hint. When `workspace_id` is empty, `resolve_workspace_id_by_cwd` in `src-tauri/src/control.rs` resolves the owning workspace lexically from the cwd (exact or component-safe subdirectory match against each workspace's `cwd`/`worktree_path`, longest root wins for nested worktrees) before falling back to the legacy active-workspace path — so agent-chat sessions (and OpenCode's shared server, which can't take per-session env) open their browser pane in the agent's own workspace, not whichever one the user is viewing
 - hang-proof external calls (issue #96): every `agent-browser` CLI / process-control invocation runs through hard-timeout wrappers (`output_capture_with_timeout` / `launch_status_with_timeout`) that kill the child — and, on Unix, its whole process group — on overrun, so a wedged daemon can never block `close()` / `start_stream()` / automation forever. The async callers also push the blocking work onto `tokio::task::spawn_blocking` so a slow CLI can't stall the runtime's worker threads. Default ceilings: ~5s process control, ~10s `close`, ~30s DOM actions, ~60s `open`/`wait`. Replaces the unbounded `std::process::Command::output()` calls that hung `cargo test` to the 30-minute job timeout on the Windows CI image.
+
+## The browser in the right-panel deck
+
+The browser's home is the **right-panel deck's `browser` pane** — not a
+split in the workspace pane tree. Opening it from the panel's `+` menu
+does not create a browser; it **docks** the workspace's existing
+`AgentBrowserSession` into the panel.
+
+**Why this is safe.** `BrowserPane` is position-independent: a `<canvas>`
+fed by a WebSocket screencast, not a native webview welded to a slot in
+the pane tree. Nothing about the daemon, the port, the cookies or the
+automation path depends on where the component is mounted.
+`BrowserPeekOverlay` already mounted one outside the pane tree; the deck
+is the same trick with a permanent home.
+
+**One session, one surface.** The backend's notion of "the browser" was
+never the pane — it is the per-workspace `AgentBrowserSession`, whose
+`cli_session_name` (derived from the workspace cwd) is the key
+`allocate_port` and every `codemux browser` / MCP call resolves to. The
+deck pane mounts `BrowserPane` against that name, so the browser the user
+drives and the Chromium the agent drives are the same daemon on the same
+port showing the same page.
+
+`AgentBrowserSession` therefore carries **two** hosts, and
+`is_surfaced()` is the union:
+
+| Field | Meaning |
+| --- | --- |
+| `pane_id: Option<PaneId>` | attached to a workspace pane-tree node |
+| `right_panel_docked: bool` | hosted by the right-panel deck |
+
+They are mutually exclusive by construction — `dock_agent_browser_in_right_panel`
+clears `pane_id`, `attach_agent_browser_to_pane` clears
+`right_panel_docked` — so the same Chromium can never be mirrored by two
+surfaces. Everything that used to ask "is a pane attached?" now asks
+`is_surfaced()`:
+
+- `should_create_browser_pane` in `control.rs` — a docked browser
+  suppresses auto-creating a main-area pane, so an agent's next
+  `browser open` drives the panel instead of splitting the workspace.
+- `release_detached_agent_browser` — a docked session is one the user is
+  looking at, so the end of an agent run no longer marks it inactive.
+- the background chip / terminal-header indicator / peek overlay, which
+  all resolve through the single `selectBackgroundBrowserSession`
+  predicate in `background-browser-indicator.tsx`.
+
+**Commands.** `dock_browser_in_right_panel(workspace_id)` mirrors the
+`browser_automation` handler's sequence — resolve-or-create the session,
+allocate its port under `cli_session_name`, write the port back, mark it
+docked — and returns the session so the frontend gets `cli_session_name`
+and `stream_url` without re-deriving either. It **adopts** rather than
+duplicates: if the session is currently attached to a pane-tree node,
+that node is closed as part of docking. `undock_browser_from_right_panel(workspace_id, dismissed)`
+mirrors closing a browser pane — the daemon keeps running, and
+`dismissed: true` (the tab's ×) stops the agent re-surfacing it on its
+next command. Collapsing the whole panel undocks with `dismissed: false`:
+a collapsed panel is not a surface, so leaving the session docked would
+hide the browser from both the agent's pane gate and the background chip.
+The tab stays in the deck, so re-opening the panel re-docks it.
+
+That rule lives in **one place**: `collapseRightPanel(workspaceId)` on the
+UI store. The titlebar cluster, the panel's own close button, the
+`toggleRightPanel` keybind (Ctrl+Shift+B) and the legacy tab-bar toggle all
+route through it, and `setRightPanelTab(ws, null)` delegates to it, so a new
+collapse path cannot bypass the undock. Opening is symmetrical everywhere:
+the panel comes back on `RIGHT_PANEL_EMPTY`, the picker sentinel, rather
+than force-opening Files over a pane the user had closed.
+
+Docking is a round trip (it allocates a port), so the deck re-checks itself
+when the promise resolves: if the tab was closed or the panel collapsed
+while it was in flight, the user's own undock no-opped on the not-yet-docked
+session, and the reply would otherwise mark it surfaced with nothing hosting
+it. The deck undocks again in that case, carrying the intent that raced it
+(`dismissed: true` for a closed tab, `false` for a collapsed panel).
+
+**Entry points, and what each one does now:**
+
+| Entry point | Behavior |
+| --- | --- |
+| Right panel `+` ▸ Browser | Docks the workspace session into the deck. If a main-area browser pane already holds that session, it is adopted (closed) rather than mirrored. |
+| Peek overlay ▸ "Open in side panel" | Docks the same session into the deck. Promote no longer splits the main area — the deck is the browser's one persistent home, so the peek stays a transient look that graduates into it. |
+| Agent `codemux browser …` with the pane docked | Drives the docked browser. No second pane is created (`is_surfaced()`). |
+| Agent `codemux browser …` with nothing surfaced | Unchanged: a main-area pane in legacy mode, a detached background session under the Agent Chat GUI. |
+| Main tab strip `+` ▸ Browser, ports popover, command palette | Unchanged — still `createBrowserPane`, still a main-area pane. If that re-attaches the docked session, the deck yields its tab rather than mirroring it. |
+
+**Pane chrome.** The deck has one 36px row of chrome shared with the tabs,
+so the browser contributes only back / forward / reload as 24px icon
+buttons in its action slot, routed through `runBrowserNav` in
+`src/components/browser/browser-nav.ts` — the same helper (and the same
+agent-browser command channel) the main-area pane's `BrowserToolbar` uses,
+so a click in either place is indistinguishable to the daemon.
+`BrowserPane` is mounted with `hideToolbar`, because that slot is the
+toolbar here. **The address is not in the row** — a URL cannot sit honestly
+in 36px it shares with the tab strip, so it renders in the deck's status
+foot instead (scheme stripped, `· agent session` appended while the agent
+is driving). There is no URL entry field either; typing an address is still
+the main-area pane's affordance, and in-page navigation, the agent, and
+back/forward all work normally in the panel.
 
 ## Background browser in GUI mode
 
@@ -151,19 +250,20 @@ already in hand:
   Escape, click-outside, and switching the active workspace all close it —
   the peek is a transient "look at this now" affordance, so returning to a
   workspace never pops it open unprompted. Header: green status dot, mono
-  URL readout, "Open as pane" (promote) and close buttons. Body: a live
+  URL readout, "Open in side panel" (promote) and close buttons. Body: a live
   `BrowserPane`. Peek open/closed state is a single `openWorkspaceId` in a
   small zustand store, `src/stores/browser-peek-store.ts` (at most one peek
   can be open app-wide).
-- **Promote to pane** — "Open as pane" calls the same `create_browser_pane`
-  Tauri command the `+` launcher's Panes → Browser item uses
-  (`agent-launcher.tsx`); `create_browser_pane_impl`
-  (`src-tauri/src/commands/browser.rs`) already finds and reconnects a
-  workspace's detached agent session, so no new backend command was
-  needed. The peek closes on promote; the chip/indicator stop showing
-  `LIVE`/the blink once the session is pane-attached (no longer
-  "background") since the chip/indicator lookups filter on `pane_id ===
-  null`.
+- **Promote to the side panel** — "Open in side panel" calls
+  `dock_browser_in_right_panel` and activates the deck's `browser` tab,
+  the same thing the right panel's `+` ▸ Browser does. It used to call
+  `create_browser_pane` and split the chat in half; the deck is now the
+  browser's one persistent home, so the peek graduates into it rather
+  than creating a second place a browser can permanently live. The peek
+  closes on promote, and the chip/indicator stop offering to reveal the
+  session because their shared predicate
+  (`selectBackgroundBrowserSession`) filters on `pane_id === null && !right_panel_docked`
+  — a browser the user is already looking at is not a background one.
 
 **`BrowserPane` plumbing note**: a detached/background session has no
 `browser_id` (that's only assigned once a pane exists), but `BrowserPane`
@@ -341,7 +441,9 @@ session are never swept, only workspace-scoped ones.
 
 - `src-tauri/src/agent_browser.rs` — `AgentBrowserManager`, stealth flags, stream port allocation (PID-tracked daemons keyed by `workspace_id`, symmetric bind probe on every OS, atomic teardown), viewport argv builder (`resolve_viewport_params`, `format_dpr`), and the external-process timeout layer (`output_capture_with_timeout`, `launch_status_with_timeout`, `wait_with_timeout`, `kill_timed_out_child`, `action_timeout`) that bounds every CLI/kill call (issue #96)
 - `src-tauri/src/browser_viewport.rs` — preset table (`PRESETS`, `RESET_SPEC`) and `parse_spec` for preset / `WxH` / `reset` parsing
-- `src-tauri/src/commands/browser.rs` — Tauri commands for pane creation, URL navigation, automation
+- `src-tauri/src/commands/browser.rs` — Tauri commands for pane creation, URL navigation, automation, and right-panel hosting (`dock_browser_in_right_panel`, `undock_browser_from_right_panel`)
+- `src/components/layout/right-panel/browser-pane.tsx` — the deck's browser pane (body + tab-row nav actions); dock/undock lifecycle lives in `right-panel.tsx`
+- `src/components/browser/browser-nav.ts` — shared `back`/`forward`/`reload`, URL normalization, and the short display form of a URL, used by both the main-area toolbar and the deck's status foot
 - `src-tauri/src/control.rs` — `browser_automation` control-socket handler: workspace-scoped routing by `workspace_id`, the `resolve_workspace_id_by_cwd` fallback for env-less callers, and the legacy active-workspace path when neither resolves
 - `src-tauri/src/cli.rs` — `BrowserCommand::Viewport` and `BrowserCommand::ViewportPresets` CLI subcommands
 - `src-tauri/src/mcp_server.rs` — `browser_viewport` and `browser_viewport_presets` MCP tools

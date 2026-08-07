@@ -107,3 +107,15 @@ vi.mock('@tauri-apps/api/core', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@tauri-apps/api/core')>();
   return { ...actual, convertFileSrc: (filePath: string) => filePath };
 });
+
+// The agent activity orb (`thinking-orbs`) paints on a 2D canvas. jsdom
+// ships no canvas implementation unless the optional `canvas` package is
+// installed, so `getContext('2d')` emits a "Not implemented" jsdomError on
+// every orb that mounts. The library already bails out cleanly on a null
+// context, so the render is correct either way — this stub only keeps the
+// test output readable. Returning null (rather than a fake context) keeps
+// the library on its no-op path instead of exercising a half-real one.
+if (typeof HTMLCanvasElement !== 'undefined') {
+  HTMLCanvasElement.prototype.getContext = (() =>
+    null) as unknown as HTMLCanvasElement['getContext'];
+}
