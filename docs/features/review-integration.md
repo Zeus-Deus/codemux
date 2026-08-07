@@ -1,14 +1,14 @@
 # Review Integration
 
-- Purpose: Describe the current capability and constraints of the Review tab (pull request review surface).
-- Audience: Anyone working on GitHub integration or the Review panel UI.
+- Purpose: Describe the current capability and constraints of the Review tab (pull/merge request review surface).
+- Audience: Anyone working on hosting-provider integration or the Review panel UI.
 - Authority: Canonical feature-level reality doc.
 - Update when: PR display, review, merge, or checks behavior changes.
-- Read next: `docs/features/changes-panel.md`, `docs/features/merge-resolver.md`
+- Read next: `docs/features/source-control-providers.md`, `docs/features/changes-panel.md`, `docs/features/merge-resolver.md`
 
 ## What This Feature Is
 
-The Review tab is a right-sidebar surface that displays pull request details, review threads, and CI checks for the current workspace branch. It integrates with GitHub via the `gh` CLI tool.
+The Review tab is a right-sidebar surface that displays change-request details, review threads, and CI checks for the current workspace branch. It is **provider-aware**: the checkout is classified by the `git_provider` registry and served by that product's adapter — `gh` for GitHub, `glab` for GitLab. See `docs/features/source-control-providers.md`.
 
 > The tab was previously named "PR." It was renamed to "Review" in Phase 3 of the right-sidebar work to match Superset's terminology (`pr-panel.tsx` → `review-panel.tsx`, `pr/` subfolder → `review/`).
 >
@@ -16,8 +16,15 @@ The Review tab is a right-sidebar surface that displays pull request details, re
 
 ## Current Model
 
-PR data is fetched from GitHub through `gh` CLI commands routed via Rust
-(`src-tauri/src/github.rs`). The current workspace association uses an explicit
+PR data is fetched through the `SourceControlProvider` the checkout resolves to
+(`src-tauri/src/git_provider/`), which shells out to that product's own CLI. The
+Tauri commands keep their GitHub-shaped names — they are the stable boundary —
+but their implementations go through the registry, so a GitLab checkout is served
+by `glab` with merge requests normalized onto the same structs. Everything below
+describes the GitHub path, which is unchanged; the GitLab adapter mirrors it
+deliberately (same branch-selection preference, same "a failed lookup preserves,
+a successful empty result clears" contract) so no component needs a per-product
+branch. The current workspace association uses an explicit
 branch query (`gh pr list --head <branch> --state all`) rather than implicit
 `gh pr view` inference or exact commit-SHA equality. This keeps a merged/closed
 PR attached when review commits advanced its remote head beyond the local
@@ -28,8 +35,29 @@ so a fork-tracking branch is disambiguated client-side by the row's
 been reused; historical matches are hidden on the repository default branch.
 A successful empty result clears the association, while an unanswerable lookup
 (command/auth/network error, or a detached HEAD) preserves the last known value.
-The frontend renders sub-components for each PR aspect. Auth status is checked
-before fetching. The panel updates when workspace state changes.
+The frontend renders sub-components for each PR aspect. The panel updates when
+workspace state changes.
+
+**Auth is checked before fetching, host-scoped.** The panel no longer asks for
+`gh`'s one global verdict: it calls `check_provider_auth` through the shared
+cached wrapper in `src/lib/provider-auth.ts`, which resolves the checkout's
+product and probes *that* CLI against *that* instance. Two self-hosted
+deployments of the same product therefore no longer share a login verdict. The
+three status messages name the resolved product: "GitLab CLI (glab) is not
+installed. Install it from …", "Not authenticated. Run: glab auth login", "Not a
+GitLab repository" — plus a new "Codemux has no <product> integration yet." for a
+recognised-but-unserved host and "No supported source control host for this
+repository" when detection classified nothing at all. A host Codemux cannot
+serve is answered *before* the CLI states, so a checkout on an unclassifiable
+host never gets told to install a CLI it may well already have. Only usable
+verdicts are cached (60s), so a fresh login shows up on the next render.
+
+**Terminology is provider-aware.** Nouns, sigils, CLI names and login commands
+come from the presentation map in `src/lib/source-control.ts`, keyed on the
+workspace snapshot's `provider_kind`: "No merge request for this branch",
+"Create Merge Request", an `MR title` placeholder, `!12` instead of `#12`. A
+workspace with no `provider_kind` resolves to GitHub, so every pre-existing
+GitHub surface renders byte-identical copy.
 
 **The Review tab is strictly current-branch, deliberately.** The sidebar shows
 a PR badge for a *side branch* the worktree merely checked out recently (the
@@ -74,14 +102,21 @@ The PR panel includes an incoming PRs list that shows all open pull requests tar
 - Review decision indicator (Approved, Changes Requested)
 - CI checks status (success/failure/pending icons)
 - Addition/deletion stats and relative timestamp
-- Hover actions: "View" opens PR on GitHub, "Checkout" creates a worktree workspace from the PR branch (or switches to an existing workspace if one already tracks that branch)
+- Hover actions: "View" opens the change request on its product, "Checkout" creates a worktree workspace from the PR branch (or switches to an existing workspace if one already tracks that branch)
 - PR number is passed through to workspace creation for sidebar badge display
 
-The view fetches up to 50 PRs via `gh pr list` and shows a "View all on GitHub" link when the limit is reached.
+The view fetches up to 50 change requests (`gh pr list` / the GitLab merge-request
+list endpoint) and shows a "View all on <product>" link when the limit is reached;
+the list URL is derived from a row's URL per product (`/pull/<n>` → `/pulls`,
+`/-/merge_requests/<n>` → `/-/merge_requests`), leaving anything unrecognised
+untouched rather than mangled. The section header, row refs and empty state all
+use the product's nouns and sigil.
 
 ## Current Constraints
 
-- Requires `gh` CLI to be installed and authenticated
+- Requires the detected product's CLI to be installed and authenticated (`gh` for GitHub, `glab` for GitLab)
+- Bitbucket and Azure DevOps checkouts are recognised but not served — the panel says so instead of offering controls that would fail
+- GitLab serves no deployments and has no request-changes verb (see `docs/features/source-control-providers.md` § Current Constraints)
 - No inline PR diff view (diffs are in the Changes panel)
 - Review comments are displayed but cannot be replied to inline
 - No draft PR promotion UI
@@ -94,5 +129,8 @@ The view fetches up to 50 PRs via `gh pr list` and shows a "View all on GitHub" 
 - `src/components/workspace/review/review-threads.tsx` — review + inline review comments (read-only)
 - `src/components/workspace/review/incoming-prs-view.tsx` — incoming PRs list
 - `src/components/workspace/review/collapsible-section.tsx` — collapsible section wrapper with item counts
-- `src-tauri/src/github.rs` — GitHub data fetching via gh CLI
-- `src-tauri/src/commands/github.rs` — Tauri GitHub commands (incl. the still-registered, currently uncalled `merge_pull_request`)
+- `src/lib/source-control.ts` — provider presentation map (nouns, sigils, CLI names)
+- `src/lib/provider-auth.ts` — cached host-scoped auth gate shared with the composer and the new-workspace preflight
+- `src-tauri/src/git_provider/` — provider detection, trait, registry, and the GitHub/GitLab adapters
+- `src-tauri/src/github.rs` — GitHub data fetching via gh CLI (behind the GitHub adapter)
+- `src-tauri/src/commands/github.rs` — Tauri commands, now routed through the registry (incl. the still-registered, currently uncalled `merge_pull_request`)

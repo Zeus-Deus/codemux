@@ -22,6 +22,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { ProjectAvatar } from "@/components/ui/project-avatar";
+import { MENU_ROW_TWO_LINE, MenuKeycap } from "@/components/ui/menu-chrome";
 import {
   selectActiveWorkspaceId,
   useAppStore,
@@ -72,6 +73,11 @@ import {
   DEFAULT_JUMP_MODIFIER,
 } from "./sidebar-inbox-jump";
 import type { ActivePaneStatus, WorkspaceSnapshot } from "@/tauri/types";
+import {
+  providerForWorkspace,
+  providerRef,
+  providerRefLabel,
+} from "@/lib/source-control";
 
 /** How many leading cards get a jump badge — the digit shortcuts only reach 1-9. */
 const MAX_JUMP_HINTS = 9;
@@ -478,6 +484,7 @@ const SettledRow = memo(function SettledRow({
 }: SettledRowProps) {
   const appearance = useProjectAppearance(repo.path);
   const prState = normalizePrState(workspace.pr_state);
+  const provider = providerForWorkspace(workspace);
 
   // Settled work is history, so the shelf reads as one grey block at rest:
   // the repo avatar desaturates, the title drops to a faint muted tone and
@@ -599,9 +606,9 @@ const SettledRow = memo(function SettledRow({
           aria-label={
             workspace.pr_number
               ? workspace.pr_url
-                ? `Open PR #${workspace.pr_number} on GitHub — ${prState}`
-                : `PR #${workspace.pr_number} — ${prState}`
-              : `Pull request — ${prState}`
+                ? `Open ${providerRefLabel(provider, workspace.pr_number)} on ${provider.name} — ${prState}`
+                : `${providerRefLabel(provider, workspace.pr_number)} — ${prState}`
+              : `${provider.nounTitle} — ${prState}`
           }
           className={cn(
             "inline-flex h-5 shrink-0 items-center gap-1 rounded px-1 font-mono text-[10px] font-medium",
@@ -629,7 +636,9 @@ const SettledRow = memo(function SettledRow({
               the icon and this badge silently goes back to a colored glyph on
               a grey number — there is a test pinning it. */}
           <PrStatusIcon state={prState} size={3} className="shrink-0 text-current" />
-          {workspace.pr_number != null && <span>#{workspace.pr_number}</span>}
+          {workspace.pr_number != null && (
+            <span>{providerRef(provider, workspace.pr_number)}</span>
+          )}
         </button>
       )}
       {time && (
@@ -1764,17 +1773,39 @@ export function SidebarInbox() {
                 +
               </button>
             </DropdownMenuTrigger>
-            <DropdownMenuContent side="bottom" align="start">
-              <DropdownMenuItem onClick={() => openProject()} className="text-xs">
-                <FolderOpen className="mr-2 h-3.5 w-3.5" />
-                Open project
+            {/* Two-line rows: "Open project" and "New project" are one word
+                apart and mean opposite things (adopt what's on disk vs clone
+                from a remote), so each carries the sentence that tells them
+                apart rather than making the user find out by clicking. */}
+            <DropdownMenuContent side="bottom" align="start" className="w-[246px]">
+              <DropdownMenuItem
+                onClick={() => openProject()}
+                className={MENU_ROW_TWO_LINE}
+              >
+                <FolderOpen />
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="flex items-center gap-2">
+                    <span className="flex-1">Open project</span>
+                    <MenuKeycap actionId="openProject" />
+                  </span>
+                  <span className="text-[11px] leading-snug text-muted-foreground/70">
+                    Pick a repo already on this machine
+                  </span>
+                </span>
               </DropdownMenuItem>
               <DropdownMenuItem
                 onClick={() => setShowNewProjectScreen(true)}
-                className="text-xs"
+                className={MENU_ROW_TWO_LINE}
               >
-                <FolderPlus className="mr-2 h-3.5 w-3.5" />
-                New project
+                <FolderPlus />
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="flex items-center gap-2">
+                    <span className="flex-1">New project</span>
+                  </span>
+                  <span className="text-[11px] leading-snug text-muted-foreground/70">
+                    Clone from a Git remote
+                  </span>
+                </span>
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>

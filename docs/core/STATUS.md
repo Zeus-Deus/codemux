@@ -21,7 +21,8 @@ not shipped in a published build. Older per-release implementation notes were mo
 Codemux is past Linux MVP and shipping cross-platform binaries. The workspace shell, terminal management, git integration, presets, settings sync, and most ADE features are real and daily-drivable on both Linux and Windows. The latest released version is **`v0.17.0` (2026-08-05)**, an app-chrome and chat-navigation release: the GUI title bar became frameless floating islands, the full-width workspace context bar was deleted, the chat transcript gained an explicit new-turn scroll contract, cross-provider skills became provider-correct, text-selection colors were standardized onto two tokens, and the legacy standalone orchestration runtime was deleted outright. `v0.16.0` (2026-08-02) was the release in which the Agent Chat GUI became the default interface — it also carried the seven-phase GUI responsiveness program, the unified Ctrl+K switcher, the Agent Tasks and context-window surfaces, the compressed web-remote transport, and the one-command remote bootstrap. Release notes for `v0.15.6` and earlier live in `docs/archive/release-notes-v0.14-v0.15.md` and `docs/archive/release-notes-v0.6-v0.13.md`.
 
 Unreleased after `v0.17.0` — nine merged PRs (#248–#256) plus the
-directly-committed side-branch PR badge fallback, grouped by subsystem below.
+directly-committed side-branch PR badge fallback and the multi-provider
+source-control seam, grouped by subsystem below.
 Everything in this block is on `main` and has not shipped in a published
 build:
 
@@ -49,6 +50,27 @@ build:
   catalog's per-effort descriptions into the picker's description line, with
   built-in fallbacks for `ultra`/`ultracode` in `ReasoningPicker.tsx`. See
   `docs/features/agent-chat.md` § "Reasoning picker (effort)".
+
+- **Popup menus restyled onto the command-palette surface.** The workspace
+  right-click menu, the footer gear menu and the projects `+` menu now share
+  one chrome (`src/components/ui/menu-chrome.tsx` + `.cm-menu-surface` in
+  `globals.css`): 13px radius, hairline border, one elevation, 32px rows with
+  a 14px icon on every row, and right-aligned mono keycaps — resolved through
+  `keybind-registry` where a binding exists, omitted where none does (no new
+  global bindings were registered, and a keycap is never shown for a combo the
+  registry hands to a different action). The item lists are unchanged.
+  New presentation: an identity header on the workspace menu (avatar,
+  workspace, project, `+A −D`), named **Workspace / Actions / Organize** groups
+  instead of bare dividers, a red-tinted destructive tail, the project colour
+  palette as a 7-across swatch grid, a two-line device submenu that always
+  exists (with "No other devices signed in." when it is empty), two-line rows
+  in the `+` menu, and a version/update footer strip in the gear menu fed by
+  the new `src/stores/update-status-store.ts` mirror — so the menu reads the
+  one `useUpdateChecker` that `UpdateToast` mounts rather than starting a
+  second poll. The shadcn dropdown/context-menu primitives adopted the surface
+  globally (submenus included, which previously diverged); the row rhythm is
+  opt-in, so the ~17 other menus on those primitives keep their dense lists.
+  See `docs/features/sidebar.md` and `docs/features/project-avatars.md`.
 
 - **AskUserQuestion panel rebuilt on the shadcn Questionnaire component** (PR #252). `ComposerPendingInputPanel`'s hand-rolled option rows, paging chevrons, and hidden `sr-only` inputs are replaced by the newly released shadcn **Questionnaire** primitives (`src/components/ui/questionnaire.tsx` over the new `@shadcn/react` package, installed for the repo's `radix-nova` style): real fieldset/legend semantics per question, radio/checkbox indicator cards with automatically mapped 1–9 shortcut chips, focus-visible rings the old panel lacked, and Previous/Next/Submit navigation. The externally observable contract is unchanged — same `AskUserQuestionOutput` shape (answers keyed by question text, `", "`-joined multiSelect with free text appended, raw `questions` echoed), same composer-docked card on the chat-column rails, same global document-level keyboard layer for focus-outside-the-form digits/arrows/Enter (now guarded against double-handling with the primitive's in-form handler), same `option.preview` HoverCards and test ids. `npm run dev` + `?askq=1` seeds a pending two-question request for browser QA; the mock's `agent_chat_respond_to_request` now resolves it so answering settles the panel into the reply bubble. See `docs/features/agent-chat.md` § "AskUserQuestion panel".
 
@@ -225,6 +247,73 @@ build:
   it appeared is what read as lag. See `docs/features/sidebar.md`.
 
 - **Send-in-thread scroll feel** (PR #249, follow-up to #247). Two behavior changes to the new-turn scroll contract, both aimed at how a follow-up send in a long thread *feels*. First, **the anchor now outlives the turn**: it persists until the next send replaces it, a rollback clears it, or the thread changes. #247 expired it on the falling edge of `streaming || isSending`, which unmounted the reserved end space in one frame and visibly yanked the parked prompt from the top to mid-viewport at the exact moment the reply finished; now nothing on screen moves at settle, at the deliberate price of blank space persisting below a completed reply. The two hazards that motivated expiry got targeted fixes instead: "which send nonce is already positioned" moved into a pane-owned ref (`sendAnchorPositionedNonceRef` → `positionedNonceRef`) so a `MessageList` remount under a live anchor re-reserves space without re-parking, and `anchoredEndSpace.onSizeChanged` re-runs the advance decision so no-data-change layout growth (a late-loading image) still reveals the tail while the built-in pin is off — plus a ≤2px offset restore makes spacer resizes imperceptible to a free-scrolling reader. Second, **the send positioning is an animated glide** (`scrollToIndex({ animated: true })`) with a settle handshake — `scrollend`, or a 750ms fallback timer where the event is unsupported — that re-pins the landed offset instantly and gates the stream-advance effect so a fast first token cannot cut the glide short; `prefers-reduced-motion` keeps the instant placement. Smaller feel parity: the edge signal for the pill and follow re-claim is now `isNearEnd` (half a viewport) instead of hairline `isAtEnd`, and the pill's return glides too. Frontend-only; the pure geometry in `send-scroll-state.ts` is untouched. See `docs/features/agent-chat.md` § "Transcript scroller" → "The new-turn scroll contract".
+
+- **Multi-provider source control — GitLab joins GitHub** (source-control
+  provider seam). The hosting integration was GitHub-only in two places at once:
+  every call shelled out to `gh`, and the gate for "may we show PR UI here?" was
+  a substring match on `github.com` in `git remote -v`. Both halves are now a
+  seam under `src-tauri/src/git_provider/`. **Detection** is offline — `git
+  remote -v` plus the branch's upstream, classified by *hostname* into a
+  `ProviderKind` (`github` / `gitlab` / `bitbucket` / `azure_devops` /
+  `unknown`), with a synced `source_control.custom_hosts` mapping outranking
+  every built-in heuristic so a self-hosted instance on a neutral domain
+  (`git.acme.internal`) can be named by the user. The multi-remote policy is
+  stated once: a classifiable remote always beats an unclassifiable one (the old
+  gate matched *any* remote and must keep doing so), then upstream → `origin` →
+  first listed. Results are cached for 60s **success-only**, so an `Unknown` is
+  re-probed every call and a `git remote add origin …` or a fresh host mapping
+  takes effect on the next render rather than a minute later; a settings write
+  that moves the mapping clears the cache outright. **`SourceControlProvider`**
+  is exactly the method set the review panel, composer pickers, worktree path and
+  both pollers already called on `crate::github`, reusing the same structs so a
+  second product populates the same shapes rather than inventing new ones; the
+  registry resolves a checkout to an adapter with a deliberate split — *strict*
+  for gates and pollers (`repo_has_supported_provider`, replacing
+  `is_github_repo`), *advisory* for the GitHub-named command surface, so a host
+  Codemux cannot classify still reaches `gh` and self-hosted GitHub Enterprise
+  keeps working. Unserved products get a null object, not an `Option`, so no
+  caller branches on "is there a provider" and every failure is one sanitized
+  sentence. **The GitHub adapter is logic-free delegation** — routing a call site
+  through the trait cannot change what GitHub users observe. **The GitLab
+  adapter** drives `glab api` (the documented REST payload, not glab's own Go
+  struct, and the only way to reach discussions/pipelines/per-file diffs),
+  host-scoped by `--hostname` because an unscoped `glab auth status` ANDs across
+  every configured instance; it normalizes merge requests onto `PullRequestInfo`
+  by `iid`, maps pipeline jobs (or the commit statuses standing in for an
+  externally reported pipeline) onto the same check buckets, splits discussions
+  into conversation threads and diff-anchored inline comments, and answers the
+  fork fetch with `refs/merge-requests/<n>/head` against GitHub's
+  `pull/<n>/head`. One deadline-bounded subprocess runner (`exec.rs`) now backs
+  both CLIs, draining both pipes on their own threads — the previous poll-then-read
+  shape deadlocked on any output larger than a pipe buffer and reported a timeout
+  that never happened. Both pollers stamp a new snapshot field **`provider_kind`**
+  (snapshot-local, serde-defaulted, never synced) and gate per provider *instance*,
+  so a signed-out GitHub can no longer stall GitLab workspaces and two self-hosted
+  deployments keep independent logins. Two new commands: `discover_source_control`
+  (infallible per-product diagnostics — CLI presence, sanitized version line,
+  account, declared capabilities; never reads a token) and `check_provider_auth`
+  (host-scoped readiness for one checkout, behind a 60s success-only frontend
+  cache in `src/lib/provider-auth.ts` shared by the review panel, both composer
+  surfaces and the new-workspace preflight, all of which previously asked `gh`'s
+  one global question). **Copy is provider-aware** through a single presentation
+  map (`src/lib/source-control.ts`): PR/MR nouns, `#`/`!` sigils, CLI names and
+  login commands across the review panel, incoming list, Context Row chip,
+  sidebar cards/rows/badges, hover card (which gains a **Hosting** row), composer
+  attach popup and mention footers, pickers, and the new-workspace dialog — with
+  an absent `provider_kind` resolving to GitHub so every existing GitHub surface
+  renders byte-identical strings, and a *present but unrecognised* one falling to
+  neutral "change request" wording rather than borrowed GitHub nouns. A new
+  **Settings → Source Control** section (`source-control-section.tsx`, plus
+  `SubsectionHeader` extracted into `settings-primitives.tsx`) carries the
+  diagnostics rows with their one actionable fix line, a Rescan button, and the
+  self-hosted host→product editor. Codemux stores no hosting credentials — each
+  product is driven through its own CLI's existing login. Bitbucket and Azure
+  DevOps are recognised, listed dimmed, and refused with a clear message rather
+  than a confusing CLI error; GitLab deliberately serves no deployments and
+  refuses `request-changes` rather than silently downgrading it to a comment.
+  Verified against a local GitLab by the `#[ignore]`d round trip in
+  `src-tauri/tests/gitlab_live.rs`. See
+  `docs/features/source-control-providers.md`.
 
 Shipped in `v0.17.0` (2026-08-05) — eight merged PRs (#239–#246) plus the
 directly-committed new-turn scroll contract (PR #247) and the floating-chrome

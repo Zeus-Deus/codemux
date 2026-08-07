@@ -1,5 +1,10 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { cn } from "@/lib/utils";
+import {
+  providerRef,
+  resolveProvider,
+  type ProviderPresentation,
+} from "@/lib/source-control";
 import { Search, Loader2 } from "lucide-react";
 import { PrStatusIcon, type PrStatusState } from "@/components/github/pr-status-icon";
 import { listPullRequests, getGithubPrByPath } from "@/tauri/commands";
@@ -35,11 +40,13 @@ function effectivePrState(pr: PullRequestInfo): PrStatusState {
 function PrRow({
   pr,
   isFocused,
+  provider,
   onSelect,
   onMouseEnter,
 }: {
   pr: PullRequestInfo;
   isFocused: boolean;
+  provider: ProviderPresentation;
   onSelect: () => void;
   onMouseEnter: () => void;
 }) {
@@ -58,7 +65,7 @@ function PrRow({
     >
       <PrStatusIcon state={effectivePrState(pr)} className="shrink-0" />
       <span className="text-muted-foreground text-[0.75rem] shrink-0 font-mono tabular-nums">
-        #{pr.number}
+        {providerRef(provider, pr.number)}
       </span>
       <span className="text-[0.8rem] text-foreground truncate min-w-0 flex-1">
         {pr.title}
@@ -88,14 +95,19 @@ function SkeletonRow() {
 export function PrPickerPanel({
   projectPath,
   open,
+  providerKind = null,
   onSelect,
   onClose,
 }: {
   projectPath: string;
   open: boolean;
+  /** Hosting product of the repo being picked from. Absent means
+   *  GitHub, so existing call sites keep their exact wording. */
+  providerKind?: string | null;
   onSelect: (pr: PullRequestInfo) => void;
   onClose: () => void;
 }) {
+  const provider = resolveProvider(providerKind);
   // Default the list-state filter to "open" — that's overwhelmingly
   // what users want to triage. The search box can dive into closed /
   // merged via fuzzy match if they pulled in earlier; numeric direct
@@ -244,7 +256,7 @@ export function PrPickerPanel({
             ref={inputRef}
             value={search}
             onChange={(e) => handleSearchChange(e.target.value)}
-            placeholder="Search PRs… (or type a number)"
+            placeholder={`Search ${provider.shortNoun}s… (or type a number)`}
             className="flex-1 bg-transparent text-xs text-foreground placeholder:text-muted-foreground/50 outline-none min-w-0"
           />
         </div>
@@ -262,21 +274,24 @@ export function PrPickerPanel({
           <div className="px-3 py-4 text-center">
             <p className="text-xs text-muted-foreground">
               {error.includes("not authenticated") || error.includes("auth")
-                ? "Connect GitHub to link PRs"
+                ? `Connect ${provider.name} to link ${provider.shortNoun}s`
                 : error.includes("not installed")
-                  ? "Install GitHub CLI (gh) to link PRs"
-                  : "Failed to load PRs"}
+                  ? `Install ${provider.cliLabel} to link ${provider.shortNoun}s`
+                  : `Failed to load ${provider.shortNoun}s`}
             </p>
           </div>
         ) : displayPrs.length === 0 ? (
           <div className="px-3 py-4 text-center text-xs text-muted-foreground">
-            {search.trim() ? "No PRs found" : "No open PRs"}
+            {search.trim()
+              ? `No ${provider.shortNoun}s found`
+              : `No open ${provider.shortNoun}s`}
           </div>
         ) : (
           displayPrs.map((pr, idx) => (
             <PrRow
               key={pr.number}
               pr={pr}
+              provider={provider}
               isFocused={idx === focusIndex}
               onSelect={() => handleSelectPr(pr)}
               onMouseEnter={() => setFocusIndex(idx)}

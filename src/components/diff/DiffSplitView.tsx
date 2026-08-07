@@ -146,7 +146,7 @@ export const DiffSplitView = forwardRef<DiffViewHandle, Props>(
       };
 
     return (
-      <div className="flex-1 grid grid-cols-[1fr_1px_1fr] min-h-0 overflow-hidden font-mono text-xs leading-[18px]">
+      <div className="select-text flex-1 grid grid-cols-[1fr_1px_1fr] min-h-0 overflow-hidden font-mono text-xs leading-[18px]">
         {/* Left — deletions / old */}
         <div
           ref={leftRef}

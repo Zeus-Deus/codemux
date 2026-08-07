@@ -17,6 +17,8 @@ pub struct UserSettings {
     #[serde(default)]
     pub git: GitSettings,
     #[serde(default)]
+    pub source_control: SourceControlSettings,
+    #[serde(default)]
     pub keyboard: KeyboardSettings,
     #[serde(default)]
     pub notifications: NotificationSettings,
@@ -108,6 +110,22 @@ impl Default for GitSettings {
             default_base_branch: default_base_branch(),
         }
     }
+}
+
+/// Git *hosting* knobs, as opposed to the local-git ones in
+/// [`GitSettings`].
+///
+/// `custom_hosts` maps a bare hostname to a hosting product
+/// (`"git.acme.internal" -> "gitlab"`), for self-hosted instances whose
+/// domain gives nothing away. It is the highest-priority input to
+/// provider detection — see `crate::git_provider::detect::classify_host`.
+/// Values are read leniently: an entry naming a product this build does
+/// not know is skipped rather than failing the whole settings blob,
+/// because these sync across devices and versions.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct SourceControlSettings {
+    #[serde(default)]
+    pub custom_hosts: HashMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -238,8 +256,21 @@ pub fn save_cache(settings: &UserSettings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
     }
+    // Read before write: provider detection reads `source_control` out of
+    // this file and caches its answer for a minute, so a new custom-host
+    // mapping would otherwise not take effect until that lapsed. Every
+    // settings write funnels through here, which is why the hook lives
+    // here rather than at each call site.
+    let host_mapping_changed = load_cache()
+        .map(|previous| previous.source_control != settings.source_control)
+        .unwrap_or(true);
+
     let json = serde_json::to_string_pretty(settings).map_err(|e| format!("serialize: {e}"))?;
     fs::write(&path, json).map_err(|e| format!("write cache: {e}"))?;
+
+    if host_mapping_changed {
+        crate::git_provider::invalidate_detection_cache(None);
+    }
     Ok(())
 }
 
@@ -540,6 +571,12 @@ mod tests {
             git: GitSettings {
                 default_base_branch: "develop".into(),
             },
+            source_control: SourceControlSettings {
+                custom_hosts: HashMap::from([(
+                    "git.acme.internal".into(),
+                    "gitlab".into(),
+                )]),
+            },
             keyboard: KeyboardSettings {
                 shortcuts: {
                     let mut m = HashMap::new();
@@ -580,6 +617,10 @@ mod tests {
         assert!(back.file_tree.show_hidden_files);
         assert_eq!(back.terminal.cursor_style, "underline");
         assert_eq!(back.git.default_base_branch, "develop");
+        assert_eq!(
+            back.source_control.custom_hosts.get("git.acme.internal"),
+            Some(&"gitlab".to_string())
+        );
         assert_eq!(back.keyboard.shortcuts.len(), 2);
         assert_eq!(back.keyboard.shortcuts.get("ctrl+s").unwrap(), "save");
         assert!(!back.notifications.sound_enabled);
@@ -604,6 +645,24 @@ mod tests {
         let explicit = r#"{"browser":{"default_viewport":"1920x1080"}}"#;
         let parsed: UserSettings = serde_json::from_str(explicit).unwrap();
         assert_eq!(parsed.browser.default_viewport.as_deref(), Some("1920x1080"));
+    }
+
+    /// A blob saved before source control had a section still
+    /// deserializes — no custom host mappings, so provider detection
+    /// runs on its built-in heuristics alone.
+    #[test]
+    #[serial]
+    fn missing_source_control_section_defaults_to_no_custom_hosts() {
+        let legacy = r#"{"appearance":{"theme":"dark"}}"#;
+        let parsed: UserSettings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.source_control.custom_hosts.is_empty());
+
+        let explicit = r#"{"source_control":{"custom_hosts":{"git.acme.internal":"gitlab"}}}"#;
+        let parsed: UserSettings = serde_json::from_str(explicit).unwrap();
+        assert_eq!(
+            parsed.source_control.custom_hosts.get("git.acme.internal"),
+            Some(&"gitlab".to_string())
+        );
     }
 
     /// A settings blob saved before the agent_chat section existed

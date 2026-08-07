@@ -134,7 +134,7 @@ export const UserMessage = memo(function UserMessage({
             </div>
           ) : null}
           {item.text ? (
-            <div className="whitespace-pre-wrap break-words">{item.text}</div>
+            <div className="select-text whitespace-pre-wrap break-words">{item.text}</div>
           ) : null}
         </div>
         {queued ? (
