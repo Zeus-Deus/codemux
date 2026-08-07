@@ -36,7 +36,8 @@ The frontend talks to Rust through typed wrappers in `src/tauri/commands.ts` plu
 Rust owns the durable app domain and runtime integration.
 
 - Tauri composition root: `src-tauri/src/lib.rs`
-- canonical app state: `src-tauri/src/state/`
+- canonical app state: `src-tauri/src/state/` (the in-memory `AppStateSnapshot` plus its `layout.json` load/save)
+- local persistence: `src-tauri/src/database.rs` (the `codemux.db` SQLite store and its replay-idempotent migration ledger) — see `docs/features/persistence-layer.md`
 - PTY and terminal lifecycle: `src-tauri/src/terminal/`
 - agent-chat providers: `src-tauri/src/agent_provider/` (the `AgentProvider` trait plus per-provider adapters for Codex and Claude; the Claude adapter drives the sidecar binary under `sidecar/claude-agent/`)
 - JSON-RPC stdio helper: `src-tauri/src/json_rpc_child/` (shared framing + routing for long-lived subprocesses both provider adapters use)
@@ -55,7 +56,7 @@ Rust owns the durable app domain and runtime integration.
 
 The Tauri command layer is split by domain.
 
-`src-tauri/src/commands/` holds 23 domain modules: `agent_chat`, `ai`, `auth`, `automations`,
+`src-tauri/src/commands/` holds 24 domain modules: `agent_chat`, `ai`, `auth`, `automations`,
 `branch_name`, `browser`, `database`, `files`, `gemini`, `git`, `github`, `hosts`, `mcp`, `opencode`,
 `package_detect`, `permissions`, `presets`, `project_files`, `settings_sync`, `skills`,
 `skills_sync`, `update`, `workspace`, `workspaces_sync`. Memory, indexing,
